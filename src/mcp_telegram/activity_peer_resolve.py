@@ -19,7 +19,7 @@ from typing import Protocol, cast
 
 from telethon.tl.types import TypeInputChannel, TypeInputPeer
 
-from .activity_substrate import ActivityClient
+from .activity_substrate import ActivityClient, call_with_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +231,7 @@ async def _resolve_linked_chat_live(
     conn: sqlite3.Connection,
     channel_id: int,
     now: int,
+    timeout_s: float | None,
 ) -> LinkedChatResolution:
     """Run the live Telethon fetch and persist the linked-chat cache."""
     from telethon.tl.functions.channels import GetFullChannelRequest
@@ -239,7 +240,11 @@ async def _resolve_linked_chat_live(
     if input_channel is None:
         return LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None)
 
-    full_result = cast(_FullResultLike, await client(GetFullChannelRequest(channel=input_channel)))
+    request = GetFullChannelRequest(channel=input_channel)
+    if timeout_s is None:
+        full_result = cast(_FullResultLike, await client(request))
+    else:
+        full_result = cast(_FullResultLike, await call_with_timeout(client, request, timeout_s=timeout_s))
     full_chat = full_result.full_chat
     linked_chat_id = _normalize_linked_chat_id(full_chat.linked_chat_id)
     existing_blob, existing_detail_row = _load_existing_detail_blob(conn, channel_id)
@@ -264,6 +269,8 @@ async def resolve_linked_chat_id(
     client: ActivityClient,
     conn: sqlite3.Connection,
     channel_id: int,
+    *,
+    timeout_s: float | None = None,
 ) -> LinkedChatResolution:
     """Dialogs-first linked-chat resolver for a broadcast channel.
 
@@ -302,7 +309,7 @@ async def resolve_linked_chat_id(
     now = int(time.time())
 
     try:
-        return await _resolve_linked_chat_live(client, conn, channel_id, now)
+        return await _resolve_linked_chat_live(client, conn, channel_id, now, timeout_s)
     except FloodWaitError as exc:
         logger.warning(
             "activity_peer_resolve_linked_flood channel_id=%r flood_wait_seconds=%d",

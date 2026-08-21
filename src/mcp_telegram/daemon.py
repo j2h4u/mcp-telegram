@@ -1133,6 +1133,7 @@ async def _start_followup_background_tasks(
             policy=ScheduledReconciliationPolicy(
                 interval_seconds=ctx.scheduling.scheduled_reconciliation_seconds,
                 flood_sleep_threshold_seconds=ctx.scheduling.scheduled_flood_sleep_threshold_seconds,
+                activity_rpc_timeout_seconds=ctx.scheduling.activity_rpc_timeout_seconds,
             ),
             own_only_context=ctx.own_only_context,
         ),

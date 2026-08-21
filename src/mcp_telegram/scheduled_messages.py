@@ -47,6 +47,7 @@ _INSERT_SCHEDULED_FTS_SQL = "INSERT INTO scheduled_messages_fts(dialog_id, messa
 class ScheduledReconciliationPolicy:
     interval_seconds: float
     flood_sleep_threshold_seconds: int
+    activity_rpc_timeout_seconds: float
 
 
 def _as_int(value: object) -> int:
@@ -338,19 +339,22 @@ def _retry_at(conn: sqlite3.Connection) -> int | None:
 class ScheduledMessageReconciler:
     """Periodic authoritative scheduled-history snapshot worker."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - explicit reconciliation dependencies and injected timeout policy
         self,
         client: _ScheduledClient,
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
         scheduled_flood_sleep_threshold_seconds: int,
         own_only_context: OwnOnlyContext | None = None,
+        *,
+        activity_rpc_timeout_seconds: float | None = None,
     ) -> None:
         self._client = client
         self._conn = conn
         self._shutdown_event = shutdown_event
         self._scheduled_flood_sleep_threshold_seconds = scheduled_flood_sleep_threshold_seconds
         self._own_only_context = own_only_context
+        self._activity_rpc_timeout_seconds = activity_rpc_timeout_seconds
 
     def _legacy_dialog_ids(self) -> set[int]:
         """Return scheduled rows already known locally.
@@ -387,7 +391,10 @@ class ScheduledMessageReconciler:
         personal_linked_chat_id = context.personal_channel_linked_chat_id
         if context.personal_channel_id is not None:
             resolution = await resolve_linked_chat_id(
-                cast(ActivityClient, self._client), self._conn, context.personal_channel_id
+                cast(ActivityClient, self._client),
+                self._conn,
+                context.personal_channel_id,
+                timeout_s=self._activity_rpc_timeout_seconds,
             )
             if resolution.flood_wait_seconds is not None:
                 _record_retry(
@@ -524,6 +531,7 @@ async def run_scheduled_reconciliation_loop(
                 shutdown_event,
                 policy.flood_sleep_threshold_seconds,
                 own_only_context,
+                activity_rpc_timeout_seconds=policy.activity_rpc_timeout_seconds,
             ).run_once()
         except asyncio.CancelledError:
             raise

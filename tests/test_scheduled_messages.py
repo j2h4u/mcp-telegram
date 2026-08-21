@@ -15,6 +15,7 @@ import pytest
 from telethon.errors import ChannelPrivateError, FloodWaitError
 from telethon.tl.types import PeerUser
 
+from mcp_telegram.activity_peer_resolve import LinkedChatResolution
 from mcp_telegram.event_handlers import EventHandlerManager, _NewMessageEvent
 from mcp_telegram.own_only import OwnOnlyContext, query_own_only_candidates
 from mcp_telegram.scheduled_messages import (
@@ -205,7 +206,9 @@ async def test_reconciliation_without_own_only_context_does_not_sweep_all_synced
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_classifies_and_enrolls_own_only_candidates(conn: sqlite3.Connection) -> None:
+async def test_reconciliation_classifies_and_enrolls_own_only_candidates(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
     personal_id = -1000000009001
     admin_id = -1000000009002
     unrelated_id = -1000000009003
@@ -234,12 +237,23 @@ async def test_reconciliation_classifies_and_enrolls_own_only_candidates(conn: s
             unrelated_id: SimpleNamespace(creator=False, admin_rights=SimpleNamespace(post_messages=False)),
         },
     )
+    captured: dict[str, float | None] = {}
+
+    async def fake_resolve_linked_chat_id(
+        client: object, conn: sqlite3.Connection, channel_id: int, *, timeout_s: float | None
+    ) -> LinkedChatResolution:
+        del client, conn, channel_id
+        captured["timeout_s"] = timeout_s
+        return LinkedChatResolution(linked_chat_id=discussion_id, flood_wait_seconds=None)
+
+    monkeypatch.setattr("mcp_telegram.scheduled_messages.resolve_linked_chat_id", fake_resolve_linked_chat_id)
     worker = ScheduledMessageReconciler(
         client,
         conn,
         asyncio.Event(),
         0,
         OwnOnlyContext(account_id=42, personal_channel_id=9001),
+        activity_rpc_timeout_seconds=53.0,
     )
 
     assert await worker.run_once() == 0
@@ -258,6 +272,7 @@ async def test_reconciliation_classifies_and_enrolls_own_only_candidates(conn: s
     assert len(client.entity_calls) == 2
     assert set(client.entity_calls) == {admin_id, unrelated_id}
     assert all(kwargs["flood_sleep_threshold"] == 0 for _, kwargs in client.requests)
+    assert captured == {"timeout_s": 53.0}
 
 
 @pytest.mark.asyncio
