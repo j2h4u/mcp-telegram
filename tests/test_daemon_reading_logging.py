@@ -5,13 +5,16 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import AsyncIterator, Mapping, Sequence
+from pathlib import Path
 from typing import cast
 
 import pytest
 
-from mcp_telegram.daemon_reading import (
-    DaemonReadingDeps,
-    DaemonReadingService,
+from mcp_telegram.models import ReadMessage
+from mcp_telegram.pagination import HistoryDirection, decode_navigation_token
+from mcp_telegram.reactions.contracts import ReactionFreshness
+from mcp_telegram.reading import ReadingDeps, ReadingService
+from mcp_telegram.reading.service import (
     _ListMessagesTelegramRequest,
     _next_telegram_offset,
     _object_to_int,
@@ -24,9 +27,6 @@ from mcp_telegram.daemon_reading import (
     _TelegramBatchCapContext,
     _TelegramBatchRequest,
 )
-from mcp_telegram.models import ReadMessage
-from mcp_telegram.pagination import HistoryDirection, decode_navigation_token
-from mcp_telegram.reactions.contracts import ReactionFreshness
 from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from mcp_telegram.telegram_history import TelethonTelegramHistoryGateway
 from mcp_telegram.telegram_reading import HistoryFetchResult, TelegramHistoryGateway
@@ -140,8 +140,8 @@ def test_read_state_per_dialog_skips_non_dm_and_zero_dialogs() -> None:
         """
     )
     seed_full_history_enrollment(conn, 7, enabled=False)
-    service = DaemonReadingService(
-        DaemonReadingDeps(
+    service = ReadingService(
+        ReadingDeps(
             conn=conn,
             sync_db_path=None,
             self_id=1,
@@ -248,9 +248,9 @@ def test_telegram_batch_cap_predicate_requires_all_boundary_conditions() -> None
     )
 
 
-def _telegram_service(gateway: _PagedHistoryGateway, conn: sqlite3.Connection | None = None) -> DaemonReadingService:
-    return DaemonReadingService(
-        DaemonReadingDeps(
+def _telegram_service(gateway: _PagedHistoryGateway, conn: sqlite3.Connection | None = None) -> ReadingService:
+    return ReadingService(
+        ReadingDeps(
             conn=conn or sqlite3.connect(":memory:"),
             sync_db_path=None,
             self_id=1,
@@ -261,6 +261,18 @@ def _telegram_service(gateway: _PagedHistoryGateway, conn: sqlite3.Connection | 
             rid=lambda: "",
         )
     )
+
+
+@pytest.mark.parametrize("file_backed", [False, True])
+def test_own_only_probe_handles_sqlite_row_without_own_only_table(tmp_path: Path, file_backed: bool) -> None:
+    database = tmp_path / "reading.db" if file_backed else ":memory:"
+    conn = sqlite3.connect(database)
+    conn.row_factory = sqlite3.Row
+    service = _telegram_service(_PagedHistoryGateway([]), conn)
+    try:
+        assert service._own_only_basis_by_dialog() is None
+    finally:
+        conn.close()
 
 
 def test_search_next_navigation_retains_scope_and_utc_bounds() -> None:
@@ -366,7 +378,7 @@ async def test_search_scoped_result_applies_time_bounds_and_keeps_cursor_context
             "outbox_cursor_state": "populated",
         }
     }
-    monkeypatch.setattr("mcp_telegram.daemon_reading._build_access_metadata", lambda *_args: {"dialog_access": "live"})
+    monkeypatch.setattr("mcp_telegram.reading.service._build_access_metadata", lambda *_args: {"dialog_access": "live"})
     request = _SearchMessagesRequest(
         dialog_id=123,
         dialog=None,
@@ -397,8 +409,8 @@ async def test_search_scoped_result_applies_time_bounds_and_keeps_cursor_context
 async def test_list_messages_telegram_entity_miss_logs_structured_warning_without_traceback() -> None:
     logger = _TestLogger()
     conn = sqlite3.connect(":memory:")
-    service = DaemonReadingService(
-        DaemonReadingDeps(
+    service = ReadingService(
+        ReadingDeps(
             conn=conn,
             sync_db_path=None,
             self_id=1,
@@ -479,8 +491,8 @@ async def test_build_read_messages_projects_persisted_reaction_events() -> None:
         """
     )
     logger = _TestLogger()
-    service = DaemonReadingService(
-        DaemonReadingDeps(
+    service = ReadingService(
+        ReadingDeps(
             conn=conn,
             sync_db_path=None,
             self_id=1,

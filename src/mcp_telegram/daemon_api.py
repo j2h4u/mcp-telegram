@@ -77,32 +77,23 @@ from .daemon_account_trace import (
     DaemonAccountTraceService,
 )
 from .daemon_dialog_queries import (
-    _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL,
-    _COUNT_BOOTSTRAP_PENDING_SQL,
     _COUNT_SYNCED_MESSAGES_SQL,
     _GET_ACCESS_LOST_ALERTS_SQL,
     _GET_DELETED_ALERTS_SQL,
     _GET_EDIT_ALERTS_SQL,
     _GET_SYNC_STATUS_SQL,
     _LIST_TOPICS_SQL,
-    _compute_sync_coverage,
-    build_sync_read_model,
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from .daemon_message import (
-    cached_reaction_freshness,
-    project_cached_message_facts,
     project_cached_message_facts_by_dialog,
 )
-from .daemon_message_queries import (
-    _FETCH_UNREAD_MESSAGES_SQL,
-    _read_message_from_row,
-)
-from .daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
 from .folders.read_model import dialog_placement, folders_by_dialog, list_folder_messages, list_folders
 from .history_enrollment import disable_history, enable_history, read_intent
 from .important_events.read_model import list_important_events as read_important_events
-from .models import DialogType, ReadMessage
+from .models import ReadMessage
+from .reading import ReadingDeps, ReadingService
+from .sync_read_model import build_sync_read_model, compute_sync_coverage
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
 
@@ -158,14 +149,12 @@ def _topic_icons_need_refresh(rows: list[tuple[object, object, object, object, o
     return any(row[2] is not None and row[4] is None for row in rows)
 
 
-from .budget import allocate_message_budget_proportional, unread_chat_tier
 from .daemon_source_export import (
     _describe_source,
     _export_source_changes,
     _read_source_unit_window,
 )
 from .feedback_db import VALID_SEVERITIES, VALID_STATUSES
-from .reactions.contracts import ReactionFreshness
 from .reactions.refresh import ReactionFreshener
 from .telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from .telegram_history import TelethonTelegramHistoryGateway
@@ -232,17 +221,10 @@ type _DispatchHandler = Callable[
 if TYPE_CHECKING:
     from .daemon_account_trace import _AccountTraceClientLike
     from .daemon_account_trace import _LoggerLike as AccountTraceLoggerLike
-    from .daemon_reading import DaemonReadingService
-    from .daemon_reading import _ListMessagesDbRequest as ReadingListMessagesDbRequest
-    from .daemon_reading import _ListMessagesTelegramRequest as ReadingListMessagesTelegramRequest
-    from .daemon_reading import _LoggerLike as ReadingLoggerLike
     from .pagination import HistoryDirection
 else:
     _AccountTraceClientLike = object
     AccountTraceLoggerLike = object
-    ReadingListMessagesDbRequest = object
-    ReadingListMessagesTelegramRequest = object
-    ReadingLoggerLike = object
 
 # Phase 39.2 §Key technical decisions: per-message TTL for JIT reactions freshen-on-read.
 # Amortizes rapid paginated reads on the same ids; live events catch most mutations.
@@ -442,7 +424,7 @@ class DaemonAPIServer:
         # While False, handle_client returns daemon_not_ready with startup_detail.
         self._ready: bool = False
         self.startup_detail: str = "connecting to Telegram"
-        self._reading_service: DaemonReadingService | None = None
+        self._reading_service: ReadingService | None = None
         self._topic_refresher = topic_refresher
         self._policy = policy
         self._health_status = health_status
@@ -478,13 +460,11 @@ class DaemonAPIServer:
             self._folder_snapshot_refreshed_at = time.monotonic()
             logger.info("telegram folder snapshot refreshed")
 
-    def _get_reading_service(self) -> DaemonReadingService:
+    def _get_reading_service(self) -> ReadingService:
         """Get memoized reading-service instance with explicit daemon dependencies."""
         if self._reading_service is None:
-            from .daemon_reading import DaemonReadingDeps, DaemonReadingService
-
-            self._reading_service = DaemonReadingService(
-                DaemonReadingDeps(
+            self._reading_service = ReadingService(
+                ReadingDeps(
                     conn=self._conn,
                     sync_db_path=self._sync_db_path,
                     self_id=self.self_id,
@@ -494,7 +474,7 @@ class DaemonAPIServer:
                         TelethonTelegramFragmentGateway(self._client),
                     ),
                     history_gateway=TelethonTelegramHistoryGateway(self._client),
-                    logger=cast(ReadingLoggerLike, logger),
+                    logger=cast(_LoggerLike, logger),
                     rid=_rid,
                 )
             )
@@ -893,7 +873,7 @@ class DaemonAPIServer:
     ) -> dict:
         """Delegate context-window reads to the reading service."""
         # "list_messages rendered"
-        return await self._get_reading_service()._list_messages_context_window(
+        return await self._get_reading_service().list_messages_context_window(
             dialog_id=dialog_id,
             anchor_message_id=anchor_message_id,
             context_size=context_size,
@@ -901,9 +881,7 @@ class DaemonAPIServer:
 
     async def _list_messages_from_telegram(self, req: object) -> dict:
         """Delegate Telegram fallback reads to the reading service."""
-        return await self._get_reading_service()._list_messages_from_telegram(
-            cast(ReadingListMessagesTelegramRequest, req)
-        )
+        return await self._get_reading_service().list_messages_from_telegram(req)
 
     # ------------------------------------------------------------------
     # list_messages — helpers
@@ -918,18 +896,14 @@ class DaemonAPIServer:
         direction_enum: HistoryDirection,
     ) -> str | None:
         """Delegate pagination encoding to the reading service."""
-        from .daemon_reading import DaemonReadingService, _NextNavContext
-
-        return DaemonReadingService._maybe_encode_next_nav(
-            _NextNavContext(
-                messages=messages,
-                limit=limit,
-                dialog_id=dialog_id,
-                direction=direction,
-                direction_enum=direction_enum,
-                logger=cast(ReadingLoggerLike, logger),
-                request_id=_rid,
-            ),
+        return ReadingService.encode_next_navigation(
+            messages=messages,
+            limit=limit,
+            dialog_id=dialog_id,
+            direction=direction,
+            direction_enum=direction_enum,
+            logger=cast(_LoggerLike, logger),
+            request_id=_rid,
         )
 
     async def _resolve_unread_position(
@@ -938,12 +912,12 @@ class DaemonAPIServer:
         unread_after_id: int | None,
     ) -> int | None:
         """Delegate unread-position resolution to the reading service."""
-        return await self._get_reading_service()._resolve_unread_position(dialog_id, unread_after_id)
+        return await self._get_reading_service().resolve_unread_position(dialog_id, unread_after_id)
 
     async def _list_messages_from_db(self, req: dict[str, object]) -> dict:
         """Delegate sync.db reads to the reading service."""
         # "list_messages rendered"
-        return await self._get_reading_service()._list_messages_from_db(cast(ReadingListMessagesDbRequest, req))
+        return await self._get_reading_service().list_messages_from_db(req)
 
     # ------------------------------------------------------------------
     # list_messages — navigation decoding
@@ -958,9 +932,7 @@ class DaemonAPIServer:
         topic_id: int | None,
     ) -> tuple[int | None, str] | dict:
         """Delegate history-navigation decoding to the reading service."""
-        from .daemon_reading import DaemonReadingService
-
-        return DaemonReadingService._decode_history_navigation(
+        return ReadingService.decode_history_navigation(
             navigation,
             dialog_id,
             direction,
@@ -974,7 +946,7 @@ class DaemonAPIServer:
 
     async def _list_messages(self, req: dict[str, object]) -> dict:
         """Delegate list_messages orchestration to the reading service."""
-        return await self._get_reading_service()._list_messages(cast(dict[str, object], req))
+        return await self._get_reading_service().list_messages(cast(dict[str, object], req))
 
     # ------------------------------------------------------------------
     # search_messages
@@ -982,7 +954,7 @@ class DaemonAPIServer:
 
     async def _search_messages(self, req: dict[str, object]) -> dict:
         """Delegate full-text search to the reading service."""
-        return await self._get_reading_service()._search_messages(cast(dict[str, object], req))
+        return await self._get_reading_service().search_messages(cast(dict[str, object], req))
 
     # ------------------------------------------------------------------
     # list_dialogs
@@ -991,7 +963,7 @@ class DaemonAPIServer:
     async def _list_dialogs(self, req: dict[str, object]) -> dict:
         """Delegate list_dialogs reads to the reading service."""
         await self._refresh_folders_if_stale()
-        result = await self._get_reading_service()._list_dialogs(cast(dict[str, object], req))
+        result = await self._get_reading_service().list_dialogs(cast(dict[str, object], req))
         if not result.get("ok"):
             return result
         memberships = folders_by_dialog(self._conn)
@@ -1015,7 +987,7 @@ class DaemonAPIServer:
 
     async def _get_unread_summary(self, req: dict[str, object]) -> dict:
         """Delegate the Dialog-projection unread overview to the read service."""
-        return await self._get_reading_service()._get_unread_summary(cast(dict[str, object], req))
+        return await self._get_reading_service().get_unread_summary(cast(dict[str, object], req))
 
     async def _list_folders(self, _req: dict[str, object]) -> dict:
         await self._refresh_folders_if_stale()
@@ -1237,7 +1209,7 @@ class DaemonAPIServer:
             "sync_progress_message_id": sync_progress,
             "total_messages": total_messages,
             "delete_detection": "reliable (channel)" if dialog_id < 0 else "best-effort weekly (DM)",
-            "sync_coverage_pct": _compute_sync_coverage(total_messages, message_count),
+            "sync_coverage_pct": compute_sync_coverage(total_messages, message_count),
             "access_lost_at": access_lost_at,
             "access_last_revalidated_at": access_revalidation[0],
             "access_next_revalidate_at": access_revalidation[1],
@@ -1386,186 +1358,8 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _list_unread_messages(self, req: dict[str, object]) -> dict:
-        """Return prioritized unread messages across dialogs.
-
-        Request: limit (int, 1-500), group_size_threshold (int).
-        Response data: {"groups": [{"dialog_id", "display_name", "tier",
-        "category", "unread_count", "unread_mentions_count",
-        "messages": [{"message_id", "sent_at", "text", ...}]}]}.
-        """
-        from .daemon_reading import _parse_request_boundary
-
-        if "scope" in req:
-            return {
-                "ok": False,
-                "error": "invalid_input",
-                "message": "scope is not supported by get_inbox; use get_unread_summary for an overview",
-            }
-        limit = _clamp(_coerce_int(req.get("limit", 100), 100), 1, 500)
-        group_size_threshold = _coerce_int(req.get("group_size_threshold", 100), 100)
-        try:
-            since_utc = _parse_request_boundary(req, "since_utc")
-        except ValueError as exc:
-            return {"ok": False, "error": "invalid_input", "message": str(exc)}
-
-        unread_dialogs, unread_counts = await self._collect_unread_dialogs(group_size_threshold, since_utc)
-        self._rank_unread_entries(unread_dialogs)
-        allocation = allocate_message_budget_proportional(unread_counts, limit)
-        groups = await self._fetch_unread_groups(unread_dialogs, allocation, since_utc)
-
-        pending_row = cast(tuple[object] | None, self._conn.execute(_COUNT_BOOTSTRAP_PENDING_SQL).fetchone())
-        bootstrap_pending = int(cast(int | str, pending_row[0])) if pending_row else 0
-        return {"ok": True, "data": {"groups": groups, "bootstrap_pending": bootstrap_pending}}
-
-    @staticmethod
-    def _should_include_unread_dialog(
-        category: str,
-        participants_count: int | None,
-        group_size_threshold: int,
-    ) -> bool:
-        """Decide whether a dialog should be included in unread results."""
-        dt = DialogType.parse(category)
-        if dt == DialogType.CHANNEL:
-            return False
-        return not (
-            dt in (DialogType.SUPERGROUP, DialogType.GROUP, DialogType.FORUM)
-            and participants_count is not None
-            and participants_count > group_size_threshold
-        )
-
-    async def _collect_unread_dialogs(
-        self,
-        group_size_threshold: int,
-        since_utc: int | None = None,
-    ) -> tuple[list[dict], dict[int, int]]:
-        """Return unread dialog entries from sync.db. Zero Telegram API calls.
-
-        Uses a single grouped query (_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL)
-        — scalar subquery computes unread_count per dialog in one round trip.
-        Excludes dialogs with read_inbox_max_id IS NULL (not yet bootstrapped).
-        See _list_unread_messages for bootstrap_pending visibility.
-        """
-        rows = cast(
-            list[tuple[object, object, object, object, object, object, object]],
-            self._conn.execute(_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL, {"since_utc": since_utc}).fetchall(),
-        )
-
-        unread_dialogs: list[dict] = []
-        unread_counts: dict[int, int] = {}
-
-        for row in rows:
-            dialog_id, read_max, last_event_at, display_name, entity_type, participants_count, unread_count = row
-            dialog_id_i = int(cast(int | str, dialog_id))
-            unread_count_i = int(cast(int | str, unread_count))
-            if unread_count_i == 0:
-                continue
-
-            # Single source of truth — parse the stored type (tolerates legacy
-            # mixed-case rows) instead of a bespoke capitalized→category map.
-            category = DialogType.parse(str(entity_type))
-
-            if not self._should_include_unread_dialog(
-                category,
-                cast(int | None, participants_count),
-                group_size_threshold,
-            ):
-                continue
-
-            unread_dialogs.append(
-                {
-                    "chat_id": dialog_id_i,
-                    "display_name": display_name,
-                    "unread_count": unread_count_i,
-                    "unread_mentions_count": 0,  # not stored — see RESEARCH open question #1
-                    "category": category,
-                    "date": last_event_at,  # int unix ts (NOT datetime — see _rank_unread_entries)
-                    "read_inbox_max_id": read_max,
-                }
-            )
-            unread_counts[dialog_id_i] = unread_count_i
-
-        return unread_dialogs, unread_counts
-
-    @staticmethod
-    def _rank_unread_entries(entries: list[dict]) -> None:
-        """Assign priority tiers and sort in place (lower tier = higher priority)."""
-        for entry in entries:
-            entry["tier"] = unread_chat_tier(
-                {
-                    "unread_mentions_count": entry["unread_mentions_count"],
-                    "category": entry["category"],
-                }
-            )
-        # date is last_event_at (int unix timestamp) after Plan 38-02 rewrite — not datetime
-        entries.sort(key=lambda e: (e["tier"], -(e["date"] or 0)))
-
-    async def _fetch_unread_groups(
-        self,
-        entries: list[dict],
-        allocation: dict[int, int],
-        since_utc: int | None = None,
-    ) -> list[dict]:
-        """Fetch unread message bodies from sync.db. Zero Telegram API calls."""
-        groups: list[dict] = []
-        for entry in entries:
-            chat_id = int(cast(int | str, entry["chat_id"]))
-            budget = allocation.get(chat_id, 0)
-            # Phase 39.3-03 Task 2: include dialog_type + read_state per group
-            # so the tool layer can render a per-chat header block (HIGH-3).
-            dialog_type = _dialog_type_from_db(self._conn, chat_id)
-            read_state = _read_state_for_dialog(self._conn, chat_id, dialog_type)
-            group: dict = {
-                "dialog_id": chat_id,
-                "display_name": entry["display_name"],
-                "tier": entry["tier"],
-                "category": entry["category"],
-                "unread_count": entry["unread_count"],
-                "unread_mentions_count": entry["unread_mentions_count"],
-                "dialog_type": dialog_type,
-                "read_state": read_state,
-                "messages": [],
-            }
-            if budget == 0:
-                groups.append(group)  # always include summary even with no messages
-                continue
-
-            rows = cast(
-                list[Mapping[str, object]],
-                self._conn.execute(
-                    _FETCH_UNREAD_MESSAGES_SQL,
-                    {
-                        "dialog_id": chat_id,
-                        "after_msg_id": entry["read_inbox_max_id"],
-                        "limit": budget,
-                        "self_id": self.self_id,
-                        "since_utc": since_utc,
-                    },
-                ).fetchall(),
-            )
-            group_messages, freshness = await self._enrich_unread_rows(chat_id, rows)
-            group["messages"] = [dataclasses.asdict(m) for m in group_messages]
-            if freshness is not None:
-                group["reaction_freshness"] = freshness.as_dict()
-            groups.append(group)
-
-        return groups
-
-    async def _enrich_unread_rows(
-        self,
-        dialog_id: int,
-        rows: list[Mapping[str, object]],
-    ) -> tuple[list[ReadMessage], ReactionFreshness | None]:
-        """Render cached optional facts for one unread group without Telegram RPC."""
-        if not rows:
-            return [_read_message_from_row(row) for row in rows], None
-
-        messages = project_cached_message_facts(
-            self._conn,
-            dialog_id,
-            [_read_message_from_row(row) for row in rows],
-        )
-        freshness = cached_reaction_freshness(len(messages))
-        return messages, freshness
+        """Delegate get_inbox orchestration to the reading application service."""
+        return await self._get_reading_service().list_unread_messages(req)
 
     # ------------------------------------------------------------------
     # record_telemetry

@@ -767,10 +767,10 @@ def test_v28_reaction_snapshot_projects_nullable_event_time_and_status_without_a
 
 def test_reading_query_modules_have_no_telethon_or_client_calls() -> None:
     paths = [
-        Path("src/mcp_telegram/daemon_reading.py"),
-        Path("src/mcp_telegram/daemon_message_queries.py"),
+        Path("src/mcp_telegram/reading/service.py"),
+        Path("src/mcp_telegram/reading/sqlite_projection.py"),
         Path("src/mcp_telegram/daemon_dialog_queries.py"),
-        Path("src/mcp_telegram/daemon_read_state_queries.py"),
+        Path("src/mcp_telegram/reading/sqlite_projection.py"),
         Path("src/mcp_telegram/telegram_reading.py"),
         Path("src/mcp_telegram/reactions/sqlite_repository.py"),
     ]

@@ -1,9 +1,7 @@
 """Slice 2a golden/parity tests for the query-module extraction.
 
 Slice 2a moved SQL text, row mappers, and pure helpers out of ``daemon_api`` into
-three focused owner modules (``daemon_message_queries``, ``daemon_dialog_queries``,
-``daemon_read_state_queries``) plus a couple of constants that already lived in
-``daemon_account_trace`` / ``daemon_message``. Golden snapshots of the pure
+the reading projection and query-record modules. Golden snapshots of the pure
 builders and helpers lock the extracted behavior directly at each owner.
 """
 
@@ -17,14 +15,16 @@ from typing import cast
 
 import pytest
 
-from mcp_telegram.daemon_dialog_queries import _compute_snapshot_age_h, _compute_sync_coverage
-from mcp_telegram.daemon_message_queries import (
+from mcp_telegram.reading.sqlite_projection import (
     _EFFECTIVE_SENDER_ID_EXPR,
     _LIST_MESSAGES_BASE_SQL,
     _build_list_messages_query,
+    _compute_snapshot_age_h,
+    _dialog_type_from_db,
     _ListMessagesDbRequest,
+    _read_state_for_dialog,
 )
-from mcp_telegram.daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
+from mcp_telegram.sync_read_model import compute_sync_coverage as _compute_sync_coverage
 
 # ---------------------------------------------------------------------------
 # 1. Golden SQL snapshot — _build_list_messages_query

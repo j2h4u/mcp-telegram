@@ -676,7 +676,7 @@ async def test_unread_group_without_stored_messages_omits_freshness(
     server = make_server(conn, client)
     server.self_id = 99
 
-    groups = await server._fetch_unread_groups(
+    groups = await server._get_reading_service()._fetch_unread_groups(
         [
             {
                 "chat_id": dialog_id,

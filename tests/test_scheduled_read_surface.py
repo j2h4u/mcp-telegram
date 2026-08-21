@@ -6,9 +6,9 @@ from typing import Literal
 
 import pytest
 
-from mcp_telegram.daemon_reading import DaemonReadingService
-from mcp_telegram.daemon_scheduled_queries import scheduled_row_to_wire
 from mcp_telegram.pagination import decode_navigation_token, encode_history_navigation, encode_search_navigation
+from mcp_telegram.reading import ReadingService
+from mcp_telegram.reading.scheduled_projection import scheduled_row_to_wire
 from mcp_telegram.tools.reading import (
     SearchMessages,
     _list_messages_structured_messages,
@@ -333,7 +333,7 @@ def test_history_navigation_rejects_mismatched_topic_scope() -> None:
     from mcp_telegram.pagination import encode_history_navigation
 
     navigation = encode_history_navigation(42, dialog_id=123, topic_id=7, message_state="sent")
-    result = DaemonReadingService._decode_history_navigation(navigation, 123, "newest", "sent", topic_id=8)
+    result = ReadingService._decode_history_navigation(navigation, 123, "newest", "sent", topic_id=8)
 
     assert isinstance(result, dict)
     assert result["error"] == "invalid_navigation"

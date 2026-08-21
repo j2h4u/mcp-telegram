@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
-from mcp_telegram.daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
+from mcp_telegram.reading.sqlite_projection import _dialog_type_from_db, _read_state_for_dialog
 from mcp_telegram.telethon_dialog import classify_dialog_type
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.history_enrollment_helpers import seed_full_history_enrollment

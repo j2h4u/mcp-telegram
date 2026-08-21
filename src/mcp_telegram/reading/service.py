@@ -1,4 +1,4 @@
-"""Reading-domain service for daemon read/search/list handlers."""
+"""Application service for all local and Telegram-backed reading operations."""
 
 import asyncio
 import dataclasses
@@ -12,37 +12,34 @@ from typing import Protocol, cast
 
 from rapidfuzz import fuzz as _fuzz
 
-from .daemon_account_trace import (
-    _TRACE_ACRONYM_MAX_LEN,
-    _TRACE_ACRONYM_MIN_LEN,
-    _TRACE_FUZZY_MIN_LEN,
-    _TRACE_FUZZY_SCORE_MIN,
-)
-from .daemon_activity_stats import _SELECT_SYNC_STATUS_SQL
-from .daemon_dialog_queries import (
-    _BATCHED_UNREAD_COUNTS_SQL,
-    _COUNT_MESSAGES_BY_DIALOG_SQL,
-    _GET_READ_POSITION_SQL,
-    _LIST_DIALOGS_SQL,
-    _UNREAD_SUMMARY_SQL,
-    _build_access_metadata,
-    _compute_snapshot_age_h,
-    _compute_sync_coverage,
-    build_sync_read_model,
-)
-from .daemon_message import (
+from ..budget import allocate_message_budget_proportional, unread_chat_tier
+from ..daemon_message import (
     cached_reaction_freshness,
     project_cached_message_facts,
     project_cached_message_facts_by_dialog,
 )
-from .daemon_message_queries import (
-    _LIST_MESSAGES_BASE_SQL,
-    _SELECT_FTS_ALL_SQL,
-    _SELECT_FTS_SQL,
-    _build_list_messages_query,
+from ..fts import stem_query
+from ..models import DialogType, ReadMessage, ReadState
+from ..own_only import own_only_basis_by_dialog
+from ..pagination import (
+    HistoryDirection,
+    NavigationToken,
+    decode_navigation_token,
+    encode_history_navigation,
+    encode_search_navigation,
 )
-from .daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
-from .daemon_scheduled_queries import (
+from ..reactions.contracts import ReactionFreshness
+from ..resolver import latinize
+from ..sync_db import open_sync_db_reader
+from ..sync_read_model import build_sync_read_model, compute_sync_coverage
+from ..telegram_fragments import FragmentContextService
+from ..telegram_reading import (
+    GatewayFailure,
+    TelegramHistoryGateway,
+)
+from ..temporal import parse_utc_boundary
+from .query_records import read_message_from_row
+from .scheduled_projection import (
     build_scheduled_list_query,
     build_scheduled_search_query,
     scheduled_message_time,
@@ -50,28 +47,38 @@ from .daemon_scheduled_queries import (
     scheduled_row_to_wire,
     scheduled_summary_by_dialog,
 )
-from .fts import stem_query
-from .models import DialogType, ReadMessage, ReadState
-from .own_only import own_only_basis_by_dialog
-from .pagination import (
-    HistoryDirection,
-    NavigationToken,
-    decode_navigation_token,
-    encode_history_navigation,
-    encode_search_navigation,
+from .sqlite_projection import (
+    _BATCHED_UNREAD_COUNTS_SQL,
+    _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL,
+    _COUNT_BOOTSTRAP_PENDING_SQL,
+    _COUNT_MESSAGES_BY_DIALOG_SQL,
+    _FETCH_UNREAD_MESSAGES_SQL,
+    _GET_READ_POSITION_SQL,
+    _LIST_DIALOGS_SQL,
+    _LIST_MESSAGES_BASE_SQL,
+    _SELECT_FTS_ALL_SQL,
+    _SELECT_FTS_SQL,
+    _SELECT_SYNC_STATUS_SQL,
+    _UNREAD_SUMMARY_SQL,
+    _build_access_metadata,
+    _build_list_messages_query,
+    _compute_snapshot_age_h,
+    _dialog_type_from_db,
+    _read_state_for_dialog,
+    count_dialog_rows,
+    read_daemon_state_int,
+    read_daemon_state_value,
 )
-from .reactions.contracts import ReactionFreshness
-from .resolver import latinize
-from .sync_db import open_sync_db_reader
-from .telegram_fragments import FragmentContextService
-from .telegram_reading import (
-    GatewayFailure,
-    TelegramHistoryGateway,
-)
-from .temporal import parse_utc_boundary
+
+# These thresholds are part of reading's local fuzzy dialog projection.  They
+# intentionally do not depend on the account-trace orchestration module.
+_TRACE_ACRONYM_MIN_LEN = 2
+_TRACE_ACRONYM_MAX_LEN = 4
+_TRACE_FUZZY_MIN_LEN = 4
+_TRACE_FUZZY_SCORE_MIN = 75
 
 
-class _LoggerLike(Protocol):
+class LoggerLike(Protocol):
     def debug(self, msg: str, *args: object, **kwargs: object) -> None: ...
 
     def info(self, msg: str, *args: object, **kwargs: object) -> None: ...
@@ -90,7 +97,7 @@ def _safe_exception_message(exc: BaseException) -> str:
     return message
 
 
-def _log_rendered_message_stats(logger: _LoggerLike, dialog_id: int, messages: Sequence[ReadMessage]) -> None:
+def _log_rendered_message_stats(logger: LoggerLike, dialog_id: int, messages: Sequence[ReadMessage]) -> None:
     """Record sender-resolution counters for a rendered message page."""
     null_sender_rows = sum(1 for message in messages if message.sender_id is None)
     unresolved_entity_rows = sum(
@@ -112,6 +119,13 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(value, high))
 
 
+def _coerce_int(value: object, default: int) -> int:
+    try:
+        return int(cast(int | str, value))
+    except TypeError, ValueError:
+        return default
+
+
 def _parse_request_boundary(req: Mapping[str, object], field: str) -> int | None:
     raw = req.get(field)
     if raw is not None and not isinstance(raw, str):
@@ -125,7 +139,7 @@ def _validate_time_bounds(since_utc: int | None, until_utc: int | None) -> None:
 
 
 def _log_recoverable_telegram_error(
-    logger: _LoggerLike,
+    logger: LoggerLike,
     *,
     event: str,
     dialog_id: int,
@@ -143,8 +157,8 @@ def _log_recoverable_telegram_error(
 
 
 @dataclass(frozen=True)
-class DaemonReadingDeps:
-    """Dependencies for ``DaemonReadingService``."""
+class ReadingDeps:
+    """External collaborators required by the reading application service."""
 
     conn: sqlite3.Connection
     sync_db_path: Path | None
@@ -152,7 +166,7 @@ class DaemonReadingDeps:
     resolve_dialog_id: Callable[[int, str | None], Awaitable[int | dict]]
     fragment_context: FragmentContextService
     history_gateway: TelegramHistoryGateway
-    logger: _LoggerLike
+    logger: LoggerLike
     rid: Callable[[], str]
 
 
@@ -301,7 +315,7 @@ class _NextNavContext:
     dialog_id: int
     direction: str
     direction_enum: HistoryDirection
-    logger: _LoggerLike
+    logger: LoggerLike
     request_id: Callable[[], str]
     topic_id: int | None = None
     message_state: str = "sent"
@@ -346,6 +360,7 @@ def _object_to_int_or_none(value: object | None) -> int | None:
         return value
     if value is None:
         return None
+
     return int(cast(int | str, value))
 
 
@@ -478,30 +493,6 @@ def _telegram_request_from_db_request(req: _ListMessagesDbRequest) -> _ListMessa
     )
 
 
-def _read_message_from_row(row: object) -> ReadMessage:
-    return ReadMessage(
-        message_id=_object_to_int(cast(object | None, _row_value(row, "message_id"))),
-        sent_at=_object_to_int(cast(object | None, _row_value(row, "sent_at"))),
-        dialog_id=_object_to_int(cast(object | None, _row_value(row, "dialog_id"))),
-        text=_object_to_str_or_none(cast(object | None, _row_value(row, "text"))),
-        sender_id=_object_to_int_or_none(cast(object | None, _row_value(row, "sender_id"))),
-        sender_first_name=_object_to_str_or_none(cast(object | None, _row_value(row, "sender_first_name"))),
-        media_description=_object_to_str_or_none(cast(object | None, _row_value(row, "media_description"))),
-        reply_to_msg_id=_object_to_int_or_none(cast(object | None, _row_value(row, "reply_to_msg_id"))),
-        forum_topic_id=_object_to_int_or_none(cast(object | None, _row_value(row, "forum_topic_id"))),
-        is_deleted=_object_to_int(cast(object | None, _row_value(row, "is_deleted")), 0),
-        deleted_at=_object_to_int_or_none(cast(object | None, _row_value(row, "deleted_at"))),
-        edit_date=_object_to_int_or_none(cast(object | None, _row_value(row, "edit_date"))),
-        topic_title=_object_to_str_or_none(cast(object | None, _row_value(row, "topic_title"))),
-        effective_sender_id=_object_to_int_or_none(cast(object | None, _row_value(row, "effective_sender_id"))),
-        is_service=_object_to_int(cast(object | None, _row_value(row, "is_service")), 0),
-        out=_object_to_int(cast(object | None, _row_value(row, "out")), 0),
-        fwd_from_name=_object_to_str_or_none(cast(object | None, _row_value(row, "fwd_from_name"))),
-        post_author=_object_to_str_or_none(cast(object | None, _row_value(row, "post_author"))),
-        dialog_name=_object_to_str_or_none(cast(object | None, _row_value(row, "dialog_name"))),
-    )
-
-
 def _status_from_row(row: object | None) -> str | None:
     if row is None:
         return None
@@ -512,10 +503,10 @@ def _status_from_row(row: object | None) -> str | None:
     return None if value is None else str(value)
 
 
-class DaemonReadingService:
+class ReadingService:
     """Domain service for list/search/list_dialogs and helper operations."""
 
-    def __init__(self, deps: DaemonReadingDeps) -> None:
+    def __init__(self, deps: ReadingDeps) -> None:
         self._deps = deps
 
     @property
@@ -523,7 +514,7 @@ class DaemonReadingService:
         return self._deps.conn
 
     @property
-    def _logger(self) -> _LoggerLike:
+    def _logger(self) -> LoggerLike:
         return self._deps.logger
 
     @staticmethod
@@ -616,12 +607,36 @@ class DaemonReadingService:
                 context.dialog_id,
                 topic_id=context.topic_id,
                 direction=context.direction_enum,
-                sent_at=DaemonReadingService._navigation_sent_at(last),
+                sent_at=ReadingService._navigation_sent_at(last),
                 message_state=context.message_state,
                 since_utc=context.since_utc,
                 until_utc=context.until_utc,
             )
         return None
+
+    @staticmethod
+    def encode_next_navigation(  # noqa: PLR0913
+        *,
+        messages: Sequence[object],
+        limit: int,
+        dialog_id: int,
+        direction: str,
+        direction_enum: HistoryDirection,
+        logger: LoggerLike,
+        request_id: Callable[[], str],
+    ) -> str | None:
+        """Encode a history continuation for daemon IPC wiring."""
+        return ReadingService._maybe_encode_next_nav(
+            _NextNavContext(
+                messages=messages,
+                limit=limit,
+                dialog_id=dialog_id,
+                direction=direction,
+                direction_enum=direction_enum,
+                logger=logger,
+                request_id=request_id,
+            )
+        )
 
     @staticmethod
     def _navigation_sent_at(message: object) -> int | None:
@@ -643,7 +658,7 @@ class DaemonReadingService:
             req.dialog_id,
             topic_id=req.topic_id,
             direction=req.direction_enum,
-            sent_at=DaemonReadingService._navigation_sent_at(last_raw_message),
+            sent_at=ReadingService._navigation_sent_at(last_raw_message),
             message_state="sent",
             since_utc=req.since_utc,
             until_utc=req.until_utc,
@@ -690,7 +705,7 @@ class DaemonReadingService:
                 nav = decode_navigation_token(navigation)
             except ValueError as exc:
                 return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
-            error_message = DaemonReadingService._history_navigation_error(
+            error_message = ReadingService._history_navigation_error(
                 nav,
                 context,
             )
@@ -722,6 +737,25 @@ class DaemonReadingService:
             return "Navigation token belongs to a different time range"
         return None
 
+    @staticmethod
+    def decode_history_navigation(
+        navigation: str | None,
+        dialog_id: int,
+        direction: str,
+        message_state: str,
+        topic_id: int | None,
+    ) -> tuple[int | None, str] | dict:
+        """Decode a history continuation for daemon IPC wiring."""
+        return ReadingService._decode_history_navigation(
+            navigation,
+            _HistoryNavigationContext(
+                dialog_id=dialog_id,
+                direction=direction,
+                message_state=message_state,
+                topic_id=topic_id,
+            ),
+        )
+
     async def _build_read_messages_from_rows(
         self,
         dialog_id: int,
@@ -732,7 +766,7 @@ class DaemonReadingService:
         messages = project_cached_message_facts(
             self._conn,
             dialog_id,
-            [_read_message_from_row(r) for r in rows],
+            [read_message_from_row(r) for r in rows],
         )
         freshness = cached_reaction_freshness(len(messages))
         if log_rendered:
@@ -968,7 +1002,7 @@ class DaemonReadingService:
         source value only for this response; list/full-body reads continue to
         return the canonical projected message.
         """
-        raw_messages = [_read_message_from_row(row) for row in rows]
+        raw_messages = [read_message_from_row(row) for row in rows]
         projected = self._enrich_cached_facts(raw_messages)
         return self._restore_search_plain_text(rows, projected, raw_messages=raw_messages)
 
@@ -985,7 +1019,7 @@ class DaemonReadingService:
         all canonical reaction/read/lifecycle facts without another enrichment
         or projection pass.
         """
-        raw = list(raw_messages) if raw_messages is not None else [_read_message_from_row(row) for row in rows]
+        raw = list(raw_messages) if raw_messages is not None else [read_message_from_row(row) for row in rows]
         return [dataclasses.replace(message, text=source.text) for message, source in zip(messages, raw, strict=True)]
 
     def _search_next_navigation(
@@ -1176,7 +1210,7 @@ class DaemonReadingService:
             "members": row["members"],
             "created": row["created"],
             "sync_status": row["sync_status"] if row["sync_status"] is not None else "not_synced",
-            "sync_coverage_pct": _compute_sync_coverage(
+            "sync_coverage_pct": compute_sync_coverage(
                 _object_to_int_or_none(row["total_messages"]),
                 local_counts.get(d_id, 0),
             ),
@@ -1193,7 +1227,7 @@ class DaemonReadingService:
             "access_lost_at": row["access_lost_at"],
             "unread_mentions_count": _object_to_int(row["unread_mentions_count"], 0),
             "unread_reactions_count": _object_to_int(row["unread_reactions_count"], 0),
-            **DaemonReadingService._dialog_lifecycle_fields(row, scheduled_summary, inclusion_basis),
+            **ReadingService._dialog_lifecycle_fields(row, scheduled_summary, inclusion_basis),
         }
         if DialogType.parse(_object_to_str_or_none(row["type"])) == DialogType.USER:
             in_cnt, out_cnt = unread_counts.get(d_id, (0, 0))
@@ -1419,7 +1453,7 @@ class DaemonReadingService:
 
     async def _list_messages_from_db(self, req: _ListMessagesDbRequest) -> dict:
         """Read messages from sync.db using the dynamic query builder."""
-        sql, params = _build_list_messages_query(req)
+        sql, params = _build_list_messages_query(req, query_logger=self._logger)
         rows = _fetchall_rows(self._conn.execute(sql, params))
         messages, freshness = await self._build_read_messages_from_rows(req.dialog_id, rows, log_rendered=True)
         next_nav = self._maybe_encode_next_nav(
@@ -1449,7 +1483,7 @@ class DaemonReadingService:
 
     def _own_only_basis_by_dialog(self, conn: sqlite3.Connection | None = None) -> dict[int, tuple[str, ...]] | None:
         """Return the ownership cache, or None for pre-cache test databases."""
-        source = conn or self._conn
+        source = self._conn if conn is None else conn
         if _fetchone_row(source.execute(_OWN_ONLY_DIALOGS_TABLE_SQL)) is None:
             return None
         return own_only_basis_by_dialog(source)
@@ -1766,6 +1800,160 @@ class DaemonReadingService:
             return {"ok": True, "data": {"messages": [], "total": 0}}
         return await self._search_messages_for_state(request, stemmed)
 
+    async def list_unread_messages(self, req: dict[str, object]) -> dict:
+        """Return prioritized unread messages across dialogs from sync.db."""
+        if "scope" in req:
+            return {
+                "ok": False,
+                "error": "invalid_input",
+                "message": "scope is not supported by get_inbox; use get_unread_summary for an overview",
+            }
+        limit = _clamp(_coerce_int(req.get("limit", 100), 100), 1, 500)
+        group_size_threshold = _coerce_int(req.get("group_size_threshold", 100), 100)
+        try:
+            since_utc = _parse_request_boundary(req, "since_utc")
+        except ValueError as exc:
+            return {"ok": False, "error": "invalid_input", "message": str(exc)}
+        entries, counts = self._collect_unread_dialogs(group_size_threshold, since_utc)
+        self._rank_unread_entries(entries)
+        groups = await self._fetch_unread_groups(
+            entries,
+            allocate_message_budget_proportional(counts, limit),
+            since_utc,
+        )
+        pending_row = cast(tuple[object] | None, self._conn.execute(_COUNT_BOOTSTRAP_PENDING_SQL).fetchone())
+        pending = int(cast(int | str, pending_row[0])) if pending_row else 0
+        return {"ok": True, "data": {"groups": groups, "bootstrap_pending": pending}}
+
+    @staticmethod
+    def _should_include_unread_dialog(category: str, participants_count: int | None, group_size_threshold: int) -> bool:
+        dialog_type = DialogType.parse(category)
+        if dialog_type == DialogType.CHANNEL:
+            return False
+        return not (
+            dialog_type in (DialogType.SUPERGROUP, DialogType.GROUP, DialogType.FORUM)
+            and participants_count is not None
+            and participants_count > group_size_threshold
+        )
+
+    def _collect_unread_dialogs(
+        self, group_size_threshold: int, since_utc: int | None = None
+    ) -> tuple[list[dict], dict[int, int]]:
+        rows = cast(
+            list[tuple[object, object, object, object, object, object, object]],
+            self._conn.execute(_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL, {"since_utc": since_utc}).fetchall(),
+        )
+        entries: list[dict] = []
+        counts: dict[int, int] = {}
+        for row in rows:
+            dialog_id, read_max, last_event_at, display_name, entity_type, participants_count, unread_count = row
+            dialog_id_i = int(cast(int | str, dialog_id))
+            unread_count_i = int(cast(int | str, unread_count))
+            if unread_count_i == 0:
+                continue
+            category = DialogType.parse(str(entity_type))
+            if not self._should_include_unread_dialog(
+                category, cast(int | None, participants_count), group_size_threshold
+            ):
+                continue
+            entries.append(
+                {
+                    "chat_id": dialog_id_i,
+                    "display_name": display_name,
+                    "unread_count": unread_count_i,
+                    "unread_mentions_count": 0,
+                    "category": category,
+                    "date": last_event_at,
+                    "read_inbox_max_id": read_max,
+                }
+            )
+            counts[dialog_id_i] = unread_count_i
+        return entries, counts
+
+    @staticmethod
+    def _rank_unread_entries(entries: list[dict]) -> None:
+        for entry in entries:
+            entry["tier"] = unread_chat_tier(
+                {"unread_mentions_count": entry["unread_mentions_count"], "category": entry["category"]}
+            )
+        entries.sort(key=lambda entry: (entry["tier"], -(entry["date"] or 0)))
+
+    async def _fetch_unread_groups(
+        self, entries: list[dict], allocation: dict[int, int], since_utc: int | None = None
+    ) -> list[dict]:
+        groups: list[dict] = []
+        for entry in entries:
+            chat_id = int(cast(int | str, entry["chat_id"]))
+            budget = allocation.get(chat_id, 0)
+            dialog_type = _dialog_type_from_db(self._conn, chat_id)
+            group: dict = {
+                "dialog_id": chat_id,
+                "display_name": entry["display_name"],
+                "tier": entry["tier"],
+                "category": entry["category"],
+                "unread_count": entry["unread_count"],
+                "unread_mentions_count": entry["unread_mentions_count"],
+                "dialog_type": dialog_type,
+                "read_state": _read_state_for_dialog(self._conn, chat_id, dialog_type),
+                "messages": [],
+            }
+            if budget:
+                rows = cast(
+                    list[Mapping[str, object]],
+                    self._conn.execute(
+                        _FETCH_UNREAD_MESSAGES_SQL,
+                        {
+                            "dialog_id": chat_id,
+                            "after_msg_id": entry["read_inbox_max_id"],
+                            "limit": budget,
+                            "self_id": self._deps.self_id,
+                            "since_utc": since_utc,
+                        },
+                    ).fetchall(),
+                )
+                messages, freshness = await self._enrich_unread_rows(chat_id, rows)
+                group["messages"] = [dataclasses.asdict(message) for message in messages]
+                if freshness is not None:
+                    group["reaction_freshness"] = freshness.as_dict()
+            groups.append(group)
+        return groups
+
+    async def _enrich_unread_rows(
+        self, dialog_id: int, rows: list[Mapping[str, object]]
+    ) -> tuple[list[ReadMessage], ReactionFreshness | None]:
+        messages = [read_message_from_row(row) for row in rows]
+        if not messages:
+            return messages, None
+        enriched = project_cached_message_facts(self._conn, dialog_id, messages)
+        return enriched, cached_reaction_freshness(len(enriched))
+
+    # Public facade methods keep daemon_api free of reading request types and internals.
+    async def list_messages(self, req: dict[str, object]) -> dict:
+        return await self._list_messages(req)
+
+    async def search_messages(self, req: dict[str, object]) -> dict:
+        return await self._search_messages(req)
+
+    async def list_dialogs(self, req: dict[str, object]) -> dict:
+        return await self._list_dialogs(req)
+
+    async def get_unread_summary(self, req: dict[str, object]) -> dict:
+        return await self._get_unread_summary(req)
+
+    async def list_messages_context_window(self, *, dialog_id: int, anchor_message_id: int, context_size: int) -> dict:
+        return await self._list_messages_context_window(
+            dialog_id=dialog_id, anchor_message_id=anchor_message_id, context_size=context_size
+        )
+
+    async def list_messages_from_telegram(self, req: object) -> dict:
+        return await self._list_messages_from_telegram(cast(_ListMessagesTelegramRequest, req))
+
+    async def list_messages_from_db(self, req: object) -> dict:
+        return await self._list_messages_from_db(cast(_ListMessagesDbRequest, req))
+
+    async def resolve_unread_position(self, dialog_id: int, unread_after_id: int | None) -> int | None:
+        return await self._resolve_unread_position(dialog_id, unread_after_id)
+
     async def _list_dialogs(self, req: dict) -> dict:
         """Return dialog list from the local dialogs snapshot.
 
@@ -1841,18 +2029,10 @@ class DaemonReadingService:
                 )
 
             def state_value(key: str) -> str | None:
-                state_row = _fetchone_row(conn.execute("SELECT value FROM daemon_state WHERE key = ?", (key,)))
-                value = _row_sequence(state_row)[0] if state_row is not None and _row_sequence(state_row) else None
-                return value if isinstance(value, str) else None
+                return read_daemon_state_value(conn, key)
 
             def state_int(key: str) -> int | None:
-                value = state_value(key)
-                if value is None:
-                    return None
-                try:
-                    return int(value)
-                except ValueError:
-                    return None
+                return read_daemon_state_int(conn, key)
 
             observation = {
                 "status": state_value("dialog_unread_sweep_status"),
@@ -1882,7 +2062,7 @@ class DaemonReadingService:
         finally:
             conn.close()
 
-    def _list_dialogs_sync(self, conn: sqlite3.Connection, req: dict) -> dict:  # noqa: PLR0914
+    def _list_dialogs_sync(self, conn: sqlite3.Connection, req: dict) -> dict:
         """Return dialog list from the local dialogs snapshot (pure SQL)."""
         request = self._parse_list_dialogs_request(req)
         if request.message_state not in {"sent", "scheduled", "all"}:
@@ -1913,8 +2093,7 @@ class DaemonReadingService:
         own_basis = self._own_only_basis_by_dialog(conn)
         sql_rows = self._fetch_list_dialog_rows(conn, request, dialog_filter)
         if not sql_rows:
-            count_row = _fetchone_row(conn.execute("SELECT COUNT(*) FROM dialogs"))
-            count_total = _object_to_int(_row_sequence(count_row)[0]) if count_row is not None else 0
+            count_total = count_dialog_rows(conn)
             return {
                 "ok": True,
                 "data": {
@@ -1931,7 +2110,7 @@ class DaemonReadingService:
             dialog_id = _object_to_int(row["dialog_id"])
             if request.scope == "own_only" and (
                 (own_basis is not None and dialog_id not in own_basis)
-                or (own_basis is None and str(row.get("sync_status") or "") != "own_only")
+                or (own_basis is None and str(_row_value(row, "sync_status") or "") != "own_only")
             ):
                 continue
             summary = scheduled_summary.get(dialog_id, (0, None))

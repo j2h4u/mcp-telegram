@@ -6,8 +6,8 @@ import ast
 from pathlib import Path
 
 
-def test_daemon_reading_does_not_import_daemon_api() -> None:
-    path = Path("src/mcp_telegram/daemon_reading.py")
+def test_reading_service_does_not_import_daemon_api() -> None:
+    path = Path("src/mcp_telegram/reading/service.py")
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     violations: list[str] = []
 
@@ -27,4 +27,4 @@ def test_daemon_reading_does_not_import_daemon_api() -> None:
                 imported = node.module or "daemon_api"
                 violations.append(f"line {node.lineno}: from {imported} import ...")
 
-    assert not violations, "daemon_reading must depend on owner modules, not daemon_api: " + "; ".join(violations)
+    assert not violations, "reading service must not depend on daemon_api: " + "; ".join(violations)

@@ -22,15 +22,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike, _ResolverEntityCache
-from mcp_telegram.daemon_dialog_queries import _compute_sync_coverage
 from mcp_telegram.daemon_ipc import get_daemon_socket_path
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
-from mcp_telegram.daemon_message_queries import _build_list_messages_query, _ListMessagesDbRequest
 from mcp_telegram.flood import FloodWaitKillSwitchStatus
 from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
+from mcp_telegram.reading.sqlite_projection import (
+    _build_list_messages_query,
+    _ListMessagesDbRequest,
+)
 from mcp_telegram.sync_db import ensure_sync_schema, record_daemon_event
+from mcp_telegram.sync_read_model import compute_sync_coverage as _compute_sync_coverage
 from mcp_telegram.telethon_dialog import classify_dialog_type
 from mcp_telegram.topics.contracts import TopicFact
 from mcp_telegram.topics.refresh import TopicRefresher
@@ -3702,7 +3705,7 @@ def test_daemon_imports_migrate_legacy_databases() -> None:
 
 
 def test_build_list_messages_query_exists() -> None:
-    """_build_list_messages_query is owned by daemon_message_queries."""
+    """_build_list_messages_query is owned by reading.sqlite_projection."""
     assert callable(_build_list_messages_query)
 
 
@@ -5940,7 +5943,7 @@ async def test_list_unread_messages_preserves_media_only_content_and_filters_ser
 
 def test_fts_sql_invariants_mandatory() -> None:
     """MANDATORY — no skip clause. Locks FTS SQL-string contract (Phase 39.1-02 aliases)."""
-    from mcp_telegram import daemon_message_queries as d
+    from mcp_telegram.reading import sqlite_projection as d
 
     # _SELECT_FTS_SQL: dual sender entity JOINs (e_raw + e_eff) for effective_sender_id lookup
     assert "LEFT JOIN entities e_raw ON e_raw.id = m.sender_id" in d._SELECT_FTS_SQL, (
@@ -5963,7 +5966,7 @@ def test_fts_sql_invariants_mandatory() -> None:
 
 
 def test_all_sql_constants_contain_entity_join_and_coalesce() -> None:
-    from mcp_telegram import daemon_message_queries as d
+    from mcp_telegram.reading import sqlite_projection as d
 
     for name in (
         "_SELECT_MESSAGES_SQL",
@@ -5984,8 +5987,8 @@ def test_line_409_filter_has_documenting_comment() -> None:
     """Documents that sender_name filter falls back to resolved DM sender names."""
     import pathlib
 
-    # _build_list_messages_query owns this filter (Slice 2a: extracted to daemon_message_queries).
-    src = pathlib.Path("src/mcp_telegram/daemon_message_queries.py").read_text()
+    # _build_list_messages_query owns this filter (Slice 2a: extracted to reading.sqlite_projection).
+    src = pathlib.Path("src/mcp_telegram/reading/sqlite_projection.py").read_text()
     assert src.count("fall back to resolved sender entities for DM rows") == 1
 
 

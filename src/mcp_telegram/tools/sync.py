@@ -16,29 +16,6 @@ from ._base import (
 )
 
 logger = logging.getLogger(__name__)
-_HISTORY_SCOPE_BY_STATUS = {
-    "synced": "full",
-    "syncing": "full",
-    "own_only": "own_only",
-    "fragment": "fragment",
-    "access_lost": "access_lost",
-}
-_HISTORY_DEPTH_BY_STATUS = {
-    "synced": "complete",
-    "syncing": "partial",
-    "own_only": "partial",
-    "fragment": "partial",
-    "access_lost": "partial",
-    "not_synced": "none",
-}
-_HISTORY_SYNC_BY_STATUS = {
-    "synced": "complete_as_of_last_sync",
-    "syncing": "syncing",
-    "own_only": "own_messages_only",
-    "fragment": "fragment_only",
-    "access_lost": "access_lost_archive",
-    "not_synced": "not_synced",
-}
 
 
 MARK_DIALOG_FOR_SYNC_OUTPUT_SCHEMA = {
@@ -415,18 +392,6 @@ def _local_knowledge_at(
 ) -> object | None:
     timestamps = [ts for ts in (last_synced_at, last_event_at, last_delta_checked_at) if isinstance(ts, int)]
     return max(timestamps) if timestamps else None
-
-
-def _history_scope(status: object) -> str:
-    return _HISTORY_SCOPE_BY_STATUS.get(status, "none") if isinstance(status, str) else "none"
-
-
-def _history_depth_state(status: object) -> str:
-    return _HISTORY_DEPTH_BY_STATUS.get(status, "unknown") if isinstance(status, str) else "unknown"
-
-
-def _history_sync_state(status: object) -> str:
-    return _HISTORY_SYNC_BY_STATUS.get(status, "unknown") if isinstance(status, str) else "unknown"
 
 
 def _sync_status_action(status: object, message_count: object, total_messages: object, coverage_state: object) -> str:

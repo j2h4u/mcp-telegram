@@ -5,7 +5,7 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
-from mcp_telegram.daemon_reading import DaemonReadingService
+from mcp_telegram.reading import ReadingService
 from mcp_telegram.tools.reading import ListMessages, SearchMessages
 
 
@@ -81,14 +81,14 @@ def test_reading_tools_reject_missing_or_non_utc_offsets(
 
 
 def test_daemon_request_parsers_normalize_utc_bounds_to_epoch_seconds() -> None:
-    list_request = DaemonReadingService._parse_list_messages_request(
+    list_request = ReadingService._parse_list_messages_request(
         {
             "dialog_id": 17,
             "since_utc": "2026-01-01T00:00:00.123456Z",
             "until_utc": "2026-01-01T00:00:01.999999+00:00",
         }
     )
-    search_request = DaemonReadingService._parse_search_messages_request(
+    search_request = ReadingService._parse_search_messages_request(
         {
             "query": "needle",
             "since_utc": "2026-01-01T00:00:00.000001Z",
