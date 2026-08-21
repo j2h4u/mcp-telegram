@@ -1904,6 +1904,82 @@ async def test_list_topics_empty_snapshot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_topics_name_miss_does_not_iterate_telegram_dialogs() -> None:
+    """list_topics misses must fail from local caches without live iter_dialogs fallback."""
+    conn = _make_db_with_dialogs()
+    client = _TestClient()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("list_topics must not call iter_dialogs on cache miss"))
+    server = make_server(conn, client)
+
+    result = await server._list_topics({"dialog": "integration-smoke-placeholder"})
+
+    assert result["ok"] is False
+    assert result["error"] == "dialog_not_found"
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
+    cast(AsyncMock, client.get_entity).assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selector", ["Cached Forum", "cached forum"])
+async def test_list_topics_cached_display_name_resolves_without_rpc(selector: str) -> None:
+    """ListTopics resolves exact and fuzzy cached display names locally."""
+    conn = _make_db_with_topics()
+    _insert_entity(conn, 321, name="Cached Forum", name_normalized="cached forum")
+    client = _TestClient()
+    client.get_entity = AsyncMock(side_effect=AssertionError("remote lookup forbidden"))
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("live lookup forbidden"))
+    server = make_server(conn, client)
+
+    result = await server._list_topics({"dialog": selector})
+
+    assert result == {"ok": True, "data": {"topics": [], "dialog_id": 321}}
+    cast(AsyncMock, client.get_entity).assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selector", ["@forum_bot", "https://t.me/forum_bot"])
+async def test_list_topics_cached_username_selectors_resolve_without_rpc(selector: str) -> None:
+    """Cached @username and t.me selectors resolve without Telegram lookups."""
+    conn = _make_db_with_topics()
+    _insert_entity(conn, 322, name="Forum Bot", username="forum_bot")
+    client = _TestClient()
+    client.get_entity = AsyncMock(side_effect=AssertionError("remote lookup forbidden"))
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("live lookup forbidden"))
+    server = make_server(conn, client)
+
+    result = await server._list_topics({"dialog": selector})
+
+    assert result == {"ok": True, "data": {"topics": [], "dialog_id": 322}}
+    cast(AsyncMock, client.get_entity).assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_topics_cached_selector_still_refreshes_topic_catalog() -> None:
+    """A locally resolved selector still permits the existing topic refresh."""
+
+    class _Gateway:
+        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
+            assert getattr(entity, "forum", False) is True
+            return (TopicFact(topic_id=306001, title="Topic"),)
+
+    conn = _make_db_with_topics()
+    _insert_entity(conn, 323, name="Forum Group", username="forum_group")
+    client = _TestClient()
+    client.get_entity = AsyncMock(return_value=SimpleNamespace(forum=True))
+    topic_refresher = TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn))
+    server = make_server(conn, client, topic_refresher=topic_refresher)
+
+    result = await server._list_topics({"dialog": "@forum_group"})
+
+    assert result["ok"] is True
+    assert result["data"]["dialog_id"] == 323
+    assert result["data"]["topics"][0]["id"] == 306001
+    cast(AsyncMock, client.get_entity).assert_awaited_once_with(323)
+
+
+@pytest.mark.asyncio
 async def test_list_topics_refreshes_empty_private_bot_catalog() -> None:
     """Empty local topic catalog is refreshed inside daemon for topic-capable bot DMs."""
 
