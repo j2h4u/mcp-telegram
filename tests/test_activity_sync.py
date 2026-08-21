@@ -24,6 +24,8 @@ from mcp_telegram.activity_sync import (
 )
 from mcp_telegram.sync_db import ensure_sync_schema
 
+_TEST_TIMEOUT_S = 0.05
+
 # -- Fakes --------------------------------------------------------
 
 
@@ -196,7 +198,7 @@ async def test_backfill_inserts_rows(conn: sqlite3.Connection) -> None:
         ]
     )
     shutdown = asyncio.Event()
-    await _run_backfill(client, conn, shutdown)
+    await _run_backfill(client, conn, shutdown, timeout_s=120.0)
 
     rows = conn.execute(
         "SELECT message_id, dialog_id, sent_at, out, reply_count FROM messages WHERE out = 1 ORDER BY message_id"
@@ -214,7 +216,7 @@ async def test_backfill_respects_shutdown(conn: sqlite3.Connection) -> None:
     client = _FakeClient(batches=[FakeSearchResult(messages=[_msg(100, 42, 1_700_000_000)])])
     shutdown = asyncio.Event()
     shutdown.set()
-    await _run_backfill(client, conn, shutdown)
+    await _run_backfill(client, conn, shutdown, timeout_s=120.0)
     # No iteration: loop condition is_set() returns immediately
     state = dict(
         cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
@@ -233,7 +235,7 @@ async def test_backfill_floodwait_recovers(conn: sqlite3.Connection) -> None:
 
     client = _FakeClient(batches=[_FWError(), FakeSearchResult(messages=[])])
     shutdown = asyncio.Event()
-    await _run_backfill(client, conn, shutdown)
+    await _run_backfill(client, conn, shutdown, timeout_s=120.0)
     state = dict(
         cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
     )
@@ -264,7 +266,7 @@ async def test_incremental_only_new_messages(conn: sqlite3.Connection) -> None:
         ]
     )
     shutdown = asyncio.Event()
-    await _run_incremental(client, conn, shutdown)
+    await _run_incremental(client, conn, shutdown, timeout_s=120.0)
 
     ids = [
         r[0]
@@ -281,7 +283,7 @@ async def test_incremental_skipped_before_backfill_complete(conn: sqlite3.Connec
     # Client should never be called — backfill not complete.
     client = _FakeClient(batches=[FakeSearchResult(messages=[_msg(100, 42, 1_700_000_000)])])
     shutdown = asyncio.Event()
-    await _run_incremental(client, conn, shutdown)
+    await _run_incremental(client, conn, shutdown, timeout_s=120.0)
     count_row = cast(tuple[int] | None, conn.execute("SELECT COUNT(*) FROM messages WHERE out = 1").fetchone())
     assert count_row is not None
     count = count_row[0]
@@ -297,7 +299,7 @@ async def test_incremental_skipped_when_messages_empty(conn: sqlite3.Connection)
     # Client should never be called — last_sync_at == 0.
     client = _FakeClient(batches=[FakeSearchResult(messages=[_msg(100, 42, 1_700_000_000)])])
     shutdown = asyncio.Event()
-    await _run_incremental(client, conn, shutdown)
+    await _run_incremental(client, conn, shutdown, timeout_s=120.0)
     count_row = cast(tuple[int] | None, conn.execute("SELECT COUNT(*) FROM messages WHERE out = 1").fetchone())
     assert count_row is not None
     count = count_row[0]
@@ -316,7 +318,7 @@ async def test_loop_shutdown_between_passes(conn: sqlite3.Connection) -> None:
         shutdown.set()
 
     await asyncio.gather(
-        run_activity_sync_loop(client, conn, shutdown, interval=60.0),
+        run_activity_sync_loop(client, conn, shutdown, interval=60.0, timeout_s=120.0),
         _flip(),
     )
 
@@ -332,7 +334,7 @@ async def test_backfill_enrolls_dialog_as_own_only(conn: sqlite3.Connection) -> 
         ]
     )
     shutdown = asyncio.Event()
-    await _run_backfill(client, conn, shutdown)
+    await _run_backfill(client, conn, shutdown, timeout_s=120.0)
     status_row = cast(
         tuple[str] | None, conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
     )
@@ -356,7 +358,7 @@ async def test_backfill_does_not_downgrade_synced_dialog(conn: sqlite3.Connectio
         ]
     )
     shutdown = asyncio.Event()
-    await _run_backfill(client, conn, shutdown)
+    await _run_backfill(client, conn, shutdown, timeout_s=120.0)
     status_row = cast(
         tuple[str] | None, conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
     )
@@ -523,7 +525,7 @@ async def test_incremental_anchor_ignores_higher_id_out0_row(conn: sqlite3.Conne
         ]
     )
     shutdown = asyncio.Event()
-    await _run_incremental(client, conn, shutdown)
+    await _run_incremental(client, conn, shutdown, timeout_s=120.0)
     own_rows = cast(list[tuple[int]], conn.execute("SELECT message_id FROM messages WHERE out = 1").fetchall())
     own_ids = sorted(r[0] for r in own_rows)
     assert own_ids == [3, 50], f"Incremental must capture id=3 from dialog 99 despite low per-chat id; got {own_ids}"
@@ -543,7 +545,6 @@ async def test_run_incremental_search_request_timeout(
 ) -> None:
     """_run_incremental exits and advances last_sync_at when SearchRequest hangs."""
     import logging
-    from unittest.mock import patch
 
     anchor_ts = 1_700_000_000
     with conn:
@@ -567,13 +568,12 @@ async def test_run_incremental_search_request_timeout(
     shutdown = asyncio.Event()
 
     # Patch timeout to 0.05s so the test is fast
-    with patch("mcp_telegram.activity_substrate.ACTIVITY_RPC_TIMEOUT_S", 0.05):
-        with caplog.at_level(logging.WARNING, logger="mcp_telegram.activity_sync"):
-            # Safety net: the whole call must finish well under 2s
-            await asyncio.wait_for(
-                _run_incremental(client, conn, shutdown),
-                timeout=2.0,
-            )
+    with caplog.at_level(logging.WARNING, logger="mcp_telegram.activity_sync"):
+        # Safety net: the whole call must finish well under 2s
+        await asyncio.wait_for(
+            _run_incremental(client, conn, shutdown, timeout_s=_TEST_TIMEOUT_S),
+            timeout=2.0,
+        )
 
     # last_sync_at must have been advanced
     state = dict(
@@ -594,7 +594,6 @@ async def test_run_backfill_search_request_timeout(
 ) -> None:
     """_run_backfill returns and logs when SearchRequest hangs."""
     import logging
-    from unittest.mock import patch
 
     # backfill not complete — will attempt to run
 
@@ -610,12 +609,11 @@ async def test_run_backfill_search_request_timeout(
     client = _HangingClient()
     shutdown = asyncio.Event()
 
-    with patch("mcp_telegram.activity_substrate.ACTIVITY_RPC_TIMEOUT_S", 0.05):
-        with caplog.at_level(logging.WARNING, logger="mcp_telegram.activity_sync"):
-            await asyncio.wait_for(
-                _run_backfill(client, conn, shutdown),
-                timeout=2.0,
-            )
+    with caplog.at_level(logging.WARNING, logger="mcp_telegram.activity_sync"):
+        await asyncio.wait_for(
+            _run_backfill(client, conn, shutdown, timeout_s=_TEST_TIMEOUT_S),
+            timeout=2.0,
+        )
 
     # backfill_offset_id must not be corrupted (still 0 / initial value)
     state = dict(

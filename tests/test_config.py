@@ -42,6 +42,7 @@ def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
     assert config.flood_wait == FloodWaitConfig()
     assert config.telegram_rpc == TelegramRpcConfig()
     assert config.scheduling == SchedulingConfig()
+    assert config.scheduling.activity_rpc_timeout_seconds == 120.0
     assert config.http == HttpServerConfig()
     with pytest.raises(FrozenInstanceError):
         config.freshness.reactions.freshness_ttl_seconds = 1  # type: ignore[misc]
@@ -103,6 +104,7 @@ message_fact_refresh_reaction_max_messages_per_cycle = 6
 message_fact_refresh_read_at_max_messages_per_cycle = 7
 message_fact_refresh_pause_seconds = 4
 activity_hot_sweep_seconds = 51
+activity_rpc_timeout_seconds = 53
 
 [http]
 host = "localhost"
@@ -143,6 +145,7 @@ daemon_api_slow_request_seconds = 2.5
         message_fact_refresh_read_at_max_messages_per_cycle=7,
         message_fact_refresh_pause_seconds=4.0,
         activity_hot_sweep_seconds=51.0,
+        activity_rpc_timeout_seconds=53.0,
         scheduled_flood_sleep_threshold_seconds=0,
         folder_projection=FolderProjectionConfig(stale_after_seconds=46),
     )
@@ -166,6 +169,7 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
             "MESSAGE_FACT_REFRESH_READ_AT_MAX_MESSAGES_PER_CYCLE": "7",
             "MESSAGE_FACT_REFRESH_PAUSE_SECONDS": "7",
             "ACTIVITY_HOT_SWEEP_SECONDS": "49",
+            "ACTIVITY_RPC_TIMEOUT_SECONDS": "54",
             "ACTIVITY_COLD_BACKFILL_SECONDS": "50",
             "ACTIVITY_COLD_BACKFILL_BATCH_PAUSE": "51",
             "ACTIVITY_COLD_ENROLL_SECONDS": "52",
@@ -201,6 +205,7 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         message_fact_refresh_read_at_max_messages_per_cycle=7,
         message_fact_refresh_pause_seconds=7.0,
         activity_hot_sweep_seconds=49.0,
+        activity_rpc_timeout_seconds=54.0,
         activity_cold_backfill_seconds=50.0,
         activity_cold_backfill_batch_pause_seconds=51.0,
         activity_cold_enroll_seconds=52.0,

@@ -1093,7 +1093,14 @@ async def _start_followup_background_tasks(
         name="access_probe_loop",
     )
     _create_tracked_task(
-        ctx, run_activity_sync_loop(activity_client, ctx.conn, ctx.shutdown_event), name="activity_sync_loop"
+        ctx,
+        run_activity_sync_loop(
+            activity_client,
+            ctx.conn,
+            ctx.shutdown_event,
+            timeout_s=ctx.scheduling.activity_rpc_timeout_seconds,
+        ),
+        name="activity_sync_loop",
     )
     _create_tracked_task(
         ctx,
@@ -1102,6 +1109,7 @@ async def _start_followup_background_tasks(
             ctx.conn,
             ctx.shutdown_event,
             interval=ctx.scheduling.activity_hot_sweep_seconds,
+            timeout_s=ctx.scheduling.activity_rpc_timeout_seconds,
         ),
         name="activity_hot_sweep",
     )
@@ -1112,6 +1120,7 @@ async def _start_followup_background_tasks(
             ctx.conn,
             ctx.shutdown_event,
             pacing=ColdBackfillPacing.from_scheduling(ctx.scheduling),
+            timeout_s=ctx.scheduling.activity_rpc_timeout_seconds,
         ),
         name="activity_cold_backfill",
     )

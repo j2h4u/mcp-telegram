@@ -42,6 +42,8 @@ from mcp_telegram.activity_peer_sweep import (
 )
 from mcp_telegram.sync_db import _apply_migrations
 
+_TEST_TIMEOUT_S = 120.0
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -340,8 +342,8 @@ def test_sweep_peer_once_resolve_none_returns_access_skip(monkeypatch: pytest.Mo
             del client, dialog_id
             return None
 
-        async def fake_call_with_timeout(client: object, request: object) -> object:
-            del client, request
+        async def fake_call_with_timeout(client: object, request: object, *, timeout_s: float) -> object:
+            del client, request, timeout_s
             calls.append(object())
             raise AssertionError("call_with_timeout must not be called when resolve_input_peer returns None")
 
@@ -350,7 +352,15 @@ def test_sweep_peer_once_resolve_none_returns_access_skip(monkeypatch: pytest.Mo
 
         result = asyncio.run(
             sweep_peer_once(
-                PeerSweepRequest(client=_FakeClient(), conn=conn, dialog_id=123, offset_id=7, min_id=3, limit=25)
+                PeerSweepRequest(
+                    client=_FakeClient(),
+                    conn=conn,
+                    dialog_id=123,
+                    offset_id=7,
+                    min_id=3,
+                    limit=25,
+                    timeout_s=_TEST_TIMEOUT_S,
+                )
             )
         )
 
@@ -376,8 +386,9 @@ def test_sweep_peer_once_floodwait_reports_seconds(monkeypatch: pytest.MonkeyPat
             del client, dialog_id
             return object()
 
-        async def fake_call_with_timeout(client: object, request: object) -> object:
+        async def fake_call_with_timeout(client: object, request: object, *, timeout_s: float) -> object:
             del client
+            captured["timeout_s"] = timeout_s
             captured["request"] = request
             raise FloodWaitError(request=None, capture=37)
 
@@ -392,10 +403,12 @@ def test_sweep_peer_once_floodwait_reports_seconds(monkeypatch: pytest.MonkeyPat
                 offset_id=11,
                 min_id=5,
                 limit=50,
+                timeout_s=_TEST_TIMEOUT_S,
             )
         )
 
         assert "request" in captured
+        assert captured["timeout_s"] == _TEST_TIMEOUT_S
         request = cast(SearchRequest, captured["request"])
         assert request.offset_id == 11
         assert request.min_id == 5
@@ -422,8 +435,8 @@ def test_sweep_peer_once_success_invokes_pacing_sleep(
             del client, dialog_id
             return object()
 
-        async def fake_call_with_timeout(client: object, request: object) -> _FakeSweepResult:
-            del client, request
+        async def fake_call_with_timeout(client: object, request: object, *, timeout_s: float) -> _FakeSweepResult:
+            del client, request, timeout_s
             return _FakeSweepResult(messages=[_FakeSweepMessage(8, peer_id="keep")])
 
         async def fake_sleep(seconds: float) -> None:
@@ -454,6 +467,7 @@ def test_sweep_peer_once_success_invokes_pacing_sleep(
                     offset_id=13,
                     min_id=6,
                     limit=30,
+                    timeout_s=_TEST_TIMEOUT_S,
                 )
             )
 
@@ -484,8 +498,8 @@ def test_sweep_peer_once_floodwait_does_not_invoke_pacing_sleep(monkeypatch: pyt
             del client, dialog_id
             return object()
 
-        async def fake_call_with_timeout(client: object, request: object) -> object:
-            del client, request
+        async def fake_call_with_timeout(client: object, request: object, *, timeout_s: float) -> object:
+            del client, request, timeout_s
             raise FloodWaitError(request=None, capture=37)
 
         async def fake_sleep(seconds: float) -> None:
@@ -503,6 +517,7 @@ def test_sweep_peer_once_floodwait_does_not_invoke_pacing_sleep(monkeypatch: pyt
                 offset_id=11,
                 min_id=5,
                 limit=50,
+                timeout_s=_TEST_TIMEOUT_S,
             )
         )
 
@@ -526,9 +541,9 @@ def test_sweep_peer_once_timeout_returns_access_skip(monkeypatch: pytest.MonkeyP
             del client, dialog_id
             return object()
 
-        async def fake_call_with_timeout(client: object, request: object) -> object:
+        async def fake_call_with_timeout(client: object, request: object, *, timeout_s: float) -> object:
             nonlocal called
-            del client, request
+            del client, request, timeout_s
             called = True
             raise TimeoutError
 
@@ -543,6 +558,7 @@ def test_sweep_peer_once_timeout_returns_access_skip(monkeypatch: pytest.MonkeyP
                 offset_id=4,
                 min_id=2,
                 limit=10,
+                timeout_s=_TEST_TIMEOUT_S,
             )
         )
 
@@ -572,8 +588,8 @@ def test_sweep_peer_once_access_lost_marks_dialog_without_traceback(
             del client, dialog_id
             return object()
 
-        async def fake_call_with_timeout(client: object, request: object) -> object:
-            del client, request
+        async def fake_call_with_timeout(client: object, request: object, *, timeout_s: float) -> object:
+            del client, request, timeout_s
             raise ChannelPrivateError(request=None)
 
         async def fake_sleep(seconds: float) -> None:
@@ -592,6 +608,7 @@ def test_sweep_peer_once_access_lost_marks_dialog_without_traceback(
                     offset_id=4,
                     min_id=2,
                     limit=10,
+                    timeout_s=_TEST_TIMEOUT_S,
                 )
             )
 
@@ -632,8 +649,8 @@ def test_sweep_peer_once_empty_batch_is_history_floor(monkeypatch: pytest.Monkey
             del client, dialog_id
             return object()
 
-        async def fake_call_with_timeout(client: object, request: object) -> _FakeSweepResult:
-            del client, request
+        async def fake_call_with_timeout(client: object, request: object, *, timeout_s: float) -> _FakeSweepResult:
+            del client, request, timeout_s
             return _FakeSweepResult(messages=[])
 
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
@@ -647,6 +664,7 @@ def test_sweep_peer_once_empty_batch_is_history_floor(monkeypatch: pytest.Monkey
                 offset_id=9,
                 min_id=1,
                 limit=20,
+                timeout_s=_TEST_TIMEOUT_S,
             )
         )
 
@@ -668,8 +686,8 @@ def test_sweep_peer_once_persists_only_extractable_messages(monkeypatch: pytest.
             del client, dialog_id
             return object()
 
-        async def fake_call_with_timeout(client: object, request: object) -> _FakeSweepResult:
-            del client, request
+        async def fake_call_with_timeout(client: object, request: object, *, timeout_s: float) -> _FakeSweepResult:
+            del client, request, timeout_s
             return _FakeSweepResult(
                 messages=[
                     _FakeSweepMessage(8, peer_id="keep"),
@@ -702,6 +720,7 @@ def test_sweep_peer_once_persists_only_extractable_messages(monkeypatch: pytest.
                 offset_id=13,
                 min_id=6,
                 limit=30,
+                timeout_s=_TEST_TIMEOUT_S,
             )
         )
 

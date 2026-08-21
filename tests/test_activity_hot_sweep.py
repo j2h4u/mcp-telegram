@@ -39,6 +39,8 @@ from mcp_telegram.activity_peer_sweep import (
 )
 from mcp_telegram.sync_db import _apply_migrations
 
+_TEST_TIMEOUT_S = 120.0
+
 # ---------------------------------------------------------------------------
 # DB and enrollment helpers
 # ---------------------------------------------------------------------------
@@ -152,8 +154,8 @@ def _patch_sweep(
     """
     call_log: dict[int, list[tuple[int, int]]] = {}
 
-    async def _fake_sweep(*args: object, offset_id: int, min_id: int, limit: int) -> SweepResult:
-        del limit
+    async def _fake_sweep(*args: object, offset_id: int, min_id: int, limit: int, timeout_s: float) -> SweepResult:
+        del limit, timeout_s
         _client, _conn, dialog_id = cast(tuple[object, object, int], args)
         call_log.setdefault(dialog_id, []).append((offset_id, min_id))
         queue = results_by_dialog.get(dialog_id, [])
@@ -199,7 +201,7 @@ async def test_stale_peer_not_selected(monkeypatch: pytest.MonkeyPatch) -> None:
         call_log = _patch_sweep(monkeypatch, {stale_dialog_id: []})
 
         shutdown = asyncio.Event()
-        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
+        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
 
         assert written == 0
         assert stale_dialog_id not in call_log, "Stale peer must not be swept — it is outside the 30-day window"
@@ -222,7 +224,7 @@ async def test_access_lost_peer_not_selected(monkeypatch: pytest.MonkeyPatch) ->
         call_log = _patch_sweep(monkeypatch, {dialog_id: [_make_sweep_result([10])]})
 
         shutdown = asyncio.Event()
-        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
+        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
 
         assert written == 0
         assert dialog_id not in call_log
@@ -250,7 +252,7 @@ async def test_first_pass_null_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
         call_log = _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
+        await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
 
         # min_id on first call must be 0 (hot_cursor was NULL)
         assert dialog_id in call_log, "Active peer must be swept"
@@ -287,7 +289,7 @@ async def test_second_pass_inclusive_cursor_fix(monkeypatch: pytest.MonkeyPatch)
         call_log = _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
+        await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
 
         assert dialog_id in call_log
         _, min_id_used = call_log[dialog_id][0]
@@ -349,7 +351,7 @@ async def test_multi_batch_window_paging(monkeypatch: pytest.MonkeyPatch) -> Non
         call_log = _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
+        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
 
         # Two requests must have been issued
         assert len(call_log[dialog_id]) == 2, (
@@ -396,7 +398,7 @@ async def test_own_messages_persisted_with_out_flag(monkeypatch: pytest.MonkeyPa
         _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
+        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
 
         # The sweep primitive itself inserts; we verify it was called and reported persisted=3
         assert written == 3, f"Expected 3 messages written, got {written}"
@@ -441,7 +443,7 @@ async def test_flood_wait_sets_retry_at_and_persists_progress(monkeypatch: pytes
 
         before = int(time.time())
         shutdown = asyncio.Event()
-        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown)  # must NOT raise
+        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)  # must NOT raise
 
         state = _get_state(conn, dialog_id)
 
@@ -484,7 +486,7 @@ async def test_access_skip_does_not_advance_cursor(monkeypatch: pytest.MonkeyPat
         _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
+        await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
 
         state = _get_state(conn, dialog_id)
 
@@ -529,7 +531,7 @@ async def test_full_page_without_min_id_persists_hot_cursor(monkeypatch: pytest.
         _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
+        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
 
         state = _get_state(conn, dialog_id)
         assert written == len(fetched_ids)
@@ -565,7 +567,7 @@ async def test_hot_sweep_never_writes_cold_columns(monkeypatch: pytest.MonkeyPat
         _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
+        await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
 
         for did in [fresh_id, flood_id, skip_id]:
             state = _get_state(conn, did)
@@ -603,7 +605,7 @@ async def test_flood_halts_whole_pass_account_safety(monkeypatch: pytest.MonkeyP
         call_log = _patch_sweep(monkeypatch, {flood_first: [_flood_result(26)]})
 
         shutdown = asyncio.Event()
-        await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
+        await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
 
         # Only the first peer was swept; the pass halted on its FloodWait.
         assert set(call_log.keys()) == {flood_first}, (

@@ -243,6 +243,7 @@ async def _search_backfill_batch(
     shutdown_event: asyncio.Event,
     *,
     total_fetched: int,
+    timeout_s: float,
 ) -> object:
     """Run the backfill SearchRequest and translate control-flow exceptions."""
     try:
@@ -262,6 +263,7 @@ async def _search_backfill_batch(
                 hash=0,
                 from_id=InputPeerSelf(),
             ),
+            timeout_s=timeout_s,
         )
     except FloodWaitError as exc:
         logger.warning(
@@ -281,13 +283,14 @@ async def _search_backfill_batch(
         return _SEARCH_BATCH_STOP
 
 
-async def _search_incremental_batch(
+async def _search_incremental_batch(  # noqa: PLR0913 - explicit worker state and injected transport policy
     client: ActivityClient,
     min_date: int,
     offset_id: int,
     shutdown_event: asyncio.Event,
     *,
     inserted: int,
+    timeout_s: float,
 ) -> object:
     """Run the incremental SearchRequest and translate control-flow exceptions."""
     try:
@@ -307,6 +310,7 @@ async def _search_incremental_batch(
                 hash=0,
                 from_id=InputPeerSelf(),
             ),
+            timeout_s=timeout_s,
         )
     except FloodWaitError as exc:
         logger.warning("activity_sync_incremental_floodwait seconds=%d", exc.seconds)
@@ -396,6 +400,8 @@ async def _run_backfill(
     client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
+    *,
+    timeout_s: float,
 ) -> None:
     state = _load_state(conn)
     if state.get("backfill_complete") == "1":
@@ -424,6 +430,7 @@ async def _run_backfill(
             progress.checkpoint,
             shutdown_event,
             total_fetched=progress.total_fetched,
+            timeout_s=timeout_s,
         )
         if result is _SEARCH_BATCH_STOP:
             return
@@ -467,6 +474,8 @@ async def _run_incremental(
     client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
+    *,
+    timeout_s: float,
 ) -> None:
     state = _load_state(conn)
     if state.get("backfill_complete") != "1":
@@ -498,6 +507,7 @@ async def _run_incremental(
             progress.offset_id,
             shutdown_event,
             inserted=progress.inserted,
+            timeout_s=timeout_s,
         )
         if result is _SEARCH_BATCH_STOP:
             _stamp_last_sync_at(conn)
@@ -564,6 +574,7 @@ async def run_activity_sync_loop(
     shutdown_event: asyncio.Event,
     *,
     interval: float = _DEFAULT_INTERVAL_S,
+    timeout_s: float,
 ) -> None:
     """Background task: keep own-message rows (out=1) in messages up-to-date.
 
@@ -573,8 +584,8 @@ async def run_activity_sync_loop(
     while not shutdown_event.is_set():
         logger.info("activity_sync_loop_start")
         try:
-            await _run_backfill(client, conn, shutdown_event)
-            await _run_incremental(client, conn, shutdown_event)
+            await _run_backfill(client, conn, shutdown_event, timeout_s=timeout_s)
+            await _run_incremental(client, conn, shutdown_event, timeout_s=timeout_s)
         except Exception:
             logger.warning("activity_sync_error", exc_info=True)
         logger.info("activity_sync_loop_sleeping interval=%.0fs", interval)

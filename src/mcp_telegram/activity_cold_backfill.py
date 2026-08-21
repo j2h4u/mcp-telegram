@@ -135,9 +135,10 @@ async def _run_cold_backfill_pass_safe(
     shutdown_event: asyncio.Event,
     *,
     pacing: ColdBackfillPacing,
+    timeout_s: float,
 ) -> ColdPassResult:
     try:
-        return await run_cold_backfill_pass(client, conn, shutdown_event, pacing=pacing)
+        return await run_cold_backfill_pass(client, conn, shutdown_event, pacing=pacing, timeout_s=timeout_s)
     except Exception:
         logger.warning("activity_cold_backfill_error", exc_info=True)
         # Treat as NO_DUE_PEER for sleep purposes to avoid tight error loops.
@@ -261,6 +262,7 @@ async def run_cold_backfill_pass(
     shutdown_event: asyncio.Event,
     *,
     pacing: ColdBackfillPacing,
+    timeout_s: float,
 ) -> ColdPassResult:
     """Run one Tier-B ColdBackfill pass.
 
@@ -325,6 +327,7 @@ async def run_cold_backfill_pass(
         offset_id=offset_id,
         min_id=0,  # no time/id ceiling — full history walk
         limit=_BACKFILL_BATCH_LIMIT,
+        timeout_s=timeout_s,
     )
 
     return _finish_cold_backfill_peer(
@@ -345,13 +348,14 @@ async def run_cold_backfill_pass(
 # ---------------------------------------------------------------------------
 
 
-async def run_cold_backfill_loop(
+async def run_cold_backfill_loop(  # noqa: PLR0913 - explicit worker state and injected transport policy
     client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
     idle_interval: float | None = None,
     pacing: ColdBackfillPacing,
+    timeout_s: float,
 ) -> None:
     """Background task: run Tier-B ColdBackfill, low-priority, self-enrolling.
 
@@ -374,7 +378,9 @@ async def run_cold_backfill_loop(
         # pacing.history.enroll_s so peer set stays current without over-calling.
         last_enroll_at = await _maybe_enroll_activity_peers(client, conn, last_enroll_at, pacing)
 
-        pass_result = await _run_cold_backfill_pass_safe(client, conn, shutdown_event, pacing=pacing)
+        pass_result = await _run_cold_backfill_pass_safe(
+            client, conn, shutdown_event, pacing=pacing, timeout_s=timeout_s
+        )
 
         sleep_s = _cold_backfill_sleep_seconds(pass_result, resolved_idle_interval, pacing)
 

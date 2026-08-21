@@ -123,6 +123,7 @@ class PeerSweepRequest:
     offset_id: int
     min_id: int
     limit: int
+    timeout_s: float
 
 
 _LEGACY_PEER_SWEEP_POSITIONAL_ARGS = 3
@@ -168,6 +169,7 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
     offset_id = cast(int, kwargs.pop("offset_id"))
     min_id = cast(int, kwargs.pop("min_id"))
     limit = cast(int, kwargs.pop("limit"))
+    timeout_s = cast(float, kwargs.pop("timeout_s"))
     if kwargs:
         raise TypeError(f"sweep_peer_once: unexpected keyword arguments {sorted(kwargs)!r}")
 
@@ -178,6 +180,7 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
         offset_id=offset_id,
         min_id=min_id,
         limit=limit,
+        timeout_s=timeout_s,
     )
 
 
@@ -225,6 +228,7 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer) 
                 min_date=None,
                 max_date=None,
             ),
+            timeout_s=request.timeout_s,
         )
     except FloodWaitError as exc:
         logger.warning(

@@ -227,11 +227,6 @@ rationale = "This pre-existing activity-sync loop cadence remains legacy schedul
 
 [[entry]]
 category = "policy_assignments"
-key = "src/mcp_telegram/activity_sync.py:<module>:_SEARCH_RPC_TIMEOUT_S"
-rationale = "This existing Telegram search RPC deadline is outside the TTL policy scope."
-
-[[entry]]
-category = "policy_assignments"
 key = "src/mcp_telegram/activity_sync.py:_trim_incremental_batch:in_window"
 rationale = "This boolean is computed batch-window state, not a tunable window duration."
 
@@ -356,11 +351,6 @@ rationale = "sync.db read and write connections share SQLite's local connection 
 category = "policy_dict_values"
 key = "src/mcp_telegram/tools/unread.py:<module>:group_size_threshold"
 rationale = "This is an MCP response field name, not a placement of an operator policy value."
-
-[[entry]]
-category = "policy_call_keywords"
-key = "src/mcp_telegram/activity_sync.py:call_with_timeout:timeout"
-rationale = "This fixed Telethon RPC deadline prevents a single activity search from hanging the worker."
 
 [[entry]]
 category = "policy_defaults"

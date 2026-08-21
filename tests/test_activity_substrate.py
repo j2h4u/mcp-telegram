@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import patch
 
 import pytest
 
 from mcp_telegram.activity_substrate import ActivityClient, call_with_timeout
+
+_TEST_TIMEOUT_S = 0.01
 
 
 @pytest.mark.asyncio
@@ -26,9 +27,8 @@ async def test_call_with_timeout_cancels_a_wedged_rpc_without_waiting() -> None:
             return object()
 
     client: ActivityClient = HangingClient()
-    with patch("mcp_telegram.activity_substrate.ACTIVITY_RPC_TIMEOUT_S", 0.01):
-        with pytest.raises(TimeoutError):
-            await call_with_timeout(client, object())
+    with pytest.raises(TimeoutError):
+        await call_with_timeout(client, object(), timeout_s=_TEST_TIMEOUT_S)
 
     await asyncio.wait_for(cancelled.wait(), timeout=1.0)
 
@@ -47,4 +47,4 @@ async def test_call_with_timeout_preserves_rpc_exception() -> None:
             return object()
 
     with pytest.raises(RuntimeError, match="rpc failed"):
-        await call_with_timeout(FailingClient(), object())
+        await call_with_timeout(FailingClient(), object(), timeout_s=1.0)

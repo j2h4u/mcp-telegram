@@ -18,13 +18,7 @@ class ActivityClient(Protocol):
     def get_input_entity(self, dialog_id: int) -> Coroutine[object, object, object]: ...
 
 
-# Upper bound on one activity SearchRequest await.  The explicit wait/cancel
-# policy below deliberately does not await cancellation completion: Telethon
-# can leave an MTProto future unresolved after startup FloodWait.
-ACTIVITY_RPC_TIMEOUT_S: float = 120.0
-
-
-async def call_with_timeout(client: ActivityClient, request: object) -> object:
+async def call_with_timeout(client: ActivityClient, request: object, *, timeout_s: float) -> object:
     """Invoke a Telegram RPC with a hard deadline and abandon on overrun.
 
     ``asyncio.wait_for`` awaits the wrapped task after cancellation.  Activity
@@ -33,11 +27,11 @@ async def call_with_timeout(client: ActivityClient, request: object) -> object:
     their original exception through ``task.result()``.
     """
     task = asyncio.create_task(client(request))
-    done, _pending = await asyncio.wait({task}, timeout=ACTIVITY_RPC_TIMEOUT_S)
+    done, _pending = await asyncio.wait({task}, timeout=timeout_s)
     if not done:
         task.cancel()
-        raise TimeoutError(f"RPC exceeded {ACTIVITY_RPC_TIMEOUT_S}s deadline")
+        raise TimeoutError(f"RPC exceeded {timeout_s}s deadline")
     return task.result()
 
 
-__all__ = ["ACTIVITY_RPC_TIMEOUT_S", "ActivityClient", "call_with_timeout"]
+__all__ = ["ActivityClient", "call_with_timeout"]
