@@ -200,9 +200,36 @@ def _patch_build_working_set(monkeypatch: pytest.MonkeyPatch, timeout_calls: lis
 async def test_cold_enrollment_forwards_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     timeout_calls: list[float] = []
     _patch_build_working_set(monkeypatch, timeout_calls)
+
+    class _DueClock:
+        def time(self) -> float:
+            return _PACING.history.enroll_s + 1.0
+
+    monkeypatch.setattr(
+        "mcp_telegram.activity_cold_backfill.asyncio.get_running_loop",
+        lambda: _DueClock(),
+    )
     with _make_db() as conn:
         await _maybe_enroll_activity_peers(_FakeClient(), conn, 0.0, _PACING, _TEST_TIMEOUT_S)
     assert timeout_calls == [_TEST_TIMEOUT_S]
+
+
+@pytest.mark.asyncio
+async def test_cold_enrollment_skips_before_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    timeout_calls: list[float] = []
+    _patch_build_working_set(monkeypatch, timeout_calls)
+
+    class _FreshClock:
+        def time(self) -> float:
+            return 0.5
+
+    monkeypatch.setattr(
+        "mcp_telegram.activity_cold_backfill.asyncio.get_running_loop",
+        lambda: _FreshClock(),
+    )
+    with _make_db() as conn:
+        await _maybe_enroll_activity_peers(_FakeClient(), conn, 0.0, _PACING, _TEST_TIMEOUT_S)
+    assert timeout_calls == []
 
 
 # ---------------------------------------------------------------------------
