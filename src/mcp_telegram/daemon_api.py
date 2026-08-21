@@ -685,38 +685,8 @@ class DaemonAPIServer:
     # Dialog name resolution
     # ------------------------------------------------------------------
 
-    async def _resolve_dialog_name(  # noqa: PLR0912 - ordered local and remote resolution fallbacks
-        self,
-        dialog: str,
-        *,
-        allow_remote_lookup: bool = True,
-    ) -> int:
-        """Resolve a dialog name string to a numeric dialog_id.
-
-        Resolution order (fastest-first):
-        1. client.get_entity() — handles @username, phone, invite link.
-        2. entities table — exact/normalized/substring match against cached DB.
-        2.5. dialogs snapshot table — Phase 41 mirror of iter_dialogs() data.
-             No name_normalized column → no transliteration; Cyrillic queries
-             that need anyascii fall through to step 3.
-        3. iter_dialogs() — last resort for dialogs not in entities or dialogs snapshot.
-
-        Returns telethon peer id (negative for channels/groups).
-        Raises ValueError with descriptive message on failure.
-
-        When ``allow_remote_lookup`` is false, only the local entities and
-        dialogs snapshots are consulted. Callers may still perform a separate
-        remote topic-catalog refresh after resolving a numeric dialog id.
-        """
-        if allow_remote_lookup:
-            try:
-                entity = await self._client.get_entity(dialog)
-                return int(cast(int, telethon_utils.get_peer_id(entity)))
-            except ValueError, KeyError:
-                pass
-            except Exception:
-                logger.debug("get_entity failed for %r, falling back to entities DB", dialog, exc_info=True)
-
+    def _resolve_dialog_name_from_local_cache(self, dialog: str) -> int | None:
+        """Resolve a dialog selector from the local entity/dialog snapshots."""
         selector = dialog.strip()
         tme = _parse_tme_link(selector)
         username = tme[0] if tme is not None else selector[1:] if selector.startswith("@") else None
@@ -799,6 +769,50 @@ class DaemonAPIServer:
         if row:
             logger.debug("resolve_dialog_dialogs_cache hit query=%r id=%d", dialog, row[0])
             return _coerce_int(row[0], 0)
+        return None
+
+    async def _resolve_dialog_entity(self, dialog: str) -> int | None:
+        """Resolve a dialog selector through the live Telegram entity lookup."""
+        try:
+            entity = await self._client.get_entity(dialog)
+            return int(cast(int, telethon_utils.get_peer_id(entity)))
+        except ValueError, KeyError:
+            return None
+        except Exception:
+            logger.debug("get_entity failed for %r, falling back to entities DB", dialog, exc_info=True)
+            return None
+
+    async def _resolve_dialog_name(
+        self,
+        dialog: str,
+        *,
+        allow_remote_lookup: bool = True,
+    ) -> int:
+        """Resolve a dialog name string to a numeric dialog_id.
+
+        Resolution order (fastest-first):
+        1. client.get_entity() — handles @username, phone, invite link.
+        2. entities table — exact/normalized/substring match against cached DB.
+        2.5. dialogs snapshot table — Phase 41 mirror of iter_dialogs() data.
+             No name_normalized column → no transliteration; Cyrillic queries
+             that need anyascii fall through to step 3.
+        3. iter_dialogs() — last resort for dialogs not in entities or dialogs snapshot.
+
+        Returns telethon peer id (negative for channels/groups).
+        Raises ValueError with descriptive message on failure.
+
+        When ``allow_remote_lookup`` is false, only the local entities and
+        dialogs snapshots are consulted. Callers may still perform a separate
+        remote topic-catalog refresh after resolving a numeric dialog id.
+        """
+        if allow_remote_lookup:
+            entity_id = await self._resolve_dialog_entity(dialog)
+            if entity_id is not None:
+                return entity_id
+
+        local_id = self._resolve_dialog_name_from_local_cache(dialog)
+        if local_id is not None:
+            return local_id
 
         if not allow_remote_lookup:
             raise ValueError(f"Dialog {dialog!r} not found. Check the dialog name or use dialog_id from ListDialogs.")
