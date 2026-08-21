@@ -8,6 +8,7 @@ from mcp_telegram.own_only import (
     OwnOnlyBasis,
     OwnOnlyContext,
     classify_own_only_dialog,
+    enroll_own_only_sync_dialog,
     query_own_only_candidates,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
@@ -118,5 +119,27 @@ def test_candidate_query_keeps_rights_classification_out_of_sql() -> None:
             -1000000008001,
             1,
         ]
+    finally:
+        conn.close()
+
+
+def test_sync_enrollment_respects_outer_transaction_rollback() -> None:
+    """Enrollment must roll back with the caller's message batch transaction."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT)")
+        conn.execute("CREATE TABLE messages (message_id INTEGER PRIMARY KEY)")
+
+        conn.execute("BEGIN")
+        try:
+            conn.execute("INSERT INTO messages (message_id) VALUES (7)")
+            enroll_own_only_sync_dialog(conn, 42)
+            raise RuntimeError("batch failed")
+        except RuntimeError as exc:
+            assert str(exc) == "batch failed"
+            conn.rollback()
+
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone() == (0,)
+        assert conn.execute("SELECT COUNT(*) FROM synced_dialogs").fetchone() == (0,)
     finally:
         conn.close()

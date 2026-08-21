@@ -169,12 +169,14 @@ def enroll_own_only_sync_dialog(conn: sqlite3.Connection, dialog_id: int) -> Non
 
     ``INSERT OR IGNORE`` is intentional: an existing ``syncing``, ``synced``
     or ``active`` row must never be downgraded to ``own_only``.
+
+    The caller owns the transaction.  Keeping this helper execute-only lets a
+    message batch atomically roll back both its message rows and enrollment.
     """
-    with conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'own_only')",
-            (int(dialog_id),),
-        )
+    conn.execute(
+        "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'own_only')",
+        (int(dialog_id),),
+    )
 
 
 def own_only_basis_by_dialog(conn: sqlite3.Connection) -> dict[int, tuple[str, ...]]:
