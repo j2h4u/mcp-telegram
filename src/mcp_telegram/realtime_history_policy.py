@@ -30,14 +30,14 @@ class RealtimeBodyEvent(StrEnum):
 _FULL_HISTORY_STATUSES = frozenset({"synced", "syncing"})
 
 
-def realtime_history_coverage(status: str | None) -> RealtimeHistoryCoverage:
-    """Map persisted sync status to realtime body coverage.
+def realtime_history_coverage(status: str | None, enrollment_enabled: bool) -> RealtimeHistoryCoverage:
+    """Map coverage status plus durable authorization to realtime body coverage.
 
     Unknown and missing statuses deliberately fail closed.  Status values are
     compared exactly so a future status cannot accidentally enable writes.
     """
 
-    if status in _FULL_HISTORY_STATUSES:
+    if enrollment_enabled and status in _FULL_HISTORY_STATUSES:
         return RealtimeHistoryCoverage.FULL_HISTORY
     if status == "own_only":
         return RealtimeHistoryCoverage.OWN_OUTGOING

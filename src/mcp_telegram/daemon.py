@@ -196,7 +196,11 @@ _BACKFILL_TOTAL_MESSAGES_SKIP_EXCEPTIONS: tuple[type[BaseException], ...] = (
     Exception,
 )
 
-_SELECT_NULL_TOTAL_SQL = "SELECT dialog_id FROM synced_dialogs WHERE total_messages IS NULL AND status != 'not_synced'"
+_SELECT_NULL_TOTAL_SQL = (
+    "SELECT sd.dialog_id FROM synced_dialogs sd "
+    "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
+    "WHERE sd.total_messages IS NULL AND sd.status != 'not_synced'"
+)
 
 _UPDATE_TOTAL_SQL = "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ?"
 
@@ -204,15 +208,17 @@ _SELECT_NULL_READ_CURSORS_SQL = (
     # Phase 39.3-02: picks up dialogs with EITHER cursor NULL. Post-v12
     # migration, every existing synced row has read_outbox_max_id = NULL, so
     # this re-bootstraps all of them in batched GetPeerDialogsRequest calls.
-    "SELECT dialog_id FROM synced_dialogs "
-    "WHERE (read_inbox_max_id IS NULL OR read_outbox_max_id IS NULL) "
-    "AND status = 'synced'"
+    "SELECT sd.dialog_id FROM synced_dialogs sd "
+    "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
+    "WHERE (sd.read_inbox_max_id IS NULL OR sd.read_outbox_max_id IS NULL) "
+    "AND sd.status = 'synced'"
 )
 
 _SELECT_BLANK_UNSUPPORTED_MESSAGES_SQL = (
-    "SELECT dialog_id, message_id FROM messages "
-    "WHERE COALESCE(text, '') = '' AND media_description IN (?, ?) "
-    "ORDER BY dialog_id, message_id "
+    "SELECT m.dialog_id, m.message_id FROM messages m "
+    "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
+    "WHERE COALESCE(m.text, '') = '' AND m.media_description IN (?, ?) "
+    "ORDER BY m.dialog_id, m.message_id "
     "LIMIT ?"
 )
 
@@ -327,6 +333,15 @@ async def _backfill_blank_unsupported_chunk(
         return _BackfillTotalDialogResult(filled=0, pause_after=True)
 
     with conn:
+        enabled = cast(
+            tuple[object, ...] | None,
+            conn.execute(
+                "SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1",
+                (dialog_id,),
+            ).fetchone(),
+        )
+        if enabled is None:
+            return _BackfillTotalDialogResult(filled=0, pause_after=True)
         insert_messages_with_fts(conn, materialized)
     return _BackfillTotalDialogResult(filled=len(materialized), pause_after=True)
 
@@ -368,8 +383,12 @@ async def _backfill_total_message_dialog(
         result = cast(_MessagesTotalLike, await client.get_messages(entity=dialog_id, limit=1))
         total = result.total
         if total is not None:
-            conn.execute(_UPDATE_TOTAL_SQL, (total, dialog_id))
-            conn.commit()
+            with conn:
+                conn.execute(
+                    _UPDATE_TOTAL_SQL + " AND EXISTS (SELECT 1 FROM full_history_enrollment fhe "
+                    "WHERE fhe.dialog_id = synced_dialogs.dialog_id AND fhe.enabled = 1)",
+                    (total, dialog_id),
+                )
             return _BackfillTotalDialogResult(filled=1, pause_after=True)
         return _BackfillTotalDialogResult(filled=0, pause_after=True)
     except FloodWaitError as exc:
@@ -472,23 +491,31 @@ async def _build_read_position_input_peers(client: _DaemonClient, batch_ids: lis
 def _apply_read_positions_from_dialogs(conn: sqlite3.Connection, result: _ReadPositionsResultLike) -> int:
     """Apply read cursors from a GetPeerDialogsRequest result."""
     filled = 0
-    for dialog in result.dialogs:
-        chat_id = int(cast(int, telethon_utils.get_peer_id(dialog.peer)))
-        # D-03 LOCKED: None → skip (preserve NULL). NEVER fold
-        # None → 0; that would lie with [all read] during the
-        # bootstrap window. The DB cursor stays NULL and Plan 03
-        # renders [unknown (sync pending)]. 0 is a legitimate
-        # distinct value (peer/me has read nothing) — writes 0.
-        inbox_max = cast(int | None, getattr(dialog, "read_inbox_max_id", None))
-        outbox_max = cast(int | None, getattr(dialog, "read_outbox_max_id", None))
-        wrote_any = False
-        if inbox_max is not None and apply_read_cursor(conn, chat_id, "inbox", inbox_max) > 0:
-            # Monotonic via shared primitive — see read_state.py.
-            wrote_any = True
-        if outbox_max is not None and apply_read_cursor(conn, chat_id, "outbox", outbox_max) > 0:
-            wrote_any = True
-        if wrote_any:
-            filled += 1
+    with conn:
+        for dialog in result.dialogs:
+            chat_id = int(cast(int, telethon_utils.get_peer_id(dialog.peer)))
+            # D-03 LOCKED: None → skip (preserve NULL). NEVER fold
+            # None → 0; that would lie with [all read] during the
+            # bootstrap window. The DB cursor stays NULL and Plan 03
+            # renders [unknown (sync pending)]. 0 is a legitimate
+            # distinct value (peer/me has read nothing) — writes 0.
+            inbox_max = cast(int | None, getattr(dialog, "read_inbox_max_id", None))
+            outbox_max = cast(int | None, getattr(dialog, "read_outbox_max_id", None))
+            wrote_any = False
+            if (
+                conn.execute(
+                    "SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1", (chat_id,)
+                ).fetchone()
+                is None
+            ):
+                continue
+            if inbox_max is not None and apply_read_cursor(conn, chat_id, "inbox", inbox_max) > 0:
+                # Monotonic via shared primitive — see read_state.py.
+                wrote_any = True
+            if outbox_max is not None and apply_read_cursor(conn, chat_id, "outbox", outbox_max) > 0:
+                wrote_any = True
+            if wrote_any:
+                filled += 1
     return filled
 
 

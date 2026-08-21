@@ -334,16 +334,48 @@ STRUCTURED_TOOL_CASES = {
             "ok": True,
             "data": {
                 "dialog_id": 123,
-                "status": "synced",
+                "coverage_status": "synced",
+                "enrollment_enabled": True,
+                "enrollment_source": "explicit",
+                "realtime_history": "full",
                 "message_count": 10,
                 "last_synced_at": 1700000000,
+                "last_event_at": None,
+                "last_delta_checked_at": None,
+                "delta_refresh_requested_at": None,
+                "is_syncing": False,
+                "saved_message_count": 10,
+                "history_scope": "complete",
+                "history_depth_state": "complete",
+                "history_sync_state": "synced",
+                "history_complete_at": 1700000000,
+                "coverage_state": "complete",
+                "local_knowledge_at": 1700000000,
+                "local_knowledge_age_seconds": 0,
+                "sync_progress": None,
+                "sync_progress_message_id": None,
+                "total_messages": 10,
+                "delete_detection": "reliable (channel)",
+                "sync_coverage_pct": 100,
+                "access_lost_at": None,
+                "access_last_revalidated_at": None,
+                "access_next_revalidate_at": None,
             },
         },
     ),
     "mark_dialog_for_sync": (
         mark_dialog_for_sync,
         MarkDialogForSync(dialog_id=123),
-        {"ok": True},
+        {
+            "ok": True,
+            "data": {
+                "enrollment_source": "explicit",
+                "coverage_status": "not_synced",
+                "action": "queue_full_history",
+                "blocked_reason": None,
+                "full_history_will_be_fetched": True,
+            },
+        },
     ),
     "get_sync_alerts": (
         get_sync_alerts,
@@ -1961,16 +1993,28 @@ def test_no_telethon_imports_in_tools():
 
 async def test_mark_dialog_for_sync_via_daemon():
     """MarkDialogForSync routes through daemon API."""
-    conn = _make_daemon_conn({"ok": True})
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "enrollment_source": "explicit",
+                "coverage_status": "not_synced",
+                "action": "queue_full_history",
+                "blocked_reason": None,
+                "full_history_will_be_fetched": True,
+            },
+        }
+    )
     with _patch_daemon(conn):
         result = await mark_dialog_for_sync(MarkDialogForSync(dialog_id=42, enable=True))
     assert result.content == ()
     assert result.structured_content == {
         "dialog_id": 42,
         "enabled": True,
-        "status": "accepted",
-        "action": "mark_for_sync",
-        "expected_next_state": "syncing",
+        "enrollment_source": "explicit",
+        "coverage_status": "not_synced",
+        "action": "queue_full_history",
+        "blocked_reason": None,
         "full_history_will_be_fetched": True,
     }
     conn.mark_dialog_for_sync.assert_called_once_with(dialog_id=42, enable=True)
@@ -1983,7 +2027,9 @@ async def test_mark_dialog_for_sync_synced_dialog_reports_delta_refresh():
             "ok": True,
             "data": {
                 "action": "request_delta_refresh",
-                "expected_next_state": "synced",
+                "enrollment_source": "explicit",
+                "coverage_status": "synced",
+                "blocked_reason": None,
                 "full_history_will_be_fetched": False,
             },
         }
@@ -1994,9 +2040,10 @@ async def test_mark_dialog_for_sync_synced_dialog_reports_delta_refresh():
     assert result.structured_content == {
         "dialog_id": 42,
         "enabled": True,
-        "status": "accepted",
+        "enrollment_source": "explicit",
+        "coverage_status": "synced",
         "action": "request_delta_refresh",
-        "expected_next_state": "synced",
+        "blocked_reason": None,
         "full_history_will_be_fetched": False,
     }
     conn.mark_dialog_for_sync.assert_called_once_with(dialog_id=42, enable=True)
@@ -2004,16 +2051,28 @@ async def test_mark_dialog_for_sync_synced_dialog_reports_delta_refresh():
 
 async def test_mark_dialog_for_sync_disable():
     """MarkDialogForSync with enable=False returns unmarked text."""
-    conn = _make_daemon_conn({"ok": True})
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "enrollment_source": "explicit",
+                "coverage_status": "synced",
+                "action": "disabled_history",
+                "blocked_reason": None,
+                "full_history_will_be_fetched": False,
+            },
+        }
+    )
     with _patch_daemon(conn):
         result = await mark_dialog_for_sync(MarkDialogForSync(dialog_id=42, enable=False))
     assert result.content == ()
     assert result.structured_content == {
         "dialog_id": 42,
         "enabled": False,
-        "status": "accepted",
-        "action": "unmark_from_sync",
-        "expected_next_state": "not_synced",
+        "enrollment_source": "explicit",
+        "coverage_status": "synced",
+        "action": "disabled_history",
+        "blocked_reason": None,
         "full_history_will_be_fetched": False,
     }
     conn.mark_dialog_for_sync.assert_called_once_with(dialog_id=42, enable=False)
@@ -2039,7 +2098,10 @@ async def test_get_sync_status_via_daemon():
             "ok": True,
             "data": {
                 "dialog_id": -1001234567890,
-                "status": "synced",
+                "coverage_status": "synced",
+                "enrollment_enabled": True,
+                "enrollment_source": "explicit",
+                "realtime_history": "full",
                 "message_count": 100,
                 "sync_progress": 100,
                 "sync_progress_message_id": 100,
@@ -2047,6 +2109,21 @@ async def test_get_sync_status_via_daemon():
                 "last_synced_at": 1700000000,
                 "last_event_at": 1700001000,
                 "delete_detection": "reliable (channel)",
+                "is_syncing": False,
+                "saved_message_count": 100,
+                "history_scope": "complete",
+                "history_depth_state": "complete",
+                "history_sync_state": "synced",
+                "history_complete_at": 1700000000,
+                "coverage_state": "complete",
+                "local_knowledge_at": 1700001000,
+                "local_knowledge_age_seconds": 0,
+                "last_delta_checked_at": None,
+                "delta_refresh_requested_at": None,
+                "access_lost_at": None,
+                "access_last_revalidated_at": None,
+                "access_next_revalidate_at": None,
+                "sync_coverage_pct": 100,
             },
         }
     )
@@ -2055,8 +2132,10 @@ async def test_get_sync_status_via_daemon():
     assert result.content == ()
     assert result.structured_content == {
         "dialog_id": -1001234567890,
-        "status": "synced",
-        "raw_status": "synced",
+        "coverage_status": "synced",
+        "enrollment_enabled": True,
+        "enrollment_source": "explicit",
+        "realtime_history": "full",
         "is_syncing": False,
         "last_synced_at": "2023-11-14T22:13:20+00:00",
         "last_event_at": "2023-11-14T22:30:00+00:00",
@@ -2064,18 +2143,18 @@ async def test_get_sync_status_via_daemon():
         "delta_refresh_requested_at": None,
         "message_count": 100,
         "saved_message_count": 100,
-        "history_scope": "full",
+        "history_scope": "complete",
         "history_depth_state": "complete",
-        "history_sync_state": "complete_as_of_last_sync",
+        "history_sync_state": "synced",
         "history_complete_at": "2023-11-14T22:13:20+00:00",
-        "coverage_state": "telegram_total_comparable",
+        "coverage_state": "complete",
         "local_knowledge_at": "2023-11-14T22:30:00+00:00",
-        "local_knowledge_age_seconds": None,
+        "local_knowledge_age_seconds": 0,
         "sync_progress": 100,
         "sync_progress_message_id": 100,
         "total_messages": 100,
         "delete_detection": "reliable (channel)",
-        "sync_coverage_pct": None,
+        "sync_coverage_pct": 100,
         "access_lost_at": None,
         "access_last_revalidated_at": None,
         "access_next_revalidate_at": None,

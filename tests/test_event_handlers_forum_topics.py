@@ -44,6 +44,7 @@ from mcp_telegram.event_handlers import (
     _NewMessageEvent,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 _SQLiteConnection = sqlite3.Connection
 
@@ -93,6 +94,7 @@ def _enroll_synced(conn: _SQLiteConnection, dialog_id: int) -> None:
         "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (dialog_id,),
     )
+    seed_full_history_enrollment(conn, dialog_id, enabled=True)
     conn.commit()
 
 

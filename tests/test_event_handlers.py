@@ -30,6 +30,7 @@ from mcp_telegram.event_handlers import (
     _ReadMessageEvent,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 _SQLiteConnection = sqlite3.Connection
 
@@ -105,6 +106,7 @@ def insert_synced_dialog(conn: _SQLiteConnection, dialog_id: int) -> None:
         "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (dialog_id,),
     )
+    seed_full_history_enrollment(conn, dialog_id, enabled=True)
     conn.commit()
 
 
@@ -983,10 +985,12 @@ def test_refresh_excludes_access_lost(
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (9901, 'access_lost')",
     )
+    seed_full_history_enrollment(sync_db, 9901, enabled=False)
     # Insert synced dialog (should still appear)
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (9902, 'synced')",
     )
+    seed_full_history_enrollment(sync_db, 9902, enabled=True)
     sync_db.commit()
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
@@ -1005,6 +1009,7 @@ def test_refresh_includes_syncing(
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (9903, 'syncing')",
     )
+    seed_full_history_enrollment(sync_db, 9903, enabled=True)
     sync_db.commit()
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
@@ -1025,6 +1030,7 @@ async def test_gap_scan_excludes_syncing_dialogs(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'syncing')",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     for msg_id in [1, 2, 3]:
         sync_db.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, ?, 1000000000)",
@@ -1060,6 +1066,7 @@ async def test_gap_scan_excludes_access_lost_dialogs(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'access_lost')",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=False)
     for msg_id in [1, 2, 3]:
         sync_db.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, ?, 1000000000)",
@@ -1094,6 +1101,7 @@ async def test_gap_scan_only_synced(
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (9920, 'synced')",
     )
+    seed_full_history_enrollment(sync_db, 9920, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (9920, 1, 1000000000)",
     )
@@ -1101,6 +1109,7 @@ async def test_gap_scan_only_synced(
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (9921, 'syncing')",
     )
+    seed_full_history_enrollment(sync_db, 9921, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (9921, 2, 1000000000)",
     )
@@ -1108,6 +1117,7 @@ async def test_gap_scan_only_synced(
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (9922, 'access_lost')",
     )
+    seed_full_history_enrollment(sync_db, 9922, enabled=False)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (9922, 3, 1000000000)",
     )

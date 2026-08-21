@@ -14,6 +14,7 @@ from mcp_telegram.message_fact_refresh import (
 from mcp_telegram.reactions.contracts import ReactionFreshness
 from mcp_telegram.reactions.refresh import ReactionFreshener
 from mcp_telegram.telegram_reading import ReadDateFetchResult, TelegramReadReceiptGateway
+from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
 def _make_db() -> sqlite3.Connection:
@@ -24,6 +25,12 @@ def _make_db() -> sqlite3.Connection:
             dialog_id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
+        CREATE TABLE full_history_enrollment (
+            dialog_id INTEGER PRIMARY KEY,
+            enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+            source TEXT NOT NULL CHECK(source IN ('explicit', 'automatic', 'migration')),
+            updated_at INTEGER NOT NULL
+        ) WITHOUT ROWID;
         CREATE TABLE entities (
             id INTEGER PRIMARY KEY,
             type TEXT NOT NULL
@@ -108,6 +115,9 @@ async def test_refresh_message_facts_once_refreshes_reactions_and_read_at() -> N
         INSERT INTO message_reactions VALUES (10, 1, '👍', 1);
         """
     )
+    seed_full_history_enrollment(conn, 10, enabled=True)
+    seed_full_history_enrollment(conn, 20, enabled=True)
+    seed_full_history_enrollment(conn, 30, enabled=False)
     reactions = _ReactionFreshener()
     read_receipts = _ReadReceiptGateway()
 

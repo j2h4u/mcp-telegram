@@ -176,8 +176,10 @@ def persist_read_at(  # noqa: PLR0913
     with conn:
         conn.execute(
             "INSERT OR REPLACE INTO message_read_facts "
-            "(dialog_id, message_id, read_at, checked_at, status) VALUES (?, ?, ?, ?, ?)",
-            (dialog_id, message_id, read_at, checked_at, status),
+            "(dialog_id, message_id, read_at, checked_at, status) "
+            "SELECT ?, ?, ?, ?, ? WHERE EXISTS ("
+            "SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)",
+            (dialog_id, message_id, read_at, checked_at, status, dialog_id),
         )
 
 

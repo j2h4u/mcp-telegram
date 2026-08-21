@@ -305,7 +305,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 33  # v33 Telegram unread facts
+        assert _CURRENT_SCHEMA_VERSION == 34  # v34 persistent history enrollment
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1044,7 +1044,31 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 33
+        assert _CURRENT_SCHEMA_VERSION == 34
+
+
+def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO synced_dialogs(dialog_id, status, sync_progress, total_messages) VALUES (?, ?, ?, ?)",
+            [(1, "synced", 10, 20), (2, "own_only", 3, 4), (3, "access_lost", 5, 6)],
+        )
+        conn.execute("DROP INDEX idx_full_history_enrollment_enabled")
+        conn.execute("DROP TABLE full_history_enrollment")
+        conn.execute("DELETE FROM schema_version WHERE version >= 34")
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        assert conn.execute(
+            "SELECT dialog_id, enabled, source FROM full_history_enrollment ORDER BY dialog_id"
+        ).fetchall() == [(1, 1, "migration"), (2, 0, "migration"), (3, 0, "migration")]
+        assert conn.execute(
+            "SELECT dialog_id, status, sync_progress, total_messages FROM synced_dialogs ORDER BY dialog_id"
+        ).fetchall() == [(1, "synced", 10, 20), (2, "own_only", 3, 4), (3, "access_lost", 5, 6)]
 
 
 def test_migration_v30_adds_delta_probe_columns(tmp_path: Path) -> None:

@@ -41,7 +41,7 @@ from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
     ],
 )
 def test_realtime_history_status_matrix(status: str | None, expected: RealtimeHistoryCoverage) -> None:
-    assert realtime_history_coverage(status) is expected
+    assert realtime_history_coverage(status, status in {"synced", "syncing"}) is expected
 
 
 def test_own_only_requires_canonical_outgoing_for_all_body_families() -> None:

@@ -3,6 +3,7 @@
 Covers DAEMON-03 (full fetch), DAEMON-04 (resume), DAEMON-05 (FloodWait),
 and DAEMON-06 (DM bootstrap) behaviors.
 """
+# pyright: reportArgumentType=false
 
 from __future__ import annotations
 
@@ -19,11 +20,13 @@ import pytest
 
 from helpers import MockTotalList, build_mock_message, build_mock_reactions
 from mcp_telegram.fts import stem_text
+from mcp_telegram.history_enrollment import disable_history
 from mcp_telegram.message_contracts import StoredMessage
 from mcp_telegram.messages.sqlite_repository import insert_messages_with_fts
 from mcp_telegram.messages.telegram_adapter import _PeerLike, extract_message_row
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_worker import FullSyncWorker
+from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
 class _SQLiteCursor(Protocol):
@@ -111,6 +114,71 @@ def make_worker(
     return FullSyncWorker(mock_client, cast(sqlite3.Connection, sync_db), shutdown_event)
 
 
+@pytest.mark.asyncio
+async def test_full_sync_disable_race_discards_fetched_body_and_checkpoint(tmp_path: Path) -> None:
+    db_path = tmp_path / "race.db"
+    ensure_sync_schema(db_path)
+    first = cast(sqlite3.Connection, _open_sync_db(db_path))
+    second = cast(sqlite3.Connection, _open_sync_db(db_path))
+    first.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (77, 'syncing')")
+    first.execute("INSERT INTO full_history_enrollment VALUES (77, 1, 'explicit', 1)")
+    first.commit()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fetch(**_kwargs: object) -> MockTotalList:
+        entered.set()
+        await release.wait()
+        return MockTotalList([build_mock_message(id=4, text="stale")], total=1)
+
+    client = _MockClient()
+    client.get_messages.side_effect = fetch
+    worker = make_worker(client, first, asyncio.Event())
+    task = asyncio.create_task(worker._fetch_batch(77, 0))
+    await entered.wait()
+    disable_history(second, 77, now=2)
+    second.commit()
+    release.set()
+    assert await task == (0, True)
+    assert first.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=77").fetchone() == (0,)
+    assert first.execute("SELECT status FROM synced_dialogs WHERE dialog_id=77").fetchone() == ("not_synced",)
+    first.close()
+    second.close()
+
+
+@pytest.mark.asyncio
+async def test_full_sync_stale_access_error_after_disable_does_not_mark_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "access-race.db"
+    ensure_sync_schema(db_path)
+    first = cast(sqlite3.Connection, _open_sync_db(db_path))
+    second = cast(sqlite3.Connection, _open_sync_db(db_path))
+    first.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (79, 'syncing')")
+    first.execute("INSERT INTO full_history_enrollment VALUES (79, 1, 'explicit', 1)")
+    first.commit()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fail(**_kwargs: object) -> MockTotalList:
+        entered.set()
+        await release.wait()
+        raise RuntimeError("stale access error")
+
+    monkeypatch.setattr("mcp_telegram.sync_worker.ACCESS_LOST_ERRORS", (RuntimeError,))
+    client = _MockClient()
+    client.get_messages.side_effect = fail
+    task = asyncio.create_task(make_worker(client, first, asyncio.Event())._fetch_batch(79, 0))
+    await entered.wait()
+    disable_history(second, 79, now=2)
+    second.commit()
+    release.set()
+    assert await task == (0, True)
+    assert first.execute("SELECT status FROM synced_dialogs WHERE dialog_id=79").fetchone() == ("not_synced",)
+    first.close()
+    second.close()
+
+
 # ---------------------------------------------------------------------------
 # DAEMON-03: Full fetch — stores messages in messages table
 # ---------------------------------------------------------------------------
@@ -129,6 +197,7 @@ async def test_full_sync_stores_all_messages(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
     msgs = [
@@ -164,6 +233,7 @@ async def test_message_fields_extracted_correctly(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
     MediaDocumentClass = type("MessageMediaDocument", (), {})
@@ -356,6 +426,7 @@ async def test_resume_from_checkpoint(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 500)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
     mock_client.get_messages = AsyncMock(return_value=MockTotalList([], total=0))
@@ -378,6 +449,7 @@ async def test_progress_atomic_commit(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
     msgs = [
@@ -418,6 +490,7 @@ async def test_floodwait_sleep_continues(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
     err = FloodWaitError(request=None)
@@ -791,6 +864,7 @@ async def test_empty_batch_marks_synced(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 100)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
     mock_client.get_messages = AsyncMock(return_value=MockTotalList([], total=100))
@@ -820,6 +894,7 @@ async def test_partial_batch_marks_synced(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
     msgs = [build_mock_message(id=i) for i in range(50, 0, -1)]  # 50 messages
@@ -851,6 +926,7 @@ async def test_full_batch_not_marked_synced(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
     msgs = [build_mock_message(id=i) for i in range(100, 0, -1)]  # exactly 100
@@ -908,6 +984,7 @@ async def test_access_lost_channel_private(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
     err = ChannelPrivateError(request=None)
@@ -941,6 +1018,7 @@ async def test_access_lost_chat_forbidden(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
     err = ChatForbiddenError(request=None)
@@ -974,6 +1052,7 @@ async def test_access_lost_user_banned(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
     err = UserBannedInChannelError(request=None)
@@ -1007,6 +1086,7 @@ async def test_access_lost_preserves_messages(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     # Pre-insert messages
     for msg_id in [10, 20, 30]:
         sync_db.execute(
@@ -1042,6 +1122,7 @@ async def test_generic_rpc_error_still_skips(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
     err = RPCError(request=None, message="SOME_GENERIC_ERROR", code=400)
@@ -1078,6 +1159,7 @@ async def test_process_one_batch_populates_fts(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
     msgs = [
@@ -1113,6 +1195,7 @@ async def test_process_one_batch_fts_matches_message_ids(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
     msgs = [build_mock_message(id=200, text="test"), build_mock_message(id=201, text="data")]
@@ -1328,6 +1411,7 @@ async def test_total_messages_written_on_batch(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
     msgs = [build_mock_message(id=300), build_mock_message(id=200), build_mock_message(id=100)]
     mock_client.get_messages = AsyncMock(return_value=MockTotalList(msgs, total=9999))
@@ -1350,6 +1434,7 @@ async def test_last_synced_at_set_on_empty_batch(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 100)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
     mock_client.get_messages = AsyncMock(return_value=MockTotalList([], total=200))
     worker = make_worker(mock_client, sync_db, shutdown_event)
@@ -1374,6 +1459,7 @@ async def test_last_synced_at_set_on_partial_batch(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
     msgs = [build_mock_message(id=50), build_mock_message(id=40)]  # < 100 = partial
     mock_client.get_messages = AsyncMock(return_value=MockTotalList(msgs, total=200))

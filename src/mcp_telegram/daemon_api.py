@@ -83,12 +83,8 @@ from .daemon_dialog_queries import (
     _GET_ACCESS_LOST_ALERTS_SQL,
     _GET_DELETED_ALERTS_SQL,
     _GET_EDIT_ALERTS_SQL,
-    _GET_MARK_SYNC_STATUS_SQL,
     _GET_SYNC_STATUS_SQL,
     _LIST_TOPICS_SQL,
-    _MARK_FOR_SYNC_SQL,
-    _REQUEST_DELTA_REFRESH_SQL,
-    _UNMARK_SYNC_SQL,
     _compute_sync_coverage,
     build_sync_read_model,
 )
@@ -104,6 +100,7 @@ from .daemon_message_queries import (
 )
 from .daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
 from .folders.read_model import dialog_placement, folders_by_dialog, list_folder_messages, list_folders
+from .history_enrollment import disable_history, enable_history, read_intent
 from .important_events.read_model import list_important_events as read_important_events
 from .models import DialogType, ReadMessage
 from .topics.contracts import TopicSourceUnavailableError
@@ -1167,39 +1164,22 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _mark_dialog_for_sync(self, req: dict[str, object]) -> dict:
-        """Add or remove a dialog from sync scope in synced_dialogs.
-
-        enable=True: INSERT OR IGNORE with status='not_synced' (daemon picks
-        up the new dialog within one heartbeat interval).
-        enable=False: UPDATE status back to 'not_synced' (re-queues dialog
-        for a full re-sync on the next daemon cycle; local messages are kept).
-        """
+        """Persist explicit full-history intent and report factual coverage."""
         dialog_id = _coerce_int(req.get("dialog_id", 0), 0)
         enable = bool(req.get("enable", True))
-        status_row = cast(
-            tuple[object] | None,
-            self._conn.execute(_GET_MARK_SYNC_STATUS_SQL, (dialog_id,)).fetchone(),
-        )
-        previous_status = str(status_row[0]) if status_row is not None else None
-        if enable:
-            self._conn.execute(_MARK_FOR_SYNC_SQL, (dialog_id,))
-            self._conn.execute(_REQUEST_DELTA_REFRESH_SQL, (int(time.time()), dialog_id))
-            action = "request_delta_refresh" if previous_status == "synced" else "mark_for_sync"
-            expected_next_state = "synced" if previous_status == "synced" else "syncing"
-            full_history_will_be_fetched = previous_status != "synced"
-        else:
-            self._conn.execute(_UNMARK_SYNC_SQL, (dialog_id,))
-            action = "unmark_from_sync"
-            expected_next_state = "not_synced"
-            full_history_will_be_fetched = False
+        outcome = enable_history(self._conn, dialog_id) if enable else disable_history(self._conn, dialog_id)
         self._conn.commit()
         logger.info("mark_dialog_for_sync dialog_id=%d enable=%s", dialog_id, enable)
         return {
             "ok": True,
             "data": {
-                "action": action,
-                "expected_next_state": expected_next_state,
-                "full_history_will_be_fetched": full_history_will_be_fetched,
+                "dialog_id": dialog_id,
+                "enabled": outcome.enabled,
+                "enrollment_source": outcome.source.value,
+                "coverage_status": outcome.coverage_status,
+                "action": outcome.action,
+                "blocked_reason": outcome.blocked_reason,
+                "full_history_will_be_fetched": outcome.full_history_will_be_fetched,
             },
         }
 
@@ -1207,7 +1187,7 @@ class DaemonAPIServer:
     # get_sync_status
     # ------------------------------------------------------------------
 
-    async def _get_sync_status(self, req: dict[str, object]) -> dict:
+    async def _get_sync_status(self, req: dict[str, object]) -> dict:  # noqa: PLR0914
         """Return sync status and message statistics for a dialog.
 
         delete_detection is derived from dialog_id sign:
@@ -1227,6 +1207,8 @@ class DaemonAPIServer:
             last_delta_checked_at = cast(int | None, row[6])
             delta_refresh_requested_at = cast(int | None, row[7])
             access_revalidation = (cast(int | None, row[8]), cast(int | None, row[9]))
+            enrollment_enabled = bool(row[10]) if row[10] is not None else None
+            enrollment_source = cast(str | None, row[11])
         else:
             status = "not_synced"
             last_synced_at = None
@@ -1237,13 +1219,15 @@ class DaemonAPIServer:
             last_delta_checked_at = None
             delta_refresh_requested_at = None
             access_revalidation = (None, None)
+            intent = read_intent(self._conn, dialog_id)
+            enrollment_enabled = intent.enabled
+            enrollment_source = intent.source.value if intent.source else None
 
         count_row = cast(tuple[object] | None, self._conn.execute(_COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)).fetchone())
         message_count = int(cast(int | str, count_row[0])) if count_row is not None else 0
 
         data: dict = {
             "dialog_id": dialog_id,
-            "status": status,
             "message_count": message_count,
             "last_synced_at": last_synced_at,
             "last_event_at": last_event_at,
@@ -1257,6 +1241,16 @@ class DaemonAPIServer:
             "access_lost_at": access_lost_at,
             "access_last_revalidated_at": access_revalidation[0],
             "access_next_revalidate_at": access_revalidation[1],
+            "enrollment_enabled": enrollment_enabled,
+            "enrollment_source": enrollment_source,
+            "coverage_status": status,
+            "realtime_history": (
+                "full"
+                if enrollment_enabled and status in {"syncing", "synced"}
+                else "own_only"
+                if status == "own_only"
+                else "none"
+            ),
             **build_sync_read_model(
                 status=status,
                 timestamps=(last_synced_at, last_event_at, last_delta_checked_at),

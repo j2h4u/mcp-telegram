@@ -21,6 +21,7 @@ from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from tests.daemon_api_policy import make_daemon_api_policy
+from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
 
 # ---------------------------------------------------------------------------
@@ -52,6 +53,7 @@ def _seed_synced(conn: sqlite3.Connection, dialog_id: int) -> None:
         "VALUES (?, 'User', 'Alice', NULL, NULL, ?)",
         (dialog_id, int(time.time())),
     )
+    seed_full_history_enrollment(conn, dialog_id, enabled=True)
     conn.commit()
 
 

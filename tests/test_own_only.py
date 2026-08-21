@@ -10,6 +10,7 @@ from mcp_telegram.own_only import (
     classify_own_only_dialog,
     query_own_only_candidates,
 )
+from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
 def _context() -> OwnOnlyContext:
@@ -89,6 +90,14 @@ def test_candidate_query_keeps_rights_classification_out_of_sql() -> None:
             "CREATE TABLE dialogs (dialog_id INTEGER, name TEXT, type TEXT, linked_chat_id INTEGER, last_message_at INTEGER, hidden INTEGER)"
         )
         conn.execute("CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT)")
+        conn.execute(
+            """CREATE TABLE full_history_enrollment (
+                dialog_id INTEGER PRIMARY KEY,
+                enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+                source TEXT NOT NULL CHECK(source IN ('explicit', 'automatic', 'migration')),
+                updated_at INTEGER NOT NULL
+            ) WITHOUT ROWID"""
+        )
         conn.executemany(
             "INSERT INTO dialogs VALUES (?, ?, ?, ?, ?, ?)",
             [
@@ -103,6 +112,7 @@ def test_candidate_query_keeps_rights_classification_out_of_sql() -> None:
             "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'access_lost')",
             (-1000000006001,),
         )
+        seed_full_history_enrollment(conn, -1000000006001, enabled=False)
         assert [row["dialog_id"] for row in query_own_only_candidates(conn, personal_channel_id=9001)] == [
             -1000000009001,
             -1000000008001,

@@ -30,6 +30,7 @@ from mcp_telegram.reactions.contracts import ReactionFreshness
 from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from mcp_telegram.telegram_history import TelethonTelegramHistoryGateway
 from mcp_telegram.telegram_reading import HistoryFetchResult, TelegramHistoryGateway
+from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
 class _EntityMissingClient:
@@ -116,8 +117,15 @@ def test_read_state_per_dialog_skips_non_dm_and_zero_dialogs() -> None:
         CREATE TABLE synced_dialogs (
             dialog_id INTEGER PRIMARY KEY,
             read_inbox_max_id INTEGER,
-            read_outbox_max_id INTEGER
+            read_outbox_max_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'synced'
         );
+        CREATE TABLE full_history_enrollment (
+            dialog_id INTEGER PRIMARY KEY,
+            enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+            source TEXT NOT NULL CHECK(source IN ('explicit', 'automatic', 'migration')),
+            updated_at INTEGER NOT NULL
+        ) WITHOUT ROWID;
         CREATE TABLE messages (
             dialog_id INTEGER NOT NULL,
             message_id INTEGER NOT NULL,
@@ -127,10 +135,11 @@ def test_read_state_per_dialog_skips_non_dm_and_zero_dialogs() -> None:
             is_service INTEGER NOT NULL
         );
         INSERT INTO entities VALUES (7, 'User'), (8, 'Channel');
-        INSERT INTO synced_dialogs VALUES (7, 10, 20);
+        INSERT INTO synced_dialogs (dialog_id, read_inbox_max_id, read_outbox_max_id) VALUES (7, 10, 20);
         INSERT INTO messages VALUES (7, 11, 1700000000, 0, 0, 0), (7, 21, 1700000100, 1, 0, 0);
         """
     )
+    seed_full_history_enrollment(conn, 7, enabled=False)
     service = DaemonReadingService(
         DaemonReadingDeps(
             conn=conn,
@@ -315,6 +324,12 @@ async def test_search_scoped_result_applies_time_bounds_and_keeps_cursor_context
         );
         CREATE VIRTUAL TABLE messages_fts USING fts5(dialog_id UNINDEXED, message_id UNINDEXED, text);
         CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL);
+        CREATE TABLE full_history_enrollment (
+            dialog_id INTEGER PRIMARY KEY,
+            enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+            source TEXT NOT NULL CHECK(source IN ('explicit', 'automatic', 'migration')),
+            updated_at INTEGER NOT NULL
+        ) WITHOUT ROWID;
         INSERT INTO synced_dialogs VALUES (123, 'synced');
         INSERT INTO messages (dialog_id, message_id, text, sent_at, is_service, out)
             VALUES (123, 10, 'needle in range', 150, 0, 0),
@@ -322,6 +337,7 @@ async def test_search_scoped_result_applies_time_bounds_and_keeps_cursor_context
         INSERT INTO messages_fts VALUES (123, 10, 'needle in range'), (123, 11, 'needle after range');
         """
     )
+    seed_full_history_enrollment(conn, 123, enabled=False)
     service = _telegram_service(_PagedHistoryGateway([]), conn)
 
     async def fake_build(
