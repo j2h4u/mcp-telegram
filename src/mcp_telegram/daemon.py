@@ -512,9 +512,15 @@ async def _reconcile_read_position_batch(
         retry_ids.update(batch_ids)
         _mark_read_position_retry(conn, retry_ids, retry_at)
         conn.commit()
-        stop = await sleep_through_flood(shutdown_event, flood_seconds(exc, source="read_position_reconciliation"))
-        return 0, stop
-    except (RPCError, TelegramRpcCircuitOpenError, sqlite3.DatabaseError) as exc:
+        await sleep_through_flood(shutdown_event, flood_seconds(exc, source="read_position_reconciliation"))
+        return 0, True
+    except TelegramRpcCircuitOpenError as exc:
+        logger.debug("read_pos_bootstrap circuit_open error=%s", exc)
+        retry_ids.update(batch_ids)
+        _mark_read_position_retry(conn, retry_ids, retry_at)
+        conn.commit()
+        return 0, True
+    except (RPCError, sqlite3.DatabaseError) as exc:
         logger.debug("read_pos_bootstrap batch_failed error=%s", exc)
         retry_ids.update(batch_ids)
         filled = 0
@@ -624,7 +630,9 @@ async def _build_read_position_input_peers(
             input_peers.append(InputDialogPeer(peer=input_peer))
         except FloodWaitError:
             raise
-        except (RPCError, TelegramRpcCircuitOpenError, TypeError, ValueError) as exc:
+        except TelegramRpcCircuitOpenError:
+            raise
+        except (RPCError, TypeError, ValueError) as exc:
             logger.debug("read_pos_bootstrap skip dialog_id=%d error=%s", dialog_id, exc)
             unresolved_ids.append(dialog_id)
     return input_peers, unresolved_ids

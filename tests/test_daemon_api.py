@@ -418,7 +418,9 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             access_last_revalidated_at INTEGER,
             access_next_revalidate_at INTEGER,
             read_inbox_max_id   INTEGER,
-            read_outbox_max_id  INTEGER
+            read_outbox_max_id  INTEGER,
+            read_position_next_attempt_at INTEGER,
+            read_position_attempt_count INTEGER NOT NULL DEFAULT 0
         )
         """
     )

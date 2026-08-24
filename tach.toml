@@ -614,7 +614,7 @@ expose = ["DaemonConnection", "DaemonNotRunningError", "daemon_connection"]
 
 [[interfaces]]
 from = ["mcp_telegram.history_enrollment"]
-expose = ["EnrollmentIntent", "EnrollmentOutcome", "EnrollmentSource", "disable_history", "enable_history", "ensure_automatic_dm_enrollment", "full_history_enabled", "read_intent", "restore_access_status"]
+expose = ["EnrollmentIntent", "EnrollmentOutcome", "EnrollmentSource", "disable_history", "enable_history", "ensure_automatic_dm_enrollment", "full_history_enabled", "read_intent", "reset_read_position_retry", "restore_access_status"]
 
 [[interfaces]]
 from = ["mcp_telegram.reading"]

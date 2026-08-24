@@ -71,6 +71,24 @@ def test_access_restore_clears_read_position_retry() -> None:
         conn.close()
 
 
+def test_access_loss_clears_read_position_retry() -> None:
+    conn = _db()
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, read_position_next_attempt_at, read_position_attempt_count) "
+        "VALUES (3, 'synced', 999, 3)"
+    )
+    conn.execute("INSERT INTO dialogs VALUES (3, 0, 0, 1, 0, 0, 0, 0, 'x')")
+    conn.commit()
+    try:
+        set_access_lost(conn, 3, 10)
+        assert conn.execute(
+            "SELECT status, read_position_next_attempt_at, read_position_attempt_count "
+            "FROM synced_dialogs WHERE dialog_id=3"
+        ).fetchone() == ("access_lost", None, 0)
+    finally:
+        conn.close()
+
+
 def test_lifecycle_failure_rolls_back_only_its_savepoint(monkeypatch: pytest.MonkeyPatch) -> None:
     conn = _db()
     conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (1, 'synced')")

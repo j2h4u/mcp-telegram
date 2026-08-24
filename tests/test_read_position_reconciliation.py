@@ -161,6 +161,62 @@ async def test_resolution_floodwait_uses_canonical_shutdown_aware_sleep(seconds:
 
 
 @pytest.mark.asyncio
+async def test_resolution_floodwait_aborts_remaining_batches() -> None:
+    from telethon.errors import FloodWaitError
+
+    from mcp_telegram.daemon import _initialize_read_positions
+
+    conn = _connection()
+    try:
+        _seed_pending(conn, 1001)
+        _seed_pending(conn, 1002)
+        error = FloodWaitError(request=None)
+        error.seconds = 5
+        client = AsyncMock()
+        client.get_input_entity.side_effect = error
+        with (
+            patch("mcp_telegram.daemon.sleep_through_flood", new=AsyncMock(return_value=False)),
+            patch("mcp_telegram.daemon._sleep_read_pos_batch", new=AsyncMock(return_value=True)),
+        ):
+            await _initialize_read_positions(
+                client, conn, asyncio.Event(), max_dialogs=2, batch_size=1, failure_cooldown_seconds=3600
+            )
+        assert client.get_input_entity.await_count == 1
+        client.assert_not_awaited()
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_request_floodwait_aborts_remaining_batches() -> None:
+    from telethon.errors import FloodWaitError
+
+    from mcp_telegram.daemon import _initialize_read_positions
+
+    conn = _connection()
+    try:
+        _seed_pending(conn, 1001)
+        _seed_pending(conn, 1002)
+        error = FloodWaitError(request=None)
+        error.seconds = 5
+        client = AsyncMock()
+        client.get_input_entity.side_effect = lambda dialog_id: SimpleNamespace(_did=dialog_id)
+        client.side_effect = error
+        with (
+            patch("mcp_telegram.daemon.sleep_through_flood", new=AsyncMock(return_value=False)),
+            patch("mcp_telegram.daemon._sleep_read_pos_batch", new=AsyncMock(return_value=True)),
+            patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: peer._did),
+        ):
+            await _initialize_read_positions(
+                client, conn, asyncio.Event(), max_dialogs=2, batch_size=1, failure_cooldown_seconds=3600
+            )
+        assert client.get_input_entity.await_count == 1
+        assert client.await_count == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
 async def test_none_input_peer_is_not_sent_and_mixed_batch_attempts_once() -> None:
     from mcp_telegram.daemon import _initialize_read_positions
 
