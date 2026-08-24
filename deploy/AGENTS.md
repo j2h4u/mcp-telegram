@@ -31,6 +31,13 @@ This directory is the live deployment workspace, not the source checkout.
   ```bash
   docker compose -f /opt/docker/mcp-telegram/docker-compose.yml ps mcp-telegram
   ```
+- Query logs across container recreation:
+  ```bash
+  journalctl CONTAINER_NAME=mcp-telegram --since '3 days ago' -o short-iso
+  ```
+  Docker Compose logs cover only the current container. Journald retention is
+  controlled by the host; this service does not configure a separate log
+  retention policy.
 - Validate MCP over stdio from the source checkout:
   ```bash
   uv run python -m devtools.mcp_client.cli list-tools \
