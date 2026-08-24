@@ -108,6 +108,8 @@ class SchedulingConfig:
     """Intervals for local daemon maintenance loops."""
 
     scheduled_reconciliation_seconds: float = 900.0
+    read_position_reconciliation_seconds: float = 900.0
+    read_position_reconciliation_max_dialogs_per_pass: int = 100
     reconciliation_hourly_seconds: float = 3_600.0
     delta_catch_up_interval_seconds: float = 300.0
     delta_catch_up_max_probes_per_cycle: int = 10
@@ -305,6 +307,19 @@ def _env_non_negative_int(environ: Mapping[str, str], name: str, default: int) -
     return value
 
 
+def _env_positive_int(environ: Mapping[str, str], name: str, default: int) -> int:
+    raw = environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer > 0") from exc
+    if value <= 0:
+        raise ConfigError(f"{name} must be an integer > 0")
+    return value
+
+
 def resolve_scheduling_config(
     config: SchedulingConfig,
     environ: Mapping[str, str] | None = None,
@@ -315,6 +330,14 @@ def resolve_scheduling_config(
         config,
         scheduled_reconciliation_seconds=_env_positive_float(
             env, "SCHEDULED_RECONCILIATION_SECONDS", config.scheduled_reconciliation_seconds
+        ),
+        read_position_reconciliation_seconds=_env_positive_float(
+            env, "READ_POSITION_RECONCILIATION_SECONDS", config.read_position_reconciliation_seconds
+        ),
+        read_position_reconciliation_max_dialogs_per_pass=_env_positive_int(
+            env,
+            "READ_POSITION_RECONCILIATION_MAX_DIALOGS_PER_PASS",
+            config.read_position_reconciliation_max_dialogs_per_pass,
         ),
         scheduled_flood_sleep_threshold_seconds=_env_non_negative_int(
             env,
@@ -593,6 +616,8 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
     defaults = SchedulingConfig()
     allowed = {
         "scheduled_reconciliation_seconds",
+        "read_position_reconciliation_seconds",
+        "read_position_reconciliation_max_dialogs_per_pass",
         "scheduled_flood_sleep_threshold_seconds",
         "reconciliation_hourly_seconds",
         "delta_catch_up_interval_seconds",
@@ -680,6 +705,20 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             "scheduling",
             path,
             defaults.scheduled_reconciliation_seconds,
+        ),
+        read_position_reconciliation_seconds=_positive_float(
+            scheduling_data,
+            "read_position_reconciliation_seconds",
+            "scheduling",
+            path,
+            defaults.read_position_reconciliation_seconds,
+        ),
+        read_position_reconciliation_max_dialogs_per_pass=_positive_int(
+            scheduling_data,
+            "read_position_reconciliation_max_dialogs_per_pass",
+            "scheduling",
+            path,
+            defaults.read_position_reconciliation_max_dialogs_per_pass,
         ),
         scheduled_flood_sleep_threshold_seconds=_non_negative_int(
             scheduling_data,

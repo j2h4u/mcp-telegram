@@ -23,6 +23,8 @@ retention_ttl_seconds = 2592000
 [scheduling]
 # Local daemon maintenance intervals. Compose environment variables can override these.
 scheduled_reconciliation_seconds = 900
+read_position_reconciliation_seconds = 900
+read_position_reconciliation_max_dialogs_per_pass = 100
 reconciliation_hourly_seconds = 3600
 activity_hot_sweep_seconds = 3600
 # Maximum wait for one Telegram activity RPC before the worker abandons it.

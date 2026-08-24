@@ -29,6 +29,8 @@ class GovernedTelegramClientTarget(Protocol):
 
     def get_messages(self, *args: object, **kwargs: object) -> Awaitable[object]: ...
 
+    def get_input_entity(self, *args: object, **kwargs: object) -> Awaitable[object]: ...
+
     def iter_messages(self, *args: object, **kwargs: object) -> AsyncIterator[object]: ...
 
     def iter_dialogs(self, *args: object, **kwargs: object) -> AsyncIterator[object]: ...
@@ -100,6 +102,11 @@ class GovernedTelegramClient:
     async def get_messages(self, *args: object, **kwargs: object) -> object:
         await self._governor.acquire(source="get_messages")
         return await self._client.get_messages(*args, **kwargs)
+
+    async def get_input_entity(self, *args: object, **kwargs: object) -> object:
+        """Resolve a peer through the shared account budget and circuit."""
+        await self._governor.acquire(source="get_input_entity")
+        return await self._client.get_input_entity(*args, **kwargs)
 
     def iter_messages(self, *args: object, **kwargs: object) -> AsyncIterator[object]:
         return self._governed_iterator("iter_messages", *args, **kwargs)

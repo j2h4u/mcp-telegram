@@ -50,12 +50,13 @@ from .scheduled_projection import (
 from .sqlite_projection import (
     _BATCHED_UNREAD_COUNTS_SQL,
     _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL,
-    _COUNT_BOOTSTRAP_PENDING_SQL,
     _COUNT_MESSAGES_BY_DIALOG_SQL,
+    _COUNT_READ_POSITION_PENDING_SQL,
     _FETCH_UNREAD_MESSAGES_SQL,
     _GET_READ_POSITION_SQL,
     _LIST_DIALOGS_SQL,
     _LIST_MESSAGES_BASE_SQL,
+    _READ_POSITION_PENDING_IDENTITIES_SQL,
     _SELECT_FTS_ALL_SQL,
     _SELECT_FTS_SQL,
     _SELECT_SYNC_STATUS_SQL,
@@ -1825,9 +1826,28 @@ class ReadingService:
             allocate_message_budget_proportional(counts, limit),
             since_utc,
         )
-        pending_row = cast(tuple[object] | None, self._conn.execute(_COUNT_BOOTSTRAP_PENDING_SQL).fetchone())
-        pending = int(cast(int | str, pending_row[0])) if pending_row else 0
-        return {"ok": True, "data": {"groups": groups, "bootstrap_pending": pending}}
+        pending_row = cast(tuple[object] | None, self._conn.execute(_COUNT_READ_POSITION_PENDING_SQL).fetchone())
+        pending_count = int(cast(int | str, pending_row[0])) if pending_row else 0
+        pending_rows = cast(
+            list[tuple[object, object, object]],
+            self._conn.execute(_READ_POSITION_PENDING_IDENTITIES_SQL).fetchall(),
+        )
+        pending_entities = [
+            {
+                "dialog_id": int(cast(int | str, dialog_id)),
+                "display_name": display_name,
+                "username": username,
+            }
+            for dialog_id, display_name, username in pending_rows
+        ]
+        return {
+            "ok": True,
+            "data": {
+                "groups": groups,
+                "read_position_pending_count": pending_count,
+                "read_position_pending_entities": pending_entities,
+            },
+        }
 
     @staticmethod
     def _parse_dialog_type_allowlist(raw: object) -> tuple[DialogType, ...] | None:
