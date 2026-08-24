@@ -320,5 +320,6 @@ __all__ = [
     "ensure_automatic_dm_enrollment",
     "full_history_enabled",
     "read_intent",
+    "reset_read_position_retry",
     "restore_access_status",
 ]
