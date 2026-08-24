@@ -37,7 +37,7 @@ jobs:
         with:
           enable-cache: true
 
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: just
 
@@ -61,7 +61,7 @@ jobs:
         with:
           enable-cache: true
 
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: just
 
@@ -85,7 +85,7 @@ jobs:
         with:
           enable-cache: true
 
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: just
 
@@ -109,7 +109,7 @@ jobs:
         with:
           enable-cache: true
 
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: just
 
@@ -125,9 +125,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: just
 
