@@ -631,39 +631,13 @@ def _project_unread_summary_dialogs(raw_dialogs: object) -> list[dict[str, objec
     return dialogs
 
 
-@mcp_tool(
-    name="get_inbox",
-    title="Inbox",
-    annotations=ToolAnnotations(
-        read_only_hint=True,
-        destructive_hint=False,
-        idempotent_hint=True,
-        open_world_hint=False,
-    ),
-    output_schema=GET_INBOX_OUTPUT_SCHEMA,
-)
-async def get_inbox(args: GetInbox) -> ToolResult:
-    try:
-        applied_since_utc = _resolve_inbox_since(args.since_utc, args.last_hours)
-    except ValueError as exc:
-        return error_result(f"Error: invalid time filter: {exc}", has_filter=True)
-    has_inbox_filter = applied_since_utc is not None or args.include_dialog_types is not None
-
-    try:
-        async with daemon_connection() as conn:
-            response = await conn.get_inbox(
-                limit=args.limit,
-                group_size_threshold=args.group_size_threshold,
-                since_utc=applied_since_utc,
-                include_dialog_types=(
-                    [dialog_type.value for dialog_type in args.include_dialog_types]
-                    if args.include_dialog_types is not None
-                    else None
-                ),
-            )
-    except DaemonNotRunningError as exc:
-        return error_result(_daemon_not_running_text(exc), has_filter=has_inbox_filter)
-
+def _project_inbox_response(
+    args: GetInbox,
+    response: dict,
+    *,
+    applied_since_utc: str | None,
+    has_inbox_filter: bool,
+) -> ToolResult:
     if err := _check_daemon_response(response):
         err.has_filter = has_inbox_filter
         return err
@@ -710,6 +684,47 @@ async def get_inbox(args: GetInbox) -> ToolResult:
         structured_content,
         result_count=result_message_count,
         has_filter=has_inbox_filter,
+    )
+
+
+@mcp_tool(
+    name="get_inbox",
+    title="Inbox",
+    annotations=ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
+    ),
+    output_schema=GET_INBOX_OUTPUT_SCHEMA,
+)
+async def get_inbox(args: GetInbox) -> ToolResult:
+    try:
+        applied_since_utc = _resolve_inbox_since(args.since_utc, args.last_hours)
+    except ValueError as exc:
+        return error_result(f"Error: invalid time filter: {exc}", has_filter=True)
+    has_inbox_filter = applied_since_utc is not None or args.include_dialog_types is not None
+
+    try:
+        async with daemon_connection() as conn:
+            response = await conn.get_inbox(
+                limit=args.limit,
+                group_size_threshold=args.group_size_threshold,
+                since_utc=applied_since_utc,
+                include_dialog_types=(
+                    [dialog_type.value for dialog_type in args.include_dialog_types]
+                    if args.include_dialog_types is not None
+                    else None
+                ),
+            )
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc), has_filter=has_inbox_filter)
+
+    return _project_inbox_response(
+        args,
+        response,
+        applied_since_utc=applied_since_utc,
+        has_inbox_filter=has_inbox_filter,
     )
 
 

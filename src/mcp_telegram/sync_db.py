@@ -7,6 +7,12 @@ import sqlite3
 from pathlib import Path
 from typing import cast
 
+from .dialog_classification import (
+    SERVICE_DIALOG_TYPE,
+    is_bot_dialog_type,
+    is_reserved_replies_username,
+)
+
 _CURRENT_SCHEMA_VERSION = 34
 _SCHEMA_VERSION_WITH_FTS = 3
 
@@ -1455,6 +1461,53 @@ def ensure_own_only_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _sync_schema_table_names(conn: sqlite3.Connection) -> set[str]:
+    rows = cast(
+        list[tuple[object]],
+        conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('entities', 'dialogs')"
+        ).fetchall(),
+    )
+    return {cast(str, row[0]) for row in rows}
+
+
+def _reserved_entity_rows(conn: sqlite3.Connection) -> list[tuple[object, object, object]]:
+    return cast(
+        list[tuple[object, object, object]],
+        conn.execute("SELECT id, username, type FROM entities WHERE username IS NOT NULL").fetchall(),
+    )
+
+
+def _reserved_reply_ids(rows: list[tuple[object, object, object]]) -> list[int]:
+    return [int(cast(int | str, row[0])) for row in rows if is_reserved_replies_username(row[1])]
+
+
+def _repair_reserved_entities(conn: sqlite3.Connection, rows: list[tuple[object, object, object]]) -> None:
+    conn.executemany(
+        "UPDATE entities SET type = ? WHERE id = ?",
+        (
+            (SERVICE_DIALOG_TYPE, int(cast(int | str, row[0])))
+            for row in rows
+            if is_reserved_replies_username(row[1]) and is_bot_dialog_type(row[2])
+        ),
+    )
+
+
+def _repair_reserved_dialogs(conn: sqlite3.Connection, reply_ids: list[int]) -> None:
+    placeholders = ",".join("?" * len(reply_ids))
+    dialog_rows = cast(
+        list[tuple[object, object]],
+        conn.execute(
+            f"SELECT dialog_id, type FROM dialogs WHERE dialog_id IN ({placeholders})",
+            reply_ids,
+        ).fetchall(),
+    )
+    conn.executemany(
+        "UPDATE dialogs SET type = ? WHERE dialog_id = ?",
+        ((SERVICE_DIALOG_TYPE, int(cast(int | str, row[0]))) for row in dialog_rows if is_bot_dialog_type(row[1])),
+    )
+
+
 def repair_reserved_dialog_types(conn: sqlite3.Connection) -> None:
     """Repair persisted @replies rows through the normal startup path.
 
@@ -1462,53 +1515,17 @@ def repair_reserved_dialog_types(conn: sqlite3.Connection) -> None:
     Username matching is delegated to the canonical classifier so this repair
     cannot drift into numeric-ID or display-name heuristics.
     """
-    from .dialog_classification import SERVICE_DIALOG_TYPE, is_bot_dialog_type, is_reserved_replies_username
-
-    tables = {
-        cast(str, row[0])
-        for row in cast(
-            list[tuple[object]],
-            conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('entities', 'dialogs')"
-            ).fetchall(),
-        )
-    }
+    tables = _sync_schema_table_names(conn)
     if "entities" not in tables:
         return
-    rows = cast(
-        list[tuple[object, object, object]],
-        conn.execute("SELECT id, username, type FROM entities WHERE username IS NOT NULL").fetchall(),
-    )
-    replies_ids = [int(cast(int | str, row[0])) for row in rows if is_reserved_replies_username(row[1])]
-    if not replies_ids:
+    rows = _reserved_entity_rows(conn)
+    reply_ids = _reserved_reply_ids(rows)
+    if not reply_ids:
         return
     with conn:
-        conn.executemany(
-            "UPDATE entities SET type = ? WHERE id = ?",
-            (
-                (SERVICE_DIALOG_TYPE, int(cast(int | str, row[0])))
-                for row in rows
-                if is_reserved_replies_username(row[1]) and is_bot_dialog_type(row[2])
-            ),
-        )
+        _repair_reserved_entities(conn, rows)
         if "dialogs" in tables:
-            dialog_rows = cast(
-                list[tuple[object, object]],
-                conn.execute(
-                    "SELECT dialog_id, type FROM dialogs WHERE dialog_id IN ({})".format(
-                        ",".join("?" * len(replies_ids))
-                    ),
-                    replies_ids,
-                ).fetchall(),
-            )
-            conn.executemany(
-                "UPDATE dialogs SET type = ? WHERE dialog_id = ?",
-                (
-                    (SERVICE_DIALOG_TYPE, int(cast(int | str, row[0])))
-                    for row in dialog_rows
-                    if is_bot_dialog_type(row[1])
-                ),
-            )
+            _repair_reserved_dialogs(conn, reply_ids)
 
 
 def record_daemon_event(
