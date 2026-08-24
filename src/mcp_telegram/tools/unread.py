@@ -39,6 +39,10 @@ GET_INBOX_OUTPUT_SCHEMA = {
         "limit": {"type": "integer"},
         "group_size_threshold": {"type": "integer"},
         "applied_since_utc": {"type": ["string", "null"]},
+        "applied_dialog_types": {
+            "type": "array",
+            "items": {"type": "string", "enum": [item.value for item in DialogType]},
+        },
         "bootstrap_pending": {"type": "integer"},
         "coverage": {
             "type": "object",
@@ -280,8 +284,10 @@ class GetUnreadSummary(ToolArgs):
 class GetInbox(ToolArgs):
     """Fetch unread messages from personal chats and small groups, prioritized by tier.
 
-    Reads local sync.db only. Prioritizes mentions, DMs, bots, and groups;
-    channel dialogs are excluded. Messages inside each chat are chronological.
+    Reads local sync.db only. Prioritizes mentions, DMs, bots, services, and groups;
+    channel dialogs are excluded unless explicitly included with include_dialog_types.
+    Messages inside each chat are chronological. ``@replies`` is classified as
+    the ``service`` dialog type.
     Check bootstrap_pending to detect incomplete read-position coverage instead
     of treating an empty result as final.
     """
@@ -305,6 +311,11 @@ class GetInbox(ToolArgs):
         ge=1,
         le=_MAX_INBOX_LAST_HOURS,
         description="Return unread messages from the last 1-720 hours, evaluated at request time; mutually exclusive with since_utc.",
+    )
+    include_dialog_types: list[DialogType] | None = Field(
+        default=None,
+        min_length=1,
+        description="Optional allowlist of canonical dialog types to include in the inbox.",
     )
 
     @model_validator(mode="before")
@@ -620,35 +631,15 @@ def _project_unread_summary_dialogs(raw_dialogs: object) -> list[dict[str, objec
     return dialogs
 
 
-@mcp_tool(
-    name="get_inbox",
-    title="Inbox",
-    annotations=ToolAnnotations(
-        read_only_hint=True,
-        destructive_hint=False,
-        idempotent_hint=True,
-        open_world_hint=False,
-    ),
-    output_schema=GET_INBOX_OUTPUT_SCHEMA,
-)
-async def get_inbox(args: GetInbox) -> ToolResult:
-    try:
-        applied_since_utc = _resolve_inbox_since(args.since_utc, args.last_hours)
-    except ValueError as exc:
-        return error_result(f"Error: invalid time filter: {exc}", has_filter=True)
-
-    try:
-        async with daemon_connection() as conn:
-            response = await conn.get_inbox(
-                limit=args.limit,
-                group_size_threshold=args.group_size_threshold,
-                since_utc=applied_since_utc,
-            )
-    except DaemonNotRunningError as exc:
-        return error_result(_daemon_not_running_text(exc), has_filter=applied_since_utc is not None)
-
+def _project_inbox_response(
+    args: GetInbox,
+    response: dict,
+    *,
+    applied_since_utc: str | None,
+    has_inbox_filter: bool,
+) -> ToolResult:
     if err := _check_daemon_response(response):
-        err.has_filter = applied_since_utc is not None
+        err.has_filter = has_inbox_filter
         return err
 
     data = response.get("data", {})
@@ -658,7 +649,7 @@ async def get_inbox(args: GetInbox) -> ToolResult:
     bootstrap_pending = int(data.get("bootstrap_pending", 0) or 0)
     warnings = _bootstrap_pending_warnings(bootstrap_pending)
     structured_dialogs, hidden_count_by_dialog, result_message_count = _structured_inbox_groups(groups)
-    structured_content = {
+    structured_content: dict[str, object] = {
         "limit": args.limit,
         "group_size_threshold": args.group_size_threshold,
         "applied_since_utc": applied_since_utc,
@@ -681,14 +672,59 @@ async def get_inbox(args: GetInbox) -> ToolResult:
         "count": len(structured_dialogs),
         "result_count_semantics": "count is the number of unread dialogs returned; budget.result_message_count is the number of message rows shown",
     }
+    if args.include_dialog_types is not None:
+        structured_content["applied_dialog_types"] = list(
+            dict.fromkeys(item.value for item in args.include_dialog_types)
+        )
 
     if not groups:
-        return structured_result(structured_content, result_count=0, has_filter=applied_since_utc is not None)
+        return structured_result(structured_content, result_count=0, has_filter=has_inbox_filter)
 
     return structured_result(
         structured_content,
         result_count=result_message_count,
-        has_filter=applied_since_utc is not None,
+        has_filter=has_inbox_filter,
+    )
+
+
+@mcp_tool(
+    name="get_inbox",
+    title="Inbox",
+    annotations=ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
+    ),
+    output_schema=GET_INBOX_OUTPUT_SCHEMA,
+)
+async def get_inbox(args: GetInbox) -> ToolResult:
+    try:
+        applied_since_utc = _resolve_inbox_since(args.since_utc, args.last_hours)
+    except ValueError as exc:
+        return error_result(f"Error: invalid time filter: {exc}", has_filter=True)
+    has_inbox_filter = applied_since_utc is not None or args.include_dialog_types is not None
+
+    try:
+        async with daemon_connection() as conn:
+            response = await conn.get_inbox(
+                limit=args.limit,
+                group_size_threshold=args.group_size_threshold,
+                since_utc=applied_since_utc,
+                include_dialog_types=(
+                    [dialog_type.value for dialog_type in args.include_dialog_types]
+                    if args.include_dialog_types is not None
+                    else None
+                ),
+            )
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc), has_filter=has_inbox_filter)
+
+    return _project_inbox_response(
+        args,
+        response,
+        applied_since_utc=applied_since_utc,
+        has_inbox_filter=has_inbox_filter,
     )
 
 

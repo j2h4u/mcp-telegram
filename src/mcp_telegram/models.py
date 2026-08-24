@@ -28,6 +28,7 @@ class DialogType(StrEnum):
 
     USER = "user"
     BOT = "bot"
+    SERVICE = "service"  # Telegram service peer (for example the reserved @replies bot)
     CHANNEL = "channel"  # broadcast channel (Channel, megagroup=False)
     SUPERGROUP = "supergroup"  # megagroup (Channel, megagroup=True, forum=False)
     FORUM = "forum"  # forum supergroup (Channel, megagroup=True, forum=True)
@@ -58,6 +59,8 @@ _DIALOG_TYPE_ALIASES: dict[str, DialogType] = {
     "User": DialogType.USER,
     "bot": DialogType.BOT,
     "Bot": DialogType.BOT,
+    "service": DialogType.SERVICE,
+    "Service": DialogType.SERVICE,
     "channel": DialogType.CHANNEL,
     "Channel": DialogType.CHANNEL,
     "supergroup": DialogType.SUPERGROUP,

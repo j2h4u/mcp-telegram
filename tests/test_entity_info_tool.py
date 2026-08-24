@@ -11,6 +11,7 @@ from typing import Protocol, cast, runtime_checkable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from jsonschema import validate
 from pydantic import ValidationError
 
 from mcp_telegram.tools._base import ToolResult
@@ -584,6 +585,17 @@ def test_entity_structured_content_frames_folder_titles_as_telegram_content() ->
         "is_telegram_content",
         "content_kind",
     ]
+
+
+def test_entity_info_service_type_validates_against_output_schema() -> None:
+    payload = _entity_structured_content(
+        args=GetEntityInfo(exact_entity_id=777000),
+        data={"type": "service", "name": "Replies", "username": "replies", "bot": True},
+        entity_id=777000,
+        display_name="Replies",
+        resolution="exact_id",
+    )
+    validate(instance=payload, schema=GET_ENTITY_INFO_OUTPUT_SCHEMA)
 
 
 @pytest.mark.asyncio
