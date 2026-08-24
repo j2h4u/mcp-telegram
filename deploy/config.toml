@@ -25,6 +25,7 @@ retention_ttl_seconds = 2592000
 scheduled_reconciliation_seconds = 900
 read_position_reconciliation_seconds = 900
 read_position_reconciliation_max_dialogs_per_pass = 100
+read_position_reconciliation_failure_cooldown_seconds = 3600
 reconciliation_hourly_seconds = 3600
 activity_hot_sweep_seconds = 3600
 # Maximum wait for one Telegram activity RPC before the worker abandons it.

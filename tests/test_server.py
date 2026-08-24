@@ -868,6 +868,8 @@ async def test_public_get_inbox_call_tool_preserves_canonical_content_schema(
             return {
                 "ok": True,
                 "data": {
+                    "read_position_pending_count": 0,
+                    "read_position_pending_entities": [],
                     "groups": [
                         {
                             "dialog_id": 123,
@@ -886,7 +888,7 @@ async def test_public_get_inbox_call_tool_preserves_canonical_content_schema(
                                 }
                             ],
                         }
-                    ]
+                    ],
                 },
             }
 

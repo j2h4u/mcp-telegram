@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -127,6 +128,83 @@ async def test_reconciliation_treats_open_rpc_circuit_as_retryable() -> None:
         conn.close()
 
 
+@pytest.mark.asyncio
+async def test_failed_low_id_does_not_starve_later_due_row() -> None:
+    from mcp_telegram.daemon import _initialize_read_positions
+
+    conn = _connection()
+    try:
+        _seed_pending(conn, 1001)
+        _seed_pending(conn, 1002)
+        client = AsyncMock()
+
+        async def resolve(dialog_id: int) -> object:
+            if dialog_id == 1001:
+                raise ValueError("unresolved")
+            return SimpleNamespace(_did=dialog_id)
+
+        client.get_input_entity.side_effect = resolve
+        client.side_effect = lambda request: SimpleNamespace(
+            dialogs=[SimpleNamespace(peer=SimpleNamespace(_did=1002), read_inbox_max_id=8, read_outbox_max_id=9)]
+        )
+        with patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: peer._did):
+            await _initialize_read_positions(
+                client, conn, asyncio.Event(), max_dialogs=1, failure_cooldown_seconds=3600
+            )
+            assert (
+                await _initialize_read_positions(
+                    client, conn, asyncio.Event(), max_dialogs=1, failure_cooldown_seconds=3600
+                )
+                == 1
+            )
+
+        assert client.get_input_entity.await_args_list[0].args == (1001,)
+        assert client.get_input_entity.await_args_list[1].args == (1002,)
+        assert conn.execute("SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = 1002").fetchone() == (8,)
+        retry_at = conn.execute(
+            "SELECT read_position_next_attempt_at FROM synced_dialogs WHERE dialog_id = 1001"
+        ).fetchone()[0]
+        assert retry_at > int(time.time())
+
+        conn.execute("UPDATE synced_dialogs SET read_position_next_attempt_at = 0 WHERE dialog_id = 1001")
+        conn.commit()
+        await _initialize_read_positions(client, conn, asyncio.Event(), max_dialogs=1, failure_cooldown_seconds=1)
+        assert client.get_input_entity.await_args_list[-1].args == (1001,)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_telegram_none_cursor_is_cooled_down() -> None:
+    from mcp_telegram.daemon import _initialize_read_positions
+
+    conn = _connection()
+    try:
+        _seed_pending(conn, 1001)
+        client = AsyncMock()
+        client.get_input_entity.return_value = SimpleNamespace(_did=1001)
+        client.return_value = SimpleNamespace(
+            dialogs=[SimpleNamespace(peer=SimpleNamespace(_did=1001), read_inbox_max_id=None, read_outbox_max_id=4)]
+        )
+        with patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: peer._did):
+            await _initialize_read_positions(
+                client, conn, asyncio.Event(), max_dialogs=1, failure_cooldown_seconds=3600
+            )
+            calls_after_none = client.get_input_entity.await_count
+            await _initialize_read_positions(
+                client, conn, asyncio.Event(), max_dialogs=1, failure_cooldown_seconds=3600
+            )
+        assert client.get_input_entity.await_count == calls_after_none
+        assert conn.execute(
+            "SELECT read_inbox_max_id, read_outbox_max_id FROM synced_dialogs WHERE dialog_id = 1001"
+        ).fetchone() == (None, 4)
+        assert conn.execute(
+            "SELECT read_position_next_attempt_at FROM synced_dialogs WHERE dialog_id = 1001"
+        ).fetchone()[0] > int(time.time())
+    finally:
+        conn.close()
+
+
 def test_inbox_projection_uses_read_position_identity_contract() -> None:
     from mcp_telegram.tools.unread import _project_inbox_response
 
@@ -155,3 +233,15 @@ def test_inbox_projection_uses_read_position_identity_contract() -> None:
         {"display_name": "Alice", "username": "@alice"},
         {"display_name": "12", "telegram_id": 12},
     ]
+
+
+def test_inbox_projection_rejects_missing_read_position_contract() -> None:
+    from mcp_telegram.tools.unread import GetInbox, _project_inbox_response
+
+    with pytest.raises(KeyError, match="read_position_pending_count"):
+        _project_inbox_response(
+            GetInbox(),
+            {"ok": True, "data": {"groups": []}},
+            applied_since_utc=None,
+            has_inbox_filter=False,
+        )

@@ -101,6 +101,8 @@ def test_synced_dialogs_schema(tmp_sync_db_path: Path) -> None:
             "access_lost_at",
             "read_inbox_max_id",
             "read_outbox_max_id",
+            "read_position_next_attempt_at",
+            "read_position_attempt_count",
         }
         assert expected == set(columns.keys()), f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
         # dialog_id is primary key
@@ -1659,7 +1661,7 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 34, f"_CURRENT_SCHEMA_VERSION must be 34, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 35, f"_CURRENT_SCHEMA_VERSION must be 35, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
 

@@ -92,6 +92,7 @@ period_seconds = 30
 scheduled_reconciliation_seconds = 48
 read_position_reconciliation_seconds = 46.5
 read_position_reconciliation_max_dialogs_per_pass = 12
+read_position_reconciliation_failure_cooldown_seconds = 47
 scheduled_flood_sleep_threshold_seconds = 0
 reconciliation_hourly_seconds = 49
 delta_catch_up_interval_seconds = 50
@@ -136,6 +137,7 @@ daemon_api_slow_request_seconds = 2.5
         scheduled_reconciliation_seconds=48.0,
         read_position_reconciliation_seconds=46.5,
         read_position_reconciliation_max_dialogs_per_pass=12,
+        read_position_reconciliation_failure_cooldown_seconds=47.0,
         reconciliation_hourly_seconds=49.0,
         delta_catch_up_interval_seconds=50.0,
         delta_catch_up_max_probes_per_cycle=7,
@@ -165,6 +167,7 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
             "SCHEDULED_RECONCILIATION_SECONDS": "47.5",
             "READ_POSITION_RECONCILIATION_SECONDS": "45.5",
             "READ_POSITION_RECONCILIATION_MAX_DIALOGS_PER_PASS": "11",
+            "READ_POSITION_RECONCILIATION_FAILURE_COOLDOWN_SECONDS": "46",
             "SCHEDULED_FLOOD_SLEEP_THRESHOLD_SECONDS": "0",
             "RECON_HOURLY_SECONDS": "48",
             "DELTA_CATCH_UP_INTERVAL_SECONDS": "54",
@@ -200,6 +203,7 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         scheduled_reconciliation_seconds=47.5,
         read_position_reconciliation_seconds=45.5,
         read_position_reconciliation_max_dialogs_per_pass=11,
+        read_position_reconciliation_failure_cooldown_seconds=46.0,
         reconciliation_hourly_seconds=48.0,
         delta_catch_up_interval_seconds=54.0,
         delta_catch_up_max_probes_per_cycle=8,

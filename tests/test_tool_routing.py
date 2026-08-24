@@ -750,6 +750,12 @@ def _make_daemon_conn(response: dict | None = None) -> _DaemonConnStub:
     """Return a mock DaemonConnection that returns *response* for any method."""
     conn = _DaemonConnStub()
     r = response or {"ok": True, "data": {}}
+    inbox_response = r
+    if isinstance(r.get("data"), dict) and "groups" in r["data"]:
+        inbox_data = dict(r["data"])
+        inbox_data.setdefault("read_position_pending_count", 0)
+        inbox_data.setdefault("read_position_pending_entities", [])
+        inbox_response = {**r, "data": inbox_data}
     conn.list_messages = _AsyncMethodMock(return_value=r)
     conn.search_messages = _AsyncMethodMock(return_value=r)
     conn.list_dialogs = _AsyncMethodMock(return_value=r)
@@ -762,7 +768,7 @@ def _make_daemon_conn(response: dict | None = None) -> _DaemonConnStub:
     conn.get_sync_status = _AsyncMethodMock(return_value=r)
     conn.get_sync_alerts = _AsyncMethodMock(return_value=r)
     conn.get_entity_info = _AsyncMethodMock(return_value=r)
-    conn.get_inbox = _AsyncMethodMock(return_value=r)
+    conn.get_inbox = _AsyncMethodMock(return_value=inbox_response)
     conn.get_unread_summary = _AsyncMethodMock(return_value=r)
     conn.record_telemetry = _AsyncMethodMock(return_value={"ok": True})
     conn.get_usage_stats = _AsyncMethodMock(return_value=r)

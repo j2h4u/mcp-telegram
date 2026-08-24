@@ -428,6 +428,7 @@ async def _initialize_read_positions(
     shutdown_event: asyncio.Event,
     *,
     max_dialogs: int | None = None,
+    failure_cooldown_seconds: float | None = None,
 ) -> int:
     """One bounded sweep to populate BOTH read cursors for synced dialogs.
 
@@ -456,7 +457,8 @@ async def _initialize_read_positions(
     that arrives during the bootstrap window cannot be overwritten by a
     stale bootstrap reply (designed race safety, not accidental).
     """
-    rows = _select_null_read_position_rows(conn, max_dialogs)
+    now = int(time.time())
+    rows = _select_null_read_position_rows(conn, max_dialogs, now=now)
     if not rows:
         logger.info("initialize_read_positions — no NULL rows, skipping")
         return 0
@@ -468,7 +470,10 @@ async def _initialize_read_positions(
         if shutdown_event.is_set():
             break
         batch_ids = dialog_ids[i : i + _BOOTSTRAP_BATCH_SIZE]
-        input_peers = await _build_read_position_input_peers(client, batch_ids)
+        input_peers, unresolved_ids = await _build_read_position_input_peers(client, batch_ids)
+        retry_at = _read_position_retry_at(now, failure_cooldown_seconds)
+        _mark_read_position_retry(conn, unresolved_ids, retry_at)
+        conn.commit()
         if not input_peers:
             if not await _sleep_read_pos_batch(shutdown_event):
                 break
@@ -476,14 +481,20 @@ async def _initialize_read_positions(
 
         try:
             result = cast(_ReadPositionsResultLike, await client(GetPeerDialogsRequest(peers=input_peers)))
-            filled += _apply_read_positions_from_dialogs(conn, result)
+            returned_ids: set[int] = set()
+            filled += _apply_read_positions_from_dialogs(conn, result, retry_at=retry_at, returned_ids=returned_ids)
+            _mark_read_position_retry(conn, set(batch_ids) - returned_ids, retry_at)
             conn.commit()
         except FloodWaitError as exc:
             logger.warning("read_pos_bootstrap flood_wait seconds=%d", exc.seconds)
+            _mark_read_position_retry(conn, set(batch_ids), retry_at)
+            conn.commit()
             if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
                 return filled
         except (RPCError, TelegramRpcCircuitOpenError, sqlite3.DatabaseError) as exc:
             logger.debug("read_pos_bootstrap batch_failed error=%s", exc)
+            _mark_read_position_retry(conn, set(batch_ids), retry_at)
+            conn.commit()
 
         if not await _sleep_read_pos_batch(shutdown_event):
             break
@@ -495,28 +506,60 @@ async def _initialize_read_positions(
 def _select_null_read_position_rows(
     conn: sqlite3.Connection,
     max_dialogs: int | None,
+    *,
+    now: int,
 ) -> list[tuple[int]]:
     """Select the durable NULL-cursor queue, optionally bounded for a pass."""
     if max_dialogs is None:
-        return cast(list[tuple[int]], conn.execute(_SELECT_NULL_READ_CURSORS_SQL).fetchall())
+        return cast(
+            list[tuple[int]],
+            conn.execute(
+                f"{_SELECT_NULL_READ_CURSORS_SQL} "
+                "AND (sd.read_position_next_attempt_at IS NULL OR sd.read_position_next_attempt_at <= ?) "
+                "ORDER BY COALESCE(sd.read_position_next_attempt_at, 0), "
+                "COALESCE(sd.read_position_attempt_count, 0), sd.dialog_id",
+                (now,),
+            ).fetchall(),
+        )
     if max_dialogs < 0:
         raise ValueError("max_dialogs must be non-negative")
     return cast(
         list[tuple[int]],
         conn.execute(
-            f"{_SELECT_NULL_READ_CURSORS_SQL} ORDER BY sd.dialog_id LIMIT ?",
-            (max_dialogs,),
+            f"{_SELECT_NULL_READ_CURSORS_SQL} "
+            "AND (sd.read_position_next_attempt_at IS NULL OR sd.read_position_next_attempt_at <= ?) "
+            "ORDER BY COALESCE(sd.read_position_next_attempt_at, 0), "
+            "COALESCE(sd.read_position_attempt_count, 0), sd.dialog_id LIMIT ?",
+            (now, max_dialogs),
         ).fetchall(),
     )
 
 
-async def _run_read_position_reconciliation_loop(
+def _mark_read_position_retry(conn: sqlite3.Connection, dialog_ids: list[int] | set[int], retry_at: int | None) -> None:
+    if retry_at is None or not dialog_ids:
+        return
+    placeholders = ", ".join("?" for _ in dialog_ids)
+    conn.execute(
+        "UPDATE synced_dialogs "
+        "SET read_position_next_attempt_at = ?, "
+        "read_position_attempt_count = COALESCE(read_position_attempt_count, 0) + 1 "
+        f"WHERE status = 'synced' AND dialog_id IN ({placeholders})",
+        (retry_at, *sorted(dialog_ids)),
+    )
+
+
+def _read_position_retry_at(now: int, cooldown_seconds: float | None) -> int | None:
+    return None if cooldown_seconds is None else int(now + cooldown_seconds)
+
+
+async def _run_read_position_reconciliation_loop(  # noqa: PLR0913 - daemon composition keeps policy explicit
     client: _DaemonClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
     interval_seconds: float,
     max_dialogs_per_pass: int,
+    failure_cooldown_seconds: float | None = None,
 ) -> None:
     """Repeatedly reconcile durable NULL read-position work after startup.
 
@@ -532,6 +575,7 @@ async def _run_read_position_reconciliation_loop(
             conn,
             shutdown_event,
             max_dialogs=max_dialogs_per_pass,
+            failure_cooldown_seconds=failure_cooldown_seconds,
         )
         if shutdown_event.is_set():
             break
@@ -541,23 +585,34 @@ async def _run_read_position_reconciliation_loop(
             continue
 
 
-async def _build_read_position_input_peers(client: _DaemonClient, batch_ids: list[int]) -> list[TypeInputDialogPeer]:
+async def _build_read_position_input_peers(
+    client: _DaemonClient, batch_ids: list[int]
+) -> tuple[list[TypeInputDialogPeer], list[int]]:
     input_peers: list[TypeInputDialogPeer] = []
+    unresolved_ids: list[int] = []
     for dialog_id in batch_ids:
         try:
             peer = cast(TypeInputPeer, await client.get_input_entity(dialog_id))
             input_peers.append(InputDialogPeer(peer=peer))
         except (RPCError, TelegramRpcCircuitOpenError, TypeError, ValueError) as exc:
             logger.debug("read_pos_bootstrap skip dialog_id=%d error=%s", dialog_id, exc)
-    return input_peers
+            unresolved_ids.append(dialog_id)
+    return input_peers, unresolved_ids
 
 
-def _apply_read_positions_from_dialogs(conn: sqlite3.Connection, result: _ReadPositionsResultLike) -> int:
+def _apply_read_positions_from_dialogs(
+    conn: sqlite3.Connection,
+    result: _ReadPositionsResultLike,
+    *,
+    retry_at: int | None = None,
+    returned_ids: set[int] | None = None,
+) -> int:
     """Apply read cursors from a GetPeerDialogsRequest result."""
     filled = 0
     with conn:
         for dialog in result.dialogs:
             chat_id = int(cast(int, telethon_utils.get_peer_id(dialog.peer)))
+            _add_returned_read_position_id(returned_ids, chat_id)
             # D-03 LOCKED: None → skip (preserve NULL). NEVER fold
             # None → 0; that would lie with [all read] during the
             # bootstrap window. The DB cursor stays NULL and Plan 03
@@ -578,9 +633,34 @@ def _apply_read_positions_from_dialogs(conn: sqlite3.Connection, result: _ReadPo
                 wrote_any = True
             if outbox_max is not None and apply_read_cursor(conn, chat_id, "outbox", outbox_max) > 0:
                 wrote_any = True
+            _record_read_position_outcome(conn, chat_id, inbox_max, outbox_max, retry_at)
             if wrote_any:
                 filled += 1
     return filled
+
+
+def _add_returned_read_position_id(returned_ids: set[int] | None, chat_id: int) -> None:
+    if returned_ids is not None:
+        returned_ids.add(chat_id)
+
+
+def _record_read_position_outcome(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    inbox_max: int | None,
+    outbox_max: int | None,
+    retry_at: int | None,
+) -> None:
+    if retry_at is None:
+        return
+    if inbox_max is None or outbox_max is None:
+        _mark_read_position_retry(conn, {dialog_id}, retry_at)
+        return
+    conn.execute(
+        "UPDATE synced_dialogs SET read_position_next_attempt_at = NULL, "
+        "read_position_attempt_count = 0 WHERE dialog_id = ?",
+        (dialog_id,),
+    )
 
 
 async def _sleep_read_pos_batch(shutdown_event: asyncio.Event) -> bool:
@@ -1296,6 +1376,7 @@ async def sync_main() -> None:
                 ctx.shutdown_event,
                 interval_seconds=ctx.scheduling.read_position_reconciliation_seconds,
                 max_dialogs_per_pass=ctx.scheduling.read_position_reconciliation_max_dialogs_per_pass,
+                failure_cooldown_seconds=ctx.scheduling.read_position_reconciliation_failure_cooldown_seconds,
             ),
             name="initialize_read_positions",
         )

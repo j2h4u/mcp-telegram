@@ -110,6 +110,7 @@ class SchedulingConfig:
     scheduled_reconciliation_seconds: float = 900.0
     read_position_reconciliation_seconds: float = 900.0
     read_position_reconciliation_max_dialogs_per_pass: int = 100
+    read_position_reconciliation_failure_cooldown_seconds: float = 3_600.0
     reconciliation_hourly_seconds: float = 3_600.0
     delta_catch_up_interval_seconds: float = 300.0
     delta_catch_up_max_probes_per_cycle: int = 10
@@ -338,6 +339,11 @@ def resolve_scheduling_config(
             env,
             "READ_POSITION_RECONCILIATION_MAX_DIALOGS_PER_PASS",
             config.read_position_reconciliation_max_dialogs_per_pass,
+        ),
+        read_position_reconciliation_failure_cooldown_seconds=_env_positive_float(
+            env,
+            "READ_POSITION_RECONCILIATION_FAILURE_COOLDOWN_SECONDS",
+            config.read_position_reconciliation_failure_cooldown_seconds,
         ),
         scheduled_flood_sleep_threshold_seconds=_env_non_negative_int(
             env,
@@ -618,6 +624,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "scheduled_reconciliation_seconds",
         "read_position_reconciliation_seconds",
         "read_position_reconciliation_max_dialogs_per_pass",
+        "read_position_reconciliation_failure_cooldown_seconds",
         "scheduled_flood_sleep_threshold_seconds",
         "reconciliation_hourly_seconds",
         "delta_catch_up_interval_seconds",
@@ -719,6 +726,13 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             "scheduling",
             path,
             defaults.read_position_reconciliation_max_dialogs_per_pass,
+        ),
+        read_position_reconciliation_failure_cooldown_seconds=_positive_float(
+            scheduling_data,
+            "read_position_reconciliation_failure_cooldown_seconds",
+            "scheduling",
+            path,
+            defaults.read_position_reconciliation_failure_cooldown_seconds,
         ),
         scheduled_flood_sleep_threshold_seconds=_non_negative_int(
             scheduling_data,

@@ -13,7 +13,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 34
+_CURRENT_SCHEMA_VERSION = 35
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -1391,6 +1391,29 @@ def _apply_migration_34(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_35(conn: sqlite3.Connection, current: int) -> int:
+    """Persist fair, durable read-position retry pacing metadata.
+
+    These are synchronizer timestamps, not Telegram event times. A due
+    timestamp lets bounded reconciliation defer an unresolved peer or a
+    Telegram response with NULL cursors without starving later dialogs.
+    """
+    return _apply_migration(
+        conn,
+        current,
+        35,
+        [
+            "ALTER TABLE synced_dialogs ADD COLUMN read_position_next_attempt_at INTEGER",
+            "ALTER TABLE synced_dialogs ADD COLUMN read_position_attempt_count INTEGER NOT NULL DEFAULT 0",
+            (
+                "CREATE INDEX IF NOT EXISTS idx_synced_dialogs_read_position_retry "
+                "ON synced_dialogs(status, read_position_next_attempt_at, read_position_attempt_count, dialog_id)"
+            ),
+        ],
+        ignore_duplicate_column=True,
+    )
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -1422,6 +1445,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_32(conn, current)
     current = _apply_migration_33(conn, current)
     current = _apply_migration_34(conn, current)
+    current = _apply_migration_35(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

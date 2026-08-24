@@ -684,10 +684,10 @@ def _project_inbox_response(
 
     data = response.get("data", {})
     groups = data.get("groups", [])
-    read_position_pending_count = int(data.get("read_position_pending_count", 0) or 0)
-    read_position_pending_entities = _project_read_position_pending_entities(
-        data.get("read_position_pending_entities", [])
-    )
+    # The daemon contract is atomic: missing read-position coverage fields are
+    # a protocol defect, never an implicit "no pending work" result.
+    read_position_pending_count = int(data["read_position_pending_count"])
+    read_position_pending_entities = _project_read_position_pending_entities(data["read_position_pending_entities"])
     warnings = _read_position_pending_warnings(read_position_pending_count)
     structured_dialogs, hidden_count_by_dialog, result_message_count = _structured_inbox_groups(groups)
     structured_content: dict[str, object] = {
