@@ -93,6 +93,8 @@ scheduled_reconciliation_seconds = 48
 read_position_reconciliation_seconds = 46.5
 read_position_reconciliation_max_dialogs_per_pass = 12
 read_position_reconciliation_failure_cooldown_seconds = 47
+read_position_reconciliation_batch_size = 16
+read_position_reconciliation_batch_pause_seconds = 1.75
 scheduled_flood_sleep_threshold_seconds = 0
 reconciliation_hourly_seconds = 49
 delta_catch_up_interval_seconds = 50
@@ -138,6 +140,8 @@ daemon_api_slow_request_seconds = 2.5
         read_position_reconciliation_seconds=46.5,
         read_position_reconciliation_max_dialogs_per_pass=12,
         read_position_reconciliation_failure_cooldown_seconds=47.0,
+        read_position_reconciliation_batch_size=16,
+        read_position_reconciliation_batch_pause_seconds=1.75,
         reconciliation_hourly_seconds=49.0,
         delta_catch_up_interval_seconds=50.0,
         delta_catch_up_max_probes_per_cycle=7,
@@ -168,6 +172,8 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
             "READ_POSITION_RECONCILIATION_SECONDS": "45.5",
             "READ_POSITION_RECONCILIATION_MAX_DIALOGS_PER_PASS": "11",
             "READ_POSITION_RECONCILIATION_FAILURE_COOLDOWN_SECONDS": "46",
+            "READ_POSITION_RECONCILIATION_BATCH_SIZE": "16",
+            "READ_POSITION_RECONCILIATION_BATCH_PAUSE_SECONDS": "1.75",
             "SCHEDULED_FLOOD_SLEEP_THRESHOLD_SECONDS": "0",
             "RECON_HOURLY_SECONDS": "48",
             "DELTA_CATCH_UP_INTERVAL_SECONDS": "54",
@@ -204,6 +210,8 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         read_position_reconciliation_seconds=45.5,
         read_position_reconciliation_max_dialogs_per_pass=11,
         read_position_reconciliation_failure_cooldown_seconds=46.0,
+        read_position_reconciliation_batch_size=16,
+        read_position_reconciliation_batch_pause_seconds=1.75,
         reconciliation_hourly_seconds=48.0,
         delta_catch_up_interval_seconds=54.0,
         delta_catch_up_max_probes_per_cycle=8,
@@ -224,6 +232,7 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         activity_cold_access_retry_seconds=53.0,
         scheduled_flood_sleep_threshold_seconds=0,
     )
+
     logging = resolve_logging_config({"LOG_LEVEL": "debug", "DAEMON_API_SLOW_REQUEST_SECONDS": "1.5"})
     assert logging.level == "DEBUG"
     assert logging.daemon_api_slow_request_seconds == 1.5
@@ -234,6 +243,11 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         allowed_hosts=("mcp-telegram:3200", "localhost:*"),
         allowed_origins=("http://gateway.local",),
     )
+
+
+def test_runtime_environment_rejects_subsecond_read_position_failure_cooldown() -> None:
+    with pytest.raises(ConfigError, match="READ_POSITION_RECONCILIATION_FAILURE_COOLDOWN_SECONDS"):
+        resolve_scheduling_config(SchedulingConfig(), {"READ_POSITION_RECONCILIATION_FAILURE_COOLDOWN_SECONDS": "0.5"})
 
 
 @pytest.mark.parametrize(
@@ -249,6 +263,10 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         (
             '[state]\ndir = "/state"\n\n[scheduling.folder_projection]\nrefresh_interval_seconds = 0.5\n',
             "refresh_interval_seconds",
+        ),
+        (
+            '[state]\ndir = "/state"\n\n[scheduling]\nread_position_reconciliation_failure_cooldown_seconds = 0.5\n',
+            "read_position_reconciliation_failure_cooldown_seconds",
         ),
         (
             '[state]\ndir = "/state"\n\n[scheduling]\nscheduled_flood_sleep_threshold_seconds = -1\n',

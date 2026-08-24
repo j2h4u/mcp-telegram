@@ -44,7 +44,7 @@ async def test_reconciliation_loop_picks_up_late_enrollment() -> None:
             dialogs=[SimpleNamespace(peer=SimpleNamespace(), read_inbox_max_id=42, read_outbox_max_id=7)]
         )
 
-        async def no_batch_pause(_event: asyncio.Event) -> bool:
+        async def no_batch_pause(_event: asyncio.Event, _pause_seconds: float | None = None) -> bool:
             return True
 
         with (
@@ -129,6 +129,79 @@ async def test_reconciliation_treats_open_rpc_circuit_as_retryable() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("seconds", [5, 120])
+async def test_resolution_floodwait_uses_canonical_shutdown_aware_sleep(seconds: int) -> None:
+    from telethon.errors import FloodWaitError
+
+    from mcp_telegram.daemon import _initialize_read_positions
+
+    conn = _connection()
+    try:
+        _seed_pending(conn, 1001)
+        error = FloodWaitError(request=None)
+        error.seconds = seconds
+        client = AsyncMock()
+        client.get_input_entity.side_effect = error
+        with (
+            patch("mcp_telegram.daemon.sleep_through_flood", new=AsyncMock(return_value=False)) as sleep,
+            patch("mcp_telegram.daemon._sleep_read_pos_batch", new=AsyncMock(return_value=True)),
+        ):
+            await _initialize_read_positions(
+                client, conn, asyncio.Event(), max_dialogs=1, failure_cooldown_seconds=3600
+            )
+        sleep.assert_awaited_once()
+        await_args = sleep.await_args
+        assert await_args is not None
+        assert await_args.args[1] == seconds
+        assert conn.execute(
+            "SELECT read_position_attempt_count FROM synced_dialogs WHERE dialog_id=1001"
+        ).fetchone() == (1,)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_none_input_peer_is_not_sent_and_mixed_batch_attempts_once() -> None:
+    from mcp_telegram.daemon import _initialize_read_positions
+
+    conn = _connection()
+    try:
+        _seed_pending(conn, 1001)
+        _seed_pending(conn, 1002)
+        client = AsyncMock()
+
+        async def resolve(dialog_id: int) -> object | None:
+            return None if dialog_id == 1001 else SimpleNamespace(_did=dialog_id)
+
+        client.get_input_entity.side_effect = resolve
+        client.side_effect = lambda _request: SimpleNamespace(
+            dialogs=[SimpleNamespace(peer=SimpleNamespace(_did=1002), read_inbox_max_id=8, read_outbox_max_id=9)]
+        )
+        with (
+            patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: peer._did),
+            patch("mcp_telegram.daemon._sleep_read_pos_batch", new=AsyncMock(return_value=True)),
+        ):
+            await _initialize_read_positions(
+                client, conn, asyncio.Event(), max_dialogs=2, failure_cooldown_seconds=3600, batch_size=2
+            )
+        assert client.await_count == 1
+        assert conn.execute(
+            "SELECT read_position_attempt_count FROM synced_dialogs WHERE dialog_id=1001"
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT read_position_next_attempt_at, read_position_attempt_count FROM synced_dialogs WHERE dialog_id=1002"
+        ).fetchone() == (None, 0)
+    finally:
+        conn.close()
+
+
+def test_fractional_retry_cooldown_never_truncates_to_now() -> None:
+    from mcp_telegram.daemon import _read_position_retry_at
+
+    assert _read_position_retry_at(100, 0.1) == 101
+
+
+@pytest.mark.asyncio
 async def test_failed_low_id_does_not_starve_later_due_row() -> None:
     from mcp_telegram.daemon import _initialize_read_positions
 
@@ -168,7 +241,8 @@ async def test_failed_low_id_does_not_starve_later_due_row() -> None:
 
         conn.execute("UPDATE synced_dialogs SET read_position_next_attempt_at = 0 WHERE dialog_id = 1001")
         conn.commit()
-        await _initialize_read_positions(client, conn, asyncio.Event(), max_dialogs=1, failure_cooldown_seconds=1)
+        with patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: peer._did):
+            await _initialize_read_positions(client, conn, asyncio.Event(), max_dialogs=1, failure_cooldown_seconds=1)
         assert client.get_input_entity.await_args_list[-1].args == (1001,)
     finally:
         conn.close()

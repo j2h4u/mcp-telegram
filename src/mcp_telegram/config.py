@@ -111,6 +111,8 @@ class SchedulingConfig:
     read_position_reconciliation_seconds: float = 900.0
     read_position_reconciliation_max_dialogs_per_pass: int = 100
     read_position_reconciliation_failure_cooldown_seconds: float = 3_600.0
+    read_position_reconciliation_batch_size: int = 15
+    read_position_reconciliation_batch_pause_seconds: float = 1.5
     reconciliation_hourly_seconds: float = 3_600.0
     delta_catch_up_interval_seconds: float = 300.0
     delta_catch_up_max_probes_per_cycle: int = 10
@@ -238,6 +240,13 @@ def _positive_float(data: dict[str, object], key: str, section: str, path: Path,
     return float(value)
 
 
+def _at_least_one_float(data: dict[str, object], key: str, section: str, path: Path, default: float) -> float:
+    value = _positive_float(data, key, section, path, default)
+    if value < 1:
+        raise ConfigError(f"Invalid {section}.{key} in {path}: expected number >= 1")
+    return value
+
+
 def _non_negative_int(data: dict[str, object], key: str, section: str, path: Path, default: int) -> int:
     value = data.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -295,6 +304,13 @@ def _env_positive_float(environ: Mapping[str, str], name: str, default: float) -
     return value
 
 
+def _env_at_least_one_float(environ: Mapping[str, str], name: str, default: float) -> float:
+    value = _env_positive_float(environ, name, default)
+    if value < 1:
+        raise ConfigError(f"{name} must be a number >= 1")
+    return value
+
+
 def _env_non_negative_int(environ: Mapping[str, str], name: str, default: int) -> int:
     raw = environ.get(name)
     if raw is None or not raw.strip():
@@ -340,10 +356,20 @@ def resolve_scheduling_config(
             "READ_POSITION_RECONCILIATION_MAX_DIALOGS_PER_PASS",
             config.read_position_reconciliation_max_dialogs_per_pass,
         ),
-        read_position_reconciliation_failure_cooldown_seconds=_env_positive_float(
+        read_position_reconciliation_failure_cooldown_seconds=_env_at_least_one_float(
             env,
             "READ_POSITION_RECONCILIATION_FAILURE_COOLDOWN_SECONDS",
             config.read_position_reconciliation_failure_cooldown_seconds,
+        ),
+        read_position_reconciliation_batch_size=_env_positive_int(
+            env,
+            "READ_POSITION_RECONCILIATION_BATCH_SIZE",
+            config.read_position_reconciliation_batch_size,
+        ),
+        read_position_reconciliation_batch_pause_seconds=_env_positive_float(
+            env,
+            "READ_POSITION_RECONCILIATION_BATCH_PAUSE_SECONDS",
+            config.read_position_reconciliation_batch_pause_seconds,
         ),
         scheduled_flood_sleep_threshold_seconds=_env_non_negative_int(
             env,
@@ -625,6 +651,8 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "read_position_reconciliation_seconds",
         "read_position_reconciliation_max_dialogs_per_pass",
         "read_position_reconciliation_failure_cooldown_seconds",
+        "read_position_reconciliation_batch_size",
+        "read_position_reconciliation_batch_pause_seconds",
         "scheduled_flood_sleep_threshold_seconds",
         "reconciliation_hourly_seconds",
         "delta_catch_up_interval_seconds",
@@ -727,12 +755,26 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             path,
             defaults.read_position_reconciliation_max_dialogs_per_pass,
         ),
-        read_position_reconciliation_failure_cooldown_seconds=_positive_float(
+        read_position_reconciliation_failure_cooldown_seconds=_at_least_one_float(
             scheduling_data,
             "read_position_reconciliation_failure_cooldown_seconds",
             "scheduling",
             path,
             defaults.read_position_reconciliation_failure_cooldown_seconds,
+        ),
+        read_position_reconciliation_batch_size=_positive_int(
+            scheduling_data,
+            "read_position_reconciliation_batch_size",
+            "scheduling",
+            path,
+            defaults.read_position_reconciliation_batch_size,
+        ),
+        read_position_reconciliation_batch_pause_seconds=_positive_float(
+            scheduling_data,
+            "read_position_reconciliation_batch_pause_seconds",
+            "scheduling",
+            path,
+            defaults.read_position_reconciliation_batch_pause_seconds,
         ),
         scheduled_flood_sleep_threshold_seconds=_non_negative_int(
             scheduling_data,
