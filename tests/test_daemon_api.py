@@ -2689,9 +2689,7 @@ async def test_list_unread_messages_filters_types_before_budget_allocation() -> 
     assert [group["dialog_id"] for group in groups] == [1001]
     assert sum(len(_group_messages(group)) for group in groups) == 1
 
-    service_result = await server._dispatch(
-        {"method": "get_inbox", "limit": 50, "include_dialog_types": ["service"]}
-    )
+    service_result = await server._dispatch({"method": "get_inbox", "limit": 50, "include_dialog_types": ["service"]})
     service_groups = cast(list[dict[str, object]], _response_data(service_result)["groups"])
     assert [group["dialog_id"] for group in service_groups] == [1003]
 
