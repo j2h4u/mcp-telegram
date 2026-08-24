@@ -35,6 +35,10 @@ class _Client:
         self.calls.append("get_messages")
         return "messages"
 
+    async def get_input_entity(self, *_args: object, **_kwargs: object) -> object:
+        self.calls.append("get_input_entity")
+        return "input-entity"
+
     async def iter_messages(self, *_args: object, **_kwargs: object) -> AsyncIterator[int]:
         self.calls.append("iter_messages")
         yield 1
@@ -101,9 +105,10 @@ async def test_governed_client_delegates_telegram_methods() -> None:
 
     assert await client("request") == "called"
     assert await client.get_messages(entity=1) == "messages"
+    assert await client.get_input_entity(1) == "input-entity"
     assert [item async for item in client.iter_messages(entity=1)] == [1]
 
-    assert raw_client.calls == ["call", "get_messages", "iter_messages"]
+    assert raw_client.calls == ["call", "get_messages", "get_input_entity", "iter_messages"]
 
 
 @pytest.mark.asyncio
@@ -112,6 +117,16 @@ async def test_governed_client_blocks_when_circuit_is_open() -> None:
 
     with pytest.raises(TelegramRpcCircuitOpenError, match="open-for-test"):
         await client.get_messages(entity=1)
+
+    assert raw_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_governed_client_blocks_peer_resolution_when_circuit_is_open() -> None:
+    raw_client, client = _governed_client(_CircuitStatus(open=True))
+
+    with pytest.raises(TelegramRpcCircuitOpenError, match="open-for-test"):
+        await client.get_input_entity(1)
 
     assert raw_client.calls == []
 

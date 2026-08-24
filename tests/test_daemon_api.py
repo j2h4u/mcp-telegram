@@ -418,7 +418,9 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             access_last_revalidated_at INTEGER,
             access_next_revalidate_at INTEGER,
             read_inbox_max_id   INTEGER,
-            read_outbox_max_id  INTEGER
+            read_outbox_max_id  INTEGER,
+            read_position_next_attempt_at INTEGER,
+            read_position_attempt_count INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -3030,8 +3032,8 @@ async def test_list_unread_messages_filter_excludes_ids_below_read_position() ->
 
 
 @pytest.mark.asyncio
-async def test_list_unread_messages_response_reports_bootstrap_pending() -> None:
-    """Response carries bootstrap_pending count so callers detect incomplete coverage.
+async def test_list_unread_messages_response_reports_read_position_pending() -> None:
+    """Response carries read-position pending count so callers detect incomplete coverage.
     Review-mandated by all 3 reviewers as HIGH priority.
     """
     conn = _make_db()
@@ -3054,7 +3056,8 @@ async def test_list_unread_messages_response_reports_bootstrap_pending() -> None
     assert result["ok"] is True
     data = _response_data(result)
     assert len(cast(list[dict[str, object]], data["groups"])) == 1
-    assert data["bootstrap_pending"] == 2, f"Expected bootstrap_pending=2, got {data.get('bootstrap_pending')}"
+    assert data["read_position_pending_count"] == 2
+    assert len(cast(list[dict[str, object]], data["read_position_pending_entities"])) == 2
     cast(MagicMock, client).assert_not_called()
 
 

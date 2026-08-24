@@ -43,15 +43,23 @@ GET_INBOX_OUTPUT_SCHEMA = {
             "type": "array",
             "items": {"type": "string", "enum": [item.value for item in DialogType]},
         },
-        "bootstrap_pending": {"type": "integer"},
+        "read_position_pending_count": {"type": "integer"},
+        "read_position_pending_entities": {
+            "type": "array",
+            "items": ENTITY_IDENTITY_SCHEMA,
+        },
         "coverage": {
             "type": "object",
             "properties": {
                 "complete": {"type": "boolean"},
                 "state": {"type": "string"},
-                "bootstrap_pending_count": {"type": "integer"},
+                "read_position_pending_count": {"type": "integer"},
+                "read_position_pending_entities": {
+                    "type": "array",
+                    "items": ENTITY_IDENTITY_SCHEMA,
+                },
             },
-            "required": ["complete", "state", "bootstrap_pending_count"],
+            "required": ["complete", "state", "read_position_pending_count", "read_position_pending_entities"],
             "additionalProperties": False,
         },
         "warnings": {
@@ -210,7 +218,8 @@ GET_INBOX_OUTPUT_SCHEMA = {
         "limit",
         "group_size_threshold",
         "applied_since_utc",
-        "bootstrap_pending",
+        "read_position_pending_count",
+        "read_position_pending_entities",
         "coverage",
         "warnings",
         "budget",
@@ -288,8 +297,9 @@ class GetInbox(ToolArgs):
     channel dialogs are excluded unless explicitly included with include_dialog_types.
     Messages inside each chat are chronological. ``@replies`` is classified as
     the ``service`` dialog type.
-    Check bootstrap_pending to detect incomplete read-position coverage instead
-    of treating an empty result as final.
+    Check read_position_pending_count and its bounded identities to detect
+    incomplete read-position coverage instead of treating an empty result as
+    final.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -475,22 +485,52 @@ def _read_state_payload(read_state: ReadState | dict | None, dialog_type: str | 
     }
 
 
-def _bootstrap_pending_warnings(bootstrap_pending: int) -> list[StructuredWarning]:
-    if bootstrap_pending <= 0:
+def _read_position_pending_warnings(read_position_pending_count: int) -> list[StructuredWarning]:
+    if read_position_pending_count <= 0:
         return []
 
     warning_message = (
-        f"bootstrap_pending={bootstrap_pending} dialog(s) are still being seeded by the sync daemon. "
-        "Results may be incomplete until bootstrap completes."
+        f"read_position_pending_count={read_position_pending_count} dialog(s) have no inbox read position yet. "
+        "Results may be incomplete until the sync daemon reconciles them."
     )
     return [
         structured_warning(
-            "bootstrap_pending",
+            "read_position_pending",
             warning_message,
             severity="warning",
-            action="Retry shortly once the sync daemon finishes read-state bootstrap.",
+            action="Retry shortly while the sync daemon reconciles read positions.",
         )
     ]
+
+
+def _project_read_position_pending_entities(raw_entities: object) -> list[EntityIdentity]:
+    """Project and deduplicate bounded pending identities for the MCP contract."""
+    if not isinstance(raw_entities, list):
+        return []
+    projected: list[EntityIdentity] = []
+    seen: set[tuple[str, str | int]] = set()
+    for raw in raw_entities:
+        if not isinstance(raw, Mapping):
+            continue
+        dialog_id = raw.get("dialog_id")
+        if isinstance(dialog_id, bool) or not isinstance(dialog_id, int):
+            continue
+        identity = project_entity_identity(
+            display_name=raw.get("display_name") if isinstance(raw.get("display_name"), str) else None,
+            username=raw.get("username") if isinstance(raw.get("username"), str) else None,
+            telegram_id=dialog_id,
+        )
+        username_value = cast(str | None, identity.get("username"))
+        key = (
+            ("username", username_value)
+            if username_value is not None
+            else ("telegram_id", cast(int, identity.get("telegram_id")))
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        projected.append(identity)
+    return projected
 
 
 def _structured_inbox_group(group: dict) -> tuple[dict[str, object], dict[str, object] | None, int]:
@@ -644,20 +684,23 @@ def _project_inbox_response(
 
     data = response.get("data", {})
     groups = data.get("groups", [])
-    # Defensive: older daemon responses or test mocks may omit bootstrap_pending.
-    # Treat missing as 0 (full coverage assumed). Also guard against explicit None.
-    bootstrap_pending = int(data.get("bootstrap_pending", 0) or 0)
-    warnings = _bootstrap_pending_warnings(bootstrap_pending)
+    # The daemon contract is atomic: missing read-position coverage fields are
+    # a protocol defect, never an implicit "no pending work" result.
+    read_position_pending_count = int(data["read_position_pending_count"])
+    read_position_pending_entities = _project_read_position_pending_entities(data["read_position_pending_entities"])
+    warnings = _read_position_pending_warnings(read_position_pending_count)
     structured_dialogs, hidden_count_by_dialog, result_message_count = _structured_inbox_groups(groups)
     structured_content: dict[str, object] = {
         "limit": args.limit,
         "group_size_threshold": args.group_size_threshold,
         "applied_since_utc": applied_since_utc,
-        "bootstrap_pending": bootstrap_pending,
+        "read_position_pending_count": read_position_pending_count,
+        "read_position_pending_entities": read_position_pending_entities,
         "coverage": {
-            "complete": bootstrap_pending == 0,
-            "state": "complete" if bootstrap_pending == 0 else "partial",
-            "bootstrap_pending_count": bootstrap_pending,
+            "complete": read_position_pending_count == 0,
+            "state": "complete" if read_position_pending_count == 0 else "partial",
+            "read_position_pending_count": read_position_pending_count,
+            "read_position_pending_entities": read_position_pending_entities,
         },
         "warnings": warnings,
         "budget": {

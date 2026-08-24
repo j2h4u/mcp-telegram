@@ -223,6 +223,8 @@ async def test_get_inbox_concrete_message_sender_validates_against_output_schema
         inbox={
             "ok": True,
             "data": {
+                "read_position_pending_count": 0,
+                "read_position_pending_entities": [],
                 "groups": [
                     {
                         "dialog_id": -1001,
@@ -242,7 +244,7 @@ async def test_get_inbox_concrete_message_sender_validates_against_output_schema
                             }
                         ],
                     }
-                ]
+                ],
             },
         }
     )
@@ -270,6 +272,8 @@ async def test_get_inbox_projects_username_and_numeric_dialog_identity() -> None
         inbox={
             "ok": True,
             "data": {
+                "read_position_pending_count": 0,
+                "read_position_pending_entities": [],
                 "groups": [
                     {
                         "dialog_id": 42,
@@ -285,7 +289,7 @@ async def test_get_inbox_projects_username_and_numeric_dialog_identity() -> None
                         "category": "user",
                         "messages": [],
                     },
-                ]
+                ],
             },
         }
     )

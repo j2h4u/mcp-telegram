@@ -24,7 +24,9 @@ def conn() -> sqlite3.Connection:
             dialog_id INTEGER PRIMARY KEY,
             status TEXT NOT NULL,
             sync_progress INTEGER,
-            delta_refresh_requested_at INTEGER
+            delta_refresh_requested_at INTEGER,
+            read_position_next_attempt_at INTEGER,
+            read_position_attempt_count INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE full_history_enrollment (
             dialog_id INTEGER PRIMARY KEY,
@@ -64,6 +66,29 @@ def test_automatic_dm_does_not_resurrect_explicit_disable(conn: sqlite3.Connecti
     outcome = ensure_automatic_dm_enrollment(conn, 1, now=11)
     assert outcome.blocked_reason == "explicit_disable"
     assert read_intent(conn, 1) == read_intent(conn, 1).__class__(1, False, EnrollmentSource.EXPLICIT)
+
+
+def test_enrollment_transitions_clear_read_position_retry(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT INTO synced_dialogs(dialog_id, status, read_position_next_attempt_at, read_position_attempt_count) "
+        "VALUES (4, 'synced', 999, 3)"
+    )
+    conn.commit()
+
+    disable_history(conn, 4, now=10)
+    assert conn.execute(
+        "SELECT read_position_next_attempt_at, read_position_attempt_count FROM synced_dialogs WHERE dialog_id=4"
+    ).fetchone() == (None, 0)
+
+    conn.execute(
+        "UPDATE synced_dialogs SET read_position_next_attempt_at = 999, read_position_attempt_count = 3 "
+        "WHERE dialog_id = 4"
+    )
+    conn.commit()
+    enable_history(conn, 4, now=11)
+    assert conn.execute(
+        "SELECT read_position_next_attempt_at, read_position_attempt_count FROM synced_dialogs WHERE dialog_id=4"
+    ).fetchone() == (None, 0)
 
 
 def test_weak_migration_disable_can_be_promoted_for_automatic_dm(conn: sqlite3.Connection) -> None:

@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from itertools import count
 from typing import cast
 
-from ..history_enrollment import restore_access_status
+from ..history_enrollment import reset_read_position_retry, restore_access_status
 
 _SAVEPOINTS = count()
 
@@ -56,6 +56,7 @@ def set_access_lost(conn: sqlite3.Connection, dialog_id: int, now: int, *, reaso
                 "UPDATE synced_dialogs SET status = 'access_lost', access_lost_at = ?, delta_refresh_requested_at = NULL WHERE dialog_id = ?",
                 (now, dialog_id),
             )
+        reset_read_position_retry(conn, dialog_id)
         conn.execute("UPDATE dialogs SET hidden = 1, snapshot_at = ? WHERE dialog_id = ?", (now, dialog_id))
         if previous_status != "access_lost":
             payload: dict[str, object] = {}

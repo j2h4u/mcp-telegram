@@ -750,6 +750,12 @@ def _make_daemon_conn(response: dict | None = None) -> _DaemonConnStub:
     """Return a mock DaemonConnection that returns *response* for any method."""
     conn = _DaemonConnStub()
     r = response or {"ok": True, "data": {}}
+    inbox_response = r
+    if isinstance(r.get("data"), dict) and "groups" in r["data"]:
+        inbox_data = dict(r["data"])
+        inbox_data.setdefault("read_position_pending_count", 0)
+        inbox_data.setdefault("read_position_pending_entities", [])
+        inbox_response = {**r, "data": inbox_data}
     conn.list_messages = _AsyncMethodMock(return_value=r)
     conn.search_messages = _AsyncMethodMock(return_value=r)
     conn.list_dialogs = _AsyncMethodMock(return_value=r)
@@ -762,7 +768,7 @@ def _make_daemon_conn(response: dict | None = None) -> _DaemonConnStub:
     conn.get_sync_status = _AsyncMethodMock(return_value=r)
     conn.get_sync_alerts = _AsyncMethodMock(return_value=r)
     conn.get_entity_info = _AsyncMethodMock(return_value=r)
-    conn.get_inbox = _AsyncMethodMock(return_value=r)
+    conn.get_inbox = _AsyncMethodMock(return_value=inbox_response)
     conn.get_unread_summary = _AsyncMethodMock(return_value=r)
     conn.record_telemetry = _AsyncMethodMock(return_value={"ok": True})
     conn.get_usage_stats = _AsyncMethodMock(return_value=r)
@@ -2580,7 +2586,7 @@ async def test_get_inbox_via_daemon():
     properties = cast(dict[str, object], schema_dict["properties"])
     assert "scope" not in properties
     dialogs = cast(dict[str, object], cast(dict[str, object], properties["dialogs"])["items"])
-    assert "bootstrap_pending" in properties
+    assert "read_position_pending_count" in properties
     assert "read_state" in cast(dict[str, object], dialogs["properties"])
     payload = _json_dict(result.structured_content)
     coverage = _json_dict(payload["coverage"])
@@ -2588,7 +2594,7 @@ async def test_get_inbox_via_daemon():
     dialogs = _json_list(payload["dialogs"])
     assert payload["limit"] == 100
     assert payload["group_size_threshold"] == 100
-    assert payload["bootstrap_pending"] == 0
+    assert payload["read_position_pending_count"] == 0
     assert coverage["complete"] is True
     assert budget["result_message_count"] == 1
     assert payload["count"] == 1
@@ -2789,15 +2795,15 @@ def test_get_inbox_output_schema_declares_applied_since_utc():
     assert "applied_since_utc" not in _json_list(schema["required"])
 
 
-async def test_get_inbox_empty_with_bootstrap_pending():
-    """UAT gap 1: when groups=[] AND bootstrap_pending>0 the tool MUST NOT return the
+async def test_get_inbox_empty_with_read_position_pending():
+    """When groups=[] and read-position work is pending, the tool MUST NOT return the
     misleading 'No unread messages' canned text — it must surface the pending count
     so the caller knows results are incomplete, not genuinely empty.
     """
     conn = _make_daemon_conn(
         {
             "ok": True,
-            "data": {"groups": [], "bootstrap_pending": 329},
+            "data": {"groups": [], "read_position_pending_count": 329, "read_position_pending_entities": []},
         }
     )
     with _patch_daemon(conn):
@@ -2807,23 +2813,24 @@ async def test_get_inbox_empty_with_bootstrap_pending():
     assert result.is_error is False
     assert result.structured_content is not None
     payload = _json_dict(result.structured_content)
-    assert payload["bootstrap_pending"] == 329
+    assert payload["read_position_pending_count"] == 329
     assert payload["coverage"] == {
         "complete": False,
         "state": "partial",
-        "bootstrap_pending_count": 329,
+        "read_position_pending_count": 329,
+        "read_position_pending_entities": [],
     }
-    assert _json_dict(_json_list(payload["warnings"])[0])["kind"] == "bootstrap_pending"
+    assert _json_dict(_json_list(payload["warnings"])[0])["kind"] == "read_position_pending"
 
 
-async def test_get_inbox_empty_with_no_bootstrap_pending():
-    """When groups=[] AND bootstrap_pending=0 the existing 'no unread' canned text
+async def test_get_inbox_empty_with_no_read_position_pending():
+    """When groups=[] and no read-position work is pending the empty result
     is correct (truly empty inbox). Asserts no behaviour regression.
     """
     conn = _make_daemon_conn(
         {
             "ok": True,
-            "data": {"groups": [], "bootstrap_pending": 0},
+            "data": {"groups": [], "read_position_pending_count": 0, "read_position_pending_entities": []},
         }
     )
     with _patch_daemon(conn):
@@ -2836,8 +2843,8 @@ async def test_get_inbox_empty_with_no_bootstrap_pending():
     assert _json_dict(payload["coverage"])["complete"] is True
 
 
-async def test_get_inbox_non_empty_with_bootstrap_pending():
-    """UAT gap 2: when groups is non-empty AND bootstrap_pending>0 the formatted
+async def test_get_inbox_non_empty_with_read_position_pending():
+    """When groups are non-empty and read-position work is pending the output
     output MUST include a one-line note disclosing the pending count, so the
     caller knows the result is partial coverage.
     """
@@ -2865,7 +2872,8 @@ async def test_get_inbox_non_empty_with_bootstrap_pending():
                         ],
                     },
                 ],
-                "bootstrap_pending": 5,
+                "read_position_pending_count": 5,
+                "read_position_pending_entities": [],
             },
         }
     )
@@ -2875,13 +2883,13 @@ async def test_get_inbox_non_empty_with_bootstrap_pending():
     assert result.content == ()
     assert result.structured_content is not None
     payload = _json_dict(result.structured_content)
-    assert payload["bootstrap_pending"] == 5
+    assert payload["read_position_pending_count"] == 5
     assert _json_dict(payload["coverage"])["complete"] is False
-    assert _json_dict(_json_list(payload["warnings"])[0])["kind"] == "bootstrap_pending"
+    assert _json_dict(_json_list(payload["warnings"])[0])["kind"] == "read_position_pending"
 
 
-async def test_get_inbox_non_empty_with_no_bootstrap_pending():
-    """When groups is non-empty AND bootstrap_pending=0 the formatted output MUST
+async def test_get_inbox_non_empty_with_no_read_position_pending():
+    """When groups are non-empty and no read-position work is pending, output MUST
     NOT include a spurious bootstrap note. Asserts no false-positive disclosure.
     """
     conn = _make_daemon_conn(
@@ -2908,7 +2916,8 @@ async def test_get_inbox_non_empty_with_no_bootstrap_pending():
                         ],
                     },
                 ],
-                "bootstrap_pending": 0,
+                "read_position_pending_count": 0,
+                "read_position_pending_entities": [],
             },
         }
     )
@@ -2918,7 +2927,7 @@ async def test_get_inbox_non_empty_with_no_bootstrap_pending():
     assert result.content == ()
     assert result.structured_content is not None
     payload = _json_dict(result.structured_content)
-    assert payload["bootstrap_pending"] == 0
+    assert payload["read_position_pending_count"] == 0
     assert _json_dict(payload["coverage"])["complete"] is True
 
 

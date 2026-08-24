@@ -1543,7 +1543,8 @@ async def test_sleep_read_pos_batch_contract() -> None:
     import inspect
     from unittest.mock import patch
 
-    from mcp_telegram.daemon import _PACING, _sleep_read_pos_batch
+    from mcp_telegram.config import SchedulingConfig
+    from mcp_telegram.daemon import _sleep_read_pos_batch
 
     shutdown_event = asyncio.Event()
     wait_calls: list[float] = []
@@ -1558,7 +1559,7 @@ async def test_sleep_read_pos_batch_contract() -> None:
         continue_loop = await _sleep_read_pos_batch(shutdown_event)
 
     assert continue_loop is True
-    assert wait_calls == [_PACING.read.batch_s]
+    assert wait_calls == [SchedulingConfig().read_position_reconciliation_batch_pause_seconds]
 
 
 @pytest.mark.asyncio
@@ -1569,7 +1570,8 @@ async def test_initialize_read_positions_uses_named_batch_pacing(tmp_path):
     from types import SimpleNamespace
     from unittest.mock import patch
 
-    from mcp_telegram.daemon import _PACING, _initialize_read_positions
+    from mcp_telegram.config import SchedulingConfig
+    from mcp_telegram.daemon import _initialize_read_positions
     from mcp_telegram.sync_db import _apply_migrations
 
     conn = sqlite3.connect(":memory:")
@@ -1608,7 +1610,7 @@ async def test_initialize_read_positions_uses_named_batch_pacing(tmp_path):
 
         assert filled == 0
         assert wait_calls
-        assert wait_calls[0] == _PACING.read.batch_s
+        assert wait_calls[0] == SchedulingConfig().read_position_reconciliation_batch_pause_seconds
     finally:
         conn.close()
 

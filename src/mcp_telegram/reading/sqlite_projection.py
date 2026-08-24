@@ -249,8 +249,14 @@ _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
 )
 
 _GET_READ_POSITION_SQL = "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?"
-_COUNT_BOOTSTRAP_PENDING_SQL = (
+_COUNT_READ_POSITION_PENDING_SQL = (
     "SELECT COUNT(*) FROM synced_dialogs WHERE status = 'synced' AND read_inbox_max_id IS NULL"
+)
+_READ_POSITION_PENDING_IDENTITIES_SQL = (
+    "SELECT sd.dialog_id, e.name AS display_name, e.username "
+    "FROM synced_dialogs sd LEFT JOIN entities e ON e.id = sd.dialog_id "
+    "WHERE sd.status = 'synced' AND sd.read_inbox_max_id IS NULL "
+    "ORDER BY sd.dialog_id LIMIT 20"
 )
 
 
