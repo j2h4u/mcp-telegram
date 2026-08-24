@@ -217,7 +217,7 @@ def test_sync_main_connects_and_heartbeats(
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon._log_heartbeat", side_effect=heartbeat_then_shutdown) as mock_hb,
         patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.01),
-        caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"),
+        caplog.at_level(logging.DEBUG, logger="mcp_telegram.daemon"),
     ):
         asyncio.run(sync_main())
 
@@ -405,7 +405,7 @@ def test_sync_main_heartbeat_logs_connection_state(
     mock_client: AsyncMock,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Heartbeat INFO log includes 'connected=True' (or connection state)."""
+    """Heartbeat DEBUG log includes 'connected=True' (or connection state)."""
     shutdown_event = asyncio.Event()
 
     def mock_register_shutdown(conn, loop, **kwargs):
@@ -424,12 +424,14 @@ def test_sync_main_heartbeat_logs_connection_state(
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon._log_heartbeat", side_effect=heartbeat_then_shutdown),
         patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.01),
-        caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"),
+        caplog.at_level(logging.DEBUG, logger="mcp_telegram.daemon"),
     ):
         asyncio.run(sync_main())
 
-    heartbeat_logs = [r.message for r in caplog.records if "heartbeat" in r.message]
+    heartbeat_records = [r for r in caplog.records if r.getMessage().startswith("heartbeat —")]
+    heartbeat_logs = [r.message for r in heartbeat_records]
     assert heartbeat_logs, "Expected at least one heartbeat log"
+    assert all(record.levelno == logging.DEBUG for record in heartbeat_records)
     assert any("connected=" in msg for msg in heartbeat_logs), (
         f"Heartbeat logs did not include 'connected=': {heartbeat_logs}"
     )
@@ -558,7 +560,7 @@ def test_sync_main_idles_when_all_synced(
         patch("mcp_telegram.daemon._log_heartbeat", side_effect=heartbeat_then_shutdown) as mock_hb,
         patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
         patch("mcp_telegram.daemon._start_followup_background_tasks", side_effect=_noop_followups),
-        caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"),
+        caplog.at_level(logging.DEBUG, logger="mcp_telegram.daemon"),
     ):
         asyncio.run(sync_main())
 
@@ -598,7 +600,7 @@ def test_sync_main_logs_heartbeat_during_sync(
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.0),  # instant heartbeat
         patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
-        caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"),
+        caplog.at_level(logging.DEBUG, logger="mcp_telegram.daemon"),
     ):
         asyncio.run(sync_main())
 

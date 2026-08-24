@@ -93,6 +93,17 @@ def test_benign_mcp_http_disconnect_filter_keeps_other_stream_errors() -> None:
     assert server._BenignMcpHttpDisconnectFilter().filter(record) is True
 
 
+def test_mcp_http_lifecycle_logger_is_quieted_without_changing_root_level() -> None:
+    target_logger = logging.getLogger(server._MCP_HTTP_LOGGER_NAME)
+    original_level = target_logger.level
+    try:
+        target_logger.setLevel(logging.NOTSET)
+        server._quiet_mcp_http_lifecycle_logs()
+        assert target_logger.level == logging.WARNING
+    finally:
+        target_logger.setLevel(original_level)
+
+
 def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
     tool = server.tool_by_name["list_messages"]
     properties = cast(dict[str, object], _tool_input_schema(tool)["properties"])
