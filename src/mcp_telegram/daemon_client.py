@@ -449,6 +449,7 @@ class DaemonConnection:
         limit: int = 100,
         group_size_threshold: int = 100,
         since_utc: str | None = None,
+        include_dialog_types: list[str] | None = None,
     ) -> dict:
         """Return prioritized unread messages across dialogs."""
         payload: dict[str, object] = {
@@ -458,6 +459,8 @@ class DaemonConnection:
         }
         if since_utc is not None:
             payload["since_utc"] = since_utc
+        if include_dialog_types is not None:
+            payload["include_dialog_types"] = include_dialog_types
         return await self.request(payload)
 
     async def get_unread_summary(self, *, limit: int = 50) -> dict:

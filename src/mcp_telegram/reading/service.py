@@ -1811,10 +1811,14 @@ class ReadingService:
         limit = _clamp(_coerce_int(req.get("limit", 100), 100), 1, 500)
         group_size_threshold = _coerce_int(req.get("group_size_threshold", 100), 100)
         try:
+            include_dialog_types = self._parse_dialog_type_allowlist(req.get("include_dialog_types"))
+        except ValueError as exc:
+            return {"ok": False, "error": "invalid_input", "message": str(exc)}
+        try:
             since_utc = _parse_request_boundary(req, "since_utc")
         except ValueError as exc:
             return {"ok": False, "error": "invalid_input", "message": str(exc)}
-        entries, counts = self._collect_unread_dialogs(group_size_threshold, since_utc)
+        entries, counts = self._collect_unread_dialogs(group_size_threshold, since_utc, include_dialog_types)
         self._rank_unread_entries(entries)
         groups = await self._fetch_unread_groups(
             entries,
@@ -1826,9 +1830,39 @@ class ReadingService:
         return {"ok": True, "data": {"groups": groups, "bootstrap_pending": pending}}
 
     @staticmethod
-    def _should_include_unread_dialog(category: str, participants_count: int | None, group_size_threshold: int) -> bool:
+    def _parse_dialog_type_allowlist(raw: object) -> tuple[DialogType, ...] | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("include_dialog_types must be a non-empty list of canonical dialog types")
+        parsed: list[DialogType] = []
+        for value in raw:
+            if isinstance(value, DialogType):
+                dialog_type = value
+            elif isinstance(value, str):
+                try:
+                    dialog_type = DialogType(value)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"include_dialog_types contains unsupported dialog type {value!r}; "
+                        f"expected one of {[item.value for item in DialogType]}"
+                    ) from exc
+            else:
+                raise ValueError("include_dialog_types must contain only canonical dialog type strings")
+            if dialog_type not in parsed:
+                parsed.append(dialog_type)
+        return tuple(parsed)
+
+    @staticmethod
+    def _should_include_unread_dialog(
+        category: str,
+        participants_count: int | None,
+        group_size_threshold: int,
+        *,
+        allow_channel: bool = False,
+    ) -> bool:
         dialog_type = DialogType.parse(category)
-        if dialog_type == DialogType.CHANNEL:
+        if dialog_type == DialogType.CHANNEL and not allow_channel:
             return False
         return not (
             dialog_type in (DialogType.SUPERGROUP, DialogType.GROUP, DialogType.FORUM)
@@ -1837,7 +1871,10 @@ class ReadingService:
         )
 
     def _collect_unread_dialogs(
-        self, group_size_threshold: int, since_utc: int | None = None
+        self,
+        group_size_threshold: int,
+        since_utc: int | None = None,
+        include_dialog_types: tuple[DialogType, ...] | None = None,
     ) -> tuple[list[dict], dict[int, int]]:
         rows = cast(
             list[tuple[object, object, object, object, object, object, object, object]],
@@ -1861,8 +1898,13 @@ class ReadingService:
             if unread_count_i == 0:
                 continue
             category = DialogType.parse(str(entity_type))
+            if include_dialog_types is not None and category not in include_dialog_types:
+                continue
             if not self._should_include_unread_dialog(
-                category, cast(int | None, participants_count), group_size_threshold
+                category,
+                cast(int | None, participants_count),
+                group_size_threshold,
+                allow_channel=include_dialog_types is not None and DialogType.CHANNEL in include_dialog_types,
             ):
                 continue
             entries.append(

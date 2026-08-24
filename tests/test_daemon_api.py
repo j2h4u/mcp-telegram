@@ -2669,6 +2669,43 @@ async def test_list_unread_messages_basic() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_unread_messages_filters_types_before_budget_allocation() -> None:
+    """Type allowlists remove dialogs before ranking and message allocation."""
+    conn = _make_db()
+    for dialog_id, dialog_type, name in (
+        (1001, "user", "Alice"),
+        (1002, "bot", "Helper"),
+        (1003, "service", "Replies"),
+    ):
+        _seed_unread_state(conn, dialog_id, read_inbox_max_id=0, entity_type=dialog_type, entity_name=name)
+        _seed_message(conn, dialog_id, message_id=1, text=name)
+    server = make_server(conn, _TestClient())
+
+    result = await server._dispatch({"method": "get_inbox", "limit": 1, "include_dialog_types": ["user"]})
+
+    assert result["ok"] is True
+    data = _response_data(result)
+    groups = cast(list[dict[str, object]], data["groups"])
+    assert [group["dialog_id"] for group in groups] == [1001]
+    assert sum(len(_group_messages(group)) for group in groups) == 1
+
+    service_result = await server._dispatch(
+        {"method": "get_inbox", "limit": 50, "include_dialog_types": ["service"]}
+    )
+    service_groups = cast(list[dict[str, object]], _response_data(service_result)["groups"])
+    assert [group["dialog_id"] for group in service_groups] == [1003]
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_rejects_empty_or_unknown_type_allowlist() -> None:
+    server = make_server(_make_db(), _TestClient())
+    for allowlist in ([], ["not_a_dialog_type"]):
+        result = await server._dispatch({"method": "get_inbox", "include_dialog_types": allowlist})
+        assert result["ok"] is False
+        assert result["error"] == "invalid_input"
+
+
+@pytest.mark.asyncio
 async def test_list_unread_messages_rejects_removed_scope_parameter() -> None:
     server = make_server(_make_db(), _TestClient())
 

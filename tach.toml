@@ -225,7 +225,7 @@ depends_on = ["mcp_telegram.activity_peer_sweep", "mcp_telegram.activity_substra
 [[modules]]
 path = "mcp_telegram.dialog_sync"
 layer = "application"
-depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.flood", "mcp_telegram.read_state", "mcp_telegram.sync_db", "mcp_telegram.telegram_access", "mcp_telegram.topics.contracts", "mcp_telegram.topics.refresh"]
+depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.dialog_classification", "mcp_telegram.flood", "mcp_telegram.read_state", "mcp_telegram.sync_db", "mcp_telegram.telegram_access", "mcp_telegram.topics.contracts", "mcp_telegram.topics.refresh"]
 
 [[modules]]
 path = "mcp_telegram.sync_worker"
@@ -367,7 +367,7 @@ depends_on = ["mcp_telegram.telegram_gateway", "mcp_telegram.telegram_reading"]
 [[modules]]
 path = "mcp_telegram.telethon_dialog"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.models"]
+depends_on = ["mcp_telegram.dialog_classification", "mcp_telegram.models"]
 
 [[modules]]
 path = "mcp_telegram.telethon_media"
@@ -408,7 +408,7 @@ depends_on = ["mcp_telegram.topics.contracts", "mcp_telegram.topics.ports"]
 [[modules]]
 path = "mcp_telegram.sync_db"
 layer = "persistence"
-depends_on = ["mcp_telegram.fts"]
+depends_on = ["mcp_telegram.dialog_classification", "mcp_telegram.fts"]
 
 [[modules]]
 path = "mcp_telegram.feedback_db"
@@ -456,6 +456,11 @@ layer = "persistence"
 depends_on = ["mcp_telegram.topics.contracts", "mcp_telegram.topics.ports"]
 
 # foundation — small neutral contracts, IPC, configuration, and primitives.
+[[modules]]
+path = "mcp_telegram.dialog_classification"
+layer = "foundation"
+depends_on = ["mcp_telegram.models"]
+
 [[modules]]
 path = "mcp_telegram.models"
 layer = "foundation"

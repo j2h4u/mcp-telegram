@@ -1455,6 +1455,62 @@ def ensure_own_only_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def repair_reserved_dialog_types(conn: sqlite3.Connection) -> None:
+    """Repair persisted @replies rows through the normal startup path.
+
+    Older snapshots classified Telegram's reserved Replies peer as ``bot``.
+    Username matching is delegated to the canonical classifier so this repair
+    cannot drift into numeric-ID or display-name heuristics.
+    """
+    from .dialog_classification import SERVICE_DIALOG_TYPE, is_bot_dialog_type, is_reserved_replies_username
+
+    tables = {
+        cast(str, row[0])
+        for row in cast(
+            list[tuple[object]],
+            conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('entities', 'dialogs')"
+            ).fetchall(),
+        )
+    }
+    if "entities" not in tables:
+        return
+    rows = cast(
+        list[tuple[object, object, object]],
+        conn.execute("SELECT id, username, type FROM entities WHERE username IS NOT NULL").fetchall(),
+    )
+    replies_ids = [int(cast(int | str, row[0])) for row in rows if is_reserved_replies_username(row[1])]
+    if not replies_ids:
+        return
+    with conn:
+        conn.executemany(
+            "UPDATE entities SET type = ? WHERE id = ?",
+            (
+                (SERVICE_DIALOG_TYPE, int(cast(int | str, row[0])))
+                for row in rows
+                if is_reserved_replies_username(row[1]) and is_bot_dialog_type(row[2])
+            ),
+        )
+        if "dialogs" in tables:
+            dialog_rows = cast(
+                list[tuple[object, object]],
+                conn.execute(
+                    "SELECT dialog_id, type FROM dialogs WHERE dialog_id IN ({})".format(
+                        ",".join("?" * len(replies_ids))
+                    ),
+                    replies_ids,
+                ).fetchall(),
+            )
+            conn.executemany(
+                "UPDATE dialogs SET type = ? WHERE dialog_id = ?",
+                (
+                    (SERVICE_DIALOG_TYPE, int(cast(int | str, row[0])))
+                    for row in dialog_rows
+                    if is_bot_dialog_type(row[1])
+                ),
+            )
+
+
 def record_daemon_event(
     conn: sqlite3.Connection,
     *,
@@ -1486,6 +1542,7 @@ def ensure_sync_schema(db_path: Path) -> None:
         if _schema_ready(probe_conn):
             ensure_own_only_schema(probe_conn)
             _ensure_scheduled_messages_fts(probe_conn)
+            repair_reserved_dialog_types(probe_conn)
             return
     finally:
         probe_conn.close()
@@ -1501,6 +1558,7 @@ def ensure_sync_schema(db_path: Path) -> None:
 
             ensure_own_only_schema(bootstrap_conn)
             _ensure_scheduled_messages_fts(bootstrap_conn)
+            repair_reserved_dialog_types(bootstrap_conn)
         finally:
             if bootstrap_conn is not None:
                 bootstrap_conn.close()

@@ -1202,3 +1202,21 @@ def test_migration_v25_ignores_non_own_only(tmp_path: Path) -> None:
 
         row_pending = _fetchone_row(conn, "SELECT dialog_id FROM dialogs WHERE dialog_id = ?", (pending_id,))
         assert row_pending is None, "non-own_only 'pending' peer must NOT get a thin dialogs row"
+
+
+def test_startup_repair_reclassifies_persisted_replies_rows(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute(
+            "INSERT INTO entities(id, type, name, username, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (777000, "bot", "Replies", "Replies", 1),
+        )
+        conn.execute("INSERT INTO dialogs(dialog_id, name, type) VALUES (?, ?, ?)", (777000, "Replies", "Bot"))
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchone_row(conn, "SELECT type FROM entities WHERE id = ?", (777000,)) == ("service",)
+        assert _fetchone_row(conn, "SELECT type FROM dialogs WHERE dialog_id = ?", (777000,)) == ("service",)
