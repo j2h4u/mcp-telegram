@@ -107,6 +107,11 @@ def _install_mcp_http_disconnect_log_filter() -> None:
     target_logger.addFilter(_BenignMcpHttpDisconnectFilter())
 
 
+def _quiet_mcp_http_lifecycle_logs() -> None:
+    """Keep routine Streamable HTTP session lifecycle logs out of INFO output."""
+    logging.getLogger(_MCP_HTTP_LOGGER_NAME).setLevel(logging.WARNING)
+
+
 @cache
 def enumerate_available_tools() -> list[tuple[str, Tool]]:
     tools.verify_tool_registry()
@@ -385,6 +390,7 @@ async def run_mcp_server() -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         force=True,
     )
+    _quiet_mcp_http_lifecycle_logs()
 
     logger.info("MCP server starting — routing through daemon API")
 
@@ -418,6 +424,7 @@ async def run_mcp_http_server(
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         force=True,
     )
+    _quiet_mcp_http_lifecycle_logs()
     _install_mcp_http_disconnect_log_filter()
 
     _assert_http_exposure_allowed(host)

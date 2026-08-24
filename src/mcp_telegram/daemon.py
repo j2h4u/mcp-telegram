@@ -770,7 +770,7 @@ def _log_heartbeat(
     delta = max(0, msg_count - int(prev_msg_count or 0))
     rate = delta / interval if interval > 0 else 0.0
 
-    logger.info(
+    logger.debug(
         "heartbeat — connected=%s dialogs=%d/%d messages=%d rate=%.0fmsg/s%s",
         client.is_connected(),
         synced,
