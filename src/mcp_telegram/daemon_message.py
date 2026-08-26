@@ -131,6 +131,7 @@ def project_read_message_content(
         MessageSnapshot(
             text=message.text,
             media_description=message.media_description,
+            media_kind=message.media_kind,
             text_links=tuple(text_links),
         )
     )
@@ -139,6 +140,7 @@ def project_read_message_content(
         text=content.text,
         media_description=content.media_description,
         content_kind=content.kind,
+        media_kind=content.media_kind,
     )
 
 

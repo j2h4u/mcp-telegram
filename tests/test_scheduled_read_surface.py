@@ -50,6 +50,7 @@ def test_scheduled_row_mapper_preserves_canonical_content_shape(
             "dialog_id": 1,
             "text": text,
             "media_description": media_description,
+            "media_kind": "other" if media_description else None,
         },
         inclusion_basis=(),
     )
@@ -69,6 +70,7 @@ def test_scheduled_caption_and_media_use_public_structured_delivery_shape() -> N
                 "dialog_id": 1,
                 "text": "caption",
                 "media_description": "[photo]",
+                "media_kind": "other",
                 "content_kind": "message_text",
             }
         ],
@@ -94,6 +96,7 @@ def _create_scheduled_table(conn: sqlite3.Connection) -> None:
             sender_id INTEGER,
             sender_first_name TEXT,
             media_description TEXT,
+            media_kind TEXT CHECK (media_kind IN ('contact', 'other')),
             reply_to_msg_id INTEGER,
             forum_topic_id INTEGER,
             edit_date INTEGER,

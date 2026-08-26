@@ -128,7 +128,7 @@ def test_sync_enrollment_respects_outer_transaction_rollback() -> None:
     conn = sqlite3.connect(":memory:")
     try:
         conn.execute("CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT)")
-        conn.execute("CREATE TABLE messages (message_id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE messages (message_id INTEGER PRIMARY KEY, media_kind TEXT)")
 
         conn.execute("BEGIN")
         try:

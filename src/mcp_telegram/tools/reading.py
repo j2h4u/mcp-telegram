@@ -625,7 +625,9 @@ def _list_message_structured_item(
         item["is_service"] = True
 
     _maybe_add(item, "topic", project_topic(topic_id=message.forum_topic_id, title=message.topic_title))
-    projected = serialize_message_content(message.text, message.media_description, message.content_kind)
+    projected = serialize_message_content(
+        message.text, message.media_description, message.content_kind, message.media_kind
+    )
     _maybe_add(item, "content", projected["content"])
     _maybe_add(item, "media", projected["media"])
     _maybe_add(
@@ -1040,6 +1042,7 @@ def _search_result_structured_rows(rows: list[dict], query: str) -> list[dict[st
             snippet,
             row.get("media_description") if isinstance(row.get("media_description"), str) else None,
             "snippet",
+            row.get("media_kind") if isinstance(row.get("media_kind"), str) else None,
         )
         _maybe_add(result, "content", projected["content"])
         _maybe_add(result, "media", projected["media"])

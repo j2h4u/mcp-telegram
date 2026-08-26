@@ -335,13 +335,14 @@ def _attach_trace_content_metadata(data: dict) -> None:
                     (True, True): "message_text",
                 }[(bool(text), bool(media_description))],
             )
-            serialized = serialize_message_content(text, media_description, content_kind)
+            serialized = serialize_message_content(text, media_description, content_kind, item.get("media_kind"))
             # These assignments intentionally overwrite daemon-provided
             # wrappers.  The daemon owns projection; this tool owns only the
             # canonical delivery envelope and must not re-project text.
             item.pop("content", None)
             item.pop("media_content", None)
             item.pop("media_description", None)
+            item.pop("media_kind", None)
             item.update(
                 dict(
                     filter(

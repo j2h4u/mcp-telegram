@@ -13,7 +13,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 35
+_CURRENT_SCHEMA_VERSION = 36
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS messages (
     sender_id           INTEGER,
     sender_first_name   TEXT,
     media_description   TEXT,
+    media_kind          TEXT CHECK (media_kind IN ('contact', 'other')),
     reply_to_msg_id     INTEGER,
     forum_topic_id      INTEGER,
     reactions           TEXT,
@@ -486,6 +487,7 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
     sender_id                   INTEGER,
     sender_first_name           TEXT,
     media_description           TEXT,
+    media_kind                  TEXT CHECK (media_kind IN ('contact', 'other')),
     reply_to_msg_id             INTEGER,
     forum_topic_id              INTEGER,
     edit_date                   INTEGER,
@@ -1414,6 +1416,33 @@ def _apply_migration_35(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_36(conn: sqlite3.Connection, current: int) -> int:
+    """Store the generic media discriminator separately from its description."""
+    statements: list[str] = []
+    for table in ("messages", "scheduled_messages"):
+        table_exists = cast(
+            tuple[object, ...] | None,
+            conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone(),
+        )
+        if table_exists is None:
+            continue
+        table_info = cast(list[tuple[object, ...]], conn.execute(f"PRAGMA table_info({table})").fetchall())
+        columns = {row[1] for row in table_info}
+        if "media_kind" not in columns:
+            statements.append(
+                f"ALTER TABLE {table} ADD COLUMN media_kind TEXT CHECK (media_kind IN ('contact', 'other'))"
+            )
+    if not statements:
+        # Still record the version on minimal test/legacy databases.
+        statements = ["SELECT 1"]
+    return _apply_migration(
+        conn,
+        current,
+        36,
+        statements,
+    )
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -1446,6 +1475,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_33(conn, current)
     current = _apply_migration_34(conn, current)
     current = _apply_migration_35(conn, current)
+    current = _apply_migration_36(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

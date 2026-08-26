@@ -9,8 +9,8 @@ from mcp_telegram.reading.query_records import read_message_from_row
 def test_decoder_sqlite_row_defaults_null_content_kind() -> None:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
-    conn.execute("CREATE TABLE messages (message_id, sent_at, dialog_id, content_kind)")
-    conn.execute("INSERT INTO messages VALUES (7, 11, 22, NULL)")
+    conn.execute("CREATE TABLE messages (message_id, sent_at, dialog_id, content_kind, media_kind)")
+    conn.execute("INSERT INTO messages VALUES (7, 11, 22, NULL, NULL)")
     row = cast(object | None, conn.execute("SELECT * FROM messages").fetchone())
     assert row is not None
     message = read_message_from_row(cast(object, row))

@@ -28,6 +28,7 @@ class StoredMessage:
     out: int
     is_service: int
     post_author: str | None
+    media_kind: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

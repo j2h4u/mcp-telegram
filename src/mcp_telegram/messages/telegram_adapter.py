@@ -21,7 +21,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
 from telethon.tl.types import TypePeer  # type: ignore[import-untyped]
 
 from .. import message_contracts as _message_contracts
-from ..telethon_media import describe_media
+from ..telethon_media import describe_media, media_kind
 from ..telethon_message import is_service_message
 
 logger = logging.getLogger(__name__)
@@ -623,6 +623,7 @@ def extract_message_row(
         sender_id=_attr(msg, "sender_id", None),
         sender_first_name=_extract_sender_first_name(msg),
         media_description=_extract_media_description(msg),
+        media_kind=media_kind(_attr(msg, "media", None)) if _attr(msg, "media", None) is not None else None,
         reply_to_msg_id=reply_to_msg_id,
         forum_topic_id=forum_topic_id,
         edit_date=_extract_edit_date(msg),

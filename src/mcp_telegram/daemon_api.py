@@ -958,6 +958,7 @@ class DaemonAPIServer:
                 dialog_id=int(cast(int | str, row["dialog_id"])),
                 text=cast(str | None, row.get("text")),
                 media_description=cast(str | None, row.get("media_description")),
+                media_kind=cast(str | None, row.get("media_kind")),
                 dialog_name=cast(str | None, row.get("dialog_name")),
             )
             for row in raw_messages
@@ -965,9 +966,10 @@ class DaemonAPIServer:
         projected = project_cached_message_facts_by_dialog(self._conn, messages)
         data["messages"] = [
             {
-                **{key: value for key, value in row.items() if key not in {"text", "media_description"}},
+                **{key: value for key, value in row.items() if key not in {"text", "media_description", "media_kind"}},
                 "text": message.text,
                 "media_description": message.media_description,
+                "media_kind": message.media_kind,
                 "content_kind": message.content_kind,
             }
             for row, message in zip(raw_messages, projected, strict=True)

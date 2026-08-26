@@ -238,7 +238,13 @@ def _structured_comment(comment: Mapping[str, object]) -> dict[str, object]:
             (True, True): "message_text",
         }[(bool(text_value), bool(media_value))],
     )
-    serialized = serialize_message_content(text_value, media_value, content_kind)
+    media_kind_value = cast(str | None, comment.get("media_kind"))
+    serialized = serialize_message_content(
+        text_value,
+        media_value,
+        content_kind,
+        media_kind_value,
+    )
     serialized_content = serialized["content"]
     text = cast(str, (serialized_content or cast(dict[str, object], {})).get("text", ""))
     result: dict[str, object] = {

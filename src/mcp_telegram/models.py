@@ -110,6 +110,7 @@ class TraceEvidenceItem(TypedDict):
     author_signature: str | None
     text: str | None
     media_description: str | None
+    media_kind: str | None
 
 
 class TraceCoverageGap(TypedDict):
@@ -174,6 +175,7 @@ class ReadMessage:
     sender_first_name: str | None = None
     sender_username: str | None = None
     media_description: str | None = None
+    media_kind: str | None = None
     content_kind: ContentKind = "none"
     reply_to_msg_id: int | None = None
     forum_topic_id: int | None = None

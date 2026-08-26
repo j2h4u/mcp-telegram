@@ -4,7 +4,6 @@ import sqlite3
 from types import SimpleNamespace
 from typing import cast
 
-import pytest
 from jsonschema import validate
 from telethon.tl.types import MessageEntityTextUrl
 
@@ -56,7 +55,7 @@ def test_delivery_serializer_uses_explicit_text_media_semantics() -> None:
     text_result = serialize_message_content("caption", "[photo]", "message_text")["content"]
     assert text_result is not None
     assert text_result["content_kind"] == "message_text"
-    media_result = serialize_message_content(None, "[photo]", "media_description")
+    media_result = serialize_message_content(None, "[photo]", "media_description", "other")
     assert media_result["content"] is None
     assert media_result["media"] == {"type": "other", "description": "[photo]"}
     assert serialize_message_content("caption", "[photo]", "none")["content"] == {
@@ -67,27 +66,31 @@ def test_delivery_serializer_uses_explicit_text_media_semantics() -> None:
 
 
 def test_delivery_serializer_projects_contact_without_repeating_description() -> None:
-    projected = serialize_message_content(None, "[contact]", "media_description")
+    projected = serialize_message_content(None, "Alice, +123", "media_description", "contact")
 
     assert projected["content"] is None
-    assert projected["media"] == {"type": "contact", "description": "[contact]"}
+    assert projected["media"] == {"type": "contact", "description": "Alice, +123"}
     validate(instance=projected["media"], schema=MEDIA_OUTPUT_SCHEMA)
 
 
+def test_delivery_serializer_projects_contact_without_description() -> None:
+    assert serialize_message_content(None, None, "none", "contact")["media"] == {"type": "contact"}
+
+
 def test_delivery_serializer_keeps_contact_attachment_with_caption() -> None:
-    projected = serialize_message_content("Please call", "[contact: Ada, +123]", "message_text")
+    projected = serialize_message_content("Please call", "Ada, +123", "message_text", "contact")
 
     assert projected["content"] == {
         "text": "Please call",
         "is_telegram_content": True,
         "content_kind": "message_text",
     }
-    assert projected["media"] == {"type": "contact", "description": "[contact: Ada, +123]"}
+    assert projected["media"] == {"type": "contact", "description": "Ada, +123"}
 
 
 def test_delivery_serializer_keeps_distinct_text_and_suppresses_exact_duplicate() -> None:
-    distinct = serialize_message_content("caption", "[photo]", "message_text")
-    duplicate = serialize_message_content("[photo]", "[photo]", "message_text")
+    distinct = serialize_message_content("caption", "[photo]", "message_text", "other")
+    duplicate = serialize_message_content("[photo]", "[photo]", "message_text", "other")
 
     assert distinct["content"] == {
         "text": "caption",
@@ -96,35 +99,6 @@ def test_delivery_serializer_keeps_distinct_text_and_suppresses_exact_duplicate(
     }
     assert duplicate["content"] is None
     assert duplicate["media"] == {"type": "other", "description": "[photo]"}
-
-
-@pytest.mark.parametrize(
-    "description",
-    ["[контакт]", "[контакт: Ada, +123]"],
-)
-def test_delivery_serializer_projects_known_legacy_contact_markers(description: str) -> None:
-    projected = serialize_message_content(None, description, "media_description")
-
-    assert projected["content"] is None
-    assert projected["media"] == {"type": "contact", "description": description}
-
-
-@pytest.mark.parametrize(
-    "description",
-    [
-        "контакт: Ada, +123",
-        "[контакт: Ada, +123",
-        "[контакт: Ada, +123]]",
-        "[контакты: Ada, +123]",
-        "Это контакт: Ada, +123",
-        "[контакт: ]",
-    ],
-)
-def test_delivery_serializer_rejects_noncanonical_legacy_contact_markers(description: str) -> None:
-    projected = serialize_message_content(None, description, "media_description")
-
-    assert projected["content"] is None
-    assert projected["media"] == {"type": "other", "description": description}
 
 
 def test_cached_message_projection_renders_persisted_hidden_link() -> None:

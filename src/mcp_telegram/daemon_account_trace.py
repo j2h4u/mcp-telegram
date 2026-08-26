@@ -523,6 +523,7 @@ class DaemonAccountTraceService:
             "author_signature": row["author_signature"],
             "text": row["text"],
             "media_description": row["media_description"],
+            "media_kind": row["media_kind"],
         }
 
     @staticmethod
@@ -893,12 +894,14 @@ def _project_trace_content_rows(
             MessageSnapshot(
                 text=cast(str | None, _row_value(row, "text")),
                 media_description=cast(str | None, _row_value(row, "media_description")),
+                media_kind=cast(str | None, _row_value(row, "media_kind")),
                 text_links=tuple(links_by_message.get((dialog_id, message_id), [])),
             )
         )
         projected_row = _row_dict(row)
         projected_row["text"] = content.text
         projected_row["media_description"] = content.media_description
+        projected_row["media_kind"] = content.media_kind
         projected.append(projected_row)
     return projected
 
@@ -1507,6 +1510,7 @@ _TRACE_MESSAGE_BASE_FIELDS = (
     "sender_id",
     "sender_first_name",
     "media_description",
+    "media_kind",
     "reply_to_msg_id",
     "reply_count",
     "forum_topic_id",
@@ -1752,9 +1756,12 @@ def _upsert_trace_coverage_fragment(
 
 def _row_value(row: Mapping[str, object] | Sequence[object], key: str) -> object:
     if isinstance(row, Mapping):
-        return cast(object, row[key])
+        return cast(object, row.get(key))
     if isinstance(row, sqlite3.Row):
-        return cast(object, row[key])
+        try:
+            return cast(object, row[key])
+        except IndexError:
+            return None
     raise TypeError("row must be a mapping")
 
 
@@ -2461,7 +2468,7 @@ def _build_trace_account_messages_query(
         "m.sent_at, "
         "m.text, "
         "m.sender_id, "
-        "m.media_description, "
+        "m.media_description, m.media_kind, "
         "m.forum_topic_id AS topic_id, "
         "COALESCE(d.name, e_dialog.name, CAST(m.dialog_id AS TEXT)) AS dialog_title, "
         "COALESCE(d.type, e_dialog.type) AS dialog_type, "
