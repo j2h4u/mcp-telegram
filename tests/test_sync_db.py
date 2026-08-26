@@ -150,7 +150,6 @@ def test_messages_schema(tmp_sync_db_path: Path) -> None:
             "sender_first_name",
             "media_description",
             "media_kind",
-                "media_kind",
             "reply_to_msg_id",
             "reply_count",
             "forum_topic_id",
