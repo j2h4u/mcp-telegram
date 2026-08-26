@@ -4,6 +4,7 @@ import sqlite3
 from types import SimpleNamespace
 from typing import cast
 
+import pytest
 from jsonschema import validate
 from telethon.tl.types import MessageEntityTextUrl
 
@@ -97,11 +98,33 @@ def test_delivery_serializer_keeps_distinct_text_and_suppresses_exact_duplicate(
     assert duplicate["media"] == {"type": "other", "description": "[photo]"}
 
 
-def test_delivery_serializer_does_not_guess_legacy_localized_contact_marker() -> None:
-    projected = serialize_message_content(None, "[контакт: Ada, +123]", "media_description")
+@pytest.mark.parametrize(
+    "description",
+    ["[контакт]", "[контакт: Ada, +123]"],
+)
+def test_delivery_serializer_projects_known_legacy_contact_markers(description: str) -> None:
+    projected = serialize_message_content(None, description, "media_description")
 
     assert projected["content"] is None
-    assert projected["media"] == {"type": "other", "description": "[контакт: Ada, +123]"}
+    assert projected["media"] == {"type": "contact", "description": description}
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "контакт: Ada, +123",
+        "[контакт: Ada, +123",
+        "[контакт: Ada, +123]]",
+        "[контакты: Ada, +123]",
+        "Это контакт: Ada, +123",
+        "[контакт: ]",
+    ],
+)
+def test_delivery_serializer_rejects_noncanonical_legacy_contact_markers(description: str) -> None:
+    projected = serialize_message_content(None, description, "media_description")
+
+    assert projected["content"] is None
+    assert projected["media"] == {"type": "other", "description": description}
 
 
 def test_cached_message_projection_renders_persisted_hidden_link() -> None:
