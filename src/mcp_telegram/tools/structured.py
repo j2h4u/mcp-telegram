@@ -155,12 +155,12 @@ def project_media_description(media_description: str | None) -> Attachment | Non
     return {"type": _attachment_type(media_description), "description": media_description}
 
 
-_CONTACT_DESCRIPTION_RE = re.compile(r"^\[contact: [^\[\]]+\]$")
+_CONTACT_DESCRIPTION_RE = re.compile(r"^\[(?:contact|контакт): [^\[\]]+\]$")
 
 
 def _attachment_type(description: str) -> AttachmentType:
     """Return only types backed by a stable generated marker."""
-    if description == "[contact]" or _CONTACT_DESCRIPTION_RE.fullmatch(description):
+    if description in {"[contact]", "[контакт]"} or _CONTACT_DESCRIPTION_RE.fullmatch(description):
         return "contact"
     return "other"
 
