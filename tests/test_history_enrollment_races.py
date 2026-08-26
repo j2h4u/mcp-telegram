@@ -71,7 +71,7 @@ async def test_message_fact_refresh_disable_during_reaction_await_discards_snaps
     conn = _make_db()
     conn.execute("INSERT INTO synced_dialogs VALUES (4, 'synced')")
     conn.execute("INSERT INTO full_history_enrollment VALUES (4, 1, 'explicit', 1)")
-    conn.execute("INSERT INTO messages VALUES (4, 1, 1, 0)")
+    conn.execute("INSERT INTO messages VALUES (4, 1, 1, 0, NULL)")
     conn.execute("INSERT INTO message_reactions VALUES (4, 1, '👍', 1)")
     conn.commit()
     entered = asyncio.Event()
