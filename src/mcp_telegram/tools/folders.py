@@ -19,6 +19,7 @@ from ._base import (
 )
 from .structured import (
     FOLDER_SNAPSHOT_OUTPUT_SCHEMA,
+    MEDIA_OUTPUT_SCHEMA,
     TELEGRAM_CONTENT_OUTPUT_SCHEMA,
     serialize_message_content,
     telegram_content,
@@ -112,10 +113,10 @@ LIST_FOLDER_MESSAGES_OUTPUT_SCHEMA = {
                         "additionalProperties": False,
                     },
                     "media": {
-                        "type": ["object", "null"],
-                        "properties": TELEGRAM_CONTENT_OUTPUT_SCHEMA["properties"],
-                        "required": TELEGRAM_CONTENT_OUTPUT_SCHEMA["required"],
-                        "additionalProperties": False,
+                        "anyOf": [
+                            {"type": "null"},
+                            MEDIA_OUTPUT_SCHEMA,
+                        ],
                     },
                 },
                 "required": ["dialog_id", "message_id", "sent_at", "dialog_name", "content", "media"],

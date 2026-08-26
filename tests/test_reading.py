@@ -6,10 +6,12 @@ from dataclasses import dataclass, replace
 from typing import cast
 
 import pytest
+from jsonschema import validate
 from pydantic import ValidationError
 
 from mcp_telegram.models import ReadReactionEvent
 from mcp_telegram.tools.reading import (
+    SEARCH_MESSAGES_OUTPUT_SCHEMA,
     ListMessages,
     SearchMessages,
     _format_search_results,
@@ -20,6 +22,7 @@ from mcp_telegram.tools.reading import (
     _search_structured_content,
     _SearchStructuredContentContext,
 )
+from mcp_telegram.tools.structured import MEDIA_OUTPUT_SCHEMA
 
 
 @pytest.mark.parametrize("anchor_message_id", [1, 2_147_483_647])
@@ -27,6 +30,83 @@ def test_list_messages_accepts_telegram_signed_32_bit_anchor_boundaries(anchor_m
     args = ListMessages(exact_dialog_id=1, anchor_message_id=anchor_message_id)
 
     assert args.anchor_message_id == anchor_message_id
+
+
+def test_list_messages_contact_has_one_explicit_attachment() -> None:
+    message = _list_messages_structured_messages(
+        [
+            {
+                "message_id": 7,
+                "sent_at": 1_700_000_000,
+                "dialog_id": 1,
+                "text": None,
+                "media_description": "[contact]",
+                "content_kind": "media_description",
+            }
+        ],
+        dialog_type="User",
+    )[0]
+
+    assert "content" not in message
+    assert message["media"] == {"type": "contact", "description": "[contact]"}
+    validate(instance=message["media"], schema=MEDIA_OUTPUT_SCHEMA)
+
+
+def test_search_messages_contact_uses_same_attachment_projection() -> None:
+    result = _search_result_structured_rows(
+        [
+            {
+                "message_id": 7,
+                "sent_at": 1_700_000_000,
+                "dialog_id": 1,
+                "dialog_name": "Chat",
+                "text": "Call me",
+                "media_description": "[contact: Ada, +123]",
+            }
+        ],
+        "Call",
+    )[0]
+
+    content = cast(dict[str, object], result["content"])
+    assert content["text"] == "Call me"
+    assert result["media"] == {"type": "contact", "description": "[contact: Ada, +123]"}
+    media = cast(dict[str, object], result["media"])
+    validate(
+        instance=media,
+        schema=SEARCH_MESSAGES_OUTPUT_SCHEMA["properties"]["results"]["items"]["properties"]["media"],
+    )
+
+
+def test_search_messages_suppresses_only_exact_snippet_duplicate() -> None:
+    equal = _search_result_structured_rows(
+        [
+            {
+                "message_id": 7,
+                "sent_at": 1_700_000_000,
+                "dialog_id": 1,
+                "text": "[contact]",
+                "media_description": "[contact]",
+            }
+        ],
+        "contact",
+    )[0]
+    distinct = _search_result_structured_rows(
+        [
+            {
+                "message_id": 8,
+                "sent_at": 1_700_000_001,
+                "dialog_id": 1,
+                "text": "caption",
+                "media_description": "[contact]",
+            }
+        ],
+        "caption",
+    )[0]
+
+    assert "content" not in equal
+    assert equal["media"] == {"type": "contact", "description": "[contact]"}
+    assert cast(dict[str, object], distinct["content"])["text"] == "caption"
+    assert distinct["media"] == {"type": "contact", "description": "[contact]"}
 
 
 @pytest.mark.parametrize("anchor_message_id", [0, -1, 2_147_483_648])
@@ -475,11 +555,7 @@ def test_list_messages_structured_messages_cover_media_reply_forward_reaction_to
     second = messages[1]
 
     assert second["topic"] == {"title": "General"}
-    assert second["media"] == {
-        "text": "[фото]",
-        "is_telegram_content": True,
-        "content_kind": "media_description",
-    }
+    assert second["media"] == {"type": "other", "description": "[фото]"}
     assert second["reply_context_ref"] == {"msg_id": 1, "in_page": True, "context_included": False}
     assert "reply_context" not in second
     assert cast(dict[str, object], second["forward"])["from_name"] == "Forward Source"

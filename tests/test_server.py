@@ -847,14 +847,14 @@ async def test_call_tool_returns_structuredContent_with_empty_success_content(
             "[photo]",
             "message_text",
             {"text": "caption", "is_telegram_content": True, "content_kind": "message_text"},
-            {"text": "[photo]", "is_telegram_content": True, "content_kind": "media_description"},
+            {"type": "other", "description": "[photo]"},
         ),
         (
             None,
             "[photo]",
             "media_description",
-            {"text": "[photo]", "is_telegram_content": True, "content_kind": "media_description"},
-            {"text": "[photo]", "is_telegram_content": True, "content_kind": "media_description"},
+            None,
+            {"type": "other", "description": "[photo]"},
         ),
         (None, None, "none", None, None),
     ],
@@ -929,6 +929,57 @@ async def test_public_get_inbox_call_tool_preserves_canonical_content_schema(
         assert message["media"] == expected_media
     assert "text" not in message
     assert "media_description" not in message
+
+
+@pytest.mark.asyncio
+async def test_public_get_inbox_call_tool_projects_empty_contact_attachment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _InboxConnection:
+        async def get_inbox(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "ok": True,
+                "data": {
+                    "read_position_pending_count": 0,
+                    "read_position_pending_entities": [],
+                    "groups": [
+                        {
+                            "dialog_id": 123,
+                            "display_name": "Chat",
+                            "category": "user",
+                            "dialog_type": "User",
+                            "unread_count": 1,
+                            "messages": [
+                                {
+                                    "message_id": 1,
+                                    "sent_at": 1_700_000_000,
+                                    "dialog_id": 123,
+                                    "text": None,
+                                    "media_description": "[contact]",
+                                    "content_kind": "media_description",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            }
+
+    @asynccontextmanager
+    async def _connection() -> AsyncIterator[_InboxConnection]:
+        yield _InboxConnection()
+
+    monkeypatch.setattr("mcp_telegram.tools.unread.daemon_connection", _connection)
+    result = _call_tool_result(await server.call_tool("get_inbox", {}))
+
+    assert result.is_error is False
+    payload = cast(dict[str, object], result.structured_content)
+    schema = server.tool_by_name["get_inbox"].output_schema
+    assert schema is not None
+    validate(instance=payload, schema=schema)
+    dialog = cast(dict[str, object], cast(list[object], payload["dialogs"])[0])
+    message = cast(dict[str, object], cast(list[object], dialog["messages"])[0])
+    assert "content" not in message
+    assert message["media"] == {"type": "contact", "description": "[contact]"}
 
 
 @pytest.mark.asyncio

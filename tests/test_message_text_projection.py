@@ -4,6 +4,7 @@ import sqlite3
 from types import SimpleNamespace
 from typing import cast
 
+from jsonschema import validate
 from telethon.tl.types import MessageEntityTextUrl
 
 from mcp_telegram.daemon_message import project_cached_message_facts, project_cached_message_facts_by_dialog
@@ -11,7 +12,7 @@ from mcp_telegram.message_content import MessageSnapshot, project_message_conten
 from mcp_telegram.models import ReadMessage
 from mcp_telegram.telegram_message_projection import MessageLike, message_to_dict
 from mcp_telegram.text_projection import render_text_links
-from mcp_telegram.tools.structured import serialize_message_content
+from mcp_telegram.tools.structured import MEDIA_OUTPUT_SCHEMA, serialize_message_content
 
 
 def test_render_text_links_uses_telegram_utf16_offsets() -> None:
@@ -54,10 +55,53 @@ def test_delivery_serializer_uses_explicit_text_media_semantics() -> None:
     text_result = serialize_message_content("caption", "[photo]", "message_text")["content"]
     assert text_result is not None
     assert text_result["content_kind"] == "message_text"
-    media_result = serialize_message_content(None, "[photo]", "media_description")["content"]
-    assert media_result is not None
-    assert media_result["content_kind"] == "media_description"
-    assert serialize_message_content("caption", "[photo]", "none")["content"] is None
+    media_result = serialize_message_content(None, "[photo]", "media_description")
+    assert media_result["content"] is None
+    assert media_result["media"] == {"type": "other", "description": "[photo]"}
+    assert serialize_message_content("caption", "[photo]", "none")["content"] == {
+        "text": "caption",
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
+
+
+def test_delivery_serializer_projects_contact_without_repeating_description() -> None:
+    projected = serialize_message_content(None, "[contact]", "media_description")
+
+    assert projected["content"] is None
+    assert projected["media"] == {"type": "contact", "description": "[contact]"}
+    validate(instance=projected["media"], schema=MEDIA_OUTPUT_SCHEMA)
+
+
+def test_delivery_serializer_keeps_contact_attachment_with_caption() -> None:
+    projected = serialize_message_content("Please call", "[contact: Ada, +123]", "message_text")
+
+    assert projected["content"] == {
+        "text": "Please call",
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
+    assert projected["media"] == {"type": "contact", "description": "[contact: Ada, +123]"}
+
+
+def test_delivery_serializer_keeps_distinct_text_and_suppresses_exact_duplicate() -> None:
+    distinct = serialize_message_content("caption", "[photo]", "message_text")
+    duplicate = serialize_message_content("[photo]", "[photo]", "message_text")
+
+    assert distinct["content"] == {
+        "text": "caption",
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
+    assert duplicate["content"] is None
+    assert duplicate["media"] == {"type": "other", "description": "[photo]"}
+
+
+def test_delivery_serializer_does_not_guess_legacy_localized_contact_marker() -> None:
+    projected = serialize_message_content(None, "[контакт: Ada, +123]", "media_description")
+
+    assert projected["content"] is None
+    assert projected["media"] == {"type": "other", "description": "[контакт: Ada, +123]"}
 
 
 def test_cached_message_projection_renders_persisted_hidden_link() -> None:

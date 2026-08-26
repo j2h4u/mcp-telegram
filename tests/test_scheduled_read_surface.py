@@ -80,11 +80,7 @@ def test_scheduled_caption_and_media_use_public_structured_delivery_shape() -> N
         "is_telegram_content": True,
         "content_kind": "message_text",
     }
-    assert structured["media"] == {
-        "text": "[photo]",
-        "is_telegram_content": True,
-        "content_kind": "media_description",
-    }
+    assert structured["media"] == {"type": "other", "description": "[photo]"}
 
 
 def _create_scheduled_table(conn: sqlite3.Connection) -> None:

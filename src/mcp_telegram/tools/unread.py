@@ -27,6 +27,7 @@ from ._base import (
     structured_result,
 )
 from .structured import (
+    MEDIA_OUTPUT_SCHEMA,
     StructuredWarning,
     serialize_message_content,
     structured_warning,
@@ -154,7 +155,7 @@ GET_INBOX_OUTPUT_SCHEMA = {
                                 # the requested timezone in the MCP response.
                                 "date": {"type": ["integer", "null"]},
                                 "content": {"type": ["object", "null"]},
-                                "media": {"type": ["object", "null"]},
+                                "media": {"anyOf": [{"type": "null"}, MEDIA_OUTPUT_SCHEMA]},
                                 "reply_to_msg_id": {"type": ["integer", "null"]},
                                 "edit_date": {"type": ["integer", "null"]},
                                 "reactions": {"type": ["object", "null"]},

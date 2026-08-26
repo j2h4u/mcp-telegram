@@ -739,16 +739,16 @@ def test_describe_media_contact_formats_name_and_phone() -> None:
     from mcp_telegram.telethon_media import describe_media
 
     contact_full = MagicMock(spec=tl.MessageMediaContact, first_name="Alice", last_name="Smith", phone_number="+1234")
-    assert describe_media(contact_full) == "[контакт: Alice Smith, +1234]"
+    assert describe_media(contact_full) == "[contact: Alice Smith, +1234]"
 
     contact_name_only = MagicMock(spec=tl.MessageMediaContact, first_name="Bob", last_name="", phone_number="")
-    assert describe_media(contact_name_only) == "[контакт: Bob]"
+    assert describe_media(contact_name_only) == "[contact: Bob]"
 
     contact_phone_only = MagicMock(spec=tl.MessageMediaContact, first_name="", last_name="", phone_number="+5678")
-    assert describe_media(contact_phone_only) == "[контакт: +5678]"
+    assert describe_media(contact_phone_only) == "[contact: +5678]"
 
     contact_empty = MagicMock(spec=tl.MessageMediaContact, first_name="", last_name="", phone_number="")
-    assert describe_media(contact_empty) == "[контакт]"
+    assert describe_media(contact_empty) == "[contact]"
 
 
 def test_describe_media_unknown_type_fallback() -> None:
