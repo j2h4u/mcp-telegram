@@ -1754,18 +1754,11 @@ def _upsert_trace_coverage_fragment(
     )
 
 
-def _row_value(row: Mapping[str, object] | Sequence[object], key: str) -> object:
-    if isinstance(row, Mapping):
-        return cast(object, row.get(key))
-    if isinstance(row, sqlite3.Row):
-        try:
-            return cast(object, row[key])
-        except IndexError:
-            return None
-    raise TypeError("row must be a mapping")
+def _row_value(row: Mapping[str, object] | sqlite3.Row, key: str) -> object:
+    return cast(object, row[key])
 
 
-def _row_int(row: Mapping[str, object] | Sequence[object], key: str) -> int:
+def _row_int(row: Mapping[str, object] | sqlite3.Row, key: str) -> int:
     value = _row_value(row, key)
     if isinstance(value, int):
         return value

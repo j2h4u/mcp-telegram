@@ -13,7 +13,13 @@ from typing import cast
 
 import pytest
 
-from mcp_telegram.sync_db import _CURRENT_SCHEMA_VERSION, _apply_migration_36, _open_sync_db, ensure_sync_schema
+from mcp_telegram.sync_db import (
+    _CURRENT_SCHEMA_VERSION,
+    _MESSAGES_DDL,
+    _SCHEDULED_MESSAGES_DDL,
+    _open_sync_db,
+    ensure_sync_schema,
+)
 
 Row = tuple[object, ...]
 TableInfoRow = tuple[int, str, str, int, object, int]
@@ -75,23 +81,30 @@ def test_migration_v11_creates_freshness_table(db_path: Path) -> None:
         assert col_map["checked_at"] == ("INTEGER", 1, 0)
 
 
-def test_migration_v36_adds_media_kind_to_v35_tables_without_backfill(db_path: Path) -> None:
+def test_migration_v36_adds_media_kind_to_real_v35_tables_without_backfill(db_path: Path) -> None:
+    # Start with the complete current schema, then represent the real v35
+    # boundary by removing only the v36 columns and version record.  This keeps
+    # every other table and migration artifact identical to a production v35 DB.
+    ensure_sync_schema(db_path)
     with _sqlite_connection(db_path) as conn:
-        conn.executescript(
-            """
-            CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL);
-            INSERT INTO schema_version VALUES (35, 1700000000);
-            CREATE TABLE messages (dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
-                sent_at INTEGER NOT NULL, text TEXT, media_description TEXT,
-                PRIMARY KEY (dialog_id, message_id)) WITHOUT ROWID;
-            CREATE TABLE scheduled_messages (dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
-                first_seen_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, media_description TEXT,
-                PRIMARY KEY (dialog_id, message_id)) WITHOUT ROWID;
-            INSERT INTO messages VALUES (1, 1, 1700000000, 'ordinary', 'human description');
-            INSERT INTO scheduled_messages VALUES (1, 2, 1700000000, 1700000000, 'scheduled description');
-            """
+        conn.execute("ALTER TABLE messages DROP COLUMN media_kind")
+        conn.execute("ALTER TABLE scheduled_messages DROP COLUMN media_kind")
+        conn.execute("DELETE FROM schema_version WHERE version = 36")
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, media_description) "
+            "VALUES (1, 1, 1700000000, 'ordinary', 'human description')"
         )
-        assert _apply_migration_36(conn, 35) == 36
+        conn.execute(
+            "INSERT INTO scheduled_messages "
+            "(dialog_id, message_id, first_seen_at, updated_at, media_description) "
+            "VALUES (1, 2, 1700000000, 1700000000, 'scheduled description')"
+        )
+        conn.commit()
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 35
+
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
         for table in ("messages", "scheduled_messages"):
             assert "media_kind" in {row[1] for row in _table_info(conn, table)}
         assert conn.execute("SELECT media_description, media_kind FROM messages").fetchone() == (
@@ -106,7 +119,10 @@ def test_migration_v36_adds_media_kind_to_v35_tables_without_backfill(db_path: P
             conn.execute("UPDATE messages SET media_kind='invalid'")
         conn.execute("UPDATE messages SET media_kind='contact'")
         conn.execute("UPDATE scheduled_messages SET media_kind='other'")
-        assert _apply_migration_36(conn, 36) == 36
+        conn.commit()
+
+    # The schema-version guard owns one-time execution on subsequent opens.
+    ensure_sync_schema(db_path)
 
 
 def test_migration_v11_idempotent(db_path: Path) -> None:
@@ -566,6 +582,7 @@ def test_migration_v21_runs_from_v20_database(tmp_path: Path) -> None:
             ) WITHOUT ROWID
             """
         )
+        conn.execute(_SCHEDULED_MESSAGES_DDL)
         # entities/entity_details were created in v16; dialogs in v17.
         # Stub both so v24 ALTER/UPDATE succeeds when this test seeds version=20
         # (skipping v1-v20 migration steps).
@@ -726,6 +743,7 @@ def test_migration_v23_runs_from_v22_database(tmp_path: Path) -> None:
             ) WITHOUT ROWID
             """
         )
+        conn.execute(_SCHEDULED_MESSAGES_DDL)
         # entities/entity_details were created in v16; dialogs in v17.
         # Stub both so v24 ALTER/UPDATE succeeds when this test seeds version=22
         # (skipping v1-v22 migration steps).
@@ -910,6 +928,8 @@ def test_migration_v24_backfill_three_shapes(tmp_path: Path) -> None:
                 updated_at  INTEGER NOT NULL
             ) WITHOUT ROWID"""
         )
+        pre_conn.execute(_MESSAGES_DDL)
+        pre_conn.execute(_SCHEDULED_MESSAGES_DDL)
         # synced_dialogs exists since v1; stub it so the v25 own_only backfill
         # (INSERT...SELECT FROM synced_dialogs) succeeds when seeding mid-chain.
         pre_conn.execute(
@@ -1026,6 +1046,11 @@ def _make_v24_db(tmp_path: Path) -> Path:
     with _sqlite_connection(db_path) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
+        # These are the complete v35 message tables.  Earlier migration tests
+        # intentionally start at a prior version, but v36 operates only on
+        # databases where both tables already exist.
+        conn.execute(_MESSAGES_DDL)
+        conn.execute(_SCHEDULED_MESSAGES_DDL)
         # Minimal dialogs table as it exists post-v24 (includes linked_chat columns)
         conn.execute(
             """CREATE TABLE dialogs (
@@ -1091,6 +1116,8 @@ def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: P
         )
         conn.execute("DROP INDEX idx_full_history_enrollment_enabled")
         conn.execute("DROP TABLE full_history_enrollment")
+        conn.execute("ALTER TABLE messages DROP COLUMN media_kind")
+        conn.execute("ALTER TABLE scheduled_messages DROP COLUMN media_kind")
         conn.execute("DELETE FROM schema_version WHERE version >= 34")
         conn.commit()
 
