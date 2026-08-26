@@ -52,9 +52,9 @@ def test_trace_content_projection_renders_persisted_hidden_link() -> None:
         )
         conn.execute("INSERT INTO message_entities VALUES (42, 7, 0, 4, 'text_url', 'https://example.com')")
         conn.execute(
-            "CREATE TABLE trace_rows (dialog_id INTEGER, message_id INTEGER, text TEXT, media_description TEXT)"
+            "CREATE TABLE trace_rows (dialog_id INTEGER, message_id INTEGER, text TEXT, media_description TEXT, media_kind TEXT)"
         )
-        conn.execute("INSERT INTO trace_rows VALUES (42, 7, 'site', NULL)")
+        conn.execute("INSERT INTO trace_rows VALUES (42, 7, 'site', NULL, NULL)")
         rows_from_db = conn.execute("SELECT * FROM trace_rows").fetchall()
 
         rows = _project_trace_content_rows(conn, rows_from_db)

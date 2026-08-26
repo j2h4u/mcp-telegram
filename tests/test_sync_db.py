@@ -1277,6 +1277,8 @@ def test_migration_v15_copies_own_only_into_messages(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
     try:
+        conn.execute("ALTER TABLE messages DROP COLUMN media_kind")
+        conn.execute("ALTER TABLE scheduled_messages DROP COLUMN media_kind")
         # Recreate activity_comments (it was dropped by v15) to simulate
         # a DB that was at v14 when the user upgraded.
         conn.execute("""
@@ -1316,6 +1318,8 @@ def test_migration_v15_preserves_existing_messages(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
     try:
+        conn.execute("ALTER TABLE messages DROP COLUMN media_kind")
+        conn.execute("ALTER TABLE scheduled_messages DROP COLUMN media_kind")
         # Seed messages with the authoritative row first
         conn.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at, text, out, is_service) "
@@ -1357,6 +1361,8 @@ def test_migration_v15_enrolls_own_only_but_preserves_higher_status(tmp_path: Pa
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
     try:
+        conn.execute("ALTER TABLE messages DROP COLUMN media_kind")
+        conn.execute("ALTER TABLE scheduled_messages DROP COLUMN media_kind")
         # Seed synced_dialogs with an already-synced dialog
         conn.execute(
             "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
