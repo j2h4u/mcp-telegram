@@ -13,7 +13,7 @@ from typing import cast
 
 import pytest
 
-from mcp_telegram.sync_db import _CURRENT_SCHEMA_VERSION, _open_sync_db, ensure_sync_schema
+from mcp_telegram.sync_db import _CURRENT_SCHEMA_VERSION, _apply_migration_36, _open_sync_db, ensure_sync_schema
 
 Row = tuple[object, ...]
 TableInfoRow = tuple[int, str, str, int, object, int]
@@ -73,6 +73,40 @@ def test_migration_v11_creates_freshness_table(db_path: Path) -> None:
         assert col_map["dialog_id"] == ("INTEGER", 1, 1)
         assert col_map["message_id"] == ("INTEGER", 1, 2)
         assert col_map["checked_at"] == ("INTEGER", 1, 0)
+
+
+def test_migration_v36_adds_media_kind_to_v35_tables_without_backfill(db_path: Path) -> None:
+    with _sqlite_connection(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL);
+            INSERT INTO schema_version VALUES (35, 1700000000);
+            CREATE TABLE messages (dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+                sent_at INTEGER NOT NULL, text TEXT, media_description TEXT,
+                PRIMARY KEY (dialog_id, message_id)) WITHOUT ROWID;
+            CREATE TABLE scheduled_messages (dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+                first_seen_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, media_description TEXT,
+                PRIMARY KEY (dialog_id, message_id)) WITHOUT ROWID;
+            INSERT INTO messages VALUES (1, 1, 1700000000, 'ordinary', 'human description');
+            INSERT INTO scheduled_messages VALUES (1, 2, 1700000000, 1700000000, 'scheduled description');
+            """
+        )
+        assert _apply_migration_36(conn, 35) == 36
+        for table in ("messages", "scheduled_messages"):
+            assert "media_kind" in {row[1] for row in _table_info(conn, table)}
+        assert conn.execute("SELECT media_description, media_kind FROM messages").fetchone() == (
+            "human description",
+            None,
+        )
+        assert conn.execute("SELECT media_description, media_kind FROM scheduled_messages").fetchone() == (
+            "scheduled description",
+            None,
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE messages SET media_kind='invalid'")
+        conn.execute("UPDATE messages SET media_kind='contact'")
+        conn.execute("UPDATE scheduled_messages SET media_kind='other'")
+        assert _apply_migration_36(conn, 36) == 36
 
 
 def test_migration_v11_idempotent(db_path: Path) -> None:
@@ -305,7 +339,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 35  # v35 read-position retry pacing
+        assert _CURRENT_SCHEMA_VERSION == 36  # v36 generic media discriminator
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1044,7 +1078,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 35
+        assert _CURRENT_SCHEMA_VERSION == 36
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:

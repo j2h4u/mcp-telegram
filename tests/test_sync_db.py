@@ -148,7 +148,8 @@ def test_messages_schema(tmp_sync_db_path: Path) -> None:
             "text",
             "sender_id",
             "sender_first_name",
-            "media_description",
+                "media_description",
+                "media_kind",
             "reply_to_msg_id",
             "reply_count",
             "forum_topic_id",
@@ -1661,7 +1662,7 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 35, f"_CURRENT_SCHEMA_VERSION must be 35, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 36, f"_CURRENT_SCHEMA_VERSION must be 36, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
 

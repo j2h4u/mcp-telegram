@@ -895,6 +895,7 @@ async def test_public_get_inbox_call_tool_preserves_canonical_content_schema(
                                     "dialog_id": 123,
                                     "text": text,
                                     "media_description": media_description,
+                                    "media_kind": "other" if media_description else None,
                                     "content_kind": content_kind,
                                 }
                             ],
@@ -955,7 +956,8 @@ async def test_public_get_inbox_call_tool_projects_empty_contact_attachment(
                                     "sent_at": 1_700_000_000,
                                     "dialog_id": 123,
                                     "text": None,
-                                    "media_description": "[contact]",
+                                    "media_description": "Ada, +123",
+                                    "media_kind": "contact",
                                     "content_kind": "media_description",
                                 }
                             ],
@@ -979,7 +981,7 @@ async def test_public_get_inbox_call_tool_projects_empty_contact_attachment(
     dialog = cast(dict[str, object], cast(list[object], payload["dialogs"])[0])
     message = cast(dict[str, object], cast(list[object], dialog["messages"])[0])
     assert "content" not in message
-    assert message["media"] == {"type": "contact", "description": "[contact]"}
+    assert message["media"] == {"type": "contact", "description": "Ada, +123"}
 
 
 @pytest.mark.asyncio

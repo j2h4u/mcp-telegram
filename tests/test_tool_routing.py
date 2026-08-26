@@ -664,6 +664,7 @@ async def test_list_folder_messages_consumes_internal_content_kind_at_schema_bou
                     "sent_at": 1705312800,
                     "text": "[hidden](https://example.test)",
                     "media_description": "photo",
+                    "media_kind": "other",
                     "dialog_name": "Synthetic",
                 }
             ],
@@ -1614,6 +1615,7 @@ def _trace_evidence_group() -> dict:
                 "author_signature": None,
                 "text": None,
                 "media_description": "photo attachment",
+                "media_kind": "other",
             },
             {
                 "source": "sync_db",
@@ -1687,6 +1689,7 @@ async def test_trace_account_messages_overwrites_wrappers_without_reprojecting_e
         {
             "text": "[site](https://example.test)",
             "media_description": "photo attachment",
+            "media_kind": "other",
             "content": {"text": "stale", "is_telegram_content": True, "content_kind": "note"},
             "media_content": {"text": "stale media", "is_telegram_content": True, "content_kind": "note"},
             "untrusted_content": True,
@@ -1746,6 +1749,7 @@ async def test_trace_content_schema_matches_canonical_body_presence(
         {
             "text": text,
             "media_description": media_description,
+            "media_kind": "other" if media_description else None,
             "content": {"text": "stale", "is_telegram_content": True, "content_kind": "note"},
             "media_content": {"text": "stale media", "is_telegram_content": True, "content_kind": "note"},
             "untrusted_content": True,
@@ -3575,7 +3579,13 @@ async def test_get_my_recent_activity_serializes_media_only_and_empty_body() -> 
             "ok": True,
             "data": {
                 "comments": [
-                    {"dialog_id": 42, "message_id": 1, "sent_at": 1, "media_description": "[photo]"},
+                    {
+                        "dialog_id": 42,
+                        "message_id": 1,
+                        "sent_at": 1,
+                        "media_description": "[photo]",
+                        "media_kind": "other",
+                    },
                     {"dialog_id": 42, "message_id": 2, "sent_at": 2, "text": None, "media_description": None},
                 ],
                 "scan_status": "complete",
@@ -3611,7 +3621,8 @@ async def test_get_my_recent_activity_projects_contact_attachment_without_duplic
                         "message_id": 3,
                         "sent_at": 3,
                         "text": None,
-                        "media_description": "[contact]",
+                        "media_description": "Ada, +123",
+                        "media_kind": "contact",
                     }
                 ],
                 "scan_status": "complete",
@@ -3625,7 +3636,7 @@ async def test_get_my_recent_activity_projects_contact_attachment_without_duplic
     comments = _json_list(_json_dict(result.structured_content)["comments"])
     comment = _json_dict(comments[0])
     assert comment["content"] is None
-    assert comment["media"] == {"type": "contact", "description": "[contact]"}
+    assert comment["media"] == {"type": "contact", "description": "Ada, +123"}
 
 
 async def test_get_my_recent_activity_passes_filter_args():

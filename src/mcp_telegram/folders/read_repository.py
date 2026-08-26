@@ -97,9 +97,9 @@ def list_folders(conn: FolderReadConnection) -> list[dict[str, object]]:
 
 def list_folder_messages(conn: FolderReadConnection, folder_id: int, limit: int) -> dict[str, object]:
     rows = cast(
-        list[tuple[int, int, int, str | None, str | None, str | None]],
+        list[tuple[int, int, int, str | None, str | None, str | None, str | None]],
         conn.execute(
-            """SELECT m.dialog_id, m.message_id, m.sent_at, m.text, m.media_description, d.name
+            """SELECT m.dialog_id, m.message_id, m.sent_at, m.text, m.media_description, m.media_kind, d.name
            FROM telegram_folder_members fm JOIN messages m ON m.dialog_id = fm.dialog_id
            LEFT JOIN dialogs d ON d.dialog_id = m.dialog_id
            WHERE fm.folder_id = ? AND m.is_deleted = 0
@@ -127,9 +127,10 @@ def list_folder_messages(conn: FolderReadConnection, folder_id: int, limit: int)
                 "sent_at": int(sent_at),
                 "text": text,
                 "media_description": media_description,
+                "media_kind": media_kind,
                 "dialog_name": dialog_name,
             }
-            for dialog_id, message_id, sent_at, text, media_description, dialog_name in rows
+            for dialog_id, message_id, sent_at, text, media_description, media_kind, dialog_name in rows
         ],
         "partial": bool(incomplete),
         "incomplete_dialog_ids": incomplete,

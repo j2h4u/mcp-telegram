@@ -14,6 +14,7 @@ class MessageSnapshot:
 
     text: str | None
     media_description: str | None
+    media_kind: str | None = None
     text_links: tuple[TextLink, ...] = ()
 
 
@@ -24,6 +25,7 @@ class MessageContent:
     text: str | None
     media_description: str | None
     kind: ContentKind
+    media_kind: str | None = None
 
     @property
     def primary_text(self) -> str | None:
@@ -46,7 +48,12 @@ def project_message_content(snapshot: MessageSnapshot) -> MessageContent:
         kind = "media_description"
     else:
         kind = "none"
-    return MessageContent(text=rendered_text, media_description=media_description, kind=kind)
+    return MessageContent(
+        text=rendered_text,
+        media_description=media_description,
+        kind=kind,
+        media_kind=snapshot.media_kind,
+    )
 
 
 def _normalize(value: str | None) -> str | None:

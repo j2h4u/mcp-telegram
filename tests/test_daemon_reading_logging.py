@@ -326,6 +326,7 @@ async def test_search_scoped_result_applies_time_bounds_and_keeps_cursor_context
             text TEXT,
             sent_at INTEGER NOT NULL,
             media_description TEXT,
+            media_kind TEXT,
             reply_to_msg_id INTEGER,
             sender_id INTEGER,
             sender_first_name TEXT,

@@ -608,7 +608,9 @@ def _structured_messages(
     for _row, message in zip(ordered_rows, messages, strict=False):
         marker_label = marker_by_message.get(message.id)
         read_markers = [_structured_read_marker(message.id, marker_label)] if marker_label else []
-        projected = serialize_message_content(message.text, message.media_description, message.content_kind)
+        projected = serialize_message_content(
+            message.text, message.media_description, message.content_kind, message.media_kind
+        )
         sender = _project_message_sender(message)
         structured_message: dict[str, object] = {
             "msg_id": message.id,

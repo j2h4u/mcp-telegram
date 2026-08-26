@@ -1,4 +1,3 @@
-import re
 from typing import Literal, NotRequired, TypedDict, cast
 
 from ..message_content import ContentKind
@@ -124,13 +123,14 @@ def serialize_message_content(
     text: str | None,
     media_description: str | None,
     kind: DeliveryContentKind,
+    media_kind: str | None = None,
 ) -> SerializedMessageContent:
     """Serialize already-projected message facts for delivery surfaces.
 
     Projection (including hidden-link rendering) belongs to ``MessageContent``;
     this helper only applies the shared wire wrapper and primary-content rule.
     """
-    media = project_media_description(media_description)
+    media = project_media_description(media_description, media_kind)
     # Media is represented once by its attachment object.  Keep content for
     # captions/text only so the description cannot be duplicated.
     normalized_text = text or None
@@ -148,21 +148,14 @@ def serialize_message_content(
     }
 
 
-def project_media_description(media_description: str | None) -> Attachment | None:
-    """Project persisted media text into one stable agent-facing attachment."""
-    if not media_description:
+def project_media_description(media_description: str | None, media_kind: str | None = None) -> Attachment | None:
+    """Project persisted media facts into one stable agent-facing attachment."""
+    if media_kind is None:
         return None
-    return {"type": _attachment_type(media_description), "description": media_description}
-
-
-_CONTACT_DESCRIPTION_RE = re.compile(r"^\[(?:contact|контакт): [^\[\]]+\]$")
-
-
-def _attachment_type(description: str) -> AttachmentType:
-    """Return only types backed by a stable generated marker."""
-    if description in {"[contact]", "[контакт]"} or _CONTACT_DESCRIPTION_RE.fullmatch(description):
-        return "contact"
-    return "other"
+    attachment: Attachment = {"type": "contact" if media_kind == "contact" else "other"}
+    if media_description:
+        attachment["description"] = media_description
+    return attachment
 
 
 def structured_warning(

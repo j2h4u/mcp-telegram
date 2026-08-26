@@ -169,7 +169,11 @@ async def list_folder_messages(args: ListFolderMessages) -> ToolResult:
     data = response.get("data", {})
     messages = []
     for row in data.get("messages", []):
-        item = {key: value for key, value in row.items() if key not in {"text", "media_description", "content_kind"}}
+        item = {
+            key: value
+            for key, value in row.items()
+            if key not in {"text", "media_description", "content_kind", "media_kind"}
+        }
         text = row.get("text")
         media_description = row.get("media_description")
         dialog_name = item.get("dialog_name")
@@ -178,6 +182,7 @@ async def list_folder_messages(args: ListFolderMessages) -> ToolResult:
             str(text) if text is not None else None,
             str(media_description) if media_description is not None else None,
             cast(ContentKind, row.get("content_kind", "none")),
+            row.get("media_kind"),
         )
         item.update(projected)
         messages.append(item)

@@ -94,6 +94,7 @@ def _make_db() -> Iterator[sqlite3.Connection]:
                 sender_id           INTEGER,
                 sender_first_name   TEXT,
                 media_description   TEXT,
+                media_kind          TEXT,
                 reply_to_msg_id     INTEGER,
                 forum_topic_id      INTEGER,
                 is_deleted          INTEGER NOT NULL DEFAULT 0,

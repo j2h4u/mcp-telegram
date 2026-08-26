@@ -39,7 +39,8 @@ def _make_db() -> sqlite3.Connection:
             dialog_id INTEGER NOT NULL,
             message_id INTEGER NOT NULL,
             sent_at INTEGER NOT NULL,
-            out INTEGER NOT NULL
+            out INTEGER NOT NULL,
+            media_kind TEXT
         );
         CREATE TABLE message_reactions (
             dialog_id INTEGER NOT NULL,
@@ -108,10 +109,10 @@ async def test_refresh_message_facts_once_refreshes_reactions_and_read_at() -> N
         """
         INSERT INTO synced_dialogs VALUES (10, 'synced'), (20, 'synced'), (30, 'access_lost');
         INSERT INTO entities VALUES (10, 'user'), (20, 'user'), (30, 'user');
-        INSERT INTO messages VALUES
-            (10, 1, 1000, 0),
-            (20, 2, 1001, 1),
-            (30, 3, 1002, 1);
+            INSERT INTO messages VALUES
+                (10, 1, 1000, 0, NULL),
+                (20, 2, 1001, 1, NULL),
+                (30, 3, 1002, 1, NULL);
         INSERT INTO message_reactions VALUES (10, 1, '👍', 1);
         """
     )

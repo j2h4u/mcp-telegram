@@ -23,6 +23,7 @@ SELECT
     sm.sender_id,
     sm.sender_first_name,
     sm.media_description,
+    sm.media_kind,
     sm.reply_to_msg_id,
     sm.forum_topic_id,
     0 AS is_deleted,

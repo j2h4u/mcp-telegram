@@ -38,16 +38,20 @@ def _describe_venue(media: object) -> str:
     return f"[место: {info}]" if info else "[место]"
 
 
-def _describe_contact(media: object) -> str:
+def _describe_contact(media: object) -> str | None:
     first = getattr(media, "first_name", "") or ""
     last = getattr(media, "last_name", "") or ""
     name = " ".join(filter(None, [first, last]))
     phone = getattr(media, "phone_number", "") or ""
     info = ", ".join(filter(None, [name, phone]))
-    # Keep a stable ASCII marker in the persisted generic description so the
-    # agent-facing projector can identify contacts without parsing localized
-    # prose or storing typed contact fields.
-    return f"[contact: {info}]" if info else "[contact]"
+    return info or None
+
+
+def media_kind(media: object) -> str | None:
+    """Return the closed generic discriminator for a Telegram media object."""
+    if isinstance(media, tl.MessageMediaEmpty):
+        return None
+    return "contact" if isinstance(media, tl.MessageMediaContact) else "other"
 
 
 def _describe_dice(media: object) -> str:
@@ -105,10 +109,10 @@ def _describe_document_filename(doc: object, attr: tl.DocumentAttributeFilename)
     return f"[документ: {attr.file_name}{size_str}]"
 
 
-def describe_media(media: object) -> str:
+def describe_media(media: object) -> str | None:
     """Return a human-readable placeholder for a media attachment."""
     if isinstance(media, tl.MessageMediaEmpty):
-        return ""
+        return None
 
     if isinstance(media, tl.MessageMediaDocument):
         return describe_document(media)

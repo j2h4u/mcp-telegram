@@ -40,7 +40,8 @@ def test_list_messages_contact_has_one_explicit_attachment() -> None:
                 "sent_at": 1_700_000_000,
                 "dialog_id": 1,
                 "text": None,
-                "media_description": "[contact]",
+                "media_description": "Ada, +123",
+                "media_kind": "contact",
                 "content_kind": "media_description",
             }
         ],
@@ -48,7 +49,7 @@ def test_list_messages_contact_has_one_explicit_attachment() -> None:
     )[0]
 
     assert "content" not in message
-    assert message["media"] == {"type": "contact", "description": "[contact]"}
+    assert message["media"] == {"type": "contact", "description": "Ada, +123"}
     validate(instance=message["media"], schema=MEDIA_OUTPUT_SCHEMA)
 
 
@@ -61,7 +62,8 @@ def test_search_messages_contact_uses_same_attachment_projection() -> None:
                 "dialog_id": 1,
                 "dialog_name": "Chat",
                 "text": "Call me",
-                "media_description": "[contact: Ada, +123]",
+                "media_description": "Ada, +123",
+                "media_kind": "contact",
             }
         ],
         "Call",
@@ -69,7 +71,7 @@ def test_search_messages_contact_uses_same_attachment_projection() -> None:
 
     content = cast(dict[str, object], result["content"])
     assert content["text"] == "Call me"
-    assert result["media"] == {"type": "contact", "description": "[contact: Ada, +123]"}
+    assert result["media"] == {"type": "contact", "description": "Ada, +123"}
     media = cast(dict[str, object], result["media"])
     validate(
         instance=media,
@@ -84,8 +86,9 @@ def test_search_messages_suppresses_only_exact_snippet_duplicate() -> None:
                 "message_id": 7,
                 "sent_at": 1_700_000_000,
                 "dialog_id": 1,
-                "text": "[contact]",
-                "media_description": "[contact]",
+                "text": "Ada, +123",
+                "media_description": "Ada, +123",
+                "media_kind": "contact",
             }
         ],
         "contact",
@@ -97,16 +100,17 @@ def test_search_messages_suppresses_only_exact_snippet_duplicate() -> None:
                 "sent_at": 1_700_000_001,
                 "dialog_id": 1,
                 "text": "caption",
-                "media_description": "[contact]",
+                "media_description": "Ada, +123",
+                "media_kind": "contact",
             }
         ],
         "caption",
     )[0]
 
     assert "content" not in equal
-    assert equal["media"] == {"type": "contact", "description": "[contact]"}
+    assert equal["media"] == {"type": "contact", "description": "Ada, +123"}
     assert cast(dict[str, object], distinct["content"])["text"] == "caption"
-    assert distinct["media"] == {"type": "contact", "description": "[contact]"}
+    assert distinct["media"] == {"type": "contact", "description": "Ada, +123"}
 
 
 @pytest.mark.parametrize("anchor_message_id", [0, -1, 2_147_483_648])
@@ -541,6 +545,7 @@ def test_list_messages_structured_messages_cover_media_reply_forward_reaction_to
             "sender_first_name": "Bob",
             "sender_id": 22,
             "media_description": "[фото]",
+            "media_kind": "other",
             "reply_to_msg_id": 1,
             "forum_topic_id": 7,
             "topic_title": "General",

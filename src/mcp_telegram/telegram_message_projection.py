@@ -8,7 +8,7 @@ from typing import Protocol
 from .formatter import format_reaction_counts
 from .message_content import MessageSnapshot, project_message_content
 from .messages.telegram_adapter import extract_entity_rows, extract_message_text, extract_reply_and_topic
-from .telethon_media import describe_media
+from .telethon_media import describe_media, media_kind
 from .telethon_message import is_service_message
 
 logger = logging.getLogger(__name__)
@@ -138,6 +138,8 @@ def message_to_dict(
     sender_first_name = _extract_sender_first_name(msg)
     sent_at = _timestamp_to_int(msg.date, msg_id=msg.id)
     media_description = _get_media_description(msg)
+    raw_media = msg.media
+    media_kind_value = media_kind(raw_media) if raw_media is not None else None
     reactions_display = _extract_reactions_display(msg)
     reply_to_msg_id, forum_topic_id = extract_reply_and_topic(msg)
     edit_date = _to_unix_timestamp_or_none(msg.edit_date)
@@ -161,6 +163,7 @@ def message_to_dict(
         MessageSnapshot(
             text=extract_message_text(msg),
             media_description=media_description,
+            media_kind=media_kind_value,
             text_links=tuple(text_links),
         )
     )
@@ -171,6 +174,7 @@ def message_to_dict(
         "sender_id": raw_sender_id,
         "sender_first_name": sender_first_name,
         "media_description": content.media_description,
+        "media_kind": media_kind_value,
         "content_kind": content.kind,
         "reply_to_msg_id": reply_to_msg_id,
         "forum_topic_id": forum_topic_id,
