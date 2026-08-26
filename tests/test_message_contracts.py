@@ -51,6 +51,7 @@ def _stored_message() -> StoredMessage:
                 "sender_id",
                 "sender_first_name",
                 "media_description",
+                "media_kind",
                 "reply_to_msg_id",
                 "forum_topic_id",
                 "edit_date",
