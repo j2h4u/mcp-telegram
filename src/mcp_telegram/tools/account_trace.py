@@ -18,6 +18,7 @@ from ._base import (
     structured_result,
 )
 from .structured import (
+    MEDIA_OUTPUT_SCHEMA,
     StructuredWarning,
     navigation_metadata,
     serialize_message_content,
@@ -80,7 +81,7 @@ TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
                                 "text": {"type": ["string", "null"]},
                                 "media_description": {"type": ["string", "null"]},
                                 "content": {"type": "object", "additionalProperties": True},
-                                "media_content": {"type": "object", "additionalProperties": True},
+                                "media_content": MEDIA_OUTPUT_SCHEMA,
                                 "untrusted_content": {"type": "boolean"},
                             },
                             "required": [
@@ -340,6 +341,7 @@ def _attach_trace_content_metadata(data: dict) -> None:
             # canonical delivery envelope and must not re-project text.
             item.pop("content", None)
             item.pop("media_content", None)
+            item.pop("media_description", None)
             item.update(
                 dict(
                     filter(

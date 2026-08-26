@@ -664,7 +664,6 @@ async def test_list_folder_messages_consumes_internal_content_kind_at_schema_bou
                     "sent_at": 1705312800,
                     "text": "[hidden](https://example.test)",
                     "media_description": "photo",
-                    "content_kind": "message_text",
                     "dialog_name": "Synthetic",
                 }
             ],
@@ -687,7 +686,7 @@ async def test_list_folder_messages_consumes_internal_content_kind_at_schema_bou
     assert "text" not in message
     assert "media_description" not in message
     assert _json_dict(message["content"])["text"] == "[hidden](https://example.test)"
-    assert _json_dict(message["media"])["text"] == "photo"
+    assert _json_dict(message["media"]) == {"type": "other", "description": "photo"}
     assert payload["partial"] is True
     assert payload["incomplete_dialog_ids"] == [456]
 
@@ -1664,11 +1663,7 @@ async def test_trace_account_messages_routes_flat_arguments_and_counts_evidence_
         "content_kind": "message_text",
     }
     assert _json_dict(evidence[0])["untrusted_content"] is True
-    assert _json_dict(evidence[1])["media_content"] == {
-        "text": "photo attachment",
-        "is_telegram_content": True,
-        "content_kind": "media_description",
-    }
+    assert _json_dict(evidence[1])["media_content"] == {"type": "other", "description": "photo attachment"}
     assert payload["preview"] == {
         "shown_count": 2,
         "hidden_count": 0,
@@ -1710,17 +1705,13 @@ async def test_trace_account_messages_overwrites_wrappers_without_reprojecting_e
         if _json_dict(candidate).get("text") == "[site](https://example.test)"
     )
     assert item["text"] == "[site](https://example.test)"
-    assert item["media_description"] == "photo attachment"
+    assert "media_description" not in item
     assert item["content"] == {
         "text": "[site](https://example.test)",
         "is_telegram_content": True,
         "content_kind": "message_text",
     }
-    assert item["media_content"] == {
-        "text": "photo attachment",
-        "is_telegram_content": True,
-        "content_kind": "media_description",
-    }
+    assert item["media_content"] == {"type": "other", "description": "photo attachment"}
     assert item["untrusted_content"] is True
 
 
@@ -1733,17 +1724,12 @@ async def test_trace_account_messages_overwrites_wrappers_without_reprojecting_e
             {"text": "caption", "is_telegram_content": True, "content_kind": "message_text"},
             None,
         ),
-        (
-            None,
-            "photo attachment",
-            {"text": "photo attachment", "is_telegram_content": True, "content_kind": "media_description"},
-            {"text": "photo attachment", "is_telegram_content": True, "content_kind": "media_description"},
-        ),
+        (None, "photo attachment", None, {"type": "other", "description": "photo attachment"}),
         (
             "caption",
             "photo attachment",
             {"text": "caption", "is_telegram_content": True, "content_kind": "message_text"},
-            {"text": "photo attachment", "is_telegram_content": True, "content_kind": "media_description"},
+            {"type": "other", "description": "photo attachment"},
         ),
         (None, None, None, None),
     ],
@@ -3602,12 +3588,9 @@ async def test_get_my_recent_activity_serializes_media_only_and_empty_body() -> 
 
     comments = _json_list(_json_dict(result.structured_content)["comments"])
     media_comment = _json_dict(comments[0])
-    assert media_comment["text"] == "[photo]"
-    assert media_comment["content"] == {
-        "text": "[photo]",
-        "is_telegram_content": True,
-        "content_kind": "media_description",
-    }
+    assert media_comment["text"] == ""
+    assert media_comment["content"] is None
+    assert media_comment["media"] == {"type": "other", "description": "[photo]"}
     empty_comment = _json_dict(comments[1])
     assert empty_comment["text"] == ""
     assert empty_comment["content"] == {
@@ -3615,6 +3598,34 @@ async def test_get_my_recent_activity_serializes_media_only_and_empty_body() -> 
         "is_telegram_content": True,
         "content_kind": "message_text",
     }
+
+
+async def test_get_my_recent_activity_projects_contact_attachment_without_duplication() -> None:
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "comments": [
+                    {
+                        "dialog_id": 42,
+                        "message_id": 3,
+                        "sent_at": 3,
+                        "text": None,
+                        "media_description": "[contact]",
+                    }
+                ],
+                "scan_status": "complete",
+                "scanned_at": 4,
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_my_recent_activity(GetMyRecentActivity(dialog_kinds=["all"]))
+
+    comments = _json_list(_json_dict(result.structured_content)["comments"])
+    comment = _json_dict(comments[0])
+    assert comment["content"] is None
+    assert comment["media"] == {"type": "contact", "description": "[contact]"}
 
 
 async def test_get_my_recent_activity_passes_filter_args():

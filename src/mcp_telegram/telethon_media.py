@@ -44,7 +44,10 @@ def _describe_contact(media: object) -> str:
     name = " ".join(filter(None, [first, last]))
     phone = getattr(media, "phone_number", "") or ""
     info = ", ".join(filter(None, [name, phone]))
-    return f"[контакт: {info}]" if info else "[контакт]"
+    # Keep a stable ASCII marker in the persisted generic description so the
+    # agent-facing projector can identify contacts without parsing localized
+    # prose or storing typed contact fields.
+    return f"[contact: {info}]" if info else "[contact]"
 
 
 def _describe_dice(media: object) -> str:

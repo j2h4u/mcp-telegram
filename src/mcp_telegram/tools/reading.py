@@ -32,6 +32,7 @@ from ._base import (
     structured_result,
 )
 from .structured import (
+    MEDIA_OUTPUT_SCHEMA,
     StructuredWarning,
     serialize_message_content,
     structured_warning,
@@ -333,7 +334,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "is_service": {"type": "boolean"},
                     "topic": TOPIC_IDENTITY_SCHEMA,
                     "content": {"type": "object"},
-                    "media": {"type": "object"},
+                    "media": MEDIA_OUTPUT_SCHEMA,
                     "reply_context_ref": {"type": "object"},
                     "forward": {"type": "object"},
                     "post_author": {"type": "string"},
@@ -864,7 +865,8 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
                     "date": {"type": ["integer", "null"]},
                     "sender": {"type": ["string", "null"]},
                     "topic": TOPIC_IDENTITY_SCHEMA,
-                    "content": {"type": "object"},
+                    "content": {"type": ["object", "null"]},
+                    "media": MEDIA_OUTPUT_SCHEMA,
                     "anchor_call": {"type": "object"},
                     "message_state": {"type": "string", "enum": ["sent", "scheduled"]},
                     "visibility": {
@@ -897,7 +899,6 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
                     "dialog_id",
                     "dialog_name",
                     "msg_id",
-                    "content",
                     "anchor_call",
                     "message_state",
                     "visibility",
@@ -1024,7 +1025,6 @@ def _search_result_structured_rows(rows: list[dict], query: str) -> list[dict[st
             # the request's timezone to every temporal field consistently.
             "date": _search_result_date(row),
             "sender": resolve_sender_label(row),
-            "content": telegram_content(snippet, "snippet"),
             **_search_result_render_fields(row, dialog_id),
             "reaction_events": _search_result_reaction_events(row),
             "reaction_events_status": row.get("reaction_events_status", "unavailable"),
@@ -1036,6 +1036,13 @@ def _search_result_structured_rows(rows: list[dict], query: str) -> list[dict[st
             topic_id=topic_id if isinstance(topic_id, int) and not isinstance(topic_id, bool) else None,
             title=title if isinstance(title, str) else None,
         )
+        projected = serialize_message_content(
+            snippet,
+            row.get("media_description") if isinstance(row.get("media_description"), str) else None,
+            "snippet",
+        )
+        _maybe_add(result, "content", projected["content"])
+        _maybe_add(result, "media", projected["media"])
         _maybe_add(result, "topic", topic)
         results.append(result)
     return results
