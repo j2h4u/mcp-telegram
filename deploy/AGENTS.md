@@ -16,10 +16,9 @@ This directory is the live deployment workspace, not the source checkout.
 
 ## Downstream Consumers
 
-- dotMD is the external Telegram indexer/search engine. It reaches this
-  deployment through dotMD's Telegram adapter/source integration.
-- On this machine dotMD mounts `/srv/mcp-telegram/database/` read-only. If this deployment path
-  changes, update `/opt/docker/dotmd/docker-compose.override.yml` as well.
+- dotMD integration is archived and stopped; this deployment has no active
+  dotMD downstream consumer. The source-export snapshot is reference-only in
+  the repository archive and is not part of the runtime contract.
 
 ## Operations
 
