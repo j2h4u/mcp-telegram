@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
@@ -33,7 +34,14 @@ class _EchoClient(_Client):
 
     async def get_messages(self, *_args: object, **kwargs: object) -> object:
         self.calls.append(kwargs)
-        ids = kwargs.get("ids", [])
+        raw_ids = kwargs.get("ids", [])
+        ids: list[int] = []
+        if not isinstance(raw_ids, list):
+            raise AssertionError("message ids must be a list")
+        for message_id in raw_ids:
+            if not isinstance(message_id, int):
+                raise AssertionError("message ids must be integers")
+            ids.append(message_id)
         return [SimpleNamespace(id=int(message_id), media=None) for message_id in ids]
 
 
@@ -88,7 +96,10 @@ def _worker(
 @pytest.mark.asyncio
 async def test_authoritative_media_update_does_not_touch_text_or_fts(db: sqlite3.Connection) -> None:
     _seed(db)
-    before = db.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=1 AND message_id=1").fetchone()
+    before = cast(
+        tuple[str] | None,
+        db.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=1 AND message_id=1").fetchone(),
+    )
     client = _Client([SimpleNamespace(id=1, media=SimpleNamespace())])
     result = await _worker(db, client).run_cycle(now=1)
     assert result.completed == 1
@@ -275,7 +286,7 @@ async def test_authoritative_write_rechecks_eligibility_after_rpc_starts(db: sql
     _seed(db)
 
     class _RacingClient(_Client):
-        async def get_messages(self, **kwargs: object) -> object:
+        async def get_messages(self, *_args: object, **kwargs: object) -> object:
             self.calls.append(kwargs)
             self_conn = db
             self_conn.execute("UPDATE synced_dialogs SET status = 'access_lost' WHERE dialog_id = 1")
