@@ -13,7 +13,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 38
+_CURRENT_SCHEMA_VERSION = 39
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -1618,6 +1618,23 @@ def _apply_migration_38(conn: sqlite3.Connection, current: int) -> int:
     return _apply_migration(conn, current, 38, [_MESSAGE_TRANSCRIPTIONS_DDL])
 
 
+def _apply_migration_39(conn: sqlite3.Connection, current: int) -> int:
+    """Add durable adaptive HotSweep cadence state."""
+    return _apply_migration(
+        conn,
+        current,
+        39,
+        [
+            "ALTER TABLE activity_dialog_state ADD COLUMN hot_next_due_at INTEGER",
+            "ALTER TABLE activity_dialog_state ADD COLUMN hot_empty_streak INTEGER NOT NULL DEFAULT 0 CHECK (hot_empty_streak >= 0)",
+            (
+                "CREATE INDEX IF NOT EXISTS idx_activity_dialog_state_hot_due "
+                "ON activity_dialog_state(hot_next_due_at, dialog_id, hot_next_retry_at)"
+            ),
+        ],
+    )
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -1653,6 +1670,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_36(conn, current)
     current = _apply_migration_37(conn, current)
     current = _apply_migration_38(conn, current)
+    current = _apply_migration_39(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

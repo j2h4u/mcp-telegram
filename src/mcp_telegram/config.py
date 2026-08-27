@@ -124,6 +124,38 @@ class MediaHydrationConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ActivityHotSweepConfig:
+    """Adaptive cadence and bounded-pass policy for own-message hot sweeps."""
+
+    loop_interval_seconds: float = 3_600.0
+    max_peers_per_pass: int = 16
+    base_due_seconds: float = 3_600.0
+    max_due_seconds: float = 604_800.0
+    jitter_max_seconds: float = 300.0
+    initial_spread_seconds: float = 86_400.0
+
+    def __post_init__(self) -> None:
+        positive = (
+            self.loop_interval_seconds,
+            self.base_due_seconds,
+            self.max_due_seconds,
+            self.initial_spread_seconds,
+        )
+        if any(not math.isfinite(value) or value <= 0 for value in positive):
+            raise ValueError("activity hot sweep durations must be finite and > 0")
+        if (
+            not isinstance(self.max_peers_per_pass, int)
+            or isinstance(self.max_peers_per_pass, bool)
+            or self.max_peers_per_pass < 1
+        ):
+            raise ValueError("activity hot sweep max_peers_per_pass must be an integer > 0")
+        if not math.isfinite(self.jitter_max_seconds) or self.jitter_max_seconds < 0:
+            raise ValueError("activity hot sweep jitter_max_seconds must be finite and >= 0")
+        if self.max_due_seconds < self.base_due_seconds:
+            raise ValueError("activity hot sweep max_due_seconds must be >= base_due_seconds")
+
+
+@dataclass(frozen=True, slots=True)
 class SchedulingConfig:
     """Intervals for local daemon maintenance loops."""
 
@@ -146,7 +178,6 @@ class SchedulingConfig:
     message_fact_refresh_reaction_max_messages_per_cycle: int = 5
     message_fact_refresh_read_at_max_messages_per_cycle: int = 5
     message_fact_refresh_pause_seconds: float = 1.0
-    activity_hot_sweep_seconds: float = 3_600.0
     activity_rpc_timeout_seconds: float = 120.0
     activity_cold_backfill_seconds: float = 300.0
     activity_cold_backfill_batch_pause_seconds: float = 5.0
@@ -155,6 +186,7 @@ class SchedulingConfig:
     scheduled_flood_sleep_threshold_seconds: int = 0
     media_hydration: MediaHydrationConfig = field(default_factory=MediaHydrationConfig)
     folder_projection: FolderProjectionConfig = field(default_factory=FolderProjectionConfig)
+    activity_hot_sweep: ActivityHotSweepConfig = field(default_factory=ActivityHotSweepConfig)
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,11 +391,48 @@ def _env_positive_int(environ: Mapping[str, str], name: str, default: int) -> in
     return value
 
 
+def _env_non_negative_float(environ: Mapping[str, str], name: str, default: float) -> float:
+    raw = environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a finite number >= 0") from exc
+    if not math.isfinite(value) or value < 0:
+        raise ConfigError(f"{name} must be a finite number >= 0")
+    return value
+
+
 def _env_media_hydration_batch_size(environ: Mapping[str, str], default: int) -> int:
     value = _env_positive_int(environ, "MEDIA_HYDRATION_BATCH_SIZE", default)
     if value > _MAX_MEDIA_HYDRATION_BATCH_SIZE:
         raise ConfigError("MEDIA_HYDRATION_BATCH_SIZE must be an integer <= 100")
     return value
+
+
+def _resolve_activity_hot_sweep_config(
+    config: ActivityHotSweepConfig, env: Mapping[str, str]
+) -> ActivityHotSweepConfig:
+    try:
+        return ActivityHotSweepConfig(
+            loop_interval_seconds=_env_positive_float(
+                env, "ACTIVITY_HOT_SWEEP_LOOP_INTERVAL_SECONDS", config.loop_interval_seconds
+            ),
+            max_peers_per_pass=_env_positive_int(
+                env, "ACTIVITY_HOT_SWEEP_MAX_PEERS_PER_PASS", config.max_peers_per_pass
+            ),
+            base_due_seconds=_env_positive_float(env, "ACTIVITY_HOT_SWEEP_BASE_DUE_SECONDS", config.base_due_seconds),
+            max_due_seconds=_env_positive_float(env, "ACTIVITY_HOT_SWEEP_MAX_DUE_SECONDS", config.max_due_seconds),
+            jitter_max_seconds=_env_non_negative_float(
+                env, "ACTIVITY_HOT_SWEEP_JITTER_MAX_SECONDS", config.jitter_max_seconds
+            ),
+            initial_spread_seconds=_env_positive_float(
+                env, "ACTIVITY_HOT_SWEEP_INITIAL_SPREAD_SECONDS", config.initial_spread_seconds
+            ),
+        )
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def resolve_scheduling_config(
@@ -450,9 +519,7 @@ def resolve_scheduling_config(
             "MESSAGE_FACT_REFRESH_PAUSE_SECONDS",
             config.message_fact_refresh_pause_seconds,
         ),
-        activity_hot_sweep_seconds=_env_positive_float(
-            env, "ACTIVITY_HOT_SWEEP_SECONDS", config.activity_hot_sweep_seconds
-        ),
+        activity_hot_sweep=_resolve_activity_hot_sweep_config(config.activity_hot_sweep, env),
         activity_rpc_timeout_seconds=_env_positive_float(
             env, "ACTIVITY_RPC_TIMEOUT_SECONDS", config.activity_rpc_timeout_seconds
         ),
@@ -830,6 +897,58 @@ def _parse_folder_projection(data: dict[str, object], path: Path, defaults: Sche
     )
 
 
+def _parse_activity_hot_sweep(
+    data: dict[str, object], path: Path, defaults: ActivityHotSweepConfig
+) -> ActivityHotSweepConfig:
+    section = _nested_table(data, "activity_hot_sweep", "scheduling.activity_hot_sweep", path) or {}
+    _reject_unknown_keys(
+        section,
+        {
+            "loop_interval_seconds",
+            "max_peers_per_pass",
+            "base_due_seconds",
+            "max_due_seconds",
+            "jitter_max_seconds",
+            "initial_spread_seconds",
+        },
+        "scheduling.activity_hot_sweep",
+        path,
+    )
+    base_due_seconds = _positive_float(
+        section, "base_due_seconds", "scheduling.activity_hot_sweep", path, defaults.base_due_seconds
+    )
+    max_due_seconds = _positive_float(
+        section, "max_due_seconds", "scheduling.activity_hot_sweep", path, defaults.max_due_seconds
+    )
+    if max_due_seconds < base_due_seconds:
+        raise ConfigError(
+            f"Invalid scheduling.activity_hot_sweep.max_due_seconds in {path}: expected >= base_due_seconds"
+        )
+    return ActivityHotSweepConfig(
+        loop_interval_seconds=_positive_float(
+            section, "loop_interval_seconds", "scheduling.activity_hot_sweep", path, defaults.loop_interval_seconds
+        ),
+        max_peers_per_pass=_positive_int(
+            section, "max_peers_per_pass", "scheduling.activity_hot_sweep", path, defaults.max_peers_per_pass
+        ),
+        base_due_seconds=base_due_seconds,
+        max_due_seconds=max_due_seconds,
+        jitter_max_seconds=_non_negative_float(
+            section, "jitter_max_seconds", "scheduling.activity_hot_sweep", path, defaults.jitter_max_seconds
+        ),
+        initial_spread_seconds=_positive_float(
+            section, "initial_spread_seconds", "scheduling.activity_hot_sweep", path, defaults.initial_spread_seconds
+        ),
+    )
+
+
+def _non_negative_float(data: dict[str, object], key: str, section: str, path: Path, default: float) -> float:
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
+        raise ConfigError(f"Invalid {section}.{key} in {path}: expected finite number >= 0")
+    return float(value)
+
+
 def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
     defaults = SchedulingConfig()
     allowed = {
@@ -853,7 +972,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "message_fact_refresh_reaction_max_messages_per_cycle",
         "message_fact_refresh_read_at_max_messages_per_cycle",
         "message_fact_refresh_pause_seconds",
-        "activity_hot_sweep_seconds",
+        "activity_hot_sweep",
         "activity_rpc_timeout_seconds",
         "activity_cold_backfill_seconds",
         "activity_cold_backfill_batch_pause_seconds",
@@ -865,6 +984,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
     scheduling_data = _optional_section(data, "scheduling", allowed, path)
     media_hydration = _parse_media_hydration(scheduling_data, path, defaults)
     folder_projection = _parse_folder_projection(scheduling_data, path, defaults)
+    activity_hot_sweep = _parse_activity_hot_sweep(scheduling_data, path, defaults.activity_hot_sweep)
     return SchedulingConfig(
         scheduled_reconciliation_seconds=_positive_float(
             scheduling_data,
@@ -1006,13 +1126,6 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             path,
             defaults.message_fact_refresh_pause_seconds,
         ),
-        activity_hot_sweep_seconds=_positive_float(
-            scheduling_data,
-            "activity_hot_sweep_seconds",
-            "scheduling",
-            path,
-            defaults.activity_hot_sweep_seconds,
-        ),
         activity_rpc_timeout_seconds=_positive_float(
             scheduling_data,
             "activity_rpc_timeout_seconds",
@@ -1050,6 +1163,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         ),
         media_hydration=media_hydration,
         folder_projection=folder_projection,
+        activity_hot_sweep=activity_hot_sweep,
     )
 
 

@@ -23,7 +23,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol, cast
 
@@ -33,7 +33,7 @@ from .access_lifecycle import set_access_lost
 from .activity_peer_resolve import LinkedChatResolution, resolve_input_peer, resolve_linked_chat_id
 from .activity_substrate import ActivityClient, call_with_timeout
 from .message_contracts import ExtractedMessage
-from .messages.sqlite_repository import insert_messages_with_fts
+from .messages.sqlite_repository import insert_messages_with_fts, message_exists
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
 from .own_only import enroll_own_only_sync_dialog
 from .telegram_access import ACCESS_LOST_ERRORS
@@ -52,6 +52,15 @@ class PeerSweepPacing:
 
 
 _PACING = PeerSweepPacing()
+
+
+@dataclass(frozen=True, slots=True)
+class WorkingSetResult:
+    """Result of refreshing the peer working set."""
+
+    enrolled_count: int
+    flood_wait_seconds: int | None = None
+
 
 # Thin dialogs row written alongside the own_only synced_dialogs insert so the
 # peer becomes visible to list_dialogs / get_my_recent_activity. INSERT OR IGNORE
@@ -101,6 +110,12 @@ class SweepResult:
     max_id: int | None  # max of batch — Tier-A high-water
     skip_reason: SkipReason = SkipReason.NONE
     flood_wait_seconds: int | None = None
+    pages_fetched: int = field(default=0, compare=False)
+    rpc_calls: int = field(default=0, compare=False)
+    extracted: int = field(default=0, compare=False)
+    genuinely_new: int = field(default=0, compare=False)
+    genuinely_new_keys: frozenset[tuple[int, int]] = field(default=frozenset(), compare=False)
+    completed: bool = field(default=False, compare=False)
 
     @property
     def hit_floor(self) -> bool:
@@ -150,6 +165,59 @@ async def _pace_successful_search_request() -> None:
     await asyncio.sleep(_PACING.search.success_s)
 
 
+async def _resolve_peer_for_sweep(request: PeerSweepRequest) -> TypeInputPeer | SweepResult | None:
+    """Resolve one peer while preserving the governed-RPC error boundary."""
+    try:
+        return await resolve_input_peer(request.client, request.dialog_id)
+    except Exception:
+        logger.warning("sweep_peer_once_resolution_error dialog_id=%r", request.dialog_id, exc_info=True)
+        return _access_skip_result(rpc_calls=1)
+
+
+def _extract_sweep_messages(
+    request: PeerSweepRequest, batch: Sequence[_SweepMessageLike]
+) -> tuple[list[ExtractedMessage], frozenset[tuple[int, int]]]:
+    extracted: list[ExtractedMessage] = []
+    seen_keys: set[tuple[int, int]] = set()
+    for message in batch:
+        dialog_id = extract_dialog_id(message)
+        if dialog_id is None:
+            continue
+        extracted_message = extract_message_row(dialog_id, message)
+        stored_message = getattr(extracted_message, "message", None)
+        key = (
+            int(getattr(stored_message, "dialog_id", dialog_id)),
+            int(getattr(stored_message, "message_id", message.id)),
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        extracted.append(extracted_message)
+
+    genuinely_new_keys = {key for key in seen_keys if not message_exists(request.conn, *key)}
+    return extracted, frozenset(genuinely_new_keys)
+
+
+def _extract_and_persist_sweep_messages(
+    request: PeerSweepRequest, batch: Sequence[_SweepMessageLike]
+) -> tuple[list[ExtractedMessage], frozenset[tuple[int, int]]] | SweepResult:
+    """Return page rows or an explicit non-completion processing error."""
+    try:
+        extracted, genuinely_new_keys = _extract_sweep_messages(request, batch)
+    except Exception:
+        logger.warning("sweep_peer_once_extraction_error dialog_id=%r", request.dialog_id, exc_info=True)
+        return _access_skip_result(rpc_calls=2, pages_fetched=1)
+
+    try:
+        if extracted:
+            with request.conn:
+                insert_messages_with_fts(request.conn, extracted)
+    except Exception:
+        logger.warning("sweep_peer_once_persistence_error dialog_id=%r", request.dialog_id, exc_info=True)
+        return _access_skip_result(rpc_calls=2, pages_fetched=1)
+    return extracted, genuinely_new_keys
+
+
 def _elapsed_s(started_at: float) -> float:
     return time.monotonic() - started_at
 
@@ -184,17 +252,19 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
     )
 
 
-def _access_skip_result() -> SweepResult:
+def _access_skip_result(*, rpc_calls: int = 0, pages_fetched: int = 0) -> SweepResult:
     return SweepResult(
         fetched_ids=[],
         persisted=0,
         min_id=None,
         max_id=None,
         skip_reason=SkipReason.ACCESS_SKIP,
+        rpc_calls=rpc_calls,
+        pages_fetched=pages_fetched,
     )
 
 
-def _flood_wait_result(seconds: int) -> SweepResult:
+def _flood_wait_result(seconds: int, *, rpc_calls: int = 0) -> SweepResult:
     return SweepResult(
         fetched_ids=[],
         persisted=0,
@@ -202,10 +272,11 @@ def _flood_wait_result(seconds: int) -> SweepResult:
         max_id=None,
         skip_reason=SkipReason.FLOOD_WAIT,
         flood_wait_seconds=seconds,
+        rpc_calls=rpc_calls,
     )
 
 
-async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer) -> _SearchOutcome:
+async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, *, rpc_calls: int) -> _SearchOutcome:
     from telethon.errors import FloodWaitError
     from telethon.tl.functions.messages import SearchRequest
     from telethon.tl.types import InputMessagesFilterEmpty, InputPeerSelf
@@ -240,7 +311,7 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer) 
         return _SearchOutcome(
             result=None,
             rpc_duration_s=_elapsed_s(search_started_at),
-            early_result=_flood_wait_result(int(exc.seconds)),
+            early_result=_flood_wait_result(int(exc.seconds), rpc_calls=rpc_calls),
         )
     except TimeoutError:
         logger.warning(
@@ -252,7 +323,7 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer) 
         return _SearchOutcome(
             result=None,
             rpc_duration_s=_elapsed_s(search_started_at),
-            early_result=_access_skip_result(),
+            early_result=_access_skip_result(rpc_calls=rpc_calls),
         )
     except ACCESS_LOST_ERRORS as exc:
         set_access_lost(request.conn, request.dialog_id, int(time.time()))
@@ -265,7 +336,20 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer) 
         return _SearchOutcome(
             result=None,
             rpc_duration_s=_elapsed_s(search_started_at),
-            early_result=_access_skip_result(),
+            early_result=_access_skip_result(rpc_calls=rpc_calls),
+        )
+    except Exception:
+        logger.warning(
+            "sweep_peer_once_search_error dialog_id=%r offset_id=%r rpc_duration_s=%.3f",
+            request.dialog_id,
+            request.offset_id,
+            _elapsed_s(search_started_at),
+            exc_info=True,
+        )
+        return _SearchOutcome(
+            result=None,
+            rpc_duration_s=_elapsed_s(search_started_at),
+            early_result=_access_skip_result(rpc_calls=rpc_calls),
         )
 
     return _SearchOutcome(result=cast(_SweepResultLike, result), rpc_duration_s=_elapsed_s(search_started_at))
@@ -294,13 +378,18 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
     request = _coerce_peer_sweep_request(*args, **kwargs)
 
     # Step 1: entity-type-aware peer resolution from session
-    peer = await resolve_input_peer(request.client, request.dialog_id)
+    rpc_calls = 1  # get_input_entity is a governed Telegram call attempt.
+    resolved = await _resolve_peer_for_sweep(request)
+    if isinstance(resolved, SweepResult):
+        return resolved
+    peer = resolved
     if peer is None:
         logger.debug("sweep_peer_once_access_skip dialog_id=%r reason=resolve_none", request.dialog_id)
-        return _access_skip_result()
+        return _access_skip_result(rpc_calls=rpc_calls)
 
     # Step 2: issue per-peer self-search with concrete peer (not InputPeerEmpty)
-    search = await _search_self_messages(request, peer)
+    rpc_calls += 1  # SearchRequest is a governed Telegram call attempt.
+    search = await _search_self_messages(request, peer, rpc_calls=rpc_calls)
     if search.early_result is not None:
         return search.early_result
 
@@ -326,21 +415,19 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
             min_id=None,
             max_id=None,
             skip_reason=SkipReason.HISTORY_FLOOR,
+            pages_fetched=1,
+            rpc_calls=rpc_calls,
+            completed=True,
         )
 
     # Step 3-4: extract and persist via canonical pipeline
-    extracted: list[ExtractedMessage] = []
-    for m in batch:
-        did = extract_dialog_id(m)
-        if did is None:
-            continue
-        extracted.append(extract_message_row(did, m))
+    page_rows = _extract_and_persist_sweep_messages(request, batch)
+    if isinstance(page_rows, SweepResult):
+        return page_rows
+    extracted, genuinely_new_keys = page_rows
+    genuinely_new = len(genuinely_new_keys)
 
-    persisted = 0
-    with request.conn:
-        if extracted:
-            insert_messages_with_fts(request.conn, extracted)
-            persisted = len(extracted)
+    persisted = len(extracted)
 
     msg_ids = [m.id for m in batch]
     logger.debug(
@@ -358,6 +445,12 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
         min_id=min(msg_ids) if msg_ids else None,
         max_id=max(msg_ids) if msg_ids else None,
         skip_reason=SkipReason.NONE,
+        pages_fetched=1,
+        rpc_calls=rpc_calls,
+        extracted=len(extracted),
+        genuinely_new=genuinely_new,
+        genuinely_new_keys=genuinely_new_keys,
+        completed=True,
     )
 
 
@@ -420,6 +513,8 @@ _DIALOG_STATE_COLUMNS = frozenset(
         "hot_cursor",
         "hot_last_sync_at",
         "hot_next_retry_at",
+        "hot_next_due_at",
+        "hot_empty_streak",
         "hot_last_error",
         "cold_offset_id",
         "cold_status",
@@ -429,7 +524,18 @@ _DIALOG_STATE_COLUMNS = frozenset(
 )
 
 
-_DialogStateRow = tuple[int | None, int | None, int | None, str | None, int | None, str | None, int | None, str | None]
+_DialogStateRow = tuple[
+    int | None,
+    int | None,
+    int | None,
+    int | None,
+    int | None,
+    str | None,
+    int | None,
+    str | None,
+    int | None,
+    int | None,
+]
 
 
 def _load_dialog_state(conn: sqlite3.Connection, dialog_id: int) -> dict[str, int | str | None]:
@@ -438,7 +544,8 @@ def _load_dialog_state(conn: sqlite3.Connection, dialog_id: int) -> dict[str, in
         _DialogStateRow | None,
         conn.execute(
             """
-        SELECT hot_cursor, hot_last_sync_at, hot_next_retry_at, hot_last_error,
+            SELECT hot_cursor, hot_last_sync_at, hot_next_retry_at, hot_last_error,
+               hot_next_due_at, hot_empty_streak,
                cold_offset_id, cold_status, cold_next_retry_at, cold_last_error
         FROM activity_dialog_state
         WHERE dialog_id = ?
@@ -453,6 +560,8 @@ def _load_dialog_state(conn: sqlite3.Connection, dialog_id: int) -> dict[str, in
         "hot_last_sync_at",
         "hot_next_retry_at",
         "hot_last_error",
+        "hot_next_due_at",
+        "hot_empty_streak",
         "cold_offset_id",
         "cold_status",
         "cold_next_retry_at",
@@ -492,7 +601,12 @@ def _save_dialog_state(
 # ---------------------------------------------------------------------------
 
 
-async def build_working_set(client: ActivityClient, conn: sqlite3.Connection, *, timeout_s: float) -> int:
+async def build_working_set(
+    client: ActivityClient,
+    conn: sqlite3.Connection,
+    *,
+    timeout_s: float,
+) -> WorkingSetResult:
     """Build the per-peer self-search working set and enroll peers.
 
     Source: dialogs.type='supergroup' (megagroups) and dialogs.type='channel'
@@ -501,7 +615,7 @@ async def build_working_set(client: ActivityClient, conn: sqlite3.Connection, *,
     to GetFullChannelRequest only when linked_chat_resolved_at IS NULL)).
     NOT entities.type='group' — that taxonomy differs (concern 4 fix).
 
-    Returns the count of peers enrolled in the working set.
+    Returns the enrolled count and whether linked-chat resolution flooded.
     """
     # Step 1: standalone supergroups (directly self-searchable)
     supergroup_rows = cast(
@@ -524,6 +638,7 @@ async def build_working_set(client: ActivityClient, conn: sqlite3.Connection, *,
     supergroup_ids = {dialog_id for dialog_id, _ in supergroup_rows}
 
     # Step 3: resolve broadcast channels to their discussion groups
+    flood_wait_seconds: int | None = None
     for channel_id, channel_last_message_at in channel_rows:
         res: LinkedChatResolution = await resolve_linked_chat_id(client, conn, channel_id, timeout_s=timeout_s)
 
@@ -535,6 +650,7 @@ async def build_working_set(client: ActivityClient, conn: sqlite3.Connection, *,
                 channel_id,
                 res.flood_wait_seconds,
             )
+            flood_wait_seconds = res.flood_wait_seconds
             break
 
         if res.linked_chat_id is not None:
@@ -546,6 +662,11 @@ async def build_working_set(client: ActivityClient, conn: sqlite3.Connection, *,
     # Step 4-5: enroll all peers via shared helper
     for peer_id, last_activity_at in working_set.items():
         source = "supergroup" if peer_id in supergroup_ids else "linked_chat"
-        enroll_activity_dialog(conn, peer_id, source, last_activity_at=last_activity_at)
+        enroll_activity_dialog(
+            conn,
+            peer_id,
+            source,
+            last_activity_at=last_activity_at,
+        )
 
-    return len(working_set)
+    return WorkingSetResult(enrolled_count=len(working_set), flood_wait_seconds=flood_wait_seconds)

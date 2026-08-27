@@ -7297,6 +7297,8 @@ def _make_trace_db() -> sqlite3.Connection:
             hot_cursor          INTEGER,
             hot_last_sync_at    INTEGER,
             hot_next_retry_at   INTEGER,
+            hot_next_due_at     INTEGER,
+            hot_empty_streak    INTEGER NOT NULL DEFAULT 0 CHECK (hot_empty_streak >= 0),
             hot_last_error      TEXT,
             cold_offset_id      INTEGER,
             cold_status         TEXT NOT NULL DEFAULT 'pending',
