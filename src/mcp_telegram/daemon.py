@@ -1203,7 +1203,7 @@ async def _start_followup_background_tasks(
             activity_client,
             ctx.conn,
             ctx.shutdown_event,
-            interval=ctx.scheduling.activity_hot_sweep_seconds,
+            policy=ctx.scheduling.activity_hot_sweep,
             timeout_s=ctx.scheduling.activity_rpc_timeout_seconds,
         ),
         name="activity_hot_sweep",

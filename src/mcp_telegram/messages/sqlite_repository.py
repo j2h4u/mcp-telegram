@@ -42,6 +42,7 @@ _INSERT_FORWARD_SQL = _insert_sql("message_forwards", _message_contracts.Forward
 _DELETE_ENTITIES_SQL = "DELETE FROM message_entities WHERE dialog_id = ? AND message_id = ?"
 _DELETE_FORWARD_SQL = "DELETE FROM message_forwards WHERE dialog_id = ? AND message_id = ?"
 _SELECT_MESSAGE_TEXT_SQL = "SELECT text FROM messages WHERE dialog_id = ? AND message_id = ?"
+_SELECT_MESSAGE_EXISTS_SQL = "SELECT 1 FROM messages WHERE dialog_id = ? AND message_id = ?"
 _SELECT_MESSAGE_OUT_SQL = "SELECT out FROM messages WHERE dialog_id = ? AND message_id = ?"
 _NEXT_VERSION_SQL = "SELECT COALESCE(MAX(version), 0) + 1 FROM message_versions WHERE dialog_id = ? AND message_id = ?"
 _INSERT_VERSION_SQL = (
@@ -73,6 +74,11 @@ class MessageOutLookup:
 
     found: bool
     outgoing: bool
+
+
+def message_exists(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
+    """Return whether the canonical message key is already persisted."""
+    return conn.execute(_SELECT_MESSAGE_EXISTS_SQL, (dialog_id, message_id)).fetchone() is not None
 
 
 def read_message_text(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> MessageTextLookup:

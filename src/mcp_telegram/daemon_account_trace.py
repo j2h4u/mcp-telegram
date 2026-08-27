@@ -1243,7 +1243,11 @@ async def _resolve_trace_account_signature_scope(
 
     linked_chat_map: dict[int, int] = {exact_dialog_id: resolution.linked_chat_id}
     scope_dialog_ids = [exact_dialog_id, resolution.linked_chat_id]
-    enroll_activity_dialog(deps.conn, resolution.linked_chat_id, source="linked_chat")
+    enroll_activity_dialog(
+        deps.conn,
+        resolution.linked_chat_id,
+        source="linked_chat",
+    )
     return scope_dialog_ids, linked_chat_map
 
 
@@ -2247,7 +2251,11 @@ def _add_trace_candidate_dialog(
     if strategy == "signature_only" and dialog_id in linked_chat_map:
         linked_id = linked_chat_map[dialog_id]
         if linked_id not in state.seen:
-            enroll_activity_dialog(request.conn, linked_id, source="linked_chat")
+            enroll_activity_dialog(
+                request.conn,
+                linked_id,
+                source="linked_chat",
+            )
             _add_trace_candidate_dialog(
                 state=state,
                 dialog_id=linked_id,

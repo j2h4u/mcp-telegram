@@ -112,6 +112,7 @@ class ColdPassResult:
 
     outcome: ColdPassOutcome
     persisted: int  # count of rows written this pass; 0 unless outcome==WROTE
+    flood_wait_seconds: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,12 +154,13 @@ def _cold_backfill_sleep_seconds(
         return idle_interval
 
     logger.debug(
-        "activity_cold_backfill_loop outcome=%s persisted=%d next_sleep_s=%.3f",
+        "activity_cold_backfill_loop outcome=%s persisted=%d flood_wait_seconds=%r next_sleep_s=%.3f",
         pass_result.outcome,
         pass_result.persisted,
-        pacing.history.batch_s,
+        pass_result.flood_wait_seconds,
+        max(pacing.history.batch_s, float(pass_result.flood_wait_seconds or 0)),
     )
-    return pacing.history.batch_s
+    return max(pacing.history.batch_s, float(pass_result.flood_wait_seconds or 0))
 
 
 async def _maybe_enroll_activity_peers(
@@ -167,17 +169,18 @@ async def _maybe_enroll_activity_peers(
     last_enroll_at: float,
     pacing: ColdBackfillPacing,
     timeout_s: float,
-) -> float:
+) -> tuple[float, int | None]:
     now_mono = asyncio.get_running_loop().time()
     if now_mono - last_enroll_at < pacing.history.enroll_s:
-        return last_enroll_at
+        return last_enroll_at, None
 
     try:
-        enrolled = await build_working_set(client, conn, timeout_s=timeout_s)
-        logger.debug("activity_cold_backfill_enroll enrolled=%d", enrolled)
+        result = await build_working_set(client, conn, timeout_s=timeout_s)
+        logger.debug("activity_cold_backfill_enroll enrolled=%d", result.enrolled_count)
+        return asyncio.get_running_loop().time(), result.flood_wait_seconds
     except Exception:
         logger.warning("activity_cold_backfill_enroll_error", exc_info=True)
-    return asyncio.get_running_loop().time()
+    return asyncio.get_running_loop().time(), None
 
 
 def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfillPacing) -> ColdPassResult:
@@ -201,7 +204,11 @@ def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfill
             next_retry_at,
             time.monotonic() - ctx.started_at,
         )
-        return ColdPassResult(outcome=ColdPassOutcome.FLOOD_WAIT, persisted=0)
+        return ColdPassResult(
+            outcome=ColdPassOutcome.FLOOD_WAIT,
+            persisted=0,
+            flood_wait_seconds=flood_wait_seconds,
+        )
 
     if result.skip_reason is SkipReason.ACCESS_SKIP:
         next_retry_at = int(ctx.now + pacing.history.access_retry_s)
@@ -377,11 +384,22 @@ async def run_cold_backfill_loop(  # noqa: PLR0913 - explicit worker state and i
     while not shutdown_event.is_set():
         # Throttled enrollment — call build_working_set no more than once per
         # pacing.history.enroll_s so peer set stays current without over-calling.
-        last_enroll_at = await _maybe_enroll_activity_peers(client, conn, last_enroll_at, pacing, timeout_s)
-
-        pass_result = await _run_cold_backfill_pass_safe(
-            client, conn, shutdown_event, pacing=pacing, timeout_s=timeout_s
+        last_enroll_at, enrollment_flood_wait_seconds = await _maybe_enroll_activity_peers(
+            client, conn, last_enroll_at, pacing, timeout_s
         )
+
+        if shutdown_event.is_set():
+            return
+        if enrollment_flood_wait_seconds is not None:
+            pass_result = ColdPassResult(
+                outcome=ColdPassOutcome.FLOOD_WAIT,
+                persisted=0,
+                flood_wait_seconds=enrollment_flood_wait_seconds,
+            )
+        else:
+            pass_result = await _run_cold_backfill_pass_safe(
+                client, conn, shutdown_event, pacing=pacing, timeout_s=timeout_s
+            )
 
         sleep_s = _cold_backfill_sleep_seconds(pass_result, resolved_idle_interval, pacing)
 

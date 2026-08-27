@@ -50,6 +50,24 @@ CREATE TABLE scheduled_messages (
 ) WITHOUT ROWID
 """
 
+_V23_ACTIVITY_DIALOG_STATE_DDL = """
+CREATE TABLE activity_dialog_state (
+    dialog_id INTEGER PRIMARY KEY,
+    source TEXT NOT NULL,
+    last_activity_at INTEGER,
+    hot_cursor INTEGER,
+    hot_last_sync_at INTEGER,
+    hot_next_retry_at INTEGER,
+    hot_last_error TEXT,
+    cold_offset_id INTEGER,
+    cold_status TEXT NOT NULL DEFAULT 'pending',
+    cold_next_retry_at INTEGER,
+    cold_last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+) WITHOUT ROWID
+"""
+
 
 @pytest.fixture()
 def db_path(tmp_path: Path) -> Path:
@@ -178,6 +196,10 @@ def test_migration_v37_rebuilds_media_tables_without_legacy_description(db_path:
         )
         conn.execute("DROP TABLE scheduled_messages_current")
         conn.execute("CREATE INDEX idx_scheduled_messages_active ON scheduled_messages(dialog_id, scheduled_at)")
+        # Replay the migration tail from a genuine pre-v39 activity table so
+        # the additive v39 columns are exercised exactly once.
+        conn.execute("DROP TABLE activity_dialog_state")
+        conn.execute(_V23_ACTIVITY_DIALOG_STATE_DDL)
         conn.execute("DELETE FROM schema_version WHERE version >= 37")
 
         # FTS is a separate contentless table and must survive the physical
@@ -494,7 +516,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 38  # v38 durable transcription facts
+        assert _CURRENT_SCHEMA_VERSION == 39  # v39 adaptive HotSweep cadence
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1039,15 +1061,16 @@ def test_migration_v24_backfill_three_shapes(tmp_path: Path) -> None:
                 draft_text              TEXT
             )"""
         )
-        # Simulate v23 table existing (to verify DROP works on existing deployment)
+        # Simulate v23 tables existing (to verify DROP works on existing deployment)
         pre_conn.execute(
             """CREATE TABLE activity_channel_resolution (
-                channel_id  INTEGER PRIMARY KEY,
-                next_retry_at INTEGER,
-                last_error  TEXT,
-                updated_at  INTEGER NOT NULL
+            channel_id  INTEGER PRIMARY KEY,
+            next_retry_at INTEGER,
+            last_error  TEXT,
+            updated_at  INTEGER NOT NULL
             ) WITHOUT ROWID"""
         )
+        pre_conn.execute(_V23_ACTIVITY_DIALOG_STATE_DDL)
         pre_conn.execute(_V36_MESSAGES_DDL)
         pre_conn.execute(_V36_SCHEDULED_MESSAGES_DDL)
         # synced_dialogs exists since v1; stub it so the v25 own_only backfill
@@ -1212,6 +1235,7 @@ def _make_v24_db(tmp_path: Path) -> Path:
                 PRIMARY KEY (dialog_id, message_id)
             )"""
         )
+        conn.execute(_V23_ACTIVITY_DIALOG_STATE_DDL)
         conn.execute("INSERT INTO schema_version VALUES (24, 1700000000)")
         conn.commit()
     return db_path
@@ -1223,7 +1247,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 38
+        assert _CURRENT_SCHEMA_VERSION == 39
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:
@@ -1243,6 +1267,8 @@ def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: P
         conn.execute("DROP TABLE scheduled_messages")
         conn.execute(_V36_MESSAGES_DDL)
         conn.execute(_V36_SCHEDULED_MESSAGES_DDL)
+        conn.execute("DROP TABLE activity_dialog_state")
+        conn.execute(_V23_ACTIVITY_DIALOG_STATE_DDL)
         conn.execute("DELETE FROM schema_version WHERE version >= 34")
         conn.commit()
 

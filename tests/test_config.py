@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from mcp_telegram.config import (
+    ActivityHotSweepConfig,
     ConfigError,
     EntitiesConfig,
     FloodWaitConfig,
@@ -126,8 +127,15 @@ message_fact_refresh_seconds = 52
 message_fact_refresh_reaction_max_messages_per_cycle = 6
 message_fact_refresh_read_at_max_messages_per_cycle = 7
 message_fact_refresh_pause_seconds = 4
-activity_hot_sweep_seconds = 51
 activity_rpc_timeout_seconds = 53
+
+[scheduling.activity_hot_sweep]
+loop_interval_seconds = 51
+max_peers_per_pass = 17
+base_due_seconds = 1800
+max_due_seconds = 604800
+jitter_max_seconds = 12
+initial_spread_seconds = 86400
 
 [scheduling.media_hydration]
 interval_seconds = 48
@@ -182,7 +190,14 @@ daemon_api_slow_request_seconds = 2.5
         message_fact_refresh_reaction_max_messages_per_cycle=6,
         message_fact_refresh_read_at_max_messages_per_cycle=7,
         message_fact_refresh_pause_seconds=4.0,
-        activity_hot_sweep_seconds=51.0,
+        activity_hot_sweep=ActivityHotSweepConfig(
+            loop_interval_seconds=51.0,
+            max_peers_per_pass=17,
+            base_due_seconds=1800.0,
+            max_due_seconds=604800.0,
+            jitter_max_seconds=12.0,
+            initial_spread_seconds=86400.0,
+        ),
         activity_rpc_timeout_seconds=53.0,
         media_hydration=MediaHydrationConfig(
             interval_seconds=48.0,
@@ -221,7 +236,12 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
             "MESSAGE_FACT_REFRESH_REACTION_MAX_MESSAGES_PER_CYCLE": "6",
             "MESSAGE_FACT_REFRESH_READ_AT_MAX_MESSAGES_PER_CYCLE": "7",
             "MESSAGE_FACT_REFRESH_PAUSE_SECONDS": "7",
-            "ACTIVITY_HOT_SWEEP_SECONDS": "49",
+            "ACTIVITY_HOT_SWEEP_LOOP_INTERVAL_SECONDS": "49",
+            "ACTIVITY_HOT_SWEEP_MAX_PEERS_PER_PASS": "18",
+            "ACTIVITY_HOT_SWEEP_BASE_DUE_SECONDS": "1800",
+            "ACTIVITY_HOT_SWEEP_MAX_DUE_SECONDS": "604800",
+            "ACTIVITY_HOT_SWEEP_JITTER_MAX_SECONDS": "0",
+            "ACTIVITY_HOT_SWEEP_INITIAL_SPREAD_SECONDS": "86400",
             "ACTIVITY_RPC_TIMEOUT_SECONDS": "54",
             "ACTIVITY_COLD_BACKFILL_SECONDS": "50",
             "ACTIVITY_COLD_BACKFILL_BATCH_PAUSE": "51",
@@ -270,7 +290,14 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         message_fact_refresh_reaction_max_messages_per_cycle=6,
         message_fact_refresh_read_at_max_messages_per_cycle=7,
         message_fact_refresh_pause_seconds=7.0,
-        activity_hot_sweep_seconds=49.0,
+        activity_hot_sweep=ActivityHotSweepConfig(
+            loop_interval_seconds=49.0,
+            max_peers_per_pass=18,
+            base_due_seconds=1800.0,
+            max_due_seconds=604800.0,
+            jitter_max_seconds=0.0,
+            initial_spread_seconds=86400.0,
+        ),
         activity_rpc_timeout_seconds=54.0,
         activity_cold_backfill_seconds=50.0,
         activity_cold_backfill_batch_pause_seconds=51.0,
@@ -304,6 +331,31 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
 def test_runtime_environment_rejects_subsecond_read_position_failure_cooldown() -> None:
     with pytest.raises(ConfigError, match="READ_POSITION_RECONCILIATION_FAILURE_COOLDOWN_SECONDS"):
         resolve_scheduling_config(SchedulingConfig(), {"READ_POSITION_RECONCILIATION_FAILURE_COOLDOWN_SECONDS": "0.5"})
+
+
+def test_activity_hot_sweep_defaults_keep_due_bounds() -> None:
+    config = ActivityHotSweepConfig()
+    assert config.max_due_seconds >= config.base_due_seconds
+
+
+def test_load_config_rejects_activity_hot_sweep_inverted_due_bounds(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        '[state]\ndir = "/state"\n\n[scheduling.activity_hot_sweep]\nbase_due_seconds = 10\nmax_due_seconds = 9\n',
+    )
+    with pytest.raises(ConfigError, match="max_due_seconds"):
+        load_config(path)
+
+
+def test_resolve_scheduling_rejects_activity_hot_sweep_inverted_due_bounds() -> None:
+    with pytest.raises(ConfigError, match="max_due_seconds"):
+        resolve_scheduling_config(
+            SchedulingConfig(),
+            {
+                "ACTIVITY_HOT_SWEEP_BASE_DUE_SECONDS": "10",
+                "ACTIVITY_HOT_SWEEP_MAX_DUE_SECONDS": "9",
+            },
+        )
 
 
 @pytest.mark.parametrize(
