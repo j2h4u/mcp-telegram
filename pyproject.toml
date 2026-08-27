@@ -212,8 +212,8 @@ ignore_missing_imports = true
 # Declaration-only schema modules are excluded: vulture only emits false
 # "unused variable" findings for dataclass fields and cannot see annotation-only
 # type usage.
-# vulture_whitelist.py lists intentionally-retained symbols (text-rendering layer,
-# framework/dotMD false positives) so the advisory scan flags only NEW dead code.
+# vulture_whitelist.py lists intentionally-retained symbols (text-rendering layer
+# and framework false positives) so the advisory scan flags only NEW dead code.
 paths = ["src/mcp_telegram", "scripts", "vulture_whitelist.py"]
 exclude = [
   "src/mcp_telegram/message_contracts.py",

@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, fields, replace
 from typing import cast
 
 from .. import message_contracts as _message_contracts
 from ..fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
+from ..hydration_queue import HydrationJob, HydrationQueueRepository
 from ..reactions.contracts import ReactionAggregate
 from ..reactions.persistence import replace_reaction_aggregates
 
-_UNSUPPORTED_MEDIA_DESCRIPTION = "[неподдерживаемый тип]"
+_EMPTY_MEDIA_PAYLOAD = "{}"
+_MEDIA_HYDRATION_KIND = "media_metadata"
+_MEDIA_HYDRATION_EMPTY_KINDS = frozenset(("contact", "other"))
+_MEDIA_HYDRATION_ELIGIBILITY_SQL = (
+    "SELECT 1 FROM synced_dialogs sd "
+    "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
+    "WHERE sd.dialog_id = ? AND sd.status IN ('syncing', 'synced')"
+)
 
 
 def _insert_sql(table: str, dataclass_type: type) -> str:
@@ -163,6 +172,76 @@ def insert_messages_with_fts(
     _insert_entity_and_forward_projections(conn, preserved)
 
 
+def media_hydration_eligible(conn: sqlite3.Connection, dialog_id: int) -> bool:
+    """Return whether the dialog currently permits full-history hydration."""
+    return conn.execute(_MEDIA_HYDRATION_ELIGIBILITY_SQL, (dialog_id,)).fetchone() is not None
+
+
+def apply_hydrated_media_fact(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    media_kind: str | None,
+    media_payload: str | None,
+) -> bool:
+    """Apply one media fact only while full-history access remains current.
+
+    The eligibility predicates live in the same UPDATE as the projection
+    write, so an access/enrollment transition committed before this statement
+    cannot be followed by a stale media write.
+    """
+    cursor = conn.execute(
+        "UPDATE messages SET media_kind = ?, media_payload = ? "
+        "WHERE dialog_id = ? AND message_id = ? "
+        "AND media_kind IN ('contact', 'other') AND media_payload = '{}' "
+        "AND EXISTS (" + _MEDIA_HYDRATION_ELIGIBILITY_SQL + ")",
+        (media_kind, media_payload, dialog_id, message_id, dialog_id),
+    )
+    return cursor.rowcount > 0
+
+
+def reconcile_media_hydration_job(
+    conn: sqlite3.Connection,
+    message: _message_contracts.StoredMessage,
+    *,
+    due_at: int,
+) -> None:
+    """Reconcile one persisted message and its queue row in caller's tx."""
+    queue = HydrationQueueRepository(conn)
+    if not queue.is_available():
+        return
+    job = HydrationJob(_MEDIA_HYDRATION_KIND, message.dialog_id, message.message_id, due_at, 0)
+    unresolved = message.media_kind in _MEDIA_HYDRATION_EMPTY_KINDS and message.media_payload == "{}"
+    if unresolved and media_hydration_eligible(conn, message.dialog_id):
+        queue.enqueue(job)
+    else:
+        queue.remove(job)
+
+
+def reconcile_media_hydration_jobs_for_dialog(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    due_at: int,
+) -> None:
+    """Enqueue all unresolved media for an eligible dialog after revalidation."""
+    queue = HydrationQueueRepository(conn)
+    if not queue.is_available():
+        return
+    if not media_hydration_eligible(conn, dialog_id):
+        return
+    rows = cast(
+        Sequence[tuple[int]],
+        conn.execute(
+            "SELECT message_id FROM messages "
+            "WHERE dialog_id = ? AND media_kind IN ('contact', 'other') AND media_payload = '{}'",
+            (dialog_id,),
+        ).fetchall(),
+    )
+    for (message_id,) in rows:
+        queue.enqueue(HydrationJob(_MEDIA_HYDRATION_KIND, dialog_id, int(message_id), due_at, 0))
+
+
 def _write_message_rows_and_fts(
     conn: sqlite3.Connection,
     extracted: Sequence[_message_contracts.ExtractedMessage],
@@ -178,6 +257,8 @@ def _write_message_rows_and_fts(
         INSERT_FTS_SQL,
         ((item.dialog_id, item.message_id, stem_text(item.text)) for item in messages),
     )
+    for message in messages:
+        reconcile_media_hydration_job(conn, message, due_at=int(time.time()))
 
 
 def _delete_entity_and_forward_projections(
@@ -223,7 +304,11 @@ def _preserve_transcribed_texts(
 ) -> list[_message_contracts.ExtractedMessage]:
     preserved_texts: dict[tuple[int, int], str] = {}
     for item in extracted:
-        if item.message.text or item.message.media_description != _UNSUPPORTED_MEDIA_DESCRIPTION:
+        # A blank re-import must not erase a previously persisted transcript.
+        # v37 extraction may carry a canonical non-empty payload for an
+        # ``other`` media fact (for example MessageMediaUnsupported), while
+        # legacy rows use ``other/{}``; both represent media without text.
+        if item.message.text or item.message.media_kind not in _MEDIA_HYDRATION_EMPTY_KINDS:
             continue
         row = cast(
             tuple[str | None] | None,

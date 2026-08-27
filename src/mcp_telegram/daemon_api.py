@@ -93,6 +93,7 @@ from .history_enrollment import disable_history, enable_history, read_intent
 from .important_events.read_model import list_important_events as read_important_events
 from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
+from .reading.query_records import read_message_from_row
 from .sync_read_model import build_sync_read_model, compute_sync_coverage
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
@@ -149,11 +150,6 @@ def _topic_icons_need_refresh(rows: list[tuple[object, object, object, object, o
     return any(row[2] is not None and row[4] is None for row in rows)
 
 
-from .daemon_source_export import (
-    _describe_source,
-    _export_source_changes,
-    _read_source_unit_window,
-)
 from .feedback_service import FeedbackService
 from .reactions.refresh import ReactionFreshener
 from .telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
@@ -567,9 +563,6 @@ class DaemonAPIServer:
     def _dispatch_handlers(self) -> dict[str, _DispatchHandler]:
         return {
             "list_messages": self._list_messages,
-            "describe_source": _describe_source,
-            "export_source_changes": lambda req: _export_source_changes(self._conn, req),
-            "read_source_unit_window": lambda req: _read_source_unit_window(self._conn, req),
             "search_messages": self._search_messages,
             "trace_account_messages": self._trace_account_messages,
             "list_dialogs": self._list_dialogs,
@@ -606,8 +599,6 @@ class DaemonAPIServer:
         if isinstance(result, dict):
             return result
         return cast(dict[str, object], await result)
-
-    # (dotMD source-export helpers are defined in daemon_source_export.py)
 
     # ------------------------------------------------------------------
     # Dialog name resolution
@@ -951,22 +942,15 @@ class DaemonAPIServer:
         limit = max(1, min(int(cast(int | str, req.get("limit", 20))), 100))
         data = list_folder_messages(self._conn, folder_id, limit)
         raw_messages = cast(list[dict[str, object]], data["messages"])
-        messages = [
-            ReadMessage(
-                message_id=int(cast(int | str, row["message_id"])),
-                sent_at=int(cast(int | str, row["sent_at"])),
-                dialog_id=int(cast(int | str, row["dialog_id"])),
-                text=cast(str | None, row.get("text")),
-                media_description=cast(str | None, row.get("media_description")),
-                media_kind=cast(str | None, row.get("media_kind")),
-                dialog_name=cast(str | None, row.get("dialog_name")),
-            )
-            for row in raw_messages
-        ]
+        messages = [read_message_from_row(row) for row in raw_messages]
         projected = project_cached_message_facts_by_dialog(self._conn, messages)
         data["messages"] = [
             {
-                **{key: value for key, value in row.items() if key not in {"text", "media_description", "media_kind"}},
+                **{
+                    key: value
+                    for key, value in row.items()
+                    if key not in {"text", "media_description", "media_kind", "media_payload"}
+                },
                 "text": message.text,
                 "media_description": message.media_description,
                 "media_kind": message.media_kind,

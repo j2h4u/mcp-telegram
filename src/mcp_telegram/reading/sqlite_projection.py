@@ -292,7 +292,7 @@ _SENDER_ENTITY_JOINS_SQL = (
 _SELECT_MESSAGES_SQL = (
     f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
     f"{_SENDER_FIRST_NAME_SQL}, "
-    f"m.media_description, m.media_kind, NULL AS content_kind, m.reply_to_msg_id, m.forum_topic_id, "
+    f"m.media_kind, m.media_payload, NULL AS content_kind, m.reply_to_msg_id, m.forum_topic_id, "
     f"m.is_deleted, m.deleted_at, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
     f"FROM messages m "
@@ -304,7 +304,7 @@ _SELECT_MESSAGES_SQL = (
 _SELECT_FTS_SQL = (
     f"SELECT f.message_id, m.text, "
     f"{_SENDER_FIRST_NAME_SQL}, "
-    f"m.sent_at, m.media_description, m.media_kind, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
+    f"m.sent_at, m.media_kind, m.media_payload, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
     f"COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
     f"FROM messages_fts f "
@@ -323,7 +323,7 @@ _SELECT_FTS_SQL = (
 _SELECT_FTS_ALL_SQL = (
     f"SELECT f.message_id, m.text, "
     f"{_SENDER_FIRST_NAME_SQL}, "
-    f"m.sent_at, m.media_description, m.media_kind, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
+    f"m.sent_at, m.media_kind, m.media_payload, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
     f"COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
     f"f.dialog_id, COALESCE(de.name, CAST(f.dialog_id AS TEXT)) AS dialog_name, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out "
@@ -341,7 +341,7 @@ _SELECT_FTS_ALL_SQL = (
 
 _FETCH_UNREAD_MESSAGES_SQL = (
     f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
-    f"{_SENDER_FIRST_NAME_SQL}, {_SENDER_USERNAME_SQL}, m.media_description, m.media_kind, NULL AS content_kind, "
+    f"{_SENDER_FIRST_NAME_SQL}, {_SENDER_USERNAME_SQL}, m.media_kind, m.media_payload, NULL AS content_kind, "
     f"m.forum_topic_id, COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
     f"FROM messages m "
@@ -361,7 +361,7 @@ _FETCH_UNREAD_MESSAGES_SQL = (
 _LIST_MESSAGES_BASE_SQL = (
     f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
     f"{_SENDER_FIRST_NAME_SQL}, "
-    f"m.media_description, m.media_kind, NULL AS content_kind, m.reply_to_msg_id, m.forum_topic_id, "
+    f"m.media_kind, m.media_payload, NULL AS content_kind, m.reply_to_msg_id, m.forum_topic_id, "
     f"m.is_deleted, m.deleted_at, "
     f"COALESCE("
     f"  (SELECT MAX(mv.edit_date) FROM message_versions mv "
@@ -394,6 +394,8 @@ def _assert_select_columns_match_read_message() -> None:
             "read_at",
             "reaction_events",
             "reaction_events_status",
+            "media_description",
+            "media_payload",
             # Username is an inbox-only enrichment; other read surfaces keep
             # their existing SQL contract during this vertical slice.
             "sender_username",
@@ -403,7 +405,7 @@ def _assert_select_columns_match_read_message() -> None:
     bare = frozenset(re.findall(r"\b(?:m|mf)\.(\w+)\b", _LIST_MESSAGES_BASE_SQL))
     found = aliases | bare
     missing = expected - found
-    extra = found - expected
+    extra = (found - expected) - {"media_payload"}
     assert not missing and not extra, f"SELECT/ReadMessage field mismatch - missing: {missing}, extra: {extra}"
 
 

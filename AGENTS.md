@@ -21,13 +21,14 @@ State location is explicit in `config.toml`. In Docker it is `/srv/mcp-telegram/
 mounted at the same path inside the container. The daemon is the only writer;
 MCP serving code uses daemon APIs and read-only DB access for lightweight queries.
 
-### Downstream consumers
+### Archived integrations
 
-- **dotMD** is the external indexer/search engine for Telegram content. Treat it
-  as a downstream consumer that reaches mcp-telegram through dotMD's Telegram
-  adapter/source integration, not as part of this server's core runtime.
-- Keep the integration boundary explicit: mcp-telegram owns Telegram auth,
-  sync, and local state; dotMD owns indexing, search, and materialization.
+- **dotMD is archived/stopped.** Its source-export daemon API is retained only
+  as archived code and its port is deliberately not registered in the active
+  daemon dispatch table. It is not a current downstream consumer.
+- Keep the active integration boundary explicit: mcp-telegram owns Telegram
+  auth, sync, and local state. Generic Unix-socket and HTTP MCP serving remain
+  active; do not remove them for the archived dotMD integration.
 
 ## Brownfield Map
 
@@ -191,7 +192,7 @@ The agent owns the full development cycle end to end: writing code, running test
 ## Lessons Learned
 
 - Forum-topic support is test-covered, but live Telegram semantics require manual validation.
-- dotMD may depend on the deployed mcp-telegram state directory for its Telegram
-  adapter. When changing deployment storage, update the dotMD mount/config too.
+- The archived dotMD source-export API is not a live integration; do not
+  re-register its daemon methods without an explicit replacement design.
 - Avoid logging Telegram message content or other sensitive data.
 - Treat session files and `.env` credentials as secrets.

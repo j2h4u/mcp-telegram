@@ -14,6 +14,7 @@ from mcp_telegram.config import (
     FolderProjectionConfig,
     FreshnessConfig,
     HttpServerConfig,
+    MediaHydrationConfig,
     ReactionsConfig,
     ReadReceiptsConfig,
     SchedulingConfig,
@@ -43,6 +44,7 @@ def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
     assert config.telegram_rpc == TelegramRpcConfig()
     assert config.scheduling == SchedulingConfig()
     assert config.scheduling.activity_rpc_timeout_seconds == 120.0
+    assert config.scheduling.media_hydration == MediaHydrationConfig()
     assert config.http == HttpServerConfig()
     with pytest.raises(FrozenInstanceError):
         config.freshness.reactions.freshness_ttl_seconds = 1  # type: ignore[misc]
@@ -111,6 +113,16 @@ message_fact_refresh_pause_seconds = 4
 activity_hot_sweep_seconds = 51
 activity_rpc_timeout_seconds = 53
 
+[scheduling.media_hydration]
+interval_seconds = 48
+max_requests_per_cycle = 4
+max_jobs_per_cycle = 301
+batch_size = 99
+pause_between_requests_seconds = 5.5
+retry_delay_seconds = 21601
+circuit_retry_seconds = 1801
+max_attempts = 4
+
 [http]
 host = "localhost"
 port = 3200
@@ -156,6 +168,16 @@ daemon_api_slow_request_seconds = 2.5
         message_fact_refresh_pause_seconds=4.0,
         activity_hot_sweep_seconds=51.0,
         activity_rpc_timeout_seconds=53.0,
+        media_hydration=MediaHydrationConfig(
+            interval_seconds=48.0,
+            max_requests_per_cycle=4,
+            max_jobs_per_cycle=301,
+            batch_size=99,
+            pause_between_requests_seconds=5.5,
+            retry_delay_seconds=21601,
+            circuit_retry_seconds=1801,
+            max_attempts=4,
+        ),
         scheduled_flood_sleep_threshold_seconds=0,
         folder_projection=FolderProjectionConfig(stale_after_seconds=46),
     )
@@ -193,6 +215,14 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
             "ACCESS_PROBE_MAX_DIALOGS_PER_CYCLE": "4",
             "ACCESS_PROBE_COOLDOWN_SECONDS": "604802",
             "ACCESS_PROBE_PAUSE_SECONDS": "6",
+            "MEDIA_HYDRATION_INTERVAL_SECONDS": "47",
+            "MEDIA_HYDRATION_MAX_REQUESTS_PER_CYCLE": "4",
+            "MEDIA_HYDRATION_MAX_JOBS_PER_CYCLE": "301",
+            "MEDIA_HYDRATION_BATCH_SIZE": "99",
+            "MEDIA_HYDRATION_PAUSE_BETWEEN_REQUESTS_SECONDS": "5.5",
+            "MEDIA_HYDRATION_RETRY_DELAY_SECONDS": "21601",
+            "MEDIA_HYDRATION_CIRCUIT_RETRY_SECONDS": "1801",
+            "MEDIA_HYDRATION_MAX_ATTEMPTS": "4",
         },
     )
     http = resolve_http_server_config(
@@ -230,6 +260,16 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         activity_cold_backfill_batch_pause_seconds=51.0,
         activity_cold_enroll_seconds=52.0,
         activity_cold_access_retry_seconds=53.0,
+        media_hydration=MediaHydrationConfig(
+            interval_seconds=47.0,
+            max_requests_per_cycle=4,
+            max_jobs_per_cycle=301,
+            batch_size=99,
+            pause_between_requests_seconds=5.5,
+            retry_delay_seconds=21601,
+            circuit_retry_seconds=1801,
+            max_attempts=4,
+        ),
         scheduled_flood_sleep_threshold_seconds=0,
     )
 

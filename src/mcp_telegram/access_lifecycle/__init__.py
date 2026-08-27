@@ -10,8 +10,14 @@ from itertools import count
 from typing import cast
 
 from ..history_enrollment import reset_read_position_retry, restore_access_status
+from ..hydration_queue import HydrationQueueRepository
+from ..messages.sqlite_repository import reconcile_media_hydration_jobs_for_dialog
 
 _SAVEPOINTS = count()
+
+
+def _purge_hydration_jobs(conn: sqlite3.Connection, dialog_id: int) -> None:
+    HydrationQueueRepository(conn).remove_for_dialog(dialog_id)
 
 
 @contextmanager
@@ -57,6 +63,7 @@ def set_access_lost(conn: sqlite3.Connection, dialog_id: int, now: int, *, reaso
                 (now, dialog_id),
             )
         reset_read_position_retry(conn, dialog_id)
+        _purge_hydration_jobs(conn, dialog_id)
         conn.execute("UPDATE dialogs SET hidden = 1, snapshot_at = ? WHERE dialog_id = ?", (now, dialog_id))
         if previous_status != "access_lost":
             payload: dict[str, object] = {}
@@ -88,6 +95,7 @@ def restore_access_after_revalidation(
             conn.execute(
                 "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ?", (total_messages, dialog_id)
             )
+        reconcile_media_hydration_jobs_for_dialog(conn, dialog_id, due_at=now)
         _record_event(conn, kind="access_restored", dialog_id=dialog_id, occurred_at=now, payload={})
 
 

@@ -25,7 +25,8 @@ def _message(
     *,
     text: str | None,
     sent_at: int = 100,
-    media_description: str | None = None,
+    media_kind: str | None = None,
+    media_payload: str | None = None,
 ) -> ExtractedMessage:
     return ExtractedMessage(
         message=StoredMessage(
@@ -35,7 +36,6 @@ def _message(
             text=text,
             sender_id=7,
             sender_first_name="Test",
-            media_description=media_description,
             reply_to_msg_id=None,
             forum_topic_id=None,
             edit_date=None,
@@ -44,6 +44,8 @@ def _message(
             out=0,
             is_service=0,
             post_author=None,
+            media_kind=media_kind,
+            media_payload=media_payload,
         ),
         reply_count=0,
     )
@@ -95,6 +97,56 @@ def test_persist_edited_message_unchanged_is_noop(conn: sqlite3.Connection) -> N
     with conn:
         assert persist_edited_message(conn, _message(11, text="same"), old_text="same", edit_date=200) is None
     assert conn.execute("SELECT COUNT(*) FROM message_versions").fetchone() == (0,)
+
+
+def _make_hydration_eligible(conn: sqlite3.Connection, status: str = "synced") -> None:
+    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (42, ?)", (status,))
+    conn.execute(
+        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (42, 1, 'explicit', 1)"
+    )
+
+
+@pytest.mark.parametrize("media_kind", ["contact", "other"])
+def test_message_persistence_enqueues_one_unresolved_job_and_preserves_attempts(
+    conn: sqlite3.Connection, media_kind: str
+) -> None:
+    _make_hydration_eligible(conn)
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts) "
+        "VALUES ('media_metadata', 42, 90, 100, 2)"
+    )
+    with conn:
+        insert_messages_with_fts(conn, [_message(90, text=None, media_kind=media_kind, media_payload="{}")])
+        insert_messages_with_fts(conn, [_message(90, text=None, media_kind=media_kind, media_payload="{}")])
+    assert conn.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=42 AND message_id=90").fetchone() == (1,)
+    assert conn.execute("SELECT kind, dialog_id, message_id, attempts FROM hydration_jobs").fetchall() == [
+        ("media_metadata", 42, 90, 2)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("media_kind", "media_payload"),
+    [(None, None), ("photo", "{}"), ("contact", '{"phone_number":"1"}')],
+)
+def test_message_persistence_removes_job_for_resolved_or_missing_media(
+    conn: sqlite3.Connection, media_kind: str | None, media_payload: str | None
+) -> None:
+    _make_hydration_eligible(conn)
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts) "
+        "VALUES ('media_metadata', 42, 91, 100, 2)"
+    )
+    with conn:
+        insert_messages_with_fts(conn, [_message(91, text=None, media_kind=media_kind, media_payload=media_payload)])
+    assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("status", ["not_synced", "own_only", "fragment", "access_lost"])
+def test_message_persistence_does_not_enqueue_inactive_dialogs(conn: sqlite3.Connection, status: str) -> None:
+    _make_hydration_eligible(conn, status=status)
+    with conn:
+        insert_messages_with_fts(conn, [_message(92, text=None, media_kind="other", media_payload="{}")])
+    assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
 
 
 def test_persist_transcribed_text_versions_and_refreshes_fts(conn: sqlite3.Connection) -> None:

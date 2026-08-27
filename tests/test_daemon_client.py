@@ -148,10 +148,10 @@ async def test_request_supports_multiple_calls_in_one_connection(tmp_path: Path)
         with patch("mcp_telegram.daemon_client.get_daemon_socket_path", return_value=sock_path):
             async with daemon_connection() as conn:
                 first = cast(dict[str, object], await conn.request({"method": "get_me"}))
-                second = cast(dict[str, object], await conn.request({"method": "describe_source"}))
+                second = cast(dict[str, object], await conn.request({"method": "second_method"}))
 
         assert first["method"] == "get_me"
-        assert second["method"] == "describe_source"
+        assert second["method"] == "second_method"
     finally:
         server.close()
         await server.wait_closed()
@@ -701,105 +701,6 @@ async def test_get_inbox_convenience_defaults() -> None:
     assert req["method"] == "get_inbox"
     assert req["limit"] == 100
     assert req["group_size_threshold"] == 100
-
-
-@pytest.mark.asyncio
-async def test_describe_source_convenience() -> None:
-    """describe_source sends expected method payload."""
-    reader = MagicMock(spec=asyncio.StreamReader)
-    writer = MagicMock(spec=asyncio.StreamWriter)
-    conn = DaemonConnection(reader, writer)
-
-    captured: list[dict] = []
-
-    async def _mock_request(payload: dict) -> dict:
-        captured.append(payload)
-        return {"ok": True, "data": {"source_id": "telegram"}}
-
-    conn.request = _mock_request  # type: ignore[method-assign]
-
-    await conn.describe_source()
-
-    req = captured[0]
-    assert req["method"] == "describe_source"
-
-
-@pytest.mark.asyncio
-async def test_export_source_changes_convenience_with_optionals() -> None:
-    """export_source_changes includes optional fields when provided."""
-    reader = MagicMock(spec=asyncio.StreamReader)
-    writer = MagicMock(spec=asyncio.StreamWriter)
-    conn = DaemonConnection(reader, writer)
-
-    captured: list[dict] = []
-
-    async def _mock_request(payload: dict) -> dict:
-        captured.append(payload)
-        return {"ok": True, "data": {"changes": []}}
-
-    conn.request = _mock_request  # type: ignore[method-assign]
-
-    await conn.export_source_changes(
-        cursor="abc",
-        limit=50,
-        updated_after="2026-01-01T00:00:00Z",
-        updated_after_cursor="last",
-    )
-
-    req = captured[0]
-    assert req["method"] == "export_source_changes"
-    assert req["cursor"] == "abc"
-    assert req["limit"] == 50
-    assert req["updated_after"] == "2026-01-01T00:00:00Z"
-    assert req["updated_after_cursor"] == "last"
-
-
-@pytest.mark.asyncio
-async def test_export_source_changes_omits_optional_fields() -> None:
-    """export_source_changes omits optional fields by default."""
-    reader = MagicMock(spec=asyncio.StreamReader)
-    writer = MagicMock(spec=asyncio.StreamWriter)
-    conn = DaemonConnection(reader, writer)
-
-    captured: list[dict] = []
-
-    async def _mock_request(payload: dict) -> dict:
-        captured.append(payload)
-        return {"ok": True, "data": {"changes": []}}
-
-    conn.request = _mock_request  # type: ignore[method-assign]
-
-    await conn.export_source_changes()
-
-    req = captured[0]
-    assert req["method"] == "export_source_changes"
-    assert req["limit"] == 100
-    assert "updated_after" not in req
-    assert "updated_after_cursor" not in req
-
-
-@pytest.mark.asyncio
-async def test_read_source_unit_window_convenience() -> None:
-    """read_source_unit_window forwards unit_ref and framing parameters."""
-    reader = MagicMock(spec=asyncio.StreamReader)
-    writer = MagicMock(spec=asyncio.StreamWriter)
-    conn = DaemonConnection(reader, writer)
-
-    captured: list[dict] = []
-
-    async def _mock_request(payload: dict) -> dict:
-        captured.append(payload)
-        return {"ok": True, "data": {"unit_ref": "u1"}}
-
-    conn.request = _mock_request  # type: ignore[method-assign]
-
-    await conn.read_source_unit_window(unit_ref="u1", before=2, after=3)
-
-    req = captured[0]
-    assert req["method"] == "read_source_unit_window"
-    assert req["unit_ref"] == "u1"
-    assert req["before"] == 2
-    assert req["after"] == 3
 
 
 @pytest.mark.asyncio

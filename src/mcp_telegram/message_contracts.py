@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .media_fact import decode_media_fact, encode_media_payload
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class StoredMessage:
@@ -19,7 +21,6 @@ class StoredMessage:
     text: str | None
     sender_id: int | None
     sender_first_name: str | None
-    media_description: str | None
     reply_to_msg_id: int | None
     forum_topic_id: int | None
     edit_date: int | None
@@ -29,6 +30,15 @@ class StoredMessage:
     is_service: int
     post_author: str | None
     media_kind: str | None = None
+    media_payload: str | None = None
+
+    def __post_init__(self) -> None:
+        """Reject non-canonical media pairs before they reach SQLite."""
+        if self.media_kind is None and self.media_payload is None:
+            return
+        fact = decode_media_fact(self.media_kind, self.media_payload)
+        if fact is None or encode_media_payload(fact) != self.media_payload:
+            raise ValueError("media_kind/media_payload must be a canonical media fact pair")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

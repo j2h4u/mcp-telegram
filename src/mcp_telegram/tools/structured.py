@@ -1,5 +1,6 @@
 from typing import Literal, NotRequired, TypedDict, cast
 
+from ..media_fact import MEDIA_KINDS
 from ..message_content import ContentKind
 
 TelegramContentKind = Literal[
@@ -54,7 +55,25 @@ class TelegramContent(TypedDict):
     content_kind: TelegramContentKind
 
 
-AttachmentType = Literal["contact", "other"]
+AttachmentType = Literal[
+    "photo",
+    "video",
+    "audio",
+    "voice",
+    "document",
+    "animation",
+    "sticker",
+    "poll",
+    "location",
+    "venue",
+    "contact",
+    "link_preview",
+    "game",
+    "invoice",
+    "dice",
+    "story",
+    "other",
+]
 DeliveryContentKind = ContentKind | Literal["snippet"]
 
 
@@ -73,7 +92,28 @@ class SerializedMessageContent(TypedDict):
 MEDIA_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
-        "type": {"type": "string", "enum": ["contact", "other"]},
+        "type": {
+            "type": "string",
+            "enum": [
+                "photo",
+                "video",
+                "audio",
+                "voice",
+                "document",
+                "animation",
+                "sticker",
+                "poll",
+                "location",
+                "venue",
+                "contact",
+                "link_preview",
+                "game",
+                "invoice",
+                "dice",
+                "story",
+                "other",
+            ],
+        },
         "description": {"type": "string"},
     },
     "required": ["type"],
@@ -150,9 +190,9 @@ def serialize_message_content(
 
 def project_media_description(media_description: str | None, media_kind: str | None = None) -> Attachment | None:
     """Project persisted media facts into one stable agent-facing attachment."""
-    if media_kind is None:
+    if media_kind is None or media_kind not in MEDIA_KINDS:
         return None
-    attachment: Attachment = {"type": "contact" if media_kind == "contact" else "other"}
+    attachment: Attachment = {"type": cast(AttachmentType, media_kind)}
     if media_description:
         attachment["description"] = media_description
     return attachment
