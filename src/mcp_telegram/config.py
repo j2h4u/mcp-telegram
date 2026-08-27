@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from collections.abc import Mapping
@@ -136,6 +137,7 @@ class SchedulingConfig:
     delta_catch_up_interval_seconds: float = 300.0
     delta_catch_up_max_probes_per_cycle: int = 10
     delta_catch_up_probe_pause_seconds: float = 1.0
+    reconnect_catch_up_interval_seconds: float = 5.0
     access_probe_interval_seconds: float = 86_400.0
     access_probe_max_dialogs_per_cycle: int = 3
     access_probe_cooldown_seconds: int = 604_800
@@ -255,7 +257,7 @@ def _positive_int(data: dict[str, object], key: str, section: str, path: Path, d
 
 def _positive_float(data: dict[str, object], key: str, section: str, path: Path, default: float) -> float:
     value = data.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value <= 0:
         raise ConfigError(f"Invalid {section}.{key} in {path}: expected number > 0")
     return float(value)
 
@@ -319,7 +321,7 @@ def _env_positive_float(environ: Mapping[str, str], name: str, default: float) -
         value = float(raw)
     except ValueError as exc:
         raise ConfigError(f"{name} must be a number > 0") from exc
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         raise ConfigError(f"{name} must be a number > 0")
     return value
 
@@ -414,6 +416,9 @@ def resolve_scheduling_config(
         ),
         delta_catch_up_probe_pause_seconds=_env_positive_float(
             env, "DELTA_CATCH_UP_PROBE_PAUSE_SECONDS", config.delta_catch_up_probe_pause_seconds
+        ),
+        reconnect_catch_up_interval_seconds=_env_positive_float(
+            env, "RECONNECT_CATCH_UP_INTERVAL_SECONDS", config.reconnect_catch_up_interval_seconds
         ),
         access_probe_interval_seconds=_env_positive_float(
             env, "ACCESS_PROBE_INTERVAL_SECONDS", config.access_probe_interval_seconds
@@ -839,6 +844,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "delta_catch_up_interval_seconds",
         "delta_catch_up_max_probes_per_cycle",
         "delta_catch_up_probe_pause_seconds",
+        "reconnect_catch_up_interval_seconds",
         "access_probe_interval_seconds",
         "access_probe_max_dialogs_per_cycle",
         "access_probe_cooldown_seconds",
@@ -936,6 +942,13 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             "scheduling",
             path,
             defaults.delta_catch_up_probe_pause_seconds,
+        ),
+        reconnect_catch_up_interval_seconds=_positive_float(
+            scheduling_data,
+            "reconnect_catch_up_interval_seconds",
+            "scheduling",
+            path,
+            defaults.reconnect_catch_up_interval_seconds,
         ),
         access_probe_interval_seconds=_positive_float(
             scheduling_data,

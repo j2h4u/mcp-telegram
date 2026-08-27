@@ -178,7 +178,7 @@ def test_migration_v37_rebuilds_media_tables_without_legacy_description(db_path:
         )
         conn.execute("DROP TABLE scheduled_messages_current")
         conn.execute("CREATE INDEX idx_scheduled_messages_active ON scheduled_messages(dialog_id, scheduled_at)")
-        conn.execute("DELETE FROM schema_version WHERE version = 37")
+        conn.execute("DELETE FROM schema_version WHERE version >= 37")
 
         # FTS is a separate contentless table and must survive the physical
         # message-table rebuild with its rows intact.
@@ -192,6 +192,20 @@ def test_migration_v37_rebuilds_media_tables_without_legacy_description(db_path:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
+        assert _fetchone_row(
+            conn,
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='message_transcriptions'",
+        ) == ("message_transcriptions",)
+        assert (
+            _fetchone_row(
+                conn,
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='pending_transcriptions'",
+            )
+            is None
+        )
+        transcription_cols = {row[1] for row in _table_info(conn, "message_transcriptions")}
+        assert {"dialog_id", "message_id", "text", "transcription_id", "received_at"} <= transcription_cols
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM message_transcriptions") == 0
         for table in ("messages", "scheduled_messages"):
             cols = {row[1] for row in _table_info(conn, table)}
             assert "media_description" not in cols
@@ -480,7 +494,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 37  # v37 normalized media facts
+        assert _CURRENT_SCHEMA_VERSION == 38  # v38 durable transcription facts
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1209,7 +1223,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 37
+        assert _CURRENT_SCHEMA_VERSION == 38
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:

@@ -48,6 +48,9 @@ _INSERT_VERSION_SQL = (
     "INSERT INTO message_versions (dialog_id, message_id, version, old_text, edit_date) VALUES (?, ?, ?, ?, ?)"
 )
 _UPDATE_MESSAGE_TEXT_SQL = "UPDATE messages SET text = ? WHERE dialog_id = ? AND message_id = ?"
+_SELECT_MESSAGE_TRANSCRIPTION_SQL = (
+    "SELECT text, transcription_id FROM message_transcriptions WHERE dialog_id = ? AND message_id = ?"
+)
 _MARK_DELETED_SQL = (
     "UPDATE messages SET is_deleted = 1, deleted_at = ? WHERE dialog_id = ? AND message_id = ? AND is_deleted = 0"
 )
@@ -140,6 +143,28 @@ def persist_transcribed_text(  # noqa: PLR0913
     return next_version
 
 
+def upsert_message_transcription(  # noqa: PLR0913
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    *,
+    transcribed_text: str,
+    transcription_id: int,
+    received_at: int,
+) -> None:
+    """Upsert the latest final Telegram transcription fact."""
+    text = transcribed_text.strip()
+    if not text:
+        return
+    conn.execute(
+        "INSERT INTO message_transcriptions(dialog_id, message_id, text, transcription_id, received_at) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(dialog_id, message_id) DO UPDATE SET text=excluded.text, "
+        "transcription_id=excluded.transcription_id, received_at=excluded.received_at",
+        (dialog_id, message_id, text, transcription_id, received_at),
+    )
+
+
 def mark_message_deleted(conn: sqlite3.Connection, dialog_id: int, message_id: int, deleted_at: int) -> bool:
     """Tombstone one message and report whether this call changed its state."""
     cursor = conn.execute(_MARK_DELETED_SQL, (deleted_at, dialog_id, message_id))
@@ -161,15 +186,17 @@ def insert_messages_with_fts(
 ) -> None:
     """Persist message bundles in the caller-owned transaction.
 
-    Replaces FTS and child projections so edits are idempotent. It deliberately
-    does not open or commit a transaction; callers compose it with their own
-    state changes.
+    Replaces FTS and child projections so edits are idempotent, while durable
+    transcription facts override source captions before the row is written.
+    It deliberately does not open or commit a transaction; callers compose it
+    with their own state changes.
     """
     preserved = _preserve_transcribed_texts(conn, extracted)
-    _write_message_rows_and_fts(conn, preserved)
-    _delete_entity_and_forward_projections(conn, preserved)
-    _replace_reaction_projections(conn, preserved)
-    _insert_entity_and_forward_projections(conn, preserved)
+    projected = _overlay_message_transcriptions(conn, preserved)
+    _write_message_rows_and_fts(conn, projected)
+    _delete_entity_and_forward_projections(conn, projected)
+    _replace_reaction_projections(conn, projected)
+    _insert_entity_and_forward_projections(conn, projected)
 
 
 def media_hydration_eligible(conn: sqlite3.Connection, dialog_id: int) -> bool:
@@ -261,6 +288,26 @@ def _write_message_rows_and_fts(
         reconcile_media_hydration_job(conn, message, due_at=int(time.time()))
 
 
+def _overlay_message_transcriptions(
+    conn: sqlite3.Connection,
+    extracted: Sequence[_message_contracts.ExtractedMessage],
+) -> list[_message_contracts.ExtractedMessage]:
+    """Overlay durable transcription facts before canonical row/FTS writes."""
+    projected: list[_message_contracts.ExtractedMessage] = []
+    for item in extracted:
+        dialog_id = item.message.dialog_id
+        message_id = item.message.message_id
+        row = cast(
+            tuple[str, int] | None,
+            conn.execute(_SELECT_MESSAGE_TRANSCRIPTION_SQL, (dialog_id, message_id)).fetchone(),
+        )
+        if row is None:
+            projected.append(item)
+            continue
+        projected.append(replace(item, message=replace(item.message, text=row[0])))
+    return projected
+
+
 def _delete_entity_and_forward_projections(
     conn: sqlite3.Connection,
     extracted: Sequence[_message_contracts.ExtractedMessage],
@@ -304,11 +351,12 @@ def _preserve_transcribed_texts(
 ) -> list[_message_contracts.ExtractedMessage]:
     preserved_texts: dict[tuple[int, int], str] = {}
     for item in extracted:
-        # A blank re-import must not erase a previously persisted transcript.
-        # v37 extraction may carry a canonical non-empty payload for an
-        # ``other`` media fact (for example MessageMediaUnsupported), while
-        # legacy rows use ``other/{}``; both represent media without text.
-        if item.message.text or item.message.media_kind not in _MEDIA_HYDRATION_EMPTY_KINDS:
+        # Retain pre-v38 hydration behavior for unresolved media and voice.
+        # Other media captions may be removed on reimport. Durable
+        # transcription facts are overlaid separately before persistence.
+        if item.message.text is not None and item.message.text.strip():
+            continue
+        if item.message.media_kind not in _MEDIA_HYDRATION_EMPTY_KINDS and item.message.media_kind != "voice":
             continue
         row = cast(
             tuple[str | None] | None,

@@ -25,6 +25,8 @@ Event handlers:
 Delta catch-up:
 - connect() called with catch_up=True — Telethon replays missed updates via PTS
   on reconnect after handlers are already registered.
+- reconnect_catch_up_loop polls public connection state and invokes public
+  catch_up() once per observed disconnected→connected transition.
 - DeltaSyncWorker.run_delta_catch_up() fills forward gaps for all 'synced'
   dialogs before bootstrap_dms() enrolls new ones.
 
@@ -102,6 +104,7 @@ from .reactions.refresh import ReactionFreshener
 from .reactions.sqlite_repository import SQLiteReactionSnapshotRepository
 from .reactions.telegram_adapter import TelethonTelegramReactionGateway
 from .read_state import apply_read_cursor
+from .reconnect import run_reconnect_catch_up_loop
 from .scheduled_messages import ScheduledReconciliationPolicy, run_scheduled_reconciliation_loop
 from .state import StatePaths, ensure_private_state_dir
 from .sync_db import (
@@ -133,6 +136,8 @@ class _DaemonClient(Protocol):
     def remove_event_handler(self, _callback: object) -> None: ...
 
     def is_connected(self) -> bool: ...
+
+    async def catch_up(self) -> None: ...
 
     async def connect(self) -> None: ...
 
@@ -1308,6 +1313,19 @@ async def sync_main() -> None:
 
         if not await _connect_telegram(ctx):
             return
+
+        # Telethon owns initial catch-up through catch_up=True. Keep the
+        # application-owned transition watcher live for the rest of startup
+        # and the daemon lifetime so transient reconnects are observed too.
+        _create_tracked_task(
+            ctx,
+            run_reconnect_catch_up_loop(
+                ctx.client,
+                ctx.shutdown_event,
+                interval_seconds=ctx.scheduling.reconnect_catch_up_interval_seconds,
+            ),
+            name="reconnect_catch_up_loop",
+        )
 
         await _prime_runtime(ctx)
 
