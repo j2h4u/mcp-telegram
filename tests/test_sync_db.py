@@ -148,8 +148,8 @@ def test_messages_schema(tmp_sync_db_path: Path) -> None:
             "text",
             "sender_id",
             "sender_first_name",
-            "media_description",
             "media_kind",
+            "media_payload",
             "reply_to_msg_id",
             "reply_count",
             "forum_topic_id",
@@ -1277,8 +1277,6 @@ def test_migration_v15_copies_own_only_into_messages(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute("ALTER TABLE messages DROP COLUMN media_kind")
-        conn.execute("ALTER TABLE scheduled_messages DROP COLUMN media_kind")
         # Recreate activity_comments (it was dropped by v15) to simulate
         # a DB that was at v14 when the user upgraded.
         conn.execute("""
@@ -1292,14 +1290,17 @@ def test_migration_v15_copies_own_only_into_messages(tmp_path: Path) -> None:
             "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text) "
             "VALUES (100, 1, 1000, 'hello'), (100, 2, 2000, 'world')"
         )
-        # Delete v15 AND any higher versions so _schema_ready returns False
-        # and the migration framework re-runs from v14.
-        conn.execute("DELETE FROM schema_version WHERE version >= 15")
         conn.commit()
     finally:
         conn.close()
-    # Re-run migrations → v15 re-applies the data migration.
-    ensure_sync_schema(db_path)
+    # Invoke v15 directly against the current physical schema; this isolates
+    # the data migration without pretending a v37 table is an older layout.
+    from mcp_telegram.sync_db import _apply_migrations_11_to_15
+
+    conn = sqlite3.connect(db_path)
+    _apply_migrations_11_to_15(conn, 14)
+    conn.commit()
+    conn.close()
     conn = sqlite3.connect(db_path)
     try:
         rows = _fetchall_rows(
@@ -1318,8 +1319,6 @@ def test_migration_v15_preserves_existing_messages(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute("ALTER TABLE messages DROP COLUMN media_kind")
-        conn.execute("ALTER TABLE scheduled_messages DROP COLUMN media_kind")
         # Seed messages with the authoritative row first
         conn.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at, text, out, is_service) "
@@ -1336,13 +1335,15 @@ def test_migration_v15_preserves_existing_messages(tmp_path: Path) -> None:
         conn.execute(
             "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text) VALUES (200, 5, 9999, 'stale-copy')"
         )
-        # Delete v15 AND any higher versions so _schema_ready returns False
-        # and the migration framework re-runs from v14.
-        conn.execute("DELETE FROM schema_version WHERE version >= 15")
         conn.commit()
     finally:
         conn.close()
-    ensure_sync_schema(db_path)
+    from mcp_telegram.sync_db import _apply_migrations_11_to_15
+
+    conn = sqlite3.connect(db_path)
+    _apply_migrations_11_to_15(conn, 14)
+    conn.commit()
+    conn.close()
     conn = sqlite3.connect(db_path)
     try:
         row = _fetchone_row(conn, "SELECT text, sent_at FROM messages WHERE dialog_id=200 AND message_id=5")
@@ -1361,8 +1362,6 @@ def test_migration_v15_enrolls_own_only_but_preserves_higher_status(tmp_path: Pa
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute("ALTER TABLE messages DROP COLUMN media_kind")
-        conn.execute("ALTER TABLE scheduled_messages DROP COLUMN media_kind")
         # Seed synced_dialogs with an already-synced dialog
         conn.execute(
             "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
@@ -1380,13 +1379,15 @@ def test_migration_v15_enrolls_own_only_but_preserves_higher_status(tmp_path: Pa
             "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text) "
             "VALUES (300, 1, 1000, 'a'), (400, 2, 2000, 'b')"
         )
-        # Delete v15 AND any higher versions so _schema_ready returns False
-        # and the migration framework re-runs from v14.
-        conn.execute("DELETE FROM schema_version WHERE version >= 15")
         conn.commit()
     finally:
         conn.close()
-    ensure_sync_schema(db_path)
+    from mcp_telegram.sync_db import _apply_migrations_11_to_15
+
+    conn = sqlite3.connect(db_path)
+    _apply_migrations_11_to_15(conn, 14)
+    conn.commit()
+    conn.close()
     conn = sqlite3.connect(db_path)
     try:
         status_300 = _fetchone_text(conn, "SELECT status FROM synced_dialogs WHERE dialog_id=300")
@@ -1668,7 +1669,7 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 36, f"_CURRENT_SCHEMA_VERSION must be 36, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 37, f"_CURRENT_SCHEMA_VERSION must be 37, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
 

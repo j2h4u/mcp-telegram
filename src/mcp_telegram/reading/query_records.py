@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import cast
 
+from ..media_fact import decode_media_fact, media_description
 from ..models import ContentKind, ReadMessage
 
 
@@ -32,6 +33,7 @@ def _coerce_optional_int(value: object | None) -> int | None:
 
 def read_message_from_row(row: Mapping[str, object] | object, *, reactions_display: str = "") -> ReadMessage:
     """Decode any reading SELECT row into the one canonical message record."""
+    fact = decode_media_fact(_row_value(row, "media_kind"), _row_value(row, "media_payload"))
     return ReadMessage(
         message_id=_coerce_int(_row_value(row, "message_id"), 0),
         sent_at=_coerce_int(_row_value(row, "sent_at"), 0),
@@ -40,8 +42,8 @@ def read_message_from_row(row: Mapping[str, object] | object, *, reactions_displ
         sender_id=_coerce_optional_int(_row_value(row, "sender_id")),
         sender_first_name=cast(str | None, _row_value(row, "sender_first_name")),
         sender_username=cast(str | None, _row_value(row, "sender_username")),
-        media_description=cast(str | None, _row_value(row, "media_description")),
-        media_kind=cast(str | None, _row_value(row, "media_kind")),
+        media_description=media_description(fact),
+        media_kind=None if fact is None else fact.kind,
         content_kind=cast(ContentKind, _row_value(row, "content_kind") or "none"),
         reply_to_msg_id=_coerce_optional_int(_row_value(row, "reply_to_msg_id")),
         forum_topic_id=_coerce_optional_int(_row_value(row, "forum_topic_id")),

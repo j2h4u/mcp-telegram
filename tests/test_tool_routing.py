@@ -1405,7 +1405,7 @@ async def test_search_messages_structured_plain_snippet_around_hidden_link_bound
     raw_text = ("prefix " * 18) + "needle" + (" tail" * 24)
     link_offset = raw_text.index("needle")
     projected_text = project_message_content(
-        MessageSnapshot(text=raw_text, media_description=None, text_links=((link_offset, 6, target),))
+        MessageSnapshot(text=raw_text, text_links=((link_offset, 6, target),))
     ).text
     assert projected_text is not None and target in projected_text
 

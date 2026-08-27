@@ -83,8 +83,8 @@ def _insert_msg(conn: _SQLiteConnection, dialog_id: int, message_id: int, text: 
     conn.execute(
         "INSERT OR REPLACE INTO messages "
         "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "
-        "media_description, reply_to_msg_id, forum_topic_id, is_deleted) "
-        "VALUES (?, ?, 1704067200, ?, 42, 'Alice', NULL, NULL, NULL, 0)",
+        "media_kind, media_payload, reply_to_msg_id, forum_topic_id, is_deleted) "
+        "VALUES (?, ?, 1704067200, ?, 42, 'Alice', NULL, NULL, NULL, NULL, 0)",
         (dialog_id, message_id, text),
     )
     conn.commit()

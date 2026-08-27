@@ -6,9 +6,10 @@ import logging
 from typing import Protocol
 
 from .formatter import format_reaction_counts
+from .media_fact import encode_media_payload
 from .message_content import MessageSnapshot, project_message_content
 from .messages.telegram_adapter import extract_entity_rows, extract_message_text, extract_reply_and_topic
-from .telethon_media import describe_media, media_kind
+from .telethon_media import extract_media_fact
 from .telethon_message import is_service_message
 
 logger = logging.getLogger(__name__)
@@ -75,13 +76,6 @@ def _timestamp_to_int(value: SupportsTimestamp | None, *, msg_id: object = None)
         return 0
 
 
-def _get_media_description(msg: MessageLike) -> str | None:
-    media = msg.media
-    if media is None:
-        return None
-    return describe_media(media)
-
-
 def _extract_reactions_display(msg: MessageLike) -> str:
     reactions_obj = msg.reactions
     if reactions_obj is None:
@@ -129,7 +123,7 @@ def _resolve_effective_sender_id(
     return None
 
 
-def message_to_dict(
+def message_to_dict(  # noqa: PLR0914
     msg: MessageLike,
     dialog_id: int | None = None,
     self_id: int | None = None,
@@ -137,9 +131,10 @@ def message_to_dict(
     """Convert a Telethon message object to the standard message dict."""
     sender_first_name = _extract_sender_first_name(msg)
     sent_at = _timestamp_to_int(msg.date, msg_id=msg.id)
-    media_description = _get_media_description(msg)
     raw_media = msg.media
-    media_kind_value = media_kind(raw_media) if raw_media is not None else None
+    fact = extract_media_fact(raw_media)
+    media_kind_value = None if fact is None else fact.kind
+    media_payload = encode_media_payload(fact)
     reactions_display = _extract_reactions_display(msg)
     reply_to_msg_id, forum_topic_id = extract_reply_and_topic(msg)
     edit_date = _to_unix_timestamp_or_none(msg.edit_date)
@@ -162,8 +157,8 @@ def message_to_dict(
     content = project_message_content(
         MessageSnapshot(
             text=extract_message_text(msg),
-            media_description=media_description,
             media_kind=media_kind_value,
+            media_payload=media_payload,
             text_links=tuple(text_links),
         )
     )

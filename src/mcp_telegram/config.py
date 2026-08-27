@@ -12,6 +12,7 @@ from typing import cast
 from xdg_base_dirs import xdg_config_home  # type: ignore[import-error]
 
 _VALID_HTTP_PORTS = range(1, 65_536)
+_MAX_MEDIA_HYDRATION_BATCH_SIZE = 100
 
 
 class ConfigError(RuntimeError):
@@ -104,6 +105,24 @@ class TelegramRpcConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class MediaHydrationConfig:
+    """Bounded policy for lazy Telegram media-fact hydration."""
+
+    interval_seconds: float = 900.0
+    max_requests_per_cycle: int = 3
+    max_jobs_per_cycle: int = 300
+    batch_size: int = 100
+    pause_between_requests_seconds: float = 5.0
+    retry_delay_seconds: int = 21_600
+    circuit_retry_seconds: int = 1_800
+    max_attempts: int = 3
+
+    def __post_init__(self) -> None:
+        if self.batch_size > _MAX_MEDIA_HYDRATION_BATCH_SIZE:
+            raise ValueError("media hydration batch_size must be <= 100")
+
+
+@dataclass(frozen=True, slots=True)
 class SchedulingConfig:
     """Intervals for local daemon maintenance loops."""
 
@@ -132,6 +151,7 @@ class SchedulingConfig:
     activity_cold_enroll_seconds: float = 1_800.0
     activity_cold_access_retry_seconds: float = 3_600.0
     scheduled_flood_sleep_threshold_seconds: int = 0
+    media_hydration: MediaHydrationConfig = field(default_factory=MediaHydrationConfig)
     folder_projection: FolderProjectionConfig = field(default_factory=FolderProjectionConfig)
 
 
@@ -337,6 +357,13 @@ def _env_positive_int(environ: Mapping[str, str], name: str, default: int) -> in
     return value
 
 
+def _env_media_hydration_batch_size(environ: Mapping[str, str], default: int) -> int:
+    value = _env_positive_int(environ, "MEDIA_HYDRATION_BATCH_SIZE", default)
+    if value > _MAX_MEDIA_HYDRATION_BATCH_SIZE:
+        raise ConfigError("MEDIA_HYDRATION_BATCH_SIZE must be an integer <= 100")
+    return value
+
+
 def resolve_scheduling_config(
     config: SchedulingConfig,
     environ: Mapping[str, str] | None = None,
@@ -435,6 +462,30 @@ def resolve_scheduling_config(
         ),
         activity_cold_access_retry_seconds=_env_positive_float(
             env, "ACTIVITY_COLD_ACCESS_RETRY_SECONDS", config.activity_cold_access_retry_seconds
+        ),
+        media_hydration=MediaHydrationConfig(
+            interval_seconds=_env_positive_float(
+                env, "MEDIA_HYDRATION_INTERVAL_SECONDS", config.media_hydration.interval_seconds
+            ),
+            max_requests_per_cycle=_env_positive_int(
+                env, "MEDIA_HYDRATION_MAX_REQUESTS_PER_CYCLE", config.media_hydration.max_requests_per_cycle
+            ),
+            max_jobs_per_cycle=_env_positive_int(
+                env, "MEDIA_HYDRATION_MAX_JOBS_PER_CYCLE", config.media_hydration.max_jobs_per_cycle
+            ),
+            batch_size=_env_media_hydration_batch_size(env, config.media_hydration.batch_size),
+            pause_between_requests_seconds=_env_positive_float(
+                env,
+                "MEDIA_HYDRATION_PAUSE_BETWEEN_REQUESTS_SECONDS",
+                config.media_hydration.pause_between_requests_seconds,
+            ),
+            retry_delay_seconds=_env_positive_int(
+                env, "MEDIA_HYDRATION_RETRY_DELAY_SECONDS", config.media_hydration.retry_delay_seconds
+            ),
+            circuit_retry_seconds=_env_positive_int(
+                env, "MEDIA_HYDRATION_CIRCUIT_RETRY_SECONDS", config.media_hydration.circuit_retry_seconds
+            ),
+            max_attempts=_env_positive_int(env, "MEDIA_HYDRATION_MAX_ATTEMPTS", config.media_hydration.max_attempts),
         ),
     )
 
@@ -644,38 +695,77 @@ def _parse_telegram_rpc(data: dict[str, object], path: Path) -> TelegramRpcConfi
     )
 
 
-def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
-    defaults = SchedulingConfig()
-    allowed = {
-        "scheduled_reconciliation_seconds",
-        "read_position_reconciliation_seconds",
-        "read_position_reconciliation_max_dialogs_per_pass",
-        "read_position_reconciliation_failure_cooldown_seconds",
-        "read_position_reconciliation_batch_size",
-        "read_position_reconciliation_batch_pause_seconds",
-        "scheduled_flood_sleep_threshold_seconds",
-        "reconciliation_hourly_seconds",
-        "delta_catch_up_interval_seconds",
-        "delta_catch_up_max_probes_per_cycle",
-        "delta_catch_up_probe_pause_seconds",
-        "access_probe_interval_seconds",
-        "access_probe_max_dialogs_per_cycle",
-        "access_probe_cooldown_seconds",
-        "access_probe_pause_seconds",
-        "message_fact_refresh_seconds",
-        "message_fact_refresh_reaction_max_messages_per_cycle",
-        "message_fact_refresh_read_at_max_messages_per_cycle",
-        "message_fact_refresh_pause_seconds",
-        "activity_hot_sweep_seconds",
-        "activity_rpc_timeout_seconds",
-        "activity_cold_backfill_seconds",
-        "activity_cold_backfill_batch_pause_seconds",
-        "activity_cold_enroll_seconds",
-        "activity_cold_access_retry_seconds",
-        "folder_projection",
-    }
-    scheduling_data = _optional_section(data, "scheduling", allowed, path)
-    folder_data = _nested_table(scheduling_data, "folder_projection", "scheduling.folder_projection", path) or {}
+def _parse_media_hydration(data: dict[str, object], path: Path, defaults: SchedulingConfig) -> MediaHydrationConfig:
+    hydration_data = _nested_table(data, "media_hydration", "scheduling.media_hydration", path) or {}
+    _reject_unknown_keys(
+        hydration_data,
+        {
+            "interval_seconds",
+            "max_requests_per_cycle",
+            "max_jobs_per_cycle",
+            "batch_size",
+            "pause_between_requests_seconds",
+            "retry_delay_seconds",
+            "circuit_retry_seconds",
+            "max_attempts",
+        },
+        "scheduling.media_hydration",
+        path,
+    )
+    hydration_defaults = defaults.media_hydration
+    hydration_batch_size = _positive_int(
+        hydration_data, "batch_size", "scheduling.media_hydration", path, hydration_defaults.batch_size
+    )
+    if hydration_batch_size > _MAX_MEDIA_HYDRATION_BATCH_SIZE:
+        raise ConfigError(f"Invalid scheduling.media_hydration.batch_size in {path}: expected integer <= 100")
+    return MediaHydrationConfig(
+        interval_seconds=_positive_float(
+            hydration_data, "interval_seconds", "scheduling.media_hydration", path, hydration_defaults.interval_seconds
+        ),
+        max_requests_per_cycle=_positive_int(
+            hydration_data,
+            "max_requests_per_cycle",
+            "scheduling.media_hydration",
+            path,
+            hydration_defaults.max_requests_per_cycle,
+        ),
+        max_jobs_per_cycle=_positive_int(
+            hydration_data,
+            "max_jobs_per_cycle",
+            "scheduling.media_hydration",
+            path,
+            hydration_defaults.max_jobs_per_cycle,
+        ),
+        batch_size=hydration_batch_size,
+        pause_between_requests_seconds=_positive_float(
+            hydration_data,
+            "pause_between_requests_seconds",
+            "scheduling.media_hydration",
+            path,
+            hydration_defaults.pause_between_requests_seconds,
+        ),
+        retry_delay_seconds=_positive_int(
+            hydration_data,
+            "retry_delay_seconds",
+            "scheduling.media_hydration",
+            path,
+            hydration_defaults.retry_delay_seconds,
+        ),
+        circuit_retry_seconds=_positive_int(
+            hydration_data,
+            "circuit_retry_seconds",
+            "scheduling.media_hydration",
+            path,
+            hydration_defaults.circuit_retry_seconds,
+        ),
+        max_attempts=_positive_int(
+            hydration_data, "max_attempts", "scheduling.media_hydration", path, hydration_defaults.max_attempts
+        ),
+    )
+
+
+def _parse_folder_projection(data: dict[str, object], path: Path, defaults: SchedulingConfig) -> FolderProjectionConfig:
+    folder_data = _nested_table(data, "folder_projection", "scheduling.folder_projection", path) or {}
     _reject_unknown_keys(
         folder_data,
         {
@@ -711,7 +801,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         raise ConfigError(
             f"Invalid scheduling.folder_projection.refresh_interval_seconds in {path}: expected number >= 1"
         )
-    folder_projection = FolderProjectionConfig(
+    return FolderProjectionConfig(
         refresh_interval_seconds=refresh_interval_seconds,
         jitter_ratio=float(jitter),
         retry_delays_seconds=_retry_schedule(
@@ -733,6 +823,42 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         ),
         stale_after_seconds=stale_value,
     )
+
+
+def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
+    defaults = SchedulingConfig()
+    allowed = {
+        "scheduled_reconciliation_seconds",
+        "read_position_reconciliation_seconds",
+        "read_position_reconciliation_max_dialogs_per_pass",
+        "read_position_reconciliation_failure_cooldown_seconds",
+        "read_position_reconciliation_batch_size",
+        "read_position_reconciliation_batch_pause_seconds",
+        "scheduled_flood_sleep_threshold_seconds",
+        "reconciliation_hourly_seconds",
+        "delta_catch_up_interval_seconds",
+        "delta_catch_up_max_probes_per_cycle",
+        "delta_catch_up_probe_pause_seconds",
+        "access_probe_interval_seconds",
+        "access_probe_max_dialogs_per_cycle",
+        "access_probe_cooldown_seconds",
+        "access_probe_pause_seconds",
+        "message_fact_refresh_seconds",
+        "message_fact_refresh_reaction_max_messages_per_cycle",
+        "message_fact_refresh_read_at_max_messages_per_cycle",
+        "message_fact_refresh_pause_seconds",
+        "activity_hot_sweep_seconds",
+        "activity_rpc_timeout_seconds",
+        "activity_cold_backfill_seconds",
+        "activity_cold_backfill_batch_pause_seconds",
+        "activity_cold_enroll_seconds",
+        "activity_cold_access_retry_seconds",
+        "media_hydration",
+        "folder_projection",
+    }
+    scheduling_data = _optional_section(data, "scheduling", allowed, path)
+    media_hydration = _parse_media_hydration(scheduling_data, path, defaults)
+    folder_projection = _parse_folder_projection(scheduling_data, path, defaults)
     return SchedulingConfig(
         scheduled_reconciliation_seconds=_positive_float(
             scheduling_data,
@@ -909,6 +1035,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             path,
             defaults.activity_cold_access_retry_seconds,
         ),
+        media_hydration=media_hydration,
         folder_projection=folder_projection,
     )
 

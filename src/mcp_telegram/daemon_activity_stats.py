@@ -356,7 +356,7 @@ def _build_recent_activity_rows_query(typed_activity_filter_sql: str, kinded_act
     return (
         "WITH typed_activity AS ("
         "SELECT m.dialog_id AS dialog_id, m.message_id AS message_id, "
-        "       m.sent_at AS sent_at, m.text AS text, m.media_description AS media_description, m.media_kind AS media_kind, "
+        "       m.sent_at AS sent_at, m.text AS text, m.media_kind AS media_kind, m.media_payload AS media_payload, "
         "       COALESCE(e.name, d.name, CAST(m.dialog_id AS TEXT)) AS dialog_name, "
         "       CASE "
         "         WHEN lower(COALESCE(e.type, '')) = 'bot' THEN 'bot' "
@@ -438,8 +438,8 @@ def _project_activity_comments(
         content = project_message_content(
             MessageSnapshot(
                 text=cast(str | None, row[3]),
-                media_description=cast(str | None, row[4]),
-                media_kind=cast(str | None, row[5]),
+                media_kind=cast(str | None, row[4]),
+                media_payload=cast(str | None, row[5]),
                 text_links=tuple(links_by_msg.get((dialog_id, message_id), [])),
             )
         )

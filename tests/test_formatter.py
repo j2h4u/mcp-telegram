@@ -43,7 +43,13 @@ def _make_msg(
 
 
 def _make_document_media(*attrs: object, size: int | None = None) -> object:
-    return SimpleNamespace(document=SimpleNamespace(attributes=list(attrs), size=size))
+    from unittest.mock import MagicMock
+
+    import telethon.tl.types as tl
+
+    media = MagicMock(spec=tl.MessageMediaDocument)
+    media.document = SimpleNamespace(attributes=list(attrs), size=size, mime_type="application/octet-stream")
+    return media
 
 
 # ---------------------------------------------------------------------------
@@ -183,20 +189,11 @@ def test_unknown_sender() -> None:
     assert "12:00 System:\n[Telegram content]\nanonymous\n[/Telegram content]" in result
 
 
-def test_media_fallback() -> None:
-    """Message with media_description renders the pre-formatted description."""
-    from mcp_telegram.formatter import format_messages
-
-    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
-    msg = _make_msg(1, dt, text="", first_name="Carol", media_description="[медиа: SomeType]")
-    result = format_messages([msg], {})
-    assert "[медиа:" in result
-
-
-def test_describe_document_priority_and_fallbacks() -> None:
+def test_project_document_media_priority_and_fallbacks() -> None:
     import telethon.tl.types as tl
 
-    from mcp_telegram.telethon_media import describe_document
+    from mcp_telegram.media_fact import media_description
+    from mcp_telegram.telethon_media import extract_media_fact
 
     sticker = _make_document_media(
         tl.DocumentAttributeSticker(alt="🙂", stickerset=tl.InputStickerSetEmpty()),
@@ -217,31 +214,32 @@ def test_describe_document_priority_and_fallbacks() -> None:
     no_document = SimpleNamespace(document=None)
 
     cases = [
-        (no_document, "[документ]"),
+        (no_document, "[медиа]"),
         (sticker, "[стикер: 🙂]"),
         (empty_sticker, "[стикер]"),
-        (round_video, "[кружок: 1:05]"),
+        (round_video, "[видео: 1:05]"),
         (animation, "[анимация]"),
         (voice, "[голосовое: 2:05]"),
-        (audio, "[аудио: Artist — Song, 3:04]"),
+        (audio, "[аудио: Artist — Song: 3:04]"),
         (video, "[видео: 9:01]"),
-        (filename, "[документ: report.pdf, 2KB]"),
+        (filename, "[документ: report.pdf]"),
         (filename_no_size, "[документ: plain.txt]"),
         (no_attrs, "[документ]"),
     ]
 
     for media, expected in cases:
-        assert describe_document(media) == expected
+        assert media_description(extract_media_fact(media)) == expected
 
 
-def test_describe_document_audio_without_metadata() -> None:
+def test_project_document_audio_without_metadata() -> None:
     import telethon.tl.types as tl
 
-    from mcp_telegram.telethon_media import describe_document
+    from mcp_telegram.media_fact import media_description
+    from mcp_telegram.telethon_media import extract_media_fact
 
     media = _make_document_media(tl.DocumentAttributeAudio(duration=30))
 
-    assert describe_document(media) == "[аудио: 0:30]"
+    assert media_description(extract_media_fact(media)) == "[аудио: 0:30]"
 
 
 def test_format_messages_frames_adversarial_body_without_framing_headers() -> None:
@@ -691,74 +689,78 @@ def test_structured_read_markers_match_formatter_marker_positions() -> None:
 
 
 # ---------------------------------------------------------------------------
-# telethon_media.describe_media tests
+# Canonical Telethon extractor + media-fact projector tests
 # ---------------------------------------------------------------------------
 
 
-def test_describe_media_handles_diverse_types() -> None:
+def test_project_media_handles_diverse_types() -> None:
     from unittest.mock import MagicMock
 
     import telethon.tl.types as tl
 
-    from mcp_telegram.telethon_media import describe_media
+    from mcp_telegram.media_fact import media_description
+    from mcp_telegram.telethon_media import extract_media_fact
 
     cases = [
         (MagicMock(spec=tl.MessageMediaPhoto), "[фото]"),
-        (MagicMock(spec=tl.MessageMediaGeoLive), "[геолокация live]"),
+        (MagicMock(spec=tl.MessageMediaGeoLive), "[геолокация]"),
         (MagicMock(spec=tl.MessageMediaStory), "[история]"),
-        (MagicMock(spec=tl.MessageMediaUnsupported), "[неподдерживаемый тип]"),
+        (MagicMock(spec=tl.MessageMediaUnsupported), "[медиа]"),
         (MagicMock(spec=tl.MessageMediaEmpty), None),
     ]
 
     for media, expected in cases:
-        assert describe_media(media) == expected
+        assert media_description(extract_media_fact(media)) == expected
 
 
-def test_describe_media_dice_with_and_without_value() -> None:
+def test_project_media_dice_with_and_without_value() -> None:
     from unittest.mock import MagicMock
 
     import telethon.tl.types as tl
 
-    from mcp_telegram.telethon_media import describe_media
+    from mcp_telegram.media_fact import media_description
+    from mcp_telegram.telethon_media import extract_media_fact
 
     dice_with_value = MagicMock(spec=tl.MessageMediaDice, emoticon="🎲", value=5)
-    assert describe_media(dice_with_value) == "[🎲 5]"
+    assert media_description(extract_media_fact(dice_with_value)) == "[🎲 5]"
 
     dice_without_value = MagicMock(spec=tl.MessageMediaDice, emoticon="🎯", value=None)
-    assert describe_media(dice_without_value) == "[🎯]"
+    assert media_description(extract_media_fact(dice_without_value)) == "[🎯]"
 
     dice_default = MagicMock(spec=tl.MessageMediaDice, emoticon=None, value=None)
-    assert describe_media(dice_default) == "[🎲]"
+    assert media_description(extract_media_fact(dice_default)) == "[🎲]"
 
 
-def test_describe_media_contact_formats_name_and_phone() -> None:
+def test_project_media_contact_formats_name_and_phone() -> None:
     from unittest.mock import MagicMock
 
     import telethon.tl.types as tl
 
-    from mcp_telegram.telethon_media import describe_media
+    from mcp_telegram.media_fact import media_description
+    from mcp_telegram.telethon_media import extract_media_fact
 
     contact_full = MagicMock(spec=tl.MessageMediaContact, first_name="Alice", last_name="Smith", phone_number="+1234")
-    assert describe_media(contact_full) == "Alice Smith, +1234"
+    assert media_description(extract_media_fact(contact_full)) == "Alice Smith, +1234"
 
     contact_name_only = MagicMock(spec=tl.MessageMediaContact, first_name="Bob", last_name="", phone_number="")
-    assert describe_media(contact_name_only) == "Bob"
+    assert media_description(extract_media_fact(contact_name_only)) == "Bob"
 
     contact_phone_only = MagicMock(spec=tl.MessageMediaContact, first_name="", last_name="", phone_number="+5678")
-    assert describe_media(contact_phone_only) == "+5678"
+    assert media_description(extract_media_fact(contact_phone_only)) == "+5678"
 
     contact_empty = MagicMock(spec=tl.MessageMediaContact, first_name="", last_name="", phone_number="")
-    assert describe_media(contact_empty) is None
+    assert media_description(extract_media_fact(contact_empty)) is None
 
 
-def test_describe_media_unknown_type_fallback() -> None:
-    from mcp_telegram.telethon_media import describe_media
+def test_project_media_unknown_type_fallback() -> None:
+    from mcp_telegram.media_fact import media_description
+    from mcp_telegram.telethon_media import extract_media_fact
 
     class _CustomMedia:
         pass
 
-    result = describe_media(_CustomMedia())
-    assert result == "[медиа: _CustomMedia]"
+    result = media_description(extract_media_fact(_CustomMedia()))
+    assert result == "[медиа]"
 
 
 # ---------------------------------------------------------------------------

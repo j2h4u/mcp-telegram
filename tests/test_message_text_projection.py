@@ -32,21 +32,21 @@ def test_render_text_links_escapes_markdown_label_syntax() -> None:
 
 
 def test_message_content_projector_preserves_text_and_media() -> None:
-    content = project_message_content(MessageSnapshot(text="caption", media_description="[photo]"))
+    content = project_message_content(MessageSnapshot(text="caption", media_kind="photo", media_payload="{}"))
 
     assert content.text == "caption"
-    assert content.media_description == "[photo]"
+    assert content.media_description == "[фото]"
     assert content.kind == "message_text"
     assert content.primary_text == "caption"
 
 
 def test_message_content_projector_distinguishes_media_only_and_none() -> None:
-    media = project_message_content(MessageSnapshot(text="", media_description="[photo]"))
-    empty = project_message_content(MessageSnapshot(text=None, media_description=None))
+    media = project_message_content(MessageSnapshot(text="", media_kind="photo", media_payload="{}"))
+    empty = project_message_content(MessageSnapshot(text=None))
 
     assert media.kind == "media_description"
     assert media.text is None
-    assert media.primary_text == "[photo]"
+    assert media.primary_text == "[фото]"
     assert empty.kind == "none"
     assert empty.primary_text is None
 

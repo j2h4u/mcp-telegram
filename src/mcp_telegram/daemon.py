@@ -41,7 +41,7 @@ import math
 import os
 import sqlite3
 import time
-from collections.abc import Coroutine, Iterator, Sequence
+from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -92,12 +92,11 @@ from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .folders.telegram_adapter import FolderClient, TelethonTelegramFolderGateway
 from .folders.worker import FolderProjectionWorker
 from .fts import backfill_fts_index
+from .media_hydration import MediaHydrationWorker
 from .message_fact_refresh import (
     MessageFactRefreshPolicy,
     run_message_fact_refresh_loop,
 )
-from .messages.sqlite_repository import insert_messages_with_fts
-from .messages.telegram_adapter import extract_message_row
 from .own_only import OwnOnlyContext, ensure_own_only_schema
 from .reactions.refresh import ReactionFreshener
 from .reactions.sqlite_repository import SQLiteReactionSnapshotRepository
@@ -186,10 +185,6 @@ GAP_SCAN_INTERVAL_S: float = 7 * 24 * 3600.0
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 60 * SECONDS_PER_MINUTE
 
-_UNSUPPORTED_TRANSCRIPTION_BACKFILL_BATCH_SIZE: int = 25
-_UNSUPPORTED_TRANSCRIPTION_BACKFILL_LIMIT: int = 500
-_UNSUPPORTED_MEDIA_DESCRIPTIONS = ("MessageMediaUnsupported", "[неподдерживаемый тип]")
-
 _BACKFILL_TOTAL_MESSAGES_SKIP_EXCEPTIONS: tuple[type[BaseException], ...] = (
     RPCError,
     sqlite3.DatabaseError,
@@ -212,14 +207,6 @@ _SELECT_NULL_READ_CURSORS_SQL = (
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
     "WHERE (sd.read_inbox_max_id IS NULL OR sd.read_outbox_max_id IS NULL) "
     "AND sd.status = 'synced'"
-)
-
-_SELECT_BLANK_UNSUPPORTED_MESSAGES_SQL = (
-    "SELECT m.dialog_id, m.message_id FROM messages m "
-    "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
-    "WHERE COALESCE(m.text, '') = '' AND m.media_description IN (?, ?) "
-    "ORDER BY m.dialog_id, m.message_id "
-    "LIMIT ?"
 )
 
 
@@ -245,6 +232,7 @@ class _SyncMainContext:
     api_server: DaemonAPIServer
     topic_refresher: TopicRefresher
     folder_projection_worker: FolderProjectionWorker
+    media_hydration_worker: MediaHydrationWorker
     socket_path: Path
     unix_server: asyncio.AbstractServer | None = None
     handler_manager: EventHandlerManager | None = None
@@ -259,92 +247,6 @@ class _BackfillTotalDialogResult:
     filled: int
     pause_after: bool
     stop: bool = False
-
-
-async def _backfill_blank_unsupported_messages(
-    client: _DaemonClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-) -> int:
-    """Re-fetch blank unsupported media rows and materialize text when Telegram exposes it."""
-    rows = cast(
-        list[tuple[int, int]],
-        conn.execute(
-            _SELECT_BLANK_UNSUPPORTED_MESSAGES_SQL,
-            (*_UNSUPPORTED_MEDIA_DESCRIPTIONS, _UNSUPPORTED_TRANSCRIPTION_BACKFILL_LIMIT),
-        ).fetchall(),
-    )
-    if not rows:
-        logger.info("backfill_blank_unsupported_messages — no rows, skipping")
-        return 0
-
-    filled = 0
-    for dialog_id, message_ids in _group_message_ids_by_dialog(rows).items():
-        if shutdown_event.is_set():
-            break
-        for chunk in _chunk_message_ids(message_ids):
-            if shutdown_event.is_set():
-                break
-            result = await _backfill_blank_unsupported_chunk(client, conn, shutdown_event, dialog_id, chunk)
-            filled += result.filled
-            if result.stop:
-                logger.info("backfill_blank_unsupported_messages filled=%d/%d", filled, len(rows))
-                return filled
-            if result.pause_after and not await _sleep_between_backfill_total_dialogs(shutdown_event):
-                logger.info("backfill_blank_unsupported_messages filled=%d/%d", filled, len(rows))
-                return filled
-
-    logger.info("backfill_blank_unsupported_messages filled=%d/%d", filled, len(rows))
-    return filled
-
-
-def _group_message_ids_by_dialog(rows: Sequence[tuple[int, int]]) -> dict[int, list[int]]:
-    grouped: dict[int, list[int]] = {}
-    for dialog_id, message_id in rows:
-        grouped.setdefault(dialog_id, []).append(message_id)
-    return grouped
-
-
-def _chunk_message_ids(message_ids: Sequence[int]) -> Iterator[list[int]]:
-    for index in range(0, len(message_ids), _UNSUPPORTED_TRANSCRIPTION_BACKFILL_BATCH_SIZE):
-        yield list(message_ids[index : index + _UNSUPPORTED_TRANSCRIPTION_BACKFILL_BATCH_SIZE])
-
-
-async def _backfill_blank_unsupported_chunk(
-    client: _DaemonClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    dialog_id: int,
-    message_ids: Sequence[int],
-) -> _BackfillTotalDialogResult:
-    try:
-        fetched = cast(Sequence[object], await client.get_messages(entity=dialog_id, ids=list(message_ids)))
-    except FloodWaitError as exc:
-        logger.warning("backfill_blank_unsupported flood_wait dialog_id=%d seconds=%d", dialog_id, exc.seconds)
-        if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
-            return _BackfillTotalDialogResult(filled=0, pause_after=False, stop=True)
-        return _BackfillTotalDialogResult(filled=0, pause_after=False)
-    except _BACKFILL_TOTAL_MESSAGES_SKIP_EXCEPTIONS as exc:
-        logger.debug("backfill_blank_unsupported skip dialog_id=%d error=%s", dialog_id, exc)
-        return _BackfillTotalDialogResult(filled=0, pause_after=True)
-
-    extracted = [extract_message_row(dialog_id, msg) for msg in fetched if msg is not None]
-    materialized = [item for item in extracted if item.message.text]
-    if not materialized:
-        return _BackfillTotalDialogResult(filled=0, pause_after=True)
-
-    with conn:
-        enabled = cast(
-            tuple[object, ...] | None,
-            conn.execute(
-                "SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1",
-                (dialog_id,),
-            ).fetchone(),
-        )
-        if enabled is None:
-            return _BackfillTotalDialogResult(filled=0, pause_after=True)
-        insert_messages_with_fts(conn, materialized)
-    return _BackfillTotalDialogResult(filled=len(materialized), pause_after=True)
 
 
 async def _backfill_total_messages(
@@ -991,6 +893,7 @@ def _create_governed_telegram_client(config: McpTelegramConfig) -> _DaemonClient
 
 async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - composition root wires all daemon-owned services
     config = load_config()
+    scheduling = resolve_scheduling_config(config.scheduling)
     state_paths = StatePaths.from_state_dir(ensure_private_state_dir(config.state.dir))
     db_path = state_paths.sync_db_path
     ensure_sync_schema(db_path)
@@ -1080,9 +983,22 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - com
             shutdown_event,
             config.scheduling.folder_projection,
         ),
+        media_hydration_worker=MediaHydrationWorker(
+            client,
+            conn,
+            shutdown_event,
+            interval_seconds=scheduling.media_hydration.interval_seconds,
+            max_requests_per_cycle=scheduling.media_hydration.max_requests_per_cycle,
+            max_jobs_per_cycle=scheduling.media_hydration.max_jobs_per_cycle,
+            batch_size=scheduling.media_hydration.batch_size,
+            pause_between_requests_seconds=scheduling.media_hydration.pause_between_requests_seconds,
+            retry_delay_seconds=scheduling.media_hydration.retry_delay_seconds,
+            circuit_retry_seconds=scheduling.media_hydration.circuit_retry_seconds,
+            max_attempts=scheduling.media_hydration.max_attempts,
+        ),
         socket_path=socket_path,
         unix_server=unix_server,
-        scheduling=resolve_scheduling_config(config.scheduling),
+        scheduling=scheduling,
         flood_wait_kill_switch_event=flood_wait_kill_switch_event,
     )
 
@@ -1236,11 +1152,6 @@ async def _start_followup_background_tasks(
     )
     _create_tracked_task(
         ctx,
-        _backfill_blank_unsupported_messages(ctx.client, ctx.conn, ctx.shutdown_event),
-        name="backfill_blank_unsupported_messages",
-    )
-    _create_tracked_task(
-        ctx,
         run_delta_catch_up_loop(
             delta_worker,
             ctx.shutdown_event,
@@ -1259,6 +1170,7 @@ async def _start_followup_background_tasks(
         ),
         name="message_fact_refresh_loop",
     )
+    _create_tracked_task(ctx, ctx.media_hydration_worker.run(), name="media_hydration_worker")
     _create_tracked_task(
         ctx,
         run_access_probe_loop(

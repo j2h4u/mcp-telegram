@@ -443,8 +443,8 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             text                TEXT,
             sender_id           INTEGER,
             sender_first_name   TEXT,
-            media_description   TEXT,
             media_kind          TEXT,
+            media_payload       TEXT,
             reply_to_msg_id     INTEGER,
             reply_count         INTEGER NOT NULL DEFAULT 0,
             forum_topic_id      INTEGER,
@@ -1411,6 +1411,44 @@ async def test_list_dialogs_serves_preserved_folder_snapshot_without_refresh(tmp
     response_data = cast(dict[str, object], _response_data(result))
     snapshot = cast(dict[str, object], response_data["folder_snapshot"])
     assert snapshot["status"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_list_folder_messages_projects_media_fact_without_payload_leak() -> None:
+    conn = _make_db()
+    conn.execute("INSERT INTO dialogs(dialog_id, name) VALUES (10, 'Media chat')")
+    conn.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+        "VALUES (10, 1, 100, '', 'photo', '{}')"
+    )
+    conn.execute("CREATE TABLE telegram_folders(folder_id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE telegram_folder_members(folder_id INTEGER NOT NULL, dialog_id INTEGER NOT NULL, "
+        "PRIMARY KEY(folder_id, dialog_id))"
+    )
+    conn.execute("INSERT INTO telegram_folders(folder_id, title) VALUES (1, 'Work')")
+    conn.execute("INSERT INTO telegram_folder_members(folder_id, dialog_id) VALUES (1, 10)")
+    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (10, 'synced')")
+    conn.commit()
+    server = make_server(conn)
+
+    result = await server._list_folder_messages({"folder_id": 1, "limit": 20})
+
+    assert result["ok"] is True
+    rows = cast(list[dict[str, object]], _response_data(result)["messages"])
+    assert rows == [
+        {
+            "dialog_id": 10,
+            "message_id": 1,
+            "sent_at": 100,
+            "text": None,
+            "media_kind": "photo",
+            "dialog_name": "Media chat",
+            "media_description": "[фото]",
+            "content_kind": "media_description",
+        }
+    ]
+    assert all("media_payload" not in row for row in rows)
 
 
 @pytest.mark.asyncio
@@ -6008,11 +6046,11 @@ async def test_list_unread_messages_preserves_media_only_content_and_filters_ser
     _seed_unread_state(conn, dialog_id=556, read_inbox_max_id=0, entity_type="User", entity_name="Media sender")
     conn.executemany(
         "INSERT INTO messages "
-        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, media_description, out, is_service) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, media_kind, media_payload, out, is_service) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
-            (556, 10, 1_700_000_010, None, 123, "Media sender", "[photo]", 0, 0),
-            (556, 11, 1_700_000_011, None, 123, "Media sender", "[service photo]", 0, 1),
+            (556, 10, 1_700_000_010, None, 123, "Media sender", "photo", "{}", 0, 0),
+            (556, 11, 1_700_000_011, None, 123, "Media sender", "photo", "{}", 0, 1),
         ],
     )
     conn.commit()
@@ -6032,7 +6070,7 @@ async def test_list_unread_messages_preserves_media_only_content_and_filters_ser
     messages = _group_messages(groups[0])
     assert [message["message_id"] for message in messages] == [10]
     assert messages[0]["text"] is None
-    assert messages[0]["media_description"] == "[photo]"
+    assert messages[0]["media_description"] == "[фото]"
     assert messages[0]["content_kind"] == "media_description"
 
 
@@ -6336,6 +6374,34 @@ async def test_list_messages_dm_outgoing_resolves_sender_first_name_via_e_eff() 
     assert _response_messages(resp)[0]["sender_first_name"] == "Me"
 
 
+# --- Archived dotMD source-export dispatch ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_archived_dotmd_source_export_methods_are_not_registered() -> None:
+    server = make_server()
+
+    handlers = server._dispatch_handlers()
+    assert {
+        "describe_source",
+        "export_source_changes",
+        "read_source_unit_window",
+    }.isdisjoint(handlers)
+
+    for method in ("describe_source", "export_source_changes", "read_source_unit_window"):
+        assert await server._dispatch({"method": method}) == {"ok": False, "error": "unknown_method"}
+
+
+@pytest.mark.asyncio
+async def test_archived_dotmd_dispatch_does_not_affect_active_daemon_api() -> None:
+    server = make_server()
+
+    result = await server._dispatch({"method": "resolve_entity", "query": "not present"})
+
+    assert result["ok"] is True
+    assert result.get("error") != "unknown_method"
+
+
 # --- Phase 999.1: get_my_recent_activity ----------------------------
 
 
@@ -6405,8 +6471,8 @@ async def test_get_my_recent_activity_projects_media_only_content() -> None:
         )
         server._conn.execute(
             "INSERT INTO messages "
-            "(dialog_id, message_id, sent_at, text, media_description, out, is_service, is_deleted) "
-            "VALUES (42, 1, ?, NULL, '[photo]', 1, 0, 0)",
+            "(dialog_id, message_id, sent_at, text, media_kind, media_payload, out, is_service, is_deleted) "
+            "VALUES (42, 1, ?, NULL, 'photo', '{}', 1, 0, 0)",
             (now - 60,),
         )
         server._conn.execute(
@@ -6422,7 +6488,7 @@ async def test_get_my_recent_activity_projects_media_only_content() -> None:
     resp = await server._dispatch({"method": "get_my_recent_activity", "dialog_kinds": ["all"]})
     comments = cast(list[dict[str, object]], _activity_data(resp)["comments"])
     assert comments[0]["text"] is None
-    assert comments[0]["media_description"] == "[photo]"
+    assert comments[0]["media_description"] == "[фото]"
     assert comments[1]["text"] == "[site](https://example.com)"
 
 
@@ -7119,8 +7185,8 @@ def _make_trace_db() -> sqlite3.Connection:
             text            TEXT,
             sender_id       INTEGER,
             sender_first_name TEXT,
-            media_description TEXT,
             media_kind TEXT,
+            media_payload TEXT,
             reply_to_msg_id INTEGER,
             reply_count     INTEGER NOT NULL DEFAULT 0,
             forum_topic_id  INTEGER,
