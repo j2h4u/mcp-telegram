@@ -13,7 +13,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 37
+_CURRENT_SCHEMA_VERSION = 38
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,17 @@ CREATE TABLE IF NOT EXISTS message_versions (
     old_text    TEXT,
     edit_date   INTEGER,
     PRIMARY KEY (dialog_id, message_id, version)
+) WITHOUT ROWID
+"""
+
+_MESSAGE_TRANSCRIPTIONS_DDL = """
+CREATE TABLE IF NOT EXISTS message_transcriptions (
+    dialog_id        INTEGER NOT NULL,
+    message_id       INTEGER NOT NULL,
+    text             TEXT NOT NULL CHECK (trim(text) <> ''),
+    transcription_id INTEGER NOT NULL,
+    received_at      INTEGER NOT NULL,
+    PRIMARY KEY (dialog_id, message_id)
 ) WITHOUT ROWID
 """
 
@@ -1480,6 +1491,7 @@ def _apply_migration_37(conn: sqlite3.Connection, current: int) -> int:
             "AND tbl_name IN ('messages', 'scheduled_messages')"
         ).fetchall(),
     )
+
     # Indexes whose key used the removed presentation column cannot survive
     # the new physical schema.  Keep all unrelated (including custom) indexes
     # and intentionally discard only those obsolete definitions.
@@ -1601,6 +1613,11 @@ FROM scheduled_messages_v36""",
     )
 
 
+def _apply_migration_38(conn: sqlite3.Connection, current: int) -> int:
+    """Persist final Telegram transcription facts without historical backfill."""
+    return _apply_migration(conn, current, 38, [_MESSAGE_TRANSCRIPTIONS_DDL])
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -1635,6 +1652,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_35(conn, current)
     current = _apply_migration_36(conn, current)
     current = _apply_migration_37(conn, current)
+    current = _apply_migration_38(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

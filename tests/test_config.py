@@ -50,6 +50,22 @@ def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
         config.freshness.reactions.freshness_ttl_seconds = 1  # type: ignore[misc]
 
 
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_load_config_rejects_non_finite_positive_float(tmp_path: Path, value: str) -> None:
+    path = _write_config(
+        tmp_path, f'[state]\ndir = "/state"\n\n[scheduling]\ndelta_catch_up_interval_seconds = {value}\n'
+    )
+
+    with pytest.raises(ConfigError, match="delta_catch_up_interval_seconds"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_resolve_scheduling_rejects_non_finite_positive_float(value: str) -> None:
+    with pytest.raises(ConfigError, match="DELTA_CATCH_UP_INTERVAL_SECONDS"):
+        resolve_scheduling_config(SchedulingConfig(), {"DELTA_CATCH_UP_INTERVAL_SECONDS": value})
+
+
 def test_load_config_reads_nested_policy_overrides(tmp_path: Path) -> None:
     path = _write_config(
         tmp_path,

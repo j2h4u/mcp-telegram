@@ -23,7 +23,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol, cast, runtime_checkable
 
@@ -60,6 +60,7 @@ from .messages.sqlite_repository import (
     persist_transcribed_text,
     read_message_out,
     read_message_text,
+    upsert_message_transcription,
 )
 from .messages.telegram_adapter import (
     PeerNameClient as _PeerNameClient,
@@ -177,6 +178,16 @@ class _ForumTopicPinnedUpdateLike(Protocol):
     peer: object | None
     topic_id: int | None
     pinned: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _TranscriptionEvent:
+    """Validated final transcription payload from Telegram."""
+
+    dialog_id: int
+    message_id: int
+    text: str
+    transcription_id: int
 
 
 class _EventHandlerClient(Protocol):
@@ -1193,18 +1204,18 @@ class EventHandlerManager:
         return True
 
     async def on_raw_transcribed_audio(self, update: UpdateTranscribedAudio) -> None:
-        """Handle transcribed voice updates by materializing the new text.
+        """Capture one final Telegram transcription fact under current policy.
 
-        Telethon emits UpdateTranscribedAudio for premium voice transcription
-        replies. The update carries the target peer, message id, and final text;
-        if the row already exists we rewrite messages.text and refresh FTS.
-        If the message row has not been inserted yet, we fetch the current
-        message and upsert it so the transcription is not dropped on the floor.
+        ``received_at`` is local technical arrival time only: Telegram does not
+        provide an event timestamp or ordering guarantee here. The latest
+        received fact is projected on canonical message writes regardless of a
+        later access-policy change.
         """
         event_fields = self._transcription_event_fields(update)
         if event_fields is None:
             return
-        dialog_id, msg_id, new_text = event_fields
+        dialog_id = event_fields.dialog_id
+        msg_id = event_fields.message_id
 
         coverage = self._realtime_coverage(dialog_id)
         if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
@@ -1216,39 +1227,19 @@ class EventHandlerManager:
             return
 
         try:
-            row = read_message_text(self._conn, dialog_id, msg_id)
-            existing_out = read_message_out(self._conn, dialog_id, msg_id)
             now = int(time.time())
-            if not row.found:
-                await self._handle_missing_transcription(update, dialog_id, msg_id, new_text, coverage, now)
-                return
-
-            old_text = row.text
-            if not allows_existing_body_update(
-                coverage,
-                RealtimeBodyEvent.TRANSCRIPTION,
-                outgoing=existing_out.outgoing,
-            ):
-                return
-            if old_text == new_text:
-                return
-
-            with self._conn:
-                if not allows_existing_body_update(
-                    self._realtime_coverage(dialog_id),
-                    RealtimeBodyEvent.TRANSCRIPTION,
-                    outgoing=existing_out.outgoing,
-                ):
-                    return
-                persist_transcribed_text(
-                    self._conn,
-                    dialog_id,
-                    msg_id,
-                    old_text=old_text,
-                    transcribed_text=new_text,
-                    transcribed_at=now,
+            row = read_message_text(self._conn, dialog_id, msg_id)
+            if row.found:
+                self._update_existing_transcription(
+                    event_fields,
+                    row.text,
+                    coverage,
+                    now,
                 )
-                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+            elif coverage is RealtimeHistoryCoverage.FULL_HISTORY:
+                self._stage_missing_transcription(event_fields, now)
+            else:
+                return
             logger.info(
                 "event_raw_transcribed_audio dialog_id=%d message_id=%d",
                 dialog_id,
@@ -1261,93 +1252,89 @@ class EventHandlerManager:
                 msg_id,
             )
 
+    def _stage_missing_transcription(
+        self,
+        event: _TranscriptionEvent,
+        now: int,
+    ) -> None:
+        """Store a FULL_HISTORY fact only while capture authorization remains."""
+        with self._conn:
+            if self._realtime_coverage(event.dialog_id) is not RealtimeHistoryCoverage.FULL_HISTORY:
+                return
+            if read_message_text(self._conn, event.dialog_id, event.message_id).found:
+                return
+            upsert_message_transcription(
+                self._conn,
+                event.dialog_id,
+                event.message_id,
+                transcribed_text=event.text,
+                transcription_id=event.transcription_id,
+                received_at=now,
+            )
+            self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, event.dialog_id))
+
+    def _update_existing_transcription(
+        self,
+        event: _TranscriptionEvent,
+        old_text: str | None,
+        coverage: RealtimeHistoryCoverage,
+        now: int,
+    ) -> None:
+        """Upsert a final fact and project changed text under current policy."""
+        existing_out = read_message_out(self._conn, event.dialog_id, event.message_id)
+        if not allows_existing_body_update(
+            coverage,
+            RealtimeBodyEvent.TRANSCRIPTION,
+            outgoing=existing_out.outgoing,
+        ):
+            return
+        with self._conn:
+            if not allows_existing_body_update(
+                self._realtime_coverage(event.dialog_id),
+                RealtimeBodyEvent.TRANSCRIPTION,
+                outgoing=existing_out.outgoing,
+            ):
+                return
+            upsert_message_transcription(
+                self._conn,
+                event.dialog_id,
+                event.message_id,
+                transcribed_text=event.text,
+                transcription_id=event.transcription_id,
+                received_at=now,
+            )
+            if old_text == event.text:
+                return
+            persist_transcribed_text(
+                self._conn,
+                event.dialog_id,
+                event.message_id,
+                old_text=old_text,
+                transcribed_text=event.text,
+                transcribed_at=now,
+            )
+            self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, event.dialog_id))
+
     @staticmethod
-    def _transcription_event_fields(update: UpdateTranscribedAudio) -> tuple[int, int, str] | None:
+    def _transcription_event_fields(update: UpdateTranscribedAudio) -> _TranscriptionEvent | None:
         peer: object = getattr(update, "peer", None)
         msg_id: object = getattr(update, "msg_id", None)
         text_value: object = getattr(update, "text", None)
-        if peer is None or not isinstance(msg_id, int) or not isinstance(text_value, str) or not text_value.strip():
+        transcription_id: object = getattr(update, "transcription_id", None)
+        if bool(getattr(update, "pending", False)):
+            return None
+        if peer is None or not isinstance(msg_id, int) or isinstance(msg_id, bool):
+            return None
+        if not isinstance(text_value, str) or not text_value.strip():
+            return None
+        if not isinstance(transcription_id, int) or isinstance(transcription_id, bool):
             return None
         try:
             dialog_id = int(cast(int, get_peer_id(peer)))
         except TypeError, ValueError:
             logger.debug("raw_transcribed_audio_unparseable_peer peer=%r", peer)
             return None
-        return dialog_id, msg_id, text_value.strip()
-
-    async def _handle_missing_transcription(  # noqa: PLR0913, PLR0917
-        self,
-        update: UpdateTranscribedAudio,
-        dialog_id: int,
-        msg_id: int,
-        new_text: str,
-        coverage: RealtimeHistoryCoverage,
-        now: int,
-    ) -> None:
-        outgoing = bool(getattr(update, "out", False))
-        if allows_missing_body_insert(coverage, RealtimeBodyEvent.TRANSCRIPTION, outgoing=outgoing):
-            logger.debug(
-                "raw_transcribed_audio_missing_message dialog_id=%d message_id=%d",
-                dialog_id,
-                msg_id,
-            )
-            await self._insert_missing_transcribed_audio(dialog_id, msg_id, new_text, now)
-            return
-        if coverage is not RealtimeHistoryCoverage.OWN_OUTGOING:
-            return
-        fetched = cast(Sequence[object], await self._client.get_messages(dialog_id, ids=[msg_id]))
-        fetched_msg = fetched[0] if fetched else None
-        if fetched_msg is None or not bool(getattr(fetched_msg, "out", False)):
-            return
-        coverage = self._realtime_coverage(dialog_id)
-        if not allows_missing_body_insert(coverage, RealtimeBodyEvent.TRANSCRIPTION, outgoing=True):
-            return
-        await self._insert_missing_transcribed_audio(
-            dialog_id,
-            msg_id,
-            new_text,
-            now,
-            fetched_msg=fetched_msg,
-        )
-
-    async def _insert_missing_transcribed_audio(
-        self,
-        dialog_id: int,
-        msg_id: int,
-        new_text: str,
-        now: int,
-        *,
-        fetched_msg: object | None = None,
-    ) -> None:
-        if fetched_msg is None:
-            fetched = cast(Sequence[object], await self._client.get_messages(dialog_id, ids=[msg_id]))
-            fetched_msg = fetched[0] if fetched else None
-        msg = fetched_msg
-        if msg is None:
-            return
-        coverage = self._realtime_coverage(dialog_id)
-        if not allows_missing_body_insert(
-            coverage,
-            RealtimeBodyEvent.TRANSCRIPTION,
-            outgoing=bool(getattr(msg, "out", False)),
-        ):
-            return
-        extracted = extract_message_row(dialog_id, msg, entity_name_map={})
-        extracted = replace(extracted, message=replace(extracted.message, text=new_text))
-        with self._conn:
-            if not allows_missing_body_insert(
-                self._realtime_coverage(dialog_id),
-                RealtimeBodyEvent.TRANSCRIPTION,
-                outgoing=bool(getattr(msg, "out", False)),
-            ):
-                return
-            insert_messages_with_fts(self._conn, [extracted])
-            self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
-        logger.info(
-            "event_raw_transcribed_audio dialog_id=%d message_id=%d inserted=true",
-            dialog_id,
-            msg_id,
-        )
+        return _TranscriptionEvent(dialog_id, msg_id, text_value.strip(), transcription_id)
 
     # ------------------------------------------------------------------
     # Phase 42: dialog metadata Raw handlers (EVENTS-01, EVENTS-02, EVENTS-03)

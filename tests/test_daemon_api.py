@@ -493,6 +493,18 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS message_transcriptions (
+            dialog_id        INTEGER NOT NULL,
+            message_id       INTEGER NOT NULL,
+            text             TEXT NOT NULL CHECK (trim(text) <> ''),
+            transcription_id INTEGER NOT NULL,
+            received_at      INTEGER NOT NULL,
+            PRIMARY KEY (dialog_id, message_id)
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS topic_metadata (
             dialog_id           INTEGER NOT NULL,
             topic_id            INTEGER NOT NULL,

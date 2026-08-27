@@ -448,7 +448,9 @@ async def test_on_raw_transcribed_audio_updates_text_and_fts(
     _enroll(sync_db, dialog_id)
     _insert_msg(sync_db, dialog_id, message_id, text="")
 
-    update = SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=message_id, text="speech to text", pending=False)
+    update = SimpleNamespace(
+        peer=PeerUser(user_id=dialog_id), msg_id=message_id, text="speech to text", pending=False, transcription_id=1
+    )
 
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     await mgr.on_raw_transcribed_audio(update)
@@ -456,30 +458,108 @@ async def test_on_raw_transcribed_audio_updates_text_and_fts(
     assert _message_text(sync_db, dialog_id, message_id) == "speech to text"
     assert _message_version_count(sync_db, dialog_id, message_id) == 1
     assert _fts_text(sync_db, dialog_id, message_id)
+    assert sync_db.execute(
+        "SELECT text, transcription_id FROM message_transcriptions WHERE dialog_id=? AND message_id=?",
+        (dialog_id, message_id),
+    ).fetchone() == ("speech to text", 1)
+    await mgr.on_raw_transcribed_audio(
+        SimpleNamespace(
+            peer=PeerUser(user_id=dialog_id),
+            msg_id=message_id,
+            text="speech to text",
+            pending=False,
+            transcription_id=2,
+        )
+    )
+    assert _message_version_count(sync_db, dialog_id, message_id) == 1
+    assert sync_db.execute(
+        "SELECT transcription_id FROM message_transcriptions WHERE dialog_id=? AND message_id=?",
+        (dialog_id, message_id),
+    ).fetchone() == (2,)
     assert _last_event_at(sync_db, dialog_id) is not None
 
 
 @pytest.mark.asyncio
-async def test_on_raw_transcribed_audio_missing_row_upserts_message(
+async def test_on_raw_transcribed_audio_pending_update_is_not_final(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """If the row is not present yet, fetch and store the transcribed message."""
+    from telethon.tl.types import PeerUser  # type: ignore[import-untyped]
+
+    dialog_id = 268071163
+    message_id = 902
+    _enroll(sync_db, dialog_id)
+    _insert_msg(sync_db, dialog_id, message_id, text="")
+    update = SimpleNamespace(
+        peer=PeerUser(user_id=dialog_id), msg_id=message_id, text="interim", pending=True, transcription_id=2
+    )
+
+    mgr = _make_manager(mock_client, sync_db, shutdown_event)
+    await mgr.on_raw_transcribed_audio(update)
+
+    assert _message_text(sync_db, dialog_id, message_id) == ""
+    assert _message_version_count(sync_db, dialog_id, message_id) == 0
+    assert sync_db.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_on_raw_transcribed_audio_requires_integer_transcription_id(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    from telethon.tl.types import PeerUser  # type: ignore[import-untyped]
+
+    dialog_id = 268071163
+    message_id = 903
+    _enroll(sync_db, dialog_id)
+    _insert_msg(sync_db, dialog_id, message_id, text="caption")
+    update = SimpleNamespace(
+        peer=PeerUser(user_id=dialog_id), msg_id=message_id, text="speech", pending=False, transcription_id=None
+    )
+
+    mgr = _make_manager(mock_client, sync_db, shutdown_event)
+    await mgr.on_raw_transcribed_audio(update)
+
+    assert _message_text(sync_db, dialog_id, message_id) == "caption"
+    assert sync_db.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_on_raw_transcribed_audio_missing_row_stages_final_fact(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """A missing full-history row retains the final fact without a Telegram fetch."""
     from telethon.tl.types import PeerUser  # type: ignore[import-untyped]
 
     dialog_id = 268071163
     message_id = 999
     _enroll(sync_db, dialog_id)
 
-    fetched_msg = build_mock_message(id=message_id, text="", media=SimpleNamespace())
-    mock_client.get_messages = AsyncMock(return_value=[fetched_msg])
-    update = SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=message_id, text="speech to text", pending=False)
+    update = SimpleNamespace(
+        peer=PeerUser(user_id=dialog_id), msg_id=message_id, text="speech to text", pending=False, transcription_id=3
+    )
 
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     await mgr.on_raw_transcribed_audio(update)
 
-    mock_client.get_messages.assert_awaited_once()
+    mock_client.get_messages.assert_not_awaited()
+    fact = sync_db.execute(
+        "SELECT text, transcription_id, received_at FROM message_transcriptions WHERE dialog_id=? AND message_id=?",
+        (dialog_id, message_id),
+    ).fetchone()
+    assert fact[0:2] == ("speech to text", 3)
+    assert isinstance(fact[2], int)
     assert _message_version_count(sync_db, dialog_id, message_id) == 0
-    assert _message_text(sync_db, dialog_id, message_id) == "speech to text"
-    assert _fts_text(sync_db, dialog_id, message_id) is not None
+    assert _message_text(sync_db, dialog_id, message_id) is None
+    assert _fts_text(sync_db, dialog_id, message_id) is None
+    sync_db.execute("UPDATE synced_dialogs SET status='access_lost' WHERE dialog_id=?", (dialog_id,))
+    sync_db.execute("UPDATE full_history_enrollment SET enabled=0 WHERE dialog_id=?", (dialog_id,))
+    sync_db.commit()
+    assert sync_db.execute(
+        "SELECT text, transcription_id FROM message_transcriptions WHERE dialog_id=? AND message_id=?",
+        (dialog_id, message_id),
+    ).fetchone() == ("speech to text", 3)

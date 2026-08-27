@@ -59,7 +59,7 @@ depends_on = [
     "mcp_telegram.event_handlers", "mcp_telegram.feedback_db", "mcp_telegram.feedback_service", "mcp_telegram.flood",
     "mcp_telegram.folders.refresh", "mcp_telegram.folders.sqlite_repository", "mcp_telegram.folders.telegram_adapter", "mcp_telegram.folders.worker",
     "mcp_telegram.fts", "mcp_telegram.media_hydration", "mcp_telegram.message_fact_refresh",
-    "mcp_telegram.own_only", "mcp_telegram.read_state", "mcp_telegram.reactions.refresh",
+    "mcp_telegram.own_only", "mcp_telegram.read_state", "mcp_telegram.reconnect", "mcp_telegram.reactions.refresh",
     "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.reactions.telegram_adapter", "mcp_telegram.scheduled_messages",
     "mcp_telegram.state", "mcp_telegram.sync_db", "mcp_telegram.sync_worker", "mcp_telegram.telegram",
     "mcp_telegram.telegram_read_receipts", "mcp_telegram.telegram_rpc", "mcp_telegram.topics.refresh",
@@ -249,6 +249,11 @@ depends_on = [
     "mcp_telegram.read_state", "mcp_telegram.realtime_history_policy", "mcp_telegram.resolver", "mcp_telegram.scheduled_messages",
     "mcp_telegram.sync_worker", "mcp_telegram.telethon_dialog", "mcp_telegram.unread_state",
 ]
+
+[[modules]]
+path = "mcp_telegram.reconnect"
+layer = "application"
+depends_on = []
 
 # capability — only established product ownership is vertical.
 [[modules]]
