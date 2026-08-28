@@ -373,7 +373,7 @@ class MessageFactHydrationWorker:
                 hydrated=applied.hydrated,
                 completed=applied.completed,
                 retried=retried,
-                dropped=dropped,
+                dropped=applied.dropped + dropped,
                 drop_observations=applied.drop_observations + drop_observations,
             )
         self._log_drops(batch, (*preflight_observations, *applied.drop_observations))
