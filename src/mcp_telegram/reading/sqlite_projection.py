@@ -162,7 +162,7 @@ FROM agent_visible_dialogs
 WHERE (:archived_filter IS NULL OR archived = :archived_filter)
 AND (:pinned_filter IS NULL OR pinned = :pinned_filter)
 AND (:name_pat IS NULL OR LOWER(name) LIKE :name_pat ESCAPE '\\')
-ORDER BY pinned DESC, last_message_at DESC
+ORDER BY pinned DESC, last_message_at DESC, dialog_id ASC
 """
 
 _LIST_DIALOG_MESSAGE_AGGREGATES_SQL = """
