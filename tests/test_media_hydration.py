@@ -509,7 +509,9 @@ async def test_transcription_does_not_project_stale_result_after_message_changes
             if mutation == "deleted":
                 db.execute("UPDATE messages SET is_deleted = 1 WHERE dialog_id = 1 AND message_id = 1")
             else:
-                db.execute("UPDATE messages SET media_kind = 'other', media_payload = '{}' WHERE dialog_id = 1 AND message_id = 1")
+                db.execute(
+                    "UPDATE messages SET media_kind = 'other', media_payload = '{}' WHERE dialog_id = 1 AND message_id = 1"
+                )
             db.commit()
             return SimpleNamespace(pending=False, text="stale text", transcription_id=9)
 
@@ -523,7 +525,14 @@ async def test_transcription_does_not_project_stale_result_after_message_changes
 
 @pytest.mark.parametrize(
     "symbol",
-    ["MSG_ID_INVALID", "MSG_VOICE_MISSING", "MSG_VOICE_TOO_LONG", "PEER_ID_INVALID", "PREMIUM_ACCOUNT_REQUIRED", "TRANSCRIPTION_FAILED"],
+    [
+        "MSG_ID_INVALID",
+        "MSG_VOICE_MISSING",
+        "MSG_VOICE_TOO_LONG",
+        "PEER_ID_INVALID",
+        "PREMIUM_ACCOUNT_REQUIRED",
+        "TRANSCRIPTION_FAILED",
+    ],
 )
 def test_transcription_documented_permanent_error_symbols_are_terminal(symbol: str) -> None:
     error = RPCError(None, symbol)
@@ -533,7 +542,9 @@ def test_transcription_documented_permanent_error_symbols_are_terminal(symbol: s
 def test_transcription_pending_drops_at_attempt_limit(db: sqlite3.Connection) -> None:
     _seed_voice(db)
     client = _Client(SimpleNamespace(pending=True, text="", transcription_id=7))
-    policy = FactHydrationConfig(max_attempts=1, transcription_recheck_delay_seconds=123, pause_between_requests_seconds=0.01)
+    policy = FactHydrationConfig(
+        max_attempts=1, transcription_recheck_delay_seconds=123, pause_between_requests_seconds=0.01
+    )
 
     result = asyncio.run(_transcription_worker(db, client, policy).run_cycle(now=10))
 

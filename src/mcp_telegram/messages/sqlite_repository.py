@@ -257,20 +257,26 @@ def apply_message_transcription_if_absent(  # noqa: PLR0913
     text = transcribed_text.strip()
     if not text:
         return "not_applied"
-    eligible = conn.execute(
-        "SELECT 1 FROM messages m "
-        "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
-        "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
-        "WHERE m.dialog_id = ? AND m.message_id = ? AND m.media_kind = 'voice' AND m.is_deleted = 0 "
-        "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
-        "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id)",
-        (dialog_id, message_id),
-    ).fetchone()
-    if eligible is None:
-        fact = conn.execute(
-            "SELECT 1 FROM message_transcriptions WHERE dialog_id = ? AND message_id = ?",
+    eligible = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT 1 FROM messages m "
+            "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
+            "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
+            "WHERE m.dialog_id = ? AND m.message_id = ? AND m.media_kind = 'voice' AND m.is_deleted = 0 "
+            "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
+            "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id)",
             (dialog_id, message_id),
-        ).fetchone()
+        ).fetchone(),
+    )
+    if eligible is None:
+        fact = cast(
+            tuple[object, ...] | None,
+            conn.execute(
+                "SELECT 1 FROM message_transcriptions WHERE dialog_id = ? AND message_id = ?",
+                (dialog_id, message_id),
+            ).fetchone(),
+        )
         return "already_applied" if fact is not None else "not_applied"
     upsert_message_transcription(
         conn,
@@ -343,24 +349,30 @@ def fact_hydration_eligible(conn: sqlite3.Connection, dialog_id: int) -> bool:
 
 def media_fact_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
     """Return whether one unresolved media message may be hydrated now."""
-    return conn.execute(
-        "SELECT 1 FROM messages m WHERE m.dialog_id = ? AND m.message_id = ? "
-        "AND m.is_deleted = 0 AND m.media_kind IN ('contact', 'other') AND m.media_payload = '{}' "
-        "AND EXISTS (" + _FACT_HYDRATION_ELIGIBILITY_SQL + ")",
-        (dialog_id, message_id, dialog_id),
-    ).fetchone() is not None
+    return (
+        conn.execute(
+            "SELECT 1 FROM messages m WHERE m.dialog_id = ? AND m.message_id = ? "
+            "AND m.is_deleted = 0 AND m.media_kind IN ('contact', 'other') AND m.media_payload = '{}' "
+            "AND EXISTS (" + _FACT_HYDRATION_ELIGIBILITY_SQL + ")",
+            (dialog_id, message_id, dialog_id),
+        ).fetchone()
+        is not None
+    )
 
 
 def transcription_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
     """Return whether one undeleted voice message still needs a transcription."""
-    return conn.execute(
-        "SELECT 1 FROM messages m WHERE m.dialog_id = ? AND m.message_id = ? "
-        "AND m.is_deleted = 0 AND m.media_kind = 'voice' "
-        "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
-        "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id) "
-        "AND EXISTS (" + _FACT_HYDRATION_ELIGIBILITY_SQL + ")",
-        (dialog_id, message_id, dialog_id),
-    ).fetchone() is not None
+    return (
+        conn.execute(
+            "SELECT 1 FROM messages m WHERE m.dialog_id = ? AND m.message_id = ? "
+            "AND m.is_deleted = 0 AND m.media_kind = 'voice' "
+            "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
+            "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id) "
+            "AND EXISTS (" + _FACT_HYDRATION_ELIGIBILITY_SQL + ")",
+            (dialog_id, message_id, dialog_id),
+        ).fetchone()
+        is not None
+    )
 
 
 def apply_hydrated_media_fact(
@@ -419,12 +431,17 @@ def reconcile_fact_hydration_job(
         message.sent_at,
         HydrationPriority.BACKFILL,
     )
-    transcription_row = conn.execute(
-        "SELECT 1 FROM message_transcriptions WHERE dialog_id = ? AND message_id = ?",
-        (message.dialog_id, message.message_id),
-    ).fetchone()
-    if message.media_kind == "voice" and transcription_row is None and transcription_hydration_eligible(
-        conn, message.dialog_id, message.message_id
+    transcription_row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT 1 FROM message_transcriptions WHERE dialog_id = ? AND message_id = ?",
+            (message.dialog_id, message.message_id),
+        ).fetchone(),
+    )
+    if (
+        message.media_kind == "voice"
+        and transcription_row is None
+        and transcription_hydration_eligible(conn, message.dialog_id, message.message_id)
     ):
         queue.enqueue(transcription_job)
     else:

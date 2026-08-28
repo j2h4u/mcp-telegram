@@ -12,6 +12,7 @@ from telethon.errors.rpcerrorlist import (  # type: ignore[import-untyped]
     PremiumAccountRequiredError,
 )
 from telethon.tl.functions.messages import TranscribeAudioRequest  # type: ignore[import-untyped]
+from telethon.tl.types import TypeInputPeer  # type: ignore[import-untyped]
 
 from .fact_hydration import AppliedFacts
 from .hydration_queue import TRANSCRIPTION_HYDRATION_KIND, HydrationJob, HydrationQueueRepository
@@ -22,7 +23,7 @@ from .messages.sqlite_repository import (
 
 
 class TranscriptionHydrationClient(Protocol):
-    async def get_input_entity(self, dialog_id: int) -> object: ...
+    async def get_input_entity(self, dialog_id: int) -> TypeInputPeer: ...
 
     async def __call__(self, request: object) -> object: ...
 
@@ -44,7 +45,7 @@ class TranscriptionHydrationHandler:
     async def request(self, client: object, jobs: Sequence[HydrationJob]) -> object:
         telegram = cast(TranscriptionHydrationClient, client)
         job = jobs[0]
-        peer = await telegram.get_input_entity(job.dialog_id)
+        peer = cast(TypeInputPeer, await telegram.get_input_entity(job.dialog_id))
         return await telegram(TranscribeAudioRequest(peer=peer, msg_id=job.message_id))
 
     def apply(

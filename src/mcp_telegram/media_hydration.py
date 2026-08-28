@@ -25,7 +25,7 @@ class MediaFactHydrationHandler:
     request_cost = 1
     pending_delay_seconds = 0
 
-    def __init__(self, *, batch_size: int = 100) -> None:
+    def __init__(self, *, batch_size: int) -> None:
         self.batch_size = batch_size
 
     def eligible(self, conn: sqlite3.Connection, job: HydrationJob) -> bool:

@@ -138,16 +138,33 @@ class MessageFactHydrationWorker:
         if not due:
             return FactHydrationCycleResult()
         request_batches = batch_jobs(due, self._handlers)
+        outcome = await self._run_batches(request_batches, int(effective_now))
+        logger.info(
+            "message_fact_hydration cycle jobs=%d requests=%d hydrated=%d completed=%d "
+            "retried=%d dropped=%d stopped=%s",
+            len(due),
+            outcome.requests,
+            outcome.hydrated,
+            outcome.completed,
+            outcome.retried,
+            outcome.dropped,
+            outcome.stopped,
+        )
+        return outcome
+
+    async def _run_batches(
+        self, request_batches: Sequence[Sequence[HydrationJob]], effective_now: int
+    ) -> FactHydrationCycleResult:
         requests = hydrated = completed = retried = dropped = 0
         stopped = False
-        request_budget = 0
+        used_requests = 0
         for batch_index, batch in enumerate(request_batches):
             handler = self._handlers[batch[0].kind]
-            if request_budget + handler.request_cost > self._max_requests_per_cycle:
+            if used_requests + handler.request_cost > self._max_requests_per_cycle:
                 break
             if self._shutdown_event.is_set():
                 break
-            request_budget += handler.request_cost
+            used_requests += handler.request_cost
             outcome = await self._process_batch(handler, batch, effective_now)
             requests += outcome.requests
             hydrated += outcome.hydrated
@@ -159,17 +176,6 @@ class MessageFactHydrationWorker:
                 break
             if batch_index + 1 < len(request_batches) and await self._pause_between_requests():
                 break
-        logger.info(
-            "message_fact_hydration cycle jobs=%d requests=%d hydrated=%d completed=%d "
-            "retried=%d dropped=%d stopped=%s",
-            len(due),
-            requests,
-            hydrated,
-            completed,
-            retried,
-            dropped,
-            stopped,
-        )
         return FactHydrationCycleResult(requests, hydrated, completed, retried, dropped, stopped)
 
     async def _process_batch(  # noqa: PLR0911
@@ -264,9 +270,7 @@ class MessageFactHydrationWorker:
             dropped=preflight_dropped + applied.dropped,
         )
 
-    def _start_batch(
-        self, handler: HydrationHandler, jobs: Sequence[HydrationJob]
-    ) -> tuple[list[HydrationJob], int]:
+    def _start_batch(self, handler: HydrationHandler, jobs: Sequence[HydrationJob]) -> tuple[list[HydrationJob], int]:
         started: list[HydrationJob] = []
         dropped = 0
         for job in jobs:

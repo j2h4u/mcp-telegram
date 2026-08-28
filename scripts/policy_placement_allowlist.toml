@@ -386,3 +386,8 @@ rationale = "This is a process-local diagnostic logging cadence."
 category = "policy_defaults"
 key = "src/mcp_telegram/scheduled_messages.py:run_scheduled_reconciliation_loop:interval"
 rationale = "This pre-existing worker scheduling default is retained as a compatibility contract."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/transcription_hydration.py:TranscriptionHydrationHandler:batch_size"
+rationale = "Telegram's TranscribeAudio request accepts one message per request; this is a fixed protocol contract, not an operator schedule."

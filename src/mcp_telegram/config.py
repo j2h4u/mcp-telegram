@@ -550,9 +550,7 @@ def resolve_scheduling_config(
             interval_seconds=_env_positive_float(
                 env, "FACT_HYDRATION_INTERVAL_SECONDS", config.fact_hydration.interval_seconds
             ),
-            max_requests_per_cycle=_env_fact_hydration_max_requests(
-                env, config.fact_hydration.max_requests_per_cycle
-            ),
+            max_requests_per_cycle=_env_fact_hydration_max_requests(env, config.fact_hydration.max_requests_per_cycle),
             max_jobs_per_cycle=_env_positive_int(
                 env, "FACT_HYDRATION_MAX_JOBS_PER_CYCLE", config.fact_hydration.max_jobs_per_cycle
             ),

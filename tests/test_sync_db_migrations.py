@@ -294,8 +294,7 @@ def test_v41_seeds_voice_transcription_hydration_as_backfill(tmp_path: Path) -> 
     with _sync_db_connection(db_path) as conn:
         conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (91, 'synced')")
         conn.execute(
-            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) "
-            "VALUES (91, 1, 'explicit', 1)"
+            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (91, 1, 'explicit', 1)"
         )
         conn.execute(
             "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
@@ -314,9 +313,12 @@ def test_v41_seeds_voice_transcription_hydration_as_backfill(tmp_path: Path) -> 
             "SELECT kind, dialog_id, message_id, priority, message_sent_at FROM hydration_jobs "
             "WHERE kind = 'transcription'"
         ).fetchone() == ("transcription", 91, 17, 0, 1234)
-        assert conn.execute(
-            "SELECT 1 FROM hydration_jobs WHERE kind = 'transcription' AND dialog_id = 91 AND message_id = 18"
-        ).fetchone() is None
+        assert (
+            conn.execute(
+                "SELECT 1 FROM hydration_jobs WHERE kind = 'transcription' AND dialog_id = 91 AND message_id = 18"
+            ).fetchone()
+            is None
+        )
 
 
 def test_migration_v11_idempotent(db_path: Path) -> None:
