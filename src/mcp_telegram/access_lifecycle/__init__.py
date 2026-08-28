@@ -11,7 +11,7 @@ from typing import cast
 
 from ..history_enrollment import reset_read_position_retry, restore_access_status
 from ..hydration_queue import HydrationQueueRepository
-from ..messages.sqlite_repository import reconcile_media_hydration_jobs_for_dialog
+from ..messages.sqlite_repository import reconcile_fact_hydration_jobs_for_dialog
 
 _SAVEPOINTS = count()
 
@@ -95,7 +95,7 @@ def restore_access_after_revalidation(
             conn.execute(
                 "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ?", (total_messages, dialog_id)
             )
-        reconcile_media_hydration_jobs_for_dialog(conn, dialog_id, due_at=now)
+        reconcile_fact_hydration_jobs_for_dialog(conn, dialog_id, due_at=now)
         _record_event(conn, kind="access_restored", dialog_id=dialog_id, occurred_at=now, payload={})
 
 

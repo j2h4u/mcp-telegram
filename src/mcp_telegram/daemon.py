@@ -78,6 +78,7 @@ from .delta_sync import (
 )
 from .dialog_sync import DialogsBootstrapWorker, run_reconciliation_loop
 from .event_handlers import EventHandlerManager
+from .fact_hydration import MessageFactHydrationWorker
 from .feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
 from .feedback_service import FeedbackApplicationService
 from .flood import (
@@ -94,12 +95,12 @@ from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .folders.telegram_adapter import FolderClient, TelethonTelegramFolderGateway
 from .folders.worker import FolderProjectionWorker
 from .fts import backfill_fts_index
-from .media_hydration import MediaHydrationWorker
+from .media_hydration import MediaFactHydrationHandler
 from .message_fact_refresh import (
     MessageFactRefreshPolicy,
     run_message_fact_refresh_loop,
 )
-from .messages.sqlite_repository import reconcile_media_hydration_jobs_for_dialog
+from .messages.sqlite_repository import reconcile_fact_hydration_jobs_for_dialog
 from .own_only import OwnOnlyContext, ensure_own_only_schema
 from .reactions.refresh import ReactionFreshener
 from .reactions.sqlite_repository import SQLiteReactionSnapshotRepository
@@ -127,6 +128,7 @@ from .telegram_rpc import (
 from .topics.refresh import TopicRefresher
 from .topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from .topics.telegram_adapter import TelethonTelegramTopicGateway, TopicClient
+from .transcription_hydration import TranscriptionHydrationHandler
 
 logger = logging.getLogger(__name__)
 
@@ -238,7 +240,7 @@ class _SyncMainContext:
     api_server: DaemonAPIServer
     topic_refresher: TopicRefresher
     folder_projection_worker: FolderProjectionWorker
-    media_hydration_worker: MediaHydrationWorker
+    fact_hydration_worker: MessageFactHydrationWorker
     socket_path: Path
     unix_server: asyncio.AbstractServer | None = None
     handler_manager: EventHandlerManager | None = None
@@ -947,7 +949,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - com
         feedback_service,
         db_path,
         reaction_freshener=reaction_freshener,
-        hydration_requester=lambda hydration_conn, dialog_id, due_at: reconcile_media_hydration_jobs_for_dialog(
+        hydration_requester=lambda hydration_conn, dialog_id, due_at: reconcile_fact_hydration_jobs_for_dialog(
             hydration_conn,
             dialog_id,
             due_at=due_at,
@@ -994,18 +996,23 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - com
             shutdown_event,
             config.scheduling.folder_projection,
         ),
-        media_hydration_worker=MediaHydrationWorker(
+        fact_hydration_worker=MessageFactHydrationWorker(
             client,
             conn,
             shutdown_event,
-            interval_seconds=scheduling.media_hydration.interval_seconds,
-            max_requests_per_cycle=scheduling.media_hydration.max_requests_per_cycle,
-            max_jobs_per_cycle=scheduling.media_hydration.max_jobs_per_cycle,
-            batch_size=scheduling.media_hydration.batch_size,
-            pause_between_requests_seconds=scheduling.media_hydration.pause_between_requests_seconds,
-            retry_delay_seconds=scheduling.media_hydration.retry_delay_seconds,
-            circuit_retry_seconds=scheduling.media_hydration.circuit_retry_seconds,
-            max_attempts=scheduling.media_hydration.max_attempts,
+            handlers=(
+                MediaFactHydrationHandler(batch_size=scheduling.fact_hydration.batch_size),
+                TranscriptionHydrationHandler(
+                    recheck_delay_seconds=scheduling.fact_hydration.transcription_recheck_delay_seconds,
+                ),
+            ),
+            interval_seconds=scheduling.fact_hydration.interval_seconds,
+            max_requests_per_cycle=scheduling.fact_hydration.max_requests_per_cycle,
+            max_jobs_per_cycle=scheduling.fact_hydration.max_jobs_per_cycle,
+            pause_between_requests_seconds=scheduling.fact_hydration.pause_between_requests_seconds,
+            retry_delay_seconds=scheduling.fact_hydration.retry_delay_seconds,
+            circuit_retry_seconds=scheduling.fact_hydration.circuit_retry_seconds,
+            max_attempts=scheduling.fact_hydration.max_attempts,
         ),
         socket_path=socket_path,
         unix_server=unix_server,
@@ -1181,7 +1188,7 @@ async def _start_followup_background_tasks(
         ),
         name="message_fact_refresh_loop",
     )
-    _create_tracked_task(ctx, ctx.media_hydration_worker.run(), name="media_hydration_worker")
+    _create_tracked_task(ctx, ctx.fact_hydration_worker.run(), name="message_fact_hydration_worker")
     _create_tracked_task(
         ctx,
         run_access_probe_loop(

@@ -57,12 +57,13 @@ depends_on = [
     "mcp_telegram.activity_cold_backfill", "mcp_telegram.activity_contracts", "mcp_telegram.activity_hot_sweep", "mcp_telegram.activity_peer_resolve", "mcp_telegram.activity_substrate", "mcp_telegram.activity_sync",
     "mcp_telegram.config", "mcp_telegram.daemon_api", "mcp_telegram.delta_sync", "mcp_telegram.dialog_sync",
     "mcp_telegram.event_handlers", "mcp_telegram.feedback_db", "mcp_telegram.feedback_service", "mcp_telegram.flood",
+    "mcp_telegram.fact_hydration",
     "mcp_telegram.folders.refresh", "mcp_telegram.folders.sqlite_repository", "mcp_telegram.folders.telegram_adapter", "mcp_telegram.folders.worker",
     "mcp_telegram.fts", "mcp_telegram.media_hydration", "mcp_telegram.message_fact_refresh", "mcp_telegram.messages.sqlite_repository",
     "mcp_telegram.own_only", "mcp_telegram.read_state", "mcp_telegram.reconnect", "mcp_telegram.reactions.refresh",
     "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.reactions.telegram_adapter", "mcp_telegram.scheduled_messages",
     "mcp_telegram.state", "mcp_telegram.sync_db", "mcp_telegram.sync_worker", "mcp_telegram.telegram",
-    "mcp_telegram.telegram_read_receipts", "mcp_telegram.telegram_rpc", "mcp_telegram.topics.refresh",
+    "mcp_telegram.telegram_read_receipts", "mcp_telegram.telegram_rpc", "mcp_telegram.topics.refresh", "mcp_telegram.transcription_hydration",
     "mcp_telegram.topics.sqlite_repository", "mcp_telegram.topics.telegram_adapter",
 ]
 
@@ -180,9 +181,23 @@ depends_on = ["mcp_telegram.models", "mcp_telegram.reactions.refresh", "mcp_tele
 path = "mcp_telegram.media_hydration"
 layer = "application"
 depends_on = [
-    "mcp_telegram.access_lifecycle", "mcp_telegram.hydration_queue",
-    "mcp_telegram.flood", "mcp_telegram.media_fact", "mcp_telegram.telegram_access", "mcp_telegram.telegram_rpc",
-    "mcp_telegram.telethon_media", "mcp_telegram.messages.sqlite_repository",
+    "mcp_telegram.fact_hydration", "mcp_telegram.hydration_queue", "mcp_telegram.media_fact", "mcp_telegram.telethon_media",
+    "mcp_telegram.messages.sqlite_repository",
+]
+
+[[modules]]
+path = "mcp_telegram.fact_hydration"
+layer = "application"
+depends_on = [
+    "mcp_telegram.access_lifecycle", "mcp_telegram.hydration_queue", "mcp_telegram.flood",
+    "mcp_telegram.telegram_access", "mcp_telegram.telegram_rpc",
+]
+
+[[modules]]
+path = "mcp_telegram.transcription_hydration"
+layer = "application"
+depends_on = [
+    "mcp_telegram.fact_hydration", "mcp_telegram.hydration_queue", "mcp_telegram.messages.sqlite_repository",
 ]
 
 [[modules]]

@@ -53,14 +53,14 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 from .activity_contracts import InputPeerResolver
 from .history_enrollment import ensure_automatic_dm_enrollment
 from .messages.sqlite_repository import (
+    apply_message_transcription,
     insert_messages_with_fts,
     list_undeleted_message_ids,
     mark_message_deleted,
     persist_edited_message,
-    persist_transcribed_text,
     read_message_out,
     read_message_text,
-    upsert_message_transcription,
+    stage_message_transcription,
 )
 from .messages.telegram_adapter import (
     PeerNameClient as _PeerNameClient,
@@ -1263,7 +1263,7 @@ class EventHandlerManager:
                 return
             if read_message_text(self._conn, event.dialog_id, event.message_id).found:
                 return
-            upsert_message_transcription(
+            stage_message_transcription(
                 self._conn,
                 event.dialog_id,
                 event.message_id,
@@ -1295,7 +1295,7 @@ class EventHandlerManager:
                 outgoing=existing_out.outgoing,
             ):
                 return
-            upsert_message_transcription(
+            apply_message_transcription(
                 self._conn,
                 event.dialog_id,
                 event.message_id,
@@ -1303,17 +1303,8 @@ class EventHandlerManager:
                 transcription_id=event.transcription_id,
                 received_at=now,
             )
-            if old_text == event.text:
-                return
-            persist_transcribed_text(
-                self._conn,
-                event.dialog_id,
-                event.message_id,
-                old_text=old_text,
-                transcribed_text=event.text,
-                transcribed_at=now,
-            )
-            self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, event.dialog_id))
+            if old_text != event.text:
+                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, event.dialog_id))
 
     @staticmethod
     def _transcription_event_fields(update: UpdateTranscribedAudio) -> _TranscriptionEvent | None:

@@ -1612,12 +1612,12 @@ def test_sync_main_registers_read_positions_bootstrap_after_handler(tmp_path):
     )
 
 
-def test_followup_tasks_register_media_hydration_worker() -> None:
+def test_followup_tasks_register_fact_hydration_worker() -> None:
     """The daemon composition root must start the media hydration loop."""
     import inspect
 
     from mcp_telegram import daemon as daemon_mod
 
     src = inspect.getsource(daemon_mod._start_followup_background_tasks)
-    assert "ctx.media_hydration_worker.run()" in src
-    assert 'name="media_hydration_worker"' in src
+    assert "ctx.fact_hydration_worker.run()" in src
+    assert 'name="message_fact_hydration_worker"' in src
