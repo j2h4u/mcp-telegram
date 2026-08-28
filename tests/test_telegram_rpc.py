@@ -1,3 +1,5 @@
+# pyright: reportAny=false, reportAttributeAccessIssue=false, reportOptionalMemberAccess=false
+
 from __future__ import annotations
 
 import asyncio
@@ -97,7 +99,7 @@ async def test_helper_and_request_iter_pages_use_the_same_public_call_seam(monke
 
     monkeypatch.setattr(TelegramClient, "__call__", base_call)
     gate._mb_entity_cache = SimpleNamespace(self_id=1)
-    assert (await gate.get_me()).id == 1
+    assert getattr(await gate.get_me(), "id", None) == 1
     iterator = _PagedRequestIter(gate, [[1, 2], [3]])
     assert [item async for item in iterator] == [1, 2, 3]
     assert calls[0].__class__.__name__ == "GetUsersRequest"
