@@ -94,6 +94,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "telegram_access.py",
             "telegram_gateway.py",
             "telegram_rpc.py",
+            "telegram_rpc_error.py",
             "telegram_read_receipts.py",
             "transcription_hydration.py",
             "telethon_dialog.py",

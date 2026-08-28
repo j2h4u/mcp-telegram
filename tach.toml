@@ -190,7 +190,7 @@ path = "mcp_telegram.fact_hydration"
 layer = "application"
 depends_on = [
     "mcp_telegram.access_lifecycle", "mcp_telegram.hydration_queue", "mcp_telegram.flood",
-    "mcp_telegram.telegram_access", "mcp_telegram.telegram_rpc",
+    "mcp_telegram.telegram_access", "mcp_telegram.telegram_rpc", "mcp_telegram.telegram_rpc_error",
 ]
 
 [[modules]]
@@ -198,6 +198,7 @@ path = "mcp_telegram.transcription_hydration"
 layer = "application"
 depends_on = [
     "mcp_telegram.fact_hydration", "mcp_telegram.hydration_queue", "mcp_telegram.messages.sqlite_repository",
+    "mcp_telegram.telegram_rpc_error",
 ]
 
 [[modules]]
@@ -344,6 +345,11 @@ depends_on = ["mcp_telegram.topics.contracts", "mcp_telegram.topics.ports"]
 # telegram_gateway — Telethon projection and live fact adapters.
 [[modules]]
 path = "mcp_telegram.telegram_access"
+layer = "telegram_gateway"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.telegram_rpc_error"
 layer = "telegram_gateway"
 depends_on = []
 

@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Sequence
 from typing import Protocol, cast
 
-from .fact_hydration import AppliedFacts
+from .fact_hydration import AppliedFacts, HydrationDropObservation
 from .hydration_queue import MEDIA_METADATA_KIND, HydrationJob, HydrationQueueRepository
 from .media_fact import encode_media_payload
 from .messages.sqlite_repository import apply_hydrated_media_fact, media_fact_hydration_eligible
@@ -44,13 +44,25 @@ class MediaFactHydrationHandler:
         now: int,
     ) -> AppliedFacts:
         del now
-        by_id = _response_map(result)
+        by_id, valid_response = _response_map(result)
         hydrated = completed = dropped = 0
+        drop_observations: list[HydrationDropObservation] = []
+        if not valid_response:
+            drop_observations.extend(
+                HydrationDropObservation("invalid_result", job.message_id, job.kind, job.dialog_id, job.attempts)
+                for job in jobs
+            )
+            for job in jobs:
+                queue.remove(job)
+            return AppliedFacts(dropped=len(jobs), drop_observations=tuple(drop_observations))
         for job in jobs:
             message = by_id.get(job.message_id)
             if message is None:
                 queue.remove(job)
                 dropped += 1
+                drop_observations.append(
+                    HydrationDropObservation("missing_response", job.message_id, job.kind, job.dialog_id, job.attempts)
+                )
                 continue
             fact = extract_media_fact(getattr(message, "media", None))
             kind = None if fact is None else fact.kind
@@ -59,33 +71,41 @@ class MediaFactHydrationHandler:
             queue.remove(job)
             if not applied:
                 dropped += 1
+                drop_observations.append(
+                    HydrationDropObservation("not_applied", job.message_id, job.kind, job.dialog_id, job.attempts)
+                )
             else:
                 completed += 1
             if fact is not None and applied:
                 hydrated += 1
-        return AppliedFacts(hydrated=hydrated, completed=completed, dropped=dropped)
+        return AppliedFacts(
+            hydrated=hydrated,
+            completed=completed,
+            dropped=dropped,
+            drop_observations=tuple(drop_observations),
+        )
 
     def is_terminal_error(self, exc: BaseException) -> bool:
         del exc
         return False
 
 
-def _response_map(result: object) -> dict[int, object]:
+def _response_map(result: object) -> tuple[dict[int, object], bool]:
     if result is None or isinstance(result, (str, bytes, dict)):
-        return {}
+        return {}, False
     if getattr(result, "id", None) is not None:
         items: Sequence[object] = [result]
     else:
         try:
             items = list(cast(Sequence[object], result))
         except TypeError:
-            return {}
+            return {}, False
     mapped: dict[int, object] = {}
     for item in items:
         raw_id = getattr(item, "id", None)
         if isinstance(raw_id, int) and raw_id > 0:
             mapped[raw_id] = item
-    return mapped
+    return mapped, True
 
 
 __all__ = ["MEDIA_METADATA_KIND", "MediaFactHydrationHandler", "MediaHydrationClient"]
