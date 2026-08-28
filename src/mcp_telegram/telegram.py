@@ -46,7 +46,7 @@ def create_client(
     """Return a cached TelegramClient singleton for the given credentials.
 
     ``@cache`` means the same instance is returned for identical
-    ``(api_id, api_hash, session_name, catch_up)`` arguments within the process lifetime.
+    ``(api_id, api_hash, session_name, catch_up, config)`` arguments within the process lifetime.
     Callers should use ``connected_client()`` for connection lifecycle management.
 
     Single-session by design: all tool calls within one process share the same
