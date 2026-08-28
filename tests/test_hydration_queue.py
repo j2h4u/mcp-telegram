@@ -143,6 +143,29 @@ def test_reschedule_and_remove_only_touch_existing_identity(db: sqlite3.Connecti
     assert not repository.remove(queued)
 
 
+def test_summarize_for_dialog_includes_future_jobs_and_bounds_message_ids(db: sqlite3.Connection) -> None:
+    repository = HydrationQueueRepository(db)
+    for message_id in range(1, 41):
+        repository.enqueue(_job("media", 42, message_id, 9_999, attempts=message_id % 4))
+    for message_id in (1, 2):
+        repository.enqueue(_job("transcription", 42, message_id, 9_999, attempts=7))
+    repository.enqueue(_job("media", 99, 1, 9_999, attempts=99))
+
+    summaries = repository.summarize_for_dialog(42)
+    media = summaries[0]
+    transcription = summaries[1]
+    assert media.kind == "media"
+    assert media.dialog_id == 42
+    assert media.job_count == 40
+    assert media.message_ids == tuple(range(1, 33))
+    assert media.attempts_min == 0
+    assert media.attempts_max == 3
+    assert transcription.kind == "transcription"
+    assert transcription.job_count == 2
+    assert transcription.message_ids == (1, 2)
+    assert transcription.attempts_min == transcription.attempts_max == 7
+
+
 def test_repository_never_commits_callers_transaction(db: sqlite3.Connection) -> None:
     conn = db
     repository = HydrationQueueRepository(conn)

@@ -424,6 +424,32 @@ async def test_multi_job_missing_response_emits_one_bounded_drop_record(
 
 
 @pytest.mark.asyncio
+async def test_preflight_drop_has_no_rpc_descriptor_when_later_job_fails(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _seed(db, message_id=1)
+    _seed(db, message_id=2)
+    db.execute("UPDATE messages SET is_deleted = 1 WHERE dialog_id = 1 AND message_id = 1")
+    db.commit()
+    monkeypatch.setattr(MediaFactHydrationHandler, "is_terminal_error", lambda _self, _exc: True)
+    client = _Client(error=BadRequestError(None, "MSG_VOICE_TOO_LONG"))
+
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.fact_hydration"):
+        result = await _worker(db, client).run_cycle(now=1)
+
+    records = [record for record in caplog.records if "message_fact_hydration_drop" in record.message]
+    assert result.dropped == 2
+    assert len(records) == 2
+    preflight_args = cast(tuple[object, ...], next(record.args for record in records if "ineligible" in record.message))
+    terminal_args = cast(
+        tuple[object, ...], next(record.args for record in records if "terminal_rpc" in record.message)
+    )
+    assert preflight_args[7:] == (None, None, None)
+    assert terminal_args[7:] == ("BadRequestError", 400, "MSG_VOICE_TOO_LONG")
+    assert all(record.exc_info is None for record in records)
+
+
+@pytest.mark.asyncio
 async def test_invalid_result_drop_is_warning_without_telegram_payload(
     db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -522,6 +548,37 @@ async def test_access_loss_purges_and_restore_reenqueues_unresolved_jobs(
         ("media_metadata", 1, 1, 20, 0),
         ("transcription", 1, 2, 20, 0),
     ]
+
+
+@pytest.mark.asyncio
+async def test_access_loss_logs_all_kinds_with_bounded_queue_summary(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    for message_id in range(1, 36):
+        _seed(db, message_id=message_id)
+    _seed_voice(db, message_id=100)
+    db.execute("UPDATE hydration_jobs SET due_at = 999 WHERE dialog_id = 1 AND message_id > 1")
+    db.commit()
+    monkeypatch.setattr("mcp_telegram.fact_hydration.ACCESS_LOST_ERRORS", (RuntimeError,))
+    client = _Client(error=RuntimeError("private"))
+    policy = FactHydrationConfig(max_jobs_per_cycle=100, max_requests_per_cycle=10, pause_between_requests_seconds=0.01)
+
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.fact_hydration"):
+        result = await _mixed_worker(db, client, policy).run_cycle(now=1)
+
+    records = [record for record in caplog.records if "message_fact_hydration_drop" in record.message]
+    assert result.dropped == 36
+    assert len(records) == 2
+    by_kind: dict[str, tuple[object, ...]] = {}
+    for record in records:
+        args = cast(tuple[object, ...], record.args)
+        by_kind[cast(str, args[1])] = args
+    media_args = by_kind["media_metadata"]
+    transcription_args = by_kind["transcription"]
+    assert media_args[3:6] == (35, tuple(range(1, 33)), 0)
+    assert transcription_args[3:6] == (1, (100,), 0)
+    assert all(cast(tuple[object, ...], record.args)[7:] == ("RuntimeError", None, None) for record in records)
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
 
 
 @pytest.mark.asyncio

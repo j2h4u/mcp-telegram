@@ -9,6 +9,7 @@ message-fact write.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import cast
@@ -18,6 +19,7 @@ from typing import cast
 HYDRATION_QUEUE_TABLE = "hydration_jobs"
 MEDIA_METADATA_KIND = "media_metadata"
 TRANSCRIPTION_HYDRATION_KIND = "transcription"
+DEFAULT_SUMMARY_MESSAGE_IDS = 32
 
 
 class HydrationPriority(IntEnum):
@@ -54,6 +56,18 @@ class HydrationJob:
             raise ValueError("message_sent_at must be nonnegative")
         if not isinstance(self.priority, HydrationPriority):
             raise ValueError("priority must be a HydrationPriority")
+
+
+@dataclass(frozen=True, slots=True)
+class HydrationQueueSummary:
+    """Bounded, privacy-safe summary of queued jobs for one kind and dialog."""
+
+    kind: str
+    dialog_id: int
+    job_count: int
+    message_ids: tuple[int, ...]
+    attempts_min: int
+    attempts_max: int
 
 
 _JOB_COLUMNS = "kind, dialog_id, message_id, due_at, attempts, message_sent_at, priority"
@@ -188,10 +202,57 @@ class HydrationQueueRepository:
             )
         return cursor.rowcount
 
+    def summarize_for_dialog(
+        self, dialog_id: int, *, max_message_ids: int = DEFAULT_SUMMARY_MESSAGE_IDS
+    ) -> tuple[HydrationQueueSummary, ...]:
+        """Summarize all queued jobs before a dialog-wide purge.
+
+        Aggregates are computed by SQLite so future-due rows are included while
+        only queue coordinates (never message payloads) are read into memory.
+        """
+        if not self.is_available():
+            return ()
+        message_id_cap = max(0, max_message_ids)
+        aggregate_rows = cast(
+            list[tuple[object, ...]],
+            self._conn.execute(
+                f"SELECT kind, COUNT(*), MIN(attempts), MAX(attempts) FROM {HYDRATION_QUEUE_TABLE} "
+                "WHERE dialog_id = ? GROUP BY kind ORDER BY kind",
+                (dialog_id,),
+            ).fetchall(),
+        )
+        ids_by_kind: dict[str, list[int]] = {str(row[0]): [] for row in aggregate_rows}
+        id_rows = cast(
+            Iterator[tuple[object, ...]],
+            iter(
+                self._conn.execute(
+                    f"SELECT kind, message_id FROM {HYDRATION_QUEUE_TABLE} WHERE dialog_id = ? ORDER BY kind, message_id",
+                    (dialog_id,),
+                )
+            ),
+        )
+        for raw_kind, raw_message_id in id_rows:
+            kind = str(raw_kind)
+            ids = ids_by_kind.get(kind)
+            if ids is not None and len(ids) < message_id_cap:
+                ids.append(int(cast(int | str, raw_message_id)))
+        return tuple(
+            HydrationQueueSummary(
+                kind=str(row[0]),
+                dialog_id=dialog_id,
+                job_count=int(cast(int | str, row[1])),
+                message_ids=tuple(ids_by_kind[str(row[0])]),
+                attempts_min=int(cast(int | str, row[2])),
+                attempts_max=int(cast(int | str, row[3])),
+            )
+            for row in aggregate_rows
+        )
+
 
 __all__ = [
     "HYDRATION_QUEUE_TABLE",
     "HydrationJob",
     "HydrationPriority",
     "HydrationQueueRepository",
+    "HydrationQueueSummary",
 ]

@@ -15,7 +15,12 @@ from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 
 from .access_lifecycle import set_access_lost
 from .flood import flood_seconds
-from .hydration_queue import HydrationJob, HydrationPriority, HydrationQueueRepository
+from .hydration_queue import (
+    HydrationJob,
+    HydrationPriority,
+    HydrationQueueRepository,
+    HydrationQueueSummary,
+)
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_rpc import TelegramRpcCircuitOpenError
 from .telegram_rpc_error import TelegramRpcErrorDescriptor, describe_telegram_rpc_error
@@ -254,7 +259,11 @@ class MessageFactHydrationWorker:
         self._conn.commit()
         self._log_drops(
             batch,
-            (*preflight_observations, *drop_observations),
+            preflight_observations,
+        )
+        self._log_drops(
+            started,
+            drop_observations,
             descriptor=describe_telegram_rpc_error(exc) if drop_observations else None,
         )
         logger.warning(
@@ -281,7 +290,8 @@ class MessageFactHydrationWorker:
     ) -> _BatchOutcome:
         retried, dropped, drop_observations = self._retry_or_drop(started, effective_now + self._circuit_retry_seconds)
         self._conn.commit()
-        self._log_drops(batch, (*preflight_observations, *drop_observations))
+        self._log_drops(batch, preflight_observations)
+        self._log_drops(started, drop_observations)
         logger.info(
             "message_fact_hydration circuit_open kind=%s dialog_id=%d jobs=%d retry_s=%d",
             handler.kind,
@@ -306,17 +316,18 @@ class MessageFactHydrationWorker:
         effective_now: int,
     ) -> _BatchOutcome:
         descriptor = describe_telegram_rpc_error(exc)
-        for dialog_id in dict.fromkeys(job.dialog_id for job in started):
+        self._log_drops(batch, preflight_observations)
+        dialog_ids = tuple(dict.fromkeys(job.dialog_id for job in started))
+        summaries = tuple(
+            summary for dialog_id in dialog_ids for summary in self._queue.summarize_for_dialog(dialog_id)
+        )
+        for dialog_id in dialog_ids:
             set_access_lost(self._conn, dialog_id, effective_now, reason=descriptor.error_type)
         self._conn.commit()
-        self._log_drops(
-            batch,
-            (*preflight_observations, *self._observations("access_lost", started)),
-            descriptor=descriptor,
-        )
+        self._log_summaries(summaries, descriptor)
         return _BatchOutcome(
             requests=handler.request_cost,
-            dropped=len(preflight_observations) + len(started),
+            dropped=len(preflight_observations) + sum(summary.job_count for summary in summaries),
         )
 
     def _handle_request_error(  # noqa: PLR0913, PLR0917
@@ -333,15 +344,13 @@ class MessageFactHydrationWorker:
             for job in started:
                 self._queue.remove(job)
             self._conn.commit()
-            self._log_drops(
-                batch,
-                (*preflight_observations, *self._observations("terminal_rpc", started)),
-                descriptor=descriptor,
-            )
+            self._log_drops(batch, preflight_observations)
+            self._log_drops(started, self._observations("terminal_rpc", started), descriptor=descriptor)
             return _BatchOutcome(requests=handler.request_cost, dropped=len(preflight_observations) + len(started))
         retried, dropped, drop_observations = self._retry_or_drop(started, effective_now + self._retry_delay_seconds)
         self._conn.commit()
-        self._log_drops(batch, (*preflight_observations, *drop_observations), descriptor=descriptor)
+        self._log_drops(batch, preflight_observations)
+        self._log_drops(started, drop_observations, descriptor=descriptor)
         logger.warning(
             "message_fact_hydration transient kind=%s dialog_id=%d jobs=%d error_type=%s",
             handler.kind,
@@ -376,7 +385,8 @@ class MessageFactHydrationWorker:
                 dropped=applied.dropped + dropped,
                 drop_observations=applied.drop_observations + drop_observations,
             )
-        self._log_drops(batch, (*preflight_observations, *applied.drop_observations))
+        self._log_drops(batch, preflight_observations)
+        self._log_drops(started, applied.drop_observations)
         self._conn.commit()
         return _BatchOutcome(
             requests=handler.request_cost,
@@ -443,21 +453,44 @@ class MessageFactHydrationWorker:
         descriptor: TelegramRpcErrorDescriptor | None = None,
     ) -> None:
         for drop in self._aggregate_drops(jobs, observations, descriptor):
-            logger.log(
-                _DROP_LEVELS[drop.reason],
-                "message_fact_hydration_drop reason=%s kind=%s dialog_id=%d job_count=%d "
-                "message_ids=%s attempts_min=%d attempts_max=%d error_type=%s rpc_code=%s rpc_symbol=%s",
-                drop.reason,
-                drop.kind,
-                drop.dialog_id,
-                drop.job_count,
-                drop.message_ids,
-                drop.attempts_min,
-                drop.attempts_max,
-                drop.error_type,
-                drop.rpc_code,
-                drop.rpc_symbol,
+            self._emit_drop(drop)
+
+    def _log_summaries(
+        self, summaries: Sequence[HydrationQueueSummary], descriptor: TelegramRpcErrorDescriptor
+    ) -> None:
+        for summary in summaries:
+            self._emit_drop(
+                HydrationDrop(
+                    reason="access_lost",
+                    kind=summary.kind,
+                    dialog_id=summary.dialog_id,
+                    job_count=summary.job_count,
+                    message_ids=summary.message_ids,
+                    attempts_min=summary.attempts_min,
+                    attempts_max=summary.attempts_max,
+                    error_type=descriptor.error_type,
+                    rpc_code=descriptor.code,
+                    rpc_symbol=descriptor.symbol,
+                )
             )
+
+    @staticmethod
+    def _emit_drop(drop: HydrationDrop) -> None:
+        logger.log(
+            _DROP_LEVELS[drop.reason],
+            "message_fact_hydration_drop reason=%s kind=%s dialog_id=%d job_count=%d "
+            "message_ids=%s attempts_min=%d attempts_max=%d error_type=%s rpc_code=%s rpc_symbol=%s",
+            drop.reason,
+            drop.kind,
+            drop.dialog_id,
+            drop.job_count,
+            drop.message_ids,
+            drop.attempts_min,
+            drop.attempts_max,
+            drop.error_type,
+            drop.rpc_code,
+            drop.rpc_symbol,
+        )
 
     @staticmethod
     def _resolve_observation_job(
