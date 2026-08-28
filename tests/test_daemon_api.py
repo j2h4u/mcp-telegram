@@ -2214,7 +2214,6 @@ async def test_daemon_api_returns_unhealthy_when_flood_wait_kill_switch_is_open(
         events_in_window=5,
         wait_s_in_window=300,
         window_seconds=600,
-        minimum_cooldown_seconds=1_800,
         source="test",
     )
 

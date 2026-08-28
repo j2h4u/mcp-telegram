@@ -119,7 +119,6 @@ kill_switch_enabled = true
 kill_switch_window_seconds = 600
 kill_switch_max_events = 5
 kill_switch_max_wait_seconds = 900
-kill_switch_minimum_cooldown_seconds = 1800
 
 [telegram_rpc]
 max_calls_per_period = 12
@@ -132,7 +131,6 @@ read_position_reconciliation_max_dialogs_per_pass = 12
 read_position_reconciliation_failure_cooldown_seconds = 47
 read_position_reconciliation_batch_size = 16
 read_position_reconciliation_batch_pause_seconds = 1.75
-scheduled_flood_sleep_threshold_seconds = 0
 reconciliation_hourly_seconds = 49
 delta_catch_up_interval_seconds = 50
 delta_catch_up_max_probes_per_cycle = 7
@@ -186,7 +184,8 @@ daemon_api_slow_request_seconds = 2.5
         kill_switch_window_seconds=600,
         kill_switch_max_events=5,
         kill_switch_max_wait_seconds=900,
-        kill_switch_minimum_cooldown_seconds=1800,
+        fallback_wait_seconds=60,
+        cooldown_buffer_seconds=1.0,
     )
     assert config.telegram_rpc == TelegramRpcConfig(max_calls_per_period=12, period_seconds=30.0)
     assert config.scheduling == SchedulingConfig(
@@ -227,7 +226,6 @@ daemon_api_slow_request_seconds = 2.5
             circuit_retry_seconds=1801,
             max_attempts=4,
         ),
-        scheduled_flood_sleep_threshold_seconds=0,
         folder_projection=FolderProjectionConfig(stale_after_seconds=46),
     )
     assert config.http == HttpServerConfig(host="localhost", port=3200)
@@ -331,7 +329,6 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
             circuit_retry_seconds=1801,
             max_attempts=4,
         ),
-        scheduled_flood_sleep_threshold_seconds=0,
     )
 
     logging = resolve_logging_config({"LOG_LEVEL": "debug", "DAEMON_API_SLOW_REQUEST_SECONDS": "1.5"})
@@ -395,8 +392,8 @@ def test_resolve_scheduling_rejects_activity_hot_sweep_inverted_due_bounds() -> 
             "read_position_reconciliation_failure_cooldown_seconds",
         ),
         (
-            '[state]\ndir = "/state"\n\n[scheduling]\nscheduled_flood_sleep_threshold_seconds = -1\n',
-            "scheduled_flood_sleep_threshold_seconds",
+            '[state]\ndir = "/state"\n\n[scheduling]\nread_position_reconciliation_batch_pause_seconds = -1\n',
+            "read_position_reconciliation_batch_pause_seconds",
         ),
         (
             '[state]\ndir = "/state"\n\n[scheduling]\ndelta_catch_up_max_probes_per_cycle = true\n',
@@ -405,6 +402,14 @@ def test_resolve_scheduling_rejects_activity_hot_sweep_inverted_due_bounds() -> 
         (
             '[state]\ndir = "/state"\n\n[telegram_rpc]\nmax_calls_per_period = -1\n',
             "max_calls_per_period",
+        ),
+        (
+            '[state]\ndir = "/state"\n\n[flood_wait]\nkill_switch_minimum_cooldown_seconds = 1800\n',
+            "kill_switch_minimum_cooldown_seconds",
+        ),
+        (
+            '[state]\ndir = "/state"\n\n[scheduling]\nscheduled_flood_sleep_threshold_seconds = 0\n',
+            "scheduled_flood_sleep_threshold_seconds",
         ),
         (
             '[state]\ndir = "/state"\n\n[logging]\ndaemon_api_slow_request_seconds = 0\n',

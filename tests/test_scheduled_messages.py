@@ -62,8 +62,6 @@ class _ScheduledSnapshotClient:
         self.requests: list[tuple[object, dict[str, object]]] = []
         self.input_entity_calls: list[int] = []
         self.entity_calls: list[int] = []
-        self.flood_sleep_threshold = 60
-        self.thresholds_during_call: list[int] = []
 
     async def get_input_entity(self, _dialog_id: int) -> object:
         self.input_entity_calls.append(_dialog_id)
@@ -78,7 +76,6 @@ class _ScheduledSnapshotClient:
 
     async def __call__(self, _request: object, **_kwargs: object) -> object:
         self.requests.append((_request, _kwargs))
-        self.thresholds_during_call.append(self.flood_sleep_threshold)
         if self.call_error is not None:
             raise self.call_error
         dialog_id = int(cast(int, cast(SimpleNamespace, _request).peer))
@@ -153,16 +150,14 @@ async def test_reconciliation_snapshot_marks_disappearance_nonvisible(conn: sqli
     upsert_scheduled_message(conn, 42, _message(11), now=100)
     conn.commit()
     client = _ScheduledSnapshotClient({42: []})
-    worker = ScheduledMessageReconciler(client, conn, asyncio.Event(), 0)
+    worker = ScheduledMessageReconciler(client, conn, asyncio.Event())
 
     assert await worker.run_once() == 1
     assert conn.execute(
         "SELECT message_state, unpublished, unseen FROM scheduled_messages WHERE message_id=11"
     ).fetchone() == ("unknown_missing", 1, 1)
     assert len(client.requests) == 1
-    assert client.requests[0][1]["flood_sleep_threshold"] == 0
-    assert client.thresholds_during_call == [0]
-    assert client.flood_sleep_threshold == 60
+    assert client.requests[0][1] == {}
 
 
 @pytest.mark.asyncio
@@ -174,7 +169,7 @@ async def test_reconciliation_floodwait_records_retry_and_stops_account_pass(con
     upsert_scheduled_message(conn, 42, _message(11), now=100)
     conn.commit()
     client = _ScheduledSnapshotClient(call_error=FloodWaitError(None, 30))
-    worker = ScheduledMessageReconciler(client, conn, asyncio.Event(), 0)
+    worker = ScheduledMessageReconciler(client, conn, asyncio.Event())
 
     assert await worker.run_once() == 0
     retry_at, error = conn.execute(
@@ -183,9 +178,7 @@ async def test_reconciliation_floodwait_records_retry_and_stops_account_pass(con
     assert retry_at is not None and retry_at >= 30
     assert error == "FloodWaitError"
     assert len(client.requests) == 1
-    assert client.requests[0][1]["flood_sleep_threshold"] == 0
-    assert client.thresholds_during_call == [0]
-    assert client.flood_sleep_threshold == 60
+    assert client.requests[0][1] == {}
 
 
 @pytest.mark.asyncio
@@ -198,7 +191,7 @@ async def test_reconciliation_without_own_only_context_does_not_sweep_all_synced
     )
     conn.commit()
     client = _ScheduledSnapshotClient()
-    worker = ScheduledMessageReconciler(client, conn, asyncio.Event(), 0)
+    worker = ScheduledMessageReconciler(client, conn, asyncio.Event())
 
     assert await worker.run_once() == 0
     assert client.requests == []
@@ -251,7 +244,6 @@ async def test_reconciliation_classifies_and_enrolls_own_only_candidates(
         client,
         conn,
         asyncio.Event(),
-        0,
         OwnOnlyContext(account_id=42, personal_channel_id=9001),
         activity_rpc_timeout_seconds=53.0,
     )
@@ -271,7 +263,6 @@ async def test_reconciliation_classifies_and_enrolls_own_only_candidates(
     assert conn.execute("SELECT 1 FROM own_only_dialogs WHERE dialog_id=999").fetchone() is None
     assert len(client.entity_calls) == 2
     assert set(client.entity_calls) == {admin_id, unrelated_id}
-    assert all(kwargs["flood_sleep_threshold"] == 0 for _, kwargs in client.requests)
     assert captured == {"timeout_s": 53.0}
 
 
@@ -296,7 +287,6 @@ async def test_reconciliation_access_lost_candidate_log_has_dialog_context(
         client,
         conn,
         asyncio.Event(),
-        0,
         OwnOnlyContext(account_id=42, personal_channel_id=9001),
     )
 
