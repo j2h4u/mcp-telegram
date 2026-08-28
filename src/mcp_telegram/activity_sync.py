@@ -20,6 +20,7 @@ from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, InputPee
 
 from .activity_substrate import ActivityClient, call_with_timeout
 from .flood import flood_seconds, sleep_through_flood
+from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
@@ -231,7 +232,7 @@ def _persist_own_message_rows(conn: sqlite3.Connection, extracted: list[Extracte
     if not extracted:
         return
     with conn:
-        insert_messages_with_fts(conn, extracted)
+        insert_messages_with_fts(conn, extracted, priority=HydrationPriority.BACKFILL)
         dialog_ids = {em.message.dialog_id for em in extracted}
         for dialog_id in dialog_ids:
             enroll_own_only_sync_dialog(conn, dialog_id)

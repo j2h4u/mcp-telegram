@@ -35,8 +35,8 @@ class _Client:
         self.calls.append({"dialog_id": dialog_id})
         return SimpleNamespace(dialog_id=dialog_id)
 
-    async def __call__(self, request: object) -> object:
-        self.calls.append({"request": request})
+    async def __call__(self, request: object, **kwargs: object) -> object:
+        self.calls.append({"request": request, **kwargs})
         if self.error is not None:
             raise self.error
         return self.response
@@ -427,8 +427,27 @@ async def test_transcription_immediate_final_persists_text_and_fts(db: sqlite3.C
     assert db.execute("SELECT text FROM messages WHERE dialog_id=1 AND message_id=1").fetchone() == ("speech words",)
     assert db.execute("SELECT text, transcription_id FROM message_transcriptions").fetchone() == ("speech words", 7)
     assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+    assert client.calls[1]["flood_sleep_threshold"] == 0
     assert db.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=1 AND message_id=1").fetchone() == (
         "speech words",
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_voice_jobs_are_scalar_and_sequential_with_budget_four(db: sqlite3.Connection) -> None:
+    _seed_voice(db, message_id=1)
+    _seed_voice(db, message_id=2)
+    client = _Client(SimpleNamespace(pending=False, text="speech words", transcription_id=7))
+    policy = FactHydrationConfig(max_requests_per_cycle=4, pause_between_requests_seconds=0.01)
+
+    result = await _transcription_worker(db, client, policy).run_cycle(now=10)
+
+    assert result.requests == 4
+    assert result.completed == 2
+    assert ["dialog_id" in call for call in client.calls] == [True, False, True, False]
+    assert all(call["flood_sleep_threshold"] == 0 for call in client.calls if "request" in call)
+    assert all(
+        not isinstance(call["request"], (list, tuple, set, dict, range)) for call in client.calls if "request" in call
     )
 
 
@@ -469,8 +488,8 @@ async def test_transcription_realtime_event_wins_worker_race(db: sqlite3.Connect
     _seed_voice(db)
 
     class _EventWinsClient(_Client):
-        async def __call__(self, request: object) -> object:
-            self.calls.append({"request": request})
+        async def __call__(self, request: object, **kwargs: object) -> object:
+            self.calls.append({"request": request, **kwargs})
             from mcp_telegram.messages.sqlite_repository import apply_message_transcription
 
             apply_message_transcription(
@@ -504,8 +523,8 @@ async def test_transcription_does_not_project_stale_result_after_message_changes
     _seed_voice(db)
 
     class _ChangingClient(_Client):
-        async def __call__(self, request: object) -> object:
-            self.calls.append({"request": request})
+        async def __call__(self, request: object, **kwargs: object) -> object:
+            self.calls.append({"request": request, **kwargs})
             if mutation == "deleted":
                 db.execute("UPDATE messages SET is_deleted = 1 WHERE dialog_id = 1 AND message_id = 1")
             else:

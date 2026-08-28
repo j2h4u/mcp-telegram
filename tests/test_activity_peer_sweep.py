@@ -469,7 +469,7 @@ def test_sweep_peer_once_persistence_error_reports_result_page(monkeypatch: pyte
             del request, batch
             return [(101, "msg")], frozenset({(101, 8)})
 
-        def failed_insert(conn: sqlite3.Connection, rows: list[tuple[int, str]]) -> None:
+        def failed_insert(conn: sqlite3.Connection, rows: list[tuple[int, str]], **_kwargs: object) -> None:
             del conn, rows
             raise RuntimeError("database unavailable")
 
@@ -562,7 +562,9 @@ def test_sweep_peer_once_success_invokes_pacing_sleep(
         def fake_extract_message_row(dialog_id: int, message: _FakeSweepMessage) -> tuple[int, str]:
             return (dialog_id, f"msg-{message.id}")
 
-        def fake_insert_messages_with_fts(conn: sqlite3.Connection, rows: list[tuple[int, str]]) -> None:
+        def fake_insert_messages_with_fts(
+            conn: sqlite3.Connection, rows: list[tuple[int, str]], **_kwargs: object
+        ) -> None:
             del conn, rows
 
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
@@ -821,7 +823,9 @@ def test_sweep_peer_once_persists_only_extractable_messages(monkeypatch: pytest.
         def fake_extract_message_row(dialog_id: int, message: _FakeSweepMessage) -> tuple[int, str]:
             return (dialog_id, f"msg-{message.id}")
 
-        def fake_insert_messages_with_fts(conn: sqlite3.Connection, rows: list[tuple[int, str]]) -> None:
+        def fake_insert_messages_with_fts(
+            conn: sqlite3.Connection, rows: list[tuple[int, str]], **_kwargs: object
+        ) -> None:
             del conn
             inserted.append(rows)
 
@@ -882,7 +886,9 @@ def test_sweep_peer_once_counts_unique_genuinely_new_keys_before_replacement(
         def fake_extract_message_row(dialog_id: int, message: _FakeSweepMessage) -> tuple[int, str]:
             return (dialog_id, f"msg-{message.id}")
 
-        def fake_insert_messages_with_fts(conn: sqlite3.Connection, rows: list[tuple[int, str]]) -> None:
+        def fake_insert_messages_with_fts(
+            conn: sqlite3.Connection, rows: list[tuple[int, str]], **_kwargs: object
+        ) -> None:
             del conn
             inserted.append(rows)
 

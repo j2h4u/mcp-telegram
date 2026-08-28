@@ -33,6 +33,7 @@ from .access_lifecycle import (
 )
 from .flood import flood_seconds, sleep_through_flood
 from .history_enrollment import full_history_enabled
+from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
@@ -396,7 +397,7 @@ class DeltaSyncWorker:
                     logger.info("delta_discarded_disabled dialog_id=%d fetched=%d", dialog_id, len(new_message_rows))
                     return 0
                 if new_message_rows:
-                    insert_messages_with_fts(self._conn, new_message_rows)
+                    insert_messages_with_fts(self._conn, new_message_rows, priority=HydrationPriority.BACKFILL)
                 self._stamp_delta_checkpoint(dialog_id, now)
             if new_message_rows:
                 logger.info(
@@ -429,7 +430,7 @@ class DeltaSyncWorker:
                 if not full_history_enabled(self._conn, dialog_id):
                     logger.info("delta_discarded_disabled dialog_id=%d fetched=%d", dialog_id, len(new_message_rows))
                     return 0
-                insert_messages_with_fts(self._conn, new_message_rows)
+                insert_messages_with_fts(self._conn, new_message_rows, priority=HydrationPriority.BACKFILL)
             logger.info("delta dialog_id=%d new_messages=%d", dialog_id, len(new_message_rows))
         # Stamp last_synced_at unconditionally on the success path so that
         # run_delta_catch_up's quick-restart skip check has a fresh anchor.

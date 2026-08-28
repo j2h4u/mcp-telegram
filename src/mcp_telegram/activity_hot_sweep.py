@@ -25,6 +25,7 @@ from .activity_peer_sweep import (
     sweep_peer_once,
 )
 from .activity_substrate import ActivityClient
+from .hydration_queue import HydrationPriority
 
 logger = logging.getLogger(__name__)
 
@@ -383,6 +384,7 @@ async def _run_hot_sweep_peer(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome
             min_id=pass_min_id,
             limit=_BACKFILL_BATCH_LIMIT,
             timeout_s=ctx.timeout_s,
+            hydration_priority=HydrationPriority.FOREGROUND,
         )
         pages_fetched += result.pages_fetched
         outcome, next_offset, max_seen = _handle_hot_sweep_page_result(

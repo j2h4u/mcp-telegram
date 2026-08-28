@@ -95,6 +95,7 @@ from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .folders.telegram_adapter import FolderClient, TelethonTelegramFolderGateway
 from .folders.worker import FolderProjectionWorker
 from .fts import backfill_fts_index
+from .hydration_queue import HydrationPriority
 from .media_hydration import MediaFactHydrationHandler
 from .message_fact_refresh import (
     MessageFactRefreshPolicy,
@@ -953,6 +954,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - com
             hydration_conn,
             dialog_id,
             due_at=due_at,
+            priority=HydrationPriority.BACKFILL,
         ),
         topic_refresher=topic_refresher,
         policy=DaemonApiPolicy(

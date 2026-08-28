@@ -37,6 +37,7 @@ from .activity_peer_sweep import (
     sweep_peer_once,
 )
 from .activity_substrate import ActivityClient
+from .hydration_queue import HydrationPriority
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +337,7 @@ async def run_cold_backfill_pass(
         min_id=0,  # no time/id ceiling — full history walk
         limit=_BACKFILL_BATCH_LIMIT,
         timeout_s=timeout_s,
+        hydration_priority=HydrationPriority.BACKFILL,
     )
 
     return _finish_cold_backfill_peer(
