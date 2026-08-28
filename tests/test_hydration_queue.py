@@ -151,7 +151,12 @@ def test_summarize_for_dialog_includes_future_jobs_and_bounds_message_ids(db: sq
         repository.enqueue(_job("transcription", 42, message_id, 9_999, attempts=7))
     repository.enqueue(_job("media", 99, 1, 9_999, attempts=99))
 
-    summaries = repository.summarize_for_dialog(42)
+    statements: list[str] = []
+    db.set_trace_callback(statements.append)
+    try:
+        summaries = repository.summarize_for_dialog(42)
+    finally:
+        db.set_trace_callback(None)
     media = summaries[0]
     transcription = summaries[1]
     assert media.kind == "media"
@@ -164,6 +169,11 @@ def test_summarize_for_dialog_includes_future_jobs_and_bounds_message_ids(db: sq
     assert transcription.job_count == 2
     assert transcription.message_ids == (1, 2)
     assert transcription.attempts_min == transcription.attempts_max == 7
+    id_queries = [statement for statement in statements if "SELECT message_id FROM hydration_jobs" in statement]
+    assert len(id_queries) == 2
+    assert all("WHERE kind = " in statement for statement in id_queries)
+    assert all("ORDER BY message_id LIMIT 32" in statement for statement in id_queries)
+    assert not any("SELECT kind, message_id FROM hydration_jobs" in statement for statement in statements)
 
 
 def test_repository_never_commits_callers_transaction(db: sqlite3.Connection) -> None:

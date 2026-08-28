@@ -9,7 +9,6 @@ message-fact write.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import cast
@@ -221,21 +220,18 @@ class HydrationQueueRepository:
                 (dialog_id,),
             ).fetchall(),
         )
-        ids_by_kind: dict[str, list[int]] = {str(row[0]): [] for row in aggregate_rows}
-        id_rows = cast(
-            Iterator[tuple[object, ...]],
-            iter(
+        ids_by_kind: dict[str, tuple[int, ...]] = {}
+        for row in aggregate_rows:
+            kind = str(row[0])
+            id_rows = cast(
+                list[tuple[object, ...]],
                 self._conn.execute(
-                    f"SELECT kind, message_id FROM {HYDRATION_QUEUE_TABLE} WHERE dialog_id = ? ORDER BY kind, message_id",
-                    (dialog_id,),
-                )
-            ),
-        )
-        for raw_kind, raw_message_id in id_rows:
-            kind = str(raw_kind)
-            ids = ids_by_kind.get(kind)
-            if ids is not None and len(ids) < message_id_cap:
-                ids.append(int(cast(int | str, raw_message_id)))
+                    f"SELECT message_id FROM {HYDRATION_QUEUE_TABLE} "
+                    "WHERE kind = ? AND dialog_id = ? ORDER BY message_id LIMIT ?",
+                    (kind, dialog_id, message_id_cap),
+                ).fetchall(),
+            )
+            ids_by_kind[kind] = tuple(int(cast(int | str, id_row[0])) for id_row in id_rows)
         return tuple(
             HydrationQueueSummary(
                 kind=str(row[0]),
