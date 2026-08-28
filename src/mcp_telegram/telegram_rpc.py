@@ -1,21 +1,39 @@
-"""Shared Telegram RPC governor.
-
-This module owns account-level request budgeting for daemon-owned Telegram
-calls. Call sites receive a client-like proxy instead of duplicating local
-sleep/rate-limit rules.
-"""
+"""Account-wide admission control for the daemon's Telethon client."""
 
 from __future__ import annotations
 
-import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
+import asyncio
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import Protocol
 
 from aiolimiter import AsyncLimiter
+from telethon import TelegramClient  # type: ignore[import-untyped]
+from telethon.errors import (  # type: ignore[import-untyped]
+    FloodPremiumWaitError,
+    FloodTestPhoneWaitError,
+    FloodWaitError,
+    InterdcCallErrorError,
+    InterdcCallRichErrorError,
+    RpcCallFailError,
+    RpcMcgetFailError,
+    ServerError,
+    TimedOutError,
+)
 from telethon.utils import is_list_like  # type: ignore[import-untyped]
 
-logger = logging.getLogger(__name__)
+from .flood import flood_seconds
+
+FloodWaitErrors = (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError)
+TransientRpcErrors = (
+    ServerError,
+    RpcCallFailError,
+    RpcMcgetFailError,
+    InterdcCallErrorError,
+    InterdcCallRichErrorError,
+    TimedOutError,
+)
 
 
 class CircuitStatus(Protocol):
@@ -25,27 +43,9 @@ class CircuitStatus(Protocol):
     def detail(self) -> str: ...
 
 
-class GovernedTelegramClientTarget(Protocol):
-    def __call__(self, *args: object, **kwargs: object) -> Awaitable[object]: ...
-
-    def get_messages(self, *args: object, **kwargs: object) -> Awaitable[object]: ...
-
-    def get_input_entity(self, *args: object, **kwargs: object) -> Awaitable[object]: ...
-
-    def iter_messages(self, *args: object, **kwargs: object) -> AsyncIterator[object]: ...
-
-    def iter_dialogs(self, *args: object, **kwargs: object) -> AsyncIterator[object]: ...
-
-    def iter_participants(self, *args: object, **kwargs: object) -> AsyncIterator[object]: ...
-
-
-class _ClientBoundIterator(Protocol):
-    client: object
-
-
 @dataclass(frozen=True, slots=True)
 class TelegramRpcBudget:
-    """Global account-level Telegram RPC budget."""
+    """Process-wide logical RPC limiter settings."""
 
     max_calls_per_period: int
     period_seconds: float
@@ -56,85 +56,136 @@ class TelegramRpcBudget:
 
 
 class TelegramRpcCircuitOpenError(RuntimeError):
-    """Raised before a Telegram RPC when the account breaker is already open."""
+    """Raised before admission when the account kill switch is open."""
 
 
-class TelegramRpcGovernor:
-    """Rate-limit Telegram RPC entry and honor the account circuit breaker."""
+_COOLDOWN_LOCK = asyncio.Lock()
+_COOLDOWN_DEADLINE = 0.0
+_OBSERVED_FLOOD_IDS: set[int] = set()
 
-    def __init__(
+
+def account_cooldown_deadline() -> float:
+    """Return the current process-wide monotonic cooldown deadline."""
+    return _COOLDOWN_DEADLINE
+
+
+def reset_account_cooldown() -> None:
+    """Reset process policy for isolated tests and process startup."""
+    global _COOLDOWN_DEADLINE
+    _COOLDOWN_DEADLINE = 0.0
+    _OBSERVED_FLOOD_IDS.clear()
+
+
+class TelegramRpcGate(TelegramClient):
+    """A Telethon client with account-global admission and transient retry.
+
+    Every admitted attempt consumes one limiter acquisition. Flood errors
+    extend the account cooldown atomically and are re-raised immediately;
+    application retry is limited to the configured server-transient taxonomy.
+    An RPC already admitted or in flight may finish after a later FloodWait is
+    observed: this gate makes no stronger claim about cancellation of work.
+    """
+
+    def __init__(  # noqa: PLR0913 - Telethon constructor plus explicit account policy
         self,
-        budget: TelegramRpcBudget,
-        *,
+        *args: object,
+        rpc_budget: TelegramRpcBudget,
         circuit_status: Callable[[], CircuitStatus],
+        fallback_wait_seconds: int,
+        cooldown_buffer_seconds: float,
+        transient_retry_delays_seconds: tuple[float, ...],
+        flood_observer: Callable[..., None] | None = None,
+        **kwargs: object,
     ) -> None:
-        self._circuit_status = circuit_status
-        self._limiter = AsyncLimiter(budget.max_calls_per_period, budget.period_seconds) if budget.enabled else None
+        kwargs["request_retries"] = 0
+        kwargs["flood_sleep_threshold"] = 0
+        kwargs["raise_last_call_error"] = True
+        kwargs.setdefault("auto_reconnect", True)
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        if fallback_wait_seconds < 1:
+            raise ValueError("fallback_wait_seconds must be >= 1")
+        if cooldown_buffer_seconds < 0:
+            raise ValueError("cooldown_buffer_seconds must be >= 0")
+        if any(delay < 0 for delay in transient_retry_delays_seconds):
+            raise ValueError("transient retry delays must be >= 0")
+        self._rpc_circuit_status = circuit_status
+        self._fallback_wait_seconds = fallback_wait_seconds
+        self._cooldown_buffer_seconds = cooldown_buffer_seconds
+        self._transient_retry_delays = transient_retry_delays_seconds
+        self._flood_observer = flood_observer
+        self._limiter = (
+            AsyncLimiter(rpc_budget.max_calls_per_period, rpc_budget.period_seconds) if rpc_budget.enabled else None
+        )
 
     def check_circuit(self) -> None:
-        status = self._circuit_status()
-        if not status.open:
-            return
-        raise TelegramRpcCircuitOpenError(status.detail())
+        status = self._rpc_circuit_status()
+        if status.open:
+            raise TelegramRpcCircuitOpenError(status.detail())
 
-    async def acquire(self, *, source: str) -> None:
-        self.check_circuit()
-        if self._limiter is None:
-            return
-        logger.debug("telegram_rpc_budget_acquire source=%s", source)
-        async with self._limiter:
-            return
-
-
-class GovernedTelegramClient:
-    """Client-like proxy applying a shared governor to Telegram-facing calls."""
-
-    def __init__(self, client: GovernedTelegramClientTarget, governor: TelegramRpcGovernor) -> None:
-        self._client = client
-        self._governor = governor
-
-    def __getattr__(self, name: str) -> object:
-        return cast(object, getattr(self._client, name))
-
-    async def __call__(self, *args: object, **kwargs: object) -> object:
-        request = args[0] if args else kwargs.get("request")
+    async def __call__(
+        self, request: object, ordered: bool = False, flood_sleep_threshold: int | None = None
+    ) -> object:
+        """Admit one scalar logical RPC and invoke Telethon."""
+        del flood_sleep_threshold  # The gate always uses the client-level zero threshold.
         if request is not None and is_list_like(request):
             raise ValueError("transport batching is forbidden; use sequential scalar calls")
-        await self._governor.acquire(source="client_call")
-        return await self._client(*args, **kwargs)
+        for retry_index, delay in enumerate((0.0, *self._transient_retry_delays)):
+            if retry_index and delay:
+                await asyncio.sleep(delay)
+            try:
+                await self._admit()
+                return await super().__call__(request, ordered=ordered)
+            except FloodWaitErrors as exc:
+                await self._observe_flood(exc)
+                raise
+            except TransientRpcErrors:
+                if retry_index >= len(self._transient_retry_delays):
+                    raise
+        raise AssertionError("unreachable")
 
-    async def get_messages(self, *args: object, **kwargs: object) -> object:
-        await self._governor.acquire(source="get_messages")
-        return await self._client.get_messages(*args, **kwargs)
+    async def _admit(self) -> None:
+        self.check_circuit()
+        await self._wait_for_cooldown()
+        if self._limiter is not None:
+            await self._limiter.acquire()
+        self.check_circuit()
+        await self._wait_for_cooldown()
 
-    async def get_input_entity(self, *args: object, **kwargs: object) -> object:
-        """Resolve a peer through the shared account budget and circuit."""
-        await self._governor.acquire(source="get_input_entity")
-        return await self._client.get_input_entity(*args, **kwargs)
+    async def _wait_for_cooldown(self) -> None:
+        while True:
+            self.check_circuit()
+            async with _COOLDOWN_LOCK:
+                remaining = _COOLDOWN_DEADLINE - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(remaining)
 
-    def iter_messages(self, *args: object, **kwargs: object) -> AsyncIterator[object]:
-        return self._governed_iterator("iter_messages", *args, **kwargs)
+    async def _observe_flood(self, exc: BaseException) -> None:
+        """Atomically extend cooldown and send exactly one telemetry event."""
+        seconds = flood_seconds(exc, default=self._fallback_wait_seconds)
+        now = time.monotonic()
+        global _COOLDOWN_DEADLINE
+        async with _COOLDOWN_LOCK:
+            _COOLDOWN_DEADLINE = max(_COOLDOWN_DEADLINE, now + seconds + self._cooldown_buffer_seconds)
+            identity = id(exc)
+            if getattr(exc, "_mcp_telegram_flood_observed", False) or identity in _OBSERVED_FLOOD_IDS:
+                return
+            try:
+                setattr(exc, "_mcp_telegram_flood_observed", True)  # noqa: B010 - exception marker is intentional
+            except AttributeError:
+                _OBSERVED_FLOOD_IDS.add(identity)
+            except TypeError:
+                _OBSERVED_FLOOD_IDS.add(identity)
+            if self._flood_observer is not None:
+                self._flood_observer(source="telegram_rpc_gate", seconds=seconds)
 
-    def iter_dialogs(self, *args: object, **kwargs: object) -> AsyncIterator[object]:
-        return self._governed_iterator("iter_dialogs", *args, **kwargs)
 
-    def iter_participants(self, *args: object, **kwargs: object) -> AsyncIterator[object]:
-        return self._governed_iterator("iter_participants", *args, **kwargs)
-
-    async def _governed_iterator(self, method_name: str, *args: object, **kwargs: object) -> AsyncIterator[object]:
-        if method_name == "iter_messages":
-            iterator = self._client.iter_messages(*args, **kwargs)
-        elif method_name == "iter_dialogs":
-            iterator = self._client.iter_dialogs(*args, **kwargs)
-        else:
-            iterator = self._client.iter_participants(*args, **kwargs)
-        if hasattr(cast(object, iterator), "client"):
-            # Telethon RequestIter routes each page through ``client(request)``.
-            # Bind this proxy at that seam so every page is governed exactly once.
-            cast(_ClientBoundIterator, iterator).client = self
-        else:
-            # Preserve governance for third-party async iterators without a
-            # RequestIter client seam; they expose no page-level request hook.
-            await self._governor.acquire(source=method_name)
-        async for item in iterator:
-            yield item
+__all__ = [
+    "FloodWaitErrors",
+    "TelegramRpcBudget",
+    "TelegramRpcCircuitOpenError",
+    "TelegramRpcGate",
+    "TransientRpcErrors",
+    "account_cooldown_deadline",
+    "reset_account_cooldown",
+]

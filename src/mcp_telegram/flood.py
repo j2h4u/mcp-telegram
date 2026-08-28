@@ -1,11 +1,8 @@
-"""Shared FloodWait helpers and low-volume FloodWait telemetry.
+"""Shared FloodWait extraction, telemetry, and durable worker sleep helpers.
 
-Telethon raises ``FloodWaitError`` (carrying a ``.seconds`` field) from any
-request that trips Telegram's per-account rate limiter. Short floods
-(``seconds <= flood_sleep_threshold``, Telethon's default 60) are absorbed
-inside Telethon itself; these helpers cover only the long-flood path that our
-own loops must handle — extracting the wait duration and sleeping through it
-without losing shutdown responsiveness.
+The TelegramRpcGate is the sole production observer of FloodWait exceptions.
+This module keeps the accumulator API used by health/telemetry and provides
+pure extraction for worker recovery paths.
 
 The *recovery policy* — commit partial progress, stamp a checkpoint, return a
 neutral result, retry the same batch — is intentionally NOT captured here. It
@@ -15,7 +12,6 @@ genuinely-duplicated mechanics live in this module.
 
 import asyncio
 import logging
-import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -24,9 +20,7 @@ from typing import Final
 DEFAULT_FLOOD_WAIT_SECONDS = 60
 """Fallback when an exception carries no usable ``.seconds``.
 
-Defensive only — a real Telethon ``FloodWaitError`` always sets ``.seconds``.
-Matches Telethon's own default ``flood_sleep_threshold`` so the long/short
-boundary stays consistent.
+Defensive only — a real Telethon FloodWait exception always sets ``.seconds``.
 """
 
 _SECONDS_PER_HOUR: Final[int] = 60 * 60
@@ -34,11 +28,6 @@ _SECONDS_PER_DAY: Final[int] = 24 * _SECONDS_PER_HOUR
 _SECONDS_PER_WEEK: Final[int] = 7 * _SECONDS_PER_DAY
 _MAX_RETAINED_EVENTS: Final[int] = 10_000
 _ROLLUP_LOG_INTERVAL_S: Final[int] = _SECONDS_PER_DAY
-_TELETHON_FLOOD_WAIT_RE: Final[re.Pattern[str]] = re.compile(
-    r"Sleeping for (?P<seconds>\d+)s .* flood wait",
-    re.IGNORECASE,
-)
-
 logger = logging.getLogger(__name__)
 
 
@@ -70,7 +59,6 @@ class FloodWaitKillSwitchPolicy:
     window_seconds: int
     max_events: int
     max_wait_seconds: int
-    minimum_cooldown_seconds: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +71,6 @@ class FloodWaitKillSwitchStatus:
     events_in_window: int
     wait_s_in_window: int
     window_seconds: int
-    minimum_cooldown_seconds: int
     source: str | None
 
     def detail(self) -> str:
@@ -91,8 +78,7 @@ class FloodWaitKillSwitchStatus:
             return "flood wait kill switch is closed"
         return (
             f"{self.reason or 'FloodWait storm'}; opened_at={self.opened_at}; events={self.events_in_window}; "
-            f"wait_s={self.wait_s_in_window}; window_s={self.window_seconds}; "
-            f"minimum_cooldown_s={self.minimum_cooldown_seconds}; source={self.source or 'unknown'}"
+            f"wait_s={self.wait_s_in_window}; window_s={self.window_seconds}; source={self.source or 'unknown'}"
         )
 
 
@@ -114,7 +100,7 @@ class FloodWaitAccumulator:
     _kill_switch_policy: FloodWaitKillSwitchPolicy | None = None
     _kill_switch_event: asyncio.Event | None = None
     _kill_switch_status: FloodWaitKillSwitchStatus = field(
-        default_factory=lambda: FloodWaitKillSwitchStatus(False, None, None, 0, 0, 0, 0, None)
+        default_factory=lambda: FloodWaitKillSwitchStatus(False, None, None, 0, 0, 0, None)
     )
 
     def observe(self, *, source: str, seconds: int, now_mono: float | None = None) -> None:
@@ -174,7 +160,6 @@ class FloodWaitAccumulator:
                 0,
                 0,
                 policy.window_seconds,
-                policy.minimum_cooldown_seconds,
                 None,
             )
 
@@ -186,7 +171,7 @@ class FloodWaitAccumulator:
             return status
         policy = self._kill_switch_policy
         if policy is None:
-            return FloodWaitKillSwitchStatus(False, None, None, 0, 0, 0, 0, None)
+            return FloodWaitKillSwitchStatus(False, None, None, 0, 0, 0, None)
         return FloodWaitKillSwitchStatus(
             False,
             None,
@@ -194,7 +179,6 @@ class FloodWaitAccumulator:
             self._count_since(now - policy.window_seconds),
             self._sum_since(now - policy.window_seconds),
             policy.window_seconds,
-            policy.minimum_cooldown_seconds,
             None,
         )
 
@@ -232,7 +216,6 @@ class FloodWaitAccumulator:
             events_in_window=events,
             wait_s_in_window=wait_s,
             window_seconds=policy.window_seconds,
-            minimum_cooldown_seconds=policy.minimum_cooldown_seconds,
             source=source,
         )
         logger.critical("flood_wait_kill_switch_open %s", self._kill_switch_status.detail())
@@ -263,51 +246,20 @@ def maybe_log_flood_wait_rollup(logger: logging.Logger) -> bool:
     return _FLOOD_WAIT_ACCUMULATOR.maybe_log_rollup(logger)
 
 
-class TelethonFloodWaitMetricsFilter(logging.Filter):
-    """Observe Telethon's internal short FloodWait sleeps without hiding logs."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        match = _TELETHON_FLOOD_WAIT_RE.search(message)
-        if match is not None:
-            observe_flood_wait(
-                source=f"{record.name}.auto_sleep",
-                seconds=int(match.group("seconds")),
-            )
-        return True
-
-
-def install_telethon_flood_wait_metrics_filter() -> None:
-    """Install the Telethon short-FloodWait observer once per process."""
-    logger = logging.getLogger("telethon.client.users")
-    marker = "_mcp_telegram_flood_wait_metrics_installed"
-    if getattr(logger, marker, False):
-        return
-    logger.addFilter(TelethonFloodWaitMetricsFilter())
-    setattr(logger, marker, True)
-
-
-def flood_seconds(
-    exc: BaseException,
-    *,
-    default: int = DEFAULT_FLOOD_WAIT_SECONDS,
-    source: str = "flood_wait_error",
-) -> int:
+def flood_seconds(exc: BaseException, *, default: int = DEFAULT_FLOOD_WAIT_SECONDS) -> int:
     """Return a FloodWait's wait duration in whole seconds.
 
     Reads ``exc.seconds`` defensively: a missing, ``None``, or zero value
     falls back to ``default`` so callers never sleep for 0s or crash on a
-    malformed exception.
+    malformed exception. This function has no telemetry side effects.
     """
     seconds = getattr(exc, "seconds", None)
-    wait_s = int(seconds or default)
-    observe_flood_wait(source=source, seconds=wait_s)
-    return wait_s
+    return int(seconds or default)
 
 
 def is_flood_wait(exc: BaseException) -> bool:
     """Identify Telethon flood exceptions without widening import ownership."""
-    return exc.__class__.__name__ in {"FloodWaitError", "FloodTestPhoneWaitError"}
+    return exc.__class__.__name__ in {"FloodWaitError", "FloodPremiumWaitError", "FloodTestPhoneWaitError"}
 
 
 async def sleep_through_flood(shutdown_event: asyncio.Event, seconds: float) -> bool:

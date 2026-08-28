@@ -27,6 +27,16 @@ rationale = "This entity-info response classification cutoff is an API semantic,
 
 [[entry]]
 category = "policy_assignments"
+key = "src/mcp_telegram/telegram_rpc.py:<module>:_COOLDOWN_DEADLINE"
+rationale = "This is process-global mutable gate state, not an operator-configured policy value."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/telegram_rpc.py:reset_account_cooldown:_COOLDOWN_DEADLINE"
+rationale = "This test/process reset clears process-global mutable gate state."
+
+[[entry]]
+category = "policy_assignments"
 key = "src/mcp_telegram/reading/service.py:ReadingService._fetch_telegram_batches:last_batch_size"
 rationale = "This is observed batch-result metadata, not an operator-tuned limit."
 

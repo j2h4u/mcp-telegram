@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Sequence
 from typing import Protocol, cast
 
-from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+from telethon.errors import (  # type: ignore[import-untyped]
+    FloodPremiumWaitError,
+    FloodTestPhoneWaitError,
+    FloodWaitError,
+)
 from telethon.tl.functions.messages import GetScheduledHistoryRequest  # type: ignore[import-untyped]
 from telethon.tl.types import TypeInputPeer  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
@@ -23,37 +26,10 @@ class ScheduledHistoryClient(Protocol):
     async def __call__(self, _request: object, **_kwargs: object) -> object: ...
 
 
-class _FloodSleepThresholdClient(Protocol):
-    flood_sleep_threshold: int
-
-
-@contextmanager
-def _client_flood_sleep_threshold(client: object, threshold: int) -> Iterator[None]:
-    """Temporarily set Telethon's client-level FloodWait sleep threshold.
-
-    Telethon 1.44 accepts a per-call ``flood_sleep_threshold`` kwarg, but its
-    FloodWait exception path still compares against ``self.flood_sleep_threshold``.
-    Scheduled reconciliation needs short FloodWaits to raise immediately so the
-    daemon can persist account-level backoff instead of sleeping inside a
-    fan-out pass.
-    """
-    if not hasattr(client, "flood_sleep_threshold"):
-        yield
-        return
-
-    threshold_client = cast(_FloodSleepThresholdClient, client)
-    original = threshold_client.flood_sleep_threshold
-    threshold_client.flood_sleep_threshold = threshold
-    try:
-        yield
-    finally:
-        threshold_client.flood_sleep_threshold = original
-
-
 def translate_gateway_failure(exc: BaseException) -> GatewayFailure:
     """Translate Telegram exceptions at the integration boundary."""
     message = str(exc).replace("\n", "\\n") or type(exc).__name__
-    if isinstance(exc, FloodWaitError):
+    if isinstance(exc, (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError)):
         return GatewayFailure(
             GatewayFailureKind.FLOOD_WAIT, type(exc).__name__, message, True, int(getattr(exc, "seconds", 0) or 0)
         )
@@ -67,22 +43,14 @@ def translate_gateway_failure(exc: BaseException) -> GatewayFailure:
 async def fetch_scheduled_history_snapshot(
     client: ScheduledHistoryClient,
     dialog_id: int,
-    *,
-    flood_sleep_threshold_seconds: int,
 ) -> list[object]:
     """Fetch one scheduled queue snapshot through Telethon.
 
-    The threshold is injected by daemon configuration.  For scheduled
-    reconciliation production uses ``0`` so Telethon raises even short
-    FloodWaits and the caller can persist durable account-level backoff instead
-    of silently sleeping and continuing the fan-out pass.
+    The daemon-owned TelegramRpcGate configures Telethon's threshold to zero,
+    so the gate owns account-wide flood admission and observation.
     """
     input_entity = cast(TypeInputPeer, await client.get_input_entity(dialog_id))
-    with _client_flood_sleep_threshold(client, flood_sleep_threshold_seconds):
-        result = await client(
-            GetScheduledHistoryRequest(peer=input_entity, hash=0),
-            flood_sleep_threshold=flood_sleep_threshold_seconds,
-        )
+    result = await client(GetScheduledHistoryRequest(peer=input_entity, hash=0))
     messages = list(cast(Sequence[object], getattr(result, "messages", ()) or ()))
     entities = {
         get_peer_id(entity): entity

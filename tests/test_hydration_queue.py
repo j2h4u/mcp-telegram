@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
+from typing import cast
 
 import pytest
 
-from mcp_telegram.hydration_queue import HydrationJob, HydrationPriority, HydrationQueueRepository
+from mcp_telegram.hydration_queue import (
+    _REGISTERED_HYDRATION_KINDS,
+    _SUMMARY_AGGREGATE_SQL,
+    MEDIA_METADATA_KIND,
+    TRANSCRIPTION_HYDRATION_KIND,
+    HydrationJob,
+    HydrationPriority,
+    HydrationQueueRepository,
+)
 
 
 def _make_db() -> sqlite3.Connection:
@@ -141,6 +150,48 @@ def test_reschedule_and_remove_only_touch_existing_identity(db: sqlite3.Connecti
     assert repository.remove(queued)
     assert repository.due_jobs(1_000, 10) == []
     assert not repository.remove(queued)
+
+
+def test_summarize_for_dialog_includes_future_jobs_and_bounds_message_ids(db: sqlite3.Connection) -> None:
+    repository = HydrationQueueRepository(db)
+    for message_id in range(1, 41):
+        repository.enqueue(_job(MEDIA_METADATA_KIND, 42, message_id, 9_999, attempts=message_id % 4))
+    for message_id in (1, 2):
+        repository.enqueue(_job(TRANSCRIPTION_HYDRATION_KIND, 42, message_id, 9_999, attempts=7))
+    repository.enqueue(_job(MEDIA_METADATA_KIND, 99, 1, 9_999, attempts=99))
+
+    statements: list[str] = []
+    db.set_trace_callback(statements.append)
+    try:
+        summaries = repository.summarize_for_dialog(42)
+    finally:
+        db.set_trace_callback(None)
+    media = summaries[0]
+    transcription = summaries[1]
+    assert media.kind == MEDIA_METADATA_KIND
+    assert media.dialog_id == 42
+    assert media.job_count == 40
+    assert media.message_ids == tuple(range(1, 33))
+    assert media.attempts_min == 0
+    assert media.attempts_max == 3
+    assert transcription.kind == TRANSCRIPTION_HYDRATION_KIND
+    assert transcription.job_count == 2
+    assert transcription.message_ids == (1, 2)
+    assert transcription.attempts_min == transcription.attempts_max == 7
+    id_queries = [statement for statement in statements if "SELECT message_id FROM hydration_jobs" in statement]
+    assert len(id_queries) == len(_REGISTERED_HYDRATION_KINDS)
+    assert all("WHERE kind = " in statement for statement in id_queries)
+    assert all("ORDER BY message_id LIMIT 32" in statement for statement in id_queries)
+    assert not any("SELECT kind, message_id FROM hydration_jobs" in statement for statement in statements)
+
+    for kind in _REGISTERED_HYDRATION_KINDS:
+        plan_rows = cast(
+            list[tuple[object, ...]],
+            db.execute("EXPLAIN QUERY PLAN " + _SUMMARY_AGGREGATE_SQL, (kind, 42)).fetchall(),
+        )
+        details = [str(row[3]) for row in plan_rows]
+        assert any("SEARCH hydration_jobs USING PRIMARY KEY (kind=? AND dialog_id=?)" in detail for detail in details)
+        assert not any("SCAN hydration_jobs" in detail for detail in details)
 
 
 def test_repository_never_commits_callers_transaction(db: sqlite3.Connection) -> None:

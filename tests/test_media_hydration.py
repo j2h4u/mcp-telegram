@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,7 +9,12 @@ from typing import cast
 
 import pytest
 from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
-from telethon.errors.rpcerrorlist import PremiumAccountRequiredError  # type: ignore[import-untyped]
+from telethon.errors.rpcbaseerrors import BadRequestError  # type: ignore[import-untyped]
+from telethon.errors.rpcerrorlist import (  # type: ignore[import-untyped]
+    MessageIdInvalidError,
+    MsgIdInvalidError,
+    PremiumAccountRequiredError,
+)
 
 from mcp_telegram.access_lifecycle import restore_access_after_revalidation
 from mcp_telegram.config import FactHydrationConfig
@@ -332,20 +338,22 @@ async def test_flood_wait_stops_without_sleep_and_reschedules(db: sqlite3.Connec
 
 
 @pytest.mark.asyncio
-async def test_flood_wait_uses_shared_account_observer(monkeypatch: pytest.MonkeyPatch, db: sqlite3.Connection) -> None:
+async def test_flood_wait_uses_pure_extractor_without_observation(
+    monkeypatch: pytest.MonkeyPatch, db: sqlite3.Connection
+) -> None:
     _seed(db)
     client = _Client(error=FloodWaitError(request=None, capture=7))
-    observed: list[tuple[BaseException, str]] = []
+    extracted: list[BaseException] = []
 
-    def _observe(exc: BaseException, *, source: str) -> int:
-        observed.append((exc, source))
+    def _extract(exc: BaseException, *, default: int = 60) -> int:
+        extracted.append(exc)
         return 13
 
-    monkeypatch.setattr("mcp_telegram.fact_hydration.flood_seconds", _observe)
+    monkeypatch.setattr("mcp_telegram.fact_hydration.flood_seconds", _extract)
     result = await _worker(db, client).run_cycle(now=1)
 
     assert result.stopped
-    assert observed and observed[0][1] == "media_hydration"
+    assert extracted == [client.error]
     assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 14)
 
 
@@ -395,8 +403,121 @@ async def test_multi_job_flood_or_circuit_failure_stops_cycle(failure: str, db: 
 
 
 @pytest.mark.asyncio
+async def test_multi_job_missing_response_emits_one_bounded_drop_record(
+    db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    _seed(db, message_id=1)
+    _seed(db, message_id=2)
+    client = _Client(response=[])
+    policy = FactHydrationConfig(batch_size=2, pause_between_requests_seconds=0.01)
+
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.fact_hydration"):
+        result = await _worker(db, client, policy).run_cycle(now=1)
+
+    records = [record for record in caplog.records if "message_fact_hydration_drop" in record.message]
+    assert result.dropped == 2
+    assert len(records) == 1
+    assert records[0].levelno == logging.DEBUG
+    assert "reason=missing_response" in records[0].message
+    assert "job_count=2" in records[0].message
+    assert "message_ids=(1, 2)" in records[0].message
+
+
+@pytest.mark.asyncio
+async def test_preflight_drop_has_no_rpc_descriptor_when_later_job_fails(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _seed(db, message_id=1)
+    _seed(db, message_id=2)
+    db.execute("UPDATE messages SET is_deleted = 1 WHERE dialog_id = 1 AND message_id = 1")
+    db.commit()
+    monkeypatch.setattr(MediaFactHydrationHandler, "is_terminal_error", lambda _self, _exc: True)
+    client = _Client(error=BadRequestError(None, "MSG_VOICE_TOO_LONG"))
+
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.fact_hydration"):
+        result = await _worker(db, client).run_cycle(now=1)
+
+    records = [record for record in caplog.records if "message_fact_hydration_drop" in record.message]
+    assert result.dropped == 2
+    assert len(records) == 2
+    preflight_args = cast(tuple[object, ...], next(record.args for record in records if "ineligible" in record.message))
+    terminal_args = cast(
+        tuple[object, ...], next(record.args for record in records if "terminal_rpc" in record.message)
+    )
+    assert preflight_args[7:] == (None, None, None)
+    assert terminal_args[7:] == ("BadRequestError", 400, "MSG_VOICE_TOO_LONG")
+    assert all(record.exc_info is None for record in records)
+
+
+@pytest.mark.asyncio
+async def test_invalid_result_drop_is_warning_without_telegram_payload(
+    db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    _seed_voice(db)
+    client = _Client(response=SimpleNamespace(pending=False, text=object(), transcription_id=True))
+
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.fact_hydration"):
+        await _transcription_worker(db, client).run_cycle(now=10)
+
+    records = [record for record in caplog.records if "message_fact_hydration_drop" in record.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert "reason=invalid_result" in records[0].message
+    assert "speech" not in records[0].message
+
+
+@pytest.mark.asyncio
+async def test_malicious_rpc_message_is_never_logged(db: sqlite3.Connection, caplog: pytest.LogCaptureFixture) -> None:
+    _seed_voice(db)
+    secret = "secret=telegram-token\nrequest-payload"
+    client = _Client(error=BadRequestError(None, secret))
+    policy = FactHydrationConfig(max_attempts=1, pause_between_requests_seconds=0.01)
+
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.fact_hydration"):
+        await _transcription_worker(db, client, policy).run_cycle(now=10)
+
+    assert all(secret not in record.message for record in caplog.records)
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_terminal_rpc_drop_is_info_with_safe_descriptor_fields(
+    db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    _seed_voice(db)
+    client = _Client(error=BadRequestError(None, "MSG_VOICE_TOO_LONG"))
+
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.fact_hydration"):
+        await _transcription_worker(db, client).run_cycle(now=10)
+
+    records = [record for record in caplog.records if "message_fact_hydration_drop" in record.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    assert "reason=terminal_rpc" in records[0].message
+    assert "error_type=BadRequestError" in records[0].message
+    assert "rpc_code=400" in records[0].message
+    assert "rpc_symbol=MSG_VOICE_TOO_LONG" in records[0].message
+    assert records[0].exc_info is None
+
+
+@pytest.mark.asyncio
+async def test_attempt_limit_drop_is_warning(db: sqlite3.Connection, caplog: pytest.LogCaptureFixture) -> None:
+    _seed_voice(db)
+    client = _Client(response=SimpleNamespace(pending=True, text="", transcription_id=7))
+    policy = FactHydrationConfig(max_attempts=1, pause_between_requests_seconds=0.01)
+
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.fact_hydration"):
+        await _transcription_worker(db, client, policy).run_cycle(now=10)
+
+    records = [record for record in caplog.records if "message_fact_hydration_drop" in record.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert "reason=attempt_limit" in records[0].message
+
+
+@pytest.mark.asyncio
 async def test_access_loss_purges_and_restore_reenqueues_unresolved_jobs(
-    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     _seed(db)
     db.execute(
@@ -413,7 +534,12 @@ async def test_access_loss_purges_and_restore_reenqueues_unresolved_jobs(
     db.commit()
     monkeypatch.setattr("mcp_telegram.fact_hydration.ACCESS_LOST_ERRORS", (RuntimeError,))
     client = _Client(error=RuntimeError("private"))
-    await _worker(db, client).run_cycle(now=10)
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.fact_hydration"):
+        await _worker(db, client).run_cycle(now=10)
+    records = [record for record in caplog.records if "message_fact_hydration_drop" in record.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    assert "reason=access_lost" in records[0].message
     assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
     restore_access_after_revalidation(db, 1, 20)
     assert db.execute(
@@ -422,6 +548,37 @@ async def test_access_loss_purges_and_restore_reenqueues_unresolved_jobs(
         ("media_metadata", 1, 1, 20, 0),
         ("transcription", 1, 2, 20, 0),
     ]
+
+
+@pytest.mark.asyncio
+async def test_access_loss_logs_all_kinds_with_bounded_queue_summary(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    for message_id in range(1, 36):
+        _seed(db, message_id=message_id)
+    _seed_voice(db, message_id=100)
+    db.execute("UPDATE hydration_jobs SET due_at = 999 WHERE dialog_id = 1 AND message_id > 1")
+    db.commit()
+    monkeypatch.setattr("mcp_telegram.fact_hydration.ACCESS_LOST_ERRORS", (RuntimeError,))
+    client = _Client(error=RuntimeError("private"))
+    policy = FactHydrationConfig(max_jobs_per_cycle=100, max_requests_per_cycle=10, pause_between_requests_seconds=0.01)
+
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.fact_hydration"):
+        result = await _mixed_worker(db, client, policy).run_cycle(now=1)
+
+    records = [record for record in caplog.records if "message_fact_hydration_drop" in record.message]
+    assert result.dropped == 36
+    assert len(records) == 2
+    by_kind: dict[str, tuple[object, ...]] = {}
+    for record in records:
+        args = cast(tuple[object, ...], record.args)
+        by_kind[cast(str, args[1])] = args
+    media_args = by_kind["media_metadata"]
+    transcription_args = by_kind["transcription"]
+    assert media_args[3:6] == (35, tuple(range(1, 33)), 0)
+    assert transcription_args[3:6] == (1, (100,), 0)
+    assert all(cast(tuple[object, ...], record.args)[7:] == ("RuntimeError", None, None) for record in records)
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
 
 
 @pytest.mark.asyncio
@@ -473,7 +630,6 @@ async def test_transcription_immediate_final_persists_text_and_fts(db: sqlite3.C
     assert db.execute("SELECT text FROM messages WHERE dialog_id=1 AND message_id=1").fetchone() == ("speech words",)
     assert db.execute("SELECT text, transcription_id FROM message_transcriptions").fetchone() == ("speech words", 7)
     assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
-    assert client.calls[1]["flood_sleep_threshold"] == 0
     assert db.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=1 AND message_id=1").fetchone() == (
         "speech words",
     )
@@ -491,7 +647,6 @@ async def test_two_voice_jobs_are_scalar_and_sequential_with_budget_four(db: sql
     assert result.requests == 4
     assert result.completed == 2
     assert ["dialog_id" in call for call in client.calls] == [True, False, True, False]
-    assert all(call["flood_sleep_threshold"] == 0 for call in client.calls if "request" in call)
     assert all(
         not isinstance(call["request"], (list, tuple, set, dict, range)) for call in client.calls if "request" in call
     )
@@ -635,7 +790,7 @@ async def test_transcription_realtime_event_wins_worker_race(db: sqlite3.Connect
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mutation", ["deleted", "changed"])
 async def test_transcription_does_not_project_stale_result_after_message_changes(
-    mutation: str, db: sqlite3.Connection
+    mutation: str, db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
 ) -> None:
     _seed_voice(db)
 
@@ -651,12 +806,17 @@ async def test_transcription_does_not_project_stale_result_after_message_changes
             db.commit()
             return SimpleNamespace(pending=False, text="stale text", transcription_id=9)
 
-    result = await _transcription_worker(db, _ChangingClient()).run_cycle(now=10)
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.fact_hydration"):
+        result = await _transcription_worker(db, _ChangingClient()).run_cycle(now=10)
 
     assert result.dropped == 1
     assert db.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
     assert db.execute("SELECT text FROM messages WHERE dialog_id=1 AND message_id=1").fetchone() == (None,)
     assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+    records = [record for record in caplog.records if "message_fact_hydration_drop" in record.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.DEBUG
+    assert "reason=not_applied" in records[0].message
 
 
 @pytest.mark.parametrize(
@@ -672,6 +832,13 @@ async def test_transcription_does_not_project_stale_result_after_message_changes
 )
 def test_transcription_documented_permanent_error_symbols_are_terminal(symbol: str) -> None:
     error = RPCError(None, symbol)
+    assert TranscriptionHydrationHandler(recheck_delay_seconds=10).is_terminal_error(error)
+
+
+@pytest.mark.parametrize("error_type", [MsgIdInvalidError, MessageIdInvalidError])
+def test_transcription_generated_message_id_errors_are_terminal(error_type: type[RPCError]) -> None:
+    error = error_type(None)  # type: ignore[call-arg]
+
     assert TranscriptionHydrationHandler(recheck_delay_seconds=10).is_terminal_error(error)
 
 

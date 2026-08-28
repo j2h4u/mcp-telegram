@@ -6,19 +6,27 @@ import sqlite3
 from collections.abc import Sequence
 from typing import Protocol, cast
 
-from telethon.errors.rpcerrorlist import (  # type: ignore[import-untyped]
-    MessageIdInvalidError,
-    PeerIdInvalidError,
-    PremiumAccountRequiredError,
-)
 from telethon.tl.functions.messages import TranscribeAudioRequest  # type: ignore[import-untyped]
 from telethon.tl.types import TypeInputPeer  # type: ignore[import-untyped]
 
-from .fact_hydration import AppliedFacts
+from .fact_hydration import AppliedFacts, HydrationDropObservation
 from .hydration_queue import TRANSCRIPTION_HYDRATION_KIND, HydrationJob, HydrationQueueRepository
 from .messages.sqlite_repository import (
     apply_message_transcription_if_absent,
     transcription_hydration_eligible,
+)
+from .telegram_rpc_error import describe_telegram_rpc_error
+
+_TERMINAL_RPC_SYMBOLS = frozenset(
+    {
+        "MESSAGE_ID_INVALID",
+        "MSG_ID_INVALID",
+        "MSG_VOICE_MISSING",
+        "MSG_VOICE_TOO_LONG",
+        "PEER_ID_INVALID",
+        "PREMIUM_ACCOUNT_REQUIRED",
+        "TRANSCRIPTION_FAILED",
+    }
 )
 
 
@@ -32,7 +40,6 @@ class TranscriptionHydrationHandler:
     """Request Telegram's persisted or on-demand voice transcription."""
 
     kind = TRANSCRIPTION_HYDRATION_KIND
-    flood_source = "transcription_hydration"
     batch_size = 1
     request_cost = 2
 
@@ -48,7 +55,6 @@ class TranscriptionHydrationHandler:
         peer = cast(TypeInputPeer, await telegram.get_input_entity(job.dialog_id))
         return await telegram(
             TranscribeAudioRequest(peer=peer, msg_id=job.message_id),
-            flood_sleep_threshold=0,
         )
 
     def apply(
@@ -72,7 +78,12 @@ class TranscriptionHydrationHandler:
             or isinstance(transcription_id, bool)
         ):
             queue.remove(job)
-            return AppliedFacts(dropped=1)
+            return AppliedFacts(
+                dropped=1,
+                drop_observations=(
+                    HydrationDropObservation("invalid_result", job.message_id, job.kind, job.dialog_id, job.attempts),
+                ),
+            )
         applied = apply_message_transcription_if_absent(
             conn,
             job.dialog_id,
@@ -86,31 +97,16 @@ class TranscriptionHydrationHandler:
             return AppliedFacts(completed=1)
         if applied != "applied":
             queue.remove(job)
-            return AppliedFacts(dropped=1)
+            return AppliedFacts(
+                dropped=1,
+                drop_observations=(
+                    HydrationDropObservation("not_applied", job.message_id, job.kind, job.dialog_id, job.attempts),
+                ),
+            )
         return AppliedFacts(hydrated=1, completed=1)
 
     def is_terminal_error(self, exc: BaseException) -> bool:
-        if isinstance(
-            exc,
-            (
-                MessageIdInvalidError,
-                PremiumAccountRequiredError,
-                PeerIdInvalidError,
-            ),
-        ):
-            return True
-        # Telethon exposes these RPC errors only as generic RPCError in the
-        # installed release; use its stable symbolic message, not a fallback
-        # retry taxonomy.
-        message = getattr(exc, "message", None)
-        return isinstance(message, str) and message in {
-            "MSG_ID_INVALID",
-            "MSG_VOICE_MISSING",
-            "MSG_VOICE_TOO_LONG",
-            "PEER_ID_INVALID",
-            "PREMIUM_ACCOUNT_REQUIRED",
-            "TRANSCRIPTION_FAILED",
-        }
+        return describe_telegram_rpc_error(exc).symbol in _TERMINAL_RPC_SYMBOLS
 
 
 __all__ = ["TRANSCRIPTION_HYDRATION_KIND", "TranscriptionHydrationClient", "TranscriptionHydrationHandler"]

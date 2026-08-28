@@ -12,7 +12,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon import _create_tracked_task, _log_heartbeat, _prime_runtime, _run_sync_loop, sync_main
+from mcp_telegram.config import McpTelegramConfig, StateConfig
+from mcp_telegram.daemon import (
+    _create_telegram_client,
+    _create_tracked_task,
+    _log_heartbeat,
+    _prime_runtime,
+    _run_sync_loop,
+    sync_main,
+)
 from mcp_telegram.folders.read_repository import list_folders
 from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.state import StatePaths
@@ -925,7 +933,19 @@ def test_create_client_called_with_catch_up(
     ):
         asyncio.run(sync_main())
 
-    mock_create.assert_called_once_with(catch_up=True)
+    mock_create.assert_called_once()
+    assert mock_create.call_args.kwargs["catch_up"] is True
+    assert mock_create.call_args.kwargs["config"] is not None
+
+
+def test_create_telegram_client_passes_one_frozen_config_snapshot(
+    tmp_path: Path,
+) -> None:
+    config = McpTelegramConfig(state=StateConfig(dir=tmp_path))
+    with patch("mcp_telegram.daemon.create_client", return_value=MagicMock()) as mock_create:
+        _create_telegram_client(config)
+
+    mock_create.assert_called_once_with(catch_up=True, config=config)
 
 
 def test_create_client_catch_up_default_false() -> None:

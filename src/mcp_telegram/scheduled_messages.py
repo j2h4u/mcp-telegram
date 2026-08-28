@@ -46,7 +46,6 @@ _INSERT_SCHEDULED_FTS_SQL = "INSERT INTO scheduled_messages_fts(dialog_id, messa
 @dataclass(frozen=True, slots=True)
 class ScheduledReconciliationPolicy:
     interval_seconds: float
-    flood_sleep_threshold_seconds: int
     activity_rpc_timeout_seconds: float
 
 
@@ -341,12 +340,11 @@ def _retry_at(conn: sqlite3.Connection) -> int | None:
 class ScheduledMessageReconciler:
     """Periodic authoritative scheduled-history snapshot worker."""
 
-    def __init__(  # noqa: PLR0913 - explicit reconciliation dependencies and injected timeout policy
+    def __init__(
         self,
         client: _ScheduledClient,
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
-        scheduled_flood_sleep_threshold_seconds: int,
         own_only_context: OwnOnlyContext | None = None,
         *,
         activity_rpc_timeout_seconds: float | None = None,
@@ -354,7 +352,6 @@ class ScheduledMessageReconciler:
         self._client = client
         self._conn = conn
         self._shutdown_event = shutdown_event
-        self._scheduled_flood_sleep_threshold_seconds = scheduled_flood_sleep_threshold_seconds
         self._own_only_context = own_only_context
         self._activity_rpc_timeout_seconds = activity_rpc_timeout_seconds
 
@@ -381,7 +378,6 @@ class ScheduledMessageReconciler:
         return await fetch_scheduled_history_snapshot(
             self._client,
             dialog_id,
-            flood_sleep_threshold_seconds=self._scheduled_flood_sleep_threshold_seconds,
         )
 
     async def _own_only_dialog_ids(self) -> set[int] | None:  # noqa: PLR0912
@@ -531,7 +527,6 @@ async def run_scheduled_reconciliation_loop(
                 client,
                 conn,
                 shutdown_event,
-                policy.flood_sleep_threshold_seconds,
                 own_only_context,
                 activity_rpc_timeout_seconds=policy.activity_rpc_timeout_seconds,
             ).run_once()

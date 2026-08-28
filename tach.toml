@@ -190,7 +190,7 @@ path = "mcp_telegram.fact_hydration"
 layer = "application"
 depends_on = [
     "mcp_telegram.access_lifecycle", "mcp_telegram.hydration_queue", "mcp_telegram.flood",
-    "mcp_telegram.telegram_access", "mcp_telegram.telegram_rpc",
+    "mcp_telegram.telegram_access", "mcp_telegram.telegram_rpc", "mcp_telegram.telegram_rpc_error",
 ]
 
 [[modules]]
@@ -198,6 +198,7 @@ path = "mcp_telegram.transcription_hydration"
 layer = "application"
 depends_on = [
     "mcp_telegram.fact_hydration", "mcp_telegram.hydration_queue", "mcp_telegram.messages.sqlite_repository",
+    "mcp_telegram.telegram_rpc_error",
 ]
 
 [[modules]]
@@ -348,6 +349,11 @@ layer = "telegram_gateway"
 depends_on = []
 
 [[modules]]
+path = "mcp_telegram.telegram_rpc_error"
+layer = "telegram_gateway"
+depends_on = []
+
+[[modules]]
 path = "mcp_telegram.telegram_gateway"
 layer = "telegram_gateway"
 depends_on = ["mcp_telegram.telegram_access", "mcp_telegram.telegram_reading"]
@@ -355,12 +361,12 @@ depends_on = ["mcp_telegram.telegram_access", "mcp_telegram.telegram_reading"]
 [[modules]]
 path = "mcp_telegram.telegram"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.config", "mcp_telegram.state"]
+depends_on = ["mcp_telegram.config", "mcp_telegram.flood", "mcp_telegram.state", "mcp_telegram.telegram_rpc"]
 
 [[modules]]
 path = "mcp_telegram.telegram_rpc"
 layer = "telegram_gateway"
-depends_on = []
+depends_on = ["mcp_telegram.flood"]
 
 [[modules]]
 path = "mcp_telegram.telegram_fact_queries"
