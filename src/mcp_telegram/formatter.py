@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import TypedDict, Unpack
 from zoneinfo import ZoneInfo
 
-from .message_content import MessageSnapshot, project_message_content
+from .message_content import project_message_text
 from .models import DialogType, LinePrefixGetter, ReadMessage, ReadState, TopicNameGetter
 
 logger = logging.getLogger(__name__)
@@ -263,8 +263,9 @@ def _resolve_message_format_options(kwargs: _FormatMessagesKwargs) -> _MessageFo
 
 
 def _format_message_body(msg: ReadMessage, effective_tz: ZoneInfo) -> str:
-    content = project_message_content(MessageSnapshot(text=msg.text, media_description=msg.media_description))
-    primary_text = content.primary_text
+    primary_text = project_message_text(msg.text)
+    if primary_text is None:
+        primary_text = msg.media_description
     text = frame_telegram_content(primary_text) if primary_text is not None else ""
     if msg.edit_date is not None:
         ed_dt = datetime.fromtimestamp(msg.edit_date, tz=UTC).astimezone(effective_tz)

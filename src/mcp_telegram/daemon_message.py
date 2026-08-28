@@ -6,8 +6,8 @@ from collections.abc import Sequence
 from typing import cast
 
 from .formatter import format_reaction_counts
-from .message_content import MessageSnapshot, project_message_content
-from .models import ReadMessage
+from .message_content import project_message_text
+from .models import ContentKind, ReadMessage
 from .reactions.contracts import ReactionFreshness
 from .telegram_fact_queries import enrich_reaction_events, read_at_map
 from .telegram_message_projection import MessageLike as _MessageLike
@@ -127,18 +127,16 @@ def project_read_message_content(
     text_links: Sequence[tuple[int, int, str]] = (),
 ) -> ReadMessage:
     """Project one read-model message through canonical content semantics."""
-    content = project_message_content(
-        MessageSnapshot(
-            text=message.text,
-            media_description=message.media_description,
-            text_links=tuple(text_links),
-        )
+    rendered_text = project_message_text(message.text, tuple(text_links))
+    content_kind: ContentKind = (
+        "message_text" if rendered_text is not None else ("media_description" if message.media_description else "none")
     )
     return dataclasses.replace(
         message,
-        text=content.text,
-        media_description=content.media_description,
-        content_kind=content.kind,
+        text=rendered_text,
+        media_description=message.media_description,
+        content_kind=content_kind,
+        media_kind=message.media_kind,
     )
 
 

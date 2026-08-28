@@ -27,6 +27,7 @@ from ._base import (
     structured_result,
 )
 from .structured import (
+    MEDIA_OUTPUT_SCHEMA,
     StructuredWarning,
     serialize_message_content,
     structured_warning,
@@ -39,15 +40,27 @@ GET_INBOX_OUTPUT_SCHEMA = {
         "limit": {"type": "integer"},
         "group_size_threshold": {"type": "integer"},
         "applied_since_utc": {"type": ["string", "null"]},
-        "bootstrap_pending": {"type": "integer"},
+        "applied_dialog_types": {
+            "type": "array",
+            "items": {"type": "string", "enum": [item.value for item in DialogType]},
+        },
+        "read_position_pending_count": {"type": "integer"},
+        "read_position_pending_entities": {
+            "type": "array",
+            "items": ENTITY_IDENTITY_SCHEMA,
+        },
         "coverage": {
             "type": "object",
             "properties": {
                 "complete": {"type": "boolean"},
                 "state": {"type": "string"},
-                "bootstrap_pending_count": {"type": "integer"},
+                "read_position_pending_count": {"type": "integer"},
+                "read_position_pending_entities": {
+                    "type": "array",
+                    "items": ENTITY_IDENTITY_SCHEMA,
+                },
             },
-            "required": ["complete", "state", "bootstrap_pending_count"],
+            "required": ["complete", "state", "read_position_pending_count", "read_position_pending_entities"],
             "additionalProperties": False,
         },
         "warnings": {
@@ -142,7 +155,7 @@ GET_INBOX_OUTPUT_SCHEMA = {
                                 # the requested timezone in the MCP response.
                                 "date": {"type": ["integer", "null"]},
                                 "content": {"type": ["object", "null"]},
-                                "media": {"type": ["object", "null"]},
+                                "media": {"anyOf": [{"type": "null"}, MEDIA_OUTPUT_SCHEMA]},
                                 "reply_to_msg_id": {"type": ["integer", "null"]},
                                 "edit_date": {"type": ["integer", "null"]},
                                 "reactions": {"type": ["object", "null"]},
@@ -206,7 +219,8 @@ GET_INBOX_OUTPUT_SCHEMA = {
         "limit",
         "group_size_threshold",
         "applied_since_utc",
-        "bootstrap_pending",
+        "read_position_pending_count",
+        "read_position_pending_entities",
         "coverage",
         "warnings",
         "budget",
@@ -280,10 +294,13 @@ class GetUnreadSummary(ToolArgs):
 class GetInbox(ToolArgs):
     """Fetch unread messages from personal chats and small groups, prioritized by tier.
 
-    Reads local sync.db only. Prioritizes mentions, DMs, bots, and groups;
-    channel dialogs are excluded. Messages inside each chat are chronological.
-    Check bootstrap_pending to detect incomplete read-position coverage instead
-    of treating an empty result as final.
+    Reads local sync.db only. Prioritizes mentions, DMs, bots, services, and groups;
+    channel dialogs are excluded unless explicitly included with include_dialog_types.
+    Messages inside each chat are chronological. ``@replies`` is classified as
+    the ``service`` dialog type.
+    Check read_position_pending_count and its bounded identities to detect
+    incomplete read-position coverage instead of treating an empty result as
+    final.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -305,6 +322,11 @@ class GetInbox(ToolArgs):
         ge=1,
         le=_MAX_INBOX_LAST_HOURS,
         description="Return unread messages from the last 1-720 hours, evaluated at request time; mutually exclusive with since_utc.",
+    )
+    include_dialog_types: list[DialogType] | None = Field(
+        default=None,
+        min_length=1,
+        description="Optional allowlist of canonical dialog types to include in the inbox.",
     )
 
     @model_validator(mode="before")
@@ -464,22 +486,52 @@ def _read_state_payload(read_state: ReadState | dict | None, dialog_type: str | 
     }
 
 
-def _bootstrap_pending_warnings(bootstrap_pending: int) -> list[StructuredWarning]:
-    if bootstrap_pending <= 0:
+def _read_position_pending_warnings(read_position_pending_count: int) -> list[StructuredWarning]:
+    if read_position_pending_count <= 0:
         return []
 
     warning_message = (
-        f"bootstrap_pending={bootstrap_pending} dialog(s) are still being seeded by the sync daemon. "
-        "Results may be incomplete until bootstrap completes."
+        f"read_position_pending_count={read_position_pending_count} dialog(s) have no inbox read position yet. "
+        "Results may be incomplete until the sync daemon reconciles them."
     )
     return [
         structured_warning(
-            "bootstrap_pending",
+            "read_position_pending",
             warning_message,
             severity="warning",
-            action="Retry shortly once the sync daemon finishes read-state bootstrap.",
+            action="Retry shortly while the sync daemon reconciles read positions.",
         )
     ]
+
+
+def _project_read_position_pending_entities(raw_entities: object) -> list[EntityIdentity]:
+    """Project and deduplicate bounded pending identities for the MCP contract."""
+    if not isinstance(raw_entities, list):
+        return []
+    projected: list[EntityIdentity] = []
+    seen: set[tuple[str, str | int]] = set()
+    for raw in raw_entities:
+        if not isinstance(raw, Mapping):
+            continue
+        dialog_id = raw.get("dialog_id")
+        if isinstance(dialog_id, bool) or not isinstance(dialog_id, int):
+            continue
+        identity = project_entity_identity(
+            display_name=raw.get("display_name") if isinstance(raw.get("display_name"), str) else None,
+            username=raw.get("username") if isinstance(raw.get("username"), str) else None,
+            telegram_id=dialog_id,
+        )
+        username_value = cast(str | None, identity.get("username"))
+        key = (
+            ("username", username_value)
+            if username_value is not None
+            else ("telegram_id", cast(int, identity.get("telegram_id")))
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        projected.append(identity)
+    return projected
 
 
 def _structured_inbox_group(group: dict) -> tuple[dict[str, object], dict[str, object] | None, int]:
@@ -556,7 +608,9 @@ def _structured_messages(
     for _row, message in zip(ordered_rows, messages, strict=False):
         marker_label = marker_by_message.get(message.id)
         read_markers = [_structured_read_marker(message.id, marker_label)] if marker_label else []
-        projected = serialize_message_content(message.text, message.media_description, message.content_kind)
+        projected = serialize_message_content(
+            message.text, message.media_description, message.content_kind, message.media_kind
+        )
         sender = _project_message_sender(message)
         structured_message: dict[str, object] = {
             "msg_id": message.id,
@@ -620,6 +674,65 @@ def _project_unread_summary_dialogs(raw_dialogs: object) -> list[dict[str, objec
     return dialogs
 
 
+def _project_inbox_response(
+    args: GetInbox,
+    response: dict,
+    *,
+    applied_since_utc: str | None,
+    has_inbox_filter: bool,
+) -> ToolResult:
+    if err := _check_daemon_response(response):
+        err.has_filter = has_inbox_filter
+        return err
+
+    data = response.get("data", {})
+    groups = data.get("groups", [])
+    # The daemon contract is atomic: missing read-position coverage fields are
+    # a protocol defect, never an implicit "no pending work" result.
+    read_position_pending_count = int(data["read_position_pending_count"])
+    read_position_pending_entities = _project_read_position_pending_entities(data["read_position_pending_entities"])
+    warnings = _read_position_pending_warnings(read_position_pending_count)
+    structured_dialogs, hidden_count_by_dialog, result_message_count = _structured_inbox_groups(groups)
+    structured_content: dict[str, object] = {
+        "limit": args.limit,
+        "group_size_threshold": args.group_size_threshold,
+        "applied_since_utc": applied_since_utc,
+        "read_position_pending_count": read_position_pending_count,
+        "read_position_pending_entities": read_position_pending_entities,
+        "coverage": {
+            "complete": read_position_pending_count == 0,
+            "state": "complete" if read_position_pending_count == 0 else "partial",
+            "read_position_pending_count": read_position_pending_count,
+            "read_position_pending_entities": read_position_pending_entities,
+        },
+        "warnings": warnings,
+        "budget": {
+            "requested_limit": args.limit,
+            "result_message_count": result_message_count,
+            "dialog_count": len(structured_dialogs),
+            "hidden_count": sum(cast(int, item["hidden_count"]) for item in hidden_count_by_dialog),
+            "hidden_count_by_dialog": hidden_count_by_dialog,
+            "allocation_policy": "daemon allocates the requested unread message budget across dialogs",
+        },
+        "dialogs": structured_dialogs,
+        "count": len(structured_dialogs),
+        "result_count_semantics": "count is the number of unread dialogs returned; budget.result_message_count is the number of message rows shown",
+    }
+    if args.include_dialog_types is not None:
+        structured_content["applied_dialog_types"] = list(
+            dict.fromkeys(item.value for item in args.include_dialog_types)
+        )
+
+    if not groups:
+        return structured_result(structured_content, result_count=0, has_filter=has_inbox_filter)
+
+    return structured_result(
+        structured_content,
+        result_count=result_message_count,
+        has_filter=has_inbox_filter,
+    )
+
+
 @mcp_tool(
     name="get_inbox",
     title="Inbox",
@@ -636,6 +749,7 @@ async def get_inbox(args: GetInbox) -> ToolResult:
         applied_since_utc = _resolve_inbox_since(args.since_utc, args.last_hours)
     except ValueError as exc:
         return error_result(f"Error: invalid time filter: {exc}", has_filter=True)
+    has_inbox_filter = applied_since_utc is not None or args.include_dialog_types is not None
 
     try:
         async with daemon_connection() as conn:
@@ -643,52 +757,20 @@ async def get_inbox(args: GetInbox) -> ToolResult:
                 limit=args.limit,
                 group_size_threshold=args.group_size_threshold,
                 since_utc=applied_since_utc,
+                include_dialog_types=(
+                    [dialog_type.value for dialog_type in args.include_dialog_types]
+                    if args.include_dialog_types is not None
+                    else None
+                ),
             )
     except DaemonNotRunningError as exc:
-        return error_result(_daemon_not_running_text(exc), has_filter=applied_since_utc is not None)
+        return error_result(_daemon_not_running_text(exc), has_filter=has_inbox_filter)
 
-    if err := _check_daemon_response(response):
-        err.has_filter = applied_since_utc is not None
-        return err
-
-    data = response.get("data", {})
-    groups = data.get("groups", [])
-    # Defensive: older daemon responses or test mocks may omit bootstrap_pending.
-    # Treat missing as 0 (full coverage assumed). Also guard against explicit None.
-    bootstrap_pending = int(data.get("bootstrap_pending", 0) or 0)
-    warnings = _bootstrap_pending_warnings(bootstrap_pending)
-    structured_dialogs, hidden_count_by_dialog, result_message_count = _structured_inbox_groups(groups)
-    structured_content = {
-        "limit": args.limit,
-        "group_size_threshold": args.group_size_threshold,
-        "applied_since_utc": applied_since_utc,
-        "bootstrap_pending": bootstrap_pending,
-        "coverage": {
-            "complete": bootstrap_pending == 0,
-            "state": "complete" if bootstrap_pending == 0 else "partial",
-            "bootstrap_pending_count": bootstrap_pending,
-        },
-        "warnings": warnings,
-        "budget": {
-            "requested_limit": args.limit,
-            "result_message_count": result_message_count,
-            "dialog_count": len(structured_dialogs),
-            "hidden_count": sum(cast(int, item["hidden_count"]) for item in hidden_count_by_dialog),
-            "hidden_count_by_dialog": hidden_count_by_dialog,
-            "allocation_policy": "daemon allocates the requested unread message budget across dialogs",
-        },
-        "dialogs": structured_dialogs,
-        "count": len(structured_dialogs),
-        "result_count_semantics": "count is the number of unread dialogs returned; budget.result_message_count is the number of message rows shown",
-    }
-
-    if not groups:
-        return structured_result(structured_content, result_count=0, has_filter=applied_since_utc is not None)
-
-    return structured_result(
-        structured_content,
-        result_count=result_message_count,
-        has_filter=applied_since_utc is not None,
+    return _project_inbox_response(
+        args,
+        response,
+        applied_since_utc=applied_since_utc,
+        has_inbox_filter=has_inbox_filter,
     )
 
 

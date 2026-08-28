@@ -311,6 +311,7 @@ def make_server(
     client: object | None = None,
     feedback_conn: sqlite3.Connection | None = None,
     topic_refresher: TopicRefresher | None = None,
+    hydration_requester: Callable[[sqlite3.Connection, int, int], None] | None = None,
 ) -> DaemonAPIServer:
     """Return a DaemonAPIServer wired to in-memory DB and mock client."""
     if conn is None:
@@ -332,6 +333,7 @@ def make_server(
         shutdown_event,
         FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn)),
         reaction_freshener=make_reaction_freshener(conn, client),
+        hydration_requester=hydration_requester,
         topic_refresher=topic_refresher,
         policy=make_daemon_api_policy(),
     )
@@ -418,7 +420,9 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             access_last_revalidated_at INTEGER,
             access_next_revalidate_at INTEGER,
             read_inbox_max_id   INTEGER,
-            read_outbox_max_id  INTEGER
+            read_outbox_max_id  INTEGER,
+            read_position_next_attempt_at INTEGER,
+            read_position_attempt_count INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -441,7 +445,8 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             text                TEXT,
             sender_id           INTEGER,
             sender_first_name   TEXT,
-            media_description   TEXT,
+            media_kind          TEXT,
+            media_payload       TEXT,
             reply_to_msg_id     INTEGER,
             reply_count         INTEGER NOT NULL DEFAULT 0,
             forum_topic_id      INTEGER,
@@ -485,6 +490,18 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             old_text    TEXT,
             edit_date   INTEGER,
             PRIMARY KEY (dialog_id, message_id, version)
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_transcriptions (
+            dialog_id        INTEGER NOT NULL,
+            message_id       INTEGER NOT NULL,
+            text             TEXT NOT NULL CHECK (trim(text) <> ''),
+            transcription_id INTEGER NOT NULL,
+            received_at      INTEGER NOT NULL,
+            PRIMARY KEY (dialog_id, message_id)
         ) WITHOUT ROWID
         """
     )
@@ -1411,6 +1428,44 @@ async def test_list_dialogs_serves_preserved_folder_snapshot_without_refresh(tmp
 
 
 @pytest.mark.asyncio
+async def test_list_folder_messages_projects_media_fact_without_payload_leak() -> None:
+    conn = _make_db()
+    conn.execute("INSERT INTO dialogs(dialog_id, name) VALUES (10, 'Media chat')")
+    conn.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+        "VALUES (10, 1, 100, '', 'photo', '{}')"
+    )
+    conn.execute("CREATE TABLE telegram_folders(folder_id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE telegram_folder_members(folder_id INTEGER NOT NULL, dialog_id INTEGER NOT NULL, "
+        "PRIMARY KEY(folder_id, dialog_id))"
+    )
+    conn.execute("INSERT INTO telegram_folders(folder_id, title) VALUES (1, 'Work')")
+    conn.execute("INSERT INTO telegram_folder_members(folder_id, dialog_id) VALUES (1, 10)")
+    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (10, 'synced')")
+    conn.commit()
+    server = make_server(conn)
+
+    result = await server._list_folder_messages({"folder_id": 1, "limit": 20})
+
+    assert result["ok"] is True
+    rows = cast(list[dict[str, object]], _response_data(result)["messages"])
+    assert rows == [
+        {
+            "dialog_id": 10,
+            "message_id": 1,
+            "sent_at": 100,
+            "text": None,
+            "media_kind": "photo",
+            "dialog_name": "Media chat",
+            "media_description": "[фото]",
+            "content_kind": "media_description",
+        }
+    ]
+    assert all("media_payload" not in row for row in rows)
+
+
+@pytest.mark.asyncio
 async def test_list_dialogs_with_folder_filter_uses_preserved_snapshot(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
@@ -2283,7 +2338,8 @@ async def test_mark_dialog_for_sync_ignores_existing() -> None:
     """mark_dialog_for_sync on already-synced dialog keeps status and requests delta refresh."""
     conn = _make_db()
     _insert_synced_dialog(conn, 42, status="synced")
-    server = make_server(conn)
+    hydration_requests: list[tuple[sqlite3.Connection, int, int]] = []
+    server = make_server(conn, hydration_requester=lambda *request: hydration_requests.append(request))
     result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 42, "enable": True})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
@@ -2296,6 +2352,11 @@ async def test_mark_dialog_for_sync_ignores_existing() -> None:
     assert row is not None
     assert row[0] == "synced"  # NOT overwritten
     assert isinstance(row[1], int)
+    assert len(hydration_requests) == 1
+    requested_conn, requested_dialog_id, requested_at = hydration_requests[0]
+    assert requested_conn is conn
+    assert requested_dialog_id == 42
+    assert isinstance(requested_at, int)
 
 
 @pytest.mark.asyncio
@@ -2669,6 +2730,41 @@ async def test_list_unread_messages_basic() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_unread_messages_filters_types_before_budget_allocation() -> None:
+    """Type allowlists remove dialogs before ranking and message allocation."""
+    conn = _make_db()
+    for dialog_id, dialog_type, name in (
+        (1001, "user", "Alice"),
+        (1002, "bot", "Helper"),
+        (1003, "service", "Replies"),
+    ):
+        _seed_unread_state(conn, dialog_id, read_inbox_max_id=0, entity_type=dialog_type, entity_name=name)
+        _seed_message(conn, dialog_id, message_id=1, text=name)
+    server = make_server(conn, _TestClient())
+
+    result = await server._dispatch({"method": "get_inbox", "limit": 1, "include_dialog_types": ["user"]})
+
+    assert result["ok"] is True
+    data = _response_data(result)
+    groups = cast(list[dict[str, object]], data["groups"])
+    assert [group["dialog_id"] for group in groups] == [1001]
+    assert sum(len(_group_messages(group)) for group in groups) == 1
+
+    service_result = await server._dispatch({"method": "get_inbox", "limit": 50, "include_dialog_types": ["service"]})
+    service_groups = cast(list[dict[str, object]], _response_data(service_result)["groups"])
+    assert [group["dialog_id"] for group in service_groups] == [1003]
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_rejects_empty_or_unknown_type_allowlist() -> None:
+    server = make_server(_make_db(), _TestClient())
+    for allowlist in ([], ["not_a_dialog_type"]):
+        result = await server._dispatch({"method": "get_inbox", "include_dialog_types": allowlist})
+        assert result["ok"] is False
+        assert result["error"] == "invalid_input"
+
+
+@pytest.mark.asyncio
 async def test_list_unread_messages_rejects_removed_scope_parameter() -> None:
     server = make_server(_make_db(), _TestClient())
 
@@ -2995,8 +3091,8 @@ async def test_list_unread_messages_filter_excludes_ids_below_read_position() ->
 
 
 @pytest.mark.asyncio
-async def test_list_unread_messages_response_reports_bootstrap_pending() -> None:
-    """Response carries bootstrap_pending count so callers detect incomplete coverage.
+async def test_list_unread_messages_response_reports_read_position_pending() -> None:
+    """Response carries read-position pending count so callers detect incomplete coverage.
     Review-mandated by all 3 reviewers as HIGH priority.
     """
     conn = _make_db()
@@ -3019,7 +3115,8 @@ async def test_list_unread_messages_response_reports_bootstrap_pending() -> None
     assert result["ok"] is True
     data = _response_data(result)
     assert len(cast(list[dict[str, object]], data["groups"])) == 1
-    assert data["bootstrap_pending"] == 2, f"Expected bootstrap_pending=2, got {data.get('bootstrap_pending')}"
+    assert data["read_position_pending_count"] == 2
+    assert len(cast(list[dict[str, object]], data["read_position_pending_entities"])) == 2
     cast(MagicMock, client).assert_not_called()
 
 
@@ -5969,11 +6066,11 @@ async def test_list_unread_messages_preserves_media_only_content_and_filters_ser
     _seed_unread_state(conn, dialog_id=556, read_inbox_max_id=0, entity_type="User", entity_name="Media sender")
     conn.executemany(
         "INSERT INTO messages "
-        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, media_description, out, is_service) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, media_kind, media_payload, out, is_service) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
-            (556, 10, 1_700_000_010, None, 123, "Media sender", "[photo]", 0, 0),
-            (556, 11, 1_700_000_011, None, 123, "Media sender", "[service photo]", 0, 1),
+            (556, 10, 1_700_000_010, None, 123, "Media sender", "photo", "{}", 0, 0),
+            (556, 11, 1_700_000_011, None, 123, "Media sender", "photo", "{}", 0, 1),
         ],
     )
     conn.commit()
@@ -5993,7 +6090,7 @@ async def test_list_unread_messages_preserves_media_only_content_and_filters_ser
     messages = _group_messages(groups[0])
     assert [message["message_id"] for message in messages] == [10]
     assert messages[0]["text"] is None
-    assert messages[0]["media_description"] == "[photo]"
+    assert messages[0]["media_description"] == "[фото]"
     assert messages[0]["content_kind"] == "media_description"
 
 
@@ -6297,6 +6394,34 @@ async def test_list_messages_dm_outgoing_resolves_sender_first_name_via_e_eff() 
     assert _response_messages(resp)[0]["sender_first_name"] == "Me"
 
 
+# --- Archived dotMD source-export dispatch ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_archived_dotmd_source_export_methods_are_not_registered() -> None:
+    server = make_server()
+
+    handlers = server._dispatch_handlers()
+    assert {
+        "describe_source",
+        "export_source_changes",
+        "read_source_unit_window",
+    }.isdisjoint(handlers)
+
+    for method in ("describe_source", "export_source_changes", "read_source_unit_window"):
+        assert await server._dispatch({"method": method}) == {"ok": False, "error": "unknown_method"}
+
+
+@pytest.mark.asyncio
+async def test_archived_dotmd_dispatch_does_not_affect_active_daemon_api() -> None:
+    server = make_server()
+
+    result = await server._dispatch({"method": "resolve_entity", "query": "not present"})
+
+    assert result["ok"] is True
+    assert result.get("error") != "unknown_method"
+
+
 # --- Phase 999.1: get_my_recent_activity ----------------------------
 
 
@@ -6366,8 +6491,8 @@ async def test_get_my_recent_activity_projects_media_only_content() -> None:
         )
         server._conn.execute(
             "INSERT INTO messages "
-            "(dialog_id, message_id, sent_at, text, media_description, out, is_service, is_deleted) "
-            "VALUES (42, 1, ?, NULL, '[photo]', 1, 0, 0)",
+            "(dialog_id, message_id, sent_at, text, media_kind, media_payload, out, is_service, is_deleted) "
+            "VALUES (42, 1, ?, NULL, 'photo', '{}', 1, 0, 0)",
             (now - 60,),
         )
         server._conn.execute(
@@ -6383,7 +6508,7 @@ async def test_get_my_recent_activity_projects_media_only_content() -> None:
     resp = await server._dispatch({"method": "get_my_recent_activity", "dialog_kinds": ["all"]})
     comments = cast(list[dict[str, object]], _activity_data(resp)["comments"])
     assert comments[0]["text"] is None
-    assert comments[0]["media_description"] == "[photo]"
+    assert comments[0]["media_description"] == "[фото]"
     assert comments[1]["text"] == "[site](https://example.com)"
 
 
@@ -7080,7 +7205,8 @@ def _make_trace_db() -> sqlite3.Connection:
             text            TEXT,
             sender_id       INTEGER,
             sender_first_name TEXT,
-            media_description TEXT,
+            media_kind TEXT,
+            media_payload TEXT,
             reply_to_msg_id INTEGER,
             reply_count     INTEGER NOT NULL DEFAULT 0,
             forum_topic_id  INTEGER,
@@ -7179,6 +7305,8 @@ def _make_trace_db() -> sqlite3.Connection:
             hot_cursor          INTEGER,
             hot_last_sync_at    INTEGER,
             hot_next_retry_at   INTEGER,
+            hot_next_due_at     INTEGER,
+            hot_empty_streak    INTEGER NOT NULL DEFAULT 0 CHECK (hot_empty_streak >= 0),
             hot_last_error      TEXT,
             cold_offset_id      INTEGER,
             cold_status         TEXT NOT NULL DEFAULT 'pending',

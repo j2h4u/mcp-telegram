@@ -664,7 +664,7 @@ async def test_list_folder_messages_consumes_internal_content_kind_at_schema_bou
                     "sent_at": 1705312800,
                     "text": "[hidden](https://example.test)",
                     "media_description": "photo",
-                    "content_kind": "message_text",
+                    "media_kind": "other",
                     "dialog_name": "Synthetic",
                 }
             ],
@@ -687,7 +687,7 @@ async def test_list_folder_messages_consumes_internal_content_kind_at_schema_bou
     assert "text" not in message
     assert "media_description" not in message
     assert _json_dict(message["content"])["text"] == "[hidden](https://example.test)"
-    assert _json_dict(message["media"])["text"] == "photo"
+    assert _json_dict(message["media"]) == {"type": "other", "description": "photo"}
     assert payload["partial"] is True
     assert payload["incomplete_dialog_ids"] == [456]
 
@@ -750,6 +750,12 @@ def _make_daemon_conn(response: dict | None = None) -> _DaemonConnStub:
     """Return a mock DaemonConnection that returns *response* for any method."""
     conn = _DaemonConnStub()
     r = response or {"ok": True, "data": {}}
+    inbox_response = r
+    if isinstance(r.get("data"), dict) and "groups" in r["data"]:
+        inbox_data = dict(r["data"])
+        inbox_data.setdefault("read_position_pending_count", 0)
+        inbox_data.setdefault("read_position_pending_entities", [])
+        inbox_response = {**r, "data": inbox_data}
     conn.list_messages = _AsyncMethodMock(return_value=r)
     conn.search_messages = _AsyncMethodMock(return_value=r)
     conn.list_dialogs = _AsyncMethodMock(return_value=r)
@@ -762,7 +768,7 @@ def _make_daemon_conn(response: dict | None = None) -> _DaemonConnStub:
     conn.get_sync_status = _AsyncMethodMock(return_value=r)
     conn.get_sync_alerts = _AsyncMethodMock(return_value=r)
     conn.get_entity_info = _AsyncMethodMock(return_value=r)
-    conn.get_inbox = _AsyncMethodMock(return_value=r)
+    conn.get_inbox = _AsyncMethodMock(return_value=inbox_response)
     conn.get_unread_summary = _AsyncMethodMock(return_value=r)
     conn.record_telemetry = _AsyncMethodMock(return_value={"ok": True})
     conn.get_usage_stats = _AsyncMethodMock(return_value=r)
@@ -1399,7 +1405,7 @@ async def test_search_messages_structured_plain_snippet_around_hidden_link_bound
     raw_text = ("prefix " * 18) + "needle" + (" tail" * 24)
     link_offset = raw_text.index("needle")
     projected_text = project_message_content(
-        MessageSnapshot(text=raw_text, media_description=None, text_links=((link_offset, 6, target),))
+        MessageSnapshot(text=raw_text, text_links=((link_offset, 6, target),))
     ).text
     assert projected_text is not None and target in projected_text
 
@@ -1609,6 +1615,7 @@ def _trace_evidence_group() -> dict:
                 "author_signature": None,
                 "text": None,
                 "media_description": "photo attachment",
+                "media_kind": "other",
             },
             {
                 "source": "sync_db",
@@ -1658,11 +1665,7 @@ async def test_trace_account_messages_routes_flat_arguments_and_counts_evidence_
         "content_kind": "message_text",
     }
     assert _json_dict(evidence[0])["untrusted_content"] is True
-    assert _json_dict(evidence[1])["media_content"] == {
-        "text": "photo attachment",
-        "is_telegram_content": True,
-        "content_kind": "media_description",
-    }
+    assert _json_dict(evidence[1])["media_content"] == {"type": "other", "description": "photo attachment"}
     assert payload["preview"] == {
         "shown_count": 2,
         "hidden_count": 0,
@@ -1686,6 +1689,7 @@ async def test_trace_account_messages_overwrites_wrappers_without_reprojecting_e
         {
             "text": "[site](https://example.test)",
             "media_description": "photo attachment",
+            "media_kind": "other",
             "content": {"text": "stale", "is_telegram_content": True, "content_kind": "note"},
             "media_content": {"text": "stale media", "is_telegram_content": True, "content_kind": "note"},
             "untrusted_content": True,
@@ -1704,17 +1708,13 @@ async def test_trace_account_messages_overwrites_wrappers_without_reprojecting_e
         if _json_dict(candidate).get("text") == "[site](https://example.test)"
     )
     assert item["text"] == "[site](https://example.test)"
-    assert item["media_description"] == "photo attachment"
+    assert "media_description" not in item
     assert item["content"] == {
         "text": "[site](https://example.test)",
         "is_telegram_content": True,
         "content_kind": "message_text",
     }
-    assert item["media_content"] == {
-        "text": "photo attachment",
-        "is_telegram_content": True,
-        "content_kind": "media_description",
-    }
+    assert item["media_content"] == {"type": "other", "description": "photo attachment"}
     assert item["untrusted_content"] is True
 
 
@@ -1727,17 +1727,12 @@ async def test_trace_account_messages_overwrites_wrappers_without_reprojecting_e
             {"text": "caption", "is_telegram_content": True, "content_kind": "message_text"},
             None,
         ),
-        (
-            None,
-            "photo attachment",
-            {"text": "photo attachment", "is_telegram_content": True, "content_kind": "media_description"},
-            {"text": "photo attachment", "is_telegram_content": True, "content_kind": "media_description"},
-        ),
+        (None, "photo attachment", None, {"type": "other", "description": "photo attachment"}),
         (
             "caption",
             "photo attachment",
             {"text": "caption", "is_telegram_content": True, "content_kind": "message_text"},
-            {"text": "photo attachment", "is_telegram_content": True, "content_kind": "media_description"},
+            {"type": "other", "description": "photo attachment"},
         ),
         (None, None, None, None),
     ],
@@ -1754,6 +1749,7 @@ async def test_trace_content_schema_matches_canonical_body_presence(
         {
             "text": text,
             "media_description": media_description,
+            "media_kind": "other" if media_description else None,
             "content": {"text": "stale", "is_telegram_content": True, "content_kind": "note"},
             "media_content": {"text": "stale media", "is_telegram_content": True, "content_kind": "note"},
             "untrusted_content": True,
@@ -2580,7 +2576,7 @@ async def test_get_inbox_via_daemon():
     properties = cast(dict[str, object], schema_dict["properties"])
     assert "scope" not in properties
     dialogs = cast(dict[str, object], cast(dict[str, object], properties["dialogs"])["items"])
-    assert "bootstrap_pending" in properties
+    assert "read_position_pending_count" in properties
     assert "read_state" in cast(dict[str, object], dialogs["properties"])
     payload = _json_dict(result.structured_content)
     coverage = _json_dict(payload["coverage"])
@@ -2588,7 +2584,7 @@ async def test_get_inbox_via_daemon():
     dialogs = _json_list(payload["dialogs"])
     assert payload["limit"] == 100
     assert payload["group_size_threshold"] == 100
-    assert payload["bootstrap_pending"] == 0
+    assert payload["read_position_pending_count"] == 0
     assert coverage["complete"] is True
     assert budget["result_message_count"] == 1
     assert payload["count"] == 1
@@ -2789,15 +2785,15 @@ def test_get_inbox_output_schema_declares_applied_since_utc():
     assert "applied_since_utc" not in _json_list(schema["required"])
 
 
-async def test_get_inbox_empty_with_bootstrap_pending():
-    """UAT gap 1: when groups=[] AND bootstrap_pending>0 the tool MUST NOT return the
+async def test_get_inbox_empty_with_read_position_pending():
+    """When groups=[] and read-position work is pending, the tool MUST NOT return the
     misleading 'No unread messages' canned text — it must surface the pending count
     so the caller knows results are incomplete, not genuinely empty.
     """
     conn = _make_daemon_conn(
         {
             "ok": True,
-            "data": {"groups": [], "bootstrap_pending": 329},
+            "data": {"groups": [], "read_position_pending_count": 329, "read_position_pending_entities": []},
         }
     )
     with _patch_daemon(conn):
@@ -2807,23 +2803,24 @@ async def test_get_inbox_empty_with_bootstrap_pending():
     assert result.is_error is False
     assert result.structured_content is not None
     payload = _json_dict(result.structured_content)
-    assert payload["bootstrap_pending"] == 329
+    assert payload["read_position_pending_count"] == 329
     assert payload["coverage"] == {
         "complete": False,
         "state": "partial",
-        "bootstrap_pending_count": 329,
+        "read_position_pending_count": 329,
+        "read_position_pending_entities": [],
     }
-    assert _json_dict(_json_list(payload["warnings"])[0])["kind"] == "bootstrap_pending"
+    assert _json_dict(_json_list(payload["warnings"])[0])["kind"] == "read_position_pending"
 
 
-async def test_get_inbox_empty_with_no_bootstrap_pending():
-    """When groups=[] AND bootstrap_pending=0 the existing 'no unread' canned text
+async def test_get_inbox_empty_with_no_read_position_pending():
+    """When groups=[] and no read-position work is pending the empty result
     is correct (truly empty inbox). Asserts no behaviour regression.
     """
     conn = _make_daemon_conn(
         {
             "ok": True,
-            "data": {"groups": [], "bootstrap_pending": 0},
+            "data": {"groups": [], "read_position_pending_count": 0, "read_position_pending_entities": []},
         }
     )
     with _patch_daemon(conn):
@@ -2836,8 +2833,8 @@ async def test_get_inbox_empty_with_no_bootstrap_pending():
     assert _json_dict(payload["coverage"])["complete"] is True
 
 
-async def test_get_inbox_non_empty_with_bootstrap_pending():
-    """UAT gap 2: when groups is non-empty AND bootstrap_pending>0 the formatted
+async def test_get_inbox_non_empty_with_read_position_pending():
+    """When groups are non-empty and read-position work is pending the output
     output MUST include a one-line note disclosing the pending count, so the
     caller knows the result is partial coverage.
     """
@@ -2865,7 +2862,8 @@ async def test_get_inbox_non_empty_with_bootstrap_pending():
                         ],
                     },
                 ],
-                "bootstrap_pending": 5,
+                "read_position_pending_count": 5,
+                "read_position_pending_entities": [],
             },
         }
     )
@@ -2875,13 +2873,13 @@ async def test_get_inbox_non_empty_with_bootstrap_pending():
     assert result.content == ()
     assert result.structured_content is not None
     payload = _json_dict(result.structured_content)
-    assert payload["bootstrap_pending"] == 5
+    assert payload["read_position_pending_count"] == 5
     assert _json_dict(payload["coverage"])["complete"] is False
-    assert _json_dict(_json_list(payload["warnings"])[0])["kind"] == "bootstrap_pending"
+    assert _json_dict(_json_list(payload["warnings"])[0])["kind"] == "read_position_pending"
 
 
-async def test_get_inbox_non_empty_with_no_bootstrap_pending():
-    """When groups is non-empty AND bootstrap_pending=0 the formatted output MUST
+async def test_get_inbox_non_empty_with_no_read_position_pending():
+    """When groups are non-empty and no read-position work is pending, output MUST
     NOT include a spurious bootstrap note. Asserts no false-positive disclosure.
     """
     conn = _make_daemon_conn(
@@ -2908,7 +2906,8 @@ async def test_get_inbox_non_empty_with_no_bootstrap_pending():
                         ],
                     },
                 ],
-                "bootstrap_pending": 0,
+                "read_position_pending_count": 0,
+                "read_position_pending_entities": [],
             },
         }
     )
@@ -2918,7 +2917,7 @@ async def test_get_inbox_non_empty_with_no_bootstrap_pending():
     assert result.content == ()
     assert result.structured_content is not None
     payload = _json_dict(result.structured_content)
-    assert payload["bootstrap_pending"] == 0
+    assert payload["read_position_pending_count"] == 0
     assert _json_dict(payload["coverage"])["complete"] is True
 
 
@@ -3580,7 +3579,13 @@ async def test_get_my_recent_activity_serializes_media_only_and_empty_body() -> 
             "ok": True,
             "data": {
                 "comments": [
-                    {"dialog_id": 42, "message_id": 1, "sent_at": 1, "media_description": "[photo]"},
+                    {
+                        "dialog_id": 42,
+                        "message_id": 1,
+                        "sent_at": 1,
+                        "media_description": "[photo]",
+                        "media_kind": "other",
+                    },
                     {"dialog_id": 42, "message_id": 2, "sent_at": 2, "text": None, "media_description": None},
                 ],
                 "scan_status": "complete",
@@ -3593,12 +3598,9 @@ async def test_get_my_recent_activity_serializes_media_only_and_empty_body() -> 
 
     comments = _json_list(_json_dict(result.structured_content)["comments"])
     media_comment = _json_dict(comments[0])
-    assert media_comment["text"] == "[photo]"
-    assert media_comment["content"] == {
-        "text": "[photo]",
-        "is_telegram_content": True,
-        "content_kind": "media_description",
-    }
+    assert media_comment["text"] == ""
+    assert media_comment["content"] is None
+    assert media_comment["media"] == {"type": "other", "description": "[photo]"}
     empty_comment = _json_dict(comments[1])
     assert empty_comment["text"] == ""
     assert empty_comment["content"] == {
@@ -3606,6 +3608,35 @@ async def test_get_my_recent_activity_serializes_media_only_and_empty_body() -> 
         "is_telegram_content": True,
         "content_kind": "message_text",
     }
+
+
+async def test_get_my_recent_activity_projects_contact_attachment_without_duplication() -> None:
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "comments": [
+                    {
+                        "dialog_id": 42,
+                        "message_id": 3,
+                        "sent_at": 3,
+                        "text": None,
+                        "media_description": "Ada, +123",
+                        "media_kind": "contact",
+                    }
+                ],
+                "scan_status": "complete",
+                "scanned_at": 4,
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_my_recent_activity(GetMyRecentActivity(dialog_kinds=["all"]))
+
+    comments = _json_list(_json_dict(result.structured_content)["comments"])
+    comment = _json_dict(comments[0])
+    assert comment["content"] is None
+    assert comment["media"] == {"type": "contact", "description": "Ada, +123"}
 
 
 async def test_get_my_recent_activity_passes_filter_args():

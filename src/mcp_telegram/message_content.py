@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .media_fact import decode_media_fact, media_description
 from .models import ContentKind
 from .text_projection import TextLink, render_text_links
 
@@ -13,7 +14,8 @@ class MessageSnapshot:
     """Raw content facts before agent-facing rendering."""
 
     text: str | None
-    media_description: str | None
+    media_kind: str | None = None
+    media_payload: str | None = None
     text_links: tuple[TextLink, ...] = ()
 
 
@@ -24,6 +26,7 @@ class MessageContent:
     text: str | None
     media_description: str | None
     kind: ContentKind
+    media_kind: str | None = None
 
     @property
     def primary_text(self) -> str | None:
@@ -38,19 +41,31 @@ def project_message_content(snapshot: MessageSnapshot) -> MessageContent:
     ``None`` so callers can distinguish no content from an empty display value.
     """
     text = _normalize(snapshot.text)
-    media_description = _normalize(snapshot.media_description)
+    fact = decode_media_fact(snapshot.media_kind, snapshot.media_payload)
+    media_kind = None if fact is None else fact.kind
+    description = _normalize(media_description(fact))
     rendered_text = render_text_links(text, snapshot.text_links)
     if rendered_text is not None:
         kind: ContentKind = "message_text"
-    elif media_description is not None:
+    elif description is not None:
         kind = "media_description"
     else:
         kind = "none"
-    return MessageContent(text=rendered_text, media_description=media_description, kind=kind)
+    return MessageContent(
+        text=rendered_text,
+        media_description=description,
+        kind=kind,
+        media_kind=media_kind,
+    )
+
+
+def project_message_text(text: str | None, text_links: tuple[TextLink, ...] = ()) -> str | None:
+    """Render message text and persisted hidden links without media input."""
+    return render_text_links(_normalize(text), text_links)
 
 
 def _normalize(value: str | None) -> str | None:
     return value or None
 
 
-__all__ = ["ContentKind", "MessageContent", "MessageSnapshot", "project_message_content"]
+__all__ = ["ContentKind", "MessageContent", "MessageSnapshot", "project_message_content", "project_message_text"]

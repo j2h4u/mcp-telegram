@@ -52,6 +52,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 
 from .access_lifecycle import set_access_lost
+from .dialog_classification import EntityKind, classify_dialog_type
 from .flood import flood_seconds, sleep_through_flood
 from .read_state import apply_read_cursor
 from .sync_db import _open_sync_db
@@ -364,20 +365,20 @@ def _extract_entity_fields(entity: _EntityLike) -> _EntityFields:
       - DialogReconciliationWorker.run_light_pass (no Dialog wrapper — get_entity result)
     """
     if isinstance(entity, types.User):
-        dialog_type = "bot" if entity.bot else "user"
+        dialog_type = classify_dialog_type(entity, entity_kind=EntityKind.USER).value
         members = None
         created = None
     elif isinstance(entity, types.Chat):
-        dialog_type = "group"
+        dialog_type = classify_dialog_type(entity, entity_kind=EntityKind.CHAT).value
         members = entity.participants_count
         created = None
     elif isinstance(entity, types.Channel):
-        dialog_type = "channel" if entity.broadcast else "supergroup"
+        dialog_type = classify_dialog_type(entity, entity_kind=EntityKind.CHANNEL).value
         members = entity.participants_count
         date = entity.date
         created = int(date.timestamp()) if date else None
     else:
-        dialog_type = "unknown"
+        dialog_type = classify_dialog_type(entity, entity_kind=EntityKind.UNKNOWN).value
         members = None
         created = None
     return {

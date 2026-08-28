@@ -18,7 +18,7 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
-from .structured import serialize_message_content
+from .structured import MEDIA_OUTPUT_SCHEMA, serialize_message_content
 
 DEFAULT_ACTIVITY_DIALOG_KINDS = ("group", "forum")
 _ALLOWED_ACTIVITY_DIALOG_KINDS = {"all", "user", "bot", "group", "forum", "channel", "unknown"}
@@ -59,7 +59,8 @@ GET_MY_RECENT_ACTIVITY_OUTPUT_SCHEMA = {
                     "message_id": {"type": "integer"},
                     "sent_at": {"type": ["integer", "null"]},
                     "text": {"type": "string"},
-                    "content": {"type": "object"},
+                    "content": {"type": ["object", "null"]},
+                    "media": MEDIA_OUTPUT_SCHEMA,
                     "sync_status": {"type": ["string", "null"]},
                     "reply_count": {"type": "integer"},
                     "reactions": {"type": "array", "items": {"type": "object"}},
@@ -212,6 +213,11 @@ def _comment_int(comment: Mapping[str, object], key: str) -> int:
     return 0
 
 
+def _add_media_if_present(result: dict[str, object], media: object | None) -> None:
+    if media is not None:
+        result["media"] = media
+
+
 def _structured_comment(comment: Mapping[str, object]) -> dict[str, object]:
     dialog_id = _comment_int(comment, "dialog_id")
     message_id = _comment_int(comment, "message_id")
@@ -232,10 +238,16 @@ def _structured_comment(comment: Mapping[str, object]) -> dict[str, object]:
             (True, True): "message_text",
         }[(bool(text_value), bool(media_value))],
     )
-    serialized = serialize_message_content(text_value, media_value, content_kind)
+    media_kind_value = cast(str | None, comment.get("media_kind"))
+    serialized = serialize_message_content(
+        text_value,
+        media_value,
+        content_kind,
+        media_kind_value,
+    )
     serialized_content = serialized["content"]
     text = cast(str, (serialized_content or cast(dict[str, object], {})).get("text", ""))
-    return {
+    result: dict[str, object] = {
         "dialog_id": dialog_id,
         "dialog_name": comment.get("dialog_name"),
         "dialog_type": str(comment.get("dialog_type") or "unknown"),
@@ -256,6 +268,8 @@ def _structured_comment(comment: Mapping[str, object]) -> dict[str, object]:
             },
         },
     }
+    _add_media_if_present(result, serialized["media"])
+    return result
 
 
 def _chronological_comments(comments: list[Mapping[str, object]]) -> list[Mapping[str, object]]:

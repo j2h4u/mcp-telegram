@@ -30,6 +30,25 @@ def _connection(*, inbox: dict[str, object] | None = None, summary: dict[str, ob
     return connection
 
 
+def test_inbox_service_dialog_is_not_projected_as_bot() -> None:
+    from mcp_telegram.tools.unread import _structured_inbox_group
+
+    dialog, _hidden, _count = _structured_inbox_group(
+        {
+            "dialog_id": 777000,
+            "display_name": "Replies",
+            "username": "replies",
+            "category": "service",
+            "dialog_type": "service",
+            "unread_count": 1,
+            "messages": [],
+        }
+    )
+    assert dialog["category"] == "service"
+    assert dialog["dialog_type"] == "service"
+    assert dialog["is_bot"] is False
+
+
 def test_unread_summary_projection_helper_keeps_identity_contract_and_skips_bad_rows() -> None:
     row = _project_unread_summary_dialog(
         {
@@ -204,6 +223,8 @@ async def test_get_inbox_concrete_message_sender_validates_against_output_schema
         inbox={
             "ok": True,
             "data": {
+                "read_position_pending_count": 0,
+                "read_position_pending_entities": [],
                 "groups": [
                     {
                         "dialog_id": -1001,
@@ -223,7 +244,7 @@ async def test_get_inbox_concrete_message_sender_validates_against_output_schema
                             }
                         ],
                     }
-                ]
+                ],
             },
         }
     )
@@ -251,6 +272,8 @@ async def test_get_inbox_projects_username_and_numeric_dialog_identity() -> None
         inbox={
             "ok": True,
             "data": {
+                "read_position_pending_count": 0,
+                "read_position_pending_entities": [],
                 "groups": [
                     {
                         "dialog_id": 42,
@@ -266,7 +289,7 @@ async def test_get_inbox_projects_username_and_numeric_dialog_identity() -> None
                         "category": "user",
                         "messages": [],
                     },
-                ]
+                ],
             },
         }
     )

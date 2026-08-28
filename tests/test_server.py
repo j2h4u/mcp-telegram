@@ -93,6 +93,17 @@ def test_benign_mcp_http_disconnect_filter_keeps_other_stream_errors() -> None:
     assert server._BenignMcpHttpDisconnectFilter().filter(record) is True
 
 
+def test_mcp_http_lifecycle_logger_is_quieted_without_changing_root_level() -> None:
+    target_logger = logging.getLogger(server._MCP_HTTP_LOGGER_NAME)
+    original_level = target_logger.level
+    try:
+        target_logger.setLevel(logging.NOTSET)
+        server._quiet_mcp_http_lifecycle_logs()
+        assert target_logger.level == logging.WARNING
+    finally:
+        target_logger.setLevel(original_level)
+
+
 def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
     tool = server.tool_by_name["list_messages"]
     properties = cast(dict[str, object], _tool_input_schema(tool)["properties"])
@@ -836,14 +847,14 @@ async def test_call_tool_returns_structuredContent_with_empty_success_content(
             "[photo]",
             "message_text",
             {"text": "caption", "is_telegram_content": True, "content_kind": "message_text"},
-            {"text": "[photo]", "is_telegram_content": True, "content_kind": "media_description"},
+            {"type": "other", "description": "[photo]"},
         ),
         (
             None,
             "[photo]",
             "media_description",
-            {"text": "[photo]", "is_telegram_content": True, "content_kind": "media_description"},
-            {"text": "[photo]", "is_telegram_content": True, "content_kind": "media_description"},
+            None,
+            {"type": "other", "description": "[photo]"},
         ),
         (None, None, "none", None, None),
     ],
@@ -868,6 +879,8 @@ async def test_public_get_inbox_call_tool_preserves_canonical_content_schema(
             return {
                 "ok": True,
                 "data": {
+                    "read_position_pending_count": 0,
+                    "read_position_pending_entities": [],
                     "groups": [
                         {
                             "dialog_id": 123,
@@ -882,11 +895,12 @@ async def test_public_get_inbox_call_tool_preserves_canonical_content_schema(
                                     "dialog_id": 123,
                                     "text": text,
                                     "media_description": media_description,
+                                    "media_kind": "other" if media_description else None,
                                     "content_kind": content_kind,
                                 }
                             ],
                         }
-                    ]
+                    ],
                 },
             }
 
@@ -916,6 +930,58 @@ async def test_public_get_inbox_call_tool_preserves_canonical_content_schema(
         assert message["media"] == expected_media
     assert "text" not in message
     assert "media_description" not in message
+
+
+@pytest.mark.asyncio
+async def test_public_get_inbox_call_tool_projects_empty_contact_attachment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _InboxConnection:
+        async def get_inbox(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "ok": True,
+                "data": {
+                    "read_position_pending_count": 0,
+                    "read_position_pending_entities": [],
+                    "groups": [
+                        {
+                            "dialog_id": 123,
+                            "display_name": "Chat",
+                            "category": "user",
+                            "dialog_type": "User",
+                            "unread_count": 1,
+                            "messages": [
+                                {
+                                    "message_id": 1,
+                                    "sent_at": 1_700_000_000,
+                                    "dialog_id": 123,
+                                    "text": None,
+                                    "media_description": "Ada, +123",
+                                    "media_kind": "contact",
+                                    "content_kind": "media_description",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            }
+
+    @asynccontextmanager
+    async def _connection() -> AsyncIterator[_InboxConnection]:
+        yield _InboxConnection()
+
+    monkeypatch.setattr("mcp_telegram.tools.unread.daemon_connection", _connection)
+    result = _call_tool_result(await server.call_tool("get_inbox", {}))
+
+    assert result.is_error is False
+    payload = cast(dict[str, object], result.structured_content)
+    schema = server.tool_by_name["get_inbox"].output_schema
+    assert schema is not None
+    validate(instance=payload, schema=schema)
+    dialog = cast(dict[str, object], cast(list[object], payload["dialogs"])[0])
+    message = cast(dict[str, object], cast(list[object], dialog["messages"])[0])
+    assert "content" not in message
+    assert message["media"] == {"type": "contact", "description": "Ada, +123"}
 
 
 @pytest.mark.asyncio

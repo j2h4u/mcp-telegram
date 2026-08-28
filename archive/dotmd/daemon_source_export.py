@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
 
+from .media_fact import decode_media_fact, media_description
+
 _SOURCE_CURSOR_PREFIX = "telegram:v1:dialog:"
 _SOURCE_UNIT_PREFIX = "dialog:"
 SourceRow = Mapping[str, object]
@@ -182,7 +184,10 @@ def _source_row_to_change(row: SourceRow) -> dict[str, object]:
     document_ref = f"dialog:{dialog_id}"
     unit_ref = _unit_ref(dialog_id, message_id)
     unit_updated_at = _source_iso(_row_int(row, "unit_updated_epoch"))
-    text = _row_text(row, "text") or _row_text(row, "media_description")
+    fact = decode_media_fact(row["media_kind"], row["media_payload"])
+    safe_kind = None if fact is None else fact.kind
+    description = media_description(fact)
+    text = _row_text(row, "text") or description
     dialog_name = _row_optional_text(row, "dialog_name") or str(dialog_id)
     dialog_type = _row_optional_text(row, "dialog_type") or "Unknown"
     username = row["username"]
@@ -202,6 +207,7 @@ def _source_row_to_change(row: SourceRow) -> dict[str, object]:
         "sender_name": row["sender_first_name"],
         "topic_id": row["forum_topic_id"],
         "topic_title": row["topic_title"],
+        "media_kind": safe_kind,
         "reply_to_msg_id": row["reply_to_msg_id"],
         "edit_date": _source_iso(_row_optional_int(row, "edit_date")) if edit_date is not None else None,
         "deleted_at": _source_iso(_row_optional_int(row, "deleted_at")) if row["deleted_at"] is not None else None,
@@ -265,7 +271,7 @@ def _source_rows_after_identity_cursor(
         SELECT
           m.dialog_id, m.message_id, m.sent_at, m.text, m.sender_id,
           COALESCE(sender.name, m.sender_first_name) AS sender_first_name,
-          m.media_description, m.reply_to_msg_id, m.forum_topic_id,
+          m.media_kind, m.media_payload, m.reply_to_msg_id, m.forum_topic_id,
           m.is_deleted, m.deleted_at, m.edit_date,
           CASE
             WHEN m.edit_date IS NOT NULL AND m.edit_date > m.sent_at THEN m.edit_date
@@ -315,7 +321,7 @@ def _source_rows_after_update_watermark(
         SELECT
           m.dialog_id, m.message_id, m.sent_at, m.text, m.sender_id,
           COALESCE(sender.name, m.sender_first_name) AS sender_first_name,
-          m.media_description, m.reply_to_msg_id, m.forum_topic_id,
+          m.media_kind, m.media_payload, m.reply_to_msg_id, m.forum_topic_id,
           m.is_deleted, m.deleted_at, m.edit_date,
           CASE
             WHEN m.edit_date IS NOT NULL AND m.edit_date > m.sent_at THEN m.edit_date
@@ -467,7 +473,7 @@ def _read_source_unit_window(conn: sqlite3.Connection, req: dict) -> dict:
         SELECT
           m.dialog_id, m.message_id, m.sent_at, m.text, m.sender_id,
           COALESCE(sender.name, m.sender_first_name) AS sender_first_name,
-          m.media_description, m.reply_to_msg_id, m.forum_topic_id,
+          m.media_kind, m.media_payload, m.reply_to_msg_id, m.forum_topic_id,
           m.is_deleted, m.deleted_at, m.edit_date,
           CASE
             WHEN m.edit_date IS NOT NULL AND m.edit_date > m.sent_at THEN m.edit_date

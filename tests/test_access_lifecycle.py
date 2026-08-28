@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from mcp_telegram.access_lifecycle import set_access_lost, stamp_access_revalidation
+from mcp_telegram.access_lifecycle import restore_access_after_revalidation, set_access_lost, stamp_access_revalidation
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -14,7 +14,8 @@ def _db() -> sqlite3.Connection:
         """CREATE TABLE synced_dialogs (
              dialog_id INTEGER PRIMARY KEY, status TEXT, access_lost_at INTEGER,
              delta_refresh_requested_at INTEGER, access_last_revalidated_at INTEGER,
-             access_next_revalidate_at INTEGER, total_messages INTEGER);
+             access_next_revalidate_at INTEGER, total_messages INTEGER,
+             read_position_next_attempt_at INTEGER, read_position_attempt_count INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE full_history_enrollment (
              dialog_id INTEGER PRIMARY KEY,
              enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
@@ -48,6 +49,42 @@ def test_nested_lifecycle_savepoint_preserves_outer_write() -> None:
         conn.rollback()
         assert conn.execute("SELECT COUNT(*) FROM unrelated").fetchone() == (0,)
         assert conn.execute("SELECT status FROM synced_dialogs").fetchone() == ("synced",)
+    finally:
+        conn.close()
+
+
+def test_access_restore_clears_read_position_retry() -> None:
+    conn = _db()
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, read_position_next_attempt_at, read_position_attempt_count) "
+        "VALUES (2, 'access_lost', 999, 3)"
+    )
+    seed_full_history_enrollment(conn, 2, enabled=True)
+    conn.execute("INSERT INTO dialogs VALUES (2, 1, 0, 1, 0, 0, 0, 0, 'x')")
+    conn.commit()
+    try:
+        restore_access_after_revalidation(conn, 2, 10)
+        assert conn.execute(
+            "SELECT read_position_next_attempt_at, read_position_attempt_count FROM synced_dialogs WHERE dialog_id=2"
+        ).fetchone() == (None, 0)
+    finally:
+        conn.close()
+
+
+def test_access_loss_clears_read_position_retry() -> None:
+    conn = _db()
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, read_position_next_attempt_at, read_position_attempt_count) "
+        "VALUES (3, 'synced', 999, 3)"
+    )
+    conn.execute("INSERT INTO dialogs VALUES (3, 0, 0, 1, 0, 0, 0, 0, 'x')")
+    conn.commit()
+    try:
+        set_access_lost(conn, 3, 10)
+        assert conn.execute(
+            "SELECT status, read_position_next_attempt_at, read_position_attempt_count "
+            "FROM synced_dialogs WHERE dialog_id=3"
+        ).fetchone() == ("access_lost", None, 0)
     finally:
         conn.close()
 

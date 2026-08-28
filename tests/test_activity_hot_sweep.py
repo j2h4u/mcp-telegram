@@ -33,13 +33,16 @@ from mcp_telegram.activity_hot_sweep import run_hot_sweep_pass
 from mcp_telegram.activity_peer_sweep import (
     SkipReason,
     SweepResult,
+    WorkingSetResult,
     _load_dialog_state,
     _save_dialog_state,
     enroll_activity_dialog,
 )
+from mcp_telegram.config import ActivityHotSweepConfig
 from mcp_telegram.sync_db import _apply_migrations
 
 _TEST_TIMEOUT_S = 120.0
+_POLICY = ActivityHotSweepConfig(jitter_max_seconds=0)
 
 # ---------------------------------------------------------------------------
 # DB and enrollment helpers
@@ -68,6 +71,11 @@ def _enroll(
 ) -> None:
     """Enroll a peer and optionally set its hot_cursor."""
     enroll_activity_dialog(conn, dialog_id, "supergroup", last_activity_at=last_activity_at)
+    conn.execute(
+        "UPDATE activity_dialog_state SET hot_next_due_at = ? WHERE dialog_id = ?",
+        (int(time.time()) - 1, dialog_id),
+    )
+    conn.commit()
     if hot_cursor is not None:
         _save_dialog_state(conn, dialog_id, hot_cursor=hot_cursor)
 
@@ -112,6 +120,11 @@ def _make_sweep_result(
         max_id=max(ids) if ids else None,
         skip_reason=skip_reason,
         flood_wait_seconds=flood_wait_seconds,
+        pages_fetched=1,
+        rpc_calls=2,
+        extracted=len(ids),
+        genuinely_new=len(ids),
+        completed=skip_reason is SkipReason.NONE or skip_reason is SkipReason.HISTORY_FLOOR,
     )
 
 
@@ -123,6 +136,7 @@ def _flood_result(seconds: int) -> SweepResult:
         max_id=None,
         skip_reason=SkipReason.FLOOD_WAIT,
         flood_wait_seconds=seconds,
+        rpc_calls=2,
     )
 
 
@@ -133,6 +147,7 @@ def _access_skip_result() -> SweepResult:
         min_id=None,
         max_id=None,
         skip_reason=SkipReason.ACCESS_SKIP,
+        rpc_calls=2,
     )
 
 
@@ -154,7 +169,14 @@ def _patch_sweep(
     """
     call_log: dict[int, list[tuple[int, int]]] = {}
 
-    async def _fake_sweep(*args: object, offset_id: int, min_id: int, limit: int, timeout_s: float) -> SweepResult:
+    async def _fake_sweep(
+        *args: object,
+        offset_id: int,
+        min_id: int,
+        limit: int,
+        timeout_s: float,
+        **_kwargs: object,
+    ) -> SweepResult:
         del limit, timeout_s
         _client, _conn, dialog_id = cast(tuple[object, object, int], args)
         call_log.setdefault(dialog_id, []).append((offset_id, min_id))
@@ -178,11 +200,16 @@ def _patch_build_working_set(
 ) -> None:
     """Patch build_working_set to a no-op (enrollment already done in test)."""
 
-    async def _noop(client: object, conn: sqlite3.Connection, *, timeout_s: float) -> int:
+    async def _noop(
+        client: object,
+        conn: sqlite3.Connection,
+        *,
+        timeout_s: float,
+    ) -> WorkingSetResult:
         del client, conn
         if timeout_calls is not None:
             timeout_calls.append(timeout_s)
-        return enrolled_count
+        return WorkingSetResult(enrolled_count=enrolled_count)
 
     monkeypatch.setattr(
         "mcp_telegram.activity_hot_sweep.build_working_set",
@@ -208,9 +235,9 @@ async def test_stale_peer_not_selected(monkeypatch: pytest.MonkeyPatch) -> None:
         call_log = _patch_sweep(monkeypatch, {stale_dialog_id: []})
 
         shutdown = asyncio.Event()
-        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
+        telemetry = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, policy=_POLICY, timeout_s=_TEST_TIMEOUT_S)
 
-        assert written == 0
+        assert telemetry["extracted"] == 0
         assert stale_dialog_id not in call_log, "Stale peer must not be swept — it is outside the 30-day window"
         assert timeout_calls == [_TEST_TIMEOUT_S]
 
@@ -232,9 +259,9 @@ async def test_access_lost_peer_not_selected(monkeypatch: pytest.MonkeyPatch) ->
         call_log = _patch_sweep(monkeypatch, {dialog_id: [_make_sweep_result([10])]})
 
         shutdown = asyncio.Event()
-        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
+        telemetry = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, policy=_POLICY, timeout_s=_TEST_TIMEOUT_S)
 
-        assert written == 0
+        assert telemetry["extracted"] == 0
         assert dialog_id not in call_log
 
 
@@ -260,7 +287,7 @@ async def test_first_pass_null_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
         call_log = _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
+        await run_hot_sweep_pass(_FakeClient(), conn, shutdown, policy=_POLICY, timeout_s=_TEST_TIMEOUT_S)
 
         # min_id on first call must be 0 (hot_cursor was NULL)
         assert dialog_id in call_log, "Active peer must be swept"
@@ -297,7 +324,7 @@ async def test_second_pass_inclusive_cursor_fix(monkeypatch: pytest.MonkeyPatch)
         call_log = _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
+        await run_hot_sweep_pass(_FakeClient(), conn, shutdown, policy=_POLICY, timeout_s=_TEST_TIMEOUT_S)
 
         assert dialog_id in call_log
         _, min_id_used = call_log[dialog_id][0]
@@ -345,6 +372,11 @@ async def test_multi_batch_window_paging(monkeypatch: pytest.MonkeyPatch) -> Non
                     min_id=min(page1_ids),
                     max_id=max(page1_ids),
                     skip_reason=SkipReason.NONE,
+                    pages_fetched=1,
+                    rpc_calls=2,
+                    extracted=len(page1_ids),
+                    genuinely_new=len(page1_ids),
+                    completed=True,
                 ),
                 SweepResult(
                     fetched_ids=page2_ids,
@@ -352,6 +384,11 @@ async def test_multi_batch_window_paging(monkeypatch: pytest.MonkeyPatch) -> Non
                     min_id=min(page2_ids),
                     max_id=max(page2_ids),
                     skip_reason=SkipReason.NONE,
+                    pages_fetched=1,
+                    rpc_calls=2,
+                    extracted=len(page2_ids),
+                    genuinely_new=len(page2_ids),
+                    completed=True,
                 ),
             ]
         }
@@ -359,7 +396,7 @@ async def test_multi_batch_window_paging(monkeypatch: pytest.MonkeyPatch) -> Non
         call_log = _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
+        telemetry = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, policy=_POLICY, timeout_s=_TEST_TIMEOUT_S)
 
         # Two requests must have been issued
         assert len(call_log[dialog_id]) == 2, (
@@ -379,8 +416,9 @@ async def test_multi_batch_window_paging(monkeypatch: pytest.MonkeyPatch) -> Non
             f"hot_cursor should be global max={max(page1_ids)}, got {state['hot_cursor']}"
         )
 
-        # Total written = both pages
-        assert written == len(page1_ids) + len(page2_ids)
+        # Extracted rows = both pages.
+        assert telemetry["extracted"] == len(page1_ids) + len(page2_ids)
+        assert telemetry["yielding_peers"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -406,10 +444,10 @@ async def test_own_messages_persisted_with_out_flag(monkeypatch: pytest.MonkeyPa
         _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
+        telemetry = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, policy=_POLICY, timeout_s=_TEST_TIMEOUT_S)
 
         # The sweep primitive itself inserts; we verify it was called and reported persisted=3
-        assert written == 3, f"Expected 3 messages written, got {written}"
+        assert telemetry["extracted"] == 3, f"Expected 3 extracted messages, got {telemetry['extracted']}"
 
         # hot_cursor must advance
         state = _get_state(conn, dialog_id)
@@ -442,6 +480,11 @@ async def test_flood_wait_sets_retry_at_and_persists_progress(monkeypatch: pytes
                     min_id=min(page1_ids),
                     max_id=max(page1_ids),
                     skip_reason=SkipReason.NONE,
+                    pages_fetched=1,
+                    rpc_calls=2,
+                    extracted=len(page1_ids),
+                    genuinely_new=len(page1_ids),
+                    completed=True,
                 ),
                 _flood_result(flood_seconds),
             ]
@@ -451,7 +494,9 @@ async def test_flood_wait_sets_retry_at_and_persists_progress(monkeypatch: pytes
 
         before = int(time.time())
         shutdown = asyncio.Event()
-        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)  # must NOT raise
+        telemetry = await run_hot_sweep_pass(
+            _FakeClient(), conn, shutdown, policy=_POLICY, timeout_s=_TEST_TIMEOUT_S
+        )  # must NOT raise
 
         state = _get_state(conn, dialog_id)
 
@@ -472,7 +517,9 @@ async def test_flood_wait_sets_retry_at_and_persists_progress(monkeypatch: pytes
         )
 
         # Page 1 messages counted (flood page contributes 0)
-        assert written == len(page1_ids), f"Expected {len(page1_ids)} written (page 1 only), got {written}"
+        assert telemetry["extracted"] == len(page1_ids), (
+            f"Expected {len(page1_ids)} extracted (page 1 only), got {telemetry['extracted']}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +541,7 @@ async def test_access_skip_does_not_advance_cursor(monkeypatch: pytest.MonkeyPat
         _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
+        await run_hot_sweep_pass(_FakeClient(), conn, shutdown, policy=_POLICY, timeout_s=_TEST_TIMEOUT_S)
 
         state = _get_state(conn, dialog_id)
 
@@ -523,6 +570,11 @@ async def test_full_page_without_min_id_persists_hot_cursor(monkeypatch: pytest.
         prior_cursor = 500
         fetched_ids = list(range(501, 601))
         _enroll(conn, dialog_id, last_activity_at=now - 500, hot_cursor=prior_cursor)
+        conn.execute(
+            "UPDATE activity_dialog_state SET hot_next_due_at = ?, hot_empty_streak = ? WHERE dialog_id = ?",
+            (now - 1, 3, dialog_id),
+        )
+        conn.commit()
 
         results = {
             dialog_id: [
@@ -532,6 +584,11 @@ async def test_full_page_without_min_id_persists_hot_cursor(monkeypatch: pytest.
                     min_id=None,
                     max_id=max(fetched_ids),
                     skip_reason=SkipReason.NONE,
+                    pages_fetched=1,
+                    rpc_calls=2,
+                    extracted=len(fetched_ids),
+                    genuinely_new=len(fetched_ids),
+                    completed=False,
                 )
             ]
         }
@@ -539,12 +596,14 @@ async def test_full_page_without_min_id_persists_hot_cursor(monkeypatch: pytest.
         _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
+        telemetry = await run_hot_sweep_pass(_FakeClient(), conn, shutdown, policy=_POLICY, timeout_s=_TEST_TIMEOUT_S)
 
         state = _get_state(conn, dialog_id)
-        assert written == len(fetched_ids)
+        assert telemetry["extracted"] == len(fetched_ids)
         assert state["hot_cursor"] == max(fetched_ids)
-        assert state["hot_next_retry_at"] is None
+        assert cast(int, state["hot_next_retry_at"]) > now
+        assert state["hot_next_due_at"] == now - 1
+        assert state["hot_empty_streak"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +634,7 @@ async def test_hot_sweep_never_writes_cold_columns(monkeypatch: pytest.MonkeyPat
         _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
+        await run_hot_sweep_pass(_FakeClient(), conn, shutdown, policy=_POLICY, timeout_s=_TEST_TIMEOUT_S)
 
         for did in [fresh_id, flood_id, skip_id]:
             state = _get_state(conn, did)
@@ -608,12 +667,25 @@ async def test_flood_halts_whole_pass_account_safety(monkeypatch: pytest.MonkeyP
         _enroll(conn, flood_first, last_activity_at=now)
         _enroll(conn, later_a, last_activity_at=now - 10)
         _enroll(conn, later_b, last_activity_at=now - 20)
+        conn.execute(
+            "UPDATE activity_dialog_state SET hot_next_due_at = ? WHERE dialog_id = ?",
+            (now - 3, flood_first),
+        )
+        conn.execute(
+            "UPDATE activity_dialog_state SET hot_next_due_at = ? WHERE dialog_id = ?",
+            (now - 2, later_a),
+        )
+        conn.execute(
+            "UPDATE activity_dialog_state SET hot_next_due_at = ? WHERE dialog_id = ?",
+            (now - 1, later_b),
+        )
+        conn.commit()
 
         _patch_build_working_set(monkeypatch)
         call_log = _patch_sweep(monkeypatch, {flood_first: [_flood_result(26)]})
 
         shutdown = asyncio.Event()
-        await run_hot_sweep_pass(_FakeClient(), conn, shutdown, timeout_s=_TEST_TIMEOUT_S)
+        await run_hot_sweep_pass(_FakeClient(), conn, shutdown, policy=_POLICY, timeout_s=_TEST_TIMEOUT_S)
 
         # Only the first peer was swept; the pass halted on its FloodWait.
         assert set(call_log.keys()) == {flood_first}, (

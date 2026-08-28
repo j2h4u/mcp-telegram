@@ -258,7 +258,7 @@ async def test_message_fields_extracted_correctly(
     row = cast(
         tuple[object | None, ...] | None,
         sync_db.execute(
-            "SELECT message_id, sender_id, sender_first_name, media_description, "
+            "SELECT message_id, sender_id, sender_first_name, media_kind, media_payload, "
             "reply_to_msg_id, forum_topic_id FROM messages WHERE dialog_id = ?",
             (dialog_id,),
         ).fetchone(),
@@ -267,9 +267,10 @@ async def test_message_fields_extracted_correctly(
     assert row[0] == 500
     assert row[1] == 99
     assert row[2] == "Bob"
-    assert row[3] is not None  # media_description populated
-    assert row[4] == 400
-    assert row[5] == 1
+    assert row[3] == "other"
+    assert row[4] == '{"type":"MessageMediaDocument"}'
+    assert row[5] == 400
+    assert row[6] == 1
 
 
 @pytest.mark.asyncio
@@ -342,7 +343,8 @@ async def test_extract_message_row_uses_rich_message_text_and_unsupported_placeh
     extracted = extract_message_row(dialog_id, msg)
 
     assert extracted.message.text == "speech to text"
-    assert extracted.message.media_description == "[неподдерживаемый тип]"
+    assert extracted.message.media_kind == "other"
+    assert extracted.message.media_payload == '{"type":"MessageMediaUnsupported"}'
 
 
 @pytest.mark.asyncio
@@ -362,9 +364,9 @@ async def test_insert_messages_with_fts_preserves_existing_transcribed_text(
     )
     sync_db.execute(
         "INSERT INTO messages "
-        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, media_description, "
+        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, media_kind, media_payload, "
         "reply_to_msg_id, forum_topic_id, edit_date, grouped_id, reply_to_peer_id, out, is_service, post_author, reply_count, is_deleted) "
-        "VALUES (?, ?, 1704067200, ?, 10, 'Bob', '[неподдерживаемый тип]', NULL, NULL, NULL, NULL, NULL, 0, 0, NULL, 0, 0)",
+        "VALUES (?, ?, 1704067200, ?, 10, 'Bob', 'other', '{}', NULL, NULL, NULL, NULL, NULL, 0, 0, NULL, 0, 0)",
         (dialog_id, message_id, "speech to text"),
     )
     sync_db.commit()
@@ -2069,7 +2071,6 @@ def _stored(dialog_id: int, message_id: int, text: str = "hello") -> StoredMessa
         text=text,
         sender_id=1,
         sender_first_name="Alice",
-        media_description=None,
         reply_to_msg_id=None,
         forum_topic_id=None,
         edit_date=None,

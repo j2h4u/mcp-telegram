@@ -19,6 +19,7 @@ from ._base import (
 )
 from .structured import (
     FOLDER_SNAPSHOT_OUTPUT_SCHEMA,
+    MEDIA_OUTPUT_SCHEMA,
     TELEGRAM_CONTENT_OUTPUT_SCHEMA,
     serialize_message_content,
     telegram_content,
@@ -112,10 +113,10 @@ LIST_FOLDER_MESSAGES_OUTPUT_SCHEMA = {
                         "additionalProperties": False,
                     },
                     "media": {
-                        "type": ["object", "null"],
-                        "properties": TELEGRAM_CONTENT_OUTPUT_SCHEMA["properties"],
-                        "required": TELEGRAM_CONTENT_OUTPUT_SCHEMA["required"],
-                        "additionalProperties": False,
+                        "anyOf": [
+                            {"type": "null"},
+                            MEDIA_OUTPUT_SCHEMA,
+                        ],
                     },
                 },
                 "required": ["dialog_id", "message_id", "sent_at", "dialog_name", "content", "media"],
@@ -168,7 +169,11 @@ async def list_folder_messages(args: ListFolderMessages) -> ToolResult:
     data = response.get("data", {})
     messages = []
     for row in data.get("messages", []):
-        item = {key: value for key, value in row.items() if key not in {"text", "media_description", "content_kind"}}
+        item = {
+            key: value
+            for key, value in row.items()
+            if key not in {"text", "media_description", "content_kind", "media_kind", "media_payload"}
+        }
         text = row.get("text")
         media_description = row.get("media_description")
         dialog_name = item.get("dialog_name")
@@ -177,6 +182,7 @@ async def list_folder_messages(args: ListFolderMessages) -> ToolResult:
             str(text) if text is not None else None,
             str(media_description) if media_description is not None else None,
             cast(ContentKind, row.get("content_kind", "none")),
+            row.get("media_kind"),
         )
         item.update(projected)
         messages.append(item)

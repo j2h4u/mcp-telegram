@@ -35,6 +35,10 @@ class _Client:
         self.calls.append("get_messages")
         return "messages"
 
+    async def get_input_entity(self, *_args: object, **_kwargs: object) -> object:
+        self.calls.append("get_input_entity")
+        return "input-entity"
+
     async def iter_messages(self, *_args: object, **_kwargs: object) -> AsyncIterator[int]:
         self.calls.append("iter_messages")
         yield 1
@@ -101,9 +105,10 @@ async def test_governed_client_delegates_telegram_methods() -> None:
 
     assert await client("request") == "called"
     assert await client.get_messages(entity=1) == "messages"
+    assert await client.get_input_entity(1) == "input-entity"
     assert [item async for item in client.iter_messages(entity=1)] == [1]
 
-    assert raw_client.calls == ["call", "get_messages", "iter_messages"]
+    assert raw_client.calls == ["call", "get_messages", "get_input_entity", "iter_messages"]
 
 
 @pytest.mark.asyncio
@@ -114,6 +119,45 @@ async def test_governed_client_blocks_when_circuit_is_open() -> None:
         await client.get_messages(entity=1)
 
     assert raw_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_governed_client_blocks_peer_resolution_when_circuit_is_open() -> None:
+    raw_client, client = _governed_client(_CircuitStatus(open=True))
+
+    with pytest.raises(TelegramRpcCircuitOpenError, match="open-for-test"):
+        await client.get_input_entity(1)
+
+    assert raw_client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "batch_request",
+    [[], (), set(), {}, range(2), (item for item in range(2))],
+    ids=["list", "tuple", "set", "dict", "range", "generator"],
+)
+async def test_governed_client_rejects_transport_batches_before_governor_or_raw_client(batch_request: object) -> None:
+    raw_client, client = _governed_client(_CircuitStatus(open=False))
+    governor = _CountingGovernor()
+    client = GovernedTelegramClient(raw_client, governor)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="transport batching.*sequential scalar calls"):
+        await client(batch_request)
+
+    assert governor.sources == []
+    assert raw_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_governed_client_scalar_request_consumes_one_logical_unit() -> None:
+    raw_client, client = _governed_client(_CircuitStatus(open=False))
+    governor = _CountingGovernor()
+    client = GovernedTelegramClient(raw_client, governor)  # type: ignore[arg-type]
+
+    assert await client("scalar") == "called"
+    assert governor.sources == ["client_call"]
+    assert raw_client.calls == ["call"]
 
 
 @pytest.mark.asyncio

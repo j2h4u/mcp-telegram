@@ -71,11 +71,6 @@ key = "src/mcp_telegram/errors.py:entity_not_found_text:retry_tool"
 rationale = "This selects the recovery-tool name included in an API error message."
 
 [[entry]]
-category = "policy_assignments"
-key = "src/mcp_telegram/daemon_source_export.py:_SourceExportRequest.parse:limit"
-rationale = "This parsed source-export request limit is part of its public request contract."
-
-[[entry]]
 category = "policy_defaults"
 key = "src/mcp_telegram/__init__.py:feedback_list:limit"
 rationale = "This CLI argument default bounds local feedback listing output."
@@ -84,11 +79,6 @@ rationale = "This CLI argument default bounds local feedback listing output."
 category = "policy_defaults"
 key = "src/mcp_telegram/daemon_api.py:DaemonClientLike.iter_participants:limit"
 rationale = "This protocol method's participant limit is an interface request contract."
-
-[[entry]]
-category = "policy_defaults"
-key = "src/mcp_telegram/daemon_client.py:DaemonConnection.export_source_changes:limit"
-rationale = "This daemon-client export page limit is a request contract."
 
 [[entry]]
 category = "policy_defaults"
@@ -252,16 +242,6 @@ rationale = "This inherited bootstrap work batch cap is unrelated to freshness r
 
 [[entry]]
 category = "policy_assignments"
-key = "src/mcp_telegram/daemon.py:<module>:_UNSUPPORTED_TRANSCRIPTION_BACKFILL_BATCH_SIZE"
-rationale = "This unsupported transcription compatibility batch cap is not new operator policy."
-
-[[entry]]
-category = "policy_assignments"
-key = "src/mcp_telegram/daemon.py:<module>:_UNSUPPORTED_TRANSCRIPTION_BACKFILL_LIMIT"
-rationale = "This unsupported transcription compatibility limit is not new operator policy."
-
-[[entry]]
-category = "policy_assignments"
 key = "src/mcp_telegram/daemon.py:_log_heartbeat:interval"
 rationale = "This logging argument reflects the established heartbeat scheduling value."
 
@@ -393,6 +373,11 @@ key = "src/mcp_telegram/reading/service.py:ReadingService._fetch_telegram_batche
 rationale = "This is internal batch result metadata, not an operator policy placement."
 
 [[entry]]
+category = "policy_call_keywords"
+key = "src/mcp_telegram/transcription_hydration.py:TranscriptionHydrationHandler.request:flood_sleep_threshold"
+rationale = "This fixed Telethon client threshold is a request-path contract, not an operator policy value."
+
+[[entry]]
 category = "policy_assignments"
 key = "src/mcp_telegram/flood.py:<module>:_ROLLUP_LOG_INTERVAL_S"
 rationale = "This is a process-local diagnostic logging cadence."
@@ -406,3 +391,8 @@ rationale = "This is a process-local diagnostic logging cadence."
 category = "policy_defaults"
 key = "src/mcp_telegram/scheduled_messages.py:run_scheduled_reconciliation_loop:interval"
 rationale = "This pre-existing worker scheduling default is retained as a compatibility contract."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/transcription_hydration.py:TranscriptionHydrationHandler:batch_size"
+rationale = "Telegram's TranscribeAudio request accepts one message per request; this is a fixed protocol contract, not an operator schedule."

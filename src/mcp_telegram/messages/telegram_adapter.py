@@ -21,7 +21,8 @@ from telethon.errors import (  # type: ignore[import-untyped]
 from telethon.tl.types import TypePeer  # type: ignore[import-untyped]
 
 from .. import message_contracts as _message_contracts
-from ..telethon_media import describe_media
+from ..media_fact import encode_media_payload
+from ..telethon_media import extract_media_fact
 from ..telethon_message import is_service_message
 
 logger = logging.getLogger(__name__)
@@ -528,11 +529,11 @@ def extract_message_text(msg: object) -> str | None:
     return rich_text or (text if isinstance(text, str) else None)
 
 
-def _extract_media_description(msg: object) -> str | None:
-    media = _attr(msg, "media", None)
-    if media is None:
-        return None
-    return describe_media(media)
+def _extract_media_fact(msg: object) -> tuple[str | None, str | None]:
+    fact = extract_media_fact(_attr(msg, "media", None))
+    if fact is None:
+        return None, None
+    return fact.kind, encode_media_payload(fact)
 
 
 def _extract_edit_date(msg: object) -> int | None:
@@ -615,6 +616,7 @@ def extract_message_row(
 
     reply_to_msg_id, forum_topic_id = extract_reply_and_topic(msg)
 
+    media_kind_value, media_payload = _extract_media_fact(msg)
     stored = _message_contracts.StoredMessage(
         dialog_id=dialog_id,
         message_id=message_id,
@@ -622,7 +624,8 @@ def extract_message_row(
         text=extract_message_text(msg),
         sender_id=_attr(msg, "sender_id", None),
         sender_first_name=_extract_sender_first_name(msg),
-        media_description=_extract_media_description(msg),
+        media_kind=media_kind_value,
+        media_payload=media_payload,
         reply_to_msg_id=reply_to_msg_id,
         forum_topic_id=forum_topic_id,
         edit_date=_extract_edit_date(msg),

@@ -130,13 +130,15 @@ def test_read_state_per_dialog_skips_non_dm_and_zero_dialogs() -> None:
             dialog_id INTEGER NOT NULL,
             message_id INTEGER NOT NULL,
             sent_at INTEGER NOT NULL,
+            media_kind TEXT,
+            media_payload TEXT,
             out INTEGER NOT NULL,
             is_deleted INTEGER NOT NULL,
             is_service INTEGER NOT NULL
         );
         INSERT INTO entities VALUES (7, 'User'), (8, 'Channel');
         INSERT INTO synced_dialogs (dialog_id, read_inbox_max_id, read_outbox_max_id) VALUES (7, 10, 20);
-        INSERT INTO messages VALUES (7, 11, 1700000000, 0, 0, 0), (7, 21, 1700000100, 1, 0, 0);
+        INSERT INTO messages VALUES (7, 11, 1700000000, NULL, NULL, 0, 0, 0), (7, 21, 1700000100, NULL, NULL, 1, 0, 0);
         """
     )
     seed_full_history_enrollment(conn, 7, enabled=False)
@@ -325,7 +327,8 @@ async def test_search_scoped_result_applies_time_bounds_and_keeps_cursor_context
             message_id INTEGER NOT NULL,
             text TEXT,
             sent_at INTEGER NOT NULL,
-            media_description TEXT,
+            media_kind TEXT,
+            media_payload TEXT,
             reply_to_msg_id INTEGER,
             sender_id INTEGER,
             sender_first_name TEXT,

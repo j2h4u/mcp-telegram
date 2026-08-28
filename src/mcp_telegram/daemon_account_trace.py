@@ -16,6 +16,7 @@ from telethon.tl.functions.contacts import ResolveUsernameRequest  # type: ignor
 from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_peer_sweep import enroll_activity_dialog
 from .daemon_message import fetch_text_links
+from .hydration_queue import HydrationPriority
 from .message_content import MessageSnapshot, project_message_content
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
@@ -523,6 +524,7 @@ class DaemonAccountTraceService:
             "author_signature": row["author_signature"],
             "text": row["text"],
             "media_description": row["media_description"],
+            "media_kind": row["media_kind"],
         }
 
     @staticmethod
@@ -892,13 +894,16 @@ def _project_trace_content_rows(
         content = project_message_content(
             MessageSnapshot(
                 text=cast(str | None, _row_value(row, "text")),
-                media_description=cast(str | None, _row_value(row, "media_description")),
+                media_kind=cast(str | None, _row_value(row, "media_kind")),
+                media_payload=cast(str | None, _row_value(row, "media_payload")),
                 text_links=tuple(links_by_message.get((dialog_id, message_id), [])),
             )
         )
         projected_row = _row_dict(row)
         projected_row["text"] = content.text
         projected_row["media_description"] = content.media_description
+        projected_row["media_kind"] = content.media_kind
+        projected_row.pop("media_payload", None)
         projected.append(projected_row)
     return projected
 
@@ -1239,7 +1244,11 @@ async def _resolve_trace_account_signature_scope(
 
     linked_chat_map: dict[int, int] = {exact_dialog_id: resolution.linked_chat_id}
     scope_dialog_ids = [exact_dialog_id, resolution.linked_chat_id]
-    enroll_activity_dialog(deps.conn, resolution.linked_chat_id, source="linked_chat")
+    enroll_activity_dialog(
+        deps.conn,
+        resolution.linked_chat_id,
+        source="linked_chat",
+    )
     return scope_dialog_ids, linked_chat_map
 
 
@@ -1476,7 +1485,7 @@ def _split_trace_duplicate_messages(
 
 def _persist_trace_messages(conn: sqlite3.Connection, messages: list[ExtractedMessage]) -> None:
     with conn:
-        insert_messages_with_fts(conn, messages)
+        insert_messages_with_fts(conn, messages, priority=HydrationPriority.BACKFILL)
 
 
 _TRACE_FRAGMENT_STATUSES = {
@@ -1506,7 +1515,7 @@ _TRACE_MESSAGE_BASE_FIELDS = (
     "text",
     "sender_id",
     "sender_first_name",
-    "media_description",
+    "media_kind",
     "reply_to_msg_id",
     "reply_count",
     "forum_topic_id",
@@ -1750,15 +1759,11 @@ def _upsert_trace_coverage_fragment(
     )
 
 
-def _row_value(row: Mapping[str, object] | Sequence[object], key: str) -> object:
-    if isinstance(row, Mapping):
-        return cast(object, row[key])
-    if isinstance(row, sqlite3.Row):
-        return cast(object, row[key])
-    raise TypeError("row must be a mapping")
+def _row_value(row: Mapping[str, object] | sqlite3.Row, key: str) -> object:
+    return cast(object, row[key])
 
 
-def _row_int(row: Mapping[str, object] | Sequence[object], key: str) -> int:
+def _row_int(row: Mapping[str, object] | sqlite3.Row, key: str) -> int:
     value = _row_value(row, key)
     if isinstance(value, int):
         return value
@@ -2247,7 +2252,11 @@ def _add_trace_candidate_dialog(
     if strategy == "signature_only" and dialog_id in linked_chat_map:
         linked_id = linked_chat_map[dialog_id]
         if linked_id not in state.seen:
-            enroll_activity_dialog(request.conn, linked_id, source="linked_chat")
+            enroll_activity_dialog(
+                request.conn,
+                linked_id,
+                source="linked_chat",
+            )
             _add_trace_candidate_dialog(
                 state=state,
                 dialog_id=linked_id,
@@ -2461,7 +2470,7 @@ def _build_trace_account_messages_query(
         "m.sent_at, "
         "m.text, "
         "m.sender_id, "
-        "m.media_description, "
+        "m.media_kind, m.media_payload, "
         "m.forum_topic_id AS topic_id, "
         "COALESCE(d.name, e_dialog.name, CAST(m.dialog_id AS TEXT)) AS dialog_title, "
         "COALESCE(d.type, e_dialog.type) AS dialog_type, "

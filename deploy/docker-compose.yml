@@ -6,6 +6,10 @@ services:
     container_name: mcp-telegram
     restart: unless-stopped
     mem_limit: 4g
+    logging:
+      driver: journald
+      options:
+        tag: mcp-telegram
     environment:
       - TELEGRAM_API_ID=${TELEGRAM_API_ID}
       - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}

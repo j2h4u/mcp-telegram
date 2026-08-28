@@ -51,7 +51,7 @@ GET_ENTITY_INFO_OUTPUT_SCHEMA = {
         },
         "entity_id": {"type": "integer"},
         "display_name": {"type": "string"},
-        "type": {"type": "string", "enum": ["user", "bot", "channel", "supergroup", "group", "unknown"]},
+        "type": {"type": "string", "enum": [item.value for item in DialogType]},
         "common": {"type": "object", "additionalProperties": True},
         "avatar_history": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
         "type_specific": {"type": "object", "additionalProperties": True},
@@ -563,7 +563,7 @@ def _group_structured(data: dict) -> dict[str, object]:
 def _type_specific_structured(data: dict) -> dict[str, object]:
     entity_type = data.get("type", "unknown")
     dt = DialogType.parse(entity_type)
-    if dt in (DialogType.USER, DialogType.BOT):
+    if dt in (DialogType.USER, DialogType.BOT, DialogType.SERVICE):
         return _user_or_bot_structured(data)
     if dt == DialogType.CHANNEL:
         return _channel_structured(data)
@@ -701,8 +701,8 @@ def _entity_info_fetch_error(args: GetEntityInfo, response: dict) -> ToolResult 
 
 
 class GetEntityInfo(ToolArgs):
-    """Look up a Telegram entity by name or exact numeric id (user, bot, channel,
-    supergroup, or legacy basic group). Returns a type-tagged profile:
+    """Look up a Telegram entity by name or exact numeric id (user, bot, service,
+    channel, supergroup, or legacy basic group). Returns a type-tagged profile:
 
       - user / bot:    id, name, usernames, bio, phone (with country),
                        language, online status, relationship
