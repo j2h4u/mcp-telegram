@@ -6,7 +6,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from telethon import TelegramClient  # type: ignore[import-untyped]
 
 from .config import load_config
+from .flood import flood_wait_kill_switch_status, observe_flood_wait
 from .state import ensure_private_state_dir
+from .telegram_rpc import TelegramRpcBudget, TelegramRpcGate
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +28,7 @@ class TelegramSettings(BaseSettings):
 
 async def logout_from_telegram() -> None:
     """Terminate the active Telegram session and delete the local session file."""
-    client = create_client()
+    client = create_maintenance_client()
     await client.connect()
     await client.log_out()
     print("You are now logged out from Telegram.")
@@ -38,7 +40,7 @@ def create_client(
     api_hash: str | None = None,
     session_name: str = "mcp_telegram_session",
     catch_up: bool = False,
-) -> TelegramClient:
+) -> TelegramRpcGate:
     """Return a cached TelegramClient singleton for the given credentials.
 
     ``@cache`` means the same instance is returned for identical
@@ -61,22 +63,42 @@ def create_client(
         settings = TelegramSettings(api_id=api_id, api_hash=api_hash)
     else:
         settings = _load_settings()
+    config = load_config()
+    state_home = ensure_private_state_dir(config.state.dir, mode=0o700)
+    return TelegramRpcGate(
+        state_home / session_name,
+        cast(int, settings.api_id),
+        cast(str, settings.api_hash),
+        base_logger="telethon",
+        catch_up=catch_up,
+        rpc_budget=TelegramRpcBudget(
+            max_calls_per_period=config.telegram_rpc.max_calls_per_period,
+            period_seconds=config.telegram_rpc.period_seconds,
+        ),
+        circuit_status=flood_wait_kill_switch_status,
+        fallback_wait_seconds=config.flood_wait.fallback_wait_seconds,
+        cooldown_buffer_seconds=config.flood_wait.cooldown_buffer_seconds,
+        transient_retry_delays_seconds=config.telegram_rpc.transient_retry_delays_seconds,
+        flood_observer=observe_flood_wait,
+    )
+
+
+@cache
+def create_maintenance_client(
+    api_id: str | None = None,
+    api_hash: str | None = None,
+    session_name: str = "mcp_telegram_session",
+) -> TelegramClient:
+    """Return a plain Telethon client for explicit maintenance operations."""
+    if api_id is not None and api_hash is not None:
+        settings = TelegramSettings(api_id=api_id, api_hash=api_hash)
+    else:
+        settings = _load_settings()
     state_home = ensure_private_state_dir(load_config().state.dir, mode=0o700)
     return TelegramClient(
         state_home / session_name,
         cast(int, settings.api_id),
         cast(str, settings.api_hash),
         base_logger="telethon",
-        catch_up=catch_up,
-        # flood_sleep_threshold is intentionally NOT set — we inherit Telethon's
-        # default (60s). Telethon auto-sleeps floods <= the threshold and pre-emptively
-        # gates same-CONSTRUCTOR_ID requests via _flood_waited_requests (yielding the
-        # asyncio loop during the sleep); only floods > threshold raise FloodWaitError
-        # to our durable *_next_retry_at backoff (delta_sync, activity_sync, sweep
-        # helpers). We previously forced flood_sleep_threshold=0 to "own" all flood
-        # handling, which disabled this built-in gate and caused a request burst
-        # (phase-53 finding). Observed production floods were 22-27s — well under the
-        # default — so the library handles them. No need to duplicate the default or
-        # expose a knob nothing tunes; our code reacts to the raised exception's
-        # .seconds, never to the threshold value itself.
+        auto_reconnect=True,
     )

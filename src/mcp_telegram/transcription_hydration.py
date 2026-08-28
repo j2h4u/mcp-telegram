@@ -32,7 +32,6 @@ class TranscriptionHydrationHandler:
     """Request Telegram's persisted or on-demand voice transcription."""
 
     kind = TRANSCRIPTION_HYDRATION_KIND
-    flood_source = "transcription_hydration"
     batch_size = 1
     request_cost = 2
 
@@ -48,7 +47,6 @@ class TranscriptionHydrationHandler:
         peer = cast(TypeInputPeer, await telegram.get_input_entity(job.dialog_id))
         return await telegram(
             TranscribeAudioRequest(peer=peer, msg_id=job.message_id),
-            flood_sleep_threshold=0,
         )
 
     def apply(

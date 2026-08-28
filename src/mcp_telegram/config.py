@@ -95,7 +95,8 @@ class FloodWaitConfig:
     kill_switch_window_seconds: int = 600
     kill_switch_max_events: int = 5
     kill_switch_max_wait_seconds: int = 900
-    kill_switch_minimum_cooldown_seconds: int = 1_800
+    fallback_wait_seconds: int = 60
+    cooldown_buffer_seconds: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +105,7 @@ class TelegramRpcConfig:
 
     max_calls_per_period: int = 30
     period_seconds: float = 60.0
+    transient_retry_delays_seconds: tuple[float, ...] = (2.0,)
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,7 +189,6 @@ class SchedulingConfig:
     activity_cold_backfill_batch_pause_seconds: float = 5.0
     activity_cold_enroll_seconds: float = 1_800.0
     activity_cold_access_retry_seconds: float = 3_600.0
-    scheduled_flood_sleep_threshold_seconds: int = 0
     fact_hydration: FactHydrationConfig = field(default_factory=FactHydrationConfig)
     folder_projection: FolderProjectionConfig = field(default_factory=FolderProjectionConfig)
     activity_hot_sweep: ActivityHotSweepConfig = field(default_factory=ActivityHotSweepConfig)
@@ -339,6 +340,19 @@ def _retry_schedule(
     return tuple(value)
 
 
+def _retry_delays_float(
+    data: dict[str, object], key: str, section: str, path: Path, default: tuple[float, ...]
+) -> tuple[float, ...]:
+    value = data.get(key, default)
+    if (
+        not isinstance(value, (list, tuple))
+        or not value
+        or any(isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)) or item < 0 for item in value)
+    ):
+        raise ConfigError(f"Invalid {section}.{key} in {path}: expected a non-empty array of finite numbers >= 0")
+    return tuple(float(item) for item in value)
+
+
 def _http_port(value: object, *, error_type: type[Exception] = ConfigError) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value not in _VALID_HTTP_PORTS:
         raise error_type("HTTP port must be between 1 and 65535")
@@ -479,11 +493,6 @@ def resolve_scheduling_config(
             env,
             "READ_POSITION_RECONCILIATION_BATCH_PAUSE_SECONDS",
             config.read_position_reconciliation_batch_pause_seconds,
-        ),
-        scheduled_flood_sleep_threshold_seconds=_env_non_negative_int(
-            env,
-            "SCHEDULED_FLOOD_SLEEP_THRESHOLD_SECONDS",
-            config.scheduled_flood_sleep_threshold_seconds,
         ),
         reconciliation_hourly_seconds=_env_positive_float(
             env, "RECON_HOURLY_SECONDS", config.reconciliation_hourly_seconds
@@ -740,7 +749,8 @@ def _parse_flood_wait(data: dict[str, object], path: Path) -> FloodWaitConfig:
             "kill_switch_window_seconds",
             "kill_switch_max_events",
             "kill_switch_max_wait_seconds",
-            "kill_switch_minimum_cooldown_seconds",
+            "fallback_wait_seconds",
+            "cooldown_buffer_seconds",
         },
         path,
     )
@@ -756,18 +766,19 @@ def _parse_flood_wait(data: dict[str, object], path: Path) -> FloodWaitConfig:
         kill_switch_max_wait_seconds=_positive_int(
             flood_data, "kill_switch_max_wait_seconds", "flood_wait", path, defaults.kill_switch_max_wait_seconds
         ),
-        kill_switch_minimum_cooldown_seconds=_positive_int(
-            flood_data,
-            "kill_switch_minimum_cooldown_seconds",
-            "flood_wait",
-            path,
-            defaults.kill_switch_minimum_cooldown_seconds,
+        fallback_wait_seconds=_positive_int(
+            flood_data, "fallback_wait_seconds", "flood_wait", path, defaults.fallback_wait_seconds
+        ),
+        cooldown_buffer_seconds=_non_negative_float(
+            flood_data, "cooldown_buffer_seconds", "flood_wait", path, defaults.cooldown_buffer_seconds
         ),
     )
 
 
 def _parse_telegram_rpc(data: dict[str, object], path: Path) -> TelegramRpcConfig:
-    rpc_data = _optional_section(data, "telegram_rpc", {"max_calls_per_period", "period_seconds"}, path)
+    rpc_data = _optional_section(
+        data, "telegram_rpc", {"max_calls_per_period", "period_seconds", "transient_retry_delays_seconds"}, path
+    )
     defaults = TelegramRpcConfig()
     return TelegramRpcConfig(
         max_calls_per_period=_non_negative_int(
@@ -778,6 +789,13 @@ def _parse_telegram_rpc(data: dict[str, object], path: Path) -> TelegramRpcConfi
             defaults.max_calls_per_period,
         ),
         period_seconds=_positive_float(rpc_data, "period_seconds", "telegram_rpc", path, defaults.period_seconds),
+        transient_retry_delays_seconds=_retry_delays_float(
+            rpc_data,
+            "transient_retry_delays_seconds",
+            "telegram_rpc",
+            path,
+            defaults.transient_retry_delays_seconds,
+        ),
     )
 
 
@@ -983,7 +1001,6 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "read_position_reconciliation_failure_cooldown_seconds",
         "read_position_reconciliation_batch_size",
         "read_position_reconciliation_batch_pause_seconds",
-        "scheduled_flood_sleep_threshold_seconds",
         "reconciliation_hourly_seconds",
         "delta_catch_up_interval_seconds",
         "delta_catch_up_max_probes_per_cycle",
@@ -1052,13 +1069,6 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             "scheduling",
             path,
             defaults.read_position_reconciliation_batch_pause_seconds,
-        ),
-        scheduled_flood_sleep_threshold_seconds=_non_negative_int(
-            scheduling_data,
-            "scheduled_flood_sleep_threshold_seconds",
-            "scheduling",
-            path,
-            defaults.scheduled_flood_sleep_threshold_seconds,
         ),
         reconciliation_hourly_seconds=_positive_float(
             scheduling_data,

@@ -86,7 +86,6 @@ from .flood import (
     configure_flood_wait_kill_switch,
     flood_seconds,
     flood_wait_kill_switch_status,
-    install_telethon_flood_wait_metrics_filter,
     maybe_log_flood_wait_rollup,
     sleep_through_flood,
 )
@@ -119,13 +118,7 @@ from .sync_db import (
 from .sync_worker import FullSyncWorker
 from .telegram import create_client
 from .telegram_read_receipts import TelethonTelegramReadReceiptGateway
-from .telegram_rpc import (
-    GovernedTelegramClient,
-    GovernedTelegramClientTarget,
-    TelegramRpcBudget,
-    TelegramRpcCircuitOpenError,
-    TelegramRpcGovernor,
-)
+from .telegram_rpc import TelegramRpcCircuitOpenError
 from .topics.refresh import TopicRefresher
 from .topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from .topics.telegram_adapter import TelethonTelegramTopicGateway, TopicClient
@@ -423,7 +416,7 @@ async def _reconcile_read_position_batch(
         retry_ids.update(batch_ids)
         _mark_read_position_retry(conn, retry_ids, retry_at)
         conn.commit()
-        await sleep_through_flood(shutdown_event, flood_seconds(exc, source="read_position_reconciliation"))
+        await sleep_through_flood(shutdown_event, flood_seconds(exc))
         return 0, True
     except TelegramRpcCircuitOpenError as exc:
         logger.debug("read_pos_bootstrap circuit_open error=%s", exc)
@@ -845,7 +838,6 @@ def _install_flood_wait_kill_switch(config: McpTelegramConfig, event: asyncio.Ev
             window_seconds=policy_config.kill_switch_window_seconds,
             max_events=policy_config.kill_switch_max_events,
             max_wait_seconds=policy_config.kill_switch_max_wait_seconds,
-            minimum_cooldown_seconds=policy_config.kill_switch_minimum_cooldown_seconds,
         ),
         event=event,
     )
@@ -868,13 +860,6 @@ def _access_probe_policy_from_scheduling(scheduling: SchedulingConfig) -> Access
     )
 
 
-def _telegram_rpc_budget_from_config(config: McpTelegramConfig) -> TelegramRpcBudget:
-    return TelegramRpcBudget(
-        max_calls_per_period=config.telegram_rpc.max_calls_per_period,
-        period_seconds=config.telegram_rpc.period_seconds,
-    )
-
-
 def _message_fact_refresh_policy_from_config(config: McpTelegramConfig) -> MessageFactRefreshPolicy:
     return MessageFactRefreshPolicy(
         interval_seconds=config.scheduling.message_fact_refresh_seconds,
@@ -886,18 +871,10 @@ def _message_fact_refresh_policy_from_config(config: McpTelegramConfig) -> Messa
     )
 
 
-def _create_governed_telegram_client(config: McpTelegramConfig) -> _DaemonClient:
-    raw_client = create_client(catch_up=True)
-    return cast(
-        _DaemonClient,
-        GovernedTelegramClient(
-            cast(GovernedTelegramClientTarget, raw_client),
-            TelegramRpcGovernor(
-                _telegram_rpc_budget_from_config(config),
-                circuit_status=flood_wait_kill_switch_status,
-            ),
-        ),
-    )
+def _create_telegram_client(config: McpTelegramConfig) -> _DaemonClient:
+    """Create the daemon-owned Telethon subclass with account-wide policy."""
+    del config  # create_client reads the same frozen operator config at the factory boundary.
+    return cast(_DaemonClient, create_client(catch_up=True))
 
 
 async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - composition root wires all daemon-owned services
@@ -927,7 +904,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - com
     flood_wait_kill_switch_event = asyncio.Event()
     _install_flood_wait_kill_switch(config, flood_wait_kill_switch_event)
 
-    client = _create_governed_telegram_client(config)
+    client = _create_telegram_client(config)
     reaction_freshener = ReactionFreshener(
         SQLiteReactionSnapshotRepository(conn),
         TelethonTelegramReactionGateway(client),
@@ -1242,7 +1219,6 @@ async def _start_followup_background_tasks(
             ctx.shutdown_event,
             policy=ScheduledReconciliationPolicy(
                 interval_seconds=ctx.scheduling.scheduled_reconciliation_seconds,
-                flood_sleep_threshold_seconds=ctx.scheduling.scheduled_flood_sleep_threshold_seconds,
                 activity_rpc_timeout_seconds=ctx.scheduling.activity_rpc_timeout_seconds,
             ),
             own_only_context=ctx.own_only_context,
@@ -1311,7 +1287,6 @@ async def sync_main() -> None:
     Orchestrates: DB init → FTS backfill → Telegram connect → wire services →
     sync loop → cleanup.
     """
-    install_telethon_flood_wait_metrics_filter()
     ctx = await _build_sync_main_context()
     try:
         _create_tracked_task(

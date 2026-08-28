@@ -45,7 +45,6 @@ class AppliedFacts:
 
 class HydrationHandler(Protocol):
     kind: str
-    flood_source: str
     batch_size: int
     request_cost: int
     pending_delay_seconds: int
@@ -192,7 +191,6 @@ class MessageFactHydrationWorker:
         except FloodWaitError as exc:
             retry_delay = flood_seconds(
                 exc,
-                source=handler.flood_source,
             )
             retried, dropped = self._retry_or_drop(started, effective_now + retry_delay)
             self._conn.commit()

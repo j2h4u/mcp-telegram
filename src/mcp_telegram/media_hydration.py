@@ -21,7 +21,6 @@ class MediaFactHydrationHandler:
     """Resolve unresolved media metadata through get_messages."""
 
     kind = MEDIA_METADATA_KIND
-    flood_source = "media_hydration"
     request_cost = 1
     pending_delay_seconds = 0
 

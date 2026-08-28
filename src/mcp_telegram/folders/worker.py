@@ -172,7 +172,7 @@ class FolderProjectionWorker:
             raise
         except Exception as exc:  # noqa: BLE001 - unexpected programming errors terminate the tracked worker
             if is_flood_wait(exc):
-                requested_flood_wait = flood_seconds(exc, source="folder_projection")
+                requested_flood_wait = flood_seconds(exc)
                 return FolderAttemptResult.FLOOD_WAIT, None, requested_flood_wait, None, None
             return FolderAttemptResult.UNEXPECTED, None, None, exc, None
 
