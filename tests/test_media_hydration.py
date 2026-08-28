@@ -332,20 +332,22 @@ async def test_flood_wait_stops_without_sleep_and_reschedules(db: sqlite3.Connec
 
 
 @pytest.mark.asyncio
-async def test_flood_wait_uses_shared_account_observer(monkeypatch: pytest.MonkeyPatch, db: sqlite3.Connection) -> None:
+async def test_flood_wait_uses_pure_extractor_without_observation(
+    monkeypatch: pytest.MonkeyPatch, db: sqlite3.Connection
+) -> None:
     _seed(db)
     client = _Client(error=FloodWaitError(request=None, capture=7))
-    observed: list[tuple[BaseException, str]] = []
+    extracted: list[BaseException] = []
 
-    def _observe(exc: BaseException, *, source: str) -> int:
-        observed.append((exc, source))
+    def _extract(exc: BaseException, *, default: int = 60) -> int:
+        extracted.append(exc)
         return 13
 
-    monkeypatch.setattr("mcp_telegram.fact_hydration.flood_seconds", _observe)
+    monkeypatch.setattr("mcp_telegram.fact_hydration.flood_seconds", _extract)
     result = await _worker(db, client).run_cycle(now=1)
 
     assert result.stopped
-    assert observed and observed[0][1] == "media_hydration"
+    assert extracted == [client.error]
     assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 14)
 
 
@@ -473,7 +475,6 @@ async def test_transcription_immediate_final_persists_text_and_fts(db: sqlite3.C
     assert db.execute("SELECT text FROM messages WHERE dialog_id=1 AND message_id=1").fetchone() == ("speech words",)
     assert db.execute("SELECT text, transcription_id FROM message_transcriptions").fetchone() == ("speech words", 7)
     assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
-    assert client.calls[1]["flood_sleep_threshold"] == 0
     assert db.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=1 AND message_id=1").fetchone() == (
         "speech words",
     )
@@ -491,7 +492,6 @@ async def test_two_voice_jobs_are_scalar_and_sequential_with_budget_four(db: sql
     assert result.requests == 4
     assert result.completed == 2
     assert ["dialog_id" in call for call in client.calls] == [True, False, True, False]
-    assert all(call["flood_sleep_threshold"] == 0 for call in client.calls if "request" in call)
     assert all(
         not isinstance(call["request"], (list, tuple, set, dict, range)) for call in client.calls if "request" in call
     )
