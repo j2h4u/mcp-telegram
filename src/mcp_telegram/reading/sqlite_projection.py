@@ -162,7 +162,46 @@ FROM agent_visible_dialogs
 WHERE (:archived_filter IS NULL OR archived = :archived_filter)
 AND (:pinned_filter IS NULL OR pinned = :pinned_filter)
 AND (:name_pat IS NULL OR LOWER(name) LIKE :name_pat ESCAPE '\\')
-ORDER BY pinned DESC, last_message_at DESC
+ORDER BY pinned DESC, last_message_at DESC, dialog_id ASC
+"""
+
+_LIST_DIALOG_MESSAGE_AGGREGATES_SQL = """
+WITH selected_dialogs AS MATERIALIZED (
+    SELECT CAST(value AS INTEGER) AS dialog_id
+    FROM json_each(:dialog_ids_json)
+), message_aggregates AS (
+    SELECT
+        ids.dialog_id,
+        SUM(CASE WHEN m.is_deleted = 0 THEN 1 ELSE 0 END) AS local_message_count,
+        SUM(CASE
+            WHEN sd.status = 'synced'
+             AND m.is_deleted = 0
+             AND m.is_service = 0
+             AND m."out" = 0
+             AND m.message_id > COALESCE(sd.read_inbox_max_id, -1)
+            THEN 1 ELSE 0 END
+        ) AS unread_in,
+        SUM(CASE
+            WHEN sd.status = 'synced'
+             AND m.is_deleted = 0
+             AND m.is_service = 0
+             AND m."out" = 1
+             AND m.message_id > COALESCE(sd.read_outbox_max_id, -1)
+            THEN 1 ELSE 0 END
+        ) AS unread_out
+    FROM selected_dialogs ids
+    LEFT JOIN synced_dialogs sd USING(dialog_id)
+    CROSS JOIN messages m
+    WHERE m.dialog_id = ids.dialog_id
+    GROUP BY ids.dialog_id
+)
+SELECT
+    ids.dialog_id,
+    COALESCE(a.local_message_count, 0) AS local_message_count,
+    COALESCE(a.unread_in, 0) AS unread_in,
+    COALESCE(a.unread_out, 0) AS unread_out
+FROM selected_dialogs ids
+LEFT JOIN message_aggregates a USING(dialog_id)
 """
 
 # Unread summary is intentionally sourced only from the persisted Telegram
@@ -209,19 +248,7 @@ LIMIT :limit
 """
 
 # Contract note (WR-06): results are emitted as unread_in / unread_out only for DMs.
-_BATCHED_UNREAD_COUNTS_SQL = (
-    "SELECT m.dialog_id, "
-    'SUM(CASE WHEN m."out" = 0 AND m.message_id > COALESCE(sd.read_inbox_max_id, -1) '
-    "THEN 1 ELSE 0 END) AS unread_in, "
-    'SUM(CASE WHEN m."out" = 1 AND m.message_id > COALESCE(sd.read_outbox_max_id, -1) '
-    "THEN 1 ELSE 0 END) AS unread_out "
-    "FROM messages m JOIN synced_dialogs sd USING(dialog_id) "
-    "WHERE sd.status = 'synced' AND m.is_deleted = 0 AND m.is_service = 0 "
-    "GROUP BY m.dialog_id"
-)
-
 _COUNT_SYNCED_MESSAGES_SQL = "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0"
-_COUNT_MESSAGES_BY_DIALOG_SQL = "SELECT dialog_id, COUNT(*) FROM messages WHERE is_deleted = 0 GROUP BY dialog_id"
 
 _SELECT_DIALOG_ACCESS_META_SQL = (
     "SELECT status, total_messages, access_lost_at, last_synced_at, last_event_at "

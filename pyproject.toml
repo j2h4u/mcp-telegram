@@ -9,7 +9,7 @@ dependencies = [
   "mcp>=2,<3",
   "telethon>=1.44.0",
   "pydantic>=2.12.5",
-  "pydantic-settings>=2.14.2",
+  "pydantic-settings>=2.15.0",
   "typer>=0.27.1",
   "xdg-base-dirs>=6.0.0",
   "rapidfuzz>=3.14.3",
@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [build-system]
-requires = ["setuptools>=83.0.0"]
+requires = ["setuptools>=84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [dependency-groups]
@@ -38,10 +38,10 @@ dev = [
     "pytest-cov>=7",
     "pytest-xdist>=3.8.0",
     "actionlint-py>=1.7.12.24",
-    "basedpyright>=1.39.9",
+    "basedpyright>=1.39.10",
     "pytest-crap>=0.3.0",
     "radon>=6.0.1",
-    "setuptools>=83.0.0",
+    "setuptools>=84.0.0",
     "deptry>=0.25.1",
     "tach>=0.35",
 ]
