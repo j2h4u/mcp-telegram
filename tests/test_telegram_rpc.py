@@ -236,6 +236,9 @@ def test_gate_factory_invariants_without_connecting() -> None:
         "hash",
         rpc_budget=TelegramRpcBudget(max_calls_per_period=3, period_seconds=60),
         circuit_status=lambda: status,
+        fallback_wait_seconds=60,
+        cooldown_buffer_seconds=1.0,
+        transient_retry_delays_seconds=(2.0,),
     )
     assert isinstance(gate, TelegramClient)
     assert gate._request_retries == 0

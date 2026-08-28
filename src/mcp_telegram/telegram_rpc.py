@@ -91,9 +91,9 @@ class TelegramRpcGate(TelegramClient):
         *args: object,
         rpc_budget: TelegramRpcBudget,
         circuit_status: Callable[[], CircuitStatus],
-        fallback_wait_seconds: int = 60,
-        cooldown_buffer_seconds: float = 1.0,
-        transient_retry_delays_seconds: tuple[float, ...] = (2.0,),
+        fallback_wait_seconds: int,
+        cooldown_buffer_seconds: float,
+        transient_retry_delays_seconds: tuple[float, ...],
         flood_observer: Callable[..., None] | None = None,
         **kwargs: object,
     ) -> None:
@@ -134,7 +134,7 @@ class TelegramRpcGate(TelegramClient):
                 await asyncio.sleep(delay)
             try:
                 await self._admit()
-                return await super().__call__(request, ordered=ordered, flood_sleep_threshold=0)
+                return await super().__call__(request, ordered=ordered)
             except FloodWaitErrors as exc:
                 await self._observe_flood(exc)
                 raise
