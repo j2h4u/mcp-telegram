@@ -13,7 +13,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 39
+_CURRENT_SCHEMA_VERSION = 40
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -604,7 +604,7 @@ INSERT OR IGNORE INTO scheduled_sync_state (key) VALUES ('account')
 # v37: durable media-fact hydration scheduling.  The queue identity includes
 # the fact kind so future hydration workers can use separate policies without
 # introducing another table or a nullable discriminator.
-_HYDRATION_JOBS_DDL = """
+_HYDRATION_JOBS_V37_DDL = """
 CREATE TABLE IF NOT EXISTS hydration_jobs (
     kind       TEXT NOT NULL,
     dialog_id  INTEGER NOT NULL,
@@ -615,9 +615,29 @@ CREATE TABLE IF NOT EXISTS hydration_jobs (
 ) WITHOUT ROWID
 """
 
-_HYDRATION_JOBS_DUE_INDEX_DDL = """
+_HYDRATION_JOBS_V37_DUE_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_hydration_jobs_due
 ON hydration_jobs(due_at, kind, dialog_id, message_id)
+"""
+
+# v40: exactly two service classes. Newly observed or explicitly requested
+# work is foreground; the migration-created historical remainder is backfill.
+_HYDRATION_JOBS_DDL = """
+CREATE TABLE IF NOT EXISTS hydration_jobs (
+    kind       TEXT NOT NULL,
+    dialog_id  INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    due_at     INTEGER NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    priority   INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1)),
+    message_sent_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, dialog_id, message_id)
+) WITHOUT ROWID
+"""
+
+_HYDRATION_JOBS_DUE_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_hydration_jobs_due
+ON hydration_jobs(due_at, priority DESC, message_sent_at DESC, kind, dialog_id, message_id)
 """
 
 _HYDRATION_JOBS_SEED_SQL = """
@@ -1606,8 +1626,8 @@ FROM scheduled_messages_v36""",
             "DROP TABLE scheduled_messages_v36",
             "ALTER TABLE scheduled_messages_v37 RENAME TO scheduled_messages",
             *index_stmts,
-            _HYDRATION_JOBS_DDL,
-            _HYDRATION_JOBS_DUE_INDEX_DDL,
+            _HYDRATION_JOBS_V37_DDL,
+            _HYDRATION_JOBS_V37_DUE_INDEX_DDL,
             _HYDRATION_JOBS_SEED_SQL,
         ],
     )
@@ -1632,6 +1652,27 @@ def _apply_migration_39(conn: sqlite3.Connection, current: int) -> int:
                 "ON activity_dialog_state(hot_next_due_at, dialog_id, hot_next_retry_at)"
             ),
         ],
+    )
+
+
+def _apply_migration_40(conn: sqlite3.Connection, current: int) -> int:
+    """Prioritize foreground hydration ahead of historical backfill."""
+    return _apply_migration(
+        conn,
+        current,
+        40,
+        [
+            "DROP INDEX IF EXISTS idx_hydration_jobs_due",
+            ("ALTER TABLE hydration_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1))"),
+            "ALTER TABLE hydration_jobs ADD COLUMN message_sent_at INTEGER NOT NULL DEFAULT 0",
+            (
+                "UPDATE hydration_jobs SET message_sent_at = COALESCE(("
+                "SELECT sent_at FROM messages WHERE messages.dialog_id = hydration_jobs.dialog_id "
+                "AND messages.message_id = hydration_jobs.message_id), 0)"
+            ),
+            _HYDRATION_JOBS_DUE_INDEX_DDL,
+        ],
+        ignore_duplicate_column=True,
     )
 
 
@@ -1671,6 +1712,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_37(conn, current)
     current = _apply_migration_38(conn, current)
     current = _apply_migration_39(conn, current)
+    current = _apply_migration_40(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

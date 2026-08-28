@@ -259,14 +259,14 @@ def test_migration_v37_rebuilds_media_tables_without_legacy_description(db_path:
             "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_scheduled_messages_active'"
         ).fetchone()
         assert conn.execute(
-            "SELECT kind, dialog_id, message_id FROM hydration_jobs ORDER BY message_id"
+            "SELECT kind, dialog_id, message_id, priority, message_sent_at FROM hydration_jobs ORDER BY message_id"
         ).fetchall() == [
-            ("media_metadata", 1, 1),
-            ("media_metadata", 1, 3),
+            ("media_metadata", 1, 1, 0, 1700000000),
+            ("media_metadata", 1, 3, 0, 1700000001),
         ]
 
 
-def test_v37_creates_exact_hydration_jobs_queue_and_due_index(tmp_path: Path) -> None:
+def test_v40_creates_prioritized_hydration_queue_and_due_index(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
@@ -276,6 +276,8 @@ def test_v37_creates_exact_hydration_jobs_queue_and_due_index(tmp_path: Path) ->
             "message_id",
             "due_at",
             "attempts",
+            "priority",
+            "message_sent_at",
         ]
         table_sql = _fetchone_row(conn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='hydration_jobs'")
         assert table_sql is not None and "WITHOUT ROWID" in str(table_sql[0]).upper()
@@ -283,7 +285,7 @@ def test_v37_creates_exact_hydration_jobs_queue_and_due_index(tmp_path: Path) ->
             conn, "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_hydration_jobs_due'"
         )
         assert due_index is not None
-        assert "DUE_AT, KIND, DIALOG_ID, MESSAGE_ID" in str(due_index[0]).upper()
+        assert "DUE_AT, PRIORITY DESC, MESSAGE_SENT_AT DESC, KIND, DIALOG_ID, MESSAGE_ID" in str(due_index[0]).upper()
 
 
 def test_migration_v11_idempotent(db_path: Path) -> None:
@@ -516,7 +518,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 39  # v39 adaptive HotSweep cadence
+        assert _CURRENT_SCHEMA_VERSION == 40  # v40 prioritized media hydration
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1247,7 +1249,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 39
+        assert _CURRENT_SCHEMA_VERSION == 40
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:

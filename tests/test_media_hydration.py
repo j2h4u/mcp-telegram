@@ -163,6 +163,56 @@ async def test_job_and_request_caps_apply_across_multiple_dialogs(db: sqlite3.Co
 
 
 @pytest.mark.asyncio
+async def test_batching_preserves_newest_first_across_dialogs(db: sqlite3.Connection) -> None:
+    _seed(db, dialog_id=1, message_id=1)
+    _seed(db, dialog_id=1, message_id=2)
+    _seed(db, dialog_id=2, message_id=1)
+    db.execute("UPDATE messages SET sent_at = 400 WHERE dialog_id = 1 AND message_id = 1")
+    db.execute("UPDATE messages SET sent_at = 100 WHERE dialog_id = 1 AND message_id = 2")
+    db.execute("UPDATE messages SET sent_at = 300 WHERE dialog_id = 2 AND message_id = 1")
+    db.execute("UPDATE hydration_jobs SET message_sent_at = 400 WHERE dialog_id = 1 AND message_id = 1")
+    db.execute("UPDATE hydration_jobs SET message_sent_at = 100 WHERE dialog_id = 1 AND message_id = 2")
+    db.execute("UPDATE hydration_jobs SET message_sent_at = 300 WHERE dialog_id = 2 AND message_id = 1")
+    db.commit()
+    client = _EchoClient()
+    policy = MediaHydrationConfig(
+        batch_size=1,
+        max_jobs_per_cycle=3,
+        max_requests_per_cycle=2,
+        pause_between_requests_seconds=0.01,
+    )
+
+    await _worker(db, client, policy).run_cycle(now=1)
+
+    assert [(call["entity"], call["ids"]) for call in client.calls] == [(1, [1]), (2, [1])]
+    assert db.execute("SELECT dialog_id, message_id FROM hydration_jobs").fetchall() == [(1, 2)]
+
+
+@pytest.mark.asyncio
+async def test_foreground_job_preempts_newer_backfill(db: sqlite3.Connection) -> None:
+    _seed(db, dialog_id=1, message_id=1)
+    _seed(db, dialog_id=2, message_id=1)
+    db.execute("UPDATE messages SET sent_at = 100 WHERE dialog_id = 1")
+    db.execute("UPDATE messages SET sent_at = 500 WHERE dialog_id = 2")
+    db.execute("UPDATE hydration_jobs SET message_sent_at = 100 WHERE dialog_id = 1")
+    db.execute("UPDATE hydration_jobs SET message_sent_at = 500 WHERE dialog_id = 2")
+    db.execute("UPDATE hydration_jobs SET priority = 1 WHERE dialog_id = 1")
+    db.commit()
+    client = _EchoClient()
+    policy = MediaHydrationConfig(
+        batch_size=1,
+        max_jobs_per_cycle=2,
+        max_requests_per_cycle=1,
+        pause_between_requests_seconds=0.01,
+    )
+
+    await _worker(db, client, policy).run_cycle(now=1)
+
+    assert [(call["entity"], call["ids"]) for call in client.calls] == [(1, [1])]
+    assert db.execute("SELECT dialog_id FROM hydration_jobs").fetchall() == [(2,)]
+
+
+@pytest.mark.asyncio
 async def test_transient_retries_then_caps_after_durable_attempts(db: sqlite3.Connection) -> None:
     _seed(db)
     client = _Client(error=RuntimeError("opaque"))

@@ -120,8 +120,8 @@ def test_message_persistence_enqueues_one_unresolved_job_and_preserves_attempts(
         insert_messages_with_fts(conn, [_message(90, text=None, media_kind=media_kind, media_payload="{}")])
         insert_messages_with_fts(conn, [_message(90, text=None, media_kind=media_kind, media_payload="{}")])
     assert conn.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=42 AND message_id=90").fetchone() == (1,)
-    assert conn.execute("SELECT kind, dialog_id, message_id, attempts FROM hydration_jobs").fetchall() == [
-        ("media_metadata", 42, 90, 2)
+    assert conn.execute("SELECT kind, dialog_id, message_id, attempts, priority FROM hydration_jobs").fetchall() == [
+        ("media_metadata", 42, 90, 2, 1)
     ]
 
 
