@@ -27,18 +27,19 @@ FUTURE_BASE = int(time.time()) + 86_400
 
 
 @pytest.mark.parametrize(
-    ("text", "media_description", "content_kind", "expected_text", "expected_media"),
+    ("text", "media_kind", "media_payload", "content_kind", "expected_text", "expected_media"),
     [
-        ("plain text", None, "message_text", "plain text", None),
-        ("caption", "[photo]", "message_text", "caption", "[photo]"),
-        (None, "[photo]", "media_description", None, "[photo]"),
-        ("", "", "none", None, None),
+        ("plain text", None, None, "message_text", "plain text", None),
+        ("caption", "photo", "{}", "message_text", "caption", "[фото]"),
+        (None, "photo", "{}", "media_description", None, "[фото]"),
+        ("", None, None, "none", None, None),
     ],
     ids=["plain-text", "caption-and-media", "media-only", "empty"],
 )
-def test_scheduled_row_mapper_preserves_canonical_content_shape(
+def test_scheduled_row_mapper_preserves_canonical_content_shape(  # noqa: PLR0913
     text: str | None,
-    media_description: str | None,
+    media_kind: str | None,
+    media_payload: str | None,
     content_kind: str,
     expected_text: str | None,
     expected_media: str | None,
@@ -49,7 +50,8 @@ def test_scheduled_row_mapper_preserves_canonical_content_shape(
             "sent_at": FUTURE_BASE + 200,
             "dialog_id": 1,
             "text": text,
-            "media_description": media_description,
+            "media_kind": media_kind,
+            "media_payload": media_payload,
         },
         inclusion_basis=(),
     )
@@ -68,7 +70,8 @@ def test_scheduled_caption_and_media_use_public_structured_delivery_shape() -> N
                 "sent_at": FUTURE_BASE + 200,
                 "dialog_id": 1,
                 "text": "caption",
-                "media_description": "[photo]",
+                "media_kind": "photo",
+                "media_description": "[фото]",
                 "content_kind": "message_text",
             }
         ],
@@ -80,11 +83,7 @@ def test_scheduled_caption_and_media_use_public_structured_delivery_shape() -> N
         "is_telegram_content": True,
         "content_kind": "message_text",
     }
-    assert structured["media"] == {
-        "text": "[photo]",
-        "is_telegram_content": True,
-        "content_kind": "media_description",
-    }
+    assert structured["media"] == {"type": "photo", "description": "[фото]"}
 
 
 def _create_scheduled_table(conn: sqlite3.Connection) -> None:
@@ -97,7 +96,8 @@ def _create_scheduled_table(conn: sqlite3.Connection) -> None:
             text TEXT,
             sender_id INTEGER,
             sender_first_name TEXT,
-            media_description TEXT,
+            media_kind TEXT CHECK (media_kind IN ('photo', 'video', 'audio', 'voice', 'document', 'animation', 'sticker', 'poll', 'location', 'venue', 'contact', 'link_preview', 'game', 'invoice', 'dice', 'story', 'other')),
+            media_payload TEXT CHECK (media_payload IS NULL OR (json_valid(media_payload) AND json_type(media_payload) = 'object')),
             reply_to_msg_id INTEGER,
             forum_topic_id INTEGER,
             edit_date INTEGER,
@@ -166,7 +166,9 @@ async def test_list_messages_scheduled_is_pending_only_and_local() -> None:
     _create_scheduled_table(conn)
     _insert_scheduled(conn, 11, FUTURE_BASE + 200, "later")
     _insert_scheduled(conn, 10, FUTURE_BASE + 100, "sooner")
-    conn.execute("UPDATE scheduled_messages SET text = NULL, media_description = '[photo]' WHERE message_id = 10")
+    conn.execute(
+        "UPDATE scheduled_messages SET text = NULL, media_kind = 'photo', media_payload = '{}' WHERE message_id = 10"
+    )
     conn.commit()
     _insert_scheduled(conn, 12, FUTURE_BASE + 300, "cancelled", state="cancelled")
 
@@ -179,7 +181,7 @@ async def test_list_messages_scheduled_is_pending_only_and_local() -> None:
     assert all(row["scheduled_at"] == row["sent_at"] for row in rows)
     assert rows[0]["content_kind"] == "media_description"
     assert rows[0]["text"] is None
-    assert rows[0]["media_description"] == "[photo]"
+    assert rows[0]["media_description"] == "[фото]"
     assert rows[1]["content_kind"] == "message_text"
     assert result["data"]["source"] == "scheduled_messages"
 

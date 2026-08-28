@@ -2,6 +2,7 @@
 
 import asyncio
 import dataclasses
+import json
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -48,14 +49,14 @@ from .scheduled_projection import (
     scheduled_summary_by_dialog,
 )
 from .sqlite_projection import (
-    _BATCHED_UNREAD_COUNTS_SQL,
     _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL,
-    _COUNT_BOOTSTRAP_PENDING_SQL,
-    _COUNT_MESSAGES_BY_DIALOG_SQL,
+    _COUNT_READ_POSITION_PENDING_SQL,
     _FETCH_UNREAD_MESSAGES_SQL,
     _GET_READ_POSITION_SQL,
+    _LIST_DIALOG_MESSAGE_AGGREGATES_SQL,
     _LIST_DIALOGS_SQL,
     _LIST_MESSAGES_BASE_SQL,
+    _READ_POSITION_PENDING_IDENTITIES_SQL,
     _SELECT_FTS_ALL_SQL,
     _SELECT_FTS_SQL,
     _SELECT_SYNC_STATUS_SQL,
@@ -306,6 +307,13 @@ class _ListDialogsFilter:
     normalized: str | None
     raw_lower: str | None
     name_pat: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _DialogMessageAggregate:
+    local_message_count: int = 0
+    unread_in: int = 0
+    unread_out: int = 0
 
 
 @dataclass(frozen=True)
@@ -1156,6 +1164,29 @@ class ReadingService:
             rows = _fetchall_rows(conn.execute(_LIST_DIALOGS_SQL, {**params, "name_pat": None}))
         return [cast(Mapping[str, object], row) for row in rows]
 
+    @staticmethod
+    def _fetch_list_dialog_aggregates(
+        conn: sqlite3.Connection,
+        dialog_ids: Sequence[int],
+    ) -> dict[int, _DialogMessageAggregate]:
+        if not dialog_ids:
+            return {}
+        unique_ids = list(dict.fromkeys(dialog_ids))
+        rows = _fetchall_rows(
+            conn.execute(
+                _LIST_DIALOG_MESSAGE_AGGREGATES_SQL,
+                {"dialog_ids_json": json.dumps(unique_ids, separators=(",", ":"))},
+            )
+        )
+        return {
+            _object_to_int(_row_value(row, "dialog_id")): _DialogMessageAggregate(
+                local_message_count=_object_to_int(_row_value(row, "local_message_count")),
+                unread_in=_object_to_int(_row_value(row, "unread_in")),
+                unread_out=_object_to_int(_row_value(row, "unread_out")),
+            )
+            for row in rows
+        }
+
     def _dialog_row_matches_filter(
         self,
         dialog_filter: _ListDialogsFilter,
@@ -1182,18 +1213,15 @@ class ReadingService:
         )
         return dialog_filter.normalized in name_norm or matches_acronym or matches_fuzzy
 
-    def _shape_dialog_row(  # noqa: PLR0913, PLR0917
+    def _shape_dialog_row(
         self,
         row: Mapping[str, object],
-        local_counts: dict[int, int],
-        unread_counts: dict[int, tuple[int, int]],
-        dialog_filter: _ListDialogsFilter,
+        aggregate: _DialogMessageAggregate,
         scheduled_summary: tuple[int, int | None] = (0, None),
         inclusion_basis: tuple[str, ...] | None = None,
-    ) -> tuple[dict[str, object] | None, int | None]:
+    ) -> tuple[dict[str, object], int | None]:
         d_id = _object_to_int(row["dialog_id"])
-        if not self._dialog_row_matches_filter(dialog_filter, _object_to_str_or_none(row["name"])):
-            return None, None
+        local_count = aggregate.local_message_count
 
         row_data: dict[str, object] = {
             "last_synced_at": row["last_synced_at"],
@@ -1212,7 +1240,7 @@ class ReadingService:
             "sync_status": row["sync_status"] if row["sync_status"] is not None else "not_synced",
             "sync_coverage_pct": compute_sync_coverage(
                 _object_to_int_or_none(row["total_messages"]),
-                local_counts.get(d_id, 0),
+                local_count,
             ),
             **build_sync_read_model(
                 status=str(row["sync_status"] or "not_synced"),
@@ -1221,7 +1249,7 @@ class ReadingService:
                     _object_to_int_or_none(row["last_event_at"]),
                     _object_to_int_or_none(row["last_delta_checked_at"]),
                 ),
-                local_count=local_counts.get(d_id, 0),
+                local_count=local_count,
                 total_messages=_object_to_int_or_none(row["total_messages"]),
             ),
             "access_lost_at": row["access_lost_at"],
@@ -1230,9 +1258,8 @@ class ReadingService:
             **ReadingService._dialog_lifecycle_fields(row, scheduled_summary, inclusion_basis),
         }
         if DialogType.parse(_object_to_str_or_none(row["type"])) == DialogType.USER:
-            in_cnt, out_cnt = unread_counts.get(d_id, (0, 0))
-            row_data["unread_in"] = in_cnt
-            row_data["unread_out"] = out_cnt
+            row_data["unread_in"] = aggregate.unread_in
+            row_data["unread_out"] = aggregate.unread_out
         return row_data, _object_to_int_or_none(row["snapshot_at"])
 
     @staticmethod
@@ -1811,24 +1838,77 @@ class ReadingService:
         limit = _clamp(_coerce_int(req.get("limit", 100), 100), 1, 500)
         group_size_threshold = _coerce_int(req.get("group_size_threshold", 100), 100)
         try:
+            include_dialog_types = self._parse_dialog_type_allowlist(req.get("include_dialog_types"))
+        except ValueError as exc:
+            return {"ok": False, "error": "invalid_input", "message": str(exc)}
+        try:
             since_utc = _parse_request_boundary(req, "since_utc")
         except ValueError as exc:
             return {"ok": False, "error": "invalid_input", "message": str(exc)}
-        entries, counts = self._collect_unread_dialogs(group_size_threshold, since_utc)
+        entries, counts = self._collect_unread_dialogs(group_size_threshold, since_utc, include_dialog_types)
         self._rank_unread_entries(entries)
         groups = await self._fetch_unread_groups(
             entries,
             allocate_message_budget_proportional(counts, limit),
             since_utc,
         )
-        pending_row = cast(tuple[object] | None, self._conn.execute(_COUNT_BOOTSTRAP_PENDING_SQL).fetchone())
-        pending = int(cast(int | str, pending_row[0])) if pending_row else 0
-        return {"ok": True, "data": {"groups": groups, "bootstrap_pending": pending}}
+        pending_row = cast(tuple[object] | None, self._conn.execute(_COUNT_READ_POSITION_PENDING_SQL).fetchone())
+        pending_count = int(cast(int | str, pending_row[0])) if pending_row else 0
+        pending_rows = cast(
+            list[tuple[object, object, object]],
+            self._conn.execute(_READ_POSITION_PENDING_IDENTITIES_SQL).fetchall(),
+        )
+        pending_entities = [
+            {
+                "dialog_id": int(cast(int | str, dialog_id)),
+                "display_name": display_name,
+                "username": username,
+            }
+            for dialog_id, display_name, username in pending_rows
+        ]
+        return {
+            "ok": True,
+            "data": {
+                "groups": groups,
+                "read_position_pending_count": pending_count,
+                "read_position_pending_entities": pending_entities,
+            },
+        }
 
     @staticmethod
-    def _should_include_unread_dialog(category: str, participants_count: int | None, group_size_threshold: int) -> bool:
+    def _parse_dialog_type_allowlist(raw: object) -> tuple[DialogType, ...] | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("include_dialog_types must be a non-empty list of canonical dialog types")
+        parsed: list[DialogType] = []
+        for value in raw:
+            if isinstance(value, DialogType):
+                dialog_type = value
+            elif isinstance(value, str):
+                try:
+                    dialog_type = DialogType(value)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"include_dialog_types contains unsupported dialog type {value!r}; "
+                        f"expected one of {[item.value for item in DialogType]}"
+                    ) from exc
+            else:
+                raise ValueError("include_dialog_types must contain only canonical dialog type strings")
+            if dialog_type not in parsed:
+                parsed.append(dialog_type)
+        return tuple(parsed)
+
+    @staticmethod
+    def _should_include_unread_dialog(
+        category: str,
+        participants_count: int | None,
+        group_size_threshold: int,
+        *,
+        allow_channel: bool = False,
+    ) -> bool:
         dialog_type = DialogType.parse(category)
-        if dialog_type == DialogType.CHANNEL:
+        if dialog_type == DialogType.CHANNEL and not allow_channel:
             return False
         return not (
             dialog_type in (DialogType.SUPERGROUP, DialogType.GROUP, DialogType.FORUM)
@@ -1837,7 +1917,10 @@ class ReadingService:
         )
 
     def _collect_unread_dialogs(
-        self, group_size_threshold: int, since_utc: int | None = None
+        self,
+        group_size_threshold: int,
+        since_utc: int | None = None,
+        include_dialog_types: tuple[DialogType, ...] | None = None,
     ) -> tuple[list[dict], dict[int, int]]:
         rows = cast(
             list[tuple[object, object, object, object, object, object, object, object]],
@@ -1861,8 +1944,13 @@ class ReadingService:
             if unread_count_i == 0:
                 continue
             category = DialogType.parse(str(entity_type))
+            if include_dialog_types is not None and category not in include_dialog_types:
+                continue
             if not self._should_include_unread_dialog(
-                category, cast(int | None, participants_count), group_size_threshold
+                category,
+                cast(int | None, participants_count),
+                group_size_threshold,
+                allow_channel=include_dialog_types is not None and DialogType.CHANNEL in include_dialog_types,
             ):
                 continue
             entries.append(
@@ -2090,17 +2178,6 @@ class ReadingService:
                 "message": "scope must be all or own_only",
             }
         dialog_filter = self._prepare_list_dialogs_filter(request.filter_raw)
-        local_counts = {
-            _object_to_int(_row_sequence(row)[0]): _object_to_int(_row_sequence(row)[1], 0)
-            for row in _fetchall_rows(conn.execute(_COUNT_MESSAGES_BY_DIALOG_SQL))
-        }
-        unread_counts = {
-            _object_to_int(_row_sequence(row)[0]): (
-                _object_to_int(_row_sequence(row)[1], 0),
-                _object_to_int(_row_sequence(row)[2], 0),
-            )
-            for row in _fetchall_rows(conn.execute(_BATCHED_UNREAD_COUNTS_SQL))
-        }
         scheduled_summary = scheduled_summary_by_dialog(conn, scheduled_now=int(time.time()))
         own_basis = self._own_only_basis_by_dialog(conn)
         sql_rows = self._fetch_list_dialog_rows(conn, request, dialog_filter)
@@ -2116,8 +2193,7 @@ class ReadingService:
                 },
             }
 
-        dialogs: list[dict] = []
-        max_snapshot: int | None = None
+        selected_rows: list[tuple[Mapping[str, object], tuple[int, int | None], tuple[str, ...] | None]] = []
         for row in sql_rows:
             dialog_id = _object_to_int(row["dialog_id"])
             if request.scope == "own_only" and (
@@ -2130,16 +2206,39 @@ class ReadingService:
                 summary = (0, None)
             if request.message_state == "scheduled" and summary[0] == 0:
                 continue
+            if not self._dialog_row_matches_filter(dialog_filter, _object_to_str_or_none(row["name"])):
+                continue
+            selected_rows.append(
+                (
+                    row,
+                    summary,
+                    own_basis.get(dialog_id) if own_basis is not None else None,
+                )
+            )
+
+        if not selected_rows:
+            return {
+                "ok": True,
+                "data": {
+                    "dialogs": [],
+                    "snapshot_age_h": None,
+                    "bootstrap_pending": False,
+                    "scope": request.scope,
+                },
+            }
+
+        dialog_ids = [_object_to_int(row["dialog_id"]) for row, _, _ in selected_rows]
+        aggregates = self._fetch_list_dialog_aggregates(conn, dialog_ids)
+        dialogs: list[dict] = []
+        max_snapshot: int | None = None
+        for row, summary, inclusion_basis in selected_rows:
+            dialog_id = _object_to_int(row["dialog_id"])
             row_data, snapshot_at = self._shape_dialog_row(
                 row,
-                local_counts,
-                unread_counts,
-                dialog_filter,
+                aggregates.get(dialog_id, _DialogMessageAggregate()),
                 summary,
-                own_basis.get(dialog_id) if own_basis is not None else None,
+                inclusion_basis,
             )
-            if row_data is None:
-                continue
             if snapshot_at is not None and (max_snapshot is None or snapshot_at > max_snapshot):
                 max_snapshot = snapshot_at
             dialogs.append(row_data)

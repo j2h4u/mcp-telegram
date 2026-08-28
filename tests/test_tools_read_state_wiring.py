@@ -457,7 +457,14 @@ async def test_unread_tool_renders_per_chat_header() -> None:
             msg_id=2,
         ),
     ]
-    response = {"ok": True, "data": {"groups": groups, "bootstrap_pending": 0}}
+    response = {
+        "ok": True,
+        "data": {
+            "groups": groups,
+            "read_position_pending_count": 0,
+            "read_position_pending_entities": [],
+        },
+    }
     conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
@@ -481,7 +488,14 @@ async def test_unread_tool_renders_collapsed_header_when_chat_caught_up() -> Non
             dialog_type="User",
         ),
     ]
-    response = {"ok": True, "data": {"groups": groups, "bootstrap_pending": 0}}
+    response = {
+        "ok": True,
+        "data": {
+            "groups": groups,
+            "read_position_pending_count": 0,
+            "read_position_pending_entities": [],
+        },
+    }
     conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
@@ -501,7 +515,14 @@ async def test_unread_tool_renders_split_header_when_inbox_unread() -> None:
             dialog_type="User",
         ),
     ]
-    response = {"ok": True, "data": {"groups": groups, "bootstrap_pending": 0}}
+    response = {
+        "ok": True,
+        "data": {
+            "groups": groups,
+            "read_position_pending_count": 0,
+            "read_position_pending_entities": [],
+        },
+    }
     conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
@@ -524,7 +545,14 @@ async def test_unread_tool_no_header_for_non_dm_group() -> None:
             category="channel",
         ),
     ]
-    response = {"ok": True, "data": {"groups": groups, "bootstrap_pending": 0}}
+    response = {
+        "ok": True,
+        "data": {
+            "groups": groups,
+            "read_position_pending_count": 0,
+            "read_position_pending_entities": [],
+        },
+    }
     conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
@@ -544,7 +572,14 @@ async def test_unread_tool_backward_compat_no_read_state() -> None:
             dialog_type=None,
         ),
     ]
-    response = {"ok": True, "data": {"groups": groups, "bootstrap_pending": 0}}
+    response = {
+        "ok": True,
+        "data": {
+            "groups": groups,
+            "read_position_pending_count": 0,
+            "read_position_pending_entities": [],
+        },
+    }
     conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())

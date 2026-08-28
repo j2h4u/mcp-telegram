@@ -16,9 +16,8 @@
 # known false positives. The `# unused ... (path:line)` comments keep the list
 # regenerable — refresh with: `uv run vulture --make-whitelist`.
 #
-# Scope note: this whitelist covers ONLY the retained text layer. Other vulture
-# findings (e.g. TypedDict fields read as "unused variable", the dotMD adapter API in
-# daemon_client.py) are deliberately NOT whitelisted — triage those on their own merits.
+# Scope note: this whitelist covers ONLY the retained text layer and individually
+# confirmed framework false positives.
 
 # --- errors.py: actionable error-message helpers (text layer) ---
 ambiguous_dialog_text  # unused function (src/mcp_telegram/errors.py:17)
@@ -59,11 +58,6 @@ row_factory      # sqlite3.Connection.row_factory, consumed by sqlite3 (daemon_a
 model_config     # Pydantic BaseModel config, consumed by Pydantic (tools/_base.py)
 capture_signals  # override of uvicorn.Server.capture_signals, called by uvicorn (server.py:357)
 
-# dotMD adapter API — the external indexer is the only caller (AGENTS.md: dotMD
-# is a downstream consumer reached through its Telegram adapter):
-describe_source         # daemon_client.py:293
-export_source_changes   # daemon_client.py:297
-read_source_unit_window # daemon_client.py:317
 upsert_entities       # retained daemon-client API for external entity projection callers
 
 # Used in production but missed by vulture's call-graph (re-imports / dynamic use):

@@ -58,6 +58,16 @@ _ENROLLMENT_SOURCES = frozenset(
 )
 
 
+def reset_read_position_retry(conn: sqlite3.Connection, dialog_id: int) -> int:
+    """Clear reconciliation backoff when enrollment or access makes work relevant."""
+    cur = conn.execute(
+        "UPDATE synced_dialogs SET read_position_next_attempt_at = NULL, "
+        "read_position_attempt_count = 0 WHERE dialog_id = ?",
+        (dialog_id,),
+    )
+    return cur.rowcount
+
+
 @contextmanager
 def _savepoint(conn: sqlite3.Connection) -> Iterator[None]:
     name = f"history_enrollment_{next(_SAVEPOINTS)}"
@@ -203,6 +213,7 @@ def enable_history(
             )
 
         _store_intent(conn, dialog_id, True, source, timestamp)
+        reset_read_position_retry(conn, dialog_id)
         decision = _decide_transition(coverage, enabled=True, automatic=source is EnrollmentSource.AUTOMATIC)
         if coverage is None:
             conn.execute(
@@ -243,6 +254,7 @@ def disable_history(
     with _savepoint(conn):
         coverage = _coverage_status(conn, dialog_id)
         _store_intent(conn, dialog_id, False, EnrollmentSource.EXPLICIT, timestamp)
+        reset_read_position_retry(conn, dialog_id)
         if coverage == "syncing":
             conn.execute("UPDATE synced_dialogs SET status = 'not_synced' WHERE dialog_id = ?", (dialog_id,))
             coverage = "not_synced"
@@ -295,6 +307,7 @@ def restore_access_status(conn: sqlite3.Connection, dialog_id: int) -> bool:
         "UPDATE synced_dialogs SET status = ?, delta_refresh_requested_at = NULL WHERE dialog_id = ?",
         ("syncing" if enabled else "not_synced", dialog_id),
     )
+    reset_read_position_retry(conn, dialog_id)
     return enabled
 
 
@@ -307,5 +320,6 @@ __all__ = [
     "ensure_automatic_dm_enrollment",
     "full_history_enabled",
     "read_intent",
+    "reset_read_position_retry",
     "restore_access_status",
 ]

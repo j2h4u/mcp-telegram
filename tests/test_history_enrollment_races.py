@@ -13,7 +13,6 @@ import pytest
 from helpers import build_mock_message
 from mcp_telegram.daemon import (
     _apply_read_positions_from_dialogs,
-    _backfill_blank_unsupported_messages,
     _backfill_total_message_dialog,
 )
 from mcp_telegram.history_enrollment import disable_history
@@ -33,45 +32,13 @@ def _dbs() -> tuple[sqlite3.Connection, sqlite3.Connection]:
 
 
 @pytest.mark.asyncio
-async def test_media_backfill_disable_after_fetch_discards_body(tmp_path) -> None:
-    path = tmp_path / "race.db"
-    first = sqlite3.connect(path)
-    second = sqlite3.connect(path)
-    _apply_migrations(first)
-    first.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (1,'synced')")
-    first.execute("INSERT INTO full_history_enrollment VALUES (1,1,'explicit',1)")
-    first.execute(
-        "INSERT INTO messages(dialog_id,message_id,sent_at,text,media_description) VALUES (1,7,1,'','MessageMediaUnsupported')"
-    )
-    first.commit()
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    async def fetch(**_: object) -> list[object]:
-        entered.set()
-        await release.wait()
-        return [build_mock_message(id=7, text="recovered")]
-
-    client = MagicMock(get_messages=AsyncMock(side_effect=fetch))
-    task = asyncio.create_task(_backfill_blank_unsupported_messages(client, first, asyncio.Event()))
-    await entered.wait()
-    disable_history(second, 1, now=2)
-    second.commit()
-    release.set()
-    await task
-    assert first.execute("SELECT text FROM messages WHERE dialog_id=1 AND message_id=7").fetchone() == ("",)
-    first.close()
-    second.close()
-
-
-@pytest.mark.asyncio
 async def test_message_fact_refresh_disable_during_reaction_await_discards_snapshot() -> None:
     from tests.test_message_fact_refresh import _make_db, _policy
 
     conn = _make_db()
     conn.execute("INSERT INTO synced_dialogs VALUES (4, 'synced')")
     conn.execute("INSERT INTO full_history_enrollment VALUES (4, 1, 'explicit', 1)")
-    conn.execute("INSERT INTO messages VALUES (4, 1, 1, 0)")
+    conn.execute("INSERT INTO messages VALUES (4, 1, 1, 0, NULL)")
     conn.execute("INSERT INTO message_reactions VALUES (4, 1, '👍', 1)")
     conn.commit()
     entered = asyncio.Event()

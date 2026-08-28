@@ -1,5 +1,6 @@
-from typing import Literal, NotRequired, TypedDict
+from typing import Literal, NotRequired, TypedDict, cast
 
+from ..media_fact import MEDIA_KINDS
 from ..message_content import ContentKind
 
 TelegramContentKind = Literal[
@@ -54,6 +55,72 @@ class TelegramContent(TypedDict):
     content_kind: TelegramContentKind
 
 
+AttachmentType = Literal[
+    "photo",
+    "video",
+    "audio",
+    "voice",
+    "document",
+    "animation",
+    "sticker",
+    "poll",
+    "location",
+    "venue",
+    "contact",
+    "link_preview",
+    "game",
+    "invoice",
+    "dice",
+    "story",
+    "other",
+]
+DeliveryContentKind = ContentKind | Literal["snippet"]
+
+
+class Attachment(TypedDict):
+    """Minimal canonical representation for any Telegram media attachment."""
+
+    type: AttachmentType
+    description: NotRequired[str]
+
+
+class SerializedMessageContent(TypedDict):
+    content: TelegramContent | None
+    media: Attachment | None
+
+
+MEDIA_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {
+            "type": "string",
+            "enum": [
+                "photo",
+                "video",
+                "audio",
+                "voice",
+                "document",
+                "animation",
+                "sticker",
+                "poll",
+                "location",
+                "venue",
+                "contact",
+                "link_preview",
+                "game",
+                "invoice",
+                "dice",
+                "story",
+                "other",
+            ],
+        },
+        "description": {"type": "string"},
+    },
+    "required": ["type"],
+    "additionalProperties": False,
+}
+
+
 class StructuredWarning(TypedDict):
     kind: str
     severity: WarningSeverity
@@ -95,18 +162,40 @@ def unavailable_folder_snapshot() -> dict[str, object]:
 def serialize_message_content(
     text: str | None,
     media_description: str | None,
-    kind: ContentKind,
-) -> dict[str, TelegramContent | None]:
+    kind: DeliveryContentKind,
+    media_kind: str | None = None,
+) -> SerializedMessageContent:
     """Serialize already-projected message facts for delivery surfaces.
 
     Projection (including hidden-link rendering) belongs to ``MessageContent``;
     this helper only applies the shared wire wrapper and primary-content rule.
     """
-    primary = text if kind == "message_text" else media_description
+    media = project_media_description(media_description, media_kind)
+    # Media is represented once by its attachment object.  Keep content for
+    # captions/text only so the description cannot be duplicated.
+    normalized_text = text or None
+    content = None
+    if normalized_text is not None and normalized_text != media_description:
+        content_kind = "message_text" if kind in {"none", "media_description"} else cast(TelegramContentKind, kind)
+        content = telegram_content(normalized_text, content_kind)
+    elif text == "" and media_description is None and kind == "message_text":
+        # Activity keeps its explicit empty-body envelope when there is no
+        # attachment at all.
+        content = telegram_content("", "message_text")
     return {
-        "content": telegram_content(primary, kind) if primary is not None and kind != "none" else None,
-        "media": telegram_content(media_description, "media_description") if media_description is not None else None,
+        "content": content,
+        "media": media,
     }
+
+
+def project_media_description(media_description: str | None, media_kind: str | None = None) -> Attachment | None:
+    """Project persisted media facts into one stable agent-facing attachment."""
+    if media_kind is None or media_kind not in MEDIA_KINDS:
+        return None
+    attachment: Attachment = {"type": cast(AttachmentType, media_kind)}
+    if media_description:
+        attachment["description"] = media_description
+    return attachment
 
 
 def structured_warning(

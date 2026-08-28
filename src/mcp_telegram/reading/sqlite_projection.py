@@ -162,7 +162,46 @@ FROM agent_visible_dialogs
 WHERE (:archived_filter IS NULL OR archived = :archived_filter)
 AND (:pinned_filter IS NULL OR pinned = :pinned_filter)
 AND (:name_pat IS NULL OR LOWER(name) LIKE :name_pat ESCAPE '\\')
-ORDER BY pinned DESC, last_message_at DESC
+ORDER BY pinned DESC, last_message_at DESC, dialog_id ASC
+"""
+
+_LIST_DIALOG_MESSAGE_AGGREGATES_SQL = """
+WITH selected_dialogs AS MATERIALIZED (
+    SELECT CAST(value AS INTEGER) AS dialog_id
+    FROM json_each(:dialog_ids_json)
+), message_aggregates AS (
+    SELECT
+        ids.dialog_id,
+        SUM(CASE WHEN m.is_deleted = 0 THEN 1 ELSE 0 END) AS local_message_count,
+        SUM(CASE
+            WHEN sd.status = 'synced'
+             AND m.is_deleted = 0
+             AND m.is_service = 0
+             AND m."out" = 0
+             AND m.message_id > COALESCE(sd.read_inbox_max_id, -1)
+            THEN 1 ELSE 0 END
+        ) AS unread_in,
+        SUM(CASE
+            WHEN sd.status = 'synced'
+             AND m.is_deleted = 0
+             AND m.is_service = 0
+             AND m."out" = 1
+             AND m.message_id > COALESCE(sd.read_outbox_max_id, -1)
+            THEN 1 ELSE 0 END
+        ) AS unread_out
+    FROM selected_dialogs ids
+    LEFT JOIN synced_dialogs sd USING(dialog_id)
+    CROSS JOIN messages m
+    WHERE m.dialog_id = ids.dialog_id
+    GROUP BY ids.dialog_id
+)
+SELECT
+    ids.dialog_id,
+    COALESCE(a.local_message_count, 0) AS local_message_count,
+    COALESCE(a.unread_in, 0) AS unread_in,
+    COALESCE(a.unread_out, 0) AS unread_out
+FROM selected_dialogs ids
+LEFT JOIN message_aggregates a USING(dialog_id)
 """
 
 # Unread summary is intentionally sourced only from the persisted Telegram
@@ -209,19 +248,7 @@ LIMIT :limit
 """
 
 # Contract note (WR-06): results are emitted as unread_in / unread_out only for DMs.
-_BATCHED_UNREAD_COUNTS_SQL = (
-    "SELECT m.dialog_id, "
-    'SUM(CASE WHEN m."out" = 0 AND m.message_id > COALESCE(sd.read_inbox_max_id, -1) '
-    "THEN 1 ELSE 0 END) AS unread_in, "
-    'SUM(CASE WHEN m."out" = 1 AND m.message_id > COALESCE(sd.read_outbox_max_id, -1) '
-    "THEN 1 ELSE 0 END) AS unread_out "
-    "FROM messages m JOIN synced_dialogs sd USING(dialog_id) "
-    "WHERE sd.status = 'synced' AND m.is_deleted = 0 AND m.is_service = 0 "
-    "GROUP BY m.dialog_id"
-)
-
 _COUNT_SYNCED_MESSAGES_SQL = "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0"
-_COUNT_MESSAGES_BY_DIALOG_SQL = "SELECT dialog_id, COUNT(*) FROM messages WHERE is_deleted = 0 GROUP BY dialog_id"
 
 _SELECT_DIALOG_ACCESS_META_SQL = (
     "SELECT status, total_messages, access_lost_at, last_synced_at, last_event_at "
@@ -249,8 +276,14 @@ _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
 )
 
 _GET_READ_POSITION_SQL = "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?"
-_COUNT_BOOTSTRAP_PENDING_SQL = (
+_COUNT_READ_POSITION_PENDING_SQL = (
     "SELECT COUNT(*) FROM synced_dialogs WHERE status = 'synced' AND read_inbox_max_id IS NULL"
+)
+_READ_POSITION_PENDING_IDENTITIES_SQL = (
+    "SELECT sd.dialog_id, e.name AS display_name, e.username "
+    "FROM synced_dialogs sd LEFT JOIN entities e ON e.id = sd.dialog_id "
+    "WHERE sd.status = 'synced' AND sd.read_inbox_max_id IS NULL "
+    "ORDER BY sd.dialog_id LIMIT 20"
 )
 
 
@@ -286,7 +319,7 @@ _SENDER_ENTITY_JOINS_SQL = (
 _SELECT_MESSAGES_SQL = (
     f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
     f"{_SENDER_FIRST_NAME_SQL}, "
-    f"m.media_description, NULL AS content_kind, m.reply_to_msg_id, m.forum_topic_id, "
+    f"m.media_kind, m.media_payload, NULL AS content_kind, m.reply_to_msg_id, m.forum_topic_id, "
     f"m.is_deleted, m.deleted_at, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
     f"FROM messages m "
@@ -298,7 +331,7 @@ _SELECT_MESSAGES_SQL = (
 _SELECT_FTS_SQL = (
     f"SELECT f.message_id, m.text, "
     f"{_SENDER_FIRST_NAME_SQL}, "
-    f"m.sent_at, m.media_description, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
+    f"m.sent_at, m.media_kind, m.media_payload, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
     f"COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
     f"FROM messages_fts f "
@@ -317,7 +350,7 @@ _SELECT_FTS_SQL = (
 _SELECT_FTS_ALL_SQL = (
     f"SELECT f.message_id, m.text, "
     f"{_SENDER_FIRST_NAME_SQL}, "
-    f"m.sent_at, m.media_description, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
+    f"m.sent_at, m.media_kind, m.media_payload, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
     f"COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
     f"f.dialog_id, COALESCE(de.name, CAST(f.dialog_id AS TEXT)) AS dialog_name, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out "
@@ -335,7 +368,7 @@ _SELECT_FTS_ALL_SQL = (
 
 _FETCH_UNREAD_MESSAGES_SQL = (
     f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
-    f"{_SENDER_FIRST_NAME_SQL}, {_SENDER_USERNAME_SQL}, m.media_description, NULL AS content_kind, "
+    f"{_SENDER_FIRST_NAME_SQL}, {_SENDER_USERNAME_SQL}, m.media_kind, m.media_payload, NULL AS content_kind, "
     f"m.forum_topic_id, COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
     f"FROM messages m "
@@ -355,7 +388,7 @@ _FETCH_UNREAD_MESSAGES_SQL = (
 _LIST_MESSAGES_BASE_SQL = (
     f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
     f"{_SENDER_FIRST_NAME_SQL}, "
-    f"m.media_description, NULL AS content_kind, m.reply_to_msg_id, m.forum_topic_id, "
+    f"m.media_kind, m.media_payload, NULL AS content_kind, m.reply_to_msg_id, m.forum_topic_id, "
     f"m.is_deleted, m.deleted_at, "
     f"COALESCE("
     f"  (SELECT MAX(mv.edit_date) FROM message_versions mv "
@@ -388,6 +421,8 @@ def _assert_select_columns_match_read_message() -> None:
             "read_at",
             "reaction_events",
             "reaction_events_status",
+            "media_description",
+            "media_payload",
             # Username is an inbox-only enrichment; other read surfaces keep
             # their existing SQL contract during this vertical slice.
             "sender_username",
@@ -397,7 +432,7 @@ def _assert_select_columns_match_read_message() -> None:
     bare = frozenset(re.findall(r"\b(?:m|mf)\.(\w+)\b", _LIST_MESSAGES_BASE_SQL))
     found = aliases | bare
     missing = expected - found
-    extra = found - expected
+    extra = (found - expected) - {"media_payload"}
     assert not missing and not extra, f"SELECT/ReadMessage field mismatch - missing: {missing}, extra: {extra}"
 
 

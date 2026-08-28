@@ -200,35 +200,6 @@
           "structuredContent"
         ]
       }
-    },
-    {
-      "_comment": "submit_feedback — live round-trip into feedback.db; hidden from default operator queue by context/harness marker",
-      "action": "call_tool",
-      "name": "submit_feedback",
-      "arguments": {
-        "message": "Automated MCP smoke test — please ignore",
-        "severity": "question",
-        "context": "smoke-integration.json automated test",
-        "model": "claude-opus-4-7",
-        "harness": "devtools.mcp_client.cli"
-      },
-      "expect": {
-        "is_error": false,
-        "path_equals": {
-          "content": []
-        },
-        "path_exists": [
-          "structuredContent.accepted",
-          "structuredContent.status"
-        ],
-        "path_not_exists": [
-          "structuredContent.tracking_id"
-        ],
-        "path_nonempty": [
-          "structuredContent.accepted",
-          "structuredContent.status"
-        ]
-      }
     }
   ]
 }

@@ -373,47 +373,6 @@ class DaemonConnection:
         """Return current authenticated user info."""
         return await self.request({"method": "get_me"})
 
-    async def describe_source(self) -> dict:
-        """Return the structured source description consumed by dotMD."""
-        return await self.request({"method": "describe_source"})
-
-    async def export_source_changes(
-        self,
-        *,
-        cursor: str | None = None,
-        limit: int = 100,
-        updated_after: str | None = None,
-        updated_after_cursor: str | None = None,
-    ) -> dict:
-        """Export structured Telegram source changes for dotMD ingestion."""
-        payload: dict = {
-            "method": "export_source_changes",
-            "cursor": cursor,
-            "limit": limit,
-        }
-        if updated_after is not None:
-            payload["updated_after"] = updated_after
-        if updated_after_cursor is not None:
-            payload["updated_after_cursor"] = updated_after_cursor
-        return await self.request(payload)
-
-    async def read_source_unit_window(
-        self,
-        *,
-        unit_ref: str,
-        before: int = 0,
-        after: int = 0,
-    ) -> dict:
-        """Return neighboring Telegram source units around *unit_ref*."""
-        return await self.request(
-            {
-                "method": "read_source_unit_window",
-                "unit_ref": unit_ref,
-                "before": before,
-                "after": after,
-            }
-        )
-
     async def mark_dialog_for_sync(self, *, dialog_id: int, enable: bool = True) -> dict:
         """Mark or unmark a dialog for persistent sync."""
         return await self.request(
@@ -449,6 +408,7 @@ class DaemonConnection:
         limit: int = 100,
         group_size_threshold: int = 100,
         since_utc: str | None = None,
+        include_dialog_types: list[str] | None = None,
     ) -> dict:
         """Return prioritized unread messages across dialogs."""
         payload: dict[str, object] = {
@@ -458,6 +418,8 @@ class DaemonConnection:
         }
         if since_utc is not None:
             payload["since_utc"] = since_utc
+        if include_dialog_types is not None:
+            payload["include_dialog_types"] = include_dialog_types
         return await self.request(payload)
 
     async def get_unread_summary(self, *, limit: int = 50) -> dict:

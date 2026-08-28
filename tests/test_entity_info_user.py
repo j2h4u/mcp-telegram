@@ -455,7 +455,8 @@ async def test_get_entity_info_user_personal_channel_falls_back_to_local_latest_
             sent_at INTEGER,
             text TEXT,
             is_deleted INTEGER DEFAULT 0,
-            is_service INTEGER DEFAULT 0
+            is_service INTEGER DEFAULT 0,
+            media_kind TEXT
         )"""
     )
     conn.execute(

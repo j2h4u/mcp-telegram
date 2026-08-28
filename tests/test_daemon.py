@@ -3,25 +3,21 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TypedDict, Unpack, cast
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon import _create_tracked_task, _log_heartbeat, _prime_runtime, sync_main
-from mcp_telegram.daemon_api import DaemonAPIServer
+from mcp_telegram.daemon import _create_tracked_task, _log_heartbeat, _prime_runtime, _run_sync_loop, sync_main
 from mcp_telegram.folders.read_repository import list_folders
 from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.state import StatePaths
 from mcp_telegram.sync_db import ensure_sync_schema
-from tests.daemon_api_policy import make_daemon_api_policy
 from tests.history_enrollment_helpers import seed_full_history_enrollment
-from tests.reaction_helpers import make_reaction_freshener
 
 
 class _PrimeRuntimeApiServerStub(SimpleNamespace):
@@ -207,7 +203,7 @@ def test_sync_main_connects_and_heartbeats(
     def heartbeat_then_shutdown(*args):
         result = _log_heartbeat(*args)
         shutdown_event.set()
-        return result  # caller unpacks (msg_count, mono) — patched mock must propagate
+        return result  # patched mock must propagate
 
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
@@ -217,13 +213,54 @@ def test_sync_main_connects_and_heartbeats(
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon._log_heartbeat", side_effect=heartbeat_then_shutdown) as mock_hb,
         patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.01),
-        caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"),
+        caplog.at_level(logging.DEBUG, logger="mcp_telegram.daemon"),
     ):
         asyncio.run(sync_main())
 
     mock_client.connect.assert_called_once()
     mock_hb.assert_called()
     assert any("heartbeat" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_initialization_and_periodic_logging_avoid_messages_sql(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Heartbeat state and logging must not inspect the message archive."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE synced_dialogs (status TEXT NOT NULL)")
+    conn.execute("INSERT INTO synced_dialogs (status) VALUES ('synced')")
+    conn.commit()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+
+    shutdown_event = asyncio.Event()
+    worker = MagicMock()
+
+    async def process_one_batch() -> bool:
+        shutdown_event.set()
+        return True
+
+    worker.process_one_batch = process_one_batch
+    handler_manager = MagicMock()
+    client = MagicMock()
+    client.is_connected.return_value = True
+
+    try:
+        with (
+            patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.0),
+            caplog.at_level(logging.DEBUG, logger="mcp_telegram.daemon"),
+        ):
+            await _run_sync_loop(worker, handler_manager, shutdown_event, conn, client)
+    finally:
+        conn.close()
+
+    message_sql = [statement for statement in statements if "messages" in statement.lower()]
+    assert message_sql == []
+    heartbeat_logs = [record.getMessage() for record in caplog.records if record.getMessage().startswith("heartbeat —")]
+    assert heartbeat_logs
+    assert all("messages=" not in message for message in heartbeat_logs)
+    assert all("rate=" not in message for message in heartbeat_logs)
 
 
 def test_sync_main_runs_fts_backfill_before_connect(
@@ -341,6 +378,7 @@ def test_self_id_cached_at_startup(
             sync_db_path=None,
             *,
             reaction_freshener,
+            hydration_requester,
             topic_refresher,
             policy,
             health_status,
@@ -351,6 +389,7 @@ def test_self_id_cached_at_startup(
             self._feedback_conn = feedback_conn
             self._sync_db_path = sync_db_path
             self._reaction_freshener = reaction_freshener
+            self._hydration_requester = hydration_requester
             self._topic_refresher = topic_refresher
             self._policy = policy
             self._health_status = health_status
@@ -405,7 +444,7 @@ def test_sync_main_heartbeat_logs_connection_state(
     mock_client: AsyncMock,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Heartbeat INFO log includes 'connected=True' (or connection state)."""
+    """Heartbeat DEBUG log includes 'connected=True' (or connection state)."""
     shutdown_event = asyncio.Event()
 
     def mock_register_shutdown(conn, loop, **kwargs):
@@ -414,7 +453,7 @@ def test_sync_main_heartbeat_logs_connection_state(
     def heartbeat_then_shutdown(*args):
         result = _log_heartbeat(*args)
         shutdown_event.set()
-        return result  # caller unpacks (msg_count, mono) — patched mock must propagate
+        return result  # patched mock must propagate
 
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
@@ -424,12 +463,14 @@ def test_sync_main_heartbeat_logs_connection_state(
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon._log_heartbeat", side_effect=heartbeat_then_shutdown),
         patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.01),
-        caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"),
+        caplog.at_level(logging.DEBUG, logger="mcp_telegram.daemon"),
     ):
         asyncio.run(sync_main())
 
-    heartbeat_logs = [r.message for r in caplog.records if "heartbeat" in r.message]
+    heartbeat_records = [r for r in caplog.records if r.getMessage().startswith("heartbeat —")]
+    heartbeat_logs = [r.message for r in heartbeat_records]
     assert heartbeat_logs, "Expected at least one heartbeat log"
+    assert all(record.levelno == logging.DEBUG for record in heartbeat_records)
     assert any("connected=" in msg for msg in heartbeat_logs), (
         f"Heartbeat logs did not include 'connected=': {heartbeat_logs}"
     )
@@ -558,7 +599,7 @@ def test_sync_main_idles_when_all_synced(
         patch("mcp_telegram.daemon._log_heartbeat", side_effect=heartbeat_then_shutdown) as mock_hb,
         patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
         patch("mcp_telegram.daemon._start_followup_background_tasks", side_effect=_noop_followups),
-        caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"),
+        caplog.at_level(logging.DEBUG, logger="mcp_telegram.daemon"),
     ):
         asyncio.run(sync_main())
 
@@ -598,7 +639,7 @@ def test_sync_main_logs_heartbeat_during_sync(
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.0),  # instant heartbeat
         patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
-        caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"),
+        caplog.at_level(logging.DEBUG, logger="mcp_telegram.daemon"),
     ):
         asyncio.run(sync_main())
 
@@ -1148,82 +1189,6 @@ def test_sync_main_cleans_socket_on_shutdown(
 
 
 @pytest.mark.asyncio
-async def test_backfill_blank_unsupported_messages_materializes_text_and_fts() -> None:
-    """Startup backfill re-fetches blank unsupported rows and indexes recovered text."""
-    from helpers import build_mock_message
-    from mcp_telegram.daemon import _backfill_blank_unsupported_messages
-    from mcp_telegram.sync_db import _apply_migrations
-
-    conn = sqlite3.connect(":memory:")
-    try:
-        _apply_migrations(conn)
-        conn.execute(
-            "INSERT INTO messages (dialog_id, message_id, sent_at, text, media_description) "
-            "VALUES (?, ?, ?, '', 'MessageMediaUnsupported')",
-            (1001, 77, 1704067200),
-        )
-        seed_full_history_enrollment(conn, 1001, enabled=True)
-        conn.commit()
-
-        client = MagicMock()
-        client.get_messages = AsyncMock(return_value=[build_mock_message(id=77, text="speech to text")])
-        filled = await _backfill_blank_unsupported_messages(client, conn, asyncio.Event())
-
-        assert filled == 1
-        row = conn.execute("SELECT text FROM messages WHERE dialog_id=? AND message_id=?", (1001, 77)).fetchone()
-        assert row == ("speech to text",)
-        fts_row = conn.execute(
-            "SELECT stemmed_text FROM messages_fts WHERE dialog_id=? AND message_id=?",
-            (1001, 77),
-        ).fetchone()
-        assert fts_row is not None
-    finally:
-        conn.close()
-
-
-@pytest.mark.asyncio
-async def test_backfill_blank_unsupported_messages_floodwait_skips_small_pause() -> None:
-    """FloodWait path delegates to flood handling and does not also sleep between batches."""
-    import inspect
-
-    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
-
-    from mcp_telegram.daemon import _backfill_blank_unsupported_messages
-    from mcp_telegram.sync_db import _apply_migrations
-
-    conn = sqlite3.connect(":memory:")
-    try:
-        _apply_migrations(conn)
-        conn.execute(
-            "INSERT INTO messages (dialog_id, message_id, sent_at, text, media_description) "
-            "VALUES (?, ?, ?, '', 'MessageMediaUnsupported')",
-            (1002, 78, 1704067200),
-        )
-        seed_full_history_enrollment(conn, 1002, enabled=True)
-        conn.commit()
-
-        err = FloodWaitError(request=None)
-        err.seconds = 3
-        client = MagicMock()
-        client.get_messages = AsyncMock(side_effect=err)
-        wait_calls: list[float] = []
-
-        async def _fake_wait_for(coro: object, timeout: float) -> None:
-            if inspect.iscoroutine(coro):
-                coro.close()
-            wait_calls.append(timeout)
-
-        with patch("mcp_telegram.daemon.sleep_through_flood", new=AsyncMock(return_value=False)):
-            with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=_fake_wait_for):
-                filled = await _backfill_blank_unsupported_messages(client, conn, asyncio.Event())
-
-        assert filled == 0
-        assert wait_calls == []
-    finally:
-        conn.close()
-
-
-@pytest.mark.asyncio
 async def test_backfill_total_messages_returns_early_when_shutdown_during_flood_wait(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1543,7 +1508,8 @@ async def test_sleep_read_pos_batch_contract() -> None:
     import inspect
     from unittest.mock import patch
 
-    from mcp_telegram.daemon import _PACING, _sleep_read_pos_batch
+    from mcp_telegram.config import SchedulingConfig
+    from mcp_telegram.daemon import _sleep_read_pos_batch
 
     shutdown_event = asyncio.Event()
     wait_calls: list[float] = []
@@ -1558,7 +1524,7 @@ async def test_sleep_read_pos_batch_contract() -> None:
         continue_loop = await _sleep_read_pos_batch(shutdown_event)
 
     assert continue_loop is True
-    assert wait_calls == [_PACING.read.batch_s]
+    assert wait_calls == [SchedulingConfig().read_position_reconciliation_batch_pause_seconds]
 
 
 @pytest.mark.asyncio
@@ -1569,7 +1535,8 @@ async def test_initialize_read_positions_uses_named_batch_pacing(tmp_path):
     from types import SimpleNamespace
     from unittest.mock import patch
 
-    from mcp_telegram.daemon import _PACING, _initialize_read_positions
+    from mcp_telegram.config import SchedulingConfig
+    from mcp_telegram.daemon import _initialize_read_positions
     from mcp_telegram.sync_db import _apply_migrations
 
     conn = sqlite3.connect(":memory:")
@@ -1608,7 +1575,7 @@ async def test_initialize_read_positions_uses_named_batch_pacing(tmp_path):
 
         assert filled == 0
         assert wait_calls
-        assert wait_calls[0] == _PACING.read.batch_s
+        assert wait_calls[0] == SchedulingConfig().read_position_reconciliation_batch_pause_seconds
     finally:
         conn.close()
 
@@ -1686,317 +1653,12 @@ def test_sync_main_registers_read_positions_bootstrap_after_handler(tmp_path):
     )
 
 
-# ---------------------------------------------------------------------------
-# Phase 29-01: dotMD structured source export API
-# ---------------------------------------------------------------------------
+def test_followup_tasks_register_fact_hydration_worker() -> None:
+    """The daemon composition root must start the media hydration loop."""
+    import inspect
 
+    from mcp_telegram import daemon as daemon_mod
 
-def _make_source_export_server() -> tuple[DaemonAPIServer, sqlite3.Connection]:
-    from mcp_telegram.sync_db import _apply_migrations
-
-    conn = sqlite3.connect(":memory:")
-    _apply_migrations(conn)
-    client = MagicMock()
-    server = DaemonAPIServer(
-        conn,
-        client,
-        asyncio.Event(),
-        reaction_freshener=make_reaction_freshener(conn, client),
-        policy=make_daemon_api_policy(),
-    )
-    server._ready = True
-    return server, conn
-
-
-def _source_export_seed_dialog(
-    conn: sqlite3.Connection,
-    dialog_id: int,
-    *,
-    status: str = "synced",
-    name: str = "Project Chat",
-    dialog_type: str = "Group",
-) -> None:
-    conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at, last_event_at) "
-        "VALUES (?, ?, 1770000000, 1770000000)",
-        (dialog_id, status),
-    )
-    conn.execute(
-        "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, 1770000000)",
-        (dialog_id, dialog_type, name, f"dialog_{abs(dialog_id)}", name.lower()),
-    )
-    conn.commit()
-
-
-def _source_export_seed_message(
-    conn: sqlite3.Connection,
-    dialog_id: int,
-    message_id: int,
-    **kwargs: Unpack[
-        TypedDict(
-            "_SourceExportSeedMessageKwargs",
-            {
-                "text": str,
-                "sent_at": int,
-                "sender_id": int | None,
-                "sender_first_name": str | None,
-                "reply_to_msg_id": int | None,
-                "forum_topic_id": int | None,
-                "edit_date": int | None,
-                "is_deleted": int,
-                "topic_title": str | None,
-            },
-            total=False,
-        )
-    ],
-) -> None:
-    text = kwargs.get("text", "Deployment checklist is ready")
-    sent_at = kwargs.get("sent_at", 1770000000)
-    sender_id = kwargs.get("sender_id", 111)
-    sender_first_name = kwargs.get("sender_first_name", "Alice")
-    reply_to_msg_id = kwargs.get("reply_to_msg_id")
-    forum_topic_id = kwargs.get("forum_topic_id")
-    edit_date = kwargs.get("edit_date")
-    is_deleted = kwargs.get("is_deleted", 0)
-    topic_title = kwargs.get("topic_title")
-    conn.execute(
-        "INSERT INTO messages "
-        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "
-        "reply_to_msg_id, forum_topic_id, edit_date, is_deleted) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            dialog_id,
-            message_id,
-            sent_at,
-            text,
-            sender_id,
-            sender_first_name,
-            reply_to_msg_id,
-            forum_topic_id,
-            edit_date,
-            is_deleted,
-        ),
-    )
-    if forum_topic_id is not None and topic_title is not None:
-        conn.execute(
-            "INSERT OR REPLACE INTO topic_metadata "
-            "(dialog_id, topic_id, title, is_general, is_deleted, updated_at) "
-            "VALUES (?, ?, ?, 0, 0, ?)",
-            (dialog_id, forum_topic_id, topic_title, sent_at),
-        )
-    conn.commit()
-
-
-@pytest.mark.asyncio
-async def test_source_export_describe_source_and_bootstrap_records() -> None:
-    server, conn = _make_source_export_server()
-    try:
-        _source_export_seed_dialog(conn, -1001, status="synced", name="Project Chat")
-        _source_export_seed_dialog(conn, -1002, status="access_lost", name="Archive Chat")
-        _source_export_seed_dialog(conn, -1003, status="not_synced", name="Private Draft")
-        _source_export_seed_message(
-            conn,
-            -1001,
-            41,
-            reply_to_msg_id=40,
-            forum_topic_id=7,
-            topic_title="Deployments",
-        )
-        _source_export_seed_message(conn, -1002, 5, text="Archived but available")
-        _source_export_seed_message(conn, -1003, 1, text="must not export")
-
-        description = await server._dispatch({"method": "describe_source"})
-        assert description == {
-            "ok": True,
-            "data": {
-                "namespace": "telegram",
-                "source_kind": "chat",
-                "display_name": "Telegram",
-                "capabilities": ["incremental-export", "unit-window"],
-                "metadata_json": {"transport": "mcp-telegram-daemon"},
-            },
-        }
-
-        result = await server._dispatch({"method": "export_source_changes", "cursor": None, "limit": 2})
-
-        assert result["ok"] is True
-        data = result["data"]
-        exported_refs = [change["unit"]["unit_ref"] for change in data["changes"]]
-        assert exported_refs == [
-            "dialog:-1002:message:5",
-            "dialog:-1001:message:41",
-        ]
-        assert all(change["document"]["ref"].startswith("telegram:dialog:") for change in data["changes"])
-        assert data["changes"][1]["document"]["document_ref"] == "dialog:-1001"
-        assert data["changes"][1]["unit"]["metadata_json"]["topic_title"] == "Deployments"
-        assert data["changes"][1]["unit"]["metadata_json"]["reply_to_msg_id"] == 40
-        assert data["checkpoint_cursor"] == "telegram:v1:dialog:-1001:message:41"
-        assert data["next_cursor"] is None
-        assert "updated_after" in data
-        assert "updated_after_cursor" in data
-        assert "dialog:-1003:message:1" not in exported_refs
-        assert "[resolved:" not in str(data)
-        assert "next_navigation" not in str(data)
-    finally:
-        conn.close()
-
-
-@pytest.mark.asyncio
-async def test_daemon_api_keeps_connection_open_for_sequential_requests(tmp_path) -> None:
-    server, conn = _make_source_export_server()
-    sock_path = tmp_path / "daemon.sock"
-    unix_server = await asyncio.start_unix_server(
-        server.handle_client,
-        path=str(sock_path),
-    )
-    try:
-        reader, writer = await asyncio.open_unix_connection(str(sock_path))
-        writer.write(json.dumps({"method": "describe_source", "request_id": "one"}).encode() + b"\n")
-        await writer.drain()
-        first = json.loads((await reader.readline()).decode())
-
-        writer.write(json.dumps({"method": "describe_source", "request_id": "two"}).encode() + b"\n")
-        await writer.drain()
-        second = json.loads((await reader.readline()).decode())
-
-        assert first["ok"] is True
-        assert first["request_id"] == "one"
-        assert second["ok"] is True
-        assert second["request_id"] == "two"
-
-        writer.close()
-        await writer.wait_closed()
-    finally:
-        conn.close()
-        unix_server.close()
-        await unix_server.wait_closed()
-
-
-@pytest.mark.asyncio
-async def test_source_export_update_watermark_mixed_stream_does_not_regress_checkpoint() -> None:
-    server, conn = _make_source_export_server()
-    try:
-        _source_export_seed_dialog(conn, -1001)
-        _source_export_seed_message(conn, -1001, 30, text="Edited old", sent_at=1769890000, edit_date=1769904060)
-        _source_export_seed_message(conn, -1001, 51, text="New bootstrap", sent_at=1769904030)
-
-        result = await server._dispatch(
-            {
-                "method": "export_source_changes",
-                "cursor": "telegram:v1:dialog:-1001:message:50",
-                "limit": 10,
-                "updated_after": "2026-02-01T00:00:00.000000Z",
-                "updated_after_cursor": "telegram:v1:dialog:-1001:message:20",
-            }
-        )
-
-        assert result["ok"] is True
-        data = result["data"]
-        assert [change["unit"]["unit_ref"] for change in data["changes"]] == [
-            "dialog:-1001:message:51",
-            "dialog:-1001:message:30",
-        ]
-        assert data["checkpoint_cursor"] == "telegram:v1:dialog:-1001:message:51"
-        assert data["updated_after"] == "2026-02-01T00:01:00.000000Z"
-        assert data["updated_after_cursor"] == "telegram:v1:dialog:-1001:message:30"
-    finally:
-        conn.close()
-
-
-@pytest.mark.asyncio
-async def test_source_export_same_timestamp_uses_updated_after_cursor_tie_break() -> None:
-    server, conn = _make_source_export_server()
-    try:
-        _source_export_seed_dialog(conn, -1001)
-        _source_export_seed_message(conn, -1001, 30, text="first edit", sent_at=1769890000, edit_date=1769904060)
-        _source_export_seed_message(conn, -1001, 31, text="second edit", sent_at=1769890001, edit_date=1769904060)
-
-        result = await server._dispatch(
-            {
-                "method": "export_source_changes",
-                "cursor": "telegram:v1:dialog:-1001:message:50",
-                "limit": 10,
-                "updated_after": "2026-02-01T00:01:00.000000Z",
-                "updated_after_cursor": "telegram:v1:dialog:-1001:message:30",
-            }
-        )
-
-        assert result["ok"] is True
-        assert [change["unit"]["unit_ref"] for change in result["data"]["changes"]] == [
-            "dialog:-1001:message:31",
-        ]
-        assert result["data"]["updated_after_cursor"] == "telegram:v1:dialog:-1001:message:31"
-
-        exhausted = await server._dispatch(
-            {
-                "method": "export_source_changes",
-                "cursor": "telegram:v1:dialog:-1001:message:50",
-                "limit": 10,
-                "updated_after": "2026-02-01T00:01:00.000000Z",
-                "updated_after_cursor": "telegram:v1:dialog:-1001:message:31",
-            }
-        )
-        assert exhausted["ok"] is True
-        assert exhausted["data"]["changes"] == []
-    finally:
-        conn.close()
-
-
-@pytest.mark.asyncio
-async def test_source_export_read_unit_window_and_negative_dialog_cursor() -> None:
-    server, conn = _make_source_export_server()
-    try:
-        _source_export_seed_dialog(conn, -1001)
-        for message_id in (40, 41, 42):
-            _source_export_seed_message(
-                conn,
-                -1001,
-                message_id,
-                text=f"message {message_id}",
-                sent_at=1770000000 + message_id,
-            )
-
-        export = await server._dispatch(
-            {
-                "method": "export_source_changes",
-                "cursor": "telegram:v1:dialog:-1001:message:41",
-                "limit": 10,
-            }
-        )
-        assert export["ok"] is True
-        assert [change["unit"]["unit_ref"] for change in export["data"]["changes"]] == [
-            "dialog:-1001:message:42",
-        ]
-
-        window = await server._dispatch(
-            {
-                "method": "read_source_unit_window",
-                "unit_ref": "dialog:-1001:message:41",
-                "before": 1,
-                "after": 1,
-            }
-        )
-
-        assert window["ok"] is True
-        data = window["data"]
-        assert data["namespace"] == "telegram"
-        assert data["document_ref"] == "dialog:-1001"
-        assert data["unit_ref"] == "dialog:-1001:message:41"
-        assert [unit["unit_ref"] for unit in data["units"]] == [
-            "dialog:-1001:message:40",
-            "dialog:-1001:message:41",
-            "dialog:-1001:message:42",
-        ]
-
-        missing = await server._dispatch(
-            {
-                "method": "read_source_unit_window",
-                "unit_ref": "dialog:-1001:message:404",
-                "before": 1,
-                "after": 1,
-            }
-        )
-        assert missing == {"ok": False, "error": "not_found"}
-    finally:
-        conn.close()
+    src = inspect.getsource(daemon_mod._start_followup_background_tasks)
+    assert "ctx.fact_hydration_worker.run()" in src
+    assert 'name="message_fact_hydration_worker"' in src

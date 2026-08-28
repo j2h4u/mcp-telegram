@@ -7,7 +7,13 @@ import sqlite3
 from pathlib import Path
 from typing import cast
 
-_CURRENT_SCHEMA_VERSION = 34
+from .dialog_classification import (
+    SERVICE_DIALOG_TYPE,
+    is_bot_dialog_type,
+    is_reserved_replies_username,
+)
+
+_CURRENT_SCHEMA_VERSION = 41
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -58,6 +64,17 @@ CREATE TABLE IF NOT EXISTS message_versions (
     old_text    TEXT,
     edit_date   INTEGER,
     PRIMARY KEY (dialog_id, message_id, version)
+) WITHOUT ROWID
+"""
+
+_MESSAGE_TRANSCRIPTIONS_DDL = """
+CREATE TABLE IF NOT EXISTS message_transcriptions (
+    dialog_id        INTEGER NOT NULL,
+    message_id       INTEGER NOT NULL,
+    text             TEXT NOT NULL CHECK (trim(text) <> ''),
+    transcription_id INTEGER NOT NULL,
+    received_at      INTEGER NOT NULL,
+    PRIMARY KEY (dialog_id, message_id)
 ) WITHOUT ROWID
 """
 
@@ -582,6 +599,66 @@ CREATE TABLE IF NOT EXISTS scheduled_sync_state (
 
 _SCHEDULED_SYNC_STATE_SEED = """
 INSERT OR IGNORE INTO scheduled_sync_state (key) VALUES ('account')
+"""
+
+# v37: durable media-fact hydration scheduling.  The queue identity includes
+# the fact kind so future hydration workers can use separate policies without
+# introducing another table or a nullable discriminator.
+_HYDRATION_JOBS_V37_DDL = """
+CREATE TABLE IF NOT EXISTS hydration_jobs (
+    kind       TEXT NOT NULL,
+    dialog_id  INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    due_at     INTEGER NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, dialog_id, message_id)
+) WITHOUT ROWID
+"""
+
+_HYDRATION_JOBS_V37_DUE_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_hydration_jobs_due
+ON hydration_jobs(due_at, kind, dialog_id, message_id)
+"""
+
+# v40: exactly two service classes. Newly observed or explicitly requested
+# work is foreground; the migration-created historical remainder is backfill.
+_HYDRATION_JOBS_DDL = """
+CREATE TABLE IF NOT EXISTS hydration_jobs (
+    kind       TEXT NOT NULL,
+    dialog_id  INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    due_at     INTEGER NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    priority   INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1)),
+    message_sent_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, dialog_id, message_id)
+) WITHOUT ROWID
+"""
+
+_HYDRATION_JOBS_DUE_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_hydration_jobs_due
+ON hydration_jobs(due_at, priority DESC, message_sent_at DESC, kind, dialog_id, message_id)
+"""
+
+_HYDRATION_JOBS_SEED_SQL = """
+INSERT OR IGNORE INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts)
+SELECT 'media_metadata', m.dialog_id, m.message_id, CAST(strftime('%s', 'now') AS INTEGER), 0
+FROM messages m
+JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
+JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
+WHERE sd.status IN ('syncing', 'synced')
+  AND m.is_deleted = 0 AND m.media_kind IN ('contact', 'other') AND m.media_payload = '{}'
+"""
+
+_TRANSCRIPTION_HYDRATION_JOBS_SEED_SQL = """
+INSERT OR IGNORE INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at)
+SELECT 'transcription', m.dialog_id, m.message_id, CAST(strftime('%s', 'now') AS INTEGER), 0, 0, m.sent_at
+FROM messages m
+JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
+JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
+LEFT JOIN message_transcriptions mt ON mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id
+WHERE sd.status IN ('syncing', 'synced')
+  AND m.is_deleted = 0 AND m.media_kind = 'voice' AND mt.message_id IS NULL
 """
 
 
@@ -1385,6 +1462,236 @@ def _apply_migration_34(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_35(conn: sqlite3.Connection, current: int) -> int:
+    """Persist fair, durable read-position retry pacing metadata.
+
+    These are synchronizer timestamps, not Telegram event times. A due
+    timestamp lets bounded reconciliation defer an unresolved peer or a
+    Telegram response with NULL cursors without starving later dialogs.
+    """
+    return _apply_migration(
+        conn,
+        current,
+        35,
+        [
+            "ALTER TABLE synced_dialogs ADD COLUMN read_position_next_attempt_at INTEGER",
+            "ALTER TABLE synced_dialogs ADD COLUMN read_position_attempt_count INTEGER NOT NULL DEFAULT 0",
+            (
+                "CREATE INDEX IF NOT EXISTS idx_synced_dialogs_read_position_retry "
+                "ON synced_dialogs(status, read_position_next_attempt_at, read_position_attempt_count, dialog_id)"
+            ),
+        ],
+        ignore_duplicate_column=True,
+    )
+
+
+def _apply_migration_36(conn: sqlite3.Connection, current: int) -> int:
+    """Store the generic media discriminator separately from its description."""
+    return _apply_migration(
+        conn,
+        current,
+        36,
+        [
+            "ALTER TABLE messages ADD COLUMN media_kind TEXT CHECK (media_kind IN ('contact', 'other'))",
+            "ALTER TABLE scheduled_messages ADD COLUMN media_kind TEXT CHECK (media_kind IN ('contact', 'other'))",
+        ],
+        ignore_duplicate_column=True,
+    )
+
+
+_MEDIA_KIND_CHECK = "'photo', 'video', 'audio', 'voice', 'document', 'animation', 'sticker', 'poll', 'location', 'venue', 'contact', 'link_preview', 'game', 'invoice', 'dice', 'story', 'other'"
+
+
+def _apply_migration_37(conn: sqlite3.Connection, current: int) -> int:
+    """Replace presentation descriptions with normalized media facts.
+
+    SQLite cannot drop/reorder columns in place.  Rebuilding both composite
+    ``WITHOUT ROWID`` tables in this one migration keeps the operation atomic,
+    preserves every non-FTS row, and leaves FTS tables untouched.  Historical
+    descriptions are deliberately not parsed: only the v36 discriminator is
+    trusted, and all other legacy media becomes ``other/{}``.
+    """
+    # Capture every ordinary index definition before the source tables are
+    # dropped.  This includes operator-created indexes in addition to the
+    # project's canonical indexes; FTS virtual-table indexes are excluded.
+    index_rows = cast(
+        list[tuple[str, str]],
+        conn.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'index' AND sql IS NOT NULL "
+            "AND tbl_name IN ('messages', 'scheduled_messages')"
+        ).fetchall(),
+    )
+
+    # Indexes whose key used the removed presentation column cannot survive
+    # the new physical schema.  Keep all unrelated (including custom) indexes
+    # and intentionally discard only those obsolete definitions.
+    index_stmts = [sql for _name, sql in index_rows if "media_description" not in sql.lower()]
+    return _apply_migration(
+        conn,
+        current,
+        37,
+        [
+            "ALTER TABLE messages RENAME TO messages_v36",
+            f"""CREATE TABLE messages_v37 (
+    dialog_id           INTEGER NOT NULL,
+    message_id          INTEGER NOT NULL,
+    sent_at             INTEGER NOT NULL,
+    text                TEXT,
+    sender_id           INTEGER,
+    sender_first_name   TEXT,
+    media_kind          TEXT CHECK (media_kind IN ({_MEDIA_KIND_CHECK})),
+    media_payload       TEXT CHECK (media_payload IS NULL OR (json_valid(media_payload) AND json_type(media_payload) = 'object')),
+    reply_to_msg_id     INTEGER,
+    forum_topic_id      INTEGER,
+    edit_date           INTEGER,
+    grouped_id          INTEGER,
+    reply_to_peer_id    INTEGER,
+    out                 INTEGER NOT NULL DEFAULT 0,
+    is_service          INTEGER NOT NULL DEFAULT 0,
+    post_author         TEXT,
+    reply_count         INTEGER NOT NULL DEFAULT 0,
+    is_deleted          INTEGER NOT NULL DEFAULT 0,
+    deleted_at          INTEGER,
+    PRIMARY KEY (dialog_id, message_id),
+    CHECK ((media_kind IS NULL AND media_payload IS NULL) OR (media_kind IS NOT NULL AND media_payload IS NOT NULL))
+) WITHOUT ROWID""",
+            """INSERT INTO messages_v37 (
+    dialog_id, message_id, sent_at, text, sender_id, sender_first_name,
+    media_kind, media_payload, reply_to_msg_id, forum_topic_id, edit_date,
+    grouped_id, reply_to_peer_id, out, is_service, post_author, reply_count,
+    is_deleted, deleted_at
+)
+SELECT dialog_id, message_id, sent_at, text, sender_id, sender_first_name,
+       CASE
+         WHEN media_kind = 'contact' THEN 'contact'
+         WHEN media_kind IS NULL AND media_description IS NULL THEN NULL
+         ELSE 'other'
+       END,
+       CASE
+         WHEN media_kind IS NULL AND media_description IS NULL THEN NULL
+         ELSE '{}'
+       END,
+       reply_to_msg_id, forum_topic_id, edit_date, grouped_id, reply_to_peer_id,
+       out, is_service, post_author, reply_count, is_deleted, deleted_at
+FROM messages_v36""",
+            "DROP TABLE messages_v36",
+            "ALTER TABLE messages_v37 RENAME TO messages",
+            "ALTER TABLE scheduled_messages RENAME TO scheduled_messages_v36",
+            f"""CREATE TABLE scheduled_messages_v37 (
+    dialog_id                   INTEGER NOT NULL,
+    message_id                  INTEGER NOT NULL,
+    scheduled_at                INTEGER,
+    text                        TEXT,
+    sender_id                   INTEGER,
+    sender_first_name           TEXT,
+    media_kind                  TEXT CHECK (media_kind IN ({_MEDIA_KIND_CHECK})),
+    media_payload               TEXT CHECK (media_payload IS NULL OR (json_valid(media_payload) AND json_type(media_payload) = 'object')),
+    reply_to_msg_id             INTEGER,
+    forum_topic_id              INTEGER,
+    edit_date                   INTEGER,
+    grouped_id                  INTEGER,
+    reply_to_peer_id            INTEGER,
+    out                         INTEGER NOT NULL DEFAULT 1,
+    is_service                  INTEGER NOT NULL DEFAULT 0,
+    post_author                 TEXT,
+    schedule_repeat_period     INTEGER,
+    message_state               TEXT NOT NULL DEFAULT 'scheduled' CHECK (message_state IN ('scheduled', 'unknown_missing', 'cancelled', 'published')),
+    visibility                  TEXT NOT NULL DEFAULT 'author_only' CHECK (visibility IN ('author_only', 'chat_visible', 'unknown')),
+    unpublished                 INTEGER NOT NULL DEFAULT 1 CHECK (unpublished IN (0, 1)),
+    unseen                      INTEGER NOT NULL DEFAULT 1 CHECK (unseen IN (0, 1)),
+    publication_hint_message_id INTEGER,
+    published_message_id        INTEGER,
+    publication_verified_at     INTEGER,
+    published_at                INTEGER,
+    deleted_at                  INTEGER,
+    first_seen_at               INTEGER NOT NULL,
+    updated_at                  INTEGER NOT NULL,
+    PRIMARY KEY (dialog_id, message_id),
+    CHECK ((media_kind IS NULL AND media_payload IS NULL) OR (media_kind IS NOT NULL AND media_payload IS NOT NULL))
+) WITHOUT ROWID""",
+            """INSERT INTO scheduled_messages_v37 (
+    dialog_id, message_id, scheduled_at, text, sender_id, sender_first_name,
+    media_kind, media_payload, reply_to_msg_id, forum_topic_id, edit_date,
+    grouped_id, reply_to_peer_id, out, is_service, post_author,
+    schedule_repeat_period, message_state, visibility, unpublished, unseen,
+    publication_hint_message_id, published_message_id, publication_verified_at,
+    published_at, deleted_at, first_seen_at, updated_at
+)
+SELECT dialog_id, message_id, scheduled_at, text, sender_id, sender_first_name,
+       CASE
+         WHEN media_kind = 'contact' THEN 'contact'
+         WHEN media_kind IS NULL AND media_description IS NULL THEN NULL
+         ELSE 'other'
+       END,
+       CASE
+         WHEN media_kind IS NULL AND media_description IS NULL THEN NULL
+         ELSE '{}'
+       END,
+       reply_to_msg_id, forum_topic_id, edit_date, grouped_id, reply_to_peer_id,
+       out, is_service, post_author, schedule_repeat_period, message_state,
+       visibility, unpublished, unseen, publication_hint_message_id,
+       published_message_id, publication_verified_at, published_at, deleted_at,
+       first_seen_at, updated_at
+FROM scheduled_messages_v36""",
+            "DROP TABLE scheduled_messages_v36",
+            "ALTER TABLE scheduled_messages_v37 RENAME TO scheduled_messages",
+            *index_stmts,
+            _HYDRATION_JOBS_V37_DDL,
+            _HYDRATION_JOBS_V37_DUE_INDEX_DDL,
+            _HYDRATION_JOBS_SEED_SQL,
+        ],
+    )
+
+
+def _apply_migration_38(conn: sqlite3.Connection, current: int) -> int:
+    """Persist final Telegram transcription facts without historical backfill."""
+    return _apply_migration(conn, current, 38, [_MESSAGE_TRANSCRIPTIONS_DDL])
+
+
+def _apply_migration_39(conn: sqlite3.Connection, current: int) -> int:
+    """Add durable adaptive HotSweep cadence state."""
+    return _apply_migration(
+        conn,
+        current,
+        39,
+        [
+            "ALTER TABLE activity_dialog_state ADD COLUMN hot_next_due_at INTEGER",
+            "ALTER TABLE activity_dialog_state ADD COLUMN hot_empty_streak INTEGER NOT NULL DEFAULT 0 CHECK (hot_empty_streak >= 0)",
+            (
+                "CREATE INDEX IF NOT EXISTS idx_activity_dialog_state_hot_due "
+                "ON activity_dialog_state(hot_next_due_at, dialog_id, hot_next_retry_at)"
+            ),
+        ],
+    )
+
+
+def _apply_migration_40(conn: sqlite3.Connection, current: int) -> int:
+    """Prioritize foreground hydration ahead of historical backfill."""
+    return _apply_migration(
+        conn,
+        current,
+        40,
+        [
+            "DROP INDEX IF EXISTS idx_hydration_jobs_due",
+            ("ALTER TABLE hydration_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1))"),
+            "ALTER TABLE hydration_jobs ADD COLUMN message_sent_at INTEGER NOT NULL DEFAULT 0",
+            (
+                "UPDATE hydration_jobs SET message_sent_at = COALESCE(("
+                "SELECT sent_at FROM messages WHERE messages.dialog_id = hydration_jobs.dialog_id "
+                "AND messages.message_id = hydration_jobs.message_id), 0)"
+            ),
+            _HYDRATION_JOBS_DUE_INDEX_DDL,
+        ],
+        ignore_duplicate_column=True,
+    )
+
+
+def _apply_migration_41(conn: sqlite3.Connection, current: int) -> int:
+    """Seed low-priority transcription hydration for existing voice messages."""
+    return _apply_migration(conn, current, 41, [_TRANSCRIPTION_HYDRATION_JOBS_SEED_SQL])
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -1416,6 +1723,13 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_32(conn, current)
     current = _apply_migration_33(conn, current)
     current = _apply_migration_34(conn, current)
+    current = _apply_migration_35(conn, current)
+    current = _apply_migration_36(conn, current)
+    current = _apply_migration_37(conn, current)
+    current = _apply_migration_38(conn, current)
+    current = _apply_migration_39(conn, current)
+    current = _apply_migration_40(conn, current)
+    current = _apply_migration_41(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
@@ -1449,10 +1763,84 @@ def _ensure_scheduled_messages_fts(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _ensure_hydration_jobs(conn: sqlite3.Connection) -> None:
+    """Ensure the current hydration queue and its due-time index exist."""
+    conn.execute(_HYDRATION_JOBS_DDL)
+    conn.execute(_HYDRATION_JOBS_DUE_INDEX_DDL)
+    conn.commit()
+
+
 def ensure_own_only_schema(conn: sqlite3.Connection) -> None:
     """Create the ownership cache table used by scheduled reconciliation and reads."""
     conn.execute(_OWN_ONLY_DIALOGS_DDL)
     conn.commit()
+
+
+def _sync_schema_table_names(conn: sqlite3.Connection) -> set[str]:
+    rows = cast(
+        list[tuple[object]],
+        conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('entities', 'dialogs')"
+        ).fetchall(),
+    )
+    return {cast(str, row[0]) for row in rows}
+
+
+def _reserved_entity_rows(conn: sqlite3.Connection) -> list[tuple[object, object, object]]:
+    return cast(
+        list[tuple[object, object, object]],
+        conn.execute("SELECT id, username, type FROM entities WHERE username IS NOT NULL").fetchall(),
+    )
+
+
+def _reserved_reply_ids(rows: list[tuple[object, object, object]]) -> list[int]:
+    return [int(cast(int | str, row[0])) for row in rows if is_reserved_replies_username(row[1])]
+
+
+def _repair_reserved_entities(conn: sqlite3.Connection, rows: list[tuple[object, object, object]]) -> None:
+    conn.executemany(
+        "UPDATE entities SET type = ? WHERE id = ?",
+        (
+            (SERVICE_DIALOG_TYPE, int(cast(int | str, row[0])))
+            for row in rows
+            if is_reserved_replies_username(row[1]) and is_bot_dialog_type(row[2])
+        ),
+    )
+
+
+def _repair_reserved_dialogs(conn: sqlite3.Connection, reply_ids: list[int]) -> None:
+    placeholders = ",".join("?" * len(reply_ids))
+    dialog_rows = cast(
+        list[tuple[object, object]],
+        conn.execute(
+            f"SELECT dialog_id, type FROM dialogs WHERE dialog_id IN ({placeholders})",
+            reply_ids,
+        ).fetchall(),
+    )
+    conn.executemany(
+        "UPDATE dialogs SET type = ? WHERE dialog_id = ?",
+        ((SERVICE_DIALOG_TYPE, int(cast(int | str, row[0]))) for row in dialog_rows if is_bot_dialog_type(row[1])),
+    )
+
+
+def repair_reserved_dialog_types(conn: sqlite3.Connection) -> None:
+    """Repair persisted @replies rows through the normal startup path.
+
+    Older snapshots classified Telegram's reserved Replies peer as ``bot``.
+    Username matching is delegated to the canonical classifier so this repair
+    cannot drift into numeric-ID or display-name heuristics.
+    """
+    tables = _sync_schema_table_names(conn)
+    if "entities" not in tables:
+        return
+    rows = _reserved_entity_rows(conn)
+    reply_ids = _reserved_reply_ids(rows)
+    if not reply_ids:
+        return
+    with conn:
+        _repair_reserved_entities(conn, rows)
+        if "dialogs" in tables:
+            _repair_reserved_dialogs(conn, reply_ids)
 
 
 def record_daemon_event(
@@ -1486,6 +1874,8 @@ def ensure_sync_schema(db_path: Path) -> None:
         if _schema_ready(probe_conn):
             ensure_own_only_schema(probe_conn)
             _ensure_scheduled_messages_fts(probe_conn)
+            _ensure_hydration_jobs(probe_conn)
+            repair_reserved_dialog_types(probe_conn)
             return
     finally:
         probe_conn.close()
@@ -1501,6 +1891,8 @@ def ensure_sync_schema(db_path: Path) -> None:
 
             ensure_own_only_schema(bootstrap_conn)
             _ensure_scheduled_messages_fts(bootstrap_conn)
+            _ensure_hydration_jobs(bootstrap_conn)
+            repair_reserved_dialog_types(bootstrap_conn)
         finally:
             if bootstrap_conn is not None:
                 bootstrap_conn.close()

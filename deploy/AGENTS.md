@@ -16,10 +16,9 @@ This directory is the live deployment workspace, not the source checkout.
 
 ## Downstream Consumers
 
-- dotMD is the external Telegram indexer/search engine. It reaches this
-  deployment through dotMD's Telegram adapter/source integration.
-- On this machine dotMD mounts `/srv/mcp-telegram/database/` read-only. If this deployment path
-  changes, update `/opt/docker/dotmd/docker-compose.override.yml` as well.
+- dotMD integration is archived and stopped; this deployment has no active
+  dotMD downstream consumer. The source-export snapshot is reference-only in
+  the repository archive and is not part of the runtime contract.
 
 ## Operations
 
@@ -31,6 +30,13 @@ This directory is the live deployment workspace, not the source checkout.
   ```bash
   docker compose -f /opt/docker/mcp-telegram/docker-compose.yml ps mcp-telegram
   ```
+- Query logs across container recreation:
+  ```bash
+  journalctl CONTAINER_NAME=mcp-telegram --since '3 days ago' -o short-iso
+  ```
+  Docker Compose logs cover only the current container. Journald retention is
+  controlled by the host; this service does not configure a separate log
+  retention policy.
 - Validate MCP over stdio from the source checkout:
   ```bash
   uv run python -m devtools.mcp_client.cli list-tools \

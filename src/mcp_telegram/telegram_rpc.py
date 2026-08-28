@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Protocol, cast
 
 from aiolimiter import AsyncLimiter
+from telethon.utils import is_list_like  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,8 @@ class GovernedTelegramClientTarget(Protocol):
     def __call__(self, *args: object, **kwargs: object) -> Awaitable[object]: ...
 
     def get_messages(self, *args: object, **kwargs: object) -> Awaitable[object]: ...
+
+    def get_input_entity(self, *args: object, **kwargs: object) -> Awaitable[object]: ...
 
     def iter_messages(self, *args: object, **kwargs: object) -> AsyncIterator[object]: ...
 
@@ -94,12 +97,20 @@ class GovernedTelegramClient:
         return cast(object, getattr(self._client, name))
 
     async def __call__(self, *args: object, **kwargs: object) -> object:
+        request = args[0] if args else kwargs.get("request")
+        if request is not None and is_list_like(request):
+            raise ValueError("transport batching is forbidden; use sequential scalar calls")
         await self._governor.acquire(source="client_call")
         return await self._client(*args, **kwargs)
 
     async def get_messages(self, *args: object, **kwargs: object) -> object:
         await self._governor.acquire(source="get_messages")
         return await self._client.get_messages(*args, **kwargs)
+
+    async def get_input_entity(self, *args: object, **kwargs: object) -> object:
+        """Resolve a peer through the shared account budget and circuit."""
+        await self._governor.acquire(source="get_input_entity")
+        return await self._client.get_input_entity(*args, **kwargs)
 
     def iter_messages(self, *args: object, **kwargs: object) -> AsyncIterator[object]:
         return self._governed_iterator("iter_messages", *args, **kwargs)

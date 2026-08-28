@@ -84,6 +84,17 @@ def test_from_entity_user_and_bot_ducktyped() -> None:
     assert classify_dialog_type(bot) == DialogType.BOT
 
 
+@pytest.mark.parametrize("username", ["replies", "Replies", " @REPLIES ", "@replies"])
+def test_reserved_replies_peer_is_service_by_normalized_username(username: str) -> None:
+    peer = SimpleNamespace(first_name="Replies", username=username, bot=True)
+    assert classify_dialog_type(peer) == DialogType.SERVICE
+
+
+def test_reserved_replies_rule_does_not_use_name_or_numeric_id() -> None:
+    bot = SimpleNamespace(id=777000, first_name="Replies", username=None, bot=True)
+    assert classify_dialog_type(bot) == DialogType.BOT
+
+
 def test_from_entity_real_telethon_types() -> None:
     from telethon.tl.types import Channel, Chat, ChatPhotoEmpty
 

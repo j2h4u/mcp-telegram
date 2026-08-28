@@ -52,9 +52,9 @@ def test_trace_content_projection_renders_persisted_hidden_link() -> None:
         )
         conn.execute("INSERT INTO message_entities VALUES (42, 7, 0, 4, 'text_url', 'https://example.com')")
         conn.execute(
-            "CREATE TABLE trace_rows (dialog_id INTEGER, message_id INTEGER, text TEXT, media_description TEXT)"
+            "CREATE TABLE trace_rows (dialog_id INTEGER, message_id INTEGER, text TEXT, media_kind TEXT, media_payload TEXT)"
         )
-        conn.execute("INSERT INTO trace_rows VALUES (42, 7, 'site', NULL)")
+        conn.execute("INSERT INTO trace_rows VALUES (42, 7, 'site', NULL, NULL)")
         rows_from_db = conn.execute("SELECT * FROM trace_rows").fetchall()
 
         rows = _project_trace_content_rows(conn, rows_from_db)
@@ -214,7 +214,8 @@ def candidate_message(  # noqa: PLR0913
             text=text,
             sender_id=101,
             sender_first_name=None,
-            media_description=None,
+            media_kind=None,
+            media_payload=None,
             reply_to_msg_id=None,
             forum_topic_id=None,
             edit_date=edit_date,
@@ -236,11 +237,11 @@ def seed_existing_message_bundle(conn: sqlite3.Connection, *, text: str = "same"
         """
         INSERT OR REPLACE INTO messages (
             dialog_id, message_id, sent_at, text, sender_id, sender_first_name,
-            media_description, reply_to_msg_id, forum_topic_id, edit_date,
+            media_kind, media_payload, reply_to_msg_id, forum_topic_id, edit_date,
             grouped_id, reply_to_peer_id, out, is_service, post_author, is_deleted
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
         """,
-        (222, 1, 1_700_000_000, text, 101, None, None, None, None, edit_date, None, None, 0, 0, None),
+        (222, 1, 1_700_000_000, text, 101, None, None, None, None, None, edit_date, None, None, 0, 0, None),
     )
     conn.commit()
 

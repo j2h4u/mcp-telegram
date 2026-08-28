@@ -399,7 +399,7 @@ class DaemonEntityInfoService:
 
     async def _build_detail_by_type(self, entity: object) -> tuple[dict[str, object] | None, dict[str, object] | None]:
         dispatch_kind = classify_dialog_type(entity)
-        if dispatch_kind in (DialogType.USER, DialogType.BOT):
+        if dispatch_kind in (DialogType.USER, DialogType.BOT, DialogType.SERVICE):
             return await self._fetch_user_detail(entity), None
         if dispatch_kind == DialogType.CHANNEL:
             return await self._fetch_channel_detail(entity), None
@@ -490,7 +490,7 @@ class DaemonEntityInfoService:
         name = " ".join(part for part in (first_name, last_name) if part)
         return {
             "id": user_id,
-            "type": "bot" if bool(_attr(user, "bot", False)) else "user",
+            "type": classify_dialog_type(user).value,
             "name": name or None,
             "username": _attr(user, "username", None),
             "about": profile["about"],
