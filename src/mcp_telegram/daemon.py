@@ -873,8 +873,7 @@ def _message_fact_refresh_policy_from_config(config: McpTelegramConfig) -> Messa
 
 def _create_telegram_client(config: McpTelegramConfig) -> _DaemonClient:
     """Create the daemon-owned Telethon subclass with account-wide policy."""
-    del config  # create_client reads the same frozen operator config at the factory boundary.
-    return cast(_DaemonClient, create_client(catch_up=True))
+    return cast(_DaemonClient, create_client(catch_up=True, config=config))
 
 
 async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - composition root wires all daemon-owned services

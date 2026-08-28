@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +16,9 @@ from telethon.errors import FloodWaitError, ServerError, SlowModeWaitError
 from telethon.requestiter import RequestIter
 from telethon.sessions import StringSession
 
+from mcp_telegram.config import FloodWaitConfig, McpTelegramConfig, StateConfig, TelegramRpcConfig
+from mcp_telegram.flood import FloodWaitAccumulator, FloodWaitKillSwitchPolicy
+from mcp_telegram.telegram import create_client
 from mcp_telegram.telegram_rpc import (
     TelegramRpcBudget,
     TelegramRpcCircuitOpenError,
@@ -128,6 +133,31 @@ async def test_get_entity_username_resolution_uses_the_same_public_call_seam(
     assert gate._limiter.acquisitions == 1
 
 
+def test_factory_uses_supplied_snapshot_without_loading_config_again(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = McpTelegramConfig(
+        state=StateConfig(dir=tmp_path),
+        flood_wait=FloodWaitConfig(fallback_wait_seconds=17, cooldown_buffer_seconds=2.5),
+        telegram_rpc=TelegramRpcConfig(
+            max_calls_per_period=7,
+            period_seconds=13.0,
+            transient_retry_delays_seconds=(0.0,),
+        ),
+    )
+    monkeypatch.setattr("mcp_telegram.telegram.load_config", lambda: (_ for _ in ()).throw(AssertionError("reloaded")))
+
+    gate = create_client.__wrapped__("1", "hash", session_name="snapshot", config=config)
+    try:
+        assert gate._limiter.max_rate == 7
+        assert gate._limiter.time_period == 13.0
+        assert gate._fallback_wait_seconds == 17
+        assert gate._cooldown_buffer_seconds == 2.5
+        assert gate._transient_retry_delays == (0.0,)
+    finally:
+        gate.session.close()
+
+
 def test_telethon_public_helper_and_update_loop_contract_is_pinned() -> None:
     from telethon.client.updates import UpdateMethods
     from telethon.tl.custom.message import Message
@@ -184,6 +214,50 @@ async def test_gate_retries_transient_once_and_acquires_each_attempt(monkeypatch
     assert attempts == 2
     assert gate._limiter.acquisitions == 2
     assert sleeps == [2.0]
+
+
+@pytest.mark.asyncio
+async def test_gate_default_retry_adds_no_sleep_beyond_telethon_builtin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transient retry has only Telethon's built-in 2s sleep by default."""
+    gate = _gate(retry_delays=(0.0,))
+    transient = ServerError(None, "temporary")
+    final = FloodWaitError(request=None, capture=7)
+
+    class _Sender:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def send(self, _request: object, *, ordered: bool = False) -> object:
+            del ordered
+            self.calls += 1
+
+            async def _fail() -> None:
+                raise transient if self.calls == 1 else final
+
+            return _fail()
+
+    gate._sender = _Sender()
+    gate._loop = None
+    gate._request_retries = 0
+    gate._raise_last_call_error = True
+    gate._flood_waited_requests = {}
+    gate._no_updates = False
+    gate._log = {"telethon.client.users": logging.getLogger(__name__)}
+    gate.flood_sleep_threshold = 0
+    gate.session = SimpleNamespace(process_entities=lambda _result: None)
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("mcp_telegram.telegram_rpc.asyncio.sleep", fake_sleep)
+    with pytest.raises(FloodWaitError) as caught:
+        await gate(functions.PingRequest(1))
+
+    assert caught.value is final
+    assert gate._sender.calls == 2
+    assert gate._limiter.acquisitions == 2
+    assert sleeps == [2]
 
 
 @pytest.mark.asyncio
@@ -244,15 +318,61 @@ async def test_gate_flood_cooldown_uses_buffer_and_extends_monotonically(monkeyp
     import mcp_telegram.telegram_rpc as rpc
 
     gate = _gate()
-    clock = iter((100.0, 200.0))
-    monkeypatch.setattr(rpc.time, "monotonic", lambda: next(clock, 200.0))
+    clock = iter((100.0, 101.0))
+    monkeypatch.setattr(rpc.time, "monotonic", lambda: next(clock, 101.0))
 
     await gate._observe_flood(FloodWaitError(request=None, capture=7))
     first_deadline = account_cooldown_deadline()
     await gate._observe_flood(FloodWaitError(request=None, capture=2))
 
     assert first_deadline == 108.0
-    assert account_cooldown_deadline() == 203.0
+    assert account_cooldown_deadline() == first_deadline
+
+
+@pytest.mark.asyncio
+async def test_gate_concurrent_observation_marks_one_exception_once() -> None:
+    gate = _gate()
+    observed: list[dict[str, object]] = []
+    gate._flood_observer = lambda **kwargs: observed.append(kwargs)
+    error = FloodWaitError(request=None, capture=7)
+    barrier = asyncio.Barrier(3)
+
+    async def observe() -> None:
+        await barrier.wait()
+        await gate._observe_flood(error)
+
+    await asyncio.gather(observe(), observe(), barrier.wait())
+
+    assert len(observed) == 1
+    assert account_cooldown_deadline() >= asyncio.get_running_loop().time() + 7
+
+
+@pytest.mark.asyncio
+async def test_gate_flood_observation_opens_accumulator_and_rejects_next_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accumulator = FloodWaitAccumulator()
+    accumulator.configure_kill_switch(
+        FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=1, max_wait_seconds=900)
+    )
+    gate = _gate()
+    gate._rpc_circuit_status = accumulator.kill_switch_status
+    gate._flood_observer = lambda **kwargs: accumulator.observe(**kwargs)
+    error = FloodWaitError(request=None, capture=7)
+
+    async def base_call(_self: TelegramClient, _request: object, **_kwargs: object) -> object:
+        raise error
+
+    monkeypatch.setattr(TelegramClient, "__call__", base_call)
+    with pytest.raises(FloodWaitError):
+        await gate("request")
+    with pytest.raises(TelegramRpcCircuitOpenError):
+        await gate("request")
+
+    status = accumulator.kill_switch_status()
+    assert status.open is True
+    assert status.events_in_window == 1
+    assert gate._limiter.acquisitions == 1
 
 
 @pytest.mark.asyncio

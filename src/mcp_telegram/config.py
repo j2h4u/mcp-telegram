@@ -101,11 +101,16 @@ class FloodWaitConfig:
 
 @dataclass(frozen=True, slots=True)
 class TelegramRpcConfig:
-    """Account-level Telegram RPC budget."""
+    """Account-level Telegram RPC budget and retry policy.
+
+    Retry delays are additional application delays. Telethon itself sleeps two
+    seconds for each server-transient failure before re-raising when
+    ``request_retries=0``.
+    """
 
     max_calls_per_period: int = 30
     period_seconds: float = 60.0
-    transient_retry_delays_seconds: tuple[float, ...] = (2.0,)
+    transient_retry_delays_seconds: tuple[float, ...] = (0.0,)
 
 
 @dataclass(frozen=True, slots=True)

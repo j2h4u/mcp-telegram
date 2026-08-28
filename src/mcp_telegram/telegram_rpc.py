@@ -130,7 +130,7 @@ class TelegramRpcGate(TelegramClient):
         if request is not None and is_list_like(request):
             raise ValueError("transport batching is forbidden; use sequential scalar calls")
         for retry_index, delay in enumerate((0.0, *self._transient_retry_delays)):
-            if retry_index:
+            if retry_index and delay:
                 await asyncio.sleep(delay)
             try:
                 await self._admit()

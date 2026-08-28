@@ -5,7 +5,7 @@ from typing import cast
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from telethon import TelegramClient  # type: ignore[import-untyped]
 
-from .config import load_config
+from .config import McpTelegramConfig, load_config
 from .flood import flood_wait_kill_switch_status, observe_flood_wait
 from .state import ensure_private_state_dir
 from .telegram_rpc import TelegramRpcBudget, TelegramRpcGate
@@ -40,6 +40,8 @@ def create_client(
     api_hash: str | None = None,
     session_name: str = "mcp_telegram_session",
     catch_up: bool = False,
+    *,
+    config: McpTelegramConfig,
 ) -> TelegramRpcGate:
     """Return a cached TelegramClient singleton for the given credentials.
 
@@ -63,7 +65,6 @@ def create_client(
         settings = TelegramSettings(api_id=api_id, api_hash=api_hash)
     else:
         settings = _load_settings()
-    config = load_config()
     state_home = ensure_private_state_dir(config.state.dir, mode=0o700)
     return TelegramRpcGate(
         state_home / session_name,
