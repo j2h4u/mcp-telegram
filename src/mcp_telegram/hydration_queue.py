@@ -19,6 +19,7 @@ HYDRATION_QUEUE_TABLE = "hydration_jobs"
 MEDIA_METADATA_KIND = "media_metadata"
 TRANSCRIPTION_HYDRATION_KIND = "transcription"
 DEFAULT_SUMMARY_MESSAGE_IDS = 32
+_REGISTERED_HYDRATION_KINDS = (MEDIA_METADATA_KIND, TRANSCRIPTION_HYDRATION_KIND)
 
 
 class HydrationPriority(IntEnum):
@@ -71,6 +72,12 @@ class HydrationQueueSummary:
 
 _JOB_COLUMNS = "kind, dialog_id, message_id, due_at, attempts, message_sent_at, priority"
 _SELECT_JOB_COLUMNS = ", ".join(f"hj.{column}" for column in _JOB_COLUMNS.split(", "))
+_SUMMARY_AGGREGATE_SQL = (
+    f"SELECT COUNT(*), MIN(attempts), MAX(attempts) FROM {HYDRATION_QUEUE_TABLE} WHERE kind = ? AND dialog_id = ?"
+)
+_SUMMARY_MESSAGE_IDS_SQL = (
+    f"SELECT message_id FROM {HYDRATION_QUEUE_TABLE} WHERE kind = ? AND dialog_id = ? ORDER BY message_id LIMIT ?"
+)
 
 
 def _identity(job: HydrationJob) -> tuple[str, int, int]:
@@ -212,37 +219,29 @@ class HydrationQueueRepository:
         if not self.is_available():
             return ()
         message_id_cap = max(0, max_message_ids)
-        aggregate_rows = cast(
-            list[tuple[object, ...]],
-            self._conn.execute(
-                f"SELECT kind, COUNT(*), MIN(attempts), MAX(attempts) FROM {HYDRATION_QUEUE_TABLE} "
-                "WHERE dialog_id = ? GROUP BY kind ORDER BY kind",
-                (dialog_id,),
-            ).fetchall(),
-        )
-        ids_by_kind: dict[str, tuple[int, ...]] = {}
-        for row in aggregate_rows:
-            kind = str(row[0])
+        summaries: list[HydrationQueueSummary] = []
+        for kind in _REGISTERED_HYDRATION_KINDS:
+            row = cast(
+                tuple[object, ...] | None,
+                self._conn.execute(_SUMMARY_AGGREGATE_SQL, (kind, dialog_id)).fetchone(),
+            )
+            if row is None or int(cast(int | str, row[0])) == 0:
+                continue
             id_rows = cast(
                 list[tuple[object, ...]],
-                self._conn.execute(
-                    f"SELECT message_id FROM {HYDRATION_QUEUE_TABLE} "
-                    "WHERE kind = ? AND dialog_id = ? ORDER BY message_id LIMIT ?",
-                    (kind, dialog_id, message_id_cap),
-                ).fetchall(),
+                self._conn.execute(_SUMMARY_MESSAGE_IDS_SQL, (kind, dialog_id, message_id_cap)).fetchall(),
             )
-            ids_by_kind[kind] = tuple(int(cast(int | str, id_row[0])) for id_row in id_rows)
-        return tuple(
-            HydrationQueueSummary(
-                kind=str(row[0]),
-                dialog_id=dialog_id,
-                job_count=int(cast(int | str, row[1])),
-                message_ids=tuple(ids_by_kind[str(row[0])]),
-                attempts_min=int(cast(int | str, row[2])),
-                attempts_max=int(cast(int | str, row[3])),
+            summaries.append(
+                HydrationQueueSummary(
+                    kind=kind,
+                    dialog_id=dialog_id,
+                    job_count=int(cast(int | str, row[0])),
+                    message_ids=tuple(int(cast(int | str, id_row[0])) for id_row in id_rows),
+                    attempts_min=int(cast(int | str, row[1])),
+                    attempts_max=int(cast(int | str, row[2])),
+                )
             )
-            for row in aggregate_rows
-        )
+        return tuple(summaries)
 
 
 __all__ = [
