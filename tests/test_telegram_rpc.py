@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 import telethon
-from telethon import TelegramClient
+from telethon import TelegramClient, functions, types
 from telethon.errors import FloodWaitError, ServerError, SlowModeWaitError
 from telethon.requestiter import RequestIter
 from telethon.sessions import StringSession
@@ -107,6 +107,27 @@ async def test_helper_and_request_iter_pages_use_the_same_public_call_seam(monke
     assert gate._limiter.acquisitions == 3
 
 
+@pytest.mark.asyncio
+async def test_get_entity_username_resolution_uses_the_same_public_call_seam(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = _gate()
+    calls: list[object] = []
+    user = types.User(1, access_hash=2, username="alice")
+
+    async def base_call(_self: TelegramClient, request: object, **_kwargs: object) -> object:
+        calls.append(request)
+        assert isinstance(request, functions.contacts.ResolveUsernameRequest)
+        return types.contacts.ResolvedPeer(types.PeerUser(1), [], [user])
+
+    monkeypatch.setattr(TelegramClient, "__call__", base_call)
+    resolved = await gate.get_entity("alice")
+
+    assert resolved is user
+    assert len(calls) == 1
+    assert gate._limiter.acquisitions == 1
+
+
 def test_telethon_public_helper_and_update_loop_contract_is_pinned() -> None:
     from telethon.client.updates import UpdateMethods
     from telethon.tl.custom.message import Message
@@ -201,16 +222,37 @@ async def test_gate_flood_is_immediate_cooldown_and_observed_once(monkeypatch: p
     observed: list[dict[str, object]] = []
     gate._flood_observer = lambda **kwargs: observed.append(kwargs)
     error = FloodWaitError(request=None, capture=7)
+    attempts = 0
 
     async def base_call(_self: TelegramClient, _request: object, **_kwargs: object) -> object:
+        nonlocal attempts
+        attempts += 1
         raise error
 
     monkeypatch.setattr(TelegramClient, "__call__", base_call)
     with pytest.raises(FloodWaitError) as caught:
         await gate("request")
     assert caught.value is error
+    assert attempts == 1
+    await gate._observe_flood(error)
     assert observed == [{"source": "telegram_rpc_gate", "seconds": 7}]
     assert account_cooldown_deadline() > 0
+
+
+@pytest.mark.asyncio
+async def test_gate_flood_cooldown_uses_buffer_and_extends_monotonically(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mcp_telegram.telegram_rpc as rpc
+
+    gate = _gate()
+    clock = iter((100.0, 200.0))
+    monkeypatch.setattr(rpc.time, "monotonic", lambda: next(clock, 200.0))
+
+    await gate._observe_flood(FloodWaitError(request=None, capture=7))
+    first_deadline = account_cooldown_deadline()
+    await gate._observe_flood(FloodWaitError(request=None, capture=2))
+
+    assert first_deadline == 108.0
+    assert account_cooldown_deadline() == 203.0
 
 
 @pytest.mark.asyncio
@@ -259,5 +301,21 @@ async def test_gate_does_not_retry_slow_mode_or_nonretryable_rpc(monkeypatch: py
 
     monkeypatch.setattr(TelegramClient, "__call__", base_call)
     with pytest.raises(SlowModeWaitError):
+        await gate("request")
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_gate_does_not_retry_arbitrary_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = _gate(retry_delays=(2.0,))
+    attempts = 0
+
+    async def base_call(_self: TelegramClient, _request: object, **_kwargs: object) -> object:
+        nonlocal attempts
+        attempts += 1
+        raise ValueError("not a server transient")
+
+    monkeypatch.setattr(TelegramClient, "__call__", base_call)
+    with pytest.raises(ValueError, match="not a server transient"):
         await gate("request")
     assert attempts == 1
