@@ -7,12 +7,10 @@ from collections.abc import Sequence
 from typing import Protocol, cast
 
 from .fact_hydration import AppliedFacts
-from .hydration_queue import HydrationJob, HydrationQueueRepository
+from .hydration_queue import MEDIA_METADATA_KIND, HydrationJob, HydrationQueueRepository
 from .media_fact import encode_media_payload
-from .messages.sqlite_repository import apply_hydrated_media_fact, media_hydration_eligible
+from .messages.sqlite_repository import apply_hydrated_media_fact, media_fact_hydration_eligible
 from .telethon_media import extract_media_fact
-
-MEDIA_METADATA_KIND = "media_metadata"
 
 
 class MediaHydrationClient(Protocol):
@@ -25,12 +23,13 @@ class MediaFactHydrationHandler:
     kind = MEDIA_METADATA_KIND
     flood_source = "media_hydration"
     request_cost = 1
+    pending_delay_seconds = 0
 
     def __init__(self, *, batch_size: int = 100) -> None:
         self.batch_size = batch_size
 
-    def eligible(self, conn: sqlite3.Connection, dialog_id: int) -> bool:
-        return media_hydration_eligible(conn, dialog_id)
+    def eligible(self, conn: sqlite3.Connection, job: HydrationJob) -> bool:
+        return media_fact_hydration_eligible(conn, job.dialog_id, job.message_id)
 
     async def request(self, client: object, jobs: Sequence[HydrationJob]) -> object:
         telegram = cast(MediaHydrationClient, client)

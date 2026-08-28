@@ -13,7 +13,8 @@ from typing import cast
 from xdg_base_dirs import xdg_config_home  # type: ignore[import-error]
 
 _VALID_HTTP_PORTS = range(1, 65_536)
-_MAX_MEDIA_HYDRATION_BATCH_SIZE = 100
+_MAX_FACT_HYDRATION_BATCH_SIZE = 100
+_MIN_FACT_HYDRATION_REQUESTS = 2
 
 
 class ConfigError(RuntimeError):
@@ -106,7 +107,7 @@ class TelegramRpcConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class MediaHydrationConfig:
+class FactHydrationConfig:
     """Bounded policy for lazy Telegram media-fact hydration."""
 
     interval_seconds: float = 900.0
@@ -120,8 +121,10 @@ class MediaHydrationConfig:
     transcription_recheck_delay_seconds: int = 86_400
 
     def __post_init__(self) -> None:
-        if self.batch_size > _MAX_MEDIA_HYDRATION_BATCH_SIZE:
-            raise ValueError("media hydration batch_size must be <= 100")
+        if self.batch_size > _MAX_FACT_HYDRATION_BATCH_SIZE:
+            raise ValueError("fact hydration batch_size must be <= 100")
+        if self.max_requests_per_cycle < _MIN_FACT_HYDRATION_REQUESTS:
+            raise ValueError("fact hydration max_requests_per_cycle must be >= 2")
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,7 +188,7 @@ class SchedulingConfig:
     activity_cold_enroll_seconds: float = 1_800.0
     activity_cold_access_retry_seconds: float = 3_600.0
     scheduled_flood_sleep_threshold_seconds: int = 0
-    media_hydration: MediaHydrationConfig = field(default_factory=MediaHydrationConfig)
+    fact_hydration: FactHydrationConfig = field(default_factory=FactHydrationConfig)
     folder_projection: FolderProjectionConfig = field(default_factory=FolderProjectionConfig)
     activity_hot_sweep: ActivityHotSweepConfig = field(default_factory=ActivityHotSweepConfig)
 
@@ -405,10 +408,17 @@ def _env_non_negative_float(environ: Mapping[str, str], name: str, default: floa
     return value
 
 
-def _env_media_hydration_batch_size(environ: Mapping[str, str], default: int) -> int:
-    value = _env_positive_int(environ, "MEDIA_HYDRATION_BATCH_SIZE", default)
-    if value > _MAX_MEDIA_HYDRATION_BATCH_SIZE:
-        raise ConfigError("MEDIA_HYDRATION_BATCH_SIZE must be an integer <= 100")
+def _env_fact_hydration_batch_size(environ: Mapping[str, str], default: int) -> int:
+    value = _env_positive_int(environ, "FACT_HYDRATION_BATCH_SIZE", default)
+    if value > _MAX_FACT_HYDRATION_BATCH_SIZE:
+        raise ConfigError("FACT_HYDRATION_BATCH_SIZE must be an integer <= 100")
+    return value
+
+
+def _env_fact_hydration_max_requests(environ: Mapping[str, str], default: int) -> int:
+    value = _env_positive_int(environ, "FACT_HYDRATION_MAX_REQUESTS_PER_CYCLE", default)
+    if value < _MIN_FACT_HYDRATION_REQUESTS:
+        raise ConfigError("FACT_HYDRATION_MAX_REQUESTS_PER_CYCLE must be an integer >= 2")
     return value
 
 
@@ -536,33 +546,33 @@ def resolve_scheduling_config(
         activity_cold_access_retry_seconds=_env_positive_float(
             env, "ACTIVITY_COLD_ACCESS_RETRY_SECONDS", config.activity_cold_access_retry_seconds
         ),
-        media_hydration=MediaHydrationConfig(
+        fact_hydration=FactHydrationConfig(
             interval_seconds=_env_positive_float(
-                env, "MEDIA_HYDRATION_INTERVAL_SECONDS", config.media_hydration.interval_seconds
+                env, "FACT_HYDRATION_INTERVAL_SECONDS", config.fact_hydration.interval_seconds
             ),
-            max_requests_per_cycle=_env_positive_int(
-                env, "MEDIA_HYDRATION_MAX_REQUESTS_PER_CYCLE", config.media_hydration.max_requests_per_cycle
+            max_requests_per_cycle=_env_fact_hydration_max_requests(
+                env, config.fact_hydration.max_requests_per_cycle
             ),
             max_jobs_per_cycle=_env_positive_int(
-                env, "MEDIA_HYDRATION_MAX_JOBS_PER_CYCLE", config.media_hydration.max_jobs_per_cycle
+                env, "FACT_HYDRATION_MAX_JOBS_PER_CYCLE", config.fact_hydration.max_jobs_per_cycle
             ),
-            batch_size=_env_media_hydration_batch_size(env, config.media_hydration.batch_size),
+            batch_size=_env_fact_hydration_batch_size(env, config.fact_hydration.batch_size),
             pause_between_requests_seconds=_env_positive_float(
                 env,
-                "MEDIA_HYDRATION_PAUSE_BETWEEN_REQUESTS_SECONDS",
-                config.media_hydration.pause_between_requests_seconds,
+                "FACT_HYDRATION_PAUSE_BETWEEN_REQUESTS_SECONDS",
+                config.fact_hydration.pause_between_requests_seconds,
             ),
             retry_delay_seconds=_env_positive_int(
-                env, "MEDIA_HYDRATION_RETRY_DELAY_SECONDS", config.media_hydration.retry_delay_seconds
+                env, "FACT_HYDRATION_RETRY_DELAY_SECONDS", config.fact_hydration.retry_delay_seconds
             ),
             circuit_retry_seconds=_env_positive_int(
-                env, "MEDIA_HYDRATION_CIRCUIT_RETRY_SECONDS", config.media_hydration.circuit_retry_seconds
+                env, "FACT_HYDRATION_CIRCUIT_RETRY_SECONDS", config.fact_hydration.circuit_retry_seconds
             ),
-            max_attempts=_env_positive_int(env, "MEDIA_HYDRATION_MAX_ATTEMPTS", config.media_hydration.max_attempts),
+            max_attempts=_env_positive_int(env, "FACT_HYDRATION_MAX_ATTEMPTS", config.fact_hydration.max_attempts),
             transcription_recheck_delay_seconds=_env_positive_int(
                 env,
-                "MEDIA_HYDRATION_TRANSCRIPTION_RECHECK_DELAY_SECONDS",
-                config.media_hydration.transcription_recheck_delay_seconds,
+                "FACT_HYDRATION_TRANSCRIPTION_RECHECK_DELAY_SECONDS",
+                config.fact_hydration.transcription_recheck_delay_seconds,
             ),
         ),
     )
@@ -773,8 +783,8 @@ def _parse_telegram_rpc(data: dict[str, object], path: Path) -> TelegramRpcConfi
     )
 
 
-def _parse_media_hydration(data: dict[str, object], path: Path, defaults: SchedulingConfig) -> MediaHydrationConfig:
-    hydration_data = _nested_table(data, "media_hydration", "scheduling.media_hydration", path) or {}
+def _parse_fact_hydration(data: dict[str, object], path: Path, defaults: SchedulingConfig) -> FactHydrationConfig:
+    hydration_data = _nested_table(data, "fact_hydration", "scheduling.fact_hydration", path) or {}
     _reject_unknown_keys(
         hydration_data,
         {
@@ -788,30 +798,33 @@ def _parse_media_hydration(data: dict[str, object], path: Path, defaults: Schedu
             "max_attempts",
             "transcription_recheck_delay_seconds",
         },
-        "scheduling.media_hydration",
+        "scheduling.fact_hydration",
         path,
     )
-    hydration_defaults = defaults.media_hydration
+    hydration_defaults = defaults.fact_hydration
     hydration_batch_size = _positive_int(
-        hydration_data, "batch_size", "scheduling.media_hydration", path, hydration_defaults.batch_size
+        hydration_data, "batch_size", "scheduling.fact_hydration", path, hydration_defaults.batch_size
     )
-    if hydration_batch_size > _MAX_MEDIA_HYDRATION_BATCH_SIZE:
-        raise ConfigError(f"Invalid scheduling.media_hydration.batch_size in {path}: expected integer <= 100")
-    return MediaHydrationConfig(
+    if hydration_batch_size > _MAX_FACT_HYDRATION_BATCH_SIZE:
+        raise ConfigError(f"Invalid scheduling.fact_hydration.batch_size in {path}: expected integer <= 100")
+    hydration_max_requests = _positive_int(
+        hydration_data,
+        "max_requests_per_cycle",
+        "scheduling.fact_hydration",
+        path,
+        hydration_defaults.max_requests_per_cycle,
+    )
+    if hydration_max_requests < _MIN_FACT_HYDRATION_REQUESTS:
+        raise ConfigError(f"Invalid scheduling.fact_hydration.max_requests_per_cycle in {path}: expected integer >= 2")
+    return FactHydrationConfig(
         interval_seconds=_positive_float(
-            hydration_data, "interval_seconds", "scheduling.media_hydration", path, hydration_defaults.interval_seconds
+            hydration_data, "interval_seconds", "scheduling.fact_hydration", path, hydration_defaults.interval_seconds
         ),
-        max_requests_per_cycle=_positive_int(
-            hydration_data,
-            "max_requests_per_cycle",
-            "scheduling.media_hydration",
-            path,
-            hydration_defaults.max_requests_per_cycle,
-        ),
+        max_requests_per_cycle=hydration_max_requests,
         max_jobs_per_cycle=_positive_int(
             hydration_data,
             "max_jobs_per_cycle",
-            "scheduling.media_hydration",
+            "scheduling.fact_hydration",
             path,
             hydration_defaults.max_jobs_per_cycle,
         ),
@@ -819,31 +832,31 @@ def _parse_media_hydration(data: dict[str, object], path: Path, defaults: Schedu
         pause_between_requests_seconds=_positive_float(
             hydration_data,
             "pause_between_requests_seconds",
-            "scheduling.media_hydration",
+            "scheduling.fact_hydration",
             path,
             hydration_defaults.pause_between_requests_seconds,
         ),
         retry_delay_seconds=_positive_int(
             hydration_data,
             "retry_delay_seconds",
-            "scheduling.media_hydration",
+            "scheduling.fact_hydration",
             path,
             hydration_defaults.retry_delay_seconds,
         ),
         circuit_retry_seconds=_positive_int(
             hydration_data,
             "circuit_retry_seconds",
-            "scheduling.media_hydration",
+            "scheduling.fact_hydration",
             path,
             hydration_defaults.circuit_retry_seconds,
         ),
         max_attempts=_positive_int(
-            hydration_data, "max_attempts", "scheduling.media_hydration", path, hydration_defaults.max_attempts
+            hydration_data, "max_attempts", "scheduling.fact_hydration", path, hydration_defaults.max_attempts
         ),
         transcription_recheck_delay_seconds=_positive_int(
             hydration_data,
             "transcription_recheck_delay_seconds",
-            "scheduling.media_hydration",
+            "scheduling.fact_hydration",
             path,
             hydration_defaults.transcription_recheck_delay_seconds,
         ),
@@ -992,11 +1005,11 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "activity_cold_backfill_batch_pause_seconds",
         "activity_cold_enroll_seconds",
         "activity_cold_access_retry_seconds",
-        "media_hydration",
+        "fact_hydration",
         "folder_projection",
     }
     scheduling_data = _optional_section(data, "scheduling", allowed, path)
-    media_hydration = _parse_media_hydration(scheduling_data, path, defaults)
+    fact_hydration = _parse_fact_hydration(scheduling_data, path, defaults)
     folder_projection = _parse_folder_projection(scheduling_data, path, defaults)
     activity_hot_sweep = _parse_activity_hot_sweep(scheduling_data, path, defaults.activity_hot_sweep)
     return SchedulingConfig(
@@ -1175,7 +1188,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             path,
             defaults.activity_cold_access_retry_seconds,
         ),
-        media_hydration=media_hydration,
+        fact_hydration=fact_hydration,
         folder_projection=folder_projection,
         activity_hot_sweep=activity_hot_sweep,
     )

@@ -60,6 +60,7 @@ from .messages.sqlite_repository import (
     persist_edited_message,
     read_message_out,
     read_message_text,
+    stage_message_transcription,
 )
 from .messages.telegram_adapter import (
     PeerNameClient as _PeerNameClient,
@@ -1262,14 +1263,13 @@ class EventHandlerManager:
                 return
             if read_message_text(self._conn, event.dialog_id, event.message_id).found:
                 return
-            apply_message_transcription(
+            stage_message_transcription(
                 self._conn,
                 event.dialog_id,
                 event.message_id,
                 transcribed_text=event.text,
                 transcription_id=event.transcription_id,
                 received_at=now,
-                allow_missing=True,
             )
             self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, event.dialog_id))
 

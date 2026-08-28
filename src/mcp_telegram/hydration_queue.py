@@ -16,6 +16,8 @@ from typing import cast
 # Keep this name in lock-step with the current schema.  The queue is part of the
 # durable database contract, so callers must never create an ad-hoc variant.
 HYDRATION_QUEUE_TABLE = "hydration_jobs"
+MEDIA_METADATA_KIND = "media_metadata"
+TRANSCRIPTION_HYDRATION_KIND = "transcription"
 
 
 class HydrationPriority(IntEnum):

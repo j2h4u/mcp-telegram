@@ -40,6 +40,7 @@ class AppliedFacts:
     completed: int = 0
     retried: int = 0
     dropped: int = 0
+    pending: bool = False
 
 
 class HydrationHandler(Protocol):
@@ -47,8 +48,9 @@ class HydrationHandler(Protocol):
     flood_source: str
     batch_size: int
     request_cost: int
+    pending_delay_seconds: int
 
-    def eligible(self, conn: sqlite3.Connection, dialog_id: int) -> bool: ...
+    def eligible(self, conn: sqlite3.Connection, job: HydrationJob) -> bool: ...
 
     async def request(self, client: object, jobs: Sequence[HydrationJob]) -> object: ...
 
@@ -176,9 +178,9 @@ class MessageFactHydrationWorker:
         batch: Sequence[HydrationJob],
         effective_now: int,
     ) -> _BatchOutcome:
-        started = self._start_batch(handler, batch)
+        started, preflight_dropped = self._start_batch(handler, batch)
         if not started:
-            return _BatchOutcome()
+            return _BatchOutcome(dropped=preflight_dropped)
         try:
             result = await handler.request(self._client, started)
         except FloodWaitError as exc:
@@ -242,30 +244,46 @@ class MessageFactHydrationWorker:
             return _BatchOutcome(requests=handler.request_cost, retried=retried, dropped=dropped)
 
         applied = handler.apply(self._conn, self._queue, started, result, now=effective_now)
+        if applied.pending:
+            retried, dropped = self._retry_or_drop(
+                started,
+                effective_now + handler.pending_delay_seconds,
+            )
+            applied = AppliedFacts(
+                hydrated=applied.hydrated,
+                completed=applied.completed,
+                retried=retried,
+                dropped=dropped,
+            )
         self._conn.commit()
         return _BatchOutcome(
             requests=handler.request_cost,
             hydrated=applied.hydrated,
             completed=applied.completed,
             retried=applied.retried,
-            dropped=applied.dropped,
+            dropped=preflight_dropped + applied.dropped,
         )
 
-    def _start_batch(self, handler: HydrationHandler, jobs: Sequence[HydrationJob]) -> list[HydrationJob]:
+    def _start_batch(
+        self, handler: HydrationHandler, jobs: Sequence[HydrationJob]
+    ) -> tuple[list[HydrationJob], int]:
         started: list[HydrationJob] = []
+        dropped = 0
         for job in jobs:
-            if not handler.eligible(self._conn, job.dialog_id):
+            if not handler.eligible(self._conn, job):
                 self._queue.remove(job)
+                dropped += 1
                 continue
             current = self._queue.start(job)
             if current is None:
                 continue
             if current.attempts > self._max_attempts:
                 self._queue.remove(current)
+                dropped += 1
                 continue
             started.append(current)
         self._conn.commit()
-        return started
+        return started, dropped
 
     def _retry_or_drop(self, jobs: Sequence[HydrationJob], due_at: int) -> tuple[int, int]:
         retried = dropped = 0

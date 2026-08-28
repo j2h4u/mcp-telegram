@@ -44,7 +44,7 @@ max_due_seconds = 604800
 jitter_max_seconds = 300
 initial_spread_seconds = 86400
 
-[scheduling.media_hydration]
+[scheduling.fact_hydration]
 # Bounded lazy re-fetch of media metadata for legacy `other/{}` rows.
 interval_seconds = 900
 max_requests_per_cycle = 3

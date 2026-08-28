@@ -647,7 +647,7 @@ FROM messages m
 JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
 JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
 WHERE sd.status IN ('syncing', 'synced')
-  AND m.media_kind IN ('contact', 'other') AND m.media_payload = '{}'
+  AND m.is_deleted = 0 AND m.media_kind IN ('contact', 'other') AND m.media_payload = '{}'
 """
 
 _TRANSCRIPTION_HYDRATION_JOBS_SEED_SQL = """
@@ -658,7 +658,7 @@ JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
 JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
 LEFT JOIN message_transcriptions mt ON mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id
 WHERE sd.status IN ('syncing', 'synced')
-  AND m.media_kind = 'voice' AND mt.message_id IS NULL
+  AND m.is_deleted = 0 AND m.media_kind = 'voice' AND mt.message_id IS NULL
 """
 
 

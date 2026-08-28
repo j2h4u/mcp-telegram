@@ -301,6 +301,10 @@ def test_v41_seeds_voice_transcription_hydration_as_backfill(tmp_path: Path) -> 
             "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
             "VALUES (91, 17, 1234, NULL, 'voice', '{}')"
         )
+        conn.execute(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload, is_deleted) "
+            "VALUES (91, 18, 1235, NULL, 'voice', '{}', 1)"
+        )
         conn.execute("DELETE FROM schema_version WHERE version = 41")
         conn.commit()
 
@@ -310,6 +314,9 @@ def test_v41_seeds_voice_transcription_hydration_as_backfill(tmp_path: Path) -> 
             "SELECT kind, dialog_id, message_id, priority, message_sent_at FROM hydration_jobs "
             "WHERE kind = 'transcription'"
         ).fetchone() == ("transcription", 91, 17, 0, 1234)
+        assert conn.execute(
+            "SELECT 1 FROM hydration_jobs WHERE kind = 'transcription' AND dialog_id = 91 AND message_id = 18"
+        ).fetchone() is None
 
 
 def test_migration_v11_idempotent(db_path: Path) -> None:
