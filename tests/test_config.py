@@ -46,6 +46,9 @@ def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
     assert config.scheduling == SchedulingConfig()
     assert config.scheduling.activity_rpc_timeout_seconds == 120.0
     assert config.scheduling.fact_hydration == FactHydrationConfig()
+    assert config.scheduling.fact_hydration.interval_seconds == 300.0
+    assert config.scheduling.fact_hydration.max_requests_per_cycle == 4
+    assert config.scheduling.fact_hydration.pause_between_requests_seconds == 5.0
     assert config.http == HttpServerConfig()
     with pytest.raises(FrozenInstanceError):
         config.freshness.reactions.freshness_ttl_seconds = 1  # type: ignore[misc]

@@ -110,8 +110,8 @@ class TelegramRpcConfig:
 class FactHydrationConfig:
     """Bounded policy for lazy Telegram media-fact hydration."""
 
-    interval_seconds: float = 900.0
-    max_requests_per_cycle: int = 3
+    interval_seconds: float = 300.0
+    max_requests_per_cycle: int = 4
     max_jobs_per_cycle: int = 300
     batch_size: int = 100
     pause_between_requests_seconds: float = 5.0

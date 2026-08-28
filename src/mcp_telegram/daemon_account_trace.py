@@ -16,6 +16,7 @@ from telethon.tl.functions.contacts import ResolveUsernameRequest  # type: ignor
 from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_peer_sweep import enroll_activity_dialog
 from .daemon_message import fetch_text_links
+from .hydration_queue import HydrationPriority
 from .message_content import MessageSnapshot, project_message_content
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
@@ -1484,7 +1485,7 @@ def _split_trace_duplicate_messages(
 
 def _persist_trace_messages(conn: sqlite3.Connection, messages: list[ExtractedMessage]) -> None:
     with conn:
-        insert_messages_with_fts(conn, messages)
+        insert_messages_with_fts(conn, messages, priority=HydrationPriority.BACKFILL)
 
 
 _TRACE_FRAGMENT_STATUSES = {

@@ -169,7 +169,14 @@ def _patch_sweep(
     """
     call_log: dict[int, list[tuple[int, int]]] = {}
 
-    async def _fake_sweep(*args: object, offset_id: int, min_id: int, limit: int, timeout_s: float) -> SweepResult:
+    async def _fake_sweep(
+        *args: object,
+        offset_id: int,
+        min_id: int,
+        limit: int,
+        timeout_s: float,
+        **_kwargs: object,
+    ) -> SweepResult:
         del limit, timeout_s
         _client, _conn, dialog_id = cast(tuple[object, object, int], args)
         call_log.setdefault(dialog_id, []).append((offset_id, min_id))

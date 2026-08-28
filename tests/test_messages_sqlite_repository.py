@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from mcp_telegram.fts import stem_text
+from mcp_telegram.hydration_queue import HydrationPriority
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.messages.sqlite_repository import (
     insert_messages_with_fts,
@@ -117,12 +118,32 @@ def test_message_persistence_enqueues_one_unresolved_job_and_preserves_attempts(
         "VALUES ('media_metadata', 42, 90, 100, 2)"
     )
     with conn:
-        insert_messages_with_fts(conn, [_message(90, text=None, media_kind=media_kind, media_payload="{}")])
-        insert_messages_with_fts(conn, [_message(90, text=None, media_kind=media_kind, media_payload="{}")])
+        insert_messages_with_fts(
+            conn,
+            [_message(90, text=None, media_kind=media_kind, media_payload="{}")],
+            priority=HydrationPriority.FOREGROUND,
+        )
+        insert_messages_with_fts(
+            conn,
+            [_message(90, text=None, media_kind=media_kind, media_payload="{}")],
+            priority=HydrationPriority.FOREGROUND,
+        )
     assert conn.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=42 AND message_id=90").fetchone() == (1,)
     assert conn.execute("SELECT kind, dialog_id, message_id, attempts, priority FROM hydration_jobs").fetchall() == [
-        ("media_metadata", 42, 90, 2, 1)
+        ("media_metadata", 42, 90, 2, 0)
     ]
+
+
+def test_foreground_voice_persistence_keeps_transcription_foreground(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    with conn:
+        insert_messages_with_fts(
+            conn,
+            [_message(93, text=None, media_kind="voice", media_payload="{}")],
+            priority=HydrationPriority.FOREGROUND,
+        )
+
+    assert conn.execute("SELECT kind, priority FROM hydration_jobs").fetchall() == [("transcription", 1)]
 
 
 @pytest.mark.parametrize(

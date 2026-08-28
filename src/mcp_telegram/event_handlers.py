@@ -52,6 +52,7 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .activity_contracts import InputPeerResolver
 from .history_enrollment import ensure_automatic_dm_enrollment
+from .hydration_queue import HydrationPriority
 from .messages.sqlite_repository import (
     apply_message_transcription,
     insert_messages_with_fts,
@@ -569,7 +570,7 @@ class EventHandlerManager:
                     self._realtime_coverage(dialog_id), outgoing=bool(getattr(msg, "out", False))
                 ):
                     return
-                insert_messages_with_fts(self._conn, [extracted])
+                insert_messages_with_fts(self._conn, [extracted], priority=HydrationPriority.FOREGROUND)
                 # A normal message carrying from_scheduled is the verification
                 # point for the untrusted sent_messages hint retained by the
                 # scheduled-queue delete update.
@@ -819,7 +820,7 @@ class EventHandlerManager:
                 self._realtime_coverage(dialog_id), RealtimeBodyEvent.EDIT, outgoing=outgoing
             ):
                 return False
-            insert_messages_with_fts(self._conn, [extracted])
+            insert_messages_with_fts(self._conn, [extracted], priority=HydrationPriority.FOREGROUND)
             self._record_body_event(dialog_id, now)
         return True
 
@@ -880,6 +881,7 @@ class EventHandlerManager:
                 extracted,
                 old_text=old_text,
                 edit_date=edit_date_unix,
+                priority=HydrationPriority.FOREGROUND,
             )
             self._record_body_event(dialog_id, now)
         return next_ver

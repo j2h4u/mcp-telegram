@@ -107,6 +107,7 @@ def persist_edited_message(
     *,
     old_text: str | None,
     edit_date: int,
+    priority: HydrationPriority = HydrationPriority.FOREGROUND,
 ) -> int | None:
     """Version and persist a changed message in the caller's transaction.
 
@@ -125,7 +126,7 @@ def persist_edited_message(
         _INSERT_VERSION_SQL,
         (dialog_id, message_id, next_version, old_text, edit_date),
     )
-    insert_messages_with_fts(conn, [extracted])
+    insert_messages_with_fts(conn, [extracted], priority=priority)
     return next_version
 
 
@@ -326,6 +327,8 @@ def list_undeleted_message_ids(conn: sqlite3.Connection, dialog_id: int, sent_be
 def insert_messages_with_fts(
     conn: sqlite3.Connection,
     extracted: Sequence[_message_contracts.ExtractedMessage],
+    *,
+    priority: HydrationPriority = HydrationPriority.FOREGROUND,
 ) -> None:
     """Persist message bundles in the caller-owned transaction.
 
@@ -336,7 +339,7 @@ def insert_messages_with_fts(
     """
     preserved = _preserve_transcribed_texts(conn, extracted)
     projected = _overlay_message_transcriptions(conn, preserved)
-    _write_message_rows_and_fts(conn, projected)
+    _write_message_rows_and_fts(conn, projected, priority=priority)
     _delete_entity_and_forward_projections(conn, projected)
     _replace_reaction_projections(conn, projected)
     _insert_entity_and_forward_projections(conn, projected)
@@ -403,6 +406,7 @@ def reconcile_fact_hydration_job(
     message: _message_contracts.StoredMessage,
     *,
     due_at: int,
+    priority: HydrationPriority = HydrationPriority.FOREGROUND,
 ) -> None:
     """Reconcile one persisted message and its queue row in caller's tx."""
     queue = HydrationQueueRepository(conn)
@@ -415,6 +419,7 @@ def reconcile_fact_hydration_job(
         due_at,
         0,
         message.sent_at,
+        HydrationPriority.BACKFILL,
     )
     unresolved = message.media_kind in _FACT_HYDRATION_EMPTY_KINDS and message.media_payload == "{}"
     if unresolved and media_fact_hydration_eligible(conn, message.dialog_id, message.message_id):
@@ -429,7 +434,7 @@ def reconcile_fact_hydration_job(
         due_at,
         0,
         message.sent_at,
-        HydrationPriority.BACKFILL,
+        priority,
     )
     transcription_row = cast(
         tuple[object, ...] | None,
@@ -453,6 +458,7 @@ def reconcile_fact_hydration_jobs_for_dialog(
     dialog_id: int,
     *,
     due_at: int,
+    priority: HydrationPriority = HydrationPriority.BACKFILL,
 ) -> None:
     """Enqueue all unresolved media for an eligible dialog after revalidation."""
     queue = HydrationQueueRepository(conn)
@@ -470,7 +476,17 @@ def reconcile_fact_hydration_jobs_for_dialog(
         ).fetchall(),
     )
     for message_id, sent_at in rows:
-        queue.enqueue(HydrationJob(MEDIA_METADATA_KIND, dialog_id, int(message_id), due_at, 0, int(sent_at)))
+        queue.enqueue(
+            HydrationJob(
+                MEDIA_METADATA_KIND,
+                dialog_id,
+                int(message_id),
+                due_at,
+                0,
+                int(sent_at),
+                HydrationPriority.BACKFILL,
+            )
+        )
     voice_rows = cast(
         Sequence[tuple[int, int]],
         conn.execute(
@@ -489,7 +505,7 @@ def reconcile_fact_hydration_jobs_for_dialog(
                 due_at,
                 0,
                 int(sent_at),
-                HydrationPriority.BACKFILL,
+                priority,
             )
         )
 
@@ -497,6 +513,8 @@ def reconcile_fact_hydration_jobs_for_dialog(
 def _write_message_rows_and_fts(
     conn: sqlite3.Connection,
     extracted: Sequence[_message_contracts.ExtractedMessage],
+    *,
+    priority: HydrationPriority = HydrationPriority.BACKFILL,
 ) -> None:
     """Replace canonical message and FTS rows for one extraction batch."""
     messages = [item.message for item in extracted]
@@ -510,7 +528,7 @@ def _write_message_rows_and_fts(
         ((item.dialog_id, item.message_id, stem_text(item.text)) for item in messages),
     )
     for message in messages:
-        reconcile_fact_hydration_job(conn, message, due_at=int(time.time()))
+        reconcile_fact_hydration_job(conn, message, due_at=int(time.time()), priority=priority)
 
 
 def _overlay_message_transcriptions(

@@ -132,6 +132,35 @@ async def test_governed_client_blocks_peer_resolution_when_circuit_is_open() -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "batch_request",
+    [[], (), set(), {}, range(2), (item for item in range(2))],
+    ids=["list", "tuple", "set", "dict", "range", "generator"],
+)
+async def test_governed_client_rejects_transport_batches_before_governor_or_raw_client(batch_request: object) -> None:
+    raw_client, client = _governed_client(_CircuitStatus(open=False))
+    governor = _CountingGovernor()
+    client = GovernedTelegramClient(raw_client, governor)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="transport batching.*sequential scalar calls"):
+        await client(batch_request)
+
+    assert governor.sources == []
+    assert raw_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_governed_client_scalar_request_consumes_one_logical_unit() -> None:
+    raw_client, client = _governed_client(_CircuitStatus(open=False))
+    governor = _CountingGovernor()
+    client = GovernedTelegramClient(raw_client, governor)  # type: ignore[arg-type]
+
+    assert await client("scalar") == "called"
+    assert governor.sources == ["client_call"]
+    assert raw_client.calls == ["call"]
+
+
+@pytest.mark.asyncio
 async def test_governed_request_iter_acquires_once_per_underlying_page() -> None:
     raw_client = _PagedClient([[1, 2], [3]])
     governor = _CountingGovernor()

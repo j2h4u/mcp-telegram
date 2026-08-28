@@ -25,7 +25,7 @@ from .messages.sqlite_repository import (
 class TranscriptionHydrationClient(Protocol):
     async def get_input_entity(self, dialog_id: int) -> TypeInputPeer: ...
 
-    async def __call__(self, request: object) -> object: ...
+    async def __call__(self, request: object, **kwargs: object) -> object: ...
 
 
 class TranscriptionHydrationHandler:
@@ -46,7 +46,10 @@ class TranscriptionHydrationHandler:
         telegram = cast(TranscriptionHydrationClient, client)
         job = jobs[0]
         peer = cast(TypeInputPeer, await telegram.get_input_entity(job.dialog_id))
-        return await telegram(TranscribeAudioRequest(peer=peer, msg_id=job.message_id))
+        return await telegram(
+            TranscribeAudioRequest(peer=peer, msg_id=job.message_id),
+            flood_sleep_threshold=0,
+        )
 
     def apply(
         self,

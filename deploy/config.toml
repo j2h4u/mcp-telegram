@@ -46,8 +46,8 @@ initial_spread_seconds = 86400
 
 [scheduling.fact_hydration]
 # Bounded lazy re-fetch of media metadata for legacy `other/{}` rows.
-interval_seconds = 900
-max_requests_per_cycle = 3
+interval_seconds = 300
+max_requests_per_cycle = 4
 max_jobs_per_cycle = 300
 batch_size = 100
 pause_between_requests_seconds = 5

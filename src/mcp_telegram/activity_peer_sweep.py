@@ -32,6 +32,7 @@ from telethon.tl.types import TypeInputPeer
 from .access_lifecycle import set_access_lost
 from .activity_peer_resolve import LinkedChatResolution, resolve_input_peer, resolve_linked_chat_id
 from .activity_substrate import ActivityClient, call_with_timeout
+from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts, message_exists
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
@@ -139,6 +140,7 @@ class PeerSweepRequest:
     min_id: int
     limit: int
     timeout_s: float
+    hydration_priority: HydrationPriority = HydrationPriority.BACKFILL
 
 
 _LEGACY_PEER_SWEEP_POSITIONAL_ARGS = 3
@@ -211,7 +213,11 @@ def _extract_and_persist_sweep_messages(
     try:
         if extracted:
             with request.conn:
-                insert_messages_with_fts(request.conn, extracted)
+                insert_messages_with_fts(
+                    request.conn,
+                    extracted,
+                    priority=request.hydration_priority,
+                )
     except Exception:
         logger.warning("sweep_peer_once_persistence_error dialog_id=%r", request.dialog_id, exc_info=True)
         return _access_skip_result(rpc_calls=2, pages_fetched=1)
@@ -238,6 +244,10 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
     min_id = cast(int, kwargs.pop("min_id"))
     limit = cast(int, kwargs.pop("limit"))
     timeout_s = cast(float, kwargs.pop("timeout_s"))
+    hydration_priority = cast(
+        HydrationPriority,
+        kwargs.pop("hydration_priority", HydrationPriority.BACKFILL),
+    )
     if kwargs:
         raise TypeError(f"sweep_peer_once: unexpected keyword arguments {sorted(kwargs)!r}")
 
@@ -249,6 +259,7 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
         min_id=min_id,
         limit=limit,
         timeout_s=timeout_s,
+        hydration_priority=hydration_priority,
     )
 
 

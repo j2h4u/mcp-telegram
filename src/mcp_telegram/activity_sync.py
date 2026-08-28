@@ -20,6 +20,7 @@ from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, InputPee
 
 from .activity_substrate import ActivityClient, call_with_timeout
 from .flood import flood_seconds, sleep_through_flood
+from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
@@ -226,12 +227,17 @@ def _extract_own_message_rows(batch: Sequence[_SearchMessageLike]) -> list[Extra
     return extracted
 
 
-def _persist_own_message_rows(conn: sqlite3.Connection, extracted: list[ExtractedMessage]) -> None:
+def _persist_own_message_rows(
+    conn: sqlite3.Connection,
+    extracted: list[ExtractedMessage],
+    *,
+    priority: HydrationPriority,
+) -> None:
     """Persist extracted own-message rows and enroll their dialogs."""
     if not extracted:
         return
     with conn:
-        insert_messages_with_fts(conn, extracted)
+        insert_messages_with_fts(conn, extracted, priority=priority)
         dialog_ids = {em.message.dialog_id for em in extracted}
         for dialog_id in dialog_ids:
             enroll_own_only_sync_dialog(conn, dialog_id)
@@ -457,7 +463,7 @@ async def _run_backfill(
 
         progress.batch_num += 1
         extracted = _extract_own_message_rows(batch)
-        _persist_own_message_rows(conn, extracted)
+        _persist_own_message_rows(conn, extracted, priority=HydrationPriority.BACKFILL)
 
         _upsert_entities_from_search(conn, search_result)
 
@@ -527,7 +533,7 @@ async def _run_incremental(
         # every later batch will be older too — break the outer loop.
         in_window, past_window = _trim_incremental_batch(batch, progress.min_date)
         extracted = _extract_own_message_rows(in_window)
-        _persist_own_message_rows(conn, extracted)
+        _persist_own_message_rows(conn, extracted, priority=HydrationPriority.FOREGROUND)
 
         _upsert_entities_from_search(conn, search_result)
         progress.inserted += len(in_window)
