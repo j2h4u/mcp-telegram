@@ -13,7 +13,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 40
+_CURRENT_SCHEMA_VERSION = 41
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -648,6 +648,17 @@ JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
 JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
 WHERE sd.status IN ('syncing', 'synced')
   AND m.media_kind IN ('contact', 'other') AND m.media_payload = '{}'
+"""
+
+_TRANSCRIPTION_HYDRATION_JOBS_SEED_SQL = """
+INSERT OR IGNORE INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at)
+SELECT 'transcription', m.dialog_id, m.message_id, CAST(strftime('%s', 'now') AS INTEGER), 0, 0, m.sent_at
+FROM messages m
+JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
+JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
+LEFT JOIN message_transcriptions mt ON mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id
+WHERE sd.status IN ('syncing', 'synced')
+  AND m.media_kind = 'voice' AND mt.message_id IS NULL
 """
 
 
@@ -1676,6 +1687,11 @@ def _apply_migration_40(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_41(conn: sqlite3.Connection, current: int) -> int:
+    """Seed low-priority transcription hydration for existing voice messages."""
+    return _apply_migration(conn, current, 41, [_TRANSCRIPTION_HYDRATION_JOBS_SEED_SQL])
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -1713,6 +1729,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_38(conn, current)
     current = _apply_migration_39(conn, current)
     current = _apply_migration_40(conn, current)
+    current = _apply_migration_41(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

@@ -117,6 +117,7 @@ class MediaHydrationConfig:
     retry_delay_seconds: int = 21_600
     circuit_retry_seconds: int = 1_800
     max_attempts: int = 3
+    transcription_recheck_delay_seconds: int = 86_400
 
     def __post_init__(self) -> None:
         if self.batch_size > _MAX_MEDIA_HYDRATION_BATCH_SIZE:
@@ -558,6 +559,11 @@ def resolve_scheduling_config(
                 env, "MEDIA_HYDRATION_CIRCUIT_RETRY_SECONDS", config.media_hydration.circuit_retry_seconds
             ),
             max_attempts=_env_positive_int(env, "MEDIA_HYDRATION_MAX_ATTEMPTS", config.media_hydration.max_attempts),
+            transcription_recheck_delay_seconds=_env_positive_int(
+                env,
+                "MEDIA_HYDRATION_TRANSCRIPTION_RECHECK_DELAY_SECONDS",
+                config.media_hydration.transcription_recheck_delay_seconds,
+            ),
         ),
     )
 
@@ -780,6 +786,7 @@ def _parse_media_hydration(data: dict[str, object], path: Path, defaults: Schedu
             "retry_delay_seconds",
             "circuit_retry_seconds",
             "max_attempts",
+            "transcription_recheck_delay_seconds",
         },
         "scheduling.media_hydration",
         path,
@@ -832,6 +839,13 @@ def _parse_media_hydration(data: dict[str, object], path: Path, defaults: Schedu
         ),
         max_attempts=_positive_int(
             hydration_data, "max_attempts", "scheduling.media_hydration", path, hydration_defaults.max_attempts
+        ),
+        transcription_recheck_delay_seconds=_positive_int(
+            hydration_data,
+            "transcription_recheck_delay_seconds",
+            "scheduling.media_hydration",
+            path,
+            hydration_defaults.transcription_recheck_delay_seconds,
         ),
     )
 

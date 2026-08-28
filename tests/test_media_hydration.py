@@ -8,12 +8,15 @@ from typing import cast
 
 import pytest
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+from telethon.errors.rpcerrorlist import PremiumAccountRequiredError  # type: ignore[import-untyped]
 
 from mcp_telegram.access_lifecycle import restore_access_after_revalidation
 from mcp_telegram.config import MediaHydrationConfig
-from mcp_telegram.media_hydration import MediaHydrationWorker
+from mcp_telegram.fact_hydration import MessageFactHydrationWorker
+from mcp_telegram.media_hydration import MediaFactHydrationHandler
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_rpc import TelegramRpcCircuitOpenError
+from mcp_telegram.transcription_hydration import TranscriptionHydrationHandler
 
 
 class _Client:
@@ -24,6 +27,16 @@ class _Client:
 
     async def get_messages(self, *_args: object, **kwargs: object) -> object:
         self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+    async def get_input_entity(self, dialog_id: int) -> object:
+        self.calls.append({"dialog_id": dialog_id})
+        return SimpleNamespace(dialog_id=dialog_id)
+
+    async def __call__(self, request: object) -> object:
+        self.calls.append({"request": request})
         if self.error is not None:
             raise self.error
         return self.response
@@ -74,22 +87,61 @@ def _seed(conn: sqlite3.Connection, dialog_id: int = 1, message_id: int = 1) -> 
     conn.commit()
 
 
+def _seed_voice(conn: sqlite3.Connection, dialog_id: int = 1, message_id: int = 1) -> None:
+    conn.execute("INSERT OR IGNORE INTO synced_dialogs(dialog_id, status) VALUES (?, 'synced')", (dialog_id,))
+    conn.execute(
+        "INSERT OR IGNORE INTO full_history_enrollment(dialog_id, enabled, source, updated_at) "
+        "VALUES (?, 1, 'explicit', 1)",
+        (dialog_id,),
+    )
+    conn.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+        "VALUES (?, ?, 1, NULL, 'voice', '{}')",
+        (dialog_id, message_id),
+    )
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at) "
+        "VALUES ('transcription', ?, ?, 1, 0, 0, 1)",
+        (dialog_id, message_id),
+    )
+    conn.commit()
+
+
 def _worker(
     conn: sqlite3.Connection, client: _Client, policy: MediaHydrationConfig | None = None
-) -> MediaHydrationWorker:
+) -> MessageFactHydrationWorker:
     config = policy or MediaHydrationConfig(pause_between_requests_seconds=0.01)
-    return MediaHydrationWorker(
+    return MessageFactHydrationWorker(
         client,
         conn,
         asyncio.Event(),
+        handlers=(MediaFactHydrationHandler(batch_size=config.batch_size),),
         interval_seconds=config.interval_seconds,
         max_requests_per_cycle=config.max_requests_per_cycle,
         max_jobs_per_cycle=config.max_jobs_per_cycle,
-        batch_size=config.batch_size,
         pause_between_requests_seconds=config.pause_between_requests_seconds,
         retry_delay_seconds=config.retry_delay_seconds,
         circuit_retry_seconds=config.circuit_retry_seconds,
         max_attempts=config.max_attempts,
+    )
+
+
+def _transcription_worker(
+    conn: sqlite3.Connection, client: _Client, policy: MediaHydrationConfig | None = None
+) -> MessageFactHydrationWorker:
+    config = policy or MediaHydrationConfig(pause_between_requests_seconds=0.01)
+    return MessageFactHydrationWorker(
+        client,
+        conn,
+        asyncio.Event(),
+        handlers=(TranscriptionHydrationHandler(recheck_delay_seconds=config.transcription_recheck_delay_seconds),),
+        interval_seconds=config.interval_seconds,
+        max_requests_per_cycle=config.max_requests_per_cycle,
+        max_jobs_per_cycle=config.max_jobs_per_cycle,
+        retry_delay_seconds=config.retry_delay_seconds,
+        circuit_retry_seconds=config.circuit_retry_seconds,
+        max_attempts=config.max_attempts,
+        pause_between_requests_seconds=config.pause_between_requests_seconds,
     )
 
 
@@ -243,7 +295,7 @@ async def test_flood_wait_uses_shared_account_observer(monkeypatch: pytest.Monke
         observed.append((exc, source))
         return 13
 
-    monkeypatch.setattr("mcp_telegram.media_hydration.flood_seconds", _observe)
+    monkeypatch.setattr("mcp_telegram.fact_hydration.flood_seconds", _observe)
     result = await _worker(db, client).run_cycle(now=1)
 
     assert result.stopped
@@ -304,19 +356,22 @@ async def test_access_loss_purges_and_restore_reenqueues_unresolved_jobs(
     db.execute(
         "INSERT INTO dialogs(dialog_id, hidden, needs_refresh, snapshot_at, archived, pinned, unread_mentions_count, unread_reactions_count) VALUES (1, 0, 0, 1, 0, 0, 0, 0)"
     )
+    db.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+        "VALUES (1, 2, 2, NULL, 'voice', '{}')"
+    )
     db.commit()
-    monkeypatch.setattr("mcp_telegram.media_hydration.ACCESS_LOST_ERRORS", (RuntimeError,))
+    monkeypatch.setattr("mcp_telegram.fact_hydration.ACCESS_LOST_ERRORS", (RuntimeError,))
     client = _Client(error=RuntimeError("private"))
     await _worker(db, client).run_cycle(now=10)
     assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
     restore_access_after_revalidation(db, 1, 20)
-    assert db.execute("SELECT kind, dialog_id, message_id, due_at, attempts FROM hydration_jobs").fetchone() == (
-        "media_metadata",
-        1,
-        1,
-        20,
-        0,
-    )
+    assert db.execute(
+        "SELECT kind, dialog_id, message_id, due_at, attempts FROM hydration_jobs ORDER BY kind"
+    ).fetchall() == [
+        ("media_metadata", 1, 1, 20, 0),
+        ("transcription", 1, 2, 20, 0),
+    ]
 
 
 @pytest.mark.asyncio
@@ -352,3 +407,106 @@ async def test_authoritative_write_rechecks_eligibility_after_rpc_starts(db: sql
         "other",
         "{}",
     )
+
+
+@pytest.mark.asyncio
+async def test_transcription_immediate_final_persists_text_and_fts(db: sqlite3.Connection) -> None:
+    _seed_voice(db)
+    client = _Client(SimpleNamespace(pending=False, text="speech words", transcription_id=7))
+
+    result = await _transcription_worker(db, client).run_cycle(now=10)
+
+    assert result.hydrated == 1
+    assert result.completed == 1
+    assert result.requests == 2
+    assert ["dialog_id" in call for call in client.calls] == [True, False]
+    assert db.execute("SELECT text FROM messages WHERE dialog_id=1 AND message_id=1").fetchone() == ("speech words",)
+    assert db.execute("SELECT text, transcription_id FROM message_transcriptions").fetchone() == ("speech words", 7)
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+    assert db.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=1 AND message_id=1").fetchone() == (
+        "speech words",
+    )
+
+
+@pytest.mark.asyncio
+async def test_transcription_pending_is_low_frequency_reschedule_without_text(db: sqlite3.Connection) -> None:
+    _seed_voice(db)
+    client = _Client(SimpleNamespace(pending=True, text="", transcription_id=7))
+    policy = MediaHydrationConfig(transcription_recheck_delay_seconds=123, pause_between_requests_seconds=0.01)
+
+    result = await _transcription_worker(db, client, policy).run_cycle(now=10)
+
+    assert result.retried == 1
+    assert db.execute("SELECT text FROM messages WHERE dialog_id=1 AND message_id=1").fetchone() == (None,)
+    assert db.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
+    assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 133)
+
+
+@pytest.mark.asyncio
+async def test_transcription_retry_after_missed_update_can_complete(db: sqlite3.Connection) -> None:
+    _seed_voice(db)
+    client = _Client(SimpleNamespace(pending=True, text="", transcription_id=7))
+    policy = MediaHydrationConfig(transcription_recheck_delay_seconds=10, pause_between_requests_seconds=0.01)
+    worker = _transcription_worker(db, client, policy)
+    await worker.run_cycle(now=10)
+    client.response = SimpleNamespace(pending=False, text="event was missed", transcription_id=8)
+
+    result = await worker.run_cycle(now=20)
+
+    assert result.completed == 1
+    assert db.execute("SELECT text FROM messages WHERE dialog_id=1 AND message_id=1").fetchone() == (
+        "event was missed",
+    )
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_transcription_permanent_error_is_terminal_without_churn(db: sqlite3.Connection) -> None:
+    _seed_voice(db)
+    client = _Client(error=PremiumAccountRequiredError(request=None))
+    result = await _transcription_worker(db, client).run_cycle(now=10)
+
+    assert result.dropped == 1
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_transcription_floodwait_stops_and_reschedules(db: sqlite3.Connection) -> None:
+    _seed_voice(db)
+    client = _Client(error=FloodWaitError(request=None, capture=7))
+
+    result = await _transcription_worker(db, client).run_cycle(now=10)
+
+    assert result.stopped
+    assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 17)
+
+
+@pytest.mark.asyncio
+async def test_transcription_circuit_open_stops_and_reschedules(db: sqlite3.Connection) -> None:
+    _seed_voice(db)
+    client = _Client(error=TelegramRpcCircuitOpenError("open"))
+    policy = MediaHydrationConfig(circuit_retry_seconds=31, pause_between_requests_seconds=0.01)
+
+    result = await _transcription_worker(db, client, policy).run_cycle(now=10)
+
+    assert result.stopped
+    assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 41)
+
+
+@pytest.mark.asyncio
+async def test_transcription_backfill_is_newest_first_and_rpc_budgeted(db: sqlite3.Connection) -> None:
+    _seed_voice(db, message_id=1)
+    _seed_voice(db, message_id=2)
+    db.execute("UPDATE messages SET sent_at = 100 WHERE message_id = 1")
+    db.execute("UPDATE messages SET sent_at = 200 WHERE message_id = 2")
+    db.execute("UPDATE hydration_jobs SET message_sent_at = 100 WHERE message_id = 1")
+    db.execute("UPDATE hydration_jobs SET message_sent_at = 200 WHERE message_id = 2")
+    db.commit()
+    client = _Client(SimpleNamespace(pending=False, text="newest", transcription_id=9))
+    policy = MediaHydrationConfig(max_requests_per_cycle=2, max_jobs_per_cycle=2, pause_between_requests_seconds=0.01)
+
+    result = await _transcription_worker(db, client, policy).run_cycle(now=10)
+
+    assert result.completed == 1
+    assert db.execute("SELECT message_id FROM hydration_jobs").fetchall() == [(1,)]
+    assert db.execute("SELECT text FROM messages WHERE message_id=2").fetchone() == ("newest",)

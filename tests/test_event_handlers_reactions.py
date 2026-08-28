@@ -447,6 +447,12 @@ async def test_on_raw_transcribed_audio_updates_text_and_fts(
     message_id = 901
     _enroll(sync_db, dialog_id)
     _insert_msg(sync_db, dialog_id, message_id, text="")
+    sync_db.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts) "
+        "VALUES ('transcription', ?, ?, 1, 0)",
+        (dialog_id, message_id),
+    )
+    sync_db.commit()
 
     update = SimpleNamespace(
         peer=PeerUser(user_id=dialog_id), msg_id=message_id, text="speech to text", pending=False, transcription_id=1
@@ -462,6 +468,7 @@ async def test_on_raw_transcribed_audio_updates_text_and_fts(
         "SELECT text, transcription_id FROM message_transcriptions WHERE dialog_id=? AND message_id=?",
         (dialog_id, message_id),
     ).fetchone() == ("speech to text", 1)
+    assert sync_db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind='transcription'").fetchone() == (0,)
     await mgr.on_raw_transcribed_audio(
         SimpleNamespace(
             peer=PeerUser(user_id=dialog_id),

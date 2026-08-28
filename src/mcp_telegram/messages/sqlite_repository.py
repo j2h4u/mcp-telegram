@@ -10,12 +10,13 @@ from typing import cast
 
 from .. import message_contracts as _message_contracts
 from ..fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
-from ..hydration_queue import HydrationJob, HydrationQueueRepository
+from ..hydration_queue import HydrationJob, HydrationPriority, HydrationQueueRepository
 from ..reactions.contracts import ReactionAggregate
 from ..reactions.persistence import replace_reaction_aggregates
 
 _EMPTY_MEDIA_PAYLOAD = "{}"
 _MEDIA_HYDRATION_KIND = "media_metadata"
+_TRANSCRIPTION_HYDRATION_KIND = "transcription"
 _MEDIA_HYDRATION_EMPTY_KINDS = frozenset(("contact", "other"))
 _MEDIA_HYDRATION_ELIGIBILITY_SQL = (
     "SELECT 1 FROM synced_dialogs sd "
@@ -171,6 +172,54 @@ def upsert_message_transcription(  # noqa: PLR0913
     )
 
 
+def apply_message_transcription(  # noqa: PLR0913
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    *,
+    transcribed_text: str,
+    transcription_id: int,
+    received_at: int,
+    allow_missing: bool = False,
+) -> bool:
+    """Apply one final Telegram transcription through the canonical path.
+
+    The fact row, canonical message text, FTS projection, and matching
+    hydration job are changed in the caller-owned transaction.  ``allow_missing``
+    is used only for a real-time event that arrives before the message history;
+    it stores the fact for the normal message importer to overlay later.
+    """
+    text = transcribed_text.strip()
+    if not text:
+        return False
+    message = read_message_text(conn, dialog_id, message_id)
+    if not message.found and not allow_missing:
+        return False
+    upsert_message_transcription(
+        conn,
+        dialog_id,
+        message_id,
+        transcribed_text=text,
+        transcription_id=transcription_id,
+        received_at=received_at,
+    )
+    if message.found and message.text != text:
+        persist_transcribed_text(
+            conn,
+            dialog_id,
+            message_id,
+            old_text=message.text,
+            transcribed_text=text,
+            transcribed_at=received_at,
+        )
+    if HydrationQueueRepository(conn).is_available():
+        conn.execute(
+            "DELETE FROM hydration_jobs WHERE kind = ? AND dialog_id = ? AND message_id = ?",
+            (_TRANSCRIPTION_HYDRATION_KIND, dialog_id, message_id),
+        )
+    return True
+
+
 def mark_message_deleted(conn: sqlite3.Connection, dialog_id: int, message_id: int, deleted_at: int) -> bool:
     """Tombstone one message and report whether this call changed its state."""
     cursor = conn.execute(_MARK_DELETED_SQL, (deleted_at, dialog_id, message_id))
@@ -257,6 +306,26 @@ def reconcile_media_hydration_job(
     else:
         queue.remove(job)
 
+    transcription_job = HydrationJob(
+        _TRANSCRIPTION_HYDRATION_KIND,
+        message.dialog_id,
+        message.message_id,
+        due_at,
+        0,
+        message.sent_at,
+        HydrationPriority.BACKFILL,
+    )
+    transcription_row = conn.execute(
+        "SELECT 1 FROM message_transcriptions WHERE dialog_id = ? AND message_id = ?",
+        (message.dialog_id, message.message_id),
+    ).fetchone()
+    if message.media_kind == "voice" and transcription_row is None and media_hydration_eligible(
+        conn, message.dialog_id
+    ):
+        queue.enqueue(transcription_job)
+    else:
+        queue.remove(transcription_job)
+
 
 def reconcile_media_hydration_jobs_for_dialog(
     conn: sqlite3.Connection,
@@ -280,6 +349,27 @@ def reconcile_media_hydration_jobs_for_dialog(
     )
     for message_id, sent_at in rows:
         queue.enqueue(HydrationJob(_MEDIA_HYDRATION_KIND, dialog_id, int(message_id), due_at, 0, int(sent_at)))
+    voice_rows = cast(
+        Sequence[tuple[int, int]],
+        conn.execute(
+            "SELECT m.message_id, m.sent_at FROM messages m "
+            "LEFT JOIN message_transcriptions mt ON mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id "
+            "WHERE m.dialog_id = ? AND m.media_kind = 'voice' AND mt.message_id IS NULL",
+            (dialog_id,),
+        ).fetchall(),
+    )
+    for message_id, sent_at in voice_rows:
+        queue.enqueue(
+            HydrationJob(
+                _TRANSCRIPTION_HYDRATION_KIND,
+                dialog_id,
+                int(message_id),
+                due_at,
+                0,
+                int(sent_at),
+                HydrationPriority.BACKFILL,
+            )
+        )
 
 
 def _write_message_rows_and_fts(
