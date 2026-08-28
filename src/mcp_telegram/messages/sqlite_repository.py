@@ -419,7 +419,7 @@ def reconcile_fact_hydration_job(
         due_at,
         0,
         message.sent_at,
-        priority,
+        HydrationPriority.BACKFILL,
     )
     unresolved = message.media_kind in _FACT_HYDRATION_EMPTY_KINDS and message.media_payload == "{}"
     if unresolved and media_fact_hydration_eligible(conn, message.dialog_id, message.message_id):
@@ -476,7 +476,17 @@ def reconcile_fact_hydration_jobs_for_dialog(
         ).fetchall(),
     )
     for message_id, sent_at in rows:
-        queue.enqueue(HydrationJob(MEDIA_METADATA_KIND, dialog_id, int(message_id), due_at, 0, int(sent_at), priority))
+        queue.enqueue(
+            HydrationJob(
+                MEDIA_METADATA_KIND,
+                dialog_id,
+                int(message_id),
+                due_at,
+                0,
+                int(sent_at),
+                HydrationPriority.BACKFILL,
+            )
+        )
     voice_rows = cast(
         Sequence[tuple[int, int]],
         conn.execute(

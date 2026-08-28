@@ -22,6 +22,7 @@ from mcp_telegram.activity_sync import (
     _upsert_entities_from_search,
     run_activity_sync_loop,
 )
+from mcp_telegram.hydration_queue import HydrationPriority
 from mcp_telegram.sync_db import ensure_sync_schema
 
 _TEST_TIMEOUT_S = 0.05
@@ -212,6 +213,25 @@ async def test_backfill_inserts_rows(conn: sqlite3.Connection) -> None:
 
 
 @pytest.mark.asyncio
+async def test_backfill_persists_hydration_as_backfill_priority(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    priorities: list[HydrationPriority] = []
+
+    def capture_persist(_conn: sqlite3.Connection, _extracted: list[object], *, priority: HydrationPriority) -> None:
+        priorities.append(priority)
+
+    monkeypatch.setattr(activity_sync, "_persist_own_message_rows", capture_persist)
+    client = _FakeClient(
+        batches=[FakeSearchResult(messages=[_msg(100, 42, 1_700_000_100)]), FakeSearchResult(messages=[])]
+    )
+
+    await _run_backfill(client, conn, asyncio.Event(), timeout_s=120.0)
+
+    assert priorities == [HydrationPriority.BACKFILL]
+
+
+@pytest.mark.asyncio
 async def test_backfill_respects_shutdown(conn: sqlite3.Connection) -> None:
     client = _FakeClient(batches=[FakeSearchResult(messages=[_msg(100, 42, 1_700_000_000)])])
     shutdown = asyncio.Event()
@@ -276,6 +296,31 @@ async def test_incremental_only_new_messages(conn: sqlite3.Connection) -> None:
         )
     ]
     assert ids == [50, 51]
+
+
+@pytest.mark.asyncio
+async def test_incremental_persists_hydration_as_foreground_priority(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    anchor_ts = 1_700_000_000
+    with conn:
+        conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        conn.execute(
+            "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)", (str(anchor_ts),)
+        )
+    priorities: list[HydrationPriority] = []
+
+    def capture_persist(_conn: sqlite3.Connection, _extracted: list[object], *, priority: HydrationPriority) -> None:
+        priorities.append(priority)
+
+    monkeypatch.setattr(activity_sync, "_persist_own_message_rows", capture_persist)
+    client = _FakeClient(
+        batches=[FakeSearchResult(messages=[_msg(51, 42, anchor_ts + 100)]), FakeSearchResult(messages=[])]
+    )
+
+    await _run_incremental(client, conn, asyncio.Event(), timeout_s=120.0)
+
+    assert priorities == [HydrationPriority.FOREGROUND]
 
 
 @pytest.mark.asyncio

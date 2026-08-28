@@ -13,7 +13,10 @@ from telethon.errors.rpcerrorlist import PremiumAccountRequiredError  # type: ig
 from mcp_telegram.access_lifecycle import restore_access_after_revalidation
 from mcp_telegram.config import FactHydrationConfig
 from mcp_telegram.fact_hydration import MessageFactHydrationWorker
+from mcp_telegram.hydration_queue import HydrationPriority, HydrationQueueRepository
 from mcp_telegram.media_hydration import MediaFactHydrationHandler
+from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
+from mcp_telegram.messages.sqlite_repository import insert_messages_with_fts
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_rpc import TelegramRpcCircuitOpenError
 from mcp_telegram.transcription_hydration import TranscriptionHydrationHandler
@@ -142,6 +145,49 @@ def _transcription_worker(
         circuit_retry_seconds=config.circuit_retry_seconds,
         max_attempts=config.max_attempts,
         pause_between_requests_seconds=config.pause_between_requests_seconds,
+    )
+
+
+def _mixed_worker(conn: sqlite3.Connection, client: _Client, policy: FactHydrationConfig) -> MessageFactHydrationWorker:
+    return MessageFactHydrationWorker(
+        client,
+        conn,
+        asyncio.Event(),
+        handlers=(
+            MediaFactHydrationHandler(batch_size=policy.batch_size),
+            TranscriptionHydrationHandler(recheck_delay_seconds=policy.transcription_recheck_delay_seconds),
+        ),
+        interval_seconds=policy.interval_seconds,
+        max_requests_per_cycle=policy.max_requests_per_cycle,
+        max_jobs_per_cycle=policy.max_jobs_per_cycle,
+        pause_between_requests_seconds=policy.pause_between_requests_seconds,
+        retry_delay_seconds=policy.retry_delay_seconds,
+        circuit_retry_seconds=policy.circuit_retry_seconds,
+        max_attempts=policy.max_attempts,
+    )
+
+
+def _hydration_message(dialog_id: int, message_id: int, media_kind: str) -> ExtractedMessage:
+    return ExtractedMessage(
+        message=StoredMessage(
+            dialog_id=dialog_id,
+            message_id=message_id,
+            sent_at=1,
+            text=None,
+            sender_id=None,
+            sender_first_name=None,
+            reply_to_msg_id=None,
+            forum_topic_id=None,
+            edit_date=None,
+            grouped_id=None,
+            reply_to_peer_id=None,
+            out=0,
+            is_service=0,
+            post_author=None,
+            media_kind=media_kind,
+            media_payload="{}",
+        ),
+        reply_count=0,
     )
 
 
@@ -449,6 +495,77 @@ async def test_two_voice_jobs_are_scalar_and_sequential_with_budget_four(db: sql
     assert all(
         not isinstance(call["request"], (list, tuple, set, dict, range)) for call in client.calls if "request" in call
     )
+
+
+@pytest.mark.asyncio
+async def test_voice_foreground_beats_large_media_backlog(db: sqlite3.Connection) -> None:
+    for message_id in range(1, 9):
+        _seed(db, dialog_id=1, message_id=message_id)
+        db.execute(
+            "DELETE FROM hydration_jobs WHERE kind = 'media_metadata' AND dialog_id = 1 AND message_id = ?",
+            (message_id,),
+        )
+        with db:
+            insert_messages_with_fts(
+                db,
+                [_hydration_message(1, message_id, "other")],
+                priority=HydrationPriority.FOREGROUND,
+            )
+
+    _seed_voice(db, dialog_id=2)
+    db.execute("DELETE FROM hydration_jobs WHERE kind = 'transcription' AND dialog_id = 2")
+    with db:
+        insert_messages_with_fts(
+            db,
+            [_hydration_message(2, 1, "voice")],
+            priority=HydrationPriority.FOREGROUND,
+        )
+    db.execute("UPDATE hydration_jobs SET due_at = 1")
+    db.commit()
+
+    media_priorities = db.execute(
+        "SELECT priority FROM hydration_jobs WHERE kind = 'media_metadata' ORDER BY message_id"
+    ).fetchall()
+    assert media_priorities == [(int(HydrationPriority.BACKFILL),)] * 8
+    assert db.execute("SELECT priority FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (
+        int(HydrationPriority.FOREGROUND),
+    )
+    assert HydrationQueueRepository(db).due_jobs(1, 100)[0].kind == "transcription"
+
+    client = _Client(SimpleNamespace(pending=False, text="speech words", transcription_id=7))
+    policy = FactHydrationConfig(
+        batch_size=1,
+        max_jobs_per_cycle=100,
+        max_requests_per_cycle=2,
+        pause_between_requests_seconds=0.01,
+    )
+    result = await _mixed_worker(db, client, policy).run_cycle(now=1)
+
+    assert result.completed == 1
+    assert ["dialog_id" in call for call in client.calls] == [True, False]
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'media_metadata'").fetchone() == (8,)
+
+
+@pytest.mark.asyncio
+async def test_voice_jobs_request_configured_pause_without_waiting(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_voice(db, message_id=1)
+    _seed_voice(db, message_id=2)
+    requested_pauses: list[float] = []
+
+    async def capture_pause(worker: MessageFactHydrationWorker) -> bool:
+        requested_pauses.append(worker._pause_between_requests_seconds)
+        return False
+
+    monkeypatch.setattr(MessageFactHydrationWorker, "_pause_between_requests", capture_pause)
+    client = _Client(SimpleNamespace(pending=False, text="speech words", transcription_id=7))
+    policy = FactHydrationConfig(max_requests_per_cycle=4, pause_between_requests_seconds=5.0)
+
+    result = await _transcription_worker(db, client, policy).run_cycle(now=10)
+
+    assert result.completed == 2
+    assert requested_pauses == [5.0]
 
 
 @pytest.mark.asyncio
