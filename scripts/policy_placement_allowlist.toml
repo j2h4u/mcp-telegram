@@ -373,6 +373,11 @@ key = "src/mcp_telegram/reading/service.py:ReadingService._fetch_telegram_batche
 rationale = "This is internal batch result metadata, not an operator policy placement."
 
 [[entry]]
+category = "policy_call_keywords"
+key = "src/mcp_telegram/transcription_hydration.py:TranscriptionHydrationHandler.request:flood_sleep_threshold"
+rationale = "This fixed Telethon client threshold is a request-path contract, not an operator policy value."
+
+[[entry]]
 category = "policy_assignments"
 key = "src/mcp_telegram/flood.py:<module>:_ROLLUP_LOG_INTERVAL_S"
 rationale = "This is a process-local diagnostic logging cadence."
@@ -386,3 +391,8 @@ rationale = "This is a process-local diagnostic logging cadence."
 category = "policy_defaults"
 key = "src/mcp_telegram/scheduled_messages.py:run_scheduled_reconciliation_loop:interval"
 rationale = "This pre-existing worker scheduling default is retained as a compatibility contract."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/transcription_hydration.py:TranscriptionHydrationHandler:batch_size"
+rationale = "Telegram's TranscribeAudio request accepts one message per request; this is a fixed protocol contract, not an operator schedule."

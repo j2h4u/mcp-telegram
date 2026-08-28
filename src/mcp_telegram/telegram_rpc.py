@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Protocol, cast
 
 from aiolimiter import AsyncLimiter
+from telethon.utils import is_list_like  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,9 @@ class GovernedTelegramClient:
         return cast(object, getattr(self._client, name))
 
     async def __call__(self, *args: object, **kwargs: object) -> object:
+        request = args[0] if args else kwargs.get("request")
+        if request is not None and is_list_like(request):
+            raise ValueError("transport batching is forbidden; use sequential scalar calls")
         await self._governor.acquire(source="client_call")
         return await self._client(*args, **kwargs)
 

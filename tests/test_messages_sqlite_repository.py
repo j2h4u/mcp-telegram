@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from mcp_telegram.fts import stem_text
+from mcp_telegram.hydration_queue import HydrationPriority
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.messages.sqlite_repository import (
     insert_messages_with_fts,
@@ -16,6 +17,7 @@ from mcp_telegram.messages.sqlite_repository import (
     persist_edited_message,
     persist_transcribed_text,
     read_message_text,
+    upsert_message_transcription,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 
@@ -116,12 +118,32 @@ def test_message_persistence_enqueues_one_unresolved_job_and_preserves_attempts(
         "VALUES ('media_metadata', 42, 90, 100, 2)"
     )
     with conn:
-        insert_messages_with_fts(conn, [_message(90, text=None, media_kind=media_kind, media_payload="{}")])
-        insert_messages_with_fts(conn, [_message(90, text=None, media_kind=media_kind, media_payload="{}")])
+        insert_messages_with_fts(
+            conn,
+            [_message(90, text=None, media_kind=media_kind, media_payload="{}")],
+            priority=HydrationPriority.FOREGROUND,
+        )
+        insert_messages_with_fts(
+            conn,
+            [_message(90, text=None, media_kind=media_kind, media_payload="{}")],
+            priority=HydrationPriority.FOREGROUND,
+        )
     assert conn.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=42 AND message_id=90").fetchone() == (1,)
-    assert conn.execute("SELECT kind, dialog_id, message_id, attempts FROM hydration_jobs").fetchall() == [
-        ("media_metadata", 42, 90, 2)
+    assert conn.execute("SELECT kind, dialog_id, message_id, attempts, priority FROM hydration_jobs").fetchall() == [
+        ("media_metadata", 42, 90, 2, 0)
     ]
+
+
+def test_foreground_voice_persistence_keeps_transcription_foreground(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    with conn:
+        insert_messages_with_fts(
+            conn,
+            [_message(93, text=None, media_kind="voice", media_payload="{}")],
+            priority=HydrationPriority.FOREGROUND,
+        )
+
+    assert conn.execute("SELECT kind, priority FROM hydration_jobs").fetchall() == [("transcription", 1)]
 
 
 @pytest.mark.parametrize(
@@ -187,6 +209,34 @@ def test_persist_transcribed_text_versions_and_refreshes_fts(conn: sqlite3.Conne
             is None
         )
     assert conn.execute("SELECT COUNT(*) FROM message_versions WHERE dialog_id=42 AND message_id=12").fetchone() == (1,)
+
+
+def test_message_transcription_is_applied_by_canonical_bundle_writer(conn: sqlite3.Connection) -> None:
+    with conn:
+        upsert_message_transcription(conn, 42, 14, transcribed_text="voice words", transcription_id=14, received_at=400)
+        insert_messages_with_fts(conn, [_message(14, text="caption")])
+        insert_messages_with_fts(conn, [_message(14, text=None)])
+
+    assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=14").fetchone() == ("voice words",)
+    assert conn.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=42 AND message_id=14").fetchone() == (
+        stem_text("voice words"),
+    )
+    assert conn.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (1,)
+
+
+def test_existing_transcription_survives_voice_reimport(conn: sqlite3.Connection) -> None:
+    with conn:
+        upsert_message_transcription(conn, 42, 15, transcribed_text="voice words", transcription_id=15, received_at=400)
+        insert_messages_with_fts(conn, [_message(15, text="caption", media_kind="voice", media_payload="{}")])
+        insert_messages_with_fts(conn, [_message(15, text=None, media_kind="voice", media_payload="{}")])
+    assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=15").fetchone() == ("voice words",)
+
+
+def test_unrelated_media_caption_can_be_removed_on_reimport(conn: sqlite3.Connection) -> None:
+    with conn:
+        insert_messages_with_fts(conn, [_message(16, text="caption", media_kind="photo", media_payload="{}")])
+        insert_messages_with_fts(conn, [_message(16, text=None, media_kind="photo", media_payload="{}")])
+    assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=16").fetchone() == (None,)
 
 
 def test_mark_message_deleted_is_idempotent_and_retains_text_and_fts(conn: sqlite3.Connection) -> None:

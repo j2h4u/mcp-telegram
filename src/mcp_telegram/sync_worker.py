@@ -31,6 +31,7 @@ from telethon.tl import types  # type: ignore[import-untyped]
 from .access_lifecycle import set_access_lost
 from .flood import flood_seconds, sleep_through_flood
 from .history_enrollment import ensure_automatic_dm_enrollment, full_history_enabled
+from .hydration_queue import HydrationPriority
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import PeerNameClient, extract_message_row, resolve_forward_entity_name_map
 from .resolver import latinize
@@ -341,7 +342,7 @@ class FullSyncWorker:
             if not full_history_enabled(self._conn, dialog_id):
                 logger.info("sync_batch_discarded_disabled dialog_id=%d fetched=%d", dialog_id, len(rows))
                 return sync_progress, True
-            insert_messages_with_fts(self._conn, rows)
+            insert_messages_with_fts(self._conn, rows, priority=HydrationPriority.BACKFILL)
             if is_done:
                 now = int(time.time())
                 self._conn.execute(

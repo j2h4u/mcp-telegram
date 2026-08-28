@@ -366,6 +366,23 @@ def test_smoke_scripts_use_snake_case_tool_names() -> None:
         assert exposed_pascal_case.search(text) is None
 
 
+def test_integration_smoke_calls_only_registered_read_only_tools() -> None:
+    script = cast(
+        dict[str, object],
+        json.loads((_repo_root() / "devtools/mcp_client/smoke-integration.json").read_text(encoding="utf-8")),
+    )
+
+    for step in cast(list[dict[str, object]], script["steps"]):
+        if step.get("action") != "call_tool":
+            continue
+        tool_name = step.get("name")
+        assert isinstance(tool_name, str)
+        tool = server.tool_by_name.get(tool_name)
+        assert tool is not None, tool_name
+        assert tool.annotations is not None, tool_name
+        assert tool.annotations.read_only_hint is True, tool_name
+
+
 def test_no_daemon_smoke_expects_all_registered_tools_and_output_schemas() -> None:
     script = cast(
         dict[str, object],

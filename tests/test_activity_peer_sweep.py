@@ -164,7 +164,7 @@ def test_supergroup_type_selected_not_group(monkeypatch: pytest.MonkeyPatch) -> 
 
         count = asyncio.run(build_working_set(_FakeClient(), conn, timeout_s=120.0))
 
-        assert count == 1, f"Expected 1 peer (only supergroup), got {count}"
+        assert count.enrolled_count == 1, f"Expected 1 peer (only supergroup), got {count.enrolled_count}"
         row = _get_activity_row(conn, supergroup_id)
         assert row is not None, "Supergroup should be enrolled"
         assert _get_activity_row(conn, legacy_group_id) is None, "Legacy group must NOT be enrolled via supergroup path"
@@ -224,7 +224,7 @@ def test_channel_no_discussion_group_not_enrolled(monkeypatch: pytest.MonkeyPatc
 
         count = asyncio.run(build_working_set(_FakeClient(), conn, timeout_s=120.0))
 
-        assert count == 0, f"Expected 0 peers enrolled, got {count}"
+        assert count.enrolled_count == 0, f"Expected 0 peers enrolled, got {count.enrolled_count}"
         assert resolver.timeouts == [120.0]
         assert _get_activity_row(conn, channel_id) is None, "Channel with no discussion group must NOT be enrolled"
 
@@ -255,7 +255,7 @@ def test_dedup_supergroup_and_linked_chat(monkeypatch: pytest.MonkeyPatch) -> No
 
         count = asyncio.run(build_working_set(_FakeClient(), conn, timeout_s=120.0))
 
-        assert count == 1, f"Expected 1 peer (dedup), got {count}"
+        assert count.enrolled_count == 1, f"Expected 1 peer (dedup), got {count.enrolled_count}"
         row = _get_activity_row(conn, supergroup_id)
         assert row is not None
         # Source must be 'supergroup' (direct enrollment wins over linked_chat)
@@ -311,10 +311,11 @@ def test_build_working_set_floodwait_halts_pass(monkeypatch: pytest.MonkeyPatch)
             mock_resolver,
         )
 
-        asyncio.run(build_working_set(_FakeClient(), conn, timeout_s=120.0))
+        result = asyncio.run(build_working_set(_FakeClient(), conn, timeout_s=120.0))
 
         # Resolver called exactly twice: first (ok) + second (flood) → break
         assert len(call_log) == 2, f"Expected exactly 2 resolver calls, got {len(call_log)}: {call_log}"
+        assert result.flood_wait_seconds == 30
         flood_channel = call_log[1]  # second channel visited triggered FloodWait
         skipped_channel = (all_channel_ids - set(call_log)).pop()  # third, never reached
 
@@ -373,6 +374,7 @@ def test_sweep_peer_once_resolve_none_returns_access_skip(monkeypatch: pytest.Mo
         )
 
         assert calls == []
+        assert result.rpc_calls == 1, "resolution attempt is the only governed RPC"
         assert result == SweepResult(
             fetched_ids=[],
             persisted=0,
@@ -380,6 +382,109 @@ def test_sweep_peer_once_resolve_none_returns_access_skip(monkeypatch: pytest.Mo
             max_id=None,
             skip_reason=SkipReason.ACCESS_SKIP,
         )
+
+
+def test_sweep_peer_once_resolution_error_reports_rpc_and_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    with closing(_make_db()) as conn:
+
+        async def failed_resolution(client: object, dialog_id: int) -> object:
+            del client, dialog_id
+            raise RuntimeError("resolver unavailable")
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", failed_resolution)
+        result = asyncio.run(
+            sweep_peer_once(
+                client=_FakeClient(), conn=conn, dialog_id=123, offset_id=0, min_id=0, limit=10, timeout_s=1
+            )
+        )
+        assert result.skip_reason is SkipReason.ACCESS_SKIP
+        assert result.rpc_calls == 1
+        assert result.pages_fetched == 0
+        assert not result.completed
+
+
+def test_sweep_peer_once_search_error_reports_two_rpcs(monkeypatch: pytest.MonkeyPatch) -> None:
+    with closing(_make_db()) as conn:
+
+        async def resolved(client: object, dialog_id: int) -> object:
+            del client, dialog_id
+            return object()
+
+        async def failed_search(client: object, request: object, *, timeout_s: float) -> object:
+            del client, request, timeout_s
+            raise RuntimeError("search unavailable")
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", resolved)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", failed_search)
+        result = asyncio.run(
+            sweep_peer_once(
+                client=_FakeClient(), conn=conn, dialog_id=123, offset_id=0, min_id=0, limit=10, timeout_s=1
+            )
+        )
+        assert result.rpc_calls == 2
+        assert result.pages_fetched == 0
+        assert not result.completed
+
+
+def test_sweep_peer_once_extraction_error_reports_result_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    with closing(_make_db()) as conn:
+
+        async def resolved(client: object, dialog_id: int) -> object:
+            del client, dialog_id
+            return object()
+
+        async def searched(client: object, request: object, *, timeout_s: float) -> _FakeSweepResult:
+            del client, request, timeout_s
+            return _FakeSweepResult(messages=[_FakeSweepMessage(8, peer_id="keep")])
+
+        def failed_extract(request: object, batch: object) -> tuple[list[object], frozenset[tuple[int, int]]]:
+            del request, batch
+            raise RuntimeError("bad message")
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", resolved)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", searched)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep._extract_sweep_messages", failed_extract)
+        result = asyncio.run(
+            sweep_peer_once(
+                client=_FakeClient(), conn=conn, dialog_id=123, offset_id=0, min_id=0, limit=10, timeout_s=1
+            )
+        )
+        assert result.rpc_calls == 2
+        assert result.pages_fetched == 1
+        assert not result.completed
+
+
+def test_sweep_peer_once_persistence_error_reports_result_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    with closing(_make_db()) as conn:
+
+        async def resolved(client: object, dialog_id: int) -> object:
+            del client, dialog_id
+            return object()
+
+        async def searched(client: object, request: object, *, timeout_s: float) -> _FakeSweepResult:
+            del client, request, timeout_s
+            return _FakeSweepResult(messages=[_FakeSweepMessage(8, peer_id="keep")])
+
+        def extracted(request: object, batch: object) -> tuple[list[tuple[int, str]], frozenset[tuple[int, int]]]:
+            del request, batch
+            return [(101, "msg")], frozenset({(101, 8)})
+
+        def failed_insert(conn: sqlite3.Connection, rows: list[tuple[int, str]], **_kwargs: object) -> None:
+            del conn, rows
+            raise RuntimeError("database unavailable")
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", resolved)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", searched)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep._extract_sweep_messages", extracted)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.insert_messages_with_fts", failed_insert)
+        result = asyncio.run(
+            sweep_peer_once(
+                client=_FakeClient(), conn=conn, dialog_id=123, offset_id=0, min_id=0, limit=10, timeout_s=1
+            )
+        )
+        assert result.rpc_calls == 2
+        assert result.pages_fetched == 1
+        assert not result.completed
 
 
 def test_sweep_peer_once_floodwait_reports_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -421,6 +526,7 @@ def test_sweep_peer_once_floodwait_reports_seconds(monkeypatch: pytest.MonkeyPat
         assert request.offset_id == 11
         assert request.min_id == 5
         assert request.limit == 50
+        assert result.rpc_calls == 2, "resolution and reached search each count once"
         assert result == SweepResult(
             fetched_ids=[],
             persisted=0,
@@ -456,7 +562,9 @@ def test_sweep_peer_once_success_invokes_pacing_sleep(
         def fake_extract_message_row(dialog_id: int, message: _FakeSweepMessage) -> tuple[int, str]:
             return (dialog_id, f"msg-{message.id}")
 
-        def fake_insert_messages_with_fts(conn: sqlite3.Connection, rows: list[tuple[int, str]]) -> None:
+        def fake_insert_messages_with_fts(
+            conn: sqlite3.Connection, rows: list[tuple[int, str]], **_kwargs: object
+        ) -> None:
             del conn, rows
 
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
@@ -480,6 +588,7 @@ def test_sweep_peer_once_success_invokes_pacing_sleep(
             )
 
         assert sleep_calls == [_PACING.search.success_s]
+        assert result.rpc_calls == 2
         assert any(
             "sweep_peer_once_done" in record.message
             and "rpc_duration_s=" in record.message
@@ -530,6 +639,7 @@ def test_sweep_peer_once_floodwait_does_not_invoke_pacing_sleep(monkeypatch: pyt
         )
 
         assert sleep_calls == []
+        assert result.rpc_calls == 2, "a SearchRequest FloodWait still counts its attempt"
         assert result == SweepResult(
             fetched_ids=[],
             persisted=0,
@@ -571,6 +681,7 @@ def test_sweep_peer_once_timeout_returns_access_skip(monkeypatch: pytest.MonkeyP
         )
 
         assert called is True
+        assert result.rpc_calls == 2, "a timed out SearchRequest still counts its attempt"
         assert result == SweepResult(
             fetched_ids=[],
             persisted=0,
@@ -634,6 +745,7 @@ def test_sweep_peer_once_access_lost_marks_dialog_without_traceback(
         access_lost_logs = [record for record in caplog.records if "sweep_peer_once_access_lost" in record.message]
 
         assert sleep_calls == []
+        assert result.rpc_calls == 2, "an access-lost SearchRequest still counts its attempt"
         assert result == SweepResult(
             fetched_ids=[],
             persisted=0,
@@ -683,6 +795,7 @@ def test_sweep_peer_once_empty_batch_is_history_floor(monkeypatch: pytest.Monkey
             max_id=None,
             skip_reason=SkipReason.HISTORY_FLOOR,
         )
+        assert result.rpc_calls == 2
 
 
 def test_sweep_peer_once_persists_only_extractable_messages(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -710,7 +823,9 @@ def test_sweep_peer_once_persists_only_extractable_messages(monkeypatch: pytest.
         def fake_extract_message_row(dialog_id: int, message: _FakeSweepMessage) -> tuple[int, str]:
             return (dialog_id, f"msg-{message.id}")
 
-        def fake_insert_messages_with_fts(conn: sqlite3.Connection, rows: list[tuple[int, str]]) -> None:
+        def fake_insert_messages_with_fts(
+            conn: sqlite3.Connection, rows: list[tuple[int, str]], **_kwargs: object
+        ) -> None:
             del conn
             inserted.append(rows)
 
@@ -740,6 +855,66 @@ def test_sweep_peer_once_persists_only_extractable_messages(monkeypatch: pytest.
             max_id=8,
             skip_reason=SkipReason.NONE,
         )
+
+
+def test_sweep_peer_once_counts_unique_genuinely_new_keys_before_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Existing rows are replacements, while each missing key counts only once."""
+    with closing(_make_db()) as conn:
+        inserted: list[list[tuple[int, str]]] = []
+        conn.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (101, 8, 1)")
+        conn.commit()
+
+        async def fake_resolve_input_peer(client: object, dialog_id: int) -> object:
+            del client, dialog_id
+            return object()
+
+        async def fake_call_with_timeout(client: object, request: object, *, timeout_s: float) -> _FakeSweepResult:
+            del client, request, timeout_s
+            return _FakeSweepResult(
+                messages=[
+                    _FakeSweepMessage(8, peer_id="keep"),
+                    _FakeSweepMessage(8, peer_id="keep"),
+                    _FakeSweepMessage(5, peer_id="keep"),
+                ]
+            )
+
+        def fake_extract_dialog_id(message: _FakeSweepMessage) -> int | None:
+            return 101 if message.peer_id == "keep" else None
+
+        def fake_extract_message_row(dialog_id: int, message: _FakeSweepMessage) -> tuple[int, str]:
+            return (dialog_id, f"msg-{message.id}")
+
+        def fake_insert_messages_with_fts(
+            conn: sqlite3.Connection, rows: list[tuple[int, str]], **_kwargs: object
+        ) -> None:
+            del conn
+            inserted.append(rows)
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.extract_dialog_id", fake_extract_dialog_id)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.extract_message_row", fake_extract_message_row)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.insert_messages_with_fts", fake_insert_messages_with_fts)
+
+        result = asyncio.run(
+            sweep_peer_once(
+                client=_FakeClient(),
+                conn=conn,
+                dialog_id=222,
+                offset_id=13,
+                min_id=6,
+                limit=30,
+                timeout_s=_TEST_TIMEOUT_S,
+            )
+        )
+
+        assert inserted == [[(101, "msg-8"), (101, "msg-5")]]
+        assert result.genuinely_new == 1
+        assert result.genuinely_new_keys == frozenset({(101, 5)})
+        assert result.pages_fetched == 1
+        assert result.rpc_calls == 2
 
 
 # ---------------------------------------------------------------------------

@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [build-system]
-requires = ["setuptools>=83.0.0"]
+requires = ["setuptools>=84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [dependency-groups]
@@ -41,7 +41,7 @@ dev = [
     "basedpyright>=1.39.9",
     "pytest-crap>=0.3.0",
     "radon>=6.0.1",
-    "setuptools>=83.0.0",
+    "setuptools>=84.0.0",
     "deptry>=0.25.1",
     "tach>=0.35",
 ]
