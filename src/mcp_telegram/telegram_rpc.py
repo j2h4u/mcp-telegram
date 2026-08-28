@@ -108,7 +108,6 @@ class TelegramRpcGate(TelegramClient):
             raise ValueError("cooldown_buffer_seconds must be >= 0")
         if any(delay < 0 for delay in transient_retry_delays_seconds):
             raise ValueError("transient retry delays must be >= 0")
-        self._rpc_budget = rpc_budget
         self._rpc_circuit_status = circuit_status
         self._fallback_wait_seconds = fallback_wait_seconds
         self._cooldown_buffer_seconds = cooldown_buffer_seconds
@@ -127,6 +126,7 @@ class TelegramRpcGate(TelegramClient):
         self, request: object, ordered: bool = False, flood_sleep_threshold: int | None = None
     ) -> object:
         """Admit one scalar logical RPC and invoke Telethon."""
+        del flood_sleep_threshold  # The gate always uses the client-level zero threshold.
         if request is not None and is_list_like(request):
             raise ValueError("transport batching is forbidden; use sequential scalar calls")
         for retry_index, delay in enumerate((0.0, *self._transient_retry_delays)):
