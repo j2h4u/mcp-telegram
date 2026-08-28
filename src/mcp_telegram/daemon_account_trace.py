@@ -16,6 +16,7 @@ from telethon.tl.functions.contacts import ResolveUsernameRequest  # type: ignor
 from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_peer_sweep import enroll_activity_dialog
 from .daemon_message import fetch_text_links
+from .hydration_queue import HydrationPriority
 from .message_content import MessageSnapshot, project_message_content
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
@@ -1243,7 +1244,11 @@ async def _resolve_trace_account_signature_scope(
 
     linked_chat_map: dict[int, int] = {exact_dialog_id: resolution.linked_chat_id}
     scope_dialog_ids = [exact_dialog_id, resolution.linked_chat_id]
-    enroll_activity_dialog(deps.conn, resolution.linked_chat_id, source="linked_chat")
+    enroll_activity_dialog(
+        deps.conn,
+        resolution.linked_chat_id,
+        source="linked_chat",
+    )
     return scope_dialog_ids, linked_chat_map
 
 
@@ -1480,7 +1485,7 @@ def _split_trace_duplicate_messages(
 
 def _persist_trace_messages(conn: sqlite3.Connection, messages: list[ExtractedMessage]) -> None:
     with conn:
-        insert_messages_with_fts(conn, messages)
+        insert_messages_with_fts(conn, messages, priority=HydrationPriority.BACKFILL)
 
 
 _TRACE_FRAGMENT_STATUSES = {
@@ -2247,7 +2252,11 @@ def _add_trace_candidate_dialog(
     if strategy == "signature_only" and dialog_id in linked_chat_map:
         linked_id = linked_chat_map[dialog_id]
         if linked_id not in state.seen:
-            enroll_activity_dialog(request.conn, linked_id, source="linked_chat")
+            enroll_activity_dialog(
+                request.conn,
+                linked_id,
+                source="linked_chat",
+            )
             _add_trace_candidate_dialog(
                 state=state,
                 dialog_id=linked_id,

@@ -13,7 +13,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 37
+_CURRENT_SCHEMA_VERSION = 41
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,17 @@ CREATE TABLE IF NOT EXISTS message_versions (
     old_text    TEXT,
     edit_date   INTEGER,
     PRIMARY KEY (dialog_id, message_id, version)
+) WITHOUT ROWID
+"""
+
+_MESSAGE_TRANSCRIPTIONS_DDL = """
+CREATE TABLE IF NOT EXISTS message_transcriptions (
+    dialog_id        INTEGER NOT NULL,
+    message_id       INTEGER NOT NULL,
+    text             TEXT NOT NULL CHECK (trim(text) <> ''),
+    transcription_id INTEGER NOT NULL,
+    received_at      INTEGER NOT NULL,
+    PRIMARY KEY (dialog_id, message_id)
 ) WITHOUT ROWID
 """
 
@@ -593,7 +604,7 @@ INSERT OR IGNORE INTO scheduled_sync_state (key) VALUES ('account')
 # v37: durable media-fact hydration scheduling.  The queue identity includes
 # the fact kind so future hydration workers can use separate policies without
 # introducing another table or a nullable discriminator.
-_HYDRATION_JOBS_DDL = """
+_HYDRATION_JOBS_V37_DDL = """
 CREATE TABLE IF NOT EXISTS hydration_jobs (
     kind       TEXT NOT NULL,
     dialog_id  INTEGER NOT NULL,
@@ -604,9 +615,29 @@ CREATE TABLE IF NOT EXISTS hydration_jobs (
 ) WITHOUT ROWID
 """
 
-_HYDRATION_JOBS_DUE_INDEX_DDL = """
+_HYDRATION_JOBS_V37_DUE_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_hydration_jobs_due
 ON hydration_jobs(due_at, kind, dialog_id, message_id)
+"""
+
+# v40: exactly two service classes. Newly observed or explicitly requested
+# work is foreground; the migration-created historical remainder is backfill.
+_HYDRATION_JOBS_DDL = """
+CREATE TABLE IF NOT EXISTS hydration_jobs (
+    kind       TEXT NOT NULL,
+    dialog_id  INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    due_at     INTEGER NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    priority   INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1)),
+    message_sent_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, dialog_id, message_id)
+) WITHOUT ROWID
+"""
+
+_HYDRATION_JOBS_DUE_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_hydration_jobs_due
+ON hydration_jobs(due_at, priority DESC, message_sent_at DESC, kind, dialog_id, message_id)
 """
 
 _HYDRATION_JOBS_SEED_SQL = """
@@ -616,7 +647,18 @@ FROM messages m
 JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
 JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
 WHERE sd.status IN ('syncing', 'synced')
-  AND m.media_kind IN ('contact', 'other') AND m.media_payload = '{}'
+  AND m.is_deleted = 0 AND m.media_kind IN ('contact', 'other') AND m.media_payload = '{}'
+"""
+
+_TRANSCRIPTION_HYDRATION_JOBS_SEED_SQL = """
+INSERT OR IGNORE INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at)
+SELECT 'transcription', m.dialog_id, m.message_id, CAST(strftime('%s', 'now') AS INTEGER), 0, 0, m.sent_at
+FROM messages m
+JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
+JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
+LEFT JOIN message_transcriptions mt ON mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id
+WHERE sd.status IN ('syncing', 'synced')
+  AND m.is_deleted = 0 AND m.media_kind = 'voice' AND mt.message_id IS NULL
 """
 
 
@@ -1480,6 +1522,7 @@ def _apply_migration_37(conn: sqlite3.Connection, current: int) -> int:
             "AND tbl_name IN ('messages', 'scheduled_messages')"
         ).fetchall(),
     )
+
     # Indexes whose key used the removed presentation column cannot survive
     # the new physical schema.  Keep all unrelated (including custom) indexes
     # and intentionally discard only those obsolete definitions.
@@ -1594,11 +1637,59 @@ FROM scheduled_messages_v36""",
             "DROP TABLE scheduled_messages_v36",
             "ALTER TABLE scheduled_messages_v37 RENAME TO scheduled_messages",
             *index_stmts,
-            _HYDRATION_JOBS_DDL,
-            _HYDRATION_JOBS_DUE_INDEX_DDL,
+            _HYDRATION_JOBS_V37_DDL,
+            _HYDRATION_JOBS_V37_DUE_INDEX_DDL,
             _HYDRATION_JOBS_SEED_SQL,
         ],
     )
+
+
+def _apply_migration_38(conn: sqlite3.Connection, current: int) -> int:
+    """Persist final Telegram transcription facts without historical backfill."""
+    return _apply_migration(conn, current, 38, [_MESSAGE_TRANSCRIPTIONS_DDL])
+
+
+def _apply_migration_39(conn: sqlite3.Connection, current: int) -> int:
+    """Add durable adaptive HotSweep cadence state."""
+    return _apply_migration(
+        conn,
+        current,
+        39,
+        [
+            "ALTER TABLE activity_dialog_state ADD COLUMN hot_next_due_at INTEGER",
+            "ALTER TABLE activity_dialog_state ADD COLUMN hot_empty_streak INTEGER NOT NULL DEFAULT 0 CHECK (hot_empty_streak >= 0)",
+            (
+                "CREATE INDEX IF NOT EXISTS idx_activity_dialog_state_hot_due "
+                "ON activity_dialog_state(hot_next_due_at, dialog_id, hot_next_retry_at)"
+            ),
+        ],
+    )
+
+
+def _apply_migration_40(conn: sqlite3.Connection, current: int) -> int:
+    """Prioritize foreground hydration ahead of historical backfill."""
+    return _apply_migration(
+        conn,
+        current,
+        40,
+        [
+            "DROP INDEX IF EXISTS idx_hydration_jobs_due",
+            ("ALTER TABLE hydration_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1))"),
+            "ALTER TABLE hydration_jobs ADD COLUMN message_sent_at INTEGER NOT NULL DEFAULT 0",
+            (
+                "UPDATE hydration_jobs SET message_sent_at = COALESCE(("
+                "SELECT sent_at FROM messages WHERE messages.dialog_id = hydration_jobs.dialog_id "
+                "AND messages.message_id = hydration_jobs.message_id), 0)"
+            ),
+            _HYDRATION_JOBS_DUE_INDEX_DDL,
+        ],
+        ignore_duplicate_column=True,
+    )
+
+
+def _apply_migration_41(conn: sqlite3.Connection, current: int) -> int:
+    """Seed low-priority transcription hydration for existing voice messages."""
+    return _apply_migration(conn, current, 41, [_TRANSCRIPTION_HYDRATION_JOBS_SEED_SQL])
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
@@ -1635,6 +1726,10 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_35(conn, current)
     current = _apply_migration_36(conn, current)
     current = _apply_migration_37(conn, current)
+    current = _apply_migration_38(conn, current)
+    current = _apply_migration_39(conn, current)
+    current = _apply_migration_40(conn, current)
+    current = _apply_migration_41(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

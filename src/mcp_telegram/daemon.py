@@ -25,6 +25,8 @@ Event handlers:
 Delta catch-up:
 - connect() called with catch_up=True — Telethon replays missed updates via PTS
   on reconnect after handlers are already registered.
+- reconnect_catch_up_loop polls public connection state and invokes public
+  catch_up() once per observed disconnected→connected transition.
 - DeltaSyncWorker.run_delta_catch_up() fills forward gaps for all 'synced'
   dialogs before bootstrap_dms() enrolls new ones.
 
@@ -76,6 +78,7 @@ from .delta_sync import (
 )
 from .dialog_sync import DialogsBootstrapWorker, run_reconciliation_loop
 from .event_handlers import EventHandlerManager
+from .fact_hydration import MessageFactHydrationWorker
 from .feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
 from .feedback_service import FeedbackApplicationService
 from .flood import (
@@ -92,16 +95,19 @@ from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .folders.telegram_adapter import FolderClient, TelethonTelegramFolderGateway
 from .folders.worker import FolderProjectionWorker
 from .fts import backfill_fts_index
-from .media_hydration import MediaHydrationWorker
+from .hydration_queue import HydrationPriority
+from .media_hydration import MediaFactHydrationHandler
 from .message_fact_refresh import (
     MessageFactRefreshPolicy,
     run_message_fact_refresh_loop,
 )
+from .messages.sqlite_repository import reconcile_fact_hydration_jobs_for_dialog
 from .own_only import OwnOnlyContext, ensure_own_only_schema
 from .reactions.refresh import ReactionFreshener
 from .reactions.sqlite_repository import SQLiteReactionSnapshotRepository
 from .reactions.telegram_adapter import TelethonTelegramReactionGateway
 from .read_state import apply_read_cursor
+from .reconnect import run_reconnect_catch_up_loop
 from .scheduled_messages import ScheduledReconciliationPolicy, run_scheduled_reconciliation_loop
 from .state import StatePaths, ensure_private_state_dir
 from .sync_db import (
@@ -123,6 +129,7 @@ from .telegram_rpc import (
 from .topics.refresh import TopicRefresher
 from .topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from .topics.telegram_adapter import TelethonTelegramTopicGateway, TopicClient
+from .transcription_hydration import TranscriptionHydrationHandler
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +140,8 @@ class _DaemonClient(Protocol):
     def remove_event_handler(self, _callback: object) -> None: ...
 
     def is_connected(self) -> bool: ...
+
+    async def catch_up(self) -> None: ...
 
     async def connect(self) -> None: ...
 
@@ -215,8 +224,6 @@ class _SyncLoopState:
     sync_start: float
     last_heartbeat: float
     last_gap_scan: float
-    last_hb_msg_count: int
-    last_hb_mono: float
     was_idle: bool = False
 
 
@@ -232,7 +239,7 @@ class _SyncMainContext:
     api_server: DaemonAPIServer
     topic_refresher: TopicRefresher
     folder_projection_worker: FolderProjectionWorker
-    media_hydration_worker: MediaHydrationWorker
+    fact_hydration_worker: MessageFactHydrationWorker
     socket_path: Path
     unix_server: asyncio.AbstractServer | None = None
     handler_manager: EventHandlerManager | None = None
@@ -616,14 +623,12 @@ async def _sleep_read_pos_batch(shutdown_event: asyncio.Event, pause_seconds: fl
 # ---------------------------------------------------------------------------
 
 
-def _fetch_heartbeat_stats(conn: sqlite3.Connection) -> tuple[dict[str, int], int]:
+def _fetch_heartbeat_stats(conn: sqlite3.Connection) -> dict[str, int]:
     stats_rows = cast(
         list[tuple[str, int]],
         conn.execute("SELECT status, COUNT(*) FROM synced_dialogs GROUP BY status").fetchall(),
     )
-    stats = dict(stats_rows)
-    msg_count_row = cast(tuple[int], conn.execute("SELECT COUNT(*) FROM messages").fetchone())
-    return stats, int(msg_count_row[0])
+    return dict(stats_rows)
 
 
 def _format_heartbeat_eta(sync_start: float, synced: int, total: int, now_mono: float) -> str:
@@ -645,44 +650,26 @@ def _log_heartbeat(
     conn: sqlite3.Connection,
     client: _DaemonClient,
     sync_start: float,
-    prev_msg_count: int,
-    prev_mono: float,
-) -> tuple[int, float]:
-    """Log heartbeat with sync stats, interval-based rate, and ETA from sync.db.
-
-    Rate is computed over the heartbeat interval (since the last call), not
-    since daemon startup — so an idle daemon shows 0msg/s instead of a stale
-    decaying lifetime average.
-
-    Returns (current_msg_count, current_mono) for the caller to feed into the
-    next invocation.
-    """
+) -> None:
+    """Log heartbeat with sync stats and ETA from sync.db."""
     try:
-        stats, msg_count = _fetch_heartbeat_stats(conn)
+        stats = _fetch_heartbeat_stats(conn)
     except sqlite3.DatabaseError:
         logger.warning("heartbeat_stats_failed", exc_info=True)
         stats = {}
-        msg_count = 0
     synced = int(stats.get("synced", 0) or 0)
     syncing = int(stats.get("syncing", 0) or 0)
     total = synced + syncing + int(stats.get("not_synced", 0) or 0)
 
     now_mono = time.monotonic()
-    interval = now_mono - prev_mono
-    delta = max(0, msg_count - int(prev_msg_count or 0))
-    rate = delta / interval if interval > 0 else 0.0
-
     logger.debug(
-        "heartbeat — connected=%s dialogs=%d/%d messages=%d rate=%.0fmsg/s%s",
+        "heartbeat — connected=%s dialogs=%d/%d%s",
         client.is_connected(),
         synced,
         total,
-        msg_count,
-        rate,
         _format_heartbeat_eta(sync_start, synced, total, now_mono),
     )
     maybe_log_flood_wait_rollup(logger)
-    return msg_count, now_mono
 
 
 # ---------------------------------------------------------------------------
@@ -703,13 +690,7 @@ async def _maybe_heartbeat_and_gap_scan(
     now_mono = time.monotonic()
 
     if now_mono - state.last_heartbeat >= HEARTBEAT_INTERVAL_S:
-        state.last_hb_msg_count, state.last_hb_mono = _log_heartbeat(
-            conn,
-            client,
-            state.sync_start,
-            state.last_hb_msg_count,
-            state.last_hb_mono,
-        )
+        _log_heartbeat(conn, client, state.sync_start)
         handler_manager.refresh_synced_dialogs()
         state.last_heartbeat = now_mono
 
@@ -730,17 +711,10 @@ async def _run_sync_loop(
 ) -> None:
     """Run the batch-sync loop with periodic heartbeat and gap scan."""
     sync_start = time.monotonic()
-    try:
-        last_hb_row = cast(tuple[int], conn.execute("SELECT COUNT(*) FROM messages").fetchone())
-        last_hb_msg_count = int(last_hb_row[0])
-    except sqlite3.DatabaseError:
-        last_hb_msg_count = 0
     state = _SyncLoopState(
         sync_start=sync_start,
         last_heartbeat=sync_start,
         last_gap_scan=sync_start,
-        last_hb_msg_count=last_hb_msg_count,
-        last_hb_mono=sync_start,
     )
 
     while not shutdown_event.is_set():
@@ -941,6 +915,12 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - com
         feedback_service,
         db_path,
         reaction_freshener=reaction_freshener,
+        hydration_requester=lambda hydration_conn, dialog_id, due_at: reconcile_fact_hydration_jobs_for_dialog(
+            hydration_conn,
+            dialog_id,
+            due_at=due_at,
+            priority=HydrationPriority.BACKFILL,
+        ),
         topic_refresher=topic_refresher,
         policy=DaemonApiPolicy(
             read_at_ttl_seconds=config.freshness.read_receipts.read_at_ttl_seconds,
@@ -983,18 +963,23 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - com
             shutdown_event,
             config.scheduling.folder_projection,
         ),
-        media_hydration_worker=MediaHydrationWorker(
+        fact_hydration_worker=MessageFactHydrationWorker(
             client,
             conn,
             shutdown_event,
-            interval_seconds=scheduling.media_hydration.interval_seconds,
-            max_requests_per_cycle=scheduling.media_hydration.max_requests_per_cycle,
-            max_jobs_per_cycle=scheduling.media_hydration.max_jobs_per_cycle,
-            batch_size=scheduling.media_hydration.batch_size,
-            pause_between_requests_seconds=scheduling.media_hydration.pause_between_requests_seconds,
-            retry_delay_seconds=scheduling.media_hydration.retry_delay_seconds,
-            circuit_retry_seconds=scheduling.media_hydration.circuit_retry_seconds,
-            max_attempts=scheduling.media_hydration.max_attempts,
+            handlers=(
+                MediaFactHydrationHandler(batch_size=scheduling.fact_hydration.batch_size),
+                TranscriptionHydrationHandler(
+                    recheck_delay_seconds=scheduling.fact_hydration.transcription_recheck_delay_seconds,
+                ),
+            ),
+            interval_seconds=scheduling.fact_hydration.interval_seconds,
+            max_requests_per_cycle=scheduling.fact_hydration.max_requests_per_cycle,
+            max_jobs_per_cycle=scheduling.fact_hydration.max_jobs_per_cycle,
+            pause_between_requests_seconds=scheduling.fact_hydration.pause_between_requests_seconds,
+            retry_delay_seconds=scheduling.fact_hydration.retry_delay_seconds,
+            circuit_retry_seconds=scheduling.fact_hydration.circuit_retry_seconds,
+            max_attempts=scheduling.fact_hydration.max_attempts,
         ),
         socket_path=socket_path,
         unix_server=unix_server,
@@ -1170,7 +1155,7 @@ async def _start_followup_background_tasks(
         ),
         name="message_fact_refresh_loop",
     )
-    _create_tracked_task(ctx, ctx.media_hydration_worker.run(), name="media_hydration_worker")
+    _create_tracked_task(ctx, ctx.fact_hydration_worker.run(), name="message_fact_hydration_worker")
     _create_tracked_task(
         ctx,
         run_access_probe_loop(
@@ -1198,7 +1183,7 @@ async def _start_followup_background_tasks(
             activity_client,
             ctx.conn,
             ctx.shutdown_event,
-            interval=ctx.scheduling.activity_hot_sweep_seconds,
+            policy=ctx.scheduling.activity_hot_sweep,
             timeout_s=ctx.scheduling.activity_rpc_timeout_seconds,
         ),
         name="activity_hot_sweep",
@@ -1308,6 +1293,19 @@ async def sync_main() -> None:
 
         if not await _connect_telegram(ctx):
             return
+
+        # Telethon owns initial catch-up through catch_up=True. Keep the
+        # application-owned transition watcher live for the rest of startup
+        # and the daemon lifetime so transient reconnects are observed too.
+        _create_tracked_task(
+            ctx,
+            run_reconnect_catch_up_loop(
+                ctx.client,
+                ctx.shutdown_event,
+                interval_seconds=ctx.scheduling.reconnect_catch_up_interval_seconds,
+            ),
+            name="reconnect_catch_up_loop",
+        )
 
         await _prime_runtime(ctx)
 

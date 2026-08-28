@@ -311,6 +311,7 @@ def make_server(
     client: object | None = None,
     feedback_conn: sqlite3.Connection | None = None,
     topic_refresher: TopicRefresher | None = None,
+    hydration_requester: Callable[[sqlite3.Connection, int, int], None] | None = None,
 ) -> DaemonAPIServer:
     """Return a DaemonAPIServer wired to in-memory DB and mock client."""
     if conn is None:
@@ -332,6 +333,7 @@ def make_server(
         shutdown_event,
         FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn)),
         reaction_freshener=make_reaction_freshener(conn, client),
+        hydration_requester=hydration_requester,
         topic_refresher=topic_refresher,
         policy=make_daemon_api_policy(),
     )
@@ -488,6 +490,18 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             old_text    TEXT,
             edit_date   INTEGER,
             PRIMARY KEY (dialog_id, message_id, version)
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_transcriptions (
+            dialog_id        INTEGER NOT NULL,
+            message_id       INTEGER NOT NULL,
+            text             TEXT NOT NULL CHECK (trim(text) <> ''),
+            transcription_id INTEGER NOT NULL,
+            received_at      INTEGER NOT NULL,
+            PRIMARY KEY (dialog_id, message_id)
         ) WITHOUT ROWID
         """
     )
@@ -2324,7 +2338,8 @@ async def test_mark_dialog_for_sync_ignores_existing() -> None:
     """mark_dialog_for_sync on already-synced dialog keeps status and requests delta refresh."""
     conn = _make_db()
     _insert_synced_dialog(conn, 42, status="synced")
-    server = make_server(conn)
+    hydration_requests: list[tuple[sqlite3.Connection, int, int]] = []
+    server = make_server(conn, hydration_requester=lambda *request: hydration_requests.append(request))
     result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 42, "enable": True})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
@@ -2337,6 +2352,11 @@ async def test_mark_dialog_for_sync_ignores_existing() -> None:
     assert row is not None
     assert row[0] == "synced"  # NOT overwritten
     assert isinstance(row[1], int)
+    assert len(hydration_requests) == 1
+    requested_conn, requested_dialog_id, requested_at = hydration_requests[0]
+    assert requested_conn is conn
+    assert requested_dialog_id == 42
+    assert isinstance(requested_at, int)
 
 
 @pytest.mark.asyncio
@@ -7285,6 +7305,8 @@ def _make_trace_db() -> sqlite3.Connection:
             hot_cursor          INTEGER,
             hot_last_sync_at    INTEGER,
             hot_next_retry_at   INTEGER,
+            hot_next_due_at     INTEGER,
+            hot_empty_streak    INTEGER NOT NULL DEFAULT 0 CHECK (hot_empty_streak >= 0),
             hot_last_error      TEXT,
             cold_offset_id      INTEGER,
             cold_status         TEXT NOT NULL DEFAULT 'pending',

@@ -202,7 +202,9 @@ async def test_transcription_disable_after_precheck_skips_body_fts_and_version(
         # TRANSCRIPTION's initial precheck is immediately followed by reads;
         # flip authorization before its guarded write transaction starts.
         _install_disable_hook(manager, disable_conn, dialog_id=dialog_id, trigger_call=1)
-        update = SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=message_id, text="voice after", pending=False)
+        update = SimpleNamespace(
+            peer=PeerUser(user_id=dialog_id), msg_id=message_id, text="voice after", pending=False, transcription_id=1
+        )
         await manager.on_raw_transcribed_audio(update)
 
         assert _message_text(handler_conn, dialog_id, message_id) == "voice before"
@@ -228,7 +230,9 @@ async def test_transcription_enabled_path_still_updates_body_fts_and_version(
     )
     try:
         manager = EventHandlerManager(mock_client, handler_conn, shutdown_event, mock_client.get_input_entity)
-        update = SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=message_id, text="voice after", pending=False)
+        update = SimpleNamespace(
+            peer=PeerUser(user_id=dialog_id), msg_id=message_id, text="voice after", pending=False, transcription_id=2
+        )
         await manager.on_raw_transcribed_audio(update)
 
         assert _message_text(handler_conn, dialog_id, message_id) == "voice after"

@@ -97,13 +97,15 @@ async def test_own_only_rejects_inbound_new_edit_reaction_transcription_delete(
     await manager.on_new_message(SimpleNamespace(chat_id=42, is_private=False, message=inbound))
     await manager.on_message_edited(SimpleNamespace(chat_id=42, message=inbound))
     await manager.on_raw_reaction_update(SimpleNamespace(peer=PeerUser(user_id=42), msg_id=1))
-    await manager.on_raw_transcribed_audio(SimpleNamespace(peer=PeerUser(user_id=42), msg_id=1, text="speech"))
+    await manager.on_raw_transcribed_audio(
+        SimpleNamespace(peer=PeerUser(user_id=42), msg_id=1, text="speech", transcription_id=1)
+    )
     await manager.on_message_deleted(SimpleNamespace(chat_id=42, deleted_ids=[1]))
     assert sync_db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
     assert sync_db.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0] == 0
     assert sync_db.execute("SELECT COUNT(*) FROM message_versions").fetchone()[0] == 0
     assert sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=42").fetchone()[0] is None
-    assert client.get_messages.await_count == 1
+    assert client.get_messages.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -160,7 +162,9 @@ async def test_own_only_allows_existing_outgoing_updates(sync_db: sqlite3.Connec
     edited = build_mock_message(id=1, text="new")
     await manager.on_message_edited(SimpleNamespace(chat_id=42, message=edited))
     await manager.on_raw_reaction_update(SimpleNamespace(peer=PeerUser(user_id=42), msg_id=1))
-    await manager.on_raw_transcribed_audio(SimpleNamespace(peer=PeerUser(user_id=42), msg_id=1, text="speech"))
+    await manager.on_raw_transcribed_audio(
+        SimpleNamespace(peer=PeerUser(user_id=42), msg_id=1, text="speech", transcription_id=1)
+    )
     await manager.on_message_deleted(SimpleNamespace(chat_id=42, deleted_ids=[1]))
     assert sync_db.execute("SELECT text, out, is_deleted FROM messages WHERE message_id=1").fetchone() == (
         "speech",
