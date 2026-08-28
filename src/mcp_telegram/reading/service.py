@@ -48,9 +48,7 @@ from .scheduled_projection import (
     scheduled_summary_by_dialog,
 )
 from .sqlite_projection import (
-    _BATCHED_UNREAD_COUNTS_SQL,
     _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL,
-    _COUNT_MESSAGES_BY_DIALOG_SQL,
     _COUNT_READ_POSITION_PENDING_SQL,
     _FETCH_UNREAD_MESSAGES_SQL,
     _GET_READ_POSITION_SQL,
@@ -1183,16 +1181,15 @@ class ReadingService:
         )
         return dialog_filter.normalized in name_norm or matches_acronym or matches_fuzzy
 
-    def _shape_dialog_row(  # noqa: PLR0913, PLR0917
+    def _shape_dialog_row(
         self,
         row: Mapping[str, object],
-        local_counts: dict[int, int],
-        unread_counts: dict[int, tuple[int, int]],
         dialog_filter: _ListDialogsFilter,
         scheduled_summary: tuple[int, int | None] = (0, None),
         inclusion_basis: tuple[str, ...] | None = None,
     ) -> tuple[dict[str, object] | None, int | None]:
         d_id = _object_to_int(row["dialog_id"])
+        local_count = _object_to_int(row["local_message_count"], 0)
         if not self._dialog_row_matches_filter(dialog_filter, _object_to_str_or_none(row["name"])):
             return None, None
 
@@ -1213,7 +1210,7 @@ class ReadingService:
             "sync_status": row["sync_status"] if row["sync_status"] is not None else "not_synced",
             "sync_coverage_pct": compute_sync_coverage(
                 _object_to_int_or_none(row["total_messages"]),
-                local_counts.get(d_id, 0),
+                local_count,
             ),
             **build_sync_read_model(
                 status=str(row["sync_status"] or "not_synced"),
@@ -1222,7 +1219,7 @@ class ReadingService:
                     _object_to_int_or_none(row["last_event_at"]),
                     _object_to_int_or_none(row["last_delta_checked_at"]),
                 ),
-                local_count=local_counts.get(d_id, 0),
+                local_count=local_count,
                 total_messages=_object_to_int_or_none(row["total_messages"]),
             ),
             "access_lost_at": row["access_lost_at"],
@@ -1231,9 +1228,8 @@ class ReadingService:
             **ReadingService._dialog_lifecycle_fields(row, scheduled_summary, inclusion_basis),
         }
         if DialogType.parse(_object_to_str_or_none(row["type"])) == DialogType.USER:
-            in_cnt, out_cnt = unread_counts.get(d_id, (0, 0))
-            row_data["unread_in"] = in_cnt
-            row_data["unread_out"] = out_cnt
+            row_data["unread_in"] = _object_to_int(row["unread_in"], 0)
+            row_data["unread_out"] = _object_to_int(row["unread_out"], 0)
         return row_data, _object_to_int_or_none(row["snapshot_at"])
 
     @staticmethod
@@ -2152,17 +2148,6 @@ class ReadingService:
                 "message": "scope must be all or own_only",
             }
         dialog_filter = self._prepare_list_dialogs_filter(request.filter_raw)
-        local_counts = {
-            _object_to_int(_row_sequence(row)[0]): _object_to_int(_row_sequence(row)[1], 0)
-            for row in _fetchall_rows(conn.execute(_COUNT_MESSAGES_BY_DIALOG_SQL))
-        }
-        unread_counts = {
-            _object_to_int(_row_sequence(row)[0]): (
-                _object_to_int(_row_sequence(row)[1], 0),
-                _object_to_int(_row_sequence(row)[2], 0),
-            )
-            for row in _fetchall_rows(conn.execute(_BATCHED_UNREAD_COUNTS_SQL))
-        }
         scheduled_summary = scheduled_summary_by_dialog(conn, scheduled_now=int(time.time()))
         own_basis = self._own_only_basis_by_dialog(conn)
         sql_rows = self._fetch_list_dialog_rows(conn, request, dialog_filter)
@@ -2194,8 +2179,6 @@ class ReadingService:
                 continue
             row_data, snapshot_at = self._shape_dialog_row(
                 row,
-                local_counts,
-                unread_counts,
                 dialog_filter,
                 summary,
                 own_basis.get(dialog_id) if own_basis is not None else None,

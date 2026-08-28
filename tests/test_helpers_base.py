@@ -97,11 +97,8 @@ async def test_maybe_heartbeat_fires_when_interval_elapsed():
     cursor_fetchall = MagicMock(return_value=[("synced", 1)])
     mock_cursor = MagicMock()
     mock_cursor.fetchall = cursor_fetchall
-    cursor_fetchone = MagicMock(return_value=(10,))
-    mock_fetchone = MagicMock()
-    mock_fetchone.fetchone = cursor_fetchone
     execute = MagicMock()
-    execute.side_effect = [mock_cursor, mock_fetchone]
+    execute.return_value = mock_cursor
     conn_mock.execute = execute
     conn = cast(sqlite3.Connection, conn_mock)
 
@@ -123,8 +120,6 @@ async def test_maybe_heartbeat_fires_when_interval_elapsed():
         sync_start=sync_start,
         last_heartbeat=old_heartbeat,
         last_gap_scan=old_gap_scan,
-        last_hb_msg_count=0,
-        last_hb_mono=old_heartbeat,
     )
 
     new_state = await _maybe_heartbeat_and_gap_scan(
@@ -160,8 +155,6 @@ async def test_maybe_heartbeat_skips_when_recent():
         sync_start=now,
         last_heartbeat=now,
         last_gap_scan=now,
-        last_hb_msg_count=0,
-        last_hb_mono=now,
     )
 
     new_state = await _maybe_heartbeat_and_gap_scan(

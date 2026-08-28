@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
+from mcp_telegram.reading.sqlite_projection import _LIST_DIALOGS_SQL
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
@@ -392,38 +393,65 @@ async def test_list_dialogs_zero_telegram_api_calls_for_unread_query() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_list_dialogs_query_uses_messages_pk_index() -> None:
-    """AC-12 hard guard: the batched unread-counts query must traverse the
-    messages PRIMARY KEY (which IS the table for WITHOUT ROWID messages).
+async def test_list_dialogs_candidate_aggregate_filters_before_messages() -> None:
+    """The production projection aggregates only SQL-visible candidates.
 
-    The assertion is structural: the plan must reference either the PK / index
-    on `messages` or a SCAN of `messages` (which, for a WITHOUT ROWID table,
-    is a scan of the PK B-tree — equivalent).
+    The distractor rows exercise the cold-plan regression: the candidate CTE
+    is materialized before the message lookup, which must use the messages PK
+    by dialog_id rather than scanning the global message archive.
     """
     with _make_db() as conn:
-        _insert_synced_dialog(conn, 1)
+        _insert_dialog(conn, 1, name="Target peer")
+        _insert_synced_dialog(conn, 1, read_inbox_max_id=10, read_outbox_max_id=20)
+        # Three non-deleted rows count locally, but service and deleted rows do
+        # not contribute to unread columns.
         _insert_message(conn, 1, 1, out=0)
-
-        # Mirror the daemon_api batched query shape.
-        sql = (
-            "SELECT m.dialog_id, "
-            'SUM(CASE WHEN m."out" = 0 AND m.message_id > COALESCE(sd.read_inbox_max_id, -1) '
-            "THEN 1 ELSE 0 END) AS unread_in, "
-            'SUM(CASE WHEN m."out" = 1 AND m.message_id > COALESCE(sd.read_outbox_max_id, -1) '
-            "THEN 1 ELSE 0 END) AS unread_out "
-            "FROM messages m JOIN synced_dialogs sd USING(dialog_id) "
-            "WHERE sd.status = 'synced' "
-            "GROUP BY m.dialog_id"
+        _insert_message(conn, 1, 11, out=0)
+        _insert_message(conn, 1, 21, out=1)
+        conn.execute("UPDATE messages SET is_service = 1 WHERE dialog_id = 1 AND message_id = 21")
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, out, is_deleted) VALUES (1, 22, 1700000000, 1, 1)"
         )
-        plan_rows = cast(list[tuple[object, ...]], conn.execute("EXPLAIN QUERY PLAN " + sql).fetchall())
-        plan_text = " | ".join(cast(str, row[3]) for row in plan_rows)
-        # HARD guard: reject if any row hints at an unintended redundant index path
-        # (e.g. a covering secondary index that shadows the PK). The canonical
-        # plans are "SCAN m" or "SEARCH ... USING PRIMARY KEY". Accept either.
-        has_pk_path = "PRIMARY KEY" in plan_text or "SCAN m" in plan_text or "SCAN messages" in plan_text
-        assert has_pk_path, f"Query plan does not show PK access: {plan_text}"
-        # Guard against an unrelated index sneaking in (regression detector).
-        assert "sqlite_autoindex_messages_" not in plan_text or "messages_1" in plan_text
+
+        # Hidden distractor: approximately 100k rows outside the candidate set.
+        _insert_dialog(conn, 2, name="Distractor")
+        conn.execute("UPDATE dialogs SET hidden = 1 WHERE dialog_id = 2")
+        conn.executemany(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, out, is_deleted) VALUES (2, ?, 1700000000, 0, 0)",
+            ((message_id,) for message_id in range(1, 100_001)),
+        )
+        _insert_dialog(conn, 3, name="No messages")
+        conn.commit()
+
+        params = {"archived_filter": None, "pinned_filter": None, "name_pat": "%target%"}
+        result = await _make_server(conn, _TestClient())._list_dialogs({"filter": "target"})
+        assert result["ok"] is True
+        rows = _dialog_rows(result)
+        assert [row["id"] for row in rows] == [1]
+        assert rows[0]["unread_in"] == 1
+        assert rows[0]["unread_out"] == 0
+
+        conn.row_factory = sqlite3.Row
+        aggregate_row = conn.execute(_LIST_DIALOGS_SQL, params).fetchone()
+        assert aggregate_row is not None
+        assert aggregate_row["local_message_count"] == 3
+        assert aggregate_row["unread_in"] == 1
+        assert aggregate_row["unread_out"] == 0
+
+        def message_plan(sql_params: dict[str, object]) -> list[str]:
+            plan_rows = cast(
+                list[tuple[object, ...]],
+                conn.execute("EXPLAIN QUERY PLAN " + _LIST_DIALOGS_SQL, sql_params).fetchall(),
+            )
+            return [cast(str, row[3]) for row in plan_rows if " m " in cast(str, row[3])]
+
+        filtered_plan = message_plan(params)
+        assert filtered_plan == ["SEARCH m USING PRIMARY KEY (dialog_id=?)"]
+        assert not any("SCAN m" in detail or "SCAN messages" in detail for detail in filtered_plan)
+
+        unfiltered_plan = message_plan({"archived_filter": None, "pinned_filter": None, "name_pat": None})
+        assert unfiltered_plan == ["SEARCH m USING PRIMARY KEY (dialog_id=?)"]
+        assert not any("SCAN m" in detail or "SCAN messages" in detail for detail in unfiltered_plan)
 
 
 # ---------------------------------------------------------------------------
