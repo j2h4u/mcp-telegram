@@ -172,7 +172,9 @@ class TelegramRpcGate(TelegramClient):
                 return
             try:
                 setattr(exc, "_mcp_telegram_flood_observed", True)  # noqa: B010 - exception marker is intentional
-            except (AttributeError, TypeError):
+            except AttributeError:
+                _OBSERVED_FLOOD_IDS.add(identity)
+            except TypeError:
                 _OBSERVED_FLOOD_IDS.add(identity)
             if self._flood_observer is not None:
                 self._flood_observer(source="telegram_rpc_gate", seconds=seconds)

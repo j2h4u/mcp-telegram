@@ -347,7 +347,10 @@ def _retry_delays_float(
     if (
         not isinstance(value, (list, tuple))
         or not value
-        or any(isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)) or item < 0 for item in value)
+        or any(
+            isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)) or item < 0
+            for item in value
+        )
     ):
         raise ConfigError(f"Invalid {section}.{key} in {path}: expected a non-empty array of finite numbers >= 0")
     return tuple(float(item) for item in value)
