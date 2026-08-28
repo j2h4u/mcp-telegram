@@ -473,10 +473,13 @@ async def test_list_dialogs_candidate_aggregate_filters_before_messages() -> Non
         assert "SEARCH" in message_access[0]
         assert "dialog_id=?" in message_access[0]
         assert "SCAN m" not in message_access[0]
-        no_message_row = conn.execute(
-            _LIST_DIALOG_MESSAGE_AGGREGATES_SQL,
-            {"dialog_ids_json": "[3]"},
-        ).fetchone()
+        no_message_row = cast(
+            sqlite3.Row | None,
+            conn.execute(
+                _LIST_DIALOG_MESSAGE_AGGREGATES_SQL,
+                {"dialog_ids_json": "[3]"},
+            ).fetchone(),
+        )
         assert no_message_row is not None
         assert tuple(no_message_row) == (3, 0, 0, 0)
 
