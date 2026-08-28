@@ -224,8 +224,6 @@ class _SyncLoopState:
     sync_start: float
     last_heartbeat: float
     last_gap_scan: float
-    last_hb_msg_count: int
-    last_hb_mono: float
     was_idle: bool = False
 
 
@@ -625,14 +623,12 @@ async def _sleep_read_pos_batch(shutdown_event: asyncio.Event, pause_seconds: fl
 # ---------------------------------------------------------------------------
 
 
-def _fetch_heartbeat_stats(conn: sqlite3.Connection) -> tuple[dict[str, int], int]:
+def _fetch_heartbeat_stats(conn: sqlite3.Connection) -> dict[str, int]:
     stats_rows = cast(
         list[tuple[str, int]],
         conn.execute("SELECT status, COUNT(*) FROM synced_dialogs GROUP BY status").fetchall(),
     )
-    stats = dict(stats_rows)
-    msg_count_row = cast(tuple[int], conn.execute("SELECT COUNT(*) FROM messages").fetchone())
-    return stats, int(msg_count_row[0])
+    return dict(stats_rows)
 
 
 def _format_heartbeat_eta(sync_start: float, synced: int, total: int, now_mono: float) -> str:
@@ -654,44 +650,26 @@ def _log_heartbeat(
     conn: sqlite3.Connection,
     client: _DaemonClient,
     sync_start: float,
-    prev_msg_count: int,
-    prev_mono: float,
-) -> tuple[int, float]:
-    """Log heartbeat with sync stats, interval-based rate, and ETA from sync.db.
-
-    Rate is computed over the heartbeat interval (since the last call), not
-    since daemon startup — so an idle daemon shows 0msg/s instead of a stale
-    decaying lifetime average.
-
-    Returns (current_msg_count, current_mono) for the caller to feed into the
-    next invocation.
-    """
+) -> None:
+    """Log heartbeat with sync stats and ETA from sync.db."""
     try:
-        stats, msg_count = _fetch_heartbeat_stats(conn)
+        stats = _fetch_heartbeat_stats(conn)
     except sqlite3.DatabaseError:
         logger.warning("heartbeat_stats_failed", exc_info=True)
         stats = {}
-        msg_count = 0
     synced = int(stats.get("synced", 0) or 0)
     syncing = int(stats.get("syncing", 0) or 0)
     total = synced + syncing + int(stats.get("not_synced", 0) or 0)
 
     now_mono = time.monotonic()
-    interval = now_mono - prev_mono
-    delta = max(0, msg_count - int(prev_msg_count or 0))
-    rate = delta / interval if interval > 0 else 0.0
-
     logger.debug(
-        "heartbeat — connected=%s dialogs=%d/%d messages=%d rate=%.0fmsg/s%s",
+        "heartbeat — connected=%s dialogs=%d/%d%s",
         client.is_connected(),
         synced,
         total,
-        msg_count,
-        rate,
         _format_heartbeat_eta(sync_start, synced, total, now_mono),
     )
     maybe_log_flood_wait_rollup(logger)
-    return msg_count, now_mono
 
 
 # ---------------------------------------------------------------------------
@@ -712,13 +690,7 @@ async def _maybe_heartbeat_and_gap_scan(
     now_mono = time.monotonic()
 
     if now_mono - state.last_heartbeat >= HEARTBEAT_INTERVAL_S:
-        state.last_hb_msg_count, state.last_hb_mono = _log_heartbeat(
-            conn,
-            client,
-            state.sync_start,
-            state.last_hb_msg_count,
-            state.last_hb_mono,
-        )
+        _log_heartbeat(conn, client, state.sync_start)
         handler_manager.refresh_synced_dialogs()
         state.last_heartbeat = now_mono
 
@@ -739,17 +711,10 @@ async def _run_sync_loop(
 ) -> None:
     """Run the batch-sync loop with periodic heartbeat and gap scan."""
     sync_start = time.monotonic()
-    try:
-        last_hb_row = cast(tuple[int], conn.execute("SELECT COUNT(*) FROM messages").fetchone())
-        last_hb_msg_count = int(last_hb_row[0])
-    except sqlite3.DatabaseError:
-        last_hb_msg_count = 0
     state = _SyncLoopState(
         sync_start=sync_start,
         last_heartbeat=sync_start,
         last_gap_scan=sync_start,
-        last_hb_msg_count=last_hb_msg_count,
-        last_hb_mono=sync_start,
     )
 
     while not shutdown_event.is_set():

@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon import _create_tracked_task, _log_heartbeat, _prime_runtime, sync_main
+from mcp_telegram.daemon import _create_tracked_task, _log_heartbeat, _prime_runtime, _run_sync_loop, sync_main
 from mcp_telegram.folders.read_repository import list_folders
 from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.state import StatePaths
@@ -203,7 +203,7 @@ def test_sync_main_connects_and_heartbeats(
     def heartbeat_then_shutdown(*args):
         result = _log_heartbeat(*args)
         shutdown_event.set()
-        return result  # caller unpacks (msg_count, mono) — patched mock must propagate
+        return result  # patched mock must propagate
 
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
@@ -220,6 +220,47 @@ def test_sync_main_connects_and_heartbeats(
     mock_client.connect.assert_called_once()
     mock_hb.assert_called()
     assert any("heartbeat" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_initialization_and_periodic_logging_avoid_messages_sql(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Heartbeat state and logging must not inspect the message archive."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE synced_dialogs (status TEXT NOT NULL)")
+    conn.execute("INSERT INTO synced_dialogs (status) VALUES ('synced')")
+    conn.commit()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+
+    shutdown_event = asyncio.Event()
+    worker = MagicMock()
+
+    async def process_one_batch() -> bool:
+        shutdown_event.set()
+        return True
+
+    worker.process_one_batch = process_one_batch
+    handler_manager = MagicMock()
+    client = MagicMock()
+    client.is_connected.return_value = True
+
+    try:
+        with (
+            patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.0),
+            caplog.at_level(logging.DEBUG, logger="mcp_telegram.daemon"),
+        ):
+            await _run_sync_loop(worker, handler_manager, shutdown_event, conn, client)
+    finally:
+        conn.close()
+
+    message_sql = [statement for statement in statements if "messages" in statement.lower()]
+    assert message_sql == []
+    heartbeat_logs = [record.getMessage() for record in caplog.records if record.getMessage().startswith("heartbeat —")]
+    assert heartbeat_logs
+    assert all("messages=" not in message for message in heartbeat_logs)
+    assert all("rate=" not in message for message in heartbeat_logs)
 
 
 def test_sync_main_runs_fts_backfill_before_connect(
@@ -412,7 +453,7 @@ def test_sync_main_heartbeat_logs_connection_state(
     def heartbeat_then_shutdown(*args):
         result = _log_heartbeat(*args)
         shutdown_event.set()
-        return result  # caller unpacks (msg_count, mono) — patched mock must propagate
+        return result  # patched mock must propagate
 
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
