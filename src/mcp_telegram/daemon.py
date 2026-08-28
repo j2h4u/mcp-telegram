@@ -99,6 +99,7 @@ from .message_fact_refresh import (
     MessageFactRefreshPolicy,
     run_message_fact_refresh_loop,
 )
+from .messages.sqlite_repository import reconcile_media_hydration_jobs_for_dialog
 from .own_only import OwnOnlyContext, ensure_own_only_schema
 from .reactions.refresh import ReactionFreshener
 from .reactions.sqlite_repository import SQLiteReactionSnapshotRepository
@@ -946,6 +947,11 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - com
         feedback_service,
         db_path,
         reaction_freshener=reaction_freshener,
+        hydration_requester=lambda hydration_conn, dialog_id, due_at: reconcile_media_hydration_jobs_for_dialog(
+            hydration_conn,
+            dialog_id,
+            due_at=due_at,
+        ),
         topic_refresher=topic_refresher,
         policy=DaemonApiPolicy(
             read_at_ttl_seconds=config.freshness.read_receipts.read_at_ttl_seconds,

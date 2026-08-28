@@ -337,6 +337,7 @@ def test_self_id_cached_at_startup(
             sync_db_path=None,
             *,
             reaction_freshener,
+            hydration_requester,
             topic_refresher,
             policy,
             health_status,
@@ -347,6 +348,7 @@ def test_self_id_cached_at_startup(
             self._feedback_conn = feedback_conn
             self._sync_db_path = sync_db_path
             self._reaction_freshener = reaction_freshener
+            self._hydration_requester = hydration_requester
             self._topic_refresher = topic_refresher
             self._policy = policy
             self._health_status = health_status

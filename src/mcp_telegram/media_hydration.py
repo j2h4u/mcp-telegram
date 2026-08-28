@@ -12,7 +12,7 @@ import asyncio
 import logging
 import sqlite3
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol, cast
@@ -21,7 +21,7 @@ from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 
 from .access_lifecycle import set_access_lost
 from .flood import flood_seconds
-from .hydration_queue import HydrationJob, HydrationQueueRepository
+from .hydration_queue import HydrationJob, HydrationPriority, HydrationQueueRepository
 from .media_fact import encode_media_payload
 from .messages.sqlite_repository import apply_hydrated_media_fact, media_hydration_eligible
 from .telegram_access import ACCESS_LOST_ERRORS
@@ -84,14 +84,19 @@ def _response_map(result: object) -> dict[int, object]:
 
 
 def _batch_jobs(jobs: Sequence[HydrationJob], batch_size: int) -> list[list[HydrationJob]]:
-    grouped: dict[int, list[HydrationJob]] = defaultdict(list)
-    for job in jobs:
-        grouped[job.dialog_id].append(job)
-    batches: list[list[HydrationJob]] = []
-    for dialog_jobs in grouped.values():
-        for offset in range(0, len(dialog_jobs), batch_size):
-            batches.extend((dialog_jobs[offset : offset + batch_size],))
-    return batches
+    """Batch per Telegram peer without weakening queue priority order."""
+    grouped: dict[tuple[HydrationPriority, int], list[tuple[int, HydrationJob]]] = defaultdict(list)
+    for position, job in enumerate(jobs):
+        grouped[(job.priority, job.dialog_id)].append((position, job))
+
+    positioned_batches: list[tuple[HydrationPriority, int, list[HydrationJob]]] = []
+    for (priority, _dialog_id), positioned_jobs in grouped.items():
+        for offset in range(0, len(positioned_jobs), batch_size):
+            chunk = positioned_jobs[offset : offset + batch_size]
+            positioned_batches.append((priority, chunk[0][0], [job for _, job in chunk]))
+
+    positioned_batches.sort(key=lambda batch: (-int(batch[0]), batch[1]))
+    return [batch for _priority, _position, batch in positioned_batches]
 
 
 class MediaHydrationWorker:
@@ -137,6 +142,9 @@ class MediaHydrationWorker:
         requests = hydrated = completed = retried = dropped = 0
         stopped = False
         request_batches = _batch_jobs(due, self._batch_size)[: self._max_requests_per_cycle]
+        jobs_by_priority = Counter(job.priority for job in due)
+        foreground_jobs = jobs_by_priority[HydrationPriority.FOREGROUND]
+        backfill_jobs = jobs_by_priority[HydrationPriority.BACKFILL]
         for batch_index, batch in enumerate(request_batches):
             if self._shutdown_event.is_set():
                 break
@@ -155,7 +163,10 @@ class MediaHydrationWorker:
                 break
 
         logger.info(
-            "media_hydration cycle requests=%d hydrated=%d completed=%d retried=%d dropped=%d stopped=%s",
+            "media_hydration cycle selected_foreground=%d selected_backfill=%d "
+            "requests=%d hydrated=%d completed=%d retried=%d dropped=%d stopped=%s",
+            foreground_jobs,
+            backfill_jobs,
             requests,
             hydrated,
             completed,

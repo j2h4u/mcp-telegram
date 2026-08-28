@@ -327,6 +327,7 @@ class DaemonAPIServer:
         sync_db_path: Path | None = None,
         *,
         reaction_freshener: ReactionFreshener,
+        hydration_requester: Callable[[sqlite3.Connection, int, int], None] | None = None,
         topic_refresher: TopicRefresher | None = None,
         policy: DaemonApiPolicy,
         health_status: Callable[[], DaemonHealthStatus] = _healthy_daemon_status,
@@ -350,6 +351,7 @@ class DaemonAPIServer:
         self.startup_detail: str = "connecting to Telegram"
         self._reading_service: ReadingService | None = None
         self._topic_refresher = topic_refresher
+        self._hydration_requester = hydration_requester
         self._policy = policy
         self._health_status = health_status
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
@@ -1085,7 +1087,10 @@ class DaemonAPIServer:
         """Persist explicit full-history intent and report factual coverage."""
         dialog_id = _coerce_int(req.get("dialog_id", 0), 0)
         enable = bool(req.get("enable", True))
-        outcome = enable_history(self._conn, dialog_id) if enable else disable_history(self._conn, dialog_id)
+        now = int(time.time())
+        outcome = enable_history(self._conn, dialog_id, now=now) if enable else disable_history(self._conn, dialog_id)
+        if enable and self._hydration_requester is not None:
+            self._hydration_requester(self._conn, dialog_id, now)
         self._conn.commit()
         logger.info("mark_dialog_for_sync dialog_id=%d enable=%s", dialog_id, enable)
         return {

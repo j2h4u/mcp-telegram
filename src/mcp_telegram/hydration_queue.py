@@ -10,11 +10,19 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import cast
 
-# Keep this name in lock-step with the v37 schema.  The queue is part of the
+# Keep this name in lock-step with the current schema.  The queue is part of the
 # durable database contract, so callers must never create an ad-hoc variant.
 HYDRATION_QUEUE_TABLE = "hydration_jobs"
+
+
+class HydrationPriority(IntEnum):
+    """Two intentional service classes for durable hydration work."""
+
+    BACKFILL = 0
+    FOREGROUND = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +34,8 @@ class HydrationJob:
     message_id: int
     due_at: int
     attempts: int
+    message_sent_at: int = 0
+    priority: HydrationPriority = HydrationPriority.FOREGROUND
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, str) or not self.kind:
@@ -38,9 +48,14 @@ class HydrationJob:
             raise ValueError("message_id must be positive")
         if self.attempts < 0:
             raise ValueError("attempts must be nonnegative")
+        if self.message_sent_at < 0:
+            raise ValueError("message_sent_at must be nonnegative")
+        if not isinstance(self.priority, HydrationPriority):
+            raise ValueError("priority must be a HydrationPriority")
 
 
-_JOB_COLUMNS = "kind, dialog_id, message_id, due_at, attempts"
+_JOB_COLUMNS = "kind, dialog_id, message_id, due_at, attempts, message_sent_at, priority"
+_SELECT_JOB_COLUMNS = ", ".join(f"hj.{column}" for column in _JOB_COLUMNS.split(", "))
 
 
 def _identity(job: HydrationJob) -> tuple[str, int, int]:
@@ -48,13 +63,15 @@ def _identity(job: HydrationJob) -> tuple[str, int, int]:
 
 
 def _job_from_row(row: sqlite3.Row | tuple[object, ...]) -> HydrationJob:
-    kind, dialog_id, message_id, due_at, attempts = row
+    kind, dialog_id, message_id, due_at, attempts, message_sent_at, priority = row
     return HydrationJob(
         kind=cast(str, kind),
         dialog_id=int(cast(int | str, dialog_id)),
         message_id=int(cast(int | str, message_id)),
         due_at=int(cast(int | str, due_at)),
         attempts=int(cast(int | str, attempts)),
+        message_sent_at=int(cast(int | str, message_sent_at)),
+        priority=HydrationPriority(int(cast(int | str, priority))),
     )
 
 
@@ -86,23 +103,35 @@ class HydrationQueueRepository:
         existing job never resets ``attempts``.
         """
         self._conn.execute(
-            f"INSERT INTO {HYDRATION_QUEUE_TABLE} ({_JOB_COLUMNS}) VALUES (?, ?, ?, ?, ?) "
+            f"INSERT INTO {HYDRATION_QUEUE_TABLE} ({_JOB_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(kind, dialog_id, message_id) DO UPDATE SET "
-            "due_at = CASE WHEN excluded.due_at < due_at THEN excluded.due_at ELSE due_at END",
-            (job.kind, job.dialog_id, job.message_id, job.due_at, job.attempts),
+            "due_at = CASE WHEN excluded.due_at < due_at THEN excluded.due_at ELSE due_at END, "
+            "message_sent_at = MAX(message_sent_at, excluded.message_sent_at), "
+            "priority = MAX(priority, excluded.priority)",
+            (
+                job.kind,
+                job.dialog_id,
+                job.message_id,
+                job.due_at,
+                job.attempts,
+                job.message_sent_at,
+                int(job.priority),
+            ),
         )
 
     def due_jobs(self, now: int, limit: int, *, kind: str | None = None) -> list[HydrationJob]:
         """Return jobs due at or before *now* in deterministic queue order."""
         if limit <= 0:
             return []
-        kind_clause = " AND kind = ?" if kind is not None else ""
+        kind_clause = " AND hj.kind = ?" if kind is not None else ""
         parameters: tuple[object, ...] = (now, kind, limit) if kind is not None else (now, limit)
         rows = cast(
             list[tuple[object, ...]],
             self._conn.execute(
-                f"SELECT {_JOB_COLUMNS} FROM {HYDRATION_QUEUE_TABLE} "
-                f"WHERE due_at <= ?{kind_clause} ORDER BY due_at, kind, dialog_id, message_id LIMIT ?",
+                f"SELECT {_SELECT_JOB_COLUMNS} FROM {HYDRATION_QUEUE_TABLE} AS hj "
+                f"WHERE hj.due_at <= ?{kind_clause} "
+                "ORDER BY hj.priority DESC, hj.message_sent_at DESC, "
+                "hj.due_at, hj.kind, hj.dialog_id, hj.message_id LIMIT ?",
                 parameters,
             ).fetchall(),
         )
@@ -161,5 +190,6 @@ class HydrationQueueRepository:
 __all__ = [
     "HYDRATION_QUEUE_TABLE",
     "HydrationJob",
+    "HydrationPriority",
     "HydrationQueueRepository",
 ]

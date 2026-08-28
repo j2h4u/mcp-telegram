@@ -243,7 +243,14 @@ def reconcile_media_hydration_job(
     queue = HydrationQueueRepository(conn)
     if not queue.is_available():
         return
-    job = HydrationJob(_MEDIA_HYDRATION_KIND, message.dialog_id, message.message_id, due_at, 0)
+    job = HydrationJob(
+        _MEDIA_HYDRATION_KIND,
+        message.dialog_id,
+        message.message_id,
+        due_at,
+        0,
+        message.sent_at,
+    )
     unresolved = message.media_kind in _MEDIA_HYDRATION_EMPTY_KINDS and message.media_payload == "{}"
     if unresolved and media_hydration_eligible(conn, message.dialog_id):
         queue.enqueue(job)
@@ -264,15 +271,15 @@ def reconcile_media_hydration_jobs_for_dialog(
     if not media_hydration_eligible(conn, dialog_id):
         return
     rows = cast(
-        Sequence[tuple[int]],
+        Sequence[tuple[int, int]],
         conn.execute(
-            "SELECT message_id FROM messages "
+            "SELECT message_id, sent_at FROM messages "
             "WHERE dialog_id = ? AND media_kind IN ('contact', 'other') AND media_payload = '{}'",
             (dialog_id,),
         ).fetchall(),
     )
-    for (message_id,) in rows:
-        queue.enqueue(HydrationJob(_MEDIA_HYDRATION_KIND, dialog_id, int(message_id), due_at, 0))
+    for message_id, sent_at in rows:
+        queue.enqueue(HydrationJob(_MEDIA_HYDRATION_KIND, dialog_id, int(message_id), due_at, 0, int(sent_at)))
 
 
 def _write_message_rows_and_fts(
