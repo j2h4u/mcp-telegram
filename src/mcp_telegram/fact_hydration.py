@@ -216,7 +216,7 @@ class MessageFactHydrationWorker:
                 break
         return FactHydrationCycleResult(requests, hydrated, completed, retried, dropped, stopped)
 
-    async def _process_batch(  # noqa: PLR0911
+    async def _process_batch(
         self,
         handler: HydrationHandler,
         batch: Sequence[HydrationJob],
@@ -229,95 +229,141 @@ class MessageFactHydrationWorker:
         try:
             result = await handler.request(self._client, started)
         except FloodWaitError as exc:
-            retry_delay = flood_seconds(
-                exc,
-            )
-            retried, dropped, drop_observations = self._retry_or_drop(started, effective_now + retry_delay)
-            self._conn.commit()
-            self._log_drops(
-                (*batch,),
-                (*preflight_observations, *drop_observations),
-                descriptor=describe_telegram_rpc_error(exc) if drop_observations else None,
-            )
-            logger.warning(
-                "message_fact_hydration flood_wait kind=%s dialog_id=%d jobs=%d retry_s=%d",
-                handler.kind,
-                started[0].dialog_id,
-                len(started),
-                retry_delay,
-            )
-            return _BatchOutcome(
-                requests=handler.request_cost,
-                retried=retried,
-                dropped=len(preflight_observations) + dropped,
-                stopped=True,
-            )
+            return self._handle_flood_wait(handler, batch, started, preflight_observations, exc, effective_now)
         except TelegramRpcCircuitOpenError:
-            retried, dropped, drop_observations = self._retry_or_drop(
-                started, effective_now + self._circuit_retry_seconds
-            )
-            self._conn.commit()
-            self._log_drops((*batch,), (*preflight_observations, *drop_observations))
-            logger.info(
-                "message_fact_hydration circuit_open kind=%s dialog_id=%d jobs=%d retry_s=%d",
-                handler.kind,
-                started[0].dialog_id,
-                len(started),
-                self._circuit_retry_seconds,
-            )
-            return _BatchOutcome(
-                requests=handler.request_cost,
-                retried=retried,
-                dropped=len(preflight_observations) + dropped,
-                stopped=True,
-            )
+            return self._handle_circuit_open(handler, batch, started, preflight_observations, effective_now)
         except ACCESS_LOST_ERRORS as exc:
-            descriptor = describe_telegram_rpc_error(exc)
-            for dialog_id in dict.fromkeys(job.dialog_id for job in started):
-                set_access_lost(self._conn, dialog_id, effective_now, reason=descriptor.error_type)
+            return self._handle_access_lost(handler, batch, started, preflight_observations, exc, effective_now)
+        except Exception as exc:  # noqa: BLE001 - Telegram transient classes vary by RPC layer
+            return self._handle_request_error(handler, batch, started, preflight_observations, exc, effective_now)
+
+        applied = handler.apply(self._conn, self._queue, started, result, now=effective_now)
+        return self._finish_applied(handler, batch, started, preflight_observations, applied, effective_now)
+
+    def _handle_flood_wait(  # noqa: PLR0913, PLR0917
+        self,
+        handler: HydrationHandler,
+        batch: Sequence[HydrationJob],
+        started: Sequence[HydrationJob],
+        preflight_observations: Sequence[HydrationDropObservation],
+        exc: FloodWaitError,
+        effective_now: int,
+    ) -> _BatchOutcome:
+        retry_delay = flood_seconds(exc)
+        retried, dropped, drop_observations = self._retry_or_drop(started, effective_now + retry_delay)
+        self._conn.commit()
+        self._log_drops(
+            batch,
+            (*preflight_observations, *drop_observations),
+            descriptor=describe_telegram_rpc_error(exc) if drop_observations else None,
+        )
+        logger.warning(
+            "message_fact_hydration flood_wait kind=%s dialog_id=%d jobs=%d retry_s=%d",
+            handler.kind,
+            started[0].dialog_id,
+            len(started),
+            retry_delay,
+        )
+        return _BatchOutcome(
+            requests=handler.request_cost,
+            retried=retried,
+            dropped=len(preflight_observations) + dropped,
+            stopped=True,
+        )
+
+    def _handle_circuit_open(
+        self,
+        handler: HydrationHandler,
+        batch: Sequence[HydrationJob],
+        started: Sequence[HydrationJob],
+        preflight_observations: Sequence[HydrationDropObservation],
+        effective_now: int,
+    ) -> _BatchOutcome:
+        retried, dropped, drop_observations = self._retry_or_drop(started, effective_now + self._circuit_retry_seconds)
+        self._conn.commit()
+        self._log_drops(batch, (*preflight_observations, *drop_observations))
+        logger.info(
+            "message_fact_hydration circuit_open kind=%s dialog_id=%d jobs=%d retry_s=%d",
+            handler.kind,
+            started[0].dialog_id,
+            len(started),
+            self._circuit_retry_seconds,
+        )
+        return _BatchOutcome(
+            requests=handler.request_cost,
+            retried=retried,
+            dropped=len(preflight_observations) + dropped,
+            stopped=True,
+        )
+
+    def _handle_access_lost(  # noqa: PLR0913, PLR0917
+        self,
+        handler: HydrationHandler,
+        batch: Sequence[HydrationJob],
+        started: Sequence[HydrationJob],
+        preflight_observations: Sequence[HydrationDropObservation],
+        exc: BaseException,
+        effective_now: int,
+    ) -> _BatchOutcome:
+        descriptor = describe_telegram_rpc_error(exc)
+        for dialog_id in dict.fromkeys(job.dialog_id for job in started):
+            set_access_lost(self._conn, dialog_id, effective_now, reason=descriptor.error_type)
+        self._conn.commit()
+        self._log_drops(
+            batch,
+            (*preflight_observations, *self._observations("access_lost", started)),
+            descriptor=descriptor,
+        )
+        return _BatchOutcome(
+            requests=handler.request_cost,
+            dropped=len(preflight_observations) + len(started),
+        )
+
+    def _handle_request_error(  # noqa: PLR0913, PLR0917
+        self,
+        handler: HydrationHandler,
+        batch: Sequence[HydrationJob],
+        started: Sequence[HydrationJob],
+        preflight_observations: Sequence[HydrationDropObservation],
+        exc: BaseException,
+        effective_now: int,
+    ) -> _BatchOutcome:
+        descriptor = describe_telegram_rpc_error(exc)
+        if handler.is_terminal_error(exc):
+            for job in started:
+                self._queue.remove(job)
             self._conn.commit()
             self._log_drops(
-                (*batch,),
-                (*preflight_observations, *self._observations("access_lost", started)),
+                batch,
+                (*preflight_observations, *self._observations("terminal_rpc", started)),
                 descriptor=descriptor,
             )
             return _BatchOutcome(requests=handler.request_cost, dropped=len(preflight_observations) + len(started))
-        except Exception as exc:  # noqa: BLE001 - Telegram transient classes vary by RPC layer
-            if handler.is_terminal_error(exc):
-                for job in started:
-                    self._queue.remove(job)
-                self._conn.commit()
-                descriptor = describe_telegram_rpc_error(exc)
-                self._log_drops(
-                    (*batch,),
-                    (*preflight_observations, *self._observations("terminal_rpc", started)),
-                    descriptor=descriptor,
-                )
-                return _BatchOutcome(requests=handler.request_cost, dropped=len(preflight_observations) + len(started))
-            retried, dropped, drop_observations = self._retry_or_drop(
-                started, effective_now + self._retry_delay_seconds
-            )
-            self._conn.commit()
-            descriptor = describe_telegram_rpc_error(exc) if drop_observations else None
-            self._log_drops(
-                (*batch,),
-                (*preflight_observations, *drop_observations),
-                descriptor=descriptor,
-            )
-            logger.warning(
-                "message_fact_hydration transient kind=%s dialog_id=%d jobs=%d error_type=%s",
-                handler.kind,
-                started[0].dialog_id,
-                len(started),
-                describe_telegram_rpc_error(exc).error_type,
-            )
-            return _BatchOutcome(
-                requests=handler.request_cost,
-                retried=retried,
-                dropped=len(preflight_observations) + dropped,
-            )
+        retried, dropped, drop_observations = self._retry_or_drop(started, effective_now + self._retry_delay_seconds)
+        self._conn.commit()
+        self._log_drops(batch, (*preflight_observations, *drop_observations), descriptor=descriptor)
+        logger.warning(
+            "message_fact_hydration transient kind=%s dialog_id=%d jobs=%d error_type=%s",
+            handler.kind,
+            started[0].dialog_id,
+            len(started),
+            descriptor.error_type,
+        )
+        return _BatchOutcome(
+            requests=handler.request_cost,
+            retried=retried,
+            dropped=len(preflight_observations) + dropped,
+        )
 
-        applied = handler.apply(self._conn, self._queue, started, result, now=effective_now)
+    def _finish_applied(  # noqa: PLR0913, PLR0917
+        self,
+        handler: HydrationHandler,
+        batch: Sequence[HydrationJob],
+        started: Sequence[HydrationJob],
+        preflight_observations: Sequence[HydrationDropObservation],
+        applied: AppliedFacts,
+        effective_now: int,
+    ) -> _BatchOutcome:
         if applied.pending:
             retried, dropped, drop_observations = self._retry_or_drop(
                 started,
@@ -330,7 +376,7 @@ class MessageFactHydrationWorker:
                 dropped=dropped,
                 drop_observations=applied.drop_observations + drop_observations,
             )
-        self._log_drops((*batch,), (*preflight_observations, *applied.drop_observations))
+        self._log_drops(batch, (*preflight_observations, *applied.drop_observations))
         self._conn.commit()
         return _BatchOutcome(
             requests=handler.request_cost,
@@ -396,50 +442,7 @@ class MessageFactHydrationWorker:
         *,
         descriptor: TelegramRpcErrorDescriptor | None = None,
     ) -> None:
-        if not observations:
-            return
-        jobs_by_coordinate: dict[tuple[str | None, int | None, int], HydrationJob] = {
-            (job.kind, job.dialog_id, job.message_id): job for job in jobs
-        }
-        grouped_observations: dict[tuple[str, str, int, str | None, int | None, str | None], list[HydrationJob]] = {}
-        for observation in observations:
-            coordinate = (observation.kind, observation.dialog_id, observation.message_id)
-            job = jobs_by_coordinate.get(coordinate)
-            if job is None:
-                # Compatibility for callers constructing the tiny two-field
-                # observation manually; production paths always include all
-                # coordinates, so IDs cannot collide across dialogs/kinds.
-                candidates = [item for item in jobs if item.message_id == observation.message_id]
-                if len(candidates) != 1:
-                    continue
-                job = candidates[0]
-            if observation.attempts is not None and job.attempts != observation.attempts:
-                job = replace(job, attempts=observation.attempts)
-            key = (
-                observation.reason,
-                job.kind,
-                job.dialog_id,
-                None if descriptor is None else descriptor.error_type,
-                None if descriptor is None else descriptor.code,
-                None if descriptor is None else descriptor.symbol,
-            )
-            grouped_observations.setdefault(key, []).append(job)
-        for (reason, kind, dialog_id, error_type, rpc_code, rpc_symbol), grouped_jobs in grouped_observations.items():
-            if not grouped_jobs:
-                continue
-            message_ids = tuple(job.message_id for job in grouped_jobs[:_MAX_LOGGED_MESSAGE_IDS])
-            drop = HydrationDrop(
-                reason=reason,
-                kind=kind,
-                dialog_id=dialog_id,
-                job_count=len(grouped_jobs),
-                message_ids=message_ids,
-                attempts_min=min(job.attempts for job in grouped_jobs),
-                attempts_max=max(job.attempts for job in grouped_jobs),
-                error_type=error_type,
-                rpc_code=rpc_code,
-                rpc_symbol=rpc_symbol,
-            )
+        for drop in self._aggregate_drops(jobs, observations, descriptor):
             logger.log(
                 _DROP_LEVELS[drop.reason],
                 "message_fact_hydration_drop reason=%s kind=%s dialog_id=%d job_count=%d "
@@ -455,6 +458,57 @@ class MessageFactHydrationWorker:
                 drop.rpc_code,
                 drop.rpc_symbol,
             )
+
+    @staticmethod
+    def _resolve_observation_job(
+        jobs: Sequence[HydrationJob], observation: HydrationDropObservation
+    ) -> HydrationJob | None:
+        candidates = [
+            job
+            for job in jobs
+            if job.message_id == observation.message_id
+            and (observation.kind is None or job.kind == observation.kind)
+            and (observation.dialog_id is None or job.dialog_id == observation.dialog_id)
+        ]
+        if len(candidates) != 1:
+            return None
+        job = candidates[0]
+        return replace(job, attempts=observation.attempts) if observation.attempts is not None else job
+
+    @classmethod
+    def _aggregate_drops(
+        cls,
+        jobs: Sequence[HydrationJob],
+        observations: Sequence[HydrationDropObservation],
+        descriptor: TelegramRpcErrorDescriptor | None,
+    ) -> tuple[HydrationDrop, ...]:
+        error_fields = (
+            None if descriptor is None else descriptor.error_type,
+            None if descriptor is None else descriptor.code,
+            None if descriptor is None else descriptor.symbol,
+        )
+        grouped: dict[tuple[str, str, int, str | None, int | None, str | None], list[HydrationJob]] = {}
+        for observation in observations:
+            job = cls._resolve_observation_job(jobs, observation)
+            if job is None:
+                continue
+            key = (observation.reason, job.kind, job.dialog_id, *error_fields)
+            grouped.setdefault(key, []).append(job)
+        return tuple(
+            HydrationDrop(
+                reason=reason,
+                kind=kind,
+                dialog_id=dialog_id,
+                job_count=len(grouped_jobs),
+                message_ids=tuple(job.message_id for job in grouped_jobs[:_MAX_LOGGED_MESSAGE_IDS]),
+                attempts_min=min(job.attempts for job in grouped_jobs),
+                attempts_max=max(job.attempts for job in grouped_jobs),
+                error_type=error_type,
+                rpc_code=rpc_code,
+                rpc_symbol=rpc_symbol,
+            )
+            for (reason, kind, dialog_id, error_type, rpc_code, rpc_symbol), grouped_jobs in grouped.items()
+        )
 
     async def _pause_between_requests(self) -> bool:
         try:
