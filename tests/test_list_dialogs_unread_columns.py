@@ -18,6 +18,7 @@ Schema is set up inline. Self-contained — does not cross-import from test_daem
 from __future__ import annotations
 
 import asyncio
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import asynccontextmanager, contextmanager
@@ -27,7 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
-from mcp_telegram.reading.sqlite_projection import _LIST_DIALOGS_SQL
+from mcp_telegram.reading.sqlite_projection import _LIST_DIALOG_MESSAGE_AGGREGATES_SQL, _LIST_DIALOGS_SQL
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
@@ -393,13 +394,8 @@ async def test_list_dialogs_zero_telegram_api_calls_for_unread_query() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_list_dialogs_candidate_aggregate_filters_before_messages() -> None:
-    """The production projection aggregates only SQL-visible candidates.
-
-    The distractor rows exercise the cold-plan regression: the candidate CTE
-    is materialized before the message lookup, which must use the messages PK
-    by dialog_id rather than scanning the global message archive.
-    """
+async def test_list_dialogs_candidate_aggregate_filters_before_messages() -> None:  # noqa: PLR0915
+    """Final dialog selection drives one bounded aggregate query."""
     with _make_db() as conn:
         _insert_dialog(conn, 1, name="Target peer")
         _insert_synced_dialog(conn, 1, read_inbox_max_id=10, read_outbox_max_id=20)
@@ -412,46 +408,105 @@ async def test_list_dialogs_candidate_aggregate_filters_before_messages() -> Non
         conn.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at, out, is_deleted) VALUES (1, 22, 1700000000, 1, 1)"
         )
+        _insert_dialog(conn, 4, name="Анна Петрова")
+        _insert_synced_dialog(conn, 4, read_inbox_max_id=0, read_outbox_max_id=0)
+        _insert_message(conn, 4, 1, out=0)
+        _insert_message(conn, 4, 2, out=1)
+        _insert_dialog(conn, 3, name="No messages")
 
-        # Hidden distractor: approximately 100k rows outside the candidate set.
+        # Visible distractor: approximately 100k rows outside each selected set.
         _insert_dialog(conn, 2, name="Distractor")
-        conn.execute("UPDATE dialogs SET hidden = 1 WHERE dialog_id = 2")
         conn.executemany(
             "INSERT INTO messages (dialog_id, message_id, sent_at, out, is_deleted) VALUES (2, ?, 1700000000, 0, 0)",
             ((message_id,) for message_id in range(1, 100_001)),
         )
-        _insert_dialog(conn, 3, name="No messages")
         conn.commit()
 
-        params = {"archived_filter": None, "pinned_filter": None, "name_pat": "%target%"}
-        result = await _make_server(conn, _TestClient())._list_dialogs({"filter": "target"})
+        server = _make_server(conn, _TestClient())
+        trace: list[str] = []
+        conn.set_trace_callback(trace.append)
+        result = await server._list_dialogs({"filter": "tp"})
+        conn.set_trace_callback(None)
         assert result["ok"] is True
         rows = _dialog_rows(result)
         assert [row["id"] for row in rows] == [1]
+        assert rows[0]["saved_message_count"] == 3
         assert rows[0]["unread_in"] == 1
         assert rows[0]["unread_out"] == 0
+        aggregate_trace = [statement for statement in trace if "json_each" in statement]
+        assert len(aggregate_trace) == 1
+        assert "json_each('[1]')" in aggregate_trace[0]
+
+        trace.clear()
+        conn.set_trace_callback(trace.append)
+        result = await server._list_dialogs({"filter": "АП"})
+        conn.set_trace_callback(None)
+        assert result["ok"] is True
+        rows = _dialog_rows(result)
+        assert [row["id"] for row in rows] == [4]
+        assert rows[0]["saved_message_count"] == 2
+        assert rows[0]["unread_in"] == 1
+        assert rows[0]["unread_out"] == 1
+        aggregate_trace = [statement for statement in trace if "json_each" in statement]
+        assert len(aggregate_trace) == 1
+        assert "json_each('[4]')" in aggregate_trace[0]
+
+        metadata_params = {"archived_filter": None, "pinned_filter": None, "name_pat": "%target%"}
+        metadata_plan = cast(
+            list[tuple[object, ...]],
+            conn.execute("EXPLAIN QUERY PLAN " + _LIST_DIALOGS_SQL, metadata_params).fetchall(),
+        )
+        metadata_details = [cast(str, row[3]) for row in metadata_plan]
+        assert not any(
+            re.search(r"\b(?:SCAN|SEARCH) m\b|messages", detail, re.IGNORECASE) for detail in metadata_details
+        )
 
         conn.row_factory = sqlite3.Row
-        aggregate_row = conn.execute(_LIST_DIALOGS_SQL, params).fetchone()
-        assert aggregate_row is not None
-        assert aggregate_row["local_message_count"] == 3
-        assert aggregate_row["unread_in"] == 1
-        assert aggregate_row["unread_out"] == 0
+        aggregate_params = {"dialog_ids_json": "[1]"}
+        aggregate_plan = cast(
+            list[tuple[object, ...]],
+            conn.execute("EXPLAIN QUERY PLAN " + _LIST_DIALOG_MESSAGE_AGGREGATES_SQL, aggregate_params).fetchall(),
+        )
+        aggregate_details = [cast(str, row[3]) for row in aggregate_plan]
+        message_access = [detail for detail in aggregate_details if re.search(r"\b(?:SCAN|SEARCH) m\b", detail)]
+        assert len(message_access) == 1
+        assert "SEARCH" in message_access[0]
+        assert "dialog_id=?" in message_access[0]
+        assert "SCAN m" not in message_access[0]
+        no_message_row = conn.execute(
+            _LIST_DIALOG_MESSAGE_AGGREGATES_SQL,
+            {"dialog_ids_json": "[3]"},
+        ).fetchone()
+        assert no_message_row is not None
+        assert tuple(no_message_row) == (3, 0, 0, 0)
 
-        def message_plan(sql_params: dict[str, object]) -> list[str]:
-            plan_rows = cast(
-                list[tuple[object, ...]],
-                conn.execute("EXPLAIN QUERY PLAN " + _LIST_DIALOGS_SQL, sql_params).fetchall(),
-            )
-            return [cast(str, row[3]) for row in plan_rows if " m " in cast(str, row[3])]
+        vm_steps = 0
 
-        filtered_plan = message_plan(params)
-        assert filtered_plan == ["SEARCH m USING PRIMARY KEY (dialog_id=?)"]
-        assert not any("SCAN m" in detail or "SCAN messages" in detail for detail in filtered_plan)
+        def progress() -> int:
+            nonlocal vm_steps
+            vm_steps += 1_000
+            return int(vm_steps > 100_000)
 
-        unfiltered_plan = message_plan({"archived_filter": None, "pinned_filter": None, "name_pat": None})
-        assert unfiltered_plan == ["SEARCH m USING PRIMARY KEY (dialog_id=?)"]
-        assert not any("SCAN m" in detail or "SCAN messages" in detail for detail in unfiltered_plan)
+        conn.set_progress_handler(progress, 1_000)
+        try:
+            conn.execute(_LIST_DIALOG_MESSAGE_AGGREGATES_SQL, aggregate_params).fetchall()
+        finally:
+            conn.set_progress_handler(None, 0)
+        assert vm_steps < 100_000
+
+
+async def test_list_dialogs_empty_final_selection_skips_message_aggregate() -> None:
+    with _make_db() as conn:
+        _insert_dialog(conn, 1, name="Visible peer")
+        conn.commit()
+        trace: list[str] = []
+        conn.set_trace_callback(trace.append)
+        result = await _make_server(conn, _TestClient())._list_dialogs({"filter": "no-such-peer"})
+        conn.set_trace_callback(None)
+
+        assert result["ok"] is True
+        assert _dialog_rows(result) == []
+        assert not any("json_each" in statement for statement in trace)
 
 
 # ---------------------------------------------------------------------------
@@ -498,11 +553,18 @@ async def test_list_dialogs_unread_columns_scales_to_200_dialogs() -> None:
 
         client = _TestClient()
         server = _make_server(conn, client)
+        trace: list[str] = []
+        conn.set_trace_callback(trace.append)
         result = await server._list_dialogs({})
+        conn.set_trace_callback(None)
         assert result["ok"] is True
 
         dialogs = result["data"]["dialogs"]
         assert len(dialogs) == N_DIALOGS, f"Expected {N_DIALOGS} dialogs, got {len(dialogs)}"
+        assert [row["id"] for row in dialogs] == list(range(1, N_DIALOGS + 1))
+        aggregate_trace = [statement for statement in trace if "json_each" in statement]
+        assert len(aggregate_trace) == 1
+        assert "json_each('[1,2,3" in aggregate_trace[0]
 
         for row in dialogs:
             if row["id"] in user_ids:

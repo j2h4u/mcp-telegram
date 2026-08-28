@@ -2,6 +2,7 @@
 
 import asyncio
 import dataclasses
+import json
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -52,6 +53,7 @@ from .sqlite_projection import (
     _COUNT_READ_POSITION_PENDING_SQL,
     _FETCH_UNREAD_MESSAGES_SQL,
     _GET_READ_POSITION_SQL,
+    _LIST_DIALOG_MESSAGE_AGGREGATES_SQL,
     _LIST_DIALOGS_SQL,
     _LIST_MESSAGES_BASE_SQL,
     _READ_POSITION_PENDING_IDENTITIES_SQL,
@@ -305,6 +307,13 @@ class _ListDialogsFilter:
     normalized: str | None
     raw_lower: str | None
     name_pat: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _DialogMessageAggregate:
+    local_message_count: int = 0
+    unread_in: int = 0
+    unread_out: int = 0
 
 
 @dataclass(frozen=True)
@@ -1155,6 +1164,29 @@ class ReadingService:
             rows = _fetchall_rows(conn.execute(_LIST_DIALOGS_SQL, {**params, "name_pat": None}))
         return [cast(Mapping[str, object], row) for row in rows]
 
+    @staticmethod
+    def _fetch_list_dialog_aggregates(
+        conn: sqlite3.Connection,
+        dialog_ids: Sequence[int],
+    ) -> dict[int, _DialogMessageAggregate]:
+        if not dialog_ids:
+            return {}
+        unique_ids = list(dict.fromkeys(dialog_ids))
+        rows = _fetchall_rows(
+            conn.execute(
+                _LIST_DIALOG_MESSAGE_AGGREGATES_SQL,
+                {"dialog_ids_json": json.dumps(unique_ids, separators=(",", ":"))},
+            )
+        )
+        return {
+            _object_to_int(_row_value(row, "dialog_id")): _DialogMessageAggregate(
+                local_message_count=_object_to_int(_row_value(row, "local_message_count")),
+                unread_in=_object_to_int(_row_value(row, "unread_in")),
+                unread_out=_object_to_int(_row_value(row, "unread_out")),
+            )
+            for row in rows
+        }
+
     def _dialog_row_matches_filter(
         self,
         dialog_filter: _ListDialogsFilter,
@@ -1184,14 +1216,12 @@ class ReadingService:
     def _shape_dialog_row(
         self,
         row: Mapping[str, object],
-        dialog_filter: _ListDialogsFilter,
+        aggregate: _DialogMessageAggregate,
         scheduled_summary: tuple[int, int | None] = (0, None),
         inclusion_basis: tuple[str, ...] | None = None,
-    ) -> tuple[dict[str, object] | None, int | None]:
+    ) -> tuple[dict[str, object], int | None]:
         d_id = _object_to_int(row["dialog_id"])
-        local_count = _object_to_int(row["local_message_count"], 0)
-        if not self._dialog_row_matches_filter(dialog_filter, _object_to_str_or_none(row["name"])):
-            return None, None
+        local_count = aggregate.local_message_count
 
         row_data: dict[str, object] = {
             "last_synced_at": row["last_synced_at"],
@@ -1228,8 +1258,8 @@ class ReadingService:
             **ReadingService._dialog_lifecycle_fields(row, scheduled_summary, inclusion_basis),
         }
         if DialogType.parse(_object_to_str_or_none(row["type"])) == DialogType.USER:
-            row_data["unread_in"] = _object_to_int(row["unread_in"], 0)
-            row_data["unread_out"] = _object_to_int(row["unread_out"], 0)
+            row_data["unread_in"] = aggregate.unread_in
+            row_data["unread_out"] = aggregate.unread_out
         return row_data, _object_to_int_or_none(row["snapshot_at"])
 
     @staticmethod
@@ -2163,8 +2193,7 @@ class ReadingService:
                 },
             }
 
-        dialogs: list[dict] = []
-        max_snapshot: int | None = None
+        selected_rows: list[tuple[Mapping[str, object], tuple[int, int | None], tuple[str, ...] | None]] = []
         for row in sql_rows:
             dialog_id = _object_to_int(row["dialog_id"])
             if request.scope == "own_only" and (
@@ -2177,14 +2206,39 @@ class ReadingService:
                 summary = (0, None)
             if request.message_state == "scheduled" and summary[0] == 0:
                 continue
+            if not self._dialog_row_matches_filter(dialog_filter, _object_to_str_or_none(row["name"])):
+                continue
+            selected_rows.append(
+                (
+                    row,
+                    summary,
+                    own_basis.get(dialog_id) if own_basis is not None else None,
+                )
+            )
+
+        if not selected_rows:
+            return {
+                "ok": True,
+                "data": {
+                    "dialogs": [],
+                    "snapshot_age_h": None,
+                    "bootstrap_pending": False,
+                    "scope": request.scope,
+                },
+            }
+
+        dialog_ids = [_object_to_int(row["dialog_id"]) for row, _, _ in selected_rows]
+        aggregates = self._fetch_list_dialog_aggregates(conn, dialog_ids)
+        dialogs: list[dict] = []
+        max_snapshot: int | None = None
+        for row, summary, inclusion_basis in selected_rows:
+            dialog_id = _object_to_int(row["dialog_id"])
             row_data, snapshot_at = self._shape_dialog_row(
                 row,
-                dialog_filter,
+                aggregates.get(dialog_id, _DialogMessageAggregate()),
                 summary,
-                own_basis.get(dialog_id) if own_basis is not None else None,
+                inclusion_basis,
             )
-            if row_data is None:
-                continue
             if snapshot_at is not None and (max_snapshot is None or snapshot_at > max_snapshot):
                 max_snapshot = snapshot_at
             dialogs.append(row_data)

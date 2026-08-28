@@ -102,103 +102,106 @@ def _build_access_metadata(
 # `:archived_filter` and `:pinned_filter` are 0 (filter rows where col=0)
 # or None (no filter).
 _LIST_DIALOGS_SQL = """
-WITH candidate_dialogs AS MATERIALIZED (
-    SELECT *
-    FROM (
-        SELECT
-            d.dialog_id,
-            d.name,
-            d.type,
-            d.archived,
-            d.pinned,
-            d.members,
-            d.created,
-            COALESCE(d.last_message_at, sd.last_event_at, sd.last_synced_at, sd.access_lost_at) AS last_message_at,
-            d.snapshot_at,
-            d.unread_mentions_count,
-            d.unread_reactions_count,
-            d.unread_count,
-            d.draft_text,
-            sd.status AS sync_status,
-            sd.total_messages,
-            sd.last_synced_at,
-            sd.last_event_at,
-            sd.last_delta_checked_at,
-            sd.access_lost_at,
-            sd.read_inbox_max_id,
-            sd.read_outbox_max_id
-        FROM dialogs d
-        LEFT JOIN synced_dialogs sd USING(dialog_id)
-        WHERE d.hidden = 0 OR sd.status = 'access_lost'
+WITH agent_visible_dialogs AS (
+    SELECT
+        d.dialog_id,
+        d.name,
+        d.type,
+        d.archived,
+        d.pinned,
+        d.members,
+        d.created,
+        COALESCE(d.last_message_at, sd.last_event_at, sd.last_synced_at, sd.access_lost_at) AS last_message_at,
+        d.snapshot_at,
+        d.unread_mentions_count,
+        d.unread_reactions_count,
+        d.unread_count,
+        d.draft_text,
+        sd.status AS sync_status,
+        sd.total_messages,
+        sd.last_synced_at,
+        sd.last_event_at,
+        sd.last_delta_checked_at,
+        sd.access_lost_at
+    FROM dialogs d
+    LEFT JOIN synced_dialogs sd USING(dialog_id)
+    WHERE d.hidden = 0 OR sd.status = 'access_lost'
 
-        UNION ALL
+    UNION ALL
 
-        SELECT
-            sd.dialog_id,
-            NULL AS name,
-            NULL AS type,
-            0 AS archived,
-            0 AS pinned,
-            NULL AS members,
-            NULL AS created,
-            COALESCE(sd.last_event_at, sd.last_synced_at, sd.access_lost_at) AS last_message_at,
-            NULL AS snapshot_at,
-            0 AS unread_mentions_count,
-            0 AS unread_reactions_count,
-            NULL AS unread_count,
-            NULL AS draft_text,
-            sd.status AS sync_status,
-            sd.total_messages,
-            sd.last_synced_at,
-            sd.last_event_at,
-            sd.last_delta_checked_at,
-            sd.access_lost_at,
-            sd.read_inbox_max_id,
-            sd.read_outbox_max_id
-        FROM synced_dialogs sd
-        LEFT JOIN dialogs d USING(dialog_id)
-        WHERE sd.status = 'access_lost' AND d.dialog_id IS NULL
-    )
-    WHERE (:archived_filter IS NULL OR archived = :archived_filter)
-      AND (:pinned_filter IS NULL OR pinned = :pinned_filter)
-      AND (:name_pat IS NULL OR LOWER(name) LIKE :name_pat ESCAPE '\\')
+    SELECT
+        sd.dialog_id,
+        NULL AS name,
+        NULL AS type,
+        0 AS archived,
+        0 AS pinned,
+        NULL AS members,
+        NULL AS created,
+        COALESCE(sd.last_event_at, sd.last_synced_at, sd.access_lost_at) AS last_message_at,
+        NULL AS snapshot_at,
+        0 AS unread_mentions_count,
+        0 AS unread_reactions_count,
+        NULL AS unread_count,
+        NULL AS draft_text,
+        sd.status AS sync_status,
+        sd.total_messages,
+        sd.last_synced_at,
+        sd.last_event_at,
+        sd.last_delta_checked_at,
+        sd.access_lost_at
+    FROM synced_dialogs sd
+    LEFT JOIN dialogs d USING(dialog_id)
+    WHERE sd.status = 'access_lost' AND d.dialog_id IS NULL
+)
+SELECT
+    dialog_id, name, type, archived, pinned,
+    members, created, last_message_at, snapshot_at,
+    unread_mentions_count, unread_reactions_count, unread_count, draft_text,
+    sync_status, total_messages, last_synced_at, last_event_at, last_delta_checked_at, access_lost_at
+FROM agent_visible_dialogs
+WHERE (:archived_filter IS NULL OR archived = :archived_filter)
+AND (:pinned_filter IS NULL OR pinned = :pinned_filter)
+AND (:name_pat IS NULL OR LOWER(name) LIKE :name_pat ESCAPE '\\')
+ORDER BY pinned DESC, last_message_at DESC
+"""
+
+_LIST_DIALOG_MESSAGE_AGGREGATES_SQL = """
+WITH selected_dialogs AS MATERIALIZED (
+    SELECT CAST(value AS INTEGER) AS dialog_id
+    FROM json_each(:dialog_ids_json)
 ), message_aggregates AS (
     SELECT
-        c.dialog_id,
+        ids.dialog_id,
         SUM(CASE WHEN m.is_deleted = 0 THEN 1 ELSE 0 END) AS local_message_count,
         SUM(CASE
-            WHEN c.sync_status = 'synced'
+            WHEN sd.status = 'synced'
              AND m.is_deleted = 0
              AND m.is_service = 0
              AND m."out" = 0
-             AND m.message_id > COALESCE(c.read_inbox_max_id, -1)
+             AND m.message_id > COALESCE(sd.read_inbox_max_id, -1)
             THEN 1 ELSE 0 END
         ) AS unread_in,
         SUM(CASE
-            WHEN c.sync_status = 'synced'
+            WHEN sd.status = 'synced'
              AND m.is_deleted = 0
              AND m.is_service = 0
              AND m."out" = 1
-             AND m.message_id > COALESCE(c.read_outbox_max_id, -1)
+             AND m.message_id > COALESCE(sd.read_outbox_max_id, -1)
             THEN 1 ELSE 0 END
         ) AS unread_out
-    FROM candidate_dialogs c
+    FROM selected_dialogs ids
+    LEFT JOIN synced_dialogs sd USING(dialog_id)
     CROSS JOIN messages m
-    WHERE m.dialog_id = c.dialog_id
-    GROUP BY c.dialog_id
+    WHERE m.dialog_id = ids.dialog_id
+    GROUP BY ids.dialog_id
 )
 SELECT
-    c.dialog_id, c.name, c.type, c.archived, c.pinned,
-    c.members, c.created, c.last_message_at, c.snapshot_at,
-    c.unread_mentions_count, c.unread_reactions_count, c.unread_count, c.draft_text,
-    c.sync_status, c.total_messages, c.last_synced_at, c.last_event_at, c.last_delta_checked_at, c.access_lost_at,
-    c.read_inbox_max_id, c.read_outbox_max_id,
+    ids.dialog_id,
     COALESCE(a.local_message_count, 0) AS local_message_count,
     COALESCE(a.unread_in, 0) AS unread_in,
     COALESCE(a.unread_out, 0) AS unread_out
-FROM candidate_dialogs c
+FROM selected_dialogs ids
 LEFT JOIN message_aggregates a USING(dialog_id)
-ORDER BY c.pinned DESC, c.last_message_at DESC
 """
 
 # Unread summary is intentionally sourced only from the persisted Telegram
