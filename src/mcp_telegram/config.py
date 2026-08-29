@@ -14,7 +14,8 @@ from xdg_base_dirs import xdg_config_home  # type: ignore[import-error]
 
 _VALID_HTTP_PORTS = range(1, 65_536)
 _MAX_FACT_HYDRATION_BATCH_SIZE = 100
-_MIN_FACT_HYDRATION_REQUESTS = 2
+_MIN_FACT_HYDRATION_REQUESTS = 3
+_MIN_FACT_HYDRATION_JOBS = 2
 
 
 class ConfigError(RuntimeError):
@@ -131,7 +132,9 @@ class FactHydrationConfig:
         if self.batch_size > _MAX_FACT_HYDRATION_BATCH_SIZE:
             raise ValueError("fact hydration batch_size must be <= 100")
         if self.max_requests_per_cycle < _MIN_FACT_HYDRATION_REQUESTS:
-            raise ValueError("fact hydration max_requests_per_cycle must be >= 2")
+            raise ValueError("fact hydration max_requests_per_cycle must be >= 3")
+        if self.max_jobs_per_cycle < _MIN_FACT_HYDRATION_JOBS:
+            raise ValueError("fact hydration max_jobs_per_cycle must be >= 2")
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,7 +443,14 @@ def _env_fact_hydration_batch_size(environ: Mapping[str, str], default: int) -> 
 def _env_fact_hydration_max_requests(environ: Mapping[str, str], default: int) -> int:
     value = _env_positive_int(environ, "FACT_HYDRATION_MAX_REQUESTS_PER_CYCLE", default)
     if value < _MIN_FACT_HYDRATION_REQUESTS:
-        raise ConfigError("FACT_HYDRATION_MAX_REQUESTS_PER_CYCLE must be an integer >= 2")
+        raise ConfigError("FACT_HYDRATION_MAX_REQUESTS_PER_CYCLE must be an integer >= 3")
+    return value
+
+
+def _env_fact_hydration_max_jobs(environ: Mapping[str, str], default: int) -> int:
+    value = _env_positive_int(environ, "FACT_HYDRATION_MAX_JOBS_PER_CYCLE", default)
+    if value < _MIN_FACT_HYDRATION_JOBS:
+        raise ConfigError("FACT_HYDRATION_MAX_JOBS_PER_CYCLE must be an integer >= 2")
     return value
 
 
@@ -568,9 +578,7 @@ def resolve_scheduling_config(
                 env, "FACT_HYDRATION_INTERVAL_SECONDS", config.fact_hydration.interval_seconds
             ),
             max_requests_per_cycle=_env_fact_hydration_max_requests(env, config.fact_hydration.max_requests_per_cycle),
-            max_jobs_per_cycle=_env_positive_int(
-                env, "FACT_HYDRATION_MAX_JOBS_PER_CYCLE", config.fact_hydration.max_jobs_per_cycle
-            ),
+            max_jobs_per_cycle=_env_fact_hydration_max_jobs(env, config.fact_hydration.max_jobs_per_cycle),
             batch_size=_env_fact_hydration_batch_size(env, config.fact_hydration.batch_size),
             pause_between_requests_seconds=_env_positive_float(
                 env,
@@ -839,19 +847,22 @@ def _parse_fact_hydration(data: dict[str, object], path: Path, defaults: Schedul
         hydration_defaults.max_requests_per_cycle,
     )
     if hydration_max_requests < _MIN_FACT_HYDRATION_REQUESTS:
-        raise ConfigError(f"Invalid scheduling.fact_hydration.max_requests_per_cycle in {path}: expected integer >= 2")
+        raise ConfigError(f"Invalid scheduling.fact_hydration.max_requests_per_cycle in {path}: expected integer >= 3")
+    hydration_max_jobs = _positive_int(
+        hydration_data,
+        "max_jobs_per_cycle",
+        "scheduling.fact_hydration",
+        path,
+        hydration_defaults.max_jobs_per_cycle,
+    )
+    if hydration_max_jobs < _MIN_FACT_HYDRATION_JOBS:
+        raise ConfigError(f"Invalid scheduling.fact_hydration.max_jobs_per_cycle in {path}: expected integer >= 2")
     return FactHydrationConfig(
         interval_seconds=_positive_float(
             hydration_data, "interval_seconds", "scheduling.fact_hydration", path, hydration_defaults.interval_seconds
         ),
         max_requests_per_cycle=hydration_max_requests,
-        max_jobs_per_cycle=_positive_int(
-            hydration_data,
-            "max_jobs_per_cycle",
-            "scheduling.fact_hydration",
-            path,
-            hydration_defaults.max_jobs_per_cycle,
-        ),
+        max_jobs_per_cycle=hydration_max_jobs,
         batch_size=hydration_batch_size,
         pause_between_requests_seconds=_positive_float(
             hydration_data,

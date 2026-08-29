@@ -40,6 +40,7 @@ class HydrationJob:
     attempts: int
     message_sent_at: int = 0
     priority: HydrationPriority = HydrationPriority.FOREGROUND
+    terminal: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, str) or not self.kind:
@@ -70,13 +71,31 @@ class HydrationQueueSummary:
     attempts_max: int
 
 
-_JOB_COLUMNS = "kind, dialog_id, message_id, due_at, attempts, message_sent_at, priority"
+@dataclass(frozen=True, slots=True)
+class TranscriptionHydrationRepair:
+    """Bounded result of repairing missing voice transcription jobs."""
+
+    enqueued: int
+    has_more: bool
+
+
+_JOB_COLUMNS = "kind, dialog_id, message_id, due_at, attempts, message_sent_at, priority, terminal"
 _SELECT_JOB_COLUMNS = ", ".join(f"hj.{column}" for column in _JOB_COLUMNS.split(", "))
 _SUMMARY_AGGREGATE_SQL = (
     f"SELECT COUNT(*), MIN(attempts), MAX(attempts) FROM {HYDRATION_QUEUE_TABLE} WHERE kind = ? AND dialog_id = ?"
 )
 _SUMMARY_MESSAGE_IDS_SQL = (
     f"SELECT message_id FROM {HYDRATION_QUEUE_TABLE} WHERE kind = ? AND dialog_id = ? ORDER BY message_id LIMIT ?"
+)
+_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL = (
+    "FROM messages m INDEXED BY idx_messages_voice_undeleted_sent "
+    "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
+    "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
+    "LEFT JOIN message_transcriptions mt ON mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id "
+    "LEFT JOIN hydration_jobs hj ON hj.kind = 'transcription' "
+    "AND hj.dialog_id = m.dialog_id AND hj.message_id = m.message_id "
+    "WHERE m.is_deleted = 0 AND m.media_kind = 'voice' "
+    "AND mt.message_id IS NULL AND hj.message_id IS NULL"
 )
 
 
@@ -85,7 +104,7 @@ def _identity(job: HydrationJob) -> tuple[str, int, int]:
 
 
 def _job_from_row(row: sqlite3.Row | tuple[object, ...]) -> HydrationJob:
-    kind, dialog_id, message_id, due_at, attempts, message_sent_at, priority = row
+    kind, dialog_id, message_id, due_at, attempts, message_sent_at, priority, terminal = row
     return HydrationJob(
         kind=cast(str, kind),
         dialog_id=int(cast(int | str, dialog_id)),
@@ -94,6 +113,7 @@ def _job_from_row(row: sqlite3.Row | tuple[object, ...]) -> HydrationJob:
         attempts=int(cast(int | str, attempts)),
         message_sent_at=int(cast(int | str, message_sent_at)),
         priority=HydrationPriority(int(cast(int | str, priority))),
+        terminal=bool(terminal),
     )
 
 
@@ -125,7 +145,7 @@ class HydrationQueueRepository:
         existing job never resets ``attempts``.
         """
         self._conn.execute(
-            f"INSERT INTO {HYDRATION_QUEUE_TABLE} ({_JOB_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            f"INSERT INTO {HYDRATION_QUEUE_TABLE} ({_JOB_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(kind, dialog_id, message_id) DO UPDATE SET "
             "due_at = CASE WHEN excluded.due_at < due_at THEN excluded.due_at ELSE due_at END, "
             "message_sent_at = MAX(message_sent_at, excluded.message_sent_at), "
@@ -138,8 +158,34 @@ class HydrationQueueRepository:
                 job.attempts,
                 job.message_sent_at,
                 int(job.priority),
+                int(job.terminal),
             ),
         )
+
+    def repair_transcription_hydration_jobs(self, *, due_at: int, max_jobs: int) -> TranscriptionHydrationRepair:
+        """Bound the recurring repair of missing voice transcription jobs."""
+        if max_jobs <= 0:
+            return TranscriptionHydrationRepair(0, False)
+        candidates_sql = (
+            "SELECT 'transcription', m.dialog_id, m.message_id, ?, 0, ?, m.sent_at, 0 "
+            f"{_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL} "
+            "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT ?"
+        )
+        cursor = self._conn.execute(
+            "INSERT OR IGNORE INTO hydration_jobs "
+            "(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at, terminal) "
+            f"{candidates_sql}",
+            (due_at, int(HydrationPriority.BACKFILL), max_jobs),
+        )
+        has_more = (
+            self._conn.execute(
+                "SELECT 1 "
+                f"{_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL} "
+                "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT 1",
+            ).fetchone()
+            is not None
+        )
+        return TranscriptionHydrationRepair(cursor.rowcount, has_more)
 
     def due_jobs(self, now: int, limit: int, *, kind: str | None = None) -> list[HydrationJob]:
         """Return jobs due at or before *now* in deterministic queue order."""
@@ -151,13 +197,25 @@ class HydrationQueueRepository:
             list[tuple[object, ...]],
             self._conn.execute(
                 f"SELECT {_SELECT_JOB_COLUMNS} FROM {HYDRATION_QUEUE_TABLE} AS hj "
-                f"WHERE hj.due_at <= ?{kind_clause} "
+                f"WHERE hj.due_at <= ? AND hj.terminal = 0{kind_clause} "
                 "ORDER BY hj.priority DESC, hj.message_sent_at DESC, "
                 "hj.due_at, hj.kind, hj.dialog_id, hj.message_id LIMIT ?",
                 parameters,
             ).fetchall(),
         )
         return [_job_from_row(row) for row in rows]
+
+    def queued_count(self, *, kind: str | None = None) -> int:
+        """Return the number of non-terminal jobs, optionally for one kind."""
+        clause = " AND kind = ?" if kind is not None else ""
+        parameters: tuple[object, ...] = (kind,) if kind is not None else ()
+        row = cast(
+            tuple[int] | None,
+            self._conn.execute(
+                f"SELECT COUNT(*) FROM {HYDRATION_QUEUE_TABLE} WHERE terminal = 0{clause}", parameters
+            ).fetchone(),
+        )
+        return int(cast(int | str, row[0])) if row is not None else 0
 
     def start(self, job: HydrationJob) -> HydrationJob | None:
         """Atomically increment and return a queued job, or return ``None``.
@@ -169,7 +227,7 @@ class HydrationQueueRepository:
             tuple[object, ...] | None,
             self._conn.execute(
                 f"UPDATE {HYDRATION_QUEUE_TABLE} SET attempts = attempts + 1 "
-                "WHERE kind = ? AND dialog_id = ? AND message_id = ? "
+                "WHERE kind = ? AND dialog_id = ? AND message_id = ? AND terminal = 0 "
                 f"RETURNING {_JOB_COLUMNS}",
                 _identity(job),
             ).fetchone(),
@@ -179,8 +237,16 @@ class HydrationQueueRepository:
     def reschedule(self, job: HydrationJob, due_at: int) -> bool:
         """Set the next due time for *job* without changing its attempts."""
         cursor = self._conn.execute(
-            f"UPDATE {HYDRATION_QUEUE_TABLE} SET due_at = ? WHERE kind = ? AND dialog_id = ? AND message_id = ?",
+            f"UPDATE {HYDRATION_QUEUE_TABLE} SET due_at = ? WHERE kind = ? AND dialog_id = ? AND message_id = ? AND terminal = 0",
             (due_at, *_identity(job)),
+        )
+        return cursor.rowcount > 0
+
+    def mark_terminal(self, job: HydrationJob) -> bool:
+        """Suppress a job permanently until its message fact is reconciled."""
+        cursor = self._conn.execute(
+            f"UPDATE {HYDRATION_QUEUE_TABLE} SET terminal = 1 WHERE kind = ? AND dialog_id = ? AND message_id = ?",
+            _identity(job),
         )
         return cursor.rowcount > 0
 
@@ -206,6 +272,16 @@ class HydrationQueueRepository:
                 f"DELETE FROM {HYDRATION_QUEUE_TABLE} WHERE dialog_id = ? AND kind = ?",
                 (dialog_id, kind),
             )
+        return cursor.rowcount
+
+    def remove_for_message(self, dialog_id: int, message_id: int) -> int:
+        """Delete every fact job associated with one message."""
+        if not self.is_available():
+            return 0
+        cursor = self._conn.execute(
+            f"DELETE FROM {HYDRATION_QUEUE_TABLE} WHERE dialog_id = ? AND message_id = ?",
+            (dialog_id, message_id),
+        )
         return cursor.rowcount
 
     def summarize_for_dialog(
@@ -250,4 +326,5 @@ __all__ = [
     "HydrationPriority",
     "HydrationQueueRepository",
     "HydrationQueueSummary",
+    "TranscriptionHydrationRepair",
 ]

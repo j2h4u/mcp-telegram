@@ -312,6 +312,8 @@ def _remove_transcription_hydration_job(conn: sqlite3.Connection, dialog_id: int
 def mark_message_deleted(conn: sqlite3.Connection, dialog_id: int, message_id: int, deleted_at: int) -> bool:
     """Tombstone one message and report whether this call changed its state."""
     cursor = conn.execute(_MARK_DELETED_SQL, (deleted_at, dialog_id, message_id))
+    if cursor.rowcount > 0:
+        HydrationQueueRepository(conn).remove_for_message(dialog_id, message_id)
     return cursor.rowcount > 0
 
 
