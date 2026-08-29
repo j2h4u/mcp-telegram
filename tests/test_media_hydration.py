@@ -19,7 +19,7 @@ from telethon.errors.rpcerrorlist import (  # type: ignore[import-untyped]
 from mcp_telegram.access_lifecycle import restore_access_after_revalidation, set_access_lost
 from mcp_telegram.config import FactHydrationConfig
 from mcp_telegram.fact_hydration import MessageFactHydrationWorker
-from mcp_telegram.history_enrollment import disable_history
+from mcp_telegram.history_enrollment import disable_history, enable_history
 from mcp_telegram.hydration_queue import HydrationPriority, HydrationQueueRepository
 from mcp_telegram.media_hydration import MediaFactHydrationHandler
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
@@ -583,6 +583,33 @@ async def test_terminal_transcription_survives_reconcile_and_repair_until_fact_i
     assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (0,)
 
 
+@pytest.mark.asyncio
+async def test_disable_reconcile_reenable_restart_repair_preserves_terminal_tombstone(tmp_path: Path) -> None:
+    path = tmp_path / "restart.db"
+    ensure_sync_schema(path)
+    conn = _open_sync_db(path)
+    try:
+        _seed_voice(conn)
+        conn.execute("UPDATE hydration_jobs SET terminal = 1, attempts = 3 WHERE kind = 'transcription'")
+        conn.commit()
+        disable_history(conn, 1, now=10)
+        with conn:
+            insert_messages_with_fts(conn, [_hydration_message(1, 1, "voice")], priority=HydrationPriority.BACKFILL)
+        enable_history(conn, 1, now=20)
+        conn.commit()
+        conn.close()
+
+        conn = _open_sync_db(path)
+        client = _Client(SimpleNamespace(pending=False, text="speech words", transcription_id=7))
+        result = await _transcription_worker(conn, client).run_cycle(now=21)
+
+        assert result.requests == 0
+        assert client.calls == []
+        assert conn.execute("SELECT attempts, terminal FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (3, 1)
+    finally:
+        conn.close()
+
+
 def test_disable_history_purges_active_jobs_but_preserves_terminal_suppression(db: sqlite3.Connection) -> None:
     _seed_voice(db)
     db.execute(
@@ -782,6 +809,66 @@ async def test_foreground_batches_exhaust_before_backfill_floodwait(
     assert ["ids" in call for call in client.calls] == [True, True, False, False]
     assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'media_metadata'").fetchone() == (0,)
     assert db.execute("SELECT attempts, due_at FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (1, 8)
+
+
+@pytest.mark.asyncio
+async def test_early_stop_logs_later_kind_as_selected_without_request(
+    db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    _seed(db, message_id=1)
+    db.execute("UPDATE hydration_jobs SET priority = 1")
+    _seed_voice(db, dialog_id=2)
+    db.commit()
+    client = _Client(error=FloodWaitError(request=None, capture=7))
+    policy = FactHydrationConfig(batch_size=1, max_jobs_per_cycle=2, max_requests_per_cycle=3, pause_between_requests_seconds=0.01)
+
+    with caplog.at_level(logging.INFO, logger="mcp_telegram.fact_hydration"):
+        result = await _mixed_worker(db, client, policy).run_cycle(now=1)
+
+    assert result.stopped is True
+    transcription_logs = [record.message for record in caplog.records if "kind=transcription" in record.message]
+    assert transcription_logs and "selected=1" in transcription_logs[-1] and "requests=0" in transcription_logs[-1]
+
+
+@pytest.mark.asyncio
+async def test_same_tier_skew_still_runs_both_kinds_with_weighted_budget(db: sqlite3.Connection) -> None:
+    for message_id in range(1, 302):
+        _seed(db, message_id=message_id)
+    _seed_voice(db, dialog_id=2)
+    db.commit()
+
+    class _WeightedClient(_Client):
+        async def get_messages(self, *_args: object, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            ids = kwargs.get("ids")
+            assert isinstance(ids, list) and len(ids) == 1
+            return [SimpleNamespace(id=ids[0], media=None)]
+
+    client = _WeightedClient(SimpleNamespace(pending=False, text="speech words", transcription_id=7))
+    policy = FactHydrationConfig(batch_size=1, max_jobs_per_cycle=2, max_requests_per_cycle=3, pause_between_requests_seconds=0.01)
+    result = await _mixed_worker(db, client, policy).run_cycle(now=1)
+
+    assert result.requests == 3
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (0,)
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'media_metadata'").fetchone() == (300,)
+
+
+def test_worker_rejects_duplicate_handler_kinds(db: sqlite3.Connection) -> None:
+    config = FactHydrationConfig(max_jobs_per_cycle=2, max_requests_per_cycle=2, pause_between_requests_seconds=0.01)
+    with pytest.raises(ValueError, match="handler kind must be unique"):
+        MessageFactHydrationWorker(
+            _Client(),
+            db,
+            asyncio.Event(),
+            handlers=(MediaFactHydrationHandler(batch_size=1), MediaFactHydrationHandler(batch_size=1)),
+            interval_seconds=config.interval_seconds,
+            max_requests_per_cycle=config.max_requests_per_cycle,
+            max_jobs_per_cycle=config.max_jobs_per_cycle,
+            retry_delay_seconds=config.retry_delay_seconds,
+            circuit_retry_seconds=config.circuit_retry_seconds,
+            max_attempts=config.max_attempts,
+            pause_between_requests_seconds=config.pause_between_requests_seconds,
+        )
 
 
 @pytest.mark.asyncio

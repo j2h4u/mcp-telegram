@@ -312,6 +312,10 @@ def test_v41_shape_seeds_voice_transcription_hydration_as_backfill(tmp_path: Pat
             "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload, is_deleted) "
             "VALUES (91, 18, 1235, NULL, 'voice', '{}', 1)"
         )
+        conn.execute(
+            "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at) "
+            "VALUES ('media_metadata', 91, 99, 1200, 2, 1, 1199)"
+        )
         conn.execute("DROP INDEX idx_hydration_jobs_schedule")
         conn.execute("DROP INDEX idx_messages_voice_undeleted_sent")
         conn.execute("ALTER TABLE hydration_jobs RENAME TO hydration_jobs_v41")
@@ -338,6 +342,10 @@ def test_v41_shape_seeds_voice_transcription_hydration_as_backfill(tmp_path: Pat
             "SELECT kind, dialog_id, message_id, priority, message_sent_at FROM hydration_jobs "
             "WHERE kind = 'transcription'"
         ).fetchone() == ("transcription", 91, 17, 0, 1234)
+        assert conn.execute(
+            "SELECT kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at, terminal "
+            "FROM hydration_jobs WHERE kind = 'media_metadata'"
+        ).fetchone() == ("media_metadata", 91, 99, 1200, 2, 1, 1199, 0)
         assert (
             conn.execute(
                 "SELECT 1 FROM hydration_jobs WHERE kind = 'transcription' AND dialog_id = 91 AND message_id = 18"

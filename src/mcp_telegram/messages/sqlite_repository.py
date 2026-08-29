@@ -27,6 +27,11 @@ _FACT_HYDRATION_ELIGIBILITY_SQL = (
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
     "WHERE sd.dialog_id = ? AND sd.status IN ('syncing', 'synced')"
 )
+_TRANSCRIPTION_HYDRATION_MESSAGE_SQL = (
+    "m.is_deleted = 0 AND m.media_kind = 'voice' "
+    "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
+    "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id)"
+)
 
 
 def _insert_sql(table: str, dataclass_type: type) -> str:
@@ -378,10 +383,7 @@ def transcription_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, m
     return (
         conn.execute(
             "SELECT 1 FROM messages m WHERE m.dialog_id = ? AND m.message_id = ? "
-            "AND m.is_deleted = 0 AND m.media_kind = 'voice' "
-            "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
-            "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id) "
-            "AND EXISTS (" + _FACT_HYDRATION_ELIGIBILITY_SQL + ")",
+            f"AND {_TRANSCRIPTION_HYDRATION_MESSAGE_SQL} AND EXISTS (" + _FACT_HYDRATION_ELIGIBILITY_SQL + ")",
             (dialog_id, message_id, dialog_id),
         ).fetchone()
         is not None
@@ -392,11 +394,9 @@ _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL = (
     "FROM messages m INDEXED BY idx_messages_voice_undeleted_sent "
     "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
-    "LEFT JOIN message_transcriptions mt ON mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id "
     "LEFT JOIN hydration_jobs hj ON hj.kind = 'transcription' "
     "AND hj.dialog_id = m.dialog_id AND hj.message_id = m.message_id "
-    "WHERE m.is_deleted = 0 AND m.media_kind = 'voice' "
-    "AND mt.message_id IS NULL AND hj.message_id IS NULL"
+    f"WHERE {_TRANSCRIPTION_HYDRATION_MESSAGE_SQL} AND hj.message_id IS NULL"
 )
 
 
