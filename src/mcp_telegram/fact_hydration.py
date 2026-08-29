@@ -129,16 +129,17 @@ def _due_job_order_key(job: HydrationJob) -> tuple[int, int, str, int, int]:
     return (-job.message_sent_at, job.due_at, job.kind, job.dialog_id, job.message_id)
 
 
-def batch_jobs(
-    jobs: Sequence[HydrationJob],
-    handlers: dict[str, HydrationHandler],
-) -> list[list[HydrationJob]]:
-    """Batch compatible jobs without weakening queue priority order."""
+HydrationBatch = tuple[HydrationPriority, int, list[HydrationJob]]
+
+
+def _group_hydration_batches(
+    jobs: Sequence[HydrationJob], handlers: dict[str, HydrationHandler]
+) -> dict[str, list[HydrationBatch]]:
     grouped: dict[tuple[str, HydrationPriority, int], list[tuple[int, HydrationJob]]] = defaultdict(list)
     for position, job in enumerate(jobs):
         grouped[(job.kind, job.priority, job.dialog_id)].append((position, job))
 
-    by_kind: dict[str, list[tuple[HydrationPriority, int, list[HydrationJob]]]] = defaultdict(list)
+    by_kind: dict[str, list[HydrationBatch]] = defaultdict(list)
     for (kind, priority, _dialog_id), positioned_jobs in grouped.items():
         handler = handlers.get(kind)
         if handler is None:
@@ -148,24 +149,62 @@ def batch_jobs(
             by_kind[kind].append((priority, chunk[0][0], [job for _, job in chunk]))
     for kind_batches in by_kind.values():
         kind_batches.sort(key=lambda batch: (-int(batch[0]), batch[1]))
-    # Exhaust each priority tier before moving to backfill. Within a tier,
-    # round-robin kinds so one kind cannot monopolize the request stream.
+    return by_kind
+
+
+def _order_hydration_batches(by_kind: dict[str, list[HydrationBatch]]) -> list[list[HydrationJob]]:
     ordered: list[list[HydrationJob]] = []
     for priority in (HydrationPriority.FOREGROUND, HydrationPriority.BACKFILL):
         tiered = {kind: [batch for batch in batches if batch[0] == priority] for kind, batches in by_kind.items()}
         for round_index in range(max((len(batches) for batches in tiered.values()), default=0)):
             round_batches = [batches[round_index] for batches in tiered.values() if round_index < len(batches)]
-            round_batches.sort(
-                key=lambda batch: (
-                    -batch[2][0].message_sent_at,
-                    batch[2][0].due_at,
-                    batch[2][0].kind,
-                    batch[2][0].dialog_id,
-                    batch[2][0].message_id,
-                )
-            )
+            round_batches.sort(key=lambda batch: _due_job_order_key(batch[2][0]))
             ordered.extend(batch[2] for batch in round_batches)
     return ordered
+
+
+def batch_jobs(
+    jobs: Sequence[HydrationJob],
+    handlers: dict[str, HydrationHandler],
+) -> list[list[HydrationJob]]:
+    """Batch compatible jobs without weakening queue priority order."""
+    return _order_hydration_batches(_group_hydration_batches(jobs, handlers))
+
+
+def _load_due_jobs_by_kind(
+    queue: HydrationQueueRepository,
+    effective_now: int,
+    limit: int,
+    handlers: dict[str, HydrationHandler],
+) -> dict[str, list[HydrationJob]]:
+    return {kind: queue.due_jobs(effective_now, limit, kind=kind) for kind in handlers}
+
+
+def _protect_due_heads(
+    per_kind: dict[str, list[HydrationJob]],
+) -> tuple[list[HydrationJob], dict[str, list[HydrationJob]]]:
+    remaining = {kind: list(jobs) for kind, jobs in per_kind.items()}
+    protected = [jobs.pop(0) for jobs in remaining.values() if jobs]
+    protected.sort(key=lambda job: (-int(job.priority), *_due_job_order_key(job)))
+    return protected, remaining
+
+
+def _append_due_priority_tier(
+    selected: list[HydrationJob],
+    remaining: dict[str, list[HydrationJob]],
+    priority: HydrationPriority,
+    limit: int,
+) -> None:
+    tiered = {kind: [job for job in jobs if job.priority == priority] for kind, jobs in remaining.items()}
+    while len(selected) < limit and any(tiered.values()):
+        heads = sorted(
+            ((jobs[0], kind) for kind, jobs in tiered.items() if jobs),
+            key=lambda pair: _due_job_order_key(pair[0]),
+        )
+        for _head, kind in heads:
+            if len(selected) >= limit:
+                break
+            selected.append(tiered[kind].pop(0))
 
 
 class MessageFactHydrationWorker:
@@ -241,25 +280,10 @@ class MessageFactHydrationWorker:
         return result
 
     def _fair_due_jobs(self, effective_now: int) -> list[HydrationJob]:
-        per_kind = {
-            kind: self._queue.due_jobs(effective_now, self._max_jobs_per_cycle, kind=kind) for kind in self._handlers
-        }
-        selected: list[HydrationJob] = []
-        remaining = {kind: list(jobs) for kind, jobs in per_kind.items()}
-        protected = [jobs.pop(0) for jobs in remaining.values() if jobs]
-        protected.sort(key=lambda job: (-int(job.priority), *_due_job_order_key(job)))
-        selected.extend(protected)
+        per_kind = _load_due_jobs_by_kind(self._queue, effective_now, self._max_jobs_per_cycle, self._handlers)
+        selected, remaining = _protect_due_heads(per_kind)
         for priority in (HydrationPriority.FOREGROUND, HydrationPriority.BACKFILL):
-            tiered = {kind: [job for job in jobs if job.priority == priority] for kind, jobs in remaining.items()}
-            while len(selected) < self._max_jobs_per_cycle and any(tiered.values()):
-                heads = sorted(
-                    ((jobs[0], kind) for kind, jobs in tiered.items() if jobs),
-                    key=lambda pair: _due_job_order_key(pair[0]),
-                )
-                for _head, kind in heads:
-                    if len(selected) >= self._max_jobs_per_cycle:
-                        break
-                    selected.append(tiered[kind].pop(0))
+            _append_due_priority_tier(selected, remaining, priority, self._max_jobs_per_cycle)
         return selected
 
     def _log_cycle(

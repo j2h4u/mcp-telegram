@@ -462,6 +462,28 @@ def reconcile_fact_hydration_job(
     queue = HydrationQueueRepository(conn)
     if not queue.is_available():
         return
+    _reconcile_media_hydration_job(
+        conn,
+        queue,
+        message,
+        due_at=due_at,
+    )
+    _reconcile_transcription_hydration_job(
+        conn,
+        queue,
+        message,
+        due_at=due_at,
+        priority=priority,
+    )
+
+
+def _reconcile_media_hydration_job(
+    conn: sqlite3.Connection,
+    queue: HydrationQueueRepository,
+    message: _message_contracts.StoredMessage,
+    *,
+    due_at: int,
+) -> None:
     job = HydrationJob(
         MEDIA_METADATA_KIND,
         message.dialog_id,
@@ -479,6 +501,15 @@ def reconcile_fact_hydration_job(
     else:
         queue.remove(job)
 
+
+def _reconcile_transcription_hydration_job(
+    conn: sqlite3.Connection,
+    queue: HydrationQueueRepository,
+    message: _message_contracts.StoredMessage,
+    *,
+    due_at: int,
+    priority: HydrationPriority,
+) -> None:
     transcription_job = HydrationJob(
         TRANSCRIPTION_HYDRATION_KIND,
         message.dialog_id,
