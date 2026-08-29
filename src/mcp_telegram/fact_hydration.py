@@ -152,16 +152,9 @@ def batch_jobs(
     # round-robin kinds so one kind cannot monopolize the request stream.
     ordered: list[list[HydrationJob]] = []
     for priority in (HydrationPriority.FOREGROUND, HydrationPriority.BACKFILL):
-        tiered = {
-            kind: [batch for batch in batches if batch[0] == priority]
-            for kind, batches in by_kind.items()
-        }
+        tiered = {kind: [batch for batch in batches if batch[0] == priority] for kind, batches in by_kind.items()}
         for round_index in range(max((len(batches) for batches in tiered.values()), default=0)):
-            round_batches = [
-                batches[round_index]
-                for batches in tiered.values()
-                if round_index < len(batches)
-            ]
+            round_batches = [batches[round_index] for batches in tiered.values() if round_index < len(batches)]
             round_batches.sort(
                 key=lambda batch: (
                     -batch[2][0].message_sent_at,
@@ -220,9 +213,7 @@ class MessageFactHydrationWorker:
     async def run_cycle(self, *, now: int | None = None) -> FactHydrationCycleResult:
         effective_now = int(self._clock()) if now is None else now
         repair = (
-            repair_transcription_hydration_jobs(
-                self._conn, due_at=effective_now, max_jobs=self._max_jobs_per_cycle
-            )
+            repair_transcription_hydration_jobs(self._conn, due_at=effective_now, max_jobs=self._max_jobs_per_cycle)
             if TRANSCRIPTION_HYDRATION_KIND in self._handlers
             else None
         )
@@ -251,8 +242,7 @@ class MessageFactHydrationWorker:
 
     def _fair_due_jobs(self, effective_now: int) -> list[HydrationJob]:
         per_kind = {
-            kind: self._queue.due_jobs(effective_now, self._max_jobs_per_cycle, kind=kind)
-            for kind in self._handlers
+            kind: self._queue.due_jobs(effective_now, self._max_jobs_per_cycle, kind=kind) for kind in self._handlers
         }
         selected: list[HydrationJob] = []
         remaining = {kind: list(jobs) for kind, jobs in per_kind.items()}
@@ -260,10 +250,7 @@ class MessageFactHydrationWorker:
         protected.sort(key=lambda job: (-int(job.priority), *_due_job_order_key(job)))
         selected.extend(protected)
         for priority in (HydrationPriority.FOREGROUND, HydrationPriority.BACKFILL):
-            tiered = {
-                kind: [job for job in jobs if job.priority == priority]
-                for kind, jobs in remaining.items()
-            }
+            tiered = {kind: [job for job in jobs if job.priority == priority] for kind, jobs in remaining.items()}
             while len(selected) < self._max_jobs_per_cycle and any(tiered.values()):
                 heads = sorted(
                     ((jobs[0], kind) for kind, jobs in tiered.items() if jobs),
@@ -382,9 +369,7 @@ class MessageFactHydrationWorker:
         effective_now: int,
     ) -> _BatchOutcome:
         retry_delay = flood_seconds(exc)
-        retried, dropped, drop_observations = self._retry_or_drop(
-            handler, started, effective_now + retry_delay
-        )
+        retried, dropped, drop_observations = self._retry_or_drop(handler, started, effective_now + retry_delay)
         self._conn.commit()
         self._log_drops(
             batch,

@@ -162,8 +162,7 @@ def test_transcription_repair_is_bounded_idempotent_and_newest_first(conn: sqlit
     assert conn.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (300,)
     assert conn.execute("SELECT MIN(message_id), MAX(message_id) FROM hydration_jobs").fetchone() == (206, 505)
     assert conn.execute(
-        "SELECT due_at, attempts, priority, message_sent_at, terminal FROM hydration_jobs "
-        "WHERE message_id = 505"
+        "SELECT due_at, attempts, priority, message_sent_at, terminal FROM hydration_jobs WHERE message_id = 505"
     ).fetchone() == (900, 0, 0, 505, 0)
 
     second = repair_transcription_hydration_jobs(conn, due_at=901, max_jobs=300)
@@ -206,7 +205,9 @@ def test_transcription_repair_excludes_ineligible_and_queued_messages(conn: sqli
     repair = repair_transcription_hydration_jobs(conn, due_at=100, max_jobs=300)
 
     assert (repair.enqueued, repair.has_more) == (2, False)
-    assert conn.execute("SELECT dialog_id, message_id, terminal FROM hydration_jobs ORDER BY message_id").fetchall() == [
+    assert conn.execute(
+        "SELECT dialog_id, message_id, terminal FROM hydration_jobs ORDER BY message_id"
+    ).fetchall() == [
         (42, 2, 1),
         (42, 6, 0),
         (42, 7, 0),

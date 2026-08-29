@@ -286,9 +286,10 @@ def test_v40_creates_prioritized_hydration_queue_and_due_index(tmp_path: Path) -
             conn, "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_hydration_jobs_schedule'"
         )
         assert due_index is not None
-        assert "KIND, TERMINAL, PRIORITY DESC, MESSAGE_SENT_AT DESC, DUE_AT, DIALOG_ID, MESSAGE_ID" in str(
-            due_index[0]
-        ).upper()
+        assert (
+            "KIND, TERMINAL, PRIORITY DESC, MESSAGE_SENT_AT DESC, DUE_AT, DIALOG_ID, MESSAGE_ID"
+            in str(due_index[0]).upper()
+        )
         repair_index = _fetchone_row(
             conn, "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_messages_voice_undeleted_sent'"
         )

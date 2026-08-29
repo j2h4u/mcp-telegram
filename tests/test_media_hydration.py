@@ -605,7 +605,9 @@ async def test_disable_reconcile_reenable_restart_repair_preserves_terminal_tomb
 
         assert result.requests == 0
         assert client.calls == []
-        assert conn.execute("SELECT attempts, terminal FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (3, 1)
+        assert conn.execute(
+            "SELECT attempts, terminal FROM hydration_jobs WHERE kind = 'transcription'"
+        ).fetchone() == (3, 1)
     finally:
         conn.close()
 
@@ -820,7 +822,9 @@ async def test_early_stop_logs_later_kind_as_selected_without_request(
     _seed_voice(db, dialog_id=2)
     db.commit()
     client = _Client(error=FloodWaitError(request=None, capture=7))
-    policy = FactHydrationConfig(batch_size=1, max_jobs_per_cycle=2, max_requests_per_cycle=3, pause_between_requests_seconds=0.01)
+    policy = FactHydrationConfig(
+        batch_size=1, max_jobs_per_cycle=2, max_requests_per_cycle=3, pause_between_requests_seconds=0.01
+    )
 
     with caplog.at_level(logging.INFO, logger="mcp_telegram.fact_hydration"):
         result = await _mixed_worker(db, client, policy).run_cycle(now=1)
@@ -845,7 +849,9 @@ async def test_same_tier_skew_still_runs_both_kinds_with_weighted_budget(db: sql
             return [SimpleNamespace(id=ids[0], media=None)]
 
     client = _WeightedClient(SimpleNamespace(pending=False, text="speech words", transcription_id=7))
-    policy = FactHydrationConfig(batch_size=1, max_jobs_per_cycle=2, max_requests_per_cycle=3, pause_between_requests_seconds=0.01)
+    policy = FactHydrationConfig(
+        batch_size=1, max_jobs_per_cycle=2, max_requests_per_cycle=3, pause_between_requests_seconds=0.01
+    )
     result = await _mixed_worker(db, client, policy).run_cycle(now=1)
 
     assert result.requests == 3
