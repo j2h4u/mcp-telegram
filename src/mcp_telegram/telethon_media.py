@@ -50,7 +50,7 @@ def extract_media_fact(media: object | None) -> MediaFact | None:
     if media is None or isinstance(media, tl.MessageMediaEmpty):
         return None
     if isinstance(media, tl.MessageMediaPhoto):
-        return MediaFact("photo", {})
+        return MediaFact("photo", _photo_payload(media))
     if isinstance(media, tl.MessageMediaDocument):
         return _extract_document(media)
     fact = _extract_location_or_poll(media)
@@ -82,6 +82,17 @@ def _extract_document(media: object) -> MediaFact:
     return MediaFact("document", base)
 
 
+def _photo_payload(media: object) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for key in ("spoiler", "live_photo"):
+        if _attr(media, key) is True:
+            payload[key] = True
+    ttl_seconds = _number(_attr(media, "ttl_seconds"))
+    if ttl_seconds is not None and ttl_seconds > 0:
+        payload["ttl_seconds"] = ttl_seconds
+    return payload
+
+
 def _extract_sticker(attrs: Sequence[object], base: dict[str, object]) -> MediaFact | None:
     sticker = _first_attribute(attrs, tl.DocumentAttributeSticker)
     if sticker is None:
@@ -89,6 +100,9 @@ def _extract_sticker(attrs: Sequence[object], base: dict[str, object]) -> MediaF
     alt = _text(_attr(sticker, "alt"))
     if alt:
         base["alt"] = alt
+    set_name = _text(_attr(_attr(sticker, "stickerset"), "short_name"))
+    if set_name:
+        base["set_name"] = set_name
     return MediaFact("sticker", base)
 
 
@@ -100,6 +114,8 @@ def _extract_visual(document: object | None, attrs: Sequence[object], base: dict
         duration = _number(_attr(video, "duration"))
         if duration is not None:
             base["duration"] = duration
+        if _attr(video, "round_message") is True:
+            base["round_message"] = True
         return MediaFact("video", base)
     mime_type = _attr(document, "mime_type")
     if isinstance(mime_type, str) and mime_type.lower() == "image/gif":

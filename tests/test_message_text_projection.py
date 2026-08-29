@@ -4,6 +4,7 @@ import sqlite3
 from types import SimpleNamespace
 from typing import cast
 
+import pytest
 from jsonschema import validate
 from telethon.tl.types import MessageEntityTextUrl
 
@@ -49,6 +50,32 @@ def test_message_content_projector_distinguishes_media_only_and_none() -> None:
     assert media.primary_text == "[фото]"
     assert empty.kind == "none"
     assert empty.primary_text is None
+
+
+@pytest.mark.parametrize(
+    ("media_kind", "media_payload", "expected_description"),
+    [
+        (
+            "link_preview",
+            '{"site_name":"Example","title":"Report","url":"https://example.test"}',
+            "[ссылка: Example — Report]",
+        ),
+        ("video", '{"duration":65,"round_message":true}', "[кружок: 1:05]"),
+        ("photo", '{"spoiler":true}', "[фото: спойлер]"),
+        ("sticker", '{"alt":"🙂","set_name":"friendly_faces"}', "[стикер: 🙂; набор friendly_faces]"),
+    ],
+)
+def test_frequent_media_enrichment_reaches_the_canonical_delivery_shape(
+    media_kind: str, media_payload: str, expected_description: str
+) -> None:
+    content = project_message_content(MessageSnapshot(text=None, media_kind=media_kind, media_payload=media_payload))
+
+    assert serialize_message_content(
+        content.text,
+        content.media_description,
+        content.kind,
+        content.media_kind,
+    )["media"] == {"type": media_kind, "description": expected_description}
 
 
 def test_delivery_serializer_uses_explicit_text_media_semantics() -> None:

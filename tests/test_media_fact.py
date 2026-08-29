@@ -76,3 +76,38 @@ def test_extractor_payload_is_json_safe_and_has_no_telethon_objects() -> None:
     encoded = encode_media_payload(fact)
     assert encoded is not None
     assert json.loads(encoded) == {"first_name": "A", "last_name": "B", "phone_number": "+7700", "user_id": 9}
+
+
+def test_projector_enriches_frequent_media_without_transport_details() -> None:
+    assert (
+        media_description(
+            MediaFact("link_preview", {"url": "https://example.test", "site_name": "Example", "title": "Report"})
+        )
+        == "[ссылка: Example — Report]"
+    )
+    assert media_description(MediaFact("video", {"duration": 65, "round_message": True})) == "[кружок: 1:05]"
+    assert media_description(MediaFact("photo", {"spoiler": True, "live_photo": True, "ttl_seconds": 30})) == (
+        "[фото: Live Photo; спойлер; исчезающее]"
+    )
+    assert media_description(MediaFact("sticker", {"alt": "🙂", "set_name": "friendly_faces"})) == (
+        "[стикер: 🙂; набор friendly_faces]"
+    )
+
+
+def test_extractor_preserves_only_agent_useful_frequent_media_facts() -> None:
+    photo = tl.MessageMediaPhoto(spoiler=True, live_photo=True, ttl_seconds=30)
+    assert extract_media_fact(photo) == MediaFact("photo", {"spoiler": True, "live_photo": True, "ttl_seconds": 30})
+
+    sticker = tl.DocumentAttributeSticker(alt="🙂", stickerset=tl.InputStickerSetShortName("friendly_faces"))
+    video = tl.DocumentAttributeVideo(duration=65, w=320, h=320, round_message=True)
+    sticker_document = MagicMock(spec=tl.Document, size=1024, mime_type="application/x-tgsticker")
+    sticker_document.attributes = [sticker]
+    video_document = MagicMock(spec=tl.Document, size=2048, mime_type="video/mp4")
+    video_document.attributes = [video]
+
+    assert extract_media_fact(MagicMock(spec=tl.MessageMediaDocument, document=sticker_document)) == MediaFact(
+        "sticker", {"size": 1024, "alt": "🙂", "set_name": "friendly_faces"}
+    )
+    assert extract_media_fact(MagicMock(spec=tl.MessageMediaDocument, document=video_document)) == MediaFact(
+        "video", {"size": 2048, "duration": 65, "round_message": True}
+    )

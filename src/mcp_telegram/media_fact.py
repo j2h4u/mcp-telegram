@@ -137,7 +137,7 @@ def _describe_kind(kind: MediaKind, payload: Mapping[str, object]) -> str | None
     elif kind in {"link_preview", "game", "invoice", "dice"}:
         description = _describe_info_kind(kind, payload)
     elif kind == "photo":
-        description = "[фото]"
+        description = _describe_photo(payload)
     elif kind == "animation":
         description = "[анимация]"
     elif kind == "story":
@@ -149,7 +149,7 @@ def _describe_kind(kind: MediaKind, payload: Mapping[str, object]) -> str | None
 
 def _describe_duration_kind(kind: MediaKind, payload: Mapping[str, object]) -> str:
     if kind == "video":
-        return _duration_description("видео", payload)
+        return _duration_description("кружок" if payload.get("round_message") is True else "видео", payload)
     if kind == "voice":
         return _duration_description("голосовое", payload)
     info = _join_present(payload, ("performer", "title"), " — ")
@@ -161,7 +161,26 @@ def _describe_document_kind(kind: MediaKind, payload: Mapping[str, object]) -> s
         name = payload.get("file_name")
         return f"[документ: {name}]" if name else "[документ]"
     alt = payload.get("alt")
-    return f"[стикер: {alt}]" if alt else "[стикер]"
+    set_name = payload.get("set_name")
+    if alt and set_name:
+        return f"[стикер: {alt}; набор {set_name}]"
+    if alt:
+        return f"[стикер: {alt}]"
+    if set_name:
+        return f"[стикер; набор {set_name}]"
+    return "[стикер]"
+
+
+def _describe_photo(payload: Mapping[str, object]) -> str:
+    details: list[str] = []
+    if payload.get("live_photo") is True:
+        details.append("Live Photo")
+    if payload.get("spoiler") is True:
+        details.append("спойлер")
+    ttl_seconds = payload.get("ttl_seconds")
+    if isinstance(ttl_seconds, (int, float)) and not isinstance(ttl_seconds, bool) and ttl_seconds > 0:
+        details.append("исчезающее")
+    return f"[фото: {'; '.join(details)}]" if details else "[фото]"
 
 
 def _describe_place_kind(kind: MediaKind, payload: Mapping[str, object]) -> str | None:
@@ -193,8 +212,7 @@ def _describe_location(payload: Mapping[str, object]) -> str:
 
 def _describe_info_kind(kind: MediaKind, payload: Mapping[str, object]) -> str:
     if kind == "link_preview":
-        value = payload.get("url")
-        return f"[ссылка: {value}]" if value else "[ссылка]"
+        return _describe_link_preview(payload)
     if kind == "game":
         value = payload.get("title")
         return f"[игра: {value}]" if value else "[игра]"
@@ -204,6 +222,15 @@ def _describe_info_kind(kind: MediaKind, payload: Mapping[str, object]) -> str:
     emoticon = payload.get("emoticon") or "🎲"
     value = payload.get("value")
     return f"[{emoticon} {value}]" if value is not None else f"[{emoticon}]"
+
+
+def _describe_link_preview(payload: Mapping[str, object]) -> str:
+    site_name = payload.get("site_name")
+    title = payload.get("title")
+    if site_name and title and site_name != title:
+        return f"[ссылка: {site_name} — {title}]"
+    summary = title or site_name or payload.get("url")
+    return f"[ссылка: {summary}]" if summary else "[ссылка]"
 
 
 def _duration_description(label: str, payload: Mapping[str, object]) -> str:

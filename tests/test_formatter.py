@@ -217,7 +217,7 @@ def test_project_document_media_priority_and_fallbacks() -> None:
         (no_document, "[медиа]"),
         (sticker, "[стикер: 🙂]"),
         (empty_sticker, "[стикер]"),
-        (round_video, "[видео: 1:05]"),
+        (round_video, "[кружок: 1:05]"),
         (animation, "[анимация]"),
         (voice, "[голосовое: 2:05]"),
         (audio, "[аудио: Artist — Song: 3:04]"),
