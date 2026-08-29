@@ -19,6 +19,7 @@ from .hydration_queue import (
     TRANSCRIPTION_HYDRATION_KIND,
     HydrationJob,
     HydrationPriority,
+    HydrationQueueKindSnapshot,
     HydrationQueueRepository,
     HydrationQueueSummary,
 )
@@ -264,7 +265,7 @@ class MessageFactHydrationWorker:
                 repaired_transcription_jobs=0 if repair is None else repair.enqueued,
                 repair_has_more=False if repair is None else repair.has_more,
             )
-            self._log_cycle(result, {})
+            self._log_cycle(result, {}, self._queue.snapshot(effective_now), now=effective_now)
             return result
         selected_by_kind: dict[str, int] = defaultdict(int)
         for job in due:
@@ -276,7 +277,14 @@ class MessageFactHydrationWorker:
             repaired_transcription_jobs=0 if repair is None else repair.enqueued,
             repair_has_more=False if repair is None else repair.has_more,
         )
-        self._log_cycle(result, per_kind, selected=len(due), selected_by_kind=selected_by_kind)
+        self._log_cycle(
+            result,
+            per_kind,
+            self._queue.snapshot(effective_now),
+            now=effective_now,
+            selected=len(due),
+            selected_by_kind=selected_by_kind,
+        )
         return result
 
     def _fair_due_jobs(self, effective_now: int) -> list[HydrationJob]:
@@ -286,17 +294,21 @@ class MessageFactHydrationWorker:
             _append_due_priority_tier(selected, remaining, priority, self._max_jobs_per_cycle)
         return selected
 
-    def _log_cycle(
+    def _log_cycle(  # noqa: PLR0913 - one log record combines cycle outcome with current queue state
         self,
         result: FactHydrationCycleResult,
         per_kind: dict[str, tuple[int, int, int, int, int]],
+        queue_snapshot: Sequence[HydrationQueueKindSnapshot],
         *,
+        now: int,
         selected: int = 0,
         selected_by_kind: dict[str, int] | None = None,
     ) -> None:
+        snapshot_by_kind = {snapshot.kind: snapshot for snapshot in queue_snapshot}
         logger.info(
             "message_fact_hydration cycle jobs=%d requests=%d hydrated=%d completed=%d "
-            "retried=%d dropped=%d stopped=%s repaired_transcription_jobs=%d repair_has_more=%s",
+            "retried=%d dropped=%d stopped=%s repaired_transcription_jobs=%d repair_has_more=%s "
+            "queue_active=%d queue_due=%d queue_terminal=%d",
             selected,
             result.requests,
             result.hydrated,
@@ -306,12 +318,18 @@ class MessageFactHydrationWorker:
             result.stopped,
             result.repaired_transcription_jobs,
             result.repair_has_more,
+            sum(snapshot.active for snapshot in queue_snapshot),
+            sum(snapshot.due for snapshot in queue_snapshot),
+            sum(snapshot.terminal for snapshot in queue_snapshot),
         )
         selected_by_kind = selected_by_kind or {}
         for kind in self._handlers:
             requests, hydrated, completed, retried, dropped = per_kind.get(kind, (0, 0, 0, 0, 0))
+            snapshot = snapshot_by_kind.get(kind, HydrationQueueKindSnapshot(kind, 0, 0, 0, 0, 0, None, None, 0))
             logger.info(
-                "message_fact_hydration kind=%s selected=%d requests=%d hydrated=%d completed=%d retried=%d dropped=%d",
+                "message_fact_hydration kind=%s selected=%d requests=%d hydrated=%d completed=%d retried=%d "
+                "dropped=%d queue_active=%d queue_due=%d queue_foreground=%d queue_backfill=%d "
+                "queue_terminal=%d oldest_message_age_s=%s newest_message_age_s=%s max_attempts=%d",
                 kind,
                 selected_by_kind.get(kind, 0),
                 requests,
@@ -319,7 +337,19 @@ class MessageFactHydrationWorker:
                 completed,
                 retried,
                 dropped,
+                snapshot.active,
+                snapshot.due,
+                snapshot.foreground,
+                snapshot.backfill,
+                snapshot.terminal,
+                self._message_age(now, snapshot.oldest_message_sent_at),
+                self._message_age(now, snapshot.newest_message_sent_at),
+                snapshot.max_attempts,
             )
+
+    @staticmethod
+    def _message_age(now: int, sent_at: int | None) -> int | None:
+        return None if sent_at is None else max(0, now - sent_at)
 
     async def _run_batches(
         self, request_batches: Sequence[Sequence[HydrationJob]], effective_now: int

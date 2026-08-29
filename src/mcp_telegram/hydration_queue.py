@@ -71,6 +71,21 @@ class HydrationQueueSummary:
     attempts_max: int
 
 
+@dataclass(frozen=True, slots=True)
+class HydrationQueueKindSnapshot:
+    """Privacy-safe operational state for one hydration kind."""
+
+    kind: str
+    active: int
+    due: int
+    foreground: int
+    backfill: int
+    terminal: int
+    oldest_message_sent_at: int | None
+    newest_message_sent_at: int | None
+    max_attempts: int
+
+
 _JOB_COLUMNS = "kind, dialog_id, message_id, due_at, attempts, message_sent_at, priority, terminal"
 _SELECT_JOB_COLUMNS = ", ".join(f"hj.{column}" for column in _JOB_COLUMNS.split(", "))
 _SUMMARY_AGGREGATE_SQL = (
@@ -80,6 +95,18 @@ _SUMMARY_AGGREGATE_SQL = (
 _SUMMARY_MESSAGE_IDS_SQL = (
     f"SELECT message_id FROM {HYDRATION_QUEUE_TABLE} WHERE kind = ? AND dialog_id = ? AND terminal = 0 "
     "ORDER BY message_id LIMIT ?"
+)
+_QUEUE_SNAPSHOT_SQL = (
+    f"SELECT kind, "
+    "SUM(CASE WHEN terminal = 0 THEN 1 ELSE 0 END), "
+    "SUM(CASE WHEN terminal = 0 AND due_at <= ? THEN 1 ELSE 0 END), "
+    "SUM(CASE WHEN terminal = 0 AND priority = 1 THEN 1 ELSE 0 END), "
+    "SUM(CASE WHEN terminal = 0 AND priority = 0 THEN 1 ELSE 0 END), "
+    "SUM(CASE WHEN terminal = 1 THEN 1 ELSE 0 END), "
+    "MIN(CASE WHEN terminal = 0 AND message_sent_at > 0 THEN message_sent_at END), "
+    "MAX(CASE WHEN terminal = 0 AND message_sent_at > 0 THEN message_sent_at END), "
+    "MAX(CASE WHEN terminal = 0 THEN attempts END) "
+    f"FROM {HYDRATION_QUEUE_TABLE} GROUP BY kind ORDER BY kind"
 )
 
 
@@ -98,6 +125,37 @@ def _job_from_row(row: sqlite3.Row | tuple[object, ...]) -> HydrationJob:
         message_sent_at=int(cast(int | str, message_sent_at)),
         priority=HydrationPriority(int(cast(int | str, priority))),
         terminal=bool(terminal),
+    )
+
+
+def _snapshot_from_row(row: sqlite3.Row | tuple[object, ...]) -> HydrationQueueKindSnapshot:
+    (
+        kind,
+        active,
+        due,
+        foreground,
+        backfill,
+        terminal,
+        oldest_message_sent_at,
+        newest_message_sent_at,
+        max_attempts,
+    ) = row
+    assert isinstance(kind, str)
+    integer_values = (active, due, foreground, backfill, terminal)
+    assert all(isinstance(value, int) for value in integer_values)
+    assert oldest_message_sent_at is None or isinstance(oldest_message_sent_at, int)
+    assert newest_message_sent_at is None or isinstance(newest_message_sent_at, int)
+    assert max_attempts is None or isinstance(max_attempts, int)
+    return HydrationQueueKindSnapshot(
+        kind=kind,
+        active=cast(int, active),
+        due=cast(int, due),
+        foreground=cast(int, foreground),
+        backfill=cast(int, backfill),
+        terminal=cast(int, terminal),
+        oldest_message_sent_at=oldest_message_sent_at,
+        newest_message_sent_at=newest_message_sent_at,
+        max_attempts=0 if max_attempts is None else max_attempts,
     )
 
 
@@ -163,6 +221,11 @@ class HydrationQueueRepository:
             ).fetchall(),
         )
         return [_job_from_row(row) for row in rows]
+
+    def snapshot(self, now: int) -> tuple[HydrationQueueKindSnapshot, ...]:
+        """Return one compact operational snapshot without changing queue state."""
+        rows = cast(list[tuple[object, ...]], self._conn.execute(_QUEUE_SNAPSHOT_SQL, (now,)).fetchall())
+        return tuple(_snapshot_from_row(row) for row in rows)
 
     def start(self, job: HydrationJob) -> HydrationJob | None:
         """Atomically increment and return a queued job, or return ``None``.

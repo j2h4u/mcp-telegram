@@ -831,7 +831,16 @@ async def test_early_stop_logs_later_kind_as_selected_without_request(
 
     assert result.stopped is True
     transcription_logs = [record.message for record in caplog.records if "kind=transcription" in record.message]
-    assert transcription_logs and "selected=1" in transcription_logs[-1] and "requests=0" in transcription_logs[-1]
+    assert transcription_logs
+    assert "selected=1" in transcription_logs[-1]
+    assert "requests=0" in transcription_logs[-1]
+    assert "queue_active=1" in transcription_logs[-1]
+    assert "queue_due=1" in transcription_logs[-1]
+    cycle_logs = [record.message for record in caplog.records if "message_fact_hydration cycle" in record.message]
+    assert cycle_logs
+    assert "queue_active=2" in cycle_logs[-1]
+    assert "queue_due=1" in cycle_logs[-1]
+    assert "queue_terminal=0" in cycle_logs[-1]
 
 
 @pytest.mark.asyncio
