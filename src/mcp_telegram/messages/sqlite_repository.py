@@ -27,6 +27,11 @@ _FACT_HYDRATION_ELIGIBILITY_SQL = (
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
     "WHERE sd.dialog_id = ? AND sd.status IN ('syncing', 'synced')"
 )
+_TRANSCRIPTION_HYDRATION_MESSAGE_SQL = (
+    "m.is_deleted = 0 AND m.media_kind = 'voice' "
+    "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
+    "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id)"
+)
 
 
 def _insert_sql(table: str, dataclass_type: type) -> str:
@@ -79,6 +84,14 @@ class MessageOutLookup:
 
     found: bool
     outgoing: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptionHydrationRepair:
+    """Bounded result of repairing missing voice transcription jobs."""
+
+    enqueued: int
+    has_more: bool
 
 
 def message_exists(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
@@ -312,6 +325,8 @@ def _remove_transcription_hydration_job(conn: sqlite3.Connection, dialog_id: int
 def mark_message_deleted(conn: sqlite3.Connection, dialog_id: int, message_id: int, deleted_at: int) -> bool:
     """Tombstone one message and report whether this call changed its state."""
     cursor = conn.execute(_MARK_DELETED_SQL, (deleted_at, dialog_id, message_id))
+    if cursor.rowcount > 0:
+        HydrationQueueRepository(conn).remove_for_message(dialog_id, message_id)
     return cursor.rowcount > 0
 
 
@@ -368,14 +383,49 @@ def transcription_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, m
     return (
         conn.execute(
             "SELECT 1 FROM messages m WHERE m.dialog_id = ? AND m.message_id = ? "
-            "AND m.is_deleted = 0 AND m.media_kind = 'voice' "
-            "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
-            "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id) "
-            "AND EXISTS (" + _FACT_HYDRATION_ELIGIBILITY_SQL + ")",
+            f"AND {_TRANSCRIPTION_HYDRATION_MESSAGE_SQL} AND EXISTS (" + _FACT_HYDRATION_ELIGIBILITY_SQL + ")",
             (dialog_id, message_id, dialog_id),
         ).fetchone()
         is not None
     )
+
+
+_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL = (
+    "FROM messages m INDEXED BY idx_messages_voice_undeleted_sent "
+    "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
+    "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
+    "LEFT JOIN hydration_jobs hj ON hj.kind = 'transcription' "
+    "AND hj.dialog_id = m.dialog_id AND hj.message_id = m.message_id "
+    f"WHERE {_TRANSCRIPTION_HYDRATION_MESSAGE_SQL} AND hj.message_id IS NULL"
+)
+
+
+def repair_transcription_hydration_jobs(
+    conn: sqlite3.Connection, *, due_at: int, max_jobs: int
+) -> TranscriptionHydrationRepair:
+    """Bound the recurring repair of missing voice transcription jobs."""
+    if max_jobs <= 0:
+        return TranscriptionHydrationRepair(0, False)
+    candidates_sql = (
+        "SELECT 'transcription', m.dialog_id, m.message_id, ?, 0, ?, m.sent_at, 0 "
+        f"{_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL} "
+        "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT ?"
+    )
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO hydration_jobs "
+        "(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at, terminal) "
+        f"{candidates_sql}",
+        (due_at, int(HydrationPriority.BACKFILL), max_jobs),
+    )
+    has_more = (
+        conn.execute(
+            "SELECT 1 "
+            f"{_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL} "
+            "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT 1",
+        ).fetchone()
+        is not None
+    )
+    return TranscriptionHydrationRepair(cursor.rowcount, has_more)
 
 
 def apply_hydrated_media_fact(
@@ -412,6 +462,28 @@ def reconcile_fact_hydration_job(
     queue = HydrationQueueRepository(conn)
     if not queue.is_available():
         return
+    _reconcile_media_hydration_job(
+        conn,
+        queue,
+        message,
+        due_at=due_at,
+    )
+    _reconcile_transcription_hydration_job(
+        conn,
+        queue,
+        message,
+        due_at=due_at,
+        priority=priority,
+    )
+
+
+def _reconcile_media_hydration_job(
+    conn: sqlite3.Connection,
+    queue: HydrationQueueRepository,
+    message: _message_contracts.StoredMessage,
+    *,
+    due_at: int,
+) -> None:
     job = HydrationJob(
         MEDIA_METADATA_KIND,
         message.dialog_id,
@@ -424,9 +496,20 @@ def reconcile_fact_hydration_job(
     unresolved = message.media_kind in _FACT_HYDRATION_EMPTY_KINDS and message.media_payload == "{}"
     if unresolved and media_fact_hydration_eligible(conn, message.dialog_id, message.message_id):
         queue.enqueue(job)
+    elif unresolved:
+        queue.remove_active(job)
     else:
         queue.remove(job)
 
+
+def _reconcile_transcription_hydration_job(
+    conn: sqlite3.Connection,
+    queue: HydrationQueueRepository,
+    message: _message_contracts.StoredMessage,
+    *,
+    due_at: int,
+    priority: HydrationPriority,
+) -> None:
     transcription_job = HydrationJob(
         TRANSCRIPTION_HYDRATION_KIND,
         message.dialog_id,
@@ -449,6 +532,8 @@ def reconcile_fact_hydration_job(
         and transcription_hydration_eligible(conn, message.dialog_id, message.message_id)
     ):
         queue.enqueue(transcription_job)
+    elif message.media_kind == "voice" and transcription_row is None:
+        queue.remove_active(transcription_job)
     else:
         queue.remove(transcription_job)
 

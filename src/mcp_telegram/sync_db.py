@@ -13,7 +13,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 41
+_CURRENT_SCHEMA_VERSION = 42
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -631,13 +631,20 @@ CREATE TABLE IF NOT EXISTS hydration_jobs (
     attempts   INTEGER NOT NULL DEFAULT 0,
     priority   INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1)),
     message_sent_at INTEGER NOT NULL DEFAULT 0,
+    terminal   INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1)),
     PRIMARY KEY (kind, dialog_id, message_id)
 ) WITHOUT ROWID
 """
 
-_HYDRATION_JOBS_DUE_INDEX_DDL = """
-CREATE INDEX IF NOT EXISTS idx_hydration_jobs_due
-ON hydration_jobs(due_at, priority DESC, message_sent_at DESC, kind, dialog_id, message_id)
+_HYDRATION_JOBS_SCHEDULE_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_hydration_jobs_schedule
+ON hydration_jobs(kind, terminal, priority DESC, message_sent_at DESC, due_at, dialog_id, message_id)
+"""
+
+_VOICE_TRANSCRIPTION_REPAIR_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_messages_voice_undeleted_sent
+ON messages(sent_at DESC, dialog_id, message_id)
+WHERE media_kind = 'voice' AND is_deleted = 0
 """
 
 _HYDRATION_JOBS_SEED_SQL = """
@@ -1681,7 +1688,6 @@ def _apply_migration_40(conn: sqlite3.Connection, current: int) -> int:
                 "SELECT sent_at FROM messages WHERE messages.dialog_id = hydration_jobs.dialog_id "
                 "AND messages.message_id = hydration_jobs.message_id), 0)"
             ),
-            _HYDRATION_JOBS_DUE_INDEX_DDL,
         ],
         ignore_duplicate_column=True,
     )
@@ -1690,6 +1696,22 @@ def _apply_migration_40(conn: sqlite3.Connection, current: int) -> int:
 def _apply_migration_41(conn: sqlite3.Connection, current: int) -> int:
     """Seed low-priority transcription hydration for existing voice messages."""
     return _apply_migration(conn, current, 41, [_TRANSCRIPTION_HYDRATION_JOBS_SEED_SQL])
+
+
+def _apply_migration_42(conn: sqlite3.Connection, current: int) -> int:
+    """Make failed transcription work terminal and index voice repair scans."""
+    return _apply_migration(
+        conn,
+        current,
+        42,
+        [
+            "ALTER TABLE hydration_jobs ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1))",
+            "DROP INDEX IF EXISTS idx_hydration_jobs_due",
+            _VOICE_TRANSCRIPTION_REPAIR_INDEX_DDL,
+            _HYDRATION_JOBS_SCHEDULE_INDEX_DDL,
+        ],
+        ignore_duplicate_column=True,
+    )
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
@@ -1730,6 +1752,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_39(conn, current)
     current = _apply_migration_40(conn, current)
     current = _apply_migration_41(conn, current)
+    current = _apply_migration_42(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
@@ -1766,7 +1789,8 @@ def _ensure_scheduled_messages_fts(conn: sqlite3.Connection) -> None:
 def _ensure_hydration_jobs(conn: sqlite3.Connection) -> None:
     """Ensure the current hydration queue and its due-time index exist."""
     conn.execute(_HYDRATION_JOBS_DDL)
-    conn.execute(_HYDRATION_JOBS_DUE_INDEX_DDL)
+    conn.execute(_HYDRATION_JOBS_SCHEDULE_INDEX_DDL)
+    conn.execute(_VOICE_TRANSCRIPTION_REPAIR_INDEX_DDL)
     conn.commit()
 
 

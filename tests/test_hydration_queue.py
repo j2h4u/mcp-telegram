@@ -29,6 +29,7 @@ def _make_db() -> sqlite3.Connection:
             attempts INTEGER NOT NULL,
             message_sent_at INTEGER NOT NULL DEFAULT 0,
             priority INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1)),
+            terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1)),
             PRIMARY KEY (kind, dialog_id, message_id)
         ) WITHOUT ROWID
         """
@@ -126,6 +127,16 @@ def test_enqueue_promotes_existing_backfill_without_resetting_attempts(db: sqlit
 
     repository.enqueue(_job("media", 1, 1, 25, priority=HydrationPriority.BACKFILL))
     assert repository.due_jobs(25, 10) == [_job("media", 1, 1, 25, attempts=1)]
+
+
+def test_terminal_job_is_suppressed_and_enqueue_preserves_state(db: sqlite3.Connection) -> None:
+    repository = HydrationQueueRepository(db)
+    job = _job(TRANSCRIPTION_HYDRATION_KIND, 1, 1, 100, attempts=2)
+    repository.enqueue(job)
+    assert repository.mark_terminal(job)
+    repository.enqueue(_job(TRANSCRIPTION_HYDRATION_KIND, 1, 1, 1, attempts=99))
+    assert repository.due_jobs(100, 10) == []
+    assert db.execute("SELECT due_at, attempts, terminal FROM hydration_jobs").fetchone() == (1, 2, 1)
 
 
 def test_start_increments_attempts_atomically_and_missing_job_returns_none(db: sqlite3.Connection) -> None:

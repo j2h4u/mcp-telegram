@@ -18,6 +18,8 @@ from enum import StrEnum
 from itertools import count
 from typing import cast
 
+from .hydration_queue import HydrationQueueRepository
+
 
 class EnrollmentSource(StrEnum):
     EXPLICIT = "explicit"
@@ -255,6 +257,7 @@ def disable_history(
         coverage = _coverage_status(conn, dialog_id)
         _store_intent(conn, dialog_id, False, EnrollmentSource.EXPLICIT, timestamp)
         reset_read_position_retry(conn, dialog_id)
+        HydrationQueueRepository(conn).remove_active_for_dialog(dialog_id)
         if coverage == "syncing":
             conn.execute("UPDATE synced_dialogs SET status = 'not_synced' WHERE dialog_id = ?", (dialog_id,))
             coverage = "not_synced"

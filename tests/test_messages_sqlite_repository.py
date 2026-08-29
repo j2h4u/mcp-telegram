@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -17,6 +18,7 @@ from mcp_telegram.messages.sqlite_repository import (
     persist_edited_message,
     persist_transcribed_text,
     read_message_text,
+    repair_transcription_hydration_jobs,
     upsert_message_transcription,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
@@ -144,6 +146,107 @@ def test_foreground_voice_persistence_keeps_transcription_foreground(conn: sqlit
         )
 
     assert conn.execute("SELECT kind, priority FROM hydration_jobs").fetchall() == [("transcription", 1)]
+
+
+def test_transcription_repair_is_bounded_idempotent_and_newest_first(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    conn.executemany(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+        "VALUES (42, ?, ?, NULL, 'voice', '{}')",
+        ((message_id, message_id) for message_id in range(1, 506)),
+    )
+    conn.commit()
+
+    first = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=300)
+    assert (first.enqueued, first.has_more) == (300, True)
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (300,)
+    assert conn.execute("SELECT MIN(message_id), MAX(message_id) FROM hydration_jobs").fetchone() == (206, 505)
+    assert conn.execute(
+        "SELECT due_at, attempts, priority, message_sent_at, terminal FROM hydration_jobs WHERE message_id = 505"
+    ).fetchone() == (900, 0, 0, 505, 0)
+
+    second = repair_transcription_hydration_jobs(conn, due_at=901, max_jobs=300)
+    assert (second.enqueued, second.has_more) == (205, False)
+    conn.commit()
+    third = repair_transcription_hydration_jobs(conn, due_at=902, max_jobs=300)
+    assert (third.enqueued, third.has_more) == (0, False)
+    assert conn.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (505,)
+
+
+def test_transcription_repair_excludes_ineligible_and_queued_messages(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (43, 'access_lost')")
+    conn.execute(
+        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (43, 1, 'explicit', 1)"
+    )
+    conn.executemany(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload, is_deleted, out) "
+        "VALUES (?, ?, ?, NULL, ?, '{}', ?, ?)",
+        [
+            (42, 1, 10, "voice", 0, 0),  # eligible inbound
+            (42, 2, 20, "voice", 0, 1),  # eligible outbound
+            (42, 3, 30, "voice", 1, 0),  # deleted
+            (42, 4, 40, "other", 0, 0),  # not voice
+            (43, 5, 50, "voice", 0, 0),  # inactive dialog
+            (42, 6, 60, "voice", 0, 0),  # eligible inbound
+            (42, 7, 70, "voice", 0, 1),  # eligible outbound
+        ],
+    )
+    conn.execute(
+        "INSERT INTO message_transcriptions(dialog_id, message_id, text, transcription_id, received_at) "
+        "VALUES (42, 1, 'already', 1, 1)"
+    )
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, terminal) "
+        "VALUES ('transcription', 42, 2, 1, 4, 1)"
+    )
+    conn.commit()
+
+    repair = repair_transcription_hydration_jobs(conn, due_at=100, max_jobs=300)
+
+    assert (repair.enqueued, repair.has_more) == (2, False)
+    assert conn.execute(
+        "SELECT dialog_id, message_id, terminal FROM hydration_jobs ORDER BY message_id"
+    ).fetchall() == [
+        (42, 2, 1),
+        (42, 6, 0),
+        (42, 7, 0),
+    ]
+
+
+def test_transcription_repair_plan_uses_partial_voice_index(conn: sqlite3.Connection) -> None:
+    plan = cast(
+        list[tuple[object, ...]],
+        conn.execute(
+            "EXPLAIN QUERY PLAN SELECT m.message_id FROM messages m INDEXED BY idx_messages_voice_undeleted_sent "
+            "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
+            "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
+            "WHERE m.is_deleted = 0 AND m.media_kind = 'voice' "
+            "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT 300"
+        ).fetchall(),
+    )
+    details = " ".join(str(row[3]) for row in plan)
+    assert "USING COVERING INDEX idx_messages_voice_undeleted_sent" in details
+    assert "USE TEMP B-TREE" not in details
+    assert "SCAN messages" not in details
+
+
+def test_transcription_repair_rolls_back_without_leaving_queue_rows(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    conn.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+        "VALUES (42, 8, 8, NULL, 'voice', '{}')"
+    )
+    conn.commit()
+
+    repair = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=1)
+    assert repair.enqueued == 1
+    conn.rollback()
+    assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+
+    repair = repair_transcription_hydration_jobs(conn, due_at=901, max_jobs=1)
+    assert (repair.enqueued, repair.has_more) == (1, False)
 
 
 @pytest.mark.parametrize(
