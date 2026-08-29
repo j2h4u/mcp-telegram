@@ -19,6 +19,7 @@ from telethon.errors.rpcerrorlist import (  # type: ignore[import-untyped]
 from mcp_telegram.access_lifecycle import restore_access_after_revalidation
 from mcp_telegram.config import FactHydrationConfig
 from mcp_telegram.fact_hydration import MessageFactHydrationWorker
+from mcp_telegram.history_enrollment import disable_history
 from mcp_telegram.hydration_queue import HydrationPriority, HydrationQueueRepository
 from mcp_telegram.media_hydration import MediaFactHydrationHandler
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
@@ -251,17 +252,16 @@ async def test_job_and_request_caps_apply_across_multiple_dialogs(db: sqlite3.Co
     policy = FactHydrationConfig(
         batch_size=1,
         max_jobs_per_cycle=3,
-        max_requests_per_cycle=2,
+        max_requests_per_cycle=4,
         pause_between_requests_seconds=0.01,
     )
 
     result = await _worker(db, client, policy).run_cycle(now=1)
 
-    assert result.requests == 2
-    assert [call["entity"] for call in client.calls] == [1, 1]
-    assert [call["ids"] for call in client.calls] == [[1], [2]]
+    assert result.requests == 3
+    assert [call["entity"] for call in client.calls] == [1, 1, 2]
+    assert [call["ids"] for call in client.calls] == [[1], [2], [1]]
     assert db.execute("SELECT dialog_id, message_id FROM hydration_jobs ORDER BY dialog_id, message_id").fetchall() == [
-        (2, 1),
         (2, 2),
     ]
 
@@ -550,6 +550,19 @@ async def test_access_loss_purges_and_restore_reenqueues_unresolved_jobs(
     ]
 
 
+def test_disable_history_purges_active_jobs_but_preserves_terminal_suppression(db: sqlite3.Connection) -> None:
+    _seed_voice(db)
+    db.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, terminal) "
+        "VALUES ('transcription', 1, 2, 1, 3, 1)"
+    )
+    db.commit()
+
+    disable_history(db, 1, now=10)
+
+    assert db.execute("SELECT dialog_id, message_id, terminal FROM hydration_jobs").fetchall() == [(1, 2, 1)]
+
+
 @pytest.mark.asyncio
 async def test_access_loss_logs_all_kinds_with_bounded_queue_summary(
     db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -691,14 +704,14 @@ async def test_voice_foreground_beats_large_media_backlog(db: sqlite3.Connection
     policy = FactHydrationConfig(
         batch_size=1,
         max_jobs_per_cycle=100,
-        max_requests_per_cycle=2,
+        max_requests_per_cycle=4,
         pause_between_requests_seconds=0.01,
     )
     result = await _mixed_worker(db, client, policy).run_cycle(now=1)
 
     assert result.completed == 1
-    assert ["dialog_id" in call for call in client.calls] == [True, False]
-    assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'media_metadata'").fetchone() == (8,)
+    assert ["dialog_id" in call for call in client.calls] == [True, False, False, False]
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'media_metadata'").fetchone() == (6,)
 
 
 @pytest.mark.asyncio
@@ -853,7 +866,7 @@ def test_transcription_pending_drops_at_attempt_limit(db: sqlite3.Connection) ->
 
     assert result.retried == 0
     assert result.dropped == 1
-    assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+    assert db.execute("SELECT terminal FROM hydration_jobs").fetchone() == (1,)
 
 
 @pytest.mark.asyncio
@@ -863,7 +876,7 @@ async def test_transcription_permanent_error_is_terminal_without_churn(db: sqlit
     result = await _transcription_worker(db, client).run_cycle(now=10)
 
     assert result.dropped == 1
-    assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+    assert db.execute("SELECT terminal FROM hydration_jobs").fetchone() == (1,)
 
 
 @pytest.mark.asyncio

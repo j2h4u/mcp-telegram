@@ -17,7 +17,7 @@ _SAVEPOINTS = count()
 
 
 def _purge_hydration_jobs(conn: sqlite3.Connection, dialog_id: int) -> None:
-    HydrationQueueRepository(conn).remove_for_dialog(dialog_id)
+    HydrationQueueRepository(conn).remove_active_for_dialog(dialog_id)
 
 
 @contextmanager

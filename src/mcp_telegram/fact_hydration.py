@@ -22,6 +22,7 @@ from .hydration_queue import (
     HydrationQueueRepository,
     HydrationQueueSummary,
 )
+from .messages.sqlite_repository import repair_transcription_hydration_jobs
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_rpc import TelegramRpcCircuitOpenError
 from .telegram_rpc_error import TelegramRpcErrorDescriptor, describe_telegram_rpc_error
@@ -121,6 +122,11 @@ class _BatchOutcome:
     retried: int = 0
     dropped: int = 0
     stopped: bool = False
+    dropped_by_kind: tuple[tuple[str, int], ...] = ()
+
+
+def _due_job_order_key(job: HydrationJob) -> tuple[int, int, str, int, int]:
+    return (-job.message_sent_at, job.due_at, job.kind, job.dialog_id, job.message_id)
 
 
 def batch_jobs(
@@ -143,13 +149,26 @@ def batch_jobs(
     for kind_batches in by_kind.values():
         kind_batches.sort(key=lambda batch: (-int(batch[0]), batch[1]))
     # Round-robin the first batch for every kind before taking a second batch.
-    # Each kind's own batches retain the queue's priority/newest ordering.
+    # Each kind's own batches retain the queue's priority/newest ordering; the
+    # round heads retain the same deterministic cross-kind ordering.
     ordered: list[list[HydrationJob]] = []
     for round_index in range(max((len(batches) for batches in by_kind.values()), default=0)):
-        for kind in handlers:
-            batches = by_kind.get(kind, [])
-            if round_index < len(batches):
-                ordered.append(batches[round_index][2])
+        round_batches = [
+            batches[round_index]
+            for batches in by_kind.values()
+            if round_index < len(batches)
+        ]
+        round_batches.sort(
+            key=lambda batch: (
+                -int(batch[0]),
+                -batch[2][0].message_sent_at,
+                batch[2][0].due_at,
+                batch[2][0].kind,
+                batch[2][0].dialog_id,
+                batch[2][0].message_id,
+            )
+        )
+        ordered.extend(batch[2] for batch in round_batches)
     return ordered
 
 
@@ -176,9 +195,14 @@ class MessageFactHydrationWorker:
         self._conn = conn
         self._shutdown_event = shutdown_event
         self._handlers = {handler.kind: handler for handler in handlers}
-        self._interval_seconds = interval_seconds
         self._max_requests_per_cycle = max_requests_per_cycle
         self._max_jobs_per_cycle = max_jobs_per_cycle
+        if self._max_jobs_per_cycle < len(self._handlers):
+            raise ValueError("fact hydration max_jobs_per_cycle must cover registered handler kinds")
+        request_capacity = sum(handler.request_cost for handler in self._handlers.values())
+        if self._max_requests_per_cycle < request_capacity:
+            raise ValueError("fact hydration max_requests_per_cycle must cover registered handler costs")
+        self._interval_seconds = interval_seconds
         self._retry_delay_seconds = retry_delay_seconds
         self._circuit_retry_seconds = circuit_retry_seconds
         self._max_attempts = max_attempts
@@ -188,63 +212,63 @@ class MessageFactHydrationWorker:
 
     async def run_cycle(self, *, now: int | None = None) -> FactHydrationCycleResult:
         effective_now = int(self._clock()) if now is None else now
-        repair = self._queue.repair_transcription_hydration_jobs(
-            due_at=effective_now, max_jobs=self._max_jobs_per_cycle
+        repair = (
+            repair_transcription_hydration_jobs(
+                self._conn, due_at=effective_now, max_jobs=self._max_jobs_per_cycle
+            )
+            if TRANSCRIPTION_HYDRATION_KIND in self._handlers
+            else None
         )
         # The repair is a producer transaction. Commit before any awaited RPC.
         self._conn.commit()
         due = self._fair_due_jobs(effective_now)
         if not due:
             result = FactHydrationCycleResult(
-                repaired_transcription_jobs=repair.enqueued,
-                repair_has_more=repair.has_more,
+                repaired_transcription_jobs=0 if repair is None else repair.enqueued,
+                repair_has_more=False if repair is None else repair.has_more,
             )
-            self._log_cycle(result, {}, effective_now)
+            self._log_cycle(result, {})
             return result
         request_batches = batch_jobs(due, self._handlers)
         outcome, per_kind = await self._run_batches(request_batches, int(effective_now))
         result = replace(
             outcome,
-            repaired_transcription_jobs=repair.enqueued,
-            repair_has_more=repair.has_more,
+            repaired_transcription_jobs=0 if repair is None else repair.enqueued,
+            repair_has_more=False if repair is None else repair.has_more,
         )
-        self._log_cycle(result, per_kind, effective_now, selected=len(due))
+        self._log_cycle(result, per_kind, selected=len(due))
         return result
 
     def _fair_due_jobs(self, effective_now: int) -> list[HydrationJob]:
-        candidates = [
-            job
+        per_kind = {
+            kind: self._queue.due_jobs(effective_now, self._max_jobs_per_cycle, kind=kind)
             for kind in self._handlers
-            for job in self._queue.due_jobs(effective_now, self._max_jobs_per_cycle, kind=kind)
-        ]
-        candidates.sort(
-            key=lambda job: (
-                -int(job.priority),
-                -job.message_sent_at,
-                job.due_at,
-                job.kind,
-                job.dialog_id,
-                job.message_id,
-            )
-        )
-        protected = [
-            next((job for job in candidates if job.kind == kind), None)
-            for kind in self._handlers
-        ]
-        selected: list[HydrationJob] = [job for job in protected if job is not None]
-        selected_ids = {(job.kind, job.dialog_id, job.message_id) for job in selected}
-        selected.extend(
-            job
-            for job in candidates
-            if (job.kind, job.dialog_id, job.message_id) not in selected_ids
-        )
-        return selected[: self._max_jobs_per_cycle]
+        }
+        selected: list[HydrationJob] = []
+        remaining = {kind: list(jobs) for kind, jobs in per_kind.items()}
+        protected = [jobs.pop(0) for jobs in remaining.values() if jobs]
+        protected.sort(key=lambda job: (-int(job.priority), *_due_job_order_key(job)))
+        selected.extend(protected)
+        for priority in (HydrationPriority.FOREGROUND, HydrationPriority.BACKFILL):
+            tiered = {
+                kind: [job for job in jobs if job.priority == priority]
+                for kind, jobs in remaining.items()
+            }
+            while len(selected) < self._max_jobs_per_cycle and any(tiered.values()):
+                heads = sorted(
+                    ((jobs[0], kind) for kind, jobs in tiered.items() if jobs),
+                    key=lambda pair: _due_job_order_key(pair[0]),
+                )
+                for _head, kind in heads:
+                    if len(selected) >= self._max_jobs_per_cycle:
+                        break
+                    selected.append(tiered[kind].pop(0))
+        return selected
 
     def _log_cycle(
         self,
         result: FactHydrationCycleResult,
-        per_kind: dict[str, tuple[int, int, int, int, int]],
-        effective_now: int,
+        per_kind: dict[str, tuple[int, int, int, int, int, int]],
         *,
         selected: int = 0,
     ) -> None:
@@ -262,27 +286,25 @@ class MessageFactHydrationWorker:
             result.repair_has_more,
         )
         for kind in self._handlers:
-            selected_kind, requests, completed, retried, dropped = per_kind.get(kind, (0, 0, 0, 0, 0))
+            selected_kind, requests, hydrated, completed, retried, dropped = per_kind.get(kind, (0, 0, 0, 0, 0, 0))
             logger.info(
-                "message_fact_hydration kind=%s selected=%d requests=%d completed=%d retried=%d dropped=%d "
-                "queued_after=%d due_after=%s",
+                "message_fact_hydration kind=%s selected=%d requests=%d hydrated=%d completed=%d retried=%d dropped=%d",
                 kind,
                 selected_kind,
                 requests,
+                hydrated,
                 completed,
                 retried,
                 dropped,
-                self._queue.queued_count(kind=kind),
-                bool(self._queue.due_jobs(effective_now, 1, kind=kind)),
             )
 
     async def _run_batches(
         self, request_batches: Sequence[Sequence[HydrationJob]], effective_now: int
-    ) -> tuple[FactHydrationCycleResult, dict[str, tuple[int, int, int, int, int]]]:
+    ) -> tuple[FactHydrationCycleResult, dict[str, tuple[int, int, int, int, int, int]]]:
         requests = hydrated = completed = retried = dropped = 0
         stopped = False
         used_requests = 0
-        per_kind: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0, 0])
+        per_kind: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0, 0, 0])
         for batch_index, batch in enumerate(request_batches):
             handler = self._handlers[batch[0].kind]
             if used_requests + handler.request_cost > self._max_requests_per_cycle:
@@ -294,9 +316,12 @@ class MessageFactHydrationWorker:
             counters = per_kind[handler.kind]
             counters[0] += len(batch)
             counters[1] += outcome.requests
-            counters[2] += outcome.completed
-            counters[3] += outcome.retried
-            counters[4] += outcome.dropped
+            counters[2] += outcome.hydrated
+            counters[3] += outcome.completed
+            counters[4] += outcome.retried
+            counters[5] += outcome.dropped
+            for kind, dropped_for_kind in outcome.dropped_by_kind:
+                per_kind[kind][5] += dropped_for_kind - (outcome.dropped if kind == handler.kind else 0)
             requests += outcome.requests
             hydrated += outcome.hydrated
             completed += outcome.completed
@@ -308,7 +333,7 @@ class MessageFactHydrationWorker:
             if batch_index + 1 < len(request_batches) and await self._pause_between_requests():
                 break
         return FactHydrationCycleResult(requests, hydrated, completed, retried, dropped, stopped), {
-            kind: (counters[0], counters[1], counters[2], counters[3], counters[4])
+            kind: (counters[0], counters[1], counters[2], counters[3], counters[4], counters[5])
             for kind, counters in per_kind.items()
         }
 
@@ -420,9 +445,17 @@ class MessageFactHydrationWorker:
             set_access_lost(self._conn, dialog_id, effective_now, reason=descriptor.error_type)
         self._conn.commit()
         self._log_summaries(summaries, descriptor)
+        drop_counts: dict[str, int] = defaultdict(int)
+        for summary in summaries:
+            drop_counts[summary.kind] += summary.job_count
+        for observation in preflight_observations:
+            if observation.kind is not None:
+                drop_counts[observation.kind] += 1
+        dropped_by_kind = tuple(drop_counts.items())
         return _BatchOutcome(
             requests=handler.request_cost,
             dropped=len(preflight_observations) + sum(summary.job_count for summary in summaries),
+            dropped_by_kind=dropped_by_kind,
         )
 
     def _handle_request_error(  # noqa: PLR0913, PLR0917

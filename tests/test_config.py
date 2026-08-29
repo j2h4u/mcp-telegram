@@ -54,19 +54,22 @@ def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
         config.freshness.reactions.freshness_ttl_seconds = 1  # type: ignore[misc]
 
 
-def test_fact_hydration_requires_transcription_request_budget() -> None:
-    with pytest.raises(ValueError, match="max_requests_per_cycle"):
-        FactHydrationConfig(max_requests_per_cycle=1)
+def test_fact_hydration_config_accepts_positive_capacity_values() -> None:
+    assert FactHydrationConfig(max_requests_per_cycle=1, max_jobs_per_cycle=1).max_requests_per_cycle == 1
 
 
-def test_load_config_rejects_fact_hydration_budget_below_transcription_cost(tmp_path: Path) -> None:
+def test_fact_hydration_config_rejects_non_positive_values() -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        FactHydrationConfig(max_jobs_per_cycle=0)
+
+
+def test_load_config_accepts_positive_fact_hydration_capacity(tmp_path: Path) -> None:
     path = _write_config(
         tmp_path,
         '[state]\ndir = "/state"\n\n[scheduling.fact_hydration]\nmax_requests_per_cycle = 1\n',
     )
 
-    with pytest.raises(ConfigError, match="max_requests_per_cycle"):
-        load_config(path)
+    assert load_config(path).scheduling.fact_hydration.max_requests_per_cycle == 1
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])

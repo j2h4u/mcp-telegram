@@ -190,6 +190,7 @@ path = "mcp_telegram.fact_hydration"
 layer = "application"
 depends_on = [
     "mcp_telegram.access_lifecycle", "mcp_telegram.hydration_queue", "mcp_telegram.flood",
+    "mcp_telegram.messages.sqlite_repository",
     "mcp_telegram.telegram_access", "mcp_telegram.telegram_rpc", "mcp_telegram.telegram_rpc_error",
 ]
 
@@ -285,7 +286,7 @@ depends_on = ["mcp_telegram.history_enrollment", "mcp_telegram.hydration_queue",
 [[modules]]
 path = "mcp_telegram.history_enrollment"
 layer = "capability"
-depends_on = []
+depends_on = ["mcp_telegram.hydration_queue"]
 
 [[modules]]
 path = "mcp_telegram.folders"

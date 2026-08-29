@@ -278,14 +278,22 @@ def test_v40_creates_prioritized_hydration_queue_and_due_index(tmp_path: Path) -
             "attempts",
             "priority",
             "message_sent_at",
+            "terminal",
         ]
         table_sql = _fetchone_row(conn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='hydration_jobs'")
         assert table_sql is not None and "WITHOUT ROWID" in str(table_sql[0]).upper()
         due_index = _fetchone_row(
-            conn, "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_hydration_jobs_due'"
+            conn, "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_hydration_jobs_schedule'"
         )
         assert due_index is not None
-        assert "DUE_AT, PRIORITY DESC, MESSAGE_SENT_AT DESC, KIND, DIALOG_ID, MESSAGE_ID" in str(due_index[0]).upper()
+        assert "KIND, TERMINAL, PRIORITY DESC, MESSAGE_SENT_AT DESC, DUE_AT, DIALOG_ID, MESSAGE_ID" in str(
+            due_index[0]
+        ).upper()
+        repair_index = _fetchone_row(
+            conn, "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_messages_voice_undeleted_sent'"
+        )
+        assert repair_index is not None
+        assert "SENT_AT DESC, DIALOG_ID, MESSAGE_ID" in str(repair_index[0]).upper()
 
 
 def test_v41_seeds_voice_transcription_hydration_as_backfill(tmp_path: Path) -> None:
@@ -304,7 +312,7 @@ def test_v41_seeds_voice_transcription_hydration_as_backfill(tmp_path: Path) -> 
             "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload, is_deleted) "
             "VALUES (91, 18, 1235, NULL, 'voice', '{}', 1)"
         )
-        conn.execute("DELETE FROM schema_version WHERE version = 41")
+        conn.execute("DELETE FROM schema_version WHERE version >= 41")
         conn.commit()
 
     ensure_sync_schema(db_path)
@@ -551,7 +559,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 41  # v41 seeds voice transcription hydration
+        assert _CURRENT_SCHEMA_VERSION == 42
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1282,7 +1290,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 41
+        assert _CURRENT_SCHEMA_VERSION == 42
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:

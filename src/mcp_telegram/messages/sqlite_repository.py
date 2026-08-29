@@ -81,6 +81,14 @@ class MessageOutLookup:
     outgoing: bool
 
 
+@dataclass(frozen=True, slots=True)
+class TranscriptionHydrationRepair:
+    """Bounded result of repairing missing voice transcription jobs."""
+
+    enqueued: int
+    has_more: bool
+
+
 def message_exists(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
     """Return whether the canonical message key is already persisted."""
     return conn.execute(_SELECT_MESSAGE_EXISTS_SQL, (dialog_id, message_id)).fetchone() is not None
@@ -378,6 +386,46 @@ def transcription_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, m
         ).fetchone()
         is not None
     )
+
+
+_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL = (
+    "FROM messages m INDEXED BY idx_messages_voice_undeleted_sent "
+    "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
+    "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
+    "LEFT JOIN message_transcriptions mt ON mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id "
+    "LEFT JOIN hydration_jobs hj ON hj.kind = 'transcription' "
+    "AND hj.dialog_id = m.dialog_id AND hj.message_id = m.message_id "
+    "WHERE m.is_deleted = 0 AND m.media_kind = 'voice' "
+    "AND mt.message_id IS NULL AND hj.message_id IS NULL"
+)
+
+
+def repair_transcription_hydration_jobs(
+    conn: sqlite3.Connection, *, due_at: int, max_jobs: int
+) -> TranscriptionHydrationRepair:
+    """Bound the recurring repair of missing voice transcription jobs."""
+    if max_jobs <= 0:
+        return TranscriptionHydrationRepair(0, False)
+    candidates_sql = (
+        "SELECT 'transcription', m.dialog_id, m.message_id, ?, 0, ?, m.sent_at, 0 "
+        f"{_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL} "
+        "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT ?"
+    )
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO hydration_jobs "
+        "(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at, terminal) "
+        f"{candidates_sql}",
+        (due_at, int(HydrationPriority.BACKFILL), max_jobs),
+    )
+    has_more = (
+        conn.execute(
+            "SELECT 1 "
+            f"{_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL} "
+            "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT 1",
+        ).fetchone()
+        is not None
+    )
+    return TranscriptionHydrationRepair(cursor.rowcount, has_more)
 
 
 def apply_hydrated_media_fact(

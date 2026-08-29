@@ -71,31 +71,15 @@ class HydrationQueueSummary:
     attempts_max: int
 
 
-@dataclass(frozen=True, slots=True)
-class TranscriptionHydrationRepair:
-    """Bounded result of repairing missing voice transcription jobs."""
-
-    enqueued: int
-    has_more: bool
-
-
 _JOB_COLUMNS = "kind, dialog_id, message_id, due_at, attempts, message_sent_at, priority, terminal"
 _SELECT_JOB_COLUMNS = ", ".join(f"hj.{column}" for column in _JOB_COLUMNS.split(", "))
 _SUMMARY_AGGREGATE_SQL = (
-    f"SELECT COUNT(*), MIN(attempts), MAX(attempts) FROM {HYDRATION_QUEUE_TABLE} WHERE kind = ? AND dialog_id = ?"
+    f"SELECT COUNT(*), MIN(attempts), MAX(attempts) FROM {HYDRATION_QUEUE_TABLE} "
+    "WHERE kind = ? AND dialog_id = ? AND terminal = 0"
 )
 _SUMMARY_MESSAGE_IDS_SQL = (
-    f"SELECT message_id FROM {HYDRATION_QUEUE_TABLE} WHERE kind = ? AND dialog_id = ? ORDER BY message_id LIMIT ?"
-)
-_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL = (
-    "FROM messages m INDEXED BY idx_messages_voice_undeleted_sent "
-    "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
-    "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
-    "LEFT JOIN message_transcriptions mt ON mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id "
-    "LEFT JOIN hydration_jobs hj ON hj.kind = 'transcription' "
-    "AND hj.dialog_id = m.dialog_id AND hj.message_id = m.message_id "
-    "WHERE m.is_deleted = 0 AND m.media_kind = 'voice' "
-    "AND mt.message_id IS NULL AND hj.message_id IS NULL"
+    f"SELECT message_id FROM {HYDRATION_QUEUE_TABLE} WHERE kind = ? AND dialog_id = ? AND terminal = 0 "
+    "ORDER BY message_id LIMIT ?"
 )
 
 
@@ -161,31 +145,6 @@ class HydrationQueueRepository:
                 int(job.terminal),
             ),
         )
-
-    def repair_transcription_hydration_jobs(self, *, due_at: int, max_jobs: int) -> TranscriptionHydrationRepair:
-        """Bound the recurring repair of missing voice transcription jobs."""
-        if max_jobs <= 0:
-            return TranscriptionHydrationRepair(0, False)
-        candidates_sql = (
-            "SELECT 'transcription', m.dialog_id, m.message_id, ?, 0, ?, m.sent_at, 0 "
-            f"{_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL} "
-            "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT ?"
-        )
-        cursor = self._conn.execute(
-            "INSERT OR IGNORE INTO hydration_jobs "
-            "(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at, terminal) "
-            f"{candidates_sql}",
-            (due_at, int(HydrationPriority.BACKFILL), max_jobs),
-        )
-        has_more = (
-            self._conn.execute(
-                "SELECT 1 "
-                f"{_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL} "
-                "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT 1",
-            ).fetchone()
-            is not None
-        )
-        return TranscriptionHydrationRepair(cursor.rowcount, has_more)
 
     def due_jobs(self, now: int, limit: int, *, kind: str | None = None) -> list[HydrationJob]:
         """Return jobs due at or before *now* in deterministic queue order."""
@@ -274,6 +233,16 @@ class HydrationQueueRepository:
             )
         return cursor.rowcount
 
+    def remove_active_for_dialog(self, dialog_id: int) -> int:
+        """Delete active jobs while retaining terminal suppressions."""
+        if not self.is_available():
+            return 0
+        cursor = self._conn.execute(
+            f"DELETE FROM {HYDRATION_QUEUE_TABLE} WHERE dialog_id = ? AND terminal = 0",
+            (dialog_id,),
+        )
+        return cursor.rowcount
+
     def remove_for_message(self, dialog_id: int, message_id: int) -> int:
         """Delete every fact job associated with one message."""
         if not self.is_available():
@@ -326,5 +295,4 @@ __all__ = [
     "HydrationPriority",
     "HydrationQueueRepository",
     "HydrationQueueSummary",
-    "TranscriptionHydrationRepair",
 ]

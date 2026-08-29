@@ -636,9 +636,9 @@ CREATE TABLE IF NOT EXISTS hydration_jobs (
 ) WITHOUT ROWID
 """
 
-_HYDRATION_JOBS_DUE_INDEX_DDL = """
-CREATE INDEX IF NOT EXISTS idx_hydration_jobs_due
-ON hydration_jobs(due_at, priority DESC, message_sent_at DESC, kind, dialog_id, message_id)
+_HYDRATION_JOBS_SCHEDULE_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_hydration_jobs_schedule
+ON hydration_jobs(kind, terminal, priority DESC, message_sent_at DESC, due_at, dialog_id, message_id)
 """
 
 _VOICE_TRANSCRIPTION_REPAIR_INDEX_DDL = """
@@ -1688,7 +1688,6 @@ def _apply_migration_40(conn: sqlite3.Connection, current: int) -> int:
                 "SELECT sent_at FROM messages WHERE messages.dialog_id = hydration_jobs.dialog_id "
                 "AND messages.message_id = hydration_jobs.message_id), 0)"
             ),
-            _HYDRATION_JOBS_DUE_INDEX_DDL,
         ],
         ignore_duplicate_column=True,
     )
@@ -1707,7 +1706,9 @@ def _apply_migration_42(conn: sqlite3.Connection, current: int) -> int:
         42,
         [
             "ALTER TABLE hydration_jobs ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1))",
+            "DROP INDEX IF EXISTS idx_hydration_jobs_due",
             _VOICE_TRANSCRIPTION_REPAIR_INDEX_DDL,
+            _HYDRATION_JOBS_SCHEDULE_INDEX_DDL,
         ],
         ignore_duplicate_column=True,
     )
@@ -1788,7 +1789,7 @@ def _ensure_scheduled_messages_fts(conn: sqlite3.Connection) -> None:
 def _ensure_hydration_jobs(conn: sqlite3.Connection) -> None:
     """Ensure the current hydration queue and its due-time index exist."""
     conn.execute(_HYDRATION_JOBS_DDL)
-    conn.execute(_HYDRATION_JOBS_DUE_INDEX_DDL)
+    conn.execute(_HYDRATION_JOBS_SCHEDULE_INDEX_DDL)
     conn.execute(_VOICE_TRANSCRIPTION_REPAIR_INDEX_DDL)
     conn.commit()
 
