@@ -116,7 +116,7 @@ def test_due_jobs_prioritize_foreground_then_newest_message(db: sqlite3.Connecti
     assert repository.due_jobs(1, 10) == [jobs[2], jobs[3], jobs[1], jobs[0]]
 
 
-def test_snapshot_distinguishes_active_due_priority_and_terminal_jobs(db: sqlite3.Connection) -> None:
+def test_snapshot_distinguishes_active_ready_deferred_priority_and_terminal_jobs(db: sqlite3.Connection) -> None:
     repository = HydrationQueueRepository(db)
     repository.enqueue(_job("media", 1, 1, 90, attempts=2, message_sent_at=40, priority=HydrationPriority.BACKFILL))
     repository.enqueue(_job("media", 1, 2, 110, attempts=1, message_sent_at=80))
@@ -128,7 +128,7 @@ def test_snapshot_distinguishes_active_due_priority_and_terminal_jobs(db: sqlite
         HydrationQueueKindSnapshot(
             kind="media",
             active=2,
-            due=1,
+            ready=1,
             foreground=1,
             backfill=1,
             terminal=1,
@@ -137,6 +137,7 @@ def test_snapshot_distinguishes_active_due_priority_and_terminal_jobs(db: sqlite
             max_attempts=2,
         ),
     )
+    assert repository.snapshot(100)[0].deferred == 1
 
 
 def test_enqueue_promotes_existing_backfill_without_resetting_attempts(db: sqlite3.Connection) -> None:

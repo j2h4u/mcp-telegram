@@ -48,6 +48,7 @@ class FactHydrationCycleResult:
     requests: int = 0
     hydrated: int = 0
     completed: int = 0
+    pending: int = 0
     retried: int = 0
     dropped: int = 0
     stopped: bool = False
@@ -59,7 +60,6 @@ class FactHydrationCycleResult:
 class AppliedFacts:
     hydrated: int = 0
     completed: int = 0
-    retried: int = 0
     dropped: int = 0
     pending: bool = False
     drop_observations: tuple[HydrationDropObservation, ...] = ()
@@ -120,6 +120,7 @@ class _BatchOutcome:
     requests: int = 0
     hydrated: int = 0
     completed: int = 0
+    pending: int = 0
     retried: int = 0
     dropped: int = 0
     stopped: bool = False
@@ -297,7 +298,7 @@ class MessageFactHydrationWorker:
     def _log_cycle(  # noqa: PLR0913 - one log record combines cycle outcome with current queue state
         self,
         result: FactHydrationCycleResult,
-        per_kind: dict[str, tuple[int, int, int, int, int]],
+        per_kind: dict[str, tuple[int, int, int, int, int, int]],
         queue_snapshot: Sequence[HydrationQueueKindSnapshot],
         *,
         now: int,
@@ -306,39 +307,57 @@ class MessageFactHydrationWorker:
     ) -> None:
         snapshot_by_kind = {snapshot.kind: snapshot for snapshot in queue_snapshot}
         logger.info(
-            "message_fact_hydration cycle jobs=%d requests=%d hydrated=%d completed=%d "
-            "retried=%d dropped=%d stopped=%s repaired_transcription_jobs=%d repair_has_more=%s "
-            "queue_active=%d queue_due=%d queue_terminal=%d",
+            "message_fact_hydration cycle selected=%d requests=%d hydrated=%d completed=%d "
+            "pending=%d retried=%d dropped=%d stopped=%s repaired_transcription_jobs=%d repair_has_more=%s "
+            "queue_active=%d queue_ready=%d queue_deferred=%d queue_terminal=%d",
             selected,
             result.requests,
             result.hydrated,
             result.completed,
+            result.pending,
             result.retried,
             result.dropped,
             result.stopped,
             result.repaired_transcription_jobs,
             result.repair_has_more,
             sum(snapshot.active for snapshot in queue_snapshot),
-            sum(snapshot.due for snapshot in queue_snapshot),
+            sum(snapshot.ready for snapshot in queue_snapshot),
+            sum(snapshot.deferred for snapshot in queue_snapshot),
             sum(snapshot.terminal for snapshot in queue_snapshot),
         )
         selected_by_kind = selected_by_kind or {}
         for kind in self._handlers:
-            requests, hydrated, completed, retried, dropped = per_kind.get(kind, (0, 0, 0, 0, 0))
-            snapshot = snapshot_by_kind.get(kind, HydrationQueueKindSnapshot(kind, 0, 0, 0, 0, 0, None, None, 0))
+            requests, hydrated, completed, pending, retried, dropped = per_kind.get(kind, (0, 0, 0, 0, 0, 0))
+            snapshot = snapshot_by_kind.get(
+                kind,
+                HydrationQueueKindSnapshot(
+                    kind=kind,
+                    active=0,
+                    ready=0,
+                    foreground=0,
+                    backfill=0,
+                    terminal=0,
+                    oldest_message_sent_at=None,
+                    newest_message_sent_at=None,
+                    max_attempts=0,
+                ),
+            )
             logger.info(
-                "message_fact_hydration kind=%s selected=%d requests=%d hydrated=%d completed=%d retried=%d "
-                "dropped=%d queue_active=%d queue_due=%d queue_foreground=%d queue_backfill=%d "
+                "message_fact_hydration kind=%s selected=%d requests=%d hydrated=%d completed=%d pending=%d "
+                "retried=%d dropped=%d queue_active=%d queue_ready=%d queue_deferred=%d "
+                "queue_foreground=%d queue_backfill=%d "
                 "queue_terminal=%d oldest_message_age_s=%s newest_message_age_s=%s max_attempts=%d",
                 kind,
                 selected_by_kind.get(kind, 0),
                 requests,
                 hydrated,
                 completed,
+                pending,
                 retried,
                 dropped,
                 snapshot.active,
-                snapshot.due,
+                snapshot.ready,
+                snapshot.deferred,
                 snapshot.foreground,
                 snapshot.backfill,
                 snapshot.terminal,
@@ -353,11 +372,11 @@ class MessageFactHydrationWorker:
 
     async def _run_batches(
         self, request_batches: Sequence[Sequence[HydrationJob]], effective_now: int
-    ) -> tuple[FactHydrationCycleResult, dict[str, tuple[int, int, int, int, int]]]:
-        requests = hydrated = completed = retried = dropped = 0
+    ) -> tuple[FactHydrationCycleResult, dict[str, tuple[int, int, int, int, int, int]]]:
+        requests = hydrated = completed = pending = retried = dropped = 0
         stopped = False
         used_requests = 0
-        per_kind: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0, 0])
+        per_kind: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0, 0, 0])
         for batch_index, batch in enumerate(request_batches):
             handler = self._handlers[batch[0].kind]
             if used_requests + handler.request_cost > self._max_requests_per_cycle:
@@ -370,13 +389,15 @@ class MessageFactHydrationWorker:
             counters[0] += outcome.requests
             counters[1] += outcome.hydrated
             counters[2] += outcome.completed
-            counters[3] += outcome.retried
-            counters[4] += outcome.dropped
+            counters[3] += outcome.pending
+            counters[4] += outcome.retried
+            counters[5] += outcome.dropped
             for kind, dropped_for_kind in outcome.dropped_by_kind:
-                per_kind[kind][4] += dropped_for_kind - (outcome.dropped if kind == handler.kind else 0)
+                per_kind[kind][5] += dropped_for_kind - (outcome.dropped if kind == handler.kind else 0)
             requests += outcome.requests
             hydrated += outcome.hydrated
             completed += outcome.completed
+            pending += outcome.pending
             retried += outcome.retried
             dropped += outcome.dropped
             if outcome.stopped:
@@ -384,8 +405,16 @@ class MessageFactHydrationWorker:
                 break
             if batch_index + 1 < len(request_batches) and await self._pause_between_requests():
                 break
-        return FactHydrationCycleResult(requests, hydrated, completed, retried, dropped, stopped), {
-            kind: (counters[0], counters[1], counters[2], counters[3], counters[4])
+        return FactHydrationCycleResult(
+            requests=requests,
+            hydrated=hydrated,
+            completed=completed,
+            pending=pending,
+            retried=retried,
+            dropped=dropped,
+            stopped=stopped,
+        ), {
+            kind: (counters[0], counters[1], counters[2], counters[3], counters[4], counters[5])
             for kind, counters in per_kind.items()
         }
 
@@ -423,7 +452,7 @@ class MessageFactHydrationWorker:
         effective_now: int,
     ) -> _BatchOutcome:
         retry_delay = flood_seconds(exc)
-        retried, dropped, drop_observations = self._retry_or_drop(handler, started, effective_now + retry_delay)
+        retried, dropped, drop_observations = self._reschedule_or_drop(handler, started, effective_now + retry_delay)
         self._conn.commit()
         self._log_drops(
             batch,
@@ -456,7 +485,7 @@ class MessageFactHydrationWorker:
         preflight_observations: Sequence[HydrationDropObservation],
         effective_now: int,
     ) -> _BatchOutcome:
-        retried, dropped, drop_observations = self._retry_or_drop(
+        retried, dropped, drop_observations = self._reschedule_or_drop(
             handler, started, effective_now + self._circuit_retry_seconds
         )
         self._conn.commit()
@@ -525,7 +554,7 @@ class MessageFactHydrationWorker:
             self._log_drops(batch, preflight_observations)
             self._log_drops(started, self._observations("terminal_rpc", started), descriptor=descriptor)
             return _BatchOutcome(requests=handler.request_cost, dropped=len(preflight_observations) + len(started))
-        retried, dropped, drop_observations = self._retry_or_drop(
+        retried, dropped, drop_observations = self._reschedule_or_drop(
             handler, started, effective_now + self._retry_delay_seconds
         )
         self._conn.commit()
@@ -553,8 +582,9 @@ class MessageFactHydrationWorker:
         applied: AppliedFacts,
         effective_now: int,
     ) -> _BatchOutcome:
+        pending = 0
         if applied.pending:
-            retried, dropped, drop_observations = self._retry_or_drop(
+            pending, dropped, drop_observations = self._reschedule_or_drop(
                 handler,
                 started,
                 effective_now + handler.pending_delay_seconds,
@@ -562,7 +592,6 @@ class MessageFactHydrationWorker:
             applied = AppliedFacts(
                 hydrated=applied.hydrated,
                 completed=applied.completed,
-                retried=retried,
                 dropped=applied.dropped + dropped,
                 drop_observations=applied.drop_observations + drop_observations,
             )
@@ -573,7 +602,7 @@ class MessageFactHydrationWorker:
             requests=handler.request_cost,
             hydrated=applied.hydrated,
             completed=applied.completed,
-            retried=applied.retried,
+            pending=pending,
             dropped=len(preflight_observations) + applied.dropped,
         )
 
@@ -607,10 +636,10 @@ class MessageFactHydrationWorker:
         self._conn.commit()
         return started, tuple(observations)
 
-    def _retry_or_drop(
+    def _reschedule_or_drop(
         self, handler: HydrationHandler, jobs: Sequence[HydrationJob], due_at: int
     ) -> tuple[int, int, tuple[HydrationDropObservation, ...]]:
-        retried = dropped = 0
+        rescheduled = dropped = 0
         observations: list[HydrationDropObservation] = []
         for job in jobs:
             if job.attempts >= self._max_attempts:
@@ -623,8 +652,8 @@ class MessageFactHydrationWorker:
                     HydrationDropObservation("attempt_limit", job.message_id, job.kind, job.dialog_id, job.attempts)
                 )
             elif self._queue.reschedule(job, due_at):
-                retried += 1
-        return retried, dropped, tuple(observations)
+                rescheduled += 1
+        return rescheduled, dropped, tuple(observations)
 
     @staticmethod
     def _observations(reason: str, jobs: Sequence[HydrationJob]) -> tuple[HydrationDropObservation, ...]:

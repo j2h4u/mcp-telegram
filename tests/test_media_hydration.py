@@ -835,11 +835,13 @@ async def test_early_stop_logs_later_kind_as_selected_without_request(
     assert "selected=1" in transcription_logs[-1]
     assert "requests=0" in transcription_logs[-1]
     assert "queue_active=1" in transcription_logs[-1]
-    assert "queue_due=1" in transcription_logs[-1]
+    assert "queue_ready=1" in transcription_logs[-1]
+    assert "queue_deferred=0" in transcription_logs[-1]
     cycle_logs = [record.message for record in caplog.records if "message_fact_hydration cycle" in record.message]
     assert cycle_logs
     assert "queue_active=2" in cycle_logs[-1]
-    assert "queue_due=1" in cycle_logs[-1]
+    assert "queue_ready=1" in cycle_logs[-1]
+    assert "queue_deferred=1" in cycle_logs[-1]
     assert "queue_terminal=0" in cycle_logs[-1]
 
 
@@ -909,14 +911,24 @@ async def test_voice_jobs_request_configured_pause_without_waiting(
 
 
 @pytest.mark.asyncio
-async def test_transcription_pending_is_low_frequency_reschedule_without_text(db: sqlite3.Connection) -> None:
+async def test_transcription_pending_is_low_frequency_reschedule_without_text(
+    db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
     _seed_voice(db)
     client = _Client(SimpleNamespace(pending=True, text="", transcription_id=7))
     policy = FactHydrationConfig(transcription_recheck_delay_seconds=123, pause_between_requests_seconds=0.01)
 
-    result = await _transcription_worker(db, client, policy).run_cycle(now=10)
+    with caplog.at_level(logging.INFO, logger="mcp_telegram.fact_hydration"):
+        result = await _transcription_worker(db, client, policy).run_cycle(now=10)
 
-    assert result.retried == 1
+    assert result.pending == 1
+    assert result.retried == 0
+    cycle_log = next(record.message for record in caplog.records if "message_fact_hydration cycle" in record.message)
+    assert "selected=1" in cycle_log
+    assert "pending=1" in cycle_log
+    assert "retried=0" in cycle_log
+    assert "queue_ready=0" in cycle_log
+    assert "queue_deferred=1" in cycle_log
     assert db.execute("SELECT text FROM messages WHERE dialog_id=1 AND message_id=1").fetchone() == (None,)
     assert db.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
     assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 133)
