@@ -12,6 +12,7 @@ from mcp_telegram.fts import stem_text
 from mcp_telegram.hydration_queue import HydrationPriority
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.messages.sqlite_repository import (
+    TranscriptionHydrationRepair,
     insert_messages_with_fts,
     list_undeleted_message_ids,
     mark_message_deleted,
@@ -172,6 +173,44 @@ def test_transcription_repair_is_bounded_idempotent_and_newest_first(conn: sqlit
     third = repair_transcription_hydration_jobs(conn, due_at=902, max_jobs=300)
     assert (third.enqueued, third.has_more) == (0, False)
     assert conn.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (505,)
+
+
+def test_transcription_repair_only_probes_has_more_at_batch_boundary(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    conn.executemany(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+        "VALUES (42, ?, ?, NULL, 'voice', '{}')",
+        ((message_id, message_id) for message_id in range(1, 3)),
+    )
+    conn.commit()
+
+    def traced_repair(max_jobs: int) -> tuple[TranscriptionHydrationRepair, list[str]]:
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+        try:
+            result = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=max_jobs)
+        finally:
+            conn.set_trace_callback(None)
+        executable = [
+            statement
+            for statement in statements
+            if statement.lstrip().split(maxsplit=1)[0].upper() not in {"BEGIN", "COMMIT", "ROLLBACK"}
+        ]
+        return result, executable
+
+    first, first_statements = traced_repair(max_jobs=1)
+    assert (first.enqueued, first.has_more) == (1, True)
+    assert len(first_statements) == 2
+    conn.commit()
+
+    second, second_statements = traced_repair(max_jobs=1)
+    assert (second.enqueued, second.has_more) == (1, False)
+    assert len(second_statements) == 2
+    conn.commit()
+
+    third, third_statements = traced_repair(max_jobs=10)
+    assert (third.enqueued, third.has_more) == (0, False)
+    assert len(third_statements) == 1
 
 
 def test_transcription_repair_excludes_ineligible_and_queued_messages(conn: sqlite3.Connection) -> None:

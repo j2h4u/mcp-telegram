@@ -417,14 +417,17 @@ def repair_transcription_hydration_jobs(
         f"{candidates_sql}",
         (due_at, int(HydrationPriority.BACKFILL), max_jobs),
     )
-    has_more = (
-        conn.execute(
-            "SELECT 1 "
-            f"{_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL} "
-            "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT 1",
-        ).fetchone()
-        is not None
-    )
+    has_more = False
+    # The candidate anti-join excludes every hydration job and unique joins prevent fan-out; below-cap rowcount proves exhaustion.
+    if cursor.rowcount >= max_jobs:
+        has_more = (
+            conn.execute(
+                "SELECT 1 "
+                f"{_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL} "
+                "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT 1",
+            ).fetchone()
+            is not None
+        )
     return TranscriptionHydrationRepair(cursor.rowcount, has_more)
 
 
