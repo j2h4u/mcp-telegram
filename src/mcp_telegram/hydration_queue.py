@@ -164,18 +164,6 @@ class HydrationQueueRepository:
         )
         return [_job_from_row(row) for row in rows]
 
-    def queued_count(self, *, kind: str | None = None) -> int:
-        """Return the number of non-terminal jobs, optionally for one kind."""
-        clause = " AND kind = ?" if kind is not None else ""
-        parameters: tuple[object, ...] = (kind,) if kind is not None else ()
-        row = cast(
-            tuple[int] | None,
-            self._conn.execute(
-                f"SELECT COUNT(*) FROM {HYDRATION_QUEUE_TABLE} WHERE terminal = 0{clause}", parameters
-            ).fetchone(),
-        )
-        return int(cast(int | str, row[0])) if row is not None else 0
-
     def start(self, job: HydrationJob) -> HydrationJob | None:
         """Atomically increment and return a queued job, or return ``None``.
 
@@ -213,6 +201,14 @@ class HydrationQueueRepository:
         """Delete *job* and report whether a row was removed."""
         cursor = self._conn.execute(
             f"DELETE FROM {HYDRATION_QUEUE_TABLE} WHERE kind = ? AND dialog_id = ? AND message_id = ?",
+            _identity(job),
+        )
+        return cursor.rowcount > 0
+
+    def remove_active(self, job: HydrationJob) -> bool:
+        """Delete one active job while retaining a terminal suppression."""
+        cursor = self._conn.execute(
+            f"DELETE FROM {HYDRATION_QUEUE_TABLE} WHERE kind = ? AND dialog_id = ? AND message_id = ? AND terminal = 0",
             _identity(job),
         )
         return cursor.rowcount > 0

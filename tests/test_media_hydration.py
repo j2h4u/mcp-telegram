@@ -16,7 +16,7 @@ from telethon.errors.rpcerrorlist import (  # type: ignore[import-untyped]
     PremiumAccountRequiredError,
 )
 
-from mcp_telegram.access_lifecycle import restore_access_after_revalidation
+from mcp_telegram.access_lifecycle import restore_access_after_revalidation, set_access_lost
 from mcp_telegram.config import FactHydrationConfig
 from mcp_telegram.fact_hydration import MessageFactHydrationWorker
 from mcp_telegram.history_enrollment import disable_history
@@ -550,6 +550,39 @@ async def test_access_loss_purges_and_restore_reenqueues_unresolved_jobs(
     ]
 
 
+@pytest.mark.asyncio
+async def test_terminal_transcription_survives_reconcile_and_repair_until_fact_invalidation(
+    db: sqlite3.Connection,
+) -> None:
+    _seed_voice(db)
+    db.execute("UPDATE hydration_jobs SET terminal = 1, attempts = 3 WHERE kind = 'transcription'")
+    db.commit()
+
+    set_access_lost(db, 1, 10)
+    with db:
+        insert_messages_with_fts(
+            db,
+            [_hydration_message(1, 1, "voice")],
+            priority=HydrationPriority.BACKFILL,
+        )
+    restore_access_after_revalidation(db, 1, 20)
+
+    client = _Client(SimpleNamespace(pending=False, text="speech words", transcription_id=7))
+    result = await _transcription_worker(db, client).run_cycle(now=21)
+
+    assert result.requests == 0
+    assert client.calls == []
+    assert db.execute("SELECT attempts, terminal FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (3, 1)
+
+    with db:
+        insert_messages_with_fts(
+            db,
+            [_hydration_message(1, 1, "other")],
+            priority=HydrationPriority.BACKFILL,
+        )
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (0,)
+
+
 def test_disable_history_purges_active_jobs_but_preserves_terminal_suppression(db: sqlite3.Connection) -> None:
     _seed_voice(db)
     db.execute(
@@ -712,6 +745,43 @@ async def test_voice_foreground_beats_large_media_backlog(db: sqlite3.Connection
     assert result.completed == 1
     assert ["dialog_id" in call for call in client.calls] == [True, False, False, False]
     assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'media_metadata'").fetchone() == (6,)
+
+
+@pytest.mark.asyncio
+async def test_foreground_batches_exhaust_before_backfill_floodwait(
+    db: sqlite3.Connection,
+) -> None:
+    _seed(db, message_id=1)
+    _seed(db, message_id=2)
+    db.execute("UPDATE hydration_jobs SET priority = 1")
+    _seed_voice(db, dialog_id=2)
+    db.execute("UPDATE hydration_jobs SET priority = 0 WHERE kind = 'transcription'")
+    db.commit()
+
+    class _ForegroundThenFloodClient(_Client):
+        async def get_messages(self, *_args: object, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            ids = kwargs.get("ids")
+            assert isinstance(ids, list)
+            return [SimpleNamespace(id=message_id, media=None) for message_id in ids]
+
+        async def __call__(self, request: object, **kwargs: object) -> object:
+            self.calls.append({"request": request, **kwargs})
+            raise FloodWaitError(request=None, capture=7)
+
+    client = _ForegroundThenFloodClient()
+    policy = FactHydrationConfig(
+        batch_size=1,
+        max_jobs_per_cycle=3,
+        max_requests_per_cycle=5,
+        pause_between_requests_seconds=0.01,
+    )
+    result = await _mixed_worker(db, client, policy).run_cycle(now=1)
+
+    assert result.stopped is True
+    assert ["ids" in call for call in client.calls] == [True, True, False, False]
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'media_metadata'").fetchone() == (0,)
+    assert db.execute("SELECT attempts, due_at FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (1, 8)
 
 
 @pytest.mark.asyncio

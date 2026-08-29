@@ -296,7 +296,7 @@ def test_v40_creates_prioritized_hydration_queue_and_due_index(tmp_path: Path) -
         assert "SENT_AT DESC, DIALOG_ID, MESSAGE_ID" in str(repair_index[0]).upper()
 
 
-def test_v41_seeds_voice_transcription_hydration_as_backfill(tmp_path: Path) -> None:
+def test_v41_shape_seeds_voice_transcription_hydration_as_backfill(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
@@ -312,6 +312,23 @@ def test_v41_seeds_voice_transcription_hydration_as_backfill(tmp_path: Path) -> 
             "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload, is_deleted) "
             "VALUES (91, 18, 1235, NULL, 'voice', '{}', 1)"
         )
+        conn.execute("DROP INDEX idx_hydration_jobs_schedule")
+        conn.execute("DROP INDEX idx_messages_voice_undeleted_sent")
+        conn.execute("ALTER TABLE hydration_jobs RENAME TO hydration_jobs_v41")
+        conn.execute(
+            "CREATE TABLE hydration_jobs ("
+            "kind TEXT NOT NULL, dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL, "
+            "due_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, "
+            "priority INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1)), "
+            "message_sent_at INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (kind, dialog_id, message_id)) WITHOUT ROWID"
+        )
+        conn.execute(
+            "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at) "
+            "SELECT kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at FROM hydration_jobs_v41"
+        )
+        conn.execute("DROP TABLE hydration_jobs_v41")
+        assert "terminal" not in [row[1] for row in _table_info(conn, "hydration_jobs")]
         conn.execute("DELETE FROM schema_version WHERE version >= 41")
         conn.commit()
 

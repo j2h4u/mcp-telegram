@@ -474,6 +474,8 @@ def reconcile_fact_hydration_job(
     unresolved = message.media_kind in _FACT_HYDRATION_EMPTY_KINDS and message.media_payload == "{}"
     if unresolved and media_fact_hydration_eligible(conn, message.dialog_id, message.message_id):
         queue.enqueue(job)
+    elif unresolved:
+        queue.remove_active(job)
     else:
         queue.remove(job)
 
@@ -499,6 +501,8 @@ def reconcile_fact_hydration_job(
         and transcription_hydration_eligible(conn, message.dialog_id, message.message_id)
     ):
         queue.enqueue(transcription_job)
+    elif message.media_kind == "voice" and transcription_row is None:
+        queue.remove_active(transcription_job)
     else:
         queue.remove(transcription_job)
 
