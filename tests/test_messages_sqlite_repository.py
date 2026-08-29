@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -215,13 +216,16 @@ def test_transcription_repair_excludes_ineligible_and_queued_messages(conn: sqli
 
 
 def test_transcription_repair_plan_uses_partial_voice_index(conn: sqlite3.Connection) -> None:
-    plan = conn.execute(
-        "EXPLAIN QUERY PLAN SELECT m.message_id FROM messages m INDEXED BY idx_messages_voice_undeleted_sent "
-        "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
-        "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
-        "WHERE m.is_deleted = 0 AND m.media_kind = 'voice' "
-        "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT 300"
-    ).fetchall()
+    plan = cast(
+        list[tuple[object, ...]],
+        conn.execute(
+            "EXPLAIN QUERY PLAN SELECT m.message_id FROM messages m INDEXED BY idx_messages_voice_undeleted_sent "
+            "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
+            "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
+            "WHERE m.is_deleted = 0 AND m.media_kind = 'voice' "
+            "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT 300"
+        ).fetchall(),
+    )
     details = " ".join(str(row[3]) for row in plan)
     assert "USING COVERING INDEX idx_messages_voice_undeleted_sent" in details
     assert "USE TEMP B-TREE" not in details
