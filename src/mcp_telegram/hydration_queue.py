@@ -77,13 +77,18 @@ class HydrationQueueKindSnapshot:
 
     kind: str
     active: int
-    due: int
+    ready: int
     foreground: int
     backfill: int
     terminal: int
     oldest_message_sent_at: int | None
     newest_message_sent_at: int | None
     max_attempts: int
+
+    @property
+    def deferred(self) -> int:
+        """Return active jobs intentionally scheduled for a later cycle."""
+        return self.active - self.ready
 
 
 _JOB_COLUMNS = "kind, dialog_id, message_id, due_at, attempts, message_sent_at, priority, terminal"
@@ -132,7 +137,7 @@ def _snapshot_from_row(row: sqlite3.Row | tuple[object, ...]) -> HydrationQueueK
     (
         kind,
         active,
-        due,
+        ready,
         foreground,
         backfill,
         terminal,
@@ -141,7 +146,7 @@ def _snapshot_from_row(row: sqlite3.Row | tuple[object, ...]) -> HydrationQueueK
         max_attempts,
     ) = row
     assert isinstance(kind, str)
-    integer_values = (active, due, foreground, backfill, terminal)
+    integer_values = (active, ready, foreground, backfill, terminal)
     assert all(isinstance(value, int) for value in integer_values)
     assert oldest_message_sent_at is None or isinstance(oldest_message_sent_at, int)
     assert newest_message_sent_at is None or isinstance(newest_message_sent_at, int)
@@ -149,7 +154,7 @@ def _snapshot_from_row(row: sqlite3.Row | tuple[object, ...]) -> HydrationQueueK
     return HydrationQueueKindSnapshot(
         kind=kind,
         active=cast(int, active),
-        due=cast(int, due),
+        ready=cast(int, ready),
         foreground=cast(int, foreground),
         backfill=cast(int, backfill),
         terminal=cast(int, terminal),
