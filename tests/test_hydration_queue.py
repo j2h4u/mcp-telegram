@@ -13,6 +13,7 @@ from mcp_telegram.hydration_queue import (
     TRANSCRIPTION_HYDRATION_KIND,
     HydrationJob,
     HydrationPriority,
+    HydrationQueueKindSnapshot,
     HydrationQueueRepository,
 )
 
@@ -113,6 +114,29 @@ def test_due_jobs_prioritize_foreground_then_newest_message(db: sqlite3.Connecti
         repository.enqueue(job)
 
     assert repository.due_jobs(1, 10) == [jobs[2], jobs[3], jobs[1], jobs[0]]
+
+
+def test_snapshot_distinguishes_active_due_priority_and_terminal_jobs(db: sqlite3.Connection) -> None:
+    repository = HydrationQueueRepository(db)
+    repository.enqueue(_job("media", 1, 1, 90, attempts=2, message_sent_at=40, priority=HydrationPriority.BACKFILL))
+    repository.enqueue(_job("media", 1, 2, 110, attempts=1, message_sent_at=80))
+    terminal = _job("media", 1, 3, 50, attempts=4, message_sent_at=20)
+    repository.enqueue(terminal)
+    assert repository.mark_terminal(terminal)
+
+    assert repository.snapshot(100) == (
+        HydrationQueueKindSnapshot(
+            kind="media",
+            active=2,
+            due=1,
+            foreground=1,
+            backfill=1,
+            terminal=1,
+            oldest_message_sent_at=40,
+            newest_message_sent_at=80,
+            max_attempts=2,
+        ),
+    )
 
 
 def test_enqueue_promotes_existing_backfill_without_resetting_attempts(db: sqlite3.Connection) -> None:
