@@ -213,22 +213,6 @@ class HydrationQueueRepository:
         )
         return cursor.rowcount > 0
 
-    def remove_for_dialog(self, dialog_id: int, *, kind: str | None = None) -> int:
-        """Delete all jobs for one dialog and return the number removed."""
-        if not self.is_available():
-            return 0
-        if kind is None:
-            cursor = self._conn.execute(
-                f"DELETE FROM {HYDRATION_QUEUE_TABLE} WHERE dialog_id = ?",
-                (dialog_id,),
-            )
-        else:
-            cursor = self._conn.execute(
-                f"DELETE FROM {HYDRATION_QUEUE_TABLE} WHERE dialog_id = ? AND kind = ?",
-                (dialog_id, kind),
-            )
-        return cursor.rowcount
-
     def remove_active_for_dialog(self, dialog_id: int) -> int:
         """Delete active jobs while retaining terminal suppressions."""
         if not self.is_available():
