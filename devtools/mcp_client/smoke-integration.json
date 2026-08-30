@@ -41,32 +41,14 @@
       }
     },
     {
-      "_comment": "list_topics — generic dialog lookup uses a non-personal placeholder",
+      "_comment": "list_topics — impossible exact @username validates recoverable not-found without fuzzy matching",
       "action": "call_tool",
       "name": "list_topics",
-      "arguments": {"dialog": "integration-smoke-placeholder"},
+      "arguments": {"dialog": "@__integration_smoke_missing__"},
       "expect": {
-        "one_of": [
-          {
-            "is_error": false,
-            "path_equals": {
-              "content": []
-            },
-            "path_exists": [
-              "structuredContent.dialog",
-              "structuredContent.topics",
-              "structuredContent.count"
-            ],
-            "path_nonempty": [
-              "structuredContent"
-            ]
-          },
-          {
-            "is_error": true,
-            "content_text_contains": [
-              "not found"
-            ]
-          }
+        "is_error": true,
+        "content_text_contains": [
+          "not found"
         ]
       }
     },
