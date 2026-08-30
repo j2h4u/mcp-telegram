@@ -20,6 +20,12 @@ from mcp_telegram.daemon_client import (
     daemon_connection,
 )
 
+
+def _dialog_selector_fields(payload: dict[str, object]) -> dict[str, object]:
+    selector_keys = {"dialog", "dialog_id", "exact_dialog_id"}
+    return {key: value for key, value in payload.items() if key in selector_keys}
+
+
 # ---------------------------------------------------------------------------
 # DaemonNotRunningError — not running when socket absent
 # ---------------------------------------------------------------------------
@@ -289,7 +295,7 @@ async def test_list_messages_convenience() -> None:
     assert len(captured) == 1
     req = captured[0]
     assert req["method"] == "list_messages"
-    assert req["dialog_id"] == 123
+    assert _dialog_selector_fields(req) == {"dialog_id": 123}
     assert req["limit"] == 10
 
 
@@ -300,7 +306,7 @@ async def test_list_messages_convenience() -> None:
 
 @pytest.mark.asyncio
 async def test_list_messages_convenience_with_name() -> None:
-    """list_messages with dialog name sends dialog='Alice', dialog_id=0."""
+    """list_messages with a name omits the absent exact-id key."""
     reader = MagicMock(spec=asyncio.StreamReader)
     writer = MagicMock(spec=asyncio.StreamWriter)
     conn = DaemonConnection(reader, writer)
@@ -317,8 +323,7 @@ async def test_list_messages_convenience_with_name() -> None:
 
     req = captured[0]
     assert req["method"] == "list_messages"
-    assert req["dialog"] == "Alice"
-    assert req["dialog_id"] == 0
+    assert _dialog_selector_fields(req) == {"dialog": "Alice"}
     assert req["limit"] == 10
 
 
@@ -346,7 +351,7 @@ async def test_search_messages_convenience() -> None:
 
     req = captured[0]
     assert req["method"] == "search_messages"
-    assert req["dialog_id"] == 123
+    assert _dialog_selector_fields(req) == {"dialog_id": 123}
     assert req["query"] == "test query"
 
 
@@ -357,7 +362,7 @@ async def test_search_messages_convenience() -> None:
 
 @pytest.mark.asyncio
 async def test_search_messages_convenience_with_name() -> None:
-    """search_messages with dialog name sends dialog='Alice', dialog_id=0."""
+    """search_messages with a name omits the absent exact-id key."""
     reader = MagicMock(spec=asyncio.StreamReader)
     writer = MagicMock(spec=asyncio.StreamWriter)
     conn = DaemonConnection(reader, writer)
@@ -374,9 +379,26 @@ async def test_search_messages_convenience_with_name() -> None:
 
     req = captured[0]
     assert req["method"] == "search_messages"
-    assert req["dialog"] == "Alice"
-    assert req["dialog_id"] == 0
+    assert _dialog_selector_fields(req) == {"dialog": "Alice"}
     assert req["query"] == "hello there"
+
+
+@pytest.mark.asyncio
+async def test_search_messages_global_omits_both_dialog_selector_keys() -> None:
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True, "data": {"messages": [], "total": 0}}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.search_messages(query="global")
+
+    assert _dialog_selector_fields(captured[0]) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +437,7 @@ async def test_trace_account_messages_convenience() -> None:
     assert req["limit"] == 25
     assert req["coverage_goal"] == "best_effort_visible"
     assert "account" not in req
+    assert _dialog_selector_fields(req) == {}
 
 
 @pytest.mark.asyncio
@@ -433,7 +456,6 @@ async def test_trace_account_messages_includes_optional_filters() -> None:
 
     await conn.trace_account_messages(
         account="@alice",
-        dialog="Forum",
         exact_dialog_id=-100222,
         sent_after="2024-01-01T00:00:00Z",
         sent_before="2024-02-01T00:00:00Z",
@@ -443,8 +465,7 @@ async def test_trace_account_messages_includes_optional_filters() -> None:
     req = captured[0]
     assert req["method"] == "trace_account_messages"
     assert req["account"] == "@alice"
-    assert req["dialog"] == "Forum"
-    assert req["exact_dialog_id"] == -100222
+    assert _dialog_selector_fields(req) == {"exact_dialog_id": -100222}
     assert req["sent_after"] == "2024-01-01T00:00:00Z"
     assert req["sent_before"] == "2024-02-01T00:00:00Z"
     assert req["navigation"] == "cursor"
@@ -484,7 +505,7 @@ async def test_list_dialogs_convenience() -> None:
 
 @pytest.mark.asyncio
 async def test_list_topics_convenience() -> None:
-    """list_topics sends correct request dict with dialog_id."""
+    """list_topics emits exactly one selector key for exact and named calls."""
     reader = MagicMock(spec=asyncio.StreamReader)
     writer = MagicMock(spec=asyncio.StreamWriter)
     conn = DaemonConnection(reader, writer)
@@ -498,10 +519,32 @@ async def test_list_topics_convenience() -> None:
     conn.request = _mock_request  # type: ignore[method-assign]
 
     await conn.list_topics(dialog_id=123)
+    await conn.list_topics(dialog="Forum")
 
-    req = captured[0]
-    assert req["method"] == "list_topics"
-    assert req["dialog_id"] == 123
+    assert captured[0]["method"] == "list_topics"
+    assert _dialog_selector_fields(captured[0]) == {"dialog_id": 123}
+    assert captured[1]["method"] == "list_topics"
+    assert _dialog_selector_fields(captured[1]) == {"dialog": "Forum"}
+
+
+@pytest.mark.asyncio
+async def test_get_dialog_stats_emits_exactly_one_selector_key() -> None:
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True, "data": {}}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.get_dialog_stats(dialog_id=123)
+    await conn.get_dialog_stats(dialog="Forum")
+
+    assert _dialog_selector_fields(captured[0]) == {"dialog_id": 123}
+    assert _dialog_selector_fields(captured[1]) == {"dialog": "Forum"}
 
 
 @pytest.mark.asyncio
