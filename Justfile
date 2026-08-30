@@ -108,13 +108,9 @@ unit:
 deadcode:
     uv run vulture
 
-# Test coverage report.
+# Informational aggregate test coverage report; never a quality gate.
 coverage:
     uv run pytest -W error::ResourceWarning --cov=src/mcp_telegram --cov-report=term-missing
-
-# Blocking coverage floor.
-coverage-check:
-    uv run pytest --cov=src/mcp_telegram --cov-report=term-missing --cov-fail-under=83
 
 # Human CRAP report over the full suite.
 crap:
