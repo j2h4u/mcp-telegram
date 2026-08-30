@@ -519,18 +519,7 @@ def _list_message_render_metadata(
 ) -> tuple[ReadMarker | None, dict[str, object]]:
     is_scheduled = row.get("message_state") == "scheduled"
     marker_label = None if is_scheduled else marker_by_message.get(message.id)
-    return marker_label, {
-        "message_state": "scheduled" if is_scheduled else "sent",
-        "visibility": "author_only" if is_scheduled else "chat_visible",
-        "unpublished": is_scheduled,
-        "published": not is_scheduled,
-        "unseen": is_scheduled,
-        "scheduled_at": row.get("scheduled_at") if is_scheduled else None,
-        "published_at": row.get("published_at")
-        if row.get("published_at") is not None
-        else (None if is_scheduled else message.sent_at),
-        "inclusion_basis": row.get("inclusion_basis") or [],
-    }
+    return marker_label, _message_lifecycle_fields(row, sent_at=message.sent_at)
 
 
 def _read_messages_from_rows(rows: list[dict]) -> list[ReadMessage]:
@@ -843,19 +832,7 @@ def _search_anchor_arguments(dialog_id: int, msg_id: int, message_state: str) ->
 
 
 def _search_result_lifecycle_fields(row: dict) -> dict[str, object]:
-    is_scheduled = row.get("message_state") == "scheduled"
-    return {
-        "message_state": "scheduled" if is_scheduled else "sent",
-        "visibility": "author_only" if is_scheduled else "chat_visible",
-        "unpublished": is_scheduled,
-        "published": not is_scheduled,
-        "unseen": is_scheduled,
-        "scheduled_at": row.get("scheduled_at") if is_scheduled else None,
-        "published_at": row.get("published_at")
-        if row.get("published_at") is not None
-        else (None if is_scheduled else row.get("sent_at")),
-        "inclusion_basis": row.get("inclusion_basis") or [],
-    }
+    return _message_lifecycle_fields(row, sent_at=_search_result_date(row))
 
 
 def _search_result_render_fields(row: dict, dialog_id: int) -> dict[str, object]:
