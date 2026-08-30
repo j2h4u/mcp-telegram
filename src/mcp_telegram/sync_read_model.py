@@ -246,6 +246,27 @@ def _action(
     return " ".join(parts)
 
 
+def _validate_freshness_timestamps(
+    observed_at: int,
+    last_synced_at: int | None,
+    last_event_at: int | None,
+    last_delta_checked_at: int | None,
+) -> None:
+    if observed_at < 0:
+        raise SyncReadModelContractError("now must be non-negative")
+    for name, value in (
+        ("last_synced_at", last_synced_at),
+        ("last_event_at", last_event_at),
+        ("last_delta_checked_at", last_delta_checked_at),
+    ):
+        if value is None:
+            continue
+        if value < 0:
+            raise SyncReadModelContractError(f"{name} must be non-negative or null")
+        if value > observed_at:
+            raise SyncReadModelContractError(f"{name} cannot be later than observed_at")
+
+
 def build_sync_read_model(  # noqa: PLR0913
     *,
     persisted_status: str | None,
@@ -268,17 +289,7 @@ def build_sync_read_model(  # noqa: PLR0913
     timestamp = _strict_int("now", now)
     if saved_count < 0:
         raise SyncReadModelContractError("saved_message_count must be non-negative")
-    if timestamp < 0:
-        raise SyncReadModelContractError("now must be non-negative")
-    for name, value in (
-        ("last_synced_at", last_synced),
-        ("last_event_at", last_event),
-        ("last_delta_checked_at", last_delta),
-    ):
-        if value is not None and value < 0:
-            raise SyncReadModelContractError(f"{name} must be non-negative or null")
-        if value is not None and value > timestamp:
-            raise SyncReadModelContractError(f"{name} cannot be later than observed_at")
+    _validate_freshness_timestamps(timestamp, last_synced, last_event, last_delta)
 
     local_knowledge_at = max(
         (value for value in (last_synced, last_event, last_delta) if value is not None),
