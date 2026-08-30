@@ -2608,7 +2608,7 @@ async def test_get_inbox_via_daemon():
     conn.get_inbox.assert_called_once()
 
 
-async def test_get_inbox_projects_date_in_requested_timezone():
+async def test_get_inbox_projects_sent_at_in_requested_timezone():
     conn = _make_daemon_conn(
         {
             "ok": True,
@@ -2634,7 +2634,8 @@ async def test_get_inbox_projects_date_in_requested_timezone():
     payload = _json_dict(result.structured_content)
     dialog = _json_dict(_json_list(payload["dialogs"])[0])
     message = _json_dict(_json_list(dialog["messages"])[0])
-    assert message["date"] == "2023-11-15T04:13:20+06:00"
+    assert message["sent_at"] == "2023-11-15T04:13:20+06:00"
+    assert "date" not in message
     assert _json_dict(payload["time_context"])["timezone"] == "Asia/Almaty"
 
 
