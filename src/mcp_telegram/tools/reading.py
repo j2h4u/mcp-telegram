@@ -467,6 +467,23 @@ def _maybe_add(item: dict[str, object], key: str, value: object | None) -> None:
         item[key] = value
 
 
+def _message_lifecycle_fields(row: Mapping[str, object], *, sent_at: int | None) -> dict[str, object]:
+    is_scheduled = row.get("message_state") == "scheduled"
+    published_at = row.get("published_at")
+    if published_at is None and not is_scheduled:
+        published_at = sent_at
+    return {
+        "message_state": "scheduled" if is_scheduled else "sent",
+        "visibility": "author_only" if is_scheduled else "chat_visible",
+        "unpublished": is_scheduled,
+        "published": not is_scheduled,
+        "unseen": is_scheduled,
+        "scheduled_at": row.get("scheduled_at") if is_scheduled else None,
+        "published_at": published_at,
+        "inclusion_basis": row.get("inclusion_basis") or [],
+    }
+
+
 def _list_message_structured_item(
     message: ReadMessage,
     *,

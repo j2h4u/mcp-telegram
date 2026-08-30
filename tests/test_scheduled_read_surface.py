@@ -12,6 +12,7 @@ from mcp_telegram.reading.scheduled_projection import scheduled_row_to_wire
 from mcp_telegram.tools.reading import (
     SearchMessages,
     _list_messages_structured_messages,
+    _message_lifecycle_fields,
     _search_messages_request_context,
     _search_result_structured_rows,
 )
@@ -24,6 +25,92 @@ from tests.test_daemon_api import (
 )
 
 FUTURE_BASE = int(time.time()) + 86_400
+LIFECYCLE_FIELDS = {
+    "message_state",
+    "visibility",
+    "unpublished",
+    "published",
+    "unseen",
+    "scheduled_at",
+    "published_at",
+    "inclusion_basis",
+}
+
+
+@pytest.mark.parametrize(
+    ("row", "sent_at", "expected"),
+    [
+        (
+            {"inclusion_basis": []},
+            100,
+            {
+                "message_state": "sent",
+                "visibility": "chat_visible",
+                "unpublished": False,
+                "published": True,
+                "unseen": False,
+                "scheduled_at": None,
+                "published_at": 100,
+                "inclusion_basis": [],
+            },
+        ),
+        (
+            {
+                "message_state": "unknown",
+                "scheduled_at": 300,
+                "published_at": 200,
+                "inclusion_basis": ["direct_message"],
+            },
+            100,
+            {
+                "message_state": "sent",
+                "visibility": "chat_visible",
+                "unpublished": False,
+                "published": True,
+                "unseen": False,
+                "scheduled_at": None,
+                "published_at": 200,
+                "inclusion_basis": ["direct_message"],
+            },
+        ),
+        (
+            {"message_state": "scheduled", "scheduled_at": 300, "published_at": 200},
+            100,
+            {
+                "message_state": "scheduled",
+                "visibility": "author_only",
+                "unpublished": True,
+                "published": False,
+                "unseen": True,
+                "scheduled_at": 300,
+                "published_at": 200,
+                "inclusion_basis": [],
+            },
+        ),
+        (
+            {"message_state": "scheduled", "scheduled_at": 300, "inclusion_basis": ["direct_message"]},
+            100,
+            {
+                "message_state": "scheduled",
+                "visibility": "author_only",
+                "unpublished": True,
+                "published": False,
+                "unseen": True,
+                "scheduled_at": 300,
+                "published_at": None,
+                "inclusion_basis": ["direct_message"],
+            },
+        ),
+    ],
+    ids=["default-sent", "unknown-sent-explicit-publication", "scheduled-explicit-publication", "scheduled"],
+)
+def test_message_lifecycle_fields_contract(
+    row: dict[str, object], sent_at: int, expected: dict[str, object]
+) -> None:
+    lifecycle = _message_lifecycle_fields(row, sent_at=sent_at)
+
+    assert set(lifecycle) == LIFECYCLE_FIELDS
+    assert lifecycle == expected
 
 
 @pytest.mark.parametrize(
@@ -483,7 +570,13 @@ async def test_scheduled_reads_filter_own_scope_and_expose_basis() -> None:
     assert dialogs["data"]["dialogs"][0]["inclusion_basis"] == ["direct_message"]
 
 
-def test_tool_read_and_search_envelopes_mark_scheduled_visibility() -> None:
+@pytest.mark.parametrize(
+    ("message_state", "scheduled_at"),
+    [("sent", None), ("scheduled", FUTURE_BASE + 200)],
+)
+def test_tool_read_and_search_lifecycle_matches_shared_contract(
+    message_state: str, scheduled_at: int | None
+) -> None:
     row = {
         "message_id": 11,
         "sent_at": FUTURE_BASE + 200,
@@ -491,19 +584,15 @@ def test_tool_read_and_search_envelopes_mark_scheduled_visibility() -> None:
         "text": "future",
         "sender_id": 99,
         "sender_first_name": "Me",
-        "message_state": "scheduled",
-        "scheduled_at": FUTURE_BASE + 200,
+        "message_state": message_state,
+        "scheduled_at": scheduled_at,
         "published_at": None,
+        "inclusion_basis": ["direct_message"],
     }
 
     listed = _list_messages_structured_messages([row], dialog_type="User")
     searched = _search_result_structured_rows([row], "future")
+    expected = _message_lifecycle_fields(row, sent_at=FUTURE_BASE + 200)
 
     for item in [listed[0], searched[0]]:
-        assert item["message_state"] == "scheduled"
-        assert item["visibility"] == "author_only"
-        assert item["published"] is False
-        assert item["unpublished"] is True
-        assert item["unseen"] is True
-        assert item["scheduled_at"] == FUTURE_BASE + 200
-        assert item["published_at"] is None
+        assert {field: item[field] for field in LIFECYCLE_FIELDS} == expected
