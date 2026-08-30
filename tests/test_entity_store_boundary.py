@@ -76,6 +76,18 @@ def test_cte_prefixed_entity_dml_is_rejected_outside_canonical_owner(sql: str) -
     assert len(findings) == 1
 
 
+def test_cte_literal_parentheses_and_doubled_quote_do_not_hide_entity_insert() -> None:
+    gate = _gate()
+    sql = (
+        "WITH incoming(name) AS (VALUES (')) O''Brien INSERT INTO decoy ((')) "
+        "INSERT INTO entities (id, type, name, updated_at) SELECT 1, 'User', name, 1 FROM incoming"
+    )
+
+    findings = _entity_findings(gate, gate.SOURCE_ROOT / "rogue.py", f"SQL = {sql!r}")
+
+    assert len(findings) == 1
+
+
 @pytest.mark.parametrize(
     "sql",
     [
