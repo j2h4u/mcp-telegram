@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from dataclasses import FrozenInstanceError, fields, is_dataclass
 from typing import cast
 
@@ -15,7 +16,7 @@ DetailRow = tuple[int, str, int]
 
 
 @pytest.fixture()
-def conn() -> sqlite3.Connection:
+def conn() -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(":memory:")
     connection.execute("PRAGMA foreign_keys = ON")
     connection.executescript(
