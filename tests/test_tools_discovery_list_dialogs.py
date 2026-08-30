@@ -15,19 +15,21 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from mcp.types import TextContent
 
+from mcp_telegram.sync_read_model import build_sync_read_model
+from mcp_telegram.tools._base import ToolResult
 from mcp_telegram.tools.discovery import ListDialogs, list_dialogs
 
 
 @dataclass(frozen=True)
 class _DialogDictOptions:
     dialog_id: int = 100
-    name: str = "Alice"
-    type_: str = "User"
+    name: str | None = "Alice"
+    type_: str | None = "User"
     unread_mentions_count: int = 0
     unread_reactions_count: int = 0
     draft_text: str | None = None
-    sync_status: str = "synced"
 
 
 def _make_dialog_dict(*, opts: _DialogDictOptions | None = None, **kwargs: object) -> dict[str, object]:
@@ -43,12 +45,28 @@ def _make_dialog_dict(*, opts: _DialogDictOptions | None = None, **kwargs: objec
         "unread_count": 0,
         "members": None,
         "created": None,
-        "sync_status": opts.sync_status,
-        "sync_coverage_pct": None,
         "access_lost_at": None,
+        "unread_in": None,
+        "unread_out": None,
         "unread_mentions_count": opts.unread_mentions_count,
         "unread_reactions_count": opts.unread_reactions_count,
         "draft_text": opts.draft_text,
+        "scheduled_count": 0,
+        "next_scheduled_at": None,
+        "inclusion_basis": None,
+        "folder_ids": [],
+        "folders": [],
+        "archived": False,
+        **build_sync_read_model(
+            persisted_status="synced",
+            enrollment_enabled=True,
+            last_synced_at=1700000000,
+            last_event_at=None,
+            last_delta_checked_at=None,
+            saved_message_count=0,
+            total_messages=None,
+            now=1700000000,
+        ).to_wire(),
     }
 
 
@@ -64,16 +82,103 @@ def _patched_daemon(response: dict[str, object]):
     return patch("mcp_telegram.tools.discovery.daemon_connection", side_effect=_cm)
 
 
-@pytest.mark.asyncio
-async def test_list_dialogs_renders_mentions_token() -> None:
-    response = {
+def _canonical_catalog(*, dialogs: list[dict[str, object]] | None = None) -> dict[str, object]:
+    return {
         "ok": True,
         "data": {
-            "dialogs": [_make_dialog_dict(unread_mentions_count=3)],
+            "dialogs": [] if dialogs is None else dialogs,
             "snapshot_age_h": None,
             "bootstrap_pending": False,
+            "scope": "all",
+            "folder_snapshot": {
+                "generation": None,
+                "status": "unavailable",
+                "completed_at": None,
+                "age_seconds": None,
+                "complete": False,
+            },
         },
     }
+
+
+def _error_text(result: ToolResult) -> str:
+    assert result.content
+    first = result.content[0]
+    assert isinstance(first, TextContent)
+    return first.text
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_accepts_canonical_empty_catalog() -> None:
+    with _patched_daemon(_canonical_catalog()):
+        result = await list_dialogs(ListDialogs())
+
+    assert result.is_error is False
+    assert result.content == ()
+    structured = cast(dict[str, object], result.structured_content)
+    assert structured["dialogs"] == []
+    assert structured["count"] == 0
+    assert structured["bootstrap_pending"] is False
+    assert structured["scope"] == "all"
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_rejects_malformed_top_level_catalog() -> None:
+    response = _canonical_catalog()
+    data = cast(dict[str, object], response["data"])
+    data["bootstrap_pending"] = 0
+
+    with _patched_daemon(response):
+        result = await list_dialogs(ListDialogs())
+
+    assert result.is_error is True
+    assert result.structured_content is None
+    assert "daemon_protocol_error" in _error_text(result)
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_rejects_missing_top_level_catalog_field() -> None:
+    response = _canonical_catalog()
+    data = cast(dict[str, object], response["data"])
+    del data["scope"]
+
+    with _patched_daemon(response):
+        result = await list_dialogs(ListDialogs())
+
+    assert result.is_error is True
+    assert result.structured_content is None
+    assert "daemon_protocol_error" in _error_text(result)
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_rejects_malformed_row_field() -> None:
+    dialog = _make_dialog_dict()
+    dialog["unread_mentions_count"] = "oops"
+
+    with _patched_daemon(_canonical_catalog(dialogs=[dialog])):
+        result = await list_dialogs(ListDialogs())
+
+    assert result.is_error is True
+    assert result.structured_content is None
+    assert "daemon_protocol_error" in _error_text(result)
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_rejects_missing_required_row_field() -> None:
+    dialog = _make_dialog_dict()
+    del dialog["name"]
+
+    with _patched_daemon(_canonical_catalog(dialogs=[dialog])):
+        result = await list_dialogs(ListDialogs())
+
+    assert result.is_error is True
+    assert result.structured_content is None
+    assert "daemon_protocol_error" in _error_text(result)
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_renders_mentions_token() -> None:
+    response = _canonical_catalog(dialogs=[_make_dialog_dict(unread_mentions_count=3)])
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
@@ -85,14 +190,7 @@ async def test_list_dialogs_renders_mentions_token() -> None:
 
 @pytest.mark.asyncio
 async def test_list_dialogs_renders_reactions_token() -> None:
-    response = {
-        "ok": True,
-        "data": {
-            "dialogs": [_make_dialog_dict(unread_reactions_count=2)],
-            "snapshot_age_h": None,
-            "bootstrap_pending": False,
-        },
-    }
+    response = _canonical_catalog(dialogs=[_make_dialog_dict(unread_reactions_count=2)])
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
@@ -104,14 +202,7 @@ async def test_list_dialogs_renders_reactions_token() -> None:
 
 @pytest.mark.asyncio
 async def test_list_dialogs_renders_draft_token() -> None:
-    response = {
-        "ok": True,
-        "data": {
-            "dialogs": [_make_dialog_dict(draft_text="Hi all")],
-            "snapshot_age_h": None,
-            "bootstrap_pending": False,
-        },
-    }
+    response = _canonical_catalog(dialogs=[_make_dialog_dict(draft_text="Hi all")])
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
@@ -127,20 +218,15 @@ async def test_list_dialogs_renders_draft_token() -> None:
 
 @pytest.mark.asyncio
 async def test_list_dialogs_omits_zero_diff_tokens() -> None:
-    response = {
-        "ok": True,
-        "data": {
-            "dialogs": [
-                _make_dialog_dict(
-                    unread_mentions_count=0,
-                    unread_reactions_count=0,
-                    draft_text=None,
-                )
-            ],
-            "snapshot_age_h": None,
-            "bootstrap_pending": False,
-        },
-    }
+    response = _canonical_catalog(
+        dialogs=[
+            _make_dialog_dict(
+                unread_mentions_count=0,
+                unread_reactions_count=0,
+                draft_text=None,
+            )
+        ]
+    )
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
@@ -153,20 +239,15 @@ async def test_list_dialogs_omits_zero_diff_tokens() -> None:
 
 @pytest.mark.asyncio
 async def test_list_dialogs_renders_all_three_diff_tokens_together() -> None:
-    response = {
-        "ok": True,
-        "data": {
-            "dialogs": [
-                _make_dialog_dict(
-                    unread_mentions_count=1,
-                    unread_reactions_count=2,
-                    draft_text="WIP",
-                )
-            ],
-            "snapshot_age_h": None,
-            "bootstrap_pending": False,
-        },
-    }
+    response = _canonical_catalog(
+        dialogs=[
+            _make_dialog_dict(
+                unread_mentions_count=1,
+                unread_reactions_count=2,
+                draft_text="WIP",
+            )
+        ]
+    )
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
@@ -179,14 +260,8 @@ async def test_list_dialogs_renders_all_three_diff_tokens_together() -> None:
 
 @pytest.mark.asyncio
 async def test_list_dialogs_renders_snapshot_age_trailing_line_when_stale() -> None:
-    response = {
-        "ok": True,
-        "data": {
-            "dialogs": [_make_dialog_dict()],
-            "snapshot_age_h": 18,
-            "bootstrap_pending": False,
-        },
-    }
+    response = _canonical_catalog(dialogs=[_make_dialog_dict()])
+    cast(dict[str, object], response["data"])["snapshot_age_h"] = 18
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
@@ -196,14 +271,7 @@ async def test_list_dialogs_renders_snapshot_age_trailing_line_when_stale() -> N
 
 @pytest.mark.asyncio
 async def test_list_dialogs_omits_snapshot_age_line_when_fresh() -> None:
-    response = {
-        "ok": True,
-        "data": {
-            "dialogs": [_make_dialog_dict()],
-            "snapshot_age_h": None,
-            "bootstrap_pending": False,
-        },
-    }
+    response = _canonical_catalog(dialogs=[_make_dialog_dict()])
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
@@ -213,14 +281,8 @@ async def test_list_dialogs_omits_snapshot_age_line_when_fresh() -> None:
 
 @pytest.mark.asyncio
 async def test_list_dialogs_renders_bootstrap_pending_line_when_true() -> None:
-    response = {
-        "ok": True,
-        "data": {
-            "dialogs": [],
-            "snapshot_age_h": None,
-            "bootstrap_pending": True,
-        },
-    }
+    response = _canonical_catalog()
+    cast(dict[str, object], response["data"])["bootstrap_pending"] = True
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
@@ -238,13 +300,7 @@ async def test_list_dialogs_renders_no_dialogs_when_empty_and_not_bootstrap() ->
     This is the 'table populated but caller's filter excluded everything' case
     per Plan 01's bootstrap_pending semantics.
     """
-    response = {
-        "ok": True,
-        "data": {
-            "dialogs": [],
-            "bootstrap_pending": False,
-        },
-    }
+    response = _canonical_catalog()
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
@@ -261,14 +317,7 @@ async def test_list_dialogs_renders_draft_with_double_quotes() -> None:
     The inner double quotes are NOT escaped — this is accepted cosmetic behavior.
     The renderer output is text-only for an LLM; no parser interprets the format.
     """
-    response = {
-        "ok": True,
-        "data": {
-            "dialogs": [_make_dialog_dict(draft_text='Say "hi" to Bob')],
-            "snapshot_age_h": None,
-            "bootstrap_pending": False,
-        },
-    }
+    response = _canonical_catalog(dialogs=[_make_dialog_dict(draft_text='Say "hi" to Bob')])
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()

@@ -1,6 +1,6 @@
 """Tests for Plan 39.3-03 Task 4 — ListDialogs unread_in / unread_out columns.
 
-Covers AC-11 (DM rows include unread_in/unread_out, non-DM rows omit both),
+Covers AC-11 (DM rows include unread counts, non-DM rows expose explicit nulls),
 AC-12 HARD GUARD (EXPLAIN QUERY PLAN hits messages PK),
 AC-12 scaling+correctness (200-dialog SQL path, replaces removed iter_dialogs
 latency benchmark — see commit body for rationale),
@@ -29,6 +29,7 @@ import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.reading.sqlite_projection import _LIST_DIALOG_MESSAGE_AGGREGATES_SQL, _LIST_DIALOGS_SQL
+from mcp_telegram.sync_read_model import build_sync_read_model
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
@@ -327,7 +328,7 @@ async def test_list_dialogs_dm_row_unread_out_only() -> None:
         assert row["unread_out"] == 1
 
 
-async def test_list_dialogs_non_dm_row_omits_unread_fields() -> None:
+async def test_list_dialogs_non_dm_row_has_null_unread_fields() -> None:
     with _make_db() as conn:
         _insert_dialog(conn, 7, name="News Channel", type_="Channel")
         _insert_synced_dialog(conn, 7, read_inbox_max_id=0, read_outbox_max_id=0)
@@ -338,8 +339,8 @@ async def test_list_dialogs_non_dm_row_omits_unread_fields() -> None:
 
         row = (await server._list_dialogs({}))["data"]["dialogs"][0]
         assert row["type"] == "Channel"
-        assert "unread_in" not in row
-        assert "unread_out" not in row
+        assert row["unread_in"] is None
+        assert row["unread_out"] is None
 
 
 async def test_list_dialogs_null_inbox_cursor_treats_all_incoming_as_unread() -> None:
@@ -576,8 +577,8 @@ async def test_list_dialogs_unread_columns_scales_to_200_dialogs() -> None:
                 assert row["unread_in"] == 1, f"User row {row['id']} unread_in should be 1"
                 assert row["unread_out"] == 1, f"User row {row['id']} unread_out should be 1"
             else:
-                assert "unread_in" not in row, f"Channel row {row['id']} should not have unread_in"
-                assert "unread_out" not in row, f"Channel row {row['id']} should not have unread_out"
+                assert row["unread_in"] is None
+                assert row["unread_out"] is None
 
         # iter_dialogs is never called in the SQL path
         cast(MagicMock, client.iter_dialogs).assert_not_called()
@@ -689,29 +690,66 @@ def test_list_dialogs_description_mentions_unread_fields() -> None:
 async def test_list_dialogs_structured_output_includes_unread_values_and_channel_nulls() -> None:
     from mcp_telegram.tools.discovery import ListDialogs, list_dialogs
 
+    sync_model = build_sync_read_model(
+        persisted_status="synced",
+        enrollment_enabled=True,
+        last_synced_at=1700000000,
+        last_event_at=None,
+        last_delta_checked_at=None,
+        saved_message_count=0,
+        total_messages=None,
+        now=1700000000,
+    ).to_wire()
+    common_row = {
+        "access_lost_at": None,
+        "members": None,
+        "created": None,
+        "unread_in": None,
+        "unread_out": None,
+        "unread_mentions_count": 0,
+        "unread_reactions_count": 0,
+        "draft_text": None,
+        "scheduled_count": 0,
+        "next_scheduled_at": None,
+        "inclusion_basis": None,
+        "folder_ids": [],
+        "folders": [],
+        "archived": False,
+        **sync_model,
+    }
     response = {
         "ok": True,
         "data": {
             "dialogs": [
                 {
+                    **common_row,
                     "id": 1,
                     "name": "Alice",
                     "type": "User",
                     "last_message_at": "2024-01-01 00:00",
                     "unread_count": 2,
-                    "sync_status": "synced",
                     "unread_in": 3,
                     "unread_out": 1,
                 },
                 {
+                    **common_row,
                     "id": 2,
                     "name": "Announcements",
                     "type": "Channel",
                     "last_message_at": "2024-01-01 00:00",
                     "unread_count": 0,
-                    "sync_status": "synced",
                 },
-            ]
+            ],
+            "snapshot_age_h": None,
+            "bootstrap_pending": False,
+            "scope": "all",
+            "folder_snapshot": {
+                "generation": None,
+                "status": "unavailable",
+                "completed_at": None,
+                "age_seconds": None,
+                "complete": False,
+            },
         },
     }
 
