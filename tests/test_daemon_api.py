@@ -2417,7 +2417,7 @@ async def test_get_sync_status_synced_dialog() -> None:
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
     assert data["sync_status"] == "synced"
-    assert data["message_count"] == 2
+    assert data["saved_message_count"] == 2
     assert data["last_synced_at"] == 1700000000
     assert data["last_event_at"] == 1700001000
     assert data["delete_detection"] == "reliable (channel)"
@@ -2441,7 +2441,7 @@ async def test_get_sync_status_overcount_omits_impossible_coverage() -> None:
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": -1001234567890})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
-    assert data["message_count"] == 150
+    assert data["saved_message_count"] == 150
     assert data["sync_progress"] == 420
     assert data["sync_progress_message_id"] == 420
     assert data["total_messages"] == 100
@@ -2469,7 +2469,7 @@ async def test_get_sync_status_non_synced() -> None:
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
     assert data["sync_status"] == "not_synced"
-    assert data["message_count"] == 0
+    assert data["saved_message_count"] == 0
 
 
 # ---------------------------------------------------------------------------
