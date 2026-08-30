@@ -119,6 +119,12 @@ def test_list_messages_rejects_out_of_range_anchor_message_id(anchor_message_id:
         ListMessages(exact_dialog_id=1, anchor_message_id=anchor_message_id)
 
 
+@pytest.mark.parametrize("exact_dialog_id", [True, False])
+def test_list_messages_rejects_boolean_exact_dialog_id(exact_dialog_id: bool) -> None:
+    with pytest.raises(ValidationError):
+        ListMessages(exact_dialog_id=exact_dialog_id)
+
+
 @dataclass(frozen=True)
 class _RowOptions:
     message_id: int = 1
