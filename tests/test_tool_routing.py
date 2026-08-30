@@ -261,6 +261,73 @@ def assert_structured_text_parity(
     return value
 
 
+def _canonical_sync_read_model_payload(
+    *,
+    status_key: str,
+    status: str = "synced",
+    saved_message_count: int = 10,
+    total_messages: int | None = 10,
+) -> dict[str, object]:
+    is_synced = status == "synced"
+    last_synced_at = 1700000000 if is_synced else None
+    return {
+        status_key: status,
+        "enrollment_enabled": is_synced,
+        "last_synced_at": last_synced_at,
+        "last_event_at": None,
+        "last_delta_checked_at": None,
+        "saved_message_count": saved_message_count,
+        "total_messages": total_messages,
+        "synced": is_synced,
+        "is_syncing": status == "syncing",
+        "realtime_history": "full" if is_synced else "none",
+        "history_scope": "full" if is_synced else "none",
+        "history_depth_state": "complete" if is_synced else "none",
+        "history_sync_state": "complete_as_of_last_sync" if is_synced else "not_synced",
+        "history_complete_at": last_synced_at,
+        "sync_coverage_pct": 100 if total_messages == saved_message_count else None,
+        "coverage_state": ("telegram_total_unknown" if total_messages is None else "telegram_total_comparable"),
+        "local_knowledge_at": last_synced_at,
+        "local_knowledge_age_seconds": 0 if last_synced_at is not None else None,
+    }
+
+
+def _unavailable_folder_snapshot_payload() -> dict[str, object]:
+    return {
+        "generation": None,
+        "status": "unavailable",
+        "completed_at": None,
+        "age_seconds": None,
+        "complete": False,
+    }
+
+
+def _canonical_list_dialogs_data(dialogs: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "dialogs": dialogs,
+        "snapshot_age_h": None,
+        "bootstrap_pending": False,
+        "scope": "all",
+        "folder_snapshot": _unavailable_folder_snapshot_payload(),
+    }
+
+
+def _canonical_get_sync_status_data() -> dict[str, object]:
+    return {
+        "dialog_id": 123,
+        "enrollment_source": "explicit",
+        "message_count": 10,
+        "sync_progress": None,
+        "sync_progress_message_id": None,
+        "delta_refresh_requested_at": None,
+        "delete_detection": "best-effort weekly (DM)",
+        "access_lost_at": None,
+        "access_last_revalidated_at": None,
+        "access_next_revalidate_at": None,
+        **_canonical_sync_read_model_payload(status_key="sync_status"),
+    }
+
+
 STRUCTURED_TOOL_CASES = {
     "list_folder_messages": (
         list_folder_messages,
@@ -315,17 +382,17 @@ STRUCTURED_TOOL_CASES = {
         ListDialogs(),
         {
             "ok": True,
-            "data": {
-                "dialogs": [
+            "data": _canonical_list_dialogs_data(
+                [
                     {
                         "id": 123,
                         "name": "Alice",
                         "type": "User",
                         "unread_count": 1,
-                        "sync_status": "synced",
+                        **_canonical_sync_read_model_payload(status_key="sync_status"),
                     }
                 ]
-            },
+            ),
         },
     ),
     "list_topics": (
@@ -398,32 +465,16 @@ STRUCTURED_TOOL_CASES = {
             "ok": True,
             "data": {
                 "dialog_id": 123,
-                "coverage_status": "synced",
-                "enrollment_enabled": True,
                 "enrollment_source": "explicit",
-                "realtime_history": "full",
                 "message_count": 10,
-                "last_synced_at": 1700000000,
-                "last_event_at": None,
-                "last_delta_checked_at": None,
                 "delta_refresh_requested_at": None,
-                "is_syncing": False,
-                "saved_message_count": 10,
-                "history_scope": "complete",
-                "history_depth_state": "complete",
-                "history_sync_state": "synced",
-                "history_complete_at": 1700000000,
-                "coverage_state": "complete",
-                "local_knowledge_at": 1700000000,
-                "local_knowledge_age_seconds": 0,
                 "sync_progress": None,
                 "sync_progress_message_id": None,
-                "total_messages": 10,
                 "delete_detection": "reliable (channel)",
-                "sync_coverage_pct": 100,
                 "access_lost_at": None,
                 "access_last_revalidated_at": None,
                 "access_next_revalidate_at": None,
+                **_canonical_sync_read_model_payload(status_key="sync_status"),
             },
         },
     ),
@@ -768,20 +819,20 @@ async def test_list_dialogs_exposes_folder_names_for_humans():
     conn = _make_daemon_conn(
         {
             "ok": True,
-            "data": {
-                "dialogs": [
+            "data": _canonical_list_dialogs_data(
+                [
                     {
                         "id": 123,
                         "name": "Fixture Person",
                         "type": "User",
                         "last_message_at": "2026-08-05T12:00:00+00:00",
                         "unread_count": 0,
-                        "sync_status": "synced",
                         "folder_ids": [3, 16],
                         "folders": [{"id": 3, "title": "People"}, {"id": 16, "title": "MD"}],
+                        **_canonical_sync_read_model_payload(status_key="sync_status"),
                     }
                 ]
-            },
+            ),
         }
     )
 
@@ -925,15 +976,15 @@ async def test_list_dialogs_via_daemon():
     conn = _make_daemon_conn(
         {
             "ok": True,
-            "data": {
-                "dialogs": [
+            "data": _canonical_list_dialogs_data(
+                [
                     {
                         "id": 123,
                         "name": "Alice",
                         "type": "User",
                         "last_message_at": "2024-01-15 10:00",
                         "unread_count": 2,
-                        "sync_status": "synced",
+                        **_canonical_sync_read_model_payload(status_key="sync_status"),
                     },
                     {
                         "id": 456,
@@ -941,10 +992,15 @@ async def test_list_dialogs_via_daemon():
                         "type": "Group",
                         "last_message_at": "2024-01-15 12:00",
                         "unread_count": 0,
-                        "sync_status": "not_synced",
+                        **_canonical_sync_read_model_payload(
+                            status_key="sync_status",
+                            status="not_synced",
+                            saved_message_count=0,
+                            total_messages=None,
+                        ),
                     },
                 ]
-            },
+            ),
         }
     )
     with _patch_daemon(conn):
@@ -982,7 +1038,7 @@ async def test_list_dialogs_via_daemon():
 
 async def test_list_dialogs_passes_limit_to_daemon():
     """ListDialogs preserves optional limit instead of letting Pydantic drop it as an unknown field."""
-    conn = _make_daemon_conn({"ok": True, "data": {"dialogs": []}})
+    conn = _make_daemon_conn({"ok": True, "data": _canonical_list_dialogs_data([])})
     with _patch_daemon(conn):
         result = await list_dialogs(ListDialogs(limit=1))
 
@@ -997,18 +1053,18 @@ async def test_list_dialogs_output_schema_omits_nullable_name():
     conn = _make_daemon_conn(
         {
             "ok": True,
-            "data": {
-                "dialogs": [
+            "data": _canonical_list_dialogs_data(
+                [
                     {
                         "id": 123,
                         "name": None,
                         "type": "User",
                         "last_message_at": None,
                         "unread_count": 0,
-                        "sync_status": "synced",
+                        **_canonical_sync_read_model_payload(status_key="sync_status"),
                     }
                 ]
-            },
+            ),
         }
     )
 
@@ -1089,18 +1145,18 @@ async def test_list_dialogs_sync_status_in_output():
     conn = _make_daemon_conn(
         {
             "ok": True,
-            "data": {
-                "dialogs": [
+            "data": _canonical_list_dialogs_data(
+                [
                     {
                         "id": 1,
                         "name": "Chat",
                         "type": "User",
                         "last_message_at": "2024-01-01 00:00",
                         "unread_count": 0,
-                        "sync_status": "synced",
+                        **_canonical_sync_read_model_payload(status_key="sync_status"),
                     },
                 ]
-            },
+            ),
         }
     )
     with _patch_daemon(conn):
@@ -1113,7 +1169,7 @@ async def test_list_dialogs_sync_status_in_output():
 
 async def test_list_dialogs_empty_via_daemon():
     """ListDialogs returns action-oriented empty text when no dialogs."""
-    conn = _make_daemon_conn({"ok": True, "data": {"dialogs": []}})
+    conn = _make_daemon_conn({"ok": True, "data": _canonical_list_dialogs_data([])})
     with _patch_daemon(conn):
         result = await list_dialogs(ListDialogs())
 
@@ -1129,18 +1185,18 @@ async def test_list_dialogs_does_not_upsert_entities_after_read():
     list_conn = _make_daemon_conn(
         {
             "ok": True,
-            "data": {
-                "dialogs": [
+            "data": _canonical_list_dialogs_data(
+                [
                     {
                         "id": 100,
                         "name": "TestChat",
                         "type": "Group",
                         "last_message_at": "2024-01-01",
                         "unread_count": 0,
-                        "sync_status": "synced",
+                        **_canonical_sync_read_model_payload(status_key="sync_status"),
                     },
                 ]
-            },
+            ),
         }
     )
 
@@ -2320,32 +2376,22 @@ async def test_get_sync_status_via_daemon():
             "ok": True,
             "data": {
                 "dialog_id": -1001234567890,
-                "coverage_status": "synced",
-                "enrollment_enabled": True,
                 "enrollment_source": "explicit",
-                "realtime_history": "full",
                 "message_count": 100,
                 "sync_progress": 100,
                 "sync_progress_message_id": 100,
-                "total_messages": 100,
-                "last_synced_at": 1700000000,
-                "last_event_at": 1700001000,
                 "delete_detection": "reliable (channel)",
-                "is_syncing": False,
-                "saved_message_count": 100,
-                "history_scope": "complete",
-                "history_depth_state": "complete",
-                "history_sync_state": "synced",
-                "history_complete_at": 1700000000,
-                "coverage_state": "complete",
-                "local_knowledge_at": 1700001000,
-                "local_knowledge_age_seconds": 0,
-                "last_delta_checked_at": None,
                 "delta_refresh_requested_at": None,
                 "access_lost_at": None,
                 "access_last_revalidated_at": None,
                 "access_next_revalidate_at": None,
-                "sync_coverage_pct": 100,
+                **_canonical_sync_read_model_payload(
+                    status_key="sync_status",
+                    saved_message_count=100,
+                    total_messages=100,
+                ),
+                "last_event_at": 1700001000,
+                "local_knowledge_at": 1700001000,
             },
         }
     )
@@ -2365,11 +2411,11 @@ async def test_get_sync_status_via_daemon():
         "delta_refresh_requested_at": None,
         "message_count": 100,
         "saved_message_count": 100,
-        "history_scope": "complete",
+        "history_scope": "full",
         "history_depth_state": "complete",
-        "history_sync_state": "synced",
+        "history_sync_state": "complete_as_of_last_sync",
         "history_complete_at": "2023-11-14T22:13:20+00:00",
-        "coverage_state": "complete",
+        "coverage_state": "telegram_total_comparable",
         "local_knowledge_at": "2023-11-14T22:30:00+00:00",
         "local_knowledge_age_seconds": 0,
         "sync_progress": 100,
@@ -2390,6 +2436,43 @@ async def test_get_sync_status_via_daemon():
         },
     }
     conn.get_sync_status.assert_called_once_with(dialog_id=-1001234567890)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("saved_message_count", "10"),
+        ("sync_status", "SYNCED"),
+        ("realtime_history", "full_history"),
+        ("history_scope", "complete"),
+        ("history_sync_state", "synced"),
+        ("coverage_state", "complete"),
+    ],
+)
+async def test_get_sync_status_rejects_noncanonical_daemon_read_model(field: str, value: object) -> None:
+    data = _canonical_get_sync_status_data()
+    data[field] = value
+    conn = _make_daemon_conn({"ok": True, "data": data})
+
+    with _patch_daemon(conn):
+        result = await get_sync_status(GetSyncStatus(dialog_id=123))
+
+    assert result.is_error is True
+    assert result.structured_content is None
+    assert "daemon" in _result_text(result).lower()
+
+
+async def test_get_sync_status_rejects_incomplete_daemon_read_model() -> None:
+    data = _canonical_get_sync_status_data()
+    del data["history_depth_state"]
+    conn = _make_daemon_conn({"ok": True, "data": data})
+
+    with _patch_daemon(conn):
+        result = await get_sync_status(GetSyncStatus(dialog_id=123))
+
+    assert result.is_error is True
+    assert result.structured_content is None
+    assert "daemon" in _result_text(result).lower()
 
 
 async def test_get_sync_status_daemon_not_running():

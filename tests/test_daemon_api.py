@@ -2416,7 +2416,7 @@ async def test_get_sync_status_synced_dialog() -> None:
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": -1001234567890})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
-    assert data["coverage_status"] == "synced"
+    assert data["sync_status"] == "synced"
     assert data["message_count"] == 2
     assert data["last_synced_at"] == 1700000000
     assert data["last_event_at"] == 1700001000
@@ -2462,13 +2462,13 @@ async def test_get_sync_status_dm_delete_detection() -> None:
 
 @pytest.mark.asyncio
 async def test_get_sync_status_non_synced() -> None:
-    """get_sync_status for non-synced dialog returns coverage_status='not_synced'."""
+    """get_sync_status for non-synced dialog returns sync_status='not_synced'."""
     conn = _make_db()
     server = make_server(conn)
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": 99999})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
-    assert data["coverage_status"] == "not_synced"
+    assert data["sync_status"] == "not_synced"
     assert data["message_count"] == 0
 
 
@@ -4932,6 +4932,73 @@ async def test_get_sync_status_access_lost_null_total_has_archived_count():
 # ---------------------------------------------------------------------------
 # list_dialogs enrichment tests (Plan 36-02, Task 1)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sync_read_model_fields_match_between_sync_status_and_dialog_catalog() -> None:
+    conn = _make_db_with_dialogs()
+    dialog_id = 5000
+    _seed_dialog_row(conn, dialog_id, name="Parity Dialog", type_="User")
+    _insert_synced_dialog(
+        conn,
+        dialog_id,
+        status="synced",
+        enrollment_enabled=True,
+        last_synced_at=90,
+        last_event_at=95,
+        total_messages=10,
+    )
+    conn.execute(
+        "UPDATE synced_dialogs SET last_delta_checked_at = 80 WHERE dialog_id = ?",
+        (dialog_id,),
+    )
+    conn.executemany(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) VALUES (?, ?, 90, 'msg', 0)",
+        [(dialog_id, message_id) for message_id in range(1, 6)],
+    )
+    conn.commit()
+    server = make_server(conn)
+
+    with (
+        patch("mcp_telegram.daemon_api.time.time", return_value=100),
+        patch("mcp_telegram.reading.service.time.time", return_value=100),
+    ):
+        sync_response = await server._get_sync_status({"dialog_id": dialog_id})
+        dialogs_response = await server._list_dialogs({})
+
+    sync_data = cast(dict[str, object], sync_response["data"])
+    dialogs = cast(list[dict[str, object]], cast(dict[str, object], dialogs_response["data"])["dialogs"])
+    dialog_data = next(dialog for dialog in dialogs if dialog["id"] == dialog_id)
+    assert sync_data["sync_status"] == dialog_data["sync_status"]
+    shared_fields = {
+        "enrollment_enabled",
+        "last_synced_at",
+        "last_event_at",
+        "last_delta_checked_at",
+        "saved_message_count",
+        "total_messages",
+        "synced",
+        "is_syncing",
+        "realtime_history",
+        "history_scope",
+        "history_depth_state",
+        "history_sync_state",
+        "history_complete_at",
+        "sync_coverage_pct",
+        "coverage_state",
+        "local_knowledge_at",
+        "local_knowledge_age_seconds",
+    }
+    sync_wire = {field: sync_data[field] for field in shared_fields}
+    dialog_wire = {field: dialog_data[field] for field in shared_fields}
+    assert (
+        json.dumps(sync_wire, sort_keys=True, separators=(",", ":")).encode()
+        == json.dumps(
+            dialog_wire,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    )
 
 
 @pytest.mark.asyncio

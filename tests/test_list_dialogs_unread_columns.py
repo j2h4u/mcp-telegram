@@ -29,6 +29,7 @@ import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.reading.sqlite_projection import _LIST_DIALOG_MESSAGE_AGGREGATES_SQL, _LIST_DIALOGS_SQL
+from mcp_telegram.sync_read_model import build_sync_read_model
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
@@ -689,6 +690,16 @@ def test_list_dialogs_description_mentions_unread_fields() -> None:
 async def test_list_dialogs_structured_output_includes_unread_values_and_channel_nulls() -> None:
     from mcp_telegram.tools.discovery import ListDialogs, list_dialogs
 
+    sync_model = build_sync_read_model(
+        persisted_status="synced",
+        enrollment_enabled=True,
+        last_synced_at=1700000000,
+        last_event_at=None,
+        last_delta_checked_at=None,
+        saved_message_count=0,
+        total_messages=None,
+        now=1700000000,
+    ).to_wire()
     response = {
         "ok": True,
         "data": {
@@ -699,9 +710,9 @@ async def test_list_dialogs_structured_output_includes_unread_values_and_channel
                     "type": "User",
                     "last_message_at": "2024-01-01 00:00",
                     "unread_count": 2,
-                    "sync_status": "synced",
                     "unread_in": 3,
                     "unread_out": 1,
+                    **sync_model,
                 },
                 {
                     "id": 2,
@@ -709,9 +720,19 @@ async def test_list_dialogs_structured_output_includes_unread_values_and_channel
                     "type": "Channel",
                     "last_message_at": "2024-01-01 00:00",
                     "unread_count": 0,
-                    "sync_status": "synced",
+                    **sync_model,
                 },
-            ]
+            ],
+            "snapshot_age_h": None,
+            "bootstrap_pending": False,
+            "scope": "all",
+            "folder_snapshot": {
+                "generation": None,
+                "status": "unavailable",
+                "completed_at": None,
+                "age_seconds": None,
+                "complete": False,
+            },
         },
     }
 
