@@ -470,6 +470,7 @@ def _maybe_add(item: dict[str, object], key: str, value: object | None) -> None:
 def _message_lifecycle_fields(row: Mapping[str, object], *, sent_at: int | None) -> dict[str, object]:
     is_scheduled = row.get("message_state") == "scheduled"
     published_at = row.get("published_at")
+    inclusion_basis = row.get("inclusion_basis") or []
     if published_at is None and not is_scheduled:
         published_at = sent_at
     return {
@@ -480,7 +481,7 @@ def _message_lifecycle_fields(row: Mapping[str, object], *, sent_at: int | None)
         "unseen": is_scheduled,
         "scheduled_at": row.get("scheduled_at") if is_scheduled else None,
         "published_at": published_at,
-        "inclusion_basis": row.get("inclusion_basis") or [],
+        "inclusion_basis": inclusion_basis.copy() if isinstance(inclusion_basis, list) else inclusion_basis,
     }
 
 
@@ -506,7 +507,7 @@ def _list_message_structured_item(
             "unseen": lifecycle["unseen"],
             "scheduled_at": lifecycle["scheduled_at"],
             "published_at": lifecycle["published_at"],
-            "inclusion_basis": lifecycle.get("inclusion_basis") or [],
+            "inclusion_basis": lifecycle["inclusion_basis"],
         }
     )
     return item

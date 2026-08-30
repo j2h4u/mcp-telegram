@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from collections.abc import Mapping
 from typing import Literal
 
 import pytest
@@ -104,13 +105,22 @@ LIFECYCLE_FIELDS = {
     ],
     ids=["default-sent", "unknown-sent-explicit-publication", "scheduled-explicit-publication", "scheduled"],
 )
-def test_message_lifecycle_fields_contract(
-    row: dict[str, object], sent_at: int, expected: dict[str, object]
-) -> None:
+def test_message_lifecycle_fields_contract(row: dict[str, object], sent_at: int, expected: dict[str, object]) -> None:
     lifecycle = _message_lifecycle_fields(row, sent_at=sent_at)
 
     assert set(lifecycle) == LIFECYCLE_FIELDS
     assert lifecycle == expected
+
+
+def test_message_lifecycle_fields_does_not_alias_mutable_inclusion_basis() -> None:
+    inclusion_basis = ["direct_message"]
+    lifecycle = _message_lifecycle_fields({"inclusion_basis": inclusion_basis}, sent_at=100)
+
+    projected_basis = lifecycle["inclusion_basis"]
+    assert isinstance(projected_basis, list)
+    projected_basis.append("own_only_dialog")
+
+    assert inclusion_basis == ["direct_message"]
 
 
 @pytest.mark.parametrize(
@@ -574,9 +584,7 @@ async def test_scheduled_reads_filter_own_scope_and_expose_basis() -> None:
     ("message_state", "scheduled_at"),
     [("sent", None), ("scheduled", FUTURE_BASE + 200)],
 )
-def test_tool_read_and_search_lifecycle_matches_shared_contract(
-    message_state: str, scheduled_at: int | None
-) -> None:
+def test_tool_read_and_search_lifecycle_matches_shared_contract(message_state: str, scheduled_at: int | None) -> None:
     row = {
         "message_id": 11,
         "sent_at": FUTURE_BASE + 200,
@@ -596,3 +604,38 @@ def test_tool_read_and_search_lifecycle_matches_shared_contract(
 
     for item in [listed[0], searched[0]]:
         assert {field: item[field] for field in LIFECYCLE_FIELDS} == expected
+
+
+def test_tool_read_and_search_route_lifecycle_through_shared_helper(monkeypatch: pytest.MonkeyPatch) -> None:
+    row = {
+        "message_id": 11,
+        "sent_at": FUTURE_BASE + 200,
+        "dialog_id": 1,
+        "text": "future",
+        "sender_id": 99,
+        "sender_first_name": "Me",
+    }
+    projected = {
+        "message_state": "sent",
+        "visibility": "chat_visible",
+        "unpublished": False,
+        "published": True,
+        "unseen": False,
+        "scheduled_at": None,
+        "published_at": FUTURE_BASE + 200,
+        "inclusion_basis": ["shared-helper"],
+    }
+    calls: list[tuple[Mapping[str, object], int | None]] = []
+
+    def project(candidate: Mapping[str, object], *, sent_at: int | None) -> dict[str, object]:
+        calls.append((candidate, sent_at))
+        return projected.copy()
+
+    monkeypatch.setattr("mcp_telegram.tools.reading._message_lifecycle_fields", project)
+
+    listed = _list_messages_structured_messages([row], dialog_type="User")[0]
+    searched = _search_result_structured_rows([row], "future")[0]
+
+    assert {field: listed[field] for field in LIFECYCLE_FIELDS} == projected
+    assert {field: searched[field] for field in LIFECYCLE_FIELDS} == projected
+    assert calls == [(row, FUTURE_BASE + 200), (row, FUTURE_BASE + 200)]
