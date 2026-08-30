@@ -58,7 +58,7 @@ MARK_DIALOG_FOR_SYNC_OUTPUT_SCHEMA = {
 GET_SYNC_STATUS_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
-        "dialog_id": {"type": ["integer", "null"]},
+        "dialog_id": {"type": "integer"},
         "coverage_status": {"type": "string", "enum": [item.value for item in SyncStatus]},
         "enrollment_enabled": {"type": ["boolean", "null"]},
         "enrollment_source": {"type": ["string", "null"]},
@@ -80,7 +80,7 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "sync_progress": {"type": ["integer", "null"]},
         "sync_progress_message_id": {"type": ["integer", "null"]},
         "total_messages": {"type": ["integer", "null"]},
-        "delete_detection": {"type": ["string", "null"]},
+        "delete_detection": {"type": "string"},
         "sync_coverage_pct": {"type": ["integer", "null"]},
         "access_lost_at": {"type": ["integer", "null"]},
         "access_last_revalidated_at": {"type": ["integer", "null"]},
@@ -124,12 +124,12 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
 @dataclass(frozen=True, slots=True)
 class _GetSyncStatusSurface:
     model: SyncReadModel
-    dialog_id: int | None
+    dialog_id: int
     enrollment_source: str | None
     delta_refresh_requested_at: int | None
     sync_progress: int | None
     sync_progress_message_id: int | None
-    delete_detection: str | None
+    delete_detection: str
     access_lost_at: int | None
     access_last_revalidated_at: int | None
     access_next_revalidate_at: int | None
@@ -150,6 +150,13 @@ def _surface_optional_int(data: Mapping[str, object], name: str) -> int | None:
     return value
 
 
+def _surface_int(data: Mapping[str, object], name: str) -> int:
+    value = _surface_required(data, name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SyncReadModelContractError(f"{name} must be an integer")
+    return value
+
+
 def _surface_optional_string(data: Mapping[str, object], name: str) -> str | None:
     value = _surface_required(data, name)
     if value is None or isinstance(value, str):
@@ -157,15 +164,31 @@ def _surface_optional_string(data: Mapping[str, object], name: str) -> str | Non
     raise SyncReadModelContractError(f"{name} must be a string or null")
 
 
-def _decode_get_sync_status_surface(data: Mapping[str, object]) -> _GetSyncStatusSurface:
+def _surface_string(data: Mapping[str, object], name: str) -> str:
+    value = _surface_required(data, name)
+    if not isinstance(value, str):
+        raise SyncReadModelContractError(f"{name} must be a string")
+    return value
+
+
+def _decode_get_sync_status_surface(
+    data: Mapping[str, object],
+    *,
+    expected_dialog_id: int,
+) -> _GetSyncStatusSurface:
+    dialog_id = _surface_int(data, "dialog_id")
+    if dialog_id != expected_dialog_id:
+        raise SyncReadModelContractError(
+            f"dialog_id does not match request: expected {expected_dialog_id}, got {dialog_id}"
+        )
     return _GetSyncStatusSurface(
         model=decode_sync_read_model(data),
-        dialog_id=_surface_optional_int(data, "dialog_id"),
+        dialog_id=dialog_id,
         enrollment_source=_surface_optional_string(data, "enrollment_source"),
         delta_refresh_requested_at=_surface_optional_int(data, "delta_refresh_requested_at"),
         sync_progress=_surface_optional_int(data, "sync_progress"),
         sync_progress_message_id=_surface_optional_int(data, "sync_progress_message_id"),
-        delete_detection=_surface_optional_string(data, "delete_detection"),
+        delete_detection=_surface_string(data, "delete_detection"),
         access_lost_at=_surface_optional_int(data, "access_lost_at"),
         access_last_revalidated_at=_surface_optional_int(data, "access_last_revalidated_at"),
         access_next_revalidate_at=_surface_optional_int(data, "access_next_revalidate_at"),
@@ -395,7 +418,7 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
     if not isinstance(data, Mapping):
         return _sync_read_model_error("data must be an object")
     try:
-        surface = _decode_get_sync_status_surface(data)
+        surface = _decode_get_sync_status_surface(data, expected_dialog_id=args.dialog_id)
     except SyncReadModelContractError as exc:
         return _sync_read_model_error(str(exc))
 

@@ -1330,7 +1330,6 @@ class DaemonAPIServer:
 
         data: dict = {
             "dialog_id": dialog_id,
-            "message_count": message_count,
             "delta_refresh_requested_at": delta_refresh_requested_at,
             "sync_progress": sync_progress,
             "sync_progress_message_id": sync_progress,
