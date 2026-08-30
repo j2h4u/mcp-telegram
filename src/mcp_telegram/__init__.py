@@ -67,6 +67,7 @@ def sync() -> None:
     import sys
 
     from .daemon import sync_main
+    from .runtime_logging import install_telethon_log_filter
 
     log_level = resolve_logging_config().level
     logging.basicConfig(
@@ -75,6 +76,7 @@ def sync() -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         force=True,
     )
+    install_telethon_log_filter()
     asyncio.run(sync_main())
 
 
@@ -103,6 +105,7 @@ def serve(
 
     from . import server as _server
     from .daemon import sync_main
+    from .runtime_logging import install_telethon_log_filter
 
     operator_config = load_config()
     resolved_host = _resolve_http_host(host, base=operator_config.http)
@@ -114,6 +117,7 @@ def serve(
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         force=True,
     )
+    install_telethon_log_filter()
 
     async def _run() -> None:
         sync_task = asyncio.create_task(sync_main(), name="sync-daemon")

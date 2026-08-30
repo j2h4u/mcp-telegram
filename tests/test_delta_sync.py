@@ -15,6 +15,7 @@ Covers DAEMON-12 (forward gap-fill on reconnect) behaviors:
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
@@ -1794,13 +1795,34 @@ async def test_delta_catch_up_complete_log_includes_watermark(
     complete_logs = [
         record.getMessage() for record in caplog.records if "delta_catch_up complete" in record.getMessage()
     ]
-    assert complete_logs
+    assert len(complete_logs) == 1
     summary = complete_logs[-1]
     assert "total_synced=3" in summary
     assert "checked_total=2" in summary
     assert "never_checked=1" in summary
     assert "pending_refresh=0" in summary
     assert "oldest_delta_checked_age_s=" in summary
+
+
+@pytest.mark.asyncio
+async def test_delta_catch_up_loop_does_not_emit_redundant_info_completion(
+    shutdown_event: asyncio.Event, caplog: pytest.LogCaptureFixture
+) -> None:
+    class _Worker:
+        async def run_delta_catch_up(self, *, policy: DeltaCatchUpPolicy) -> int:
+            shutdown_event.set()
+            return 3
+
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.delta_sync"):
+        await run_delta_catch_up_loop(
+            _Worker(),
+            shutdown_event,
+            DeltaCatchUpPolicy(interval_seconds=300.0, max_probes_per_cycle=1, probe_pause_seconds=0.01),
+        )
+
+    cycle_logs = [record for record in caplog.records if "delta_catch_up_cycle complete" in record.getMessage()]
+    assert len(cycle_logs) == 1
+    assert cycle_logs[0].levelno == logging.DEBUG
 
 
 @pytest.mark.asyncio

@@ -41,6 +41,7 @@ from .config import (
     resolve_logging_config,
 )
 from .correlation import correlation_context, current_correlation_ids
+from .runtime_logging import install_telethon_log_filter
 
 logger = logging.getLogger(__name__)
 _MAX_ERROR_DETAIL_LENGTH = 160
@@ -390,6 +391,7 @@ async def run_mcp_server() -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         force=True,
     )
+    install_telethon_log_filter()
     _quiet_mcp_http_lifecycle_logs()
 
     logger.info("MCP server starting — routing through daemon API")
@@ -424,6 +426,7 @@ async def run_mcp_http_server(
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         force=True,
     )
+    install_telethon_log_filter()
     _quiet_mcp_http_lifecycle_logs()
     _install_mcp_http_disconnect_log_filter()
 
