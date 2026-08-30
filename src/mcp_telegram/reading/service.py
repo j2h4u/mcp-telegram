@@ -19,6 +19,7 @@ from ..daemon_message import (
     project_cached_message_facts,
     project_cached_message_facts_by_dialog,
 )
+from ..dialog_selector import DialogSelector, DialogSelectorError, optional_dialog_selector, required_dialog_selector
 from ..fts import stem_query
 from ..models import DialogType, ReadMessage, ReadState
 from ..own_only import own_only_basis_by_dialog
@@ -120,6 +121,10 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(value, high))
 
 
+def _selector_error_response(exc: DialogSelectorError) -> dict[str, object]:
+    return {"ok": False, "error": exc.code, "message": str(exc)}
+
+
 def _coerce_int(value: object, default: int) -> int:
     try:
         return int(cast(int | str, value))
@@ -164,7 +169,7 @@ class ReadingDeps:
     conn: sqlite3.Connection
     sync_db_path: Path | None
     self_id: int | None
-    resolve_dialog_id: Callable[[int, str | None], Awaitable[int | dict]]
+    resolve_dialog_id: Callable[[DialogSelector], Awaitable[int | dict]]
     fragment_context: FragmentContextService
     history_gateway: TelegramHistoryGateway
     logger: LoggerLike
@@ -1708,14 +1713,20 @@ class ReadingService:
     async def _list_messages(self, req: dict) -> dict:
         """Return messages from sync.db (if synced) or Telegram (on-demand)."""
         try:
+            selector = required_dialog_selector(
+                exact_id=req.get("dialog_id"),
+                dialog=req.get("dialog"),
+            )
             request = self._parse_list_messages_request(req)
+        except DialogSelectorError as exc:
+            return _selector_error_response(exc)
         except ValueError as exc:
             return {"ok": False, "error": "invalid_time_range", "message": str(exc)}
         direction = request.direction
         if direction not in ("newest", "oldest"):
             direction = "newest"
 
-        resolved = await self._deps.resolve_dialog_id(request.dialog_id, request.dialog)
+        resolved = await self._deps.resolve_dialog_id(selector)
         if isinstance(resolved, dict):
             return resolved
         dialog_id = resolved
@@ -1731,8 +1742,9 @@ class ReadingService:
         self,
         request: _SearchMessagesRequest,
         stemmed: str,
+        selector: DialogSelector,
     ) -> dict:
-        resolved = await self._deps.resolve_dialog_id(request.dialog_id, request.dialog)
+        resolved = await self._deps.resolve_dialog_id(selector)
         if isinstance(resolved, dict):
             return resolved
         request = dataclasses.replace(request, dialog_id=resolved)
@@ -1756,14 +1768,19 @@ class ReadingService:
             )
         return await self._search_messages_scoped_result(request, stemmed)
 
-    async def _search_messages_for_state(self, request: _SearchMessagesRequest, stemmed: str) -> dict:
+    async def _search_messages_for_state(
+        self,
+        request: _SearchMessagesRequest,
+        stemmed: str,
+        selector: DialogSelector | None,
+    ) -> dict:
         if request.message_state not in {"sent", "scheduled", "all"}:
             return {
                 "ok": False,
                 "error": "invalid_message_state",
                 "message": "message_state must be sent, scheduled, or all",
             }
-        global_mode = not request.dialog_id and request.dialog is None
+        global_mode = selector is None
         if global_mode:
             navigation_result = self._bind_search_navigation(request, 0)
             if isinstance(navigation_result, dict):
@@ -1783,7 +1800,8 @@ class ReadingService:
                 request,
             )
         if not global_mode:
-            return await self._search_messages_scoped_for_state(request, stemmed)
+            assert selector is not None
+            return await self._search_messages_scoped_for_state(request, stemmed, selector)
         return await self._search_messages_global_result(request, stemmed)
 
     @staticmethod
@@ -1819,13 +1837,19 @@ class ReadingService:
     async def _search_messages(self, req: dict) -> dict:
         """FTS5 stemmed full-text search against messages_fts."""
         try:
+            selector = optional_dialog_selector(
+                exact_id=req.get("dialog_id"),
+                dialog=req.get("dialog"),
+            )
             request = self._parse_search_messages_request(req)
+        except DialogSelectorError as exc:
+            return _selector_error_response(exc)
         except ValueError as exc:
             return {"ok": False, "error": "invalid_time_range", "message": str(exc)}
         stemmed = stem_query(request.query)
         if not stemmed:
             return {"ok": True, "data": {"messages": [], "total": 0}}
-        return await self._search_messages_for_state(request, stemmed)
+        return await self._search_messages_for_state(request, stemmed, selector)
 
     async def list_unread_messages(self, req: dict[str, object]) -> dict:
         """Return prioritized unread messages across dialogs from sync.db."""

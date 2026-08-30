@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
-from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
 from telethon.tl.functions.channels import (
     GetFullChannelRequest,  # type: ignore[import-untyped]
     GetParticipantsRequest,  # type: ignore[import-untyped]
@@ -88,7 +88,9 @@ from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from .daemon_message import (
     project_cached_message_facts_by_dialog,
 )
+from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
+from .flood import flood_seconds
 from .folders.read_model import dialog_placement, folder_snapshot, folders_by_dialog, list_folder_messages, list_folders
 from .history_enrollment import disable_history, enable_history, read_intent
 from .important_events.read_model import list_important_events as read_important_events
@@ -96,6 +98,7 @@ from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
 from .reading.query_records import read_message_from_row
 from .sync_read_model import build_sync_read_model, compute_sync_coverage
+from .telegram_rpc import FloodWaitErrors
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
 
@@ -112,7 +115,7 @@ _ALL_ENTITY_NAMES_NORMALIZED_SQL = (
     "AND ((type IN ('User', 'Bot') AND updated_at > ?) "  # PascalCase per ListDialogs type vocabulary
     "OR (type NOT IN ('User', 'Bot') AND updated_at > ?))"
 )
-_ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE username = ? COLLATE NOCASE"
+_ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, type FROM entities WHERE username = ? COLLATE NOCASE"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -228,9 +231,13 @@ _UPSERT_ENTITIES_MAX_LEN = 10000
 
 from .resolver import (
     Candidates,
+    MatchInfo,
+    NotFound,
     Resolved,
     ResolverEnrichmentPolicy,
+    _fuzzy_resolve,
     _parse_tme_link,
+    apply_disambiguation_hint,
     latinize,
 )
 from .resolver import (
@@ -238,6 +245,75 @@ from .resolver import (
 )
 
 logger = logging.getLogger(__name__)
+
+type _DialogMetadata = Mapping[int, tuple[str | None, str | None, bool]]
+type _DialogDirectoryResult = tuple[
+    dict[int, str],
+    dict[int, str],
+    dict[int, str],
+    dict[int, str],
+    dict[int, str],
+    set[int],
+]
+
+
+def _selector_dialog_name(entity_id: int, dialog_name: str | None, entity_name: object) -> str | None:
+    name = dialog_name or (entity_name if isinstance(entity_name, str) else None)
+    if entity_id == 0 or not isinstance(name, str) or not name.strip():
+        return None
+    return name
+
+
+@dataclasses.dataclass(slots=True)
+class _LocalDialogDirectory:
+    """Mutable assembly state for one local selector directory snapshot."""
+
+    names: dict[int, str] = dataclasses.field(default_factory=dict)
+    normalized: dict[int, str] = dataclasses.field(default_factory=dict)
+    fuzzy_names: dict[int, str] = dataclasses.field(default_factory=dict)
+    fuzzy_normalized: dict[int, str] = dataclasses.field(default_factory=dict)
+    entity_types: dict[int, str] = dataclasses.field(default_factory=dict)
+    ineligible_ids: set[int] = dataclasses.field(default_factory=set)
+
+    @classmethod
+    def from_metadata(cls, metadata: _DialogMetadata) -> _LocalDialogDirectory:
+        return cls(
+            ineligible_ids={entity_id for entity_id, (_name, _type, eligible) in metadata.items() if not eligible}
+        )
+
+    def add(
+        self,
+        entity_id: int,
+        *,
+        stored_name: object,
+        stored_type: str | None,
+        dialog_metadata: _DialogMetadata,
+    ) -> None:
+        dialog_name, dialog_type, eligible = dialog_metadata.get(entity_id, (None, None, True))
+        if not eligible:
+            return
+        name = _selector_dialog_name(entity_id, dialog_name, stored_name)
+        if name is None:
+            return
+        self.names[entity_id] = name
+        self.normalized[entity_id] = latinize(name)
+        selected_type = dialog_type if dialog_type is not None else stored_type
+        if selected_type is not None:
+            self.entity_types[entity_id] = selected_type
+        if entity_id in dialog_metadata:
+            self.fuzzy_names[entity_id] = name
+            self.fuzzy_normalized[entity_id] = latinize(name)
+
+    def result(self) -> _DialogDirectoryResult:
+        return (
+            self.names,
+            self.normalized,
+            self.fuzzy_names,
+            self.fuzzy_normalized,
+            self.entity_types,
+            self.ineligible_ids,
+        )
+
 
 _current_request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_current_request_id",
@@ -604,91 +680,124 @@ class DaemonAPIServer:
     # Dialog name resolution
     # ------------------------------------------------------------------
 
-    def _resolve_dialog_name_from_local_cache(self, dialog: str) -> int | None:
-        """Resolve a dialog selector from the local entity/dialog snapshots."""
-        selector = dialog.strip()
-        tme = _parse_tme_link(selector)
-        username = tme[0] if tme is not None else selector[1:] if selector.startswith("@") else None
-        if username:
-            row = cast(
-                tuple[object, ...] | None,
-                self._conn.execute(_ENTITY_BY_USERNAME_SQL, (username,)).fetchone(),
+    def _local_dialog_metadata(self) -> dict[int, tuple[str | None, str | None, bool]]:
+        """Read dialog eligibility from the canonical snapshot without column-order assumptions."""
+        cursor = self._conn.execute(
+            "SELECT d.*, sd.status AS selector_sync_status "
+            "FROM dialogs d LEFT JOIN synced_dialogs sd ON sd.dialog_id = d.dialog_id "
+            "ORDER BY d.dialog_id"
+        )
+        columns = [str(description[0]) for description in cursor.description or ()]
+        metadata: dict[int, tuple[str | None, str | None, bool]] = {}
+        rows = cast(list[Sequence[object]], cursor.fetchall())
+        for raw_row in rows:
+            row = dict(zip(columns, raw_row, strict=True))
+            dialog_id = _coerce_int(row.get("dialog_id"), 0)
+            if dialog_id == 0:
+                continue
+            raw_name = row.get("name")
+            raw_type = row.get("type")
+            name = raw_name if isinstance(raw_name, str) else None
+            entity_type = raw_type if isinstance(raw_type, str) else None
+            eligible = not bool(row.get("hidden", 0)) or row.get("selector_sync_status") == "access_lost"
+            metadata[dialog_id] = (name, entity_type, eligible)
+        return metadata
+
+    def _local_dialog_directory(
+        self,
+    ) -> _DialogDirectoryResult:
+        """Return exact-name cache entries and fuzzy-eligible dialog entries."""
+        dialog_metadata = self._local_dialog_metadata()
+        entity_rows = cast(
+            list[tuple[object, ...]],
+            self._conn.execute("SELECT id, name, type FROM entities WHERE name IS NOT NULL ORDER BY id").fetchall(),
+        )
+        stored_entities = {
+            _coerce_int(row[0], 0): (row[1], row[2] if isinstance(row[2], str) and row[2] else None)
+            for row in entity_rows
+        }
+        directory = _LocalDialogDirectory.from_metadata(dialog_metadata)
+        for entity_id in sorted(set(stored_entities) | set(dialog_metadata)):
+            stored_name, stored_type = stored_entities.get(entity_id, (None, None))
+            directory.add(
+                entity_id,
+                stored_name=stored_name,
+                stored_type=stored_type,
+                dialog_metadata=dialog_metadata,
             )
-            if row:
-                logger.debug("resolve_dialog_username_cache hit query=%r id=%d", dialog, row[0])
-                return _coerce_int(row[0], 0)
+        return directory.result()
 
-        # Fast path: look up in local entities table (O(1), no network).
-        # Priority: exact name match > normalized exact > normalized substring.
-        norm = latinize(dialog)
-        row = cast(
-            tuple[object] | None,
-            self._conn.execute(
-                """
-                SELECT id FROM entities
-                WHERE LOWER(name) = LOWER(?)
-                   OR name_normalized = ?
-                   OR (? != '' AND name_normalized LIKE '%' || ? || '%')
-                ORDER BY
-                  CASE WHEN LOWER(name) = LOWER(?) THEN 0
-                       WHEN name_normalized = ?     THEN 1
-                       ELSE 2
-                  END
-                LIMIT 1
-                """,
-                (dialog, norm, norm, norm, dialog, norm),
-            ).fetchone(),
-        )
-        if row:
-            logger.debug("resolve_dialog_entities_cache hit query=%r id=%d", dialog, row[0])
-            return _coerce_int(row[0], 0)
+    @staticmethod
+    def _local_username_match(
+        row: tuple[object, ...],
+        *,
+        username: str,
+        dialog_metadata: _DialogMetadata,
+    ) -> MatchInfo | None:
+        entity_id = _coerce_int(row[0], 0)
+        dialog_name, dialog_type, eligible = dialog_metadata.get(entity_id, (None, None, True))
+        if entity_id == 0 or not eligible:
+            return None
+        return {
+            "entity_id": entity_id,
+            "display_name": str(dialog_name or row[1] or f"@{username}"),
+            "score": 100,
+            "username": str(row[2]) if row[2] is not None else username,
+            "entity_type": dialog_type or (str(row[3]) if row[3] is not None else None),
+            "disambiguation_hint": None,
+        }
 
-        # Step 2.5: dialogs snapshot table — name lookup with agent-visible guard.
-        # Hidden dialogs are skipped unless they are access_lost archives; those
-        # remain queryable by name even when Telegram no longer exposes them.
-        # Phase 46 D-04: avoids live iter_dialogs() RPC for dialogs already in snapshot.
-        #
-        # Known limitation: the `dialogs` table has NO `name_normalized` column,
-        # so this branch does not perform anyascii / Cyrillic transliteration.
-        # A query like "zhenskie sezony" against a dialog named "Женские сезоны"
-        # will MISS step 2.5 and fall through to step 3 (iter_dialogs). This is
-        # acceptable: the entities table step 2 already covers the transliteration
-        # path via `name_normalized`, and step 3 is a correct (if slower) fallback.
-        # The cache hit rate of step 2.5 is therefore lower for non-Latin names
-        # than the entities path, by design.
-        #
-        # LIKE-wildcard parity: the `'%' || LOWER(?) || '%'` substring pattern is
-        # the same shape used by the entities-table step 2 query above. Literal
-        # `%` or `_` in the user's query string are interpreted as LIKE wildcards
-        # in BOTH branches — pre-existing behaviour, not a regression. No
-        # external-attacker model applies (daemon socket is local-only).
-        #
-        # Performance note: no index covers `LOWER(name)`; the query does a
-        # linear scan over non-hidden rows (filtered by `idx_dialogs_hidden_pinned`).
-        # `dialogs` is bounded by user's dialog count (typically <500); sub-ms.
-        row = cast(
-            tuple[object] | None,
-            self._conn.execute(
-                """
-                SELECT d.dialog_id
-                FROM dialogs d
-                LEFT JOIN synced_dialogs sd USING(dialog_id)
-                WHERE (d.hidden = 0 OR sd.status = 'access_lost')
-                  AND (LOWER(d.name) = LOWER(?)
-                       OR (? != '' AND LOWER(d.name) LIKE '%' || LOWER(?) || '%'))
-                ORDER BY
-                  CASE WHEN LOWER(d.name) = LOWER(?) THEN 0
-                       ELSE 1
-                  END
-                LIMIT 1
-                """,
-                (dialog, dialog, dialog, dialog),
-            ).fetchone(),
+    @staticmethod
+    def _resolve_exact_natural_name(
+        query: str,
+        names: dict[int, str],
+        normalized: dict[int, str],
+        entity_types: Mapping[int, str],
+    ) -> Resolved | Candidates | None:
+        norm_query = latinize(query)
+        exact_names = {entity_id: name for entity_id, name in names.items() if normalized.get(entity_id) == norm_query}
+        if not exact_names:
+            return None
+        exact_normalized = dict.fromkeys(exact_names, norm_query)
+        result = _fuzzy_resolve(query, exact_names, normalized_name_map=exact_normalized)
+        DaemonAPIServer._apply_dialog_candidate_types(result, entity_types)
+        if isinstance(result, Candidates):
+            apply_disambiguation_hint(
+                result.matches,
+                collision_query=query,
+                collision_count=len(exact_names),
+            )
+        return result if isinstance(result, Resolved | Candidates) else None
+
+    @staticmethod
+    def _apply_dialog_candidate_types(
+        result: Resolved | Candidates | NotFound,
+        entity_types: Mapping[int, str],
+    ) -> None:
+        """Replace resolver id-sign guesses with observed local types or unknown."""
+        if isinstance(result, Candidates):
+            for match in result.matches:
+                match["entity_type"] = entity_types.get(match["entity_id"])
+
+    def _resolve_local_dialog_username(self, username: str, query: str) -> Resolved | Candidates | NotFound:
+        dialog_metadata = self._local_dialog_metadata()
+        rows = cast(
+            list[tuple[object, ...]],
+            self._conn.execute(_ENTITY_BY_USERNAME_SQL, (username,)).fetchall(),
         )
-        if row:
-            logger.debug("resolve_dialog_dialogs_cache hit query=%r id=%d", dialog, row[0])
-            return _coerce_int(row[0], 0)
-        return None
+        matches = [
+            match
+            for row in rows
+            if (match := self._local_username_match(row, username=username, dialog_metadata=dialog_metadata))
+            is not None
+        ]
+        matches.sort(key=lambda item: (item["display_name"].casefold(), item["entity_id"]))
+        if len(matches) == 1:
+            match = matches[0]
+            return Resolved(entity_id=match["entity_id"], display_name=match["display_name"])
+        if matches:
+            return Candidates(query=query, matches=matches)
+        return NotFound(query=query)
 
     async def _resolve_dialog_entity(self, dialog: str) -> int | None:
         """Resolve a dialog selector through the live Telegram entity lookup."""
@@ -697,87 +806,159 @@ class DaemonAPIServer:
             return int(cast(int, telethon_utils.get_peer_id(entity)))
         except ValueError, KeyError:
             return None
+        except FloodWaitErrors:
+            raise
+        except RPCError, TimeoutError:
+            raise
         except Exception:
-            logger.debug("get_entity failed for %r, falling back to entities DB", dialog, exc_info=True)
-            return None
+            logger.exception("unexpected get_entity failure for %r", dialog)
+            raise
+
+    async def _remote_dialog_directory(
+        self,
+        *,
+        excluded_ids: set[int],
+    ) -> tuple[dict[int, str], dict[int, str]]:
+        """Enumerate the full visible remote directory before fuzzy resolution."""
+        names: dict[int, str] = {}
+        normalized: dict[int, str] = {}
+        async for remote_dialog in self._client.iter_dialogs():
+            name = _attr(remote_dialog, "name", "")
+            entity = _attr(remote_dialog, "entity", None)
+            if not isinstance(name, str) or not name.strip() or entity is None:
+                continue
+            entity_id = int(cast(int, telethon_utils.get_peer_id(entity)))
+            if entity_id in excluded_ids:
+                continue
+            names[entity_id] = name
+            normalized[entity_id] = latinize(name)
+        return names, normalized
+
+    async def _resolve_dialog_username(
+        self,
+        query: str,
+        username: str,
+        *,
+        allow_remote_lookup: bool,
+        ineligible_ids: set[int],
+    ) -> Resolved | Candidates | NotFound:
+        local = self._resolve_local_dialog_username(username, query)
+        if not isinstance(local, NotFound) or not allow_remote_lookup:
+            return local
+        entity_id = await self._resolve_dialog_entity(query)
+        if entity_id is not None and entity_id not in ineligible_ids:
+            return Resolved(entity_id=entity_id, display_name=query)
+        return local
+
+    @staticmethod
+    def _sorted_dialog_matches(matches: list[MatchInfo]) -> list[MatchInfo]:
+        return sorted(
+            matches,
+            key=lambda item: (-item["score"], item["display_name"].casefold(), item["entity_id"]),
+        )
 
     async def _resolve_dialog_name(
         self,
         dialog: str,
         *,
         allow_remote_lookup: bool = True,
-    ) -> int:
-        """Resolve a dialog name string to a numeric dialog_id.
+    ) -> Resolved | Candidates | NotFound:
+        """Resolve one normalized natural selector without silent precedence."""
+        tme = _parse_tme_link(dialog)
+        username = tme[0] if tme is not None else dialog[1:] if dialog.startswith("@") else None
+        if username is not None:
+            ineligible_ids = {
+                entity_id
+                for entity_id, (_name, _type, eligible) in self._local_dialog_metadata().items()
+                if not eligible
+            }
+            return await self._resolve_dialog_username(
+                dialog,
+                username,
+                allow_remote_lookup=allow_remote_lookup,
+                ineligible_ids=ineligible_ids,
+            )
 
-        Resolution order (fastest-first):
-        1. client.get_entity() — handles @username, phone, invite link.
-        2. entities table — exact/normalized/substring match against cached DB.
-        2.5. dialogs snapshot table — Phase 41 mirror of iter_dialogs() data.
-             No name_normalized column → no transliteration; Cyrillic queries
-             that need anyascii fall through to step 3.
-        3. iter_dialogs() — last resort for dialogs not in entities or dialogs snapshot.
-
-        Returns telethon peer id (negative for channels/groups).
-        Raises ValueError with descriptive message on failure.
-
-        When ``allow_remote_lookup`` is false, only the local entities and
-        dialogs snapshots are consulted. Callers may still perform a separate
-        remote topic-catalog refresh after resolving a numeric dialog id.
-        """
-        if allow_remote_lookup:
-            entity_id = await self._resolve_dialog_entity(dialog)
-            if entity_id is not None:
-                return entity_id
-
-        local_id = self._resolve_dialog_name_from_local_cache(dialog)
-        if local_id is not None:
-            return local_id
-
+        (
+            local_names,
+            local_normalized,
+            fuzzy_names,
+            fuzzy_normalized,
+            entity_types,
+            ineligible_ids,
+        ) = self._local_dialog_directory()
+        exact_result = self._resolve_exact_natural_name(dialog, local_names, local_normalized, entity_types)
+        if exact_result is not None:
+            return exact_result
+        local_result = _fuzzy_resolve(dialog, fuzzy_names, normalized_name_map=fuzzy_normalized)
+        self._apply_dialog_candidate_types(local_result, entity_types)
         if not allow_remote_lookup:
-            raise ValueError(f"Dialog {dialog!r} not found. Check the dialog name or use dialog_id from ListDialogs.")
+            return local_result
 
-        # Slow path: iterate dialogs via Telegram API (catches dialogs not yet in entities).
         logger.debug("resolve_dialog_fallback_iter_dialogs query=%r", dialog)
-        matched_dialog: object | None = None
-        async for d in self._client.iter_dialogs():
-            name = _attr(d, "name", "") or ""
-            if isinstance(name, str) and name.lower() == dialog.lower():
-                matched_dialog = d
-                break
-            if isinstance(name, str) and dialog.lower() in name.lower() and matched_dialog is None:
-                matched_dialog = d
+        remote_names, remote_normalized = await self._remote_dialog_directory(excluded_ids=ineligible_ids)
+        all_names = {**fuzzy_names, **remote_names}
+        all_normalized = {**fuzzy_normalized, **remote_normalized}
+        exact_result = self._resolve_exact_natural_name(dialog, all_names, all_normalized, entity_types)
+        if exact_result is not None:
+            return exact_result
+        result = _fuzzy_resolve(dialog, all_names, normalized_name_map=all_normalized)
+        self._apply_dialog_candidate_types(result, entity_types)
+        return result
 
-        if matched_dialog is not None:
-            entity = _attr(matched_dialog, "entity", None)
-            if entity is None:
-                raise ValueError(
-                    f"Dialog {dialog!r} not found. Check the dialog name or use dialog_id from ListDialogs."
-                )
-            return int(cast(int, telethon_utils.get_peer_id(entity)))
-
-        raise ValueError(f"Dialog {dialog!r} not found. Check the dialog name or use dialog_id from ListDialogs.")
+    @staticmethod
+    def _dialog_resolution_retryable_response(*, retry_after: int | None = None) -> dict[str, object]:
+        response: dict[str, object] = {
+            "ok": False,
+            "error": "dialog_resolution_retryable",
+            "message": "Telegram dialog enumeration did not complete; no dialog was selected.",
+            "retryable": True,
+            "required_action": "Retry the request; use an exact dialog id when already known.",
+        }
+        if retry_after is not None:
+            response["retry_after"] = retry_after
+        return response
 
     async def _resolve_dialog_id(
         self,
-        dialog_id: int,
-        dialog: str | None,
+        selector: DialogSelector,
         *,
         allow_remote_lookup: bool = True,
     ) -> int | dict:
-        """Resolve dialog_id from name if needed.
-
-        Returns the resolved int dialog_id on success,
-        or an error response dict on failure.
-        """
-        if not dialog_id and dialog:
-            try:
-                return await self._resolve_dialog_name(
-                    dialog,
-                    allow_remote_lookup=allow_remote_lookup,
-                )
-            except ValueError as exc:
-                return {"ok": False, "error": "dialog_not_found", "message": str(exc)}
-        return dialog_id
+        """Resolve a validated selector to one id or a stable failure response."""
+        if selector.exact_id is not None:
+            return selector.exact_id
+        assert selector.query is not None
+        try:
+            result = await self._resolve_dialog_name(selector.query, allow_remote_lookup=allow_remote_lookup)
+        except (RPCError, TimeoutError) as exc:
+            retry_after = flood_seconds(exc) if isinstance(exc, FloodWaitErrors) else None
+            return self._dialog_resolution_retryable_response(retry_after=retry_after)
+        if isinstance(result, Resolved):
+            return result.entity_id
+        if isinstance(result, Candidates):
+            candidates = self._sorted_dialog_matches(result.matches)
+            if len(candidates) == 1:
+                return {
+                    "ok": False,
+                    "error": "dialog_not_found",
+                    "message": f"Dialog {selector.label!r} was not found; one approximate match is available.",
+                    "suggestion": candidates[0],
+                    "required_action": "Retry with the suggestion's exact dialog id, or refine the dialog name.",
+                }
+            return {
+                "ok": False,
+                "error": "ambiguous_dialog",
+                "message": f"Dialog {selector.label!r} matched multiple dialogs.",
+                "candidates": candidates,
+                "required_action": "Retry with an exact dialog id from candidates.",
+            }
+        return {
+            "ok": False,
+            "error": "dialog_not_found",
+            "message": f"Dialog {selector.label!r} was not found.",
+            "required_action": "Call list_dialogs, then retry with an exact dialog id or full dialog name.",
+        }
 
     def _trace_service(self) -> DaemonAccountTraceService:
         return DaemonAccountTraceService(
@@ -980,25 +1161,15 @@ class DaemonAPIServer:
         "dialog_id": int}.
         Errors: missing_dialog, dialog_not_found (from _resolve_dialog_id).
         """
-        dialog_id = _coerce_int(req.get("dialog_id", 0), 0)
-        dialog_obj = req.get("dialog")
-        dialog = dialog_obj if isinstance(dialog_obj, str) else None
+        try:
+            selector = required_dialog_selector(exact_id=req.get("dialog_id"), dialog=req.get("dialog"))
+        except DialogSelectorError as exc:
+            return {"ok": False, "error": exc.code, "message": str(exc)}
 
-        resolved = await self._resolve_dialog_id(
-            dialog_id,
-            dialog,
-            allow_remote_lookup=False,
-        )
+        resolved = await self._resolve_dialog_id(selector, allow_remote_lookup=False)
         if isinstance(resolved, dict):
             return resolved
         dialog_id = resolved
-
-        if not dialog_id:
-            return {
-                "ok": False,
-                "error": "missing_dialog",
-                "message": "Either dialog_id or dialog name is required for list_topics",
-            }
 
         rows = self._topic_rows(dialog_id)
         empty_reason = None

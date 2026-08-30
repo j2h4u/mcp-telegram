@@ -107,17 +107,6 @@ def _parse_numeric_query(query: str) -> int | None:
     return None
 
 
-def parse_exact_dialog_id(dialog: str) -> int | None:
-    """Return an exact dialog id for one signed numeric selector string.
-
-    Rejects @username queries and non-numeric strings.
-    """
-    selector = dialog.strip()
-    if not selector or selector.startswith("@"):
-        return None
-    return _parse_numeric_query(selector)
-
-
 def _parse_tme_link(query: str) -> tuple[str, int | None] | None:
     """Extract (username, message_id|None) from a t.me URL.
 
@@ -271,7 +260,7 @@ def _build_matches(
         norm_map,
         enrichment,
     )
-    _apply_disambiguation_hint(
+    apply_disambiguation_hint(
         matches,
         collision_query=effective_options.collision_query,
         collision_count=effective_options.collision_count,
@@ -301,12 +290,13 @@ def _append_remaining_matches(
             )
 
 
-def _apply_disambiguation_hint(
+def apply_disambiguation_hint(
     matches: list[MatchInfo],
     *,
     collision_query: str | None,
     collision_count: int | None,
 ) -> None:
+    """Set the canonical collision hint from the candidates' current metadata."""
     if collision_query is None:
         for match in matches:
             match["disambiguation_hint"] = None

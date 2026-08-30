@@ -16,6 +16,7 @@ from telethon.tl.functions.contacts import ResolveUsernameRequest  # type: ignor
 from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_peer_sweep import enroll_activity_dialog
 from .daemon_message import fetch_text_links
+from .dialog_selector import DialogSelector, DialogSelectorError, optional_dialog_selector
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .hydration_queue import HydrationPriority
 from .message_content import MessageSnapshot, project_message_content
@@ -95,7 +96,7 @@ class DaemonAccountTraceDeps:
 
     conn: sqlite3.Connection
     client: _AccountTraceClientLike
-    resolve_dialog_id: Callable[[int, str | None], Awaitable[int | dict]]
+    resolve_dialog_id: Callable[[DialogSelector], Awaitable[int | dict]]
     self_id: int | None
     logger: _LoggerLike
     rid: Callable[[], str]
@@ -113,6 +114,7 @@ class _TraceAccountLookup:
 class _TraceAccountMessagesRequest:
     group_by: str
     coverage_goal: str
+    dialog_selector: DialogSelector | None
     exact_dialog_id: int | None
     exact_topic_id: int | None
     limit: int
@@ -1092,7 +1094,14 @@ def _parse_trace_account_messages_request(req: dict) -> tuple[_TraceAccountMessa
             "message": "coverage_goal must be observed or best_effort_visible",
         }
 
-    exact_dialog_id = _parse_trace_int(req.get("exact_dialog_id"))
+    try:
+        dialog_selector = optional_dialog_selector(
+            exact_id=req.get("exact_dialog_id"),
+            dialog=req.get("dialog"),
+        )
+    except DialogSelectorError as exc:
+        return None, {"ok": False, "error": exc.code, "message": str(exc)}
+    exact_dialog_id = dialog_selector.exact_id if dialog_selector is not None else None
     exact_topic_id = _parse_trace_int(req.get("exact_topic_id"))
     limit = _clamp(int(req.get("limit", 50)), 1, 200)
     sent_after = req.get("sent_after")
@@ -1115,6 +1124,7 @@ def _parse_trace_account_messages_request(req: dict) -> tuple[_TraceAccountMessa
         _TraceAccountMessagesRequest(
             group_by=group_by,
             coverage_goal=coverage_goal,
+            dialog_selector=dialog_selector,
             exact_dialog_id=exact_dialog_id,
             exact_topic_id=exact_topic_id,
             limit=limit,
@@ -1139,8 +1149,7 @@ async def _resolve_trace_account_scope(
 
     resolved_dialog_id, scope_error = await _resolve_trace_account_scope_dialog_id(
         request.deps,
-        request.req,
-        exact_dialog_id,
+        request.request.dialog_selector,
     )
     if scope_error is not None:
         return None, scope_error
@@ -1193,17 +1202,11 @@ class _TraceNavigationScopeResult:
 
 async def _resolve_trace_account_scope_dialog_id(
     deps: DaemonAccountTraceDeps,
-    req: dict,
-    exact_dialog_id: int | None,
+    selector: DialogSelector | None,
 ) -> tuple[int | None, dict | None]:
-    if exact_dialog_id is not None:
-        return exact_dialog_id, None
-
-    dialog = req.get("dialog")
-    if not isinstance(dialog, str) or not dialog.strip():
+    if selector is None:
         return None, None
-
-    resolved_dialog = await deps.resolve_dialog_id(0, dialog)
+    resolved_dialog = await deps.resolve_dialog_id(selector)
     if isinstance(resolved_dialog, dict):
         return None, resolved_dialog
     return resolved_dialog, None

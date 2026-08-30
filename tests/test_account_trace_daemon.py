@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -210,6 +210,138 @@ def test_account_trace_navigation_rejects_topic_scope_mismatch() -> None:
                 expected_exact_topic_id=9,
             ),
         )
+
+
+@pytest.mark.parametrize("exact_dialog_id", [True, False, 0])
+async def test_trace_raw_selector_rejects_boolean_and_zero_ids(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    exact_dialog_id: object,
+) -> None:
+    server, _conn, _client = trace_server
+
+    result = await server._dispatch(
+        {
+            "method": "trace_account_messages",
+            "exact_account_id": 101,
+            "exact_dialog_id": exact_dialog_id,
+        }
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "invalid_dialog_selector"
+
+
+@pytest.mark.parametrize("dialog", ["0", "+0", "-0"])
+async def test_trace_raw_selector_rejects_zero_strings(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    dialog: str,
+) -> None:
+    server, _conn, _client = trace_server
+
+    result = await server._dispatch(
+        {
+            "method": "trace_account_messages",
+            "exact_account_id": 101,
+            "dialog": dialog,
+        }
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "invalid_dialog_selector"
+
+
+async def test_trace_raw_conflicting_selector_does_not_prefer_exact_id(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+) -> None:
+    server, conn, _client = trace_server
+    seed_entity(conn, entity_id=101, name="Me", username="me")
+    seed_dialog(conn, dialog_id=222, name="Exact Scope")
+    seed_message(conn, dialog_id=222, message_id=1, sent_at=1, sender_id=101)
+    conn.commit()
+
+    result = await server._dispatch(
+        {
+            "method": "trace_account_messages",
+            "exact_account_id": 101,
+            "exact_dialog_id": 222,
+            "dialog": "Contradictory Scope",
+        }
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "invalid_dialog_selector"
+    assert "data" not in result
+
+
+async def test_trace_ambiguous_dialog_fails_before_evidence_query(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+) -> None:
+    server, conn, client = trace_server
+    seed_entity(conn, entity_id=101, name="Me", username="me")
+    seed_dialog(conn, dialog_id=303, name="Twin Trace")
+    seed_dialog(conn, dialog_id=404, name="Twin Trace")
+    seed_message(conn, dialog_id=303, message_id=1, sent_at=1, sender_id=101)
+    conn.commit()
+    client.get_entity = AsyncMock(side_effect=ValueError("not found"))
+
+    async def empty_dialogs():
+        if False:
+            yield None
+
+    client.iter_dialogs = MagicMock(return_value=empty_dialogs())
+
+    result = await server._dispatch(
+        {
+            "method": "trace_account_messages",
+            "exact_account_id": 101,
+            "dialog": "Twin Trace",
+        }
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "ambiguous_dialog"
+    candidates = cast(list[dict[str, object]], result["candidates"])
+    assert {303, 404} <= {candidate["entity_id"] for candidate in candidates}
+    assert "data" not in result
+
+
+async def test_trace_numeric_dialog_navigation_scope_remains_stable(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+) -> None:
+    server, conn, _client = trace_server
+    seed_entity(conn, entity_id=101, name="Me", username="me")
+    seed_dialog(conn, dialog_id=505, name="Numeric Scope")
+    seed_synced_dialog(conn, dialog_id=505)
+    seed_message(conn, dialog_id=505, message_id=1, sent_at=1, sender_id=101)
+    seed_message(conn, dialog_id=505, message_id=2, sent_at=2, sender_id=101)
+    conn.commit()
+
+    first = await server._dispatch(
+        {
+            "method": "trace_account_messages",
+            "exact_account_id": 101,
+            "dialog": "505",
+            "limit": 1,
+        }
+    )
+    assert first["ok"] is True
+    first_data = _dict(first["data"])
+    navigation = first_data["next_navigation"]
+    assert isinstance(navigation, str)
+
+    second = await server._dispatch(
+        {
+            "method": "trace_account_messages",
+            "exact_account_id": 101,
+            "dialog": "505",
+            "limit": 1,
+            "navigation": navigation,
+        }
+    )
+
+    assert second["ok"] is True
+    bounds = _dict(_dict(second["data"])["provenance"])["coverage_bounds"]
+    assert _dict(bounds)["exact_dialog_id"] == 505
 
 
 def test_account_trace_navigation_rejects_time_bound_mismatch() -> None:

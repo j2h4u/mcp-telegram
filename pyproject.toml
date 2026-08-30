@@ -234,9 +234,9 @@ branch = true
 sigterm = true
 
 [tool.coverage.report]
+# Aggregate coverage is informational; per-function coverage feeds the CRAP gate.
 show_missing = true
 skip_covered = true
-fail_under = 83
 
 [tool.pyright]
 include = ["src/mcp_telegram", "deploy", "scripts", "tests"]

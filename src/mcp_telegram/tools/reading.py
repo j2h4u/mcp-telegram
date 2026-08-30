@@ -4,8 +4,9 @@ from dataclasses import fields as dataclass_fields
 from datetime import UTC, datetime
 from typing import Literal, cast
 
-from pydantic import Field, model_validator
+from pydantic import Field, StrictInt, model_validator
 
+from ..dialog_selector import DialogSelectorError, optional_dialog_selector, required_dialog_selector
 from ..errors import dialog_not_found_text, invalid_navigation_text
 from ..formatter import (
     _render_read_state_header,
@@ -15,7 +16,6 @@ from ..formatter import (
 )
 from ..models import DialogType, ReadMessage
 from ..pagination import NavigationToken
-from ..resolver import parse_exact_dialog_id
 from ..temporal import parse_utc_boundary
 from ._base import (
     DaemonNotRunningError,
@@ -29,6 +29,7 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
+from .dialog_resolution import project_dialog_resolution_error
 from .message_view import MESSAGE_VIEW_SCHEMA, ReadMarker, project_message_view, project_read_markers
 from .search_hit import SEARCH_HIT_SCHEMA, extract_search_snippet, project_search_hit
 from .structured import (
@@ -151,6 +152,7 @@ class _ListMessagesErrorContext:
     has_filter: bool
     has_cursor: bool
     structured_content: dict[str, object] | None = None
+    rendered_text: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -803,12 +805,12 @@ def _search_navigation_error(
 
 
 def _search_messages_request_context(args: SearchMessages) -> _SearchMessagesRequestContext | ToolResult:
-    global_mode = args.dialog is None
-    dialog_id: int | None = None
-    if args.dialog is not None:
-        exact_id = parse_exact_dialog_id(args.dialog)
-        if exact_id is not None:
-            dialog_id = exact_id
+    try:
+        selector = optional_dialog_selector(dialog=args.dialog)
+    except DialogSelectorError as exc:
+        return error_result(f"{exc.code}: {exc}\nAction: Retry SearchMessages with a valid dialog selector.")
+    global_mode = selector is None
+    dialog_id = selector.exact_id if selector is not None else None
 
     offset = 0
     if args.navigation:
@@ -837,7 +839,7 @@ def _search_messages_request_context(args: SearchMessages) -> _SearchMessagesReq
     return _SearchMessagesRequestContext(
         args=args,
         dialog_id=dialog_id,
-        dialog_label=str(dialog_id) if dialog_id else args.dialog,
+        dialog_label=selector.label if selector is not None else None,
         global_mode=global_mode,
         offset=offset,
     )
@@ -845,11 +847,24 @@ def _search_messages_request_context(args: SearchMessages) -> _SearchMessagesReq
 
 def _search_messages_error_result(
     *,
+    response: dict,
     error: str,
     error_detail: str,
     dialog_label: str | None,
     has_cursor: bool,
 ) -> ToolResult:
+    projection = project_dialog_resolution_error(
+        response,
+        fallback_action="Retry SearchMessages with an exact dialog id.",
+    )
+    if projection is not None:
+        return ToolResult(
+            content=_text_response(projection.text),
+            is_error=True,
+            structured_content=projection.structured_content,
+            has_filter=True,
+            has_cursor=has_cursor,
+        )
     if error == "dialog_not_found":
         return error_result(
             dialog_not_found_text(dialog_label or "?", retry_tool="SearchMessages"),
@@ -985,7 +1000,7 @@ class ListMessages(ToolArgs):
             "Use this for exploratory or ambiguity-safe reads. Mutually exclusive with exact_dialog_id."
         ),
     )
-    exact_dialog_id: int | None = Field(
+    exact_dialog_id: StrictInt | None = Field(
         default=None,
         description=(
             "Optional exact dialog id for direct reads when the target dialog is already known. "
@@ -1067,10 +1082,10 @@ class ListMessages(ToolArgs):
 
 
 def _validate_dialog_selectors(args: ListMessages) -> None:
-    if args.dialog is None and args.exact_dialog_id is None:
-        raise ValueError("Provide either dialog or exact_dialog_id.")
-    if args.dialog is not None and args.exact_dialog_id is not None:
-        raise ValueError("dialog and exact_dialog_id are mutually exclusive.")
+    try:
+        required_dialog_selector(exact_id=args.exact_dialog_id, dialog=args.dialog)
+    except DialogSelectorError as exc:
+        raise ValueError(f"{exc.code}: {exc}") from exc
 
 
 def _validate_topic_selectors(args: ListMessages) -> None:
@@ -1161,11 +1176,8 @@ def _list_messages_request_context(args: ListMessages) -> _ListMessagesRequestCo
             has_cursor=False,
         )
 
-    dialog_id: int | None = args.exact_dialog_id
-    if dialog_id is None and args.dialog is not None:
-        exact_id = parse_exact_dialog_id(args.dialog)
-        if exact_id is not None:
-            dialog_id = exact_id
+    selector = required_dialog_selector(exact_id=args.exact_dialog_id, dialog=args.dialog)
+    dialog_id = selector.exact_id
 
     direction = "oldest" if args.navigation in {"start", "oldest"} else "newest"
     daemon_navigation = None if args.navigation in navigation_sentinels else args.navigation
@@ -1181,7 +1193,7 @@ def _list_messages_request_context(args: ListMessages) -> _ListMessagesRequestCo
     return _ListMessagesRequestContext(
         args=args,
         dialog_id=dialog_id,
-        dialog_label=str(dialog_id) if dialog_id is not None else (args.dialog or ""),
+        dialog_label=selector.label,
         has_filter=has_filter,
         has_cursor=has_cursor,
         direction=direction,
@@ -1207,20 +1219,20 @@ def _list_messages_has_filter(args: ListMessages) -> bool:
 def _list_messages_error_result(
     ctx: _ListMessagesErrorContext,
 ) -> ToolResult:
-    if ctx.error == "dialog_not_found":
-        return error_result(
-            dialog_not_found_text(ctx.dialog_label, retry_tool="ListMessages"),
-            has_filter=ctx.has_filter,
-            has_cursor=ctx.has_cursor,
-        )
     if ctx.structured_content is not None:
         return ToolResult(
             content=_text_response(
-                f"Error: {ctx.error}: {ctx.error_detail}\n"
-                f"Action: {ctx.structured_content.get('required_action') or 'Retry list_messages with corrected arguments.'}"
+                ctx.rendered_text
+                or f"Error: {ctx.error}: {ctx.error_detail}\nAction: Retry list_messages with corrected arguments."
             ),
             is_error=True,
             structured_content=ctx.structured_content,
+            has_filter=ctx.has_filter,
+            has_cursor=ctx.has_cursor,
+        )
+    if ctx.error == "dialog_not_found":
+        return error_result(
+            dialog_not_found_text(ctx.dialog_label, retry_tool="ListMessages"),
             has_filter=ctx.has_filter,
             has_cursor=ctx.has_cursor,
         )
@@ -1233,7 +1245,8 @@ def _list_messages_error_result(
 
 
 def _list_messages_structured_error_content(response: dict) -> dict[str, object] | None:
-    if response.get("error") not in {"fragment_fetch_failed", "not_synced"}:
+    error = response.get("error")
+    if error not in {"fragment_fetch_failed", "not_synced"}:
         return None
     return {
         "error": response.get("error", "unknown"),
@@ -1242,6 +1255,81 @@ def _list_messages_structured_error_content(response: dict) -> dict[str, object]
         "context_availability": response.get("context_availability"),
         "dialog_status": response.get("dialog_status"),
     }
+
+
+async def _list_messages_topic_id(
+    args: ListMessages,
+    request_context: _ListMessagesRequestContext,
+) -> int | ToolResult | None:
+    if args.exact_topic_id is not None or args.topic is None:
+        return args.exact_topic_id
+    resolved = await _resolve_topic_id(
+        args.topic,
+        dialog_id=request_context.dialog_id or 0,
+        dialog_name=request_context.dialog_label if request_context.dialog_id is None else None,
+    )
+    if not isinstance(resolved, ToolResult):
+        return resolved
+    return ToolResult(
+        content=resolved.content,
+        is_error=resolved.is_error,
+        structured_content=resolved.structured_content,
+        has_filter=request_context.has_filter,
+        has_cursor=request_context.has_cursor,
+    )
+
+
+async def _request_list_messages(
+    args: ListMessages,
+    request_context: _ListMessagesRequestContext,
+    topic_id: int | None,
+) -> dict:
+    selector_kwargs: dict = (
+        {"dialog_id": request_context.dialog_id}
+        if request_context.dialog_id is not None
+        else {"dialog": request_context.dialog_label}
+    )
+    async with daemon_connection() as conn:
+        return await conn.list_messages(
+            **selector_kwargs,
+            limit=args.limit,
+            navigation=request_context.daemon_navigation,
+            direction=request_context.direction,
+            sender_id=request_context.sender_id,
+            sender_name=request_context.sender_name,
+            topic_id=topic_id,
+            unread=request_context.unread_flag,
+            context_message_id=args.anchor_message_id,
+            context_size=args.context_size if args.anchor_message_id else None,
+            message_state=args.message_state,
+            since_utc=args.since_utc,
+            until_utc=args.until_utc,
+        )
+
+
+def _list_messages_response_error(
+    response: dict,
+    request_context: _ListMessagesRequestContext,
+) -> ToolResult:
+    dialog_projection = project_dialog_resolution_error(
+        response,
+        fallback_action="Retry ListMessages with an exact dialog id.",
+    )
+    return _list_messages_error_result(
+        _ListMessagesErrorContext(
+            error=response.get("error", "unknown"),
+            error_detail=response.get("message", ""),
+            dialog_label=request_context.dialog_label,
+            has_filter=request_context.has_filter,
+            has_cursor=request_context.has_cursor,
+            structured_content=(
+                dialog_projection.structured_content
+                if dialog_projection is not None
+                else _list_messages_structured_error_content(response)
+            ),
+            rendered_text=dialog_projection.text if dialog_projection is not None else None,
+        )
+    )
 
 
 @mcp_tool(
@@ -1260,55 +1348,16 @@ async def list_messages(args: ListMessages) -> ToolResult:
     if isinstance(request_context, ToolResult):
         return request_context
 
-    topic_id: int | None = args.exact_topic_id
-    if topic_id is None and args.topic is not None:
-        resolved = await _resolve_topic_id(
-            args.topic,
-            dialog_id=request_context.dialog_id or 0,
-            dialog_name=args.dialog if request_context.dialog_id is None else None,
-        )
-        if isinstance(resolved, ToolResult):
-            return ToolResult(
-                content=resolved.content,
-                is_error=resolved.is_error,
-                structured_content=resolved.structured_content,
-                has_filter=request_context.has_filter,
-                has_cursor=request_context.has_cursor,
-            )
-        topic_id = resolved
-
-    id_kwarg: dict = {"dialog_id": request_context.dialog_id} if request_context.dialog_id else {"dialog": args.dialog}
+    topic_id = await _list_messages_topic_id(args, request_context)
+    if isinstance(topic_id, ToolResult):
+        return topic_id
     try:
-        async with daemon_connection() as conn:
-            response = await conn.list_messages(
-                **id_kwarg,
-                limit=args.limit,
-                navigation=request_context.daemon_navigation,
-                direction=request_context.direction,
-                sender_id=request_context.sender_id,
-                sender_name=request_context.sender_name,
-                topic_id=topic_id,
-                unread=request_context.unread_flag,
-                context_message_id=args.anchor_message_id,
-                context_size=args.context_size if args.anchor_message_id else None,
-                message_state=args.message_state,
-                since_utc=args.since_utc,
-                until_utc=args.until_utc,
-            )
+        response = await _request_list_messages(args, request_context, topic_id)
     except DaemonNotRunningError as exc:
         return error_result(_daemon_not_running_text(exc))
 
     if not response.get("ok"):
-        return _list_messages_error_result(
-            _ListMessagesErrorContext(
-                error=response.get("error", "unknown"),
-                error_detail=response.get("message", ""),
-                dialog_label=request_context.dialog_label,
-                has_filter=request_context.has_filter,
-                has_cursor=request_context.has_cursor,
-                structured_content=_list_messages_structured_error_content(response),
-            )
-        )
+        return _list_messages_response_error(response, request_context)
 
     data = response.get("data", {})
     rows = data.get("messages", [])
@@ -1430,7 +1479,7 @@ async def search_messages(args: SearchMessages) -> ToolResult:
         elif request_context.dialog_id:
             id_kwarg = {"dialog_id": request_context.dialog_id}
         else:
-            id_kwarg = {"dialog": args.dialog}
+            id_kwarg = {"dialog": request_context.dialog_label}
         async with daemon_connection() as conn:
             response = await conn.search_messages(
                 **id_kwarg,
@@ -1447,6 +1496,7 @@ async def search_messages(args: SearchMessages) -> ToolResult:
 
     if not response.get("ok"):
         return _search_messages_error_result(
+            response=response,
             error=response.get("error", "unknown"),
             error_detail=response.get("message", ""),
             dialog_label=request_context.dialog_label,

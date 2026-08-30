@@ -91,6 +91,41 @@ def _list_messages_state_payload(kwargs: _ListMessagesKwargs) -> dict[str, objec
     return {"message_state": message_state} if message_state is not None else {}
 
 
+def _list_messages_selector_payload(kwargs: _ListMessagesKwargs) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    if (dialog_id := kwargs.get("dialog_id")) is not None:
+        payload["dialog_id"] = dialog_id
+    if (dialog := kwargs.get("dialog")) is not None:
+        payload["dialog"] = dialog
+    return payload
+
+
+def _list_messages_filter_payload(kwargs: _ListMessagesKwargs) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    if (sender_id := kwargs.get("sender_id")) is not None:
+        payload["sender_id"] = sender_id
+    if (sender_name := kwargs.get("sender_name")) is not None:
+        payload["sender_name"] = sender_name
+    if (topic_id := kwargs.get("topic_id")) is not None:
+        payload["topic_id"] = topic_id
+    if (unread_after_id := kwargs.get("unread_after_id")) is not None:
+        payload["unread_after_id"] = unread_after_id
+    if (unread := kwargs.get("unread")) is not None:
+        payload["unread"] = unread
+    return payload
+
+
+def _list_messages_navigation_payload(kwargs: _ListMessagesKwargs) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    if (direction := kwargs.get("direction")) is not None:
+        payload["direction"] = direction
+    if (context_message_id := kwargs.get("context_message_id")) is not None:
+        payload["context_message_id"] = context_message_id
+    if (context_size := kwargs.get("context_size")) is not None:
+        payload["context_size"] = context_size
+    return payload
+
+
 def _add_time_bounds(payload: dict[str, object], kwargs: Mapping[str, object]) -> None:
     """Add optional UTC bounds without emitting null-valued JSON fields."""
     for field in ("since_utc", "until_utc"):
@@ -249,27 +284,12 @@ class DaemonConnection:
         """
         payload: dict = {
             "method": "list_messages",
-            "dialog_id": kwargs.get("dialog_id", 0),
-            "dialog": kwargs.get("dialog"),
             "limit": kwargs.get("limit", 50),
             "navigation": kwargs.get("navigation"),
         }
-        if (direction := kwargs.get("direction")) is not None:
-            payload["direction"] = direction
-        if (sender_id := kwargs.get("sender_id")) is not None:
-            payload["sender_id"] = sender_id
-        if (sender_name := kwargs.get("sender_name")) is not None:
-            payload["sender_name"] = sender_name
-        if (topic_id := kwargs.get("topic_id")) is not None:
-            payload["topic_id"] = topic_id
-        if (unread_after_id := kwargs.get("unread_after_id")) is not None:
-            payload["unread_after_id"] = unread_after_id
-        if (unread := kwargs.get("unread")) is not None:
-            payload["unread"] = unread
-        if (context_message_id := kwargs.get("context_message_id")) is not None:
-            payload["context_message_id"] = context_message_id
-        if (context_size := kwargs.get("context_size")) is not None:
-            payload["context_size"] = context_size
+        payload.update(_list_messages_selector_payload(kwargs))
+        payload.update(_list_messages_filter_payload(kwargs))
+        payload.update(_list_messages_navigation_payload(kwargs))
         _add_time_bounds(payload, kwargs)
         payload.update(_list_messages_state_payload(kwargs))
         return await self.request(payload)
@@ -282,14 +302,16 @@ class DaemonConnection:
         """
         payload: dict[str, object] = {
             "method": "search_messages",
-            "dialog_id": kwargs.get("dialog_id", 0),
-            "dialog": kwargs.get("dialog"),
             "query": kwargs["query"],
             "limit": kwargs.get("limit", 20),
             "offset": kwargs.get("offset", 0),
             "navigation": kwargs.get("navigation"),
             "message_state": kwargs.get("message_state", "sent"),
         }
+        if (dialog_id := kwargs.get("dialog_id")) is not None:
+            payload["dialog_id"] = dialog_id
+        if (dialog := kwargs.get("dialog")) is not None:
+            payload["dialog"] = dialog
         _add_time_bounds(payload, kwargs)
         return await self.request(payload)
 
@@ -357,17 +379,16 @@ class DaemonConnection:
     async def list_topics(
         self,
         *,
-        dialog_id: int = 0,
+        dialog_id: int | None = None,
         dialog: str | None = None,
     ) -> dict:
         """List forum topics. Accepts dialog name or numeric id."""
-        return await self.request(
-            {
-                "method": "list_topics",
-                "dialog_id": dialog_id,
-                "dialog": dialog,
-            }
-        )
+        payload: dict[str, object] = {"method": "list_topics"}
+        if dialog_id is not None:
+            payload["dialog_id"] = dialog_id
+        if dialog is not None:
+            payload["dialog"] = dialog
+        return await self.request(payload)
 
     async def get_me(self) -> dict:
         """Return current authenticated user info."""
@@ -452,19 +473,17 @@ class DaemonConnection:
     async def get_dialog_stats(
         self,
         *,
-        dialog_id: int = 0,
+        dialog_id: int | None = None,
         dialog: str | None = None,
         limit: int = 5,
     ) -> dict:
         """Return aggregated stats (reactions, mentions, hashtags, forwards) for a dialog."""
-        return await self.request(
-            {
-                "method": "get_dialog_stats",
-                "dialog_id": dialog_id,
-                "dialog": dialog,
-                "limit": limit,
-            }
-        )
+        payload: dict[str, object] = {"method": "get_dialog_stats", "limit": limit}
+        if dialog_id is not None:
+            payload["dialog_id"] = dialog_id
+        if dialog is not None:
+            payload["dialog"] = dialog
+        return await self.request(payload)
 
     async def get_my_recent_activity(  # noqa: PLR0913
         self,
