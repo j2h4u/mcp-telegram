@@ -1041,27 +1041,30 @@ async def test_list_messages_context_window_own_only_uses_fragment_fetch() -> No
 
 @pytest.mark.asyncio
 async def test_list_messages_name_resolution() -> None:
-    """list_messages resolves dialog name to dialog_id via client.get_entity."""
+    """Natural names resolve after enumerating the complete remote dialog set."""
     conn = _make_db()
-
-    # Entity returned by get_entity
-    entity = MagicMock()
-    entity.id = 123
-
+    enumerated: list[str] = []
     client = _TestClient()
-    client.get_entity = AsyncMock(return_value=entity)
+    client.get_entity = AsyncMock(side_effect=AssertionError("natural names must not use exact get_entity"))
+
+    async def _remote_dialogs():
+        for dialog_id, name in [(123, "Alice"), (456, "Other")]:
+            enumerated.append(name)
+            yield SimpleNamespace(name=name, entity=SimpleNamespace(id=dialog_id))
 
     async def _fake_iter(*args: object, **kwargs: object):  # type: ignore[misc]
         return
         yield  # make it an async generator
 
+    client.iter_dialogs = MagicMock(return_value=_remote_dialogs())
     client.iter_messages = _fake_iter
     server = make_server(conn, client)
 
     result = await server._list_messages({"dialog": "Alice", "limit": 10})
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
-    cast(AsyncMock, client.get_entity).assert_called_once_with("Alice")
+    assert enumerated == ["Alice", "Other"]
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -1202,19 +1205,25 @@ async def test_search_messages_empty_query() -> None:
 
 @pytest.mark.asyncio
 async def test_search_messages_name_resolution() -> None:
-    """search_messages resolves dialog name via client.get_entity, then runs FTS."""
+    """search_messages resolves a natural name from the full remote directory."""
     conn = _make_db(with_fts=True)
-
-    entity = MagicMock()
-    entity.id = 123
+    enumerated: list[str] = []
     client = _TestClient()
-    client.get_entity = AsyncMock(return_value=entity)
+    client.get_entity = AsyncMock(side_effect=AssertionError("natural names must not use exact get_entity"))
+
+    async def _remote_dialogs():
+        for dialog_id, name in [(123, "Alice"), (456, "Other")]:
+            enumerated.append(name)
+            yield SimpleNamespace(name=name, entity=SimpleNamespace(id=dialog_id))
+
+    client.iter_dialogs = MagicMock(return_value=_remote_dialogs())
     server = make_server(conn, client)
 
     result = await server._search_messages({"dialog": "Alice", "query": "hello"})
 
     assert result["ok"] is True
-    cast(AsyncMock, client.get_entity).assert_called_once_with("Alice")
+    assert enumerated == ["Alice", "Other"]
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -5919,21 +5928,26 @@ async def test_get_dialog_stats_access_lost_allowed() -> None:
 
 @pytest.mark.asyncio
 async def test_get_dialog_stats_resolves_fuzzy_dialog_name() -> None:
-    """_get_dialog_stats resolves fuzzy dialog name to dialog_id via get_entity."""
+    """_get_dialog_stats resolves a natural name after full remote enumeration."""
     conn = _make_db_for_dialog_stats()
     _insert_synced_dialog(conn, 1, status="synced")
-
-    entity = MagicMock()
-    entity.id = 1
+    enumerated: list[str] = []
     client = _TestClient()
-    client.get_entity = AsyncMock(return_value=entity)
+    client.get_entity = AsyncMock(side_effect=AssertionError("natural names must not use exact get_entity"))
 
+    async def _remote_dialogs():
+        for dialog_id, name in [(1, "Chat Foo"), (2, "Other")]:
+            enumerated.append(name)
+            yield SimpleNamespace(name=name, entity=SimpleNamespace(id=dialog_id))
+
+    client.iter_dialogs = MagicMock(return_value=_remote_dialogs())
     server = make_server(conn, client)
     result = await server._get_dialog_stats({"dialog": "Chat Foo"})
 
     assert result["ok"] is True
     assert result["data"]["dialog_id"] == 1
-    cast(AsyncMock, client.get_entity).assert_called_once_with("Chat Foo")
+    assert enumerated == ["Chat Foo", "Other"]
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
 
 
 # - Simplify _format_reactions to only handle count-only display path
