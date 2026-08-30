@@ -18,6 +18,7 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
+from .dialog_resolution import project_dialog_resolution_error
 from .structured import (
     MEDIA_OUTPUT_SCHEMA,
     StructuredWarning,
@@ -451,24 +452,20 @@ async def trace_account_messages(args: TraceAccountMessages) -> ToolResult:
     except DaemonNotRunningError as exc:
         return error_result(_daemon_not_running_text(exc), has_filter=True, has_cursor=args.navigation is not None)
 
-    if response.get("error") in {"ambiguous_dialog", "dialog_not_found"} and (
-        response.get("candidates") is not None or response.get("suggestion") is not None
-    ):
-        structured_content = {
-            key: response[key]
-            for key in ("error", "message", "candidates", "suggestion", "required_action")
-            if key in response
-        }
+    projection = project_dialog_resolution_error(
+        response,
+        fallback_action="Retry trace_account_messages with an exact dialog id.",
+    )
+    if projection is not None:
         ambiguity_error = error_result(
-            f"Error: {response.get('error')}: {response.get('message', 'Request failed.')}\n"
-            f"Action: {structured_content.get('required_action') or 'Retry trace_account_messages with an exact dialog id.'}",
+            projection.text,
             has_filter=True,
             has_cursor=args.navigation is not None,
         )
         return ToolResult(
             content=ambiguity_error.content,
             is_error=True,
-            structured_content=structured_content,
+            structured_content=projection.structured_content,
             has_filter=True,
             has_cursor=args.navigation is not None,
         )

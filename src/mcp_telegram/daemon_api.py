@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
-from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
 from telethon.tl.functions.channels import (
     GetFullChannelRequest,  # type: ignore[import-untyped]
     GetParticipantsRequest,  # type: ignore[import-untyped]
@@ -90,6 +90,7 @@ from .daemon_message import (
 )
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
+from .flood import flood_seconds
 from .folders.read_model import dialog_placement, folder_snapshot, folders_by_dialog, list_folder_messages, list_folders
 from .history_enrollment import disable_history, enable_history, read_intent
 from .important_events.read_model import list_important_events as read_important_events
@@ -97,6 +98,7 @@ from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
 from .reading.query_records import read_message_from_row
 from .sync_read_model import build_sync_read_model, compute_sync_coverage
+from .telegram_rpc import FloodWaitErrors
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
 
@@ -113,7 +115,7 @@ _ALL_ENTITY_NAMES_NORMALIZED_SQL = (
     "AND ((type IN ('User', 'Bot') AND updated_at > ?) "  # PascalCase per ListDialogs type vocabulary
     "OR (type NOT IN ('User', 'Bot') AND updated_at > ?))"
 )
-_ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE username = ? COLLATE NOCASE"
+_ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, type FROM entities WHERE username = ? COLLATE NOCASE"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -633,21 +635,32 @@ class DaemonAPIServer:
 
     def _local_dialog_directory(
         self,
-    ) -> tuple[dict[int, str], dict[int, str], dict[int, str], dict[int, str]]:
+    ) -> tuple[
+        dict[int, str],
+        dict[int, str],
+        dict[int, str],
+        dict[int, str],
+        dict[int, str],
+        set[int],
+    ]:
         """Return exact-name cache entries and fuzzy-eligible dialog entries."""
         dialog_metadata = self._local_dialog_metadata()
         names: dict[int, str] = {}
         normalized: dict[int, str] = {}
         fuzzy_names: dict[int, str] = {}
         fuzzy_normalized: dict[int, str] = {}
+        entity_types: dict[int, str] = {}
+        ineligible_ids = {entity_id for entity_id, (_name, _type, eligible) in dialog_metadata.items() if not eligible}
         entity_rows = cast(
             list[tuple[object, ...]],
-            self._conn.execute("SELECT id, name FROM entities WHERE name IS NOT NULL ORDER BY id").fetchall(),
+            self._conn.execute("SELECT id, name, type FROM entities WHERE name IS NOT NULL ORDER BY id").fetchall(),
         )
         entity_names = {_coerce_int(row[0], 0): row[1] for row in entity_rows}
-        candidate_ids = sorted(set(entity_names) | set(dialog_metadata))
-        for entity_id in candidate_ids:
-            dialog_name, _dialog_type, eligible = dialog_metadata.get(entity_id, (None, None, True))
+        stored_entity_types = {
+            _coerce_int(row[0], 0): row[2] for row in entity_rows if isinstance(row[2], str) and row[2]
+        }
+        for entity_id in sorted(set(entity_names) | set(dialog_metadata)):
+            dialog_name, dialog_type, eligible = dialog_metadata.get(entity_id, (None, None, True))
             if not eligible:
                 continue
             entity_name = entity_names.get(entity_id)
@@ -656,16 +669,21 @@ class DaemonAPIServer:
                 continue
             names[entity_id] = name
             normalized[entity_id] = latinize(name)
+            if dialog_type is not None:
+                entity_types[entity_id] = dialog_type
+            elif entity_id in stored_entity_types:
+                entity_types[entity_id] = stored_entity_types[entity_id]
             if entity_id in dialog_metadata:
                 fuzzy_names[entity_id] = name
                 fuzzy_normalized[entity_id] = latinize(name)
-        return names, normalized, fuzzy_names, fuzzy_normalized
+        return names, normalized, fuzzy_names, fuzzy_normalized, entity_types, ineligible_ids
 
     @staticmethod
     def _resolve_exact_natural_name(
         query: str,
         names: dict[int, str],
         normalized: dict[int, str],
+        entity_types: Mapping[int, str],
     ) -> Resolved | Candidates | None:
         norm_query = latinize(query)
         exact_names = {entity_id: name for entity_id, name in names.items() if normalized.get(entity_id) == norm_query}
@@ -673,7 +691,18 @@ class DaemonAPIServer:
             return None
         exact_normalized = dict.fromkeys(exact_names, norm_query)
         result = _fuzzy_resolve(query, exact_names, normalized_name_map=exact_normalized)
+        DaemonAPIServer._apply_dialog_candidate_types(result, entity_types)
         return result if isinstance(result, Resolved | Candidates) else None
+
+    @staticmethod
+    def _apply_dialog_candidate_types(
+        result: Resolved | Candidates | NotFound,
+        entity_types: Mapping[int, str],
+    ) -> None:
+        """Replace resolver id-sign guesses with observed local types or unknown."""
+        if isinstance(result, Candidates):
+            for match in result.matches:
+                match["entity_type"] = entity_types.get(match["entity_id"])
 
     def _resolve_local_dialog_username(self, username: str, query: str) -> Resolved | Candidates | NotFound:
         dialog_metadata = self._local_dialog_metadata()
@@ -713,11 +742,19 @@ class DaemonAPIServer:
             return int(cast(int, telethon_utils.get_peer_id(entity)))
         except ValueError, KeyError:
             return None
+        except FloodWaitErrors:
+            raise
+        except RPCError, TimeoutError:
+            raise
         except Exception:
-            logger.debug("get_entity failed for %r, falling back to entities DB", dialog, exc_info=True)
-            return None
+            logger.exception("unexpected get_entity failure for %r", dialog)
+            raise
 
-    async def _remote_dialog_directory(self) -> tuple[dict[int, str], dict[int, str]]:
+    async def _remote_dialog_directory(
+        self,
+        *,
+        excluded_ids: set[int],
+    ) -> tuple[dict[int, str], dict[int, str]]:
         """Enumerate the full visible remote directory before fuzzy resolution."""
         names: dict[int, str] = {}
         normalized: dict[int, str] = {}
@@ -727,6 +764,8 @@ class DaemonAPIServer:
             if not isinstance(name, str) or not name.strip() or entity is None:
                 continue
             entity_id = int(cast(int, telethon_utils.get_peer_id(entity)))
+            if entity_id in excluded_ids:
+                continue
             names[entity_id] = name
             normalized[entity_id] = latinize(name)
         return names, normalized
@@ -737,12 +776,13 @@ class DaemonAPIServer:
         username: str,
         *,
         allow_remote_lookup: bool,
+        ineligible_ids: set[int],
     ) -> Resolved | Candidates | NotFound:
         local = self._resolve_local_dialog_username(username, query)
         if not isinstance(local, NotFound) or not allow_remote_lookup:
             return local
         entity_id = await self._resolve_dialog_entity(query)
-        if entity_id is not None:
+        if entity_id is not None and entity_id not in ineligible_ids:
             return Resolved(entity_id=entity_id, display_name=query)
         return local
 
@@ -763,28 +803,57 @@ class DaemonAPIServer:
         tme = _parse_tme_link(dialog)
         username = tme[0] if tme is not None else dialog[1:] if dialog.startswith("@") else None
         if username is not None:
+            ineligible_ids = {
+                entity_id
+                for entity_id, (_name, _type, eligible) in self._local_dialog_metadata().items()
+                if not eligible
+            }
             return await self._resolve_dialog_username(
                 dialog,
                 username,
                 allow_remote_lookup=allow_remote_lookup,
+                ineligible_ids=ineligible_ids,
             )
 
-        local_names, local_normalized, fuzzy_names, fuzzy_normalized = self._local_dialog_directory()
-        exact_result = self._resolve_exact_natural_name(dialog, local_names, local_normalized)
+        (
+            local_names,
+            local_normalized,
+            fuzzy_names,
+            fuzzy_normalized,
+            entity_types,
+            ineligible_ids,
+        ) = self._local_dialog_directory()
+        exact_result = self._resolve_exact_natural_name(dialog, local_names, local_normalized, entity_types)
         if exact_result is not None:
             return exact_result
         local_result = _fuzzy_resolve(dialog, fuzzy_names, normalized_name_map=fuzzy_normalized)
+        self._apply_dialog_candidate_types(local_result, entity_types)
         if not allow_remote_lookup:
             return local_result
 
         logger.debug("resolve_dialog_fallback_iter_dialogs query=%r", dialog)
-        remote_names, remote_normalized = await self._remote_dialog_directory()
+        remote_names, remote_normalized = await self._remote_dialog_directory(excluded_ids=ineligible_ids)
         all_names = {**fuzzy_names, **remote_names}
         all_normalized = {**fuzzy_normalized, **remote_normalized}
-        exact_result = self._resolve_exact_natural_name(dialog, all_names, all_normalized)
+        exact_result = self._resolve_exact_natural_name(dialog, all_names, all_normalized, entity_types)
         if exact_result is not None:
             return exact_result
-        return _fuzzy_resolve(dialog, all_names, normalized_name_map=all_normalized)
+        result = _fuzzy_resolve(dialog, all_names, normalized_name_map=all_normalized)
+        self._apply_dialog_candidate_types(result, entity_types)
+        return result
+
+    @staticmethod
+    def _dialog_resolution_retryable_response(*, retry_after: int | None = None) -> dict[str, object]:
+        response: dict[str, object] = {
+            "ok": False,
+            "error": "dialog_resolution_retryable",
+            "message": "Telegram dialog enumeration did not complete; no dialog was selected.",
+            "retryable": True,
+            "required_action": "Retry the request; use an exact dialog id when already known.",
+        }
+        if retry_after is not None:
+            response["retry_after"] = retry_after
+        return response
 
     async def _resolve_dialog_id(
         self,
@@ -796,7 +865,11 @@ class DaemonAPIServer:
         if selector.exact_id is not None:
             return selector.exact_id
         assert selector.query is not None
-        result = await self._resolve_dialog_name(selector.query, allow_remote_lookup=allow_remote_lookup)
+        try:
+            result = await self._resolve_dialog_name(selector.query, allow_remote_lookup=allow_remote_lookup)
+        except (RPCError, TimeoutError) as exc:
+            retry_after = flood_seconds(exc) if isinstance(exc, FloodWaitErrors) else None
+            return self._dialog_resolution_retryable_response(retry_after=retry_after)
         if isinstance(result, Resolved):
             return result.entity_id
         if isinstance(result, Candidates):

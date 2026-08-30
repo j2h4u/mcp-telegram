@@ -361,12 +361,12 @@ class DaemonConnection:
     async def list_topics(
         self,
         *,
-        dialog_id: int = 0,
+        dialog_id: int | None = None,
         dialog: str | None = None,
     ) -> dict:
         """List forum topics. Accepts dialog name or numeric id."""
         payload: dict[str, object] = {"method": "list_topics"}
-        if dialog_id != 0 or dialog is None:
+        if dialog_id is not None:
             payload["dialog_id"] = dialog_id
         if dialog is not None:
             payload["dialog"] = dialog
@@ -455,13 +455,13 @@ class DaemonConnection:
     async def get_dialog_stats(
         self,
         *,
-        dialog_id: int = 0,
+        dialog_id: int | None = None,
         dialog: str | None = None,
         limit: int = 5,
     ) -> dict:
         """Return aggregated stats (reactions, mentions, hashtags, forwards) for a dialog."""
         payload: dict[str, object] = {"method": "get_dialog_stats", "limit": limit}
-        if dialog_id != 0 or dialog is None:
+        if dialog_id is not None:
             payload["dialog_id"] = dialog_id
         if dialog is not None:
             payload["dialog"] = dialog

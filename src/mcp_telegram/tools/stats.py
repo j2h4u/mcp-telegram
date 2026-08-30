@@ -18,6 +18,7 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
+from .dialog_resolution import project_dialog_resolution_error
 
 logger = logging.getLogger(__name__)
 _DEEP_PAGE_DEPTH_THRESHOLD = 5
@@ -294,19 +295,17 @@ async def get_dialog_stats(args: GetDialogStats) -> ToolResult:
     if not response.get("ok"):
         error = response.get("error", "")
         msg = response.get("message", "Request failed.")
-        if error in {"ambiguous_dialog", "dialog_not_found"} and (
-            response.get("candidates") is not None or response.get("suggestion") is not None
-        ):
-            structured_content = {
-                key: response[key]
-                for key in ("error", "message", "candidates", "suggestion", "required_action")
-                if key in response
-            }
-            err = error_result(
-                f"Error: {error}: {msg}\n"
-                f"Action: {structured_content.get('required_action') or 'Retry GetDialogStats with an exact dialog id.'}"
+        projection = project_dialog_resolution_error(
+            response,
+            fallback_action="Retry GetDialogStats with an exact dialog id.",
+        )
+        if projection is not None:
+            err = error_result(projection.text)
+            return ToolResult(
+                content=err.content,
+                is_error=True,
+                structured_content=projection.structured_content,
             )
-            return ToolResult(content=err.content, is_error=True, structured_content=structured_content)
         if error == "not_synced":
             return error_result(
                 f"Error: dialog is not synced. {msg}\n"

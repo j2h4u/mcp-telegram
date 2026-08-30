@@ -63,11 +63,7 @@ def _selector_from_natural_value(value: object) -> DialogSelector:
             "Dialog must be a nonempty string or an exact dialog id must be provided.",
         )
     if _SIGNED_ASCII_DECIMAL_RE.fullmatch(query):
-        try:
-            exact_id = int(query)
-        except ValueError as exc:  # defensive: regex-bounded ASCII decimal always parses
-            raise DialogSelectorError("invalid_dialog_selector", "Dialog id is invalid.") from exc
-        return DialogSelector(exact_id=_validated_exact_id(exact_id))
+        return DialogSelector(exact_id=_validated_exact_id(int(query)))
     return DialogSelector(query=query)
 
 

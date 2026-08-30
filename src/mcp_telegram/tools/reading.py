@@ -29,6 +29,7 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
+from .dialog_resolution import project_dialog_resolution_error
 from .message_view import MESSAGE_VIEW_SCHEMA, ReadMarker, project_message_view, project_read_markers
 from .search_hit import SEARCH_HIT_SCHEMA, extract_search_snippet, project_search_hit
 from .structured import (
@@ -151,6 +152,7 @@ class _ListMessagesErrorContext:
     has_filter: bool
     has_cursor: bool
     structured_content: dict[str, object] | None = None
+    rendered_text: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -851,21 +853,15 @@ def _search_messages_error_result(
     dialog_label: str | None,
     has_cursor: bool,
 ) -> ToolResult:
-    if error in {"ambiguous_dialog", "dialog_not_found"} and (
-        response.get("candidates") is not None or response.get("suggestion") is not None
-    ):
-        structured_content = {
-            key: response[key]
-            for key in ("error", "message", "candidates", "suggestion", "required_action")
-            if key in response
-        }
+    projection = project_dialog_resolution_error(
+        response,
+        fallback_action="Retry SearchMessages with an exact dialog id.",
+    )
+    if projection is not None:
         return ToolResult(
-            content=_text_response(
-                f"Error: {error}: {error_detail}\n"
-                f"Action: {structured_content.get('required_action') or 'Retry SearchMessages with an exact dialog id.'}"
-            ),
+            content=_text_response(projection.text),
             is_error=True,
-            structured_content=structured_content,
+            structured_content=projection.structured_content,
             has_filter=True,
             has_cursor=has_cursor,
         )
@@ -1226,8 +1222,8 @@ def _list_messages_error_result(
     if ctx.structured_content is not None:
         return ToolResult(
             content=_text_response(
-                f"Error: {ctx.error}: {ctx.error_detail}\n"
-                f"Action: {ctx.structured_content.get('required_action') or 'Retry list_messages with corrected arguments.'}"
+                ctx.rendered_text
+                or f"Error: {ctx.error}: {ctx.error_detail}\nAction: Retry list_messages with corrected arguments."
             ),
             is_error=True,
             structured_content=ctx.structured_content,
@@ -1250,14 +1246,6 @@ def _list_messages_error_result(
 
 def _list_messages_structured_error_content(response: dict) -> dict[str, object] | None:
     error = response.get("error")
-    if error in {"ambiguous_dialog", "dialog_not_found"} and (
-        response.get("candidates") is not None or response.get("suggestion") is not None
-    ):
-        return {
-            key: response[key]
-            for key in ("error", "message", "candidates", "suggestion", "required_action")
-            if key in response
-        }
     if error not in {"fragment_fetch_failed", "not_synced"}:
         return None
     return {
@@ -1328,6 +1316,10 @@ async def list_messages(args: ListMessages) -> ToolResult:
         return error_result(_daemon_not_running_text(exc))
 
     if not response.get("ok"):
+        dialog_projection = project_dialog_resolution_error(
+            response,
+            fallback_action="Retry ListMessages with an exact dialog id.",
+        )
         return _list_messages_error_result(
             _ListMessagesErrorContext(
                 error=response.get("error", "unknown"),
@@ -1335,7 +1327,12 @@ async def list_messages(args: ListMessages) -> ToolResult:
                 dialog_label=request_context.dialog_label,
                 has_filter=request_context.has_filter,
                 has_cursor=request_context.has_cursor,
-                structured_content=_list_messages_structured_error_content(response),
+                structured_content=(
+                    dialog_projection.structured_content
+                    if dialog_projection is not None
+                    else _list_messages_structured_error_content(response)
+                ),
+                rendered_text=dialog_projection.text if dialog_projection is not None else None,
             )
         )
 

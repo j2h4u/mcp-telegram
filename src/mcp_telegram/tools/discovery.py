@@ -17,6 +17,7 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
+from .dialog_resolution import project_dialog_resolution_error
 from .structured import (
     FOLDER_SNAPSHOT_OUTPUT_SCHEMA,
     StructuredWarning,
@@ -471,7 +472,7 @@ async def _fetch_topics_response(
     dialog_id: int | None,
     dialog_name: str | None,
 ) -> dict[str, object]:
-    if dialog_id is not None and dialog_id != 0:
+    if dialog_id is not None:
         return await conn.list_topics(dialog_id=dialog_id)
     return await conn.list_topics(dialog=dialog_name)
 
@@ -479,20 +480,21 @@ async def _fetch_topics_response(
 def _list_topics_error_result(args: ListTopics, response: dict[str, object]) -> ToolResult:
     error_code = response.get("error", "")
     error_msg = response.get("message", "Request failed.")
-    if error_code in {"ambiguous_dialog", "dialog_not_found"} and (
-        response.get("candidates") is not None or response.get("suggestion") is not None
-    ):
-        structured_content: dict[str, object] = {
-            key: response[key]
-            for key in ("error", "message", "candidates", "suggestion", "required_action")
-            if key in response
-        }
+    projection = project_dialog_resolution_error(
+        response,
+        fallback_action="Retry ListTopics with an exact dialog id.",
+    )
+    if projection is not None:
         err = error_result(
-            f"Error: {error_code}: {error_msg}\n"
-            f"Action: {structured_content.get('required_action') or 'Retry ListTopics with an exact dialog id.'}",
+            projection.text,
             has_filter=True,
         )
-        return ToolResult(content=err.content, is_error=True, structured_content=structured_content, has_filter=True)
+        return ToolResult(
+            content=err.content,
+            is_error=True,
+            structured_content=projection.structured_content,
+            has_filter=True,
+        )
     if error_code == "dialog_not_found":
         from ..errors import dialog_not_found_text
 
