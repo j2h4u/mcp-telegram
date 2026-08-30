@@ -1278,6 +1278,8 @@ class ReadingService:
             "created": row["created"],
             **sync_read_model.to_wire(),
             "access_lost_at": row["access_lost_at"],
+            "unread_in": None,
+            "unread_out": None,
             "unread_mentions_count": _object_to_int(row["unread_mentions_count"], 0),
             "unread_reactions_count": _object_to_int(row["unread_reactions_count"], 0),
             **ReadingService._dialog_lifecycle_fields(row, scheduled_summary, inclusion_basis),

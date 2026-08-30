@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 
 from .realtime_history_policy import RealtimeHistoryCoverage, realtime_history_coverage
 
@@ -58,30 +59,54 @@ class CoverageState(StrEnum):
     TELEGRAM_TOTAL_COMPARABLE = "telegram_total_comparable"
 
 
-_HISTORY_SCOPE_BY_STATUS = {
-    SyncStatus.SYNCED: HistoryScope.FULL,
-    SyncStatus.SYNCING: HistoryScope.FULL,
-    SyncStatus.OWN_ONLY: HistoryScope.OWN_ONLY,
-    SyncStatus.FRAGMENT: HistoryScope.FRAGMENT,
-    SyncStatus.ACCESS_LOST: HistoryScope.ACCESS_LOST,
-    SyncStatus.NOT_SYNCED: HistoryScope.NONE,
-}
-_HISTORY_DEPTH_BY_STATUS = {
-    SyncStatus.SYNCED: HistoryDepthState.COMPLETE,
-    SyncStatus.SYNCING: HistoryDepthState.PARTIAL,
-    SyncStatus.OWN_ONLY: HistoryDepthState.PARTIAL,
-    SyncStatus.FRAGMENT: HistoryDepthState.PARTIAL,
-    SyncStatus.ACCESS_LOST: HistoryDepthState.PARTIAL,
-    SyncStatus.NOT_SYNCED: HistoryDepthState.NONE,
-}
-_HISTORY_SYNC_BY_STATUS = {
-    SyncStatus.SYNCED: HistorySyncState.COMPLETE_AS_OF_LAST_SYNC,
-    SyncStatus.SYNCING: HistorySyncState.SYNCING,
-    SyncStatus.OWN_ONLY: HistorySyncState.OWN_MESSAGES_ONLY,
-    SyncStatus.FRAGMENT: HistorySyncState.FRAGMENT_ONLY,
-    SyncStatus.ACCESS_LOST: HistorySyncState.ACCESS_LOST_ARCHIVE,
-    SyncStatus.NOT_SYNCED: HistorySyncState.NOT_SYNCED,
-}
+@dataclass(frozen=True, slots=True)
+class _StatusProfile:
+    history_scope: HistoryScope
+    history_depth_state: HistoryDepthState
+    history_sync_state: HistorySyncState
+    advisory: str
+
+
+_STATUS_PROFILES: Mapping[SyncStatus, _StatusProfile] = MappingProxyType(
+    {
+        SyncStatus.SYNCED: _StatusProfile(
+            HistoryScope.FULL,
+            HistoryDepthState.COMPLETE,
+            HistorySyncState.COMPLETE_AS_OF_LAST_SYNC,
+            "Full history was fetched as of last_synced_at; ongoing freshness is represented by local_knowledge_at.",
+        ),
+        SyncStatus.SYNCING: _StatusProfile(
+            HistoryScope.FULL,
+            HistoryDepthState.PARTIAL,
+            HistorySyncState.SYNCING,
+            "History sync state is represented by history_sync_state.",
+        ),
+        SyncStatus.OWN_ONLY: _StatusProfile(
+            HistoryScope.OWN_ONLY,
+            HistoryDepthState.PARTIAL,
+            HistorySyncState.OWN_MESSAGES_ONLY,
+            "Only own-message-related history is stored for this dialog.",
+        ),
+        SyncStatus.FRAGMENT: _StatusProfile(
+            HistoryScope.FRAGMENT,
+            HistoryDepthState.PARTIAL,
+            HistorySyncState.FRAGMENT_ONLY,
+            "History sync state is represented by history_sync_state.",
+        ),
+        SyncStatus.ACCESS_LOST: _StatusProfile(
+            HistoryScope.ACCESS_LOST,
+            HistoryDepthState.PARTIAL,
+            HistorySyncState.ACCESS_LOST_ARCHIVE,
+            "This dialog is an access-lost local archive, not a current live mirror.",
+        ),
+        SyncStatus.NOT_SYNCED: _StatusProfile(
+            HistoryScope.NONE,
+            HistoryDepthState.NONE,
+            HistorySyncState.NOT_SYNCED,
+            "This dialog is not enrolled for history sync.",
+        ),
+    }
+)
 _REALTIME_HISTORY_WIRE = {
     RealtimeHistoryCoverage.FULL_HISTORY: RealtimeHistory.FULL,
     RealtimeHistoryCoverage.OWN_OUTGOING: RealtimeHistory.OWN_ONLY,
@@ -111,6 +136,8 @@ class SyncReadModel:
     coverage_state: CoverageState
     local_knowledge_at: int | None
     local_knowledge_age_seconds: int | None
+    observed_at: int
+    action: str
 
     def to_wire(self) -> dict[str, object]:
         """Serialize the complete canonical daemon-to-delivery contract."""
@@ -133,6 +160,8 @@ class SyncReadModel:
             "coverage_state": self.coverage_state.value,
             "local_knowledge_at": self.local_knowledge_at,
             "local_knowledge_age_seconds": self.local_knowledge_age_seconds,
+            "observed_at": self.observed_at,
+            "action": self.action,
         }
 
 
@@ -191,6 +220,32 @@ def _realtime_history(status: SyncStatus, enrollment_enabled: bool | None) -> Re
     return _REALTIME_HISTORY_WIRE[coverage]
 
 
+def _coverage_advisory(total_messages: int | None, saved_message_count: int) -> str:
+    if total_messages is None:
+        return "Coverage is unknown without Telegram total_messages."
+    if saved_message_count > total_messages:
+        return "Local message_count exceeds Telegram total_messages, so coverage is not comparable."
+    if total_messages == 0:
+        return "Empty dialogs are complete; non-empty local counts would be inconsistent."
+    return "Treat sync_coverage_pct as an approximate local-vs-Telegram ratio."
+
+
+def _action(
+    profile: _StatusProfile,
+    total_messages: int | None,
+    saved_message_count: int,
+    coverage_state: CoverageState,
+) -> str:
+    parts = [
+        profile.advisory,
+        "sync_progress is a message_id offset, not a count.",
+        _coverage_advisory(total_messages, saved_message_count),
+    ]
+    if coverage_state is CoverageState.TELEGRAM_TOTAL_NOT_COMPARABLE:
+        parts.append("Stored Telegram total_messages is suspect; percentage coverage is diagnostic-only.")
+    return " ".join(parts)
+
+
 def build_sync_read_model(  # noqa: PLR0913
     *,
     persisted_status: str | None,
@@ -213,11 +268,24 @@ def build_sync_read_model(  # noqa: PLR0913
     timestamp = _strict_int("now", now)
     if saved_count < 0:
         raise SyncReadModelContractError("saved_message_count must be non-negative")
+    if timestamp < 0:
+        raise SyncReadModelContractError("now must be non-negative")
+    for name, value in (
+        ("last_synced_at", last_synced),
+        ("last_event_at", last_event),
+        ("last_delta_checked_at", last_delta),
+    ):
+        if value is not None and value < 0:
+            raise SyncReadModelContractError(f"{name} must be non-negative or null")
+        if value is not None and value > timestamp:
+            raise SyncReadModelContractError(f"{name} cannot be later than observed_at")
 
     local_knowledge_at = max(
         (value for value in (last_synced, last_event, last_delta) if value is not None),
         default=None,
     )
+    profile = _STATUS_PROFILES[status]
+    coverage_state = _coverage_state(telegram_total, saved_count)
     return SyncReadModel(
         sync_status=status,
         enrollment_enabled=enrollment,
@@ -229,14 +297,16 @@ def build_sync_read_model(  # noqa: PLR0913
         synced=status is SyncStatus.SYNCED,
         is_syncing=status is SyncStatus.SYNCING,
         realtime_history=_realtime_history(status, enrollment),
-        history_scope=_HISTORY_SCOPE_BY_STATUS[status],
-        history_depth_state=_HISTORY_DEPTH_BY_STATUS[status],
-        history_sync_state=_HISTORY_SYNC_BY_STATUS[status],
+        history_scope=profile.history_scope,
+        history_depth_state=profile.history_depth_state,
+        history_sync_state=profile.history_sync_state,
         history_complete_at=last_synced if status is SyncStatus.SYNCED else None,
         sync_coverage_pct=compute_sync_coverage(telegram_total, saved_count),
-        coverage_state=_coverage_state(telegram_total, saved_count),
+        coverage_state=coverage_state,
         local_knowledge_at=local_knowledge_at,
-        local_knowledge_age_seconds=(None if local_knowledge_at is None else max(0, timestamp - local_knowledge_at)),
+        local_knowledge_age_seconds=(None if local_knowledge_at is None else timestamp - local_knowledge_at),
+        observed_at=timestamp,
+        action=_action(profile, telegram_total, saved_count, coverage_state),
     )
 
 
@@ -263,6 +333,13 @@ def _bool_field(data: Mapping[str, object], name: str) -> bool:
     return value
 
 
+def _string_field(data: Mapping[str, object], name: str) -> str:
+    value = _required(data, name)
+    if not isinstance(value, str):
+        raise SyncReadModelContractError(f"{name} must be a string, got {type(value).__name__}")
+    return value
+
+
 def _optional_bool_field(data: Mapping[str, object], name: str) -> bool | None:
     return _strict_optional_bool(name, _required(data, name))
 
@@ -284,27 +361,13 @@ def _validate_decoded(model: SyncReadModel) -> None:
         last_delta_checked_at=model.last_delta_checked_at,
         saved_message_count=model.saved_message_count,
         total_messages=model.total_messages,
-        now=(0 if model.local_knowledge_at is None else model.local_knowledge_at),
+        now=model.observed_at,
     )
-    comparable_fields = (
-        "synced",
-        "is_syncing",
-        "realtime_history",
-        "history_scope",
-        "history_depth_state",
-        "history_sync_state",
-        "history_complete_at",
-        "sync_coverage_pct",
-        "coverage_state",
-        "local_knowledge_at",
-    )
-    for name in comparable_fields:
-        if getattr(model, name) != getattr(expected, name):
+    expected_wire = expected.to_wire()
+    model_wire = model.to_wire()
+    for name, expected_value in expected_wire.items():
+        if model_wire[name] != expected_value:
             raise SyncReadModelContractError(f"inconsistent canonical sync field: {name}")
-    if model.local_knowledge_age_seconds is not None and model.local_knowledge_age_seconds < 0:
-        raise SyncReadModelContractError("local_knowledge_age_seconds must be non-negative or null")
-    if (model.local_knowledge_at is None) != (model.local_knowledge_age_seconds is None):
-        raise SyncReadModelContractError("local knowledge timestamp and age must both be null or both be integers")
 
 
 def decode_sync_read_model(data: Mapping[str, object]) -> SyncReadModel:
@@ -328,6 +391,8 @@ def decode_sync_read_model(data: Mapping[str, object]) -> SyncReadModel:
         coverage_state=_enum_field(data, "coverage_state", CoverageState),
         local_knowledge_at=_optional_int_field(data, "local_knowledge_at"),
         local_knowledge_age_seconds=_optional_int_field(data, "local_knowledge_age_seconds"),
+        observed_at=_int_field(data, "observed_at"),
+        action=_string_field(data, "action"),
     )
     _validate_decoded(model)
     return model

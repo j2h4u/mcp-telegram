@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Literal, cast
 
 from pydantic import ConfigDict, Field, StrictInt, model_validator
@@ -213,49 +214,55 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
 }
 
 
-def _structured_dialog_lifecycle_fields(dialog: dict) -> dict[str, object]:
-    draft_text = dialog.get("draft_text")
-    return {
-        "draft_text": draft_text,
-        "draft_content": telegram_content(str(draft_text), "message_text") if draft_text is not None else None,
-        "scheduled_count": int(dialog.get("scheduled_count", 0) or 0),
-        "next_scheduled_at": dialog.get("next_scheduled_at"),
-        "inclusion_basis": dialog.get("inclusion_basis"),
-    }
+@dataclass(frozen=True, slots=True)
+class _FolderSnapshotSurface:
+    generation: int | None
+    status: str
+    completed_at: int | None
+    age_seconds: int | None
+    complete: bool
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "generation": self.generation,
+            "status": self.status,
+            "completed_at": self.completed_at,
+            "age_seconds": self.age_seconds,
+            "complete": self.complete,
+        }
 
 
-def _structured_folder_placement(dialog: dict) -> dict[str, object]:
-    folders: list[dict[str, object]] = []
-    for folder in dialog.get("folders", []):
-        if not isinstance(folder, dict):
-            continue
-        raw_id = folder.get("id")
-        if isinstance(raw_id, bool) or not isinstance(raw_id, int):
-            continue
-        folders.append(
-            {
-                "id": raw_id,
-                "title": telegram_content(str(folder.get("title", "")), "message_text"),
-            }
-        )
-    return {
-        "folder_ids": list(dialog.get("folder_ids", [])),
-        "folders": folders,
-    }
+@dataclass(frozen=True, slots=True)
+class _DialogSurface:
+    model: SyncReadModel
+    dialog_id: int
+    name: str | None
+    dialog_type: str | None
+    last_message_at: int | str | None
+    unread_count: int | None
+    access_lost_at: int | None
+    members: int | None
+    created: int | str | None
+    unread_in: int | None
+    unread_out: int | None
+    unread_mentions_count: int
+    unread_reactions_count: int
+    draft_text: str | None
+    scheduled_count: int
+    next_scheduled_at: int | None
+    inclusion_basis: list[str] | None
+    folder_ids: list[int]
+    folders: list[tuple[int, str]]
+    archived: bool
 
 
-def _structured_sync_read_model(model: SyncReadModel) -> dict[str, object]:
-    return {
-        "saved_message_count": model.saved_message_count,
-        "history_scope": model.history_scope.value,
-        "history_depth_state": model.history_depth_state.value,
-        "history_sync_state": model.history_sync_state.value,
-        "history_complete_at": model.history_complete_at,
-        "last_delta_checked_at": model.last_delta_checked_at,
-        "coverage_state": model.coverage_state.value,
-        "local_knowledge_at": model.local_knowledge_at,
-        "local_knowledge_age_seconds": model.local_knowledge_age_seconds,
-    }
+@dataclass(frozen=True, slots=True)
+class _ListDialogsSurface:
+    dialogs: list[_DialogSurface]
+    snapshot_age_h: int | None
+    bootstrap_pending: bool
+    scope: str
+    folder_snapshot: _FolderSnapshotSurface
 
 
 def _list_dialogs_contract_error(detail: str) -> ToolResult:
@@ -265,65 +272,146 @@ def _list_dialogs_contract_error(detail: str) -> ToolResult:
     )
 
 
-def _strict_optional_int(data: Mapping[str, object], name: str) -> int | None:
+def _required(data: Mapping[str, object], name: str, *, context: str) -> object:
     if name not in data:
-        raise SyncReadModelContractError(f"missing list_dialogs field: {name}")
-    value = data[name]
-    if value is None:
-        return None
+        raise SyncReadModelContractError(f"missing {context} field: {name}")
+    return data[name]
+
+
+def _strict_int(data: Mapping[str, object], name: str, *, context: str) -> int:
+    value = _required(data, name, context=context)
     if isinstance(value, bool) or not isinstance(value, int):
-        raise SyncReadModelContractError(f"{name} must be an integer or null")
+        raise SyncReadModelContractError(f"{context}.{name} must be an integer")
     return value
 
 
-def _strict_folder_snapshot(value: object) -> dict[str, object]:
+def _strict_optional_int(data: Mapping[str, object], name: str, *, context: str) -> int | None:
+    value = _required(data, name, context=context)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SyncReadModelContractError(f"{context}.{name} must be an integer or null")
+    return value
+
+
+def _strict_optional_string(data: Mapping[str, object], name: str, *, context: str) -> str | None:
+    value = _required(data, name, context=context)
+    if value is None or isinstance(value, str):
+        return value
+    raise SyncReadModelContractError(f"{context}.{name} must be a string or null")
+
+
+def _strict_optional_timestamp(data: Mapping[str, object], name: str, *, context: str) -> int | str | None:
+    value = _required(data, name, context=context)
+    if value is None or isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool)):
+        return value
+    raise SyncReadModelContractError(f"{context}.{name} must be an integer, string, or null")
+
+
+def _strict_bool(data: Mapping[str, object], name: str, *, context: str) -> bool:
+    value = _required(data, name, context=context)
+    if not isinstance(value, bool):
+        raise SyncReadModelContractError(f"{context}.{name} must be a boolean")
+    return value
+
+
+def _strict_string_list_or_none(data: Mapping[str, object], name: str, *, context: str) -> list[str] | None:
+    value = _required(data, name, context=context)
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise SyncReadModelContractError(f"{context}.{name} must be an array of strings or null")
+    return value
+
+
+def _strict_int_list(data: Mapping[str, object], name: str, *, context: str) -> list[int]:
+    value = _required(data, name, context=context)
+    if not isinstance(value, list) or not all(isinstance(item, int) and not isinstance(item, bool) for item in value):
+        raise SyncReadModelContractError(f"{context}.{name} must be an array of integers")
+    return value
+
+
+def _strict_folders(data: Mapping[str, object], *, context: str) -> list[tuple[int, str]]:
+    value = _required(data, "folders", context=context)
+    if not isinstance(value, list):
+        raise SyncReadModelContractError(f"{context}.folders must be an array")
+    folders: list[tuple[int, str]] = []
+    for index, item in enumerate(value):
+        item_context = f"{context}.folders[{index}]"
+        if not isinstance(item, Mapping):
+            raise SyncReadModelContractError(f"{item_context} must be an object")
+        folder_id = _strict_int(item, "id", context=item_context)
+        title = _required(item, "title", context=item_context)
+        if not isinstance(title, str):
+            raise SyncReadModelContractError(f"{item_context}.title must be a string")
+        folders.append((folder_id, title))
+    return folders
+
+
+def _strict_folder_snapshot(value: object) -> _FolderSnapshotSurface:
     if not isinstance(value, Mapping):
         raise SyncReadModelContractError("folder_snapshot must be an object")
-    generation = _strict_optional_int(value, "generation")
-    completed_at = _strict_optional_int(value, "completed_at")
-    age_seconds = _strict_optional_int(value, "age_seconds")
-    status = value.get("status")
-    complete = value.get("complete")
-    if status not in {"fresh", "stale", "unavailable"}:
+    context = "folder_snapshot"
+    generation = _strict_optional_int(value, "generation", context=context)
+    completed_at = _strict_optional_int(value, "completed_at", context=context)
+    age_seconds = _strict_optional_int(value, "age_seconds", context=context)
+    status = _required(value, "status", context=context)
+    complete = _required(value, "complete", context=context)
+    if not isinstance(status, str) or status not in {"fresh", "stale", "unavailable"}:
         raise SyncReadModelContractError("folder_snapshot.status is invalid")
     if not isinstance(complete, bool):
         raise SyncReadModelContractError("folder_snapshot.complete must be a boolean")
-    return {
-        "generation": generation,
-        "status": status,
-        "completed_at": completed_at,
-        "age_seconds": age_seconds,
-        "complete": complete,
-    }
+    return _FolderSnapshotSurface(generation, cast(str, status), completed_at, age_seconds, complete)
+
+
+def _strict_dialog(value: object, index: int) -> _DialogSurface:
+    context = f"dialogs[{index}]"
+    if not isinstance(value, Mapping):
+        raise SyncReadModelContractError(f"{context} must be an object")
+    return _DialogSurface(
+        model=decode_sync_read_model(value),
+        dialog_id=_strict_int(value, "id", context=context),
+        name=_strict_optional_string(value, "name", context=context),
+        dialog_type=_strict_optional_string(value, "type", context=context),
+        last_message_at=_strict_optional_timestamp(value, "last_message_at", context=context),
+        unread_count=_strict_optional_int(value, "unread_count", context=context),
+        access_lost_at=_strict_optional_int(value, "access_lost_at", context=context),
+        members=_strict_optional_int(value, "members", context=context),
+        created=_strict_optional_timestamp(value, "created", context=context),
+        unread_in=_strict_optional_int(value, "unread_in", context=context),
+        unread_out=_strict_optional_int(value, "unread_out", context=context),
+        unread_mentions_count=_strict_int(value, "unread_mentions_count", context=context),
+        unread_reactions_count=_strict_int(value, "unread_reactions_count", context=context),
+        draft_text=_strict_optional_string(value, "draft_text", context=context),
+        scheduled_count=_strict_int(value, "scheduled_count", context=context),
+        next_scheduled_at=_strict_optional_int(value, "next_scheduled_at", context=context),
+        inclusion_basis=_strict_string_list_or_none(value, "inclusion_basis", context=context),
+        folder_ids=_strict_int_list(value, "folder_ids", context=context),
+        folders=_strict_folders(value, context=context),
+        archived=_strict_bool(value, "archived", context=context),
+    )
 
 
 def _strict_list_dialogs_data(
     response: Mapping[str, object],
-) -> tuple[list[dict[str, object]], int | None, bool, str, dict[str, object]]:
+) -> _ListDialogsSurface:
     raw_data = response.get("data")
     if not isinstance(raw_data, Mapping):
         raise SyncReadModelContractError("data must be an object")
-    if "dialogs" not in raw_data or not isinstance(raw_data["dialogs"], list):
+    raw_dialogs = _required(raw_data, "dialogs", context="list_dialogs")
+    if not isinstance(raw_dialogs, list):
         raise SyncReadModelContractError("dialogs must be an array")
-    dialogs: list[dict[str, object]] = []
-    for index, raw_dialog in enumerate(raw_data["dialogs"]):
-        if not isinstance(raw_dialog, Mapping):
-            raise SyncReadModelContractError(f"dialogs[{index}] must be an object")
-        dialogs.append(dict(raw_dialog))
-    if "bootstrap_pending" not in raw_data or not isinstance(raw_data["bootstrap_pending"], bool):
-        raise SyncReadModelContractError("bootstrap_pending must be a boolean")
-    scope = raw_data.get("scope")
-    if scope not in {"all", "own_only"}:
+    dialogs = [_strict_dialog(raw_dialog, index) for index, raw_dialog in enumerate(raw_dialogs)]
+    bootstrap_pending = _strict_bool(raw_data, "bootstrap_pending", context="list_dialogs")
+    scope = _required(raw_data, "scope", context="list_dialogs")
+    if not isinstance(scope, str) or scope not in {"all", "own_only"}:
         raise SyncReadModelContractError("scope must be all or own_only")
-    if "folder_snapshot" not in raw_data:
-        raise SyncReadModelContractError("missing list_dialogs field: folder_snapshot")
-    snapshot_age_h = _strict_optional_int(raw_data, "snapshot_age_h")
-    return (
-        dialogs,
-        snapshot_age_h,
-        raw_data["bootstrap_pending"],
-        cast(str, scope),
-        _strict_folder_snapshot(raw_data["folder_snapshot"]),
+    return _ListDialogsSurface(
+        dialogs=dialogs,
+        snapshot_age_h=_strict_optional_int(raw_data, "snapshot_age_h", context="list_dialogs"),
+        bootstrap_pending=bootstrap_pending,
+        scope=cast(str, scope),
+        folder_snapshot=_strict_folder_snapshot(_required(raw_data, "folder_snapshot", context="list_dialogs")),
     )
 
 
@@ -378,7 +466,7 @@ class ListDialogs(ToolArgs):
     over loading the full list.
 
     DM rows include integer 'unread_in' (incoming unread by me) and 'unread_out' (outgoing
-    unread by peer); non-DM rows omit both fields.
+    unread by peer); both fields are null for non-DM rows.
 
     Dialog rows include a local scheduled buffer summary. Use message_state="scheduled" to
     return only dialogs with pending author-only scheduled messages; "all" is the default.
@@ -387,10 +475,13 @@ class ListDialogs(ToolArgs):
     sync_status values:
       - 'not_synced'  — no bulk fetch attempted
       - 'syncing'     — bulk fetch in progress
-      - 'synced'      — full history mirrored locally, real-time events active
+      - 'synced'      — complete historical coverage as of history_complete_at; this does not prove active realtime
+      - 'own_only'    — only own-message-related history is stored
       - 'access_lost' — account no longer has access; read-only snapshot
       - 'fragment'    — no full sync; only point-fetched snippets from targeted
                         ListMessages(context_message_id=...) calls (Phase 999.1)
+
+    Call `get_sync_status` and inspect `realtime_history` when active realtime coverage matters.
     """
 
     exclude_archived: bool = False
@@ -438,46 +529,61 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
         return err
 
     try:
-        dialogs, snapshot_age_h, bootstrap_pending, scope, folder_snapshot = _strict_list_dialogs_data(response)
+        surface = _strict_list_dialogs_data(response)
     except SyncReadModelContractError as exc:
         return _list_dialogs_contract_error(str(exc))
     warnings: list[StructuredWarning] = []
-    if snapshot_age_h is not None:
+    if surface.snapshot_age_h is not None:
         warnings.append(
             structured_warning(
                 "snapshot_stale",
-                f"Dialog snapshot may be stale: snapshot_age_h={snapshot_age_h}.",
+                f"Dialog snapshot may be stale: snapshot_age_h={surface.snapshot_age_h}.",
                 severity="warning",
                 action="Treat list_dialogs as a cached snapshot; call get_sync_status for critical dialogs.",
             )
         )
     structured_dialogs: list[dict[str, object]] = []
-    for index, d in enumerate(dialogs):
-        try:
-            model = decode_sync_read_model(d)
-        except SyncReadModelContractError as exc:
-            return _list_dialogs_contract_error(f"dialogs[{index}]: {exc}")
+    for dialog in surface.dialogs:
+        wire = dialog.model.to_wire()
         structured_dialogs.append(
             {
-                "id": d.get("id"),
-                "name": d.get("name", ""),
-                "type": d.get("type"),
-                "last_message_at": d.get("last_message_at"),
-                "unread_count": d.get("unread_count"),
-                "sync_status": model.sync_status.value,
-                "synced": model.synced,
-                "sync_coverage_pct": model.sync_coverage_pct,
-                **_structured_sync_read_model(model),
-                "access_lost_at": d.get("access_lost_at"),
-                "members": d.get("members"),
-                "created": d.get("created"),
-                "unread_in": d.get("unread_in"),
-                "unread_out": d.get("unread_out"),
-                "unread_mentions_count": int(cast(int | str, d.get("unread_mentions_count", 0) or 0)),
-                "unread_reactions_count": int(cast(int | str, d.get("unread_reactions_count", 0) or 0)),
-                **_structured_dialog_lifecycle_fields(d),
-                **_structured_folder_placement(d),
-                "archived": bool(d.get("archived", False)),
+                "id": dialog.dialog_id,
+                "name": dialog.name,
+                "type": dialog.dialog_type,
+                "last_message_at": dialog.last_message_at,
+                "unread_count": dialog.unread_count,
+                "sync_status": wire["sync_status"],
+                "synced": wire["synced"],
+                "sync_coverage_pct": wire["sync_coverage_pct"],
+                "saved_message_count": wire["saved_message_count"],
+                "history_scope": wire["history_scope"],
+                "history_depth_state": wire["history_depth_state"],
+                "history_sync_state": wire["history_sync_state"],
+                "history_complete_at": wire["history_complete_at"],
+                "last_delta_checked_at": wire["last_delta_checked_at"],
+                "coverage_state": wire["coverage_state"],
+                "local_knowledge_at": wire["local_knowledge_at"],
+                "local_knowledge_age_seconds": wire["local_knowledge_age_seconds"],
+                "access_lost_at": dialog.access_lost_at,
+                "members": dialog.members,
+                "created": dialog.created,
+                "unread_in": dialog.unread_in,
+                "unread_out": dialog.unread_out,
+                "unread_mentions_count": dialog.unread_mentions_count,
+                "unread_reactions_count": dialog.unread_reactions_count,
+                "draft_text": dialog.draft_text,
+                "draft_content": (
+                    telegram_content(dialog.draft_text, "message_text") if dialog.draft_text is not None else None
+                ),
+                "scheduled_count": dialog.scheduled_count,
+                "next_scheduled_at": dialog.next_scheduled_at,
+                "inclusion_basis": dialog.inclusion_basis,
+                "folder_ids": dialog.folder_ids,
+                "folders": [
+                    {"id": folder_id, "title": telegram_content(title, "message_text")}
+                    for folder_id, title in dialog.folders
+                ],
+                "archived": dialog.archived,
             }
         )
     structured_content = {
@@ -492,14 +598,14 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
             "folder_id": args.folder_id,
             "limit": args.limit,
         },
-        "snapshot_age_h": snapshot_age_h,
-        "bootstrap_pending": bootstrap_pending,
-        "scope": scope,
-        "folder_snapshot": folder_snapshot,
+        "snapshot_age_h": surface.snapshot_age_h,
+        "bootstrap_pending": surface.bootstrap_pending,
+        "scope": surface.scope,
+        "folder_snapshot": surface.folder_snapshot.to_wire(),
         "warnings": warnings,
     }
 
-    if not dialogs:
+    if not surface.dialogs:
         return structured_result(structured_content, result_count=0)
 
     return structured_result(structured_content, result_count=len(structured_dialogs))

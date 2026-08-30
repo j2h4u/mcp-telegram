@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 from pydantic import Field
 
@@ -9,6 +10,7 @@ from ..sync_read_model import (
     HistoryScope,
     HistorySyncState,
     RealtimeHistory,
+    SyncReadModel,
     SyncReadModelContractError,
     SyncStatus,
     decode_sync_read_model,
@@ -66,8 +68,8 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "last_event_at": {"type": ["integer", "null"]},
         "last_delta_checked_at": {"type": ["integer", "null"]},
         "delta_refresh_requested_at": {"type": ["integer", "null"]},
-        "message_count": {"type": ["integer", "null"]},
-        "saved_message_count": {"type": ["integer", "null"]},
+        "message_count": {"type": "integer"},
+        "saved_message_count": {"type": "integer"},
         "history_scope": {"type": "string", "enum": [item.value for item in HistoryScope]},
         "history_depth_state": {"type": "string", "enum": [item.value for item in HistoryDepthState]},
         "history_sync_state": {"type": "string", "enum": [item.value for item in HistorySyncState]},
@@ -83,7 +85,7 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "access_lost_at": {"type": ["integer", "null"]},
         "access_last_revalidated_at": {"type": ["integer", "null"]},
         "access_next_revalidate_at": {"type": ["integer", "null"]},
-        "action": {"type": ["string", "null"]},
+        "action": {"type": "string"},
     },
     "required": [
         "dialog_id",
@@ -117,6 +119,57 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
     ],
     "additionalProperties": False,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _GetSyncStatusSurface:
+    model: SyncReadModel
+    dialog_id: int | None
+    enrollment_source: str | None
+    delta_refresh_requested_at: int | None
+    sync_progress: int | None
+    sync_progress_message_id: int | None
+    delete_detection: str | None
+    access_lost_at: int | None
+    access_last_revalidated_at: int | None
+    access_next_revalidate_at: int | None
+
+
+def _surface_required(data: Mapping[str, object], name: str) -> object:
+    if name not in data:
+        raise SyncReadModelContractError(f"missing get_sync_status field: {name}")
+    return data[name]
+
+
+def _surface_optional_int(data: Mapping[str, object], name: str) -> int | None:
+    value = _surface_required(data, name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SyncReadModelContractError(f"{name} must be an integer or null")
+    return value
+
+
+def _surface_optional_string(data: Mapping[str, object], name: str) -> str | None:
+    value = _surface_required(data, name)
+    if value is None or isinstance(value, str):
+        return value
+    raise SyncReadModelContractError(f"{name} must be a string or null")
+
+
+def _decode_get_sync_status_surface(data: Mapping[str, object]) -> _GetSyncStatusSurface:
+    return _GetSyncStatusSurface(
+        model=decode_sync_read_model(data),
+        dialog_id=_surface_optional_int(data, "dialog_id"),
+        enrollment_source=_surface_optional_string(data, "enrollment_source"),
+        delta_refresh_requested_at=_surface_optional_int(data, "delta_refresh_requested_at"),
+        sync_progress=_surface_optional_int(data, "sync_progress"),
+        sync_progress_message_id=_surface_optional_int(data, "sync_progress_message_id"),
+        delete_detection=_surface_optional_string(data, "delete_detection"),
+        access_lost_at=_surface_optional_int(data, "access_lost_at"),
+        access_last_revalidated_at=_surface_optional_int(data, "access_last_revalidated_at"),
+        access_next_revalidate_at=_surface_optional_int(data, "access_next_revalidate_at"),
+    )
 
 
 GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
@@ -342,43 +395,40 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
     if not isinstance(data, Mapping):
         return _sync_read_model_error("data must be an object")
     try:
-        model = decode_sync_read_model(data)
+        surface = _decode_get_sync_status_surface(data)
     except SyncReadModelContractError as exc:
         return _sync_read_model_error(str(exc))
 
-    status = model.sync_status.value
-    message_count = model.saved_message_count
-    total_messages = model.total_messages
-    sync_progress_message_id = data.get("sync_progress_message_id")
+    wire = surface.model.to_wire()
     structured_content = {
-        "dialog_id": data.get("dialog_id"),
-        "coverage_status": status,
-        "enrollment_enabled": model.enrollment_enabled,
-        "enrollment_source": data["enrollment_source"],
-        "realtime_history": model.realtime_history.value,
-        "is_syncing": model.is_syncing,
-        "last_synced_at": model.last_synced_at,
-        "last_event_at": model.last_event_at,
-        "last_delta_checked_at": model.last_delta_checked_at,
-        "delta_refresh_requested_at": data.get("delta_refresh_requested_at"),
-        "message_count": message_count,
-        "saved_message_count": model.saved_message_count,
-        "history_scope": model.history_scope.value,
-        "history_depth_state": model.history_depth_state.value,
-        "history_sync_state": model.history_sync_state.value,
-        "history_complete_at": model.history_complete_at,
-        "coverage_state": model.coverage_state.value,
-        "local_knowledge_at": model.local_knowledge_at,
-        "local_knowledge_age_seconds": model.local_knowledge_age_seconds,
-        "sync_progress": data.get("sync_progress"),
-        "sync_progress_message_id": sync_progress_message_id,
-        "total_messages": total_messages,
-        "delete_detection": data.get("delete_detection"),
-        "sync_coverage_pct": model.sync_coverage_pct,
-        "access_lost_at": data.get("access_lost_at"),
-        "access_last_revalidated_at": data.get("access_last_revalidated_at"),
-        "access_next_revalidate_at": data.get("access_next_revalidate_at"),
-        "action": _sync_status_action(status, message_count, total_messages, model.coverage_state.value),
+        "dialog_id": surface.dialog_id,
+        "coverage_status": wire["sync_status"],
+        "enrollment_enabled": wire["enrollment_enabled"],
+        "enrollment_source": surface.enrollment_source,
+        "realtime_history": wire["realtime_history"],
+        "is_syncing": wire["is_syncing"],
+        "last_synced_at": wire["last_synced_at"],
+        "last_event_at": wire["last_event_at"],
+        "last_delta_checked_at": wire["last_delta_checked_at"],
+        "delta_refresh_requested_at": surface.delta_refresh_requested_at,
+        "message_count": wire["saved_message_count"],
+        "saved_message_count": wire["saved_message_count"],
+        "history_scope": wire["history_scope"],
+        "history_depth_state": wire["history_depth_state"],
+        "history_sync_state": wire["history_sync_state"],
+        "history_complete_at": wire["history_complete_at"],
+        "coverage_state": wire["coverage_state"],
+        "local_knowledge_at": wire["local_knowledge_at"],
+        "local_knowledge_age_seconds": wire["local_knowledge_age_seconds"],
+        "sync_progress": surface.sync_progress,
+        "sync_progress_message_id": surface.sync_progress_message_id,
+        "total_messages": wire["total_messages"],
+        "delete_detection": surface.delete_detection,
+        "sync_coverage_pct": wire["sync_coverage_pct"],
+        "access_lost_at": surface.access_lost_at,
+        "access_last_revalidated_at": surface.access_last_revalidated_at,
+        "access_next_revalidate_at": surface.access_next_revalidate_at,
+        "action": wire["action"],
     }
     return structured_result(structured_content, result_count=1)
 
@@ -388,36 +438,6 @@ def _sync_read_model_error(detail: str) -> ToolResult:
         f"Error: daemon_protocol_error: invalid canonical sync read model ({detail}).\n"
         "Action: Restart the daemon with the same mcp-telegram build, then retry GetSyncStatus."
     )
-
-
-def _sync_status_action(status: object, message_count: object, total_messages: object, coverage_state: object) -> str:
-    parts = [_history_action(status), "sync_progress is a message_id offset, not a count."]
-    parts.append(_sync_coverage_action(message_count, total_messages))
-    if coverage_state == "telegram_total_not_comparable":
-        parts.append("Stored Telegram total_messages is suspect; percentage coverage is diagnostic-only.")
-    return " ".join(parts)
-
-
-def _history_action(status: object) -> str:
-    if status == "synced":
-        return "Full history was fetched as of last_synced_at; ongoing freshness is represented by local_knowledge_at."
-    if status == "own_only":
-        return "Only own-message-related history is stored for this dialog."
-    if status == "not_synced":
-        return "This dialog is not enrolled for history sync."
-    if status == "access_lost":
-        return "This dialog is an access-lost local archive, not a current live mirror."
-    return "History sync state is represented by history_sync_state."
-
-
-def _sync_coverage_action(message_count: object, total_messages: object) -> str:
-    if total_messages is None:
-        return "Coverage is unknown without Telegram total_messages."
-    if isinstance(message_count, int) and isinstance(total_messages, int) and message_count > total_messages:
-        return "Local message_count exceeds Telegram total_messages, so coverage is not comparable."
-    if total_messages == 0:
-        return "Empty dialogs are complete; non-empty local counts would be inconsistent."
-    return "Treat sync_coverage_pct as an approximate local-vs-Telegram ratio."
 
 
 class GetSyncAlerts(ToolArgs):
