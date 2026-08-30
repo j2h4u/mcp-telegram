@@ -826,12 +826,13 @@ async def test_early_stop_logs_later_kind_as_selected_without_request(
         batch_size=1, max_jobs_per_cycle=2, max_requests_per_cycle=3, pause_between_requests_seconds=0.01
     )
 
-    with caplog.at_level(logging.INFO, logger="mcp_telegram.fact_hydration"):
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.fact_hydration"):
         result = await _mixed_worker(db, client, policy).run_cycle(now=1)
 
     assert result.stopped is True
     transcription_logs = [record.message for record in caplog.records if "kind=transcription" in record.message]
     assert transcription_logs
+    assert all(record.levelno == logging.DEBUG for record in caplog.records if "kind=transcription" in record.message)
     assert "selected=1" in transcription_logs[-1]
     assert "requests=0" in transcription_logs[-1]
     assert "queue_active=1" in transcription_logs[-1]

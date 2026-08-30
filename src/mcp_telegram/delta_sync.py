@@ -454,7 +454,7 @@ async def run_delta_catch_up_loop(
 
     while not shutdown_event.is_set():
         total_new = await worker.run_delta_catch_up(policy=policy)
-        logger.info("delta_catch_up_cycle complete — new_messages=%d", total_new)
+        logger.debug("delta_catch_up_cycle complete — new_messages=%d", total_new)
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=policy.interval_seconds)
             break

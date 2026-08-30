@@ -342,7 +342,7 @@ class MessageFactHydrationWorker:
                     max_attempts=0,
                 ),
             )
-            logger.info(
+            logger.debug(
                 "message_fact_hydration kind=%s selected=%d requests=%d hydrated=%d completed=%d pending=%d "
                 "retried=%d dropped=%d queue_active=%d queue_ready=%d queue_deferred=%d "
                 "queue_foreground=%d queue_backfill=%d "
