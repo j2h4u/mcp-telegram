@@ -589,6 +589,47 @@ def test_ceremonial_search_hit_projector_call_does_not_excuse_manual_return() ->
     assert any("SearchHit field 'msg_id'" in finding.message for finding in findings)
 
 
+def test_search_hit_projector_call_cannot_hide_conditional_row_passthrough() -> None:
+    gate = _gate()
+    source = _search_hit_fixture(
+        "    return [\n"
+        "        project_search_hit(row, query, lifecycle={}) if row.get('canonical') else row\n"
+        "        for row in rows\n"
+        "    ]\n"
+    )
+
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
+
+    assert any("only items directly projected by project_search_hit" in finding.message for finding in findings)
+
+
+def test_ceremonial_projector_call_cannot_hide_imported_manual_result_helper() -> None:
+    gate = _gate()
+    source = _search_hit_fixture(
+        (
+            "    project_search_hit(rows[0], query, lifecycle={})\n"
+            "    return imported_manual_results(rows, query)\n"
+        ),
+        helpers="from .rogue_search import imported_manual_results\n",
+    )
+
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
+
+    assert any("only items directly projected by project_search_hit" in finding.message for finding in findings)
+
+
+def test_search_hit_direct_comprehension_allows_unrelated_local_metadata() -> None:
+    gate = _gate()
+    source = _search_hit_fixture(
+        "    row_count = len(rows)\n"
+        "    return [project_search_hit(row, query, lifecycle={}) for row in rows]\n"
+    )
+
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
+
+    assert not any("only items directly projected by project_search_hit" in finding.message for finding in findings)
+
+
 def test_local_helper_cannot_hide_search_hit_mutation() -> None:
     gate = _gate()
     source = _search_hit_fixture(

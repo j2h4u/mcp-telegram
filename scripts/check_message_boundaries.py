@@ -893,6 +893,20 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
     return findings
 
 
+def _is_direct_search_hit_call(node: ast.AST) -> bool:
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "project_search_hit"
+
+
+def _search_hit_return_items_are_direct(entrypoint: ast.FunctionDef) -> bool:
+    returns = [node for node in ast.walk(entrypoint) if isinstance(node, ast.Return)]
+    if len(returns) != 1:
+        return False
+    value = returns[0].value
+    if isinstance(value, ast.ListComp):
+        return _is_direct_search_hit_call(value.elt)
+    return isinstance(value, ast.List) and bool(value.elts) and all(_is_direct_search_hit_call(item) for item in value.elts)
+
+
 def _search_hit_violations(path: str, tree: ast.AST) -> list[Finding]:  # noqa: PLR0912, PLR0915
     """Keep search result construction on the distinct SearchHit projector seam."""
     findings: list[Finding] = []
@@ -964,6 +978,15 @@ def _search_hit_violations(path: str, tree: ast.AST) -> list[Finding]:  # noqa: 
     if len(direct_projector_calls) != 1:
         findings.append(
             Finding(path, entrypoint.lineno, "search result mapper must call project_search_hit directly exactly once")
+        )
+
+    if not _search_hit_return_items_are_direct(entrypoint):
+        findings.append(
+            Finding(
+                path,
+                entrypoint.lineno,
+                "search result mapper must return only items directly projected by project_search_hit",
+            )
         )
 
     reachable = {SEARCH_HIT_ENTRYPOINT}
