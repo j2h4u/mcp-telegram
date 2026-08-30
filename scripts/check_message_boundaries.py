@@ -687,23 +687,27 @@ def _raw_message_content_violations(path: str, tree: ast.AST) -> list[Finding]:
     return findings
 
 
-def _literal_mapping_keys(node: ast.expr | None) -> frozenset[str] | None:
-    """Return statically visible keys for a literal mapping construction."""
+def _mapping_key_facts(node: ast.expr | None) -> tuple[frozenset[str], bool]:
+    """Return visible keys and whether a mapping has opaque key sources."""
     if isinstance(node, ast.Dict):
         keys: set[str] = set()
+        has_opaque_sources = False
         for key in node.keys:
             if key is None or not isinstance(key, ast.Constant) or not isinstance(key.value, str):
-                return None
-            keys.add(key.value)
-        return frozenset(keys)
-    result: frozenset[str] | None = None
+                has_opaque_sources = True
+            else:
+                keys.add(key.value)
+        return frozenset(keys), has_opaque_sources
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "dict":
-        positional_keys = frozenset() if not node.args else _literal_mapping_keys(node.args[0])
-        valid_args = len(node.args) <= 1 and positional_keys is not None
-        valid_keywords = all(keyword.arg is not None for keyword in node.keywords)
-        if valid_args and valid_keywords:
-            result = positional_keys | frozenset(keyword.arg for keyword in node.keywords if keyword.arg is not None)
-    return result
+        positional_keys, positional_opaque = (
+            (frozenset(), False) if not node.args else _mapping_key_facts(node.args[0])
+        )
+        keyword_keys = frozenset(keyword.arg for keyword in node.keywords if keyword.arg is not None)
+        has_opaque_sources = (
+            len(node.args) > 1 or positional_opaque or any(keyword.arg is None for keyword in node.keywords)
+        )
+        return positional_keys | keyword_keys, has_opaque_sources
+    return frozenset(), True
 
 
 def _literal_subscript_key(node: ast.expr) -> str | None:
@@ -773,8 +777,8 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
                     Finding(path, _line(node), f"list message extension field {key!r} is not an allowed lifecycle field")
                 )
 
-        def _record_construction(self, node: ast.AST, keys: frozenset[str] | None) -> None:
-            if keys is None or self.function is None:
+        def _record_construction(self, node: ast.AST, keys: frozenset[str]) -> None:
+            if self.function is None:
                 return
             if self.function in CANONICAL_MESSAGE_VIEW_CONSTRUCTION_EXEMPT_FUNCTIONS.get(path, frozenset()):
                 return
@@ -797,7 +801,8 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
                 self._record_mutation(node, key)
 
         def visit_Dict(self, node: ast.Dict) -> None:
-            self._record_construction(node, _literal_mapping_keys(node))
+            keys, _has_opaque_sources = _mapping_key_facts(node)
+            self._record_construction(node, keys)
             self.generic_visit(node)
 
         def visit_Assign(self, node: ast.Assign) -> None:
@@ -811,6 +816,14 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
 
         def visit_AugAssign(self, node: ast.AugAssign) -> None:
             self._record_mutation(node, _literal_subscript_key(node.target))
+            if isinstance(node.op, ast.BitOr):
+                keys, has_opaque_sources = _mapping_key_facts(node.value)
+                if has_opaque_sources:
+                    findings.append(
+                        Finding(path, node.lineno, "message view |= keys must be a statically known literal mapping")
+                    )
+                for key in sorted(keys):
+                    self._record_mutation(node, key)
             self.generic_visit(node)
 
         def visit_Delete(self, node: ast.Delete) -> None:
@@ -820,25 +833,26 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
 
         def visit_Call(self, node: ast.Call) -> None:
             if isinstance(node.func, ast.Name) and node.func.id == "dict":
-                self._record_construction(node, _literal_mapping_keys(node))
+                keys, _has_opaque_sources = _mapping_key_facts(node)
+                self._record_construction(node, keys)
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"pop", "setdefault"}:
                 key = node.args[0].value if node.args and isinstance(node.args[0], ast.Constant) else None
                 self._record_mutation(node, key if isinstance(key, str) else None)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "update":
-                mapping_keys = _literal_mapping_keys(node.args[0]) if node.args else frozenset()
+                mapping_keys, mapping_opaque = (
+                    _mapping_key_facts(node.args[0]) if node.args else (frozenset(), False)
+                )
                 # Deliberately shallow and fail-closed: ordinary presenter
                 # extensions use one literal mapping; this is not data-flow analysis.
                 has_unknown_keys = (
-                    len(node.args) > 1
-                    or (bool(node.args) and mapping_keys is None)
-                    or any(keyword.arg is None for keyword in node.keywords)
+                    len(node.args) > 1 or mapping_opaque or any(keyword.arg is None for keyword in node.keywords)
                 )
                 if has_unknown_keys:
                     findings.append(
                         Finding(path, node.lineno, "message view update keys must be a statically known literal mapping")
                     )
                 keyword_keys = frozenset(keyword.arg for keyword in node.keywords if keyword.arg is not None)
-                for key in sorted((mapping_keys or frozenset()) | keyword_keys):
+                for key in sorted(mapping_keys | keyword_keys):
                     self._record_mutation(node, key)
             self.generic_visit(node)
 

@@ -320,6 +320,70 @@ def test_filter_shaped_literal_cannot_be_merged_into_message_view() -> None:
     assert not any("update keys must be a statically known literal mapping" in finding.message for finding in findings)
 
 
+@pytest.mark.parametrize(
+    "merge",
+    [
+        "item.update(patch, sender='parallel')",
+        "item.update({**patch, 'sender': 'parallel'})",
+    ],
+)
+def test_opaque_update_preserves_known_presenter_overwrite_keys(merge: str) -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _structured_messages(message, patch):\n"
+        "    item = project_message_view(message)\n"
+        f"    {merge}\n"
+        "    return item\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("canonical field 'sender'" in finding.message for finding in findings)
+    assert any("update keys must be a statically known literal mapping" in finding.message for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "construction",
+    [
+        "{**project_message_view(message), 'sender': 'parallel'}",
+        "dict(project_message_view(message), sender='parallel')",
+    ],
+)
+def test_opaque_construction_preserves_known_presenter_overwrite_keys(construction: str) -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _structured_messages(message):\n"
+        f"    return {construction}\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("canonical field 'sender'" in finding.message for finding in findings)
+
+
+def test_message_view_ior_fails_closed_for_unknown_mapping_keys() -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _structured_messages(message, patch):\n"
+        "    item = project_message_view(message)\n"
+        "    item |= patch\n"
+        "    return item\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("|= keys must be a statically known literal mapping" in finding.message for finding in findings)
+
+
+def test_list_message_ior_allows_known_lifecycle_literal() -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _list_message_structured_item(message):\n"
+        "    item = project_message_view(message)\n"
+        "    item |= {'visibility': 'chat_visible'}\n"
+        "    return item\n"
+    )
+    assert gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source) == []
+
+
 def test_noop_presenter_call_does_not_excuse_manually_returned_envelope() -> None:
     gate = _gate()
     source = (
