@@ -107,17 +107,6 @@ def _parse_numeric_query(query: str) -> int | None:
     return None
 
 
-def parse_exact_dialog_id(dialog: str) -> int | None:
-    """Return an exact dialog id for one signed numeric selector string.
-
-    Rejects @username queries and non-numeric strings.
-    """
-    selector = dialog.strip()
-    if not selector or selector.startswith("@"):
-        return None
-    return _parse_numeric_query(selector)
-
-
 def _parse_tme_link(query: str) -> tuple[str, int | None] | None:
     """Extract (username, message_id|None) from a t.me URL.
 

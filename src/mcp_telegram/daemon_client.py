@@ -249,11 +249,13 @@ class DaemonConnection:
         """
         payload: dict = {
             "method": "list_messages",
-            "dialog_id": kwargs.get("dialog_id", 0),
-            "dialog": kwargs.get("dialog"),
             "limit": kwargs.get("limit", 50),
             "navigation": kwargs.get("navigation"),
         }
+        if (dialog_id := kwargs.get("dialog_id")) is not None:
+            payload["dialog_id"] = dialog_id
+        if (dialog := kwargs.get("dialog")) is not None:
+            payload["dialog"] = dialog
         if (direction := kwargs.get("direction")) is not None:
             payload["direction"] = direction
         if (sender_id := kwargs.get("sender_id")) is not None:
@@ -282,14 +284,16 @@ class DaemonConnection:
         """
         payload: dict[str, object] = {
             "method": "search_messages",
-            "dialog_id": kwargs.get("dialog_id", 0),
-            "dialog": kwargs.get("dialog"),
             "query": kwargs["query"],
             "limit": kwargs.get("limit", 20),
             "offset": kwargs.get("offset", 0),
             "navigation": kwargs.get("navigation"),
             "message_state": kwargs.get("message_state", "sent"),
         }
+        if (dialog_id := kwargs.get("dialog_id")) is not None:
+            payload["dialog_id"] = dialog_id
+        if (dialog := kwargs.get("dialog")) is not None:
+            payload["dialog"] = dialog
         _add_time_bounds(payload, kwargs)
         return await self.request(payload)
 
@@ -361,13 +365,12 @@ class DaemonConnection:
         dialog: str | None = None,
     ) -> dict:
         """List forum topics. Accepts dialog name or numeric id."""
-        return await self.request(
-            {
-                "method": "list_topics",
-                "dialog_id": dialog_id,
-                "dialog": dialog,
-            }
-        )
+        payload: dict[str, object] = {"method": "list_topics"}
+        if dialog_id != 0 or dialog is None:
+            payload["dialog_id"] = dialog_id
+        if dialog is not None:
+            payload["dialog"] = dialog
+        return await self.request(payload)
 
     async def get_me(self) -> dict:
         """Return current authenticated user info."""
@@ -457,14 +460,12 @@ class DaemonConnection:
         limit: int = 5,
     ) -> dict:
         """Return aggregated stats (reactions, mentions, hashtags, forwards) for a dialog."""
-        return await self.request(
-            {
-                "method": "get_dialog_stats",
-                "dialog_id": dialog_id,
-                "dialog": dialog,
-                "limit": limit,
-            }
-        )
+        payload: dict[str, object] = {"method": "get_dialog_stats", "limit": limit}
+        if dialog_id != 0 or dialog is None:
+            payload["dialog_id"] = dialog_id
+        if dialog is not None:
+            payload["dialog"] = dialog
+        return await self.request(payload)
 
     async def get_my_recent_activity(  # noqa: PLR0913
         self,

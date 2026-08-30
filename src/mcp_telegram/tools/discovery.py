@@ -1,11 +1,9 @@
 import logging
 from typing import Literal, cast
 
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field, StrictInt, model_validator
 
-logger = logging.getLogger(__name__)
-
-from ..resolver import parse_exact_dialog_id
+from ..dialog_selector import DialogSelectorError, required_dialog_selector
 from ._base import (
     DaemonConnection,
     DaemonNotRunningError,
@@ -26,6 +24,8 @@ from .structured import (
     telegram_content,
     unavailable_folder_snapshot,
 )
+
+logger = logging.getLogger(__name__)
 
 TELEGRAM_CONTENT_OUTPUT_SCHEMA = {
     "type": "object",
@@ -439,7 +439,7 @@ class ListTopics(ToolArgs):
     )
 
     dialog: str | None = Field(default=None, max_length=500)
-    exact_dialog_id: int | None = Field(
+    exact_dialog_id: StrictInt | None = Field(
         default=None,
         description=(
             "Known numeric dialog id. Prefer this when available; do not pass sender_id values from messages."
@@ -448,10 +448,10 @@ class ListTopics(ToolArgs):
 
     @model_validator(mode="after")
     def validate_dialog_selector(self) -> ListTopics:
-        if self.dialog is None and self.exact_dialog_id is None:
-            raise ValueError("Provide either dialog or exact_dialog_id.")
-        if self.dialog is not None and self.exact_dialog_id is not None:
-            raise ValueError("dialog and exact_dialog_id are mutually exclusive.")
+        try:
+            required_dialog_selector(exact_id=self.exact_dialog_id, dialog=self.dialog)
+        except DialogSelectorError as exc:
+            raise ValueError(f"{exc.code}: {exc}") from exc
         return self
 
 
@@ -462,11 +462,8 @@ def _list_topics_input_label(args: ListTopics) -> str:
 
 
 def _list_topics_target(args: ListTopics) -> tuple[int | None, str | None]:
-    dialog_id = args.exact_dialog_id
-    if dialog_id is None and args.dialog is not None:
-        dialog_id = parse_exact_dialog_id(args.dialog)
-    dialog_name = None if dialog_id is not None else args.dialog
-    return dialog_id, dialog_name
+    selector = required_dialog_selector(exact_id=args.exact_dialog_id, dialog=args.dialog)
+    return selector.exact_id, selector.query
 
 
 async def _fetch_topics_response(
@@ -482,6 +479,20 @@ async def _fetch_topics_response(
 def _list_topics_error_result(args: ListTopics, response: dict[str, object]) -> ToolResult:
     error_code = response.get("error", "")
     error_msg = response.get("message", "Request failed.")
+    if error_code in {"ambiguous_dialog", "dialog_not_found"} and (
+        response.get("candidates") is not None or response.get("suggestion") is not None
+    ):
+        structured_content: dict[str, object] = {
+            key: response[key]
+            for key in ("error", "message", "candidates", "suggestion", "required_action")
+            if key in response
+        }
+        err = error_result(
+            f"Error: {error_code}: {error_msg}\n"
+            f"Action: {structured_content.get('required_action') or 'Retry ListTopics with an exact dialog id.'}",
+            has_filter=True,
+        )
+        return ToolResult(content=err.content, is_error=True, structured_content=structured_content, has_filter=True)
     if error_code == "dialog_not_found":
         from ..errors import dialog_not_found_text
 

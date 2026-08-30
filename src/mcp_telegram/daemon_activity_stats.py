@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Protocol, cast
 
 from .daemon_message import fetch_text_links
+from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
 from .message_content import MessageSnapshot, project_message_content
 
 
@@ -68,7 +69,7 @@ class DaemonActivityStatsDeps:
     """Dependency container for activity/statistics orchestration."""
 
     conn: sqlite3.Connection
-    resolve_dialog_id: Callable[[int, str | None], Awaitable[int | dict]]
+    resolve_dialog_id: Callable[[DialogSelector], Awaitable[int | dict]]
     logger: _LoggerLike
 
 
@@ -478,22 +479,16 @@ class DaemonActivityStatsService:
             return {"ok": False, "error": "internal", "message": "internal error"}
 
     async def get_dialog_stats(self, req: Mapping[str, object]) -> dict[str, object]:
-        dialog_id = _coerce_int(req.get("dialog_id", 0), 0)
-        dialog_obj = req.get("dialog")
-        dialog = dialog_obj if isinstance(dialog_obj, str) else None
+        try:
+            selector = required_dialog_selector(exact_id=req.get("dialog_id"), dialog=req.get("dialog"))
+        except DialogSelectorError as exc:
+            return {"ok": False, "error": exc.code, "message": str(exc)}
         limit = _clamp(_coerce_int(req.get("limit", 5), 5), 1, 20)
 
-        resolved = await self._deps.resolve_dialog_id(dialog_id, dialog)
+        resolved = await self._deps.resolve_dialog_id(selector)
         if isinstance(resolved, dict):
             return resolved
         dialog_id = resolved
-        if not dialog_id:
-            return {
-                "ok": False,
-                "error": "missing_dialog",
-                "message": "Either dialog_id or dialog name is required for get_dialog_stats",
-            }
-
         row = cast(tuple[object] | None, self._deps.conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone())
         if row is None or row[0] not in ("synced", "syncing", "access_lost"):
             return {

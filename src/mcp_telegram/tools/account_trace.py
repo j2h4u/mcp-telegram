@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import Literal, cast
+from typing import Literal, TypedDict, cast
 
-from pydantic import Field, model_validator
+from pydantic import Field, StrictInt, model_validator
 
+from ..dialog_selector import DialogSelectorError, optional_dialog_selector
 from ..models import ContentKind
 from ._base import (
     DaemonNotRunningError,
@@ -188,6 +189,11 @@ TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
 }
 
 
+class _TraceDialogSelectorKwargs(TypedDict, total=False):
+    dialog: str
+    exact_dialog_id: int
+
+
 class TraceAccountMessages(ToolArgs):
     """
     Find observable authored-message evidence for one account across visible message history.
@@ -218,7 +224,7 @@ class TraceAccountMessages(ToolArgs):
         max_length=500,
         description="Optional dialog selector for scoping by name, link, or numeric id.",
     )
-    exact_dialog_id: int | None = Field(
+    exact_dialog_id: StrictInt | None = Field(
         default=None,
         description="Optional numeric dialog id for exact dialog scoping.",
     )
@@ -250,6 +256,10 @@ class TraceAccountMessages(ToolArgs):
 
     @model_validator(mode="after")
     def _validate_scope(self) -> TraceAccountMessages:
+        try:
+            optional_dialog_selector(exact_id=self.exact_dialog_id, dialog=self.dialog)
+        except DialogSelectorError as exc:
+            raise ValueError(f"{exc.code}: {exc}") from exc
         if self.exact_topic_id is not None and self.dialog is None and self.exact_dialog_id is None:
             raise ValueError("exact_topic_id requires dialog or exact_dialog_id")
         if self.account is not None and self.exact_account_id is not None:
@@ -417,23 +427,51 @@ def _trace_structured_content(data: dict, args: TraceAccountMessages) -> dict[st
     output_schema=TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA,
 )
 async def trace_account_messages(args: TraceAccountMessages) -> ToolResult:
+    selector = optional_dialog_selector(exact_id=args.exact_dialog_id, dialog=args.dialog)
     try:
         async with daemon_connection() as conn:
+            selector_kwargs = _TraceDialogSelectorKwargs()
+            if selector is not None:
+                if selector.exact_id is not None:
+                    selector_kwargs["exact_dialog_id"] = selector.exact_id
+                elif selector.query is not None:
+                    selector_kwargs["dialog"] = selector.query
             response = await conn.trace_account_messages(
                 account=args.account,
                 exact_account_id=args.exact_account_id,
                 group_by=args.group_by,
-                dialog=args.dialog,
-                exact_dialog_id=args.exact_dialog_id,
                 exact_topic_id=args.exact_topic_id,
                 sent_after=args.sent_after,
                 sent_before=args.sent_before,
                 limit=args.limit,
                 navigation=args.navigation,
                 coverage_goal=args.coverage_goal,
+                **selector_kwargs,
             )
     except DaemonNotRunningError as exc:
         return error_result(_daemon_not_running_text(exc), has_filter=True, has_cursor=args.navigation is not None)
+
+    if response.get("error") in {"ambiguous_dialog", "dialog_not_found"} and (
+        response.get("candidates") is not None or response.get("suggestion") is not None
+    ):
+        structured_content = {
+            key: response[key]
+            for key in ("error", "message", "candidates", "suggestion", "required_action")
+            if key in response
+        }
+        ambiguity_error = error_result(
+            f"Error: {response.get('error')}: {response.get('message', 'Request failed.')}\n"
+            f"Action: {structured_content.get('required_action') or 'Retry trace_account_messages with an exact dialog id.'}",
+            has_filter=True,
+            has_cursor=args.navigation is not None,
+        )
+        return ToolResult(
+            content=ambiguity_error.content,
+            is_error=True,
+            structured_content=structured_content,
+            has_filter=True,
+            has_cursor=args.navigation is not None,
+        )
 
     if err := _check_daemon_response(
         response,
