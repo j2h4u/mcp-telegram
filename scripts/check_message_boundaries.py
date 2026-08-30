@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Enforce message-table and agent-facing Telegram-content ownership.
+"""Enforce message/entity-table and agent-facing Telegram-content ownership.
 
-Tach owns the Python import graph.  This focused AST gate owns two smaller
-contracts that cannot be expressed by an import graph alone:
+Tach owns the Python import graph. This focused AST gate owns smaller contracts
+that cannot be expressed by an import graph alone:
 
 * SQL that reads ``messages`` belongs to a reviewed repository/query owner.
+* Runtime DML for the exact ``entities`` table belongs to ``entity_store``.
 * The structured Telegram-content marker is constructed by its canonical
   wrapper, rather than by each tool independently.
 * List and Inbox message envelopes are constructed by their canonical delivery
@@ -55,6 +56,9 @@ MESSAGE_SQL_LEGACY_EXCEPTION_PATHS = frozenset(
 
 # Schema/migration DDL has a distinct owner from runtime message persistence.
 MESSAGE_SQL_SCHEMA_OWNER_PATHS = frozenset({"sync_db.py"})
+
+ENTITY_DML_OWNER_PATHS = frozenset({"entity_store.py"})
+ENTITY_DML_SCHEMA_OWNER_PATHS = frozenset({"sync_db.py"})
 
 CONTENT_WRAPPER_PATH = "tools/structured.py"
 CONTENT_PROJECTOR_PATH = "message_content.py"
@@ -146,7 +150,7 @@ _EXECUTE_METHODS = frozenset({"execute", "executemany", "executescript"})
 _SQL_NAME = re.compile(r"(?:^|_)(?:SQL|DDL|QUERY)(?:$|_)", re.IGNORECASE)
 _SQL_START = re.compile(r"^(?:SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b", re.IGNORECASE)
 _SQL_TOKEN = re.compile(
-    r"--[^\n]*|/\*.*?\*/|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*|[.]",
+    r"--[^\n]*|/\*.*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*|[().]",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -283,6 +287,65 @@ def _has_message_table_sql(sql: str) -> bool:
             and _identifier(tokens[next_index + 2]).casefold() in _MESSAGE_SQL_TABLES
         ):
             return True
+    return False
+
+
+def _is_exact_table_at(tokens: list[str], index: int, table_name: str) -> bool:
+    if index >= len(tokens):
+        return False
+    if _identifier(tokens[index]).casefold() == table_name:
+        return True
+    return (
+        index + 2 < len(tokens) and tokens[index + 1] == "." and _identifier(tokens[index + 2]).casefold() == table_name
+    )
+
+
+def _top_level_statement_index(tokens: list[str]) -> int | None:
+    """Locate the statement following an optional sequence of CTEs."""
+    if not tokens:
+        return None
+    if tokens[0].casefold() != "with":
+        return 0
+
+    depth = 0
+    for index, token in enumerate(tokens[1:], start=1):
+        if token == "(":
+            depth += 1
+        elif token == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and token.casefold() in {"delete", "insert", "replace", "select", "update"}:
+            return index
+    return None
+
+
+def _has_entity_table_dml(sql: str) -> bool:
+    """Return whether DML in *sql* writes the exact ``entities`` table."""
+    tokens = _sql_tokens(sql)
+    statement_index = _top_level_statement_index(tokens)
+    if statement_index is None:
+        return False
+    statement = tokens[statement_index].casefold()
+    if statement in {"insert", "replace"}:
+        table_indices = [
+            index + 1
+            for index, token in enumerate(tokens[statement_index + 1 :], start=statement_index + 1)
+            if token.casefold() == "into"
+        ]
+        return bool(table_indices) and _is_exact_table_at(tokens, table_indices[0], "entities")
+    if statement == "update":
+        table_index = statement_index + 1
+        if table_index < len(tokens) and tokens[table_index].casefold() == "or":
+            if table_index + 2 >= len(tokens) or tokens[table_index + 1].casefold() not in _SQLITE_UPDATE_CONFLICTS:
+                return False
+            table_index += 2
+        return _is_exact_table_at(tokens, table_index, "entities")
+    if statement == "delete":
+        table_index = statement_index + 2
+        return (
+            statement_index + 1 < len(tokens)
+            and tokens[statement_index + 1].casefold() == "from"
+            and _is_exact_table_at(tokens, table_index, "entities")
+        )
     return False
 
 
@@ -955,6 +1018,16 @@ def violations_for(path: Path, source: str) -> list[Finding]:
                 "direct FROM/JOIN messages or UPDATE/INSERT/DELETE messages/message_versions SQL is outside a reviewed owner",
             )
             for snippet in sql_hits
+        )
+    entity_dml_hits = [snippet for snippet in _sql_snippets(tree, constants) if _has_entity_table_dml(snippet.text)]
+    if entity_dml_hits and relative not in ENTITY_DML_OWNER_PATHS and relative not in ENTITY_DML_SCHEMA_OWNER_PATHS:
+        findings.extend(
+            Finding(
+                relative,
+                snippet.line,
+                "direct INSERT/UPDATE/DELETE/REPLACE entities SQL is outside canonical entity_store.py ownership",
+            )
+            for snippet in entity_dml_hits
         )
     return findings
 

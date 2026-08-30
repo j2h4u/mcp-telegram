@@ -88,6 +88,7 @@ from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from .daemon_message import (
     project_cached_message_facts_by_dialog,
 )
+from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .folders.read_model import dialog_placement, folder_snapshot, folders_by_dialog, list_folder_messages, list_folders
 from .history_enrollment import disable_history, enable_history, read_intent
 from .important_events.read_model import list_important_events as read_important_events
@@ -99,9 +100,6 @@ from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
 
 # Entity / telemetry SQL
-_UPSERT_ENTITY_SQL = (
-    "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
-)
 _ALL_ENTITY_NAMES_SQL = (
     "SELECT id, name FROM entities "
     "WHERE name IS NOT NULL "
@@ -1415,16 +1413,16 @@ class DaemonAPIServer:
         now = int(time.time())
         try:
             mapped_entities = [cast(Mapping[str, object], e) for e in entities]
-            self._conn.executemany(
-                _UPSERT_ENTITY_SQL,
+            upsert_entity_snapshots(
+                self._conn,
                 [
-                    (
-                        e["id"],
-                        e["type"],
-                        e.get("name") or None,
-                        e.get("username"),
-                        latinize(str(e["name"])) if e.get("name") else None,
-                        now,
+                    EntitySnapshot(
+                        entity_id=cast(int, e["id"]),
+                        entity_type=cast(str, e["type"]),
+                        name=cast(str | None, e.get("name") or None),
+                        username=cast(str | None, e.get("username")),
+                        name_normalized=latinize(str(e["name"])) if e.get("name") else None,
+                        updated_at=now,
                     )
                     for e in mapped_entities
                 ],

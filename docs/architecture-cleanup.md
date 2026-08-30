@@ -10,7 +10,6 @@ this table until removed.
 
 | ID | Deprecated edge(s) | Owner / target | Removal condition |
 |---|---|---|---|
-| `SYNC-001` | `event_handlers` → `sync_worker` | Sync | Move dialog/entity upsert SQL to `sync_db` or an event-write service. |
 | `TG-001` | `telegram_fragments` → `messages.sqlite_repository` | Telegram/messages | Inject a message-write port at the fragment ingestion seam. |
 
 Deprecated diagnostics are warnings so the gate stays green, but they are not
@@ -19,10 +18,12 @@ the same change with an owner and a concrete removal condition.
 
 ## Next cleanup slices
 
-1. `SYNC-001`: replace the direct worker reach with a daemon-wired application
-   service.
-2. `TG-001`: introduce the message write boundary only once the fragment path
+1. `TG-001`: introduce the message write boundary only once the fragment path
    has a real interchangeable dependency.
+
+The SYNC-001 frontier is closed. Runtime entity writers use the canonical,
+transaction-neutral `entity_store` persistence boundary, and `event_handlers`
+no longer imports `sync_worker`.
 
 The READ-001/READ-002 frontier is closed. Reading orchestration and SQLite
 projection now live under `mcp_telegram.reading`; scheduled projection imports

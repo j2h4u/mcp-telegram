@@ -51,6 +51,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .activity_contracts import InputPeerResolver
+from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .history_enrollment import ensure_automatic_dm_enrollment
 from .hydration_queue import HydrationPriority
 from .messages.sqlite_repository import (
@@ -92,7 +93,6 @@ from .scheduled_messages import (
     upsert_scheduled_message,
     verify_scheduled_publication,
 )
-from .sync_worker import UPSERT_ENTITY_SQL
 from .telethon_dialog import classify_dialog_type
 from .unread_state import apply_unread_facts
 
@@ -499,15 +499,17 @@ class EventHandlerManager:
             name: str | None = f"{first} {last}".strip() or None
             entity_type_str = classify_dialog_type(sender).value
             with self._conn:
-                self._conn.execute(
-                    UPSERT_ENTITY_SQL,
+                upsert_entity_snapshots(
+                    self._conn,
                     (
-                        dialog_id,
-                        entity_type_str,
-                        name,
-                        username,
-                        latinize(name) if name else None,
-                        int(time.time()),
+                        EntitySnapshot(
+                            entity_id=dialog_id,
+                            entity_type=entity_type_str,
+                            name=name,
+                            username=username,
+                            name_normalized=latinize(name) if name else None,
+                            updated_at=int(time.time()),
+                        ),
                     ),
                 )
             logger.info("dm_auto_enroll_entity dialog_id=%d name=%r", dialog_id, name)
