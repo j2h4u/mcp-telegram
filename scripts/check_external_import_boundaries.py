@@ -46,6 +46,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "reading/scheduled_projection.py",
             "delta_sync.py",
             "dialog_sync.py",
+            "entity_store.py",
             "event_handlers.py",
             "fact_hydration.py",
             "feedback_db.py",
