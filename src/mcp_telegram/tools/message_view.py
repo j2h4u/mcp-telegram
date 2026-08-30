@@ -28,7 +28,6 @@ class ReadMarker(TypedDict):
     kind: str
     label: str
     side: str
-    role: str
     anchor_message_id: int
 
 
@@ -44,10 +43,9 @@ READ_MARKER_SCHEMA: dict[str, object] = {
             "enum": ["[I read up to here]", "[unread by me]", "[peer read up to here]", "[unread by peer]"],
         },
         "side": {"type": "string", "enum": ["inbox", "outbox"]},
-        "role": {"type": "string", "enum": ["boundary", "tail_start"]},
         "anchor_message_id": {"type": "integer"},
     },
-    "required": ["kind", "label", "side", "role", "anchor_message_id"],
+    "required": ["kind", "label", "side", "anchor_message_id"],
     "additionalProperties": False,
 }
 
@@ -113,10 +111,10 @@ MESSAGE_VIEW_SCHEMA: dict[str, object] = {
 }
 
 _READ_MARKER_METADATA = {
-    "[I read up to here]": {"kind": "i_read_up_to_here", "side": "inbox", "role": "boundary"},
-    "[unread by me]": {"kind": "unread_by_me", "side": "inbox", "role": "tail_start"},
-    "[peer read up to here]": {"kind": "peer_read_up_to_here", "side": "outbox", "role": "boundary"},
-    "[unread by peer]": {"kind": "unread_by_peer", "side": "outbox", "role": "tail_start"},
+    "[I read up to here]": {"kind": "i_read_up_to_here", "side": "inbox"},
+    "[unread by me]": {"kind": "unread_by_me", "side": "inbox"},
+    "[peer read up to here]": {"kind": "peer_read_up_to_here", "side": "outbox"},
+    "[unread by peer]": {"kind": "unread_by_peer", "side": "outbox"},
 }
 
 
@@ -137,7 +135,6 @@ def project_read_markers(
             "kind": metadata["kind"],
             "label": label,
             "side": metadata["side"],
-            "role": metadata["role"],
             "anchor_message_id": message_id,
         }
     return markers

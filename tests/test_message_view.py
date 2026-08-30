@@ -114,14 +114,12 @@ def test_read_markers_are_projected_once_for_both_surfaces() -> None:
             "kind": "i_read_up_to_here",
             "label": "[I read up to here]",
             "side": "inbox",
-            "role": "boundary",
             "anchor_message_id": 16,
         },
         17: {
             "kind": "unread_by_me",
             "label": "[unread by me]",
             "side": "inbox",
-            "role": "tail_start",
             "anchor_message_id": 17,
         },
     }
