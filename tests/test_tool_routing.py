@@ -344,7 +344,6 @@ def _canonical_get_sync_status_data() -> dict[str, object]:
     return {
         "dialog_id": 123,
         "enrollment_source": "explicit",
-        "message_count": 10,
         "sync_progress": None,
         "sync_progress_message_id": None,
         "delta_refresh_requested_at": None,
@@ -493,7 +492,6 @@ STRUCTURED_TOOL_CASES = {
             "data": {
                 "dialog_id": 123,
                 "enrollment_source": "explicit",
-                "message_count": 10,
                 "delta_refresh_requested_at": None,
                 "sync_progress": None,
                 "sync_progress_message_id": None,
@@ -2376,8 +2374,6 @@ async def test_get_sync_status_via_daemon():
     data = {
         "dialog_id": -1001234567890,
         "enrollment_source": "explicit",
-        # A stale legacy count must not influence the canonical model action.
-        "message_count": 0,
         "sync_progress": 100,
         "sync_progress_message_id": 100,
         "delete_detection": "reliable (channel)",
@@ -2433,7 +2429,6 @@ async def test_get_sync_status_via_daemon():
             "technical_timestamps": "not_telegram_events",
         },
     }
-    assert "Local message_count exceeds Telegram total_messages" in cast(str, data["action"])
     conn.get_sync_status.assert_called_once_with(dialog_id=-1001234567890)
 
 
@@ -2453,6 +2448,19 @@ async def test_get_sync_status_rejects_malformed_required_surface_field() -> Non
 async def test_get_sync_status_rejects_missing_enrollment_source() -> None:
     data = _canonical_get_sync_status_data()
     del data["enrollment_source"]
+    conn = _make_daemon_conn({"ok": True, "data": data})
+
+    with _patch_daemon(conn):
+        result = await get_sync_status(GetSyncStatus(dialog_id=123))
+
+    assert result.is_error is True
+    assert result.structured_content is None
+    assert "daemon_protocol_error" in _result_text(result)
+
+
+async def test_get_sync_status_rejects_mismatched_daemon_dialog_id() -> None:
+    data = _canonical_get_sync_status_data()
+    data["dialog_id"] = 456
     conn = _make_daemon_conn({"ok": True, "data": data})
 
     with _patch_daemon(conn):
