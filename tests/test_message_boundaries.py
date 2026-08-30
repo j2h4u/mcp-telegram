@@ -276,7 +276,9 @@ def test_list_message_presenter_extension_allows_only_lifecycle_fields() -> None
         "    return item\n"
     )
     findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
-    assert any("extension field 'unexpected' is not an allowed lifecycle field" in finding.message for finding in findings)
+    assert any(
+        "extension field 'unexpected' is not an allowed lifecycle field" in finding.message for finding in findings
+    )
     assert not any("extension field 'visibility'" in finding.message for finding in findings)
 
 

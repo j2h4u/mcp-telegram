@@ -653,9 +653,10 @@ def _raw_message_content_violations(path: str, tree: ast.AST) -> list[Finding]:
             if called_name == "project_message_view":
                 function = self.function or ""
                 self.message_view_counts[function] = self.message_view_counts.get(function, 0) + 1
-            if self.function in CANONICAL_MESSAGE_VIEW_ENTRYPOINTS.get(
-                path, frozenset()
-            ) and called_name in MESSAGE_VIEW_BYPASS_NAMES:
+            if (
+                self.function in CANONICAL_MESSAGE_VIEW_ENTRYPOINTS.get(path, frozenset())
+                and called_name in MESSAGE_VIEW_BYPASS_NAMES
+            ):
                 findings.append(
                     Finding(path, node.lineno, "canonical message delivery path must use project_message_view")
                 )
@@ -699,9 +700,7 @@ def _mapping_key_facts(node: ast.expr | None) -> tuple[frozenset[str], bool]:
                 keys.add(key.value)
         return frozenset(keys), has_opaque_sources
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "dict":
-        positional_keys, positional_opaque = (
-            (frozenset(), False) if not node.args else _mapping_key_facts(node.args[0])
-        )
+        positional_keys, positional_opaque = (frozenset(), False) if not node.args else _mapping_key_facts(node.args[0])
         keyword_keys = frozenset(keyword.arg for keyword in node.keywords if keyword.arg is not None)
         has_opaque_sources = (
             len(node.args) > 1 or positional_opaque or any(keyword.arg is None for keyword in node.keywords)
@@ -774,7 +773,9 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
                 and key not in LIST_MESSAGE_LIFECYCLE_FIELDS
             ):
                 findings.append(
-                    Finding(path, _line(node), f"list message extension field {key!r} is not an allowed lifecycle field")
+                    Finding(
+                        path, _line(node), f"list message extension field {key!r} is not an allowed lifecycle field"
+                    )
                 )
 
         def _record_construction(self, node: ast.AST, keys: frozenset[str]) -> None:
@@ -784,17 +785,23 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
                 return
             if self.function == "_list_message_structured_item":
                 findings.extend(
-                    Finding(path, _line(node), f"list message extension field {key!r} is not an allowed lifecycle field")
+                    Finding(
+                        path, _line(node), f"list message extension field {key!r} is not an allowed lifecycle field"
+                    )
                     for key in sorted(keys - LIST_MESSAGE_LIFECYCLE_FIELDS)
                 )
             core_fields = keys & CANONICAL_MESSAGE_VIEW_FIELDS
             if core_fields == {"dialog_id"}:
                 return
-            is_list_filter = core_fields <= {"sender", "topic"} and {
-                "exact_dialog_id",
-                "sender_id",
-                "exact_topic_id",
-            } <= keys
+            is_list_filter = (
+                core_fields <= {"sender", "topic"}
+                and {
+                    "exact_dialog_id",
+                    "sender_id",
+                    "exact_topic_id",
+                }
+                <= keys
+            )
             if is_list_filter:
                 return
             for key in sorted(core_fields):
@@ -839,9 +846,7 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
                 key = node.args[0].value if node.args and isinstance(node.args[0], ast.Constant) else None
                 self._record_mutation(node, key if isinstance(key, str) else None)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "update":
-                mapping_keys, mapping_opaque = (
-                    _mapping_key_facts(node.args[0]) if node.args else (frozenset(), False)
-                )
+                mapping_keys, mapping_opaque = _mapping_key_facts(node.args[0]) if node.args else (frozenset(), False)
                 # Deliberately shallow and fail-closed: ordinary presenter
                 # extensions use one literal mapping; this is not data-flow analysis.
                 has_unknown_keys = (
@@ -849,7 +854,9 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
                 )
                 if has_unknown_keys:
                     findings.append(
-                        Finding(path, node.lineno, "message view update keys must be a statically known literal mapping")
+                        Finding(
+                            path, node.lineno, "message view update keys must be a statically known literal mapping"
+                        )
                     )
                 keyword_keys = frozenset(keyword.arg for keyword in node.keywords if keyword.arg is not None)
                 for key in sorted(mapping_keys | keyword_keys):

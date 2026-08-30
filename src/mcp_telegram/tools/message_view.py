@@ -204,9 +204,7 @@ def _content_facts(message: ReadMessage) -> dict[str, object]:
     return {key: value for key, value in projected.items() if value is not None}
 
 
-def _context_facts(
-    message: ReadMessage, *, parent_in_page: bool, context_included: bool
-) -> dict[str, object]:
+def _context_facts(message: ReadMessage, *, parent_in_page: bool, context_included: bool) -> dict[str, object]:
     facts: dict[str, object] = {}
     reply = _reply_context(message, parent_in_page=parent_in_page, context_included=context_included)
     if reply is not None:
