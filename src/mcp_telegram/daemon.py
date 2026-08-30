@@ -366,7 +366,7 @@ async def _initialize_read_positions(  # noqa: PLR0913
     now = int(time.time())
     rows = _select_null_read_position_rows(conn, max_dialogs, now=now)
     if not rows:
-        logger.info("initialize_read_positions — no NULL rows, skipping")
+        logger.debug("initialize_read_positions — no NULL rows, skipping")
         return 0
 
     dialog_ids = [dialog_id for (dialog_id,) in rows]
