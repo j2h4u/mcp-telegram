@@ -29,6 +29,7 @@ from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-unty
 from telethon.tl import types  # type: ignore[import-untyped]
 
 from .access_lifecycle import set_access_lost
+from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import flood_seconds, sleep_through_flood
 from .history_enrollment import ensure_automatic_dm_enrollment, full_history_enabled
 from .hydration_queue import HydrationPriority
@@ -56,10 +57,6 @@ _UPDATE_PROGRESS_DONE_SQL = (
     "UPDATE synced_dialogs SET sync_progress = ?, status = ?, total_messages = COALESCE(?, total_messages), "
     "last_synced_at = ? WHERE dialog_id = ? "
     "AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
-)
-
-UPSERT_ENTITY_SQL = (
-    "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
 )
 
 
@@ -185,15 +182,17 @@ class FullSyncWorker:
                 last = getattr(entity, "last_name", None) or ""
                 name: str | None = f"{first} {last}".strip() or None
                 entity_type_str = classify_dialog_type(entity).value
-                self._conn.execute(
-                    UPSERT_ENTITY_SQL,
+                upsert_entity_snapshots(
+                    self._conn,
                     (
-                        dialog.id,
-                        entity_type_str,
-                        name,
-                        getattr(entity, "username", None),
-                        latinize(name) if name else None,
-                        now,
+                        EntitySnapshot(
+                            entity_id=dialog.id,
+                            entity_type=entity_type_str,
+                            name=name,
+                            username=getattr(entity, "username", None),
+                            name_normalized=latinize(name) if name else None,
+                            updated_at=now,
+                        ),
                     ),
                 )
         except FloodWaitError as exc:

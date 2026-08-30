@@ -19,6 +19,7 @@ from telethon.tl.functions.messages import SearchRequest
 from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, InputPeerSelf
 
 from .activity_substrate import ActivityClient, call_with_timeout
+from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import flood_seconds, sleep_through_flood
 from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage
@@ -47,13 +48,6 @@ class ActivitySyncPacing:
 
 
 _PACING = ActivitySyncPacing()
-
-
-# Mirrors sync_worker.UPSERT_ENTITY_SQL (verified line 239).
-# NOTE: `type` and `updated_at` are NOT NULL with no DEFAULT — both MUST be supplied.
-UPSERT_ENTITY_SQL = (
-    "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
-)
 
 
 @dataclass
@@ -169,7 +163,7 @@ def _upsert_entities_from_search(conn: sqlite3.Connection, result: _SearchResult
     from telethon.utils import get_peer_id
 
     now = int(time.time())
-    rows: list[tuple[int, str, str | None, str | None, str | None, int]] = []
+    snapshots: list[EntitySnapshot] = []
 
     for u in result.users or ():
         etype = _classify_entity(u)
@@ -179,7 +173,16 @@ def _upsert_entities_from_search(conn: sqlite3.Connection, result: _SearchResult
         last_name = _optional_entity_attr(u, "last_name")
         username = _optional_entity_attr(u, "username")
         name = " ".join(p for p in (first_name, last_name) if p) or username
-        rows.append((int(u.id), etype, name, username, _normalize(name), now))
+        snapshots.append(
+            EntitySnapshot(
+                entity_id=int(u.id),
+                entity_type=etype,
+                name=name,
+                username=username,
+                name_normalized=_normalize(name),
+                updated_at=now,
+            )
+        )
 
     for c in result.chats or ():
         etype = _classify_entity(c)
@@ -191,12 +194,21 @@ def _upsert_entities_from_search(conn: sqlite3.Connection, result: _SearchResult
             continue
         name = _optional_entity_attr(c, "title")
         username = _optional_entity_attr(c, "username")
-        rows.append((pid, etype, name, username, _normalize(name), now))
+        snapshots.append(
+            EntitySnapshot(
+                entity_id=pid,
+                entity_type=etype,
+                name=name,
+                username=username,
+                name_normalized=_normalize(name),
+                updated_at=now,
+            )
+        )
 
-    if not rows:
+    if not snapshots:
         return
     with conn:
-        conn.executemany(UPSERT_ENTITY_SQL, rows)
+        upsert_entity_snapshots(conn, snapshots)
 
 
 def _fmt_duration(seconds: int) -> str:

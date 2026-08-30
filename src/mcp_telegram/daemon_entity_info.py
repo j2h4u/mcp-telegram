@@ -16,6 +16,7 @@ from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[imp
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
 from .daemon_log_context import dialog_log_context
+from .entity_store import EntitySnapshot, ensure_entity_stub
 from .models import DialogType
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telethon_dialog import classify_dialog_type
@@ -412,14 +413,15 @@ class DaemonEntityInfoService:
     def _writeback(self, entity_id: int, detail: dict[str, object], now: int) -> None:
         full_fetch_ok = detail.pop("_full_fetch_ok", True)
         try:
-            self._deps.conn.execute(
-                "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (
-                    entity_id,
-                    detail.get("type", "unknown"),
-                    detail.get("name"),
-                    detail.get("username"),
-                    now,
+            ensure_entity_stub(
+                self._deps.conn,
+                EntitySnapshot(
+                    entity_id=entity_id,
+                    entity_type=cast(str, detail.get("type", "unknown")),
+                    name=cast(str | None, detail.get("name")),
+                    username=cast(str | None, detail.get("username")),
+                    name_normalized=None,
+                    updated_at=now,
                 ),
             )
             if full_fetch_ok:

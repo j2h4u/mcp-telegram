@@ -20,6 +20,7 @@ from typing import Protocol, cast
 from telethon.tl.types import TypeInputChannel, TypeInputPeer
 
 from .activity_substrate import ActivityClient, call_with_timeout
+from .entity_store import EntitySnapshot, ensure_entity_stub
 
 logger = logging.getLogger(__name__)
 
@@ -201,9 +202,16 @@ def _write_linked_chat_resolution(payload: _LinkedChatCacheWrite) -> None:
     has_sibling_fields = any(k in payload.existing_blob for k in ("subscribers_count", "pinned_msg_id", "about"))
     try:
         with payload.conn:
-            payload.conn.execute(
-                "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) VALUES (?, 'channel', ?, ?, ?)",
-                (payload.channel_id, payload.channel_name, payload.channel_username, payload.now),
+            ensure_entity_stub(
+                payload.conn,
+                EntitySnapshot(
+                    entity_id=payload.channel_id,
+                    entity_type="channel",
+                    name=payload.channel_name,
+                    username=payload.channel_username,
+                    name_normalized=None,
+                    updated_at=payload.now,
+                ),
             )
             payload.conn.execute(
                 "INSERT INTO dialogs (dialog_id, linked_chat_id, linked_chat_resolved_at) "

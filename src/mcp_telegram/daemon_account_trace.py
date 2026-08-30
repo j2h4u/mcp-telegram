@@ -16,6 +16,7 @@ from telethon.tl.functions.contacts import ResolveUsernameRequest  # type: ignor
 from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_peer_sweep import enroll_activity_dialog
 from .daemon_message import fetch_text_links
+from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .hydration_queue import HydrationPriority
 from .message_content import MessageSnapshot, project_message_content
 from .message_contracts import ExtractedMessage
@@ -72,9 +73,6 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(value, high))
 
 
-_UPSERT_ENTITY_SQL = (
-    "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
-)
 _ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE username = ? COLLATE NOCASE"
 _TRACE_ACCOUNT_BY_ID_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE id = ?"
 _TRACE_ACCOUNT_NAMES_SQL = (
@@ -381,15 +379,17 @@ class DaemonAccountTraceService:
             resolved_username = username
         entity_type = classify_dialog_type(user).value
         now = int(time.time())
-        self._deps.conn.execute(
-            _UPSERT_ENTITY_SQL,
+        upsert_entity_snapshots(
+            self._deps.conn,
             (
-                user_id,
-                entity_type,
-                display_name,
-                resolved_username,
-                latinize(display_name),
-                now,
+                EntitySnapshot(
+                    entity_id=user_id,
+                    entity_type=entity_type,
+                    name=display_name,
+                    username=resolved_username,
+                    name_normalized=latinize(display_name),
+                    updated_at=now,
+                ),
             ),
         )
         self._deps.conn.commit()
