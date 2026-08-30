@@ -1,7 +1,18 @@
 import logging
+from collections.abc import Mapping
 
 from pydantic import Field
 
+from ..sync_read_model import (
+    CoverageState,
+    HistoryDepthState,
+    HistoryScope,
+    HistorySyncState,
+    RealtimeHistory,
+    SyncReadModelContractError,
+    SyncStatus,
+    decode_sync_read_model,
+)
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -46,10 +57,10 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
         "dialog_id": {"type": ["integer", "null"]},
-        "coverage_status": {"type": "string"},
+        "coverage_status": {"type": "string", "enum": [item.value for item in SyncStatus]},
         "enrollment_enabled": {"type": ["boolean", "null"]},
         "enrollment_source": {"type": ["string", "null"]},
-        "realtime_history": {"type": "string"},
+        "realtime_history": {"type": "string", "enum": [item.value for item in RealtimeHistory]},
         "is_syncing": {"type": "boolean"},
         "last_synced_at": {"type": ["integer", "null"]},
         "last_event_at": {"type": ["integer", "null"]},
@@ -57,11 +68,11 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "delta_refresh_requested_at": {"type": ["integer", "null"]},
         "message_count": {"type": ["integer", "null"]},
         "saved_message_count": {"type": ["integer", "null"]},
-        "history_scope": {"type": "string"},
-        "history_depth_state": {"type": "string"},
-        "history_sync_state": {"type": "string"},
+        "history_scope": {"type": "string", "enum": [item.value for item in HistoryScope]},
+        "history_depth_state": {"type": "string", "enum": [item.value for item in HistoryDepthState]},
+        "history_sync_state": {"type": "string", "enum": [item.value for item in HistorySyncState]},
         "history_complete_at": {"type": ["integer", "null"]},
-        "coverage_state": {"type": "string"},
+        "coverage_state": {"type": "string", "enum": [item.value for item in CoverageState]},
         "local_knowledge_at": {"type": ["integer", "null"]},
         "local_knowledge_age_seconds": {"type": ["integer", "null"]},
         "sync_progress": {"type": ["integer", "null"]},
@@ -327,71 +338,56 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
     if err := _check_daemon_response(response):
         return err
 
-    data = response.get("data", {})
-    status = data["coverage_status"]
-    message_count = data.get("message_count")
-    total_messages = data.get("total_messages")
-    saved_message_count = data.get("saved_message_count", message_count)
-    coverage_state = data.get("coverage_state", _coverage_state(saved_message_count, total_messages))
-    last_synced_at = data.get("last_synced_at")
-    last_event_at = data.get("last_event_at")
-    last_delta_checked_at = data.get("last_delta_checked_at")
-    delta_refresh_requested_at = data.get("delta_refresh_requested_at")
-    local_knowledge_at = data.get(
-        "local_knowledge_at",
-        _local_knowledge_at(last_synced_at, last_event_at, last_delta_checked_at),
-    )
-    sync_progress_message_id = data.get("sync_progress_message_id", data.get("sync_progress"))
+    data = response.get("data")
+    if not isinstance(data, Mapping):
+        return _sync_read_model_error("data must be an object")
+    try:
+        model = decode_sync_read_model(data)
+    except SyncReadModelContractError as exc:
+        return _sync_read_model_error(str(exc))
+
+    status = model.sync_status.value
+    message_count = model.saved_message_count
+    total_messages = model.total_messages
+    sync_progress_message_id = data.get("sync_progress_message_id")
     structured_content = {
         "dialog_id": data.get("dialog_id"),
-        "coverage_status": data["coverage_status"],
-        "enrollment_enabled": data["enrollment_enabled"],
+        "coverage_status": status,
+        "enrollment_enabled": model.enrollment_enabled,
         "enrollment_source": data["enrollment_source"],
-        "realtime_history": data["realtime_history"],
-        "is_syncing": status == "syncing",
-        "last_synced_at": last_synced_at,
-        "last_event_at": last_event_at,
-        "last_delta_checked_at": last_delta_checked_at,
-        "delta_refresh_requested_at": delta_refresh_requested_at,
+        "realtime_history": model.realtime_history.value,
+        "is_syncing": model.is_syncing,
+        "last_synced_at": model.last_synced_at,
+        "last_event_at": model.last_event_at,
+        "last_delta_checked_at": model.last_delta_checked_at,
+        "delta_refresh_requested_at": data.get("delta_refresh_requested_at"),
         "message_count": message_count,
-        "saved_message_count": saved_message_count,
-        "history_scope": data["history_scope"],
-        "history_depth_state": data["history_depth_state"],
-        "history_sync_state": data["history_sync_state"],
-        "history_complete_at": data["history_complete_at"],
-        "coverage_state": coverage_state,
-        "local_knowledge_at": local_knowledge_at,
-        "local_knowledge_age_seconds": data.get("local_knowledge_age_seconds"),
+        "saved_message_count": model.saved_message_count,
+        "history_scope": model.history_scope.value,
+        "history_depth_state": model.history_depth_state.value,
+        "history_sync_state": model.history_sync_state.value,
+        "history_complete_at": model.history_complete_at,
+        "coverage_state": model.coverage_state.value,
+        "local_knowledge_at": model.local_knowledge_at,
+        "local_knowledge_age_seconds": model.local_knowledge_age_seconds,
         "sync_progress": data.get("sync_progress"),
         "sync_progress_message_id": sync_progress_message_id,
         "total_messages": total_messages,
         "delete_detection": data.get("delete_detection"),
-        "sync_coverage_pct": data.get("sync_coverage_pct"),
+        "sync_coverage_pct": model.sync_coverage_pct,
         "access_lost_at": data.get("access_lost_at"),
         "access_last_revalidated_at": data.get("access_last_revalidated_at"),
         "access_next_revalidate_at": data.get("access_next_revalidate_at"),
-        "action": _sync_status_action(status, message_count, total_messages, coverage_state),
+        "action": _sync_status_action(status, message_count, total_messages, model.coverage_state.value),
     }
     return structured_result(structured_content, result_count=1)
 
 
-def _coverage_state(message_count: object, total_messages: object) -> str:
-    if total_messages is None:
-        return "telegram_total_unknown"
-    if not isinstance(total_messages, int) or total_messages < 0:
-        return "telegram_total_invalid"
-    if isinstance(message_count, int) and message_count > total_messages:
-        return "telegram_total_not_comparable"
-    return "telegram_total_comparable"
-
-
-def _local_knowledge_at(
-    last_synced_at: object,
-    last_event_at: object,
-    last_delta_checked_at: object = None,
-) -> object | None:
-    timestamps = [ts for ts in (last_synced_at, last_event_at, last_delta_checked_at) if isinstance(ts, int)]
-    return max(timestamps) if timestamps else None
+def _sync_read_model_error(detail: str) -> ToolResult:
+    return error_result(
+        f"Error: daemon_protocol_error: invalid canonical sync read model ({detail}).\n"
+        "Action: Restart the daemon with the same mcp-telegram build, then retry GetSyncStatus."
+    )
 
 
 def _sync_status_action(status: object, message_count: object, total_messages: object, coverage_state: object) -> str:

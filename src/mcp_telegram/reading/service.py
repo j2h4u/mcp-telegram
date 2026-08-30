@@ -33,7 +33,7 @@ from ..pagination import (
 from ..reactions.contracts import ReactionFreshness
 from ..resolver import latinize
 from ..sync_db import open_sync_db_reader
-from ..sync_read_model import build_sync_read_model, compute_sync_coverage
+from ..sync_read_model import SyncReadModelContractError, build_sync_read_model
 from ..telegram_fragments import FragmentContextService
 from ..telegram_reading import (
     GatewayFailure,
@@ -1192,6 +1192,31 @@ class ReadingService:
             for row in rows
         }
 
+    @staticmethod
+    def _fetch_history_enrollment(
+        conn: sqlite3.Connection,
+        dialog_ids: Sequence[int],
+    ) -> dict[int, bool]:
+        if not dialog_ids:
+            return {}
+        unique_ids = list(dict.fromkeys(dialog_ids))
+        placeholders = ",".join("?" for _ in unique_ids)
+        rows = _fetchall_rows(
+            conn.execute(
+                f"SELECT dialog_id, enabled FROM full_history_enrollment WHERE dialog_id IN ({placeholders})",
+                unique_ids,
+            )
+        )
+        enrollment: dict[int, bool] = {}
+        for row in rows:
+            raw_enabled = _row_value(row, "enabled")
+            if isinstance(raw_enabled, bool) or raw_enabled not in (0, 1):
+                raise SyncReadModelContractError(
+                    f"invalid persisted history enrollment for dialog {_row_value(row, 'dialog_id')!r}"
+                )
+            enrollment[_object_to_int(_row_value(row, "dialog_id"))] = raw_enabled == 1
+        return enrollment
+
     def _dialog_row_matches_filter(
         self,
         dialog_filter: _ListDialogsFilter,
@@ -1218,20 +1243,29 @@ class ReadingService:
         )
         return dialog_filter.normalized in name_norm or matches_acronym or matches_fuzzy
 
-    def _shape_dialog_row(
+    def _shape_dialog_row(  # noqa: PLR0913, PLR0917
         self,
         row: Mapping[str, object],
         aggregate: _DialogMessageAggregate,
+        enrollment_enabled: bool | None,
+        read_model_now: int,
         scheduled_summary: tuple[int, int | None] = (0, None),
         inclusion_basis: tuple[str, ...] | None = None,
     ) -> tuple[dict[str, object], int | None]:
         d_id = _object_to_int(row["dialog_id"])
         local_count = aggregate.local_message_count
+        sync_read_model = build_sync_read_model(
+            persisted_status=cast(str | None, row["sync_status"]),
+            enrollment_enabled=enrollment_enabled,
+            last_synced_at=_object_to_int_or_none(row["last_synced_at"]),
+            last_event_at=_object_to_int_or_none(row["last_event_at"]),
+            last_delta_checked_at=_object_to_int_or_none(row["last_delta_checked_at"]),
+            saved_message_count=local_count,
+            total_messages=_object_to_int_or_none(row["total_messages"]),
+            now=read_model_now,
+        )
 
         row_data: dict[str, object] = {
-            "last_synced_at": row["last_synced_at"],
-            "last_event_at": row["last_event_at"],
-            "last_delta_checked_at": row["last_delta_checked_at"],
             "id": d_id,
             "name": row["name"],
             "type": row["type"],
@@ -1242,21 +1276,7 @@ class ReadingService:
             "unread_count": _object_to_int_or_none(row["unread_count"]),
             "members": row["members"],
             "created": row["created"],
-            "sync_status": row["sync_status"] if row["sync_status"] is not None else "not_synced",
-            "sync_coverage_pct": compute_sync_coverage(
-                _object_to_int_or_none(row["total_messages"]),
-                local_count,
-            ),
-            **build_sync_read_model(
-                status=str(row["sync_status"] or "not_synced"),
-                timestamps=(
-                    _object_to_int_or_none(row["last_synced_at"]),
-                    _object_to_int_or_none(row["last_event_at"]),
-                    _object_to_int_or_none(row["last_delta_checked_at"]),
-                ),
-                local_count=local_count,
-                total_messages=_object_to_int_or_none(row["total_messages"]),
-            ),
+            **sync_read_model.to_wire(),
             "access_lost_at": row["access_lost_at"],
             "unread_mentions_count": _object_to_int(row["unread_mentions_count"], 0),
             "unread_reactions_count": _object_to_int(row["unread_reactions_count"], 0),
@@ -2186,7 +2206,7 @@ class ReadingService:
         finally:
             conn.close()
 
-    def _list_dialogs_sync(self, conn: sqlite3.Connection, req: dict) -> dict:
+    def _list_dialogs_sync(self, conn: sqlite3.Connection, req: dict) -> dict:  # noqa: PLR0914
         """Return dialog list from the local dialogs snapshot (pure SQL)."""
         request = self._parse_list_dialogs_request(req)
         if request.message_state not in {"sent", "scheduled", "all"}:
@@ -2253,6 +2273,8 @@ class ReadingService:
 
         dialog_ids = [_object_to_int(row["dialog_id"]) for row, _, _ in selected_rows]
         aggregates = self._fetch_list_dialog_aggregates(conn, dialog_ids)
+        enrollment_by_dialog = self._fetch_history_enrollment(conn, dialog_ids)
+        read_model_now = int(time.time())
         dialogs: list[dict] = []
         max_snapshot: int | None = None
         for row, summary, inclusion_basis in selected_rows:
@@ -2260,6 +2282,8 @@ class ReadingService:
             row_data, snapshot_at = self._shape_dialog_row(
                 row,
                 aggregates.get(dialog_id, _DialogMessageAggregate()),
+                enrollment_by_dialog.get(dialog_id),
+                read_model_now,
                 summary,
                 inclusion_basis,
             )

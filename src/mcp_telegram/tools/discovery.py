@@ -1,9 +1,20 @@
 import logging
+from collections.abc import Mapping
 from typing import Literal, cast
 
 from pydantic import ConfigDict, Field, StrictInt, model_validator
 
 from ..dialog_selector import DialogSelectorError, required_dialog_selector
+from ..sync_read_model import (
+    CoverageState,
+    HistoryDepthState,
+    HistoryScope,
+    HistorySyncState,
+    SyncReadModel,
+    SyncReadModelContractError,
+    SyncStatus,
+    decode_sync_read_model,
+)
 from ._base import (
     DaemonConnection,
     DaemonNotRunningError,
@@ -23,7 +34,6 @@ from .structured import (
     StructuredWarning,
     structured_warning,
     telegram_content,
-    unavailable_folder_snapshot,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,16 +69,22 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "type": {"type": ["string", "null"]},
                     "last_message_at": {"type": ["integer", "string", "null"]},
                     "unread_count": {"type": ["integer", "null"]},
-                    "sync_status": {"type": ["string", "null"]},
-                    "synced": {"type": ["boolean", "null"]},
+                    "sync_status": {"type": "string", "enum": [item.value for item in SyncStatus]},
+                    "synced": {"type": "boolean"},
                     "sync_coverage_pct": {"type": ["integer", "null"]},
                     "saved_message_count": {"type": "integer"},
-                    "history_scope": {"type": "string"},
-                    "history_depth_state": {"type": "string"},
-                    "history_sync_state": {"type": "string"},
+                    "history_scope": {"type": "string", "enum": [item.value for item in HistoryScope]},
+                    "history_depth_state": {
+                        "type": "string",
+                        "enum": [item.value for item in HistoryDepthState],
+                    },
+                    "history_sync_state": {
+                        "type": "string",
+                        "enum": [item.value for item in HistorySyncState],
+                    },
                     "history_complete_at": {"type": ["integer", "null"]},
                     "last_delta_checked_at": {"type": ["integer", "null"]},
-                    "coverage_state": {"type": "string"},
+                    "coverage_state": {"type": "string", "enum": [item.value for item in CoverageState]},
                     "local_knowledge_at": {"type": ["integer", "null"]},
                     "local_knowledge_age_seconds": {"type": ["integer", "null"]},
                     "access_lost_at": {"type": ["integer", "null"]},
@@ -228,18 +244,87 @@ def _structured_folder_placement(dialog: dict) -> dict[str, object]:
     }
 
 
-def _structured_sync_read_model(dialog: dict) -> dict[str, object]:
+def _structured_sync_read_model(model: SyncReadModel) -> dict[str, object]:
     return {
-        "saved_message_count": int(dialog.get("saved_message_count", 0) or 0),
-        "history_scope": dialog.get("history_scope", "none"),
-        "history_depth_state": dialog.get("history_depth_state", "unknown"),
-        "history_sync_state": dialog.get("history_sync_state", "unknown"),
-        "history_complete_at": dialog.get("history_complete_at"),
-        "last_delta_checked_at": dialog.get("last_delta_checked_at"),
-        "coverage_state": dialog.get("coverage_state", "telegram_total_unknown"),
-        "local_knowledge_at": dialog.get("local_knowledge_at"),
-        "local_knowledge_age_seconds": dialog.get("local_knowledge_age_seconds"),
+        "saved_message_count": model.saved_message_count,
+        "history_scope": model.history_scope.value,
+        "history_depth_state": model.history_depth_state.value,
+        "history_sync_state": model.history_sync_state.value,
+        "history_complete_at": model.history_complete_at,
+        "last_delta_checked_at": model.last_delta_checked_at,
+        "coverage_state": model.coverage_state.value,
+        "local_knowledge_at": model.local_knowledge_at,
+        "local_knowledge_age_seconds": model.local_knowledge_age_seconds,
     }
+
+
+def _list_dialogs_contract_error(detail: str) -> ToolResult:
+    return error_result(
+        f"Error: daemon_protocol_error: invalid list_dialogs contract ({detail}).\n"
+        "Action: Restart the daemon with the same mcp-telegram build, then retry ListDialogs."
+    )
+
+
+def _strict_optional_int(data: Mapping[str, object], name: str) -> int | None:
+    if name not in data:
+        raise SyncReadModelContractError(f"missing list_dialogs field: {name}")
+    value = data[name]
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SyncReadModelContractError(f"{name} must be an integer or null")
+    return value
+
+
+def _strict_folder_snapshot(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise SyncReadModelContractError("folder_snapshot must be an object")
+    generation = _strict_optional_int(value, "generation")
+    completed_at = _strict_optional_int(value, "completed_at")
+    age_seconds = _strict_optional_int(value, "age_seconds")
+    status = value.get("status")
+    complete = value.get("complete")
+    if status not in {"fresh", "stale", "unavailable"}:
+        raise SyncReadModelContractError("folder_snapshot.status is invalid")
+    if not isinstance(complete, bool):
+        raise SyncReadModelContractError("folder_snapshot.complete must be a boolean")
+    return {
+        "generation": generation,
+        "status": status,
+        "completed_at": completed_at,
+        "age_seconds": age_seconds,
+        "complete": complete,
+    }
+
+
+def _strict_list_dialogs_data(
+    response: Mapping[str, object],
+) -> tuple[list[dict[str, object]], int | None, bool, str, dict[str, object]]:
+    raw_data = response.get("data")
+    if not isinstance(raw_data, Mapping):
+        raise SyncReadModelContractError("data must be an object")
+    if "dialogs" not in raw_data or not isinstance(raw_data["dialogs"], list):
+        raise SyncReadModelContractError("dialogs must be an array")
+    dialogs: list[dict[str, object]] = []
+    for index, raw_dialog in enumerate(raw_data["dialogs"]):
+        if not isinstance(raw_dialog, Mapping):
+            raise SyncReadModelContractError(f"dialogs[{index}] must be an object")
+        dialogs.append(dict(raw_dialog))
+    if "bootstrap_pending" not in raw_data or not isinstance(raw_data["bootstrap_pending"], bool):
+        raise SyncReadModelContractError("bootstrap_pending must be a boolean")
+    scope = raw_data.get("scope")
+    if scope not in {"all", "own_only"}:
+        raise SyncReadModelContractError("scope must be all or own_only")
+    if "folder_snapshot" not in raw_data:
+        raise SyncReadModelContractError("missing list_dialogs field: folder_snapshot")
+    snapshot_age_h = _strict_optional_int(raw_data, "snapshot_age_h")
+    return (
+        dialogs,
+        snapshot_age_h,
+        raw_data["bootstrap_pending"],
+        cast(str, scope),
+        _strict_folder_snapshot(raw_data["folder_snapshot"]),
+    )
 
 
 LIST_TOPICS_OUTPUT_SCHEMA = {
@@ -352,10 +437,10 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
     if err := _check_daemon_response(response):
         return err
 
-    data = response.get("data", {})
-    dialogs = data.get("dialogs", [])
-    snapshot_age_h = data.get("snapshot_age_h")
-    bootstrap_pending = bool(data.get("bootstrap_pending", False))
+    try:
+        dialogs, snapshot_age_h, bootstrap_pending, scope, folder_snapshot = _strict_list_dialogs_data(response)
+    except SyncReadModelContractError as exc:
+        return _list_dialogs_contract_error(str(exc))
     warnings: list[StructuredWarning] = []
     if snapshot_age_h is not None:
         warnings.append(
@@ -367,8 +452,11 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
             )
         )
     structured_dialogs: list[dict[str, object]] = []
-    for d in dialogs:
-        sync_status = d.get("sync_status")
+    for index, d in enumerate(dialogs):
+        try:
+            model = decode_sync_read_model(d)
+        except SyncReadModelContractError as exc:
+            return _list_dialogs_contract_error(f"dialogs[{index}]: {exc}")
         structured_dialogs.append(
             {
                 "id": d.get("id"),
@@ -376,17 +464,17 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 "type": d.get("type"),
                 "last_message_at": d.get("last_message_at"),
                 "unread_count": d.get("unread_count"),
-                "sync_status": sync_status,
-                "synced": (sync_status == "synced") if sync_status is not None else None,
-                "sync_coverage_pct": d.get("sync_coverage_pct"),
-                **_structured_sync_read_model(d),
+                "sync_status": model.sync_status.value,
+                "synced": model.synced,
+                "sync_coverage_pct": model.sync_coverage_pct,
+                **_structured_sync_read_model(model),
                 "access_lost_at": d.get("access_lost_at"),
                 "members": d.get("members"),
                 "created": d.get("created"),
                 "unread_in": d.get("unread_in"),
                 "unread_out": d.get("unread_out"),
-                "unread_mentions_count": int(d.get("unread_mentions_count", 0) or 0),
-                "unread_reactions_count": int(d.get("unread_reactions_count", 0) or 0),
+                "unread_mentions_count": int(cast(int | str, d.get("unread_mentions_count", 0) or 0)),
+                "unread_reactions_count": int(cast(int | str, d.get("unread_reactions_count", 0) or 0)),
                 **_structured_dialog_lifecycle_fields(d),
                 **_structured_folder_placement(d),
                 "archived": bool(d.get("archived", False)),
@@ -406,8 +494,8 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
         },
         "snapshot_age_h": snapshot_age_h,
         "bootstrap_pending": bootstrap_pending,
-        "scope": data.get("scope", args.scope),
-        "folder_snapshot": data.get("folder_snapshot") or unavailable_folder_snapshot(),
+        "scope": scope,
+        "folder_snapshot": folder_snapshot,
         "warnings": warnings,
     }
 
