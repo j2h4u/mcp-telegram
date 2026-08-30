@@ -826,6 +826,17 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
                 self._record_mutation(node, key if isinstance(key, str) else None)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "update":
                 mapping_keys = _literal_mapping_keys(node.args[0]) if node.args else frozenset()
+                # Deliberately shallow and fail-closed: ordinary presenter
+                # extensions use one literal mapping; this is not data-flow analysis.
+                has_unknown_keys = (
+                    len(node.args) > 1
+                    or (bool(node.args) and mapping_keys is None)
+                    or any(keyword.arg is None for keyword in node.keywords)
+                )
+                if has_unknown_keys:
+                    findings.append(
+                        Finding(path, node.lineno, "message view update keys must be a statically known literal mapping")
+                    )
                 keyword_keys = frozenset(keyword.arg for keyword in node.keywords if keyword.arg is not None)
                 for key in sorted((mapping_keys or frozenset()) | keyword_keys):
                     self._record_mutation(node, key)

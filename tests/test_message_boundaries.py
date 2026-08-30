@@ -280,6 +280,46 @@ def test_list_message_presenter_extension_allows_only_lifecycle_fields() -> None
     assert not any("extension field 'visibility'" in finding.message for finding in findings)
 
 
+@pytest.mark.parametrize(
+    "merge",
+    [
+        "item.update(patch)",
+        "item.update(build_patch())",
+        "item.update(dict(patch))",
+        "item.update({**patch})",
+        "item.update(**patch)",
+    ],
+)
+def test_message_view_update_fails_closed_for_unknown_mapping_keys(merge: str) -> None:
+    """Catch ordinary accidental bypasses without pretending to prove provenance."""
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _structured_messages(message, patch):\n"
+        "    item = project_message_view(message)\n"
+        f"    {merge}\n"
+        "    return item\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("update keys must be a statically known literal mapping" in finding.message for finding in findings)
+
+
+def test_filter_shaped_literal_cannot_be_merged_into_message_view() -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _structured_messages(message):\n"
+        "    item = project_message_view(message)\n"
+        "    item.update({'exact_dialog_id': 1, 'sender': 'parallel', 'sender_id': 2, "
+        "'exact_topic_id': 3, 'topic': 'parallel'})\n"
+        "    return item\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("canonical field 'sender'" in finding.message for finding in findings)
+    assert any("canonical field 'topic'" in finding.message for finding in findings)
+    assert not any("update keys must be a statically known literal mapping" in finding.message for finding in findings)
+
+
 def test_noop_presenter_call_does_not_excuse_manually_returned_envelope() -> None:
     gate = _gate()
     source = (
