@@ -230,6 +230,11 @@ def test_legitimate_metadata_call_remains_allowed_with_serializer_entrypoint() -
         "item['sent_at'] = 1",
         "item.update({'read_markers': []})",
         "item.update(content={'text': 'raw'})",
+        "item.setdefault('sender', 'parallel label')",
+        "item.update(dict(sent_at=1))",
+        "item = dict(dialog_id=1, sent_at=1)",
+        "item.pop('sender')",
+        "del item['read_at']",
     ],
 )
 def test_canonical_message_entrypoint_cannot_overwrite_presenter_fields(write: str) -> None:
@@ -258,6 +263,78 @@ def test_list_message_page_composer_cannot_overwrite_presenter_fields() -> None:
     )
     findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
     assert any("must be owned by project_message_view" in finding.message for finding in findings)
+
+
+def test_list_message_presenter_extension_allows_only_lifecycle_fields() -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _list_message_structured_item(message):\n"
+        "    item = project_message_view(message)\n"
+        "    item.update({'visibility': 'chat_visible'})\n"
+        "    item.update({'unexpected': True})\n"
+        "    return item\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
+    assert any("extension field 'unexpected' is not an allowed lifecycle field" in finding.message for finding in findings)
+    assert not any("extension field 'visibility'" in finding.message for finding in findings)
+
+
+def test_noop_presenter_call_does_not_excuse_manually_returned_envelope() -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _structured_messages(message):\n"
+        "    project_message_view(message)\n"
+        "    return dict(dialog_id=message.dialog_id, sent_at=message.sent_at)\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("canonical field 'sent_at'" in finding.message for finding in findings)
+
+
+def test_local_helper_cannot_hide_presenter_field_mutation() -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _manual_sender(item):\n"
+        "    item.setdefault('sender', 'parallel label')\n"
+        "    return item\n"
+        "def _structured_messages(message):\n"
+        "    return _manual_sender(project_message_view(message))\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("canonical field 'sender'" in finding.message for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "from .message_view import project_message_view as present\n"
+            "def _structured_messages(message):\n"
+            "    return present(message)\n"
+        ),
+        (
+            "import mcp_telegram.tools.message_view as message_view\n"
+            "def _structured_messages(message):\n"
+            "    return message_view.project_message_view(message)\n"
+        ),
+    ],
+)
+def test_presenter_alias_and_module_qualified_calls_are_noncanonical(source: str) -> None:
+    gate = _gate()
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("canonical direct import and name" in finding.message for finding in findings)
+    assert any("must call project_message_view" in finding.message for finding in findings)
+
+
+def test_boundary_gate_fields_match_canonical_message_view_schema() -> None:
+    from mcp_telegram.tools.message_view import MESSAGE_VIEW_SCHEMA
+
+    gate = _gate()
+    properties = MESSAGE_VIEW_SCHEMA["properties"]
+    assert isinstance(properties, dict)
+    assert frozenset(properties) == gate.CANONICAL_MESSAGE_VIEW_FIELDS
 
 
 def test_serializer_call_does_not_excuse_second_raw_wrapper() -> None:
