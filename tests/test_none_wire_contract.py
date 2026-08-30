@@ -82,35 +82,26 @@ def test_mixed_null_enum_is_optional_but_keeps_non_null_values() -> None:
     validate(instance={"value": "x"}, schema=schema)
 
 
-def test_registered_output_schemas_have_no_nullable_object_properties() -> None:
+def test_registered_output_schemas_do_not_advertise_null() -> None:
     for name, entry in tools.TOOL_REGISTRY.items():
         schema_name = name
         schema = entry.output_schema
         assert schema is not None, schema_name
 
-        def check(node: object, *, in_array: bool = False, schema_name: str = schema_name) -> None:
+        def check(node: object, *, schema_name: str = schema_name) -> None:
             if isinstance(node, list):
                 for item in node:
-                    check(item, in_array=in_array)
+                    check(item)
                 return
             if not isinstance(node, dict):
                 return
+            assert not _schema_has_null(node), schema_name
             properties = node.get("properties")
             required = node.get("required")
-            if isinstance(properties, dict):
-                assert all(not _schema_has_null(property_schema) for property_schema in properties.values()), (
-                    schema_name
-                )
-                if isinstance(required, list):
-                    assert set(required) <= set(properties), schema_name
-                for property_schema in properties.values():
-                    check(property_schema)
-            for key in ("items", "prefixItems"):
-                if key in node:
-                    check(node[key], in_array=True)
-            for key in ("anyOf", "oneOf", "allOf"):
-                if key in node:
-                    check(node[key], in_array=in_array)
+            if isinstance(properties, dict) and isinstance(required, list):
+                assert set(required) <= set(properties), schema_name
+            for child in node.values():
+                check(child)
 
         check(schema)
 
@@ -127,7 +118,10 @@ def _schema_has_null(value: object) -> bool:
             isinstance(item, dict) and item.get("type") == "null" for item in variants
         ):
             return True
-    return schema_type == "null"
+    if value.get("const", object()) is None:
+        return True
+    enum = value.get("enum")
+    return schema_type == "null" or (isinstance(enum, list) and None in enum)
 
 
 @pytest.mark.asyncio
