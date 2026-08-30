@@ -79,6 +79,46 @@ MESSAGE_BODY_ENTRYPOINTS = {
     "tools/activity.py": frozenset({"_structured_comment"}),
     "tools/account_trace.py": frozenset({"_attach_trace_content_metadata"}),
 }
+CANONICAL_MESSAGE_VIEW_ENTRYPOINTS = {
+    "tools/reading.py": frozenset({"_list_message_structured_item"}),
+    "tools/unread.py": frozenset({"_structured_messages"}),
+}
+CANONICAL_MESSAGE_VIEW_GUARDED_FUNCTIONS = {
+    "tools/reading.py": frozenset({"_list_message_structured_item", "_list_messages_structured_messages"}),
+    "tools/unread.py": frozenset({"_structured_messages"}),
+}
+CANONICAL_MESSAGE_VIEW_FIELDS = frozenset(
+    {
+        "dialog_id",
+        "msg_id",
+        "sent_at",
+        "sender",
+        "out",
+        "is_service",
+        "topic",
+        "content",
+        "media",
+        "reply_context_ref",
+        "forward",
+        "post_author",
+        "edit_date",
+        "reactions",
+        "reaction_events",
+        "reaction_events_status",
+        "read_at",
+        "read_markers",
+    }
+)
+MESSAGE_VIEW_BYPASS_NAMES = frozenset(
+    {
+        "serialize_message_content",
+        "project_topic",
+        "_compute_inline_markers",
+        "_structured_read_marker",
+        "_structured_reaction_events",
+        "_structured_reactions",
+    }
+)
 TOOL_MESSAGE_PROJECTOR_PATHS = frozenset({"tools/activity.py", "tools/account_trace.py"})
 MESSAGE_METADATA_FUNCTIONS = {
     "tools/folders.py": frozenset({"list_folders", "list_folder_messages"}),
@@ -502,6 +542,7 @@ def _raw_message_content_violations(path: str, tree: ast.AST) -> list[Finding]:
             self.function: str | None = None
             self.tainted: set[str] = set()
             self.serializer_counts: dict[str, int] = {}
+            self.message_view_counts: dict[str, int] = {}
             self.content_aliases = {"telegram_content"}
 
         def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
@@ -516,12 +557,25 @@ def _raw_message_content_violations(path: str, tree: ast.AST) -> list[Finding]:
             self.function, self.tainted = node.name, set()
             self.generic_visit(node)
             if node.name in MESSAGE_BODY_ENTRYPOINTS.get(path, frozenset()):
-                serializer_count = self.serializer_counts.get(node.name, 0)
-                if serializer_count == 0:
+                message_view_count = self.message_view_counts.get(node.name, 0)
+                if node.name in CANONICAL_MESSAGE_VIEW_ENTRYPOINTS.get(path, frozenset()):
+                    if message_view_count == 0:
+                        findings.append(
+                            Finding(path, node.lineno, "canonical message delivery path must call project_message_view")
+                        )
+                    elif message_view_count != 1:
+                        findings.append(
+                            Finding(
+                                path,
+                                node.lineno,
+                                "canonical message delivery path must call project_message_view exactly once",
+                            )
+                        )
+                elif self.serializer_counts.get(node.name, 0) == 0:
                     findings.append(
                         Finding(path, node.lineno, "message delivery path must call serialize_message_content")
                     )
-                elif path in TOOL_MESSAGE_PROJECTOR_PATHS and serializer_count != 1:
+                elif path in TOOL_MESSAGE_PROJECTOR_PATHS and self.serializer_counts.get(node.name, 0) != 1:
                     findings.append(
                         Finding(
                             path,
@@ -548,6 +602,33 @@ def _raw_message_content_violations(path: str, tree: ast.AST) -> list[Finding]:
                 for target in node.targets:
                     if isinstance(target, ast.Name):
                         self.tainted.add(target.id)
+            if self.function in CANONICAL_MESSAGE_VIEW_GUARDED_FUNCTIONS.get(path, frozenset()):
+                findings.extend(
+                    Finding(
+                        path,
+                        node.lineno,
+                        f"canonical field {target.slice.value!r} must be owned by project_message_view",
+                    )
+                    for target in node.targets
+                    if (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.slice, ast.Constant)
+                        and target.slice.value in CANONICAL_MESSAGE_VIEW_FIELDS
+                    )
+                )
+            self.generic_visit(node)
+
+        def visit_Dict(self, node: ast.Dict) -> None:
+            if self.function in CANONICAL_MESSAGE_VIEW_GUARDED_FUNCTIONS.get(path, frozenset()):
+                written_fields = {
+                    key.value
+                    for key in node.keys
+                    if isinstance(key, ast.Constant) and key.value in CANONICAL_MESSAGE_VIEW_FIELDS
+                }
+                findings.extend(
+                    Finding(path, node.lineno, f"canonical field {field!r} must be owned by project_message_view")
+                    for field in sorted(written_fields)
+                )
             self.generic_visit(node)
 
         def _message_tainted(self, node: ast.expr) -> bool:  # noqa: PLR0911
@@ -576,9 +657,33 @@ def _raw_message_content_violations(path: str, tree: ast.AST) -> list[Finding]:
             return False
 
         def visit_Call(self, node: ast.Call) -> None:
-            if isinstance(node.func, ast.Name) and node.func.id == "serialize_message_content":
+            called_name = node.func.id if isinstance(node.func, ast.Name) else None
+            if called_name == "serialize_message_content":
                 function = self.function or ""
                 self.serializer_counts[function] = self.serializer_counts.get(function, 0) + 1
+            if called_name == "project_message_view":
+                function = self.function or ""
+                self.message_view_counts[function] = self.message_view_counts.get(function, 0) + 1
+            if self.function in CANONICAL_MESSAGE_VIEW_ENTRYPOINTS.get(
+                path, frozenset()
+            ) and called_name in MESSAGE_VIEW_BYPASS_NAMES:
+                findings.append(
+                    Finding(path, node.lineno, "canonical message delivery path must use project_message_view")
+                )
+            if (
+                self.function in CANONICAL_MESSAGE_VIEW_GUARDED_FUNCTIONS.get(path, frozenset())
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"update", "setdefault"}
+            ):
+                findings.extend(
+                    Finding(
+                        path,
+                        node.lineno,
+                        f"canonical field {keyword.arg!r} must be owned by project_message_view",
+                    )
+                    for keyword in node.keywords
+                    if keyword.arg in CANONICAL_MESSAGE_VIEW_FIELDS
+                )
             is_content_call = isinstance(node.func, ast.Name) and node.func.id in self.content_aliases
             is_content_call = is_content_call or (
                 isinstance(node.func, ast.Attribute) and node.func.attr == "telegram_content"

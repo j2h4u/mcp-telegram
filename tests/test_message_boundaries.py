@@ -197,7 +197,7 @@ def test_message_entrypoint_must_call_shared_serializer() -> None:
     gate = _gate()
     source = "def _structured_messages(message):\n    return {'text': message.text}\n"
     findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
-    assert any("must call serialize_message_content" in finding.message for finding in findings)
+    assert any("must call project_message_view" in finding.message for finding in findings)
 
 
 def test_metadata_wrapper_allowlist_does_not_hide_message_body_bypass() -> None:
@@ -214,13 +214,50 @@ def test_metadata_wrapper_allowlist_does_not_hide_message_body_bypass() -> None:
 def test_legitimate_metadata_call_remains_allowed_with_serializer_entrypoint() -> None:
     gate = _gate()
     source = (
-        "from .structured import telegram_content, serialize_message_content\n"
+        "from .message_view import project_message_view\n"
         "def _structured_messages(message):\n"
-        "    return serialize_message_content(message.text, message.media_description)\n"
+        "    return project_message_view(message)\n"
         "def _structured_reactions(display):\n"
-        "    return telegram_content(display, 'reaction')\n"
+        "    return display\n"
     )
     assert gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source) == []
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        "item = {'sender': 'parallel label'}",
+        "item['sent_at'] = 1",
+        "item.update({'read_markers': []})",
+        "item.update(content={'text': 'raw'})",
+    ],
+)
+def test_canonical_message_entrypoint_cannot_overwrite_presenter_fields(write: str) -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _structured_messages(message):\n"
+        "    item = project_message_view(message)\n"
+        f"    {write}\n"
+        "    return item\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("must be owned by project_message_view" in finding.message for finding in findings)
+
+
+def test_list_message_page_composer_cannot_overwrite_presenter_fields() -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _list_message_structured_item(message):\n"
+        "    return project_message_view(message)\n"
+        "def _list_messages_structured_messages(message):\n"
+        "    item = _list_message_structured_item(message)\n"
+        "    item['sender'] = 'parallel label'\n"
+        "    return [item]\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
+    assert any("must be owned by project_message_view" in finding.message for finding in findings)
 
 
 def test_serializer_call_does_not_excuse_second_raw_wrapper() -> None:

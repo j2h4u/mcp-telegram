@@ -8,12 +8,10 @@ from pydantic import ConfigDict, Field, StrictInt, model_validator
 
 from ..entity_identity import ENTITY_IDENTITY_SCHEMA, EntityIdentity, project_entity_identity
 from ..formatter import (
-    _compute_inline_markers,
     _render_read_state_header,
 )
 from ..models import DialogType, ReadMessage, ReadState
 from ..temporal import parse_utc_boundary
-from ..topic_identity import TOPIC_IDENTITY_SCHEMA, project_topic
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -26,12 +24,10 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
+from .message_view import MESSAGE_VIEW_SCHEMA, project_message_view, project_read_markers
 from .structured import (
-    MEDIA_OUTPUT_SCHEMA,
     StructuredWarning,
-    serialize_message_content,
     structured_warning,
-    telegram_content,
 )
 
 GET_INBOX_OUTPUT_SCHEMA = {
@@ -146,51 +142,15 @@ GET_INBOX_OUTPUT_SCHEMA = {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "msg_id": {"type": "integer"},
-                                "sender": ENTITY_IDENTITY_SCHEMA,
-                                "topic": TOPIC_IDENTITY_SCHEMA,
-                                "out": {"type": "boolean"},
-                                # Keep Unix seconds at the internal tool boundary so
-                                # the shared temporal presentation layer can render
-                                # the requested timezone in the MCP response.
-                                "date": {"type": ["integer", "null"]},
-                                "content": {"type": ["object", "null"]},
-                                "media": {"anyOf": [{"type": "null"}, MEDIA_OUTPUT_SCHEMA]},
-                                "reply_to_msg_id": {"type": ["integer", "null"]},
-                                "edit_date": {"type": ["integer", "null"]},
-                                "reactions": {"type": ["object", "null"]},
-                                "reaction_events": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "reactor_id": {"type": ["integer", "null"]},
-                                            "emoji": {"type": "string"},
-                                            "reacted_at": {"type": ["integer", "null"]},
-                                        },
-                                        "required": ["reactor_id", "emoji", "reacted_at"],
-                                        "additionalProperties": False,
-                                    },
-                                },
-                                "reaction_events_status": {"type": "string"},
-                                "read_at": {"type": ["integer", "null"]},
-                                "read_markers": {"type": "array", "items": {"type": "object"}},
-                                "inline_markers": {"type": "array", "items": {"type": "object"}},
+                                **cast(dict[str, object], MESSAGE_VIEW_SCHEMA["properties"]),
                             },
                             "required": [
+                                "dialog_id",
                                 "msg_id",
+                                "sent_at",
                                 "out",
-                                "date",
-                                "content",
-                                "media",
-                                "reply_to_msg_id",
-                                "edit_date",
-                                "reactions",
                                 "reaction_events",
                                 "reaction_events_status",
-                                "read_at",
-                                "read_markers",
-                                "inline_markers",
                             ],
                             "additionalProperties": False,
                         },
@@ -390,92 +350,6 @@ def _resolve_inbox_since(
     return _resolve_inbox_relative(last_hours, now)
 
 
-def _message_date(sent_at: object) -> int | None:
-    if sent_at is None or isinstance(sent_at, bool):
-        return None
-    if not isinstance(sent_at, (int, float, str, bytes, bytearray)):
-        return None
-    try:
-        return int(sent_at)
-    except TypeError, ValueError, OverflowError:
-        return None
-
-
-def _project_message_sender(message: ReadMessage) -> EntityIdentity | None:
-    """Project one inbox message author without inventing an identity.
-
-    ``effective_sender_id`` carries the concrete actor for ordinary senders,
-    including the peer/self sides of direct messages.  Rows with no actor id
-    remain null because Inbox already excludes service messages.
-    """
-    actor_id = message.effective_sender_id
-    if actor_id is None:
-        actor_id = message.sender_id
-    if isinstance(actor_id, bool) or not isinstance(actor_id, int) or actor_id == 0:
-        return None
-
-    return project_entity_identity(
-        display_name=message.sender_first_name,
-        username=message.sender_username,
-        telegram_id=actor_id,
-    )
-
-
-_READ_MARKER_METADATA = {
-    "[I read up to here]": {
-        "kind": "i_read_up_to_here",
-        "side": "inbox",
-        "role": "boundary",
-    },
-    "[unread by me]": {
-        "kind": "unread_by_me",
-        "side": "inbox",
-        "role": "tail_start",
-    },
-    "[peer read up to here]": {
-        "kind": "peer_read_up_to_here",
-        "side": "outbox",
-        "role": "boundary",
-    },
-    "[unread by peer]": {
-        "kind": "unread_by_peer",
-        "side": "outbox",
-        "role": "tail_start",
-    },
-}
-
-
-def _structured_reactions(display: str | None) -> dict[str, object] | None:
-    if not display:
-        return None
-    return {
-        "display": display,
-        "content": telegram_content(display, "reaction"),
-    }
-
-
-def _structured_reaction_events(message: ReadMessage) -> list[dict[str, object]]:
-    return [
-        {
-            "reactor_id": event.get("reactor_id") if isinstance(event, Mapping) else event.reactor_id,
-            "emoji": event.get("emoji") if isinstance(event, Mapping) else event.emoji,
-            "reacted_at": event.get("reacted_at") if isinstance(event, Mapping) else event.reacted_at,
-        }
-        for event in message.reaction_events
-    ]
-
-
-def _structured_read_marker(message_id: int, label: str) -> dict[str, object]:
-    metadata = _READ_MARKER_METADATA[label]
-    return {
-        "kind": metadata["kind"],
-        "label": label,
-        "side": metadata["side"],
-        "role": metadata["role"],
-        "anchor_message_id": message_id,
-    }
-
-
 def _read_state_payload(read_state: ReadState | dict | None, dialog_type: str | None) -> dict[str, object] | None:
     if read_state is None and dialog_type is None:
         return None
@@ -601,39 +475,8 @@ def _structured_messages(
         ),
     )
     messages = [ReadMessage(**row) for row in ordered_rows]
-    marker_by_message = (
-        _compute_inline_markers(messages, read_state) if DialogType.parse(dialog_type) == DialogType.USER else {}
-    )
-    structured: list[dict[str, object]] = []
-    for _row, message in zip(ordered_rows, messages, strict=False):
-        marker_label = marker_by_message.get(message.id)
-        read_markers = [_structured_read_marker(message.id, marker_label)] if marker_label else []
-        projected = serialize_message_content(
-            message.text, message.media_description, message.content_kind, message.media_kind
-        )
-        sender = _project_message_sender(message)
-        structured_message: dict[str, object] = {
-            "msg_id": message.id,
-            "out": bool(message.out),
-            "date": _message_date(message.sent_at),
-            "content": projected["content"],
-            "media": projected["media"],
-            "reply_to_msg_id": message.reply_to_msg_id,
-            "edit_date": message.edit_date,
-            "reactions": _structured_reactions(message.reactions_display),
-            "reaction_events": _structured_reaction_events(message),
-            "reaction_events_status": message.reaction_events_status,
-            "read_at": message.read_at,
-            "read_markers": read_markers,
-            "inline_markers": read_markers,
-        }
-        if sender is not None:
-            structured_message["sender"] = sender
-        topic = project_topic(topic_id=message.forum_topic_id, title=message.topic_title)
-        if topic is not None:
-            structured_message["topic"] = topic
-        structured.append(structured_message)
-    return structured
+    marker_by_message = project_read_markers(messages, read_state=read_state, dialog_type=dialog_type)
+    return [project_message_view(message, read_marker=marker_by_message.get(message.id)) for message in messages]
 
 
 def _identity_text_fact(value: object) -> str | None:

@@ -8,7 +8,6 @@ from pydantic import Field, model_validator
 
 from ..errors import dialog_not_found_text, invalid_navigation_text
 from ..formatter import (
-    _compute_inline_markers,
     _render_read_state_header,
     format_messages,
     frame_telegram_snippet,
@@ -31,6 +30,7 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
+from .message_view import MESSAGE_VIEW_SCHEMA, ReadMarker, project_message_view, project_read_markers
 from .structured import (
     MEDIA_OUTPUT_SCHEMA,
     StructuredWarning,
@@ -323,39 +323,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "dialog_id": {"type": "integer"},
-                    "msg_id": {"type": "integer"},
-                    "sent_at": {"type": "integer"},
-                    "date": {"type": "string"},
-                    "sender": {"type": "string"},
-                    "sender_id": {"type": ["integer", "null"]},
-                    "effective_sender_id": {"type": "integer"},
-                    "out": {"type": "boolean"},
-                    "is_service": {"type": "boolean"},
-                    "topic": TOPIC_IDENTITY_SCHEMA,
-                    "content": {"type": "object"},
-                    "media": MEDIA_OUTPUT_SCHEMA,
-                    "reply_context_ref": {"type": "object"},
-                    "forward": {"type": "object"},
-                    "post_author": {"type": "string"},
-                    "edit_date": {"type": "integer"},
-                    "reactions": {"type": "object"},
-                    "reaction_events": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "reactor_id": {"type": ["integer", "null"]},
-                                "emoji": {"type": "string"},
-                                "reacted_at": {"type": ["integer", "null"]},
-                            },
-                            "required": ["reactor_id", "emoji", "reacted_at"],
-                            "additionalProperties": False,
-                        },
-                    },
-                    "reaction_events_status": {"type": "string"},
-                    "read_at": {"type": ["integer", "null"]},
-                    "read_markers": {"type": "array", "items": {"type": "object"}},
+                    **cast(dict[str, object], MESSAGE_VIEW_SCHEMA["properties"]),
                     "message_state": {"type": "string", "enum": ["sent", "scheduled"]},
                     "visibility": {
                         "type": "string",
@@ -372,9 +340,6 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "dialog_id",
                     "msg_id",
                     "sent_at",
-                    "date",
-                    "sender",
-                    "sender_id",
                     "out",
                     "message_state",
                     "visibility",
@@ -386,7 +351,6 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "inclusion_basis",
                     "reaction_events",
                     "reaction_events_status",
-                    "read_at",
                 ],
                 "additionalProperties": False,
             },
@@ -485,30 +449,6 @@ def _navigation_direction_for_structured(direction: str, anchor_message_id: int 
     return "older"
 
 
-_READ_MARKER_METADATA = {
-    "[I read up to here]": {
-        "kind": "i_read_up_to_here",
-        "side": "inbox",
-        "role": "boundary",
-    },
-    "[unread by me]": {
-        "kind": "unread_by_me",
-        "side": "inbox",
-        "role": "tail_start",
-    },
-    "[peer read up to here]": {
-        "kind": "peer_read_up_to_here",
-        "side": "outbox",
-        "role": "boundary",
-    },
-    "[unread by peer]": {
-        "kind": "unread_by_peer",
-        "side": "outbox",
-        "role": "tail_start",
-    },
-}
-
-
 def _topic_candidate_payload(topic: dict) -> dict[str, object]:
     title = topic.get("title") or ""
     return {
@@ -522,71 +462,6 @@ def _topic_candidate_payload(topic: dict) -> dict[str, object]:
     }
 
 
-def _message_date(sent_at: int) -> str:
-    return datetime.fromtimestamp(int(sent_at), tz=UTC).isoformat()
-
-
-def _structured_read_marker(message_id: int, label: str) -> dict[str, object]:
-    metadata = _READ_MARKER_METADATA[label]
-    return {
-        "kind": metadata["kind"],
-        "label": label,
-        "side": metadata["side"],
-        "role": metadata["role"],
-        "anchor_message_id": message_id,
-    }
-
-
-def _structured_reply_context_ref(
-    reply_to_msg_id: int | None,
-    *,
-    parent_in_page: bool,
-    context_included: bool,
-) -> dict[str, object] | None:
-    if reply_to_msg_id is None:
-        return None
-    return {
-        "msg_id": reply_to_msg_id,
-        "in_page": parent_in_page,
-        "context_included": context_included,
-    }
-
-
-def _structured_forward(from_name: str | None) -> dict[str, object] | None:
-    if not from_name:
-        return None
-    return {
-        "from_name": from_name,
-    }
-
-
-def _structured_reactions(display: str | None) -> dict[str, object] | None:
-    if not display:
-        return None
-    return {
-        "display": display,
-    }
-
-
-def _reaction_event_payload(event: object) -> dict[str, object]:
-    if isinstance(event, Mapping):
-        return {
-            "reactor_id": event.get("reactor_id"),
-            "emoji": event.get("emoji"),
-            "reacted_at": event.get("reacted_at"),
-        }
-    typed_event = cast("ReadReactionEvent", event)
-    return {
-        "reactor_id": typed_event.reactor_id,
-        "emoji": typed_event.emoji,
-        "reacted_at": typed_event.reacted_at,
-    }
-
-
-def _structured_reaction_events(message: ReadMessage) -> list[dict[str, object]]:
-    return [_reaction_event_payload(event) for event in message.reaction_events]
-
-
 def _maybe_add(item: dict[str, object], key: str, value: object | None) -> None:
     if value is not None:
         item[key] = value
@@ -596,63 +471,35 @@ def _list_message_structured_item(
     message: ReadMessage,
     *,
     parent_in_page: bool,
-    read_markers: list[dict[str, object]],
+    read_marker: ReadMarker | None,
     lifecycle: dict[str, object],
 ) -> dict[str, object]:
-    item: dict[str, object] = {
-        "dialog_id": message.dialog_id,
-        "msg_id": message.id,
-        "sent_at": message.sent_at,
-        "date": _message_date(message.sent_at),
-        "sender": resolve_sender_label(message),
-        "sender_id": message.sender_id,
-        "out": bool(message.out),
-        "message_state": lifecycle["message_state"],
-        "visibility": lifecycle["visibility"],
-        "unpublished": lifecycle["unpublished"],
-        "published": lifecycle["published"],
-        "unseen": lifecycle["unseen"],
-        "scheduled_at": lifecycle["scheduled_at"],
-        "published_at": lifecycle["published_at"],
-        "inclusion_basis": lifecycle.get("inclusion_basis") or [],
-        "reaction_events": _structured_reaction_events(message),
-        "reaction_events_status": message.reaction_events_status,
-        "read_at": message.read_at,
-    }
-    if message.effective_sender_id is not None and message.effective_sender_id != message.sender_id:
-        item["effective_sender_id"] = message.effective_sender_id
-    if message.is_service:
-        item["is_service"] = True
-
-    _maybe_add(item, "topic", project_topic(topic_id=message.forum_topic_id, title=message.topic_title))
-    projected = serialize_message_content(
-        message.text, message.media_description, message.content_kind, message.media_kind
+    item = project_message_view(
+        message,
+        parent_in_page=parent_in_page,
+        context_included=False,
+        read_marker=read_marker,
     )
-    _maybe_add(item, "content", projected["content"])
-    _maybe_add(item, "media", projected["media"])
-    _maybe_add(
-        item,
-        "reply_context_ref",
-        _structured_reply_context_ref(
-            message.reply_to_msg_id,
-            parent_in_page=parent_in_page,
-            context_included=False,
-        ),
+    item.update(
+        {
+            "message_state": lifecycle["message_state"],
+            "visibility": lifecycle["visibility"],
+            "unpublished": lifecycle["unpublished"],
+            "published": lifecycle["published"],
+            "unseen": lifecycle["unseen"],
+            "scheduled_at": lifecycle["scheduled_at"],
+            "published_at": lifecycle["published_at"],
+            "inclusion_basis": lifecycle.get("inclusion_basis") or [],
+        }
     )
-    _maybe_add(item, "forward", _structured_forward(message.fwd_from_name))
-    _maybe_add(item, "post_author", message.post_author)
-    _maybe_add(item, "edit_date", message.edit_date)
-    _maybe_add(item, "reactions", _structured_reactions(message.reactions_display))
-    if read_markers:
-        item["read_markers"] = read_markers
     return item
 
 
 def _list_message_render_metadata(
     row: dict,
     message: ReadMessage,
-    marker_by_message: dict[int, str],
-) -> tuple[str | None, dict[str, object]]:
+    marker_by_message: Mapping[int, ReadMarker],
+) -> tuple[ReadMarker | None, dict[str, object]]:
     is_scheduled = row.get("message_state") == "scheduled"
     marker_label = None if is_scheduled else marker_by_message.get(message.id)
     return marker_label, {
@@ -684,21 +531,18 @@ def _list_messages_structured_messages(
         return []
     messages = _read_messages_from_rows(rows)
     reply_map: dict[int, ReadMessage] = {message.id: message for message in messages}
-    marker_by_message = (
-        _compute_inline_markers(messages, read_state) if DialogType.parse(dialog_type) == DialogType.USER else {}
-    )
+    marker_by_message = project_read_markers(messages, read_state=read_state, dialog_type=dialog_type)
 
     structured: list[dict[str, object]] = []
     for row, message in zip(rows, messages, strict=True):
         marker_label, lifecycle = _list_message_render_metadata(row, message, marker_by_message)
-        read_markers = [_structured_read_marker(message.id, marker_label)] if marker_label else []
         reply_parent = reply_map.get(message.reply_to_msg_id or -1)
         parent_in_page = reply_parent is not None
         structured.append(
             _list_message_structured_item(
                 message,
                 parent_in_page=parent_in_page,
-                read_markers=read_markers,
+                read_marker=marker_label,
                 lifecycle=lifecycle,
             )
         )
@@ -1008,6 +852,22 @@ def _search_result_render_fields(row: dict, dialog_id: int) -> dict[str, object]
 def _search_result_date(row: dict) -> int | None:
     sent_at = row.get("sent_at")
     return int(sent_at) if sent_at is not None else None
+
+
+def _reaction_event_payload(event: object) -> dict[str, object]:
+    """Keep search's existing result shape isolated from the message view."""
+    if isinstance(event, Mapping):
+        return {
+            "reactor_id": event.get("reactor_id"),
+            "emoji": event.get("emoji"),
+            "reacted_at": event.get("reacted_at"),
+        }
+    typed_event = cast("ReadReactionEvent", event)
+    return {
+        "reactor_id": typed_event.reactor_id,
+        "emoji": typed_event.emoji,
+        "reacted_at": typed_event.reacted_at,
+    }
 
 
 def _search_result_reaction_events(row: dict) -> list[dict[str, object]]:
