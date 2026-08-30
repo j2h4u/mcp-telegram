@@ -29,12 +29,12 @@ require_ignore_directive_reasons = "error"
 [[modules]]
 path = "mcp_telegram"
 layer = "delivery"
-depends_on = ["mcp_telegram.config", "mcp_telegram.daemon", "mcp_telegram.daemon_client", "mcp_telegram.feedback_db", "mcp_telegram.server", "mcp_telegram.telegram"]
+depends_on = ["mcp_telegram.config", "mcp_telegram.daemon", "mcp_telegram.daemon_client", "mcp_telegram.feedback_db", "mcp_telegram.runtime_logging", "mcp_telegram.server", "mcp_telegram.telegram"]
 
 [[modules]]
 path = "mcp_telegram.server"
 layer = "delivery"
-depends_on = ["mcp_telegram.config", "mcp_telegram.correlation", "mcp_telegram.daemon_client", "mcp_telegram.tools"]
+depends_on = ["mcp_telegram.config", "mcp_telegram.correlation", "mcp_telegram.daemon_client", "mcp_telegram.runtime_logging", "mcp_telegram.tools"]
 
 [[modules]]
 path = "mcp_telegram.tools"
@@ -558,6 +558,11 @@ depends_on = []
 
 [[modules]]
 path = "mcp_telegram.correlation"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.runtime_logging"
 layer = "foundation"
 depends_on = []
 
