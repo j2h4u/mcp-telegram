@@ -444,7 +444,7 @@ async def test_update_read_history_inbox_logs_still_unread_count(
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     mgr._synced_dialog_ids.add(dialog_id)
 
-    with caplog.at_level(logging.INFO, logger="mcp_telegram.event_handlers"):
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.event_handlers"):
         await mgr.on_raw_inbox_read(cast(_InboxReadUpdateLike, upd))
 
     assert any("still_unread_count=7" in r.message for r in caplog.records)
@@ -486,7 +486,7 @@ async def test_update_read_channel_inbox_extracts_dialog_id_via_peer_channel(
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     mgr._synced_dialog_ids.add(dialog_id)
 
-    with caplog.at_level(logging.INFO, logger="mcp_telegram.event_handlers"):
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.event_handlers"):
         await mgr.on_raw_inbox_read(cast(_ChannelInboxReadUpdateLike, upd))
 
     assert any("still_unread_count=3" in r.message for r in caplog.records)
@@ -513,7 +513,7 @@ async def test_update_read_history_inbox_persists_unenrolled_dialog(
     )
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
 
-    with caplog.at_level(logging.INFO, logger="mcp_telegram.event_handlers"):
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.event_handlers"):
         await mgr.on_raw_inbox_read(cast(_InboxReadUpdateLike, upd))
 
     assert any("still_unread_count=0" in r.message for r in caplog.records)

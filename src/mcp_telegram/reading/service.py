@@ -2114,7 +2114,7 @@ class ReadingService:
                 return await asyncio.to_thread(self._list_dialogs_from_reader, db_path, req)
             finally:
                 elapsed_ms = (time.monotonic() - started) * 1000
-                self._logger.info("list_dialogs_sql_reader completed in %.3fms%s", elapsed_ms, self._deps.rid())
+                self._logger.debug("list_dialogs_sql_reader completed in %.3fms%s", elapsed_ms, self._deps.rid())
         return self._list_dialogs_sync(self._conn, req)
 
     async def _get_unread_summary(self, req: dict) -> dict:

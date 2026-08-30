@@ -993,7 +993,7 @@ class DialogReconciliationWorker:
             )
             return 0
 
-        logger.info("recon_topics_complete dialog_id=%d count=%d", dialog_id, count)
+        logger.debug("recon_topics_complete dialog_id=%d count=%d", dialog_id, count)
         return count
 
 

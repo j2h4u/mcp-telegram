@@ -6260,6 +6260,19 @@ async def test_list_messages_emits_structured_log_on_sync_db_success(caplog: pyt
     assert rec.unresolved_entity_rows == 1
 
 
+def test_slow_successful_request_completion_is_logged_at_info(caplog: pytest.LogCaptureFixture) -> None:
+    """Slow successful calls remain visible after ordinary completion logs are compacted."""
+    server = make_server()
+    with caplog.at_level("INFO", logger="mcp_telegram.daemon_api"):
+        server._log_request_completion("list_dialogs", "request-1", {"ok": True}, duration_s=5.001)
+
+    records = [record for record in caplog.records if "daemon_api_request_complete" in record.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelname == "INFO"
+    assert "method=list_dialogs" in records[0].getMessage()
+    assert "ok=True" in records[0].getMessage()
+
+
 @pytest.mark.asyncio
 async def test_list_messages_logs_zero_counters_when_empty(caplog: pytest.LogCaptureFixture) -> None:
     """Empty synced dialog emits log with zero counters."""

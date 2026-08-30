@@ -584,7 +584,7 @@ class EventHandlerManager:
                 self._project_new_message_metadata(dialog_id, msg, now)
                 self._record_body_event(dialog_id, now)
 
-            logger.info("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
+            logger.debug("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
         except Exception:
             logger.exception("event_new_failed dialog_id=%s", dialog_id)
 
@@ -793,7 +793,7 @@ class EventHandlerManager:
             if next_ver is None:
                 return
 
-            logger.info(
+            logger.debug(
                 "event_edit dialog_id=%d message_id=%d version=%d",
                 dialog_id,
                 message_id,
@@ -846,7 +846,7 @@ class EventHandlerManager:
         with self._conn:
             replace_reaction_aggregates(self._conn, dialog_id, message_id, aggregates)
             self._record_body_event(dialog_id, now)
-        logger.info(
+        logger.debug(
             "event_edit_reactions dialog_id=%d message_id=%d count=%d",
             dialog_id,
             message_id,
@@ -1000,7 +1000,7 @@ class EventHandlerManager:
                 rowcount = apply_read_cursor(self._conn, dialog_id, "inbox", max_id)
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
             if rowcount > 0:
-                logger.info("event_read dialog_id=%d max_id=%d", dialog_id, max_id)
+                logger.debug("event_read dialog_id=%d max_id=%d", dialog_id, max_id)
             else:
                 logger.warning(
                     "event_read_no_row dialog_id=%d max_id=%d — UPDATE matched 0 rows",
@@ -1076,7 +1076,7 @@ class EventHandlerManager:
                 rowcount = apply_read_cursor(self._conn, dialog_id, "outbox", max_id)
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
             if rowcount > 0:
-                logger.info("event_outbox_read dialog_id=%d max_id=%d", dialog_id, max_id)
+                logger.debug("event_outbox_read dialog_id=%d max_id=%d", dialog_id, max_id)
             else:
                 logger.warning(
                     "event_outbox_read_no_row dialog_id=%d max_id=%d — UPDATE matched 0 rows",
@@ -1144,7 +1144,7 @@ class EventHandlerManager:
             aggregates = project_reaction_aggregates(msg.reactions)
             if not self._apply_reaction_event(dialog_id, msg_id, aggregates):
                 return
-            logger.info(
+            logger.debug(
                 "event_raw_reaction dialog_id=%d message_id=%d count=%d",
                 dialog_id,
                 msg_id,
@@ -1244,7 +1244,7 @@ class EventHandlerManager:
                 self._stage_missing_transcription(event_fields, now)
             else:
                 return
-            logger.info(
+            logger.debug(
                 "event_raw_transcribed_audio dialog_id=%d message_id=%d",
                 dialog_id,
                 msg_id,
@@ -1582,7 +1582,7 @@ class EventHandlerManager:
                     create_missing=True,
                 )
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
-            logger.info(
+            logger.debug(
                 "event_raw_inbox_read dialog_id=%d max_id=%d still_unread_count=%s updated=%d",
                 dialog_id,
                 max_id,
