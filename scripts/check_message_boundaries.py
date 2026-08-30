@@ -150,7 +150,7 @@ _EXECUTE_METHODS = frozenset({"execute", "executemany", "executescript"})
 _SQL_NAME = re.compile(r"(?:^|_)(?:SQL|DDL|QUERY)(?:$|_)", re.IGNORECASE)
 _SQL_START = re.compile(r"^(?:SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b", re.IGNORECASE)
 _SQL_TOKEN = re.compile(
-    r"--[^\n]*|/\*.*?\*/|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*|[.]",
+    r"--[^\n]*|/\*.*?\*/|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*|[().]",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -300,24 +300,52 @@ def _is_exact_table_at(tokens: list[str], index: int, table_name: str) -> bool:
     )
 
 
+def _top_level_statement_index(tokens: list[str]) -> int | None:
+    """Locate the statement following an optional sequence of CTEs."""
+    if not tokens:
+        return None
+    if tokens[0].casefold() != "with":
+        return 0
+
+    depth = 0
+    for index, token in enumerate(tokens[1:], start=1):
+        if token == "(":
+            depth += 1
+        elif token == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and token.casefold() in {"delete", "insert", "replace", "select", "update"}:
+            return index
+    return None
+
+
 def _has_entity_table_dml(sql: str) -> bool:
     """Return whether DML in *sql* writes the exact ``entities`` table."""
     tokens = _sql_tokens(sql)
-    if not tokens:
+    statement_index = _top_level_statement_index(tokens)
+    if statement_index is None:
         return False
-    statement = tokens[0].casefold()
+    statement = tokens[statement_index].casefold()
     if statement in {"insert", "replace"}:
-        table_indices = [index + 1 for index, token in enumerate(tokens) if token.casefold() == "into"]
+        table_indices = [
+            index + 1
+            for index, token in enumerate(tokens[statement_index + 1 :], start=statement_index + 1)
+            if token.casefold() == "into"
+        ]
         return bool(table_indices) and _is_exact_table_at(tokens, table_indices[0], "entities")
     if statement == "update":
-        table_index = 1
+        table_index = statement_index + 1
         if table_index < len(tokens) and tokens[table_index].casefold() == "or":
             if table_index + 2 >= len(tokens) or tokens[table_index + 1].casefold() not in _SQLITE_UPDATE_CONFLICTS:
                 return False
             table_index += 2
         return _is_exact_table_at(tokens, table_index, "entities")
     if statement == "delete":
-        return len(tokens) > 1 and tokens[1].casefold() == "from" and _is_exact_table_at(tokens, 2, "entities")
+        table_index = statement_index + 2
+        return (
+            statement_index + 1 < len(tokens)
+            and tokens[statement_index + 1].casefold() == "from"
+            and _is_exact_table_at(tokens, table_index, "entities")
+        )
     return False
 
 
