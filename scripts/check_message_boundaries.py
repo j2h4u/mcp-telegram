@@ -108,11 +108,8 @@ CANONICAL_MESSAGE_VIEW_FIELDS = frozenset(
     }
 )
 CANONICAL_MESSAGE_VIEW_CONSUMER_PATHS = frozenset(CANONICAL_MESSAGE_VIEW_ENTRYPOINTS)
-# Search is explicitly outside the canonical List/Inbox presenter slice and
-# retains its existing compact hit shape in the same module.
-CANONICAL_MESSAGE_VIEW_CONSTRUCTION_EXEMPT_FUNCTIONS = {
-    "tools/reading.py": frozenset({"_search_result_structured_rows"}),
-}
+SEARCH_HIT_CONSUMER_PATH = "tools/reading.py"
+SEARCH_HIT_ENTRYPOINT = "_search_result_structured_rows"
 LIST_MESSAGE_LIFECYCLE_FIELDS = frozenset(
     {
         "message_state",
@@ -138,7 +135,7 @@ MESSAGE_VIEW_BYPASS_NAMES = frozenset(
 TOOL_MESSAGE_PROJECTOR_PATHS = frozenset({"tools/activity.py", "tools/account_trace.py"})
 MESSAGE_METADATA_FUNCTIONS = {
     "tools/folders.py": frozenset({"list_folders", "list_folder_messages"}),
-    "tools/reading.py": frozenset({"_topic_candidate_payload", "_search_result_structured_rows"}),
+    "tools/reading.py": frozenset({"_topic_candidate_payload"}),
     "tools/unread.py": frozenset({"_structured_reactions"}),
 }
 MESSAGE_BODY_SURFACE_FUNCTION_NAMES = frozenset(
@@ -503,8 +500,10 @@ def _scheduled_import_violations(path: str, tree: ast.AST) -> tuple[list[Finding
 def _scheduled_shadow_violations(path: str, tree: ast.AST) -> list[Finding]:
     findings: list[Finding] = []
     for node in ast.walk(tree):
-        is_definition = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-        if is_definition and node.name == SCHEDULED_PROJECTOR_NAME:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name == SCHEDULED_PROJECTOR_NAME
+        ):
             findings.append(Finding(path, node.lineno, "canonical projector binding is shadowed locally"))
             continue
         if not isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -781,8 +780,6 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
         def _record_construction(self, node: ast.AST, keys: frozenset[str]) -> None:
             if self.function is None:
                 return
-            if self.function in CANONICAL_MESSAGE_VIEW_CONSTRUCTION_EXEMPT_FUNCTIONS.get(path, frozenset()):
-                return
             if self.function == "_list_message_structured_item":
                 findings.extend(
                     Finding(
@@ -870,6 +867,69 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
     return findings
 
 
+def _search_schema_uses_canonical_hit(tree: ast.Module) -> bool:
+    assignments = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and "SEARCH_MESSAGES_OUTPUT_SCHEMA" in _assignment_names(node)
+    ]
+    if len(assignments) != 1 or not isinstance(assignments[0].value, ast.Dict):
+        return False
+    schema = _dict_string_keys(assignments[0].value)
+    properties = schema.get("properties")
+    if not isinstance(properties, ast.Dict):
+        return False
+    results = _dict_string_keys(properties).get("results")
+    if not isinstance(results, ast.Dict):
+        return False
+    items = _dict_string_keys(results).get("items")
+    return isinstance(items, ast.Name) and items.id == "SEARCH_HIT_SCHEMA"
+
+
+def _search_mapper_uses_canonical_hit(tree: ast.Module) -> bool:
+    entrypoints = [
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == SEARCH_HIT_ENTRYPOINT
+    ]
+    if len(entrypoints) != 1:
+        return False
+    returns = [node for node in entrypoints[0].body if isinstance(node, ast.Return)]
+    if len(returns) != 1 or not isinstance(returns[0].value, ast.ListComp):
+        return False
+    item = returns[0].value.elt
+    return isinstance(item, ast.Call) and isinstance(item.func, ast.Name) and item.func.id == "project_search_hit"
+
+
+def _search_hit_violations(path: str, tree: ast.AST) -> list[Finding]:
+    """Keep reading's search schema and result mapper on the canonical seam."""
+    if path != SEARCH_HIT_CONSUMER_PATH or not isinstance(tree, ast.Module):
+        return []
+
+    findings: list[Finding] = []
+    canonical_imports = {
+        alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and _import_module(node).endswith(("tools.search_hit", ".search_hit"))
+        for alias in node.names
+        if alias.asname is None
+    }
+    missing_imports = {"SEARCH_HIT_SCHEMA", "project_search_hit"} - canonical_imports
+    if missing_imports:
+        findings.append(
+            Finding(path, 1, "reading must directly import canonical SEARCH_HIT_SCHEMA and project_search_hit")
+        )
+    if not _search_schema_uses_canonical_hit(tree):
+        findings.append(Finding(path, 1, "search results.items must reference SEARCH_HIT_SCHEMA"))
+    if not _search_mapper_uses_canonical_hit(tree):
+        findings.append(
+            Finding(
+                path,
+                1,
+                "search result mapper must directly project every list-comprehension item with project_search_hit",
+            )
+        )
+    return findings
+
+
 def violations_for(path: Path, source: str) -> list[Finding]:
     relative = _relative(path)
     tree = ast.parse(source, filename=str(path))
@@ -879,6 +939,7 @@ def violations_for(path: Path, source: str) -> list[Finding]:
     findings.extend(_scheduled_content_violations(relative, tree))
     findings.extend(_raw_message_content_violations(relative, tree))
     findings.extend(_canonical_message_view_violations(relative, tree))
+    findings.extend(_search_hit_violations(relative, tree))
 
     sql_hits = [snippet for snippet in _sql_snippets(tree, constants) if _has_message_table_sql(snippet.text)]
     if (

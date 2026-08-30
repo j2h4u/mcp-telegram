@@ -109,6 +109,16 @@ def _json_text(value: object) -> str:
     return value
 
 
+def _assert_null_free(value: object, *, path: str = "$") -> None:
+    assert value is not None, path
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _assert_null_free(child, path=f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _assert_null_free(child, path=f"{path}[{index}]")
+
+
 def _result_text(result: StructuredResult) -> str:
     assert result.content
     first_content = result.content[0]
@@ -617,17 +627,20 @@ STRUCTURED_TOOL_CASES = {
 
 
 @pytest.mark.parametrize("tool_name", sorted(server.tool_by_name))
-async def test_registered_tools_return_structured_content_and_text(tool_name: str):
+async def test_registered_tool_outputs_match_their_null_free_schemas(tool_name: str):
     assert set(STRUCTURED_TOOL_CASES) == set(server.tool_by_name)
-    assert TOOL_REGISTRY[tool_name].output_schema is not None
+    output_schema = TOOL_REGISTRY[tool_name].output_schema
+    assert output_schema is not None
 
-    runner, args, response = STRUCTURED_TOOL_CASES[tool_name]
+    _runner, args, response = STRUCTURED_TOOL_CASES[tool_name]
     conn = _make_daemon_conn(response)
 
     with _patch_daemon(conn):
-        result = await runner(args)
+        result = await server.call_tool(tool_name, args.model_dump())
 
-    assert_structured_success_payload(result)
+    payload = assert_structured_success_payload(result)
+    _assert_null_free(payload)
+    validate(payload, output_schema)
 
 
 async def test_folder_tools_frame_telegram_labels_without_raw_duplicates():

@@ -378,10 +378,14 @@ def test_list_message_ior_allows_known_lifecycle_literal() -> None:
     gate = _gate()
     source = (
         "from .message_view import project_message_view\n"
+        "from .search_hit import SEARCH_HIT_SCHEMA, project_search_hit\n"
+        "SEARCH_MESSAGES_OUTPUT_SCHEMA = {'properties': {'results': {'items': SEARCH_HIT_SCHEMA}}}\n"
         "def _list_message_structured_item(message):\n"
         "    item = project_message_view(message)\n"
         "    item |= {'visibility': 'chat_visible'}\n"
         "    return item\n"
+        "def _search_result_structured_rows(rows, query):\n"
+        "    return [project_search_hit(row, query, lifecycle={}) for row in rows]\n"
     )
     assert gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source) == []
 
@@ -441,6 +445,82 @@ def test_boundary_gate_fields_match_canonical_message_view_schema() -> None:
     properties = MESSAGE_VIEW_SCHEMA["properties"]
     assert isinstance(properties, dict)
     assert frozenset(properties) == gate.CANONICAL_MESSAGE_VIEW_FIELDS
+
+
+def _search_hit_fixture(
+    mapper_body: str = "    return [project_search_hit(row, query, lifecycle={}) for row in rows]\n",
+    *,
+    search_import: str = "from .search_hit import SEARCH_HIT_SCHEMA, project_search_hit\n",
+    schema_items: str = "SEARCH_HIT_SCHEMA",
+    helpers: str = "",
+) -> str:
+    return (
+        "from .message_view import project_message_view\n"
+        f"{search_import}"
+        f"SEARCH_MESSAGES_OUTPUT_SCHEMA = {{'properties': {{'results': {{'items': {schema_items}}}}}}}\n"
+        "def _list_message_structured_item(message):\n"
+        "    return project_message_view(message)\n"
+        f"{helpers}"
+        "def _search_result_structured_rows(rows, query):\n"
+        f"{mapper_body}"
+    )
+
+
+def test_search_hit_boundary_accepts_canonical_seams_with_benign_helpers() -> None:
+    gate = _gate()
+    source = _search_hit_fixture(
+        helpers=("def _unrelated_metadata():\n    return {'dialog_name': 'benign', 'anchor_call': {}}\n")
+    )
+
+    assert gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source) == []
+
+
+@pytest.mark.parametrize(
+    "search_import",
+    [
+        "from .search_hit import project_search_hit\n",
+        "from .search_hit import SEARCH_HIT_SCHEMA\n",
+        "from .search_hit import SEARCH_HIT_SCHEMA as HIT_SCHEMA, project_search_hit as project\n",
+    ],
+)
+def test_search_hit_boundary_requires_both_canonical_direct_imports(search_import: str) -> None:
+    gate = _gate()
+    source = _search_hit_fixture(search_import=search_import)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
+    assert any("directly import canonical" in finding.message for finding in findings)
+
+
+def test_search_hit_boundary_rejects_copied_result_item_schema() -> None:
+    gate = _gate()
+    source = _search_hit_fixture(schema_items="{'type': 'object', 'properties': {}}")
+
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
+
+    assert any("results.items must reference SEARCH_HIT_SCHEMA" in finding.message for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "mapper_body",
+    [
+        "    return rows\n",
+        "    return [project_search_hit(rows[0], query, lifecycle={})]\n",
+        "    return [row for row in rows]\n",
+        (
+            "    return [\n"
+            "        project_search_hit(row, query, lifecycle={}) if row.get('canonical') else row\n"
+            "        for row in rows\n"
+            "    ]\n"
+        ),
+        "    return [_manual(project_search_hit(row, query, lifecycle={})) for row in rows]\n",
+    ],
+)
+def test_search_hit_boundary_requires_direct_projector_list_comprehension(mapper_body: str) -> None:
+    gate = _gate()
+    source = _search_hit_fixture(mapper_body)
+
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
+
+    assert any("directly project every list-comprehension item" in finding.message for finding in findings)
 
 
 def test_serializer_call_does_not_excuse_second_raw_wrapper() -> None:

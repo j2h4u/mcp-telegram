@@ -13,11 +13,10 @@ from ..formatter import (
     frame_telegram_snippet,
     resolve_sender_label,
 )
-from ..models import DialogType, ReadMessage, ReadReactionEvent
+from ..models import DialogType, ReadMessage
 from ..pagination import NavigationToken
 from ..resolver import parse_exact_dialog_id
 from ..temporal import parse_utc_boundary
-from ..topic_identity import TOPIC_IDENTITY_SCHEMA, project_topic
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -31,10 +30,9 @@ from ._base import (
     structured_result,
 )
 from .message_view import MESSAGE_VIEW_SCHEMA, ReadMarker, project_message_view, project_read_markers
+from .search_hit import SEARCH_HIT_SCHEMA, extract_search_snippet, project_search_hit
 from .structured import (
-    MEDIA_OUTPUT_SCHEMA,
     StructuredWarning,
-    serialize_message_content,
     structured_warning,
     telegram_content,
 )
@@ -462,11 +460,6 @@ def _topic_candidate_payload(topic: dict) -> dict[str, object]:
     }
 
 
-def _maybe_add(item: dict[str, object], key: str, value: object | None) -> None:
-    if value is not None:
-        item[key] = value
-
-
 def _message_lifecycle_fields(row: Mapping[str, object], *, sent_at: int | None) -> dict[str, object]:
     is_scheduled = row.get("message_state") == "scheduled"
     published_at = row.get("published_at")
@@ -649,9 +642,6 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
 # Search result formatting — snippets + anchors
 # ---------------------------------------------------------------------------
 
-_SNIPPET_MAX_LEN = 150
-_SNIPPET_LEAD = 50  # chars to show before the matched word
-
 SEARCH_MESSAGES_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -707,66 +697,7 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
         },
         "results": {
             "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "dialog_id": {"type": "integer"},
-                    "dialog_name": {"type": ["string", "null"]},
-                    "msg_id": {"type": "integer"},
-                    # Keep the canonical Unix moment internally; the shared temporal
-                    # projection renders this as ISO-8601 in the requested timezone.
-                    "date": {"type": ["integer", "null"]},
-                    "sender": {"type": ["string", "null"]},
-                    "topic": TOPIC_IDENTITY_SCHEMA,
-                    "content": {"type": ["object", "null"]},
-                    "media": MEDIA_OUTPUT_SCHEMA,
-                    "anchor_call": {"type": "object"},
-                    "message_state": {"type": "string", "enum": ["sent", "scheduled"]},
-                    "visibility": {
-                        "type": "string",
-                        "description": "author_only before publication, chat_visible after publication.",
-                    },
-                    "unpublished": {"type": "boolean"},
-                    "published": {"type": "boolean"},
-                    "unseen": {"type": "boolean"},
-                    "scheduled_at": {"type": ["integer", "null"]},
-                    "published_at": {"type": ["integer", "null"]},
-                    "inclusion_basis": {"type": "array", "items": {"type": "string"}},
-                    "reaction_events": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "reactor_id": {"type": ["integer", "null"]},
-                                "emoji": {"type": "string"},
-                                "reacted_at": {"type": ["integer", "null"]},
-                            },
-                            "required": ["reactor_id", "emoji", "reacted_at"],
-                            "additionalProperties": False,
-                        },
-                    },
-                    "reaction_events_status": {"type": "string"},
-                    "read_at": {"type": ["integer", "null"]},
-                },
-                "required": [
-                    "dialog_id",
-                    "dialog_name",
-                    "msg_id",
-                    "anchor_call",
-                    "message_state",
-                    "visibility",
-                    "unpublished",
-                    "published",
-                    "unseen",
-                    "scheduled_at",
-                    "published_at",
-                    "inclusion_basis",
-                    "reaction_events",
-                    "reaction_events_status",
-                    "read_at",
-                ],
-                "additionalProperties": False,
-            },
+            "items": SEARCH_HIT_SCHEMA,
         },
         "count": {"type": "integer"},
         "next_navigation": {"type": ["string", "null"]},
@@ -792,118 +723,18 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
 }
 
 
-def _extract_snippet(text: str | None, query: str) -> str:
-    """Return a short excerpt from *text* centred on the first query word match.
-
-    Falls back to a simple head-truncation when no query word appears in the
-    original text (e.g. stemming produced a morphologically distant match).
-    """
-    if not text:
-        return "(no text)"
-    if len(text) <= _SNIPPET_MAX_LEN:
-        return text
-
-    for word in query.split():
-        pos = text.lower().find(word.lower())
-        if pos >= 0:
-            start = max(0, pos - _SNIPPET_LEAD)
-            end = min(len(text), start + _SNIPPET_MAX_LEN)
-            snippet = text[start:end]
-            prefix = "..." if start > 0 else ""
-            suffix = "..." if end < len(text) else ""
-            return f"{prefix}{snippet}{suffix}"
-
-    return text[:_SNIPPET_MAX_LEN] + "..."
-
-
-def _search_anchor_call(dialog_id: int, msg_id: int, message_state: str = "sent") -> dict[str, object]:
-    return {
-        "tool": "list_messages",
-        "arguments": _search_anchor_arguments(dialog_id, msg_id, message_state),
-    }
-
-
-def _search_anchor_arguments(dialog_id: int, msg_id: int, message_state: str) -> dict[str, object]:
-    arguments: dict[str, object] = {"exact_dialog_id": dialog_id}
-    if message_state == "scheduled":
-        arguments["message_state"] = "scheduled"
-    else:
-        arguments["anchor_message_id"] = msg_id
-    return arguments
-
-
-def _search_result_lifecycle_fields(row: dict) -> dict[str, object]:
-    return _message_lifecycle_fields(row, sent_at=_search_result_date(row))
-
-
-def _search_result_render_fields(row: dict, dialog_id: int) -> dict[str, object]:
-    lifecycle = _search_result_lifecycle_fields(row)
-    return {
-        "anchor_call": _search_anchor_call(dialog_id, row["message_id"], str(lifecycle["message_state"])),
-        **lifecycle,
-    }
-
-
-def _search_result_date(row: dict) -> int | None:
-    sent_at = row.get("sent_at")
-    return int(sent_at) if sent_at is not None else None
-
-
-def _reaction_event_payload(event: object) -> dict[str, object]:
-    """Keep search's existing result shape isolated from the message view."""
-    if isinstance(event, Mapping):
-        return {
-            "reactor_id": event.get("reactor_id"),
-            "emoji": event.get("emoji"),
-            "reacted_at": event.get("reacted_at"),
-        }
-    typed_event = cast("ReadReactionEvent", event)
-    return {
-        "reactor_id": typed_event.reactor_id,
-        "emoji": typed_event.emoji,
-        "reacted_at": typed_event.reacted_at,
-    }
-
-
-def _search_result_reaction_events(row: dict) -> list[dict[str, object]]:
-    return [_reaction_event_payload(event) for event in (row.get("reaction_events") or ())]
-
-
 def _search_result_structured_rows(rows: list[dict], query: str) -> list[dict[str, object]]:
-    results: list[dict[str, object]] = []
-    for row in rows:
-        snippet = _extract_snippet(row.get("text"), query)
-        dialog_id = int(row.get("dialog_id") or 0)
-        result: dict[str, object] = {
-            "dialog_id": dialog_id,
-            "dialog_name": row.get("dialog_name"),
-            "msg_id": row["message_id"],
-            # Leave the canonical epoch untouched until structured_result applies
-            # the request's timezone to every temporal field consistently.
-            "date": _search_result_date(row),
-            "sender": resolve_sender_label(row),
-            **_search_result_render_fields(row, dialog_id),
-            "reaction_events": _search_result_reaction_events(row),
-            "reaction_events_status": row.get("reaction_events_status", "unavailable"),
-            "read_at": row.get("read_at"),
-        }
-        topic_id = row.get("forum_topic_id")
-        title = row.get("topic_title")
-        topic = project_topic(
-            topic_id=topic_id if isinstance(topic_id, int) and not isinstance(topic_id, bool) else None,
-            title=title if isinstance(title, str) else None,
+    return [
+        project_search_hit(
+            row,
+            query,
+            lifecycle=_message_lifecycle_fields(
+                row,
+                sent_at=int(row["sent_at"]) if row.get("sent_at") is not None else None,
+            ),
         )
-        projected = serialize_message_content(
-            snippet,
-            row.get("media_description") if isinstance(row.get("media_description"), str) else None,
-            "snippet",
-            row.get("media_kind") if isinstance(row.get("media_kind"), str) else None,
-        )
-        _maybe_add(result, "content", projected["content"])
-        _maybe_add(result, "media", projected["media"])
-        _maybe_add(result, "topic", topic)
-        results.append(result)
-    return results
+        for row in rows
+    ]
 
 
 def _search_read_state_per_dialog(data: dict) -> dict[str, object]:
@@ -1109,7 +940,7 @@ def _format_search_results(
         sender = resolve_sender_label(row)
         dt = datetime.fromtimestamp(int(sent_at), tz=UTC)
         time_str = dt.strftime("%Y-%m-%d %H:%M")
-        snippet = frame_telegram_snippet(_extract_snippet(row.get("text"), query))
+        snippet = frame_telegram_snippet(extract_search_snippet(row.get("text"), query))
 
         dialog_prefix = f"[{row.get('dialog_name') or '?'}] " if global_mode else ""
         lines.append(f"{dialog_prefix}{time_str} {sender} (msg_id:{msg_id}): {snippet}")
