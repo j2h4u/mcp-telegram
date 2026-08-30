@@ -39,6 +39,31 @@ def _dialog_candidate_payload(match: Mapping[str, object]) -> dict[str, object]:
     return candidate
 
 
+def _dialog_resolution_message_and_action(
+    response: Mapping[str, object],
+    fallback_action: str,
+) -> tuple[str, str]:
+    message = response.get("message")
+    message_text = message if isinstance(message, str) else "Dialog resolution failed."
+    required_action = response.get("required_action")
+    action_text = required_action if isinstance(required_action, str) and required_action else fallback_action
+    return message_text, action_text
+
+
+def _dialog_resolution_candidate_fields(
+    raw_candidates: object,
+    raw_suggestion: object,
+) -> dict[str, object]:
+    fields: dict[str, object] = {}
+    if isinstance(raw_candidates, list):
+        fields["candidates"] = [
+            _dialog_candidate_payload(candidate) for candidate in raw_candidates if isinstance(candidate, Mapping)
+        ]
+    if isinstance(raw_suggestion, Mapping):
+        fields["suggestion"] = _dialog_candidate_payload(raw_suggestion)
+    return fields
+
+
 def project_dialog_resolution_error(
     response: Mapping[str, object],
     *,
@@ -54,21 +79,13 @@ def project_dialog_resolution_error(
     if not isinstance(raw_candidates, list) and not isinstance(raw_suggestion, Mapping):
         return None
 
-    message = response.get("message")
-    message_text = message if isinstance(message, str) else "Dialog resolution failed."
-    required_action = response.get("required_action")
-    action_text = required_action if isinstance(required_action, str) and required_action else fallback_action
+    message_text, action_text = _dialog_resolution_message_and_action(response, fallback_action)
     structured_content: dict[str, object] = {
         "error": error,
         "message": message_text,
         "required_action": action_text,
     }
-    if isinstance(raw_candidates, list):
-        structured_content["candidates"] = [
-            _dialog_candidate_payload(candidate) for candidate in raw_candidates if isinstance(candidate, Mapping)
-        ]
-    if isinstance(raw_suggestion, Mapping):
-        structured_content["suggestion"] = _dialog_candidate_payload(raw_suggestion)
+    structured_content.update(_dialog_resolution_candidate_fields(raw_candidates, raw_suggestion))
     return DialogResolutionErrorProjection(
         text=f"Error: {error}: {message_text}\nAction: {action_text}",
         structured_content=structured_content,

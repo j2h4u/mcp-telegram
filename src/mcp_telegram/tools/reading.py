@@ -1257,6 +1257,81 @@ def _list_messages_structured_error_content(response: dict) -> dict[str, object]
     }
 
 
+async def _list_messages_topic_id(
+    args: ListMessages,
+    request_context: _ListMessagesRequestContext,
+) -> int | ToolResult | None:
+    if args.exact_topic_id is not None or args.topic is None:
+        return args.exact_topic_id
+    resolved = await _resolve_topic_id(
+        args.topic,
+        dialog_id=request_context.dialog_id or 0,
+        dialog_name=request_context.dialog_label if request_context.dialog_id is None else None,
+    )
+    if not isinstance(resolved, ToolResult):
+        return resolved
+    return ToolResult(
+        content=resolved.content,
+        is_error=resolved.is_error,
+        structured_content=resolved.structured_content,
+        has_filter=request_context.has_filter,
+        has_cursor=request_context.has_cursor,
+    )
+
+
+async def _request_list_messages(
+    args: ListMessages,
+    request_context: _ListMessagesRequestContext,
+    topic_id: int | None,
+) -> dict:
+    selector_kwargs: dict = (
+        {"dialog_id": request_context.dialog_id}
+        if request_context.dialog_id is not None
+        else {"dialog": request_context.dialog_label}
+    )
+    async with daemon_connection() as conn:
+        return await conn.list_messages(
+            **selector_kwargs,
+            limit=args.limit,
+            navigation=request_context.daemon_navigation,
+            direction=request_context.direction,
+            sender_id=request_context.sender_id,
+            sender_name=request_context.sender_name,
+            topic_id=topic_id,
+            unread=request_context.unread_flag,
+            context_message_id=args.anchor_message_id,
+            context_size=args.context_size if args.anchor_message_id else None,
+            message_state=args.message_state,
+            since_utc=args.since_utc,
+            until_utc=args.until_utc,
+        )
+
+
+def _list_messages_response_error(
+    response: dict,
+    request_context: _ListMessagesRequestContext,
+) -> ToolResult:
+    dialog_projection = project_dialog_resolution_error(
+        response,
+        fallback_action="Retry ListMessages with an exact dialog id.",
+    )
+    return _list_messages_error_result(
+        _ListMessagesErrorContext(
+            error=response.get("error", "unknown"),
+            error_detail=response.get("message", ""),
+            dialog_label=request_context.dialog_label,
+            has_filter=request_context.has_filter,
+            has_cursor=request_context.has_cursor,
+            structured_content=(
+                dialog_projection.structured_content
+                if dialog_projection is not None
+                else _list_messages_structured_error_content(response)
+            ),
+            rendered_text=dialog_projection.text if dialog_projection is not None else None,
+        )
+    )
+
+
 @mcp_tool(
     name="list_messages",
     title="List Messages",
@@ -1273,68 +1348,16 @@ async def list_messages(args: ListMessages) -> ToolResult:
     if isinstance(request_context, ToolResult):
         return request_context
 
-    topic_id: int | None = args.exact_topic_id
-    if topic_id is None and args.topic is not None:
-        resolved = await _resolve_topic_id(
-            args.topic,
-            dialog_id=request_context.dialog_id or 0,
-            dialog_name=request_context.dialog_label if request_context.dialog_id is None else None,
-        )
-        if isinstance(resolved, ToolResult):
-            return ToolResult(
-                content=resolved.content,
-                is_error=resolved.is_error,
-                structured_content=resolved.structured_content,
-                has_filter=request_context.has_filter,
-                has_cursor=request_context.has_cursor,
-            )
-        topic_id = resolved
-
-    id_kwarg: dict = (
-        {"dialog_id": request_context.dialog_id}
-        if request_context.dialog_id is not None
-        else {"dialog": request_context.dialog_label}
-    )
+    topic_id = await _list_messages_topic_id(args, request_context)
+    if isinstance(topic_id, ToolResult):
+        return topic_id
     try:
-        async with daemon_connection() as conn:
-            response = await conn.list_messages(
-                **id_kwarg,
-                limit=args.limit,
-                navigation=request_context.daemon_navigation,
-                direction=request_context.direction,
-                sender_id=request_context.sender_id,
-                sender_name=request_context.sender_name,
-                topic_id=topic_id,
-                unread=request_context.unread_flag,
-                context_message_id=args.anchor_message_id,
-                context_size=args.context_size if args.anchor_message_id else None,
-                message_state=args.message_state,
-                since_utc=args.since_utc,
-                until_utc=args.until_utc,
-            )
+        response = await _request_list_messages(args, request_context, topic_id)
     except DaemonNotRunningError as exc:
         return error_result(_daemon_not_running_text(exc))
 
     if not response.get("ok"):
-        dialog_projection = project_dialog_resolution_error(
-            response,
-            fallback_action="Retry ListMessages with an exact dialog id.",
-        )
-        return _list_messages_error_result(
-            _ListMessagesErrorContext(
-                error=response.get("error", "unknown"),
-                error_detail=response.get("message", ""),
-                dialog_label=request_context.dialog_label,
-                has_filter=request_context.has_filter,
-                has_cursor=request_context.has_cursor,
-                structured_content=(
-                    dialog_projection.structured_content
-                    if dialog_projection is not None
-                    else _list_messages_structured_error_content(response)
-                ),
-                rendered_text=dialog_projection.text if dialog_projection is not None else None,
-            )
-        )
+        return _list_messages_response_error(response, request_context)
 
     data = response.get("data", {})
     rows = data.get("messages", [])

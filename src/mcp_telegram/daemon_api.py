@@ -246,6 +246,75 @@ from .resolver import (
 
 logger = logging.getLogger(__name__)
 
+type _DialogMetadata = Mapping[int, tuple[str | None, str | None, bool]]
+type _DialogDirectoryResult = tuple[
+    dict[int, str],
+    dict[int, str],
+    dict[int, str],
+    dict[int, str],
+    dict[int, str],
+    set[int],
+]
+
+
+def _selector_dialog_name(entity_id: int, dialog_name: str | None, entity_name: object) -> str | None:
+    name = dialog_name or (entity_name if isinstance(entity_name, str) else None)
+    if entity_id == 0 or not isinstance(name, str) or not name.strip():
+        return None
+    return name
+
+
+@dataclasses.dataclass(slots=True)
+class _LocalDialogDirectory:
+    """Mutable assembly state for one local selector directory snapshot."""
+
+    names: dict[int, str] = dataclasses.field(default_factory=dict)
+    normalized: dict[int, str] = dataclasses.field(default_factory=dict)
+    fuzzy_names: dict[int, str] = dataclasses.field(default_factory=dict)
+    fuzzy_normalized: dict[int, str] = dataclasses.field(default_factory=dict)
+    entity_types: dict[int, str] = dataclasses.field(default_factory=dict)
+    ineligible_ids: set[int] = dataclasses.field(default_factory=set)
+
+    @classmethod
+    def from_metadata(cls, metadata: _DialogMetadata) -> _LocalDialogDirectory:
+        return cls(
+            ineligible_ids={entity_id for entity_id, (_name, _type, eligible) in metadata.items() if not eligible}
+        )
+
+    def add(
+        self,
+        entity_id: int,
+        *,
+        stored_name: object,
+        stored_type: str | None,
+        dialog_metadata: _DialogMetadata,
+    ) -> None:
+        dialog_name, dialog_type, eligible = dialog_metadata.get(entity_id, (None, None, True))
+        if not eligible:
+            return
+        name = _selector_dialog_name(entity_id, dialog_name, stored_name)
+        if name is None:
+            return
+        self.names[entity_id] = name
+        self.normalized[entity_id] = latinize(name)
+        selected_type = dialog_type if dialog_type is not None else stored_type
+        if selected_type is not None:
+            self.entity_types[entity_id] = selected_type
+        if entity_id in dialog_metadata:
+            self.fuzzy_names[entity_id] = name
+            self.fuzzy_normalized[entity_id] = latinize(name)
+
+    def result(self) -> _DialogDirectoryResult:
+        return (
+            self.names,
+            self.normalized,
+            self.fuzzy_names,
+            self.fuzzy_normalized,
+            self.entity_types,
+            self.ineligible_ids,
+        )
+
+
 _current_request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_current_request_id",
     default=None,
@@ -636,48 +705,47 @@ class DaemonAPIServer:
 
     def _local_dialog_directory(
         self,
-    ) -> tuple[
-        dict[int, str],
-        dict[int, str],
-        dict[int, str],
-        dict[int, str],
-        dict[int, str],
-        set[int],
-    ]:
+    ) -> _DialogDirectoryResult:
         """Return exact-name cache entries and fuzzy-eligible dialog entries."""
         dialog_metadata = self._local_dialog_metadata()
-        names: dict[int, str] = {}
-        normalized: dict[int, str] = {}
-        fuzzy_names: dict[int, str] = {}
-        fuzzy_normalized: dict[int, str] = {}
-        entity_types: dict[int, str] = {}
-        ineligible_ids = {entity_id for entity_id, (_name, _type, eligible) in dialog_metadata.items() if not eligible}
         entity_rows = cast(
             list[tuple[object, ...]],
             self._conn.execute("SELECT id, name, type FROM entities WHERE name IS NOT NULL ORDER BY id").fetchall(),
         )
-        entity_names = {_coerce_int(row[0], 0): row[1] for row in entity_rows}
-        stored_entity_types = {
-            _coerce_int(row[0], 0): row[2] for row in entity_rows if isinstance(row[2], str) and row[2]
+        stored_entities = {
+            _coerce_int(row[0], 0): (row[1], row[2] if isinstance(row[2], str) and row[2] else None)
+            for row in entity_rows
         }
-        for entity_id in sorted(set(entity_names) | set(dialog_metadata)):
-            dialog_name, dialog_type, eligible = dialog_metadata.get(entity_id, (None, None, True))
-            if not eligible:
-                continue
-            entity_name = entity_names.get(entity_id)
-            name = dialog_name or (entity_name if isinstance(entity_name, str) else None)
-            if entity_id == 0 or not isinstance(name, str) or not name.strip():
-                continue
-            names[entity_id] = name
-            normalized[entity_id] = latinize(name)
-            if dialog_type is not None:
-                entity_types[entity_id] = dialog_type
-            elif entity_id in stored_entity_types:
-                entity_types[entity_id] = stored_entity_types[entity_id]
-            if entity_id in dialog_metadata:
-                fuzzy_names[entity_id] = name
-                fuzzy_normalized[entity_id] = latinize(name)
-        return names, normalized, fuzzy_names, fuzzy_normalized, entity_types, ineligible_ids
+        directory = _LocalDialogDirectory.from_metadata(dialog_metadata)
+        for entity_id in sorted(set(stored_entities) | set(dialog_metadata)):
+            stored_name, stored_type = stored_entities.get(entity_id, (None, None))
+            directory.add(
+                entity_id,
+                stored_name=stored_name,
+                stored_type=stored_type,
+                dialog_metadata=dialog_metadata,
+            )
+        return directory.result()
+
+    @staticmethod
+    def _local_username_match(
+        row: tuple[object, ...],
+        *,
+        username: str,
+        dialog_metadata: _DialogMetadata,
+    ) -> MatchInfo | None:
+        entity_id = _coerce_int(row[0], 0)
+        dialog_name, dialog_type, eligible = dialog_metadata.get(entity_id, (None, None, True))
+        if entity_id == 0 or not eligible:
+            return None
+        return {
+            "entity_id": entity_id,
+            "display_name": str(dialog_name or row[1] or f"@{username}"),
+            "score": 100,
+            "username": str(row[2]) if row[2] is not None else username,
+            "entity_type": dialog_type or (str(row[3]) if row[3] is not None else None),
+            "disambiguation_hint": None,
+        }
 
     @staticmethod
     def _resolve_exact_natural_name(
@@ -717,23 +785,12 @@ class DaemonAPIServer:
             list[tuple[object, ...]],
             self._conn.execute(_ENTITY_BY_USERNAME_SQL, (username,)).fetchall(),
         )
-        matches: list[MatchInfo] = []
-        for row in rows:
-            entity_id = _coerce_int(row[0], 0)
-            dialog_name, dialog_type, eligible = dialog_metadata.get(entity_id, (None, None, True))
-            if entity_id == 0 or not eligible:
-                continue
-            name = str(dialog_name or row[1] or f"@{username}")
-            matches.append(
-                {
-                    "entity_id": entity_id,
-                    "display_name": name,
-                    "score": 100,
-                    "username": str(row[2]) if row[2] is not None else username,
-                    "entity_type": dialog_type or (str(row[3]) if row[3] is not None else None),
-                    "disambiguation_hint": None,
-                }
-            )
+        matches = [
+            match
+            for row in rows
+            if (match := self._local_username_match(row, username=username, dialog_metadata=dialog_metadata))
+            is not None
+        ]
         matches.sort(key=lambda item: (item["display_name"].casefold(), item["entity_id"]))
         if len(matches) == 1:
             match = matches[0]
