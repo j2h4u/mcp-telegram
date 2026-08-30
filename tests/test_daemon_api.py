@@ -1840,7 +1840,7 @@ async def test_list_dialogs_diff04_fields_present_in_data() -> None:
 
 @pytest.mark.asyncio
 async def test_list_dialogs_dm_unread_in_out_preserved() -> None:
-    """Test H: WR-06 — User rows carry unread_in/unread_out; Channel rows omit both."""
+    """Test H: WR-06 — User rows carry counts; Channel rows carry explicit nulls."""
     conn = _make_db_with_dialogs()
     # User DM row
     _seed_dialog_row(conn, 10, name="DM Peer", type_="User")
@@ -1876,9 +1876,9 @@ async def test_list_dialogs_dm_unread_in_out_preserved() -> None:
     assert by_id[10]["unread_in"] == 1
     assert by_id[10]["unread_out"] == 1
 
-    # Channel row omits both
-    assert "unread_in" not in by_id[20]
-    assert "unread_out" not in by_id[20]
+    # Non-DM rows retain the stable schema with explicit nullable values.
+    assert by_id[20]["unread_in"] is None
+    assert by_id[20]["unread_out"] is None
     cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
@@ -4988,17 +4988,12 @@ async def test_sync_read_model_fields_match_between_sync_status_and_dialog_catal
         "coverage_state",
         "local_knowledge_at",
         "local_knowledge_age_seconds",
+        "observed_at",
+        "action",
     }
     sync_wire = {field: sync_data[field] for field in shared_fields}
     dialog_wire = {field: dialog_data[field] for field in shared_fields}
-    assert (
-        json.dumps(sync_wire, sort_keys=True, separators=(",", ":")).encode()
-        == json.dumps(
-            dialog_wire,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    )
+    assert sync_wire == dialog_wire
 
 
 @pytest.mark.asyncio

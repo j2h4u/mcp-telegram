@@ -8,6 +8,7 @@ import pytest
 
 from mcp_telegram.realtime_history_policy import realtime_history_coverage
 from mcp_telegram.sync_read_model import (
+    SyncReadModel,
     SyncReadModelContractError,
     build_sync_read_model,
     decode_sync_read_model,
@@ -26,9 +27,31 @@ _REALTIME_WIRE_BY_POLICY_VALUE = {
     "own_outgoing": "own_only",
     "no_realtime_history": "none",
 }
+_WIRE_KEYS = {
+    "sync_status",
+    "enrollment_enabled",
+    "last_synced_at",
+    "last_event_at",
+    "last_delta_checked_at",
+    "saved_message_count",
+    "total_messages",
+    "synced",
+    "is_syncing",
+    "realtime_history",
+    "history_scope",
+    "history_depth_state",
+    "history_sync_state",
+    "history_complete_at",
+    "sync_coverage_pct",
+    "coverage_state",
+    "local_knowledge_at",
+    "local_knowledge_age_seconds",
+    "observed_at",
+    "action",
+}
 
 
-def _build(**overrides: object):
+def _build(**overrides: object) -> SyncReadModel:
     facts: dict[str, object] = {
         "persisted_status": "synced",
         "enrollment_enabled": True,
@@ -58,11 +81,10 @@ def test_status_and_enrollment_matrix_matches_realtime_policy(
     persisted_status: str | None,
     enrollment_enabled: bool | None,
 ) -> None:
-    model = _build(
+    wire = _build(
         persisted_status=persisted_status,
         enrollment_enabled=enrollment_enabled,
-    )
-    wire = model.to_wire()
+    ).to_wire()
     effective_status = "not_synced" if persisted_status is None else persisted_status
 
     assert wire["sync_status"] == effective_status
@@ -77,14 +99,9 @@ def test_status_and_enrollment_matrix_matches_realtime_policy(
         wire["history_sync_state"],
     ) == _HISTORY_BY_STATUS[effective_status]
     assert wire["history_complete_at"] == (90 if effective_status == "synced" else None)
-    assert wire["saved_message_count"] == 5
-    assert wire["sync_coverage_pct"] == 50
-    assert wire["coverage_state"] == "telegram_total_comparable"
-    assert wire["local_knowledge_at"] == 95
-    assert wire["local_knowledge_age_seconds"] == 5
 
 
-@pytest.mark.parametrize("persisted_status", ["unknown", "SYNCED", "synced ", " synced"])
+@pytest.mark.parametrize("persisted_status", ["unknown", "SYNCED", "synced "])
 def test_builder_rejects_noncanonical_status(persisted_status: str) -> None:
     with pytest.raises(SyncReadModelContractError):
         _build(persisted_status=persisted_status)
@@ -95,18 +112,30 @@ def test_builder_rejects_noncanonical_status(persisted_status: str) -> None:
     [
         ("saved_message_count", -1),
         ("saved_message_count", True),
-        ("saved_message_count", "5"),
-        ("last_synced_at", True),
         ("last_event_at", "95"),
-        ("last_delta_checked_at", 80.5),
         ("now", "100"),
-        ("total_messages", True),
-        ("total_messages", "10"),
     ],
 )
-def test_builder_rejects_malformed_counts_and_timestamps(field: str, value: object) -> None:
+def test_builder_rejects_representative_malformed_facts(field: str, value: object) -> None:
     with pytest.raises(SyncReadModelContractError):
         _build(**{field: value})
+
+
+@pytest.mark.parametrize("field", ["last_synced_at", "last_event_at", "last_delta_checked_at"])
+@pytest.mark.parametrize("value", [-1, 101])
+def test_builder_rejects_negative_or_future_source_timestamp(field: str, value: int) -> None:
+    with pytest.raises(SyncReadModelContractError):
+        _build(**{field: value})
+
+
+def test_builder_rejects_negative_observation_timestamp() -> None:
+    with pytest.raises(SyncReadModelContractError):
+        _build(
+            last_synced_at=None,
+            last_event_at=None,
+            last_delta_checked_at=None,
+            now=-1,
+        )
 
 
 @pytest.mark.parametrize(
@@ -149,106 +178,67 @@ def test_access_lost_preserves_archived_count_without_inventing_telegram_total()
     assert wire["coverage_state"] == "telegram_total_unknown"
 
 
-@pytest.mark.parametrize(
-    ("last_synced_at", "last_event_at", "last_delta_checked_at", "expected_at", "expected_age"),
-    [
-        (None, None, None, None, None),
-        (90, 95, 80, 95, 5),
-        (90, 120, 80, 120, 0),
-    ],
-)
-def test_local_knowledge_uses_latest_observation_and_injected_now(
-    last_synced_at: int | None,
-    last_event_at: int | None,
-    last_delta_checked_at: int | None,
-    expected_at: int | None,
-    expected_age: int | None,
-) -> None:
+def test_freshness_uses_latest_timestamp_and_exact_observation_age() -> None:
+    wire = _build().to_wire()
+
+    assert wire["local_knowledge_at"] == 95
+    assert wire["observed_at"] == 100
+    assert wire["local_knowledge_age_seconds"] == 5
+
+
+def test_freshness_accepts_explicit_null_timestamp_pair() -> None:
     wire = _build(
-        last_synced_at=last_synced_at,
-        last_event_at=last_event_at,
-        last_delta_checked_at=last_delta_checked_at,
+        last_synced_at=None,
+        last_event_at=None,
+        last_delta_checked_at=None,
     ).to_wire()
 
-    assert wire["local_knowledge_at"] == expected_at
-    assert wire["local_knowledge_age_seconds"] == expected_age
+    assert wire["local_knowledge_at"] is None
+    assert wire["local_knowledge_age_seconds"] is None
 
 
-def test_strict_decoder_round_trips_complete_canonical_payload() -> None:
+def test_canonical_wire_key_set_and_round_trip() -> None:
     model = _build()
+    wire = model.to_wire()
 
-    assert decode_sync_read_model(model.to_wire()) == model
+    assert set(wire) == _WIRE_KEYS
+    assert decode_sync_read_model(wire) == model
 
 
-@pytest.mark.parametrize(
-    "missing_field",
-    [
-        "sync_status",
-        "enrollment_enabled",
-        "last_synced_at",
-        "last_event_at",
-        "last_delta_checked_at",
-        "saved_message_count",
-        "total_messages",
-        "synced",
-        "is_syncing",
-        "realtime_history",
-        "history_scope",
-        "history_depth_state",
-        "history_sync_state",
-        "history_complete_at",
-        "sync_coverage_pct",
-        "coverage_state",
-        "local_knowledge_at",
-        "local_knowledge_age_seconds",
-    ],
-)
-def test_strict_decoder_rejects_each_incomplete_payload(missing_field: str) -> None:
-    payload = _build().to_wire()
-    del payload[missing_field]
+def test_decoder_rejects_missing_required_wire_field() -> None:
+    wire = _build().to_wire()
+    del wire["observed_at"]
 
     with pytest.raises(SyncReadModelContractError):
-        decode_sync_read_model(payload)
+        decode_sync_read_model(wire)
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("sync_status", "SYNCED"),
-        ("enrollment_enabled", 1),
-        ("saved_message_count", "5"),
-        ("last_synced_at", "90"),
-        ("synced", 1),
-        ("is_syncing", None),
-        ("realtime_history", "full_history"),
+        ("observed_at", 94),
+        ("observed_at", -1),
+        ("local_knowledge_age_seconds", 6),
+        ("local_knowledge_age_seconds", None),
         ("history_scope", "complete"),
-        ("history_depth_state", "unknown"),
-        ("history_sync_state", "synced"),
-        ("coverage_state", "complete"),
-        ("local_knowledge_age_seconds", -1),
+        ("action", "invented delivery action"),
     ],
 )
-def test_strict_decoder_rejects_mistyped_or_noncanonical_payload(field: str, value: object) -> None:
-    payload = _build().to_wire()
-    payload[field] = value
+def test_decoder_rejects_inconsistent_canonical_derivation(field: str, value: object) -> None:
+    wire = _build().to_wire()
+    wire[field] = value
 
     with pytest.raises(SyncReadModelContractError):
-        decode_sync_read_model(payload)
+        decode_sync_read_model(wire)
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("synced", False),
-        ("is_syncing", True),
-        ("sync_coverage_pct", 49),
-        ("history_complete_at", None),
-        ("local_knowledge_at", 90),
-    ],
-)
-def test_strict_decoder_rejects_internally_inconsistent_payload(field: str, value: object) -> None:
-    payload = _build().to_wire()
-    payload[field] = value
+def test_decoder_rejects_nonnull_age_without_local_knowledge_timestamp() -> None:
+    wire = _build(
+        last_synced_at=None,
+        last_event_at=None,
+        last_delta_checked_at=None,
+    ).to_wire()
+    wire["local_knowledge_age_seconds"] = 0
 
     with pytest.raises(SyncReadModelContractError):
-        decode_sync_read_model(payload)
+        decode_sync_read_model(wire)

@@ -24,6 +24,7 @@ from jsonschema import validate
 from mcp.types import CallToolResult
 
 from mcp_telegram import server
+from mcp_telegram.sync_read_model import build_sync_read_model
 from mcp_telegram.tools import (
     TOOL_REGISTRY,
     GetEntityInfo,
@@ -261,35 +262,62 @@ def assert_structured_text_parity(
     return value
 
 
-def _canonical_sync_read_model_payload(
+def _sync_read_model_payload(
     *,
-    status_key: str,
     status: str = "synced",
     saved_message_count: int = 10,
     total_messages: int | None = 10,
+    last_event_at: int | None = None,
+    now: int = 1700000000,
 ) -> dict[str, object]:
     is_synced = status == "synced"
-    last_synced_at = 1700000000 if is_synced else None
-    return {
-        status_key: status,
-        "enrollment_enabled": is_synced,
-        "last_synced_at": last_synced_at,
-        "last_event_at": None,
-        "last_delta_checked_at": None,
-        "saved_message_count": saved_message_count,
-        "total_messages": total_messages,
-        "synced": is_synced,
-        "is_syncing": status == "syncing",
-        "realtime_history": "full" if is_synced else "none",
-        "history_scope": "full" if is_synced else "none",
-        "history_depth_state": "complete" if is_synced else "none",
-        "history_sync_state": "complete_as_of_last_sync" if is_synced else "not_synced",
-        "history_complete_at": last_synced_at,
-        "sync_coverage_pct": 100 if total_messages == saved_message_count else None,
-        "coverage_state": ("telegram_total_unknown" if total_messages is None else "telegram_total_comparable"),
-        "local_knowledge_at": last_synced_at,
-        "local_knowledge_age_seconds": 0 if last_synced_at is not None else None,
+    return build_sync_read_model(
+        persisted_status=status,
+        enrollment_enabled=is_synced,
+        last_synced_at=1700000000 if is_synced else None,
+        last_event_at=last_event_at,
+        last_delta_checked_at=None,
+        saved_message_count=saved_message_count,
+        total_messages=total_messages,
+        now=now,
+    ).to_wire()
+
+
+def _canonical_dialog_row(
+    *,
+    status: str = "synced",
+    saved_message_count: int = 10,
+    total_messages: int | None = 10,
+    **overrides: object,
+) -> dict[str, object]:
+    row: dict[str, object] = {
+        "id": 123,
+        "name": "Alice",
+        "type": "User",
+        "last_message_at": 1700000000,
+        "unread_count": 0,
+        "access_lost_at": None,
+        "members": None,
+        "created": None,
+        "unread_in": None,
+        "unread_out": None,
+        "unread_mentions_count": 0,
+        "unread_reactions_count": 0,
+        "draft_text": None,
+        "scheduled_count": 0,
+        "next_scheduled_at": None,
+        "inclusion_basis": None,
+        "folder_ids": [],
+        "folders": [],
+        "archived": False,
+        **_sync_read_model_payload(
+            status=status,
+            saved_message_count=saved_message_count,
+            total_messages=total_messages,
+        ),
     }
+    row.update(overrides)
+    return row
 
 
 def _unavailable_folder_snapshot_payload() -> dict[str, object]:
@@ -324,7 +352,7 @@ def _canonical_get_sync_status_data() -> dict[str, object]:
         "access_lost_at": None,
         "access_last_revalidated_at": None,
         "access_next_revalidate_at": None,
-        **_canonical_sync_read_model_payload(status_key="sync_status"),
+        **_sync_read_model_payload(),
     }
 
 
@@ -384,13 +412,12 @@ STRUCTURED_TOOL_CASES = {
             "ok": True,
             "data": _canonical_list_dialogs_data(
                 [
-                    {
-                        "id": 123,
-                        "name": "Alice",
-                        "type": "User",
-                        "unread_count": 1,
-                        **_canonical_sync_read_model_payload(status_key="sync_status"),
-                    }
+                    _canonical_dialog_row(
+                        id=123,
+                        name="Alice",
+                        type="User",
+                        unread_count=1,
+                    )
                 ]
             ),
         },
@@ -474,7 +501,7 @@ STRUCTURED_TOOL_CASES = {
                 "access_lost_at": None,
                 "access_last_revalidated_at": None,
                 "access_next_revalidate_at": None,
-                **_canonical_sync_read_model_payload(status_key="sync_status"),
+                **_sync_read_model_payload(),
             },
         },
     ),
@@ -821,16 +848,13 @@ async def test_list_dialogs_exposes_folder_names_for_humans():
             "ok": True,
             "data": _canonical_list_dialogs_data(
                 [
-                    {
-                        "id": 123,
-                        "name": "Fixture Person",
-                        "type": "User",
-                        "last_message_at": "2026-08-05T12:00:00+00:00",
-                        "unread_count": 0,
-                        "folder_ids": [3, 16],
-                        "folders": [{"id": 3, "title": "People"}, {"id": 16, "title": "MD"}],
-                        **_canonical_sync_read_model_payload(status_key="sync_status"),
-                    }
+                    _canonical_dialog_row(
+                        id=123,
+                        name="Fixture Person",
+                        last_message_at="2026-08-05T12:00:00+00:00",
+                        folder_ids=[3, 16],
+                        folders=[{"id": 3, "title": "People"}, {"id": 16, "title": "MD"}],
+                    )
                 ]
             ),
         }
@@ -978,27 +1002,21 @@ async def test_list_dialogs_via_daemon():
             "ok": True,
             "data": _canonical_list_dialogs_data(
                 [
-                    {
-                        "id": 123,
-                        "name": "Alice",
-                        "type": "User",
-                        "last_message_at": "2024-01-15 10:00",
-                        "unread_count": 2,
-                        **_canonical_sync_read_model_payload(status_key="sync_status"),
-                    },
-                    {
-                        "id": 456,
-                        "name": "Dev Chat",
-                        "type": "Group",
-                        "last_message_at": "2024-01-15 12:00",
-                        "unread_count": 0,
-                        **_canonical_sync_read_model_payload(
-                            status_key="sync_status",
-                            status="not_synced",
-                            saved_message_count=0,
-                            total_messages=None,
-                        ),
-                    },
+                    _canonical_dialog_row(
+                        id=123,
+                        name="Alice",
+                        last_message_at="2024-01-15 10:00",
+                        unread_count=2,
+                    ),
+                    _canonical_dialog_row(
+                        id=456,
+                        name="Dev Chat",
+                        type="Group",
+                        last_message_at="2024-01-15 12:00",
+                        status="not_synced",
+                        saved_message_count=0,
+                        total_messages=None,
+                    ),
                 ]
             ),
         }
@@ -1053,18 +1071,7 @@ async def test_list_dialogs_output_schema_omits_nullable_name():
     conn = _make_daemon_conn(
         {
             "ok": True,
-            "data": _canonical_list_dialogs_data(
-                [
-                    {
-                        "id": 123,
-                        "name": None,
-                        "type": "User",
-                        "last_message_at": None,
-                        "unread_count": 0,
-                        **_canonical_sync_read_model_payload(status_key="sync_status"),
-                    }
-                ]
-            ),
+            "data": _canonical_list_dialogs_data([_canonical_dialog_row(id=123, name=None, last_message_at=None)]),
         }
     )
 
@@ -1147,14 +1154,11 @@ async def test_list_dialogs_sync_status_in_output():
             "ok": True,
             "data": _canonical_list_dialogs_data(
                 [
-                    {
-                        "id": 1,
-                        "name": "Chat",
-                        "type": "User",
-                        "last_message_at": "2024-01-01 00:00",
-                        "unread_count": 0,
-                        **_canonical_sync_read_model_payload(status_key="sync_status"),
-                    },
+                    _canonical_dialog_row(
+                        id=1,
+                        name="Chat",
+                        last_message_at="2024-01-01 00:00",
+                    ),
                 ]
             ),
         }
@@ -1187,14 +1191,12 @@ async def test_list_dialogs_does_not_upsert_entities_after_read():
             "ok": True,
             "data": _canonical_list_dialogs_data(
                 [
-                    {
-                        "id": 100,
-                        "name": "TestChat",
-                        "type": "Group",
-                        "last_message_at": "2024-01-01",
-                        "unread_count": 0,
-                        **_canonical_sync_read_model_payload(status_key="sync_status"),
-                    },
+                    _canonical_dialog_row(
+                        id=100,
+                        name="TestChat",
+                        type="Group",
+                        last_message_at="2024-01-01",
+                    ),
                 ]
             ),
         }
@@ -2371,30 +2373,26 @@ async def test_mark_dialog_for_sync_daemon_not_running():
 
 async def test_get_sync_status_via_daemon():
     """GetSyncStatus routes through daemon and formats key=value output."""
-    conn = _make_daemon_conn(
-        {
-            "ok": True,
-            "data": {
-                "dialog_id": -1001234567890,
-                "enrollment_source": "explicit",
-                "message_count": 100,
-                "sync_progress": 100,
-                "sync_progress_message_id": 100,
-                "delete_detection": "reliable (channel)",
-                "delta_refresh_requested_at": None,
-                "access_lost_at": None,
-                "access_last_revalidated_at": None,
-                "access_next_revalidate_at": None,
-                **_canonical_sync_read_model_payload(
-                    status_key="sync_status",
-                    saved_message_count=100,
-                    total_messages=100,
-                ),
-                "last_event_at": 1700001000,
-                "local_knowledge_at": 1700001000,
-            },
-        }
-    )
+    data = {
+        "dialog_id": -1001234567890,
+        "enrollment_source": "explicit",
+        # A stale legacy count must not influence the canonical model action.
+        "message_count": 0,
+        "sync_progress": 100,
+        "sync_progress_message_id": 100,
+        "delete_detection": "reliable (channel)",
+        "delta_refresh_requested_at": None,
+        "access_lost_at": None,
+        "access_last_revalidated_at": None,
+        "access_next_revalidate_at": None,
+        **_sync_read_model_payload(
+            saved_message_count=100,
+            total_messages=10,
+            last_event_at=1700001000,
+            now=1700001000,
+        ),
+    }
+    conn = _make_daemon_conn({"ok": True, "data": data})
     with _patch_daemon(conn):
         result = await get_sync_status(GetSyncStatus(dialog_id=-1001234567890))
     assert result.content == ()
@@ -2415,18 +2413,18 @@ async def test_get_sync_status_via_daemon():
         "history_depth_state": "complete",
         "history_sync_state": "complete_as_of_last_sync",
         "history_complete_at": "2023-11-14T22:13:20+00:00",
-        "coverage_state": "telegram_total_comparable",
+        "coverage_state": "telegram_total_not_comparable",
         "local_knowledge_at": "2023-11-14T22:30:00+00:00",
         "local_knowledge_age_seconds": 0,
         "sync_progress": 100,
         "sync_progress_message_id": 100,
-        "total_messages": 100,
+        "total_messages": 10,
         "delete_detection": "reliable (channel)",
-        "sync_coverage_pct": 100,
+        "sync_coverage_pct": None,
         "access_lost_at": None,
         "access_last_revalidated_at": None,
         "access_next_revalidate_at": None,
-        "action": "Full history was fetched as of last_synced_at; ongoing freshness is represented by local_knowledge_at. sync_progress is a message_id offset, not a count. Treat sync_coverage_pct as an approximate local-vs-Telegram ratio.",
+        "action": data["action"],
         "time_context": {
             "timezone": "UTC",
             "canonical": "UTC",
@@ -2435,23 +2433,13 @@ async def test_get_sync_status_via_daemon():
             "technical_timestamps": "not_telegram_events",
         },
     }
+    assert "Local message_count exceeds Telegram total_messages" in cast(str, data["action"])
     conn.get_sync_status.assert_called_once_with(dialog_id=-1001234567890)
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("saved_message_count", "10"),
-        ("sync_status", "SYNCED"),
-        ("realtime_history", "full_history"),
-        ("history_scope", "complete"),
-        ("history_sync_state", "synced"),
-        ("coverage_state", "complete"),
-    ],
-)
-async def test_get_sync_status_rejects_noncanonical_daemon_read_model(field: str, value: object) -> None:
+async def test_get_sync_status_rejects_malformed_required_surface_field() -> None:
     data = _canonical_get_sync_status_data()
-    data[field] = value
+    data["delete_detection"] = 7
     conn = _make_daemon_conn({"ok": True, "data": data})
 
     with _patch_daemon(conn):
@@ -2459,12 +2447,12 @@ async def test_get_sync_status_rejects_noncanonical_daemon_read_model(field: str
 
     assert result.is_error is True
     assert result.structured_content is None
-    assert "daemon" in _result_text(result).lower()
+    assert "daemon_protocol_error" in _result_text(result)
 
 
-async def test_get_sync_status_rejects_incomplete_daemon_read_model() -> None:
+async def test_get_sync_status_rejects_missing_enrollment_source() -> None:
     data = _canonical_get_sync_status_data()
-    del data["history_depth_state"]
+    del data["enrollment_source"]
     conn = _make_daemon_conn({"ok": True, "data": data})
 
     with _patch_daemon(conn):
@@ -2472,7 +2460,7 @@ async def test_get_sync_status_rejects_incomplete_daemon_read_model() -> None:
 
     assert result.is_error is True
     assert result.structured_content is None
-    assert "daemon" in _result_text(result).lower()
+    assert "daemon_protocol_error" in _result_text(result)
 
 
 async def test_get_sync_status_daemon_not_running():

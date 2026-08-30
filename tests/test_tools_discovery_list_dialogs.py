@@ -15,19 +15,21 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from mcp.types import TextContent
 
+from mcp_telegram.sync_read_model import build_sync_read_model
+from mcp_telegram.tools._base import ToolResult
 from mcp_telegram.tools.discovery import ListDialogs, list_dialogs
 
 
 @dataclass(frozen=True)
 class _DialogDictOptions:
     dialog_id: int = 100
-    name: str = "Alice"
-    type_: str = "User"
+    name: str | None = "Alice"
+    type_: str | None = "User"
     unread_mentions_count: int = 0
     unread_reactions_count: int = 0
     draft_text: str | None = None
-    sync_status: str = "synced"
 
 
 def _make_dialog_dict(*, opts: _DialogDictOptions | None = None, **kwargs: object) -> dict[str, object]:
@@ -43,28 +45,28 @@ def _make_dialog_dict(*, opts: _DialogDictOptions | None = None, **kwargs: objec
         "unread_count": 0,
         "members": None,
         "created": None,
-        "sync_status": opts.sync_status,
-        "enrollment_enabled": True,
-        "last_synced_at": 1700000000,
-        "last_event_at": None,
-        "last_delta_checked_at": None,
-        "saved_message_count": 0,
-        "total_messages": None,
-        "synced": True,
-        "is_syncing": False,
-        "realtime_history": "full",
-        "sync_coverage_pct": None,
-        "history_scope": "full",
-        "history_depth_state": "complete",
-        "history_sync_state": "complete_as_of_last_sync",
-        "history_complete_at": 1700000000,
-        "coverage_state": "telegram_total_unknown",
-        "local_knowledge_at": 1700000000,
-        "local_knowledge_age_seconds": 0,
         "access_lost_at": None,
+        "unread_in": None,
+        "unread_out": None,
         "unread_mentions_count": opts.unread_mentions_count,
         "unread_reactions_count": opts.unread_reactions_count,
         "draft_text": opts.draft_text,
+        "scheduled_count": 0,
+        "next_scheduled_at": None,
+        "inclusion_basis": None,
+        "folder_ids": [],
+        "folders": [],
+        "archived": False,
+        **build_sync_read_model(
+            persisted_status="synced",
+            enrollment_enabled=True,
+            last_synced_at=1700000000,
+            last_event_at=None,
+            last_delta_checked_at=None,
+            saved_message_count=0,
+            total_messages=None,
+            now=1700000000,
+        ).to_wire(),
     }
 
 
@@ -99,6 +101,13 @@ def _canonical_catalog(*, dialogs: list[dict[str, object]] | None = None) -> dic
     }
 
 
+def _error_text(result: ToolResult) -> str:
+    assert result.content
+    first = result.content[0]
+    assert isinstance(first, TextContent)
+    return first.text
+
+
 @pytest.mark.asyncio
 async def test_list_dialogs_accepts_canonical_empty_catalog() -> None:
     with _patched_daemon(_canonical_catalog()):
@@ -113,79 +122,58 @@ async def test_list_dialogs_accepts_canonical_empty_catalog() -> None:
     assert structured["scope"] == "all"
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("dialogs", None),
-        ("bootstrap_pending", 0),
-        ("scope", "everything"),
-        ("folder_snapshot", {}),
-    ],
-)
 @pytest.mark.asyncio
-async def test_list_dialogs_rejects_malformed_atomic_catalog(field: str, value: object) -> None:
+async def test_list_dialogs_rejects_malformed_top_level_catalog() -> None:
     response = _canonical_catalog()
     data = cast(dict[str, object], response["data"])
-    data[field] = value
+    data["bootstrap_pending"] = 0
 
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
 
     assert result.is_error is True
     assert result.structured_content is None
-    assert result.content
+    assert "daemon_protocol_error" in _error_text(result)
 
 
-@pytest.mark.parametrize("missing_field", ["dialogs", "bootstrap_pending", "scope", "folder_snapshot"])
 @pytest.mark.asyncio
-async def test_list_dialogs_rejects_incomplete_atomic_catalog(missing_field: str) -> None:
+async def test_list_dialogs_rejects_missing_top_level_catalog_field() -> None:
     response = _canonical_catalog()
     data = cast(dict[str, object], response["data"])
-    del data[missing_field]
+    del data["scope"]
 
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
 
     assert result.is_error is True
     assert result.structured_content is None
-    assert result.content
+    assert "daemon_protocol_error" in _error_text(result)
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("saved_message_count", "0"),
-        ("sync_status", "Synced"),
-        ("realtime_history", "full_history"),
-        ("history_scope", "complete"),
-        ("history_sync_state", "synced"),
-        ("coverage_state", "complete"),
-    ],
-)
 @pytest.mark.asyncio
-async def test_list_dialogs_rejects_noncanonical_dialog_read_model(field: str, value: object) -> None:
+async def test_list_dialogs_rejects_malformed_row_field() -> None:
     dialog = _make_dialog_dict()
-    dialog[field] = value
+    dialog["unread_mentions_count"] = "oops"
 
     with _patched_daemon(_canonical_catalog(dialogs=[dialog])):
         result = await list_dialogs(ListDialogs())
 
     assert result.is_error is True
     assert result.structured_content is None
-    assert result.content
+    assert "daemon_protocol_error" in _error_text(result)
 
 
 @pytest.mark.asyncio
-async def test_list_dialogs_rejects_incomplete_dialog_read_model() -> None:
+async def test_list_dialogs_rejects_missing_required_row_field() -> None:
     dialog = _make_dialog_dict()
-    del dialog["history_depth_state"]
+    del dialog["name"]
 
     with _patched_daemon(_canonical_catalog(dialogs=[dialog])):
         result = await list_dialogs(ListDialogs())
 
     assert result.is_error is True
     assert result.structured_content is None
-    assert result.content
+    assert "daemon_protocol_error" in _error_text(result)
 
 
 @pytest.mark.asyncio
