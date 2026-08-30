@@ -22,7 +22,7 @@ from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.reading.query_records import read_message_from_row
 from mcp_telegram.reading.sqlite_projection import _FETCH_UNREAD_MESSAGES_SQL
-from mcp_telegram.tools.unread import _project_message_sender
+from mcp_telegram.tools.message_view import project_message_view
 from mcp_telegram.topic_identity import project_topic
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.history_enrollment_helpers import seed_full_history_enrollment
@@ -722,7 +722,7 @@ def test_fetch_unread_group_sender_carries_raw_entity_username_to_projector(
     assert row["sender_username"] == "group_member"
     message = read_message_from_row(row)
     assert message.sender_id == 99
-    assert _project_message_sender(message) == {
+    assert project_message_view(message)["sender"] == {
         "display_name": "Group Member",
         "username": "@group_member",
     }

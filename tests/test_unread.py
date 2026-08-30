@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 from pydantic import ValidationError
 
-from mcp_telegram.tools.unread import GetInbox, _message_date, _resolve_inbox_since
+from mcp_telegram.tools.unread import GetInbox, _resolve_inbox_since
 
 
 def test_inbox_since_resolver_canonicalizes_absolute_and_relative_bounds() -> None:
@@ -50,23 +50,3 @@ def test_inbox_relative_resolver_requires_aware_utc_clock(clock: datetime) -> No
 def test_inbox_time_filter_validation_is_actionable(kwargs: dict[str, object]) -> None:
     with pytest.raises(ValidationError, match="mutually exclusive|offset|between 1 and 720"):
         GetInbox.model_validate(kwargs)
-
-
-@pytest.mark.parametrize(
-    ("sent_at", "expected"),
-    [
-        (1_700_000_000, 1_700_000_000),
-        ("1700000000", 1_700_000_000),
-        (1_700_000_000.9, 1_700_000_000),
-        (b"1700000000", 1_700_000_000),
-        (None, None),
-        (True, None),
-        (object(), None),
-        ([], None),
-    ],
-)
-def test_message_date_accepts_epoch_inputs_and_rejects_unsupported_values(
-    sent_at: object,
-    expected: int | None,
-) -> None:
-    assert _message_date(sent_at) == expected

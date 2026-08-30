@@ -668,17 +668,35 @@ def test_tool_description_points_to_structured_read_state_fields() -> None:
 
 def test_read_state_marker_labels_remain_available_in_structured_output_helpers() -> None:
     """The old marker information lives in structured output, not the tool descriptor."""
+    from mcp_telegram.models import ReadMessage
+    from mcp_telegram.tools.message_view import project_read_markers
     from mcp_telegram.tools.reading import ListMessages
-    from mcp_telegram.tools.unread import _structured_read_marker
 
     assert ListMessages.__doc__
-    for label in [
+    messages = [
+        ReadMessage(message_id=1, sent_at=1, dialog_id=42, out=0),
+        ReadMessage(message_id=2, sent_at=2, dialog_id=42, out=0),
+        ReadMessage(message_id=10, sent_at=3, dialog_id=42, out=1),
+        ReadMessage(message_id=11, sent_at=4, dialog_id=42, out=1),
+    ]
+    markers = project_read_markers(
+        messages,
+        read_state={
+            "inbox_unread_count": 1,
+            "inbox_cursor_state": "populated",
+            "inbox_max_id_anchor": 1,
+            "outbox_unread_count": 1,
+            "outbox_cursor_state": "populated",
+            "outbox_max_id_anchor": 10,
+        },
+        dialog_type="user",
+    )
+    assert [marker["label"] for marker in markers.values()] == [
         "[I read up to here]",
         "[unread by me]",
         "[peer read up to here]",
         "[unread by peer]",
-    ]:
-        assert _structured_read_marker(123, label)["label"] == label
+    ]
 
 
 # ---------------------------------------------------------------------------

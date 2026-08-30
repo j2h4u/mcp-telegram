@@ -197,7 +197,7 @@ def test_message_entrypoint_must_call_shared_serializer() -> None:
     gate = _gate()
     source = "def _structured_messages(message):\n    return {'text': message.text}\n"
     findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
-    assert any("must call serialize_message_content" in finding.message for finding in findings)
+    assert any("must call project_message_view" in finding.message for finding in findings)
 
 
 def test_metadata_wrapper_allowlist_does_not_hide_message_body_bypass() -> None:
@@ -214,13 +214,233 @@ def test_metadata_wrapper_allowlist_does_not_hide_message_body_bypass() -> None:
 def test_legitimate_metadata_call_remains_allowed_with_serializer_entrypoint() -> None:
     gate = _gate()
     source = (
-        "from .structured import telegram_content, serialize_message_content\n"
+        "from .message_view import project_message_view\n"
         "def _structured_messages(message):\n"
-        "    return serialize_message_content(message.text, message.media_description)\n"
+        "    return project_message_view(message)\n"
         "def _structured_reactions(display):\n"
-        "    return telegram_content(display, 'reaction')\n"
+        "    return display\n"
     )
     assert gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source) == []
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        "item = {'sender': 'parallel label'}",
+        "item['sent_at'] = 1",
+        "item.update({'read_markers': []})",
+        "item.update(content={'text': 'raw'})",
+        "item.setdefault('sender', 'parallel label')",
+        "item.update(dict(sent_at=1))",
+        "item = dict(dialog_id=1, sent_at=1)",
+        "item.pop('sender')",
+        "del item['read_at']",
+    ],
+)
+def test_canonical_message_entrypoint_cannot_overwrite_presenter_fields(write: str) -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _structured_messages(message):\n"
+        "    item = project_message_view(message)\n"
+        f"    {write}\n"
+        "    return item\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("must be owned by project_message_view" in finding.message for finding in findings)
+
+
+def test_list_message_page_composer_cannot_overwrite_presenter_fields() -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _list_message_structured_item(message):\n"
+        "    return project_message_view(message)\n"
+        "def _list_messages_structured_messages(message):\n"
+        "    item = _list_message_structured_item(message)\n"
+        "    item['sender'] = 'parallel label'\n"
+        "    return [item]\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
+    assert any("must be owned by project_message_view" in finding.message for finding in findings)
+
+
+def test_list_message_presenter_extension_allows_only_lifecycle_fields() -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _list_message_structured_item(message):\n"
+        "    item = project_message_view(message)\n"
+        "    item.update({'visibility': 'chat_visible'})\n"
+        "    item.update({'unexpected': True})\n"
+        "    return item\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
+    assert any(
+        "extension field 'unexpected' is not an allowed lifecycle field" in finding.message for finding in findings
+    )
+    assert not any("extension field 'visibility'" in finding.message for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "merge",
+    [
+        "item.update(patch)",
+        "item.update(build_patch())",
+        "item.update(dict(patch))",
+        "item.update({**patch})",
+        "item.update(**patch)",
+    ],
+)
+def test_message_view_update_fails_closed_for_unknown_mapping_keys(merge: str) -> None:
+    """Catch ordinary accidental bypasses without pretending to prove provenance."""
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _structured_messages(message, patch):\n"
+        "    item = project_message_view(message)\n"
+        f"    {merge}\n"
+        "    return item\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("update keys must be a statically known literal mapping" in finding.message for finding in findings)
+
+
+def test_filter_shaped_literal_cannot_be_merged_into_message_view() -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _structured_messages(message):\n"
+        "    item = project_message_view(message)\n"
+        "    item.update({'exact_dialog_id': 1, 'sender': 'parallel', 'sender_id': 2, "
+        "'exact_topic_id': 3, 'topic': 'parallel'})\n"
+        "    return item\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("canonical field 'sender'" in finding.message for finding in findings)
+    assert any("canonical field 'topic'" in finding.message for finding in findings)
+    assert not any("update keys must be a statically known literal mapping" in finding.message for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "merge",
+    [
+        "item.update(patch, sender='parallel')",
+        "item.update({**patch, 'sender': 'parallel'})",
+    ],
+)
+def test_opaque_update_preserves_known_presenter_overwrite_keys(merge: str) -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _structured_messages(message, patch):\n"
+        "    item = project_message_view(message)\n"
+        f"    {merge}\n"
+        "    return item\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("canonical field 'sender'" in finding.message for finding in findings)
+    assert any("update keys must be a statically known literal mapping" in finding.message for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "construction",
+    [
+        "{**project_message_view(message), 'sender': 'parallel'}",
+        "dict(project_message_view(message), sender='parallel')",
+    ],
+)
+def test_opaque_construction_preserves_known_presenter_overwrite_keys(construction: str) -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _structured_messages(message):\n"
+        f"    return {construction}\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("canonical field 'sender'" in finding.message for finding in findings)
+
+
+def test_message_view_ior_fails_closed_for_unknown_mapping_keys() -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _structured_messages(message, patch):\n"
+        "    item = project_message_view(message)\n"
+        "    item |= patch\n"
+        "    return item\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("|= keys must be a statically known literal mapping" in finding.message for finding in findings)
+
+
+def test_list_message_ior_allows_known_lifecycle_literal() -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _list_message_structured_item(message):\n"
+        "    item = project_message_view(message)\n"
+        "    item |= {'visibility': 'chat_visible'}\n"
+        "    return item\n"
+    )
+    assert gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source) == []
+
+
+def test_noop_presenter_call_does_not_excuse_manually_returned_envelope() -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _structured_messages(message):\n"
+        "    project_message_view(message)\n"
+        "    return dict(dialog_id=message.dialog_id, sent_at=message.sent_at)\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("canonical field 'sent_at'" in finding.message for finding in findings)
+
+
+def test_local_helper_cannot_hide_presenter_field_mutation() -> None:
+    gate = _gate()
+    source = (
+        "from .message_view import project_message_view\n"
+        "def _manual_sender(item):\n"
+        "    item.setdefault('sender', 'parallel label')\n"
+        "    return item\n"
+        "def _structured_messages(message):\n"
+        "    return _manual_sender(project_message_view(message))\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("canonical field 'sender'" in finding.message for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "from .message_view import project_message_view as present\n"
+            "def _structured_messages(message):\n"
+            "    return present(message)\n"
+        ),
+        (
+            "import mcp_telegram.tools.message_view as message_view\n"
+            "def _structured_messages(message):\n"
+            "    return message_view.project_message_view(message)\n"
+        ),
+    ],
+)
+def test_presenter_alias_and_module_qualified_calls_are_noncanonical(source: str) -> None:
+    gate = _gate()
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("canonical direct import and name" in finding.message for finding in findings)
+    assert any("must call project_message_view" in finding.message for finding in findings)
+
+
+def test_boundary_gate_fields_match_canonical_message_view_schema() -> None:
+    from mcp_telegram.tools.message_view import MESSAGE_VIEW_SCHEMA
+
+    gate = _gate()
+    properties = MESSAGE_VIEW_SCHEMA["properties"]
+    assert isinstance(properties, dict)
+    assert frozenset(properties) == gate.CANONICAL_MESSAGE_VIEW_FIELDS
 
 
 def test_serializer_call_does_not_excuse_second_raw_wrapper() -> None:

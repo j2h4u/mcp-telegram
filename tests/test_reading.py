@@ -522,9 +522,9 @@ def test_list_messages_structured_messages_include_content_metadata_and_all_read
         "content_kind": "message_text",
     }
     assert "text" not in messages[0]
-    assert messages[2]["sender"] == "[me]"
+    assert messages[2]["sender"] == {"display_name": "999", "telegram_id": 999}
     assert messages[2]["out"] is True
-    assert messages[2]["effective_sender_id"] == 999
+    assert "effective_sender_id" not in messages[2]
 
 
 def test_list_messages_structured_messages_cover_media_reply_forward_reaction_topic_and_edit_fields():
@@ -567,7 +567,11 @@ def test_list_messages_structured_messages_cover_media_reply_forward_reaction_to
     assert second["post_author"] == "Channel Author"
     assert second["edit_date"] == 1_700_000_120
     assert cast(dict[str, object], second["reactions"])["display"] == "[👍×2]"
-    assert "content" not in cast(dict[str, object], second["reactions"])
+    assert cast(dict[str, object], second["reactions"])["content"] == {
+        "text": "[👍×2]",
+        "is_telegram_content": True,
+        "content_kind": "reaction",
+    }
     assert "read_markers" not in second
 
 
@@ -614,7 +618,7 @@ def test_structured_read_surfaces_preserve_nullable_reaction_events_and_read_at(
     listed = _list_messages_structured_messages([row], dialog_type="User")
     assert listed[0]["reaction_events"] == [
         {"reactor_id": 77, "emoji": "👍", "reacted_at": 1_700_000_100},
-        {"reactor_id": None, "emoji": "🔥", "reacted_at": None},
+        {"emoji": "🔥"},
     ]
     listed_events = cast(list[dict[str, object]], listed[0]["reaction_events"])
     assert "checked_at" not in listed_events[0]
@@ -623,7 +627,10 @@ def test_structured_read_surfaces_preserve_nullable_reaction_events_and_read_at(
     assert listed[0]["read_at"] == 1_700_000_200
 
     searched = _search_result_structured_rows([row], "outgoing")
-    assert searched[0]["reaction_events"] == listed[0]["reaction_events"]
+    assert searched[0]["reaction_events"] == [
+        {"reactor_id": 77, "emoji": "👍", "reacted_at": 1_700_000_100},
+        {"reactor_id": None, "emoji": "🔥", "reacted_at": None},
+    ]
     assert searched[0]["reaction_events_status"] == "partial"
     assert searched[0]["read_at"] == 1_700_000_200
 

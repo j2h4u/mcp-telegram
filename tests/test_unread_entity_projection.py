@@ -9,11 +9,11 @@ from jsonschema import validate
 
 from mcp_telegram.models import ReadMessage
 from mcp_telegram.temporal import normalize_temporal_output_schema
+from mcp_telegram.tools.message_view import project_message_view
 from mcp_telegram.tools.unread import (
     GET_INBOX_OUTPUT_SCHEMA,
     GetInbox,
     GetUnreadSummary,
-    _project_message_sender,
     _project_unread_summary_dialog,
     _project_unread_summary_dialogs,
     _structured_messages,
@@ -148,11 +148,11 @@ def test_unread_summary_projection_helper_keeps_identity_contract_and_skips_bad_
 def test_inbox_sender_projection_uses_identity_contract_or_null(
     message: ReadMessage, expected: dict[str, object]
 ) -> None:
-    assert _project_message_sender(message) == expected
+    assert project_message_view(message).get("sender") == expected
 
 
 def test_inbox_sender_projection_returns_null_without_actor_id() -> None:
-    assert _project_message_sender(ReadMessage(message_id=5, sent_at=1, dialog_id=-1001)) is None
+    assert "sender" not in project_message_view(ReadMessage(message_id=5, sent_at=1, dialog_id=-1001))
 
 
 def test_structured_inbox_message_omits_sender_without_actor_id() -> None:

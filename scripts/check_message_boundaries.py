@@ -7,6 +7,8 @@ contracts that cannot be expressed by an import graph alone:
 * SQL that reads ``messages`` belongs to a reviewed repository/query owner.
 * The structured Telegram-content marker is constructed by its canonical
   wrapper, rather than by each tool independently.
+* List and Inbox message envelopes are constructed by their canonical delivery
+  presenter, including when consumer code delegates to a local helper.
 
 The SQL check deliberately parses only SQL-shaped assignments and arguments to
 the sqlite execute family.  It does not grep all source strings, which keeps
@@ -79,6 +81,60 @@ MESSAGE_BODY_ENTRYPOINTS = {
     "tools/activity.py": frozenset({"_structured_comment"}),
     "tools/account_trace.py": frozenset({"_attach_trace_content_metadata"}),
 }
+CANONICAL_MESSAGE_VIEW_ENTRYPOINTS = {
+    "tools/reading.py": frozenset({"_list_message_structured_item"}),
+    "tools/unread.py": frozenset({"_structured_messages"}),
+}
+CANONICAL_MESSAGE_VIEW_FIELDS = frozenset(
+    {
+        "dialog_id",
+        "msg_id",
+        "sent_at",
+        "sender",
+        "out",
+        "is_service",
+        "topic",
+        "content",
+        "media",
+        "reply_context_ref",
+        "forward",
+        "post_author",
+        "edit_date",
+        "reactions",
+        "reaction_events",
+        "reaction_events_status",
+        "read_at",
+        "read_markers",
+    }
+)
+CANONICAL_MESSAGE_VIEW_CONSUMER_PATHS = frozenset(CANONICAL_MESSAGE_VIEW_ENTRYPOINTS)
+# Search is explicitly outside the canonical List/Inbox presenter slice and
+# retains its existing compact hit shape in the same module.
+CANONICAL_MESSAGE_VIEW_CONSTRUCTION_EXEMPT_FUNCTIONS = {
+    "tools/reading.py": frozenset({"_search_result_structured_rows"}),
+}
+LIST_MESSAGE_LIFECYCLE_FIELDS = frozenset(
+    {
+        "message_state",
+        "visibility",
+        "unpublished",
+        "published",
+        "unseen",
+        "scheduled_at",
+        "published_at",
+        "inclusion_basis",
+    }
+)
+MESSAGE_VIEW_BYPASS_NAMES = frozenset(
+    {
+        "serialize_message_content",
+        "project_topic",
+        "_compute_inline_markers",
+        "_structured_read_marker",
+        "_structured_reaction_events",
+        "_structured_reactions",
+    }
+)
 TOOL_MESSAGE_PROJECTOR_PATHS = frozenset({"tools/activity.py", "tools/account_trace.py"})
 MESSAGE_METADATA_FUNCTIONS = {
     "tools/folders.py": frozenset({"list_folders", "list_folder_messages"}),
@@ -502,6 +558,7 @@ def _raw_message_content_violations(path: str, tree: ast.AST) -> list[Finding]:
             self.function: str | None = None
             self.tainted: set[str] = set()
             self.serializer_counts: dict[str, int] = {}
+            self.message_view_counts: dict[str, int] = {}
             self.content_aliases = {"telegram_content"}
 
         def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
@@ -516,12 +573,25 @@ def _raw_message_content_violations(path: str, tree: ast.AST) -> list[Finding]:
             self.function, self.tainted = node.name, set()
             self.generic_visit(node)
             if node.name in MESSAGE_BODY_ENTRYPOINTS.get(path, frozenset()):
-                serializer_count = self.serializer_counts.get(node.name, 0)
-                if serializer_count == 0:
+                message_view_count = self.message_view_counts.get(node.name, 0)
+                if node.name in CANONICAL_MESSAGE_VIEW_ENTRYPOINTS.get(path, frozenset()):
+                    if message_view_count == 0:
+                        findings.append(
+                            Finding(path, node.lineno, "canonical message delivery path must call project_message_view")
+                        )
+                    elif message_view_count != 1:
+                        findings.append(
+                            Finding(
+                                path,
+                                node.lineno,
+                                "canonical message delivery path must call project_message_view exactly once",
+                            )
+                        )
+                elif self.serializer_counts.get(node.name, 0) == 0:
                     findings.append(
                         Finding(path, node.lineno, "message delivery path must call serialize_message_content")
                     )
-                elif path in TOOL_MESSAGE_PROJECTOR_PATHS and serializer_count != 1:
+                elif path in TOOL_MESSAGE_PROJECTOR_PATHS and self.serializer_counts.get(node.name, 0) != 1:
                     findings.append(
                         Finding(
                             path,
@@ -576,9 +646,20 @@ def _raw_message_content_violations(path: str, tree: ast.AST) -> list[Finding]:
             return False
 
         def visit_Call(self, node: ast.Call) -> None:
-            if isinstance(node.func, ast.Name) and node.func.id == "serialize_message_content":
+            called_name = node.func.id if isinstance(node.func, ast.Name) else None
+            if called_name == "serialize_message_content":
                 function = self.function or ""
                 self.serializer_counts[function] = self.serializer_counts.get(function, 0) + 1
+            if called_name == "project_message_view":
+                function = self.function or ""
+                self.message_view_counts[function] = self.message_view_counts.get(function, 0) + 1
+            if (
+                self.function in CANONICAL_MESSAGE_VIEW_ENTRYPOINTS.get(path, frozenset())
+                and called_name in MESSAGE_VIEW_BYPASS_NAMES
+            ):
+                findings.append(
+                    Finding(path, node.lineno, "canonical message delivery path must use project_message_view")
+                )
             is_content_call = isinstance(node.func, ast.Name) and node.func.id in self.content_aliases
             is_content_call = is_content_call or (
                 isinstance(node.func, ast.Attribute) and node.func.attr == "telegram_content"
@@ -607,6 +688,188 @@ def _raw_message_content_violations(path: str, tree: ast.AST) -> list[Finding]:
     return findings
 
 
+def _mapping_key_facts(node: ast.expr | None) -> tuple[frozenset[str], bool]:
+    """Return visible keys and whether a mapping has opaque key sources."""
+    if isinstance(node, ast.Dict):
+        keys: set[str] = set()
+        has_opaque_sources = False
+        for key in node.keys:
+            if key is None or not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                has_opaque_sources = True
+            else:
+                keys.add(key.value)
+        return frozenset(keys), has_opaque_sources
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "dict":
+        positional_keys, positional_opaque = (frozenset(), False) if not node.args else _mapping_key_facts(node.args[0])
+        keyword_keys = frozenset(keyword.arg for keyword in node.keywords if keyword.arg is not None)
+        has_opaque_sources = (
+            len(node.args) > 1 or positional_opaque or any(keyword.arg is None for keyword in node.keywords)
+        )
+        return positional_keys | keyword_keys, has_opaque_sources
+    return frozenset(), True
+
+
+def _literal_subscript_key(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+        return node.slice.value
+    return None
+
+
+def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding]:
+    """Reject literal presenter-field construction or mutation in List/Inbox consumers.
+
+    This deliberately does not trace aliases or values. A shallow whole-module
+    rule catches local-helper bypasses while keeping the gate predictable.
+    """
+    if path not in CANONICAL_MESSAGE_VIEW_CONSUMER_PATHS:
+        return []
+
+    findings: list[Finding] = []
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.function: str | None = None
+            self.canonical_import_count = 0
+
+        def visit_Import(self, node: ast.Import) -> None:
+            if any(alias.name.endswith(".tools.message_view") for alias in node.names):
+                findings.append(
+                    Finding(path, node.lineno, "project_message_view must use its canonical direct import and name")
+                )
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            if not _import_module(node).endswith(("tools.message_view", ".message_view")):
+                return
+            for alias in node.names:
+                if alias.name != "project_message_view":
+                    continue
+                if alias.asname is None:
+                    self.canonical_import_count += 1
+                else:
+                    findings.append(
+                        Finding(path, node.lineno, "project_message_view must use its canonical direct import and name")
+                    )
+
+        def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            previous = self.function
+            self.function = node.name
+            self.generic_visit(node)
+            self.function = previous
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_function(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_function(node)
+
+        def _record_mutation(self, node: ast.AST, key: str | None) -> None:
+            if key in CANONICAL_MESSAGE_VIEW_FIELDS:
+                findings.append(
+                    Finding(path, _line(node), f"canonical field {key!r} must be owned by project_message_view")
+                )
+            if (
+                self.function == "_list_message_structured_item"
+                and key is not None
+                and key not in LIST_MESSAGE_LIFECYCLE_FIELDS
+            ):
+                findings.append(
+                    Finding(
+                        path, _line(node), f"list message extension field {key!r} is not an allowed lifecycle field"
+                    )
+                )
+
+        def _record_construction(self, node: ast.AST, keys: frozenset[str]) -> None:
+            if self.function is None:
+                return
+            if self.function in CANONICAL_MESSAGE_VIEW_CONSTRUCTION_EXEMPT_FUNCTIONS.get(path, frozenset()):
+                return
+            if self.function == "_list_message_structured_item":
+                findings.extend(
+                    Finding(
+                        path, _line(node), f"list message extension field {key!r} is not an allowed lifecycle field"
+                    )
+                    for key in sorted(keys - LIST_MESSAGE_LIFECYCLE_FIELDS)
+                )
+            core_fields = keys & CANONICAL_MESSAGE_VIEW_FIELDS
+            if core_fields == {"dialog_id"}:
+                return
+            is_list_filter = (
+                core_fields <= {"sender", "topic"}
+                and {
+                    "exact_dialog_id",
+                    "sender_id",
+                    "exact_topic_id",
+                }
+                <= keys
+            )
+            if is_list_filter:
+                return
+            for key in sorted(core_fields):
+                self._record_mutation(node, key)
+
+        def visit_Dict(self, node: ast.Dict) -> None:
+            keys, _has_opaque_sources = _mapping_key_facts(node)
+            self._record_construction(node, keys)
+            self.generic_visit(node)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            for target in node.targets:
+                self._record_mutation(node, _literal_subscript_key(target))
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            self._record_mutation(node, _literal_subscript_key(node.target))
+            self.generic_visit(node)
+
+        def visit_AugAssign(self, node: ast.AugAssign) -> None:
+            self._record_mutation(node, _literal_subscript_key(node.target))
+            if isinstance(node.op, ast.BitOr):
+                keys, has_opaque_sources = _mapping_key_facts(node.value)
+                if has_opaque_sources:
+                    findings.append(
+                        Finding(path, node.lineno, "message view |= keys must be a statically known literal mapping")
+                    )
+                for key in sorted(keys):
+                    self._record_mutation(node, key)
+            self.generic_visit(node)
+
+        def visit_Delete(self, node: ast.Delete) -> None:
+            for target in node.targets:
+                self._record_mutation(node, _literal_subscript_key(target))
+            self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if isinstance(node.func, ast.Name) and node.func.id == "dict":
+                keys, _has_opaque_sources = _mapping_key_facts(node)
+                self._record_construction(node, keys)
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"pop", "setdefault"}:
+                key = node.args[0].value if node.args and isinstance(node.args[0], ast.Constant) else None
+                self._record_mutation(node, key if isinstance(key, str) else None)
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "update":
+                mapping_keys, mapping_opaque = _mapping_key_facts(node.args[0]) if node.args else (frozenset(), False)
+                # Deliberately shallow and fail-closed: ordinary presenter
+                # extensions use one literal mapping; this is not data-flow analysis.
+                has_unknown_keys = (
+                    len(node.args) > 1 or mapping_opaque or any(keyword.arg is None for keyword in node.keywords)
+                )
+                if has_unknown_keys:
+                    findings.append(
+                        Finding(
+                            path, node.lineno, "message view update keys must be a statically known literal mapping"
+                        )
+                    )
+                keyword_keys = frozenset(keyword.arg for keyword in node.keywords if keyword.arg is not None)
+                for key in sorted(mapping_keys | keyword_keys):
+                    self._record_mutation(node, key)
+            self.generic_visit(node)
+
+    visitor = Visitor()
+    visitor.visit(tree)
+    if visitor.canonical_import_count != 1:
+        findings.append(Finding(path, 1, "consumer must import project_message_view directly exactly once"))
+    return findings
+
+
 def violations_for(path: Path, source: str) -> list[Finding]:
     relative = _relative(path)
     tree = ast.parse(source, filename=str(path))
@@ -615,6 +878,7 @@ def violations_for(path: Path, source: str) -> list[Finding]:
     findings.extend(_projection_import_violations(relative, tree))
     findings.extend(_scheduled_content_violations(relative, tree))
     findings.extend(_raw_message_content_violations(relative, tree))
+    findings.extend(_canonical_message_view_violations(relative, tree))
 
     sql_hits = [snippet for snippet in _sql_snippets(tree, constants) if _has_message_table_sql(snippet.text)]
     if (
