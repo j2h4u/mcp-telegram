@@ -237,6 +237,7 @@ from .resolver import (
     ResolverEnrichmentPolicy,
     _fuzzy_resolve,
     _parse_tme_link,
+    apply_disambiguation_hint,
     latinize,
 )
 from .resolver import (
@@ -692,6 +693,12 @@ class DaemonAPIServer:
         exact_normalized = dict.fromkeys(exact_names, norm_query)
         result = _fuzzy_resolve(query, exact_names, normalized_name_map=exact_normalized)
         DaemonAPIServer._apply_dialog_candidate_types(result, entity_types)
+        if isinstance(result, Candidates):
+            apply_disambiguation_hint(
+                result.matches,
+                collision_query=query,
+                collision_count=len(exact_names),
+            )
         return result if isinstance(result, Resolved | Candidates) else None
 
     @staticmethod
