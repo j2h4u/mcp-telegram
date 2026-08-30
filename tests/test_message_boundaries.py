@@ -469,10 +469,7 @@ def _search_hit_fixture(
 def test_search_hit_boundary_accepts_canonical_seams_with_benign_helpers() -> None:
     gate = _gate()
     source = _search_hit_fixture(
-        helpers=(
-            "def _unrelated_metadata():\n"
-            "    return {'dialog_name': 'benign', 'anchor_call': {}}\n"
-        )
+        helpers=("def _unrelated_metadata():\n    return {'dialog_name': 'benign', 'anchor_call': {}}\n")
     )
 
     assert gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source) == []

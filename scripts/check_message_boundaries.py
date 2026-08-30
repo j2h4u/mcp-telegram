@@ -914,12 +914,18 @@ def _search_hit_violations(path: str, tree: ast.AST) -> list[Finding]:
     }
     missing_imports = {"SEARCH_HIT_SCHEMA", "project_search_hit"} - canonical_imports
     if missing_imports:
-        findings.append(Finding(path, 1, "reading must directly import canonical SEARCH_HIT_SCHEMA and project_search_hit"))
+        findings.append(
+            Finding(path, 1, "reading must directly import canonical SEARCH_HIT_SCHEMA and project_search_hit")
+        )
     if not _search_schema_uses_canonical_hit(tree):
         findings.append(Finding(path, 1, "search results.items must reference SEARCH_HIT_SCHEMA"))
     if not _search_mapper_uses_canonical_hit(tree):
         findings.append(
-            Finding(path, 1, "search result mapper must directly project every list-comprehension item with project_search_hit")
+            Finding(
+                path,
+                1,
+                "search result mapper must directly project every list-comprehension item with project_search_hit",
+            )
         )
     return findings
 
