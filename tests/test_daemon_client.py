@@ -505,7 +505,7 @@ async def test_list_dialogs_convenience() -> None:
 
 @pytest.mark.asyncio
 async def test_list_topics_convenience() -> None:
-    """list_topics emits exactly one selector key for exact and named calls."""
+    """list_topics emits exact-one selectors and no legacy zero for absence."""
     reader = MagicMock(spec=asyncio.StreamReader)
     writer = MagicMock(spec=asyncio.StreamWriter)
     conn = DaemonConnection(reader, writer)
@@ -520,11 +520,14 @@ async def test_list_topics_convenience() -> None:
 
     await conn.list_topics(dialog_id=123)
     await conn.list_topics(dialog="Forum")
+    await conn.list_topics()
 
     assert captured[0]["method"] == "list_topics"
     assert _dialog_selector_fields(captured[0]) == {"dialog_id": 123}
     assert captured[1]["method"] == "list_topics"
     assert _dialog_selector_fields(captured[1]) == {"dialog": "Forum"}
+    assert captured[2]["method"] == "list_topics"
+    assert _dialog_selector_fields(captured[2]) == {}
 
 
 @pytest.mark.asyncio
@@ -542,9 +545,11 @@ async def test_get_dialog_stats_emits_exactly_one_selector_key() -> None:
 
     await conn.get_dialog_stats(dialog_id=123)
     await conn.get_dialog_stats(dialog="Forum")
+    await conn.get_dialog_stats()
 
     assert _dialog_selector_fields(captured[0]) == {"dialog_id": 123}
     assert _dialog_selector_fields(captured[1]) == {"dialog": "Forum"}
+    assert _dialog_selector_fields(captured[2]) == {}
 
 
 @pytest.mark.asyncio

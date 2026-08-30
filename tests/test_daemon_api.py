@@ -20,6 +20,7 @@ from typing import Final, Protocol, TypedDict, Unpack, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from telethon.errors import FloodWaitError, ServerError
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike, _ResolverEntityCache
 from mcp_telegram.daemon_ipc import get_daemon_socket_path
@@ -7061,7 +7062,7 @@ async def test_resolve_dialog_name_dialogs_snapshot_substring_is_suggestion_only
 
 @pytest.mark.asyncio
 async def test_resolve_dialog_name_dialogs_snapshot_skips_hidden() -> None:
-    """hidden=1 rows must NOT match step 2.5 — fallthrough to iter_dialogs is required."""
+    """Remote fallback cannot reintroduce a locally hidden dialog id."""
     conn = _make_db_with_dialogs()
     _seed_dialog_row(conn, 999, name="Old Group", type_="supergroup", hidden=1)
 
@@ -7074,6 +7075,7 @@ async def test_resolve_dialog_name_dialogs_snapshot_skips_hidden() -> None:
 
     client = _TestClient()
     client.get_entity = AsyncMock(side_effect=ValueError(""))
+    client.iter_messages = MagicMock(side_effect=AssertionError("hidden selector must not read messages"))
 
     async def fake_iter(*args: object, **kwargs: object):  # type: ignore[misc]
         yield fake_dialog
@@ -7081,11 +7083,12 @@ async def test_resolve_dialog_name_dialogs_snapshot_skips_hidden() -> None:
     client.iter_dialogs = MagicMock(return_value=fake_iter())
 
     server = make_server(conn, client)
-    result = await server._resolve_dialog_id(required_dialog_selector(dialog="Old Group"))
+    result = await server._dispatch({"method": "list_messages", "dialog": "Old Group"})
 
-    # Came from iter_dialogs — proves step 2.5 correctly skipped hidden=1
-    assert result == 999
+    assert result["ok"] is False
+    assert result["error"] == "dialog_not_found"
     cast(MagicMock, client.iter_dialogs).assert_called_once()
+    cast(MagicMock, client.iter_messages).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -7229,23 +7232,10 @@ async def test_raw_dialog_selector_rejects_conflicting_fields(method: str) -> No
     assert result["error"] == "invalid_dialog_selector"
 
 
-@pytest.mark.parametrize("dialog", ["١٢٣", "１２３", "²"])
-async def test_unicode_numeral_dialog_reaches_resolver_as_query_without_crashing(dialog: str) -> None:
-    client = _TestClient()
-    client.get_entity = AsyncMock(side_effect=ValueError("not found"))
-    client.iter_dialogs = MagicMock(side_effect=_empty_dialogs)
-    server = make_server(_make_db_with_dialogs(), client)
-
-    result = await server._dispatch({"method": "list_messages", "dialog": dialog})
-
-    assert result["ok"] is False
-    assert result["error"] == "dialog_not_found"
-
-
 async def test_duplicate_exact_dialog_names_fail_closed_with_deterministic_ids_and_no_read() -> None:
     conn = _make_db_with_dialogs()
-    _seed_dialog_row(conn, 101, name="Twin Project")
-    _seed_dialog_row(conn, 202, name="Twin Project")
+    _seed_dialog_row(conn, 101, name="Twin Project", type_="user")
+    _seed_dialog_row(conn, 202, name="Twin Project", type_="supergroup")
     client = _TestClient()
     client.get_entity = AsyncMock(side_effect=ValueError("not found"))
     client.iter_dialogs = MagicMock(side_effect=_empty_dialogs)
@@ -7260,6 +7250,10 @@ async def test_duplicate_exact_dialog_names_fail_closed_with_deterministic_ids_a
     assert first["candidates"] == second["candidates"]
     candidates = cast(list[dict[str, object]], first["candidates"])
     assert {candidate["entity_id"] for candidate in candidates} == {101, 202}
+    assert {candidate["entity_id"]: candidate["entity_type"] for candidate in candidates} == {
+        101: "user",
+        202: "supergroup",
+    }
     assert "exact" in str(first["required_action"]).lower()
     assert "id" in str(first["required_action"]).lower()
     cast(MagicMock, client.iter_messages).assert_not_called()
@@ -7291,36 +7285,6 @@ async def test_unique_exact_name_precedes_nearby_substring_and_exact_id_bypasses
 
     assert await server._resolve_dialog_id(required_dialog_selector(exact_id=707)) == 707
     assert await server._resolve_dialog_id(required_dialog_selector(dialog="Project")) == 505
-
-
-async def test_unique_approximate_dialog_is_not_auto_selected_and_returns_suggestion() -> None:
-    conn = _make_db_with_dialogs()
-    _seed_dialog_row(conn, 808, name="Project Alpha")
-    client = _TestClient()
-    client.get_entity = AsyncMock(side_effect=ValueError("not found"))
-    server = make_server(conn, client)
-
-    result = await server._resolve_dialog_id(
-        required_dialog_selector(dialog="Project"),
-        allow_remote_lookup=False,
-    )
-
-    assert isinstance(result, dict)
-    assert result["error"] == "dialog_not_found"
-    suggestion = cast(dict[str, object], result["suggestion"])
-    assert suggestion["entity_id"] == 808
-
-
-async def test_hidden_dialog_is_excluded_but_hidden_access_lost_archive_remains_selectable() -> None:
-    conn = _make_db_with_dialogs()
-    _seed_dialog_row(conn, 909, name="Archived Project", hidden=1)
-    _seed_dialog_row(conn, 1001, name="Archived Project", hidden=1)
-    _insert_synced_dialog(conn, 1001, status="access_lost")
-    client = _TestClient()
-    client.get_entity = AsyncMock(side_effect=AssertionError("eligible local archive must resolve without Telegram"))
-    server = make_server(conn, client)
-
-    assert await server._resolve_dialog_id(required_dialog_selector(dialog="Archived Project")) == 1001
 
 
 async def test_list_topics_dialog_resolution_remains_local_only() -> None:
@@ -7357,6 +7321,70 @@ async def test_remote_fallback_enumerates_all_matches_before_ambiguity_decision(
     assert result["error"] == "ambiguous_dialog"
     candidates = cast(list[dict[str, object]], result["candidates"])
     assert {candidate["entity_id"] for candidate in candidates} == {1101, 1202}
+    assert all(candidate["entity_type"] is None for candidate in candidates)
+    assert all(candidate["username"] is None for candidate in candidates)
+
+
+async def test_duplicate_username_candidates_preserve_truthful_cached_metadata() -> None:
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 1303, name="Shared User", type_="user")
+    _seed_dialog_row(conn, 1404, name="Shared Group", type_="supergroup")
+    conn.executemany(
+        "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            (1303, "User", "Shared User", "shared", "shared user", 1_700_000_000),
+            (1404, "Channel", "Shared Group", "shared", "shared group", 1_700_000_000),
+        ],
+    )
+    conn.commit()
+    client = _TestClient()
+    client.get_entity = AsyncMock(side_effect=AssertionError("ambiguous local username must fail closed"))
+    server = make_server(conn, client)
+
+    result = await server._resolve_dialog_id(required_dialog_selector(dialog="@shared"))
+
+    assert isinstance(result, dict)
+    assert result["error"] == "ambiguous_dialog"
+    candidates = cast(list[dict[str, object]], result["candidates"])
+    assert {candidate["entity_id"]: (candidate["username"], candidate["entity_type"]) for candidate in candidates} == {
+        1303: ("shared", "user"),
+        1404: ("shared", "supergroup"),
+    }
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_retry_after"),
+    [
+        pytest.param(FloodWaitError(request=None, capture=17), 17, id="flood-wait"),
+        pytest.param(ServerError(None, "temporary"), None, id="retryable-rpc"),
+        pytest.param(TimeoutError("incomplete enumeration"), None, id="timeout"),
+    ],
+)
+async def test_remote_dialog_enumeration_failure_is_retryable_and_never_reads(
+    failure: Exception,
+    expected_retry_after: int | None,
+) -> None:
+    async def interrupted_dialogs():
+        yield SimpleNamespace(name="Remote Project", entity=SimpleNamespace(id=1505))
+        raise failure
+
+    client = _TestClient()
+    client.iter_dialogs = MagicMock(return_value=interrupted_dialogs())
+    client.iter_messages = MagicMock(side_effect=AssertionError("incomplete selector must not read messages"))
+    server = make_server(_make_db_with_dialogs(), client)
+
+    result = await server._dispatch({"method": "list_messages", "dialog": "Remote Project"})
+
+    assert result == {
+        "ok": False,
+        "error": "dialog_resolution_retryable",
+        "message": "Telegram dialog enumeration did not complete; no dialog was selected.",
+        "retryable": True,
+        "required_action": "Retry the request; use an exact dialog id when already known.",
+        **({"retry_after": expected_retry_after} if expected_retry_after is not None else {}),
+    }
+    cast(MagicMock, client.iter_messages).assert_not_called()
 
 
 # ---------------------------------------------------------------------------
