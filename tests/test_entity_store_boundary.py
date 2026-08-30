@@ -55,6 +55,44 @@ def test_runtime_entity_dml_is_rejected_outside_canonical_owner(sql: str) -> Non
 
 
 @pytest.mark.parametrize(
+    "sql",
+    [
+        (
+            "WITH incoming(id, type, updated_at) AS (VALUES (1, 'User', 1)) "
+            "INSERT INTO entities (id, type, updated_at) SELECT id, type, updated_at FROM incoming"
+        ),
+        (
+            "WITH incoming(name) AS (VALUES ('Alice')) "
+            "UPDATE entities SET name = (SELECT name FROM incoming) WHERE id = 1"
+        ),
+        ("WITH doomed(id) AS (VALUES (1)) DELETE FROM entities WHERE id IN (SELECT id FROM doomed)"),
+    ],
+)
+def test_cte_prefixed_entity_dml_is_rejected_outside_canonical_owner(sql: str) -> None:
+    gate = _gate()
+
+    findings = _entity_findings(gate, gate.SOURCE_ROOT / "rogue.py", f"SQL = {sql!r}")
+
+    assert len(findings) == 1
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "WITH selected AS (SELECT * FROM entities) SELECT * FROM selected",
+        (
+            "WITH selected(entity_id) AS (VALUES (1)) "
+            "UPDATE entity_details SET fetched_at = 2 WHERE entity_id IN (SELECT entity_id FROM selected)"
+        ),
+    ],
+)
+def test_cte_without_entity_dml_remains_allowed(sql: str) -> None:
+    gate = _gate()
+
+    assert _entity_findings(gate, gate.SOURCE_ROOT / "reader.py", f"SQL = {sql!r}") == []
+
+
+@pytest.mark.parametrize(
     "relative_path",
     [
         "entity_store.py",
