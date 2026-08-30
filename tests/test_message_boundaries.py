@@ -378,10 +378,13 @@ def test_list_message_ior_allows_known_lifecycle_literal() -> None:
     gate = _gate()
     source = (
         "from .message_view import project_message_view\n"
+        "from .search_hit import project_search_hit\n"
         "def _list_message_structured_item(message):\n"
         "    item = project_message_view(message)\n"
         "    item |= {'visibility': 'chat_visible'}\n"
         "    return item\n"
+        "def _search_result_structured_rows(rows, query):\n"
+        "    return [project_search_hit(rows[0], query, lifecycle={})]\n"
     )
     assert gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source) == []
 
@@ -441,6 +444,168 @@ def test_boundary_gate_fields_match_canonical_message_view_schema() -> None:
     properties = MESSAGE_VIEW_SCHEMA["properties"]
     assert isinstance(properties, dict)
     assert frozenset(properties) == gate.CANONICAL_MESSAGE_VIEW_FIELDS
+
+
+def _search_hit_fixture(mapper_body: str, *, helpers: str = "") -> str:
+    return (
+        "from .message_view import project_message_view\n"
+        "from .search_hit import project_search_hit\n"
+        "def _list_message_structured_item(message):\n"
+        "    return project_message_view(message)\n"
+        f"{helpers}"
+        "def _search_result_structured_rows(rows, query, patch=None):\n"
+        f"{mapper_body}"
+    )
+
+
+def test_search_hit_boundary_requires_one_direct_canonical_projector_call() -> None:
+    gate = _gate()
+    path = gate.SOURCE_ROOT / "tools" / "reading.py"
+    missing = _search_hit_fixture("    return rows\n")
+    findings = gate.violations_for(path, missing)
+    assert any("must call project_search_hit directly exactly once" in finding.message for finding in findings)
+
+    duplicate = _search_hit_fixture(
+        "    project_search_hit(rows[0], query, lifecycle={})\n"
+        "    return [project_search_hit(rows[0], query, lifecycle={})]\n"
+    )
+    findings = gate.violations_for(path, duplicate)
+    assert any("must call project_search_hit directly exactly once" in finding.message for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "from .message_view import project_message_view\n"
+            "from .search_hit import project_search_hit as present\n"
+            "def _list_message_structured_item(message):\n"
+            "    return project_message_view(message)\n"
+            "def _search_result_structured_rows(rows, query):\n"
+            "    return [present(rows[0], query, lifecycle={})]\n"
+        ),
+        (
+            "from .message_view import project_message_view\n"
+            "import mcp_telegram.tools.search_hit as search_hit\n"
+            "def _list_message_structured_item(message):\n"
+            "    return project_message_view(message)\n"
+            "def _search_result_structured_rows(rows, query):\n"
+            "    return [search_hit.project_search_hit(rows[0], query, lifecycle={})]\n"
+        ),
+    ],
+)
+def test_search_hit_alias_and_module_qualified_paths_are_noncanonical(source: str) -> None:
+    gate = _gate()
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
+    assert any("canonical direct import and name" in finding.message for finding in findings)
+    assert any("must call project_search_hit directly exactly once" in finding.message for finding in findings)
+
+
+def test_search_hit_projector_binding_cannot_be_shadowed() -> None:
+    gate = _gate()
+    source = _search_hit_fixture(
+        "    return [project_search_hit(rows[0], query, lifecycle={})]\n",
+        helpers="project_search_hit = object()\n",
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
+    assert any("owner binding 'project_search_hit' is shadowed" in finding.message for finding in findings)
+
+    schema_findings = gate.violations_for(
+        gate.SOURCE_ROOT / "tools" / "reading.py",
+        _search_hit_fixture(
+            "    return [project_search_hit(rows[0], query, lifecycle={})]\n",
+            helpers="SEARCH_HIT_SCHEMA = {}\n",
+        ),
+    )
+    assert any("owner binding 'SEARCH_HIT_SCHEMA' is shadowed" in finding.message for finding in schema_findings)
+
+
+def test_search_hit_contract_cannot_gain_a_second_source_consumer() -> None:
+    gate = _gate()
+    source = "from .search_hit import SEARCH_HIT_SCHEMA, project_search_hit\n"
+
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "rogue_search.py", source)
+
+    assert any("may be consumed only by tools/reading.py" in finding.message for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "mapper_body",
+    [
+        (
+            "    item = project_search_hit(rows[0], query, lifecycle={})\n"
+            "    item['sender'] = 'parallel'\n"
+            "    return [item]\n"
+        ),
+        (
+            "    item = project_search_hit(rows[0], query, lifecycle={})\n"
+            "    item.update({'topic': {'title': 'parallel'}})\n"
+            "    return [item]\n"
+        ),
+        (
+            "    item = project_search_hit(rows[0], query, lifecycle={})\n"
+            "    item.setdefault('content', None)\n"
+            "    return [item]\n"
+        ),
+        ("    item = project_search_hit(rows[0], query, lifecycle={})\n    item.pop('read_at')\n    return [item]\n"),
+        ("    item = project_search_hit(rows[0], query, lifecycle={})\n    del item['media']\n    return [item]\n"),
+        "    return [{**project_search_hit(rows[0], query, lifecycle={}), 'dialog_name': 'parallel'}]\n",
+        "    return [dict(project_search_hit(rows[0], query, lifecycle={}), sender='parallel')]\n",
+    ],
+)
+def test_search_hit_owned_fields_cannot_be_manually_constructed_or_mutated(mapper_body: str) -> None:
+    gate = _gate()
+    source = _search_hit_fixture(mapper_body)
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
+    assert any("must be owned by project_search_hit" in finding.message for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "item.update(patch)",
+        "item.update({**patch})",
+        "item.update(**patch)",
+        "item |= patch",
+        "item = item | patch",
+    ],
+)
+def test_search_hit_opaque_merges_fail_closed(mutation: str) -> None:
+    gate = _gate()
+    source = _search_hit_fixture(
+        f"    item = project_search_hit(rows[0], query, lifecycle={{}})\n    {mutation}\n    return [item]\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
+    assert any("statically known literal mapping" in finding.message for finding in findings)
+
+
+def test_ceremonial_search_hit_projector_call_does_not_excuse_manual_return() -> None:
+    gate = _gate()
+    source = _search_hit_fixture(
+        "    project_search_hit(rows[0], query, lifecycle={})\n"
+        "    return [{'dialog_id': 1, 'msg_id': 2, 'sender': 'parallel'}]\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
+    assert any("SearchHit field 'msg_id'" in finding.message for finding in findings)
+
+
+def test_local_helper_cannot_hide_search_hit_mutation() -> None:
+    gate = _gate()
+    source = _search_hit_fixture(
+        "    return [_tamper(project_search_hit(rows[0], query, lifecycle={}))]\n",
+        helpers=("def _tamper(item):\n    item.setdefault('sender', 'parallel')\n    return item\n"),
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "reading.py", source)
+    assert any("SearchHit field 'sender'" in finding.message for finding in findings)
+
+
+def test_boundary_gate_fields_match_canonical_search_hit_schema() -> None:
+    from mcp_telegram.tools.search_hit import SEARCH_HIT_SCHEMA
+
+    gate = _gate()
+    properties = SEARCH_HIT_SCHEMA["properties"]
+    assert isinstance(properties, dict)
+    assert frozenset(properties) == gate.SEARCH_HIT_FIELDS
 
 
 def test_serializer_call_does_not_excuse_second_raw_wrapper() -> None:

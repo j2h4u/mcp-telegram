@@ -108,11 +108,34 @@ CANONICAL_MESSAGE_VIEW_FIELDS = frozenset(
     }
 )
 CANONICAL_MESSAGE_VIEW_CONSUMER_PATHS = frozenset(CANONICAL_MESSAGE_VIEW_ENTRYPOINTS)
-# Search is explicitly outside the canonical List/Inbox presenter slice and
-# retains its existing compact hit shape in the same module.
-CANONICAL_MESSAGE_VIEW_CONSTRUCTION_EXEMPT_FUNCTIONS = {
-    "tools/reading.py": frozenset({"_search_result_structured_rows"}),
-}
+SEARCH_HIT_PROJECTOR_PATH = "tools/search_hit.py"
+SEARCH_HIT_CONSUMER_PATH = "tools/reading.py"
+SEARCH_HIT_ENTRYPOINT = "_search_result_structured_rows"
+SEARCH_HIT_INPUT_OWNER_FUNCTIONS = frozenset({"_message_lifecycle_fields"})
+SEARCH_HIT_FIELDS = frozenset(
+    {
+        "dialog_id",
+        "dialog_name",
+        "msg_id",
+        "date",
+        "sender",
+        "topic",
+        "content",
+        "media",
+        "anchor_call",
+        "message_state",
+        "visibility",
+        "unpublished",
+        "published",
+        "unseen",
+        "scheduled_at",
+        "published_at",
+        "inclusion_basis",
+        "reaction_events",
+        "reaction_events_status",
+        "read_at",
+    }
+)
 LIST_MESSAGE_LIFECYCLE_FIELDS = frozenset(
     {
         "message_state",
@@ -138,7 +161,7 @@ MESSAGE_VIEW_BYPASS_NAMES = frozenset(
 TOOL_MESSAGE_PROJECTOR_PATHS = frozenset({"tools/activity.py", "tools/account_trace.py"})
 MESSAGE_METADATA_FUNCTIONS = {
     "tools/folders.py": frozenset({"list_folders", "list_folder_messages"}),
-    "tools/reading.py": frozenset({"_topic_candidate_payload", "_search_result_structured_rows"}),
+    "tools/reading.py": frozenset({"_topic_candidate_payload"}),
     "tools/unread.py": frozenset({"_structured_reactions"}),
 }
 MESSAGE_BODY_SURFACE_FUNCTION_NAMES = frozenset(
@@ -503,8 +526,10 @@ def _scheduled_import_violations(path: str, tree: ast.AST) -> tuple[list[Finding
 def _scheduled_shadow_violations(path: str, tree: ast.AST) -> list[Finding]:
     findings: list[Finding] = []
     for node in ast.walk(tree):
-        is_definition = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-        if is_definition and node.name == SCHEDULED_PROJECTOR_NAME:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name == SCHEDULED_PROJECTOR_NAME
+        ):
             findings.append(Finding(path, node.lineno, "canonical projector binding is shadowed locally"))
             continue
         if not isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -781,8 +806,6 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
         def _record_construction(self, node: ast.AST, keys: frozenset[str]) -> None:
             if self.function is None:
                 return
-            if self.function in CANONICAL_MESSAGE_VIEW_CONSTRUCTION_EXEMPT_FUNCTIONS.get(path, frozenset()):
-                return
             if self.function == "_list_message_structured_item":
                 findings.extend(
                     Finding(
@@ -870,6 +893,175 @@ def _canonical_message_view_violations(path: str, tree: ast.AST) -> list[Finding
     return findings
 
 
+def _search_hit_violations(path: str, tree: ast.AST) -> list[Finding]:  # noqa: PLR0912, PLR0915
+    """Keep search result construction on the distinct SearchHit projector seam."""
+    findings: list[Finding] = []
+    owned_names = frozenset({"SEARCH_HIT_SCHEMA", "project_search_hit"})
+    if path != SEARCH_HIT_PROJECTOR_PATH:
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in owned_names:
+                findings.append(
+                    Finding(path, node.lineno, f"canonical SearchHit owner binding {node.name!r} is shadowed")
+                )
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            findings.extend(
+                Finding(path, _line(node), f"canonical SearchHit owner binding {target.id!r} is shadowed")
+                for target in targets
+                if isinstance(target, ast.Name) and target.id in owned_names
+            )
+
+    if path not in {SEARCH_HIT_PROJECTOR_PATH, SEARCH_HIT_CONSUMER_PATH}:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import) and any(alias.name.endswith(".tools.search_hit") for alias in node.names):
+                findings.append(Finding(path, node.lineno, "SearchHit may be consumed only by tools/reading.py"))
+            if isinstance(node, ast.ImportFrom) and _import_module(node).endswith(("tools.search_hit", ".search_hit")):
+                imported_names = {alias.name for alias in node.names}
+                if imported_names & owned_names:
+                    findings.append(Finding(path, node.lineno, "SearchHit may be consumed only by tools/reading.py"))
+        return findings
+    if path != SEARCH_HIT_CONSUMER_PATH:
+        return findings
+
+    canonical_import_count = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(alias.name.endswith(".tools.search_hit") for alias in node.names):
+            findings.append(
+                Finding(path, node.lineno, "project_search_hit must use its canonical direct import and name")
+            )
+        if not isinstance(node, ast.ImportFrom) or not _import_module(node).endswith(
+            ("tools.search_hit", ".search_hit")
+        ):
+            continue
+        for alias in node.names:
+            if alias.name != "project_search_hit":
+                continue
+            if alias.asname is None:
+                canonical_import_count += 1
+            else:
+                findings.append(
+                    Finding(path, node.lineno, "project_search_hit must use its canonical direct import and name")
+                )
+    if canonical_import_count != 1:
+        findings.append(Finding(path, 1, "consumer must import project_search_hit directly exactly once"))
+
+    module_body = tree.body if isinstance(tree, ast.Module) else ()
+    functions = {node.name: node for node in module_body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    entrypoints = [
+        node for node in module_body if isinstance(node, ast.FunctionDef) and node.name == SEARCH_HIT_ENTRYPOINT
+    ]
+    if len(entrypoints) != 1:
+        findings.append(Finding(path, 1, "search hits must have exactly one module-level result mapper"))
+        return findings
+
+    entrypoint = entrypoints[0]
+    direct_projector_calls = [
+        node
+        for node in ast.walk(entrypoint)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "project_search_hit"
+    ]
+    if len(direct_projector_calls) != 1:
+        findings.append(
+            Finding(path, entrypoint.lineno, "search result mapper must call project_search_hit directly exactly once")
+        )
+
+    reachable = {SEARCH_HIT_ENTRYPOINT}
+    pending = [SEARCH_HIT_ENTRYPOINT]
+    while pending:
+        function_name = pending.pop()
+        function = functions.get(function_name)
+        if function is None:
+            continue
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            called = node.func.id
+            if called in SEARCH_HIT_INPUT_OWNER_FUNCTIONS or called not in functions or called in reachable:
+                continue
+            reachable.add(called)
+            pending.append(called)
+
+    class Visitor(ast.NodeVisitor):
+        def _record_key(self, node: ast.AST, key: str | None) -> None:
+            if key in SEARCH_HIT_FIELDS:
+                findings.append(
+                    Finding(path, _line(node), f"SearchHit field {key!r} must be owned by project_search_hit")
+                )
+
+        def _record_mapping(self, node: ast.AST, expression: ast.expr | None, *, operation: str) -> None:
+            keys, opaque = _mapping_key_facts(expression)
+            if opaque:
+                findings.append(
+                    Finding(path, _line(node), f"SearchHit {operation} keys must be a statically known literal mapping")
+                )
+            for key in sorted(keys):
+                self._record_key(node, key)
+
+        def visit_Dict(self, node: ast.Dict) -> None:
+            self._record_mapping(node, node, operation="construction")
+            self.generic_visit(node)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            for target in node.targets:
+                self._record_key(node, _literal_subscript_key(target))
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            self._record_key(node, _literal_subscript_key(node.target))
+            self.generic_visit(node)
+
+        def visit_AugAssign(self, node: ast.AugAssign) -> None:
+            self._record_key(node, _literal_subscript_key(node.target))
+            if isinstance(node.op, ast.BitOr):
+                self._record_mapping(node, node.value, operation="|=")
+            self.generic_visit(node)
+
+        def visit_Delete(self, node: ast.Delete) -> None:
+            for target in node.targets:
+                self._record_key(node, _literal_subscript_key(target))
+            self.generic_visit(node)
+
+        def visit_BinOp(self, node: ast.BinOp) -> None:
+            if isinstance(node.op, ast.BitOr):
+                self._record_mapping(node, node.left, operation="merge")
+                self._record_mapping(node, node.right, operation="merge")
+            self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if isinstance(node.func, ast.Name) and node.func.id == "dict":
+                self._record_mapping(node, node, operation="construction")
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"pop", "setdefault"}:
+                key = node.args[0].value if node.args and isinstance(node.args[0], ast.Constant) else None
+                if not isinstance(key, str):
+                    findings.append(
+                        Finding(
+                            path,
+                            node.lineno,
+                            f"SearchHit {node.func.attr} key must be a statically known string literal",
+                        )
+                    )
+                self._record_key(node, key if isinstance(key, str) else None)
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "update":
+                mapping_keys, mapping_opaque = _mapping_key_facts(node.args[0]) if node.args else (frozenset(), False)
+                has_unknown_keys = (
+                    len(node.args) > 1 or mapping_opaque or any(keyword.arg is None for keyword in node.keywords)
+                )
+                if has_unknown_keys:
+                    findings.append(
+                        Finding(path, node.lineno, "SearchHit update keys must be a statically known literal mapping")
+                    )
+                keyword_keys = frozenset(keyword.arg for keyword in node.keywords if keyword.arg is not None)
+                for key in sorted(mapping_keys | keyword_keys):
+                    self._record_key(node, key)
+            self.generic_visit(node)
+
+    visitor = Visitor()
+    for function_name in reachable:
+        visitor.visit(functions[function_name])
+    return findings
+
+
 def violations_for(path: Path, source: str) -> list[Finding]:
     relative = _relative(path)
     tree = ast.parse(source, filename=str(path))
@@ -879,6 +1071,7 @@ def violations_for(path: Path, source: str) -> list[Finding]:
     findings.extend(_scheduled_content_violations(relative, tree))
     findings.extend(_raw_message_content_violations(relative, tree))
     findings.extend(_canonical_message_view_violations(relative, tree))
+    findings.extend(_search_hit_violations(relative, tree))
 
     sql_hits = [snippet for snippet in _sql_snippets(tree, constants) if _has_message_table_sql(snippet.text)]
     if (
