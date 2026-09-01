@@ -117,6 +117,26 @@ def _seed_voice(conn: sqlite3.Connection, dialog_id: int = 1, message_id: int = 
     conn.commit()
 
 
+def _seed_round_video(conn: sqlite3.Connection, dialog_id: int = 1, message_id: int = 1) -> None:
+    conn.execute("INSERT OR IGNORE INTO synced_dialogs(dialog_id, status) VALUES (?, 'synced')", (dialog_id,))
+    conn.execute(
+        "INSERT OR IGNORE INTO full_history_enrollment(dialog_id, enabled, source, updated_at) "
+        "VALUES (?, 1, 'explicit', 1)",
+        (dialog_id,),
+    )
+    conn.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+        "VALUES (?, ?, 1, NULL, 'video', '{\"round_message\":true}')",
+        (dialog_id, message_id),
+    )
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at) "
+        "VALUES ('transcription', ?, ?, 1, 0, 1, 1)",
+        (dialog_id, message_id),
+    )
+    conn.commit()
+
+
 def _worker(
     conn: sqlite3.Connection, client: _Client, policy: FactHydrationConfig | None = None
 ) -> MessageFactHydrationWorker:
@@ -923,6 +943,39 @@ async def test_transcription_pending_is_low_frequency_reschedule_without_text(
     assert db.execute("SELECT text FROM messages WHERE dialog_id=1 AND message_id=1").fetchone() == (None,)
     assert db.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
     assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 133)
+
+
+@pytest.mark.asyncio
+async def test_round_video_transcription_persists_text_fts_fact_and_removes_job(db: sqlite3.Connection) -> None:
+    _seed_round_video(db)
+    client = _Client(SimpleNamespace(pending=False, text="round speech", transcription_id=7))
+
+    result = await _transcription_worker(db, client).run_cycle(now=10)
+
+    assert result.hydrated == 1
+    assert db.execute("SELECT text FROM messages WHERE dialog_id=1 AND message_id=1").fetchone() == ("round speech",)
+    assert db.execute("SELECT text, transcription_id FROM message_transcriptions").fetchone() == ("round speech", 7)
+    assert db.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=1 AND message_id=1").fetchone() == (
+        "round speech",
+    )
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_plain_video_transcription_job_is_dropped_without_rpc(db: sqlite3.Connection) -> None:
+    _seed_round_video(db)
+    db.execute("UPDATE messages SET media_payload='{}'")
+    db.commit()
+    client = _Client(SimpleNamespace(pending=False, text="must not be used", transcription_id=7))
+
+    result = await _transcription_worker(db, client).run_cycle(now=10)
+
+    assert result.requests == 0
+    assert result.dropped == 1
+    assert client.calls == []
+    assert db.execute("SELECT text FROM messages WHERE dialog_id=1 AND message_id=1").fetchone() == (None,)
+    assert db.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
 
 
 @pytest.mark.asyncio

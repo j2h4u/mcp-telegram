@@ -13,13 +13,16 @@ from mcp_telegram.hydration_queue import HydrationPriority
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.messages.sqlite_repository import (
     TranscriptionHydrationRepair,
+    apply_message_transcription,
     insert_messages_with_fts,
     list_undeleted_message_ids,
     mark_message_deleted,
     persist_edited_message,
     persist_transcribed_text,
     read_message_text,
+    reconcile_fact_hydration_jobs_for_dialog,
     repair_transcription_hydration_jobs,
+    transcription_hydration_eligible,
     upsert_message_transcription,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
@@ -147,6 +150,75 @@ def test_foreground_voice_persistence_keeps_transcription_foreground(conn: sqlit
         )
 
     assert conn.execute("SELECT kind, priority FROM hydration_jobs").fetchall() == [("transcription", 1)]
+
+
+def test_foreground_round_video_persistence_enqueues_transcription(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    with conn:
+        insert_messages_with_fts(
+            conn,
+            [_message(94, text=None, media_kind="video", media_payload='{"round_message":true}')],
+            priority=HydrationPriority.FOREGROUND,
+        )
+
+    assert conn.execute("SELECT kind, priority FROM hydration_jobs").fetchall() == [("transcription", 1)]
+    assert transcription_hydration_eligible(conn, 42, 94)
+
+
+def test_plain_video_is_not_admitted_to_transcription(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    with conn:
+        insert_messages_with_fts(
+            conn,
+            [_message(95, text=None, media_kind="video", media_payload='{"duration":12}')],
+            priority=HydrationPriority.FOREGROUND,
+        )
+
+    assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+    assert not transcription_hydration_eligible(conn, 42, 95)
+
+
+def test_historical_transcription_repair_and_dialog_reconciliation_stay_voice_only(
+    conn: sqlite3.Connection,
+) -> None:
+    _make_hydration_eligible(conn)
+    conn.executemany(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+        "VALUES (42, ?, ?, NULL, ?, ?)",
+        [(96, 96, "video", '{"round_message":true}'), (97, 97, "voice", "{}")],
+    )
+    conn.commit()
+
+    repair = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=300)
+    assert repair.enqueued == 1
+    assert conn.execute("SELECT message_id FROM hydration_jobs").fetchall() == [(97,)]
+    conn.execute("DELETE FROM hydration_jobs")
+    conn.commit()
+
+    with conn:
+        reconcile_fact_hydration_jobs_for_dialog(conn, 42, due_at=901)
+    assert conn.execute("SELECT message_id FROM hydration_jobs").fetchall() == [(97,)]
+
+
+@pytest.mark.parametrize(
+    "media_kind, media_payload, expected",
+    [("voice", "{}", True), ("video", '{"round_message":true}', True), ("video", "{}", False)],
+)
+def test_authoritative_transcription_applies_only_to_transcribable_media(
+    conn: sqlite3.Connection, media_kind: str, media_payload: str, expected: bool
+) -> None:
+    with conn:
+        insert_messages_with_fts(
+            conn,
+            [_message(98, text=None, media_kind=media_kind, media_payload=media_payload)],
+        )
+
+    with conn:
+        applied = apply_message_transcription(
+            conn, 42, 98, transcribed_text="round words", transcription_id=7, received_at=100
+        )
+    assert applied is expected
+    assert conn.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == ((1,) if expected else (0,))
 
 
 def test_transcription_repair_is_bounded_idempotent_and_newest_first(conn: sqlite3.Connection) -> None:

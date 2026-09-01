@@ -13,6 +13,7 @@ from mcp_telegram.media_fact import (
     decode_media_fact,
     encode_media_fact,
     encode_media_payload,
+    is_transcribable_telegram_media,
     media_description,
 )
 from mcp_telegram.telethon_media import extract_media_fact
@@ -92,6 +93,24 @@ def test_projector_enriches_frequent_media_without_transport_details() -> None:
     assert media_description(MediaFact("sticker", {"alt": "🙂", "set_name": "friendly_faces"})) == (
         "[стикер: 🙂; набор friendly_faces]"
     )
+
+
+@pytest.mark.parametrize(
+    ("fact", "expected"),
+    [
+        (MediaFact("voice", {}), True),
+        (MediaFact("video", {"round_message": True}), True),
+        (MediaFact("video", {"round_message": False}), False),
+        (MediaFact("video", {}), False),
+        (MediaFact("audio", {"round_message": True}), False),
+        (MediaFact("story", {"round_message": True}), False),
+        (MediaFact("video", {"round_message": "true"}), False),
+        (MediaFact("video", {"round_message": True, "raw": object()}), False),
+        (None, False),
+    ],
+)
+def test_transcribable_media_predicate_is_fail_closed(fact: MediaFact | None, expected: bool) -> None:
+    assert is_transcribable_telegram_media(fact) is expected
 
 
 def test_extractor_preserves_only_agent_useful_frequent_media_facts() -> None:

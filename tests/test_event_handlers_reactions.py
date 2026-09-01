@@ -448,6 +448,11 @@ async def test_on_raw_transcribed_audio_updates_text_and_fts(
     _enroll(sync_db, dialog_id)
     _insert_msg(sync_db, dialog_id, message_id, text="")
     sync_db.execute(
+        "UPDATE messages SET media_kind='voice', media_payload='{}' WHERE dialog_id=? AND message_id=?",
+        (dialog_id, message_id),
+    )
+    sync_db.commit()
+    sync_db.execute(
         "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts) "
         "VALUES ('transcription', ?, ?, 1, 0)",
         (dialog_id, message_id),

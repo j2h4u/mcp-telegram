@@ -59,6 +59,25 @@ class MediaFact:
     payload: dict[str, object]
 
 
+def is_transcribable_telegram_media(fact: MediaFact | None) -> bool:
+    """Return whether a normalized Telegram media fact supports transcription.
+
+    Voice messages are identified by their media kind.  Telegram round videos
+    use the existing ``video`` kind and are admitted only when the canonical
+    boolean marker is present.  Unknown, malformed, or non-Telegram-shaped
+    values fail closed.
+    """
+    if fact is None or not isinstance(fact.payload, dict):
+        return False
+    try:
+        _json_value(fact.payload)
+    except TypeError, ValueError:
+        return False
+    if fact.kind == "voice":
+        return True
+    return fact.kind == "video" and fact.payload.get("round_message") is True
+
+
 def _json_value(value: object) -> object:
     """Return a JSON-safe primitive/container, rejecting TL objects."""
     if value is None or isinstance(value, (str, int, bool)):
@@ -248,5 +267,6 @@ __all__ = [
     "decode_media_fact",
     "encode_media_fact",
     "encode_media_payload",
+    "is_transcribable_telegram_media",
     "media_description",
 ]

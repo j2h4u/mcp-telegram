@@ -198,6 +198,11 @@ async def test_transcription_disable_after_precheck_skips_body_fts_and_version(
         tmp_path / "transcription-race.db", dialog_id=dialog_id, message_id=message_id, text="voice before"
     )
     try:
+        handler_conn.execute(
+            "UPDATE messages SET media_kind='voice', media_payload='{}' WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        )
+        handler_conn.commit()
         manager = EventHandlerManager(mock_client, handler_conn, shutdown_event, mock_client.get_input_entity)
         # TRANSCRIPTION's initial precheck is immediately followed by reads;
         # flip authorization before its guarded write transaction starts.
@@ -229,6 +234,11 @@ async def test_transcription_enabled_path_still_updates_body_fts_and_version(
         tmp_path / "transcription-enabled.db", dialog_id=dialog_id, message_id=message_id, text="voice before"
     )
     try:
+        handler_conn.execute(
+            "UPDATE messages SET media_kind='voice', media_payload='{}' WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        )
+        handler_conn.commit()
         manager = EventHandlerManager(mock_client, handler_conn, shutdown_event, mock_client.get_input_entity)
         update = SimpleNamespace(
             peer=PeerUser(user_id=dialog_id), msg_id=message_id, text="voice after", pending=False, transcription_id=2
