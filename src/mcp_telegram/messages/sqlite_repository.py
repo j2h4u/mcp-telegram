@@ -17,7 +17,7 @@ from ..hydration_queue import (
     HydrationPriority,
     HydrationQueueRepository,
 )
-from ..media_fact import decode_media_fact, encode_media_payload, is_transcribable_telegram_media
+from ..media_fact import MediaFact, decode_media_fact, encode_media_payload, is_transcribable_telegram_media
 from ..reactions.contracts import ReactionAggregate
 from ..reactions.persistence import replace_reaction_aggregates
 
@@ -331,12 +331,13 @@ def _remove_transcription_hydration_job(conn: sqlite3.Connection, dialog_id: int
 def _is_transcribable_media_pair(kind: object, payload: object) -> bool:
     """Apply the domain predicate to one projected SQLite media pair."""
     fact = decode_media_fact(kind, payload)
-    return (
-        isinstance(payload, str)
-        and fact is not None
-        and encode_media_payload(fact) == payload
-        and is_transcribable_telegram_media(fact)
-    )
+    return _is_canonical_media_pair(kind, payload, fact=fact) and is_transcribable_telegram_media(fact)
+
+
+def _is_canonical_media_pair(kind: object, payload: object, *, fact: MediaFact | None = None) -> bool:
+    """Return whether a stored media pair round-trips through the codec."""
+    decoded = fact if fact is not None else decode_media_fact(kind, payload)
+    return isinstance(payload, str) and decoded is not None and encode_media_payload(decoded) == payload
 
 
 def mark_message_deleted(conn: sqlite3.Connection, dialog_id: int, message_id: int, deleted_at: int) -> bool:
@@ -661,7 +662,19 @@ def _overlay_message_transcriptions(
         if row is None:
             projected.append(item)
             continue
-        projected.append(replace(item, message=replace(item.message, text=row[0])))
+        message = item.message
+        fact = decode_media_fact(message.media_kind, message.media_payload)
+        if _is_canonical_media_pair(
+            message.media_kind, message.media_payload, fact=fact
+        ) and is_transcribable_telegram_media(fact):
+            projected.append(replace(item, message=replace(message, text=row[0])))
+            continue
+        if _is_canonical_media_pair(message.media_kind, message.media_payload, fact=fact):
+            conn.execute(
+                "DELETE FROM message_transcriptions WHERE dialog_id = ? AND message_id = ?",
+                (dialog_id, message_id),
+            )
+        projected.append(item)
     return projected
 
 

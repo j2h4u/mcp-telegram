@@ -22,6 +22,7 @@ from mcp_telegram.messages.sqlite_repository import (
     read_message_text,
     reconcile_fact_hydration_jobs_for_dialog,
     repair_transcription_hydration_jobs,
+    stage_message_transcription,
     transcription_hydration_eligible,
     upsert_message_transcription,
 )
@@ -219,6 +220,49 @@ def test_authoritative_transcription_applies_only_to_transcribable_media(
         )
     assert applied is expected
     assert conn.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == ((1,) if expected else (0,))
+
+
+def test_staged_transcription_is_removed_when_plain_video_materializes(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    with conn:
+        assert stage_message_transcription(
+            conn, 42, 99, transcribed_text="staged speech", transcription_id=8, received_at=100
+        )
+    with conn:
+        insert_messages_with_fts(
+            conn,
+            [_message(99, text="caption", media_kind="video", media_payload='{"duration":12}')],
+        )
+
+    assert conn.execute("SELECT text FROM messages WHERE message_id=99").fetchone() == ("caption",)
+    assert conn.execute("SELECT stemmed_text FROM messages_fts WHERE message_id=99").fetchone() == (
+        stem_text("caption"),
+    )
+    assert conn.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
+    assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+
+
+def test_staged_transcription_overlays_round_video_materialization(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    with conn:
+        assert stage_message_transcription(
+            conn, 42, 100, transcribed_text="round speech", transcription_id=9, received_at=100
+        )
+    with conn:
+        insert_messages_with_fts(
+            conn,
+            [_message(100, text="caption", media_kind="video", media_payload='{"round_message":true}')],
+        )
+
+    assert conn.execute("SELECT text FROM messages WHERE message_id=100").fetchone() == ("round speech",)
+    assert conn.execute("SELECT stemmed_text FROM messages_fts WHERE message_id=100").fetchone() == (
+        stem_text("round speech"),
+    )
+    assert conn.execute("SELECT text, transcription_id FROM message_transcriptions").fetchone() == (
+        "round speech",
+        9,
+    )
+    assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
 
 
 def test_transcription_repair_is_bounded_idempotent_and_newest_first(conn: sqlite3.Connection) -> None:
@@ -428,8 +472,8 @@ def test_persist_transcribed_text_versions_and_refreshes_fts(conn: sqlite3.Conne
 def test_message_transcription_is_applied_by_canonical_bundle_writer(conn: sqlite3.Connection) -> None:
     with conn:
         upsert_message_transcription(conn, 42, 14, transcribed_text="voice words", transcription_id=14, received_at=400)
-        insert_messages_with_fts(conn, [_message(14, text="caption")])
-        insert_messages_with_fts(conn, [_message(14, text=None)])
+        insert_messages_with_fts(conn, [_message(14, text="caption", media_kind="voice", media_payload="{}")])
+        insert_messages_with_fts(conn, [_message(14, text=None, media_kind="voice", media_payload="{}")])
 
     assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=14").fetchone() == ("voice words",)
     assert conn.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=42 AND message_id=14").fetchone() == (
