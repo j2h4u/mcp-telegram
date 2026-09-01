@@ -21,6 +21,7 @@ from mcp_telegram.messages.sqlite_repository import (
     persist_transcribed_text,
     read_message_text,
     reconcile_fact_hydration_jobs_for_dialog,
+    repair_media_metadata_hydration_jobs,
     repair_transcription_hydration_jobs,
     stage_message_transcription,
     transcription_hydration_eligible,
@@ -177,6 +178,44 @@ def test_plain_video_is_not_admitted_to_transcription(conn: sqlite3.Connection) 
 
     assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
     assert not transcription_hydration_eligible(conn, 42, 95)
+
+
+def test_media_metadata_repair_is_bounded_newest_first_and_terminal_safe(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    conn.executemany(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload, is_deleted) "
+        "VALUES (42, ?, ?, NULL, ?, ?, ?)",
+        [
+            (101, 100, "other", "{}", 0),
+            (102, 200, "video", '{"duration": 2}', 0),
+            (103, 300, "other", "{}", 1),
+            (104, 400, "video", '{"round_message":false}', 0),
+            (105, 500, "video", '{"duration": 2}', 0),
+        ],
+    )
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, terminal) "
+        "VALUES ('media_metadata', 42, 105, 1, 3, 1)"
+    )
+    conn.commit()
+
+    first = repair_media_metadata_hydration_jobs(conn, due_at=900, max_jobs=2)
+    assert first == type(first)(enqueued=2, has_more=False)
+    assert conn.execute(
+        "SELECT message_id, priority, message_sent_at, terminal FROM hydration_jobs "
+        "WHERE kind = 'media_metadata' ORDER BY message_id"
+    ).fetchall() == [(101, 0, 100, 0), (102, 0, 200, 0), (105, 0, 0, 1)]
+
+    second = repair_media_metadata_hydration_jobs(conn, due_at=901, max_jobs=2)
+    assert second == type(second)(enqueued=0, has_more=False)
+
+    for index_name in (
+        "idx_messages_media_unresolved_contact_other",
+        "idx_messages_media_unresolved_video",
+    ):
+        row = cast(tuple[str], conn.execute("SELECT sql FROM sqlite_master WHERE name = ?", (index_name,)).fetchone())
+        sql = row[0]
+        assert "WHERE" in sql
 
 
 def test_historical_transcription_repair_and_dialog_reconciliation_stay_voice_only(

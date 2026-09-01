@@ -96,6 +96,14 @@ class TranscriptionHydrationRepair:
     has_more: bool
 
 
+@dataclass(frozen=True, slots=True)
+class MediaMetadataHydrationRepair:
+    """Bounded result of repairing missing media metadata jobs."""
+
+    enqueued: int
+    has_more: bool
+
+
 def message_exists(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
     """Return whether the canonical message key is already persisted."""
     return conn.execute(_SELECT_MESSAGE_EXISTS_SQL, (dialog_id, message_id)).fetchone() is not None
@@ -388,7 +396,10 @@ def media_fact_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, mess
     return (
         conn.execute(
             "SELECT 1 FROM messages m WHERE m.dialog_id = ? AND m.message_id = ? "
-            "AND m.is_deleted = 0 AND m.media_kind IN ('contact', 'other') AND m.media_payload = '{}' "
+            "AND m.is_deleted = 0 AND ((m.media_kind IN ('contact', 'other') AND m.media_payload = '{}') "
+            "OR (m.media_kind = 'video' AND json_valid(m.media_payload) "
+            "AND json_type(m.media_payload) = 'object' "
+            "AND json_type(m.media_payload, '$.round_message') IS NULL)) "
             "AND EXISTS (" + _FACT_HYDRATION_ELIGIBILITY_SQL + ")",
             (dialog_id, message_id, dialog_id),
         ).fetchone()
@@ -420,6 +431,34 @@ _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL = (
     "LEFT JOIN hydration_jobs hj ON hj.kind = 'transcription' "
     "AND hj.dialog_id = m.dialog_id AND hj.message_id = m.message_id "
     f"WHERE {_TRANSCRIPTION_HYDRATION_MESSAGE_SQL} AND hj.message_id IS NULL"
+)
+
+_MEDIA_METADATA_HYDRATION_ELIGIBILITY_SQL = (
+    "m.is_deleted = 0 AND ((m.media_kind IN ('contact', 'other') AND m.media_payload = '{}') "
+    "OR (m.media_kind = 'video' AND json_valid(m.media_payload) "
+    "AND json_type(m.media_payload) = 'object' "
+    "AND json_type(m.media_payload, '$.round_message') IS NULL))"
+)
+
+_REPAIR_MEDIA_METADATA_CONTACT_OTHER_SQL = (
+    "FROM messages m INDEXED BY idx_messages_media_unresolved_contact_other "
+    "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
+    "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
+    "LEFT JOIN hydration_jobs hj ON hj.kind = 'media_metadata' "
+    "AND hj.dialog_id = m.dialog_id AND hj.message_id = m.message_id "
+    "WHERE m.is_deleted = 0 AND m.media_kind IN ('contact', 'other') AND m.media_payload = '{}' "
+    "AND hj.message_id IS NULL"
+)
+_REPAIR_MEDIA_METADATA_VIDEO_SQL = (
+    "FROM messages m INDEXED BY idx_messages_media_unresolved_video "
+    "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
+    "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
+    "LEFT JOIN hydration_jobs hj ON hj.kind = 'media_metadata' "
+    "AND hj.dialog_id = m.dialog_id AND hj.message_id = m.message_id "
+    "WHERE m.is_deleted = 0 AND m.media_kind = 'video' AND json_valid(m.media_payload) "
+    "AND json_type(m.media_payload) = 'object' "
+    "AND json_type(m.media_payload, '$.round_message') IS NULL "
+    "AND hj.message_id IS NULL"
 )
 
 
@@ -454,6 +493,42 @@ def repair_transcription_hydration_jobs(
     return TranscriptionHydrationRepair(cursor.rowcount, has_more)
 
 
+def repair_media_metadata_hydration_jobs(
+    conn: sqlite3.Connection, *, due_at: int, max_jobs: int
+) -> MediaMetadataHydrationRepair:
+    """Bound recurring repair of unresolved contact/other and video metadata."""
+    if max_jobs <= 0:
+        return MediaMetadataHydrationRepair(0, False)
+    # Keep the two candidate predicates as independently indexed branches.
+    # SQLite can merge the ordered branches without scanning all messages.
+    candidates_sql = (
+        "SELECT 'media_metadata', m.dialog_id, m.message_id, ?, 0, ?, m.sent_at, 0 "
+        f"{_REPAIR_MEDIA_METADATA_CONTACT_OTHER_SQL} "
+        "UNION ALL "
+        "SELECT 'media_metadata', m.dialog_id, m.message_id, ?, 0, ?, m.sent_at, 0 "
+        f"{_REPAIR_MEDIA_METADATA_VIDEO_SQL} "
+        "ORDER BY 7 DESC, 2, 3 LIMIT ?"
+    )
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO hydration_jobs "
+        "(kind, dialog_id, message_id, due_at, attempts, priority, message_sent_at, terminal) "
+        f"{candidates_sql}",
+        (due_at, int(HydrationPriority.BACKFILL), due_at, int(HydrationPriority.BACKFILL), max_jobs),
+    )
+    has_more = False
+    if cursor.rowcount >= max_jobs:
+        has_more = (
+            conn.execute(
+                "SELECT 1 FROM (SELECT 1 "
+                f"{_REPAIR_MEDIA_METADATA_CONTACT_OTHER_SQL} "
+                "UNION ALL SELECT 1 "
+                f"{_REPAIR_MEDIA_METADATA_VIDEO_SQL}) LIMIT 1",
+            ).fetchone()
+            is not None
+        )
+    return MediaMetadataHydrationRepair(cursor.rowcount, has_more)
+
+
 def apply_hydrated_media_fact(
     conn: sqlite3.Connection,
     dialog_id: int,
@@ -470,11 +545,47 @@ def apply_hydrated_media_fact(
     cursor = conn.execute(
         "UPDATE messages SET media_kind = ?, media_payload = ? "
         "WHERE dialog_id = ? AND message_id = ? "
-        "AND is_deleted = 0 AND media_kind IN ('contact', 'other') AND media_payload = '{}' "
+        "AND " + _MEDIA_METADATA_HYDRATION_ELIGIBILITY_SQL.replace("m.", "") + " "
         "AND EXISTS (" + _FACT_HYDRATION_ELIGIBILITY_SQL + ")",
         (media_kind, media_payload, dialog_id, message_id, dialog_id),
     )
     return cursor.rowcount > 0
+
+
+def enqueue_transcription_for_hydrated_media(
+    conn: sqlite3.Connection, dialog_id: int, message_id: int, *, due_at: int
+) -> bool:
+    """Enqueue one backfill transcription after a canonical media update."""
+    row = cast(
+        tuple[object, object, int] | None,
+        conn.execute(
+            "SELECT m.media_kind, m.media_payload, m.sent_at FROM messages m "
+            "WHERE m.dialog_id = ? AND m.message_id = ? AND m.is_deleted = 0 "
+            "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
+            "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id)",
+            (dialog_id, message_id),
+        ).fetchone(),
+    )
+    if row is None:
+        return False
+    fact = decode_media_fact(row[0], row[1])
+    if not _is_canonical_media_pair(row[0], row[1], fact=fact) or not is_transcribable_telegram_media(fact):
+        return False
+    queue = HydrationQueueRepository(conn)
+    if not queue.is_available():
+        return False
+    queue.enqueue(
+        HydrationJob(
+            TRANSCRIPTION_HYDRATION_KIND,
+            dialog_id,
+            message_id,
+            due_at,
+            0,
+            int(row[2]),
+            HydrationPriority.BACKFILL,
+        )
+    )
+    return True
 
 
 def reconcile_fact_hydration_job(
@@ -586,8 +697,13 @@ def reconcile_fact_hydration_jobs_for_dialog(
         conn.execute(
             "SELECT message_id, sent_at FROM messages "
             "WHERE dialog_id = ? AND is_deleted = 0 "
-            "AND media_kind IN ('contact', 'other') AND media_payload = '{}'",
-            (dialog_id,),
+            "AND media_kind IN ('contact', 'other') AND media_payload = '{}' "
+            "UNION ALL "
+            "SELECT message_id, sent_at FROM messages "
+            "WHERE dialog_id = ? AND is_deleted = 0 AND media_kind = 'video' "
+            "AND json_valid(media_payload) AND json_type(media_payload) = 'object' "
+            "AND json_type(media_payload, '$.round_message') IS NULL",
+            (dialog_id, dialog_id),
         ).fetchall(),
     )
     for message_id, sent_at in rows:

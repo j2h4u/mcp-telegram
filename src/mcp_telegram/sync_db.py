@@ -13,7 +13,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 42
+_CURRENT_SCHEMA_VERSION = 43
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -645,6 +645,20 @@ _VOICE_TRANSCRIPTION_REPAIR_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_messages_voice_undeleted_sent
 ON messages(sent_at DESC, dialog_id, message_id)
 WHERE media_kind = 'voice' AND is_deleted = 0
+"""
+
+_MEDIA_METADATA_UNRESOLVED_CONTACT_OTHER_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_messages_media_unresolved_contact_other
+ON messages(sent_at DESC, dialog_id, message_id)
+WHERE is_deleted = 0 AND media_kind IN ('contact', 'other') AND media_payload = '{}'
+"""
+
+_MEDIA_METADATA_UNRESOLVED_VIDEO_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_messages_media_unresolved_video
+ON messages(sent_at DESC, dialog_id, message_id)
+WHERE is_deleted = 0 AND media_kind = 'video' AND json_valid(media_payload)
+  AND json_type(media_payload) = 'object'
+  AND json_type(media_payload, '$.round_message') IS NULL
 """
 
 _HYDRATION_JOBS_SEED_SQL = """
@@ -1714,6 +1728,19 @@ def _apply_migration_42(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_43(conn: sqlite3.Connection, current: int) -> int:
+    """Index bounded repair candidates for unresolved media metadata."""
+    return _apply_migration(
+        conn,
+        current,
+        43,
+        [
+            _MEDIA_METADATA_UNRESOLVED_CONTACT_OTHER_INDEX_DDL,
+            _MEDIA_METADATA_UNRESOLVED_VIDEO_INDEX_DDL,
+        ],
+    )
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -1753,6 +1780,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_40(conn, current)
     current = _apply_migration_41(conn, current)
     current = _apply_migration_42(conn, current)
+    current = _apply_migration_43(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
@@ -1791,6 +1819,8 @@ def _ensure_hydration_jobs(conn: sqlite3.Connection) -> None:
     conn.execute(_HYDRATION_JOBS_DDL)
     conn.execute(_HYDRATION_JOBS_SCHEDULE_INDEX_DDL)
     conn.execute(_VOICE_TRANSCRIPTION_REPAIR_INDEX_DDL)
+    conn.execute(_MEDIA_METADATA_UNRESOLVED_CONTACT_OTHER_INDEX_DDL)
+    conn.execute(_MEDIA_METADATA_UNRESOLVED_VIDEO_INDEX_DDL)
     conn.commit()
 
 

@@ -6,11 +6,25 @@ import sqlite3
 from collections.abc import Sequence
 from typing import Protocol, cast
 
-from .fact_hydration import AppliedFacts, HydrationDropObservation
+from .fact_hydration import AppliedFacts, HydrationDropObservation, _has_terminal_rpc_symbol
 from .hydration_queue import MEDIA_METADATA_KIND, HydrationJob, HydrationQueueRepository
 from .media_fact import encode_media_payload
-from .messages.sqlite_repository import apply_hydrated_media_fact, media_fact_hydration_eligible
+from .messages.sqlite_repository import (
+    apply_hydrated_media_fact,
+    enqueue_transcription_for_hydrated_media,
+    media_fact_hydration_eligible,
+)
 from .telethon_media import extract_media_fact
+
+_TERMINAL_RPC_SYMBOLS = frozenset(
+    {
+        "MESSAGE_ID_INVALID",
+        "MSG_ID_INVALID",
+        "PEER_ID_INVALID",
+        "CHANNEL_PRIVATE",
+        "CHAT_ID_INVALID",
+    }
+)
 
 
 class MediaHydrationClient(Protocol):
@@ -43,7 +57,6 @@ class MediaFactHydrationHandler:
         *,
         now: int,
     ) -> AppliedFacts:
-        del now
         by_id, valid_response = _response_map(result)
         hydrated = completed = dropped = 0
         drop_observations: list[HydrationDropObservation] = []
@@ -53,12 +66,12 @@ class MediaFactHydrationHandler:
                 for job in jobs
             )
             for job in jobs:
-                queue.remove(job)
+                queue.mark_terminal(job)
             return AppliedFacts(dropped=len(jobs), drop_observations=tuple(drop_observations))
         for job in jobs:
             message = by_id.get(job.message_id)
             if message is None:
-                queue.remove(job)
+                queue.mark_terminal(job)
                 dropped += 1
                 drop_observations.append(
                     HydrationDropObservation("missing_response", job.message_id, job.kind, job.dialog_id, job.attempts)
@@ -78,6 +91,7 @@ class MediaFactHydrationHandler:
                 completed += 1
             if fact is not None and applied:
                 hydrated += 1
+                enqueue_transcription_for_hydrated_media(conn, job.dialog_id, job.message_id, due_at=now)
         return AppliedFacts(
             hydrated=hydrated,
             completed=completed,
@@ -86,8 +100,7 @@ class MediaFactHydrationHandler:
         )
 
     def is_terminal_error(self, exc: BaseException) -> bool:
-        del exc
-        return False
+        return _has_terminal_rpc_symbol(exc, _TERMINAL_RPC_SYMBOLS)
 
 
 def _response_map(result: object) -> tuple[dict[int, object], bool]:

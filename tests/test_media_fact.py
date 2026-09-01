@@ -130,3 +130,21 @@ def test_extractor_preserves_only_agent_useful_frequent_media_facts() -> None:
     assert extract_media_fact(MagicMock(spec=tl.MessageMediaDocument, document=video_document)) == MediaFact(
         "video", {"size": 2048, "duration": 65, "round_message": True}
     )
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [
+        ("video", MediaFact("video", {"round_message": False})),
+        ("round", MediaFact("video", {"round_message": True})),
+        ("voice", MediaFact("voice", {})),
+    ],
+)
+def test_extractor_uses_document_wrapper_media_flags(flag: str, expected: MediaFact) -> None:
+    if flag == "video":
+        media = tl.MessageMediaDocument(document=None, video=True)
+    elif flag == "round":
+        media = tl.MessageMediaDocument(document=None, round=True)
+    else:
+        media = tl.MessageMediaDocument(document=None, voice=True)
+    assert extract_media_fact(media) == expected

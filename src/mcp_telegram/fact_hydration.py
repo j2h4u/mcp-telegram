@@ -14,6 +14,7 @@ from typing import Protocol
 from .access_lifecycle import set_access_lost
 from .flood import TelegramRpcThrottled
 from .hydration_queue import (
+    MEDIA_METADATA_KIND,
     TRANSCRIPTION_HYDRATION_KIND,
     HydrationJob,
     HydrationPriority,
@@ -21,7 +22,12 @@ from .hydration_queue import (
     HydrationQueueRepository,
     HydrationQueueSummary,
 )
-from .messages.sqlite_repository import repair_transcription_hydration_jobs
+from .messages.sqlite_repository import (
+    MediaMetadataHydrationRepair,
+    TranscriptionHydrationRepair,
+    repair_media_metadata_hydration_jobs,
+    repair_transcription_hydration_jobs,
+)
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_rpc_error import TelegramRpcErrorDescriptor, describe_telegram_rpc_error
 
@@ -38,6 +44,11 @@ _DROP_LEVELS = {
 }
 
 
+def _has_terminal_rpc_symbol(exc: BaseException, symbols: frozenset[str]) -> bool:
+    """Match a bounded set of safe Telegram RPC symbols for a handler."""
+    return describe_telegram_rpc_error(exc).symbol in symbols
+
+
 @dataclass(frozen=True, slots=True)
 class FactHydrationCycleResult:
     """Sanitized counters for one bounded worker cycle."""
@@ -51,6 +62,8 @@ class FactHydrationCycleResult:
     stopped: bool = False
     repaired_transcription_jobs: int = 0
     repair_has_more: bool = False
+    repaired_media_metadata_jobs: int = 0
+    media_repair_has_more: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,15 +192,6 @@ def _load_due_jobs_by_kind(
     return {kind: queue.due_jobs(effective_now, limit, kind=kind) for kind in handlers}
 
 
-def _protect_due_heads(
-    per_kind: dict[str, list[HydrationJob]],
-) -> tuple[list[HydrationJob], dict[str, list[HydrationJob]]]:
-    remaining = {kind: list(jobs) for kind, jobs in per_kind.items()}
-    protected = [jobs.pop(0) for jobs in remaining.values() if jobs]
-    protected.sort(key=lambda job: (-int(job.priority), *_due_job_order_key(job)))
-    return protected, remaining
-
-
 def _append_due_priority_tier(
     selected: list[HydrationJob],
     remaining: dict[str, list[HydrationJob]],
@@ -249,18 +253,17 @@ class MessageFactHydrationWorker:
 
     async def run_cycle(self, *, now: int | None = None) -> FactHydrationCycleResult:
         effective_now = int(self._clock()) if now is None else now
-        repair = (
-            repair_transcription_hydration_jobs(self._conn, due_at=effective_now, max_jobs=self._max_jobs_per_cycle)
-            if TRANSCRIPTION_HYDRATION_KIND in self._handlers
-            else None
-        )
+        transcription_repair, media_repair = self._run_repair_producers(effective_now)
         # The repair is a producer transaction. Commit before any awaited RPC.
         self._conn.commit()
         due = self._fair_due_jobs(effective_now)
+        repair_fields = self._repair_result_fields(transcription_repair, media_repair)
         if not due:
             result = FactHydrationCycleResult(
-                repaired_transcription_jobs=0 if repair is None else repair.enqueued,
-                repair_has_more=False if repair is None else repair.has_more,
+                repaired_transcription_jobs=repair_fields[0],
+                repair_has_more=repair_fields[1],
+                repaired_media_metadata_jobs=repair_fields[2],
+                media_repair_has_more=repair_fields[3],
             )
             self._log_cycle(result, {}, self._queue.snapshot(effective_now), now=effective_now)
             return result
@@ -271,8 +274,10 @@ class MessageFactHydrationWorker:
         outcome, per_kind = await self._run_batches(request_batches, int(effective_now))
         result = replace(
             outcome,
-            repaired_transcription_jobs=0 if repair is None else repair.enqueued,
-            repair_has_more=False if repair is None else repair.has_more,
+            repaired_transcription_jobs=repair_fields[0],
+            repair_has_more=repair_fields[1],
+            repaired_media_metadata_jobs=repair_fields[2],
+            media_repair_has_more=repair_fields[3],
         )
         self._log_cycle(
             result,
@@ -284,9 +289,40 @@ class MessageFactHydrationWorker:
         )
         return result
 
+    def _run_repair_producers(
+        self, effective_now: int
+    ) -> tuple[TranscriptionHydrationRepair | None, MediaMetadataHydrationRepair | None]:
+        transcription_repair: TranscriptionHydrationRepair | None = None
+        if TRANSCRIPTION_HYDRATION_KIND in self._handlers:
+            transcription_repair = repair_transcription_hydration_jobs(
+                self._conn, due_at=effective_now, max_jobs=self._max_jobs_per_cycle
+            )
+        media_repair: MediaMetadataHydrationRepair | None = None
+        media_handler = self._handlers.get(MEDIA_METADATA_KIND)
+        if media_handler is not None:
+            media_repair = repair_media_metadata_hydration_jobs(
+                self._conn,
+                due_at=effective_now,
+                max_jobs=min(media_handler.batch_size, self._max_jobs_per_cycle),
+            )
+        return transcription_repair, media_repair
+
+    @staticmethod
+    def _repair_result_fields(
+        transcription_repair: TranscriptionHydrationRepair | None,
+        media_repair: MediaMetadataHydrationRepair | None,
+    ) -> tuple[int, bool, int, bool]:
+        return (
+            0 if transcription_repair is None else transcription_repair.enqueued,
+            False if transcription_repair is None else transcription_repair.has_more,
+            0 if media_repair is None else media_repair.enqueued,
+            False if media_repair is None else media_repair.has_more,
+        )
+
     def _fair_due_jobs(self, effective_now: int) -> list[HydrationJob]:
         per_kind = _load_due_jobs_by_kind(self._queue, effective_now, self._max_jobs_per_cycle, self._handlers)
-        selected, remaining = _protect_due_heads(per_kind)
+        selected: list[HydrationJob] = []
+        remaining = {kind: list(jobs) for kind, jobs in per_kind.items()}
         for priority in (HydrationPriority.FOREGROUND, HydrationPriority.BACKFILL):
             _append_due_priority_tier(selected, remaining, priority, self._max_jobs_per_cycle)
         return selected
@@ -305,6 +341,7 @@ class MessageFactHydrationWorker:
         logger.info(
             "message_fact_hydration cycle selected=%d requests=%d hydrated=%d completed=%d "
             "pending=%d retried=%d dropped=%d stopped=%s repaired_transcription_jobs=%d repair_has_more=%s "
+            "repaired_media_metadata_jobs=%d media_repair_has_more=%s "
             "queue_active=%d queue_ready=%d queue_deferred=%d queue_terminal=%d",
             selected,
             result.requests,
@@ -316,6 +353,8 @@ class MessageFactHydrationWorker:
             result.stopped,
             result.repaired_transcription_jobs,
             result.repair_has_more,
+            result.repaired_media_metadata_jobs,
+            result.media_repair_has_more,
             sum(snapshot.active for snapshot in queue_snapshot),
             sum(snapshot.ready for snapshot in queue_snapshot),
             sum(snapshot.deferred for snapshot in queue_snapshot),
@@ -614,10 +653,7 @@ class MessageFactHydrationWorker:
             if current is None:
                 continue
             if current.attempts > self._max_attempts:
-                if current.kind == TRANSCRIPTION_HYDRATION_KIND:
-                    self._queue.mark_terminal(current)
-                else:
-                    self._queue.remove(current)
+                self._queue.mark_terminal(current)
                 observations.append(
                     HydrationDropObservation(
                         "attempt_limit", current.message_id, current.kind, current.dialog_id, current.attempts
@@ -635,10 +671,7 @@ class MessageFactHydrationWorker:
         observations: list[HydrationDropObservation] = []
         for job in jobs:
             if job.attempts >= self._max_attempts:
-                if handler.kind == TRANSCRIPTION_HYDRATION_KIND:
-                    self._queue.mark_terminal(job)
-                else:
-                    self._queue.remove(job)
+                self._queue.mark_terminal(job)
                 dropped += 1
                 observations.append(
                     HydrationDropObservation("attempt_limit", job.message_id, job.kind, job.dialog_id, job.attempts)
