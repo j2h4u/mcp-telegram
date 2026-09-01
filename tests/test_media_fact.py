@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -176,3 +177,74 @@ def test_extractor_uses_document_wrapper_media_flags(flag: str, expected: MediaF
     else:
         media = tl.MessageMediaDocument(document=None, voice=True)
     assert extract_media_fact(media) == expected
+
+
+def test_extractor_and_projector_enrich_new_video_with_filename_and_wrapper_flags() -> None:
+    video_attribute = tl.DocumentAttributeVideo(duration=65, w=1920, h=1080, round_message=False)
+    filename_attribute = tl.DocumentAttributeFilename(file_name="report.mp4")
+    document = MagicMock(spec=tl.Document, size=2048, mime_type="video/mp4")
+    document.attributes = [video_attribute, filename_attribute]
+    media = tl.MessageMediaDocument(document=document, video=True, spoiler=True, ttl_seconds=30)
+
+    fact = extract_media_fact(media)
+
+    assert fact == MediaFact(
+        "video",
+        {
+            "size": 2048,
+            "duration": 65,
+            "round_message": False,
+            "file_name": "report.mp4",
+            "spoiler": True,
+            "ttl_seconds": 30,
+        },
+    )
+    assert media_description(fact) == "[видео: 1:05; report.mp4; спойлер; исчезающее]"
+
+
+def test_round_video_keeps_round_label_and_filename() -> None:
+    video_attribute = tl.DocumentAttributeVideo(duration=5, w=320, h=320, round_message=True)
+    filename_attribute = tl.DocumentAttributeFilename(file_name="circle.mp4")
+    document = MagicMock(spec=tl.Document, size=512, mime_type="video/mp4")
+    document.attributes = [video_attribute, filename_attribute]
+    media = tl.MessageMediaDocument(document=document, round=True)
+
+    fact = extract_media_fact(media)
+
+    assert fact == MediaFact("video", {"size": 512, "duration": 5, "round_message": True, "file_name": "circle.mp4"})
+    assert media_description(fact) == "[кружок: 0:05; circle.mp4]"
+
+
+@pytest.mark.parametrize("ttl_seconds", [None, 0, -1, 1.5, float("inf"), True, "30"])
+def test_video_omits_malformed_or_non_positive_wrapper_ttl(ttl_seconds: object) -> None:
+    media = MagicMock(spec=tl.MessageMediaDocument, document=None, video=True, ttl_seconds=ttl_seconds)
+
+    assert extract_media_fact(media) == MediaFact("video", {"round_message": False})
+
+
+def test_video_omits_malformed_filename() -> None:
+    filename_attribute = MagicMock(spec=tl.DocumentAttributeFilename, file_name="")
+    document = MagicMock(spec=tl.Document, size=512, mime_type="video/mp4")
+    document.attributes = [filename_attribute]
+
+    assert extract_media_fact(tl.MessageMediaDocument(document=document, video=True)) == MediaFact(
+        "video", {"size": 512, "round_message": False}
+    )
+
+
+@pytest.mark.parametrize("ttl_seconds", [0, -1, 1.5, float("inf"), True, "30"])
+def test_photo_omits_malformed_or_non_positive_ttl(ttl_seconds: object) -> None:
+    media = tl.MessageMediaPhoto(ttl_seconds=cast(int | None, ttl_seconds))
+
+    assert extract_media_fact(media) == MediaFact("photo", {})
+
+
+def test_video_filename_description_is_compact_and_single_line() -> None:
+    filename_attribute = tl.DocumentAttributeFilename(file_name="report\n[evil]\x1b\t.mp4")
+    document = MagicMock(spec=tl.Document, size=512, mime_type="video/mp4")
+    document.attributes = [filename_attribute]
+    fact = extract_media_fact(tl.MessageMediaDocument(document=document, video=True))
+
+    assert media_description(fact) == "[видео: report evil .mp4]"
+    assert "\n" not in (media_description(fact) or "")
+    assert "[evil]" not in (media_description(fact) or "")

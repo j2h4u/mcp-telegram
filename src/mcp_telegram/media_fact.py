@@ -170,11 +170,27 @@ def _describe_kind(kind: MediaKind, payload: Mapping[str, object]) -> str | None
 
 def _describe_duration_kind(kind: MediaKind, payload: Mapping[str, object]) -> str:
     if kind == "video":
-        return _duration_description("кружок" if payload.get("round_message") is True else "видео", payload)
+        return _describe_video(payload)
     if kind == "voice":
         return _duration_description("голосовое", payload)
     info = _join_present(payload, ("performer", "title"), " — ")
     return _duration_description(f"аудио: {info}" if info else "аудио", payload)
+
+
+def _describe_video(payload: Mapping[str, object]) -> str:
+    label = "кружок" if payload.get("round_message") is True else "видео"
+    details: list[str] = []
+    duration = payload.get("duration")
+    if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+        minutes, seconds = divmod(int(duration), 60)
+        details.append(f"{minutes}:{seconds:02d}")
+    filename = payload.get("file_name")
+    if isinstance(filename, str) and filename:
+        compact_filename = _compact_filename(filename)
+        if compact_filename:
+            details.append(compact_filename)
+    details.extend(_visual_flags(payload))
+    return f"[{label}: {'; '.join(details)}]" if details else f"[{label}]"
 
 
 def _describe_document_kind(kind: MediaKind, payload: Mapping[str, object]) -> str:
@@ -199,12 +215,24 @@ def _describe_photo(payload: Mapping[str, object]) -> str:
     details: list[str] = []
     if payload.get("live_photo") is True:
         details.append("Live Photo")
+    details.extend(_visual_flags(payload))
+    return f"[фото: {'; '.join(details)}]" if details else "[фото]"
+
+
+def _visual_flags(payload: Mapping[str, object]) -> list[str]:
+    details: list[str] = []
     if payload.get("spoiler") is True:
         details.append("спойлер")
     ttl_seconds = payload.get("ttl_seconds")
-    if isinstance(ttl_seconds, (int, float)) and not isinstance(ttl_seconds, bool) and ttl_seconds > 0:
+    if isinstance(ttl_seconds, int) and not isinstance(ttl_seconds, bool) and ttl_seconds > 0:
         details.append("исчезающее")
-    return f"[фото: {'; '.join(details)}]" if details else "[фото]"
+    return details
+
+
+def _compact_filename(value: str) -> str:
+    """Keep an untrusted Telegram filename on one safe, compact line."""
+    normalized = "".join(char if char.isprintable() and char not in "[]" else " " for char in value)
+    return " ".join(normalized.split())
 
 
 def _describe_place_kind(kind: MediaKind, payload: Mapping[str, object]) -> str | None:
