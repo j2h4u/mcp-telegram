@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, fields, replace
-from typing import cast
+from typing import NoReturn, cast
 
 from .. import message_contracts as _message_contracts
 from ..fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
@@ -28,11 +29,32 @@ _FACT_HYDRATION_ELIGIBILITY_SQL = (
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
     "WHERE sd.dialog_id = ? AND sd.status IN ('syncing', 'synced')"
 )
+_TRANSCRIBABLE_MEDIA_SQL = (
+    "(json_valid(m.media_payload) "
+    "AND json_type(CASE WHEN json_valid(m.media_payload) THEN m.media_payload ELSE '{}' END) = 'object' "
+    "AND (m.media_kind = 'voice' OR (m.media_kind = 'video' "
+    "AND json_type(CASE WHEN json_valid(m.media_payload) THEN m.media_payload ELSE '{}' END, "
+    "'$.round_message') = 'true')))"
+)
 _TRANSCRIPTION_HYDRATION_MESSAGE_SQL = (
-    "m.is_deleted = 0 AND m.media_kind = 'voice' "
+    "m.is_deleted = 0 AND (" + _TRANSCRIBABLE_MEDIA_SQL + ") "
     "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
     "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id)"
 )
+
+
+def _first_json_object_key_wins(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Decode JSON objects with SQLite JSON1's first-key-wins semantics."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key not in result:
+            result[key] = value
+    return result
+
+
+def _reject_json_constant(_value: str) -> NoReturn:
+    """Reject Python JSON extensions that SQLite JSON1 does not accept."""
+    raise ValueError("non-finite JSON number")
 
 
 def _insert_sql(table: str, dataclass_type: type) -> str:
@@ -90,7 +112,7 @@ class MessageOutLookup:
 
 @dataclass(frozen=True, slots=True)
 class TranscriptionHydrationRepair:
-    """Bounded result of repairing missing voice transcription jobs."""
+    """Bounded result of repairing missing transcription jobs."""
 
     enqueued: int
     has_more: bool
@@ -291,7 +313,7 @@ def apply_message_transcription_if_absent(  # noqa: PLR0913
             "SELECT m.media_kind, m.media_payload FROM messages m "
             "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
             "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
-            "WHERE m.dialog_id = ? AND m.message_id = ? AND m.media_kind IN ('voice', 'video') AND m.is_deleted = 0 "
+            "WHERE m.dialog_id = ? AND m.message_id = ? AND m.is_deleted = 0 AND (" + _TRANSCRIBABLE_MEDIA_SQL + ") "
             "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
             "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id)",
             (dialog_id, message_id),
@@ -338,8 +360,27 @@ def _remove_transcription_hydration_job(conn: sqlite3.Connection, dialog_id: int
 
 def _is_transcribable_media_pair(kind: object, payload: object) -> bool:
     """Apply the domain predicate to one projected SQLite media pair."""
-    fact = decode_media_fact(kind, payload)
-    return _is_canonical_media_pair(kind, payload, fact=fact) and is_transcribable_telegram_media(fact)
+    if not isinstance(payload, str):
+        return False
+    try:
+        decoded_payload = cast(
+            object,
+            json.loads(
+                payload,
+                object_pairs_hook=_first_json_object_key_wins,
+                parse_constant=_reject_json_constant,
+            ),
+        )
+    except TypeError, ValueError, json.JSONDecodeError:
+        return False
+    if not isinstance(decoded_payload, dict):
+        return False
+    fact = decode_media_fact(kind, decoded_payload)
+    # ``decode_media_fact`` fails closed for unsupported JSON values by
+    # returning an empty payload.  Compare the decoded object to retain that
+    # fail-closed behavior (Python's json parser accepts NaN/Infinity while
+    # SQLite's json_valid does not).
+    return fact is not None and fact.payload == decoded_payload and is_transcribable_telegram_media(fact)
 
 
 def _is_canonical_media_pair(kind: object, payload: object, *, fact: MediaFact | None = None) -> bool:
@@ -414,7 +455,7 @@ def transcription_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, m
         conn.execute(
             "SELECT m.media_kind, m.media_payload FROM messages m "
             "WHERE m.dialog_id = ? AND m.message_id = ? AND m.is_deleted = 0 "
-            "AND m.media_kind IN ('voice', 'video') "
+            "AND (" + _TRANSCRIBABLE_MEDIA_SQL + ") "
             "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
             "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id) "
             "AND EXISTS (" + _FACT_HYDRATION_ELIGIBILITY_SQL + ")",
@@ -425,7 +466,7 @@ def transcription_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, m
 
 
 _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL = (
-    "FROM messages m INDEXED BY idx_messages_voice_undeleted_sent "
+    "FROM messages m INDEXED BY idx_messages_transcribable_undeleted_sent "
     "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
     "LEFT JOIN hydration_jobs hj ON hj.kind = 'transcription' "
@@ -465,7 +506,7 @@ _REPAIR_MEDIA_METADATA_VIDEO_SQL = (
 def repair_transcription_hydration_jobs(
     conn: sqlite3.Connection, *, due_at: int, max_jobs: int
 ) -> TranscriptionHydrationRepair:
-    """Bound the recurring repair of missing voice transcription jobs."""
+    """Bound the recurring repair of missing transcribable-media jobs."""
     if max_jobs <= 0:
         return TranscriptionHydrationRepair(0, False)
     candidates_sql = (
@@ -663,10 +704,7 @@ def _reconcile_transcription_hydration_job(
             (message.dialog_id, message.message_id),
         ).fetchone(),
     )
-    transcribable = message.media_kind == "voice" or (
-        priority is HydrationPriority.FOREGROUND
-        and _is_transcribable_media_pair(message.media_kind, message.media_payload)
-    )
+    transcribable = _is_transcribable_media_pair(message.media_kind, message.media_payload)
     if (
         transcribable
         and transcription_row is None
@@ -718,16 +756,17 @@ def reconcile_fact_hydration_jobs_for_dialog(
                 HydrationPriority.BACKFILL,
             )
         )
-    voice_rows = cast(
+    transcribable_rows = cast(
         Sequence[tuple[int, int]],
         conn.execute(
             "SELECT m.message_id, m.sent_at FROM messages m "
             "LEFT JOIN message_transcriptions mt ON mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id "
-            "WHERE m.dialog_id = ? AND m.is_deleted = 0 AND m.media_kind = 'voice' AND mt.message_id IS NULL",
+            "WHERE m.dialog_id = ? AND m.is_deleted = 0 AND (" + _TRANSCRIBABLE_MEDIA_SQL + ") "
+            "AND mt.message_id IS NULL",
             (dialog_id,),
         ).fetchall(),
     )
-    for message_id, sent_at in voice_rows:
+    for message_id, sent_at in transcribable_rows:
         queue.enqueue(
             HydrationJob(
                 TRANSCRIPTION_HYDRATION_KIND,
