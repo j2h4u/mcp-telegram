@@ -32,6 +32,7 @@ from telethon.tl.types import TypeInputPeer
 from .access_lifecycle import set_access_lost
 from .activity_peer_resolve import LinkedChatResolution, resolve_input_peer, resolve_linked_chat_id
 from .activity_substrate import ActivityClient, call_with_timeout
+from .flood import TelegramRpcThrottled
 from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts, message_exists
@@ -288,7 +289,6 @@ def _flood_wait_result(seconds: int, *, rpc_calls: int = 0) -> SweepResult:
 
 
 async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, *, rpc_calls: int) -> _SearchOutcome:
-    from telethon.errors import FloodWaitError
     from telethon.tl.functions.messages import SearchRequest
     from telethon.tl.types import InputMessagesFilterEmpty, InputPeerSelf
 
@@ -312,17 +312,28 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, 
             ),
             timeout_s=request.timeout_s,
         )
-    except FloodWaitError as exc:
+    except TelegramRpcThrottled as exc:
+        if exc.retry_after_seconds is None:
+            logger.info(
+                "sweep_peer_once_circuit_open dialog_id=%r rpc_duration_s=%.3f",
+                request.dialog_id,
+                _elapsed_s(search_started_at),
+            )
+            return _SearchOutcome(
+                result=None,
+                rpc_duration_s=_elapsed_s(search_started_at),
+                early_result=_access_skip_result(rpc_calls=rpc_calls),
+            )
         logger.warning(
-            "sweep_peer_once_flood dialog_id=%r flood_wait_seconds=%d rpc_duration_s=%.3f",
+            "sweep_peer_once_flood dialog_id=%r flood_wait_seconds=%s rpc_duration_s=%.3f",
             request.dialog_id,
-            exc.seconds,
+            exc.retry_after_seconds,
             _elapsed_s(search_started_at),
         )
         return _SearchOutcome(
             result=None,
             rpc_duration_s=_elapsed_s(search_started_at),
-            early_result=_flood_wait_result(int(exc.seconds), rpc_calls=rpc_calls),
+            early_result=_flood_wait_result(exc.retry_after_seconds, rpc_calls=rpc_calls),
         )
     except TimeoutError:
         logger.warning(

@@ -50,7 +50,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
-from telethon.errors.rpcerrorlist import FloodWaitError, RPCError  # type: ignore[import-untyped]
+from telethon.errors.rpcerrorlist import RPCError  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetPeerDialogsRequest  # type: ignore[import-untyped]
 from telethon.tl.functions.users import GetFullUserRequest  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
@@ -83,8 +83,8 @@ from .feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
 from .feedback_service import FeedbackApplicationService
 from .flood import (
     FloodWaitKillSwitchPolicy,
+    TelegramRpcThrottled,
     configure_flood_wait_kill_switch,
-    flood_seconds,
     flood_wait_kill_switch_status,
     maybe_log_flood_wait_rollup,
     sleep_through_flood,
@@ -118,7 +118,6 @@ from .sync_db import (
 from .sync_worker import FullSyncWorker
 from .telegram import create_client
 from .telegram_read_receipts import TelethonTelegramReadReceiptGateway
-from .telegram_rpc import TelegramRpcCircuitOpenError
 from .topics.refresh import TopicRefresher
 from .topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from .topics.telegram_adapter import TelethonTelegramTopicGateway, TopicClient
@@ -294,9 +293,11 @@ async def _backfill_total_message_dialog(
                 )
             return _BackfillTotalDialogResult(filled=1, pause_after=True)
         return _BackfillTotalDialogResult(filled=0, pause_after=True)
-    except FloodWaitError as exc:
-        logger.warning("backfill_total flood_wait dialog_id=%d seconds=%d", dialog_id, exc.seconds)
-        if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
+    except TelegramRpcThrottled as exc:
+        logger.warning("backfill_total flood_wait dialog_id=%d seconds=%s", dialog_id, exc.retry_after_seconds)
+        if exc.retry_after_seconds is None:
+            return _BackfillTotalDialogResult(filled=0, pause_after=False, stop=True)
+        if await sleep_through_flood(shutdown_event, exc.retry_after_seconds):
             return _BackfillTotalDialogResult(filled=0, pause_after=False, stop=True)
         return _BackfillTotalDialogResult(filled=0, pause_after=False)
     except _BACKFILL_TOTAL_MESSAGES_SKIP_EXCEPTIONS as exc:
@@ -409,18 +410,16 @@ async def _reconcile_read_position_batch(
             retry_ids.update(set(batch_ids) - returned_ids)
         else:
             filled = 0
-    except FloodWaitError as exc:
-        logger.warning("read_pos_bootstrap flood_wait seconds=%d", exc.seconds)
+    except TelegramRpcThrottled as exc:
+        if exc.retry_after_seconds is None:
+            logger.debug("read_pos_bootstrap circuit_open error=%s", exc)
+        else:
+            logger.warning("read_pos_bootstrap flood_wait seconds=%s", exc.retry_after_seconds)
         retry_ids.update(batch_ids)
         _mark_read_position_retry(conn, retry_ids, retry_at)
         conn.commit()
-        await sleep_through_flood(shutdown_event, flood_seconds(exc))
-        return 0, True
-    except TelegramRpcCircuitOpenError as exc:
-        logger.debug("read_pos_bootstrap circuit_open error=%s", exc)
-        retry_ids.update(batch_ids)
-        _mark_read_position_retry(conn, retry_ids, retry_at)
-        conn.commit()
+        if exc.retry_after_seconds is not None:
+            await sleep_through_flood(shutdown_event, exc.retry_after_seconds)
         return 0, True
     except (RPCError, sqlite3.DatabaseError) as exc:
         logger.debug("read_pos_bootstrap batch_failed error=%s", exc)
@@ -530,9 +529,7 @@ async def _build_read_position_input_peers(
                 continue
             input_peer = cast(TypeInputPeer, peer)
             input_peers.append(InputDialogPeer(peer=input_peer))
-        except FloodWaitError:
-            raise
-        except TelegramRpcCircuitOpenError:
+        except TelegramRpcThrottled:
             raise
         except (RPCError, TypeError, ValueError) as exc:
             logger.debug("read_pos_bootstrap skip dialog_id=%d error=%s", dialog_id, exc)
@@ -1011,7 +1008,7 @@ async def _load_own_only_context(client: _DaemonClient, account_id: int) -> OwnO
         personal_channel_id = getattr(user_full, "personal_channel_id", None)
         if isinstance(personal_channel_id, int) and personal_channel_id > 0:
             return OwnOnlyContext(account_id=account_id, personal_channel_id=personal_channel_id)
-    except (FloodWaitError, RPCError, TypeError, AttributeError, ValueError) as exc:
+    except (TelegramRpcThrottled, RPCError, TypeError, AttributeError, ValueError) as exc:
         logger.warning("own_only_account_facts_unavailable error=%s", exc)
     return context
 

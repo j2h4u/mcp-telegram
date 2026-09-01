@@ -23,9 +23,8 @@ from telethon.errors import (  # type: ignore[import-untyped]
 )
 from telethon.utils import is_list_like  # type: ignore[import-untyped]
 
-from .flood import flood_seconds
+from .flood import TelegramRpcThrottled, flood_seconds
 
-FloodWaitErrors = (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError)
 TransientRpcErrors = (
     ServerError,
     RpcCallFailError,
@@ -53,10 +52,6 @@ class TelegramRpcBudget:
     @property
     def enabled(self) -> bool:
         return self.max_calls_per_period > 0
-
-
-class TelegramRpcCircuitOpenError(RuntimeError):
-    """Raised before admission when the account kill switch is open."""
 
 
 _COOLDOWN_LOCK = asyncio.Lock()
@@ -120,7 +115,11 @@ class TelegramRpcGate(TelegramClient):
     def check_circuit(self) -> None:
         status = self._rpc_circuit_status()
         if status.open:
-            raise TelegramRpcCircuitOpenError(status.detail())
+            raise TelegramRpcThrottled(
+                retry_after_seconds=None,
+                latched=True,
+                detail=status.detail(),
+            )
 
     async def __call__(
         self, request: object, ordered: bool = False, flood_sleep_threshold: int | None = None
@@ -135,9 +134,13 @@ class TelegramRpcGate(TelegramClient):
             try:
                 await self._admit()
                 return await super().__call__(request, ordered=ordered)
-            except FloodWaitErrors as exc:
-                await self._observe_flood(exc)
-                raise
+            except (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError) as exc:
+                seconds = await self._observe_flood(exc)
+                raise TelegramRpcThrottled(
+                    retry_after_seconds=seconds,
+                    latched=False,
+                    detail=f"Telegram RPC throttled for {seconds}s",
+                ) from exc
             except TransientRpcErrors:
                 if retry_index >= len(self._transient_retry_delays):
                     raise
@@ -160,7 +163,7 @@ class TelegramRpcGate(TelegramClient):
                 return
             await asyncio.sleep(remaining)
 
-    async def _observe_flood(self, exc: BaseException) -> None:
+    async def _observe_flood(self, exc: BaseException) -> int:
         """Atomically extend cooldown and send exactly one telemetry event."""
         seconds = flood_seconds(exc, default=self._fallback_wait_seconds)
         now = time.monotonic()
@@ -169,7 +172,7 @@ class TelegramRpcGate(TelegramClient):
             _COOLDOWN_DEADLINE = max(_COOLDOWN_DEADLINE, now + seconds + self._cooldown_buffer_seconds)
             identity = id(exc)
             if getattr(exc, "_mcp_telegram_flood_observed", False) or identity in _OBSERVED_FLOOD_IDS:
-                return
+                return seconds
             try:
                 setattr(exc, "_mcp_telegram_flood_observed", True)  # noqa: B010 - exception marker is intentional
             except AttributeError:
@@ -178,12 +181,11 @@ class TelegramRpcGate(TelegramClient):
                 _OBSERVED_FLOOD_IDS.add(identity)
             if self._flood_observer is not None:
                 self._flood_observer(source="telegram_rpc_gate", seconds=seconds)
+            return seconds
 
 
 __all__ = [
-    "FloodWaitErrors",
     "TelegramRpcBudget",
-    "TelegramRpcCircuitOpenError",
     "TelegramRpcGate",
     "TransientRpcErrors",
     "account_cooldown_deadline",

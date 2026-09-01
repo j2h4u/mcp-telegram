@@ -25,12 +25,12 @@ from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import datetime
 from typing import Protocol, cast
 
-from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
+from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 
 from .access_lifecycle import set_access_lost
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
-from .flood import flood_seconds, sleep_through_flood
+from .flood import TelegramRpcThrottled, sleep_through_flood
 from .history_enrollment import ensure_automatic_dm_enrollment, full_history_enabled
 from .hydration_queue import HydrationPriority
 from .messages.sqlite_repository import insert_messages_with_fts
@@ -195,10 +195,10 @@ class FullSyncWorker:
                         ),
                     ),
                 )
-        except FloodWaitError as exc:
-            wait_seconds = getattr(exc, "seconds", 60)
+        except TelegramRpcThrottled as exc:
+            wait_seconds = exc.retry_after_seconds
             logger.warning(
-                "dm_bootstrap flood_wait=%ds enrolled_so_far=%d — committing partial progress",
+                "dm_bootstrap flood_wait=%ss enrolled_so_far=%d — committing partial progress",
                 wait_seconds,
                 enrolled,
             )
@@ -282,11 +282,12 @@ class FullSyncWorker:
             total_messages = result.total if sync_progress == 0 else None
             batch = list(result)
             # Note: batch size 100 keeps memory bounded; get_messages needed for .total
-        except FloodWaitError as exc:
-            logger.warning("FloodWait dialog_id=%d — sleeping %ds", dialog_id, exc.seconds)
+        except TelegramRpcThrottled as exc:
+            logger.warning("Telegram RPC throttled dialog_id=%d — retry_after=%s", dialog_id, exc.retry_after_seconds)
             # Either outcome (shutdown or full sleep) retries the same batch on
             # the next call, so the shutdown signal is not distinguished here.
-            await sleep_through_flood(self._shutdown_event, flood_seconds(exc))
+            if exc.retry_after_seconds is not None:
+                await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
             return sync_progress, False
         except ACCESS_LOST_ERRORS as exc:
             logger.warning("access_lost dialog_id=%d — %s: %s", dialog_id, type(exc).__name__, exc)

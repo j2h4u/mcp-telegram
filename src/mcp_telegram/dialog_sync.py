@@ -39,11 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol, TypeVar, cast
 
-from telethon.errors import (  # type: ignore[import-untyped]
-    FloodWaitError,
-    PeerIdInvalidError,
-    RPCError,
-)
+from telethon.errors import PeerIdInvalidError, RPCError  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     InputPeerChannel,
@@ -53,7 +49,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 
 from .access_lifecycle import set_access_lost
 from .dialog_classification import EntityKind, classify_dialog_type
-from .flood import flood_seconds, sleep_through_flood
+from .flood import TelegramRpcThrottled, sleep_through_flood
 from .read_state import apply_read_cursor
 from .sync_db import _open_sync_db
 from .telegram_access import ACCESS_LOST_ERRORS
@@ -592,7 +588,7 @@ class DialogsBootstrapWorker:
                 _clear_cursor(self._conn)
             return None, 0, None
 
-    async def run(self) -> int:
+    async def run(self) -> int:  # noqa: PLR0915 - checkpointed bootstrap phases stay explicit
         """Run (or skip) the bootstrap sweep. Returns count of dialogs processed.
 
         Returns 0 if the sweep is already complete or if it exits early on
@@ -653,8 +649,10 @@ class DialogsBootstrapWorker:
                     if count % _PROGRESS_REPORT_EVERY == 0:
                         self._set_detail(f"bootstrap sweep: {count} dialogs processed")
 
-            except FloodWaitError as exc:
-                wait_s = flood_seconds(exc)
+            except TelegramRpcThrottled as exc:
+                if exc.retry_after_seconds is None:
+                    return count
+                wait_s = exc.retry_after_seconds
                 logger.warning(
                     "bootstrap_sweep flood_wait=%ds processed_so_far=%d — sleeping",
                     wait_s,
@@ -796,8 +794,10 @@ class DialogReconciliationWorker:
                         dialog_id,
                         topic_count,
                     )
-            except FloodWaitError as exc:
-                wait_s = flood_seconds(exc)
+            except TelegramRpcThrottled as exc:
+                if exc.retry_after_seconds is None:
+                    return count
+                wait_s = exc.retry_after_seconds
                 logger.warning(
                     "recon_light_flood_wait dialog_id=%d wait=%ds",
                     dialog_id,
@@ -868,8 +868,17 @@ class DialogReconciliationWorker:
                         int(dialog.id),
                         topic_count,
                     )
-        except FloodWaitError as exc:
-            wait_s = flood_seconds(exc)
+        except TelegramRpcThrottled as exc:
+            if exc.retry_after_seconds is None:
+                with self._conn:
+                    _finish_unread_sweep(
+                        self._conn,
+                        status="partial",
+                        observed_count=count,
+                        completed=False,
+                    )
+                return seen_ids, count, False
+            wait_s = exc.retry_after_seconds
             logger.warning(
                 "recon_full_flood_wait wait=%ds processed=%d",
                 wait_s,
@@ -976,8 +985,10 @@ class DialogReconciliationWorker:
             return 0
         try:
             count = await self._topic_refresher.refresh(dialog_id, entity)
-        except FloodWaitError as exc:
-            wait_s = flood_seconds(exc)
+        except TelegramRpcThrottled as exc:
+            if exc.retry_after_seconds is None:
+                return 0
+            wait_s = exc.retry_after_seconds
             logger.warning(
                 "recon_forum_topics_flood_wait dialog_id=%d wait=%ds",
                 dialog_id,

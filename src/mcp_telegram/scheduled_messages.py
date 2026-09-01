@@ -17,13 +17,14 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol, cast
 
-from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
+from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .access_lifecycle import set_access_lost
 from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_substrate import ActivityClient
 from .daemon_log_context import dialog_log_context
+from .flood import TelegramRpcThrottled
 from .fts import stem_text
 from .message_contracts import ExtractedMessage
 from .messages.telegram_adapter import extract_message_row
@@ -431,8 +432,10 @@ class ScheduledMessageReconciler:
             if dialog_type == "channel" and dialog_id != context.personal_channel_id:
                 try:
                     entity = await self._client.get_entity(dialog_id)
-                except FloodWaitError as exc:
-                    _record_retry(self._conn, int(time.time()) + max(1, int(exc.seconds)), "FloodWaitError")
+                except TelegramRpcThrottled as exc:
+                    if exc.retry_after_seconds is None:
+                        return None
+                    _record_retry(self._conn, int(time.time()) + exc.retry_after_seconds, "FloodWaitError")
                     break
                 except RPCError as exc:
                     _log_own_only_entity_rpc_error(self._conn, dialog_id, exc)
@@ -478,8 +481,10 @@ class ScheduledMessageReconciler:
                 break
             try:
                 snapshot = await self._fetch_scheduled_snapshot(dialog_id)
-            except FloodWaitError as exc:
-                retry_at = int(time.time()) + max(1, int(exc.seconds))
+            except TelegramRpcThrottled as exc:
+                if exc.retry_after_seconds is None:
+                    return 0
+                retry_at = int(time.time()) + exc.retry_after_seconds
                 _record_retry(self._conn, retry_at, "FloodWaitError")
                 logger.warning(
                     "scheduled_reconcile_flood_wait dialog_id=%d retry_at=%d — stopping account pass",

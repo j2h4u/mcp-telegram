@@ -10,7 +10,6 @@ from typing import Protocol, TypeVar, cast
 from telethon import utils as tl_utils  # type: ignore[import-untyped]
 from telethon.errors import (  # type: ignore[import-untyped]
     ChannelPrivateError,
-    FloodWaitError,
     InputUserDeactivatedError,
     PeerFloodError,
     PeerIdInvalidError,
@@ -21,6 +20,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
 from telethon.tl.types import TypePeer  # type: ignore[import-untyped]
 
 from .. import message_contracts as _message_contracts
+from ..flood import TelegramRpcThrottled
 from ..media_fact import encode_media_payload
 from ..telethon_media import extract_media_fact
 from ..telethon_message import is_service_message
@@ -428,8 +428,8 @@ async def _resolve_peer_name(client: PeerNameClient, peer: _PeerLike) -> str | N
         if last:
             name = f"{name} {last}".strip()
         return name or None
-    except FloodWaitError as e:
-        logger.warning("resolve_peer_name_flood_wait peer_id=%d retry_after=%ds", log_id, e.seconds)
+    except TelegramRpcThrottled as e:
+        logger.warning("resolve_peer_name_flood_wait peer_id=%d retry_after=%ss", log_id, e.retry_after_seconds)
         return None
     except PeerFloodError:
         logger.warning("resolve_peer_name_peer_flood peer_id=%d", log_id)

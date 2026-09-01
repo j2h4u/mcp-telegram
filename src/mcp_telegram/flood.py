@@ -31,6 +31,34 @@ _ROLLUP_LOG_INTERVAL_S: Final[int] = _SECONDS_PER_DAY
 logger = logging.getLogger(__name__)
 
 
+class TelegramRpcThrottled(RuntimeError):  # noqa: N818 - public domain outcome name is intentional
+    """An application-owned account-wide Telegram throttling outcome.
+
+    ``retry_after_seconds`` is a positive duration when the caller may retry
+    after waiting.  A latched outcome has no finite retry duration: the
+    account circuit is open and work must remain stopped until the process is
+    restarted or the circuit is otherwise reset by its owner.
+    """
+
+    retry_after_seconds: int | None
+    latched: bool
+
+    def __init__(
+        self,
+        retry_after_seconds: int | None = None,
+        *,
+        latched: bool = False,
+        detail: str | None = None,
+    ) -> None:
+        if retry_after_seconds is not None and retry_after_seconds < 1:
+            raise ValueError("retry_after_seconds must be >= 1 when finite")
+        if latched and retry_after_seconds is not None:
+            raise ValueError("latched throttling cannot have a finite retry duration")
+        self.retry_after_seconds = retry_after_seconds
+        self.latched = latched
+        super().__init__(detail or ("Telegram RPC circuit is latched" if latched else "Telegram RPC throttled"))
+
+
 @dataclass(frozen=True, slots=True)
 class FloodWaitRollup:
     """Aggregated FloodWait counters for operational logs."""
@@ -254,12 +282,7 @@ def flood_seconds(exc: BaseException, *, default: int = DEFAULT_FLOOD_WAIT_SECON
     malformed exception. This function has no telemetry side effects.
     """
     seconds = getattr(exc, "seconds", None)
-    return int(seconds or default)
-
-
-def is_flood_wait(exc: BaseException) -> bool:
-    """Identify Telethon flood exceptions without widening import ownership."""
-    return exc.__class__.__name__ in {"FloodWaitError", "FloodPremiumWaitError", "FloodTestPhoneWaitError"}
+    return max(1, int(seconds or default))
 
 
 async def sleep_through_flood(shutdown_event: asyncio.Event, seconds: float) -> bool:

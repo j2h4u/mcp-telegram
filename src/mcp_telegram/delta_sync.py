@@ -20,10 +20,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol, TypedDict, Unpack, cast
 
-from telethon.errors import (
-    FloodWaitError,  # type: ignore[import-untyped]
-    RPCError,  # type: ignore[import-untyped]
-)
+from telethon.errors import RPCError  # type: ignore[import-untyped]
 
 from .access_lifecycle import (
     due_access_revalidations,
@@ -31,7 +28,7 @@ from .access_lifecycle import (
     set_access_lost,
     stamp_access_revalidation,
 )
-from .flood import flood_seconds, sleep_through_flood
+from .flood import TelegramRpcThrottled, sleep_through_flood
 from .history_enrollment import full_history_enabled
 from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage
@@ -380,11 +377,11 @@ class DeltaSyncWorker:
                 if self._shutdown_event.is_set():
                     break
                 new_message_rows.append(extract_message_row(dialog_id, msg))
-        except FloodWaitError as exc:
+        except TelegramRpcThrottled as exc:
             logger.warning(
-                "FloodWait delta dialog_id=%d — %ds (preserving %d already-fetched messages)",
+                "FloodWait delta dialog_id=%d — %ss (preserving %d already-fetched messages)",
                 dialog_id,
-                exc.seconds,
+                exc.retry_after_seconds,
                 len(new_message_rows),
             )
             # Stamp last_synced_at so the next cold restart skips this dialog
@@ -405,7 +402,8 @@ class DeltaSyncWorker:
                     dialog_id,
                     len(new_message_rows),
                 )
-            await sleep_through_flood(self._shutdown_event, flood_seconds(exc))
+            if exc.retry_after_seconds is not None:
+                await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
             return len(new_message_rows)
         except ACCESS_LOST_ERRORS as exc:
             logger.warning(
@@ -516,16 +514,17 @@ async def _probe_access_lost_dialogs(  # noqa: PLR0915
             logger.debug("access_still_lost dialog_id=%d", dialog_id)
             still_lost += 1
             stamp_access_revalidation(conn, dialog_id, int(time.time()), policy.cooldown_seconds)
-        except FloodWaitError as exc:
-            logger.warning("probe_flood_wait dialog_id=%d seconds=%d", dialog_id, exc.seconds)
+        except TelegramRpcThrottled as exc:
+            logger.warning("probe_flood_wait dialog_id=%d seconds=%s", dialog_id, exc.retry_after_seconds)
             flood_wait_hit = True
             stamp_access_revalidation(
                 conn,
                 dialog_id,
                 int(time.time()),
-                max(policy.cooldown_seconds, flood_seconds(exc)),
+                max(policy.cooldown_seconds, exc.retry_after_seconds or policy.cooldown_seconds),
             )
-            await sleep_through_flood(shutdown_event, flood_seconds(exc))
+            if exc.retry_after_seconds is not None:
+                await sleep_through_flood(shutdown_event, exc.retry_after_seconds)
             break
         except RPCError as exc:
             logger.warning("probe_rpc_error dialog_id=%d error=%s", dialog_id, exc)

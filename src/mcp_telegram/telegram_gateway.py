@@ -5,15 +5,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Protocol, cast
 
-from telethon.errors import (  # type: ignore[import-untyped]
-    FloodPremiumWaitError,
-    FloodTestPhoneWaitError,
-    FloodWaitError,
-)
 from telethon.tl.functions.messages import GetScheduledHistoryRequest  # type: ignore[import-untyped]
 from telethon.tl.types import TypeInputPeer  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
+from .flood import TelegramRpcThrottled
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_reading import GatewayFailure, GatewayFailureKind
 
@@ -29,9 +25,13 @@ class ScheduledHistoryClient(Protocol):
 def translate_gateway_failure(exc: BaseException) -> GatewayFailure:
     """Translate Telegram exceptions at the integration boundary."""
     message = str(exc).replace("\n", "\\n") or type(exc).__name__
-    if isinstance(exc, (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError)):
+    if isinstance(exc, TelegramRpcThrottled):
         return GatewayFailure(
-            GatewayFailureKind.FLOOD_WAIT, type(exc).__name__, message, True, int(getattr(exc, "seconds", 0) or 0)
+            GatewayFailureKind.FLOOD_WAIT,
+            type(exc).__name__,
+            message,
+            not exc.latched,
+            exc.retry_after_seconds,
         )
     if isinstance(exc, ACCESS_LOST_ERRORS):
         return GatewayFailure(GatewayFailureKind.ACCESS_LOST, type(exc).__name__, message, False)

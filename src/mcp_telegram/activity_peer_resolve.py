@@ -21,6 +21,7 @@ from telethon.tl.types import TypeInputChannel, TypeInputPeer
 
 from .activity_substrate import ActivityClient, call_with_timeout
 from .entity_store import EntitySnapshot, ensure_entity_stub
+from .flood import TelegramRpcThrottled
 
 logger = logging.getLogger(__name__)
 
@@ -307,8 +308,6 @@ async def resolve_linked_chat_id(
     Never raises into the caller (beyond the schema-floor RuntimeError on
     misconfigured connections).
     """
-    from telethon.errors import FloodWaitError
-
     _assert_linked_chat_schema(conn)
     cached_resolution = _read_cached_linked_chat(conn, channel_id)
     if cached_resolution is not None:
@@ -318,16 +317,16 @@ async def resolve_linked_chat_id(
 
     try:
         return await _resolve_linked_chat_live(client, conn, channel_id, now, timeout_s)
-    except FloodWaitError as exc:
+    except TelegramRpcThrottled as exc:
         logger.warning(
-            "activity_peer_resolve_linked_flood channel_id=%r flood_wait_seconds=%d",
+            "activity_peer_resolve_linked_flood channel_id=%r flood_wait_seconds=%s",
             channel_id,
-            exc.seconds,
+            exc.retry_after_seconds,
         )
         # FloodWait-NEUTRAL: do NOT sleep — surface wait to calling tier.
         # D-08: do NOT touch dialogs — resolved_at stays NULL, which IS the retry
         # signal. The next sweep cycle will re-attempt naturally.
-        return LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=int(exc.seconds))
+        return LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=exc.retry_after_seconds)
     except Exception:
         logger.debug("activity_peer_resolve_linked_error channel_id=%r", channel_id, exc_info=True)
         # D-08 (generic error path): do NOT touch dialogs — resolved_at stays NULL

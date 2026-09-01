@@ -11,10 +11,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol
 
-from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
-
 from .access_lifecycle import set_access_lost
-from .flood import flood_seconds
+from .flood import TelegramRpcThrottled
 from .hydration_queue import (
     TRANSCRIPTION_HYDRATION_KIND,
     HydrationJob,
@@ -25,7 +23,6 @@ from .hydration_queue import (
 )
 from .messages.sqlite_repository import repair_transcription_hydration_jobs
 from .telegram_access import ACCESS_LOST_ERRORS
-from .telegram_rpc import TelegramRpcCircuitOpenError
 from .telegram_rpc_error import TelegramRpcErrorDescriptor, describe_telegram_rpc_error
 
 logger = logging.getLogger(__name__)
@@ -430,10 +427,10 @@ class MessageFactHydrationWorker:
             return _BatchOutcome(dropped=len(preflight_observations))
         try:
             result = await handler.request(self._client, started)
-        except FloodWaitError as exc:
+        except TelegramRpcThrottled as exc:
+            if exc.retry_after_seconds is None:
+                return self._handle_circuit_open(handler, batch, started, preflight_observations, effective_now)
             return self._handle_flood_wait(handler, batch, started, preflight_observations, exc, effective_now)
-        except TelegramRpcCircuitOpenError:
-            return self._handle_circuit_open(handler, batch, started, preflight_observations, effective_now)
         except ACCESS_LOST_ERRORS as exc:
             return self._handle_access_lost(handler, batch, started, preflight_observations, exc, effective_now)
         except Exception as exc:  # noqa: BLE001 - Telegram transient classes vary by RPC layer
@@ -448,10 +445,12 @@ class MessageFactHydrationWorker:
         batch: Sequence[HydrationJob],
         started: Sequence[HydrationJob],
         preflight_observations: Sequence[HydrationDropObservation],
-        exc: FloodWaitError,
+        exc: TelegramRpcThrottled,
         effective_now: int,
     ) -> _BatchOutcome:
-        retry_delay = flood_seconds(exc)
+        retry_delay = exc.retry_after_seconds
+        if retry_delay is None:
+            return self._handle_circuit_open(handler, batch, started, preflight_observations, effective_now)
         retried, dropped, drop_observations = self._reschedule_or_drop(handler, started, effective_now + retry_delay)
         self._conn.commit()
         self._log_drops(

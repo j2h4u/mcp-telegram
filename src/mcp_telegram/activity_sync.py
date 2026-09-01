@@ -14,13 +14,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol, cast
 
-from telethon.errors import FloodWaitError
 from telethon.tl.functions.messages import SearchRequest
 from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, InputPeerSelf
 
 from .activity_substrate import ActivityClient, call_with_timeout
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
-from .flood import flood_seconds, sleep_through_flood
+from .flood import TelegramRpcThrottled, sleep_through_flood
 from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
@@ -283,13 +282,15 @@ async def _search_backfill_batch(
             ),
             timeout_s=timeout_s,
         )
-    except FloodWaitError as exc:
+    except TelegramRpcThrottled as exc:
         logger.warning(
-            "activity_sync_floodwait seconds=%d total_fetched=%d",
-            exc.seconds,
+            "activity_sync_floodwait seconds=%s total_fetched=%d",
+            exc.retry_after_seconds,
             total_fetched,
         )
-        if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
+        if exc.retry_after_seconds is None:
+            return _SEARCH_BATCH_STOP
+        if await sleep_through_flood(shutdown_event, exc.retry_after_seconds):
             return _SEARCH_BATCH_STOP
         return _SEARCH_BATCH_RETRY
     except TimeoutError:
@@ -330,9 +331,11 @@ async def _search_incremental_batch(  # noqa: PLR0913 - explicit worker state an
             ),
             timeout_s=timeout_s,
         )
-    except FloodWaitError as exc:
-        logger.warning("activity_sync_incremental_floodwait seconds=%d", exc.seconds)
-        if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
+    except TelegramRpcThrottled as exc:
+        logger.warning("activity_sync_incremental_floodwait seconds=%s", exc.retry_after_seconds)
+        if exc.retry_after_seconds is None:
+            return _SEARCH_BATCH_STOP
+        if await sleep_through_flood(shutdown_event, exc.retry_after_seconds):
             return _SEARCH_BATCH_STOP
         return _SEARCH_BATCH_RETRY
     except TimeoutError:
