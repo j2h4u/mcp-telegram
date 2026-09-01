@@ -481,7 +481,7 @@ def test_trace_fragment_helpers_preserve_created_at_and_store_retry(
             dialog_id=-100123,
             status="flood_wait",
             next_retry_at=1_700_000_120,
-            last_error="FloodWaitError:120",
+            last_error="TelegramRpcThrottled:120",
             now=1_700_000_000,
         )
     )

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Protocol, TypedDict, cast
 
-from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
+from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.tl.functions.contacts import ResolveUsernameRequest  # type: ignore[import-untyped]
 
 from .activity_peer_resolve import resolve_linked_chat_id
@@ -18,6 +18,7 @@ from .activity_peer_sweep import enroll_activity_dialog
 from .daemon_message import fetch_text_links
 from .dialog_selector import DialogSelector, DialogSelectorError, optional_dialog_selector
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
+from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
 from .message_content import MessageSnapshot, project_message_content
 from .message_contracts import ExtractedMessage
@@ -351,6 +352,7 @@ class DaemonAccountTraceService:
         try:
             result = await self._deps.client(ResolveUsernameRequest(username=username))
         except (RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+            _raise_if_latched(exc)
             self._deps.logger.info(
                 "trace_account username_lookup_failed username=%r error_type=%s%s",
                 username,
@@ -1391,15 +1393,17 @@ async def _trace_enrich_candidate_messages(
             if time.monotonic() >= request.deadline_at:
                 break
             fetched.append(extract_message_row(request.dialog_id, msg, entity_name_map={}))
-    except FloodWaitError as exc:
-        seconds = int(getattr(exc, "seconds", 0))
+    except TelegramRpcThrottled as exc:
+        seconds = exc.retry_after_seconds
+        if seconds is None:
+            return fetched, "flood_wait"
         _upsert_trace_coverage_fragment(
             _TraceCoverageFragmentUpsertRequest(
                 conn=request.conn,
                 target_user_id=request.target_user_id,
                 dialog_id=request.dialog_id,
                 status="flood_wait",
-                last_error=f"FloodWaitError:{seconds}",
+                last_error=f"TelegramRpcThrottled:{seconds}",
                 next_retry_at=request.now + seconds,
                 now=request.now,
             )

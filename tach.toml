@@ -83,7 +83,7 @@ depends_on = [
     "mcp_telegram.own_only", "mcp_telegram.read_state", "mcp_telegram.reconnect", "mcp_telegram.reactions.refresh",
     "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.reactions.telegram_adapter", "mcp_telegram.scheduled_messages",
     "mcp_telegram.state", "mcp_telegram.sync_db", "mcp_telegram.sync_worker", "mcp_telegram.telegram",
-    "mcp_telegram.telegram_read_receipts", "mcp_telegram.telegram_rpc", "mcp_telegram.topics.refresh", "mcp_telegram.transcription_hydration",
+    "mcp_telegram.telegram_read_receipts", "mcp_telegram.topics.refresh", "mcp_telegram.transcription_hydration",
     "mcp_telegram.topics.sqlite_repository", "mcp_telegram.topics.telegram_adapter",
 ]
 
@@ -102,7 +102,7 @@ depends_on = [
     "mcp_telegram.models", "mcp_telegram.pagination",
     "mcp_telegram.reactions.refresh", "mcp_telegram.resolver",
     "mcp_telegram.telegram_fragments", "mcp_telegram.telegram_history",
-    "mcp_telegram.flood", "mcp_telegram.telegram_rpc",
+    "mcp_telegram.flood",
     "mcp_telegram.topics.contracts", "mcp_telegram.topics.refresh",
     "mcp_telegram.folders.read_model", "mcp_telegram.reading.query_records",
 ]
@@ -115,7 +115,7 @@ cannot_depend_on = [
 [[modules]]
 path = "mcp_telegram.daemon_account_trace"
 layer = "application"
-depends_on = ["mcp_telegram.activity_peer_resolve", "mcp_telegram.activity_peer_sweep", "mcp_telegram.daemon_message", "mcp_telegram.dialog_selector", "mcp_telegram.entity_store", "mcp_telegram.hydration_queue", "mcp_telegram.message_contracts", "mcp_telegram.message_content", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.models", "mcp_telegram.pagination", "mcp_telegram.resolver", "mcp_telegram.telegram_access", "mcp_telegram.telethon_dialog"]
+depends_on = ["mcp_telegram.activity_peer_resolve", "mcp_telegram.activity_peer_sweep", "mcp_telegram.daemon_message", "mcp_telegram.dialog_selector", "mcp_telegram.entity_store", "mcp_telegram.hydration_queue", "mcp_telegram.message_contracts", "mcp_telegram.message_content", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.models", "mcp_telegram.pagination", "mcp_telegram.resolver", "mcp_telegram.telegram_access", "mcp_telegram.telethon_dialog", "mcp_telegram.flood"]
 
 [[modules]]
 path = "mcp_telegram.feedback_service"
@@ -192,7 +192,7 @@ depends_on = ["mcp_telegram.daemon_message", "mcp_telegram.reading.query_records
 [[modules]]
 path = "mcp_telegram.scheduled_messages"
 layer = "application"
-depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.activity_peer_resolve", "mcp_telegram.activity_substrate", "mcp_telegram.daemon_log_context", "mcp_telegram.fts", "mcp_telegram.message_contracts", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.own_only", "mcp_telegram.telegram_access", "mcp_telegram.telegram_gateway"]
+depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.activity_peer_resolve", "mcp_telegram.activity_substrate", "mcp_telegram.daemon_log_context", "mcp_telegram.fts", "mcp_telegram.message_contracts", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.own_only", "mcp_telegram.telegram_access", "mcp_telegram.telegram_gateway", "mcp_telegram.flood"]
 
 [[modules]]
 path = "mcp_telegram.message_fact_refresh"
@@ -213,7 +213,7 @@ layer = "application"
 depends_on = [
     "mcp_telegram.access_lifecycle", "mcp_telegram.hydration_queue", "mcp_telegram.flood",
     "mcp_telegram.messages.sqlite_repository",
-    "mcp_telegram.telegram_access", "mcp_telegram.telegram_rpc", "mcp_telegram.telegram_rpc_error",
+    "mcp_telegram.telegram_access", "mcp_telegram.telegram_rpc_error",
 ]
 
 [[modules]]
@@ -247,22 +247,22 @@ depends_on = ["mcp_telegram.activity_substrate", "mcp_telegram.entity_store", "m
 [[modules]]
 path = "mcp_telegram.activity_peer_resolve"
 layer = "application"
-depends_on = ["mcp_telegram.activity_substrate", "mcp_telegram.entity_store"]
+depends_on = ["mcp_telegram.activity_substrate", "mcp_telegram.entity_store", "mcp_telegram.flood"]
 
 [[modules]]
 path = "mcp_telegram.activity_peer_sweep"
 layer = "application"
-depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.activity_peer_resolve", "mcp_telegram.activity_substrate", "mcp_telegram.hydration_queue", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.own_only", "mcp_telegram.telegram_access"]
+depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.activity_peer_resolve", "mcp_telegram.activity_substrate", "mcp_telegram.hydration_queue", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.own_only", "mcp_telegram.telegram_access", "mcp_telegram.flood"]
 
 [[modules]]
 path = "mcp_telegram.activity_hot_sweep"
 layer = "application"
-depends_on = ["mcp_telegram.activity_peer_sweep", "mcp_telegram.activity_substrate", "mcp_telegram.hydration_queue"]
+depends_on = ["mcp_telegram.activity_peer_sweep", "mcp_telegram.activity_substrate", "mcp_telegram.hydration_queue", "mcp_telegram.flood"]
 
 [[modules]]
 path = "mcp_telegram.activity_cold_backfill"
 layer = "application"
-depends_on = ["mcp_telegram.activity_peer_sweep", "mcp_telegram.activity_substrate", "mcp_telegram.hydration_queue"]
+depends_on = ["mcp_telegram.activity_peer_sweep", "mcp_telegram.activity_substrate", "mcp_telegram.hydration_queue", "mcp_telegram.flood"]
 
 [[modules]]
 path = "mcp_telegram.dialog_sync"
@@ -286,7 +286,7 @@ depends_on = [
     "mcp_telegram.activity_contracts", "mcp_telegram.entity_store", "mcp_telegram.history_enrollment", "mcp_telegram.hydration_queue", "mcp_telegram.messages.sqlite_repository",
     "mcp_telegram.messages.telegram_adapter", "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.persistence", "mcp_telegram.reactions.projection",
     "mcp_telegram.read_state", "mcp_telegram.realtime_history_policy", "mcp_telegram.resolver", "mcp_telegram.scheduled_messages",
-    "mcp_telegram.telethon_dialog", "mcp_telegram.unread_state",
+    "mcp_telegram.telethon_dialog", "mcp_telegram.unread_state", "mcp_telegram.flood",
 ]
 
 [[modules]]
@@ -338,7 +338,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.folders.worker"
 layer = "application"
-depends_on = ["mcp_telegram.flood", "mcp_telegram.folders.contracts", "mcp_telegram.folders.ports", "mcp_telegram.folders.refresh", "mcp_telegram.telegram_rpc"]
+depends_on = ["mcp_telegram.flood", "mcp_telegram.folders.contracts", "mcp_telegram.folders.ports", "mcp_telegram.folders.refresh"]
 
 [[modules]]
 path = "mcp_telegram.important_events"
@@ -379,7 +379,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.telegram_gateway"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.telegram_access", "mcp_telegram.telegram_reading"]
+depends_on = ["mcp_telegram.telegram_access", "mcp_telegram.telegram_reading", "mcp_telegram.flood"]
 
 [[modules]]
 path = "mcp_telegram.telegram"
@@ -434,12 +434,12 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.messages.telegram_adapter"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.media_fact", "mcp_telegram.message_contracts", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message"]
+depends_on = ["mcp_telegram.media_fact", "mcp_telegram.message_contracts", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message", "mcp_telegram.flood"]
 
 [[modules]]
 path = "mcp_telegram.folders.telegram_adapter"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.folders.contracts", "mcp_telegram.folders.ports"]
+depends_on = ["mcp_telegram.folders.contracts", "mcp_telegram.folders.ports", "mcp_telegram.flood"]
 
 [[modules]]
 path = "mcp_telegram.reactions.projection"
@@ -454,7 +454,7 @@ depends_on = ["mcp_telegram.reactions.contracts", "mcp_telegram.reactions.ports"
 [[modules]]
 path = "mcp_telegram.topics.telegram_adapter"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.topics.contracts", "mcp_telegram.topics.ports"]
+depends_on = ["mcp_telegram.topics.contracts", "mcp_telegram.topics.ports", "mcp_telegram.flood"]
 
 # persistence — SQLite schema and repositories.
 [[modules]]

@@ -247,11 +247,11 @@ async def test_backfill_respects_shutdown(conn: sqlite3.Connection) -> None:
 
 @pytest.mark.asyncio
 async def test_backfill_floodwait_recovers(conn: sqlite3.Connection) -> None:
-    from telethon.errors import FloodWaitError
+    from mcp_telegram.flood import TelegramRpcThrottled
 
-    class _FWError(FloodWaitError):
+    class _FWError(TelegramRpcThrottled):
         def __init__(self):
-            self.seconds = 0
+            super().__init__(retry_after_seconds=1)
 
     client = _FakeClient(batches=[_FWError(), FakeSearchResult(messages=[])])
     shutdown = asyncio.Event()

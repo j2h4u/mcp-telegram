@@ -113,16 +113,17 @@ async def test_reconciliation_stops_cleanly_on_shutdown() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_treats_open_rpc_circuit_as_retryable() -> None:
+async def test_reconciliation_propagates_latched_rpc_circuit() -> None:
     from mcp_telegram.daemon import _initialize_read_positions
-    from mcp_telegram.telegram_rpc import TelegramRpcCircuitOpenError
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     conn = _connection()
     try:
         _seed_pending(conn, 1001)
         client = AsyncMock()
-        client.get_input_entity.side_effect = TelegramRpcCircuitOpenError("open-for-test")
-        assert await _initialize_read_positions(client, conn, asyncio.Event(), max_dialogs=1) == 0
+        client.get_input_entity.side_effect = TelegramRpcThrottled(latched=True, detail="open-for-test")
+        with pytest.raises(TelegramRpcThrottled, match="open-for-test"):
+            await _initialize_read_positions(client, conn, asyncio.Event(), max_dialogs=1)
         assert conn.execute("SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = 1001").fetchone() == (None,)
     finally:
         conn.close()
@@ -131,15 +132,13 @@ async def test_reconciliation_treats_open_rpc_circuit_as_retryable() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("seconds", [5, 120])
 async def test_resolution_floodwait_uses_canonical_shutdown_aware_sleep(seconds: int) -> None:
-    from telethon.errors import FloodWaitError
-
     from mcp_telegram.daemon import _initialize_read_positions
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     conn = _connection()
     try:
         _seed_pending(conn, 1001)
-        error = FloodWaitError(request=None)
-        error.seconds = seconds
+        error = TelegramRpcThrottled(retry_after_seconds=seconds)
         client = AsyncMock()
         client.get_input_entity.side_effect = error
         with (
@@ -162,16 +161,14 @@ async def test_resolution_floodwait_uses_canonical_shutdown_aware_sleep(seconds:
 
 @pytest.mark.asyncio
 async def test_resolution_floodwait_aborts_remaining_batches() -> None:
-    from telethon.errors import FloodWaitError
-
     from mcp_telegram.daemon import _initialize_read_positions
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     conn = _connection()
     try:
         _seed_pending(conn, 1001)
         _seed_pending(conn, 1002)
-        error = FloodWaitError(request=None)
-        error.seconds = 5
+        error = TelegramRpcThrottled(retry_after_seconds=5)
         client = AsyncMock()
         client.get_input_entity.side_effect = error
         with (
@@ -189,16 +186,14 @@ async def test_resolution_floodwait_aborts_remaining_batches() -> None:
 
 @pytest.mark.asyncio
 async def test_request_floodwait_aborts_remaining_batches() -> None:
-    from telethon.errors import FloodWaitError
-
     from mcp_telegram.daemon import _initialize_read_positions
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     conn = _connection()
     try:
         _seed_pending(conn, 1001)
         _seed_pending(conn, 1002)
-        error = FloodWaitError(request=None)
-        error.seconds = 5
+        error = TelegramRpcThrottled(retry_after_seconds=5)
         client = AsyncMock()
         client.get_input_entity.side_effect = lambda dialog_id: SimpleNamespace(_did=dialog_id)
         client.side_effect = error

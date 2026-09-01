@@ -25,6 +25,7 @@ from .activity_peer_sweep import (
     sweep_peer_once,
 )
 from .activity_substrate import ActivityClient
+from .flood import TelegramRpcThrottled
 from .hydration_queue import HydrationPriority
 
 logger = logging.getLogger(__name__)
@@ -482,6 +483,8 @@ def _count_due_hot_peers(conn: sqlite3.Connection, *, now: int) -> int:
 async def _run_hot_sweep_peer_safe(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome:
     try:
         return await _run_hot_sweep_peer(ctx)
+    except TelegramRpcThrottled:
+        raise
     except Exception:
         _save_hot_access_skip_state(ctx.conn, ctx.dialog_id, retry_at=int(time.time()) + _ACCESS_SKIP_RETRY_S)
         logger.warning("activity_hot_sweep_peer_error dialog_id=%r", ctx.dialog_id, exc_info=True)
@@ -672,6 +675,8 @@ async def run_hot_sweep_loop(
                 telemetry["genuinely_new"],
                 telemetry["flood_wait_seconds"],
             )
+        except TelegramRpcThrottled:
+            raise
         except Exception:
             logger.warning("activity_hot_sweep_error", exc_info=True)
         wait_seconds = max(policy.loop_interval_seconds, float(telemetry.get("flood_wait_seconds") or 0))

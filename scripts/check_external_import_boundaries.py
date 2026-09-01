@@ -85,7 +85,6 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "delta_sync.py",
             "dialog_sync.py",
             "event_handlers.py",
-            "fact_hydration.py",
             "folders/telegram_adapter.py",
             "messages/telegram_adapter.py",
             "reactions/telegram_adapter.py",

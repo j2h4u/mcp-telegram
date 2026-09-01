@@ -5,13 +5,14 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Protocol, cast
 
-from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
+from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
     GetCustomEmojiDocumentsRequest,
     GetForumTopicsRequest,
 )
 from telethon.tl.types import DocumentAttributeCustomEmoji, TypeInputPeer  # type: ignore[import-untyped]
 
+from ..flood import TelegramRpcThrottled
 from .contracts import TopicFact, TopicSourceUnavailableError
 from .ports import TelegramTopicGateway
 
@@ -50,7 +51,7 @@ class TelethonTelegramTopicGateway(TelegramTopicGateway):
             result = await self._client(
                 GetForumTopicsRequest(peer=peer, offset_date=None, offset_id=0, offset_topic=0, limit=100)
             )
-        except FloodWaitError:
+        except TelegramRpcThrottled:
             raise
         except (RPCError, TypeError) as exc:
             raise TopicSourceUnavailableError("Telegram topic source is unavailable") from exc
@@ -79,7 +80,7 @@ class TelethonTelegramTopicGateway(TelegramTopicGateway):
                     list[_DocumentLike],
                     await self._client(GetCustomEmojiDocumentsRequest(document_id=missing_ids)),
                 )
-            except FloodWaitError:
+            except TelegramRpcThrottled:
                 raise
             except RPCError, TypeError:
                 return {

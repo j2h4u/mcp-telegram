@@ -12,8 +12,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, cast
 
-from ..flood import flood_seconds, is_flood_wait
-from ..telegram_rpc import TelegramRpcCircuitOpenError
+from ..flood import TelegramRpcThrottled
 from .contracts import FolderSourceUnavailableError
 from .ports import FolderSnapshotRepository
 from .refresh import FolderRefresher, FolderRefreshResult
@@ -152,7 +151,6 @@ class FolderProjectionWorker:
         self,
     ) -> tuple[FolderAttemptResult, FolderRefreshResult | None, int | None, Exception | None, int | None]:
         refresh_result: FolderRefreshResult | None = None
-        requested_flood_wait: int | None = None
         next_due_at: int | None = None
         try:
             projection = await self._refresher.acquire()
@@ -166,19 +164,18 @@ class FolderProjectionWorker:
             return FolderAttemptResult.SUCCESS, refresh_result, None, None, next_due_at
         except FolderSourceUnavailableError, TimeoutError, OSError:
             return FolderAttemptResult.SOURCE_UNAVAILABLE, None, None, None, None
-        except TelegramRpcCircuitOpenError:
-            return FolderAttemptResult.CIRCUIT_OPEN, None, None, None, None
+        except TelegramRpcThrottled as exc:
+            if exc.retry_after_seconds is None:
+                return FolderAttemptResult.CIRCUIT_OPEN, None, None, None, None
+            return FolderAttemptResult.FLOOD_WAIT, None, exc.retry_after_seconds, None, None
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - unexpected programming errors terminate the tracked worker
-            if is_flood_wait(exc):
-                requested_flood_wait = flood_seconds(exc)
-                return FolderAttemptResult.FLOOD_WAIT, None, requested_flood_wait, None, None
             return FolderAttemptResult.UNEXPECTED, None, None, exc, None
 
     def _record_failure(self, result: FolderAttemptResult, requested_flood_wait: int | None) -> int | None:
         self._failure_count += 1
-        if result == FolderAttemptResult.UNEXPECTED:
+        if result in {FolderAttemptResult.CIRCUIT_OPEN, FolderAttemptResult.UNEXPECTED}:
             next_due_at = None
         else:
             retry_delay = self._retry_delay(self._failure_count)

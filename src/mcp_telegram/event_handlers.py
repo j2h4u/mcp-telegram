@@ -28,7 +28,7 @@ from datetime import datetime
 from typing import Protocol, cast, runtime_checkable
 
 from telethon import events  # type: ignore[import-untyped]
-from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
+from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     MessageActionTopicCreate,
     MessageActionTopicEdit,
@@ -52,6 +52,7 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .activity_contracts import InputPeerResolver
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
+from .flood import TelegramRpcThrottled
 from .history_enrollment import ensure_automatic_dm_enrollment
 from .hydration_queue import HydrationPriority
 from .messages.sqlite_repository import (
@@ -1172,12 +1173,12 @@ class EventHandlerManager:
     async def _fetch_reaction_message(self, dialog_id: int, msg_id: int) -> _MessageLike | None:
         try:
             result = cast(Sequence[_MessageLike | None], await self._client.get_messages(dialog_id, ids=[msg_id]))
-        except FloodWaitError as exc:
+        except TelegramRpcThrottled as exc:
             logger.warning(
-                "raw_reaction_floodwait dialog_id=%d message_id=%d seconds=%d",
+                "raw_reaction_floodwait dialog_id=%d message_id=%d seconds=%s",
                 dialog_id,
                 msg_id,
-                int(exc.seconds),
+                exc.retry_after_seconds,
             )
             return None
         except RPCError, RuntimeError:
@@ -1501,7 +1502,6 @@ class EventHandlerManager:
         writing — the unchanged resolved_at acts as the retry signal for the
         next sweep cycle or UpdateChannel event.
         """
-        from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
         from telethon.tl.functions.channels import GetFullChannelRequest  # type: ignore[import-untyped]
         from telethon.tl.types import PeerChannel as _PeerChannel  # type: ignore[import-untyped]
         from telethon.utils import get_peer_id as _get_peer_id  # type: ignore[import-untyped]
@@ -1516,11 +1516,11 @@ class EventHandlerManager:
 
         try:
             full_result = await self._client(GetFullChannelRequest(channel=input_channel))
-        except FloodWaitError as exc:
+        except TelegramRpcThrottled as exc:
             logger.warning(
-                "event_linked_chat_refresh_flood dialog_id=%d flood_wait_seconds=%d",
+                "event_linked_chat_refresh_flood dialog_id=%d flood_wait_seconds=%s",
                 dialog_id,
-                int(exc.seconds),
+                exc.retry_after_seconds,
             )
             return
         except Exception:

@@ -5,23 +5,30 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import telethon
 from telethon import TelegramClient, functions, types
-from telethon.errors import FloodWaitError, ServerError, SlowModeWaitError
+from telethon.errors import (
+    FloodPremiumWaitError,
+    FloodTestPhoneWaitError,
+    FloodWaitError,
+    ServerError,
+    SlowModeWaitError,
+)
 from telethon.requestiter import RequestIter
 from telethon.sessions import StringSession
 
 from mcp_telegram.config import FloodWaitConfig, McpTelegramConfig, StateConfig, TelegramRpcConfig
-from mcp_telegram.flood import FloodWaitAccumulator, FloodWaitKillSwitchPolicy
+from mcp_telegram.flood import FloodWaitAccumulator, FloodWaitKillSwitchPolicy, TelegramRpcThrottled
 from mcp_telegram.telegram import create_client
 from mcp_telegram.telegram_rpc import (
     TelegramRpcBudget,
-    TelegramRpcCircuitOpenError,
     TelegramRpcGate,
     account_cooldown_deadline,
     reset_account_cooldown,
@@ -174,8 +181,10 @@ def test_telethon_public_helper_and_update_loop_contract_is_pinned() -> None:
 @pytest.mark.asyncio
 async def test_gate_blocks_when_circuit_is_open() -> None:
     gate = _gate(_CircuitStatus(open=True))
-    with pytest.raises(TelegramRpcCircuitOpenError, match="open-for-test"):
+    with pytest.raises(TelegramRpcThrottled, match="open-for-test") as caught:
         await gate("request")
+    assert caught.value.latched
+    assert caught.value.retry_after_seconds is None
     assert gate._limiter.acquisitions == 0
 
 
@@ -251,13 +260,35 @@ async def test_gate_default_retry_adds_no_sleep_beyond_telethon_builtin(monkeypa
         sleeps.append(delay)
 
     monkeypatch.setattr("mcp_telegram.telegram_rpc.asyncio.sleep", fake_sleep)
-    with pytest.raises(FloodWaitError) as caught:
+    with pytest.raises(TelegramRpcThrottled) as caught:
         await gate(functions.PingRequest(1))
 
-    assert caught.value is final
+    assert caught.value.__cause__ is final
+    assert caught.value.retry_after_seconds == 7
     assert gate._sender.calls == 2
     assert gate._limiter.acquisitions == 2
     assert sleeps == [2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError])
+async def test_gate_normalizes_each_vendor_wait_to_owned_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type,
+) -> None:
+    gate = _gate()
+    vendor_error = cast(Callable[..., BaseException], error_type)(request=None, capture=7)
+
+    async def base_call(_self: TelegramClient, _request: object, **_kwargs: object) -> object:
+        raise vendor_error
+
+    monkeypatch.setattr(TelegramClient, "__call__", base_call)
+    with pytest.raises(TelegramRpcThrottled) as caught:
+        await gate("request")
+
+    assert caught.value.retry_after_seconds == 7
+    assert caught.value.latched is False
+    assert caught.value.__cause__ is vendor_error
 
 
 @pytest.mark.asyncio
@@ -304,9 +335,9 @@ async def test_gate_flood_is_immediate_cooldown_and_observed_once(monkeypatch: p
         raise error
 
     monkeypatch.setattr(TelegramClient, "__call__", base_call)
-    with pytest.raises(FloodWaitError) as caught:
+    with pytest.raises(TelegramRpcThrottled) as caught:
         await gate("request")
-    assert caught.value is error
+    assert caught.value.__cause__ is error
     assert attempts == 1
     await gate._observe_flood(error)
     assert observed == [{"source": "telegram_rpc_gate", "seconds": 7}]
@@ -364,10 +395,13 @@ async def test_gate_flood_observation_opens_accumulator_and_rejects_next_admissi
         raise error
 
     monkeypatch.setattr(TelegramClient, "__call__", base_call)
-    with pytest.raises(FloodWaitError):
+    with pytest.raises(TelegramRpcThrottled) as caught:
         await gate("request")
-    with pytest.raises(TelegramRpcCircuitOpenError):
+    assert caught.value.retry_after_seconds == 7
+    with pytest.raises(TelegramRpcThrottled) as caught:
         await gate("request")
+    assert caught.value.latched
+    assert caught.value.retry_after_seconds is None
 
     status = accumulator.kill_switch_status()
     assert status.open is True

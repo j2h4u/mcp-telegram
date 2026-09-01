@@ -11,12 +11,40 @@ from mcp_telegram.flood import (
     DEFAULT_FLOOD_WAIT_SECONDS,
     FloodWaitAccumulator,
     FloodWaitKillSwitchPolicy,
+    TelegramRpcThrottled,
     flood_seconds,
     sleep_through_flood,
 )
 
 
-class _FloodWaitError(Exception):
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"retry_after_seconds": None, "latched": False},
+        {"retry_after_seconds": 0},
+        {"retry_after_seconds": -1},
+        {"retry_after_seconds": 1, "latched": True},
+        {"retry_after_seconds": 1.0},
+        {"retry_after_seconds": True},
+    ],
+)
+def test_telegram_rpc_throttled_rejects_invalid_or_ambiguous_state(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        TelegramRpcThrottled(**kwargs)  # pyright: ignore[reportArgumentType]
+
+
+@pytest.mark.parametrize(
+    ("retry_after_seconds", "latched"),
+    [(1, False), (120, False), (None, True)],
+)
+def test_telegram_rpc_throttled_accepts_exact_states(retry_after_seconds: int | None, latched: bool) -> None:
+    exc = TelegramRpcThrottled(retry_after_seconds, latched=latched)
+    assert exc.retry_after_seconds == retry_after_seconds
+    assert exc.latched is latched
+
+
+class _SecondsError(Exception):
     def __init__(self, seconds: object | None = None) -> None:
         super().__init__()
         self.seconds = seconds
@@ -28,33 +56,33 @@ class _FloodWaitError(Exception):
 
 
 def test_flood_seconds_reads_seconds_attribute() -> None:
-    exc = _FloodWaitError(27)
+    exc = _SecondsError(27)
     assert flood_seconds(exc) == 27
 
 
 def test_flood_seconds_coerces_to_int() -> None:
-    exc = _FloodWaitError(12.9)
+    exc = _SecondsError(12.9)
     assert flood_seconds(exc) == 12
 
 
 def test_flood_seconds_missing_attribute_uses_default() -> None:
-    exc = _FloodWaitError()  # no `seconds`
+    exc = _SecondsError()  # no `seconds`
     assert flood_seconds(exc) == DEFAULT_FLOOD_WAIT_SECONDS
 
 
 def test_flood_seconds_none_uses_default() -> None:
-    exc = _FloodWaitError(None)
+    exc = _SecondsError(None)
     assert flood_seconds(exc) == DEFAULT_FLOOD_WAIT_SECONDS
 
 
 def test_flood_seconds_zero_uses_default() -> None:
     # 0s would be a no-op sleep — fall back so callers never busy-spin.
-    exc = _FloodWaitError(0)
+    exc = _SecondsError(0)
     assert flood_seconds(exc) == DEFAULT_FLOOD_WAIT_SECONDS
 
 
 def test_flood_seconds_custom_default() -> None:
-    exc = _FloodWaitError(0)
+    exc = _SecondsError(0)
     assert flood_seconds(exc, default=5) == 5
 
 

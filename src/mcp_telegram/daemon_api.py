@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
-from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
+from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.tl.functions.channels import (
     GetFullChannelRequest,  # type: ignore[import-untyped]
     GetParticipantsRequest,  # type: ignore[import-untyped]
@@ -90,7 +90,7 @@ from .daemon_message import (
 )
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
-from .flood import flood_seconds
+from .flood import TelegramRpcThrottled
 from .folders.read_model import dialog_placement, folder_snapshot, folders_by_dialog, list_folder_messages, list_folders
 from .history_enrollment import disable_history, enable_history, read_intent
 from .important_events.read_model import list_important_events as read_important_events
@@ -98,7 +98,6 @@ from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
 from .reading.query_records import read_message_from_row
 from .sync_read_model import SyncStatus, build_sync_read_model
-from .telegram_rpc import FloodWaitErrors
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
 
@@ -806,7 +805,7 @@ class DaemonAPIServer:
             return int(cast(int, telethon_utils.get_peer_id(entity)))
         except ValueError, KeyError:
             return None
-        except FloodWaitErrors:
+        except TelegramRpcThrottled:
             raise
         except RPCError, TimeoutError:
             raise
@@ -907,19 +906,21 @@ class DaemonAPIServer:
         return result
 
     @staticmethod
-    def _dialog_resolution_retryable_response(*, retry_after: int | None = None) -> dict[str, object]:
+    def _dialog_resolution_retryable_response(
+        *, retry_after: int | None = None, transient: bool = True
+    ) -> dict[str, object]:
         response: dict[str, object] = {
             "ok": False,
             "error": "dialog_resolution_retryable",
             "message": "Telegram dialog enumeration did not complete; no dialog was selected.",
-            "retryable": True,
+            "retryable": transient,
             "required_action": "Retry the request; use an exact dialog id when already known.",
         }
         if retry_after is not None:
             response["retry_after"] = retry_after
         return response
 
-    async def _resolve_dialog_id(
+    async def _resolve_dialog_id(  # noqa: PLR0911 - stable resolution response branches
         self,
         selector: DialogSelector,
         *,
@@ -931,8 +932,11 @@ class DaemonAPIServer:
         assert selector.query is not None
         try:
             result = await self._resolve_dialog_name(selector.query, allow_remote_lookup=allow_remote_lookup)
-        except (RPCError, TimeoutError) as exc:
-            retry_after = flood_seconds(exc) if isinstance(exc, FloodWaitErrors) else None
+        except TelegramRpcThrottled as exc:
+            retry_after = exc.retry_after_seconds
+            return self._dialog_resolution_retryable_response(retry_after=retry_after, transient=not exc.latched)
+        except RPCError, TimeoutError:
+            retry_after = None
             return self._dialog_resolution_retryable_response(retry_after=retry_after)
         if isinstance(result, Resolved):
             return result.entity_id
@@ -1204,11 +1208,11 @@ class DaemonAPIServer:
         try:
             entity = await self._client.get_entity(dialog_id)
             refreshed = await self._topic_refresher.refresh(dialog_id, entity)
-        except FloodWaitError as exc:
+        except TelegramRpcThrottled as exc:
             logger.info(
                 "list_topics_refresh_deferred_flood_wait dialog_id=%d seconds=%s",
                 dialog_id,
-                getattr(exc, "seconds", None),
+                exc.retry_after_seconds,
             )
             return "topic_catalog_deferred_flood_wait"
         except TopicSourceUnavailableError as exc:
@@ -1233,6 +1237,16 @@ class DaemonAPIServer:
         # demand because callers want display fields, not just the id.
         try:
             me = await self._client.get_me()
+        except TelegramRpcThrottled as exc:
+            response: dict[str, object] = {
+                "ok": False,
+                "error": "flood_wait",
+                "message": "Telegram account info is temporarily throttled.",
+                "retryable": not exc.latched,
+            }
+            if exc.retry_after_seconds is not None:
+                response["retry_after"] = exc.retry_after_seconds
+            return response
         except Exception as exc:
             logger.warning("get_me_failed error=%s", exc, exc_info=True)
             return {"ok": False, "error": "telegram_error", "message": "failed to retrieve account info"}

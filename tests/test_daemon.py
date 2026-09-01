@@ -1215,9 +1215,8 @@ async def test_backfill_total_messages_returns_early_when_shutdown_during_flood_
     """shutdown_event set during FloodWait sleep → function returns early with filled=0."""
     import sqlite3
 
-    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
-
     from mcp_telegram.daemon import _backfill_total_messages
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     conn = sqlite3.connect(":memory:")
     from mcp_telegram.sync_db import _apply_migrations
@@ -1233,8 +1232,7 @@ async def test_backfill_total_messages_returns_early_when_shutdown_during_flood_
 
         shutdown_event = asyncio.Event()
 
-        err = FloodWaitError(request=None)
-        err.seconds = 30
+        err = TelegramRpcThrottled(retry_after_seconds=30)
 
         client = MagicMock()
         client.get_messages = AsyncMock(side_effect=err)
@@ -1302,9 +1300,8 @@ async def test_backfill_total_messages_floodwait_elapsed_skips_small_pause(monke
     import sqlite3
     from unittest.mock import patch
 
-    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
-
     from mcp_telegram.daemon import _backfill_total_messages
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     conn = sqlite3.connect(":memory:")
     from mcp_telegram.sync_db import _apply_migrations
@@ -1320,8 +1317,7 @@ async def test_backfill_total_messages_floodwait_elapsed_skips_small_pause(monke
 
         shutdown_event = asyncio.Event()
         client = MagicMock()
-        err = FloodWaitError(request=None)
-        err.seconds = 3
+        err = TelegramRpcThrottled(retry_after_seconds=3)
         client.get_messages = AsyncMock(side_effect=err)
         wait_calls: list[float] = []
 
@@ -1487,9 +1483,8 @@ async def test_initialize_read_positions_returns_early_when_shutdown_during_floo
     import sqlite3
     from unittest.mock import patch
 
-    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
-
     from mcp_telegram.daemon import _initialize_read_positions
+    from mcp_telegram.flood import TelegramRpcThrottled
     from mcp_telegram.sync_db import _apply_migrations
 
     conn = sqlite3.connect(":memory:")
@@ -1503,8 +1498,7 @@ async def test_initialize_read_positions_returns_early_when_shutdown_during_floo
         conn.commit()
 
         shutdown_event = asyncio.Event()
-        err = FloodWaitError(request=None)
-        err.seconds = 30
+        err = TelegramRpcThrottled(retry_after_seconds=30)
 
         client = MagicMock()
         client.get_input_entity = AsyncMock(side_effect=err)

@@ -8,12 +8,12 @@ from pathlib import Path
 
 import pytest
 
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.folders.contracts import DialogCategory, DialogFacts, FolderRule, FolderSourceSnapshot
 from mcp_telegram.folders.refresh import FolderRefresher
 from mcp_telegram.folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from mcp_telegram.folders.worker import FolderProjectionWorker
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_rpc import TelegramRpcCircuitOpenError
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,17 +161,17 @@ async def test_concurrent_attempts_are_single_flight(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("error", "outcome", "retry"),
+    ("error", "outcome", "expected_retry_at"),
     [
-        (TimeoutError("network"), "source_unavailable", 60),
-        (TelegramRpcCircuitOpenError("open"), "circuit_open", 60),
+        (TimeoutError("network"), "source_unavailable", 160),
+        (TelegramRpcThrottled(latched=True, detail="open"), "circuit_open", None),
     ],
 )
-async def test_expected_failures_preserve_snapshot_and_schedule_retry(
+async def test_expected_failures_preserve_snapshot_and_retry_state(
     tmp_path: Path,
     error: Exception,
     outcome: str,
-    retry: int,
+    expected_retry_at: int | None,
 ) -> None:
     conn, repository = _db(tmp_path)
     repository.replace_snapshot(_snapshot(), ((1, 10),), completed_at=90)
@@ -180,20 +180,17 @@ async def test_expected_failures_preserve_snapshot_and_schedule_retry(
     try:
         await worker.prime()
         assert repository.read_last_outcome() == outcome
-        assert repository.read_next_retry_at() == 160
+        assert repository.read_next_retry_at() == expected_retry_at
         assert repository.read_last_success_at() == 90
-        assert retry == 60
+        assert worker._next_due_at == expected_retry_at  # type: ignore[attr-defined]
     finally:
         conn.close()
 
 
 @pytest.mark.asyncio
 async def test_flood_wait_uses_requested_delay_without_same_cycle_retry(tmp_path: Path) -> None:
-    class FloodWaitError(RuntimeError):
-        seconds = 1_200
-
     conn, repository = _db(tmp_path)
-    gateway = _Gateway(FloodWaitError())
+    gateway = _Gateway(TelegramRpcThrottled(retry_after_seconds=1_200))
     worker = _worker(gateway, repository, now=[100.0])
     try:
         await worker.prime()

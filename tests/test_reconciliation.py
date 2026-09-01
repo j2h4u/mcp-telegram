@@ -17,7 +17,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from telethon.errors import (
     ChannelPrivateError,
-    FloodWaitError,
     PeerIdInvalidError,
 )
 
@@ -25,6 +24,7 @@ from mcp_telegram.dialog_sync import (
     DialogReconciliationWorker,
     run_reconciliation_loop,
 )
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
@@ -171,14 +171,8 @@ def _async_iter(items: list[object]):
     return _gen()
 
 
-def _make_flood(seconds: int) -> FloodWaitError:
-    """Construct a real FloodWaitError instance (mirrors tests/test_dialog_sync.py:228).
-
-    FloodWaitError is a BaseException subclass — Python's `raise` requires a
-    real instance, so MagicMock(spec=FloodWaitError) does NOT work here.
-    Use `capture=N` to set the .seconds attribute via Telethon's own ctor.
-    """
-    return FloodWaitError(request=None, capture=seconds)  # type: ignore[call-arg]
+def _make_flood(seconds: int) -> TelegramRpcThrottled:
+    return TelegramRpcThrottled(retry_after_seconds=seconds)
 
 
 # --- light pass tests -------------------------------------------------------
@@ -336,7 +330,8 @@ async def test_recon_light_pass_access_lost_sets_hidden(
     _seed_dialog_row(sync_db, 100, needs_refresh=1)
     _seed_synced_dialog(sync_db, 100, status="syncing")
 
-    # ChannelPrivateError takes the same Telethon-error kwargs as FloodWaitError.
+    # ChannelPrivateError takes the same Telethon-error constructor shape as the
+    # vendor throttling errors handled by TelegramRpcGate.
     mock_client.get_entity.side_effect = ChannelPrivateError(request=None)
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)

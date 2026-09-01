@@ -7,10 +7,11 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Protocol, cast
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
-from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
+from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetDialogFiltersRequest  # type: ignore[import-untyped]
 from telethon.tl.types import Channel, Chat, DialogFilter, DialogFilterChatlist, User  # type: ignore[import-untyped]
 
+from ..flood import TelegramRpcThrottled
 from .contracts import DialogCategory, DialogFacts, FolderRule, FolderSourceSnapshot, FolderSourceUnavailableError
 from .ports import TelegramFolderGateway
 
@@ -106,7 +107,7 @@ class TelethonTelegramFolderGateway(TelegramFolderGateway):
         try:
             response = await self._client(GetDialogFiltersRequest())
             raw_dialogs = [dialog async for dialog in self._client.iter_dialogs()]
-        except FloodWaitError:
+        except TelegramRpcThrottled:
             raise
         except (RPCError, TimeoutError, OSError) as exc:
             raise FolderSourceUnavailableError("Telegram folder source is unavailable") from exc

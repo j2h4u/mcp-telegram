@@ -9,7 +9,7 @@ default:
     @just --list
 
 # Run all local source checks.
-check: fmt-check lint complexity-ratchet lock-check typecheck typecheck-pyright typecheck-tests module-boundaries semantic-boundaries message-boundaries config-imports policy-placement runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
+check: fmt-check lint complexity-ratchet lock-check typecheck typecheck-pyright typecheck-tests module-boundaries semantic-boundaries message-boundaries telegram-rpc-boundaries config-imports policy-placement runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
 
 # Verify uv.lock is synchronized with pyproject.toml.
 lock-check:
@@ -50,6 +50,10 @@ semantic-boundaries:
 # Keep message-table reads and agent-facing Telegram content at reviewed owners.
 message-boundaries:
     uv run python scripts/check_message_boundaries.py
+
+# Keep Telethon flood taxonomy owned by TelegramRpcGate.
+telegram-rpc-boundaries:
+    uv run python scripts/check_telegram_rpc_boundaries.py
 
 # Keep direct runtime-config reads at the daemon, CLI, and transport entrypoints.
 config-imports:

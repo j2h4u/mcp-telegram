@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
-from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
+from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.errors.rpcbaseerrors import BadRequestError  # type: ignore[import-untyped]
 from telethon.errors.rpcerrorlist import (  # type: ignore[import-untyped]
     MessageIdInvalidError,
@@ -19,13 +19,13 @@ from telethon.errors.rpcerrorlist import (  # type: ignore[import-untyped]
 from mcp_telegram.access_lifecycle import restore_access_after_revalidation, set_access_lost
 from mcp_telegram.config import FactHydrationConfig
 from mcp_telegram.fact_hydration import MessageFactHydrationWorker
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.history_enrollment import disable_history, enable_history
 from mcp_telegram.hydration_queue import HydrationPriority, HydrationQueueRepository
 from mcp_telegram.media_hydration import MediaFactHydrationHandler
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.messages.sqlite_repository import insert_messages_with_fts
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-from mcp_telegram.telegram_rpc import TelegramRpcCircuitOpenError
 from mcp_telegram.transcription_hydration import TranscriptionHydrationHandler
 
 
@@ -331,57 +331,47 @@ async def test_transient_retries_then_caps_after_durable_attempts(db: sqlite3.Co
 @pytest.mark.asyncio
 async def test_flood_wait_stops_without_sleep_and_reschedules(db: sqlite3.Connection) -> None:
     _seed(db)
-    client = _Client(error=FloodWaitError(request=None, capture=7))
+    client = _Client(error=TelegramRpcThrottled(retry_after_seconds=7))
     result = await _worker(db, client).run_cycle(now=1)
     assert result.stopped
     assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 8)
 
 
 @pytest.mark.asyncio
-async def test_flood_wait_uses_pure_extractor_without_observation(
-    monkeypatch: pytest.MonkeyPatch, db: sqlite3.Connection
-) -> None:
+async def test_flood_wait_uses_owned_retry_duration_without_observation(db: sqlite3.Connection) -> None:
     _seed(db)
-    client = _Client(error=FloodWaitError(request=None, capture=7))
-    extracted: list[BaseException] = []
-
-    def _extract(exc: BaseException, *, default: int = 60) -> int:
-        extracted.append(exc)
-        return 13
-
-    monkeypatch.setattr("mcp_telegram.fact_hydration.flood_seconds", _extract)
+    client = _Client(error=TelegramRpcThrottled(retry_after_seconds=7))
     result = await _worker(db, client).run_cycle(now=1)
 
     assert result.stopped
-    assert extracted == [client.error]
-    assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 14)
+    assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 8)
 
 
 @pytest.mark.asyncio
-async def test_circuit_open_stops_without_sleep_and_uses_circuit_delay(db: sqlite3.Connection) -> None:
+async def test_circuit_open_stops_without_sleep_and_keeps_jobs_paused(db: sqlite3.Connection) -> None:
     _seed(db)
-    client = _Client(error=TelegramRpcCircuitOpenError("closed"))
+    client = _Client(error=TelegramRpcThrottled(latched=True, detail="closed"))
     policy = FactHydrationConfig(circuit_retry_seconds=20, pause_between_requests_seconds=0.01)
     result = await _worker(db, client, policy).run_cycle(now=1)
     assert result.stopped
-    assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 21)
+    assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 1)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["flood", "circuit"])
 async def test_multi_job_flood_or_circuit_failure_stops_cycle(failure: str, db: sqlite3.Connection) -> None:
-    """A governed failure reschedules the whole batch and prevents later RPCs."""
+    """A finite throttle reschedules the batch; a latched throttle pauses it."""
     for message_id in (1, 2):
         _seed(db, dialog_id=1, message_id=message_id)
     _seed(db, dialog_id=2, message_id=1)
     error: BaseException
     retry_at: int
     if failure == "flood":
-        error = FloodWaitError(request=None, capture=7)
+        error = TelegramRpcThrottled(retry_after_seconds=7)
         retry_at = 8
     else:
-        error = TelegramRpcCircuitOpenError("closed")
-        retry_at = 21
+        error = TelegramRpcThrottled(latched=True, detail="closed")
+        retry_at = 1
     client = _Client(error=error)
     policy = FactHydrationConfig(
         batch_size=2,
@@ -796,7 +786,7 @@ async def test_foreground_batches_exhaust_before_backfill_floodwait(
 
         async def __call__(self, request: object, **kwargs: object) -> object:
             self.calls.append({"request": request, **kwargs})
-            raise FloodWaitError(request=None, capture=7)
+            raise TelegramRpcThrottled(retry_after_seconds=7)
 
     client = _ForegroundThenFloodClient()
     policy = FactHydrationConfig(
@@ -821,7 +811,7 @@ async def test_early_stop_logs_later_kind_as_selected_without_request(
     db.execute("UPDATE hydration_jobs SET priority = 1")
     _seed_voice(db, dialog_id=2)
     db.commit()
-    client = _Client(error=FloodWaitError(request=None, capture=7))
+    client = _Client(error=TelegramRpcThrottled(retry_after_seconds=7))
     policy = FactHydrationConfig(
         batch_size=1, max_jobs_per_cycle=2, max_requests_per_cycle=3, pause_between_requests_seconds=0.01
     )
@@ -1067,7 +1057,7 @@ async def test_transcription_permanent_error_is_terminal_without_churn(db: sqlit
 @pytest.mark.asyncio
 async def test_transcription_floodwait_stops_and_reschedules(db: sqlite3.Connection) -> None:
     _seed_voice(db)
-    client = _Client(error=FloodWaitError(request=None, capture=7))
+    client = _Client(error=TelegramRpcThrottled(retry_after_seconds=7))
 
     result = await _transcription_worker(db, client).run_cycle(now=10)
 
@@ -1076,15 +1066,15 @@ async def test_transcription_floodwait_stops_and_reschedules(db: sqlite3.Connect
 
 
 @pytest.mark.asyncio
-async def test_transcription_circuit_open_stops_and_reschedules(db: sqlite3.Connection) -> None:
+async def test_transcription_circuit_open_stops_and_keeps_job_paused(db: sqlite3.Connection) -> None:
     _seed_voice(db)
-    client = _Client(error=TelegramRpcCircuitOpenError("open"))
+    client = _Client(error=TelegramRpcThrottled(latched=True, detail="open"))
     policy = FactHydrationConfig(circuit_retry_seconds=31, pause_between_requests_seconds=0.01)
 
     result = await _transcription_worker(db, client, policy).run_cycle(now=10)
 
     assert result.stopped
-    assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 41)
+    assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 1)
 
 
 @pytest.mark.asyncio

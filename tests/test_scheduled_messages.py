@@ -12,11 +12,12 @@ from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
-from telethon.errors import ChannelPrivateError, FloodWaitError
+from telethon.errors import ChannelPrivateError
 from telethon.tl.types import PeerUser
 
 from mcp_telegram.activity_peer_resolve import LinkedChatResolution
 from mcp_telegram.event_handlers import EventHandlerManager, _NewMessageEvent
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.own_only import OwnOnlyContext, query_own_only_candidates
 from mcp_telegram.scheduled_messages import (
     ScheduledMessageReconciler,
@@ -168,7 +169,7 @@ async def test_reconciliation_floodwait_records_retry_and_stops_account_pass(con
     )
     upsert_scheduled_message(conn, 42, _message(11), now=100)
     conn.commit()
-    client = _ScheduledSnapshotClient(call_error=FloodWaitError(None, 30))
+    client = _ScheduledSnapshotClient(call_error=TelegramRpcThrottled(retry_after_seconds=30))
     worker = ScheduledMessageReconciler(client, conn, asyncio.Event())
 
     assert await worker.run_once() == 0
@@ -176,7 +177,7 @@ async def test_reconciliation_floodwait_records_retry_and_stops_account_pass(con
         "SELECT next_retry_at, last_error FROM scheduled_sync_state WHERE key='account'"
     ).fetchone()
     assert retry_at is not None and retry_at >= 30
-    assert error == "FloodWaitError"
+    assert error == "TelegramRpcThrottled"
     assert len(client.requests) == 1
     assert client.requests[0][1] == {}
 

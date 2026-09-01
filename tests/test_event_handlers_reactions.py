@@ -25,7 +25,6 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     PeerChannel,
     PeerUser,
@@ -37,6 +36,7 @@ from mcp_telegram.event_handlers import (
     _EditedMessageEvent,
     _RawReactionUpdate,
 )
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
@@ -333,13 +333,13 @@ async def test_on_raw_reaction_update_floodwait_logs_and_skips(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """AC-6 supporting: FloodWaitError -> no DB mutation, warning logged."""
+    """AC-6 supporting: TelegramRpcThrottled -> no DB mutation, warning logged."""
     dialog_id = 268071163
     _enroll(sync_db, dialog_id)
     _insert_msg(sync_db, dialog_id, 900, text="hi")
     _insert_reaction(sync_db, dialog_id, 900, "👍", 2)
 
-    mock_client.get_messages = AsyncMock(side_effect=FloodWaitError(request=None, capture=60))
+    mock_client.get_messages = AsyncMock(side_effect=TelegramRpcThrottled(retry_after_seconds=60))
 
     update = cast(_RawReactionUpdate, SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=900))
 

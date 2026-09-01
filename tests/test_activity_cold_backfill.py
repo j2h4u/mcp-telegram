@@ -143,7 +143,7 @@ def _access_skip_result() -> SweepResult:
 
 
 def _flood_result(seconds: int) -> SweepResult:
-    """FloodWaitError surfaced during the sweep."""
+    """TelegramRpcThrottled surfaced during the sweep."""
     return SweepResult(
         fetched_ids=[],
         persisted=0,

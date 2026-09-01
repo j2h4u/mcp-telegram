@@ -37,6 +37,7 @@ from .activity_peer_sweep import (
     sweep_peer_once,
 )
 from .activity_substrate import ActivityClient
+from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
 
 logger = logging.getLogger(__name__)
@@ -141,6 +142,12 @@ async def _run_cold_backfill_pass_safe(
 ) -> ColdPassResult:
     try:
         return await run_cold_backfill_pass(client, conn, shutdown_event, pacing=pacing, timeout_s=timeout_s)
+    except TelegramRpcThrottled as exc:
+        _raise_if_latched(exc)
+        logger.warning("activity_cold_backfill_throttled retry_after=%s", exc.retry_after_seconds)
+        return ColdPassResult(
+            outcome=ColdPassOutcome.FLOOD_WAIT, persisted=0, flood_wait_seconds=exc.retry_after_seconds
+        )
     except Exception:
         logger.warning("activity_cold_backfill_error", exc_info=True)
         # Treat as NO_DUE_PEER for sleep purposes to avoid tight error loops.
@@ -179,6 +186,10 @@ async def _maybe_enroll_activity_peers(
         result = await build_working_set(client, conn, timeout_s=timeout_s)
         logger.debug("activity_cold_backfill_enroll enrolled=%d", result.enrolled_count)
         return asyncio.get_running_loop().time(), result.flood_wait_seconds
+    except TelegramRpcThrottled as exc:
+        _raise_if_latched(exc)
+        logger.warning("activity_cold_backfill_enroll_throttled retry_after=%s", exc.retry_after_seconds)
+        return asyncio.get_running_loop().time(), exc.retry_after_seconds
     except Exception:
         logger.warning("activity_cold_backfill_enroll_error", exc_info=True)
     return asyncio.get_running_loop().time(), None

@@ -12,7 +12,7 @@ Covers:
       NOT write linked_chat_id into detail_json, normalizes to -100… form.
   (e) A channel with no linked chat returns
       LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None).
-  (f) When GetFullChannel raises FloodWaitError(seconds=N), the resolver
+  (f) When GetFullChannel raises TelegramRpcThrottled(seconds=N), the resolver
       returns LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=N)
       WITHOUT sleeping, WITHOUT raising, and WITHOUT touching dialogs.
 """
@@ -395,19 +395,19 @@ async def test_resolve_linked_chat_id_no_discussion_group():
 
 
 # ---------------------------------------------------------------------------
-# (f) FloodWaitError → returns flood_wait_seconds, no sleep, no raise
+# (f) TelegramRpcThrottled → returns flood_wait_seconds, no sleep, no raise
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_resolve_linked_chat_id_flood_wait_no_sleep():
-    """FloodWaitError returns flood_wait_seconds set, does NOT sleep, does NOT raise."""
-    from telethon.errors import FloodWaitError
+    """TelegramRpcThrottled returns flood_wait_seconds set, does NOT sleep, does NOT raise."""
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     channel_id = -100200000005
 
     with _make_db() as conn:
-        flood_error = FloodWaitError(request=None, capture=120)
+        flood_error = TelegramRpcThrottled(retry_after_seconds=120)
         client = _FakeClient(
             input_entity=object(),
             full_channel_error=flood_error,
@@ -424,11 +424,11 @@ async def test_resolve_linked_chat_id_flood_wait_no_sleep():
 @pytest.mark.asyncio
 async def test_resolve_linked_chat_id_flood_wait_distinct_from_no_group():
     """FloodWait is distinguishable from 'no discussion group' by flood_wait_seconds field."""
-    from telethon.errors import FloodWaitError
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     with _make_db() as conn:
         channel_id = -100200000006
-        flood_error = FloodWaitError(request=None, capture=60)
+        flood_error = TelegramRpcThrottled(retry_after_seconds=60)
         client = _FakeClient(input_entity=object(), full_channel_error=flood_error)
 
         flood_result = await resolve_linked_chat_id(client, conn, channel_id)
@@ -631,9 +631,9 @@ async def test_resolve_linked_chat_id_schema_floor_passes_on_v24():
 
 @pytest.mark.asyncio
 async def test_resolve_linked_chat_id_flood_wait_leaves_dialogs_untouched():
-    """FloodWaitError must NOT touch dialogs; resolved_at stays NULL so the next
+    """TelegramRpcThrottled must NOT touch dialogs; resolved_at stays NULL so the next
     sweep pass retries naturally (D-08 contract)."""
-    from telethon.errors import FloodWaitError
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     channel_id = -1003333333333
 
@@ -645,7 +645,7 @@ async def test_resolve_linked_chat_id_flood_wait_leaves_dialogs_untouched():
             {"linked_chat_id": None, "linked_chat_resolved_at": None},
         )
 
-        flood_error = FloodWaitError(request=None, capture=42)
+        flood_error = TelegramRpcThrottled(retry_after_seconds=42)
         client = _FakeClient(
             input_entity=object(),
             full_channel_error=flood_error,

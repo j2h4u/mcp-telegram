@@ -17,9 +17,9 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.reading.query_records import read_message_from_row
 from mcp_telegram.reading.sqlite_projection import _FETCH_UNREAD_MESSAGES_SQL
 from mcp_telegram.tools.message_view import project_message_view
@@ -315,8 +315,7 @@ async def test_jit_floodwait_preserves_stale(make_synced_db: Callable[[], sqlite
     _seed_freshness(conn, dialog_id, ids, expired)
 
     client = _TestClient()
-    err = FloodWaitError(request=None)
-    err.seconds = 30
+    err = TelegramRpcThrottled(retry_after_seconds=60)
     client.get_messages = AsyncMock(side_effect=err)
     freshener = make_reaction_freshener(conn, client)
 

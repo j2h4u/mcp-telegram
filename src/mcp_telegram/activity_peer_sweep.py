@@ -32,6 +32,7 @@ from telethon.tl.types import TypeInputPeer
 from .access_lifecycle import set_access_lost
 from .activity_peer_resolve import LinkedChatResolution, resolve_input_peer, resolve_linked_chat_id
 from .activity_substrate import ActivityClient, call_with_timeout
+from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts, message_exists
@@ -93,7 +94,7 @@ class SkipReason(StrEnum):
     # A genuinely empty batch was returned by a REACHABLE peer. Tier B may
     # set cold_status='complete' ONLY for this reason.
     FLOOD_WAIT = "flood_wait"
-    # FloodWaitError surfaced. The caller owns the durable backoff write.
+    # TelegramRpcThrottled surfaced. The caller owns the durable backoff write.
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +172,10 @@ async def _resolve_peer_for_sweep(request: PeerSweepRequest) -> TypeInputPeer | 
     """Resolve one peer while preserving the governed-RPC error boundary."""
     try:
         return await resolve_input_peer(request.client, request.dialog_id)
+    except TelegramRpcThrottled as exc:
+        _raise_if_latched(exc)
+        logger.warning("sweep_peer_once_resolution_throttled dialog_id=%r", request.dialog_id)
+        return _access_skip_result(rpc_calls=1)
     except Exception:
         logger.warning("sweep_peer_once_resolution_error dialog_id=%r", request.dialog_id, exc_info=True)
         return _access_skip_result(rpc_calls=1)
@@ -288,7 +293,6 @@ def _flood_wait_result(seconds: int, *, rpc_calls: int = 0) -> SweepResult:
 
 
 async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, *, rpc_calls: int) -> _SearchOutcome:
-    from telethon.errors import FloodWaitError
     from telethon.tl.functions.messages import SearchRequest
     from telethon.tl.types import InputMessagesFilterEmpty, InputPeerSelf
 
@@ -312,17 +316,19 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, 
             ),
             timeout_s=request.timeout_s,
         )
-    except FloodWaitError as exc:
+    except TelegramRpcThrottled as exc:
+        _raise_if_latched(exc)
+        assert exc.retry_after_seconds is not None
         logger.warning(
-            "sweep_peer_once_flood dialog_id=%r flood_wait_seconds=%d rpc_duration_s=%.3f",
+            "sweep_peer_once_flood dialog_id=%r flood_wait_seconds=%s rpc_duration_s=%.3f",
             request.dialog_id,
-            exc.seconds,
+            exc.retry_after_seconds,
             _elapsed_s(search_started_at),
         )
         return _SearchOutcome(
             result=None,
             rpc_duration_s=_elapsed_s(search_started_at),
-            early_result=_flood_wait_result(int(exc.seconds), rpc_calls=rpc_calls),
+            early_result=_flood_wait_result(exc.retry_after_seconds, rpc_calls=rpc_calls),
         )
     except TimeoutError:
         logger.warning(
@@ -379,9 +385,10 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
       - HotSweep (plan 03) reads max_id (forward/newest-side cursor).
       - ColdBackfill (plan 04) reads min_id (backward cursor).
 
-    FloodWait-neutral: on FloodWaitError the function returns immediately with
-    skip_reason=FLOOD_WAIT and flood_wait_seconds set — it does NOT sleep.
-    The owning scheduler sets the per-tier *_next_retry_at.
+    Finite throttling returns immediately with skip_reason=FLOOD_WAIT and
+    flood_wait_seconds set — it does NOT sleep; the owning scheduler sets the
+    per-tier *_next_retry_at. A latched throttle propagates to stop account-wide
+    work and never creates per-tier retry state.
 
     TimeoutError (wedged RPC): treated as ACCESS_SKIP — a transient fault,
     not history-floor completion.
@@ -656,7 +663,7 @@ async def build_working_set(
         if res.flood_wait_seconds is not None:
             logger.warning(
                 "build_working_set_channel_flood channel_id=%r flood_wait_seconds=%d"
-                " — halting resolution pass (FloodWait from GetFullChannelRequest is"
+                " — halting resolution pass (Telegram throttling from GetFullChannelRequest is"
                 " account-global; remaining channels stay due for next sweep cycle)",
                 channel_id,
                 res.flood_wait_seconds,

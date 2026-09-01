@@ -272,7 +272,7 @@ class TestDialogsBootstrapWorker:
 
     @pytest.mark.asyncio
     async def test_floodwait_mid_sweep_checkpoints_and_returns_partial(self, db_path: Path) -> None:
-        from telethon.errors import FloodWaitError
+        from mcp_telegram.flood import TelegramRpcThrottled
 
         dialogs_before_flood = [
             _make_dialog(11, _make_user_entity(11, first_name="A")),
@@ -282,7 +282,7 @@ class TestDialogsBootstrapWorker:
         async def flooding_gen(items: Sequence[object]) -> AsyncIterator[object]:
             for it in items:
                 yield it
-            raise FloodWaitError(request=None, capture=2)  # type: ignore[call-arg]
+            raise TelegramRpcThrottled(retry_after_seconds=2)
 
         client = MagicMock()
         client.iter_dialogs = MagicMock(side_effect=lambda **kw: flooding_gen(dialogs_before_flood))
@@ -518,12 +518,12 @@ class TestDialogsBootstrapWorker:
     @pytest.mark.asyncio
     async def test_floodwait_sleep_is_interruptible(self, db_path: Path) -> None:
         # D-13: shutdown_event wakes the worker before the full FloodWait elapses.
-        from telethon.errors import FloodWaitError
+        from mcp_telegram.flood import TelegramRpcThrottled
 
         async def slow_flooding_gen(items: Sequence[object]) -> AsyncIterator[object]:
             for it in items:
                 yield it
-            raise FloodWaitError(request=None, capture=120)  # type: ignore[call-arg]
+            raise TelegramRpcThrottled(retry_after_seconds=120)
 
         client = MagicMock()
         client.iter_dialogs = MagicMock(
@@ -539,7 +539,7 @@ class TestDialogsBootstrapWorker:
         start = time.monotonic()
         await asyncio.gather(worker.run(), trip_shutdown())
         elapsed = time.monotonic() - start
-        # If sleep were uninterruptible the FloodWaitError of 120s would block.
+        # If sleep were uninterruptible the throttling wait of 120s would block.
         assert elapsed < 5.0
 
     @pytest.mark.asyncio
