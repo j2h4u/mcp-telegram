@@ -110,6 +110,31 @@ def _table_info(conn: sqlite3.Connection, table: str) -> list[TableInfoRow]:
     return cast(list[TableInfoRow], _fetchall_rows(conn, f"PRAGMA table_info({table})"))
 
 
+def _downgrade_media_tables_to_v43(conn: sqlite3.Connection) -> None:
+    """Recreate current media tables with the pre-v44 kind CHECK for upgrade tests."""
+    index_rows = _fetchall_rows(
+        conn,
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL "
+        "AND tbl_name IN ('messages', 'scheduled_messages')",
+    )
+    index_sql = [str(row[0]) for row in index_rows]
+    for table in ("messages", "scheduled_messages"):
+        table_sql_row = _fetchone_row(conn, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,))
+        assert table_sql_row is not None
+        table_sql = str(table_sql_row[0])
+        v43_sql = table_sql.replace("'custom_emoji', ", "")
+        assert v43_sql != table_sql
+        columns = [str(row[1]) for row in _table_info(conn, table)]
+        column_list = ", ".join(columns)
+        old_table = f"{table}_v44"
+        conn.execute(f"ALTER TABLE {table} RENAME TO {old_table}")
+        conn.execute(v43_sql)
+        conn.execute(f"INSERT INTO {table} ({column_list}) SELECT {column_list} FROM {old_table}")
+        conn.execute(f"DROP TABLE {old_table}")
+    for statement in index_sql:
+        conn.execute(statement)
+
+
 def test_migration_v11_creates_freshness_table(db_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
@@ -264,6 +289,84 @@ def test_migration_v37_rebuilds_media_tables_without_legacy_description(db_path:
             ("media_metadata", 1, 1, 0, 1700000000),
             ("media_metadata", 1, 3, 0, 1700000001),
         ]
+
+
+def test_migration_v44_accepts_custom_emoji_and_preserves_media_artifacts(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+            "VALUES (1, 1, 1700000000, 'ordinary', 'document', '{\"size\":4}')"
+        )
+        conn.execute(
+            "INSERT INTO scheduled_messages(dialog_id, message_id, scheduled_at, text, media_kind, media_payload, "
+            "first_seen_at, updated_at) VALUES (1, 2, 1700000100, 'scheduled', 'document', '{\"size\":5}', 1, 1)"
+        )
+        conn.execute("INSERT INTO messages_fts(dialog_id, message_id, stemmed_text) VALUES (1, 1, 'ordinary')")
+        conn.execute(
+            "INSERT INTO scheduled_messages_fts(dialog_id, message_id, stemmed_text) VALUES (1, 2, 'scheduled')"
+        )
+        conn.execute(
+            "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at) VALUES ('media_metadata', 1, 1, 1)"
+        )
+        conn.execute("CREATE INDEX idx_messages_v44_probe ON messages(sender_id)")
+        conn.execute("CREATE INDEX idx_scheduled_messages_v44_probe ON scheduled_messages(sender_id)")
+
+        _downgrade_media_tables_to_v43(conn)
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
+                "VALUES (1, 3, 1700000001, 'custom_emoji', '{\"alt\":\"📊\"}')"
+            )
+        conn.execute("DELETE FROM schema_version WHERE version = 44")
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 44
+        assert conn.execute("SELECT media_kind, media_payload FROM messages WHERE message_id = 1").fetchone() == (
+            "document",
+            '{"size":4}',
+        )
+        assert conn.execute(
+            "SELECT media_kind, media_payload FROM scheduled_messages WHERE message_id = 2"
+        ).fetchone() == (
+            "document",
+            '{"size":5}',
+        )
+        assert conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone() == (1,)
+        assert conn.execute("SELECT COUNT(*) FROM scheduled_messages_fts").fetchone() == (1,)
+        assert conn.execute("SELECT kind, dialog_id, message_id FROM hydration_jobs").fetchone() == (
+            "media_metadata",
+            1,
+            1,
+        )
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN "
+            "('idx_messages_dialog_sent', 'idx_messages_v44_probe', 'idx_scheduled_messages_v44_probe') "
+            "ORDER BY name"
+        ).fetchall() == [
+            ("idx_messages_dialog_sent",),
+            ("idx_messages_v44_probe",),
+            ("idx_scheduled_messages_v44_probe",),
+        ]
+        conn.execute(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
+            "VALUES (1, 3, 1700000001, 'custom_emoji', '{\"alt\":\"📊\"}')"
+        )
+        conn.execute(
+            "INSERT INTO scheduled_messages(dialog_id, message_id, scheduled_at, media_kind, media_payload, "
+            "first_seen_at, updated_at) VALUES (1, 4, 1700000101, 'custom_emoji', '{\"alt\":\"📊\"}', 1, 1)"
+        )
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 44
+        assert conn.execute("SELECT media_kind FROM messages WHERE message_id = 3").fetchone() == ("custom_emoji",)
+        assert conn.execute("SELECT media_kind FROM scheduled_messages WHERE message_id = 4").fetchone() == (
+            "custom_emoji",
+        )
 
 
 def test_v40_creates_prioritized_hydration_queue_and_due_index(tmp_path: Path) -> None:
@@ -585,7 +688,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 43
+        assert _CURRENT_SCHEMA_VERSION == 44
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1316,7 +1419,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 43
+        assert _CURRENT_SCHEMA_VERSION == 44
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:

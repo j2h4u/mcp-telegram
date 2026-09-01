@@ -13,7 +13,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 43
+_CURRENT_SCHEMA_VERSION = 44
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -1520,7 +1520,7 @@ def _apply_migration_36(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
-_MEDIA_KIND_CHECK = "'photo', 'video', 'audio', 'voice', 'document', 'animation', 'sticker', 'poll', 'location', 'venue', 'contact', 'link_preview', 'game', 'invoice', 'dice', 'story', 'other'"
+_MEDIA_KIND_CHECK = "'photo', 'video', 'audio', 'voice', 'document', 'animation', 'sticker', 'custom_emoji', 'poll', 'location', 'venue', 'contact', 'link_preview', 'game', 'invoice', 'dice', 'story', 'other'"
 
 
 def _apply_migration_37(conn: sqlite3.Connection, current: int) -> int:
@@ -1741,6 +1741,120 @@ def _apply_migration_43(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_44(conn: sqlite3.Connection, current: int) -> int:
+    """Allow custom-emoji facts in the canonical message tables.
+
+    SQLite cannot alter a CHECK constraint in place. Rebuild only the two
+    media-bearing tables, carrying every row across and recreating all
+    ordinary indexes captured before the swap. FTS tables and hydration jobs
+    are separate tables and are intentionally left untouched.
+    """
+    index_rows = cast(
+        list[tuple[str, str]],
+        conn.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'index' AND sql IS NOT NULL "
+            "AND tbl_name IN ('messages', 'scheduled_messages')"
+        ).fetchall(),
+    )
+    index_stmts = [sql for _name, sql in index_rows]
+    return _apply_migration(
+        conn,
+        current,
+        44,
+        [
+            "ALTER TABLE messages RENAME TO messages_v43",
+            f"""CREATE TABLE messages_v44 (
+    dialog_id           INTEGER NOT NULL,
+    message_id          INTEGER NOT NULL,
+    sent_at             INTEGER NOT NULL,
+    text                TEXT,
+    sender_id           INTEGER,
+    sender_first_name   TEXT,
+    media_kind          TEXT CHECK (media_kind IN ({_MEDIA_KIND_CHECK})),
+    media_payload       TEXT CHECK (media_payload IS NULL OR (json_valid(media_payload) AND json_type(media_payload) = 'object')),
+    reply_to_msg_id     INTEGER,
+    forum_topic_id      INTEGER,
+    edit_date           INTEGER,
+    grouped_id          INTEGER,
+    reply_to_peer_id    INTEGER,
+    out                 INTEGER NOT NULL DEFAULT 0,
+    is_service          INTEGER NOT NULL DEFAULT 0,
+    post_author         TEXT,
+    reply_count         INTEGER NOT NULL DEFAULT 0,
+    is_deleted          INTEGER NOT NULL DEFAULT 0,
+    deleted_at          INTEGER,
+    PRIMARY KEY (dialog_id, message_id),
+    CHECK ((media_kind IS NULL AND media_payload IS NULL) OR (media_kind IS NOT NULL AND media_payload IS NOT NULL))
+) WITHOUT ROWID""",
+            """INSERT INTO messages_v44 (
+    dialog_id, message_id, sent_at, text, sender_id, sender_first_name,
+    media_kind, media_payload, reply_to_msg_id, forum_topic_id, edit_date,
+    grouped_id, reply_to_peer_id, out, is_service, post_author, reply_count,
+    is_deleted, deleted_at
+)
+SELECT dialog_id, message_id, sent_at, text, sender_id, sender_first_name,
+       media_kind, media_payload, reply_to_msg_id, forum_topic_id, edit_date,
+       grouped_id, reply_to_peer_id, out, is_service, post_author, reply_count,
+       is_deleted, deleted_at
+FROM messages_v43""",
+            "DROP TABLE messages_v43",
+            "ALTER TABLE messages_v44 RENAME TO messages",
+            "ALTER TABLE scheduled_messages RENAME TO scheduled_messages_v43",
+            f"""CREATE TABLE scheduled_messages_v44 (
+    dialog_id                   INTEGER NOT NULL,
+    message_id                  INTEGER NOT NULL,
+    scheduled_at                INTEGER,
+    text                        TEXT,
+    sender_id                   INTEGER,
+    sender_first_name           TEXT,
+    media_kind                  TEXT CHECK (media_kind IN ({_MEDIA_KIND_CHECK})),
+    media_payload               TEXT CHECK (media_payload IS NULL OR (json_valid(media_payload) AND json_type(media_payload) = 'object')),
+    reply_to_msg_id             INTEGER,
+    forum_topic_id              INTEGER,
+    edit_date                   INTEGER,
+    grouped_id                  INTEGER,
+    reply_to_peer_id            INTEGER,
+    out                         INTEGER NOT NULL DEFAULT 1,
+    is_service                  INTEGER NOT NULL DEFAULT 0,
+    post_author                 TEXT,
+    schedule_repeat_period     INTEGER,
+    message_state               TEXT NOT NULL DEFAULT 'scheduled' CHECK (message_state IN ('scheduled', 'unknown_missing', 'cancelled', 'published')),
+    visibility                  TEXT NOT NULL DEFAULT 'author_only' CHECK (visibility IN ('author_only', 'chat_visible', 'unknown')),
+    unpublished                 INTEGER NOT NULL DEFAULT 1 CHECK (unpublished IN (0, 1)),
+    unseen                      INTEGER NOT NULL DEFAULT 1 CHECK (unseen IN (0, 1)),
+    publication_hint_message_id INTEGER,
+    published_message_id        INTEGER,
+    publication_verified_at    INTEGER,
+    published_at                INTEGER,
+    deleted_at                  INTEGER,
+    first_seen_at               INTEGER NOT NULL,
+    updated_at                  INTEGER NOT NULL,
+    PRIMARY KEY (dialog_id, message_id),
+    CHECK ((media_kind IS NULL AND media_payload IS NULL) OR (media_kind IS NOT NULL AND media_payload IS NOT NULL))
+) WITHOUT ROWID""",
+            """INSERT INTO scheduled_messages_v44 (
+    dialog_id, message_id, scheduled_at, text, sender_id, sender_first_name,
+    media_kind, media_payload, reply_to_msg_id, forum_topic_id, edit_date,
+    grouped_id, reply_to_peer_id, out, is_service, post_author,
+    schedule_repeat_period, message_state, visibility, unpublished, unseen,
+    publication_hint_message_id, published_message_id, publication_verified_at,
+    published_at, deleted_at, first_seen_at, updated_at
+)
+SELECT dialog_id, message_id, scheduled_at, text, sender_id, sender_first_name,
+       media_kind, media_payload, reply_to_msg_id, forum_topic_id, edit_date,
+       grouped_id, reply_to_peer_id, out, is_service, post_author,
+       schedule_repeat_period, message_state, visibility, unpublished, unseen,
+       publication_hint_message_id, published_message_id, publication_verified_at,
+       published_at, deleted_at, first_seen_at, updated_at
+FROM scheduled_messages_v43""",
+            "DROP TABLE scheduled_messages_v43",
+            "ALTER TABLE scheduled_messages_v44 RENAME TO scheduled_messages",
+            *index_stmts,
+        ],
+    )
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -1781,6 +1895,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_41(conn, current)
     current = _apply_migration_42(conn, current)
     current = _apply_migration_43(conn, current)
+    current = _apply_migration_44(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
