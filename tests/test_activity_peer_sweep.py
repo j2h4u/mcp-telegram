@@ -651,6 +651,50 @@ def test_sweep_peer_once_floodwait_does_not_invoke_pacing_sleep(monkeypatch: pyt
         )
 
 
+def test_sweep_peer_once_latched_throttling_propagates_without_retry_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A latched throttle stops account-wide work instead of becoming ACCESS_SKIP."""
+    from mcp_telegram.flood import TelegramRpcThrottled
+
+    with closing(_make_db()) as conn:
+        dialog_id = 445
+        enroll_activity_dialog(conn, dialog_id, "supergroup", last_activity_at=1000)
+
+        async def fake_resolve_input_peer(client: object, dialog_id: int) -> object:
+            del client, dialog_id
+            return object()
+
+        async def fake_call_with_timeout(client: object, request: object, *, timeout_s: float) -> object:
+            del client, request, timeout_s
+            raise TelegramRpcThrottled(latched=True, detail="account gate latched")
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
+
+        with pytest.raises(TelegramRpcThrottled, match="account gate latched"):
+            asyncio.run(
+                sweep_peer_once(
+                    client=_FakeClient(),
+                    conn=conn,
+                    dialog_id=dialog_id,
+                    offset_id=0,
+                    min_id=0,
+                    limit=50,
+                    timeout_s=_TEST_TIMEOUT_S,
+                )
+            )
+
+        state = cast(
+            tuple[int | None, int | None] | None,
+            conn.execute(
+                "SELECT hot_next_retry_at, cold_next_retry_at FROM activity_dialog_state WHERE dialog_id = ?",
+                (dialog_id,),
+            ).fetchone(),
+        )
+        assert state == (None, None)
+
+
 def test_sweep_peer_once_timeout_returns_access_skip(monkeypatch: pytest.MonkeyPatch) -> None:
     """TimeoutError is treated as ACCESS_SKIP, not history-floor completion."""
     with closing(_make_db()) as conn:

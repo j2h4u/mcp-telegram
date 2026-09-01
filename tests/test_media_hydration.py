@@ -348,19 +348,19 @@ async def test_flood_wait_uses_owned_retry_duration_without_observation(db: sqli
 
 
 @pytest.mark.asyncio
-async def test_circuit_open_stops_without_sleep_and_uses_circuit_delay(db: sqlite3.Connection) -> None:
+async def test_circuit_open_stops_without_sleep_and_keeps_jobs_paused(db: sqlite3.Connection) -> None:
     _seed(db)
     client = _Client(error=TelegramRpcThrottled(latched=True, detail="closed"))
     policy = FactHydrationConfig(circuit_retry_seconds=20, pause_between_requests_seconds=0.01)
     result = await _worker(db, client, policy).run_cycle(now=1)
     assert result.stopped
-    assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 21)
+    assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 1)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["flood", "circuit"])
 async def test_multi_job_flood_or_circuit_failure_stops_cycle(failure: str, db: sqlite3.Connection) -> None:
-    """A governed failure reschedules the whole batch and prevents later RPCs."""
+    """A finite throttle reschedules the batch; a latched throttle pauses it."""
     for message_id in (1, 2):
         _seed(db, dialog_id=1, message_id=message_id)
     _seed(db, dialog_id=2, message_id=1)
@@ -371,7 +371,7 @@ async def test_multi_job_flood_or_circuit_failure_stops_cycle(failure: str, db: 
         retry_at = 8
     else:
         error = TelegramRpcThrottled(latched=True, detail="closed")
-        retry_at = 21
+        retry_at = 1
     client = _Client(error=error)
     policy = FactHydrationConfig(
         batch_size=2,
@@ -1066,7 +1066,7 @@ async def test_transcription_floodwait_stops_and_reschedules(db: sqlite3.Connect
 
 
 @pytest.mark.asyncio
-async def test_transcription_circuit_open_stops_and_reschedules(db: sqlite3.Connection) -> None:
+async def test_transcription_circuit_open_stops_and_keeps_job_paused(db: sqlite3.Connection) -> None:
     _seed_voice(db)
     client = _Client(error=TelegramRpcThrottled(latched=True, detail="open"))
     policy = FactHydrationConfig(circuit_retry_seconds=31, pause_between_requests_seconds=0.01)
@@ -1074,7 +1074,7 @@ async def test_transcription_circuit_open_stops_and_reschedules(db: sqlite3.Conn
     result = await _transcription_worker(db, client, policy).run_cycle(now=10)
 
     assert result.stopped
-    assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 41)
+    assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 1)
 
 
 @pytest.mark.asyncio

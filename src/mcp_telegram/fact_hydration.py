@@ -242,7 +242,6 @@ class MessageFactHydrationWorker:
             raise ValueError("fact hydration max_requests_per_cycle must cover registered handler costs")
         self._interval_seconds = interval_seconds
         self._retry_delay_seconds = retry_delay_seconds
-        self._circuit_retry_seconds = circuit_retry_seconds
         self._max_attempts = max_attempts
         self._pause_between_requests_seconds = pause_between_requests_seconds
         self._clock = clock
@@ -484,23 +483,17 @@ class MessageFactHydrationWorker:
         preflight_observations: Sequence[HydrationDropObservation],
         effective_now: int,
     ) -> _BatchOutcome:
-        retried, dropped, drop_observations = self._reschedule_or_drop(
-            handler, started, effective_now + self._circuit_retry_seconds
-        )
         self._conn.commit()
         self._log_drops(batch, preflight_observations)
-        self._log_drops(started, drop_observations)
         logger.info(
-            "message_fact_hydration circuit_open kind=%s dialog_id=%d jobs=%d retry_s=%d",
+            "message_fact_hydration circuit_open kind=%s dialog_id=%d jobs=%d paused_until_reset=true",
             handler.kind,
             started[0].dialog_id,
             len(started),
-            self._circuit_retry_seconds,
         )
         return _BatchOutcome(
             requests=handler.request_cost,
-            retried=retried,
-            dropped=len(preflight_observations) + dropped,
+            dropped=len(preflight_observations),
             stopped=True,
         )
 

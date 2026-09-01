@@ -175,7 +175,7 @@ class FolderProjectionWorker:
 
     def _record_failure(self, result: FolderAttemptResult, requested_flood_wait: int | None) -> int | None:
         self._failure_count += 1
-        if result == FolderAttemptResult.UNEXPECTED:
+        if result in {FolderAttemptResult.CIRCUIT_OPEN, FolderAttemptResult.UNEXPECTED}:
             next_due_at = None
         else:
             retry_delay = self._retry_delay(self._failure_count)

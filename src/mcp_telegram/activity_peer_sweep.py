@@ -317,17 +317,8 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, 
             timeout_s=request.timeout_s,
         )
     except TelegramRpcThrottled as exc:
-        if exc.retry_after_seconds is None:
-            logger.info(
-                "sweep_peer_once_circuit_open dialog_id=%r rpc_duration_s=%.3f",
-                request.dialog_id,
-                _elapsed_s(search_started_at),
-            )
-            return _SearchOutcome(
-                result=None,
-                rpc_duration_s=_elapsed_s(search_started_at),
-                early_result=_access_skip_result(rpc_calls=rpc_calls),
-            )
+        _raise_if_latched(exc)
+        assert exc.retry_after_seconds is not None
         logger.warning(
             "sweep_peer_once_flood dialog_id=%r flood_wait_seconds=%s rpc_duration_s=%.3f",
             request.dialog_id,
@@ -394,9 +385,10 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
       - HotSweep (plan 03) reads max_id (forward/newest-side cursor).
       - ColdBackfill (plan 04) reads min_id (backward cursor).
 
-    Throttling-neutral: on TelegramRpcThrottled the function returns immediately with
-    skip_reason=FLOOD_WAIT and flood_wait_seconds set — it does NOT sleep.
-    The owning scheduler sets the per-tier *_next_retry_at.
+    Finite throttling returns immediately with skip_reason=FLOOD_WAIT and
+    flood_wait_seconds set — it does NOT sleep; the owning scheduler sets the
+    per-tier *_next_retry_at. A latched throttle propagates to stop account-wide
+    work and never creates per-tier retry state.
 
     TimeoutError (wedged RPC): treated as ACCESS_SKIP — a transient fault,
     not history-floor completion.
