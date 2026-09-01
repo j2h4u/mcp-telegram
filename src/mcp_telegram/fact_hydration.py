@@ -11,8 +11,6 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol
 
-from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
-
 from .access_lifecycle import set_access_lost
 from .flood import flood_seconds
 from .hydration_queue import (
@@ -25,7 +23,7 @@ from .hydration_queue import (
 )
 from .messages.sqlite_repository import repair_transcription_hydration_jobs
 from .telegram_access import ACCESS_LOST_ERRORS
-from .telegram_rpc import TelegramRpcCircuitOpenError
+from .telegram_rpc import FloodWaitErrors, TelegramRpcCircuitOpenError
 from .telegram_rpc_error import TelegramRpcErrorDescriptor, describe_telegram_rpc_error
 
 logger = logging.getLogger(__name__)
@@ -430,7 +428,7 @@ class MessageFactHydrationWorker:
             return _BatchOutcome(dropped=len(preflight_observations))
         try:
             result = await handler.request(self._client, started)
-        except FloodWaitError as exc:
+        except FloodWaitErrors as exc:
             return self._handle_flood_wait(handler, batch, started, preflight_observations, exc, effective_now)
         except TelegramRpcCircuitOpenError:
             return self._handle_circuit_open(handler, batch, started, preflight_observations, effective_now)
@@ -448,7 +446,7 @@ class MessageFactHydrationWorker:
         batch: Sequence[HydrationJob],
         started: Sequence[HydrationJob],
         preflight_observations: Sequence[HydrationDropObservation],
-        exc: FloodWaitError,
+        exc: BaseException,
         effective_now: int,
     ) -> _BatchOutcome:
         retry_delay = flood_seconds(exc)
