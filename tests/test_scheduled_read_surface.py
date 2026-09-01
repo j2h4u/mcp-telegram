@@ -193,7 +193,7 @@ def _create_scheduled_table(conn: sqlite3.Connection) -> None:
             text TEXT,
             sender_id INTEGER,
             sender_first_name TEXT,
-            media_kind TEXT CHECK (media_kind IN ('photo', 'video', 'audio', 'voice', 'document', 'animation', 'sticker', 'poll', 'location', 'venue', 'contact', 'link_preview', 'game', 'invoice', 'dice', 'story', 'other')),
+            media_kind TEXT CHECK (media_kind IN ('photo', 'video', 'audio', 'voice', 'document', 'animation', 'sticker', 'custom_emoji', 'poll', 'location', 'venue', 'contact', 'link_preview', 'game', 'invoice', 'dice', 'story', 'other')),
             media_payload TEXT CHECK (media_payload IS NULL OR (json_valid(media_payload) AND json_type(media_payload) = 'object')),
             reply_to_msg_id INTEGER,
             forum_topic_id INTEGER,

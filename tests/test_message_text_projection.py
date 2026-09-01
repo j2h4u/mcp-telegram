@@ -78,6 +78,17 @@ def test_frequent_media_enrichment_reaches_the_canonical_delivery_shape(
     )["media"] == {"type": media_kind, "description": expected_description}
 
 
+def test_custom_emoji_delivery_shape_is_schema_valid_and_not_generic() -> None:
+    content = project_message_content(
+        MessageSnapshot(text=None, media_kind="custom_emoji", media_payload='{"alt":"📊"}')
+    )
+
+    projected = serialize_message_content(content.text, content.media_description, content.kind, content.media_kind)
+
+    assert projected["media"] == {"type": "custom_emoji", "description": "[кастомный эмодзи: 📊]"}
+    validate(instance=projected["media"], schema=MEDIA_OUTPUT_SCHEMA)
+
+
 def test_delivery_serializer_uses_explicit_text_media_semantics() -> None:
     text_result = serialize_message_content("caption", "[photo]", "message_text")["content"]
     assert text_result is not None

@@ -70,6 +70,34 @@ def test_extractor_normalizes_telethon_document_and_unknown_media() -> None:
     assert extract_media_fact(None) is None
 
 
+def test_extractor_classifies_custom_emoji_before_generic_document() -> None:
+    custom_emoji = tl.DocumentAttributeCustomEmoji(alt="📊", stickerset=tl.InputStickerSetEmpty())
+    document = MagicMock(spec=tl.Document, size=128, mime_type="application/x-tgsticker")
+    document.attributes = [custom_emoji]
+    media = MagicMock(spec=tl.MessageMediaDocument, document=document)
+
+    fact = extract_media_fact(media)
+    assert fact is not None
+    assert fact == MediaFact("custom_emoji", {"size": 128, "alt": "📊"})
+    assert media_description(fact) == "[кастомный эмодзи: 📊]"
+    assert "stickerset" not in fact.payload
+
+
+def test_malformed_custom_emoji_attribute_falls_back_to_document() -> None:
+    custom_emoji = MagicMock(spec=tl.DocumentAttributeCustomEmoji, alt=None)
+    document = MagicMock(spec=tl.Document, size=128, mime_type="application/octet-stream")
+    document.attributes = [custom_emoji]
+    media = MagicMock(spec=tl.MessageMediaDocument, document=document)
+
+    assert extract_media_fact(media) == MediaFact("document", {"size": 128})
+
+
+def test_story_fact_keeps_telethon_story_item_id() -> None:
+    media = tl.MessageMediaStory(peer=tl.PeerUser(7), id=42)
+
+    assert extract_media_fact(media) == MediaFact("story", {"story_id": 42})
+
+
 def test_extractor_payload_is_json_safe_and_has_no_telethon_objects() -> None:
     media = MagicMock(spec=tl.MessageMediaContact, phone_number="+7700", first_name="A", last_name="B", user_id=9)
     fact = extract_media_fact(media)
