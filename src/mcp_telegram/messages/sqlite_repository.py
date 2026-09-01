@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from collections.abc import Sequence
@@ -345,8 +346,20 @@ def _remove_transcription_hydration_job(conn: sqlite3.Connection, dialog_id: int
 
 def _is_transcribable_media_pair(kind: object, payload: object) -> bool:
     """Apply the domain predicate to one projected SQLite media pair."""
+    if not isinstance(payload, str):
+        return False
+    try:
+        decoded_payload = cast(object, json.loads(payload))
+    except TypeError, ValueError, json.JSONDecodeError:
+        return False
+    if not isinstance(decoded_payload, dict):
+        return False
     fact = decode_media_fact(kind, payload)
-    return _is_canonical_media_pair(kind, payload, fact=fact) and is_transcribable_telegram_media(fact)
+    # ``decode_media_fact`` fails closed for unsupported JSON values by
+    # returning an empty payload.  Compare the decoded object to retain that
+    # fail-closed behavior (Python's json parser accepts NaN/Infinity while
+    # SQLite's json_valid does not).
+    return fact is not None and fact.payload == decoded_payload and is_transcribable_telegram_media(fact)
 
 
 def _is_canonical_media_pair(kind: object, payload: object, *, fact: MediaFact | None = None) -> bool:

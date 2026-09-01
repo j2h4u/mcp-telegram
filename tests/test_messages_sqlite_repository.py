@@ -286,7 +286,11 @@ def test_historical_transcription_repair_and_dialog_reconciliation_admit_voice_a
     ("media_kind", "media_payload"),
     [
         ("voice", "{}"),
+        ("voice", "{ }"),
         ("video", '{"round_message":true}'),
+        ("video", '{"round_message": true}'),
+        ("video", '{"duration":12, "round_message": true}'),
+        ("video", '{"round_message": true, "duration":12}'),
         ("video", '{"round_message":false}'),
         ("video", "{}"),
         ("video", '{"round_message":"true"}'),
@@ -294,6 +298,9 @@ def test_historical_transcription_repair_and_dialog_reconciliation_admit_voice_a
         ("audio", "{}"),
         ("other", "{}"),
         ("video", "not-json"),
+        ("voice", '{"duration":NaN}'),
+        ("video", "[]"),
+        ("video", "true"),
         ("voice", None),
         (None, None),
     ],
@@ -311,6 +318,23 @@ def test_sql_transcribable_media_predicate_matches_pair_adapter(
     sql_result = sql_row[0]
 
     assert bool(sql_result) is _is_transcribable_media_pair(media_kind, media_payload)
+
+
+def test_transcription_repair_accepts_noncanonical_json_and_preflight_stays_eligible(
+    conn: sqlite3.Connection,
+) -> None:
+    _make_hydration_eligible(conn)
+    conn.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+        "VALUES (42, 101, 101, NULL, 'video', '{\"duration\":12, \"round_message\": true}')"
+    )
+    conn.commit()
+
+    first = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=1)
+    assert (first.enqueued, first.has_more) == (1, False)
+    assert transcription_hydration_eligible(conn, 42, 101)
+    second = repair_transcription_hydration_jobs(conn, due_at=901, max_jobs=1)
+    assert (second.enqueued, second.has_more) == (0, False)
 
 
 @pytest.mark.parametrize(
