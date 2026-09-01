@@ -16,6 +16,7 @@ type MediaKind = Literal[
     "document",
     "animation",
     "sticker",
+    "custom_emoji",
     "poll",
     "location",
     "venue",
@@ -37,6 +38,7 @@ MEDIA_KINDS: frozenset[str] = frozenset(
         "document",
         "animation",
         "sticker",
+        "custom_emoji",
         "poll",
         "location",
         "venue",
@@ -149,7 +151,7 @@ def _describe_kind(kind: MediaKind, payload: Mapping[str, object]) -> str | None
     description: str | None
     if kind in {"video", "audio", "voice"}:
         description = _describe_duration_kind(kind, payload)
-    elif kind in {"document", "sticker"}:
+    elif kind in {"document", "sticker", "custom_emoji"}:
         description = _describe_document_kind(kind, payload)
     elif kind in {"poll", "location", "venue", "contact"}:
         description = _describe_place_kind(kind, payload)
@@ -179,6 +181,9 @@ def _describe_document_kind(kind: MediaKind, payload: Mapping[str, object]) -> s
     if kind == "document":
         name = payload.get("file_name")
         return f"[документ: {name}]" if name else "[документ]"
+    if kind == "custom_emoji":
+        alt = payload.get("alt")
+        return f"[кастомный эмодзи: {alt}]" if alt else "[кастомный эмодзи]"
     alt = payload.get("alt")
     set_name = payload.get("set_name")
     if alt and set_name:

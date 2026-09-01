@@ -19,6 +19,10 @@ def _number(value: object) -> int | float | None:
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
+def _integer(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def _text(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
@@ -77,7 +81,11 @@ def _extract_document(media: object) -> MediaFact:
         if audio is not None:
             return _audio_fact(audio, base, force_voice=True)
         return MediaFact("voice", base)
-    sticker_fact = _extract_sticker(attrs, base)
+    # Custom emoji is checked first because it is a specialized document
+    # attribute and must not be hidden by the generic document fallback.
+    sticker_fact = _extract_custom_emoji(attrs, base)
+    if sticker_fact is None:
+        sticker_fact = _extract_sticker(attrs, base)
     if sticker_fact is not None:
         return sticker_fact
     visual_fact = _extract_visual(document, attrs, base, wrapper_video=wrapper_video, wrapper_round=wrapper_round)
@@ -112,6 +120,19 @@ def _extract_sticker(attrs: Sequence[object], base: dict[str, object]) -> MediaF
     if set_name:
         base["set_name"] = set_name
     return MediaFact("sticker", base)
+
+
+def _extract_custom_emoji(attrs: Sequence[object], base: dict[str, object]) -> MediaFact | None:
+    custom_emoji = _first_attribute(attrs, tl.DocumentAttributeCustomEmoji)
+    if custom_emoji is None:
+        return None
+    # A custom-emoji attribute without its required textual alternative is
+    # malformed. Keep the pre-existing generic-document fallback in that case.
+    alt = _text(_attr(custom_emoji, "alt"))
+    if alt is None:
+        return None
+    base["alt"] = alt
+    return MediaFact("custom_emoji", base)
 
 
 def _extract_visual(
@@ -198,7 +219,10 @@ def _extract_rich_media(media: object) -> MediaFact | None:
     elif isinstance(media, tl.MessageMediaDice):
         fact = _dice_fact(media)
     elif isinstance(media, tl.MessageMediaStory):
-        story_id = _number(_attr(media, "story_id"))
+        # Telethon exposes the TL ``stories.StoryItem`` identifier as ``id``.
+        # Keep the canonical key explicit so it cannot be confused with the
+        # containing Telegram message id.
+        story_id = _integer(_attr(media, "id"))
         fact = MediaFact("story", {"story_id": story_id} if story_id is not None else {})
     return fact
 
