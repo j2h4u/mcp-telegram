@@ -318,12 +318,12 @@ def test_migration_v44_accepts_custom_emoji_and_preserves_media_artifacts(db_pat
                 "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
                 "VALUES (1, 3, 1700000001, 'custom_emoji', '{\"alt\":\"📊\"}')"
             )
-        conn.execute("DELETE FROM schema_version WHERE version = 44")
+        conn.execute("DELETE FROM schema_version WHERE version >= 44")
         conn.commit()
 
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 44
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 45
         assert conn.execute("SELECT media_kind, media_payload FROM messages WHERE message_id = 1").fetchone() == (
             "document",
             '{"size":4}',
@@ -362,7 +362,7 @@ def test_migration_v44_accepts_custom_emoji_and_preserves_media_artifacts(db_pat
 
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 44
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 45
         assert conn.execute("SELECT media_kind FROM messages WHERE message_id = 3").fetchone() == ("custom_emoji",)
         assert conn.execute("SELECT media_kind FROM scheduled_messages WHERE message_id = 4").fetchone() == (
             "custom_emoji",
@@ -394,10 +394,18 @@ def test_v40_creates_prioritized_hydration_queue_and_due_index(tmp_path: Path) -
             in str(due_index[0]).upper()
         )
         repair_index = _fetchone_row(
-            conn, "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_messages_voice_undeleted_sent'"
+            conn,
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_messages_transcribable_undeleted_sent'",
         )
         assert repair_index is not None
         assert "SENT_AT DESC, DIALOG_ID, MESSAGE_ID" in str(repair_index[0]).upper()
+        assert "ROUND_MESSAGE" in str(repair_index[0]).upper()
+        assert (
+            _fetchone_row(
+                conn, "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_voice_undeleted_sent'"
+            )
+            is None
+        )
 
 
 def test_v41_shape_seeds_voice_transcription_hydration_as_backfill(tmp_path: Path) -> None:
@@ -421,7 +429,7 @@ def test_v41_shape_seeds_voice_transcription_hydration_as_backfill(tmp_path: Pat
             "VALUES ('media_metadata', 91, 99, 1200, 2, 1, 1199)"
         )
         conn.execute("DROP INDEX idx_hydration_jobs_schedule")
-        conn.execute("DROP INDEX idx_messages_voice_undeleted_sent")
+        conn.execute("DROP INDEX idx_messages_transcribable_undeleted_sent")
         conn.execute("ALTER TABLE hydration_jobs RENAME TO hydration_jobs_v41")
         conn.execute(
             "CREATE TABLE hydration_jobs ("
@@ -688,7 +696,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 44
+        assert _CURRENT_SCHEMA_VERSION == 45
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1419,7 +1427,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 44
+        assert _CURRENT_SCHEMA_VERSION == 45
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:

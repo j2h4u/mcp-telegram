@@ -14,7 +14,10 @@ from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.messages.sqlite_repository import (
     _REPAIR_MEDIA_METADATA_CONTACT_OTHER_SQL,
     _REPAIR_MEDIA_METADATA_VIDEO_SQL,
+    _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL,
+    _TRANSCRIBABLE_MEDIA_SQL,
     TranscriptionHydrationRepair,
+    _is_transcribable_media_pair,
     apply_message_transcription,
     insert_messages_with_fts,
     list_undeleted_message_ids,
@@ -250,26 +253,64 @@ def test_media_metadata_repair_plan_uses_both_partial_indexes_without_sort(conn:
     assert "USE TEMP B-TREE" not in details
 
 
-def test_historical_transcription_repair_and_dialog_reconciliation_stay_voice_only(
+def test_historical_transcription_repair_and_dialog_reconciliation_admit_voice_and_round_video(
     conn: sqlite3.Connection,
 ) -> None:
     _make_hydration_eligible(conn)
     conn.executemany(
         "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
         "VALUES (42, ?, ?, NULL, ?, ?)",
-        [(96, 96, "video", '{"round_message":true}'), (97, 97, "voice", "{}")],
+        [
+            (96, 96, "video", '{"round_message":true}'),
+            (97, 97, "voice", "{}"),
+            (98, 98, "video", '{"round_message":false}'),
+        ],
     )
     conn.commit()
 
     repair = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=300)
-    assert repair.enqueued == 1
-    assert conn.execute("SELECT message_id FROM hydration_jobs").fetchall() == [(97,)]
+    assert repair.enqueued == 2
+    assert conn.execute("SELECT message_id FROM hydration_jobs ORDER BY message_id").fetchall() == [(96,), (97,)]
+    assert conn.execute("SELECT DISTINCT priority FROM hydration_jobs").fetchall() == [
+        (int(HydrationPriority.BACKFILL),)
+    ]
     conn.execute("DELETE FROM hydration_jobs")
     conn.commit()
 
     with conn:
         reconcile_fact_hydration_jobs_for_dialog(conn, 42, due_at=901)
-    assert conn.execute("SELECT message_id FROM hydration_jobs").fetchall() == [(97,)]
+    assert conn.execute("SELECT message_id FROM hydration_jobs ORDER BY message_id").fetchall() == [(96,), (97,)]
+
+
+@pytest.mark.parametrize(
+    ("media_kind", "media_payload"),
+    [
+        ("voice", "{}"),
+        ("video", '{"round_message":true}'),
+        ("video", '{"round_message":false}'),
+        ("video", "{}"),
+        ("video", '{"round_message":"true"}'),
+        ("video", '{"round_message":1}'),
+        ("audio", "{}"),
+        ("other", "{}"),
+        ("video", "not-json"),
+        ("voice", None),
+        (None, None),
+    ],
+)
+def test_sql_transcribable_media_predicate_matches_pair_adapter(
+    conn: sqlite3.Connection, media_kind: str | None, media_payload: str | None
+) -> None:
+    conn.execute("CREATE TEMP TABLE media_candidates(media_kind TEXT, media_payload TEXT)")
+    conn.execute("INSERT INTO media_candidates VALUES (?, ?)", (media_kind, media_payload))
+    sql_row = cast(
+        tuple[object] | None,
+        conn.execute(f"SELECT {_TRANSCRIBABLE_MEDIA_SQL} FROM media_candidates m").fetchone(),
+    )
+    assert sql_row is not None
+    sql_result = sql_row[0]
+
+    assert bool(sql_result) is _is_transcribable_media_pair(media_kind, media_payload)
 
 
 @pytest.mark.parametrize(
@@ -408,15 +449,20 @@ def test_transcription_repair_excludes_ineligible_and_queued_messages(conn: sqli
     )
     conn.executemany(
         "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload, is_deleted, out) "
-        "VALUES (?, ?, ?, NULL, ?, '{}', ?, ?)",
+        "VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
         [
-            (42, 1, 10, "voice", 0, 0),  # eligible inbound
-            (42, 2, 20, "voice", 0, 1),  # eligible outbound
-            (42, 3, 30, "voice", 1, 0),  # deleted
-            (42, 4, 40, "other", 0, 0),  # not voice
-            (43, 5, 50, "voice", 0, 0),  # inactive dialog
-            (42, 6, 60, "voice", 0, 0),  # eligible inbound
-            (42, 7, 70, "voice", 0, 1),  # eligible outbound
+            (42, 1, 10, "voice", "{}", 0, 0),  # eligible inbound, transcript below
+            (42, 2, 20, "voice", "{}", 0, 1),  # eligible outbound, terminal job below
+            (42, 3, 30, "voice", "{}", 1, 0),  # deleted
+            (42, 4, 40, "other", "{}", 0, 0),  # not transcribable
+            (43, 5, 50, "voice", "{}", 0, 0),  # inactive dialog
+            (42, 6, 60, "voice", "{}", 0, 0),  # eligible inbound
+            (42, 7, 70, "voice", "{}", 0, 1),  # eligible outbound
+            (42, 8, 80, "video", '{"round_message":true}', 0, 0),  # round, transcript below
+            (42, 9, 90, "video", '{"round_message":true}', 0, 0),  # round, terminal job below
+            (42, 10, 100, "video", '{"round_message":true}', 1, 0),  # deleted round
+            (43, 11, 110, "video", '{"round_message":true}', 0, 0),  # inactive round
+            (42, 12, 120, "video", '{"round_message":true}', 0, 0),  # eligible round
         ],
     )
     conn.execute(
@@ -424,20 +470,30 @@ def test_transcription_repair_excludes_ineligible_and_queued_messages(conn: sqli
         "VALUES (42, 1, 'already', 1, 1)"
     )
     conn.execute(
+        "INSERT INTO message_transcriptions(dialog_id, message_id, text, transcription_id, received_at) "
+        "VALUES (42, 8, 'already round', 8, 1)"
+    )
+    conn.execute(
         "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, terminal) "
         "VALUES ('transcription', 42, 2, 1, 4, 1)"
+    )
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, terminal) "
+        "VALUES ('transcription', 42, 9, 1, 4, 1)"
     )
     conn.commit()
 
     repair = repair_transcription_hydration_jobs(conn, due_at=100, max_jobs=300)
 
-    assert (repair.enqueued, repair.has_more) == (2, False)
+    assert (repair.enqueued, repair.has_more) == (3, False)
     assert conn.execute(
         "SELECT dialog_id, message_id, terminal FROM hydration_jobs ORDER BY message_id"
     ).fetchall() == [
         (42, 2, 1),
         (42, 6, 0),
         (42, 7, 0),
+        (42, 9, 1),
+        (42, 12, 0),
     ]
 
 
@@ -445,15 +501,13 @@ def test_transcription_repair_plan_uses_partial_voice_index(conn: sqlite3.Connec
     plan = cast(
         list[tuple[object, ...]],
         conn.execute(
-            "EXPLAIN QUERY PLAN SELECT m.message_id FROM messages m INDEXED BY idx_messages_voice_undeleted_sent "
-            "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
-            "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
-            "WHERE m.is_deleted = 0 AND m.media_kind = 'voice' "
+            "EXPLAIN QUERY PLAN SELECT m.message_id "
+            f"{_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL} "
             "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT 300"
         ).fetchall(),
     )
     details = " ".join(str(row[3]) for row in plan)
-    assert "USING COVERING INDEX idx_messages_voice_undeleted_sent" in details
+    assert "USING INDEX idx_messages_transcribable_undeleted_sent" in details
     assert "USE TEMP B-TREE" not in details
     assert "SCAN messages" not in details
 

@@ -28,8 +28,15 @@ _FACT_HYDRATION_ELIGIBILITY_SQL = (
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
     "WHERE sd.dialog_id = ? AND sd.status IN ('syncing', 'synced')"
 )
+_TRANSCRIBABLE_MEDIA_SQL = (
+    "(json_valid(m.media_payload) "
+    "AND json_type(CASE WHEN json_valid(m.media_payload) THEN m.media_payload ELSE '{}' END) = 'object' "
+    "AND (m.media_kind = 'voice' OR (m.media_kind = 'video' "
+    "AND json_type(CASE WHEN json_valid(m.media_payload) THEN m.media_payload ELSE '{}' END, "
+    "'$.round_message') = 'true')))"
+)
 _TRANSCRIPTION_HYDRATION_MESSAGE_SQL = (
-    "m.is_deleted = 0 AND m.media_kind = 'voice' "
+    "m.is_deleted = 0 AND (" + _TRANSCRIBABLE_MEDIA_SQL + ") "
     "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
     "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id)"
 )
@@ -90,7 +97,7 @@ class MessageOutLookup:
 
 @dataclass(frozen=True, slots=True)
 class TranscriptionHydrationRepair:
-    """Bounded result of repairing missing voice transcription jobs."""
+    """Bounded result of repairing missing transcription jobs."""
 
     enqueued: int
     has_more: bool
@@ -291,7 +298,7 @@ def apply_message_transcription_if_absent(  # noqa: PLR0913
             "SELECT m.media_kind, m.media_payload FROM messages m "
             "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
             "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
-            "WHERE m.dialog_id = ? AND m.message_id = ? AND m.media_kind IN ('voice', 'video') AND m.is_deleted = 0 "
+            "WHERE m.dialog_id = ? AND m.message_id = ? AND m.is_deleted = 0 AND (" + _TRANSCRIBABLE_MEDIA_SQL + ") "
             "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
             "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id)",
             (dialog_id, message_id),
@@ -414,7 +421,7 @@ def transcription_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, m
         conn.execute(
             "SELECT m.media_kind, m.media_payload FROM messages m "
             "WHERE m.dialog_id = ? AND m.message_id = ? AND m.is_deleted = 0 "
-            "AND m.media_kind IN ('voice', 'video') "
+            "AND (" + _TRANSCRIBABLE_MEDIA_SQL + ") "
             "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
             "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id) "
             "AND EXISTS (" + _FACT_HYDRATION_ELIGIBILITY_SQL + ")",
@@ -425,7 +432,7 @@ def transcription_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, m
 
 
 _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL = (
-    "FROM messages m INDEXED BY idx_messages_voice_undeleted_sent "
+    "FROM messages m INDEXED BY idx_messages_transcribable_undeleted_sent "
     "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
     "LEFT JOIN hydration_jobs hj ON hj.kind = 'transcription' "
@@ -465,7 +472,7 @@ _REPAIR_MEDIA_METADATA_VIDEO_SQL = (
 def repair_transcription_hydration_jobs(
     conn: sqlite3.Connection, *, due_at: int, max_jobs: int
 ) -> TranscriptionHydrationRepair:
-    """Bound the recurring repair of missing voice transcription jobs."""
+    """Bound the recurring repair of missing transcribable-media jobs."""
     if max_jobs <= 0:
         return TranscriptionHydrationRepair(0, False)
     candidates_sql = (
@@ -663,10 +670,7 @@ def _reconcile_transcription_hydration_job(
             (message.dialog_id, message.message_id),
         ).fetchone(),
     )
-    transcribable = message.media_kind == "voice" or (
-        priority is HydrationPriority.FOREGROUND
-        and _is_transcribable_media_pair(message.media_kind, message.media_payload)
-    )
+    transcribable = _is_transcribable_media_pair(message.media_kind, message.media_payload)
     if (
         transcribable
         and transcription_row is None
@@ -718,16 +722,17 @@ def reconcile_fact_hydration_jobs_for_dialog(
                 HydrationPriority.BACKFILL,
             )
         )
-    voice_rows = cast(
+    transcribable_rows = cast(
         Sequence[tuple[int, int]],
         conn.execute(
             "SELECT m.message_id, m.sent_at FROM messages m "
             "LEFT JOIN message_transcriptions mt ON mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id "
-            "WHERE m.dialog_id = ? AND m.is_deleted = 0 AND m.media_kind = 'voice' AND mt.message_id IS NULL",
+            "WHERE m.dialog_id = ? AND m.is_deleted = 0 AND (" + _TRANSCRIBABLE_MEDIA_SQL + ") "
+            "AND mt.message_id IS NULL",
             (dialog_id,),
         ).fetchall(),
     )
-    for message_id, sent_at in voice_rows:
+    for message_id, sent_at in transcribable_rows:
         queue.enqueue(
             HydrationJob(
                 TRANSCRIPTION_HYDRATION_KIND,
