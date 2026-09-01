@@ -18,7 +18,7 @@ from .activity_peer_sweep import enroll_activity_dialog
 from .daemon_message import fetch_text_links
 from .dialog_selector import DialogSelector, DialogSelectorError, optional_dialog_selector
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
-from .flood import TelegramRpcThrottled
+from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
 from .message_content import MessageSnapshot, project_message_content
 from .message_contracts import ExtractedMessage
@@ -352,6 +352,7 @@ class DaemonAccountTraceService:
         try:
             result = await self._deps.client(ResolveUsernameRequest(username=username))
         except (RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+            _raise_if_latched(exc)
             self._deps.logger.info(
                 "trace_account username_lookup_failed username=%r error_type=%s%s",
                 username,
@@ -1402,7 +1403,7 @@ async def _trace_enrich_candidate_messages(
                 target_user_id=request.target_user_id,
                 dialog_id=request.dialog_id,
                 status="flood_wait",
-                last_error=f"FloodWaitError:{seconds}",
+                last_error=f"TelegramRpcThrottled:{seconds}",
                 next_retry_at=request.now + seconds,
                 now=request.now,
             )

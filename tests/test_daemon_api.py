@@ -20,7 +20,7 @@ from typing import Final, Protocol, TypedDict, Unpack, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from telethon.errors import FloodWaitError, ServerError
+from telethon.errors import ServerError
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike, _ResolverEntityCache
 from mcp_telegram.daemon_ipc import get_daemon_socket_path
@@ -28,7 +28,7 @@ from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, mes
 from mcp_telegram.dialog_selector import required_dialog_selector
 from mcp_telegram.feedback_db import SQLiteFeedbackStore
 from mcp_telegram.feedback_service import FeedbackApplicationService
-from mcp_telegram.flood import FloodWaitKillSwitchStatus
+from mcp_telegram.flood import FloodWaitKillSwitchStatus, TelegramRpcThrottled
 from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
@@ -2164,6 +2164,33 @@ async def test_get_me_through_daemon() -> None:
     assert result["data"]["first_name"] == "Test"
     assert result["data"]["username"] == "testuser"
     cast(AsyncMock, client.get_me).assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "retryable", "retry_after"),
+    [
+        (TelegramRpcThrottled(retry_after_seconds=9), True, 9),
+        (TelegramRpcThrottled(latched=True), False, None),
+    ],
+)
+async def test_get_me_serializes_owned_throttling_without_ambiguous_retry(
+    failure: TelegramRpcThrottled,
+    retryable: bool,
+    retry_after: int | None,
+) -> None:
+    client = _TestClient()
+    client.get_me = AsyncMock(side_effect=failure)
+    server = make_server(client=client)
+
+    result = await server._get_me({})
+
+    assert result["ok"] is False
+    assert result["error"] == "flood_wait"
+    assert result["retryable"] is retryable
+    assert result.get("retry_after") == retry_after
+    if not retryable:
+        assert "retry_after" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -7432,16 +7459,18 @@ async def test_duplicate_username_candidates_preserve_truthful_cached_metadata()
 
 
 @pytest.mark.parametrize(
-    ("failure", "expected_retry_after"),
+    ("failure", "expected_retry_after", "expected_retryable"),
     [
-        pytest.param(FloodWaitError(request=None, capture=17), 17, id="flood-wait"),
-        pytest.param(ServerError(None, "temporary"), None, id="retryable-rpc"),
-        pytest.param(TimeoutError("incomplete enumeration"), None, id="timeout"),
+        pytest.param(TelegramRpcThrottled(retry_after_seconds=17), 17, True, id="flood-wait"),
+        pytest.param(TelegramRpcThrottled(latched=True), None, False, id="latched-circuit"),
+        pytest.param(ServerError(None, "temporary"), None, True, id="retryable-rpc"),
+        pytest.param(TimeoutError("incomplete enumeration"), None, True, id="timeout"),
     ],
 )
 async def test_remote_dialog_enumeration_failure_is_retryable_and_never_reads(
     failure: Exception,
     expected_retry_after: int | None,
+    expected_retryable: bool,
 ) -> None:
     async def interrupted_dialogs():
         yield SimpleNamespace(name="Remote Project", entity=SimpleNamespace(id=1505))
@@ -7458,7 +7487,7 @@ async def test_remote_dialog_enumeration_failure_is_retryable_and_never_reads(
         "ok": False,
         "error": "dialog_resolution_retryable",
         "message": "Telegram dialog enumeration did not complete; no dialog was selected.",
-        "retryable": True,
+        "retryable": expected_retryable,
         "required_action": "Retry the request; use an exact dialog id when already known.",
         **({"retry_after": expected_retry_after} if expected_retry_after is not None else {}),
     }

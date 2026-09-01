@@ -8,12 +8,12 @@ from pathlib import Path
 
 import pytest
 
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.folders.contracts import DialogCategory, DialogFacts, FolderRule, FolderSourceSnapshot
 from mcp_telegram.folders.refresh import FolderRefresher
 from mcp_telegram.folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from mcp_telegram.folders.worker import FolderProjectionWorker
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_rpc import TelegramRpcCircuitOpenError
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,7 +164,7 @@ async def test_concurrent_attempts_are_single_flight(tmp_path: Path) -> None:
     ("error", "outcome", "retry"),
     [
         (TimeoutError("network"), "source_unavailable", 60),
-        (TelegramRpcCircuitOpenError("open"), "circuit_open", 60),
+        (TelegramRpcThrottled(latched=True, detail="open"), "circuit_open", 60),
     ],
 )
 async def test_expected_failures_preserve_snapshot_and_schedule_retry(
@@ -189,11 +189,8 @@ async def test_expected_failures_preserve_snapshot_and_schedule_retry(
 
 @pytest.mark.asyncio
 async def test_flood_wait_uses_requested_delay_without_same_cycle_retry(tmp_path: Path) -> None:
-    class FloodWaitError(RuntimeError):
-        seconds = 1_200
-
     conn, repository = _db(tmp_path)
-    gateway = _Gateway(FloodWaitError())
+    gateway = _Gateway(TelegramRpcThrottled(retry_after_seconds=1_200))
     worker = _worker(gateway, repository, now=[100.0])
     try:
         await worker.prime()

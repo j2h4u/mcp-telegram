@@ -906,12 +906,14 @@ class DaemonAPIServer:
         return result
 
     @staticmethod
-    def _dialog_resolution_retryable_response(*, retry_after: int | None = None) -> dict[str, object]:
+    def _dialog_resolution_retryable_response(
+        *, retry_after: int | None = None, transient: bool = True
+    ) -> dict[str, object]:
         response: dict[str, object] = {
             "ok": False,
             "error": "dialog_resolution_retryable",
             "message": "Telegram dialog enumeration did not complete; no dialog was selected.",
-            "retryable": True,
+            "retryable": transient,
             "required_action": "Retry the request; use an exact dialog id when already known.",
         }
         if retry_after is not None:
@@ -932,7 +934,7 @@ class DaemonAPIServer:
             result = await self._resolve_dialog_name(selector.query, allow_remote_lookup=allow_remote_lookup)
         except TelegramRpcThrottled as exc:
             retry_after = exc.retry_after_seconds
-            return self._dialog_resolution_retryable_response(retry_after=retry_after)
+            return self._dialog_resolution_retryable_response(retry_after=retry_after, transient=not exc.latched)
         except RPCError, TimeoutError:
             retry_after = None
             return self._dialog_resolution_retryable_response(retry_after=retry_after)
@@ -1235,6 +1237,16 @@ class DaemonAPIServer:
         # demand because callers want display fields, not just the id.
         try:
             me = await self._client.get_me()
+        except TelegramRpcThrottled as exc:
+            response: dict[str, object] = {
+                "ok": False,
+                "error": "flood_wait",
+                "message": "Telegram account info is temporarily throttled.",
+                "retryable": not exc.latched,
+            }
+            if exc.retry_after_seconds is not None:
+                response["retry_after"] = exc.retry_after_seconds
+            return response
         except Exception as exc:
             logger.warning("get_me_failed error=%s", exc, exc_info=True)
             return {"ok": False, "error": "telegram_error", "message": "failed to retrieve account info"}

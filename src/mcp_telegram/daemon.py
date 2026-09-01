@@ -84,6 +84,7 @@ from .feedback_service import FeedbackApplicationService
 from .flood import (
     FloodWaitKillSwitchPolicy,
     TelegramRpcThrottled,
+    _raise_if_latched,
     configure_flood_wait_kill_switch,
     flood_wait_kill_switch_status,
     maybe_log_flood_wait_rollup,
@@ -296,7 +297,7 @@ async def _backfill_total_message_dialog(
     except TelegramRpcThrottled as exc:
         logger.warning("backfill_total flood_wait dialog_id=%d seconds=%s", dialog_id, exc.retry_after_seconds)
         if exc.retry_after_seconds is None:
-            return _BackfillTotalDialogResult(filled=0, pause_after=False, stop=True)
+            raise
         if await sleep_through_flood(shutdown_event, exc.retry_after_seconds):
             return _BackfillTotalDialogResult(filled=0, pause_after=False, stop=True)
         return _BackfillTotalDialogResult(filled=0, pause_after=False)
@@ -412,9 +413,8 @@ async def _reconcile_read_position_batch(
             filled = 0
     except TelegramRpcThrottled as exc:
         if exc.retry_after_seconds is None:
-            logger.debug("read_pos_bootstrap circuit_open error=%s", exc)
-        else:
-            logger.warning("read_pos_bootstrap flood_wait seconds=%s", exc.retry_after_seconds)
+            raise
+        logger.warning("read_pos_bootstrap flood_wait seconds=%s", exc.retry_after_seconds)
         retry_ids.update(batch_ids)
         _mark_read_position_retry(conn, retry_ids, retry_at)
         conn.commit()
@@ -1008,7 +1008,10 @@ async def _load_own_only_context(client: _DaemonClient, account_id: int) -> OwnO
         personal_channel_id = getattr(user_full, "personal_channel_id", None)
         if isinstance(personal_channel_id, int) and personal_channel_id > 0:
             return OwnOnlyContext(account_id=account_id, personal_channel_id=personal_channel_id)
-    except (TelegramRpcThrottled, RPCError, TypeError, AttributeError, ValueError) as exc:
+    except TelegramRpcThrottled as exc:
+        _raise_if_latched(exc)
+        logger.warning("own_only_account_facts_unavailable error=%s", exc)
+    except (RPCError, TypeError, AttributeError, ValueError) as exc:
         logger.warning("own_only_account_facts_unavailable error=%s", exc)
     return context
 

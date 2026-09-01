@@ -12,7 +12,6 @@ from typing import TypedDict, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from telethon.errors import FloodWaitError
 
 from account_trace_fixtures import (
     open_trace_db,
@@ -32,6 +31,7 @@ from mcp_telegram.daemon_account_trace import (
     _TraceCandidateBuildRequest,
 )
 from mcp_telegram.daemon_api import DaemonAPIServer
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.message_contracts import (
     EntityRecord,
     ExtractedMessage,
@@ -475,7 +475,7 @@ async def test_trace_enrichment_floodwait_persists_retry_fragment(
     trace_service: DaemonAccountTraceService,
 ) -> None:
     server, conn, client = trace_enrichment_server
-    client.exc = FloodWaitError(None, 120)
+    client.exc = TelegramRpcThrottled(retry_after_seconds=120)
 
     result = await trace_service._trace_enrich_visible_dialogs(
         101,
@@ -491,7 +491,7 @@ async def test_trace_enrichment_floodwait_persists_retry_fragment(
     assert fragment is not None
     assert result["fragment_status_counts"]["flood_wait"] == 1
     assert fragment[0] == "flood_wait"
-    assert fragment[1] == "FloodWaitError:120"
+    assert fragment[1] == "TelegramRpcThrottled:120"
     assert fragment[2] > int(datetime.now(tz=UTC).timestamp())
 
 

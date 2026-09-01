@@ -13,9 +13,10 @@ from typing import Protocol, cast
 from unittest.mock import AsyncMock
 
 import pytest
-from telethon.errors import ChannelPrivateError, FloodWaitError
+from telethon.errors import ChannelPrivateError
 from telethon.tl import types
 
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.models import ReadMessage
 from mcp_telegram.reactions.contracts import ReactionAggregate, ReactionEvent, ReactionFetchResult, ReactionSnapshot
 from mcp_telegram.reactions.ports import ReactionSnapshotRepository, TelegramReactionGateway
@@ -192,7 +193,7 @@ async def test_fragment_gateway_translates_floodwait_without_partial_persistence
     make_synced_db: Callable[[], sqlite3.Connection],
 ) -> None:
     conn = make_synced_db()
-    flood = FloodWaitError(request=None, capture=17)
+    flood = TelegramRpcThrottled(retry_after_seconds=17)
     client = SimpleNamespace(
         get_input_entity=AsyncMock(side_effect=flood),
         get_messages=AsyncMock(),
@@ -203,7 +204,7 @@ async def test_fragment_gateway_translates_floodwait_without_partial_persistence
     assert result.ok is False
     assert result.failure == GatewayFailure(
         kind=GatewayFailureKind.FLOOD_WAIT,
-        error_type="FloodWaitError",
+        error_type="TelegramRpcThrottled",
         error_message=str(flood),
         retryable=True,
         retry_after=17,
@@ -398,7 +399,7 @@ async def test_reaction_gateway_translates_private_and_floodwait_failures() -> N
     assert private.failure is not None
     assert private.failure.kind is GatewayFailureKind.ACCESS_LOST
 
-    flood = FloodWaitError(request=None, capture=23)
+    flood = TelegramRpcThrottled(retry_after_seconds=23)
     flood_client = SimpleNamespace(get_messages=AsyncMock(side_effect=flood))
     result = await TelethonTelegramReactionGateway(flood_client).fetch_reactions(1, [10])
     assert result.failure is not None

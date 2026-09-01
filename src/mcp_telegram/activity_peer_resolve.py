@@ -21,7 +21,7 @@ from telethon.tl.types import TypeInputChannel, TypeInputPeer
 
 from .activity_substrate import ActivityClient, call_with_timeout
 from .entity_store import EntitySnapshot, ensure_entity_stub
-from .flood import TelegramRpcThrottled
+from .flood import TelegramRpcThrottled, _raise_if_latched
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ class LinkedChatResolution:
 
     linked_chat_id: int | None
         The normalized -100… discussion-group peer id, or None when the
-        channel has no discussion group OR when a FloodWait was caught
+        channel has no discussion group OR when TelegramRpcThrottled was caught
         (check flood_wait_seconds to distinguish).
 
     flood_wait_seconds: int | None
@@ -77,6 +77,10 @@ async def resolve_input_peer(client: _InputEntityResolverClient, dialog_id: int)
     """
     try:
         return cast(TypeInputPeer, await client.get_input_entity(dialog_id))
+    except TelegramRpcThrottled as exc:
+        _raise_if_latched(exc)
+        logger.debug("activity_peer_resolve_input_peer_throttled dialog_id=%r", dialog_id)
+        return None
     except Exception:
         logger.debug("activity_peer_resolve_input_peer_miss dialog_id=%r", dialog_id, exc_info=True)
         return None
@@ -296,7 +300,7 @@ async def resolve_linked_chat_id(
        updated — name/type/hidden/members etc. are never touched here.
        Sibling fields (subscribers_count, about, pinned_msg_id) still flow
        into entity_details.detail_json as before.
-    4. On FloodWaitError: do NOT touch dialogs. resolved_at stays NULL, which
+    4. On TelegramRpcThrottled: do NOT touch dialogs. resolved_at stays NULL, which
        IS the retry signal. The next sweep cycle re-attempts naturally.
     5. A channel with no linked chat returns linked_chat_id=None,
        flood_wait_seconds=None (distinct from a flood wait by flood_wait_seconds
@@ -323,9 +327,10 @@ async def resolve_linked_chat_id(
             channel_id,
             exc.retry_after_seconds,
         )
-        # FloodWait-NEUTRAL: do NOT sleep — surface wait to calling tier.
+        # Throttling-neutral: do NOT sleep — surface wait to calling tier.
         # D-08: do NOT touch dialogs — resolved_at stays NULL, which IS the retry
         # signal. The next sweep cycle will re-attempt naturally.
+        _raise_if_latched(exc)
         return LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=exc.retry_after_seconds)
     except Exception:
         logger.debug("activity_peer_resolve_linked_error channel_id=%r", channel_id, exc_info=True)

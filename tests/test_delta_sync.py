@@ -402,8 +402,8 @@ async def test_delta_floodwait_handled(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """FloodWaitError during iter_messages triggers interruptible wait, returns 0 for that dialog."""
-    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+    """TelegramRpcThrottled during iter_messages triggers interruptible wait, returns 0 for that dialog."""
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     dialog_id = 1005
 
@@ -418,8 +418,7 @@ async def test_delta_floodwait_handled(
     )
     sync_db.commit()
 
-    err = FloodWaitError(request=None)
-    err.seconds = 3
+    err = TelegramRpcThrottled(retry_after_seconds=3)
 
     async def _iter_messages(**kwargs: object):
         raise err
@@ -1037,9 +1036,8 @@ async def test_probe_flood_wait_stops_account_pass(
     """FloodWait is account-global: do not continue to the next lost dialog."""
     from unittest.mock import AsyncMock, patch
 
-    from telethon.errors import FloodWaitError
-
     from mcp_telegram.delta_sync import DeltaSyncWorker, _probe_access_lost_dialogs
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     sync_db.executemany(
         "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at) VALUES (?, 'access_lost', ?)",
@@ -1048,8 +1046,7 @@ async def test_probe_flood_wait_stops_account_pass(
     seed_full_history_enrollment(sync_db, 9201, enabled=False)
     seed_full_history_enrollment(sync_db, 9202, enabled=False)
     sync_db.commit()
-    err = FloodWaitError(request=None)
-    err.seconds = 30
+    err = TelegramRpcThrottled(retry_after_seconds=30)
     mock_client.get_messages = AsyncMock(side_effect=err)
     delta_worker = DeltaSyncWorker(
         cast(_DeltaSyncClient, mock_client), cast(sqlite3.Connection, sync_db), shutdown_event
@@ -1480,7 +1477,7 @@ async def test_fetch_delta_stamps_on_floodwait(
     repeatedly hitting FloodWait on the same hot dialogs every boot."""
     import time as _time
 
-    from telethon.errors import FloodWaitError as _FloodWaitError
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     dialog_id = 6007
     original_ts = 1000
@@ -1496,8 +1493,7 @@ async def test_fetch_delta_stamps_on_floodwait(
     )
     sync_db.commit()
 
-    err = _FloodWaitError(request=None)
-    err.seconds = 1
+    err = TelegramRpcThrottled(retry_after_seconds=1)
 
     async def _iter_messages(**kwargs: object):
         raise err

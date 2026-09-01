@@ -28,7 +28,7 @@ from .access_lifecycle import (
     set_access_lost,
     stamp_access_revalidation,
 )
-from .flood import TelegramRpcThrottled, sleep_through_flood
+from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
 from .history_enrollment import full_history_enabled
 from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage
@@ -346,7 +346,30 @@ class DeltaSyncWorker:
         )
         return total_new
 
-    async def fetch_delta_for_dialog(self, dialog_id: int) -> int:  # noqa: PLR0911, PLR0912
+    async def _handle_delta_throttling(
+        self, dialog_id: int, new_message_rows: list[ExtractedMessage], exc: TelegramRpcThrottled
+    ) -> int:
+        _raise_if_latched(exc)
+        logger.warning(
+            "FloodWait delta dialog_id=%d — %ss (preserving %d already-fetched messages)",
+            dialog_id,
+            exc.retry_after_seconds,
+            len(new_message_rows),
+        )
+        now = int(time.time())
+        with self._conn:
+            if not full_history_enabled(self._conn, dialog_id):
+                logger.info("delta_discarded_disabled dialog_id=%d fetched=%d", dialog_id, len(new_message_rows))
+                return 0
+            if new_message_rows:
+                insert_messages_with_fts(self._conn, new_message_rows, priority=HydrationPriority.BACKFILL)
+            self._stamp_delta_checkpoint(dialog_id, now)
+        if new_message_rows:
+            logger.info("delta dialog_id=%d preserved_messages=%d before FloodWait", dialog_id, len(new_message_rows))
+        await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds or 1)
+        return len(new_message_rows)
+
+    async def fetch_delta_for_dialog(self, dialog_id: int) -> int:  # noqa: PLR0911
         """Fetch all messages newer than max known message_id for one dialog.
 
         Public API: used by probe-worker for gap-fill after access recovery.
@@ -378,33 +401,7 @@ class DeltaSyncWorker:
                     break
                 new_message_rows.append(extract_message_row(dialog_id, msg))
         except TelegramRpcThrottled as exc:
-            logger.warning(
-                "FloodWait delta dialog_id=%d — %ss (preserving %d already-fetched messages)",
-                dialog_id,
-                exc.retry_after_seconds,
-                len(new_message_rows),
-            )
-            # Stamp last_synced_at so the next cold restart skips this dialog
-            # via the checkpoint guard instead of repeatedly hitting FloodWait
-            # on the same hot dialogs every boot. Trade-off: gap-fill for this
-            # dialog is deferred until the skip threshold expires (~1h).
-            now = int(time.time())
-            with self._conn:
-                if not full_history_enabled(self._conn, dialog_id):
-                    logger.info("delta_discarded_disabled dialog_id=%d fetched=%d", dialog_id, len(new_message_rows))
-                    return 0
-                if new_message_rows:
-                    insert_messages_with_fts(self._conn, new_message_rows, priority=HydrationPriority.BACKFILL)
-                self._stamp_delta_checkpoint(dialog_id, now)
-            if new_message_rows:
-                logger.info(
-                    "delta dialog_id=%d preserved_messages=%d before FloodWait",
-                    dialog_id,
-                    len(new_message_rows),
-                )
-            if exc.retry_after_seconds is not None:
-                await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
-            return len(new_message_rows)
+            return await self._handle_delta_throttling(dialog_id, new_message_rows, exc)
         except ACCESS_LOST_ERRORS as exc:
             logger.warning(
                 "access_lost delta dialog_id=%d — %s",
@@ -465,6 +462,24 @@ async def run_delta_catch_up_loop(
 # ---------------------------------------------------------------------------
 
 
+async def _handle_probe_throttling(
+    conn: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+    policy: AccessProbePolicy,
+    dialog_id: int,
+    exc: TelegramRpcThrottled,
+) -> None:
+    _raise_if_latched(exc)
+    logger.warning("probe_flood_wait dialog_id=%d seconds=%s", dialog_id, exc.retry_after_seconds)
+    stamp_access_revalidation(
+        conn,
+        dialog_id,
+        int(time.time()),
+        max(policy.cooldown_seconds, exc.retry_after_seconds or policy.cooldown_seconds),
+    )
+    await sleep_through_flood(shutdown_event, exc.retry_after_seconds or 1)
+
+
 async def _probe_access_lost_dialogs(  # noqa: PLR0915
     client: _DeltaSyncClient,
     conn: sqlite3.Connection,
@@ -515,16 +530,8 @@ async def _probe_access_lost_dialogs(  # noqa: PLR0915
             still_lost += 1
             stamp_access_revalidation(conn, dialog_id, int(time.time()), policy.cooldown_seconds)
         except TelegramRpcThrottled as exc:
-            logger.warning("probe_flood_wait dialog_id=%d seconds=%s", dialog_id, exc.retry_after_seconds)
+            await _handle_probe_throttling(conn, shutdown_event, policy, dialog_id, exc)
             flood_wait_hit = True
-            stamp_access_revalidation(
-                conn,
-                dialog_id,
-                int(time.time()),
-                max(policy.cooldown_seconds, exc.retry_after_seconds or policy.cooldown_seconds),
-            )
-            if exc.retry_after_seconds is not None:
-                await sleep_through_flood(shutdown_event, exc.retry_after_seconds)
             break
         except RPCError as exc:
             logger.warning("probe_rpc_error dialog_id=%d error=%s", dialog_id, exc)

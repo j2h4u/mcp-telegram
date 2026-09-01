@@ -3,19 +3,26 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
+from typing import Protocol, cast
 
 import pytest
 
 
-def _load_gate() -> ModuleType:
+class _BoundaryChecker(Protocol):
+    GATE_PATH: Path
+
+    def _violations(self, path: Path) -> list[str]: ...
+    def check(self) -> list[str]: ...
+
+
+def _load_gate() -> _BoundaryChecker:
     path = Path(__file__).parents[1] / "scripts" / "check_telegram_rpc_boundaries.py"
     spec = importlib.util.spec_from_file_location("check_telegram_rpc_boundaries", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    return module
+    return cast(_BoundaryChecker, module)
 
 
 @pytest.mark.parametrize(
@@ -24,6 +31,10 @@ def _load_gate() -> ModuleType:
         "from telethon.errors import FloodWaitError\n",
         "from telethon.errors.rpcerrorlist import FloodPremiumWaitError as Wait\n",
         "from telethon.errors import FloodTestPhoneWaitError\ndef f():\n    raise FloodTestPhoneWaitError\n",
+        "from telethon import errors as e\ne.FloodWaitError\n",
+        "import telethon as t\nt.errors.FloodPremiumWaitError\n",
+        "import telethon.errors as e\ne.FloodTestPhoneWaitError\n",
+        "def f():\n    from telethon.errors import FloodTestPhoneWaitError as Wait\n",
         "from mcp_telegram.telegram_rpc import TelegramRpcCircuitOpenError\n",
         "def f(exc):\n    return isinstance(exc, FloodWaitErrors)\n",
     ],

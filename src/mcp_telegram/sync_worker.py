@@ -30,7 +30,7 @@ from telethon.tl import types  # type: ignore[import-untyped]
 
 from .access_lifecycle import set_access_lost
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
-from .flood import TelegramRpcThrottled, sleep_through_flood
+from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
 from .history_enrollment import ensure_automatic_dm_enrollment, full_history_enabled
 from .hydration_queue import HydrationPriority
 from .messages.sqlite_repository import insert_messages_with_fts
@@ -162,7 +162,7 @@ class FullSyncWorker:
         progress) are not overwritten.  Only types.User dialogs are
         enrolled; groups and channels require explicit opt-in (Phase 30).
 
-        Handles FloodWaitError with interruptible sleep and RPCError
+        Handles TelegramRpcThrottled with interruptible sleep and RPCError
         gracefully — a transient Telegram error does not kill the daemon.
 
         Returns:
@@ -195,17 +195,12 @@ class FullSyncWorker:
                         ),
                     ),
                 )
-        except TelegramRpcThrottled as exc:
-            wait_seconds = exc.retry_after_seconds
+        except (TelegramRpcThrottled, RPCError) as exc:
+            _raise_if_latched(exc)
+            wait_seconds = getattr(exc, "retry_after_seconds", None)
             logger.warning(
                 "dm_bootstrap flood_wait=%ss enrolled_so_far=%d — committing partial progress",
                 wait_seconds,
-                enrolled,
-            )
-        except RPCError as exc:
-            logger.warning(
-                "dm_bootstrap rpc_error=%s enrolled_so_far=%d — committing partial progress",
-                exc,
                 enrolled,
             )
         except (TimeoutError, OSError) as exc:
@@ -263,7 +258,7 @@ class FullSyncWorker:
         After a full batch (100 msgs), sync_progress advances to the min
         message_id; a partial or empty batch marks the dialog 'synced'.
 
-        On FloodWaitError: sleep interruptibly, return (same_progress, False).
+        On TelegramRpcThrottled: sleep interruptibly, return (same_progress, False).
         On other RPCError: log ERROR, return (same_progress, False) — dialog stays
         in-progress for retry on the next sync cycle.
 

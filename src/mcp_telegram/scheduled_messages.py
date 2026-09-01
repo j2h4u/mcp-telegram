@@ -24,7 +24,7 @@ from .access_lifecycle import set_access_lost
 from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_substrate import ActivityClient
 from .daemon_log_context import dialog_log_context
-from .flood import TelegramRpcThrottled
+from .flood import TelegramRpcThrottled, _raise_if_latched
 from .fts import stem_text
 from .message_contracts import ExtractedMessage
 from .messages.telegram_adapter import extract_message_row
@@ -52,6 +52,28 @@ class ScheduledReconciliationPolicy:
 
 def _as_int(value: object) -> int:
     return int(cast(int | str, value))
+
+
+async def _load_candidate_entity(
+    client: _ScheduledClient,
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    dialog_type: str,
+    personal_channel_id: int | None,
+) -> tuple[object | None, bool, bool]:
+    """Fetch a channel entity; return (entity, stop, skip) for classification."""
+    if dialog_type != "channel" or dialog_id == personal_channel_id:
+        return None, False, False
+    try:
+        return await client.get_entity(dialog_id), False, False
+    except TelegramRpcThrottled as exc:
+        _raise_if_latched(exc)
+        assert exc.retry_after_seconds is not None
+        _record_retry(conn, int(time.time()) + exc.retry_after_seconds, "TelegramRpcThrottled")
+        return None, True, False
+    except RPCError as exc:
+        _log_own_only_entity_rpc_error(conn, dialog_id, exc)
+        return None, False, True
 
 
 class _ScheduledClient(ScheduledHistoryClient, Protocol):
@@ -381,7 +403,7 @@ class ScheduledMessageReconciler:
             dialog_id,
         )
 
-    async def _own_only_dialog_ids(self) -> set[int] | None:  # noqa: PLR0912
+    async def _own_only_dialog_ids(self) -> set[int] | None:
         """Classify accessible local candidates before touching scheduled history."""
         context = self._own_only_context
         if context is None:
@@ -399,7 +421,7 @@ class ScheduledMessageReconciler:
                 _record_retry(
                     self._conn,
                     int(time.time()) + max(1, resolution.flood_wait_seconds),
-                    "FloodWaitError",
+                    "TelegramRpcThrottled",
                 )
                 return set()
             personal_linked_chat_id = resolution.linked_chat_id
@@ -428,18 +450,13 @@ class ScheduledMessageReconciler:
                 break
             dialog_id = int(cast(int, candidate["dialog_id"]))
             dialog_type = str(candidate.get("type") or "unknown")
-            entity: object | None = None
-            if dialog_type == "channel" and dialog_id != context.personal_channel_id:
-                try:
-                    entity = await self._client.get_entity(dialog_id)
-                except TelegramRpcThrottled as exc:
-                    if exc.retry_after_seconds is None:
-                        return None
-                    _record_retry(self._conn, int(time.time()) + exc.retry_after_seconds, "FloodWaitError")
-                    break
-                except RPCError as exc:
-                    _log_own_only_entity_rpc_error(self._conn, dialog_id, exc)
-                    continue
+            entity, stop, skip = await _load_candidate_entity(
+                self._client, self._conn, dialog_id, dialog_type, context.personal_channel_id
+            )
+            if stop:
+                return None
+            if skip:
+                continue
             classification = classify_own_only_dialog(
                 dialog_id=dialog_id,
                 dialog_type=dialog_type,
@@ -485,7 +502,7 @@ class ScheduledMessageReconciler:
                 if exc.retry_after_seconds is None:
                     return 0
                 retry_at = int(time.time()) + exc.retry_after_seconds
-                _record_retry(self._conn, retry_at, "FloodWaitError")
+                _record_retry(self._conn, retry_at, "TelegramRpcThrottled")
                 logger.warning(
                     "scheduled_reconcile_flood_wait dialog_id=%d retry_at=%d — stopping account pass",
                     dialog_id,

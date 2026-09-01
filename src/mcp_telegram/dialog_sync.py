@@ -20,7 +20,7 @@ serialization safely. This isolation was added per Phase 41 review HIGH finding.
 BOOTSTRAP requirements coverage
 -------------------------------
 - BOOTSTRAP-01: iter_dialogs() sweep populates `dialogs`.
-- BOOTSTRAP-03: FloodWait → interruptible sleep, no crash (D-13).
+- BOOTSTRAP-03: TelegramRpcThrottled → interruptible sleep, no crash (D-13).
 - BOOTSTRAP-04: cursor checkpoint enables mid-sweep resume.
 - BOOTSTRAP-06: INSERT ... ON CONFLICT ... DO UPDATE ... uses a NULL-aware
   body snapshot guard and per-fact unread observation guards, so bootstrap
@@ -492,7 +492,7 @@ def _apply_dialog_read_cursors(conn: sqlite3.Connection, dialog: _DialogLike) ->
     ``iter_dialogs()`` returns Telegram's current ``read_inbox_max_id`` and
     ``read_outbox_max_id`` on each Dialog.  Reconciliation already consumes
     that stream to maintain the local dialog snapshot, so applying the cursors
-    here adds no Telegram RPCs and therefore does not change FloodWait risk.
+    here adds no Telegram RPCs and therefore does not change throttling risk.
 
     ``None`` means Telegram did not provide a cursor for that side; preserve
     the existing DB value rather than inventing precision.  Non-``None`` values
@@ -523,7 +523,7 @@ class DialogsBootstrapWorker:
 
     Resumable via a cursor checkpoint in `daemon_state`. Idempotent — once the
     completion flag is written, subsequent runs short-circuit without calling
-    iter_dialogs(). FloodWait causes an interruptible sleep; the daemon's
+    iter_dialogs(). TelegramRpcThrottled causes an interruptible sleep; the daemon's
     shutdown_event wakes it before the full wait elapses.
 
     Connection ownership: takes `db_path` and opens its own dedicated SQLite
@@ -588,11 +588,24 @@ class DialogsBootstrapWorker:
                 _clear_cursor(self._conn)
             return None, 0, None
 
-    async def run(self) -> int:  # noqa: PLR0915 - checkpointed bootstrap phases stay explicit
+    async def _handle_bootstrap_throttling(self, exc: TelegramRpcThrottled, count: int) -> int:
+        if exc.retry_after_seconds is None:
+            return count
+        wait_s = exc.retry_after_seconds
+        logger.warning(
+            "bootstrap_sweep flood_wait=%ds processed_so_far=%d — sleeping",
+            wait_s,
+            count,
+        )
+        self._set_detail(f"bootstrap sweep: flood_wait {wait_s}s (processed {count})")
+        await sleep_through_flood(self._shutdown_event, wait_s)
+        return count
+
+    async def run(self) -> int:
         """Run (or skip) the bootstrap sweep. Returns count of dialogs processed.
 
         Returns 0 if the sweep is already complete or if it exits early on
-        FloodWait/RPCError/shutdown. Caller does not need to inspect the
+        TelegramRpcThrottled/RPCError/shutdown. Caller does not need to inspect the
         return value — daemon_state holds the persistent state.
 
         The dedicated connection is closed in the finally block.
@@ -650,18 +663,9 @@ class DialogsBootstrapWorker:
                         self._set_detail(f"bootstrap sweep: {count} dialogs processed")
 
             except TelegramRpcThrottled as exc:
-                if exc.retry_after_seconds is None:
-                    return count
-                wait_s = exc.retry_after_seconds
-                logger.warning(
-                    "bootstrap_sweep flood_wait=%ds processed_so_far=%d — sleeping",
-                    wait_s,
-                    count,
-                )
-                self._set_detail(f"bootstrap sweep: flood_wait {wait_s}s (processed {count})")
-                await sleep_through_flood(self._shutdown_event, wait_s)
+                await self._handle_bootstrap_throttling(exc, count)
                 # Return without writing 'complete'. iter_dialogs() is an async
-                # generator and is not restartable mid-stream after FloodWait — the
+                # generator and is not restartable mid-stream after throttling — the
                 # next daemon start re-enters this method, picks up the cursor,
                 # and calls iter_dialogs() afresh with the saved offset triple.
                 return count
@@ -722,7 +726,7 @@ class DialogReconciliationWorker:
     FloodWait semantics (RECON-05):
       - Light pass: sleep, then advance to next dialog. Does NOT retry the
         same dialog. The needs_refresh=1 flag remains set on the dialog that
-        triggered the FloodWait, so the NEXT hourly cycle picks it up.
+        triggered throttling, so the NEXT hourly cycle picks it up.
       - Full pass: sleep, then return. Does NOT resume the iter_dialogs
         stream (Telethon's iter_dialogs is a generator and cannot be resumed
         mid-stream). The next daily cycle re-runs the full pass from
@@ -742,12 +746,20 @@ class DialogReconciliationWorker:
         self._shutdown_event = shutdown_event
         self._topic_refresher = topic_refresher
 
+    async def _handle_light_throttling(self, exc: TelegramRpcThrottled, count: int, dialog_id: int) -> int:
+        if exc.retry_after_seconds is None:
+            return count
+        wait_s = exc.retry_after_seconds
+        logger.warning("recon_light_flood_wait dialog_id=%d wait=%ds", dialog_id, wait_s)
+        await sleep_through_flood(self._shutdown_event, wait_s)
+        return count
+
     async def run_light_pass(self) -> int:
         """RECON-02: refresh dialogs flagged with needs_refresh=1.
 
         Returns count of dialogs successfully refreshed.
 
-        FloodWait behavior: on FloodWaitError we sleep (interruptible by
+        Throttling behavior: on TelegramRpcThrottled we sleep (interruptible by
         shutdown_event), then ADVANCE TO THE NEXT DIALOG. We do NOT retry
         the same dialog — its needs_refresh=1 flag remains set, so the next
         hourly cycle picks it up. Returning early on shutdown preserves the
@@ -795,21 +807,10 @@ class DialogReconciliationWorker:
                         topic_count,
                     )
             except TelegramRpcThrottled as exc:
-                if exc.retry_after_seconds is None:
+                count = await self._handle_light_throttling(exc, count, dialog_id)
+                if self._shutdown_event.is_set():
                     return count
-                wait_s = exc.retry_after_seconds
-                logger.warning(
-                    "recon_light_flood_wait dialog_id=%d wait=%ds",
-                    dialog_id,
-                    wait_s,
-                )
-                if await sleep_through_flood(self._shutdown_event, wait_s):
-                    logger.info(
-                        "recon_light_pass_complete count=%d (shutdown_during_flood_wait)",
-                        count,
-                    )
-                    return count  # shutdown during flood wait
-                # Slept full duration; advance to NEXT dialog (per FloodWait
+                # Slept full duration; advance to NEXT dialog (per throttling
                 # semantics in class docstring). Do NOT retry the same dialog —
                 # its needs_refresh=1 will be picked up by the next hourly cycle.
             except ACCESS_LOST_ERRORS as exc:
@@ -929,8 +930,8 @@ class DialogReconciliationWorker:
         phase ran). Dialogs visible before the sweep but not returned by
         iter_dialogs() get hidden=1 when completed=True.
 
-        FloodWait behavior: iter_dialogs is a generator — it cannot be
-        resumed mid-stream. On FloodWaitError we sleep (interruptible by
+        Throttling behavior: iter_dialogs is a generator — it cannot be
+        resumed mid-stream. On TelegramRpcThrottled we sleep (interruptible by
         shutdown_event) and return (count, False). Soft-deletes are NOT
         applied (we cannot tell which dialogs are truly missing vs simply
         not yet streamed). The caller (run_reconciliation_loop) only advances
@@ -975,7 +976,7 @@ class DialogReconciliationWorker:
         """Refresh a topic-capable dialog's canonical topic_metadata snapshot.
 
         Called from run_light_pass after entity is already fetched. Handles
-        FloodWaitError by sleeping (interruptible by shutdown_event) and returning 0.
+        TelegramRpcThrottled by sleeping (interruptible by shutdown_event) and returning 0.
         The injected application service identifies both forum supergroups and
         private bot dialogs with ``bot_forum_view``.
 
@@ -1049,7 +1050,7 @@ async def run_reconciliation_loop(  # noqa: PLR0913
             try:
                 _count, completed = await worker.run_full_pass()
                 # Advance last_full_pass only when the sweep completed
-                # normally (soft-delete phase ran). FloodWait or shutdown
+                # normally (soft-delete phase ran). Throttling or shutdown
                 # mid-stream returns completed=False, leaving last_full_pass
                 # unchanged so the next hourly tick retries the full pass.
                 if completed:

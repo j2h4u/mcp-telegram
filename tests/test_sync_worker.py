@@ -484,8 +484,8 @@ async def test_floodwait_sleep_continues(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """FloodWaitError causes interruptible sleep and returns (progress, False)."""
-    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+    """TelegramRpcThrottled causes interruptible sleep and returns (progress, False)."""
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     dialog_id = 3001
     sync_db.execute(
@@ -495,8 +495,7 @@ async def test_floodwait_sleep_continues(
     seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
-    err = FloodWaitError(request=None)
-    err.seconds = 5
+    err = TelegramRpcThrottled(retry_after_seconds=5)
 
     mock_client.get_messages = AsyncMock(side_effect=err)
 
@@ -526,7 +525,7 @@ async def test_floodwait_no_progress_loss(
     shutdown_event: asyncio.Event,
 ) -> None:
     """sync_progress in DB has NOT changed after a FloodWait."""
-    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     dialog_id = 3002
     initial_progress = 750
@@ -536,8 +535,7 @@ async def test_floodwait_no_progress_loss(
     )
     sync_db.commit()
 
-    err = FloodWaitError(request=None)
-    err.seconds = 2
+    err = TelegramRpcThrottled(retry_after_seconds=2)
 
     mock_client.get_messages = AsyncMock(side_effect=err)
 
@@ -1225,9 +1223,10 @@ async def test_dm_bootstrap_handles_flood_wait(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """bootstrap_dms() catches FloodWaitError and commits partial progress."""
-    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+    """bootstrap_dms() catches TelegramRpcThrottled and commits partial progress."""
     from telethon.tl import types  # type: ignore[import-untyped]
+
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     user = MagicMock(spec=types.User)
     dialog = SimpleNamespace(entity=user, id=40001)
@@ -1238,7 +1237,7 @@ async def test_dm_bootstrap_handles_flood_wait(
         nonlocal call_count
         yield dialog
         call_count += 1
-        raise FloodWaitError(request=None, capture=42)
+        raise TelegramRpcThrottled(retry_after_seconds=42)
 
     mock_client.iter_dialogs = _iter_dialogs
 

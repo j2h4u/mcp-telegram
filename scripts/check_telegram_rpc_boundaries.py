@@ -23,6 +23,14 @@ def _violations(path: Path) -> list[str]:  # noqa: PLR0912 - AST policy branches
                 for imported in node.names:
                     if imported.name in _VENDOR_WAIT_NAMES:
                         violations.extend([f"{path}:{node.lineno}: vendor wait import {imported.name}"])
+            if isinstance(node, ast.ImportFrom) and node.module == "telethon":
+                for imported in node.names:
+                    if imported.name == "errors":
+                        violations.extend([f"{path}:{node.lineno}: vendor errors module import"])
+            if isinstance(node, ast.Import):
+                for imported in node.names:
+                    if imported.name in {"telethon", "telethon.errors", "telethon.errors.rpcerrorlist"}:
+                        violations.extend([f"{path}:{node.lineno}: vendor module import {imported.name}"])
             if isinstance(node, ast.Name) and node.id in _VENDOR_WAIT_NAMES:
                 violations.append(f"{path}:{node.lineno}: vendor wait reference {node.id}")
             if isinstance(node, ast.Attribute) and node.attr in _VENDOR_WAIT_NAMES:

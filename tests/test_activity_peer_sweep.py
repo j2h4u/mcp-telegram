@@ -489,8 +489,9 @@ def test_sweep_peer_once_persistence_error_reports_result_page(monkeypatch: pyte
 
 def test_sweep_peer_once_floodwait_reports_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
     """FloodWait becomes a non-sleeping FLOOD_WAIT result with seconds preserved."""
-    from telethon.errors import FloodWaitError
     from telethon.tl.functions.messages import SearchRequest
+
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     with closing(_make_db()) as conn:
         captured: dict[str, object] = {}
@@ -503,7 +504,7 @@ def test_sweep_peer_once_floodwait_reports_seconds(monkeypatch: pytest.MonkeyPat
             del client
             captured["timeout_s"] = timeout_s
             captured["request"] = request
-            raise FloodWaitError(request=None, capture=37)
+            raise TelegramRpcThrottled(retry_after_seconds=37)
 
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
@@ -606,7 +607,7 @@ def test_sweep_peer_once_success_invokes_pacing_sleep(
 
 def test_sweep_peer_once_floodwait_does_not_invoke_pacing_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     """FloodWait should return immediately without the success pacing sleep."""
-    from telethon.errors import FloodWaitError
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     with closing(_make_db()) as conn:
         sleep_calls: list[float] = []
@@ -617,7 +618,7 @@ def test_sweep_peer_once_floodwait_does_not_invoke_pacing_sleep(monkeypatch: pyt
 
         async def fake_call_with_timeout(client: object, request: object, *, timeout_s: float) -> object:
             del client, request, timeout_s
-            raise FloodWaitError(request=None, capture=37)
+            raise TelegramRpcThrottled(retry_after_seconds=37)
 
         async def fake_sleep(seconds: float) -> None:
             sleep_calls.append(seconds)

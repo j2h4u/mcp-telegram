@@ -50,13 +50,27 @@ class TelegramRpcThrottled(RuntimeError):  # noqa: N818 - public domain outcome 
         latched: bool = False,
         detail: str | None = None,
     ) -> None:
-        if retry_after_seconds is not None and retry_after_seconds < 1:
-            raise ValueError("retry_after_seconds must be >= 1 when finite")
-        if latched and retry_after_seconds is not None:
-            raise ValueError("latched throttling cannot have a finite retry duration")
+        _validate_throttle_state(retry_after_seconds, latched)
         self.retry_after_seconds = retry_after_seconds
         self.latched = latched
         super().__init__(detail or ("Telegram RPC circuit is latched" if latched else "Telegram RPC throttled"))
+
+
+def _validate_throttle_state(retry_after_seconds: int | None, latched: bool) -> None:
+    if not isinstance(latched, bool):
+        raise ValueError("latched must be a bool")
+    if retry_after_seconds is not None and (
+        isinstance(retry_after_seconds, bool) or not isinstance(retry_after_seconds, int) or retry_after_seconds < 1
+    ):
+        raise ValueError("retry_after_seconds must be a positive integer when finite")
+    if (retry_after_seconds is None) is not latched:
+        state = "latched" if latched else "non-latched"
+        raise ValueError(f"{state} throttling has an invalid retry duration")
+
+
+def _raise_if_latched(exc: BaseException) -> None:
+    if isinstance(exc, TelegramRpcThrottled) and exc.latched:
+        raise exc
 
 
 @dataclass(frozen=True, slots=True)

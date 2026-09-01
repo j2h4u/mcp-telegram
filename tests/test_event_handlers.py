@@ -1622,8 +1622,9 @@ async def test_linked_chat_refresh_flood_no_op(
     """
     from types import SimpleNamespace
 
-    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
     from telethon.tl.types import UpdateChannel  # type: ignore[import-untyped]
+
+    from mcp_telegram.flood import TelegramRpcThrottled
 
     dialog_id = -1009999999999
     channel_id = 9999999999
@@ -1638,8 +1639,8 @@ async def test_linked_chat_refresh_flood_no_op(
 
     insert_synced_dialog(sync_db, dialog_id)
 
-    # FloodWaitError — constructor takes (request, capture) where capture is seconds
-    flood_error = FloodWaitError(request=None, capture=120)
+    # TelegramRpcThrottled carries the finite retry duration.
+    flood_error = TelegramRpcThrottled(retry_after_seconds=120)
     fake_input = SimpleNamespace(channel_id=channel_id)
     client = _LinkedChatFakeClient(
         input_entity=fake_input,

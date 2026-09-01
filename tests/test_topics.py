@@ -6,10 +6,10 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
-from telethon.errors import FloodWaitError
 from telethon.tl.functions.messages import GetCustomEmojiDocumentsRequest, GetForumTopicsRequest
 from telethon.tl.types import DocumentAttributeCustomEmoji, InputStickerSetEmpty
 
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.topics.contracts import TopicFact, is_topic_capable
 from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway
@@ -154,7 +154,7 @@ async def test_telethon_gateway_does_not_mask_flood_wait() -> None:
             return entity
 
         async def __call__(self, request: object) -> object:
-            raise FloodWaitError(request=request, capture=3)
+            raise TelegramRpcThrottled(retry_after_seconds=3)
 
-    with pytest.raises(FloodWaitError):
+    with pytest.raises(TelegramRpcThrottled):
         await TelethonTelegramTopicGateway(Client()).fetch_topics(object())
