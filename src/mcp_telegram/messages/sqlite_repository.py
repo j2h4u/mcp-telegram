@@ -43,6 +43,15 @@ _TRANSCRIPTION_HYDRATION_MESSAGE_SQL = (
 )
 
 
+def _first_json_object_key_wins(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Decode JSON objects with SQLite JSON1's first-key-wins semantics."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key not in result:
+            result[key] = value
+    return result
+
+
 def _insert_sql(table: str, dataclass_type: type) -> str:
     column_names = tuple(field.name for field in fields(dataclass_type))
     return (
@@ -349,12 +358,15 @@ def _is_transcribable_media_pair(kind: object, payload: object) -> bool:
     if not isinstance(payload, str):
         return False
     try:
-        decoded_payload = cast(object, json.loads(payload))
+        decoded_payload = cast(
+            object,
+            json.loads(payload, object_pairs_hook=_first_json_object_key_wins),
+        )
     except TypeError, ValueError, json.JSONDecodeError:
         return False
     if not isinstance(decoded_payload, dict):
         return False
-    fact = decode_media_fact(kind, payload)
+    fact = decode_media_fact(kind, decoded_payload)
     # ``decode_media_fact`` fails closed for unsupported JSON values by
     # returning an empty payload.  Compare the decoded object to retain that
     # fail-closed behavior (Python's json parser accepts NaN/Infinity while

@@ -291,6 +291,8 @@ def test_historical_transcription_repair_and_dialog_reconciliation_admit_voice_a
         ("video", '{"round_message": true}'),
         ("video", '{"duration":12, "round_message": true}'),
         ("video", '{"round_message": true, "duration":12}'),
+        ("video", '{"round_message":false,"round_message":true}'),
+        ("video", '{"round_message":true,"round_message":false}'),
         ("video", '{"round_message":false}'),
         ("video", "{}"),
         ("video", '{"round_message":"true"}'),
