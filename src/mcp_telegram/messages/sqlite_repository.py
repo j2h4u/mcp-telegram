@@ -7,7 +7,7 @@ import sqlite3
 import time
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, fields, replace
-from typing import cast
+from typing import NoReturn, cast
 
 from .. import message_contracts as _message_contracts
 from ..fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
@@ -50,6 +50,11 @@ def _first_json_object_key_wins(pairs: list[tuple[str, object]]) -> dict[str, ob
         if key not in result:
             result[key] = value
     return result
+
+
+def _reject_json_constant(_value: str) -> NoReturn:
+    """Reject Python JSON extensions that SQLite JSON1 does not accept."""
+    raise ValueError("non-finite JSON number")
 
 
 def _insert_sql(table: str, dataclass_type: type) -> str:
@@ -360,7 +365,11 @@ def _is_transcribable_media_pair(kind: object, payload: object) -> bool:
     try:
         decoded_payload = cast(
             object,
-            json.loads(payload, object_pairs_hook=_first_json_object_key_wins),
+            json.loads(
+                payload,
+                object_pairs_hook=_first_json_object_key_wins,
+                parse_constant=_reject_json_constant,
+            ),
         )
     except TypeError, ValueError, json.JSONDecodeError:
         return False
