@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import telethon.tl.types as tl  # type: ignore[import-untyped]
 from telethon.tl.types import PeerUser  # type: ignore[import-untyped]
 
 from helpers import build_mock_message, build_mock_reactions
@@ -74,13 +75,26 @@ def _manager(conn: sqlite3.Connection, client: MagicMock) -> EventHandlerManager
     return manager
 
 
-def _insert_message(conn: sqlite3.Connection, *, out: int, message_id: int = 1) -> None:
+def _insert_message(
+    conn: sqlite3.Connection,
+    *,
+    out: int,
+    message_id: int = 1,
+    media_kind: str | None = None,
+    media_payload: str | None = None,
+) -> None:
     conn.execute(
-        "INSERT INTO messages(dialog_id, message_id, sent_at, text, sender_id, out, is_deleted) "
-        "VALUES (42, ?, 1704067200, 'old', 7, ?, 0)",
-        (message_id, out),
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, sender_id, out, media_kind, media_payload, is_deleted) "
+        "VALUES (42, ?, 1704067200, 'old', 7, ?, ?, ?, 0)",
+        (message_id, out, media_kind, media_payload),
     )
     conn.commit()
+
+
+def _voice_media() -> MagicMock:
+    document = MagicMock(spec=tl.Document, size=1, mime_type="audio/ogg")
+    document.attributes = [tl.DocumentAttributeAudio(duration=1, voice=True)]
+    return MagicMock(spec=tl.MessageMediaDocument, document=document)
 
 
 @pytest.mark.asyncio
@@ -153,13 +167,15 @@ async def test_own_only_outgoing_new_is_persisted(sync_db: sqlite3.Connection) -
 
 @pytest.mark.asyncio
 async def test_own_only_allows_existing_outgoing_updates(sync_db: sqlite3.Connection) -> None:
-    _insert_message(sync_db, out=1)
+    _insert_message(sync_db, out=1, media_kind="voice", media_payload="{}")
     client = MagicMock()
     client.get_messages = AsyncMock(
-        return_value=[build_mock_message(id=1, text="old", reactions=build_mock_reactions({"👍": 2}))]
+        return_value=[
+            build_mock_message(id=1, text="old", media=_voice_media(), reactions=build_mock_reactions({"👍": 2}))
+        ]
     )
     manager = _manager(sync_db, client)
-    edited = build_mock_message(id=1, text="new")
+    edited = build_mock_message(id=1, text="new", media=_voice_media())
     await manager.on_message_edited(SimpleNamespace(chat_id=42, message=edited))
     await manager.on_raw_reaction_update(SimpleNamespace(peer=PeerUser(user_id=42), msg_id=1))
     await manager.on_raw_transcribed_audio(

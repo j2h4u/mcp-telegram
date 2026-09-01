@@ -490,7 +490,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.messages.sqlite_repository"
 layer = "persistence"
-depends_on = ["mcp_telegram.fts", "mcp_telegram.hydration_queue", "mcp_telegram.message_contracts", "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.persistence"]
+depends_on = ["mcp_telegram.fts", "mcp_telegram.hydration_queue", "mcp_telegram.media_fact", "mcp_telegram.message_contracts", "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.persistence"]
 
 [[modules]]
 path = "mcp_telegram.folders.sqlite_repository"

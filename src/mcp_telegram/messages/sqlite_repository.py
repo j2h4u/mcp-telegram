@@ -17,6 +17,7 @@ from ..hydration_queue import (
     HydrationPriority,
     HydrationQueueRepository,
 )
+from ..media_fact import MediaFact, decode_media_fact, encode_media_payload, is_transcribable_telegram_media
 from ..reactions.contracts import ReactionAggregate
 from ..reactions.persistence import replace_reaction_aggregates
 
@@ -62,6 +63,7 @@ _UPDATE_MESSAGE_TEXT_SQL = "UPDATE messages SET text = ? WHERE dialog_id = ? AND
 _SELECT_MESSAGE_TRANSCRIPTION_SQL = (
     "SELECT text, transcription_id FROM message_transcriptions WHERE dialog_id = ? AND message_id = ?"
 )
+_SELECT_MESSAGE_MEDIA_SQL = "SELECT media_kind, media_payload FROM messages WHERE dialog_id = ? AND message_id = ?"
 _MARK_DELETED_SQL = (
     "UPDATE messages SET is_deleted = 1, deleted_at = ? WHERE dialog_id = ? AND message_id = ? AND is_deleted = 0"
 )
@@ -209,9 +211,13 @@ def apply_message_transcription(  # noqa: PLR0913
     text = transcribed_text.strip()
     if not text:
         return False
-    message = read_message_text(conn, dialog_id, message_id)
-    if not message.found:
+    message_row = cast(
+        tuple[object, object] | None,
+        conn.execute(_SELECT_MESSAGE_MEDIA_SQL, (dialog_id, message_id)).fetchone(),
+    )
+    if message_row is None or not _is_transcribable_media_pair(*message_row):
         return False
+    message = read_message_text(conn, dialog_id, message_id)
     upsert_message_transcription(
         conn,
         dialog_id,
@@ -271,19 +277,19 @@ def apply_message_transcription_if_absent(  # noqa: PLR0913
     text = transcribed_text.strip()
     if not text:
         return "not_applied"
-    eligible = cast(
-        tuple[object, ...] | None,
+    eligible_row = cast(
+        tuple[object, object] | None,
         conn.execute(
-            "SELECT 1 FROM messages m "
+            "SELECT m.media_kind, m.media_payload FROM messages m "
             "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
             "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
-            "WHERE m.dialog_id = ? AND m.message_id = ? AND m.media_kind = 'voice' AND m.is_deleted = 0 "
+            "WHERE m.dialog_id = ? AND m.message_id = ? AND m.media_kind IN ('voice', 'video') AND m.is_deleted = 0 "
             "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
             "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id)",
             (dialog_id, message_id),
         ).fetchone(),
     )
-    if eligible is None:
+    if eligible_row is None or not _is_transcribable_media_pair(*eligible_row):
         fact = cast(
             tuple[object, ...] | None,
             conn.execute(
@@ -320,6 +326,18 @@ def _remove_transcription_hydration_job(conn: sqlite3.Connection, dialog_id: int
             "DELETE FROM hydration_jobs WHERE kind = ? AND dialog_id = ? AND message_id = ?",
             (TRANSCRIPTION_HYDRATION_KIND, dialog_id, message_id),
         )
+
+
+def _is_transcribable_media_pair(kind: object, payload: object) -> bool:
+    """Apply the domain predicate to one projected SQLite media pair."""
+    fact = decode_media_fact(kind, payload)
+    return _is_canonical_media_pair(kind, payload, fact=fact) and is_transcribable_telegram_media(fact)
+
+
+def _is_canonical_media_pair(kind: object, payload: object, *, fact: MediaFact | None = None) -> bool:
+    """Return whether a stored media pair round-trips through the codec."""
+    decoded = fact if fact is not None else decode_media_fact(kind, payload)
+    return isinstance(payload, str) and decoded is not None and encode_media_payload(decoded) == payload
 
 
 def mark_message_deleted(conn: sqlite3.Connection, dialog_id: int, message_id: int, deleted_at: int) -> bool:
@@ -379,15 +397,20 @@ def media_fact_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, mess
 
 
 def transcription_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
-    """Return whether one undeleted voice message still needs a transcription."""
-    return (
+    """Return whether one undeleted transcribable message still needs work."""
+    row = cast(
+        tuple[object, object] | None,
         conn.execute(
-            "SELECT 1 FROM messages m WHERE m.dialog_id = ? AND m.message_id = ? "
-            f"AND {_TRANSCRIPTION_HYDRATION_MESSAGE_SQL} AND EXISTS (" + _FACT_HYDRATION_ELIGIBILITY_SQL + ")",
+            "SELECT m.media_kind, m.media_payload FROM messages m "
+            "WHERE m.dialog_id = ? AND m.message_id = ? AND m.is_deleted = 0 "
+            "AND m.media_kind IN ('voice', 'video') "
+            "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
+            "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id) "
+            "AND EXISTS (" + _FACT_HYDRATION_ELIGIBILITY_SQL + ")",
             (dialog_id, message_id, dialog_id),
-        ).fetchone()
-        is not None
+        ).fetchone(),
     )
+    return row is not None and _is_transcribable_media_pair(*row)
 
 
 _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL = (
@@ -529,13 +552,17 @@ def _reconcile_transcription_hydration_job(
             (message.dialog_id, message.message_id),
         ).fetchone(),
     )
+    transcribable = message.media_kind == "voice" or (
+        priority is HydrationPriority.FOREGROUND
+        and _is_transcribable_media_pair(message.media_kind, message.media_payload)
+    )
     if (
-        message.media_kind == "voice"
+        transcribable
         and transcription_row is None
         and transcription_hydration_eligible(conn, message.dialog_id, message.message_id)
     ):
         queue.enqueue(transcription_job)
-    elif message.media_kind == "voice" and transcription_row is None:
+    elif transcribable and transcription_row is None:
         queue.remove_active(transcription_job)
     else:
         queue.remove(transcription_job)
@@ -635,7 +662,19 @@ def _overlay_message_transcriptions(
         if row is None:
             projected.append(item)
             continue
-        projected.append(replace(item, message=replace(item.message, text=row[0])))
+        message = item.message
+        fact = decode_media_fact(message.media_kind, message.media_payload)
+        if _is_canonical_media_pair(
+            message.media_kind, message.media_payload, fact=fact
+        ) and is_transcribable_telegram_media(fact):
+            projected.append(replace(item, message=replace(message, text=row[0])))
+            continue
+        if _is_canonical_media_pair(message.media_kind, message.media_payload, fact=fact):
+            conn.execute(
+                "DELETE FROM message_transcriptions WHERE dialog_id = ? AND message_id = ?",
+                (dialog_id, message_id),
+            )
+        projected.append(item)
     return projected
 
 
