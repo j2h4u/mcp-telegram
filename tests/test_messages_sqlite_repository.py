@@ -12,6 +12,8 @@ from mcp_telegram.fts import stem_text
 from mcp_telegram.hydration_queue import HydrationPriority
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.messages.sqlite_repository import (
+    _REPAIR_MEDIA_METADATA_CONTACT_OTHER_SQL,
+    _REPAIR_MEDIA_METADATA_VIDEO_SQL,
     TranscriptionHydrationRepair,
     apply_message_transcription,
     insert_messages_with_fts,
@@ -191,23 +193,36 @@ def test_media_metadata_repair_is_bounded_newest_first_and_terminal_safe(conn: s
             (103, 300, "other", "{}", 1),
             (104, 400, "video", '{"round_message":false}', 0),
             (105, 500, "video", '{"duration": 2}', 0),
+            (106, 150, "other", "{}", 0),
+            (107, 550, "other", "{}", 0),
         ],
     )
     conn.execute(
         "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, terminal) "
-        "VALUES ('media_metadata', 42, 105, 1, 3, 1)"
+        "VALUES ('media_metadata', 42, 107, 1, 3, 1)"
     )
     conn.commit()
 
     first = repair_media_metadata_hydration_jobs(conn, due_at=900, max_jobs=2)
-    assert first == type(first)(enqueued=2, has_more=False)
+    assert first == type(first)(enqueued=2, has_more=True)
     assert conn.execute(
         "SELECT message_id, priority, message_sent_at, terminal FROM hydration_jobs "
         "WHERE kind = 'media_metadata' ORDER BY message_id"
-    ).fetchall() == [(101, 0, 100, 0), (102, 0, 200, 0), (105, 0, 0, 1)]
+    ).fetchall() == [(102, 0, 200, 0), (105, 0, 500, 0), (107, 0, 0, 1)]
+    assert conn.execute(
+        "SELECT message_id FROM hydration_jobs WHERE kind = 'media_metadata' AND terminal = 0 "
+        "ORDER BY message_sent_at DESC"
+    ).fetchall() == [(105,), (102,)]
 
     second = repair_media_metadata_hydration_jobs(conn, due_at=901, max_jobs=2)
-    assert second == type(second)(enqueued=0, has_more=False)
+    assert second == type(second)(enqueued=2, has_more=False)
+    assert conn.execute(
+        "SELECT message_id FROM hydration_jobs WHERE kind = 'media_metadata' AND terminal = 0 "
+        "ORDER BY message_sent_at DESC"
+    ).fetchall() == [(105,), (102,), (106,), (101,)]
+
+    third = repair_media_metadata_hydration_jobs(conn, due_at=902, max_jobs=2)
+    assert third == type(third)(enqueued=0, has_more=False)
 
     for index_name in (
         "idx_messages_media_unresolved_contact_other",
@@ -216,6 +231,23 @@ def test_media_metadata_repair_is_bounded_newest_first_and_terminal_safe(conn: s
         row = cast(tuple[str], conn.execute("SELECT sql FROM sqlite_master WHERE name = ?", (index_name,)).fetchone())
         sql = row[0]
         assert "WHERE" in sql
+
+
+def test_media_metadata_repair_plan_uses_both_partial_indexes_without_sort(conn: sqlite3.Connection) -> None:
+    selection = (
+        "SELECT 'media_metadata', m.dialog_id, m.message_id, 900, 0, 0, m.sent_at, 0 "
+        f"{_REPAIR_MEDIA_METADATA_CONTACT_OTHER_SQL} "
+        "UNION ALL "
+        "SELECT 'media_metadata', m.dialog_id, m.message_id, 900, 0, 0, m.sent_at, 0 "
+        f"{_REPAIR_MEDIA_METADATA_VIDEO_SQL} "
+        "ORDER BY 7 DESC, 2, 3 LIMIT 2"
+    )
+    plan = cast(list[tuple[object, ...]], conn.execute("EXPLAIN QUERY PLAN " + selection).fetchall())
+    details = " ".join(str(row[3]) for row in plan)
+    assert "idx_messages_media_unresolved_contact_other" in details
+    assert "idx_messages_media_unresolved_video" in details
+    assert "SCAN messages" not in details
+    assert "USE TEMP B-TREE" not in details
 
 
 def test_historical_transcription_repair_and_dialog_reconciliation_stay_voice_only(
