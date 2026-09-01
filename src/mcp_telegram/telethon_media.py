@@ -23,6 +23,11 @@ def _integer(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _positive_integer(value: object) -> int | None:
+    integer = _integer(value)
+    return integer if integer is not None and integer > 0 else None
+
+
 def _text(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
@@ -71,11 +76,14 @@ def extract_media_fact(media: object | None) -> MediaFact | None:
 
 def _extract_document(media: object) -> MediaFact:
     document = _attr(media, "document")
-    attrs = list(cast(Sequence[object], _attr(document, "attributes", []) or []))
+    raw_attrs = _attr(document, "attributes", [])
+    attrs = (
+        list(cast(Sequence[object], raw_attrs))
+        if isinstance(raw_attrs, Sequence) and not isinstance(raw_attrs, (str, bytes, bytearray))
+        else []
+    )
     base = _document_base(document)
     wrapper_voice = _attr(media, "voice") is True
-    wrapper_video = _attr(media, "video") is True or _attr(media, "round") is True
-    wrapper_round = _attr(media, "round") is True
     if wrapper_voice:
         audio = _first_attribute(attrs, tl.DocumentAttributeAudio)
         if audio is not None:
@@ -88,7 +96,7 @@ def _extract_document(media: object) -> MediaFact:
         sticker_fact = _extract_sticker(attrs, base)
     if sticker_fact is not None:
         return sticker_fact
-    visual_fact = _extract_visual(document, attrs, base, wrapper_video=wrapper_video, wrapper_round=wrapper_round)
+    visual_fact = _extract_visual(document, attrs, base, media)
     if visual_fact is not None:
         return visual_fact
     audio = _first_attribute(attrs, tl.DocumentAttributeAudio)
@@ -103,8 +111,8 @@ def _photo_payload(media: object) -> dict[str, object]:
     for key in ("spoiler", "live_photo"):
         if _attr(media, key) is True:
             payload[key] = True
-    ttl_seconds = _number(_attr(media, "ttl_seconds"))
-    if ttl_seconds is not None and ttl_seconds > 0:
+    ttl_seconds = _positive_integer(_attr(media, "ttl_seconds"))
+    if ttl_seconds is not None:
         payload["ttl_seconds"] = ttl_seconds
     return payload
 
@@ -139,23 +147,40 @@ def _extract_visual(
     document: object | None,
     attrs: Sequence[object],
     base: dict[str, object],
-    *,
-    wrapper_video: bool = False,
-    wrapper_round: bool = False,
+    media: object,
 ) -> MediaFact | None:
     video = _first_attribute(attrs, tl.DocumentAttributeVideo)
-    if video is not None or wrapper_video:
-        duration = _number(_attr(video, "duration")) if video is not None else None
-        if duration is not None:
-            base["duration"] = duration
-        base["round_message"] = wrapper_round or _attr(video, "round_message") is True
-        return MediaFact("video", base)
+    if video is not None or _is_wrapper_video(media):
+        return _video_fact(attrs, base, media, video)
     if any(isinstance(attribute, tl.DocumentAttributeAnimated) for attribute in attrs):
         return MediaFact("animation", base)
     mime_type = _attr(document, "mime_type")
     if isinstance(mime_type, str) and mime_type.lower() == "image/gif":
         return MediaFact("animation", base)
     return None
+
+
+def _is_wrapper_video(media: object) -> bool:
+    return _attr(media, "video") is True or _attr(media, "round") is True
+
+
+def _video_fact(attrs: Sequence[object], base: dict[str, object], media: object, video: object | None) -> MediaFact:
+    _add_filename(base, _first_attribute(attrs, tl.DocumentAttributeFilename))
+    duration = _number(_attr(video, "duration")) if video is not None else None
+    if duration is not None:
+        base["duration"] = duration
+    base["round_message"] = _attr(media, "round") is True or _attr(video, "round_message") is True
+    _add_visual_wrapper_flags(base, media)
+    return MediaFact("video", base)
+
+
+def _add_visual_wrapper_flags(base: dict[str, object], media: object) -> None:
+    """Add only the safe MessageMediaDocument flags for a visual fact."""
+    if _attr(media, "spoiler") is True:
+        base["spoiler"] = True
+    ttl_seconds = _positive_integer(_attr(media, "ttl_seconds"))
+    if ttl_seconds is not None:
+        base["ttl_seconds"] = ttl_seconds
 
 
 def _add_filename(base: dict[str, object], filename: object | None) -> None:
