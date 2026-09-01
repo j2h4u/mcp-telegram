@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+import telethon.tl.types as tl  # type: ignore[import-untyped]
 from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.errors.rpcbaseerrors import BadRequestError  # type: ignore[import-untyped]
 from telethon.errors.rpcerrorlist import (  # type: ignore[import-untyped]
@@ -259,7 +260,7 @@ async def test_batch_and_request_cap_are_deterministic(db: sqlite3.Connection) -
     policy = FactHydrationConfig(batch_size=2, max_requests_per_cycle=2, pause_between_requests_seconds=0.01)
     await _worker(db, client, policy).run_cycle(now=1)
     assert [call["ids"] for call in client.calls] == [[1, 2], [3, 4]]
-    assert db.execute("SELECT message_id FROM hydration_jobs ORDER BY message_id").fetchall() == [(5,)]
+    assert db.execute("SELECT message_id FROM hydration_jobs ORDER BY message_id").fetchall() == [(3,), (4,), (5,)]
 
 
 @pytest.mark.asyncio
@@ -345,7 +346,8 @@ async def test_transient_retries_then_caps_after_durable_attempts(db: sqlite3.Co
     await worker.run_cycle(now=1)
     assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 11)
     await worker.run_cycle(now=11)
-    assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (1,)
+    assert db.execute("SELECT terminal FROM hydration_jobs").fetchone() == (1,)
 
 
 @pytest.mark.asyncio
@@ -783,7 +785,7 @@ async def test_voice_foreground_beats_large_media_backlog(db: sqlite3.Connection
 
     assert result.completed == 1
     assert ["dialog_id" in call for call in client.calls] == [True, False, False, False]
-    assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'media_metadata'").fetchone() == (6,)
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'media_metadata'").fetchone() == (8,)
 
 
 @pytest.mark.asyncio
@@ -975,6 +977,47 @@ async def test_plain_video_transcription_job_is_dropped_without_rpc(db: sqlite3.
     assert client.calls == []
     assert db.execute("SELECT text FROM messages WHERE dialog_id=1 AND message_id=1").fetchone() == (None,)
     assert db.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_repaired_round_video_enqueues_one_backfill_transcription(db: sqlite3.Connection) -> None:
+    db.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
+    db.execute(
+        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
+    )
+    db.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+        "VALUES (1, 1, 123, NULL, 'video', '{\"duration\":5}')"
+    )
+    db.commit()
+    media = tl.MessageMediaDocument(video=True, round=True)
+    client = _Client([SimpleNamespace(id=1, media=media)])
+
+    result = await _worker(db, client).run_cycle(now=10)
+
+    assert result.repaired_media_metadata_jobs == 1
+    assert db.execute("SELECT kind, priority, message_sent_at FROM hydration_jobs").fetchall() == [
+        ("transcription", int(HydrationPriority.BACKFILL), 123)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_repaired_plain_video_does_not_enqueue_transcription(db: sqlite3.Connection) -> None:
+    db.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
+    db.execute(
+        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
+    )
+    db.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+        "VALUES (1, 1, 123, NULL, 'video', '{\"duration\":5}')"
+    )
+    db.commit()
+    media = tl.MessageMediaDocument(video=True, round=False)
+    client = _Client([SimpleNamespace(id=1, media=media)])
+
+    await _worker(db, client).run_cycle(now=10)
+
     assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
 
 

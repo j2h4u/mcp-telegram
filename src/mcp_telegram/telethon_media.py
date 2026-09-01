@@ -69,10 +69,18 @@ def _extract_document(media: object) -> MediaFact:
     document = _attr(media, "document")
     attrs = list(cast(Sequence[object], _attr(document, "attributes", []) or []))
     base = _document_base(document)
+    wrapper_voice = _attr(media, "voice") is True
+    wrapper_video = _attr(media, "video") is True or _attr(media, "round") is True
+    wrapper_round = _attr(media, "round") is True
+    if wrapper_voice:
+        audio = _first_attribute(attrs, tl.DocumentAttributeAudio)
+        if audio is not None:
+            return _audio_fact(audio, base, force_voice=True)
+        return MediaFact("voice", base)
     sticker_fact = _extract_sticker(attrs, base)
     if sticker_fact is not None:
         return sticker_fact
-    visual_fact = _extract_visual(document, attrs, base)
+    visual_fact = _extract_visual(document, attrs, base, wrapper_video=wrapper_video, wrapper_round=wrapper_round)
     if visual_fact is not None:
         return visual_fact
     audio = _first_attribute(attrs, tl.DocumentAttributeAudio)
@@ -106,17 +114,23 @@ def _extract_sticker(attrs: Sequence[object], base: dict[str, object]) -> MediaF
     return MediaFact("sticker", base)
 
 
-def _extract_visual(document: object | None, attrs: Sequence[object], base: dict[str, object]) -> MediaFact | None:
-    if any(isinstance(attribute, tl.DocumentAttributeAnimated) for attribute in attrs):
-        return MediaFact("animation", base)
+def _extract_visual(
+    document: object | None,
+    attrs: Sequence[object],
+    base: dict[str, object],
+    *,
+    wrapper_video: bool = False,
+    wrapper_round: bool = False,
+) -> MediaFact | None:
     video = _first_attribute(attrs, tl.DocumentAttributeVideo)
-    if video is not None:
-        duration = _number(_attr(video, "duration"))
+    if video is not None or wrapper_video:
+        duration = _number(_attr(video, "duration")) if video is not None else None
         if duration is not None:
             base["duration"] = duration
-        if _attr(video, "round_message") is True:
-            base["round_message"] = True
+        base["round_message"] = wrapper_round or _attr(video, "round_message") is True
         return MediaFact("video", base)
+    if any(isinstance(attribute, tl.DocumentAttributeAnimated) for attribute in attrs):
+        return MediaFact("animation", base)
     mime_type = _attr(document, "mime_type")
     if isinstance(mime_type, str) and mime_type.lower() == "image/gif":
         return MediaFact("animation", base)
@@ -139,7 +153,7 @@ def _document_base(document: object | None) -> dict[str, object]:
     return base
 
 
-def _audio_fact(audio: object, base: dict[str, object]) -> MediaFact:
+def _audio_fact(audio: object, base: dict[str, object], *, force_voice: bool = False) -> MediaFact:
     duration = _number(_attr(audio, "duration"))
     if duration is not None:
         base["duration"] = duration
@@ -147,7 +161,7 @@ def _audio_fact(audio: object, base: dict[str, object]) -> MediaFact:
         value = _text(_attr(audio, key))
         if value:
             base[key] = value
-    return MediaFact("voice" if _attr(audio, "voice", False) else "audio", base)
+    return MediaFact("voice" if force_voice or _attr(audio, "voice", False) is True else "audio", base)
 
 
 def _extract_location_or_poll(media: object) -> MediaFact | None:
