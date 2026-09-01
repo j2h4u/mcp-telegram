@@ -334,12 +334,18 @@ async def test_transient_retries_then_caps_after_durable_attempts(db: sqlite3.Co
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("flood_error", [FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError])
-async def test_flood_wait_stops_without_sleep_and_reschedules(
-    flood_error: type[BaseException], db: sqlite3.Connection
-) -> None:
+@pytest.mark.parametrize(
+    "flood_error",
+    [
+        FloodWaitError(request=None, capture=7),
+        FloodPremiumWaitError(request=None, capture=7),
+        FloodTestPhoneWaitError(request=None, capture=7),
+    ],
+    ids=["FloodWaitError", "FloodPremiumWaitError", "FloodTestPhoneWaitError"],
+)
+async def test_flood_wait_stops_without_sleep_and_reschedules(flood_error: Exception, db: sqlite3.Connection) -> None:
     _seed(db)
-    client = _Client(error=flood_error(request=None, capture=7))
+    client = _Client(error=flood_error)
     result = await _worker(db, client).run_cycle(now=1)
     assert result.stopped
     assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 8)
