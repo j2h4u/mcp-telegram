@@ -826,10 +826,10 @@ def test_register_attaches_three_new_handlers(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """Three new Phase 42 Plan 01 handlers (+ one Plan 02 handler) bring total to 11."""
+    """Dialog, scheduled, and topic handlers bring the registration total to 14."""
     mgr = EventHandlerManager(mock_client, sync_db, shutdown_event, mock_client.get_input_entity)
     mgr.register()
-    assert mock_client.add_event_handler.call_count == 13
+    assert mock_client.add_event_handler.call_count == 14
 
 
 def test_unregister_detaches_all_new_handlers(

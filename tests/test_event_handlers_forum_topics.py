@@ -601,12 +601,12 @@ async def test_update_pinned_forum_topic_unsets_when_pinned_false(
 
 
 @pytest.mark.asyncio
-async def test_update_pinned_forum_topic_unsets_when_pinned_none(
+async def test_update_pinned_forum_topic_ignores_when_pinned_none(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """UpdatePinnedForumTopic(pinned=None) treats as falsy → pinned=0."""
+    """UpdatePinnedForumTopic(pinned=None) is incomplete and leaves state unchanged."""
     channel_id = 12345
     dialog_id = get_peer_id(PeerChannel(channel_id))
     _enroll_synced(sync_db, dialog_id)
@@ -623,7 +623,7 @@ async def test_update_pinned_forum_topic_unsets_when_pinned_none(
     await mgr.on_raw_forum_topic_pinned(cast(_ForumTopicPinnedUpdateLike, update))
 
     row = _topic_row(sync_db, dialog_id, 100)
-    assert row["pinned"] == 0
+    assert row["pinned"] == 1
 
 
 @pytest.mark.asyncio
