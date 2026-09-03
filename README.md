@@ -2,11 +2,11 @@
 
 **A local Telegram mirror and MCP server for personal AI agents.**
 
-`mcp-telegram` keeps a local, structured copy of your Telegram dialogs and
+`mcp-telegram` keeps a local, searchable copy of your Telegram dialogs and
 exposes it through the [Model Context Protocol](https://modelcontextprotocol.io).
-It is built for agents that need to triage unread chats, read recent context,
-search message history, audit your own recent activity, and inspect sync
-coverage without taking over the Telegram client session.
+It is built for agents that need to triage unread chats, browse folders and
+topics, read recent context, search message history, audit your own activity,
+and understand how fresh or complete the local mirror is.
 
 > [!IMPORTANT]
 > Review the [Telegram API Terms of Service](https://core.telegram.org/api/terms)
@@ -18,8 +18,12 @@ coverage without taking over the Telegram client session.
 - Serves MCP tools over stdio and Streamable HTTP.
 - Returns successful tool responses as structured `structuredContent`; text
   `content` is reserved for recoverable tool errors.
-- Reads dialogs, forum topics, messages, unread inbox state, search results,
-  reactions, edits, reply links, and sync coverage.
+- Reads dialogs, Telegram folders, forum and bot-DM topics, messages, unread
+  state, reactions, edits, replies, and sync coverage.
+- Projects Telegram media into compact attachment descriptions and stores
+  Telegram-provided voice and video-message transcriptions as searchable text.
+- Keeps a compact journal of important access changes such as losing or
+  regaining access to a chat.
 - Tracks your own recent messages across group/forum chats by default, including
   reactions and `reply_count` for follow-up audits.
 - Lets agents submit tool feedback into a local operator queue.
@@ -68,14 +72,16 @@ network.
 
 ## MCP Tools
 
-There are 14 MCP tools. Successful calls are machine-oriented: agents should
+There are 18 MCP tools. Successful calls are machine-oriented: agents should
 read `structuredContent` for IDs, counts, navigation tokens, coverage, warnings,
 and Telegram-originated content.
 
 | Tool | Purpose |
 | --- | --- |
 | `list_dialogs` | List dialogs with type, unread counters, sync status, draft text, and cached metadata. |
-| `list_topics` | List forum topics for a dialog. |
+| `list_topics` | List threads for a topic-capable dialog, including forum topics and bot-DM topics. |
+| `list_folders` | List custom Telegram folders. Archive is represented separately. |
+| `list_folder_messages` | Read a unified recent-message feed across one folder, with explicit partial-coverage reporting. |
 | `list_messages` | Read one dialog in chronological order within each page, with pagination, topic/sender/unread filters, UTC time bounds, reply refs, reactions, read-state markers, and archive coverage. |
 | `search_messages` | Full-text search across synced dialogs or within one dialog, with optional UTC time bounds; results include anchors for `list_messages`. |
 | `get_inbox` | Fetch unread messages from personal chats and small groups with budgeted per-dialog output. |
@@ -86,6 +92,7 @@ and Telegram-originated content.
 | `mark_dialog_for_sync` | Enable or disable persistent sync for a dialog. |
 | `get_sync_status` | Inspect sync progress, coverage, access state, and local message counts. |
 | `get_sync_alerts` | Report locally observed delete, edit, and access-loss alerts. |
+| `list_important_events` | List recent persisted access-loss and access-restoration events. |
 | `get_usage_stats` | Summarize local MCP tool telemetry for the last 30 days. |
 | `get_dialog_stats` | Show dialog-level reaction, mention, hashtag, and forward statistics. |
 | `submit_feedback` | Write agent feedback into the local operator queue. |
@@ -98,6 +105,9 @@ Search, then read context:
 search_messages(query="contract")
 list_messages(exact_dialog_id=<hit.dialog_id>, anchor_message_id=<hit.msg_id>)
 ```
+
+Search includes normalized message text and available Telegram transcriptions
+for voice messages and round video messages.
 
 Both reading tools accept optional absolute `since_utc` (inclusive) and
 `until_utc` (exclusive) boundaries. Values must be RFC3339 timestamps with an
@@ -139,8 +149,31 @@ disable the filter.
 Triage unread conversations:
 
 ```text
-get_inbox(limit=100)
+get_inbox(last_hours=24, limit=100)
+get_unread_summary(limit=50)
 list_messages(exact_dialog_id=<dialog_id>, unread=true)
+```
+
+Browse a Telegram folder:
+
+```text
+list_folders()
+list_dialogs(folder_id=<folder_id>)
+list_folder_messages(folder_id=<folder_id>, limit=50)
+```
+
+Inspect threads without caring whether Telegram implements them as forum or
+bot-DM topics:
+
+```text
+list_topics(exact_dialog_id=<dialog_id>)
+list_messages(exact_dialog_id=<dialog_id>, exact_topic_id=<topic_id>)
+```
+
+Review recent important access changes:
+
+```text
+list_important_events(last_hours=168)
 ```
 
 Bring a dialog under full local sync:
@@ -151,11 +184,15 @@ mark_dialog_for_sync(dialog_id=<dialog_id>, enable=true)
 get_sync_status(dialog_id=<dialog_id>)
 ```
 
+MCP clients that support prompts can request `telegram_workflows` for the
+current workflow guide and important interpretation rules.
+
 ## Requirements
 
 - Telegram API ID and hash from [my.telegram.org](https://my.telegram.org/auth).
 - Docker Compose for the deployed runtime.
-- Python 3.14 and [uv](https://docs.astral.sh/uv/) for local development.
+- Python 3.14.6 (pinned by `.python-version`) and
+  [uv](https://docs.astral.sh/uv/) for local development.
 - `just` for the checked-in developer workflow.
 - An MCP client that can run a stdio command or connect to Streamable HTTP.
 
@@ -275,6 +312,7 @@ just coverage
 just crap-ratchet
 just runtime-smoke
 just runtime-verify
+just verify
 ```
 
 `just check` runs Ruff plus the non-test static gates. `just typecheck` runs
@@ -302,16 +340,23 @@ uv run python -m devtools.mcp_client.cli call-tool \
 
 | Path | Purpose |
 | --- | --- |
-| `src/mcp_telegram/daemon.py` | Long-running sync daemon and Telegram client owner. |
-| `src/mcp_telegram/daemon_api.py` | Unix socket API used by MCP tools and admin commands. |
-| `src/mcp_telegram/server.py` | MCP stdio and Streamable HTTP transports. |
-| `src/mcp_telegram/tools/` | MCP tool schemas, routing, and structured outputs. |
-| `src/mcp_telegram/sync_db.py` | Local SQLite schema and migrations. |
-| `src/mcp_telegram/event_handlers.py` | Real-time Telegram update handling. |
-| `src/mcp_telegram/activity_sync.py` | Own-message archive used by recent activity audits. |
+| `src/mcp_telegram/daemon.py` | Composition root and sole owner of the Telegram client and writable state. |
+| `src/mcp_telegram/daemon_api.py` | Internal Unix-socket application API. |
+| `src/mcp_telegram/server.py` | MCP stdio/HTTP transports and the `telegram_workflows` prompt. |
+| `src/mcp_telegram/tools/` | MCP schemas and structured agent-facing projections. |
+| `src/mcp_telegram/messages/` | Canonical Telegram message extraction and persistence. |
+| `src/mcp_telegram/reading/` | Read-only message query and projection capability. |
+| `src/mcp_telegram/folders/`, `reactions/`, `topics/` | Established vertical capabilities. |
+| `src/mcp_telegram/sync_db.py` | SQLite schema bootstrap and migrations. |
+| `src/mcp_telegram/event_handlers.py` | Real-time Telegram update ingestion. |
 | `deploy/` | Dockerfile, compose template, QR login helper, and healthcheck scripts. |
 | `devtools/mcp_client/` | Local MCP client and smoke-test runner. |
 | `tests/` | Unit, integration-style, and contract tests. |
+
+The project is a hybrid modular monolith: Telegram acquisition writes local
+facts, while agent reads project persisted state without contacting Telegram.
+See [the architecture proposal](docs/architecture-proposal.md) and the
+[current cleanup frontier](docs/architecture-cleanup.md).
 
 ## Data and Privacy
 
