@@ -333,6 +333,9 @@ runtime verification. `just runtime-verify` rebuilds the live Docker container,
 waits for it to become healthy, and runs the redacted MCP smoke test through
 `devtools/mcp_client/cli.py`.
 
+Pull requests that change documentation only retain the required `ci` status
+but skip Python tests, CRAP analysis, CodeQL, dependency review, and Docker builds.
+
 Use the devtools MCP client for local MCP validation:
 
 ```bash
