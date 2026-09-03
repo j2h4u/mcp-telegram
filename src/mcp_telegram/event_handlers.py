@@ -143,6 +143,7 @@ class _DeletedMessagesEvent(Protocol):
 class _ReadMessageEvent(Protocol):
     chat_id: int | None
     max_id: int | None
+    contents: bool
 
 
 class _OutboxReadEvent(Protocol):
@@ -180,6 +181,42 @@ class _ForumTopicPinnedUpdateLike(Protocol):
     peer: object | None
     topic_id: int | None
     pinned: bool
+
+
+def _is_valid_nonnegative_int(value: object, *, allow_none: bool = False) -> bool:
+    """Validate Telegram integer facts without coercing malformed values."""
+    return (allow_none and value is None) or (isinstance(value, int) and not isinstance(value, bool) and value >= 0)
+
+
+def _apply_inbox_read_fact(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    max_id: int,
+    unread_count: int | None,
+    observed_at: int,
+) -> tuple[int, int]:
+    """Apply the composite Telegram inbox-read fact in one transaction.
+
+    This is the application seam for the raw update: it delegates cursor and
+    exact unread-count persistence to their canonical primitives, while the
+    caller owns the transaction boundary and commit.
+
+    ``create_missing=True`` is deliberate for the metadata side: an update
+    can arrive before dialog snapshot sync, so it may create a thin
+    ``dialogs`` row marked for refresh. The cursor side remains UPDATE-only
+    and therefore does nothing when ``synced_dialogs`` has no row.
+    """
+    cursor_rowcount = apply_read_cursor(conn, dialog_id, "inbox", max_id)
+    unread_rowcount = apply_unread_facts(
+        conn,
+        dialog_id,
+        unread_count=unread_count,
+        observed_at=observed_at,
+        create_missing=True,
+    )
+    conn.execute(_UPDATE_LAST_EVENT_SQL, (observed_at, dialog_id))
+    return cursor_rowcount, unread_rowcount
 
 
 @dataclass(frozen=True, slots=True)
@@ -971,21 +1008,28 @@ class EventHandlerManager:
         against bootstrap races where an older GetPeerDialogsRequest response
         could otherwise overwrite a newer live event.
 
-        event.chat_id may be None for PM read events on some Telethon versions
-        (UpdateReadHistoryInbox normalization differs). We log a WARNING so PM
-        read-position staleness is observable; regular dialog reconciliation
-        also refreshes read cursors from Telegram Dialog state, so this is not
-        the only source of read-state truth.
+        ``UpdateReadMessagesContents`` is also normalized as a
+        ``MessageRead(inbox=True)`` event, but it has no peer and only signals
+        that message contents were opened (for example, a voice note). It is
+        not a dialog read-cursor movement. Peerless synthetic or malformed
+        events are likewise ignored quietly at debug level.
         """
-        dialog_id = event.chat_id
+        contents = bool(getattr(event, "contents", False))
+        if contents:
+            logger.debug(
+                "event_read_contents_ignored chat_id=%s max_id=%s — no dialog read cursor applied",
+                getattr(event, "chat_id", None),
+                getattr(event, "max_id", None),
+            )
+            return
+
+        dialog_id = cast(int | None, getattr(event, "chat_id", None))
 
         if dialog_id is None:
-            logger.warning(
-                "event_read_null_chat_id max_id=%s — PM read position could not "
-                "be updated from this real-time event because Telethon did not "
-                "provide chat_id; dialog reconciliation will refresh cursors from "
-                "Telegram Dialog state",
-                event.max_id,
+            logger.debug(
+                "event_read_without_chat_id contents=%s max_id=%s — no dialog read cursor applied",
+                contents,
+                getattr(event, "max_id", None),
             )
             return
 
@@ -995,7 +1039,7 @@ class EventHandlerManager:
         try:
             now = int(time.time())
             with self._conn:
-                max_id = event.max_id
+                max_id = cast(int | None, getattr(event, "max_id", None))
                 if max_id is None:
                     return
                 rowcount = apply_read_cursor(self._conn, dialog_id, "inbox", max_id)
@@ -1555,12 +1599,13 @@ class EventHandlerManager:
     async def on_raw_inbox_read(self, update: _InboxReadUpdateLike | _ChannelInboxReadUpdateLike) -> None:
         """Phase 42 EVENTS-02: UpdateReadHistoryInbox / UpdateReadChannelInbox.
 
-        Captures still_unread_count via the raw update (the high-level
-        events.MessageRead wrapper drops this field) and stores the exact
-        Telegram fact, including zero. Metadata facts are intentionally not
-        gated on sync coverage; body-event gates remain unchanged.
-        Updates synced_dialogs.last_event_at via the existing _UPDATE_LAST_EVENT_SQL
-        so the last_event_at observability stays intact.
+        Captures both ``max_id`` and ``still_unread_count`` via the raw update
+        (the high-level ``events.MessageRead`` wrapper drops the latter) and
+        stores the exact Telegram facts in one transaction. Metadata facts are
+        intentionally not gated on sync coverage; body-event gates remain
+        unchanged. A missing or malformed ``max_id`` is ignored rather than
+        converted into a fabricated cursor value. The metadata policy may
+        create a thin ``dialogs`` row when the synced-dialog row is absent.
         """
         try:
             if isinstance(update, UpdateReadHistoryInbox):
@@ -1570,24 +1615,39 @@ class EventHandlerManager:
             else:
                 return
             still_unread_raw = getattr(update, "still_unread_count", None)
-            still_unread = int(cast(int, still_unread_raw)) if still_unread_raw is not None else None
-            max_id = int(update.max_id or 0)
+            if not _is_valid_nonnegative_int(still_unread_raw, allow_none=True):
+                logger.debug(
+                    "event_raw_inbox_read_invalid_still_unread_count dialog_id=%d value=%r",
+                    dialog_id,
+                    still_unread_raw,
+                )
+                return
+            still_unread = cast(int | None, still_unread_raw)
+            max_id_raw = getattr(update, "max_id", None)
+            if not _is_valid_nonnegative_int(max_id_raw):
+                logger.debug(
+                    "event_raw_inbox_read_invalid_max_id dialog_id=%d max_id=%r",
+                    dialog_id,
+                    max_id_raw,
+                )
+                return
+            max_id = cast(int, max_id_raw)
             now = int(time.time())
             with self._conn:
-                rowcount = apply_unread_facts(
+                cursor_rowcount, unread_rowcount = _apply_inbox_read_fact(
                     self._conn,
                     dialog_id,
+                    max_id=max_id,
                     unread_count=still_unread,
                     observed_at=now,
-                    create_missing=True,
                 )
-                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
             logger.debug(
-                "event_raw_inbox_read dialog_id=%d max_id=%d still_unread_count=%s updated=%d",
+                "event_raw_inbox_read dialog_id=%d max_id=%d still_unread_count=%s cursor_updated=%d unread_updated=%d",
                 dialog_id,
                 max_id,
                 still_unread,
-                rowcount,
+                cursor_rowcount,
+                unread_rowcount,
             )
         except Exception:
             logger.exception(

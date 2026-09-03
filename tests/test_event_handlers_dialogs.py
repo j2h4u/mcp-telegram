@@ -449,12 +449,14 @@ async def test_update_read_history_inbox_logs_still_unread_count(
 
     assert any("still_unread_count=7" in r.message for r in caplog.records)
     row = cast(
-        tuple[int, int],
+        tuple[int, int, int | None],
         sync_db.execute(
-            "SELECT unread_count, unread_count_observed_at FROM dialogs WHERE dialog_id=?", (dialog_id,)
+            "SELECT unread_count, unread_count_observed_at, read_inbox_max_id "
+            "FROM dialogs JOIN synced_dialogs USING(dialog_id) WHERE dialogs.dialog_id=?",
+            (dialog_id,),
         ).fetchone(),
     )
-    assert row[0] == 7 and row[1] is not None
+    assert row[0] == 7 and row[1] is not None and row[2] == 42
     # last_event_at should be advanced
     assert _last_event_at(sync_db, dialog_id) is not None
 
@@ -490,6 +492,98 @@ async def test_update_read_channel_inbox_extracts_dialog_id_via_peer_channel(
         await mgr.on_raw_inbox_read(cast(_ChannelInboxReadUpdateLike, upd))
 
     assert any("still_unread_count=3" in r.message for r in caplog.records)
+    assert sync_db.execute(
+        "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (55,)
+
+
+@pytest.mark.asyncio
+async def test_raw_channel_inbox_read_cursor_is_monotonic(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """A late raw channel read update cannot regress the local cursor."""
+    channel_id = 1234567891
+    dialog_id = get_peer_id(PeerChannel(channel_id))
+    _enroll_synced(sync_db, dialog_id)
+    sync_db.execute("UPDATE synced_dialogs SET read_inbox_max_id=100 WHERE dialog_id=?", (dialog_id,))
+    sync_db.commit()
+
+    mgr = _make_manager(mock_client, sync_db, shutdown_event)
+    await mgr.on_raw_inbox_read(
+        cast(
+            _ChannelInboxReadUpdateLike,
+            UpdateReadChannelInbox(
+                channel_id=channel_id,
+                max_id=55,
+                still_unread_count=3,
+                pts=201,
+                folder_id=None,
+            ),
+        )
+    )
+
+    assert sync_db.execute(
+        "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (100,)
+
+
+@pytest.mark.asyncio
+async def test_raw_inbox_read_missing_max_id_does_not_fabricate_cursor(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """An incomplete raw update is ignored without applying partial read state."""
+    dialog_id = get_peer_id(PeerChannel(channel_id=99991))
+    _enroll_synced(sync_db, dialog_id)
+    mgr = _make_manager(mock_client, sync_db, shutdown_event)
+
+    upd = UpdateReadHistoryInbox(
+        peer=PeerChannel(channel_id=99991),
+        max_id=None,
+        still_unread_count=0,
+        pts=202,
+        pts_count=1,
+        folder_id=None,
+    )
+    await mgr.on_raw_inbox_read(cast(_InboxReadUpdateLike, upd))
+
+    assert sync_db.execute(
+        "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (None,)
+    assert sync_db.execute("SELECT unread_count FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_count", [True, 1.5, "1", -1])
+async def test_raw_inbox_read_invalid_unread_count_is_atomic_noop(
+    invalid_count: object,
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Invalid unread counts cannot cause cursor-only or unread-only writes."""
+    dialog_id = get_peer_id(PeerChannel(channel_id=99992))
+    _enroll_synced(sync_db, dialog_id)
+    mgr = _make_manager(mock_client, sync_db, shutdown_event)
+
+    upd = UpdateReadHistoryInbox(
+        peer=PeerChannel(channel_id=99992),
+        max_id=42,
+        still_unread_count=cast(int, invalid_count),
+        pts=203,
+        pts_count=1,
+        folder_id=None,
+    )
+    await mgr.on_raw_inbox_read(cast(_InboxReadUpdateLike, upd))
+
+    assert sync_db.execute(
+        "SELECT read_inbox_max_id, last_event_at FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone() == (None, None)
+    assert sync_db.execute("SELECT unread_count FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is None
 
 
 @pytest.mark.asyncio
