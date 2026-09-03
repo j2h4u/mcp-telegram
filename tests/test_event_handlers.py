@@ -926,11 +926,11 @@ def test_register_adds_handlers(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """register() includes the two scheduled-message raw handlers."""
+    """register() includes scheduled-message and raw topic handlers."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    assert mock_client.add_event_handler.call_count == 13
+    assert mock_client.add_event_handler.call_count == 14
 
 
 def test_unregister_removes_handlers(
@@ -938,12 +938,12 @@ def test_unregister_removes_handlers(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """unregister() removes the two scheduled-message raw handlers."""
+    """unregister() removes scheduled-message and raw topic handlers."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
     manager.unregister()
 
-    assert mock_client.remove_event_handler.call_count == 13
+    assert mock_client.remove_event_handler.call_count == 14
 
 
 def test_refresh_synced_dialogs(
@@ -1371,12 +1371,12 @@ def test_register_adds_message_read_handler(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """register() preserves the on_message_read position and adds scheduled handlers."""
+    """register() preserves the on_message_read position and adds topic handlers."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
-    assert mock_client.add_event_handler.call_count == 13
-    fourth_call = mock_client.add_event_handler.call_args_list[3]
-    assert fourth_call.args[0] == manager.on_message_read
+    assert mock_client.add_event_handler.call_count == 14
+    message_read_call = mock_client.add_event_handler.call_args_list[4]
+    assert message_read_call.args[0] == manager.on_message_read
 
 
 def test_unregister_removes_message_read_handler(
@@ -1388,7 +1388,7 @@ def test_unregister_removes_message_read_handler(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
     manager.unregister()
-    assert mock_client.remove_event_handler.call_count == 13
+    assert mock_client.remove_event_handler.call_count == 14
 
 
 # ---------------------------------------------------------------------------

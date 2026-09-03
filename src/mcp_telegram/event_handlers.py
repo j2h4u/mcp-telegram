@@ -32,18 +32,23 @@ from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     MessageActionTopicCreate,
     MessageActionTopicEdit,
+    MessageService,
     PeerChannel,
     PeerChat,
     TypeInputChannel,
+    TypePeer,
     UpdateChannel,
     UpdateChat,
     UpdateDeleteScheduledMessages,
     UpdateDialogPinned,
     UpdateDialogUnreadMark,
     UpdateMessageReactions,
+    UpdateNewChannelMessage,
+    UpdateNewMessage,
     UpdateNewScheduledMessage,
     UpdatePinnedDialogs,
     UpdatePinnedForumTopic,
+    UpdatePinnedForumTopics,
     UpdateReadChannelInbox,
     UpdateReadHistoryInbox,
     UpdateTranscribedAudio,
@@ -95,6 +100,7 @@ from .scheduled_messages import (
     verify_scheduled_publication,
 )
 from .telethon_dialog import classify_dialog_type
+from .topics.sqlite_repository import SQLiteTopicMetadataRepository
 from .unread_state import apply_unread_facts
 
 logger = logging.getLogger(__name__)
@@ -183,9 +189,22 @@ class _ForumTopicPinnedUpdateLike(Protocol):
     pinned: bool
 
 
+class _ForumTopicsPinnedUpdateLike(Protocol):
+    peer: object | None
+    order: object | None
+
+
 def _is_valid_nonnegative_int(value: object, *, allow_none: bool = False) -> bool:
     """Validate Telegram integer facts without coercing malformed values."""
     return (allow_none and value is None) or (isinstance(value, int) and not isinstance(value, bool) and value >= 0)
+
+
+def _validated_topic_pin_order(value: object) -> tuple[int, ...] | None:
+    if value is None or not isinstance(value, (list, tuple)):
+        return None
+    if any(not _is_valid_nonnegative_int(topic_id) for topic_id in value):
+        return None
+    return tuple(int(topic_id) for topic_id in value)
 
 
 def _apply_inbox_read_fact(
@@ -322,52 +341,6 @@ _CLEAR_PINS_NOT_IN_SQL_TEMPLATE = (
 _CLEAR_ALL_PINS_SQL = "UPDATE dialogs SET pinned=0, snapshot_at=? WHERE pinned=1"
 
 # ---------------------------------------------------------------------------
-# Phase 42 SQL — topic_metadata event writes (target table extended by
-# Plan 01 v19 ALTER. ON CONFLICT preserves existing fields not present in
-# the edit via COALESCE. `pinned` is intentionally OMITTED from the UPDATE
-# clause — pin state is owned by the dedicated UpdatePinnedForumTopic
-# handler. Legacy NOT NULL columns (is_general, is_deleted, updated_at)
-# supplied with safe defaults; the on-conflict path leaves them alone
-# because they are not in the SET list.)
-# ---------------------------------------------------------------------------
-
-_UPSERT_TOPIC_METADATA_SQL = """
-INSERT INTO topic_metadata
-    (dialog_id, topic_id, title, top_message_id,
-     is_general, is_deleted, updated_at,
-     icon_emoji_id, pinned, hidden, snapshot_at, date)
-VALUES
-    (:dialog_id, :topic_id, :title, NULL,
-     0, 0, :updated_at,
-     :icon_emoji_id, 0, 0, :snapshot_at, :date)
-ON CONFLICT(dialog_id, topic_id) DO UPDATE SET
-    title          = COALESCE(excluded.title, topic_metadata.title),
-    icon_emoji_id  = COALESCE(excluded.icon_emoji_id, topic_metadata.icon_emoji_id),
-    updated_at     = excluded.updated_at,
-    snapshot_at    = excluded.snapshot_at
-WHERE topic_metadata.snapshot_at IS NULL
-   OR topic_metadata.snapshot_at < excluded.snapshot_at
-"""
-
-_UPDATE_TOPIC_METADATA_EDIT_SQL = (
-    "UPDATE topic_metadata "
-    "SET title      = COALESCE(?, title), "
-    "    icon_emoji_id = COALESCE(?, icon_emoji_id), "
-    "    updated_at = ?, snapshot_at = ? "
-    "WHERE dialog_id = ? AND topic_id = ? "
-    "  AND (snapshot_at IS NULL OR snapshot_at < ?)"
-)
-
-_UPDATE_TOPIC_METADATA_HIDDEN_SQL = (
-    "UPDATE topic_metadata SET hidden=1, snapshot_at=?, updated_at=? WHERE dialog_id=? AND topic_id=?"
-)
-
-_UPDATE_TOPIC_METADATA_PINNED_SQL = (
-    "UPDATE topic_metadata SET pinned=?, snapshot_at=?, updated_at=? WHERE dialog_id=? AND topic_id=?"
-)
-
-
-# ---------------------------------------------------------------------------
 # EventHandlerManager
 # ---------------------------------------------------------------------------
 
@@ -395,6 +368,7 @@ class EventHandlerManager:
         self._shutdown_event.is_set()
         self._synced_dialog_ids: set[int] = set()
         self._realtime_history_status: _RealtimeHistoryStatusReader = _SQLiteRealtimeHistoryStatusReader(conn)
+        self._topic_metadata = SQLiteTopicMetadataRepository(conn)
 
     # ------------------------------------------------------------------
     # Registration
@@ -409,6 +383,10 @@ class EventHandlerManager:
         """
         self._refresh_synced_dialogs()
         self._client.add_event_handler(self.on_new_message, events.NewMessage)
+        self._client.add_event_handler(
+            self.on_raw_topic_message,
+            events.Raw(types=[UpdateNewMessage, UpdateNewChannelMessage]),
+        )
         self._client.add_event_handler(self.on_message_edited, events.MessageEdited)
         self._client.add_event_handler(self.on_message_deleted, events.MessageDeleted)
         self._client.add_event_handler(self.on_message_read, events.MessageRead(inbox=True))
@@ -457,12 +435,13 @@ class EventHandlerManager:
         # Phase 42 EVENTS-05: forum topic pin state.
         self._client.add_event_handler(
             self.on_raw_forum_topic_pinned,
-            events.Raw(types=[UpdatePinnedForumTopic]),
+            events.Raw(types=[UpdatePinnedForumTopic, UpdatePinnedForumTopics]),
         )
 
     def unregister(self) -> None:
         """Remove all handlers from the client (graceful shutdown)."""
         self._client.remove_event_handler(self.on_new_message)
+        self._client.remove_event_handler(self.on_raw_topic_message)
         self._client.remove_event_handler(self.on_message_edited)
         self._client.remove_event_handler(self.on_message_deleted)
         self._client.remove_event_handler(self.on_message_read)
@@ -673,6 +652,31 @@ class EventHandlerManager:
         self._update_last_message_timestamp(dialog_id, now, msg.date)
         self._handle_topic_message_action(dialog_id, msg, now)
 
+    async def on_raw_topic_message(self, update: object) -> None:
+        """Project topic service messages omitted by Telethon's NewMessage builder."""
+        try:
+            if not isinstance(update, (UpdateNewMessage, UpdateNewChannelMessage)):
+                return
+            msg = update.message
+            if not isinstance(msg, MessageService):
+                return
+            action = getattr(msg, "action", None)
+            if not isinstance(action, (MessageActionTopicCreate, MessageActionTopicEdit)):
+                return
+            peer = getattr(msg, "peer_id", None)
+            if peer is None:
+                return
+            dialog_id = int(get_peer_id(cast(TypePeer, peer)))
+            if not self._metadata_realtime_allowed(self._realtime_coverage(dialog_id)):
+                return
+            now = int(time.time())
+            with self._conn:
+                if not self._metadata_realtime_allowed(self._realtime_coverage(dialog_id)):
+                    return
+                self._handle_topic_message_action(dialog_id, cast(_MessageLike, msg), now)
+        except Exception:
+            logger.exception("event_raw_topic_message_failed update=%r", type(update).__name__)
+
     def _handle_topic_message_action(
         self,
         dialog_id: int,
@@ -698,17 +702,13 @@ class EventHandlerManager:
             return
         msg_date = msg.date
         topic_timestamp = int(msg_date.timestamp()) if msg_date is not None else now
-        self._conn.execute(
-            _UPSERT_TOPIC_METADATA_SQL,
-            {
-                "dialog_id": dialog_id,
-                "topic_id": topic_id,
-                "title": action.title or "Topic",
-                "icon_emoji_id": action.icon_emoji_id,
-                "updated_at": now,
-                "snapshot_at": now,
-                "date": topic_timestamp,
-            },
+        self._topic_metadata.apply_topic_create(
+            dialog_id,
+            topic_id,
+            title=action.title or "Topic",
+            icon_emoji_id=action.icon_emoji_id,
+            date=topic_timestamp,
+            observed_at=now,
         )
         logger.info(
             "event_topic_create dialog_id=%d topic_id=%d",
@@ -733,39 +733,28 @@ class EventHandlerManager:
             )
             return
 
-        topic_id_raw = cast(int | None, getattr(reply_to, "reply_to_msg_id", None))
-        if topic_id_raw is None:
+        topic_id_raw = getattr(reply_to, "reply_to_top_id", None)
+        if not _is_valid_nonnegative_int(topic_id_raw, allow_none=True):
+            topic_id_raw = getattr(reply_to, "reply_to_msg_id", None)
+        if not _is_valid_nonnegative_int(topic_id_raw):
             logger.debug(
-                "event_topic_edit_skipped reason=no_reply_to_msg_id dialog_id=%d",
+                "event_topic_edit_skipped reason=no_reply_target dialog_id=%d",
                 dialog_id,
             )
             return
 
-        topic_id = int(topic_id_raw)
-        if action.hidden:
-            self._conn.execute(
-                _UPDATE_TOPIC_METADATA_HIDDEN_SQL,
-                (now, now, dialog_id, topic_id),
-            )
-            logger.info(
-                "event_topic_hidden dialog_id=%d topic_id=%d",
-                dialog_id,
-                topic_id,
-            )
-            return
-
-        # Non-hidden edits use an UPDATE-only path.
-        # COALESCE(?, existing) preserves fields when the
-        # edit omits them (action.title / icon_emoji_id may
-        # be None). UPDATE matches 0 rows for unknown topics
-        # — silent no-op; on_new_message UPSERT is the sole
-        # row-creation path.
-        edit_title = action.title
-        edit_icon = action.icon_emoji_id
-        self._conn.execute(
-            _UPDATE_TOPIC_METADATA_EDIT_SQL,
-            (edit_title, edit_icon, now, now, dialog_id, topic_id, now),
+        topic_id = int(cast(int, topic_id_raw))
+        self._topic_metadata.apply_topic_edit(
+            dialog_id,
+            topic_id,
+            title=action.title,
+            icon_emoji_id=action.icon_emoji_id,
+            hidden=action.hidden,
+            observed_at=now,
         )
+        if action.hidden:
+            logger.info("event_topic_hidden dialog_id=%d topic_id=%d", dialog_id, topic_id)
+            return
         logger.info(
             "event_topic_edit dialog_id=%d topic_id=%d",
             dialog_id,
@@ -1655,7 +1644,7 @@ class EventHandlerManager:
                 type(update).__name__,
             )
 
-    async def on_raw_forum_topic_pinned(self, update: _ForumTopicPinnedUpdateLike) -> None:
+    async def on_raw_forum_topic_pinned(self, update: object) -> None:
         """Phase 42 EVENTS-05: UpdatePinnedForumTopic → topic_metadata.pinned.
 
         Gated on _synced_dialog_ids; UPDATE-only. Missing-row UPDATE matches
@@ -1663,32 +1652,73 @@ class EventHandlerManager:
         sole row-creation paths.
         """
         try:
+            if isinstance(update, UpdatePinnedForumTopics):
+                await self.on_raw_forum_topics_pinned(cast(_ForumTopicsPinnedUpdateLike, update))
+                return
             if not isinstance(update, UpdatePinnedForumTopic):
                 return
-            peer = update.peer
-            topic_id_raw = update.topic_id
+            singular_update = cast(_ForumTopicPinnedUpdateLike, update)
+            peer = singular_update.peer
+            topic_id_raw = singular_update.topic_id
             if peer is None or topic_id_raw is None:
                 return
             dialog_id = int(cast(int, get_peer_id(peer)))
             if dialog_id not in self._synced_dialog_ids:
                 return
+            if not self._metadata_realtime_allowed(self._realtime_coverage(dialog_id)):
+                return
+            if not _is_valid_nonnegative_int(topic_id_raw) or singular_update.pinned is None:
+                return
             topic_id = int(topic_id_raw)
-            pinned = 1 if update.pinned else 0
             now = int(time.time())
             with self._conn:
-                self._conn.execute(
-                    _UPDATE_TOPIC_METADATA_PINNED_SQL,
-                    (pinned, now, now, dialog_id, topic_id),
+                self._topic_metadata.apply_topic_pin(
+                    dialog_id,
+                    topic_id,
+                    pinned=bool(singular_update.pinned),
+                    observed_at=now,
                 )
             logger.info(
                 "event_forum_topic_pinned dialog_id=%d topic_id=%d pinned=%d",
                 dialog_id,
                 topic_id,
-                pinned,
+                int(bool(singular_update.pinned)),
             )
         except Exception:
             logger.exception(
                 "event_forum_topic_pinned_failed update=%r",
+                type(update).__name__,
+            )
+
+    async def on_raw_forum_topics_pinned(self, update: object) -> None:
+        """Apply UpdatePinnedForumTopics as a complete known-topic membership set."""
+        try:
+            if not isinstance(update, UpdatePinnedForumTopics):
+                return
+            peer = update.peer
+            order = _validated_topic_pin_order(update.order)
+            if peer is None or order is None:
+                return
+            dialog_id = int(get_peer_id(peer))
+            if dialog_id not in self._synced_dialog_ids:
+                return
+            if not self._metadata_realtime_allowed(self._realtime_coverage(dialog_id)):
+                return
+            now = int(time.time())
+            with self._conn:
+                self._topic_metadata.apply_topic_pins(
+                    dialog_id,
+                    order,
+                    observed_at=now,
+                )
+            logger.info(
+                "event_forum_topics_pinned dialog_id=%d pinned_count=%d",
+                dialog_id,
+                len(order),
+            )
+        except Exception:
+            logger.exception(
+                "event_forum_topics_pinned_failed update=%r",
                 type(update).__name__,
             )
 
