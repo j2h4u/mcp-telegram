@@ -553,7 +553,7 @@ dependencies = [
     { name = "aiolimiter" },
     { name = "anyascii" },
     { name = "mcp" },
-    { name = "phonenumbers" },
+    { name = "phonenumberslite" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
@@ -591,7 +591,7 @@ requires-dist = [
     { name = "aiolimiter", specifier = ">=1.2.1" },
     { name = "anyascii", specifier = ">=0.3.3" },
     { name = "mcp", specifier = ">=2,<3" },
-    { name = "phonenumbers", specifier = ">=9.0.37" },
+    { name = "phonenumberslite", specifier = ">=9.0.37" },
     { name = "pydantic", specifier = ">=2.12.5" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
     { name = "python-dotenv", specifier = ">=1.2.3" },
@@ -753,12 +753,12 @@ wheels = [
 ]
 
 [[package]]
-name = "phonenumbers"
-version = "9.0.37"
+name = "phonenumberslite"
+version = "9.0.38"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/4c/36/ee5b6d7ccc28cb7848e8dfefce94df9178b6318ed56adab97550b6ba99ec/phonenumbers-9.0.37.tar.gz", hash = "sha256:8923ab413c575b27da2815c9bef48290181aab565398b5e7e23cc7ace212a293", size = 2312364, upload-time = "2026-08-14T05:29:13.533Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/70/958aeb1e6c6f110bc0587eeb2993e059bcb6bdee5f3a78902aaefeb64db6/phonenumberslite-9.0.38.tar.gz", hash = "sha256:ee3441c0fa6e0a8a5282cf8b10fdd0bde05bb8f0fe9dd60efbfe688364819089", size = 292927, upload-time = "2026-08-28T09:48:34.938Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/99/68/544cb901964e8bfc3c8d215d5620e63a009b32437efaec905fdefdf59e26/phonenumbers-9.0.37-py2.py3-none-any.whl", hash = "sha256:55ae8243c1e2fe8ae2548d979e57155d9ae0f6084f8a1d6884050b143aff0a7c", size = 2595712, upload-time = "2026-08-14T05:29:10.464Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/74/487e0399e3ebbbd8ba1ad6ba553d422fb05684d1993ceff058fdc76de17c/phonenumberslite-9.0.38-py2.py3-none-any.whl", hash = "sha256:a089149e963c6373fc0db41b2b103e7d12a6788ef186c4d5c205837ff5f1e32a", size = 473165, upload-time = "2026-08-28T09:48:33.55Z" },
 ]
 
 [[package]]
