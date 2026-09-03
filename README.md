@@ -70,6 +70,15 @@ http://127.0.0.1:3100/mcp
 Do not expose the HTTP endpoint or Telegram session volume to an untrusted
 network.
 
+### Background fact queue
+
+The daemon also owns one durable, bounded background queue for facts that may
+arrive later or require a Telegram refresh. It currently enriches voice and
+round-video transcriptions and incomplete media metadata. Fresh, explicitly
+needed work is processed before historical backfill; requests are batched,
+rate-limited, and share the Telegram circuit breaker. MCP reads never execute
+this work themselves: they return the facts already persisted by the daemon.
+
 ## MCP Tools
 
 There are 18 MCP tools. Successful calls are machine-oriented: agents should

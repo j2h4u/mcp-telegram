@@ -46,7 +46,9 @@ def test_crap_remains_the_coverage_informed_gate() -> None:
 
     assert re.search(r"(?m)^  crap:\s*$", workflow) is not None
     assert "run: just crap-check" in workflow
-    assert "needs: [quality, unit, crap, docker-build]" in workflow
+    assert workflow.count("needs: changes") == 4
+    assert workflow.count("if: needs.changes.outputs.run_heavy == 'true'") == 4
+    assert "needs: [changes, quality, unit, crap, docker-build]" in workflow
     assert re.search(r"(?m)^crap-ratchet:\s*$", justfile) is not None
     assert justfile.count("--cov-report=;") == 3
     assert justfile.count('uv run coverage json -o "$coverage_file";') == 3

@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 env:
   UV_LINK_MODE: hardlink
@@ -23,7 +24,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      run_heavy: ${{ steps.filter.outputs.run_heavy }}
+    steps:
+      - name: Detect runtime-affecting changes
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "run_heavy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          run_heavy=false
+          while IFS= read -r path; do
+            case "$path" in
+              *.md|docs/*|.planning/*) ;;
+              *) run_heavy=true; break ;;
+            esac
+          done < <(
+            gh api --paginate \
+              "repos/${{ github.repository }}/pulls/$PR_NUMBER/files" \
+              --jq '.[].filename'
+          )
+          echo "run_heavy=$run_heavy" >> "$GITHUB_OUTPUT"
+
   quality:
+    needs: changes
+    if: needs.changes.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -48,6 +81,8 @@ jobs:
         run: just check
 
   unit:
+    needs: changes
+    if: needs.changes.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -72,6 +107,8 @@ jobs:
         run: just unit
 
   crap:
+    needs: changes
+    if: needs.changes.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -96,6 +133,8 @@ jobs:
         run: just crap-check
 
   docker-build:
+    needs: changes
+    if: needs.changes.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -113,7 +152,7 @@ jobs:
   ci:
     if: always()
     runs-on: ubuntu-latest
-    needs: [quality, unit, crap, docker-build]
+    needs: [changes, quality, unit, crap, docker-build]
     steps:
       - name: Check required jobs
         run: |
