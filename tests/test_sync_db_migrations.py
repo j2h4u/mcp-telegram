@@ -323,7 +323,7 @@ def test_migration_v44_accepts_custom_emoji_and_preserves_media_artifacts(db_pat
 
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 45
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 46
         assert conn.execute("SELECT media_kind, media_payload FROM messages WHERE message_id = 1").fetchone() == (
             "document",
             '{"size":4}',
@@ -362,7 +362,7 @@ def test_migration_v44_accepts_custom_emoji_and_preserves_media_artifacts(db_pat
 
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 45
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 46
         assert conn.execute("SELECT media_kind FROM messages WHERE message_id = 3").fetchone() == ("custom_emoji",)
         assert conn.execute("SELECT media_kind FROM scheduled_messages WHERE message_id = 4").fetchone() == (
             "custom_emoji",
@@ -382,6 +382,8 @@ def test_v40_creates_prioritized_hydration_queue_and_due_index(tmp_path: Path) -
             "priority",
             "message_sent_at",
             "terminal",
+            "last_outcome",
+            "last_error_code",
         ]
         table_sql = _fetchone_row(conn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='hydration_jobs'")
         assert table_sql is not None and "WITHOUT ROWID" in str(table_sql[0]).upper()
@@ -696,7 +698,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 45
+        assert _CURRENT_SCHEMA_VERSION == 46
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1427,7 +1429,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 45
+        assert _CURRENT_SCHEMA_VERSION == 46
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:

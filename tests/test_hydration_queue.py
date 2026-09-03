@@ -31,6 +31,8 @@ def _make_db() -> sqlite3.Connection:
             message_sent_at INTEGER NOT NULL DEFAULT 0,
             priority INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1)),
             terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1)),
+            last_outcome TEXT NOT NULL DEFAULT 'queued',
+            last_error_code TEXT,
             PRIMARY KEY (kind, dialog_id, message_id)
         ) WITHOUT ROWID
         """

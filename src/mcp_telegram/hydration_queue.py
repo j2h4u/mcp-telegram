@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from typing import cast
 
 # Keep this name in lock-step with the current schema.  The queue is part of the
@@ -20,6 +20,17 @@ MEDIA_METADATA_KIND = "media_metadata"
 TRANSCRIPTION_HYDRATION_KIND = "transcription"
 DEFAULT_SUMMARY_MESSAGE_IDS = 32
 _REGISTERED_HYDRATION_KINDS = (MEDIA_METADATA_KIND, TRANSCRIPTION_HYDRATION_KIND)
+
+
+class HydrationOutcome(StrEnum):
+    """Privacy-safe operational outcome of the latest queue attempt."""
+
+    PROCESSING = "processing"
+    TELEGRAM_PENDING = "telegram_pending"
+    TEMPORARY_FAILURE = "temporary_failure"
+    RPC_PAUSED = "rpc_paused"
+    TERMINAL_ERROR = "terminal_error"
+    EXHAUSTED = "exhausted"
 
 
 class HydrationPriority(IntEnum):
@@ -232,6 +243,17 @@ class HydrationQueueRepository:
         rows = cast(list[tuple[object, ...]], self._conn.execute(_QUEUE_SNAPSHOT_SQL, (now,)).fetchall())
         return tuple(_snapshot_from_row(row) for row in rows)
 
+    def outcome_counts(self) -> tuple[tuple[str, int], ...]:
+        """Return compact counts by durable last outcome."""
+        rows = cast(
+            list[tuple[str, int]],
+            self._conn.execute(
+                f"SELECT last_outcome, COUNT(*) FROM {HYDRATION_QUEUE_TABLE} "
+                "GROUP BY last_outcome ORDER BY last_outcome"
+            ).fetchall(),
+        )
+        return tuple((str(outcome), int(count)) for outcome, count in rows)
+
     def start(self, job: HydrationJob) -> HydrationJob | None:
         """Atomically increment and return a queued job, or return ``None``.
 
@@ -241,27 +263,43 @@ class HydrationQueueRepository:
         row = cast(
             tuple[object, ...] | None,
             self._conn.execute(
-                f"UPDATE {HYDRATION_QUEUE_TABLE} SET attempts = attempts + 1 "
+                f"UPDATE {HYDRATION_QUEUE_TABLE} SET attempts = attempts + 1, "
+                "last_outcome = ?, last_error_code = NULL "
                 "WHERE kind = ? AND dialog_id = ? AND message_id = ? AND terminal = 0 "
                 f"RETURNING {_JOB_COLUMNS}",
-                _identity(job),
+                (HydrationOutcome.PROCESSING, *_identity(job)),
             ).fetchone(),
         )
         return None if row is None else _job_from_row(row)
 
-    def reschedule(self, job: HydrationJob, due_at: int) -> bool:
+    def reschedule(
+        self,
+        job: HydrationJob,
+        due_at: int,
+        *,
+        outcome: HydrationOutcome = HydrationOutcome.TEMPORARY_FAILURE,
+        error_code: str | None = None,
+    ) -> bool:
         """Set the next due time for *job* without changing its attempts."""
         cursor = self._conn.execute(
-            f"UPDATE {HYDRATION_QUEUE_TABLE} SET due_at = ? WHERE kind = ? AND dialog_id = ? AND message_id = ? AND terminal = 0",
-            (due_at, *_identity(job)),
+            f"UPDATE {HYDRATION_QUEUE_TABLE} SET due_at = ?, last_outcome = ?, last_error_code = ? "
+            "WHERE kind = ? AND dialog_id = ? AND message_id = ? AND terminal = 0",
+            (due_at, outcome, error_code, *_identity(job)),
         )
         return cursor.rowcount > 0
 
-    def mark_terminal(self, job: HydrationJob) -> bool:
+    def mark_terminal(
+        self,
+        job: HydrationJob,
+        *,
+        outcome: HydrationOutcome = HydrationOutcome.TERMINAL_ERROR,
+        error_code: str | None = None,
+    ) -> bool:
         """Suppress a job permanently until its message fact is reconciled."""
         cursor = self._conn.execute(
-            f"UPDATE {HYDRATION_QUEUE_TABLE} SET terminal = 1 WHERE kind = ? AND dialog_id = ? AND message_id = ?",
-            _identity(job),
+            f"UPDATE {HYDRATION_QUEUE_TABLE} SET terminal = 1, last_outcome = ?, last_error_code = ? "
+            "WHERE kind = ? AND dialog_id = ? AND message_id = ?",
+            (outcome, error_code, *_identity(job)),
         )
         return cursor.rowcount > 0
 

@@ -17,6 +17,7 @@ from .hydration_queue import (
     MEDIA_METADATA_KIND,
     TRANSCRIPTION_HYDRATION_KIND,
     HydrationJob,
+    HydrationOutcome,
     HydrationPriority,
     HydrationQueueKindSnapshot,
     HydrationQueueRepository,
@@ -342,7 +343,7 @@ class MessageFactHydrationWorker:
             "message_fact_hydration cycle selected=%d requests=%d hydrated=%d completed=%d "
             "pending=%d retried=%d dropped=%d stopped=%s repaired_transcription_jobs=%d repair_has_more=%s "
             "repaired_media_metadata_jobs=%d media_repair_has_more=%s "
-            "queue_active=%d queue_ready=%d queue_deferred=%d queue_terminal=%d",
+            "queue_active=%d queue_ready=%d queue_deferred=%d queue_terminal=%d queue_outcomes=%s",
             selected,
             result.requests,
             result.hydrated,
@@ -359,6 +360,7 @@ class MessageFactHydrationWorker:
             sum(snapshot.ready for snapshot in queue_snapshot),
             sum(snapshot.deferred for snapshot in queue_snapshot),
             sum(snapshot.terminal for snapshot in queue_snapshot),
+            ",".join(f"{outcome}:{count}" for outcome, count in self._queue.outcome_counts()) or "none",
         )
         selected_by_kind = selected_by_kind or {}
         for kind in self._handlers:
@@ -489,7 +491,14 @@ class MessageFactHydrationWorker:
         retry_delay = exc.retry_after_seconds
         if retry_delay is None:
             return self._handle_circuit_open(handler, batch, started, preflight_observations, effective_now)
-        retried, dropped, drop_observations = self._reschedule_or_drop(handler, started, effective_now + retry_delay)
+        descriptor = describe_telegram_rpc_error(exc)
+        retried, dropped, drop_observations = self._reschedule_or_drop(
+            handler,
+            started,
+            effective_now + retry_delay,
+            outcome=HydrationOutcome.RPC_PAUSED,
+            error_code=descriptor.symbol,
+        )
         self._conn.commit()
         self._log_drops(
             batch,
@@ -580,13 +589,17 @@ class MessageFactHydrationWorker:
         descriptor = describe_telegram_rpc_error(exc)
         if handler.is_terminal_error(exc):
             for job in started:
-                self._queue.mark_terminal(job)
+                self._queue.mark_terminal(job, outcome=HydrationOutcome.TERMINAL_ERROR, error_code=descriptor.symbol)
             self._conn.commit()
             self._log_drops(batch, preflight_observations)
             self._log_drops(started, self._observations("terminal_rpc", started), descriptor=descriptor)
             return _BatchOutcome(requests=handler.request_cost, dropped=len(preflight_observations) + len(started))
         retried, dropped, drop_observations = self._reschedule_or_drop(
-            handler, started, effective_now + self._retry_delay_seconds
+            handler,
+            started,
+            effective_now + self._retry_delay_seconds,
+            outcome=HydrationOutcome.TEMPORARY_FAILURE,
+            error_code=descriptor.symbol,
         )
         self._conn.commit()
         self._log_drops(batch, preflight_observations)
@@ -619,6 +632,7 @@ class MessageFactHydrationWorker:
                 handler,
                 started,
                 effective_now + handler.pending_delay_seconds,
+                outcome=HydrationOutcome.TELEGRAM_PENDING,
             )
             applied = AppliedFacts(
                 hydrated=applied.hydrated,
@@ -653,7 +667,7 @@ class MessageFactHydrationWorker:
             if current is None:
                 continue
             if current.attempts > self._max_attempts:
-                self._queue.mark_terminal(current)
+                self._queue.mark_terminal(current, outcome=HydrationOutcome.EXHAUSTED)
                 observations.append(
                     HydrationDropObservation(
                         "attempt_limit", current.message_id, current.kind, current.dialog_id, current.attempts
@@ -665,18 +679,24 @@ class MessageFactHydrationWorker:
         return started, tuple(observations)
 
     def _reschedule_or_drop(
-        self, handler: HydrationHandler, jobs: Sequence[HydrationJob], due_at: int
+        self,
+        handler: HydrationHandler,
+        jobs: Sequence[HydrationJob],
+        due_at: int,
+        *,
+        outcome: HydrationOutcome,
+        error_code: str | None = None,
     ) -> tuple[int, int, tuple[HydrationDropObservation, ...]]:
         rescheduled = dropped = 0
         observations: list[HydrationDropObservation] = []
         for job in jobs:
             if job.attempts >= self._max_attempts:
-                self._queue.mark_terminal(job)
+                self._queue.mark_terminal(job, outcome=HydrationOutcome.EXHAUSTED, error_code=error_code)
                 dropped += 1
                 observations.append(
                     HydrationDropObservation("attempt_limit", job.message_id, job.kind, job.dialog_id, job.attempts)
                 )
-            elif self._queue.reschedule(job, due_at):
+            elif self._queue.reschedule(job, due_at, outcome=outcome, error_code=error_code):
                 rescheduled += 1
         return rescheduled, dropped, tuple(observations)
 

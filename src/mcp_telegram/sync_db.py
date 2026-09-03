@@ -13,7 +13,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 45
+_CURRENT_SCHEMA_VERSION = 46
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -1878,6 +1878,25 @@ def _apply_migration_45(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_46(conn: sqlite3.Connection, current: int) -> int:
+    """Persist the last privacy-safe hydration outcome for operations."""
+    return _apply_migration(
+        conn,
+        current,
+        46,
+        [
+            "ALTER TABLE hydration_jobs ADD COLUMN last_outcome TEXT NOT NULL DEFAULT 'queued'",
+            "ALTER TABLE hydration_jobs ADD COLUMN last_error_code TEXT",
+            (
+                "UPDATE hydration_jobs SET last_outcome = CASE "
+                "WHEN terminal = 1 THEN 'terminal_unknown' "
+                "WHEN attempts > 0 THEN 'deferred_unknown' ELSE 'queued' END"
+            ),
+        ],
+        ignore_duplicate_column=True,
+    )
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -1920,6 +1939,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_43(conn, current)
     current = _apply_migration_44(conn, current)
     current = _apply_migration_45(conn, current)
+    current = _apply_migration_46(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
