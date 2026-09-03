@@ -123,11 +123,14 @@ crap:
 # CI/regression CRAP gate that checks the tracked baseline.
 crap-check: crap-ratchet
 
+# Keep JSON serialization out of pytest's memory-heavy process. The standalone
+# coverage command reads the same .coverage data and preserves function regions.
 # Migrate/tighten the tracked CRAP baseline from the current coverage state.
 crap-baseline:
     coverage_file="$(mktemp /tmp/mcp-telegram-crap-coverage.XXXXXX.json)"; \
     trap 'rm -f "$coverage_file"' EXIT; \
-    uv run pytest --cov=src/mcp_telegram --cov-report=json:"$coverage_file"; \
+    uv run pytest --cov=src/mcp_telegram --cov-report=; \
+    uv run coverage json -o "$coverage_file"; \
     uv run python -m devtools.crap_ratchet --coverage "$coverage_file" --baseline reports/crap-baseline.json --src src/mcp_telegram --threshold 30 --tighten-baseline
 
 # Tighten the tracked CRAP baseline by clamping existing entries downward and adding
@@ -135,14 +138,16 @@ crap-baseline:
 crap-tighten:
     coverage_file="$(mktemp /tmp/mcp-telegram-crap-coverage.XXXXXX.json)"; \
     trap 'rm -f "$coverage_file"' EXIT; \
-    uv run pytest --cov=src/mcp_telegram --cov-report=json:"$coverage_file"; \
+    uv run pytest --cov=src/mcp_telegram --cov-report=; \
+    uv run coverage json -o "$coverage_file"; \
     uv run python -m devtools.crap_ratchet --coverage "$coverage_file" --baseline reports/crap-baseline.json --src src/mcp_telegram --threshold 30 --tighten-baseline
 
 # Enforce the CRAP ratchet against the tracked baseline.
 crap-ratchet:
     coverage_file="$(mktemp /tmp/mcp-telegram-crap-coverage.XXXXXX.json)"; \
     trap 'rm -f "$coverage_file"' EXIT; \
-    uv run pytest --cov=src/mcp_telegram --cov-report=json:"$coverage_file"; \
+    uv run pytest --cov=src/mcp_telegram --cov-report=; \
+    uv run coverage json -o "$coverage_file"; \
     uv run python -m devtools.crap_ratchet --coverage "$coverage_file" --baseline reports/crap-baseline.json --src src/mcp_telegram --threshold 30
 
 # Rebuild and restart the live Docker container.
