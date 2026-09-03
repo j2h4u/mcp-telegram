@@ -10,6 +10,7 @@ DAEMON-09 (channel/supergroup MessageDeleted), and DAEMON-10
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
@@ -829,8 +830,6 @@ async def test_on_message_deleted_dm_logs_debug(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """MessageDeleted with chat_id=None logs DEBUG and makes no DB changes."""
-    import logging
-
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
@@ -1208,7 +1207,7 @@ async def test_on_message_edited_updates_fts(
 
 
 # ---------------------------------------------------------------------------
-# MessageRead handler — monotonic writes, NULL chat_id warning
+# MessageRead handler — monotonic writes, peerless contents-read handling
 # ---------------------------------------------------------------------------
 
 
@@ -1318,31 +1317,53 @@ async def test_on_message_read_ignores_unknown_dialog(
 
 
 @pytest.mark.asyncio
-async def test_on_message_read_logs_warning_on_null_chat_id(
+async def test_on_message_read_peerless_contents_read_is_not_warning(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """NULL chat_id is observable without falsely implying restart is required.
-
-    Some Telethon PM read events do not expose chat_id. The real-time handler
-    cannot apply those events directly, but regular dialog reconciliation also
-    refreshes cursors from Telegram Dialog state.
-    """
+    """Contents-read updates have no peer and must not look like lost PM reads."""
     import logging
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    event = make_message_read_event(chat_id=None, max_id=42)
-    with caplog.at_level(logging.WARNING, logger="mcp_telegram.event_handlers"):
+    event = cast(_ReadMessageEvent, SimpleNamespace(chat_id=None, max_id=None, contents=True))
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.event_handlers"):
         await manager.on_message_read(event)  # must not raise
 
-    messages = [rec.message for rec in caplog.records]
-    assert any("event_read_null_chat_id" in message for message in messages), f"Expected WARNING log; got {messages}"
-    assert any("dialog reconciliation will refresh cursors" in message for message in messages)
-    assert not any("restart" in message for message in messages)
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert any("event_read_contents_ignored" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_on_message_read_peerful_contents_read_does_not_move_cursor(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A content-read signal must not advance even when Telethon supplies a peer."""
+    dialog_id = 1001
+    insert_synced_dialog(sync_db, dialog_id)
+    sync_db.execute("UPDATE synced_dialogs SET read_inbox_max_id=10 WHERE dialog_id=?", (dialog_id,))
+    sync_db.commit()
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+
+    event = cast(
+        _ReadMessageEvent,
+        SimpleNamespace(chat_id=dialog_id, max_id=42, contents=True),
+    )
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.event_handlers"):
+        await manager.on_message_read(event)
+
+    assert sync_db.execute(
+        "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (10,)
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert any("event_read_contents_ignored" in rec.message for rec in caplog.records)
 
 
 def test_register_adds_message_read_handler(

@@ -21,11 +21,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from telethon.errors import ServerError
+from telethon.tl.types import PeerUser, UpdateReadHistoryInbox
 
+from mcp_telegram.activity_contracts import InputPeerResolver
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike, _ResolverEntityCache
 from mcp_telegram.daemon_ipc import get_daemon_socket_path
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
 from mcp_telegram.dialog_selector import required_dialog_selector
+from mcp_telegram.event_handlers import EventHandlerManager, _InboxReadUpdateLike
 from mcp_telegram.feedback_db import SQLiteFeedbackStore
 from mcp_telegram.feedback_service import FeedbackApplicationService
 from mcp_telegram.flood import FloodWaitKillSwitchStatus, TelegramRpcThrottled
@@ -2769,6 +2772,42 @@ async def test_list_unread_messages_basic() -> None:
 
     cast(AsyncMock, client.get_input_entity).assert_not_called()
     cast(MagicMock, client).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_raw_inbox_read_updates_cursor_before_get_inbox_projection() -> None:
+    """Raw read updates make the corresponding message disappear from GetInbox."""
+    conn = _make_db_with_dialogs()
+    dialog_id = 1001
+    _seed_unread_state(conn, dialog_id, read_inbox_max_id=10, entity_type="User", entity_name="Alice")
+    _seed_unread_dialog(conn, dialog_id, name="Alice", type_="User")
+    _seed_message(conn, dialog_id, message_id=11, text="new")
+
+    client = _TestClient()
+    manager = EventHandlerManager(client, conn, asyncio.Event(), cast(InputPeerResolver, client.get_input_entity))
+    manager._synced_dialog_ids.add(dialog_id)
+    await manager.on_raw_inbox_read(
+        cast(
+            _InboxReadUpdateLike,
+            UpdateReadHistoryInbox(
+                peer=PeerUser(user_id=dialog_id),
+                max_id=11,
+                still_unread_count=0,
+                pts=1,
+                pts_count=1,
+                folder_id=None,
+            ),
+        )
+    )
+
+    assert conn.execute("SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        11,
+    )
+    result = await make_server(conn, client)._dispatch(
+        {"method": "get_inbox", "limit": 100, "group_size_threshold": 100}
+    )
+    assert result["ok"] is True
+    assert _response_groups(result) == []
 
 
 @pytest.mark.asyncio
