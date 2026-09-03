@@ -942,9 +942,14 @@ async def test_transcription_pending_is_low_frequency_reschedule_without_text(
     assert "retried=0" in cycle_log
     assert "queue_ready=0" in cycle_log
     assert "queue_deferred=1" in cycle_log
+    assert "queue_outcomes=telegram_pending:1" in cycle_log
     assert db.execute("SELECT text FROM messages WHERE dialog_id=1 AND message_id=1").fetchone() == (None,)
     assert db.execute("SELECT COUNT(*) FROM message_transcriptions").fetchone() == (0,)
     assert db.execute("SELECT attempts, due_at FROM hydration_jobs").fetchone() == (1, 133)
+    assert db.execute("SELECT last_outcome, last_error_code FROM hydration_jobs").fetchone() == (
+        "telegram_pending",
+        None,
+    )
 
 
 @pytest.mark.asyncio
