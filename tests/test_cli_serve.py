@@ -11,7 +11,7 @@ def _patch_serve_tasks(monkeypatch: pytest.MonkeyPatch, captured: dict[str, obje
     async def fake_sync_main() -> None:
         await asyncio.Event().wait()
 
-    async def fake_run_mcp_http_server(*, host: str, port: int) -> None:
+    async def fake_run_mcp_http_server(*, host: str, port: int, stop_event: asyncio.Event | None = None) -> None:
         captured["host"] = host
         captured["port"] = port
 
@@ -63,3 +63,28 @@ def test_serve_uses_operator_http_config_when_no_overrides(monkeypatch: pytest.M
     mcp_telegram.serve()
 
     assert captured == {"host": "localhost", "port": 3201}
+
+
+def test_serve_requests_http_shutdown_after_daemon_stops(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_sync_main() -> None:
+        return
+
+    async def fake_run_mcp_http_server(*, host: str, port: int, stop_event: asyncio.Event) -> None:
+        captured["host"] = host
+        captured["port"] = port
+        await stop_event.wait()
+        captured["stopped"] = True
+
+    monkeypatch.setattr("mcp_telegram.daemon.sync_main", fake_sync_main)
+    monkeypatch.setattr("mcp_telegram.server.run_mcp_http_server", fake_run_mcp_http_server)
+    monkeypatch.setattr(
+        mcp_telegram,
+        "load_config",
+        lambda: McpTelegramConfig(state=StateConfig(dir=Path("/tmp/mcp-telegram-test"))),
+    )
+
+    mcp_telegram.serve()
+
+    assert captured == {"host": "127.0.0.1", "port": 3100, "stopped": True}

@@ -121,12 +121,19 @@ def serve(
 
     async def _run() -> None:
         sync_task = asyncio.create_task(sync_main(), name="sync-daemon")
+        http_stop_event = asyncio.Event()
         http_task = asyncio.create_task(
-            _server.run_mcp_http_server(host=resolved_host, port=resolved_port),
+            _server.run_mcp_http_server(host=resolved_host, port=resolved_port, stop_event=http_stop_event),
             name="mcp-http",
         )
         tasks = {sync_task, http_task}
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+        if sync_task in done and not sync_task.cancelled() and sync_task.exception() is None:
+            http_stop_event.set()
+            await http_task
+            return
+
         for task in pending:
             task.cancel()
         for task in pending:
@@ -135,6 +142,8 @@ def serve(
             except asyncio.CancelledError:
                 pass
         for task in done:
+            if task.cancelled():
+                raise asyncio.CancelledError
             exc = task.exception()
             if exc is not None:
                 raise exc

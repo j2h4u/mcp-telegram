@@ -5,6 +5,7 @@ via the public correlation context API for cross-process log correlation, and
 runs stdio or Streamable HTTP transport loops.
 """
 
+import asyncio
 import contextlib
 import ipaddress
 import logging
@@ -79,6 +80,37 @@ Important limitations:
 - Read cursors and reaction aggregates may not include Telegram event timestamps. Do not infer unavailable times from sync or database timestamps.
 - Do not use WebFetch or web scraping for Telegram content available through these tools.
 """
+
+
+class _HttpServer(t.Protocol):
+    should_exit: bool
+
+    async def serve(self) -> None:
+        """Run the HTTP server until its normal shutdown condition."""
+
+
+async def _serve_http_until_stop(server: _HttpServer, stop_event: asyncio.Event) -> None:
+    """Request Uvicorn shutdown without cancelling its lifespan task."""
+    serve_task = asyncio.create_task(server.serve(), name="mcp-http-uvicorn")
+    stop_task = asyncio.create_task(stop_event.wait(), name="mcp-http-stop")
+    try:
+        done, _ = await asyncio.wait(
+            (serve_task, stop_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if serve_task in done:
+            await serve_task
+            return
+
+        server.should_exit = True
+        await serve_task
+    finally:
+        for task in (serve_task, stop_task):
+            if not task.done():
+                task.cancel()
+        for task in (serve_task, stop_task):
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 class _BenignMcpHttpDisconnectFilter(logging.Filter):
@@ -408,8 +440,13 @@ async def run_mcp_http_server(
     host: str = "127.0.0.1",
     port: int = 3100,
     mount_path: str = "/mcp",
+    stop_event: asyncio.Event | None = None,
 ) -> None:
-    """Run the MCP server over Streamable HTTP."""
+    """Run the MCP server over Streamable HTTP.
+
+    When ``stop_event`` is provided, it requests Uvicorn's normal shutdown so
+    Starlette can complete its lifespan context before this coroutine returns.
+    """
 
     import uvicorn
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -476,7 +513,7 @@ async def run_mcp_http_server(
         @contextlib.contextmanager
         def capture_signals(self) -> t.Iterator[None]:
             # The sync daemon owns process signal handling; this server is
-            # cancelled by the combined `serve` entrypoint during shutdown.
+            # asked to stop by the combined `serve` entrypoint during shutdown.
             yield
 
     config = uvicorn.Config(
@@ -486,4 +523,8 @@ async def run_mcp_http_server(
         log_level=log_level.lower(),
         access_log=False,
     )
-    await _NoSignalServer(config).serve()
+    http_server = _NoSignalServer(config)
+    if stop_event is None:
+        await http_server.serve()
+    else:
+        await _serve_http_until_stop(http_server, stop_event)

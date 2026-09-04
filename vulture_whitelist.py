@@ -57,6 +57,7 @@ instructions     # MCP server instructions, read by the MCP SDK (server.py:287,3
 row_factory      # sqlite3.Connection.row_factory, consumed by sqlite3 (daemon_api.py:1780)
 model_config     # Pydantic BaseModel config, consumed by Pydantic (tools/_base.py)
 capture_signals  # override of uvicorn.Server.capture_signals, called by uvicorn (server.py:357)
+should_exit     # uvicorn.Server shutdown flag, consumed by Uvicorn (server.py:86,105)
 
 upsert_entities       # retained daemon-client API for external entity projection callers
 

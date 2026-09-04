@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import re
@@ -692,6 +693,37 @@ async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(
     assert routes[1][0] == "route"
     assert routes[1][1] == "/health"
     assert server.app.instructions == "Built"
+
+
+@pytest.mark.asyncio
+async def test_serve_http_until_stop_requests_normal_lifespan_shutdown() -> None:
+    class FakeServer:
+        should_exit = False
+
+        async def serve(self) -> None:
+            while not self.should_exit:
+                await asyncio.sleep(0)
+
+    stop_event = asyncio.Event()
+    fake_server = FakeServer()
+    server_task = asyncio.create_task(server._serve_http_until_stop(fake_server, stop_event))
+    await asyncio.sleep(0)
+    stop_event.set()
+
+    await server_task
+    assert fake_server.should_exit is True
+
+
+@pytest.mark.asyncio
+async def test_serve_http_until_stop_propagates_server_failure() -> None:
+    class FakeServer:
+        should_exit = False
+
+        async def serve(self) -> None:
+            raise RuntimeError("lifespan failed")
+
+    with pytest.raises(RuntimeError, match="lifespan failed"):
+        await server._serve_http_until_stop(FakeServer(), asyncio.Event())
 
 
 def test_list_tools_exposes_list_dialogs_output_schema() -> None:
