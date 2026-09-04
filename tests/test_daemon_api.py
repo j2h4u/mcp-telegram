@@ -7419,6 +7419,28 @@ async def test_multiple_substring_dialog_matches_fail_closed_before_stats_query(
     assert {candidate["entity_id"] for candidate in candidates} == {303, 404}
 
 
+async def test_search_messages_local_ambiguity_skips_slow_telegram_enumeration() -> None:
+    """A local ambiguous selector fails before the search path can acquire Telegram state."""
+    conn = _make_db_with_dialogs(with_fts=True)
+    _seed_dialog_row(conn, 303, name="Alpha Project")
+    _seed_dialog_row(conn, 404, name="Beta Project")
+    client = _TestClient()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("local ambiguity must not enumerate Telegram"))
+    client.iter_messages = MagicMock(side_effect=AssertionError("ambiguous selector must not read Telegram messages"))
+    server = make_server(conn, client)
+
+    result = await asyncio.wait_for(
+        server._dispatch({"method": "search_messages", "dialog": "Project", "query": "needle"}),
+        timeout=0.1,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "ambiguous_dialog"
+    assert {candidate["entity_id"] for candidate in cast(list[dict[str, object]], result["candidates"])} == {303, 404}
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
+    cast(MagicMock, client.iter_messages).assert_not_called()
+
+
 async def test_unique_exact_name_precedes_nearby_substring_and_exact_id_bypasses_lookup() -> None:
     conn = _make_db_with_dialogs()
     _seed_dialog_row(conn, 505, name="Project")

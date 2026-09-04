@@ -891,6 +891,11 @@ class DaemonAPIServer:
             return exact_result
         local_result = _fuzzy_resolve(dialog, fuzzy_names, normalized_name_map=fuzzy_normalized)
         self._apply_dialog_candidate_types(local_result, entity_types)
+        # A local ambiguity is already a fail-closed selector outcome.  Remote
+        # enumeration cannot select a dialog safely and must not turn an MCP
+        # read into Telegram work merely to expand an existing ambiguity.
+        if isinstance(local_result, Candidates) and len(local_result.matches) > 1:
+            return local_result
         if not allow_remote_lookup:
             return local_result
 
