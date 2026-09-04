@@ -20,6 +20,7 @@ from account_trace_fixtures import (
     seed_message,
     seed_synced_dialog,
 )
+from mcp_telegram.account_trace_sqlite import TRACE_MESSAGE_COMPARE_FIELDS, existing_message_bundle
 from mcp_telegram.daemon_account_trace import (
     DaemonAccountTraceDeps,
     DaemonAccountTraceService,
@@ -27,7 +28,6 @@ from mcp_telegram.daemon_account_trace import (
     _messages_row_equal,
     _project_trace_content_rows,
     _trace_candidate_dialogs,
-    _trace_existing_message_bundle,
     _TraceCandidateBuildRequest,
 )
 from mcp_telegram.daemon_api import DaemonAPIServer
@@ -350,7 +350,7 @@ def test_messages_row_equal_covers_base_and_child_tables(
         (222, 1, 333, "Source", 1_700_000_010, 5),
     )
     conn.commit()
-    existing = _trace_existing_message_bundle(conn, dialog_id=222, message_id=1)
+    existing = existing_message_bundle(conn, dialog_id=222, message_id=1, fields=TRACE_MESSAGE_COMPARE_FIELDS)
     same = candidate_message(
         reply_count=0,
         reactions=[ReactionRecord(dialog_id=222, message_id=1, emoji="👍", count=2)],
@@ -403,7 +403,12 @@ def test_messages_row_equal_covers_base_and_child_tables(
     )
     conn.execute("UPDATE messages SET is_deleted = 1 WHERE dialog_id = 222 AND message_id = 1")
     conn.commit()
-    assert _messages_row_equal(_trace_existing_message_bundle(conn, dialog_id=222, message_id=1), same) is False
+    assert (
+        _messages_row_equal(
+            existing_message_bundle(conn, dialog_id=222, message_id=1, fields=TRACE_MESSAGE_COMPARE_FIELDS), same
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio

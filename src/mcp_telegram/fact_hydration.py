@@ -23,7 +23,7 @@ from .hydration_queue import (
     HydrationQueueRepository,
     HydrationQueueSummary,
 )
-from .messages.sqlite_repository import (
+from .messages.sqlite_hydration_jobs import (
     MediaMetadataHydrationRepair,
     TranscriptionHydrationRepair,
     repair_media_metadata_hydration_jobs,

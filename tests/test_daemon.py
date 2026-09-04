@@ -216,7 +216,7 @@ def test_sync_main_connects_and_heartbeats(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", side_effect=mock_register_shutdown),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", side_effect=mock_register_shutdown),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon._log_heartbeat", side_effect=heartbeat_then_shutdown) as mock_hb,
@@ -299,7 +299,7 @@ def test_sync_main_runs_fts_backfill_before_connect(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon._run_fts_backfill", side_effect=_fake_fts_backfill),
@@ -331,7 +331,7 @@ def test_sync_main_ensures_schema(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema") as mock_ensure,
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
     ):
@@ -350,7 +350,9 @@ def test_sync_main_registers_shutdown(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event) as mock_reg,
+        patch(
+            "mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=instant_shutdown_event
+        ) as mock_reg,
         patch("mcp_telegram.daemon._open_sync_db", return_value=mock_conn),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
     ):
@@ -410,7 +412,7 @@ def test_self_id_cached_at_startup(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.DaemonAPIServer", _Capturing),
@@ -439,7 +441,7 @@ def test_sync_main_disconnects_client_on_shutdown(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
     ):
@@ -466,7 +468,7 @@ def test_sync_main_heartbeat_logs_connection_state(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", side_effect=mock_register_shutdown),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", side_effect=mock_register_shutdown),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon._log_heartbeat", side_effect=heartbeat_then_shutdown),
@@ -496,7 +498,7 @@ def test_sync_main_survives_connection_error(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler"),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler"),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         caplog.at_level(logging.ERROR, logger="mcp_telegram.daemon"),
@@ -528,7 +530,7 @@ def test_sync_main_calls_bootstrap_dms(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
@@ -558,7 +560,7 @@ def test_sync_main_calls_process_one_batch(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
@@ -600,7 +602,7 @@ def test_sync_main_idles_when_all_synced(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", side_effect=mock_register_shutdown),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", side_effect=mock_register_shutdown),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.0),
@@ -642,7 +644,7 @@ def test_sync_main_logs_heartbeat_during_sync(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.0),  # instant heartbeat
@@ -684,7 +686,7 @@ def test_handlers_registered_before_worker(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
@@ -722,7 +724,7 @@ def test_handlers_registered_before_telegram_connect(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.FullSyncWorker", return_value=worker_instance),
@@ -764,7 +766,7 @@ def test_heartbeat_refreshes_synced_dialogs(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.0),  # instant heartbeat
@@ -809,7 +811,7 @@ def test_gap_scan_runs_on_weekly_schedule(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.GAP_SCAN_INTERVAL_S", 0.0),
@@ -844,7 +846,7 @@ def test_gap_scan_not_called_before_interval(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.0),
@@ -883,7 +885,7 @@ def test_handlers_unregistered_on_shutdown(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
@@ -924,7 +926,7 @@ def test_create_client_called_with_catch_up(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client) as mock_create,
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.FullSyncWorker", return_value=worker_instance),
@@ -982,7 +984,7 @@ def test_delta_catch_up_no_longer_blocks_bootstrap(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.FullSyncWorker", return_value=worker_instance),
@@ -1022,7 +1024,7 @@ def test_delta_catch_up_loop_is_started_as_background_task(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.FullSyncWorker", return_value=worker_instance),
@@ -1107,7 +1109,7 @@ def test_sync_main_starts_api_server(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.FullSyncWorker", return_value=mocks["worker"]),
@@ -1146,7 +1148,7 @@ def test_sync_main_runs_fts_backfill(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db", return_value=mock_conn),
         patch("mcp_telegram.daemon.backfill_fts_index", mock_backfill),
         patch("mcp_telegram.daemon.FullSyncWorker", return_value=mocks["worker"]),
@@ -1179,7 +1181,7 @@ def test_sync_main_cleans_socket_on_shutdown(
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.daemon_shutdown.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch(

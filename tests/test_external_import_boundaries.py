@@ -53,6 +53,20 @@ def test_current_source_baseline_has_no_external_import_boundary_violations() ->
     assert gate.boundary_violations(gate.SOURCE_ROOT, allowed_importer_paths=gate.ALLOWED_IMPORTER_PATHS) == []
 
 
+def test_sqlite_import_owners_name_split_persistence_modules() -> None:
+    gate = _load_gate()
+
+    assert {
+        "account_trace_sqlite.py",
+        "daemon_shutdown.py",
+        "sqlite_checkpoint.py",
+        "messages/sqlite_bundle.py",
+        "messages/sqlite_hydration.py",
+        "messages/sqlite_hydration_jobs.py",
+    } <= gate.ALLOWED_IMPORTER_PATHS["sqlite3"]
+    assert "messages/sqlite_repository.py" not in gate.ALLOWED_IMPORTER_PATHS["sqlite3"]
+
+
 def test_forbidden_import_owner_is_rejected() -> None:
     gate = _load_gate()
     path = gate.SOURCE_ROOT / "not_an_owner.py"

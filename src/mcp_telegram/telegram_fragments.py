@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Protocol, cast
 
 from .hydration_queue import HydrationPriority
-from .messages.sqlite_repository import insert_messages_with_fts
+from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES, translate_gateway_failure
 from .telegram_reading import FragmentFetchResult, TelegramFragmentGateway

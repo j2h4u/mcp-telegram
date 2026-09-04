@@ -23,15 +23,17 @@ from account_trace_fixtures import (
     seed_topic,
     seed_trace_fragment,
 )
+from mcp_telegram.account_trace_sqlite import (
+    TraceMessageQueryRequest,
+    build_evidence_query,
+    coverage_fragments,
+)
 from mcp_telegram.daemon_account_trace import (
     DaemonAccountTraceDeps,
     DaemonAccountTraceService,
-    _build_trace_account_messages_query,
     _build_trace_coverage,
-    _get_trace_coverage_fragments,
     _LoggerLike,
     _TraceCoverageFragmentUpsertRequest,
-    _TraceMessageQueryRequest,
     _upsert_trace_coverage_fragment,
 )
 from mcp_telegram.daemon_api import DaemonAPIServer
@@ -496,7 +498,7 @@ def test_trace_fragment_helpers_preserve_created_at_and_store_retry(
     )
     conn.commit()
 
-    fragments = _get_trace_coverage_fragments(conn, target_user_id=101)
+    fragments = coverage_fragments(conn, target_user_id=101)
 
     assert len(fragments) == 1
     assert fragments[0]["topic_id"] == 0
@@ -658,8 +660,8 @@ async def test_trace_ambiguous_account_gap_has_candidate_ids(
 
 
 def test_trace_query_uses_effective_sender_topic_and_signature_params() -> None:
-    sql, params = _build_trace_account_messages_query(
-        _TraceMessageQueryRequest(
+    sql, params = build_evidence_query(
+        TraceMessageQueryRequest(
             target_user_id=101,
             self_id=101,
             limit=51,

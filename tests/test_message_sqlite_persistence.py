@@ -11,26 +11,30 @@ import pytest
 from mcp_telegram.fts import stem_text
 from mcp_telegram.hydration_queue import HydrationPriority
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
-from mcp_telegram.messages.sqlite_repository import (
-    _REPAIR_MEDIA_METADATA_CONTACT_OTHER_SQL,
-    _REPAIR_MEDIA_METADATA_VIDEO_SQL,
-    _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL,
-    _TRANSCRIBABLE_MEDIA_SQL,
-    TranscriptionHydrationRepair,
-    _is_transcribable_media_pair,
-    apply_message_transcription,
+from mcp_telegram.messages.sqlite_bundle import (
     insert_messages_with_fts,
     list_undeleted_message_ids,
     mark_message_deleted,
     persist_edited_message,
     persist_transcribed_text,
     read_message_text,
+)
+from mcp_telegram.messages.sqlite_hydration import (
+    apply_message_transcription,
+    stage_message_transcription,
+    upsert_message_transcription,
+)
+from mcp_telegram.messages.sqlite_hydration_jobs import (
+    _REPAIR_MEDIA_METADATA_CONTACT_OTHER_SQL,
+    _REPAIR_MEDIA_METADATA_VIDEO_SQL,
+    _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL,
+    _TRANSCRIBABLE_MEDIA_SQL,
+    TranscriptionHydrationRepair,
+    _is_transcribable_media_pair,
     reconcile_fact_hydration_jobs_for_dialog,
     repair_media_metadata_hydration_jobs,
     repair_transcription_hydration_jobs,
-    stage_message_transcription,
     transcription_hydration_eligible,
-    upsert_message_transcription,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 

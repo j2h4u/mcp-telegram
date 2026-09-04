@@ -33,7 +33,7 @@ from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
 from .history_enrollment import ensure_automatic_dm_enrollment, full_history_enabled
 from .hydration_queue import HydrationPriority
-from .messages.sqlite_repository import insert_messages_with_fts
+from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import PeerNameClient, extract_message_row, resolve_forward_entity_name_map
 from .resolver import latinize
 from .telegram_access import ACCESS_LOST_ERRORS

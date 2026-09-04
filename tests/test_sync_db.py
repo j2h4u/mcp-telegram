@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 import time
-from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -16,7 +14,6 @@ from mcp_telegram.sync_db import (
     ensure_sync_schema,
     migrate_legacy_databases,
     open_sync_db_reader,
-    register_shutdown_handler,
 )
 
 TableInfoRow = tuple[int, str, str, int, object, int]
@@ -415,47 +412,6 @@ def test_concurrent_read_during_write(tmp_sync_db_path: Path) -> None:
         writer.rollback()
     finally:
         writer.close()
-
-
-# ---------------------------------------------------------------------------
-# SYNC-08: SIGTERM checkpoint
-# ---------------------------------------------------------------------------
-
-
-def test_sigterm_checkpoint(tmp_sync_db_path: Path) -> None:
-    """Write data, invoke shutdown callback directly, reopen DB, verify integrity."""
-    ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_db(tmp_sync_db_path)
-    reopen = None
-    try:
-        # Write some committed data
-        conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (1, 'synced')")
-        conn.commit()
-
-        # Use a tiny loop stub to capture the callback passed to add_signal_handler.
-        class _LoopStub:
-            def __init__(self) -> None:
-                self.call_args: tuple[object, object] | None = None
-
-            def add_signal_handler(self, signal_num: int, callback: object) -> None:
-                self.call_args = (signal_num, callback)
-
-        mock_loop = _LoopStub()
-        register_shutdown_handler(conn, cast(asyncio.AbstractEventLoop, mock_loop))
-        assert mock_loop.call_args is not None
-        sigterm_callback = cast(Callable[[], None], mock_loop.call_args[1])
-        sigterm_callback()
-
-        # Reopen DB and verify data is intact
-        reopen = sqlite3.connect(str(tmp_sync_db_path), timeout=10.0)
-        integrity = _fetchone_row(reopen, "PRAGMA integrity_check")
-        assert integrity is not None and str(integrity[0]).lower() == "ok", f"integrity_check failed: {integrity}"
-        row = _fetchone_text(reopen, "SELECT status FROM synced_dialogs WHERE dialog_id=1")
-        assert row == "synced", f"Data not preserved after shutdown: {row}"
-    finally:
-        if reopen is not None:
-            reopen.close()
-        conn.close()
 
 
 # ---------------------------------------------------------------------------

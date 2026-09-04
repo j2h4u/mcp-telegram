@@ -25,7 +25,7 @@ from mcp_telegram.history_enrollment import disable_history, enable_history
 from mcp_telegram.hydration_queue import HydrationPriority, HydrationQueueRepository
 from mcp_telegram.media_hydration import MediaFactHydrationHandler
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
-from mcp_telegram.messages.sqlite_repository import insert_messages_with_fts
+from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.transcription_hydration import TranscriptionHydrationHandler
 
@@ -1051,7 +1051,7 @@ async def test_transcription_realtime_event_wins_worker_race(db: sqlite3.Connect
     class _EventWinsClient(_Client):
         async def __call__(self, request: object, **kwargs: object) -> object:
             self.calls.append({"request": request, **kwargs})
-            from mcp_telegram.messages.sqlite_repository import apply_message_transcription
+            from mcp_telegram.messages.sqlite_hydration import apply_message_transcription
 
             apply_message_transcription(
                 db,

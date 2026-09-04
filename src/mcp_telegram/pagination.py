@@ -57,7 +57,7 @@ class AccountTraceNavigationToken:
     ``scope_dialog_ids`` carries the effective dialog-id set for a channel-
     scoped trace that has a linked discussion group (≤2 ids: channel +
     linked chat).  It is encoded in the token and fed back into
-    ``_build_trace_account_messages_query(scope_dialog_ids=…)`` on decode so
+    ``build_evidence_query(scope_dialog_ids=…)`` on decode so
     the expanded ``m.dialog_id IN (…)`` scope is preserved across pages
     WITHOUT any live ``GetFullChannelRequest`` re-resolution.
 

@@ -11,8 +11,8 @@ from telethon.tl.types import TypeInputPeer  # type: ignore[import-untyped]
 
 from .fact_hydration import AppliedFacts, HydrationDropObservation
 from .hydration_queue import TRANSCRIPTION_HYDRATION_KIND, HydrationJob, HydrationQueueRepository
-from .messages.sqlite_repository import (
-    apply_message_transcription_if_absent,
+from .messages.sqlite_hydration import apply_message_transcription_if_absent
+from .messages.sqlite_hydration_jobs import (
     transcription_hydration_eligible,
 )
 from .telegram_rpc_error import describe_telegram_rpc_error

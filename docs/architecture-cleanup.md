@@ -10,7 +10,7 @@ this table until removed.
 
 | ID | Deprecated edge(s) | Owner / target | Removal condition |
 |---|---|---|---|
-| `TG-001` | `telegram_fragments` → `messages.sqlite_repository` | Telegram/messages | Inject a message-write port at the fragment ingestion seam. |
+| `TG-001` | `telegram_fragments` → `messages.sqlite_bundle` | Telegram/messages | Inject a message-write port at the fragment ingestion seam. |
 
 Deprecated diagnostics are warnings so the gate stays green, but they are not
 approval to add more coupling. A new deprecated edge requires a table row in

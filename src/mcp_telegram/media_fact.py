@@ -6,7 +6,7 @@ import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Literal, cast, get_args
 
 type MediaKind = Literal[
     "photo",
@@ -29,28 +29,11 @@ type MediaKind = Literal[
     "other",
 ]
 
-MEDIA_KINDS: frozenset[str] = frozenset(
-    {
-        "photo",
-        "video",
-        "audio",
-        "voice",
-        "document",
-        "animation",
-        "sticker",
-        "custom_emoji",
-        "poll",
-        "location",
-        "venue",
-        "contact",
-        "link_preview",
-        "game",
-        "invoice",
-        "dice",
-        "story",
-        "other",
-    }
-)
+# ``MediaKind`` is a PEP 695 type alias, so unwrap its value before asking
+# ``typing`` for the ordered Literal arguments.  Keep this tuple as the one
+# runtime/schema vocabulary source; the set below is only for membership tests.
+MEDIA_KIND_VALUES: tuple[str, ...] = get_args(cast(object, MediaKind.__value__))
+MEDIA_KINDS: frozenset[str] = frozenset(MEDIA_KIND_VALUES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,6 +278,7 @@ def _duration_description(label: str, payload: Mapping[str, object]) -> str:
 
 __all__ = [
     "MEDIA_KINDS",
+    "MEDIA_KIND_VALUES",
     "MediaFact",
     "MediaKind",
     "decode_media_fact",
