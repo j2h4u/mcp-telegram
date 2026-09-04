@@ -1,6 +1,6 @@
 from typing import Literal, NotRequired, TypedDict, cast
 
-from ..media_fact import MEDIA_KINDS
+from ..media_fact import MEDIA_KIND_VALUES, MEDIA_KINDS, MediaKind
 from ..message_content import ContentKind
 
 TelegramContentKind = Literal[
@@ -55,33 +55,13 @@ class TelegramContent(TypedDict):
     content_kind: TelegramContentKind
 
 
-AttachmentType = Literal[
-    "photo",
-    "video",
-    "audio",
-    "voice",
-    "document",
-    "animation",
-    "sticker",
-    "custom_emoji",
-    "poll",
-    "location",
-    "venue",
-    "contact",
-    "link_preview",
-    "game",
-    "invoice",
-    "dice",
-    "story",
-    "other",
-]
 DeliveryContentKind = ContentKind | Literal["snippet"]
 
 
 class Attachment(TypedDict):
     """Minimal canonical representation for any Telegram media attachment."""
 
-    type: AttachmentType
+    type: MediaKind
     description: NotRequired[str]
 
 
@@ -95,26 +75,7 @@ MEDIA_OUTPUT_SCHEMA = {
     "properties": {
         "type": {
             "type": "string",
-            "enum": [
-                "photo",
-                "video",
-                "audio",
-                "voice",
-                "document",
-                "animation",
-                "sticker",
-                "custom_emoji",
-                "poll",
-                "location",
-                "venue",
-                "contact",
-                "link_preview",
-                "game",
-                "invoice",
-                "dice",
-                "story",
-                "other",
-            ],
+            "enum": list(MEDIA_KIND_VALUES),
         },
         "description": {"type": "string"},
     },
@@ -194,7 +155,7 @@ def project_media_description(media_description: str | None, media_kind: str | N
     """Project persisted media facts into one stable agent-facing attachment."""
     if media_kind is None or media_kind not in MEDIA_KINDS:
         return None
-    attachment: Attachment = {"type": cast(AttachmentType, media_kind)}
+    attachment: Attachment = {"type": cast(MediaKind, media_kind)}
     if media_description:
         attachment["description"] = media_description
     return attachment

@@ -8,8 +8,8 @@ Architecture:
 - sync-daemon is the sole owner of TelegramClient — connects once, holds it.
 - MCP server runs separately with disable_telegram_session() active and reads
   sync.db via open_sync_db_reader(); it never calls client.connect().
-- SIGTERM triggers shutdown_event (set by register_shutdown_handler), which
-  checkpoints WAL and closes the DB connection before the daemon disconnects.
+- SIGTERM triggers shutdown_event (set by daemon_shutdown), which checkpoints
+  WAL before the daemon disconnects.
 
 Event handlers:
 - EventHandlerManager is registered BEFORE Telegram connect() so Telethon
@@ -60,6 +60,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     TypeInputUser,
 )
 
+from . import daemon_shutdown
 from .activity_cold_backfill import ColdBackfillPacing, run_cold_backfill_loop
 from .activity_contracts import InputPeerResolver
 from .activity_hot_sweep import run_hot_sweep_loop
@@ -101,7 +102,7 @@ from .message_fact_refresh import (
     MessageFactRefreshPolicy,
     run_message_fact_refresh_loop,
 )
-from .messages.sqlite_repository import reconcile_fact_hydration_jobs_for_dialog
+from .messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
 from .own_only import OwnOnlyContext, ensure_own_only_schema
 from .reactions.refresh import ReactionFreshener
 from .reactions.sqlite_repository import SQLiteReactionSnapshotRepository
@@ -114,7 +115,6 @@ from .sync_db import (
     _open_sync_db,
     ensure_sync_schema,
     migrate_legacy_databases,
-    register_shutdown_handler,
 )
 from .sync_worker import FullSyncWorker
 from .telegram import create_client
@@ -861,7 +861,11 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - com
     feedback_service = FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn))
     logger.info("feedback.db ready at %s", feedback_db_path)
 
-    shutdown_event = register_shutdown_handler(conn, asyncio.get_running_loop(), feedback_conn=feedback_conn)
+    shutdown_event = daemon_shutdown.register_shutdown_handler(
+        conn,
+        asyncio.get_running_loop(),
+        feedback_conn=feedback_conn,
+    )
     flood_wait_kill_switch_event = asyncio.Event()
     _install_flood_wait_kill_switch(config, flood_wait_kill_switch_event)
 

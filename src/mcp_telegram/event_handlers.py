@@ -60,14 +60,16 @@ from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
 from .history_enrollment import ensure_automatic_dm_enrollment
 from .hydration_queue import HydrationPriority
-from .messages.sqlite_repository import (
-    apply_message_transcription,
+from .messages.sqlite_bundle import (
     insert_messages_with_fts,
     list_undeleted_message_ids,
     mark_message_deleted,
     persist_edited_message,
     read_message_out,
     read_message_text,
+)
+from .messages.sqlite_hydration import (
+    apply_message_transcription,
     stage_message_transcription,
 )
 from .messages.telegram_adapter import (

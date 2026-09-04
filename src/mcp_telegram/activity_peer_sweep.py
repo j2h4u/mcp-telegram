@@ -35,7 +35,7 @@ from .activity_substrate import ActivityClient, call_with_timeout
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage
-from .messages.sqlite_repository import insert_messages_with_fts, message_exists
+from .messages.sqlite_bundle import insert_messages_with_fts, message_exists
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
 from .own_only import enroll_own_only_sync_dialog
 from .telegram_access import ACCESS_LOST_ERRORS

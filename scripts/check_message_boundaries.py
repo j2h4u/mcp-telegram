@@ -32,15 +32,17 @@ SOURCE_ROOT = ROOT / "src" / "mcp_telegram"
 # is intentionally a policy change: update this set and its focused tests.
 MESSAGE_SQL_OWNER_PATHS = frozenset(
     {
-        "daemon_account_trace.py",
         "daemon_activity_stats.py",
         "daemon_dialog_queries.py",
         "daemon_entity_info.py",
+        "account_trace_sqlite.py",
         "reading/sqlite_projection.py",
         "folders/read_repository.py",
         "fts.py",
         "message_fact_refresh.py",
-        "messages/sqlite_repository.py",
+        "messages/sqlite_bundle.py",
+        "messages/sqlite_hydration.py",
+        "messages/sqlite_hydration_jobs.py",
     }
 )
 

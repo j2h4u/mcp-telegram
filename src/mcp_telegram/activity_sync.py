@@ -22,7 +22,7 @@ from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled, sleep_through_flood
 from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage
-from .messages.sqlite_repository import insert_messages_with_fts
+from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
 from .models import DialogType
 from .own_only import enroll_own_only_sync_dialog

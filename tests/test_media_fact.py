@@ -8,8 +8,11 @@ from unittest.mock import MagicMock
 
 import pytest
 import telethon.tl.types as tl  # type: ignore[import-untyped]
+from jsonschema import ValidationError, validate
 
 from mcp_telegram.media_fact import (
+    MEDIA_KIND_VALUES,
+    MEDIA_KINDS,
     MediaFact,
     decode_media_fact,
     encode_media_fact,
@@ -18,6 +21,20 @@ from mcp_telegram.media_fact import (
     media_description,
 )
 from mcp_telegram.telethon_media import extract_media_fact
+from mcp_telegram.tools.structured import MEDIA_OUTPUT_SCHEMA, project_media_description
+
+
+def test_media_kind_is_the_runtime_and_schema_vocabulary() -> None:
+    assert frozenset(MEDIA_KIND_VALUES) == MEDIA_KINDS
+    assert MEDIA_OUTPUT_SCHEMA["properties"]["type"]["enum"] == list(MEDIA_KIND_VALUES)  # type: ignore[index]
+
+    for kind in MEDIA_KIND_VALUES:
+        validate(instance={"type": kind}, schema=MEDIA_OUTPUT_SCHEMA)
+        assert project_media_description(None, kind) == {"type": kind}
+
+    with pytest.raises(ValidationError):
+        validate(instance={"type": "unknown"}, schema=MEDIA_OUTPUT_SCHEMA)
+    assert project_media_description("ignored", "unknown") is None
 
 
 def test_codec_is_canonical_and_rejects_non_json_values() -> None:

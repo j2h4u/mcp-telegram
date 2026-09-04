@@ -7555,7 +7555,7 @@ def _make_trace_db() -> sqlite3.Connection:
     """Minimal in-memory DB for account-trace scope-remap tests.
 
     Includes all tables required by:
-    - _build_trace_account_messages_query  (messages, dialogs, entities, topic_metadata)
+    - build_evidence_query                  (messages, dialogs, entities, topic_metadata)
     - _trace_candidate_dialogs             (synced_dialogs, dialogs, trace_coverage_fragments,
                                             entity_details)
     - enroll_activity_dialog               (activity_dialog_state, synced_dialogs)
@@ -7714,7 +7714,7 @@ def _seed_channel_with_linked_chat(conn: sqlite3.Connection) -> None:
     """Seed a broadcast channel + its linked discussion group as synced dialogs.
 
     The trace tests that consume this fixture call pure-SQL builders such as
-    `_build_trace_account_messages_query` and pass `linked_chat_map` directly —
+    `build_evidence_query` and pass `linked_chat_map` directly —
     they do NOT invoke `resolve_linked_chat_id`, so no `entity_details` row or
     `dialogs.linked_chat_*` column needs to be populated here. The fixture's
     only job is to make the two peers exist as `dialogs`/`synced_dialogs` rows
@@ -7909,10 +7909,7 @@ def test_trace_query_returns_messages_under_linked_chat_id() -> None:
     """(c) A channel-scoped trace with scope_dialog_ids=[channel, linked] returns
     messages stored under linked_chat_id — not just the channel's dialog_id.
     """
-    from mcp_telegram.daemon_account_trace import (
-        _build_trace_account_messages_query,
-        _TraceMessageQueryRequest,
-    )
+    from mcp_telegram.account_trace_sqlite import TraceMessageQueryRequest, build_evidence_query
 
     conn = _make_trace_db()
     _seed_channel_with_linked_chat(conn)
@@ -7921,8 +7918,8 @@ def test_trace_query_returns_messages_under_linked_chat_id() -> None:
     _insert_own_message(conn, _LINKED_CHAT_ID, message_id=42, sender_id=_TARGET_USER_ID)
 
     scope_dialog_ids = [_CHANNEL_ID, _LINKED_CHAT_ID]
-    sql, params = _build_trace_account_messages_query(
-        _TraceMessageQueryRequest(
+    sql, params = build_evidence_query(
+        TraceMessageQueryRequest(
             target_user_id=_TARGET_USER_ID,
             self_id=_TARGET_USER_ID,
             limit=50,
@@ -7943,14 +7940,11 @@ def test_trace_query_returns_messages_under_linked_chat_id() -> None:
 
 def test_trace_query_uses_in_filter_for_scope_dialog_ids() -> None:
     """(d) When scope_dialog_ids is set, the built SQL contains 'IN' not '= :exact_dialog_id'."""
-    from mcp_telegram.daemon_account_trace import (
-        _build_trace_account_messages_query,
-        _TraceMessageQueryRequest,
-    )
+    from mcp_telegram.account_trace_sqlite import TraceMessageQueryRequest, build_evidence_query
 
     scope_dialog_ids = [_CHANNEL_ID, _LINKED_CHAT_ID]
-    sql, params = _build_trace_account_messages_query(
-        _TraceMessageQueryRequest(
+    sql, params = build_evidence_query(
+        TraceMessageQueryRequest(
             target_user_id=_TARGET_USER_ID,
             self_id=_TARGET_USER_ID,
             limit=50,
@@ -7979,10 +7973,7 @@ def test_trace_query_uses_in_filter_for_scope_dialog_ids() -> None:
 
 def test_trace_query_authorship_predicate_unchanged() -> None:
     """(e) scope_dialog_ids does not widen authorship — target_user_id still filters sender."""
-    from mcp_telegram.daemon_account_trace import (
-        _build_trace_account_messages_query,
-        _TraceMessageQueryRequest,
-    )
+    from mcp_telegram.account_trace_sqlite import TraceMessageQueryRequest, build_evidence_query
 
     conn = _make_trace_db()
     _seed_channel_with_linked_chat(conn)
@@ -7998,8 +7989,8 @@ def test_trace_query_authorship_predicate_unchanged() -> None:
     conn.commit()
 
     scope_dialog_ids = [_CHANNEL_ID, _LINKED_CHAT_ID]
-    sql, params = _build_trace_account_messages_query(
-        _TraceMessageQueryRequest(
+    sql, params = build_evidence_query(
+        TraceMessageQueryRequest(
             target_user_id=_TARGET_USER_ID,
             self_id=_TARGET_USER_ID,
             limit=50,
@@ -8058,17 +8049,14 @@ def test_trace_navigation_token_carries_scope_dialog_ids() -> None:
     assert decoded.exact_dialog_id == _CHANNEL_ID
 
     # Feeding the decoded scope back into the query builder must produce IN(...).
-    from mcp_telegram.daemon_account_trace import (
-        _build_trace_account_messages_query,
-        _TraceMessageQueryRequest,
-    )
+    from mcp_telegram.account_trace_sqlite import TraceMessageQueryRequest, build_evidence_query
 
     conn = _make_trace_db()
     _seed_channel_with_linked_chat(conn)
     _insert_own_message(conn, _LINKED_CHAT_ID, message_id=43, sender_id=_TARGET_USER_ID)
 
-    sql, params = _build_trace_account_messages_query(
-        _TraceMessageQueryRequest(
+    sql, params = build_evidence_query(
+        TraceMessageQueryRequest(
             target_user_id=_TARGET_USER_ID,
             self_id=_TARGET_USER_ID,
             limit=50,
@@ -8089,13 +8077,10 @@ def test_trace_navigation_token_carries_scope_dialog_ids() -> None:
 
 def test_trace_query_scalar_filter_when_no_scope_dialog_ids() -> None:
     """(g) When scope_dialog_ids is absent, the scalar m.dialog_id = :exact_dialog_id is used."""
-    from mcp_telegram.daemon_account_trace import (
-        _build_trace_account_messages_query,
-        _TraceMessageQueryRequest,
-    )
+    from mcp_telegram.account_trace_sqlite import TraceMessageQueryRequest, build_evidence_query
 
-    sql, params = _build_trace_account_messages_query(
-        _TraceMessageQueryRequest(
+    sql, params = build_evidence_query(
+        TraceMessageQueryRequest(
             target_user_id=_TARGET_USER_ID,
             self_id=_TARGET_USER_ID,
             limit=50,

@@ -35,6 +35,18 @@ def test_live_runtime_entity_dml_has_only_canonical_owners() -> None:
     assert findings == []
 
 
+def test_message_sql_owners_name_the_split_persistence_modules() -> None:
+    gate = _gate()
+
+    assert {
+        "account_trace_sqlite.py",
+        "messages/sqlite_bundle.py",
+        "messages/sqlite_hydration.py",
+        "messages/sqlite_hydration_jobs.py",
+    } <= gate.MESSAGE_SQL_OWNER_PATHS
+    assert "messages/sqlite_repository.py" not in gate.MESSAGE_SQL_OWNER_PATHS
+
+
 @pytest.mark.parametrize(
     "sql",
     [

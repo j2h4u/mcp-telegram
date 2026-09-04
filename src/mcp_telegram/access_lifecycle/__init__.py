@@ -11,7 +11,7 @@ from typing import cast
 
 from ..history_enrollment import reset_read_position_retry, restore_access_status
 from ..hydration_queue import HydrationPriority, HydrationQueueRepository
-from ..messages.sqlite_repository import reconcile_fact_hydration_jobs_for_dialog
+from ..messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
 
 _SAVEPOINTS = count()
 

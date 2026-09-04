@@ -9,9 +9,11 @@ from typing import Protocol, cast
 from .fact_hydration import AppliedFacts, HydrationDropObservation, _has_terminal_rpc_symbol
 from .hydration_queue import MEDIA_METADATA_KIND, HydrationJob, HydrationQueueRepository
 from .media_fact import encode_media_payload
-from .messages.sqlite_repository import (
+from .messages.sqlite_hydration import (
     apply_hydrated_media_fact,
     enqueue_transcription_for_hydrated_media,
+)
+from .messages.sqlite_hydration_jobs import (
     media_fact_hydration_eligible,
 )
 from .telethon_media import extract_media_fact

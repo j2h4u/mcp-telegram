@@ -32,7 +32,7 @@ from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
 from .history_enrollment import full_history_enabled
 from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage
-from .messages.sqlite_repository import insert_messages_with_fts
+from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
 from .telegram_access import ACCESS_LOST_ERRORS
 
