@@ -11,7 +11,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 48
+_CURRENT_SCHEMA_VERSION = 49
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -52,6 +52,12 @@ CREATE TABLE IF NOT EXISTS messages (
 _MESSAGES_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_messages_dialog_sent
 ON messages(dialog_id, sent_at DESC)
+"""
+
+_MESSAGES_OWN_ACTIVITY_SENT_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_messages_own_activity_sent
+ON messages(sent_at DESC, dialog_id DESC, message_id DESC)
+WHERE out = 1 AND is_service = 0 AND is_deleted = 0
 """
 
 _MESSAGE_VERSIONS_DDL = """
@@ -2095,6 +2101,11 @@ def _apply_migration_48(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_49(conn: sqlite3.Connection, current: int) -> int:
+    """Index the bounded authored-message activity feed."""
+    return _apply_migration(conn, current, 49, [_MESSAGES_OWN_ACTIVITY_SENT_INDEX_DDL])
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -2140,6 +2151,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_46(conn, current)
     current = _apply_migration_47(conn, current)
     current = _apply_migration_48(conn, current)
+    current = _apply_migration_49(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

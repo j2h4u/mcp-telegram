@@ -713,6 +713,7 @@ def _make_db_with_activity() -> sqlite3.Connection:
         )
         """
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(dialog_id, reply_to_msg_id)")
     conn.commit()
     return conn
 
@@ -7104,6 +7105,8 @@ def test_build_recent_activity_rows_query_wraps_filters() -> None:
     sql = _build_recent_activity_rows_query("m.out = 1", "dialog_kind IN (?)")
     assert "WHERE m.out = 1" in sql
     assert "WHERE dialog_kind IN (?)" in sql
+    assert "messages replies INDEXED BY idx_messages_reply" in sql
+    assert "GROUP BY dialog_id, reply_to_msg_id" not in sql
     assert _build_recent_activity_rows_query("", "").startswith("WITH typed_activity AS (SELECT")
     assert _where_clause("m.out = 1") == "WHERE m.out = 1"
     assert _where_clause("") == ""
