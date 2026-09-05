@@ -1028,13 +1028,8 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     ctx.api_server.startup_detail = "fetching account info"
     _ = ctx.api_server.startup_detail
     me = cast(_MeLike, await ctx.client.get_me())
-    ctx.api_server.self_id = int(me.id)
-    ctx.api_server.self_profile = {
-        "id": ctx.api_server.self_id,
-        "first_name": getattr(me, "first_name", None),
-        "last_name": getattr(me, "last_name", None),
-        "username": getattr(me, "username", None),
-    }
+    _update_self_profile(ctx.api_server, me)
+    assert ctx.api_server.self_id is not None
     ctx.own_only_context = await _load_own_only_context(ctx.client, ctx.api_server.self_id)
     ensure_own_only_schema(ctx.conn)
     logger.info("daemon self_id cached: %s", ctx.api_server.self_id)
@@ -1063,6 +1058,40 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     if ctx.api_server._ready:
         pass
     logger.info("daemon ready — serving requests on %s", ctx.socket_path)
+
+
+def _update_self_profile(api_server: DaemonAPIServer, me: _MeLike) -> None:
+    """Atomically replace the account identity exposed to local readers."""
+    self_id = int(me.id)
+    api_server.self_id = self_id
+    api_server.self_profile = {
+        "id": self_id,
+        "first_name": getattr(me, "first_name", None),
+        "last_name": getattr(me, "last_name", None),
+        "username": getattr(me, "username", None),
+    }
+
+
+async def _run_self_profile_refresh_loop(ctx: _SyncMainContext) -> None:
+    """Refresh account display identity off the MCP request path."""
+    while True:
+        try:
+            await asyncio.wait_for(
+                ctx.shutdown_event.wait(),
+                timeout=ctx.scheduling.self_profile_refresh_seconds,
+            )
+            return
+        except TimeoutError:
+            pass
+
+        try:
+            me = cast(_MeLike, await ctx.client.get_me())
+            _update_self_profile(ctx.api_server, me)
+        except TelegramRpcThrottled as exc:
+            _raise_if_latched(exc)
+            logger.info("self_profile_refresh_deferred retry_after=%s", exc.retry_after_seconds)
+        except (RPCError, OSError, TimeoutError) as exc:
+            logger.warning("self_profile_refresh_failed error=%s", exc)
 
 
 async def _start_bootstrap_background_tasks(
@@ -1114,6 +1143,11 @@ async def _start_followup_background_tasks(
         ctx.folder_projection_worker.run(),
         name="folder_projection_worker",
         critical=True,
+    )
+    _create_tracked_task(
+        ctx,
+        _run_self_profile_refresh_loop(ctx),
+        name="self_profile_refresh_loop",
     )
     _create_tracked_task(
         ctx,

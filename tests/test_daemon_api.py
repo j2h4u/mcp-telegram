@@ -2148,17 +2148,15 @@ async def test_list_topics_deleted_excluded() -> None:
 
 @pytest.mark.asyncio
 async def test_get_me_through_daemon() -> None:
-    """get_me calls client.get_me() and returns user info dict."""
-    me = MagicMock()
-    me.id = 12345
-    me.first_name = "Test"
-    me.last_name = "User"
-    me.username = "testuser"
-    me.phone = "+1234567890"
-
     client = _TestClient()
-    client.get_me = AsyncMock(return_value=me)
+    client.get_me = AsyncMock()
     server = make_server(client=client)
+    server.self_profile = {
+        "id": 12345,
+        "first_name": "Test",
+        "last_name": "User",
+        "username": "testuser",
+    }
 
     result = await server._get_me({})
 
@@ -2166,34 +2164,16 @@ async def test_get_me_through_daemon() -> None:
     assert result["data"]["id"] == 12345
     assert result["data"]["first_name"] == "Test"
     assert result["data"]["username"] == "testuser"
-    cast(AsyncMock, client.get_me).assert_called_once()
+    cast(AsyncMock, client.get_me).assert_not_called()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("failure", "retryable", "retry_after"),
-    [
-        (TelegramRpcThrottled(retry_after_seconds=9), True, 9),
-        (TelegramRpcThrottled(latched=True), False, None),
-    ],
-)
-async def test_get_me_serializes_owned_throttling_without_ambiguous_retry(
-    failure: TelegramRpcThrottled,
-    retryable: bool,
-    retry_after: int | None,
-) -> None:
-    client = _TestClient()
-    client.get_me = AsyncMock(side_effect=failure)
-    server = make_server(client=client)
+async def test_get_me_reports_unavailable_before_identity_is_primed() -> None:
+    server = make_server()
 
     result = await server._get_me({})
 
-    assert result["ok"] is False
-    assert result["error"] == "flood_wait"
-    assert result["retryable"] is retryable
-    assert result.get("retry_after") == retry_after
-    if not retryable:
-        assert "retry_after" not in result
+    assert result == {"ok": False, "error": "not_found", "message": "account info unavailable"}
 
 
 # ---------------------------------------------------------------------------
@@ -2325,15 +2305,13 @@ async def test_handle_client_round_trip() -> None:
     """handle_client reads JSON request, dispatches, writes JSON response."""
     server = make_server()
 
-    # Provide a get_me request
-    me = MagicMock()
-    me.id = 42
-    me.first_name = "Round"
-    me.last_name = "Trip"
-    me.username = "rt"
-    me.phone = "+0"
-    server._client = MagicMock()  # type: ignore[attr-defined]
-    server._client.get_me = AsyncMock(return_value=me)
+    # Provide a get_me request against the daemon-owned snapshot.
+    server.self_profile = {
+        "id": 42,
+        "first_name": "Round",
+        "last_name": "Trip",
+        "username": "rt",
+    }
 
     request_line = json.dumps({"method": "get_me"}).encode() + b"\n"
     reader = asyncio.StreamReader()

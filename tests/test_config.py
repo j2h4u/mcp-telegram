@@ -236,6 +236,15 @@ daemon_api_slow_request_seconds = 2.5
     assert config.logging.daemon_api_slow_request_seconds == 2.5
 
 
+def test_load_config_reads_self_profile_refresh_interval(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        '[state]\ndir = "/state"\n\n[scheduling]\nself_profile_refresh_seconds = 43200\n',
+    )
+
+    assert load_config(path).scheduling.self_profile_refresh_seconds == 43_200.0
+
+
 def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
     scheduling = resolve_scheduling_config(
         SchedulingConfig(),

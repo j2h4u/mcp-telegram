@@ -18,6 +18,7 @@ from mcp_telegram.daemon import (
     _create_tracked_task,
     _log_heartbeat,
     _prime_runtime,
+    _run_self_profile_refresh_loop,
     _run_sync_loop,
     sync_main,
 )
@@ -30,6 +31,49 @@ from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 class _PrimeRuntimeApiServerStub(SimpleNamespace):
     pass
+
+
+@pytest.mark.asyncio
+async def test_self_profile_refresh_updates_snapshot_after_interval() -> None:
+    shutdown_event = asyncio.Event()
+    me = SimpleNamespace(id=123, first_name="New", last_name=None, username="new_name")
+
+    async def _get_me() -> object:
+        shutdown_event.set()
+        return me
+
+    ctx = SimpleNamespace(
+        shutdown_event=shutdown_event,
+        scheduling=SimpleNamespace(self_profile_refresh_seconds=0.001),
+        client=SimpleNamespace(get_me=_get_me),
+        api_server=SimpleNamespace(self_id=123, self_profile={"id": 123, "first_name": "Old"}),
+    )
+
+    await _run_self_profile_refresh_loop(ctx)
+
+    assert ctx.api_server.self_profile == {
+        "id": 123,
+        "first_name": "New",
+        "last_name": None,
+        "username": "new_name",
+    }
+
+
+@pytest.mark.asyncio
+async def test_self_profile_refresh_does_not_call_telegram_during_shutdown() -> None:
+    shutdown_event = asyncio.Event()
+    shutdown_event.set()
+    get_me = AsyncMock()
+    ctx = SimpleNamespace(
+        shutdown_event=shutdown_event,
+        scheduling=SimpleNamespace(self_profile_refresh_seconds=0.001),
+        client=SimpleNamespace(get_me=get_me),
+        api_server=SimpleNamespace(),
+    )
+
+    await _run_self_profile_refresh_loop(ctx)
+
+    get_me.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
