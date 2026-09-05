@@ -1,4 +1,3 @@
-import asyncio
 import functools
 import logging
 import re
@@ -368,14 +367,6 @@ async def _send_telemetry_event(event_dict: dict[str, object]) -> None:
             await conn.record_telemetry(event=event_dict)
     except Exception as exc:  # noqa: BLE001 - telemetry must never affect tool execution
         logger.debug("telemetry_send_failed: %s", exc)
-
-
-def _telemetry_done_callback(task: asyncio.Task[None]) -> None:
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        logger.warning("telemetry_event_failed error=%s", exc)
 
 
 def _track_tool_telemetry(tool_name: str) -> t.Callable[[ToolRunnerFunc[ToolArgT]], ToolRunnerFunc[ToolArgT]]:

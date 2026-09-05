@@ -41,6 +41,16 @@ class SyncAlertCursor:
     page_depth: int
 
 
+@dataclass(frozen=True, slots=True)
+class _AlertQueryContext:
+    since: int
+    limit: int
+    snapshot_seq: int
+    snapshot_upper_event_at: int
+    after_seq: int | None
+    page_depth: int
+
+
 def _strict_int(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{field} must be an integer")
@@ -99,39 +109,44 @@ class SyncAlertTokenCodec:
         return f"{encoded}.{_b64encode(signature)}"
 
     def decode(self, token: str) -> SyncAlertCursor:
-        if not isinstance(token, str) or len(token) > _TOKEN_MAX_LENGTH or token.count(".") != 1:
+        data = _decode_signed_payload(self._secret, token)
+        return _decode_cursor_payload(data)
+
+
+def _decode_signed_payload(secret: bytes, token: str) -> object:
+    if not isinstance(token, str) or len(token) > _TOKEN_MAX_LENGTH or token.count(".") != 1:
+        raise ValueError("invalid_navigation")
+    encoded, signature_text = token.split(".")
+    try:
+        supplied = _b64decode(signature_text)
+        expected = hmac.new(secret, encoded.encode(), hashlib.sha256).digest()
+        if not hmac.compare_digest(expected, supplied):
             raise ValueError("invalid_navigation")
-        encoded, signature_text = token.split(".")
-        try:
-            supplied = _b64decode(signature_text)
-            expected = hmac.new(self._secret, encoded.encode(), hashlib.sha256).digest()
-            if not hmac.compare_digest(expected, supplied):
-                raise ValueError("invalid_navigation")
-            data = cast(object, json.loads(_b64decode(encoded)))
-        except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, binascii.Error) as exc:
-            raise ValueError("invalid_navigation") from exc
-        if not isinstance(data, dict):
-            raise ValueError("invalid_navigation")
-        try:
-            version = _strict_int(data.get("version"), "version")
-        except ValueError as exc:
-            raise ValueError("invalid_navigation") from exc
-        if data.get("kind") != "sync_alerts" or version != _TOKEN_VERSION:
-            raise ValueError("invalid_navigation")
-        try:
-            since = _strict_int(data.get("since"), "since")
-            snapshot_seq = _strict_int(data.get("snapshot_seq"), "snapshot_seq")
-            snapshot_upper_event_at = _strict_int(data.get("snapshot_upper_event_at"), "snapshot_upper_event_at")
-            after_seq = _strict_int(data.get("after_seq"), "after_seq")
-            page_limit = _strict_int(data.get("page_limit"), "page_limit")
-            page_depth = _strict_int(data.get("page_depth"), "page_depth")
-        except ValueError as exc:
-            raise ValueError("invalid_navigation") from exc
-        if any(value < 0 for value in (since, snapshot_seq, snapshot_upper_event_at)) or after_seq <= 0:
-            raise ValueError("invalid_navigation")
-        if not 1 <= page_limit <= MAX_PAGE_SIZE or page_depth < _MIN_PAGE_DEPTH:
-            raise ValueError("invalid_navigation")
-        return SyncAlertCursor(since, page_limit, snapshot_seq, snapshot_upper_event_at, after_seq, page_depth)
+        return cast(object, json.loads(_b64decode(encoded)))
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, binascii.Error) as exc:
+        raise ValueError("invalid_navigation") from exc
+
+
+def _decode_cursor_payload(data: object) -> SyncAlertCursor:
+    if not isinstance(data, dict):
+        raise ValueError("invalid_navigation")
+    try:
+        version = _strict_int(data.get("version"), "version")
+        since = _strict_int(data.get("since"), "since")
+        snapshot_seq = _strict_int(data.get("snapshot_seq"), "snapshot_seq")
+        snapshot_upper_event_at = _strict_int(data.get("snapshot_upper_event_at"), "snapshot_upper_event_at")
+        after_seq = _strict_int(data.get("after_seq"), "after_seq")
+        page_limit = _strict_int(data.get("page_limit"), "page_limit")
+        page_depth = _strict_int(data.get("page_depth"), "page_depth")
+    except ValueError as exc:
+        raise ValueError("invalid_navigation") from exc
+    if data.get("kind") != "sync_alerts" or version != _TOKEN_VERSION:
+        raise ValueError("invalid_navigation")
+    if any(value < 0 for value in (since, snapshot_seq, snapshot_upper_event_at)) or after_seq <= 0:
+        raise ValueError("invalid_navigation")
+    if not 1 <= page_limit <= MAX_PAGE_SIZE or page_depth < _MIN_PAGE_DEPTH:
+        raise ValueError("invalid_navigation")
+    return SyncAlertCursor(since, page_limit, snapshot_seq, snapshot_upper_event_at, after_seq, page_depth)
 
 
 def _b64encode(value: bytes) -> str:
@@ -218,83 +233,107 @@ def _navigation_request(req: SyncAlertRequest, cursor: SyncAlertCursor) -> tuple
     return cursor.since, cursor.page_limit
 
 
-def query_alerts(  # noqa: PLR0912, PLR0914, PLR0915 - assembles one bounded wire page
+def _resolve_query_context(
     conn: sqlite3.Connection, req: dict[str, object], codec: SyncAlertTokenCodec
-) -> dict[str, object]:
-    """Return one canonical page and exact legacy projections for that page."""
-    try:
-        parsed = parse_request(req)
-        cursor = codec.decode(parsed.navigation) if parsed.navigation is not None else None
-        if cursor is not None:
-            effective_since, effective_limit = _navigation_request(parsed, cursor)
-            snapshot_seq = cursor.snapshot_seq
-            snapshot_upper_event_at = cursor.snapshot_upper_event_at
-            after_seq, page_depth = cursor.after_seq, cursor.page_depth
-        else:
-            effective_since, effective_limit = parsed.since, parsed.page_limit
-            snapshot_seq = cast(int, conn.execute("SELECT COALESCE(MAX(seq), 0) FROM sync_alert_events").fetchone()[0])
-            snapshot_upper_event_at = _snapshot_event_at(conn, snapshot_seq, effective_since)
-            after_seq, page_depth = None, 1
-    except (ValueError, sqlite3.OperationalError) as exc:
-        message = str(exc)
-        if isinstance(exc, sqlite3.OperationalError):
-            return {"ok": False, "error": "backend_error", "message": "sync alerts unavailable"}
-        return {
-            "ok": False,
-            "error": "invalid_navigation" if message == "invalid_navigation" else "invalid_input",
-            "message": message,
-        }
-
-    rows = _query_rows(
-        conn,
-        since=effective_since,
-        snapshot_seq=snapshot_seq,
-        after_seq=after_seq,
-        limit=effective_limit + 1,
-    )
-    has_more = len(rows) > effective_limit
-    page_rows = rows[:effective_limit]
-    alerts: list[dict[str, object]] = []
-    for row in page_rows:
-        _seq, kind, occurred_at, dialog_id, message_id, version, daemon_event_id = row
-        public_message_id = message_id if kind != "access_lost" else None
-        public_version = version if kind == "edit" else None
-        item: dict[str, object] = {
-            "kind": kind,
-            "dialog_id": dialog_id,
-            "message_id": public_message_id,
-            "version": public_version,
-            "deleted_at": occurred_at if kind == "deleted_message" else None,
-            "edit_date": occurred_at if kind == "edit" else None,
-            "access_lost_at": occurred_at if kind == "access_lost" else None,
-            "source_id": daemon_event_id if kind == "access_lost" else 0,
-            "occurred_at": occurred_at,
-            "severity": "high" if kind == "access_lost" else "medium" if kind == "deleted_message" else "low",
-        }
-        if kind == "access_lost":
-            item["message"] = f"Access lost at {occurred_at}"
-            item["action"] = "Use get_sync_status for coverage details."
-        elif kind == "deleted_message":
-            item["message"] = f"Deleted message msg={message_id} deleted_at={occurred_at}"
-            item["action"] = "Inspect the dialog history around this message id if surrounding context is needed."
-        else:
-            item["message"] = f"Edited message msg={message_id} v{version} edit_date={occurred_at}"
-            item["action"] = "Treat cached text as versioned; inspect edit history before relying on older wording."
-        alerts.append(item)
-
-    next_navigation = None
-    if has_more and page_rows:
-        next_navigation = codec.encode(
-            SyncAlertCursor(
-                effective_since,
-                effective_limit,
-                snapshot_seq,
-                snapshot_upper_event_at,
-                _strict_int(page_rows[-1][0], "seq"),
-                page_depth + 1,
-            )
+) -> _AlertQueryContext:
+    parsed = parse_request(req)
+    cursor = codec.decode(parsed.navigation) if parsed.navigation is not None else None
+    if cursor is not None:
+        effective_since, effective_limit = _navigation_request(parsed, cursor)
+        return _AlertQueryContext(
+            effective_since,
+            effective_limit,
+            cursor.snapshot_seq,
+            cursor.snapshot_upper_event_at,
+            cursor.after_seq,
+            cursor.page_depth,
         )
+    effective_since, effective_limit = parsed.since, parsed.page_limit
+    snapshot_seq = cast(int, conn.execute("SELECT COALESCE(MAX(seq), 0) FROM sync_alert_events").fetchone()[0])
+    return _AlertQueryContext(
+        effective_since,
+        effective_limit,
+        snapshot_seq,
+        _snapshot_event_at(conn, snapshot_seq, effective_since),
+        None,
+        1,
+    )
 
+
+def _query_error(exc: ValueError | sqlite3.OperationalError) -> dict[str, object]:
+    if isinstance(exc, sqlite3.OperationalError):
+        return {"ok": False, "error": "backend_error", "message": "sync alerts unavailable"}
+    message = str(exc)
+    return {
+        "ok": False,
+        "error": "invalid_navigation" if message == "invalid_navigation" else "invalid_input",
+        "message": message,
+    }
+
+
+def _alert_narrative(kind: object, message_id: object, version: object, occurred_at: object) -> tuple[str, str]:
+    if kind == "access_lost":
+        return f"Access lost at {occurred_at}", "Use get_sync_status for coverage details."
+    if kind == "deleted_message":
+        return (
+            f"Deleted message msg={message_id} deleted_at={occurred_at}",
+            "Inspect the dialog history around this message id if surrounding context is needed.",
+        )
+    return (
+        f"Edited message msg={message_id} v{version} edit_date={occurred_at}",
+        "Treat cached text as versioned; inspect edit history before relying on older wording.",
+    )
+
+
+def _alert_from_row(row: tuple[object, ...]) -> dict[str, object]:
+    _seq, kind, occurred_at, dialog_id, message_id, version, daemon_event_id = row
+    message, action = _alert_narrative(kind, message_id, version, occurred_at)
+    item: dict[str, object] = {
+        "kind": kind,
+        "dialog_id": dialog_id,
+        "message_id": message_id if kind != "access_lost" else None,
+        "version": version if kind == "edit" else None,
+        "deleted_at": occurred_at if kind == "deleted_message" else None,
+        "edit_date": occurred_at if kind == "edit" else None,
+        "access_lost_at": occurred_at if kind == "access_lost" else None,
+        "source_id": daemon_event_id if kind == "access_lost" else 0,
+        "occurred_at": occurred_at,
+        "severity": "high" if kind == "access_lost" else "medium" if kind == "deleted_message" else "low",
+        "message": message,
+        "action": action,
+    }
+    return item
+
+
+def _project_alerts(page_rows: list[tuple[object, ...]]) -> list[dict[str, object]]:
+    return [_alert_from_row(row) for row in page_rows]
+
+
+def _next_navigation(
+    codec: SyncAlertTokenCodec,
+    context: _AlertQueryContext,
+    page_rows: list[tuple[object, ...]],
+    has_more: bool,
+) -> str | None:
+    if not has_more or not page_rows:
+        return None
+    return codec.encode(
+        SyncAlertCursor(
+            context.since,
+            context.limit,
+            context.snapshot_seq,
+            context.snapshot_upper_event_at,
+            _strict_int(page_rows[-1][0], "seq"),
+            context.page_depth + 1,
+        )
+    )
+
+
+def _legacy_projections(
+    conn: sqlite3.Connection,
+    alerts: list[dict[str, object]],
+    page_rows: list[tuple[object, ...]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
     deleted: list[dict[str, object]] = []
     edits: list[dict[str, object]] = []
     access: list[dict[str, object]] = []
@@ -321,7 +360,19 @@ def query_alerts(  # noqa: PLR0912, PLR0914, PLR0915 - assembles one bounded wir
             )
         else:
             access.append({"dialog_id": dialog_id, "access_lost_at": item["access_lost_at"]})
-    data: dict[str, object] = {
+    return deleted, edits, access
+
+
+def _alert_page_data(
+    context: _AlertQueryContext,
+    alerts: list[dict[str, object]],
+    projections: tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]],
+    *,
+    has_more: bool,
+    next_navigation: str | None,
+) -> dict[str, object]:
+    deleted, edits, access = projections
+    return {
         "alerts": alerts,
         "deleted_messages": deleted,
         "edits": edits,
@@ -333,20 +384,46 @@ def query_alerts(  # noqa: PLR0912, PLR0914, PLR0915 - assembles one bounded wir
             "total": len(alerts),
         },
         "count": len(alerts),
-        "since": effective_since,
-        "limit": effective_limit,
-        "page_limit": effective_limit,
+        "since": context.since,
+        "limit": context.limit,
+        "page_limit": context.limit,
         "limited_by": {
-            "deleted_messages": {"since": effective_since, "limit": effective_limit},
-            "edits": {"since": effective_since, "limit": effective_limit},
-            "access_lost": {"since": effective_since, "limit": effective_limit},
+            "deleted_messages": {"since": context.since, "limit": context.limit},
+            "edits": {"since": context.since, "limit": context.limit},
+            "access_lost": {"since": context.since, "limit": context.limit},
         },
         "has_more": has_more,
         "next_navigation": next_navigation,
-        "snapshot_upper_event_at": snapshot_upper_event_at,
+        "snapshot_upper_event_at": context.snapshot_upper_event_at,
         "result_count_semantics": "count=len(alerts)=sum(counts)",
-        "page_depth": page_depth,
+        "page_depth": context.page_depth,
     }
+
+
+def query_alerts(conn: sqlite3.Connection, req: dict[str, object], codec: SyncAlertTokenCodec) -> dict[str, object]:
+    """Return one canonical page and exact legacy projections for that page."""
+    try:
+        context = _resolve_query_context(conn, req, codec)
+    except (ValueError, sqlite3.OperationalError) as exc:
+        return _query_error(exc)
+    rows = _query_rows(
+        conn,
+        since=context.since,
+        snapshot_seq=context.snapshot_seq,
+        after_seq=context.after_seq,
+        limit=context.limit + 1,
+    )
+    has_more = len(rows) > context.limit
+    page_rows = rows[: context.limit]
+    alerts = _project_alerts(page_rows)
+    projections = _legacy_projections(conn, alerts, page_rows)
+    data = _alert_page_data(
+        context,
+        alerts,
+        projections,
+        has_more=has_more,
+        next_navigation=_next_navigation(codec, context, page_rows, has_more),
+    )
     return {"ok": True, "data": data}
 
 

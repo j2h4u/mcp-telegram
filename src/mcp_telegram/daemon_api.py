@@ -118,6 +118,105 @@ _TELEMETRY_OUTCOMES = frozenset({"success", "tool_error", "validation_error", "e
 _TELEMETRY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
+def _telemetry_input_error(message: str) -> dict[str, object]:
+    return {"ok": False, "error": "invalid_input", "message": message}
+
+
+def _normalize_telemetry_outcome(event: dict[str, object]) -> tuple[str, str | None] | dict[str, object]:
+    raw_outcome = event.get("outcome")
+    if raw_outcome is None:
+        raw_outcome = "exception" if event.get("error_type") is not None else "success"
+    if not isinstance(raw_outcome, str) or raw_outcome not in _TELEMETRY_OUTCOMES:
+        return _telemetry_input_error("outcome is invalid")
+    raw_error_code = event.get("error_code")
+    if raw_outcome == "success":
+        normalized_error_code = None
+    elif isinstance(raw_error_code, str) and _TELEMETRY_ERROR_CODE_RE.fullmatch(raw_error_code):
+        normalized_error_code = raw_error_code
+    else:
+        normalized_error_code = raw_outcome if raw_outcome != "tool_error" else "tool_error"
+    return raw_outcome, normalized_error_code
+
+
+def _normalize_telemetry_event(
+    req: dict[str, object],
+) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+    event_obj = req.get("event")
+    if not isinstance(event_obj, dict):
+        return None, _telemetry_input_error("event must be a JSON object")
+    event = dict(cast(Mapping[str, object], event_obj))
+    tool_name = event.get("tool_name", "")
+    if not isinstance(tool_name, str) or len(tool_name) > _TELEMETRY_TOOL_NAME_MAX_LEN:
+        return None, _telemetry_input_error("tool_name must be a string (max 200 chars)")
+    event["tool_name"] = tool_name
+    return event, None
+
+
+def _telemetry_columns(conn: sqlite3.Connection) -> set[str]:
+    try:
+        rows = cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(telemetry_events)").fetchall())
+    except sqlite3.Error:
+        return set()
+    return {str(row[1]) for row in rows}
+
+
+def _insert_telemetry_row(
+    conn: sqlite3.Connection,
+    event: Mapping[str, object],
+    *,
+    legacy: bool,
+) -> None:
+    if legacy:
+        conn.execute(
+            "INSERT INTO telemetry_events "
+            "(tool_name, timestamp, duration_ms, result_count, "
+            "has_cursor, page_depth, has_filter, error_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event["tool_name"],
+                event.get("timestamp"),
+                event.get("duration_ms"),
+                event.get("result_count"),
+                event.get("has_cursor"),
+                event.get("page_depth"),
+                event.get("has_filter"),
+                event.get("error_type"),
+            ),
+        )
+        return
+    conn.execute(
+        "INSERT INTO telemetry_events "
+        "(tool_name, timestamp, duration_ms, result_count, "
+        "has_cursor, page_depth, has_filter, outcome, error_code, error_type) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            event["tool_name"],
+            event.get("timestamp"),
+            event.get("duration_ms"),
+            event.get("result_count"),
+            event.get("has_cursor"),
+            event.get("page_depth"),
+            event.get("has_filter"),
+            event["outcome"],
+            event["error_code"],
+            event.get("error_type"),
+        ),
+    )
+
+
+def _write_telemetry(
+    conn: sqlite3.Connection,
+    policy: DaemonApiPolicy,
+    event: Mapping[str, object],
+    *,
+    legacy: bool,
+) -> None:
+    _insert_telemetry_row(conn, event, legacy=legacy)
+    cutoff = time.time() - policy.telemetry_retention_ttl_seconds
+    conn.execute("DELETE FROM telemetry_events WHERE timestamp < ?", (cutoff,))
+    conn.commit()
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class DaemonApiPolicy:
     """Operator-controlled cache and retention policy supplied by the daemon root."""
@@ -1415,88 +1514,23 @@ class DaemonAPIServer:
     # record_telemetry
     # ------------------------------------------------------------------
 
-    async def _record_telemetry(self, req: dict[str, object]) -> dict:  # noqa: PLR0911 - compatibility branches
+    async def _record_telemetry(self, req: dict[str, object]) -> dict:
         """Write a telemetry event row to sync.db telemetry_events table.
 
         Evicts rows older than the configured retention window on every write.
         """
-        event_obj = req.get("event")
-        if not isinstance(event_obj, dict):
-            return {"ok": False, "error": "invalid_input", "message": "event must be a JSON object"}
-        event = cast(Mapping[str, object], event_obj)
-        tool_name = event.get("tool_name", "")
-        if not isinstance(tool_name, str) or len(tool_name) > _TELEMETRY_TOOL_NAME_MAX_LEN:
-            return {"ok": False, "error": "invalid_input", "message": "tool_name must be a string (max 200 chars)"}
+        event, error = _normalize_telemetry_event(req)
+        if error is not None:
+            return error
+        assert event is not None
+        legacy = not {"outcome", "error_code"} <= _telemetry_columns(self._conn)
+        if not legacy:
+            outcome = _normalize_telemetry_outcome(event)
+            if isinstance(outcome, dict):
+                return outcome
+            event["outcome"], event["error_code"] = outcome
         try:
-            telemetry_rows = cast(
-                list[tuple[object, ...]],
-                self._conn.execute("PRAGMA table_info(telemetry_events)").fetchall(),
-            )
-            columns = {str(row[1]) for row in telemetry_rows}
-        except sqlite3.Error:
-            columns = set()
-        # Keep old in-memory/test databases and pre-v47 installations writable
-        # while the real sync.db migration adds the new columns.
-        if not {"outcome", "error_code"} <= columns:
-            try:
-                self._conn.execute(
-                    "INSERT INTO telemetry_events "
-                    "(tool_name, timestamp, duration_ms, result_count, "
-                    "has_cursor, page_depth, has_filter, error_type) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        tool_name,
-                        event.get("timestamp"),
-                        event.get("duration_ms"),
-                        event.get("result_count"),
-                        event.get("has_cursor"),
-                        event.get("page_depth"),
-                        event.get("has_filter"),
-                        event.get("error_type"),
-                    ),
-                )
-                cutoff = time.time() - self._policy.telemetry_retention_ttl_seconds
-                self._conn.execute("DELETE FROM telemetry_events WHERE timestamp < ?", (cutoff,))
-                self._conn.commit()
-                return {"ok": True}
-            except Exception as exc:
-                logger.exception("record_telemetry failed: %s", exc)
-                return {"ok": False, "error": "internal", "message": "internal error"}
-
-        raw_outcome = event.get("outcome")
-        if raw_outcome is None:
-            raw_outcome = "exception" if event.get("error_type") is not None else "success"
-        if not isinstance(raw_outcome, str) or raw_outcome not in _TELEMETRY_OUTCOMES:
-            return {"ok": False, "error": "invalid_input", "message": "outcome is invalid"}
-        raw_error_code = event.get("error_code")
-        if raw_outcome == "success":
-            normalized_error_code = None
-        elif isinstance(raw_error_code, str) and _TELEMETRY_ERROR_CODE_RE.fullmatch(raw_error_code):
-            normalized_error_code = raw_error_code
-        else:
-            normalized_error_code = raw_outcome if raw_outcome != "tool_error" else "tool_error"
-        try:
-            self._conn.execute(
-                "INSERT INTO telemetry_events "
-                "(tool_name, timestamp, duration_ms, result_count, "
-                "has_cursor, page_depth, has_filter, outcome, error_code, error_type) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    tool_name,
-                    event.get("timestamp"),
-                    event.get("duration_ms"),
-                    event.get("result_count"),
-                    event.get("has_cursor"),
-                    event.get("page_depth"),
-                    event.get("has_filter"),
-                    raw_outcome,
-                    normalized_error_code,
-                    event.get("error_type"),
-                ),
-            )
-            cutoff = time.time() - self._policy.telemetry_retention_ttl_seconds
-            self._conn.execute("DELETE FROM telemetry_events WHERE timestamp < ?", (cutoff,))
-            self._conn.commit()
+            _write_telemetry(self._conn, self._policy, event, legacy=legacy)
             return {"ok": True}
         except Exception as exc:
             logger.exception("record_telemetry failed: %s", exc)

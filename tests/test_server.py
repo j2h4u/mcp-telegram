@@ -239,6 +239,7 @@ async def test_search_invalid_query_preserves_error_code_and_telemetry_once(
 
     assert result.is_error is True
     assert send_mock.await_count == 1
+    assert send_mock.await_args is not None
     event = cast(dict[str, object], send_mock.await_args.args[0])
     assert event["outcome"] == "tool_error"
     assert event["error_code"] == "invalid_query"

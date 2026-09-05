@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import sqlite3
+from collections.abc import Generator
 
 import pytest
 
@@ -71,10 +72,22 @@ def _db() -> sqlite3.Connection:
 
 
 @pytest.fixture
-def db() -> sqlite3.Connection:
+def db() -> Generator[sqlite3.Connection]:
     conn = _db()
     yield conn
     conn.close()
+
+
+def _page_data(result: dict[str, object]) -> dict[str, object]:
+    data = result.get("data")
+    assert isinstance(data, dict)
+    return data
+
+
+def _next_navigation(result: dict[str, object]) -> str:
+    token = _page_data(result).get("next_navigation")
+    assert isinstance(token, str)
+    return token
 
 
 def test_parse_request_is_strict_and_page_limit_is_effective() -> None:
@@ -122,20 +135,20 @@ def test_navigation_can_change_size_only_with_explicit_page_limit(db: sqlite3.Co
     db.executemany("INSERT INTO messages VALUES (1, ?, 1, ?, ?)", [(1, 3, "a"), (2, 2, "b"), (3, 1, "c")])
     codec = SyncAlertTokenCodec()
     first = query_alerts(db, {"limit": 1}, codec)
-    token = first["data"]["next_navigation"]
+    token = _next_navigation(first)
     changed = query_alerts(db, {"page_limit": 2, "navigation": token}, codec)
     assert changed["ok"] is True
-    assert changed["data"]["page_limit"] == 2
+    assert _page_data(changed)["page_limit"] == 2
 
 
 def test_navigation_only_preserves_cursor_context_and_page_depth(db: sqlite3.Connection) -> None:
     db.executemany("INSERT INTO messages VALUES (1, ?, 1, ?, ?)", [(1, 3, "a"), (2, 2, "b"), (3, 1, "c")])
     codec = SyncAlertTokenCodec()
     first = query_alerts(db, {"limit": 1}, codec)
-    second = query_alerts(db, {"navigation": first["data"]["next_navigation"]}, codec)
-    third = query_alerts(db, {"navigation": second["data"]["next_navigation"]}, codec)
-    assert second["data"]["page_depth"] == 2
-    assert third["data"]["page_depth"] == 3
+    second = query_alerts(db, {"navigation": _next_navigation(first)}, codec)
+    third = query_alerts(db, {"navigation": _next_navigation(second)}, codec)
+    assert _page_data(second)["page_depth"] == 2
+    assert _page_data(third)["page_depth"] == 3
 
 
 def test_snapshot_watermark_is_max_fact_time_within_snapshot(db: sqlite3.Connection) -> None:
@@ -144,8 +157,8 @@ def test_snapshot_watermark_is_max_fact_time_within_snapshot(db: sqlite3.Connect
     codec = SyncAlertTokenCodec()
     first = query_alerts(db, {"limit": 1}, codec)
     db.execute("INSERT INTO messages VALUES (1, 3, 1, 5, 'late')")
-    second = query_alerts(db, {"navigation": first["data"]["next_navigation"]}, codec)
-    assert second["data"]["snapshot_upper_event_at"] == 11
+    second = query_alerts(db, {"navigation": _next_navigation(first)}, codec)
+    assert _page_data(second)["snapshot_upper_event_at"] == 11
 
 
 def test_snapshot_watermark_is_computed_once_and_cursor_bound(
@@ -165,9 +178,9 @@ def test_snapshot_watermark_is_computed_once_and_cursor_bound(
     monkeypatch.setattr(sync_alerts_module, "_snapshot_event_at", counted)
     first = query_alerts(db, {"limit": 1}, codec)
     db.execute("INSERT INTO messages VALUES (1, 3, 1, 5, 'late')")
-    second = query_alerts(db, {"navigation": first["data"]["next_navigation"]}, codec)
+    second = query_alerts(db, {"navigation": _next_navigation(first)}, codec)
     assert calls == 1
-    assert second["data"]["snapshot_upper_event_at"] == 11
+    assert _page_data(second)["snapshot_upper_event_at"] == 11
 
 
 def test_token_requires_snapshot_watermark_field() -> None:

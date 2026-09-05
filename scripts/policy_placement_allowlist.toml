@@ -257,6 +257,26 @@ rationale = "This logging argument reflects the established heartbeat scheduling
 
 [[entry]]
 category = "policy_assignments"
+key = "src/mcp_telegram/server.py:<module>:_TELEMETRY_FLUSH_TIMEOUT_SECONDS"
+rationale = "This bounds best-effort telemetry shutdown flushing as a transport lifecycle contract."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/server.py:flush_telemetry:timeout_seconds"
+rationale = "This exposes the transport telemetry flush bound as a stable lifecycle contract."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/sync_alerts.py:<module>:MAX_PAGE_SIZE"
+rationale = "This is the sync-alert API page-size contract, not an operator-configured policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/sync_alerts.py:<module>:DEFAULT_PAGE_SIZE"
+rationale = "This is the sync-alert API default page-size contract, not an operator-configured policy."
+
+[[entry]]
+category = "policy_assignments"
 key = "src/mcp_telegram/daemon_account_trace.py:<module>:_TRACE_ENRICHMENT_CONCURRENCY"
 rationale = "This inherited trace enrichment work cap is not part of the TTL configuration surface."
 

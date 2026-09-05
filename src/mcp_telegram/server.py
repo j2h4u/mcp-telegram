@@ -12,6 +12,7 @@ import logging
 import sys
 import time
 import typing as t
+from dataclasses import dataclass
 from functools import cache
 
 from mcp.server import Server
@@ -52,6 +53,16 @@ _MCP_HTTP_SSE_ERROR_MESSAGE = "SSE response error"
 _ANYIO_CLOSED_RESOURCE_ERROR = ("anyio", "ClosedResourceError")
 _TELEMETRY_FLUSH_TIMEOUT_SECONDS = 1.0
 _TELEMETRY_OUTCOMES = frozenset({"success", "tool_error", "validation_error", "exception", "cancelled"})
+
+
+@dataclass
+class _CallTelemetry:
+    outcome: str = "success"
+    error_type: str | None = None
+    result: object | None = None
+    error_code: object = None
+
+
 _WORKFLOWS_PROMPT_NAME = "telegram_workflows"
 _WORKFLOWS_PROMPT_TITLE = "Telegram workflows"
 _WORKFLOWS_PROMPT_DESCRIPTION = "Reusable scenarios for navigating Telegram through this MCP server."
@@ -338,7 +349,86 @@ async def list_resource_templates() -> list[ResourceTemplate]:
     return []
 
 
-async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:  # noqa: PLR0915 - boundary outcomes stay together
+def _log_tool_failure(name: str, exc: Exception, *, stage: str, started_at: float) -> None:
+    elapsed = time.monotonic() - started_at
+    logger.error(
+        "call_tool[%s] %s failed after %.3fs",
+        name,
+        stage,
+        elapsed,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+
+
+def _project_tool_result(
+    name: str, tool_result: object, telemetry: _CallTelemetry, started_at: float
+) -> CallToolResult:
+    if not isinstance(tool_result, tools.ToolResult):
+        raise TypeError("tool runner returned an invalid result")
+    telemetry.outcome = "tool_error" if tool_result.is_error else "success"
+    telemetry.error_code = tool_result.error_code
+    elapsed = time.monotonic() - started_at
+    rid_str = ",".join(current_correlation_ids()) or "-"
+    logger.info("call_tool[%s] completed in %.3fs rids=%s", name, elapsed, rid_str)
+    return CallToolResult(
+        content=list(tool_result.content) if tool_result.is_error else [],
+        structured_content=(
+            t.cast(dict[str, object], tools.omit_none_mapping_values(tool_result.structured_content))
+            if tool_result.structured_content is not None
+            else None
+        ),
+        is_error=tool_result.is_error,
+    )
+
+
+async def _execute_tool(
+    name: str,
+    tool: Tool,
+    arguments: dict[str, object],
+    started_at: float,
+    telemetry: _CallTelemetry,
+) -> CallToolResult:
+    try:
+        args = tools.tool_args(tool, **arguments)
+    except asyncio.CancelledError:
+        telemetry.outcome = "cancelled"
+        raise
+    except (TypeError, ValueError, ValidationError) as exc:
+        telemetry.outcome = "validation_error"
+        elapsed = time.monotonic() - started_at
+        logger.info(
+            "call_tool[%s] validation_failed after %.3fs (%s)",
+            name,
+            elapsed,
+            type(exc).__name__,
+        )
+        return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="validation", exc=exc))
+
+    try:
+        tool_result = await tools.tool_runner(args)
+        telemetry.result = tool_result
+    except asyncio.CancelledError:
+        telemetry.outcome = "cancelled"
+        raise
+    except Exception as exc:  # noqa: BLE001 - tool boundary must classify runner failures
+        telemetry.outcome = "exception"
+        telemetry.error_type = type(exc).__name__
+        _log_tool_failure(name, exc, stage="runtime", started_at=started_at)
+        return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc))
+
+    try:
+        return _project_tool_result(name, tool_result, telemetry, started_at)
+    except asyncio.CancelledError:
+        telemetry.outcome = "cancelled"
+        raise
+    except Exception as exc:  # noqa: BLE001 - tool boundary must classify projection failures
+        telemetry.outcome = "exception"
+        telemetry.error_type = type(exc).__name__
+        _log_tool_failure(name, exc, stage="runtime", started_at=started_at)
+        return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc))
+
+
+async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
     """Handle tool calls for command line run."""
 
     if not isinstance(arguments, dict):
@@ -349,80 +439,19 @@ async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult: 
         raise ValueError(f"Unknown tool: {name}")
 
     t0 = time.monotonic()
-    outcome = "success"
-    error_type: str | None = None
-    result: object | None = None
-    error_code: object = None
+    telemetry = _CallTelemetry()
     try:
         with correlation_context():
-            try:
-                args = tools.tool_args(tool, **arguments)
-            except asyncio.CancelledError:
-                outcome = "cancelled"
-                raise
-            except (TypeError, ValueError, ValidationError) as exc:
-                outcome = "validation_error"
-                elapsed = time.monotonic() - t0
-                # Invalid user arguments are an expected boundary error. Keep the
-                # response unchanged, but do not make routine validation failures
-                # look like server incidents by attaching a traceback.
-                logger.info(
-                    "call_tool[%s] validation_failed after %.3fs (%s)",
-                    name,
-                    elapsed,
-                    type(exc).__name__,
-                )
-                return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="validation", exc=exc))
-
-            try:
-                tool_result: object | None = None
-                tool_result = await tools.tool_runner(args)
-                result = tool_result
-            except asyncio.CancelledError:
-                outcome = "cancelled"
-                raise
-            except Exception as exc:
-                outcome = "exception"
-                error_type = type(exc).__name__
-                elapsed = time.monotonic() - t0
-                logger.exception("call_tool[%s] runtime failed after %.3fs", name, elapsed)
-                return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc))
-
-            try:
-                if not isinstance(tool_result, tools.ToolResult):
-                    raise TypeError("tool runner returned an invalid result")
-                outcome = "tool_error" if tool_result.is_error else "success"
-                error_code = tool_result.error_code
-                elapsed = time.monotonic() - t0
-                rid_str = ",".join(current_correlation_ids()) or "-"
-                logger.info("call_tool[%s] completed in %.3fs rids=%s", name, elapsed, rid_str)
-                return CallToolResult(
-                    content=list(tool_result.content) if tool_result.is_error else [],
-                    structured_content=(
-                        t.cast(dict[str, object], tools.omit_none_mapping_values(tool_result.structured_content))
-                        if tool_result.structured_content is not None
-                        else None
-                    ),
-                    is_error=tool_result.is_error,
-                )
-            except asyncio.CancelledError:
-                outcome = "cancelled"
-                raise
-            except Exception as exc:
-                outcome = "exception"
-                error_type = type(exc).__name__
-                elapsed = time.monotonic() - t0
-                logger.exception("call_tool[%s] runtime failed after %.3fs", name, elapsed)
-                return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc))
+            return await _execute_tool(name, tool, arguments, t0, telemetry)
     finally:
         _schedule_telemetry(
             _telemetry_event(
                 tool_name=name,
-                outcome=outcome,
+                outcome=telemetry.outcome,
                 duration_ms=(time.monotonic() - t0) * 1000,
-                result=result,
-                error_type=error_type,
-                error_code=error_code,
+                result=telemetry.result,
+                error_type=telemetry.error_type,
+                error_code=telemetry.error_code,
             )
         )
 

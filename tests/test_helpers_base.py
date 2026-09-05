@@ -15,7 +15,6 @@ from mcp_telegram.tools._base import (
     ToolResult,
     _check_daemon_response,
     _send_telemetry_event,
-    _telemetry_done_callback,
     _track_tool_telemetry,
 )
 
@@ -210,34 +209,6 @@ async def test_send_telemetry_event_swallows_exceptions(monkeypatch: pytest.Monk
     monkeypatch.setattr(_base, "daemon_connection", failing_daemon_connection)
 
     await _send_telemetry_event({"tool_name": "test_tool"})
-
-
-@pytest.mark.asyncio
-async def test_telemetry_done_callback_logs_error_on_exception(caplog: pytest.LogCaptureFixture) -> None:
-    async def fail() -> None:
-        raise RuntimeError("telemetry failed")
-
-    task = asyncio.create_task(fail())
-    with pytest.raises(RuntimeError):
-        await task
-
-    with caplog.at_level("WARNING", logger="mcp_telegram.tools._base"):
-        _telemetry_done_callback(task)
-
-    assert any("telemetry_event_failed" in rec.message for rec in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_telemetry_done_callback_ignores_cancelled(caplog: pytest.LogCaptureFixture) -> None:
-    task = asyncio.create_task(asyncio.sleep(10))
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    with caplog.at_level("WARNING", logger="mcp_telegram.tools._base"):
-        _telemetry_done_callback(task)
-
-    assert not any("telemetry_event_failed" in rec.message for rec in caplog.records)
 
 
 @pytest.mark.asyncio
