@@ -24,7 +24,12 @@ from telethon.errors import ServerError
 from telethon.tl.types import PeerUser, UpdateReadHistoryInbox
 
 from mcp_telegram.activity_contracts import InputPeerResolver
-from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike, _ResolverEntityCache
+from mcp_telegram.daemon_api import (
+    DaemonAPIServer,
+    DaemonClientLike,
+    _normalize_telemetry_outcome,
+    _ResolverEntityCache,
+)
 from mcp_telegram.daemon_ipc import get_daemon_socket_path
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
 from mcp_telegram.dialog_selector import required_dialog_selector
@@ -3368,6 +3373,48 @@ def _insert_telemetry(
 # ---------------------------------------------------------------------------
 # record_telemetry (Plan 33-01)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        ({"error_type": None}, ("success", None)),
+        ({"error_type": "ValueError"}, ("exception", "exception")),
+    ],
+)
+def test_normalize_telemetry_outcome_infers_legacy_events(
+    event: dict[str, object],
+    expected: tuple[str, str | None],
+) -> None:
+    assert _normalize_telemetry_outcome(event) == expected
+
+
+@pytest.mark.parametrize("outcome", [42, "unknown"])
+def test_normalize_telemetry_outcome_rejects_invalid_outcomes(outcome: object) -> None:
+    result = _normalize_telemetry_outcome({"outcome": outcome})
+    assert result == {"ok": False, "error": "invalid_input", "message": "outcome is invalid"}
+
+
+def test_normalize_telemetry_outcome_success_discards_supplied_code() -> None:
+    assert _normalize_telemetry_outcome({"outcome": "success", "error_code": "secret_code"}) == ("success", None)
+
+
+@pytest.mark.parametrize("outcome", ["tool_error", "validation_error", "exception", "cancelled"])
+def test_normalize_telemetry_outcome_accepts_safe_codes_for_errors(outcome: str) -> None:
+    assert _normalize_telemetry_outcome({"outcome": outcome, "error_code": "dialog_not_found"}) == (
+        outcome,
+        "dialog_not_found",
+    )
+
+
+@pytest.mark.parametrize("error_code", [None, "DialogNotFound", "contains secret", "a" * 65])
+@pytest.mark.parametrize("outcome", ["tool_error", "validation_error", "exception", "cancelled"])
+def test_normalize_telemetry_outcome_falls_back_for_unsafe_error_codes(
+    outcome: str,
+    error_code: object,
+) -> None:
+    expected_code = "tool_error" if outcome == "tool_error" else outcome
+    assert _normalize_telemetry_outcome({"outcome": outcome, "error_code": error_code}) == (outcome, expected_code)
 
 
 @pytest.mark.asyncio
