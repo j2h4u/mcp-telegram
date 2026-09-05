@@ -713,6 +713,7 @@ def _make_db_with_activity() -> sqlite3.Connection:
         )
         """
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(dialog_id, reply_to_msg_id)")
     conn.commit()
     return conn
 
@@ -6405,7 +6406,7 @@ def test_slow_successful_request_completion_is_logged_at_info(caplog: pytest.Log
     """Slow successful calls remain visible after ordinary completion logs are compacted."""
     server = make_server()
     with caplog.at_level("INFO", logger="mcp_telegram.daemon_api"):
-        server._log_request_completion("list_dialogs", "request-1", {"ok": True}, duration_s=5.001)
+        server._log_request_completion("list_dialogs", "request-1", {"ok": True}, duration_s=1.001)
 
     records = [record for record in caplog.records if "daemon_api_request_complete" in record.getMessage()]
     assert len(records) == 1
@@ -7104,6 +7105,8 @@ def test_build_recent_activity_rows_query_wraps_filters() -> None:
     sql = _build_recent_activity_rows_query("m.out = 1", "dialog_kind IN (?)")
     assert "WHERE m.out = 1" in sql
     assert "WHERE dialog_kind IN (?)" in sql
+    assert "messages replies INDEXED BY idx_messages_reply" in sql
+    assert "GROUP BY dialog_id, reply_to_msg_id" not in sql
     assert _build_recent_activity_rows_query("", "").startswith("WITH typed_activity AS (SELECT")
     assert _where_clause("m.out = 1") == "WHERE m.out = 1"
     assert _where_clause("") == ""

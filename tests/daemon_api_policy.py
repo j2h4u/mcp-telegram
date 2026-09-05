@@ -1,6 +1,6 @@
 """Shared explicit daemon policy for tests that exercise the composition seam."""
 
-from mcp_telegram.config import FreshnessConfig, SchedulingConfig, TelemetryConfig
+from mcp_telegram.config import FreshnessConfig, LoggingConfig, SchedulingConfig, TelemetryConfig
 from mcp_telegram.daemon_api import DaemonApiPolicy
 
 
@@ -15,5 +15,5 @@ def make_daemon_api_policy() -> DaemonApiPolicy:
         resolver_enrichment_ttl_seconds=freshness.entities.resolver_enrichment_ttl_seconds,
         folder_snapshot_stale_after_seconds=scheduling.folder_projection.stale_threshold_seconds,
         telemetry_retention_ttl_seconds=TelemetryConfig().retention_ttl_seconds,
-        slow_request_seconds=5.0,
+        slow_request_seconds=LoggingConfig().daemon_api_slow_request_seconds,
     )

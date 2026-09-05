@@ -325,7 +325,7 @@ def test_migration_v44_accepts_custom_emoji_and_preserves_media_artifacts(db_pat
 
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 48
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 50
         assert conn.execute("SELECT media_kind, media_payload FROM messages WHERE message_id = 1").fetchone() == (
             "document",
             '{"size":4}',
@@ -364,7 +364,7 @@ def test_migration_v44_accepts_custom_emoji_and_preserves_media_artifacts(db_pat
 
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 48
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 50
         assert conn.execute("SELECT media_kind FROM messages WHERE message_id = 3").fetchone() == ("custom_emoji",)
         assert conn.execute("SELECT media_kind FROM scheduled_messages WHERE message_id = 4").fetchone() == (
             "custom_emoji",
@@ -700,7 +700,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 48
+        assert _CURRENT_SCHEMA_VERSION == 50
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1431,7 +1431,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 48
+        assert _CURRENT_SCHEMA_VERSION == 50
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:
@@ -1622,7 +1622,7 @@ def test_v48_fresh_schema_has_sync_alert_projection(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 48
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 50
         columns = _fetchall_rows(conn, "PRAGMA table_info(sync_alert_events)")
         assert [row[1] for row in columns] == [
             "seq",
@@ -1633,6 +1633,30 @@ def test_v48_fresh_schema_has_sync_alert_projection(tmp_path: Path) -> None:
             "version",
             "daemon_event_id",
         ]
+
+
+def test_v49_adds_bounded_own_activity_index(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        row = _fetchone_row(
+            conn,
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_own_activity_sent'",
+        )
+        assert row is not None
+        assert "WHERE out = 1 AND is_service = 0 AND is_deleted = 0" in str(row[0])
+
+
+def test_v50_adds_covering_dialog_summary_index(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        row = _fetchone_row(
+            conn,
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_dialog_summary'",
+        )
+        assert row is not None
+        assert "dialog_id, is_deleted, is_service, out, message_id" in str(row[0])
         assert _fetchone_row(conn, "SELECT name FROM sqlite_master WHERE name = 'sync_alert_events_message_edit'") == (
             "sync_alert_events_message_edit",
         )
@@ -1642,7 +1666,7 @@ def test_v48_backfills_current_access_loss_and_replays_safely(tmp_path: Path) ->
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        conn.execute("DELETE FROM schema_version WHERE version = 48")
+        conn.execute("DELETE FROM schema_version WHERE version >= 48")
         conn.execute(
             "INSERT INTO synced_dialogs(dialog_id, status, access_lost_at) VALUES (?, 'access_lost', ?)",
             (902, 1700000100),
@@ -1668,7 +1692,7 @@ def test_v48_backfill_preserves_historical_fixture_shape(tmp_path: Path) -> None
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        conn.execute("DELETE FROM schema_version WHERE version = 48")
+        conn.execute("DELETE FROM schema_version WHERE version >= 48")
         conn.execute(
             "INSERT INTO synced_dialogs(dialog_id, status, access_lost_at) VALUES (?, 'access_lost', ?)",
             (903, 1700000200),
@@ -1705,7 +1729,7 @@ def test_v48_backfills_all_sources_deterministically_and_idempotently(tmp_path: 
         ):
             conn.execute(f"DROP TRIGGER {trigger}")
         conn.execute("DELETE FROM sync_alert_events")
-        conn.execute("DELETE FROM schema_version WHERE version = 48")
+        conn.execute("DELETE FROM schema_version WHERE version >= 48")
         conn.execute(
             "INSERT INTO messages(dialog_id, message_id, sent_at, text, is_deleted, deleted_at) VALUES (?, ?, ?, ?, 1, ?)",
             (901, 1, 1, "deleted", 100),
@@ -1781,7 +1805,7 @@ def test_v48_migration_rolls_back_atomically_on_projection_invariant_conflict(tm
         conn.execute(
             "INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, message_id) VALUES ('deleted_message', 1, 1, 1), ('deleted_message', 2, 1, 1)"
         )
-        conn.execute("DELETE FROM schema_version WHERE version = 48")
+        conn.execute("DELETE FROM schema_version WHERE version >= 48")
         conn.commit()
         with pytest.raises(sqlite3.IntegrityError):
             _apply_migration_48(conn, 47)

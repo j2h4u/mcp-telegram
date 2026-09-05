@@ -111,6 +111,9 @@ def _make_db() -> Iterator[sqlite3.Connection]:
             """
         )
         conn.execute(
+            "CREATE INDEX idx_messages_dialog_summary ON messages(dialog_id, is_deleted, is_service, out, message_id)"
+        )
+        conn.execute(
             """
             CREATE TABLE entities (
                 id              INTEGER PRIMARY KEY,
@@ -473,6 +476,7 @@ async def test_list_dialogs_candidate_aggregate_filters_before_messages() -> Non
         assert len(message_access) == 1
         assert "SEARCH" in message_access[0]
         assert "dialog_id=?" in message_access[0]
+        assert "COVERING INDEX idx_messages_dialog_summary" in message_access[0]
         assert "SCAN m" not in message_access[0]
         no_message_row = cast(
             sqlite3.Row | None,

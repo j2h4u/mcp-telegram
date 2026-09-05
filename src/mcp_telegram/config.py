@@ -217,7 +217,7 @@ class LoggingConfig:
     """Process logging policy."""
 
     level: str = "INFO"
-    daemon_api_slow_request_seconds: float = 5.0
+    daemon_api_slow_request_seconds: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
