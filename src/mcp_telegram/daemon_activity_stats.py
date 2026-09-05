@@ -111,6 +111,11 @@ def _coerce_int(value: object, default: int) -> int:
 
 
 def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict[str, object]:
+    telemetry_rows = cast(
+        list[tuple[object, ...]],
+        cursor.execute("PRAGMA table_info(telemetry_events)").fetchall(),
+    )
+    telemetry_columns = {str(row[1]) for row in telemetry_rows}
     tool_dist = dict(
         cursor.execute(
             "SELECT tool_name, COUNT(*) FROM telemetry_events "
@@ -119,14 +124,24 @@ def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict[str, object]:
         ).fetchall()
     )
 
-    error_dist = dict(
-        cursor.execute(
-            "SELECT error_type, COUNT(*) FROM telemetry_events "
-            "WHERE timestamp >= ? AND error_type IS NOT NULL "
-            "GROUP BY error_type ORDER BY COUNT(*) DESC",
-            (since,),
-        ).fetchall()
-    )
+    if {"outcome", "error_code"} <= telemetry_columns:
+        error_dist = dict(
+            cursor.execute(
+                "SELECT COALESCE(NULLIF(error_code, ''), error_type), COUNT(*) FROM telemetry_events "
+                "WHERE timestamp >= ? AND (NULLIF(error_code, '') IS NOT NULL OR error_type IS NOT NULL) "
+                "GROUP BY COALESCE(NULLIF(error_code, ''), error_type) ORDER BY COUNT(*) DESC",
+                (since,),
+            ).fetchall()
+        )
+    else:
+        error_dist = dict(
+            cursor.execute(
+                "SELECT error_type, COUNT(*) FROM telemetry_events "
+                "WHERE timestamp >= ? AND error_type IS NOT NULL "
+                "GROUP BY error_type ORDER BY COUNT(*) DESC",
+                (since,),
+            ).fetchall()
+        )
 
     def _scalar(sql: str, params: tuple[object, ...] = (since,), default: int = 0) -> int:
         row = cast(tuple[object] | None, cursor.execute(sql, params).fetchone())

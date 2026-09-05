@@ -40,6 +40,7 @@ import contextvars
 import dataclasses
 import json
 import logging
+import re
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -115,6 +116,8 @@ _ALL_ENTITY_NAMES_NORMALIZED_SQL = (
     "OR (type NOT IN ('User', 'Bot') AND updated_at > ?))"
 )
 _ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, type FROM entities WHERE username = ? COLLATE NOCASE"
+_TELEMETRY_OUTCOMES = frozenset({"success", "tool_error", "validation_error", "exception", "cancelled"})
+_TELEMETRY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1467,7 +1470,7 @@ class DaemonAPIServer:
     # record_telemetry
     # ------------------------------------------------------------------
 
-    async def _record_telemetry(self, req: dict[str, object]) -> dict:
+    async def _record_telemetry(self, req: dict[str, object]) -> dict:  # noqa: PLR0911 - compatibility branches
         """Write a telemetry event row to sync.db telemetry_events table.
 
         Evicts rows older than the configured retention window on every write.
@@ -1480,11 +1483,62 @@ class DaemonAPIServer:
         if not isinstance(tool_name, str) or len(tool_name) > _TELEMETRY_TOOL_NAME_MAX_LEN:
             return {"ok": False, "error": "invalid_input", "message": "tool_name must be a string (max 200 chars)"}
         try:
+            telemetry_rows = cast(
+                list[tuple[object, ...]],
+                self._conn.execute("PRAGMA table_info(telemetry_events)").fetchall(),
+            )
+            columns = {
+                str(row[1])
+                for row in telemetry_rows
+            }
+        except sqlite3.Error:
+            columns = set()
+        # Keep old in-memory/test databases and pre-v47 installations writable
+        # while the real sync.db migration adds the new columns.
+        if not {"outcome", "error_code"} <= columns:
+            try:
+                self._conn.execute(
+                    "INSERT INTO telemetry_events "
+                    "(tool_name, timestamp, duration_ms, result_count, "
+                    "has_cursor, page_depth, has_filter, error_type) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        tool_name,
+                        event.get("timestamp"),
+                        event.get("duration_ms"),
+                        event.get("result_count"),
+                        event.get("has_cursor"),
+                        event.get("page_depth"),
+                        event.get("has_filter"),
+                        event.get("error_type"),
+                    ),
+                )
+                cutoff = time.time() - self._policy.telemetry_retention_ttl_seconds
+                self._conn.execute("DELETE FROM telemetry_events WHERE timestamp < ?", (cutoff,))
+                self._conn.commit()
+                return {"ok": True}
+            except Exception as exc:
+                logger.exception("record_telemetry failed: %s", exc)
+                return {"ok": False, "error": "internal", "message": "internal error"}
+
+        raw_outcome = event.get("outcome")
+        if raw_outcome is None:
+            raw_outcome = "exception" if event.get("error_type") is not None else "success"
+        if not isinstance(raw_outcome, str) or raw_outcome not in _TELEMETRY_OUTCOMES:
+            return {"ok": False, "error": "invalid_input", "message": "outcome is invalid"}
+        raw_error_code = event.get("error_code")
+        if raw_outcome == "success":
+            normalized_error_code = None
+        elif isinstance(raw_error_code, str) and _TELEMETRY_ERROR_CODE_RE.fullmatch(raw_error_code):
+            normalized_error_code = raw_error_code
+        else:
+            normalized_error_code = raw_outcome if raw_outcome != "tool_error" else "tool_error"
+        try:
             self._conn.execute(
                 "INSERT INTO telemetry_events "
                 "(tool_name, timestamp, duration_ms, result_count, "
-                "has_cursor, page_depth, has_filter, error_type) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "has_cursor, page_depth, has_filter, outcome, error_code, error_type) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     tool_name,
                     event.get("timestamp"),
@@ -1493,6 +1547,8 @@ class DaemonAPIServer:
                     event.get("has_cursor"),
                     event.get("page_depth"),
                     event.get("has_filter"),
+                    raw_outcome,
+                    normalized_error_code,
                     event.get("error_type"),
                 ),
             )

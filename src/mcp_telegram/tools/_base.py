@@ -2,7 +2,6 @@ import asyncio
 import functools
 import logging
 import re
-import time
 import typing as t
 from collections.abc import Mapping
 from copy import deepcopy
@@ -286,7 +285,7 @@ def _check_daemon_response(
         text = f"Error: {error_detail}"
     if "action:" not in text.lower():
         text = f"{text}\nAction: {action}"
-    return error_result(text, **extra_kwargs)
+    return error_result(text, error_code=safe_error_code(error_code), **extra_kwargs)
 
 
 @dataclass
@@ -300,6 +299,12 @@ class ToolResult:
     has_cursor: bool = False
     page_depth: int = 1
     has_filter: bool = False
+    error_code: str | None = None
+
+    def __post_init__(self) -> None:
+        """Give every recoverable error a bounded machine code."""
+        if self.is_error:
+            self.error_code = safe_error_code(self.error_code)
 
 
 ToolArgT = t.TypeVar("ToolArgT", bound=ToolArgs)
@@ -331,13 +336,29 @@ def structured_result(structured_content: Mapping[str, object], **metadata: Unpa
     return ToolResult(content=(), structured_content=content, **metadata)
 
 
-def error_result(text: str, **metadata: Unpack[ToolResultMetadata]) -> ToolResult:
-    """Return recoverable error text as an MCP tool result."""
-    return ToolResult(content=_text_response(text), is_error=True, **metadata)
+_MACHINE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
-# Strong references to fire-and-forget tasks prevent GC before completion.
-_background_tasks: set[asyncio.Task[None]] = set()
+def safe_error_code(value: object, *, fallback: str = "tool_error") -> str:
+    """Return a bounded machine code without inspecting human-facing text."""
+    if isinstance(value, str) and _MACHINE_ERROR_CODE_RE.fullmatch(value):
+        return value
+    return fallback
+
+
+def error_result(
+    text: str,
+    *,
+    error_code: str = "tool_error",
+    **metadata: Unpack[ToolResultMetadata],
+) -> ToolResult:
+    """Return recoverable error text with a safe machine-readable code."""
+    return ToolResult(
+        content=_text_response(text),
+        is_error=True,
+        error_code=safe_error_code(error_code),
+        **metadata,
+    )
 
 
 async def _send_telemetry_event(event_dict: dict[str, object]) -> None:
@@ -345,7 +366,7 @@ async def _send_telemetry_event(event_dict: dict[str, object]) -> None:
     try:
         async with daemon_connection() as conn:
             await conn.record_telemetry(event=event_dict)
-    except (DaemonNotRunningError, RuntimeError) as exc:
+    except Exception as exc:  # noqa: BLE001 - telemetry must never affect tool execution
         logger.debug("telemetry_send_failed: %s", exc)
 
 
@@ -358,48 +379,21 @@ def _telemetry_done_callback(task: asyncio.Task[None]) -> None:
 
 
 def _track_tool_telemetry(tool_name: str) -> t.Callable[[ToolRunnerFunc[ToolArgT]], ToolRunnerFunc[ToolArgT]]:
-    """Decorator that wraps an async tool runner with timing + telemetry recording.
+    """Decorator that installs response-timezone projection around a runner.
 
-    Applied automatically by @mcp_tool() — do not use directly.
+    Telemetry is emitted by the MCP boundary in ``server.call_tool`` so every
+    logical call, including validation and cancellation, is recorded exactly once.
     """
 
     def decorator(fn: ToolRunnerFunc[ToolArgT]) -> ToolRunnerFunc[ToolArgT]:
         @functools.wraps(fn)
         async def wrapper(args: ToolArgT) -> ToolResult:
             logger.debug("method[%s]", tool_name)
-            start_time = time.monotonic()
-            error_type = None
-            tool_result: ToolResult | None = None
             timezone_token = response_timezone.set(args.timezone)
             try:
-                tool_result = await fn(args)
-                return tool_result
-            except Exception as exc:
-                error_type = type(exc).__name__
-                raise
+                return await fn(args)
             finally:
                 response_timezone.reset(timezone_token)
-                duration_ms = (time.monotonic() - start_time) * 1000
-                try:
-                    task = asyncio.create_task(
-                        _send_telemetry_event(
-                            {
-                                "tool_name": tool_name,
-                                "timestamp": time.time(),
-                                "duration_ms": duration_ms,
-                                "result_count": tool_result.result_count if tool_result else 0,
-                                "has_cursor": tool_result.has_cursor if tool_result else False,
-                                "page_depth": tool_result.page_depth if tool_result else 1,
-                                "has_filter": tool_result.has_filter if tool_result else False,
-                                "error_type": error_type,
-                            }
-                        )
-                    )
-                    _background_tasks.add(task)
-                    task.add_done_callback(_background_tasks.discard)
-                    task.add_done_callback(_telemetry_done_callback)
-                except RuntimeError as e:
-                    logger.debug("telemetry_send_skipped: %s", e)
 
         return wrapper
 
@@ -434,7 +428,7 @@ def mcp_tool(
     annotations: ToolAnnotations | None = None,
     output_schema: dict[str, object] | None = None,
 ) -> t.Callable[[ToolRunnerFunc[ToolArgT]], ToolRunnerFunc[ToolArgT]]:
-    """Register runner with singledispatch + telemetry + tool registry.
+    """Register runner with singledispatch + timezone projection + tool registry.
 
     ``posture`` is a free-form internal label used for audits and documentation.
     Current values used in the codebase:

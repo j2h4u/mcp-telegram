@@ -11,7 +11,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 46
+_CURRENT_SCHEMA_VERSION = 47
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -149,6 +149,25 @@ ON topic_metadata(dialog_id, updated_at)
 # ---------------------------------------------------------------------------
 
 _TELEMETRY_EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS telemetry_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tool_name TEXT NOT NULL,
+    timestamp REAL NOT NULL,
+    duration_ms REAL NOT NULL,
+    result_count INTEGER NOT NULL,
+    has_cursor BOOLEAN NOT NULL,
+    page_depth INTEGER NOT NULL,
+    has_filter BOOLEAN NOT NULL,
+    outcome TEXT NOT NULL DEFAULT 'success',
+    error_code TEXT,
+    error_type TEXT
+)
+"""
+
+# Mid-chain fixture/upgrade databases may have a schema_version row without
+# having replayed v5. v47 creates this legacy-compatible base before adding
+# its own columns; an actually malformed existing table still fails loudly.
+_TELEMETRY_EVENTS_BASE_DDL = """
 CREATE TABLE IF NOT EXISTS telemetry_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tool_name TEXT NOT NULL,
@@ -1895,6 +1914,52 @@ def _apply_migration_46(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_47(conn: sqlite3.Connection, current: int) -> int:
+    """Add the boundary outcome and safe machine error code fields."""
+    existing_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'telemetry_events'"
+    ).fetchone() is not None
+    existing_columns = {
+        str(row[1])
+        for row in cast(
+            list[tuple[object, ...]],
+            conn.execute("PRAGMA table_info(telemetry_events)").fetchall(),
+        )
+    } if existing_table else set()
+    outcome_added = "outcome" not in existing_columns
+    error_code_added = "error_code" not in existing_columns
+    statements = []
+    if not existing_table:
+        statements.extend([_TELEMETRY_EVENTS_BASE_DDL, _TELEMETRY_EVENTS_INDEX_DDL])
+    else:
+        statements.append(_TELEMETRY_EVENTS_INDEX_DDL)
+    if outcome_added:
+        statements.append("ALTER TABLE telemetry_events ADD COLUMN outcome TEXT NOT NULL DEFAULT 'success'")
+    if error_code_added:
+        statements.append("ALTER TABLE telemetry_events ADD COLUMN error_code TEXT")
+    # Keep these updates on every v47 retry. A process can crash after either
+    # ALTER and before the backfill while schema_version is still 46.
+    statements.extend(
+        [
+            (
+                "UPDATE telemetry_events SET outcome = 'exception' "
+                "WHERE outcome = 'success' AND error_type IS NOT NULL"
+            ),
+            (
+                "UPDATE telemetry_events SET error_code = 'exception' "
+                "WHERE error_code IS NULL AND error_type IS NOT NULL"
+            ),
+        ]
+    )
+    return _apply_migration(
+        conn,
+        current,
+        47,
+        statements,
+        ignore_duplicate_column=True,
+    )
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -1938,6 +2003,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_44(conn, current)
     current = _apply_migration_45(conn, current)
     current = _apply_migration_46(conn, current)
+    current = _apply_migration_47(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
@@ -2168,8 +2234,10 @@ def migrate_legacy_databases(
     telemetry_stmts = [
         (
             "INSERT OR IGNORE INTO telemetry_events "
-            "(tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type) "
-            "SELECT tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type "
+            "(tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, outcome, error_code, error_type) "
+            "SELECT tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, "
+            "CASE WHEN error_type IS NOT NULL THEN 'exception' ELSE 'success' END, "
+            "CASE WHEN error_type IS NOT NULL THEN 'exception' ELSE NULL END, error_type "
             "FROM legacy.telemetry_events "
             f"WHERE timestamp > strftime('%s', 'now') - {telemetry_retention_ttl_seconds}"
         ),

@@ -257,6 +257,173 @@ async def test_call_tool_passthrough_recoverable_error_text_contract(
 
 
 @pytest.mark.asyncio
+async def test_call_tool_emits_one_boundary_telemetry_event_with_result_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
+    monkeypatch.setattr(
+        "mcp_telegram.server.tools.tool_runner",
+        AsyncMock(return_value=ToolResult(result_count=7, has_cursor=True, page_depth=3, has_filter=True)),
+    )
+    send_mock = AsyncMock()
+    monkeypatch.setattr(server, "_send_telemetry_event", send_mock)
+    server._telemetry_tasks.clear()
+
+    result = _call_tool_result(await server.call_tool("list_dialogs", {}))
+    await server.flush_telemetry()
+
+    assert result.is_error is False
+    send_mock.assert_awaited_once()
+    assert send_mock.await_args is not None
+    event = cast(dict[str, object], send_mock.await_args.args[0])
+    assert event["outcome"] == "success"
+    assert event["error_code"] is None
+    assert event["error_type"] is None
+    assert event["result_count"] == 7
+    assert event["has_cursor"] is True
+    assert event["page_depth"] == 3
+    assert event["has_filter"] is True
+
+
+@pytest.mark.asyncio
+async def test_call_tool_validation_telemetry_has_no_arguments_or_error_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
+
+    def _raise_validation_error(tool: Tool, **kwargs: object) -> object:
+        raise ValueError("secret argument text")
+
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_args", _raise_validation_error)
+    send_mock = AsyncMock()
+    monkeypatch.setattr(server, "_send_telemetry_event", send_mock)
+    server._telemetry_tasks.clear()
+
+    result = _call_tool_result(await server.call_tool("list_dialogs", {"secret": "telegram content"}))
+    await server.flush_telemetry()
+
+    assert result.is_error is True
+    send_mock.assert_awaited_once()
+    assert send_mock.await_args is not None
+    event = cast(dict[str, object], send_mock.await_args.args[0])
+    assert event["outcome"] == "validation_error"
+    assert event["error_code"] == "validation_error"
+    assert "secret" not in str(event)
+    assert "telegram content" not in str(event)
+    assert "secret argument text" not in str(event)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_records_tool_error_code_without_parsing_response_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
+    monkeypatch.setattr(
+        "mcp_telegram.server.tools.tool_runner",
+        AsyncMock(return_value=ToolResult(content=[TextContent(type="text", text="error=secret")], is_error=True, error_code="dialog_not_found")),
+    )
+    send_mock = AsyncMock()
+    monkeypatch.setattr(server, "_send_telemetry_event", send_mock)
+    server._telemetry_tasks.clear()
+
+    result = _call_tool_result(await server.call_tool("list_dialogs", {}))
+    await server.flush_telemetry()
+
+    assert result.is_error is True
+    assert send_mock.await_args is not None
+    event = cast(dict[str, object], send_mock.await_args.args[0])
+    assert event["outcome"] == "tool_error"
+    assert event["error_code"] == "dialog_not_found"
+    assert "secret" not in str(event)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_records_cancellation_once_and_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
+    started = asyncio.Event()
+
+    async def _wait_forever(_args: object) -> ToolResult:
+        started.set()
+        await asyncio.Future()
+        return ToolResult()
+
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_runner", _wait_forever)
+    send_mock = AsyncMock()
+    monkeypatch.setattr(server, "_send_telemetry_event", send_mock)
+    server._telemetry_tasks.clear()
+
+    call = asyncio.create_task(server.call_tool("list_dialogs", {}))
+    await started.wait()
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    await server.flush_telemetry()
+
+    send_mock.assert_awaited_once()
+    assert send_mock.await_args is not None
+    event = cast(dict[str, object], send_mock.await_args.args[0])
+    assert event["outcome"] == "cancelled"
+    assert event["error_code"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_flush_telemetry_cancels_delivery_after_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    release = asyncio.Event()
+
+    async def _blocked(_event: dict[str, object]) -> None:
+        await release.wait()
+
+    monkeypatch.setattr(server, "_send_telemetry_event", _blocked)
+    server._telemetry_tasks.clear()
+    server._schedule_telemetry({"tool_name": "slow"})
+    await server.flush_telemetry(timeout_seconds=0)
+
+    assert not server._telemetry_tasks
+
+
+@pytest.mark.asyncio
+async def test_submit_feedback_type_error_is_boundary_validation_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    send_mock = AsyncMock()
+    monkeypatch.setattr(server, "_send_telemetry_event", send_mock)
+    server._telemetry_tasks.clear()
+
+    result = _call_tool_result(await server.call_tool("submit_feedback", {"message": 123}))
+    await server.flush_telemetry()
+
+    assert result.is_error is True
+    send_mock.assert_awaited_once()
+    assert send_mock.await_args is not None
+    event = cast(dict[str, object], send_mock.await_args.args[0])
+    assert event["outcome"] == "validation_error"
+    assert event["error_code"] == "validation_error"
+
+
+@pytest.mark.asyncio
+async def test_malformed_runner_result_is_safe_exception_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_runner", AsyncMock(return_value={}))
+    send_mock = AsyncMock()
+    monkeypatch.setattr(server, "_send_telemetry_event", send_mock)
+    server._telemetry_tasks.clear()
+
+    result = _call_tool_result(await server.call_tool("list_dialogs", {}))
+    await server.flush_telemetry()
+
+    assert result.is_error is True
+    assert "runtime" in _call_tool_text(result).lower()
+    send_mock.assert_awaited_once()
+    assert send_mock.await_args is not None
+    event = cast(dict[str, object], send_mock.await_args.args[0])
+    assert event["outcome"] == "exception"
+    assert event["error_code"] == "exception"
+    assert event["result_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_call_tool_unknown_tool_control_contract() -> None:
     with pytest.raises(ValueError, match="Unknown tool: MissingTool"):
         await server.call_tool("MissingTool", {})

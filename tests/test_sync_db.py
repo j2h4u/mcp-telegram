@@ -9,6 +9,7 @@ import pytest
 
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
+    _apply_migration_47,
     _migrate_from_legacy_db,
     _open_sync_db,
     ensure_sync_schema,
@@ -554,6 +555,8 @@ def test_schema_v5_telemetry_events_table(tmp_sync_db_path: Path) -> None:
             "has_cursor",
             "page_depth",
             "has_filter",
+            "outcome",
+            "error_code",
             "error_type",
         }
         assert expected == columns, f"Got: {columns}, expected: {expected}"
@@ -570,6 +573,127 @@ def test_schema_v5_telemetry_index_exists(tmp_sync_db_path: Path) -> None:
             conn, "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_telemetry_tool_timestamp'"
         )
         assert row is not None, "idx_telemetry_tool_timestamp index missing"
+    finally:
+        conn.close()
+
+
+def test_schema_v47_backfills_legacy_telemetry_outcomes() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE telemetry_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, tool_name TEXT NOT NULL, timestamp REAL NOT NULL, "
+        "duration_ms REAL NOT NULL, result_count INTEGER NOT NULL, has_cursor BOOLEAN NOT NULL, "
+        "page_depth INTEGER NOT NULL, has_filter BOOLEAN NOT NULL, error_type TEXT)"
+    )
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
+    conn.executemany(
+        "INSERT INTO telemetry_events "
+        "(tool_name,timestamp,duration_ms,result_count,has_cursor,page_depth,has_filter,error_type) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        [("legacy_ok", 1, 1, 0, 0, 1, 0, None), ("legacy_error", 1, 1, 0, 0, 1, 0, "RuntimeError")],
+    )
+    conn.commit()
+    try:
+        assert _apply_migration_47(conn, 46) == 47
+        rows = conn.execute("SELECT tool_name, outcome, error_code FROM telemetry_events ORDER BY tool_name").fetchall()
+        assert rows == [("legacy_error", "exception", "exception"), ("legacy_ok", "success", None)]
+    finally:
+        conn.close()
+
+
+def test_schema_v47_replay_preserves_existing_boundary_outcomes() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE telemetry_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, tool_name TEXT NOT NULL, timestamp REAL NOT NULL, "
+        "duration_ms REAL NOT NULL, result_count INTEGER NOT NULL, has_cursor BOOLEAN NOT NULL, "
+        "page_depth INTEGER NOT NULL, has_filter BOOLEAN NOT NULL, outcome TEXT NOT NULL, "
+        "error_code TEXT, error_type TEXT)"
+    )
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
+    conn.executemany(
+        "INSERT INTO telemetry_events "
+        "(tool_name,timestamp,duration_ms,result_count,has_cursor,page_depth,has_filter,outcome,error_code,error_type) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        [
+            ("cancelled", 1, 1, 0, 0, 1, 0, "cancelled", "client_cancelled", None),
+            ("tool_error", 1, 1, 0, 0, 1, 0, "tool_error", "dialog_not_found", None),
+            ("validation", 1, 1, 0, 0, 1, 0, "validation_error", "validation_error", None),
+        ],
+    )
+    conn.commit()
+    try:
+        assert _apply_migration_47(conn, 46) == 47
+        rows = conn.execute(
+            "SELECT tool_name, outcome, error_code FROM telemetry_events ORDER BY tool_name"
+        ).fetchall()
+        assert rows == [
+            ("cancelled", "cancelled", "client_cancelled"),
+            ("tool_error", "tool_error", "dialog_not_found"),
+            ("validation", "validation_error", "validation_error"),
+        ]
+    finally:
+        conn.close()
+
+
+def test_schema_v47_replay_after_outcome_alter_backfills_legacy_error() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE telemetry_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, tool_name TEXT NOT NULL, timestamp REAL NOT NULL, "
+        "duration_ms REAL NOT NULL, result_count INTEGER NOT NULL, has_cursor BOOLEAN NOT NULL, "
+        "page_depth INTEGER NOT NULL, has_filter BOOLEAN NOT NULL, outcome TEXT NOT NULL DEFAULT 'success', "
+        "error_type TEXT)"
+    )
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
+    conn.execute(
+        "INSERT INTO telemetry_events "
+        "(tool_name,timestamp,duration_ms,result_count,has_cursor,page_depth,has_filter,outcome,error_type) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        ("legacy_error", 1, 1, 0, 0, 1, 0, "success", "RuntimeError"),
+    )
+    conn.commit()
+    try:
+        assert _apply_migration_47(conn, 46) == 47
+        assert conn.execute("SELECT outcome, error_code FROM telemetry_events").fetchone() == (
+            "exception",
+            "exception",
+        )
+    finally:
+        conn.close()
+
+
+def test_schema_v47_replay_with_both_columns_backfills_only_legacy_error() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE telemetry_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, tool_name TEXT NOT NULL, timestamp REAL NOT NULL, "
+        "duration_ms REAL NOT NULL, result_count INTEGER NOT NULL, has_cursor BOOLEAN NOT NULL, "
+        "page_depth INTEGER NOT NULL, has_filter BOOLEAN NOT NULL, outcome TEXT NOT NULL DEFAULT 'success', "
+        "error_code TEXT, error_type TEXT)"
+    )
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
+    conn.executemany(
+        "INSERT INTO telemetry_events "
+        "(tool_name,timestamp,duration_ms,result_count,has_cursor,page_depth,has_filter,outcome,error_code,error_type) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        [
+            ("legacy_error", 1, 1, 0, 0, 1, 0, "success", None, "RuntimeError"),
+            ("cancelled", 1, 1, 0, 0, 1, 0, "cancelled", "client_cancelled", None),
+            ("tool_error", 1, 1, 0, 0, 1, 0, "tool_error", "dialog_not_found", None),
+        ],
+    )
+    conn.commit()
+    try:
+        assert _apply_migration_47(conn, 46) == 47
+        rows = conn.execute(
+            "SELECT tool_name, outcome, error_code FROM telemetry_events ORDER BY tool_name"
+        ).fetchall()
+        assert rows == [
+            ("cancelled", "cancelled", "client_cancelled"),
+            ("legacy_error", "exception", "exception"),
+            ("tool_error", "tool_error", "dialog_not_found"),
+        ]
     finally:
         conn.close()
 
@@ -759,6 +883,12 @@ def test_migrate_legacy_databases_uses_injected_telemetry_retention(tmp_path: Pa
         tool_names = [str(row[0]) for row in rows]
         assert "ListMessages" in tool_names, "Recent event should be migrated"
         assert "ListDialogs" not in tool_names, "Old event should be excluded"
+        migrated = _fetchone_row(
+            conn,
+            "SELECT outcome, error_code FROM telemetry_events WHERE tool_name = ?",
+            ("ListMessages",),
+        )
+        assert migrated == ("success", None)
     finally:
         conn.close()
 
@@ -1625,7 +1755,7 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 46, f"_CURRENT_SCHEMA_VERSION must be 46, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 47, f"_CURRENT_SCHEMA_VERSION must be 47, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
 
