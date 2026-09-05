@@ -529,6 +529,23 @@ async def test_resolve_trace_exact_account_id_from_entities(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("value", [True, False, 0, -1, 9_223_372_036_854_775_808, "123"])
+async def test_trace_rejects_invalid_exact_account_id_before_resolution(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+    value: object,
+) -> None:
+    _server, _conn, client = trace_server
+
+    result = await trace_service._trace_account_messages({"exact_account_id": value})
+
+    assert result["ok"] is False
+    assert result["error"] == "invalid_exact_account_id"
+    assert "Action:" in str(result["message"])
+    client.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_resolve_trace_unknown_numeric_does_not_call_client(
     trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
     trace_service: DaemonAccountTraceService,

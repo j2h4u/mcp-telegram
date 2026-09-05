@@ -24,7 +24,12 @@ from telethon.errors import ServerError
 from telethon.tl.types import PeerUser, UpdateReadHistoryInbox
 
 from mcp_telegram.activity_contracts import InputPeerResolver
-from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike, _ResolverEntityCache
+from mcp_telegram.daemon_api import (
+    DaemonAPIServer,
+    DaemonClientLike,
+    _normalize_telemetry_outcome,
+    _ResolverEntityCache,
+)
 from mcp_telegram.daemon_ipc import get_daemon_socket_path
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
 from mcp_telegram.dialog_selector import required_dialog_selector
@@ -564,6 +569,49 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             fwd_channel_post    INTEGER,
             PRIMARY KEY (dialog_id, message_id)
         ) WITHOUT ROWID
+        """
+    )
+    conn.executescript(
+        """
+        CREATE TABLE daemon_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            dialog_id INTEGER,
+            occurred_at INTEGER NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE sync_alert_events (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            occurred_at INTEGER NOT NULL,
+            dialog_id INTEGER NOT NULL,
+            message_id INTEGER,
+            version INTEGER,
+            daemon_event_id INTEGER
+        );
+        CREATE UNIQUE INDEX sync_alert_deleted_source ON sync_alert_events(dialog_id, message_id) WHERE kind = 'deleted_message';
+        CREATE UNIQUE INDEX sync_alert_edit_source ON sync_alert_events(dialog_id, message_id, version) WHERE kind = 'edit';
+        CREATE UNIQUE INDEX sync_alert_access_source ON sync_alert_events(daemon_event_id) WHERE kind = 'access_lost';
+        CREATE TRIGGER sync_alert_message_insert_deleted AFTER INSERT ON messages
+        WHEN NEW.is_deleted = 1 AND NEW.deleted_at IS NOT NULL BEGIN
+            INSERT OR IGNORE INTO sync_alert_events(kind, occurred_at, dialog_id, message_id)
+            VALUES ('deleted_message', NEW.deleted_at, NEW.dialog_id, NEW.message_id);
+        END;
+        CREATE TRIGGER sync_alert_message_delete_transition AFTER UPDATE OF is_deleted, deleted_at ON messages
+        WHEN OLD.is_deleted = 0 AND NEW.is_deleted = 1 AND NEW.deleted_at IS NOT NULL BEGIN
+            INSERT OR IGNORE INTO sync_alert_events(kind, occurred_at, dialog_id, message_id)
+            VALUES ('deleted_message', NEW.deleted_at, NEW.dialog_id, NEW.message_id);
+        END;
+        CREATE TRIGGER sync_alert_message_edit AFTER INSERT ON message_versions
+        WHEN NEW.edit_date IS NOT NULL BEGIN
+            INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, message_id, version)
+            VALUES ('edit', NEW.edit_date, NEW.dialog_id, NEW.message_id, NEW.version);
+        END;
+        CREATE TRIGGER sync_alert_access_lost AFTER INSERT ON daemon_events
+        WHEN NEW.kind = 'access_lost' BEGIN
+            INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, daemon_event_id)
+            VALUES ('access_lost', NEW.occurred_at, NEW.dialog_id, NEW.id);
+        END;
         """
     )
     if with_fts:
@@ -1187,19 +1235,25 @@ async def test_search_messages_keeps_raw_text_while_list_projects_hidden_links()
 
 
 # ---------------------------------------------------------------------------
-# search_messages — empty query
+# search_messages — queries without searchable tokens
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_search_messages_empty_query() -> None:
-    """search_messages with empty query returns empty result."""
+@pytest.mark.parametrize("query", ["", "  ", "!!! ???", "😀👍"])
+async def test_search_messages_without_searchable_tokens(query: str) -> None:
+    """search_messages rejects queries that cannot produce an indexed token."""
     server = make_server(_make_db(with_fts=True))
-    result = await server._search_messages({"dialog_id": 1, "query": "", "limit": 10})
+    result = await server._search_messages({"dialog_id": 1, "query": query, "limit": 10})
 
-    assert result["ok"] is True
-    assert _response_messages(result) == []
-    assert result["data"]["total"] == 0
+    assert result == {
+        "ok": False,
+        "error": "invalid_query",
+        "message": (
+            "query must contain at least one Cyrillic or Latin letter or ASCII digit. "
+            "Action: pass a searchable query, or use list_messages."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2520,6 +2574,7 @@ async def test_get_sync_alerts_access_lost() -> None:
     """get_sync_alerts returns access_lost dialogs."""
     conn = _make_db()
     _insert_synced_dialog(conn, 1, status="access_lost", access_lost_at=1700000700)
+    record_daemon_event(conn, kind="access_lost", dialog_id=1, occurred_at=1700000700)
     server = make_server(conn)
     result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 50})
     assert result["ok"] is True
@@ -3318,6 +3373,48 @@ def _insert_telemetry(
 # ---------------------------------------------------------------------------
 # record_telemetry (Plan 33-01)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        ({"error_type": None}, ("success", None)),
+        ({"error_type": "ValueError"}, ("exception", "exception")),
+    ],
+)
+def test_normalize_telemetry_outcome_infers_legacy_events(
+    event: dict[str, object],
+    expected: tuple[str, str | None],
+) -> None:
+    assert _normalize_telemetry_outcome(event) == expected
+
+
+@pytest.mark.parametrize("outcome", [42, "unknown"])
+def test_normalize_telemetry_outcome_rejects_invalid_outcomes(outcome: object) -> None:
+    result = _normalize_telemetry_outcome({"outcome": outcome})
+    assert result == {"ok": False, "error": "invalid_input", "message": "outcome is invalid"}
+
+
+def test_normalize_telemetry_outcome_success_discards_supplied_code() -> None:
+    assert _normalize_telemetry_outcome({"outcome": "success", "error_code": "secret_code"}) == ("success", None)
+
+
+@pytest.mark.parametrize("outcome", ["tool_error", "validation_error", "exception", "cancelled"])
+def test_normalize_telemetry_outcome_accepts_safe_codes_for_errors(outcome: str) -> None:
+    assert _normalize_telemetry_outcome({"outcome": outcome, "error_code": "dialog_not_found"}) == (
+        outcome,
+        "dialog_not_found",
+    )
+
+
+@pytest.mark.parametrize("error_code", [None, "DialogNotFound", "contains secret", "a" * 65])
+@pytest.mark.parametrize("outcome", ["tool_error", "validation_error", "exception", "cancelled"])
+def test_normalize_telemetry_outcome_falls_back_for_unsafe_error_codes(
+    outcome: str,
+    error_code: object,
+) -> None:
+    expected_code = "tool_error" if outcome == "tool_error" else outcome
+    assert _normalize_telemetry_outcome({"outcome": outcome, "error_code": error_code}) == (outcome, expected_code)
 
 
 @pytest.mark.asyncio

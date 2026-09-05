@@ -2,7 +2,7 @@
 
 Wires tool_runner (singledispatch) to the MCP Server, tracks per-request IDs
 via the public correlation context API for cross-process log correlation, and
-runs stdio or Streamable HTTP transport loops.
+runs the Streamable HTTP transport loop.
 """
 
 import asyncio
@@ -12,6 +12,7 @@ import logging
 import sys
 import time
 import typing as t
+from dataclasses import dataclass
 from functools import cache
 
 from mcp.server import Server
@@ -43,12 +44,25 @@ from .config import (
 )
 from .correlation import correlation_context, current_correlation_ids
 from .runtime_logging import install_telethon_log_filter
+from .tools._base import _send_telemetry_event, safe_error_code
 
 logger = logging.getLogger(__name__)
 _MAX_ERROR_DETAIL_LENGTH = 160
 _MCP_HTTP_LOGGER_NAME = "mcp.server.streamable_http"
 _MCP_HTTP_SSE_ERROR_MESSAGE = "SSE response error"
 _ANYIO_CLOSED_RESOURCE_ERROR = ("anyio", "ClosedResourceError")
+_TELEMETRY_FLUSH_TIMEOUT_SECONDS = 1.0
+_TELEMETRY_OUTCOMES = frozenset({"success", "tool_error", "validation_error", "exception", "cancelled"})
+
+
+@dataclass
+class _CallTelemetry:
+    outcome: str = "success"
+    error_type: str | None = None
+    result: object | None = None
+    error_code: object = None
+
+
 _WORKFLOWS_PROMPT_NAME = "telegram_workflows"
 _WORKFLOWS_PROMPT_TITLE = "Telegram workflows"
 _WORKFLOWS_PROMPT_DESCRIPTION = "Reusable scenarios for navigating Telegram through this MCP server."
@@ -152,6 +166,70 @@ def enumerate_available_tools() -> list[tuple[str, Tool]]:
 
 
 tool_by_name: dict[str, Tool] = dict(enumerate_available_tools())
+
+# Strong references keep fire-and-forget deliveries alive until they either
+# complete or the transport shutdown flush reaches its bounded deadline.
+_telemetry_tasks: set[asyncio.Task[None]] = set()
+
+
+def _schedule_telemetry(event: dict[str, object]) -> None:
+    """Schedule one best-effort telemetry delivery without affecting the call."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError as exc:
+        logger.debug("telemetry_send_skipped: %s", exc)
+        return
+    task = loop.create_task(_send_telemetry_event(event), name="mcp-telemetry-delivery")
+    _telemetry_tasks.add(task)
+    task.add_done_callback(_telemetry_tasks.discard)
+
+
+async def flush_telemetry(*, timeout_seconds: float = _TELEMETRY_FLUSH_TIMEOUT_SECONDS) -> None:
+    """Wait briefly for queued telemetry, cancelling anything still pending."""
+    tasks = tuple(_telemetry_tasks)
+    if not tasks:
+        return
+    _, pending = await asyncio.wait(tasks, timeout=max(0.0, timeout_seconds))
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def _telemetry_event(  # noqa: PLR0913 - explicit telemetry fields keep the contract visible
+    *,
+    tool_name: str,
+    outcome: str,
+    duration_ms: float,
+    result: object | None,
+    error_type: str | None = None,
+    error_code: object = None,
+) -> dict[str, object]:
+    """Build the privacy-safe event shared by all MCP boundary outcomes."""
+    if outcome not in _TELEMETRY_OUTCOMES:
+        outcome = "exception"
+    safe_result = result if isinstance(result, tools.ToolResult) else None
+    machine_code: str | None
+    if outcome == "success":
+        machine_code = None
+    elif outcome == "tool_error":
+        machine_code = safe_error_code(error_code)
+    else:
+        machine_code = outcome
+    return {
+        "tool_name": tool_name,
+        "timestamp": time.time(),
+        "duration_ms": duration_ms,
+        "result_count": safe_result.result_count if safe_result is not None else 0,
+        "has_cursor": safe_result.has_cursor if safe_result is not None else False,
+        "page_depth": safe_result.page_depth if safe_result is not None else 1,
+        "has_filter": safe_result.has_filter if safe_result is not None else False,
+        # Kept for old analytics consumers. New consumers should use outcome
+        # and error_code; this field is populated only for raised exceptions.
+        "error_type": error_type,
+        "outcome": outcome,
+        "error_code": machine_code,
+    }
 
 
 def _safe_boundary_error_text(*, tool_name: str, stage: str, exc: Exception) -> str:
@@ -271,6 +349,85 @@ async def list_resource_templates() -> list[ResourceTemplate]:
     return []
 
 
+def _log_tool_failure(name: str, exc: Exception, *, stage: str, started_at: float) -> None:
+    elapsed = time.monotonic() - started_at
+    logger.error(
+        "call_tool[%s] %s failed after %.3fs",
+        name,
+        stage,
+        elapsed,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+
+
+def _project_tool_result(
+    name: str, tool_result: object, telemetry: _CallTelemetry, started_at: float
+) -> CallToolResult:
+    if not isinstance(tool_result, tools.ToolResult):
+        raise TypeError("tool runner returned an invalid result")
+    telemetry.outcome = "tool_error" if tool_result.is_error else "success"
+    telemetry.error_code = tool_result.error_code
+    elapsed = time.monotonic() - started_at
+    rid_str = ",".join(current_correlation_ids()) or "-"
+    logger.info("call_tool[%s] completed in %.3fs rids=%s", name, elapsed, rid_str)
+    return CallToolResult(
+        content=list(tool_result.content) if tool_result.is_error else [],
+        structured_content=(
+            t.cast(dict[str, object], tools.omit_none_mapping_values(tool_result.structured_content))
+            if tool_result.structured_content is not None
+            else None
+        ),
+        is_error=tool_result.is_error,
+    )
+
+
+async def _execute_tool(
+    name: str,
+    tool: Tool,
+    arguments: dict[str, object],
+    started_at: float,
+    telemetry: _CallTelemetry,
+) -> CallToolResult:
+    try:
+        args = tools.tool_args(tool, **arguments)
+    except asyncio.CancelledError:
+        telemetry.outcome = "cancelled"
+        raise
+    except (TypeError, ValueError, ValidationError) as exc:
+        telemetry.outcome = "validation_error"
+        elapsed = time.monotonic() - started_at
+        logger.info(
+            "call_tool[%s] validation_failed after %.3fs (%s)",
+            name,
+            elapsed,
+            type(exc).__name__,
+        )
+        return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="validation", exc=exc))
+
+    try:
+        tool_result = await tools.tool_runner(args)
+        telemetry.result = tool_result
+    except asyncio.CancelledError:
+        telemetry.outcome = "cancelled"
+        raise
+    except Exception as exc:  # noqa: BLE001 - tool boundary must classify runner failures
+        telemetry.outcome = "exception"
+        telemetry.error_type = type(exc).__name__
+        _log_tool_failure(name, exc, stage="runtime", started_at=started_at)
+        return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc))
+
+    try:
+        return _project_tool_result(name, tool_result, telemetry, started_at)
+    except asyncio.CancelledError:
+        telemetry.outcome = "cancelled"
+        raise
+    except Exception as exc:  # noqa: BLE001 - tool boundary must classify projection failures
+        telemetry.outcome = "exception"
+        telemetry.error_type = type(exc).__name__
+        _log_tool_failure(name, exc, stage="runtime", started_at=started_at)
+        return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc))
+
+
 async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
     """Handle tool calls for command line run."""
 
@@ -282,40 +439,20 @@ async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
         raise ValueError(f"Unknown tool: {name}")
 
     t0 = time.monotonic()
-    with correlation_context():
-        try:
-            args = tools.tool_args(tool, **arguments)
-        except (ValueError, ValidationError) as exc:
-            elapsed = time.monotonic() - t0
-            # Invalid user arguments are an expected boundary error. Keep the
-            # response unchanged, but do not make routine validation failures
-            # look like server incidents by attaching a traceback.
-            logger.info(
-                "call_tool[%s] validation_failed after %.3fs (%s)",
-                name,
-                elapsed,
-                type(exc).__name__,
+    telemetry = _CallTelemetry()
+    try:
+        with correlation_context():
+            return await _execute_tool(name, tool, arguments, t0, telemetry)
+    finally:
+        _schedule_telemetry(
+            _telemetry_event(
+                tool_name=name,
+                outcome=telemetry.outcome,
+                duration_ms=(time.monotonic() - t0) * 1000,
+                result=telemetry.result,
+                error_type=telemetry.error_type,
+                error_code=telemetry.error_code,
             )
-            return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="validation", exc=exc))
-
-        try:
-            result = await tools.tool_runner(args)
-        except Exception as exc:
-            elapsed = time.monotonic() - t0
-            logger.exception("call_tool[%s] runtime failed after %.3fs", name, elapsed)
-            return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc))
-
-        elapsed = time.monotonic() - t0
-        rid_str = ",".join(current_correlation_ids()) or "-"
-        logger.info("call_tool[%s] completed in %.3fs rids=%s", name, elapsed, rid_str)
-        return CallToolResult(
-            content=list(result.content) if result.is_error else [],
-            structured_content=(
-                t.cast(dict[str, object], tools.omit_none_mapping_values(result.structured_content))
-                if result.structured_content is not None
-                else None
-            ),
-            is_error=result.is_error,
         )
 
 
@@ -412,29 +549,6 @@ async def _build_server_instructions() -> str:
     return base
 
 
-async def run_mcp_server() -> None:
-    # Deferred: stdio_server touches the event loop at import time in some envs
-    from mcp.server.stdio import stdio_server
-
-    log_level = resolve_logging_config().level
-    logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
-        stream=sys.stderr,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        force=True,
-    )
-    install_telethon_log_filter()
-    _quiet_mcp_http_lifecycle_logs()
-
-    logger.info("MCP server starting — routing through daemon API")
-
-    mcp_server = bootstrap_server()
-    mcp_server.instructions = await _build_server_instructions()
-
-    async with stdio_server() as (read_stream, write_stream):
-        await mcp_server.run(read_stream, write_stream, mcp_server.create_initialization_options())
-
-
 async def run_mcp_http_server(
     *,
     host: str = "127.0.0.1",
@@ -524,7 +638,10 @@ async def run_mcp_http_server(
         access_log=False,
     )
     http_server = _NoSignalServer(config)
-    if stop_event is None:
-        await http_server.serve()
-    else:
-        await _serve_http_until_stop(http_server, stop_event)
+    try:
+        if stop_event is None:
+            await http_server.serve()
+        else:
+            await _serve_http_until_stop(http_server, stop_event)
+    finally:
+        await flush_telemetry()

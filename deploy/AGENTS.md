@@ -37,10 +37,9 @@ This directory is the live deployment workspace, not the source checkout.
   Docker Compose logs cover only the current container. Journald retention is
   controlled by the host; this service does not configure a separate log
   retention policy.
-- Validate MCP over stdio from the source checkout:
+- Validate MCP over HTTP from the source checkout:
   ```bash
-  uv run python -m devtools.mcp_client.cli list-tools \
-    -- docker exec -i mcp-telegram mcp-telegram run
+  uv run python -m devtools.mcp_client.cli list-tools
   ```
 
 ## Auth

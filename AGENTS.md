@@ -11,9 +11,6 @@ Default Docker runtime is one container process:
 - **Service** (`mcp-telegram serve`) — PID 1; runs the sync daemon and Streamable HTTP MCP endpoint
   together. The daemon owns the TelegramClient, runs FullSyncWorker and DeltaSyncWorker, handles
   real-time events, and exposes its Unix socket API internally.
-- **stdio MCP server** (`mcp-telegram run`) — still available for `docker exec` checks and MCP
-  clients that need stdio. It connects to the daemon over the Unix socket and translates tool calls
-  into daemon API requests.
 - **Daemon-only mode** (`mcp-telegram sync`) — useful for split-mode debugging, but it is not the
   default Docker command.
 
@@ -43,7 +40,7 @@ MCP serving code uses daemon APIs and read-only DB access for lightweight querie
 - `read_state.py` — `apply_read_cursor()`: monotonic inbox/outbox read cursor writes to `synced_dialogs`
 - `fts.py` — FTS5 full-text search with Russian snowball stemming
 - `telegram.py` — TelegramClient factory and auth flows
-- `__init__.py` — CLI entrypoint: `run`, `logout`, `sync`, `serve`, `feedback`
+- `__init__.py` — CLI entrypoint: `logout`, `sync`, `serve`, `feedback`
 
 ### Dialog & Own-Message Substrate
 - `dialog_sync.py` — dialog snapshot synchronisation: bootstrap sweep + (Phase 43) reconciliation
@@ -61,7 +58,7 @@ MCP serving code uses daemon APIs and read-only DB access for lightweight querie
 - `formatter.py` — `format_messages()` with `[edited HH:mm]`, media, reactions
 - `pagination.py` — `NavigationToken`, `HistoryDirection` StrEnum, encode/decode
 - `errors.py` — structured error types
-- `server.py` — MCP stdio server; iterates `TOOL_REGISTRY` for tool listing
+- `server.py` — Streamable HTTP MCP server; iterates `TOOL_REGISTRY` for tool listing
 
 ### Deploy (`deploy/`)
 - `Dockerfile` — multi-stage build; default command is `mcp-telegram serve`
@@ -152,19 +149,16 @@ uv run pytest tests/test_daemon_api.py -v  # focused
 
 ```bash
 # Список доступных tools
-uv run python -m devtools.mcp_client.cli list-tools \
-  -- docker exec -i mcp-telegram mcp-telegram run
+uv run python -m devtools.mcp_client.cli list-tools
 
 # Разовый вызов tool'а
 uv run python -m devtools.mcp_client.cli call-tool \
   --name get_sync_status \
-  --arguments '{"dialog_id": 228055330}' \
-  -- docker exec -i mcp-telegram mcp-telegram run
+  --arguments '{"dialog_id": 228055330}'
 
 # Запуск smoke-теста из JSON-файла
 uv run python -m devtools.mcp_client.cli script \
-  --file devtools/mcp_client/smoke-integration.json \
-  -- docker exec -i mcp-telegram mcp-telegram run
+  --file devtools/mcp_client/smoke-integration.json
 ```
 
 Требует живого daemon (контейнер должен быть Healthy).

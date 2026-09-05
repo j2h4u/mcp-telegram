@@ -40,6 +40,7 @@ import contextvars
 import dataclasses
 import json
 import logging
+import re
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -78,9 +79,6 @@ from .daemon_account_trace import (
 )
 from .daemon_dialog_queries import (
     _COUNT_SYNCED_MESSAGES_SQL,
-    _GET_ACCESS_LOST_ALERTS_SQL,
-    _GET_DELETED_ALERTS_SQL,
-    _GET_EDIT_ALERTS_SQL,
     _GET_SYNC_STATUS_SQL,
     _LIST_TOPICS_SQL,
 )
@@ -97,6 +95,7 @@ from .important_events.read_model import list_important_events as read_important
 from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
 from .reading.query_records import read_message_from_row
+from .sync_alerts import SyncAlertTokenCodec, query_alerts
 from .sync_read_model import SyncStatus, build_sync_read_model
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
@@ -115,6 +114,107 @@ _ALL_ENTITY_NAMES_NORMALIZED_SQL = (
     "OR (type NOT IN ('User', 'Bot') AND updated_at > ?))"
 )
 _ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, type FROM entities WHERE username = ? COLLATE NOCASE"
+_TELEMETRY_OUTCOMES = frozenset({"success", "tool_error", "validation_error", "exception", "cancelled"})
+_TELEMETRY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def _telemetry_input_error(message: str) -> dict[str, object]:
+    return {"ok": False, "error": "invalid_input", "message": message}
+
+
+def _normalize_telemetry_outcome(event: dict[str, object]) -> tuple[str, str | None] | dict[str, object]:
+    raw_outcome = event.get("outcome")
+    if raw_outcome is None:
+        raw_outcome = "exception" if event.get("error_type") is not None else "success"
+    if not isinstance(raw_outcome, str) or raw_outcome not in _TELEMETRY_OUTCOMES:
+        return _telemetry_input_error("outcome is invalid")
+    raw_error_code = event.get("error_code")
+    if raw_outcome == "success":
+        normalized_error_code = None
+    elif isinstance(raw_error_code, str) and _TELEMETRY_ERROR_CODE_RE.fullmatch(raw_error_code):
+        normalized_error_code = raw_error_code
+    else:
+        normalized_error_code = raw_outcome if raw_outcome != "tool_error" else "tool_error"
+    return raw_outcome, normalized_error_code
+
+
+def _normalize_telemetry_event(
+    req: dict[str, object],
+) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+    event_obj = req.get("event")
+    if not isinstance(event_obj, dict):
+        return None, _telemetry_input_error("event must be a JSON object")
+    event = dict(cast(Mapping[str, object], event_obj))
+    tool_name = event.get("tool_name", "")
+    if not isinstance(tool_name, str) or len(tool_name) > _TELEMETRY_TOOL_NAME_MAX_LEN:
+        return None, _telemetry_input_error("tool_name must be a string (max 200 chars)")
+    event["tool_name"] = tool_name
+    return event, None
+
+
+def _telemetry_columns(conn: sqlite3.Connection) -> set[str]:
+    try:
+        rows = cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(telemetry_events)").fetchall())
+    except sqlite3.Error:
+        return set()
+    return {str(row[1]) for row in rows}
+
+
+def _insert_telemetry_row(
+    conn: sqlite3.Connection,
+    event: Mapping[str, object],
+    *,
+    legacy: bool,
+) -> None:
+    if legacy:
+        conn.execute(
+            "INSERT INTO telemetry_events "
+            "(tool_name, timestamp, duration_ms, result_count, "
+            "has_cursor, page_depth, has_filter, error_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event["tool_name"],
+                event.get("timestamp"),
+                event.get("duration_ms"),
+                event.get("result_count"),
+                event.get("has_cursor"),
+                event.get("page_depth"),
+                event.get("has_filter"),
+                event.get("error_type"),
+            ),
+        )
+        return
+    conn.execute(
+        "INSERT INTO telemetry_events "
+        "(tool_name, timestamp, duration_ms, result_count, "
+        "has_cursor, page_depth, has_filter, outcome, error_code, error_type) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            event["tool_name"],
+            event.get("timestamp"),
+            event.get("duration_ms"),
+            event.get("result_count"),
+            event.get("has_cursor"),
+            event.get("page_depth"),
+            event.get("has_filter"),
+            event["outcome"],
+            event["error_code"],
+            event.get("error_type"),
+        ),
+    )
+
+
+def _write_telemetry(
+    conn: sqlite3.Connection,
+    policy: DaemonApiPolicy,
+    event: Mapping[str, object],
+    *,
+    legacy: bool,
+) -> None:
+    _insert_telemetry_row(conn, event, legacy=legacy)
+    cutoff = time.time() - policy.telemetry_retention_ttl_seconds
+    conn.execute("DELETE FROM telemetry_events WHERE timestamp < ?", (cutoff,))
+    conn.commit()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -428,6 +528,7 @@ class DaemonAPIServer:
         self._policy = policy
         self._health_status = health_status
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
+        self._sync_alert_token_codec = SyncAlertTokenCodec()
 
     def _get_reading_service(self) -> ReadingService:
         """Get memoized reading-service instance with explicit daemon dependencies."""
@@ -1341,62 +1442,8 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _get_sync_alerts(self, req: dict[str, object]) -> dict:
-        """Return sync alerts: deleted messages, edit history, access-lost dialogs.
-
-        since: unix timestamp — only return alerts newer than this value (default 0).
-        limit: max items per category (default 50).
-        """
-        since = _coerce_int(req.get("since", 0), 0)
-        limit = _clamp(_coerce_int(req.get("limit", 50), 50), 1, 500)
-
-        deleted_rows = cast(
-            list[tuple[object, object, object, object]],
-            self._conn.execute(_GET_DELETED_ALERTS_SQL, (since, limit)).fetchall(),
-        )
-        deleted_messages = [
-            {
-                "dialog_id": r[0],
-                "message_id": r[1],
-                "text": r[2],
-                "deleted_at": r[3],
-            }
-            for r in deleted_rows
-        ]
-
-        edit_rows = cast(
-            list[tuple[object, object, object, object, object]],
-            self._conn.execute(_GET_EDIT_ALERTS_SQL, (since, limit)).fetchall(),
-        )
-        edits = [
-            {
-                "dialog_id": r[0],
-                "message_id": r[1],
-                "version": r[2],
-                "old_text": r[3],
-                "edit_date": r[4],
-            }
-            for r in edit_rows
-        ]
-
-        access_lost_rows = cast(
-            list[tuple[object, object]], self._conn.execute(_GET_ACCESS_LOST_ALERTS_SQL, (since,)).fetchall()
-        )
-        access_lost = [
-            {
-                "dialog_id": r[0],
-                "access_lost_at": r[1],
-            }
-            for r in access_lost_rows
-        ]
-
-        return {
-            "ok": True,
-            "data": {
-                "deleted_messages": deleted_messages,
-                "edits": edits,
-                "access_lost": access_lost,
-            },
-        }
+        """Return one globally ordered, snapshot-bounded sync-alert page."""
+        return query_alerts(self._conn, req, self._sync_alert_token_codec)
 
     # ------------------------------------------------------------------
     # get_entity_info
@@ -1472,33 +1519,18 @@ class DaemonAPIServer:
 
         Evicts rows older than the configured retention window on every write.
         """
-        event_obj = req.get("event")
-        if not isinstance(event_obj, dict):
-            return {"ok": False, "error": "invalid_input", "message": "event must be a JSON object"}
-        event = cast(Mapping[str, object], event_obj)
-        tool_name = event.get("tool_name", "")
-        if not isinstance(tool_name, str) or len(tool_name) > _TELEMETRY_TOOL_NAME_MAX_LEN:
-            return {"ok": False, "error": "invalid_input", "message": "tool_name must be a string (max 200 chars)"}
+        event, error = _normalize_telemetry_event(req)
+        if error is not None:
+            return error
+        assert event is not None
+        legacy = not {"outcome", "error_code"} <= _telemetry_columns(self._conn)
+        if not legacy:
+            outcome = _normalize_telemetry_outcome(event)
+            if isinstance(outcome, dict):
+                return outcome
+            event["outcome"], event["error_code"] = outcome
         try:
-            self._conn.execute(
-                "INSERT INTO telemetry_events "
-                "(tool_name, timestamp, duration_ms, result_count, "
-                "has_cursor, page_depth, has_filter, error_type) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    tool_name,
-                    event.get("timestamp"),
-                    event.get("duration_ms"),
-                    event.get("result_count"),
-                    event.get("has_cursor"),
-                    event.get("page_depth"),
-                    event.get("has_filter"),
-                    event.get("error_type"),
-                ),
-            )
-            cutoff = time.time() - self._policy.telemetry_retention_ttl_seconds
-            self._conn.execute("DELETE FROM telemetry_events WHERE timestamp < ?", (cutoff,))
-            self._conn.commit()
+            _write_telemetry(self._conn, self._policy, event, legacy=legacy)
             return {"ok": True}
         except Exception as exc:
             logger.exception("record_telemetry failed: %s", exc)

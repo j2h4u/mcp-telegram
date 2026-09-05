@@ -1,6 +1,8 @@
 import logging
+import typing as t
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import TypedDict
 
 from pydantic import Field
 
@@ -29,6 +31,20 @@ from ._base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _GetSyncAlertsKwargs(TypedDict, total=False):
+    since: int
+    limit: int
+    page_limit: int
+    navigation: str
+
+
+class _SyncAlertMetadata(TypedDict):
+    result_count: int
+    has_cursor: bool
+    page_depth: int
+    has_filter: bool
 
 
 MARK_DIALOG_FOR_SYNC_OUTPUT_SCHEMA = {
@@ -210,6 +226,8 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                     "version": {"type": ["integer", "null"]},
                     "edit_date": {"type": ["integer", "null"]},
                     "access_lost_at": {"type": ["integer", "null"]},
+                    "occurred_at": {"type": ["integer", "null"]},
+                    "source_id": {"type": ["integer", "null"]},
                     "severity": {"type": "string"},
                     "message": {"type": "string"},
                     "action": {"type": ["string", "null"]},
@@ -222,6 +240,8 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                     "version",
                     "edit_date",
                     "access_lost_at",
+                    "occurred_at",
+                    "source_id",
                     "severity",
                     "message",
                     "action",
@@ -230,6 +250,7 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
             },
         },
         "deleted_messages": {
+            "description": "Deprecated compatibility projection; use alerts.",
             "type": "array",
             "items": {
                 "type": "object",
@@ -244,6 +265,7 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
             },
         },
         "edits": {
+            "description": "Deprecated compatibility projection; use alerts.",
             "type": "array",
             "items": {
                 "type": "object",
@@ -259,6 +281,7 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
             },
         },
         "access_lost": {
+            "description": "Deprecated compatibility projection; use alerts.",
             "type": "array",
             "items": {
                 "type": "object",
@@ -272,6 +295,7 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
             },
         },
         "counts": {
+            "description": "Deprecated compatibility projection; counts apply to the current alerts page.",
             "type": "object",
             "properties": {
                 "deleted_messages": {"type": "integer"},
@@ -282,13 +306,20 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
             "required": ["deleted_messages", "edits", "access_lost", "total"],
             "additionalProperties": False,
         },
-        "count": {"type": "integer"},
+        "count": {"type": "integer", "description": "Deprecated compatibility count for the current alerts page."},
         "since": {"type": "integer"},
-        "limit": {"type": "integer"},
+        "limit": {"type": "integer", "description": "Deprecated page-size alias; use page_limit."},
+        "page_limit": {"type": "integer", "description": "Effective page size."},
+        "has_more": {"type": "boolean"},
+        "next_navigation": {"type": ["string", "null"]},
+        "snapshot_upper_event_at": {"type": "integer"},
+        "result_count_semantics": {"type": "string"},
+        "page_depth": {"type": "integer"},
         "limited_by": {
             "type": "object",
             "properties": {
                 "deleted_messages": {
+                    "description": "Deprecated compatibility projection; use alerts.",
                     "type": "object",
                     "properties": {
                         "since": {"type": "integer"},
@@ -298,6 +329,7 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                     "additionalProperties": False,
                 },
                 "edits": {
+                    "description": "Deprecated compatibility projection; use alerts.",
                     "type": "object",
                     "properties": {
                         "since": {"type": "integer"},
@@ -307,10 +339,11 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                     "additionalProperties": False,
                 },
                 "access_lost": {
+                    "description": "Deprecated compatibility projection; use alerts.",
                     "type": "object",
                     "properties": {
                         "since": {"type": "integer"},
-                        "limit": {"type": "null"},
+                        "limit": {"type": ["integer", "null"]},
                     },
                     "required": ["since", "limit"],
                     "additionalProperties": False,
@@ -464,17 +497,67 @@ def _sync_read_model_error(detail: str) -> ToolResult:
 
 
 class GetSyncAlerts(ToolArgs):
-    """Audit what changed in synced dialogs: deleted messages (text preserved), edit history,
+    """Audit what changed in synced dialogs: deleted messages, edit history,
     and dialogs where access was lost after syncing.
 
     Use when investigating anomalies — e.g. after GetSyncStatus shows access_lost, or to
     audit what was deleted or silently edited since a given timestamp.
-    Use since= (unix timestamp) to scope alerts to a time window. Default since=0 returns all.
-    Deleted messages include the last known text before deletion.
-    Edit history shows previous versions of edited messages."""
+    Use since= (unix timestamp) to scope alerts to a time window. Default since=0 starts a full paginated traversal.
+    The MCP response intentionally exposes metadata only (IDs, timestamps,
+    kind, severity, and action); message text and prior text are not returned.
+    New events above a cursor snapshot are excluded; late historical backfills
+    at or before that snapshot can be omitted from an in-progress traversal.
+    Results follow immutable newest-observed sequence order; occurred_at remains
+    the source fact time, so historical reconstruction is deterministic."""
 
-    since: int = Field(default=0, description="Unix timestamp — only return alerts after this time. Default 0 = all.")
-    limit: int = Field(default=50, description="Maximum deleted messages and edits to return. Default 50.")
+    since: int = Field(
+        default=0,
+        ge=0,
+        strict=True,
+        description=(
+            "Unix timestamp — only return alerts after this time. Must be >= 0; default 0 starts a full paginated traversal. "
+            "New events above a cursor snapshot are excluded; late historical backfills at or before it can be omitted. "
+            "Continue with next_navigation until has_more is false."
+        ),
+    )
+    limit: int = Field(
+        default=50,
+        ge=1,
+        le=500,
+        strict=True,
+        description="Deprecated page-size alias; must be 1..500. Use page_limit for new callers.",
+    )
+    page_limit: int | None = Field(
+        default=None,
+        ge=1,
+        le=500,
+        strict=True,
+        description="Optional canonical page size, 1..500. When supplied it is effective.",
+    )
+    navigation: str | None = Field(
+        default=None,
+        description="Opaque daemon-signed cursor returned as next_navigation.",
+    )
+
+
+@dataclass
+class _SyncAlertPage:
+    alerts: list[dict[str, object]]
+    deleted: list[dict[str, object]]
+    edits: list[dict[str, object]]
+    access: list[dict[str, object]]
+    since: object
+    limit: object
+    page_limit: object
+    limited_by: object
+    has_more: bool = False
+    next_navigation: object = None
+    snapshot_upper_event_at: object = 0
+    result_count_semantics: object = "count=len(alerts)=sum(counts)"
+    page_depth: int = 1
+    has_cursor: bool = False
+    has_filter: bool = False
+    include_pagination: bool = False
 
 
 def _as_int(value: object) -> int:
@@ -502,6 +585,268 @@ def _alert_timestamp(alert: dict[str, object]) -> tuple[int, int, int, str]:
     )
 
 
+def _sync_alert_metadata(args: GetSyncAlerts) -> _SyncAlertMetadata:
+    return {
+        "result_count": 0,
+        "has_cursor": args.navigation is not None,
+        "page_depth": 1,
+        "has_filter": args.since > 0,
+    }
+
+
+def _sync_alert_kwargs(args: GetSyncAlerts) -> _GetSyncAlertsKwargs:
+    supplied = args.model_fields_set
+    kwargs: _GetSyncAlertsKwargs = {}
+    if "since" in supplied:
+        kwargs["since"] = args.since
+    if "limit" in supplied:
+        kwargs["limit"] = args.limit
+    if "page_limit" in supplied and args.page_limit is not None:
+        kwargs["page_limit"] = args.page_limit
+    if "navigation" in supplied and args.navigation is not None:
+        kwargs["navigation"] = args.navigation
+    return kwargs
+
+
+async def _fetch_sync_alerts(args: GetSyncAlerts) -> dict[str, object]:
+    async with daemon_connection() as conn:
+        return await conn.get_sync_alerts(**_sync_alert_kwargs(args))
+
+
+def _sync_alert_response_error(response: Mapping[str, object], metadata: _SyncAlertMetadata) -> ToolResult | None:
+    if response.get("error") == "invalid_navigation":
+        return _check_daemon_response(
+            response,
+            action="Retry get_sync_alerts without navigation to start a new traversal; repeat the same since value when one was supplied.",
+            **metadata,
+        )
+    return _check_daemon_response(response, **metadata)
+
+
+def _canonical_deleted(alerts: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        {
+            "dialog_id": item.get("dialog_id"),
+            "message_id": item.get("message_id"),
+            "deleted_at": item.get("deleted_at"),
+            "action": item.get("action")
+            or "Inspect the dialog history around this message id if surrounding context is needed.",
+        }
+        for item in alerts
+        if item.get("kind") == "deleted_message"
+    ]
+
+
+def _canonical_edits(alerts: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        {
+            "dialog_id": item.get("dialog_id"),
+            "message_id": item.get("message_id"),
+            "version": item.get("version"),
+            "edit_date": item.get("edit_date"),
+            "action": item.get("action")
+            or "Treat cached text as versioned; inspect edit history before relying on older wording.",
+        }
+        for item in alerts
+        if item.get("kind") == "edit"
+    ]
+
+
+def _canonical_access(alerts: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        {
+            "dialog_id": item.get("dialog_id"),
+            "access_lost_at": item.get("access_lost_at"),
+            "action": item.get("action") or "Use get_sync_status for coverage details.",
+        }
+        for item in alerts
+        if item.get("kind") == "access_lost"
+    ]
+
+
+def _canonical_alerts(
+    data: dict[str, object],
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    raw_alerts = [item for item in t.cast(list[object], data["alerts"]) if isinstance(item, dict)]
+    alerts = [{key: value for key, value in item.items() if key not in {"text", "old_text"}} for item in raw_alerts]
+    return alerts, _canonical_deleted(alerts), _canonical_edits(alerts), _canonical_access(alerts)
+
+
+def _alert_result(page: _SyncAlertPage) -> ToolResult:
+    structured_content: dict[str, object] = {
+        "alerts": page.alerts,
+        "deleted_messages": page.deleted,
+        "edits": page.edits,
+        "access_lost": page.access,
+        "counts": {
+            "deleted_messages": len(page.deleted),
+            "edits": len(page.edits),
+            "access_lost": len(page.access),
+            "total": len(page.alerts),
+        },
+        "count": len(page.alerts),
+        "since": page.since,
+        "limit": page.limit,
+        "limited_by": page.limited_by,
+    }
+    if page.include_pagination:
+        structured_content.update(
+            {
+                "page_limit": page.page_limit,
+                "has_more": page.has_more,
+                "next_navigation": page.next_navigation,
+                "snapshot_upper_event_at": page.snapshot_upper_event_at,
+                "result_count_semantics": page.result_count_semantics,
+            }
+        )
+    return structured_result(
+        structured_content,
+        result_count=len(page.alerts),
+        has_cursor=page.has_cursor,
+        page_depth=page.page_depth,
+        has_filter=page.has_filter,
+    )
+
+
+def _canonical_alert_result(data: dict[str, object], args: GetSyncAlerts) -> ToolResult:
+    alerts, deleted, edits, access = _canonical_alerts(data)
+    page_limit = data.get("page_limit", args.page_limit or args.limit)
+    fallback_limit = args.page_limit or args.limit
+    return _alert_result(
+        _SyncAlertPage(
+            alerts,
+            deleted,
+            edits,
+            access,
+            data.get("since", args.since),
+            data.get("limit", args.limit),
+            page_limit,
+            data.get(
+                "limited_by",
+                {
+                    "deleted_messages": {"since": args.since, "limit": fallback_limit},
+                    "edits": {"since": args.since, "limit": fallback_limit},
+                    "access_lost": {"since": args.since, "limit": fallback_limit},
+                },
+            ),
+            has_more=bool(data.get("has_more", False)),
+            next_navigation=data.get("next_navigation"),
+            snapshot_upper_event_at=data.get("snapshot_upper_event_at", 0),
+            result_count_semantics=data.get("result_count_semantics", "count=len(alerts)=sum(counts)"),
+            page_depth=int(t.cast(str | int, data.get("page_depth", 1))),
+            has_cursor=args.navigation is not None or bool(data.get("next_navigation")),
+            has_filter=_as_int(data.get("since", args.since)) > 0,
+            include_pagination=True,
+        )
+    )
+
+
+def _legacy_alert_result(data: object, args: GetSyncAlerts) -> ToolResult:
+    data = t.cast(Mapping[str, object], data)
+    deleted = data.get("deleted_messages", [])
+    edits = data.get("edits", [])
+    access_lost = data.get("access_lost", [])
+    alerts: list[dict[str, object]] = []
+    deleted_messages: list[dict[str, object]] = []
+    edit_alerts: list[dict[str, object]] = []
+    access_lost_alerts: list[dict[str, object]] = []
+    if deleted:
+        for item in t.cast(list[Mapping[str, object]], deleted):
+            action = "Inspect the dialog history around this message id if surrounding context is needed."
+            deleted_messages.append(
+                {
+                    "dialog_id": item.get("dialog_id"),
+                    "message_id": item.get("message_id"),
+                    "deleted_at": item.get("deleted_at"),
+                    "action": action,
+                }
+            )
+            alerts.append(
+                {
+                    "kind": "deleted_message",
+                    "dialog_id": item.get("dialog_id"),
+                    "message_id": item.get("message_id"),
+                    "deleted_at": item.get("deleted_at"),
+                    "version": None,
+                    "edit_date": None,
+                    "access_lost_at": None,
+                    "severity": "medium",
+                    "message": f"Deleted message msg={item['message_id']} deleted_at={item['deleted_at']}",
+                    "action": action,
+                }
+            )
+    if edits:
+        for item in t.cast(list[Mapping[str, object]], edits):
+            action = "Treat cached text as versioned; inspect edit history before relying on older wording."
+            edit_alerts.append(
+                {
+                    "dialog_id": item.get("dialog_id"),
+                    "message_id": item.get("message_id"),
+                    "version": item.get("version"),
+                    "edit_date": item.get("edit_date"),
+                    "action": action,
+                }
+            )
+            alerts.append(
+                {
+                    "kind": "edit",
+                    "dialog_id": item.get("dialog_id"),
+                    "message_id": item.get("message_id"),
+                    "deleted_at": None,
+                    "version": item.get("version"),
+                    "edit_date": item.get("edit_date"),
+                    "access_lost_at": None,
+                    "severity": "low",
+                    "message": f"Edited message msg={item['message_id']} v{item['version']} edit_date={item['edit_date']}",
+                    "action": action,
+                }
+            )
+    if access_lost:
+        for item in t.cast(list[Mapping[str, object]], access_lost):
+            action = "Use get_sync_status for coverage details."
+            access_lost_alerts.append(
+                {
+                    "dialog_id": item.get("dialog_id"),
+                    "access_lost_at": item.get("access_lost_at"),
+                    "action": action,
+                }
+            )
+            alerts.append(
+                {
+                    "kind": "access_lost",
+                    "dialog_id": item.get("dialog_id"),
+                    "message_id": None,
+                    "deleted_at": None,
+                    "version": None,
+                    "edit_date": None,
+                    "access_lost_at": item.get("access_lost_at"),
+                    "severity": "high",
+                    "message": f"Access lost at {item.get('access_lost_at')}",
+                    "action": action,
+                }
+            )
+    for values in (deleted_messages, edit_alerts, access_lost_alerts, alerts):
+        values.sort(key=_alert_timestamp)
+    return _alert_result(
+        _SyncAlertPage(
+            alerts,
+            deleted_messages,
+            edit_alerts,
+            access_lost_alerts,
+            args.since,
+            args.limit,
+            args.limit,
+            {
+                "deleted_messages": {"since": args.since, "limit": args.limit},
+                "edits": {"since": args.since, "limit": args.limit},
+                "access_lost": {"since": args.since, "limit": None},
+            },
+            has_cursor=args.navigation is not None,
+            has_filter=args.since > 0,
+        )
+    )
+
+
 @mcp_tool(
     name="get_sync_alerts",
     title="Sync Alerts",
@@ -515,129 +860,21 @@ def _alert_timestamp(alert: dict[str, object]) -> tuple[int, int, int, str]:
     output_schema=GET_SYNC_ALERTS_OUTPUT_SCHEMA,
 )
 async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
+    error_metadata = _sync_alert_metadata(args)
     try:
-        async with daemon_connection() as conn:
-            response = await conn.get_sync_alerts(since=args.since, limit=args.limit)
+        response = await _fetch_sync_alerts(args)
     except DaemonNotRunningError as exc:
-        return error_result(_daemon_not_running_text(exc))
+        return error_result(_daemon_not_running_text(exc), **error_metadata)
 
-    if err := _check_daemon_response(response):
+    err = _sync_alert_response_error(response, error_metadata)
+    if err:
         return err
 
     data = response.get("data", {})
-    deleted = data.get("deleted_messages", [])
-    edits = data.get("edits", [])
-    access_lost = data.get("access_lost", [])
-
-    alerts: list[dict[str, object]] = []
-    deleted_messages: list[dict[str, object]] = []
-    edit_alerts: list[dict[str, object]] = []
-    access_lost_alerts: list[dict[str, object]] = []
-
-    if deleted:
-        for d in deleted:
-            message = f"Deleted message msg={d['message_id']} deleted_at={d['deleted_at']}"
-            action = "Inspect the dialog history around this message id if surrounding context is needed."
-            deleted_messages.append(
-                {
-                    "dialog_id": d.get("dialog_id"),
-                    "message_id": d.get("message_id"),
-                    "deleted_at": d.get("deleted_at"),
-                    "action": action,
-                }
-            )
-            alerts.append(
-                {
-                    "kind": "deleted_message",
-                    "dialog_id": d.get("dialog_id"),
-                    "message_id": d.get("message_id"),
-                    "deleted_at": d.get("deleted_at"),
-                    "version": None,
-                    "edit_date": None,
-                    "access_lost_at": None,
-                    "severity": "medium",
-                    "message": message,
-                    "action": action,
-                }
-            )
-
-    if edits:
-        for e in edits:
-            message = f"Edited message msg={e['message_id']} v{e['version']} edit_date={e['edit_date']}"
-            action = "Treat cached text as versioned; inspect edit history before relying on older wording."
-            edit_alerts.append(
-                {
-                    "dialog_id": e.get("dialog_id"),
-                    "message_id": e.get("message_id"),
-                    "version": e.get("version"),
-                    "edit_date": e.get("edit_date"),
-                    "action": action,
-                }
-            )
-            alerts.append(
-                {
-                    "kind": "edit",
-                    "dialog_id": e.get("dialog_id"),
-                    "message_id": e.get("message_id"),
-                    "deleted_at": None,
-                    "version": e.get("version"),
-                    "edit_date": e.get("edit_date"),
-                    "access_lost_at": None,
-                    "severity": "low",
-                    "message": message,
-                    "action": action,
-                }
-            )
-
-    if access_lost:
-        for a in access_lost:
-            action = "Use get_sync_status for coverage details."
-            access_lost_alerts.append(
-                {
-                    "dialog_id": a.get("dialog_id"),
-                    "access_lost_at": a.get("access_lost_at"),
-                    "action": action,
-                }
-            )
-            alerts.append(
-                {
-                    "kind": "access_lost",
-                    "dialog_id": a.get("dialog_id"),
-                    "message_id": None,
-                    "deleted_at": None,
-                    "version": None,
-                    "edit_date": None,
-                    "access_lost_at": a.get("access_lost_at"),
-                    "severity": "high",
-                    "message": f"Access lost at {a.get('access_lost_at')}",
-                    "action": action,
-                }
-            )
-
-    deleted_messages.sort(key=_alert_timestamp)
-    edit_alerts.sort(key=_alert_timestamp)
-    access_lost_alerts.sort(key=_alert_timestamp)
-    alerts.sort(key=_alert_timestamp)
-
-    structured_content = {
-        "alerts": alerts,
-        "deleted_messages": deleted_messages,
-        "edits": edit_alerts,
-        "access_lost": access_lost_alerts,
-        "counts": {
-            "deleted_messages": len(deleted_messages),
-            "edits": len(edit_alerts),
-            "access_lost": len(access_lost_alerts),
-            "total": len(alerts),
-        },
-        "count": len(alerts),
-        "since": args.since,
-        "limit": args.limit,
-        "limited_by": {
-            "deleted_messages": {"since": args.since, "limit": args.limit},
-            "edits": {"since": args.since, "limit": args.limit},
-            "access_lost": {"since": args.since, "limit": None},
-        },
-    }
-
-    return structured_result(structured_content, result_count=len(alerts))
+    if (
+        isinstance(data, dict)
+        and isinstance(data.get("alerts"), list)
+        and ("page_limit" in data or "next_navigation" in data)
+    ):
+        return _canonical_alert_result(data, args)
+    return _legacy_alert_result(data, args)

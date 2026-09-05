@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock
 from urllib.parse import urlparse
 
 import pytest
-from jsonschema import validate
+from jsonschema import ValidationError, validate
 from mcp.types import CallToolResult, Prompt, TextContent, Tool
 
 from mcp_telegram import server
@@ -164,6 +164,25 @@ async def test_call_tool_validation_rejects_conflicting_list_messages_selectors(
     assert "exact_dialog_id" in message
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "expected_fragment"),
+    [
+        ("search_messages", {"query": "😀👍"}, "Cyrillic or Latin letter or ASCII digit"),
+        ("trace_account_messages", {"exact_account_id": True}, "exact_account_id"),
+    ],
+)
+async def test_public_tools_reject_invalid_boundary_arguments(
+    tool_name: str,
+    arguments: dict[str, object],
+    expected_fragment: str,
+) -> None:
+    result = _call_tool_result(await server.call_tool(tool_name, arguments))
+
+    assert result.is_error is True
+    assert expected_fragment in _call_tool_text(result)
+
+
 def test_search_messages_reflection_exposes_shared_navigation_schema() -> None:
     tool = server.tool_by_name["search_messages"]
     properties = cast(dict[str, object], _tool_input_schema(tool)["properties"])
@@ -179,6 +198,57 @@ def test_search_messages_reflection_exposes_shared_navigation_schema() -> None:
     assert navigation["type"] == "string"
     assert "first search page" in cast(str, navigation["description"])
     assert "next_navigation" in cast(str, navigation["description"])
+    query = cast(dict[str, object], properties["query"])
+    assert query["pattern"] == r"[A-Za-z0-9А-Яа-яЁё]"
+    assert "Cyrillic or Latin letter or ASCII digit" in cast(str, query["description"])
+
+
+@pytest.mark.parametrize("query", ["", "  ", "!!!", "😀👍"])
+def test_search_query_schema_rejects_unsearchable_values(query: str) -> None:
+    schema = _tool_input_schema(server.tool_by_name["search_messages"])
+    with pytest.raises(ValidationError):
+        validate({"query": query}, schema)
+
+
+@pytest.mark.asyncio
+async def test_search_invalid_query_preserves_error_code_and_telemetry_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mock_conn = AsyncMock()
+    mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_conn.__aexit__ = AsyncMock(return_value=False)
+    mock_conn.search_messages = AsyncMock(
+        return_value={
+            "ok": False,
+            "error": "invalid_query",
+            "message": "query has no searchable token",
+        }
+    )
+
+    @asynccontextmanager
+    async def _connection():
+        yield mock_conn
+
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", _connection)
+    send_mock = AsyncMock()
+    monkeypatch.setattr(server, "_send_telemetry_event", send_mock)
+    server._telemetry_tasks.clear()
+
+    result = _call_tool_result(await server.call_tool("search_messages", {"query": "needle"}))
+    await server.flush_telemetry()
+
+    assert result.is_error is True
+    assert send_mock.await_count == 1
+    assert send_mock.await_args is not None
+    event = cast(dict[str, object], send_mock.await_args.args[0])
+    assert event["outcome"] == "tool_error"
+    assert event["error_code"] == "invalid_query"
+
+
+@pytest.mark.parametrize("query", ["hello", "мир", "123"])
+def test_search_query_schema_accepts_searchable_values(query: str) -> None:
+    schema = _tool_input_schema(server.tool_by_name["search_messages"])
+    validate({"query": query}, schema)
 
 
 @pytest.mark.asyncio
@@ -254,6 +324,177 @@ async def test_call_tool_passthrough_recoverable_error_text_contract(
     assert _call_tool_text(result) == expected[0].text
     assert "Action:" in _call_tool_text(result)
     assert "failed" not in _call_tool_text(result)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_emits_one_boundary_telemetry_event_with_result_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
+    monkeypatch.setattr(
+        "mcp_telegram.server.tools.tool_runner",
+        AsyncMock(return_value=ToolResult(result_count=7, has_cursor=True, page_depth=3, has_filter=True)),
+    )
+    send_mock = AsyncMock()
+    monkeypatch.setattr(server, "_send_telemetry_event", send_mock)
+    server._telemetry_tasks.clear()
+
+    result = _call_tool_result(await server.call_tool("list_dialogs", {}))
+    await server.flush_telemetry()
+
+    assert result.is_error is False
+    send_mock.assert_awaited_once()
+    assert send_mock.await_args is not None
+    event = cast(dict[str, object], send_mock.await_args.args[0])
+    assert event["outcome"] == "success"
+    assert event["error_code"] is None
+    assert event["error_type"] is None
+    assert event["result_count"] == 7
+    assert event["has_cursor"] is True
+    assert event["page_depth"] == 3
+    assert event["has_filter"] is True
+
+
+@pytest.mark.asyncio
+async def test_call_tool_validation_telemetry_has_no_arguments_or_error_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
+
+    def _raise_validation_error(tool: Tool, **kwargs: object) -> object:
+        raise ValueError("secret argument text")
+
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_args", _raise_validation_error)
+    send_mock = AsyncMock()
+    monkeypatch.setattr(server, "_send_telemetry_event", send_mock)
+    server._telemetry_tasks.clear()
+
+    result = _call_tool_result(await server.call_tool("list_dialogs", {"secret": "telegram content"}))
+    await server.flush_telemetry()
+
+    assert result.is_error is True
+    send_mock.assert_awaited_once()
+    assert send_mock.await_args is not None
+    event = cast(dict[str, object], send_mock.await_args.args[0])
+    assert event["outcome"] == "validation_error"
+    assert event["error_code"] == "validation_error"
+    assert "secret" not in str(event)
+    assert "telegram content" not in str(event)
+    assert "secret argument text" not in str(event)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_records_tool_error_code_without_parsing_response_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
+    monkeypatch.setattr(
+        "mcp_telegram.server.tools.tool_runner",
+        AsyncMock(
+            return_value=ToolResult(
+                content=[TextContent(type="text", text="error=secret")], is_error=True, error_code="dialog_not_found"
+            )
+        ),
+    )
+    send_mock = AsyncMock()
+    monkeypatch.setattr(server, "_send_telemetry_event", send_mock)
+    server._telemetry_tasks.clear()
+
+    result = _call_tool_result(await server.call_tool("list_dialogs", {}))
+    await server.flush_telemetry()
+
+    assert result.is_error is True
+    assert send_mock.await_args is not None
+    event = cast(dict[str, object], send_mock.await_args.args[0])
+    assert event["outcome"] == "tool_error"
+    assert event["error_code"] == "dialog_not_found"
+    assert "secret" not in str(event)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_records_cancellation_once_and_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
+    started = asyncio.Event()
+
+    async def _wait_forever(_args: object) -> ToolResult:
+        started.set()
+        await asyncio.Future()
+        return ToolResult()
+
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_runner", _wait_forever)
+    send_mock = AsyncMock()
+    monkeypatch.setattr(server, "_send_telemetry_event", send_mock)
+    server._telemetry_tasks.clear()
+
+    call = asyncio.create_task(server.call_tool("list_dialogs", {}))
+    await started.wait()
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    await server.flush_telemetry()
+
+    send_mock.assert_awaited_once()
+    assert send_mock.await_args is not None
+    event = cast(dict[str, object], send_mock.await_args.args[0])
+    assert event["outcome"] == "cancelled"
+    assert event["error_code"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_flush_telemetry_cancels_delivery_after_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    release = asyncio.Event()
+
+    async def _blocked(_event: dict[str, object]) -> None:
+        await release.wait()
+
+    monkeypatch.setattr(server, "_send_telemetry_event", _blocked)
+    server._telemetry_tasks.clear()
+    server._schedule_telemetry({"tool_name": "slow"})
+    await server.flush_telemetry(timeout_seconds=0)
+
+    assert not server._telemetry_tasks
+
+
+@pytest.mark.asyncio
+async def test_submit_feedback_type_error_is_boundary_validation_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    send_mock = AsyncMock()
+    monkeypatch.setattr(server, "_send_telemetry_event", send_mock)
+    server._telemetry_tasks.clear()
+
+    result = _call_tool_result(await server.call_tool("submit_feedback", {"message": 123}))
+    await server.flush_telemetry()
+
+    assert result.is_error is True
+    send_mock.assert_awaited_once()
+    assert send_mock.await_args is not None
+    event = cast(dict[str, object], send_mock.await_args.args[0])
+    assert event["outcome"] == "validation_error"
+    assert event["error_code"] == "validation_error"
+
+
+@pytest.mark.asyncio
+async def test_malformed_runner_result_is_safe_exception_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_runner", AsyncMock(return_value={}))
+    send_mock = AsyncMock()
+    monkeypatch.setattr(server, "_send_telemetry_event", send_mock)
+    server._telemetry_tasks.clear()
+
+    result = _call_tool_result(await server.call_tool("list_dialogs", {}))
+    await server.flush_telemetry()
+
+    assert result.is_error is True
+    assert "runtime" in _call_tool_text(result).lower()
+    send_mock.assert_awaited_once()
+    assert send_mock.await_args is not None
+    event = cast(dict[str, object], send_mock.await_args.args[0])
+    assert event["outcome"] == "exception"
+    assert event["error_code"] == "exception"
+    assert event["result_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -547,35 +788,6 @@ async def test_get_prompt_returns_telegram_workflows_guide() -> None:
     assert "best_effort_visible" in text
     assert "not_synced" in text
     assert "own_only" in text
-
-
-@pytest.mark.asyncio
-async def test_run_mcp_server_invokes_stdio_transport(monkeypatch: pytest.MonkeyPatch) -> None:
-    from contextlib import asynccontextmanager
-
-    calls = {"enter": 0, "exit": 0, "run": 0}
-
-    @asynccontextmanager
-    async def fake_stdio_server():
-        calls["enter"] += 1
-        yield object(), object()
-        calls["exit"] += 1
-
-    async def fake_run(*_args: object, **_kwargs: object) -> None:
-        calls["run"] += 1
-
-    monkeypatch.setattr("mcp.server.stdio.stdio_server", fake_stdio_server)
-    monkeypatch.setattr(server.app, "run", fake_run)
-    monkeypatch.setattr(server.app, "create_initialization_options", lambda: "INIT")
-    monkeypatch.setattr("logging.basicConfig", lambda *args, **kwargs: None)
-    monkeypatch.setattr("mcp_telegram.server._build_server_instructions", AsyncMock(return_value="Built"))
-
-    await server.run_mcp_server()
-
-    assert calls["enter"] == 1
-    assert calls["exit"] == 1
-    assert calls["run"] == 1
-    assert server.app.instructions == "Built"
 
 
 class _FakeTransportSecuritySettings:
@@ -1183,6 +1395,10 @@ def test_primary_tools_have_core_read_search_schema() -> None:
     trace_account = server.tool_by_name["trace_account_messages"]
     trace_props = cast(dict[str, object], _tool_input_schema(trace_account)["properties"])
     assert "exact_account_id" in trace_props, "trace_account_messages missing exact_account_id"
+    exact_account_schema = cast(dict[str, object], trace_props["exact_account_id"])
+    assert exact_account_schema["type"] == "integer"
+    assert exact_account_schema["minimum"] == 1
+    assert exact_account_schema["maximum"] == 9223372036854775807
     assert "exact_topic_id" in trace_props, "trace_account_messages missing exact_topic_id"
     assert "coverage_goal" in trace_props, "trace_account_messages missing coverage_goal"
 

@@ -1,52 +1,24 @@
 # MCP Test Client
 
-Small MCP client for local regression testing.
-
-Usage:
-
-```bash
-uv run python -m devtools.mcp_client.cli list-tools -- docker exec -i mcp-telegram mcp-telegram run
-```
+Small Streamable HTTP MCP client for local regression testing. It connects to
+`http://127.0.0.1:3100/mcp` by default; use `--url` to select another endpoint.
 
 ```bash
-uv run python -m devtools.mcp_client.cli list-prompts -- docker exec -i mcp-telegram mcp-telegram run
-```
-
-```bash
-uv run python -m devtools.mcp_client.cli get-prompt \
-  --name telegram_workflows \
-  -- docker exec -i mcp-telegram mcp-telegram run
-```
-
-Streamable HTTP:
-
-```bash
-uv run python -m devtools.mcp_client.cli list-tools --url http://127.0.0.1:3100/mcp
-```
-
-```bash
+uv run python -m devtools.mcp_client.cli list-tools
+uv run python -m devtools.mcp_client.cli list-prompts
+uv run python -m devtools.mcp_client.cli get-prompt --name telegram_workflows
 uv run python -m devtools.mcp_client.cli call-tool \
   --name list_topics \
-  --arguments '{"dialog":"Studio Robots and Inbox"}' \
-  -- docker exec -i mcp-telegram mcp-telegram run
+  --arguments '{"dialog":"Studio Robots and Inbox"}'
 ```
 
 ## Smoke Tests
 
-Two smoke scripts cover all registered MCP tools:
+Run the integration smoke against the live HTTP service:
 
-**No-daemon smoke** — schema validation + graceful degradation (after every build):
 ```bash
 uv run python -m devtools.mcp_client.cli script \
-  --file devtools/mcp_client/smoke-no-daemon.json \
-  -- docker exec -i mcp-telegram mcp-telegram run
-```
-
-**Integration smoke** — real Telegram data (requires running daemon):
-```bash
-uv run python -m devtools.mcp_client.cli script \
-  --file devtools/mcp_client/smoke-integration.json \
-  -- docker exec -i mcp-telegram mcp-telegram run
+  --file devtools/mcp_client/smoke-integration.json
 ```
 
 ## Script Format
@@ -59,29 +31,10 @@ Run several actions in one MCP session:
     {"action": "list_tools"},
     {"action": "list_prompts"},
     {"action": "get_prompt", "name": "telegram_workflows"},
-    {
-      "action": "call_tool",
-      "name": "list_dialogs",
-      "arguments": {}
-    }
+    {"action": "call_tool", "name": "list_dialogs", "arguments": {}}
   ]
 }
 ```
 
-```bash
-uv run python -m devtools.mcp_client.cli script \
-  --file devtools/mcp_client/your-script.json \
-  -- docker exec -i mcp-telegram mcp-telegram run
-```
-
-The `script` format supports assertions:
-
-- `expect.tool_names_include`
-- `expect.tool_expectations`
-- `expect.prompt_names_include`
-- `expect.path_equals`
-- `expect.is_error`
-- `expect.content_text_contains`
-- `expect.content_text_not_contains`
-- `expect.prompt_text_contains`
-- `expect.prompt_text_not_contains`
+The `script` format supports assertions through `expect`, including tool and
+prompt name checks, path checks, error state checks, and text containment checks.

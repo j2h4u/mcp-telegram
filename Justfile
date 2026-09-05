@@ -3,7 +3,6 @@ export UV_LINK_MODE := "hardlink"
 
 compose_file := "/opt/docker/mcp-telegram/docker-compose.yml"
 container := "mcp-telegram"
-mcp_command := "docker exec -i mcp-telegram mcp-telegram run"
 
 default:
     @just --list
@@ -164,17 +163,12 @@ runtime-wait:
     done; \
     exit 1
 
-# Run the redacted stdio MCP integration smoke against the live container.
-runtime-smoke-stdio:
-    uv run python -m devtools.mcp_client.cli script --redact --file devtools/mcp_client/smoke-integration.json -- {{mcp_command}}
-
-# Run an HTTP MCP smoke against the live container.
+# Run the redacted MCP integration smoke over the production HTTP transport.
 runtime-smoke-http:
-    uv run python -m devtools.mcp_client.cli list-tools --url http://127.0.0.1:3100/mcp > /tmp/mcp-telegram-http-tools.json
-    count="$(jq 'length' /tmp/mcp-telegram-http-tools.json)"; echo "http_tool_count $count"; test "$count" -gt 0
+    uv run python -m devtools.mcp_client.cli script --redact --file devtools/mcp_client/smoke-integration.json --url http://127.0.0.1:3100/mcp
 
 # Run MCP smoke tests against the live container.
-runtime-smoke: runtime-smoke-stdio runtime-smoke-http
+runtime-smoke: runtime-smoke-http
 
 # Rebuild the live container and run the redacted MCP smoke.
 runtime-verify: runtime-build runtime-wait runtime-smoke

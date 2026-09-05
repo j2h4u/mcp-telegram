@@ -55,6 +55,8 @@ _TRACE_ENRICHMENT_MAX_DIALOGS = 10
 _TRACE_ENRICHMENT_MAX_PER_DIALOG = 100
 _TRACE_ENRICHMENT_DEADLINE_MS = 15_000
 _TRACE_ENRICHMENT_CONCURRENCY = 2
+_MIN_EXACT_ACCOUNT_ID = 1
+_MAX_EXACT_ACCOUNT_ID = 9_223_372_036_854_775_807
 
 
 class _LoggerLike(Protocol):
@@ -773,6 +775,9 @@ class DaemonAccountTraceService:
         return result
 
     async def _trace_account_messages(self, req: dict) -> dict[str, object]:
+        exact_account_error = _validate_exact_account_id(req.get("exact_account_id"))
+        if exact_account_error is not None:
+            return exact_account_error
         request, request_error = _parse_trace_account_messages_request(req)
         if request_error is not None:
             return request_error
@@ -991,6 +996,22 @@ def _extract_trace_account_lookup(req: dict) -> _TraceAccountLookup:
         return _TraceAccountLookup(mode="username", query=query[1:])
 
     return _TraceAccountLookup(mode="fuzzy", query=query)
+
+
+def _validate_exact_account_id(value: object) -> dict[str, object] | None:
+    """Validate the exact account selector before resolution or database access."""
+    if value is None:
+        return None
+    if type(value) is not int or not (_MIN_EXACT_ACCOUNT_ID <= value <= _MAX_EXACT_ACCOUNT_ID):
+        return {
+            "ok": False,
+            "error": "invalid_exact_account_id",
+            "message": (
+                "exact_account_id must be a JSON integer in the range "
+                "1..9223372036854775807. Action: retry with a valid exact_account_id."
+            ),
+        }
+    return None
 
 
 def _resolve_trace_account_by_id(

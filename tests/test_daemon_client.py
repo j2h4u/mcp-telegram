@@ -775,7 +775,7 @@ async def test_get_sync_status_convenience() -> None:
 
 @pytest.mark.asyncio
 async def test_get_sync_alerts_convenience_defaults() -> None:
-    """get_sync_alerts sends defaults when params are omitted."""
+    """get_sync_alerts omits defaults so the daemon sees caller provenance."""
     reader = MagicMock(spec=asyncio.StreamReader)
     writer = MagicMock(spec=asyncio.StreamWriter)
     conn = DaemonConnection(reader, writer)
@@ -792,8 +792,8 @@ async def test_get_sync_alerts_convenience_defaults() -> None:
 
     req = captured[0]
     assert req["method"] == "get_sync_alerts"
-    assert req["since"] == 0
-    assert req["limit"] == 50
+    assert "since" not in req
+    assert "limit" not in req
 
 
 @pytest.mark.asyncio

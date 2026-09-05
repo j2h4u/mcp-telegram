@@ -15,7 +15,6 @@ from devtools.mcp_client.client import (
     DEFAULT_TIMEOUT_SECONDS,
     HttpMcpClient,
     McpClientError,
-    StdioMcpClient,
     execute_script_steps,
     load_script_steps,
 )
@@ -78,17 +77,13 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Print one-line JSON instead of pretty output.",
     )
-    parser.add_argument(
-        "server_command",
-        nargs=argparse.REMAINDER,
-        help="Command used to launch the stdio MCP server. Prefix with '--'.",
-    )
 
 
 def _add_http_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--url",
-        help="Streamable HTTP MCP endpoint. When set, server_command is ignored.",
+        default="http://127.0.0.1:3100/mcp",
+        help="Streamable HTTP MCP endpoint. Default: http://127.0.0.1:3100/mcp",
     )
 
 
@@ -111,15 +106,6 @@ def parse_prompt_arguments(raw_arguments: str) -> dict[str, str]:
     return payload
 
 
-def normalize_server_command(server_command: list[str]) -> list[str]:
-    command = list(server_command)
-    if command and command[0] == "--":
-        command = command[1:]
-    if not command:
-        raise ValueError("server command is required; pass it after '--'")
-    return command
-
-
 def print_json(payload: Any, *, compact: bool) -> None:
     if compact:
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
@@ -128,16 +114,11 @@ def print_json(payload: Any, *, compact: bool) -> None:
 
 
 async def _run_command(args: argparse.Namespace) -> Any:
-    if args.url:
-        async with HttpMcpClient(args.url, timeout_seconds=args.timeout) as client:
-            return await _run_client_command(client, args)
-
-    command = normalize_server_command(args.server_command)
-    async with StdioMcpClient(command, timeout_seconds=args.timeout) as client:
+    async with HttpMcpClient(args.url, timeout_seconds=args.timeout) as client:
         return await _run_client_command(client, args)
 
 
-async def _run_client_command(client: StdioMcpClient | HttpMcpClient, args: argparse.Namespace) -> Any:
+async def _run_client_command(client: HttpMcpClient, args: argparse.Namespace) -> Any:
     if args.command == "list-tools":
         return await client.list_tools()
     if args.command == "list-prompts":

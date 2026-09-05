@@ -15,7 +15,6 @@ from mcp_telegram.tools._base import (
     ToolResult,
     _check_daemon_response,
     _send_telemetry_event,
-    _telemetry_done_callback,
     _track_tool_telemetry,
 )
 
@@ -213,35 +212,7 @@ async def test_send_telemetry_event_swallows_exceptions(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
-async def test_telemetry_done_callback_logs_error_on_exception(caplog: pytest.LogCaptureFixture) -> None:
-    async def fail() -> None:
-        raise RuntimeError("telemetry failed")
-
-    task = asyncio.create_task(fail())
-    with pytest.raises(RuntimeError):
-        await task
-
-    with caplog.at_level("WARNING", logger="mcp_telegram.tools._base"):
-        _telemetry_done_callback(task)
-
-    assert any("telemetry_event_failed" in rec.message for rec in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_telemetry_done_callback_ignores_cancelled(caplog: pytest.LogCaptureFixture) -> None:
-    task = asyncio.create_task(asyncio.sleep(10))
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    with caplog.at_level("WARNING", logger="mcp_telegram.tools._base"):
-        _telemetry_done_callback(task)
-
-    assert not any("telemetry_event_failed" in rec.message for rec in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_track_tool_telemetry_schedules_background_event_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_track_tool_telemetry_has_no_telemetry_side_effect(monkeypatch: pytest.MonkeyPatch) -> None:
     send_mock = AsyncMock()
     monkeypatch.setattr(_base, "_send_telemetry_event", send_mock)
 
@@ -254,19 +225,11 @@ async def test_track_tool_telemetry_schedules_background_event_on_success(monkey
     await ok_tool(Args())
     await asyncio.sleep(0.01)
 
-    assert send_mock.await_count == 1
-    assert send_mock.await_args is not None
-    event = cast(dict[str, object], send_mock.await_args.args[0])
-    assert event["tool_name"] == "ok_tool"
-    assert event["error_type"] is None
-    assert event["result_count"] == 7
-    assert event["has_cursor"] is True
-    assert event["page_depth"] == 3
-    assert event["has_filter"] is True
+    send_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_track_tool_telemetry_records_error_type_on_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_track_tool_telemetry_preserves_runner_exception(monkeypatch: pytest.MonkeyPatch) -> None:
     send_mock = AsyncMock()
     monkeypatch.setattr(_base, "_send_telemetry_event", send_mock)
 
@@ -279,21 +242,13 @@ async def test_track_tool_telemetry_records_error_type_on_exception(monkeypatch:
     with pytest.raises(RuntimeError, match="boom"):
         await error_tool(Args())
     await asyncio.sleep(0.01)
-
-    assert send_mock.await_count == 1
-    assert send_mock.await_args is not None
-    event = cast(dict[str, object], send_mock.await_args.args[0])
-    assert event["error_type"] == "RuntimeError"
+    send_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_track_tool_telemetry_logs_warning_on_background_send_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _fail_send(_event: dict[str, object]) -> None:
-        raise RuntimeError("telemetry backend down")
-
-    monkeypatch.setattr(_base, "_send_telemetry_event", _fail_send)
-    warning_mock = MagicMock()
-    monkeypatch.setattr(_base.logger, "warning", warning_mock)
+async def test_track_tool_telemetry_does_not_handle_delivery_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    send_mock = AsyncMock(side_effect=RuntimeError("telemetry backend down"))
+    monkeypatch.setattr(_base, "_send_telemetry_event", send_mock)
 
     class Args(ToolArgs): ...
 
@@ -304,11 +259,7 @@ async def test_track_tool_telemetry_logs_warning_on_background_send_failure(monk
     await ok_tool(Args())
     await asyncio.sleep(0.01)
 
-    assert warning_mock.call_count == 1
-    assert warning_mock.call_args is not None
-    call_args = cast(tuple[object, object], warning_mock.call_args.args[:2])
-    assert call_args[0] == "telemetry_event_failed error=%s"
-    assert "telemetry backend down" in str(call_args[1])
+    send_mock.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

@@ -212,8 +212,10 @@ class TraceAccountMessages(ToolArgs):
         max_length=500,
         description="Name, username, or profile link for the account to trace.",
     )
-    exact_account_id: int | None = Field(
+    exact_account_id: StrictInt | None = Field(
         default=None,
+        ge=1,
+        le=9_223_372_036_854_775_807,
         description="Known numeric account id. Prefer this when available to avoid ambiguity.",
     )
     group_by: Literal["timeline", "dialog"] = Field(

@@ -1870,7 +1870,14 @@ class ReadingService:
             return {"ok": False, "error": "invalid_time_range", "message": str(exc)}
         stemmed = stem_query(request.query)
         if not stemmed:
-            return {"ok": True, "data": {"messages": [], "total": 0}}
+            return {
+                "ok": False,
+                "error": "invalid_query",
+                "message": (
+                    "query must contain at least one Cyrillic or Latin letter or ASCII digit. "
+                    "Action: pass a searchable query, or use list_messages."
+                ),
+            }
         return await self._search_messages_for_state(request, stemmed, selector)
 
     async def list_unread_messages(self, req: dict[str, object]) -> dict:

@@ -177,11 +177,6 @@ rationale = "This explicit unsafe-exposure escape hatch remains an environment-o
 
 [[entry]]
 category = "environment_reads"
-key = "src/mcp_telegram/server.py:run_mcp_server:os.environ.get"
-rationale = "The stdio server's existing environment inputs are outside the TTL policy scope."
-
-[[entry]]
-category = "environment_reads"
 key = "src/mcp_telegram/server.py:run_mcp_http_server:os.environ.get"
 rationale = "The HTTP server's existing environment inputs are outside the TTL policy scope."
 
@@ -254,6 +249,26 @@ rationale = "This inherited bootstrap work batch cap is unrelated to freshness r
 category = "policy_assignments"
 key = "src/mcp_telegram/daemon.py:_log_heartbeat:interval"
 rationale = "This logging argument reflects the established heartbeat scheduling value."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/server.py:<module>:_TELEMETRY_FLUSH_TIMEOUT_SECONDS"
+rationale = "This bounds best-effort telemetry shutdown flushing as a transport lifecycle contract."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/server.py:flush_telemetry:timeout_seconds"
+rationale = "This exposes the transport telemetry flush bound as a stable lifecycle contract."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/sync_alerts.py:<module>:MAX_PAGE_SIZE"
+rationale = "This is the sync-alert API page-size contract, not an operator-configured policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/sync_alerts.py:<module>:DEFAULT_PAGE_SIZE"
+rationale = "This is the sync-alert API default page-size contract, not an operator-configured policy."
 
 [[entry]]
 category = "policy_assignments"
