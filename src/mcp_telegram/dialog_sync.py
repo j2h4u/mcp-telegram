@@ -50,6 +50,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 from .access_lifecycle import set_access_lost
 from .dialog_classification import EntityKind, classify_dialog_type
 from .flood import TelegramRpcThrottled, sleep_through_flood
+from .maintenance_logging import log_maintenance_cycle
 from .read_state import apply_read_cursor
 from .sync_db import _open_sync_db
 from .telegram_access import ACCESS_LOST_ERRORS
@@ -837,7 +838,7 @@ class DialogReconciliationWorker:
                     exc,
                 )
                 # leave needs_refresh=1 for next cycle
-        logger.info("recon_light_pass_complete count=%d", count)
+        log_maintenance_cycle(logger, count > 0, "recon_light_pass_complete count=%d", count)
         return count
 
     async def _enumerate_full_pass(self) -> tuple[set[int], int, bool]:
@@ -961,7 +962,9 @@ class DialogReconciliationWorker:
                 completed=True,
                 visible_count=len(seen_ids),
             )
-        logger.info(
+        log_maintenance_cycle(
+            logger,
+            bool(missing),
             "recon_full_pass_complete count=%d hidden=%d",
             count,
             len(missing),

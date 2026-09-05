@@ -23,6 +23,7 @@ from .hydration_queue import (
     HydrationQueueRepository,
     HydrationQueueSummary,
 )
+from .maintenance_logging import log_maintenance_cycle
 from .messages.sqlite_hydration_jobs import (
     MediaMetadataHydrationRepair,
     TranscriptionHydrationRepair,
@@ -339,7 +340,17 @@ class MessageFactHydrationWorker:
         selected_by_kind: dict[str, int] | None = None,
     ) -> None:
         snapshot_by_kind = {snapshot.kind: snapshot for snapshot in queue_snapshot}
-        logger.info(
+        did_work = any(
+            (
+                selected,
+                result.repaired_transcription_jobs,
+                result.repaired_media_metadata_jobs,
+                result.stopped,
+            )
+        )
+        log_maintenance_cycle(
+            logger,
+            did_work,
             "message_fact_hydration cycle selected=%d requests=%d hydrated=%d completed=%d "
             "pending=%d retried=%d dropped=%d stopped=%s repaired_transcription_jobs=%d repair_has_more=%s "
             "repaired_media_metadata_jobs=%d media_repair_has_more=%s "

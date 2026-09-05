@@ -212,6 +212,7 @@ path = "mcp_telegram.fact_hydration"
 layer = "application"
 depends_on = [
     "mcp_telegram.access_lifecycle", "mcp_telegram.hydration_queue", "mcp_telegram.flood",
+    "mcp_telegram.maintenance_logging",
     "mcp_telegram.messages.sqlite_hydration_jobs",
     "mcp_telegram.telegram_access", "mcp_telegram.telegram_rpc_error",
 ]
@@ -257,7 +258,7 @@ depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.activity_peer_resol
 [[modules]]
 path = "mcp_telegram.activity_hot_sweep"
 layer = "application"
-depends_on = ["mcp_telegram.activity_peer_sweep", "mcp_telegram.activity_substrate", "mcp_telegram.hydration_queue", "mcp_telegram.messages.sqlite_bundle", "mcp_telegram.flood"]
+depends_on = ["mcp_telegram.activity_peer_sweep", "mcp_telegram.activity_substrate", "mcp_telegram.hydration_queue", "mcp_telegram.maintenance_logging", "mcp_telegram.messages.sqlite_bundle", "mcp_telegram.flood"]
 
 [[modules]]
 path = "mcp_telegram.activity_cold_backfill"
@@ -267,7 +268,7 @@ depends_on = ["mcp_telegram.activity_peer_sweep", "mcp_telegram.activity_substra
 [[modules]]
 path = "mcp_telegram.dialog_sync"
 layer = "application"
-depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.dialog_classification", "mcp_telegram.flood", "mcp_telegram.read_state", "mcp_telegram.sync_db", "mcp_telegram.telegram_access", "mcp_telegram.topics.contracts", "mcp_telegram.topics.refresh"]
+depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.dialog_classification", "mcp_telegram.flood", "mcp_telegram.maintenance_logging", "mcp_telegram.read_state", "mcp_telegram.sync_db", "mcp_telegram.telegram_access", "mcp_telegram.topics.contracts", "mcp_telegram.topics.refresh"]
 
 [[modules]]
 path = "mcp_telegram.sync_worker"
@@ -277,7 +278,7 @@ depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.entity_store", "mcp
 [[modules]]
 path = "mcp_telegram.delta_sync"
 layer = "application"
-depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.flood", "mcp_telegram.history_enrollment", "mcp_telegram.hydration_queue", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_bundle", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.telegram_access"]
+depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.flood", "mcp_telegram.history_enrollment", "mcp_telegram.hydration_queue", "mcp_telegram.maintenance_logging", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_bundle", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.telegram_access"]
 
 [[modules]]
 path = "mcp_telegram.event_handlers"
@@ -338,7 +339,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.folders.worker"
 layer = "application"
-depends_on = ["mcp_telegram.flood", "mcp_telegram.folders.contracts", "mcp_telegram.folders.ports", "mcp_telegram.folders.refresh"]
+depends_on = ["mcp_telegram.flood", "mcp_telegram.folders.contracts", "mcp_telegram.folders.ports", "mcp_telegram.folders.refresh", "mcp_telegram.maintenance_logging"]
 
 [[modules]]
 path = "mcp_telegram.important_events"
@@ -620,6 +621,11 @@ depends_on = []
 
 [[modules]]
 path = "mcp_telegram.runtime_logging"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.maintenance_logging"
 layer = "foundation"
 depends_on = []
 

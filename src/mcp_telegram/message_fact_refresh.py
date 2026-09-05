@@ -226,7 +226,7 @@ async def run_message_fact_refresh_loop(
                 policy,
                 shutdown_event=shutdown_event,
             )
-            logger.info(
+            logger.debug(
                 "message_fact_refresh_cycle complete — reaction_candidates=%d reaction_refreshed=%d "
                 "read_at_candidates=%d",
                 result.reaction_candidates,
