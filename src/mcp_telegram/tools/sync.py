@@ -1,6 +1,7 @@
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import TypedDict
 
 from pydantic import Field
 
@@ -29,6 +30,13 @@ from ._base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _GetSyncAlertsKwargs(TypedDict, total=False):
+    since: int
+    limit: int
+    page_limit: int
+    navigation: str
 
 
 MARK_DIALOG_FOR_SYNC_OUTPUT_SCHEMA = {
@@ -210,6 +218,8 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                     "version": {"type": ["integer", "null"]},
                     "edit_date": {"type": ["integer", "null"]},
                     "access_lost_at": {"type": ["integer", "null"]},
+                    "occurred_at": {"type": ["integer", "null"]},
+                    "source_id": {"type": ["integer", "null"]},
                     "severity": {"type": "string"},
                     "message": {"type": "string"},
                     "action": {"type": ["string", "null"]},
@@ -222,6 +232,8 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                     "version",
                     "edit_date",
                     "access_lost_at",
+                    "occurred_at",
+                    "source_id",
                     "severity",
                     "message",
                     "action",
@@ -230,6 +242,7 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
             },
         },
         "deleted_messages": {
+            "description": "Deprecated compatibility projection; use alerts.",
             "type": "array",
             "items": {
                 "type": "object",
@@ -244,6 +257,7 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
             },
         },
         "edits": {
+            "description": "Deprecated compatibility projection; use alerts.",
             "type": "array",
             "items": {
                 "type": "object",
@@ -259,6 +273,7 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
             },
         },
         "access_lost": {
+            "description": "Deprecated compatibility projection; use alerts.",
             "type": "array",
             "items": {
                 "type": "object",
@@ -272,6 +287,7 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
             },
         },
         "counts": {
+            "description": "Deprecated compatibility projection; counts apply to the current alerts page.",
             "type": "object",
             "properties": {
                 "deleted_messages": {"type": "integer"},
@@ -282,13 +298,20 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
             "required": ["deleted_messages", "edits", "access_lost", "total"],
             "additionalProperties": False,
         },
-        "count": {"type": "integer"},
+        "count": {"type": "integer", "description": "Deprecated compatibility count for the current alerts page."},
         "since": {"type": "integer"},
-        "limit": {"type": "integer"},
+        "limit": {"type": "integer", "description": "Deprecated page-size alias; use page_limit."},
+        "page_limit": {"type": "integer", "description": "Effective page size."},
+        "has_more": {"type": "boolean"},
+        "next_navigation": {"type": ["string", "null"]},
+        "snapshot_upper_event_at": {"type": "integer"},
+        "result_count_semantics": {"type": "string"},
+        "page_depth": {"type": "integer"},
         "limited_by": {
             "type": "object",
             "properties": {
                 "deleted_messages": {
+                    "description": "Deprecated compatibility projection; use alerts.",
                     "type": "object",
                     "properties": {
                         "since": {"type": "integer"},
@@ -298,6 +321,7 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                     "additionalProperties": False,
                 },
                 "edits": {
+                    "description": "Deprecated compatibility projection; use alerts.",
                     "type": "object",
                     "properties": {
                         "since": {"type": "integer"},
@@ -307,10 +331,11 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                     "additionalProperties": False,
                 },
                 "access_lost": {
+                    "description": "Deprecated compatibility projection; use alerts.",
                     "type": "object",
                     "properties": {
                         "since": {"type": "integer"},
-                        "limit": {"type": "null"},
+                        "limit": {"type": ["integer", "null"]},
                     },
                     "required": ["since", "limit"],
                     "additionalProperties": False,
@@ -464,17 +489,47 @@ def _sync_read_model_error(detail: str) -> ToolResult:
 
 
 class GetSyncAlerts(ToolArgs):
-    """Audit what changed in synced dialogs: deleted messages (text preserved), edit history,
+    """Audit what changed in synced dialogs: deleted messages, edit history,
     and dialogs where access was lost after syncing.
 
     Use when investigating anomalies — e.g. after GetSyncStatus shows access_lost, or to
     audit what was deleted or silently edited since a given timestamp.
-    Use since= (unix timestamp) to scope alerts to a time window. Default since=0 returns all.
-    Deleted messages include the last known text before deletion.
-    Edit history shows previous versions of edited messages."""
+    Use since= (unix timestamp) to scope alerts to a time window. Default since=0 starts a full paginated traversal.
+    The MCP response intentionally exposes metadata only (IDs, timestamps,
+    kind, severity, and action); message text and prior text are not returned.
+    New events above a cursor snapshot are excluded; late historical backfills
+    at or before that snapshot can be omitted from an in-progress traversal.
+    Results follow immutable newest-observed sequence order; occurred_at remains
+    the source fact time, so historical reconstruction is deterministic."""
 
-    since: int = Field(default=0, description="Unix timestamp — only return alerts after this time. Default 0 = all.")
-    limit: int = Field(default=50, description="Maximum deleted messages and edits to return. Default 50.")
+    since: int = Field(
+        default=0,
+        ge=0,
+        strict=True,
+        description=(
+            "Unix timestamp — only return alerts after this time. Must be >= 0; default 0 starts a full paginated traversal. "
+            "New events above a cursor snapshot are excluded; late historical backfills at or before it can be omitted. "
+            "Continue with next_navigation until has_more is false."
+        ),
+    )
+    limit: int = Field(
+        default=50,
+        ge=1,
+        le=500,
+        strict=True,
+        description="Deprecated page-size alias; must be 1..500. Use page_limit for new callers.",
+    )
+    page_limit: int | None = Field(
+        default=None,
+        ge=1,
+        le=500,
+        strict=True,
+        description="Optional canonical page size, 1..500. When supplied it is effective.",
+    )
+    navigation: str | None = Field(
+        default=None,
+        description="Opaque daemon-signed cursor returned as next_navigation.",
+    )
 
 
 def _as_int(value: object) -> int:
@@ -514,17 +569,120 @@ def _alert_timestamp(alert: dict[str, object]) -> tuple[int, int, int, str]:
     ),
     output_schema=GET_SYNC_ALERTS_OUTPUT_SCHEMA,
 )
-async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
+async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:  # noqa: PLR0912, PLR0914, PLR0915 - legacy and canonical wire projections
+    error_metadata = {
+        "result_count": 0,
+        "has_cursor": args.navigation is not None,
+        "page_depth": 1,
+        "has_filter": args.since > 0,
+    }
     try:
         async with daemon_connection() as conn:
-            response = await conn.get_sync_alerts(since=args.since, limit=args.limit)
+            supplied = args.model_fields_set
+            kwargs: _GetSyncAlertsKwargs = {}
+            if "since" in supplied:
+                kwargs["since"] = args.since
+            if "limit" in supplied:
+                kwargs["limit"] = args.limit
+            if "page_limit" in supplied and args.page_limit is not None:
+                kwargs["page_limit"] = args.page_limit
+            if "navigation" in supplied and args.navigation is not None:
+                kwargs["navigation"] = args.navigation
+            response = await conn.get_sync_alerts(**kwargs)
     except DaemonNotRunningError as exc:
-        return error_result(_daemon_not_running_text(exc))
+        return error_result(_daemon_not_running_text(exc), **error_metadata)
 
-    if err := _check_daemon_response(response):
+    if response.get("error") == "invalid_navigation":
+        err = _check_daemon_response(
+            response,
+            action="Retry get_sync_alerts without navigation to start a new traversal; repeat the same since value when one was supplied.",
+            **error_metadata,
+        )
+    else:
+        err = _check_daemon_response(response, **error_metadata)
+    if err:
         return err
 
     data = response.get("data", {})
+
+    # New daemons return a canonical globally ordered page. Keep the old
+    # category projections available for clients that have not migrated yet.
+    if isinstance(data, dict) and isinstance(data.get("alerts"), list) and (
+        "page_limit" in data or "next_navigation" in data
+    ):
+        raw_alerts = [item for item in data["alerts"] if isinstance(item, dict)]
+        alerts = [
+            {key: value for key, value in item.items() if key not in {"text", "old_text"}}
+            for item in raw_alerts
+        ]
+        deleted_messages = [
+            {
+                "dialog_id": item.get("dialog_id"),
+                "message_id": item.get("message_id"),
+                "deleted_at": item.get("deleted_at"),
+                "action": item.get("action")
+                or "Inspect the dialog history around this message id if surrounding context is needed.",
+            }
+            for item in alerts
+            if item.get("kind") == "deleted_message"
+        ]
+        edit_alerts = [
+            {
+                "dialog_id": item.get("dialog_id"),
+                "message_id": item.get("message_id"),
+                "version": item.get("version"),
+                "edit_date": item.get("edit_date"),
+                "action": item.get("action")
+                or "Treat cached text as versioned; inspect edit history before relying on older wording.",
+            }
+            for item in alerts
+            if item.get("kind") == "edit"
+        ]
+        access_lost_alerts = [
+            {
+                "dialog_id": item.get("dialog_id"),
+                "access_lost_at": item.get("access_lost_at"),
+                "action": item.get("action") or "Use get_sync_status for coverage details.",
+            }
+            for item in alerts
+            if item.get("kind") == "access_lost"
+        ]
+        structured_content = {
+            "alerts": alerts,
+            "deleted_messages": deleted_messages,
+            "edits": edit_alerts,
+            "access_lost": access_lost_alerts,
+            "counts": {
+                "deleted_messages": len(deleted_messages),
+                "edits": len(edit_alerts),
+                "access_lost": len(access_lost_alerts),
+                "total": len(alerts),
+            },
+            "count": len(alerts),
+            "since": data.get("since", args.since),
+            "limit": data.get("limit", args.limit),
+            "page_limit": data.get("page_limit", args.page_limit or args.limit),
+            "limited_by": data.get(
+                "limited_by",
+                {
+                    "deleted_messages": {"since": args.since, "limit": args.page_limit or args.limit},
+                    "edits": {"since": args.since, "limit": args.page_limit or args.limit},
+                    "access_lost": {"since": args.since, "limit": args.page_limit or args.limit},
+                },
+            ),
+            "has_more": bool(data.get("has_more", False)),
+            "next_navigation": data.get("next_navigation"),
+            "snapshot_upper_event_at": data.get("snapshot_upper_event_at", 0),
+            "result_count_semantics": data.get("result_count_semantics", "count=len(alerts)=sum(counts)"),
+        }
+        return structured_result(
+            structured_content,
+            result_count=len(alerts),
+            has_cursor=args.navigation is not None or bool(data.get("next_navigation")),
+            page_depth=int(data.get("page_depth", 1)),
+            has_filter=_as_int(data.get("since", args.since)) > 0,
+        )
+
     deleted = data.get("deleted_messages", [])
     edits = data.get("edits", [])
     access_lost = data.get("access_lost", [])
@@ -640,4 +798,10 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
         },
     }
 
-    return structured_result(structured_content, result_count=len(alerts))
+    return structured_result(
+        structured_content,
+        result_count=len(alerts),
+        has_cursor=args.navigation is not None,
+        page_depth=1,
+        has_filter=args.since > 0,
+    )

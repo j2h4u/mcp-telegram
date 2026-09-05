@@ -408,9 +408,29 @@ class DaemonConnection:
         """Return sync status and message stats for a dialog."""
         return await self.request({"method": "get_sync_status", "dialog_id": dialog_id})
 
-    async def get_sync_alerts(self, *, since: int = 0, limit: int = 50) -> dict:
-        """Return deleted messages, edit history, and access-lost alerts."""
-        return await self.request({"method": "get_sync_alerts", "since": since, "limit": limit})
+    async def get_sync_alerts(
+        self,
+        *,
+        since: int | None = None,
+        limit: int | None = None,
+        page_limit: int | None = None,
+        navigation: str | None = None,
+    ) -> dict:
+        """Return one globally paginated sync-alert page.
+
+        Optional values stay omitted on the wire so the daemon can preserve
+        whether a caller used a default or explicitly supplied a value.
+        """
+        payload: dict[str, object] = {"method": "get_sync_alerts"}
+        if since is not None:
+            payload["since"] = since
+        if limit is not None:
+            payload["limit"] = limit
+        if page_limit is not None:
+            payload["page_limit"] = page_limit
+        if navigation is not None:
+            payload["navigation"] = navigation
+        return await self.request(payload)
 
     async def get_entity_info(self, *, entity_id: int) -> dict:
         """Return type-tagged entity profile (user/bot/channel/supergroup/group).

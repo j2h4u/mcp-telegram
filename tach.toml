@@ -105,6 +105,7 @@ depends_on = [
     "mcp_telegram.flood",
     "mcp_telegram.topics.contracts", "mcp_telegram.topics.refresh",
     "mcp_telegram.folders.read_model", "mcp_telegram.reading.query_records",
+    "mcp_telegram.sync_alerts",
 ]
 cannot_depend_on = [
     "mcp_telegram.folders.telegram_adapter", "mcp_telegram.messages", "mcp_telegram.messages.telegram_adapter",
@@ -133,6 +134,11 @@ path = "mcp_telegram.daemon_dialog_queries"
 layer = "application"
 depends_on = []
 cannot_depend_on = ["mcp_telegram.folders.sqlite_repository", "mcp_telegram.messages", "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.topics.sqlite_repository"]
+
+[[modules]]
+path = "mcp_telegram.sync_alerts"
+layer = "application"
+depends_on = []
 
 [[modules]]
 path = "mcp_telegram.daemon_entity_info"

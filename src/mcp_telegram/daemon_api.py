@@ -79,9 +79,6 @@ from .daemon_account_trace import (
 )
 from .daemon_dialog_queries import (
     _COUNT_SYNCED_MESSAGES_SQL,
-    _GET_ACCESS_LOST_ALERTS_SQL,
-    _GET_DELETED_ALERTS_SQL,
-    _GET_EDIT_ALERTS_SQL,
     _GET_SYNC_STATUS_SQL,
     _LIST_TOPICS_SQL,
 )
@@ -98,6 +95,7 @@ from .important_events.read_model import list_important_events as read_important
 from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
 from .reading.query_records import read_message_from_row
+from .sync_alerts import SyncAlertTokenCodec, query_alerts
 from .sync_read_model import SyncStatus, build_sync_read_model
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
@@ -431,6 +429,7 @@ class DaemonAPIServer:
         self._policy = policy
         self._health_status = health_status
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
+        self._sync_alert_token_codec = SyncAlertTokenCodec()
 
     def _get_reading_service(self) -> ReadingService:
         """Get memoized reading-service instance with explicit daemon dependencies."""
@@ -1344,62 +1343,8 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _get_sync_alerts(self, req: dict[str, object]) -> dict:
-        """Return sync alerts: deleted messages, edit history, access-lost dialogs.
-
-        since: unix timestamp — only return alerts newer than this value (default 0).
-        limit: max items per category (default 50).
-        """
-        since = _coerce_int(req.get("since", 0), 0)
-        limit = _clamp(_coerce_int(req.get("limit", 50), 50), 1, 500)
-
-        deleted_rows = cast(
-            list[tuple[object, object, object, object]],
-            self._conn.execute(_GET_DELETED_ALERTS_SQL, (since, limit)).fetchall(),
-        )
-        deleted_messages = [
-            {
-                "dialog_id": r[0],
-                "message_id": r[1],
-                "text": r[2],
-                "deleted_at": r[3],
-            }
-            for r in deleted_rows
-        ]
-
-        edit_rows = cast(
-            list[tuple[object, object, object, object, object]],
-            self._conn.execute(_GET_EDIT_ALERTS_SQL, (since, limit)).fetchall(),
-        )
-        edits = [
-            {
-                "dialog_id": r[0],
-                "message_id": r[1],
-                "version": r[2],
-                "old_text": r[3],
-                "edit_date": r[4],
-            }
-            for r in edit_rows
-        ]
-
-        access_lost_rows = cast(
-            list[tuple[object, object]], self._conn.execute(_GET_ACCESS_LOST_ALERTS_SQL, (since,)).fetchall()
-        )
-        access_lost = [
-            {
-                "dialog_id": r[0],
-                "access_lost_at": r[1],
-            }
-            for r in access_lost_rows
-        ]
-
-        return {
-            "ok": True,
-            "data": {
-                "deleted_messages": deleted_messages,
-                "edits": edits,
-                "access_lost": access_lost,
-            },
-        }
+        """Return one globally ordered, snapshot-bounded sync-alert page."""
+        return query_alerts(self._conn, req, self._sync_alert_token_codec)
 
     # ------------------------------------------------------------------
     # get_entity_info

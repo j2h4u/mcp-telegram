@@ -11,7 +11,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 47
+_CURRENT_SCHEMA_VERSION = 48
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -199,6 +199,78 @@ CREATE TABLE IF NOT EXISTS daemon_events (
 _DAEMON_EVENTS_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_daemon_events_kind_time
 ON daemon_events(kind, occurred_at DESC)
+"""
+
+_SYNC_ALERT_EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS sync_alert_events (
+    seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind            TEXT NOT NULL CHECK (kind IN ('deleted_message', 'edit', 'access_lost')),
+    occurred_at     INTEGER NOT NULL,
+    dialog_id       INTEGER NOT NULL,
+    message_id      INTEGER,
+    version         INTEGER,
+    daemon_event_id INTEGER,
+    CHECK (
+        (kind = 'deleted_message' AND message_id IS NOT NULL AND version IS NULL AND daemon_event_id IS NULL)
+        OR (kind = 'edit' AND message_id IS NOT NULL AND version IS NOT NULL AND daemon_event_id IS NULL)
+        OR (kind = 'access_lost' AND message_id IS NULL AND version IS NULL AND daemon_event_id IS NOT NULL)
+    )
+)
+"""
+
+_SYNC_ALERT_DELETED_INDEX_DDL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_alert_events_deleted_source
+ON sync_alert_events(dialog_id, message_id) WHERE kind = 'deleted_message'
+"""
+
+_SYNC_ALERT_EDIT_INDEX_DDL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_alert_events_edit_source
+ON sync_alert_events(dialog_id, message_id, version) WHERE kind = 'edit'
+"""
+
+_SYNC_ALERT_ACCESS_INDEX_DDL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_alert_events_access_source
+ON sync_alert_events(daemon_event_id) WHERE kind = 'access_lost'
+"""
+
+_SYNC_ALERT_DELETED_INSERT_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS sync_alert_events_message_insert_deleted
+AFTER INSERT ON messages
+WHEN NEW.is_deleted = 1 AND NEW.deleted_at IS NOT NULL
+BEGIN
+    INSERT OR IGNORE INTO sync_alert_events(kind, occurred_at, dialog_id, message_id)
+    VALUES ('deleted_message', NEW.deleted_at, NEW.dialog_id, NEW.message_id);
+END
+"""
+
+_SYNC_ALERT_DELETED_UPDATE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS sync_alert_events_message_delete_transition
+AFTER UPDATE OF is_deleted, deleted_at ON messages
+WHEN OLD.is_deleted = 0 AND NEW.is_deleted = 1 AND NEW.deleted_at IS NOT NULL
+BEGIN
+    INSERT OR IGNORE INTO sync_alert_events(kind, occurred_at, dialog_id, message_id)
+    VALUES ('deleted_message', NEW.deleted_at, NEW.dialog_id, NEW.message_id);
+END
+"""
+
+_SYNC_ALERT_EDIT_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS sync_alert_events_message_edit
+AFTER INSERT ON message_versions
+WHEN NEW.edit_date IS NOT NULL
+BEGIN
+    INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, message_id, version)
+    VALUES ('edit', NEW.edit_date, NEW.dialog_id, NEW.message_id, NEW.version);
+END
+"""
+
+_SYNC_ALERT_ACCESS_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS sync_alert_events_access_lost
+AFTER INSERT ON daemon_events
+WHEN NEW.kind = 'access_lost'
+BEGIN
+    INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, daemon_event_id)
+    VALUES ('access_lost', NEW.occurred_at, NEW.dialog_id, NEW.id);
+END
 """
 
 # ---------------------------------------------------------------------------
@@ -1960,6 +2032,67 @@ def _apply_migration_47(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_48(conn: sqlite3.Connection, current: int) -> int:
+    """Create the immutable observed-order alert projection and its writers."""
+    return _apply_migration(
+        conn,
+        current,
+        48,
+        [
+            _DAEMON_EVENTS_DDL,
+            _MESSAGE_VERSIONS_DDL,
+            _SYNC_ALERT_EVENTS_DDL,
+            _SYNC_ALERT_DELETED_INDEX_DDL,
+            _SYNC_ALERT_EDIT_INDEX_DDL,
+            _SYNC_ALERT_ACCESS_INDEX_DDL,
+            """INSERT INTO daemon_events(kind, dialog_id, occurred_at, payload_json)
+               SELECT 'access_lost', sd.dialog_id, sd.access_lost_at, '{}'
+                 FROM synced_dialogs sd
+                WHERE sd.status = 'access_lost'
+                  AND sd.access_lost_at IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM daemon_events de
+                       WHERE de.kind = 'access_lost'
+                         AND de.dialog_id = sd.dialog_id
+                         AND de.occurred_at = sd.access_lost_at
+                  )""",
+            """INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, message_id, version, daemon_event_id)
+               SELECT c.kind, c.occurred_at, c.dialog_id, c.message_id, c.version, c.daemon_event_id
+                 FROM (
+                       SELECT 'deleted_message' AS kind, m.deleted_at AS occurred_at,
+                              m.dialog_id, m.message_id, NULL AS version, NULL AS daemon_event_id,
+                              1 AS kind_rank
+                         FROM messages m
+                        WHERE m.is_deleted = 1 AND m.deleted_at IS NOT NULL
+                       UNION ALL
+                       SELECT 'edit', mv.edit_date, mv.dialog_id, mv.message_id, mv.version, NULL, 2
+                         FROM message_versions mv
+                        WHERE mv.edit_date IS NOT NULL
+                       UNION ALL
+                       SELECT 'access_lost', de.occurred_at, de.dialog_id, NULL, NULL, de.id, 3
+                         FROM daemon_events de
+                        WHERE de.kind = 'access_lost' AND de.dialog_id IS NOT NULL
+                 ) c
+                WHERE NOT EXISTS (
+                      SELECT 1 FROM sync_alert_events sae
+                       WHERE (c.kind = 'deleted_message' AND sae.kind = c.kind
+                              AND sae.dialog_id = c.dialog_id AND sae.message_id = c.message_id)
+                          OR (c.kind = 'edit' AND sae.kind = c.kind
+                              AND sae.dialog_id = c.dialog_id AND sae.message_id = c.message_id
+                              AND sae.version = c.version)
+                          OR (c.kind = 'access_lost' AND sae.kind = c.kind
+                              AND sae.daemon_event_id = c.daemon_event_id)
+                  )
+                ORDER BY c.occurred_at, c.kind_rank, c.dialog_id,
+                         COALESCE(c.message_id, 0), COALESCE(c.version, 0), COALESCE(c.daemon_event_id, 0)""",
+            _SYNC_ALERT_DELETED_INSERT_TRIGGER,
+            _SYNC_ALERT_DELETED_UPDATE_TRIGGER,
+            _SYNC_ALERT_EDIT_TRIGGER,
+            _SYNC_ALERT_ACCESS_TRIGGER,
+        ],
+    )
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -2004,6 +2137,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_45(conn, current)
     current = _apply_migration_46(conn, current)
     current = _apply_migration_47(conn, current)
+    current = _apply_migration_48(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

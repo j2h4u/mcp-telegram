@@ -2614,6 +2614,7 @@ async def test_get_sync_alerts_empty():
             "access_lost": {"since": 0, "limit": None},
         },
     }
+    conn.get_sync_alerts.assert_called_once_with()
 
 
 async def test_get_sync_status_recoverable_error_has_no_structured_content():
@@ -2646,6 +2647,10 @@ async def test_get_sync_alerts_recoverable_error_has_no_structured_content():
 
     assert result.is_error is True
     assert result.structured_content is None
+    assert result.result_count == 0
+    assert result.has_cursor is False
+    assert result.page_depth == 1
+    assert result.has_filter is False
 
 
 async def test_get_sync_alerts_daemon_not_running():
@@ -2654,6 +2659,74 @@ async def test_get_sync_alerts_daemon_not_running():
         result = await get_sync_alerts(GetSyncAlerts())
     text = _result_text(result)
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
+    assert result.result_count == 0
+    assert result.has_cursor is False
+    assert result.page_depth == 1
+    assert result.has_filter is False
+
+
+async def test_get_sync_alerts_preserves_wire_provenance_and_page_depth():
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "alerts": [
+                    {
+                        "kind": "deleted_message",
+                        "dialog_id": 1,
+                        "message_id": 2,
+                        "deleted_at": 10,
+                        "version": None,
+                        "edit_date": None,
+                        "access_lost_at": None,
+                        "occurred_at": 10,
+                        "source_id": 0,
+                        "severity": "medium",
+                        "message": "safe metadata",
+                        "action": "inspect",
+                        "text": "telegram secret",
+                        "old_text": "older secret",
+                    }
+                ],
+                "deleted_messages": [],
+                "edits": [],
+                "access_lost": [],
+                "counts": {"deleted_messages": 1, "edits": 0, "access_lost": 0, "total": 1},
+                "count": 1,
+                "since": 12,
+                "limit": 1,
+                "page_limit": 1,
+                "limited_by": {},
+                "has_more": True,
+                "next_navigation": "next",
+                "snapshot_upper_event_at": 20,
+                "result_count_semantics": "count=len(alerts)=sum(counts)",
+                "page_depth": 3,
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_sync_alerts(GetSyncAlerts(navigation="opaque"))
+    assert result.page_depth == 3
+    assert result.has_cursor is True
+    assert result.has_filter is True
+    payload = assert_structured_success_payload(result)
+    assert "text" not in _json_dict(_json_list(payload["alerts"])[0])
+    conn.get_sync_alerts.assert_called_once_with(navigation="opaque")
+
+
+async def test_get_sync_alerts_invalid_navigation_has_restart_action():
+    conn = _make_daemon_conn({"ok": False, "error": "invalid_navigation", "message": "invalid_navigation"})
+    with _patch_daemon(conn):
+        result = await get_sync_alerts(GetSyncAlerts(since=5, navigation="opaque"))
+    assert result.is_error is True
+    assert result.result_count == 0
+    assert result.has_cursor is True
+    assert result.page_depth == 1
+    assert result.has_filter is True
+    text = _result_text(result)
+    assert "without navigation" in text
+    assert "opaque" not in text
 
 
 def test_no_connected_client_in_tools():
