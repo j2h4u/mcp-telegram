@@ -27,6 +27,7 @@ from .activity_peer_sweep import (
 from .activity_substrate import ActivityClient
 from .flood import TelegramRpcThrottled
 from .hydration_queue import HydrationPriority
+from .messages.sqlite_bundle import message_log_context
 
 logger = logging.getLogger(__name__)
 
@@ -498,6 +499,33 @@ async def _run_hot_sweep_peer_safe(ctx: _HotSweepPeerContext) -> _HotSweepPeerOu
         )
 
 
+def _log_recovered_messages(
+    conn: sqlite3.Connection,
+    outcome: _HotSweepPeerOutcome,
+    *,
+    prior_hot_cursor: int | None,
+    discovered_at: int,
+) -> None:
+    """Log safe coordinates for messages recovered by the hourly safety net."""
+    discovery_scope = "baseline" if prior_hot_cursor is None else "incremental"
+    for dialog_id, message_id in sorted(outcome.genuinely_new_keys):
+        context = message_log_context(conn, dialog_id, message_id)
+        telegram_sent_at = context.telegram_sent_at
+        discovery_lag_s = max(0, discovered_at - telegram_sent_at) if telegram_sent_at is not None else None
+        logger.info(
+            "activity_hot_sweep_message_recovered dialog_id=%d message_id=%d"
+            " telegram_sent_at=%r discovered_at=%d discovery_lag_s=%r"
+            " discovery_scope=%s prior_hot_cursor=%r",
+            context.dialog_id,
+            context.message_id,
+            telegram_sent_at,
+            discovered_at,
+            discovery_lag_s,
+            discovery_scope,
+            prior_hot_cursor,
+        )
+
+
 async def run_hot_sweep_pass(  # noqa: PLR0914 - explicit pass telemetry counters
     client: ActivityClient,
     conn: sqlite3.Connection,
@@ -609,6 +637,12 @@ async def run_hot_sweep_pass(  # noqa: PLR0914 - explicit pass telemetry counter
         rpc_calls += peer_result.rpc_calls
         extracted += peer_result.extracted
         genuinely_new += peer_result.genuinely_new
+        _log_recovered_messages(
+            conn,
+            peer_result,
+            prior_hot_cursor=old_hot_cursor,
+            discovered_at=int(time.time()),
+        )
         if peer_result.flood_wait_seconds is not None:
             flood_wait_seconds = peer_result.flood_wait_seconds
         if peer_result.completed and peer_result.genuinely_new > 0:

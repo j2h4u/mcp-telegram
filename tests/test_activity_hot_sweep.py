@@ -29,7 +29,7 @@ from typing import cast
 
 import pytest
 
-from mcp_telegram.activity_hot_sweep import run_hot_sweep_pass
+from mcp_telegram.activity_hot_sweep import _HotSweepPeerOutcome, _log_recovered_messages, run_hot_sweep_pass
 from mcp_telegram.activity_peer_sweep import (
     SkipReason,
     SweepResult,
@@ -97,6 +97,38 @@ class _FakeClient:
 def _get_messages(conn: sqlite3.Connection) -> list[tuple[int, int, int]]:
     """Return (dialog_id, message_id, out) tuples ordered by message_id."""
     return conn.execute("SELECT dialog_id, message_id, out FROM messages ORDER BY message_id").fetchall()
+
+
+def test_recovered_message_log_has_safe_coordinates_and_lag(caplog: pytest.LogCaptureFixture) -> None:
+    with _make_db() as conn:
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text) VALUES (?, ?, ?, ?)",
+            (-100123, 456, 1_000, "sensitive message text"),
+        )
+        conn.commit()
+
+        with caplog.at_level("INFO", logger="mcp_telegram.activity_hot_sweep"):
+            _log_recovered_messages(
+                conn,
+                _HotSweepPeerOutcome(
+                    flooded=False,
+                    completed=True,
+                    pages_fetched=1,
+                    rpc_calls=2,
+                    extracted=1,
+                    genuinely_new=1,
+                    genuinely_new_keys=frozenset({(-100123, 456)}),
+                ),
+                prior_hot_cursor=400,
+                discovered_at=1_120,
+            )
+
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "dialog_id=-100123 message_id=456" in message
+    assert "telegram_sent_at=1000 discovered_at=1120 discovery_lag_s=120" in message
+    assert "discovery_scope=incremental prior_hot_cursor=400" in message
+    assert "sensitive message text" not in message
 
 
 # ---------------------------------------------------------------------------
