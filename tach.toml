@@ -257,7 +257,7 @@ depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.activity_peer_resol
 [[modules]]
 path = "mcp_telegram.activity_hot_sweep"
 layer = "application"
-depends_on = ["mcp_telegram.activity_peer_sweep", "mcp_telegram.activity_substrate", "mcp_telegram.hydration_queue", "mcp_telegram.flood"]
+depends_on = ["mcp_telegram.activity_peer_sweep", "mcp_telegram.activity_substrate", "mcp_telegram.hydration_queue", "mcp_telegram.messages.sqlite_bundle", "mcp_telegram.flood"]
 
 [[modules]]
 path = "mcp_telegram.activity_cold_backfill"
@@ -706,7 +706,7 @@ expose = ["contracts\\..*", "ports\\..*", "refresh\\..*", "read_model\\..*", "wo
 from = ["mcp_telegram.messages"]
 expose = [
     "telegram_adapter\\..*",
-    "sqlite_bundle\\.(insert_messages_with_fts|list_undeleted_message_ids|mark_message_deleted|message_exists|persist_edited_message|read_message_out|read_message_text)",
+    "sqlite_bundle\\.(insert_messages_with_fts|list_undeleted_message_ids|mark_message_deleted|message_exists|message_log_context|persist_edited_message|read_message_out|read_message_text)",
     "sqlite_hydration\\.(apply_hydrated_media_fact|apply_message_transcription|apply_message_transcription_if_absent|enqueue_transcription_for_hydrated_media|stage_message_transcription)",
     "sqlite_hydration_jobs\\.(MediaMetadataHydrationRepair|TranscriptionHydrationRepair|media_fact_hydration_eligible|reconcile_fact_hydration_jobs_for_dialog|repair_media_metadata_hydration_jobs|repair_transcription_hydration_jobs|transcription_hydration_eligible)",
 ]

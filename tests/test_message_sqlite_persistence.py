@@ -12,9 +12,11 @@ from mcp_telegram.fts import stem_text
 from mcp_telegram.hydration_queue import HydrationPriority
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.messages.sqlite_bundle import (
+    MessageLogContext,
     insert_messages_with_fts,
     list_undeleted_message_ids,
     mark_message_deleted,
+    message_log_context,
     persist_edited_message,
     persist_transcribed_text,
     read_message_text,
@@ -91,6 +93,18 @@ def test_read_message_text_distinguishes_missing_from_null(conn: sqlite3.Connect
     null_text = read_message_text(conn, 42, 1)
     assert null_text.found is True
     assert null_text.text is None
+
+
+def test_message_log_context_projects_only_safe_coordinates(conn: sqlite3.Connection) -> None:
+    with conn:
+        insert_messages_with_fts(conn, [_message(11, text="must not be projected", sent_at=1_700_000_000)])
+
+    assert message_log_context(conn, 42, 11) == MessageLogContext(
+        dialog_id=42,
+        message_id=11,
+        telegram_sent_at=1_700_000_000,
+    )
+    assert message_log_context(conn, 42, 12) == MessageLogContext(dialog_id=42, message_id=12)
 
 
 def test_persist_edited_message_versions_sequentially_and_refreshes_fts(conn: sqlite3.Connection) -> None:
