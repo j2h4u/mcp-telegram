@@ -391,7 +391,11 @@ async def test_call_tool_records_tool_error_code_without_parsing_response_text(
     monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
     monkeypatch.setattr(
         "mcp_telegram.server.tools.tool_runner",
-        AsyncMock(return_value=ToolResult(content=[TextContent(type="text", text="error=secret")], is_error=True, error_code="dialog_not_found")),
+        AsyncMock(
+            return_value=ToolResult(
+                content=[TextContent(type="text", text="error=secret")], is_error=True, error_code="dialog_not_found"
+            )
+        ),
     )
     send_mock = AsyncMock()
     monkeypatch.setattr(server, "_send_telemetry_event", send_mock)

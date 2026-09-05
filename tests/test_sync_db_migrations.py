@@ -1625,7 +1625,13 @@ def test_v48_fresh_schema_has_sync_alert_projection(tmp_path: Path) -> None:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 48
         columns = _fetchall_rows(conn, "PRAGMA table_info(sync_alert_events)")
         assert [row[1] for row in columns] == [
-            "seq", "kind", "occurred_at", "dialog_id", "message_id", "version", "daemon_event_id"
+            "seq",
+            "kind",
+            "occurred_at",
+            "dialog_id",
+            "message_id",
+            "version",
+            "daemon_event_id",
         ]
         assert _fetchone_row(conn, "SELECT name FROM sqlite_master WHERE name = 'sync_alert_events_message_edit'") == (
             "sync_alert_events_message_edit",
@@ -1740,9 +1746,7 @@ def test_v48_triggers_are_interleaved_strict_and_access_restore_is_new_event(tmp
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        conn.execute(
-            "INSERT INTO messages(dialog_id, message_id, sent_at, text) VALUES (1, 1, 1, 'raw')"
-        )
+        conn.execute("INSERT INTO messages(dialog_id, message_id, sent_at, text) VALUES (1, 1, 1, 'raw')")
         conn.execute("UPDATE messages SET is_deleted = 1, deleted_at = 10 WHERE dialog_id = 1 AND message_id = 1")
         conn.execute(
             "INSERT INTO message_versions(dialog_id, message_id, version, old_text, edit_date) VALUES (1, 1, 1, 'old', 20)"
@@ -1757,9 +1761,13 @@ def test_v48_triggers_are_interleaved_strict_and_access_restore_is_new_event(tmp
         conn.execute("UPDATE messages SET is_deleted = 0 WHERE dialog_id = 1 AND message_id = 1")
         conn.execute("UPDATE messages SET is_deleted = 1, deleted_at = 11 WHERE dialog_id = 1 AND message_id = 1")
         conn.commit()
-        assert _fetchone_row(conn, "SELECT is_deleted, deleted_at FROM messages WHERE dialog_id = 1 AND message_id = 1") == (1, 11)
+        assert _fetchone_row(
+            conn, "SELECT is_deleted, deleted_at FROM messages WHERE dialog_id = 1 AND message_id = 1"
+        ) == (1, 11)
         conn.execute("UPDATE synced_dialogs SET status = 'synced' WHERE dialog_id = 1")
-        conn.execute("INSERT INTO daemon_events(kind, dialog_id, occurred_at, payload_json) VALUES ('access_lost', 1, 50, '{}')")
+        conn.execute(
+            "INSERT INTO daemon_events(kind, dialog_id, occurred_at, payload_json) VALUES ('access_lost', 1, 50, '{}')"
+        )
         conn.commit()
         assert _fetchone_int(conn, "SELECT COUNT(*) FROM sync_alert_events WHERE kind = 'access_lost'") == 2
 
@@ -1799,7 +1807,10 @@ def test_v48_delete_resync_delete_is_idempotent_for_message_source(tmp_path: Pat
             conn,
             "SELECT is_deleted, deleted_at FROM messages WHERE dialog_id = 1 AND message_id = 1",
         ) == (1, 20)
-        assert _fetchone_int(
-            conn,
-            "SELECT COUNT(*) FROM sync_alert_events WHERE kind = 'deleted_message' AND dialog_id = 1 AND message_id = 1",
-        ) == 1
+        assert (
+            _fetchone_int(
+                conn,
+                "SELECT COUNT(*) FROM sync_alert_events WHERE kind = 'deleted_message' AND dialog_id = 1 AND message_id = 1",
+            )
+            == 1
+        )

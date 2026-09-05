@@ -95,9 +95,7 @@ def test_parse_request_is_strict_and_page_limit_is_effective() -> None:
 
 def test_global_keyset_page_and_snapshot_exclude_newer_events(db: sqlite3.Connection) -> None:
     conn = db
-    conn.executemany(
-        "INSERT INTO messages VALUES (?, ?, 1, ?, ?)", [(1, 1, 10, "one"), (1, 2, 9, "two")]
-    )
+    conn.executemany("INSERT INTO messages VALUES (?, ?, 1, ?, ?)", [(1, 1, 10, "one"), (1, 2, 9, "two")])
     conn.execute("INSERT INTO message_versions VALUES (2, 4, 1, 10, 'old')")
     codec = SyncAlertTokenCodec()
     first = query_alerts(conn, {"limit": 2}, codec)
@@ -150,7 +148,9 @@ def test_snapshot_watermark_is_max_fact_time_within_snapshot(db: sqlite3.Connect
     assert second["data"]["snapshot_upper_event_at"] == 11
 
 
-def test_snapshot_watermark_is_computed_once_and_cursor_bound(db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_snapshot_watermark_is_computed_once_and_cursor_bound(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
     db.execute("INSERT INTO messages VALUES (1, 1, 1, 11, 'newer')")
     db.execute("INSERT INTO messages VALUES (1, 2, 1, 10, 'older')")
     codec = SyncAlertTokenCodec()

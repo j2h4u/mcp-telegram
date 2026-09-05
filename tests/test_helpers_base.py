@@ -278,6 +278,7 @@ async def test_track_tool_telemetry_preserves_runner_exception(monkeypatch: pyte
 async def test_track_tool_telemetry_does_not_handle_delivery_failures(monkeypatch: pytest.MonkeyPatch) -> None:
     send_mock = AsyncMock(side_effect=RuntimeError("telemetry backend down"))
     monkeypatch.setattr(_base, "_send_telemetry_event", send_mock)
+
     class Args(ToolArgs): ...
 
     @_track_tool_telemetry("warn_tool")

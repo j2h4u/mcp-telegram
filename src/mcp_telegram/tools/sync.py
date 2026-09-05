@@ -607,14 +607,13 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:  # noqa: PLR0912, 
 
     # New daemons return a canonical globally ordered page. Keep the old
     # category projections available for clients that have not migrated yet.
-    if isinstance(data, dict) and isinstance(data.get("alerts"), list) and (
-        "page_limit" in data or "next_navigation" in data
+    if (
+        isinstance(data, dict)
+        and isinstance(data.get("alerts"), list)
+        and ("page_limit" in data or "next_navigation" in data)
     ):
         raw_alerts = [item for item in data["alerts"] if isinstance(item, dict)]
-        alerts = [
-            {key: value for key, value in item.items() if key not in {"text", "old_text"}}
-            for item in raw_alerts
-        ]
+        alerts = [{key: value for key, value in item.items() if key not in {"text", "old_text"}} for item in raw_alerts]
         deleted_messages = [
             {
                 "dialog_id": item.get("dialog_id"),

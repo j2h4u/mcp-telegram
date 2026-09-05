@@ -624,9 +624,7 @@ def test_schema_v47_replay_preserves_existing_boundary_outcomes() -> None:
     conn.commit()
     try:
         assert _apply_migration_47(conn, 46) == 47
-        rows = conn.execute(
-            "SELECT tool_name, outcome, error_code FROM telemetry_events ORDER BY tool_name"
-        ).fetchall()
+        rows = conn.execute("SELECT tool_name, outcome, error_code FROM telemetry_events ORDER BY tool_name").fetchall()
         assert rows == [
             ("cancelled", "cancelled", "client_cancelled"),
             ("tool_error", "tool_error", "dialog_not_found"),
@@ -686,9 +684,7 @@ def test_schema_v47_replay_with_both_columns_backfills_only_legacy_error() -> No
     conn.commit()
     try:
         assert _apply_migration_47(conn, 46) == 47
-        rows = conn.execute(
-            "SELECT tool_name, outcome, error_code FROM telemetry_events ORDER BY tool_name"
-        ).fetchall()
+        rows = conn.execute("SELECT tool_name, outcome, error_code FROM telemetry_events ORDER BY tool_name").fetchall()
         assert rows == [
             ("cancelled", "cancelled", "client_cancelled"),
             ("legacy_error", "exception", "exception"),

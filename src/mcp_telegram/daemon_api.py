@@ -1432,10 +1432,7 @@ class DaemonAPIServer:
                 list[tuple[object, ...]],
                 self._conn.execute("PRAGMA table_info(telemetry_events)").fetchall(),
             )
-            columns = {
-                str(row[1])
-                for row in telemetry_rows
-            }
+            columns = {str(row[1]) for row in telemetry_rows}
         except sqlite3.Error:
             columns = set()
         # Keep old in-memory/test databases and pre-v47 installations writable

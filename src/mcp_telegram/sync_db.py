@@ -1988,16 +1988,21 @@ def _apply_migration_46(conn: sqlite3.Connection, current: int) -> int:
 
 def _apply_migration_47(conn: sqlite3.Connection, current: int) -> int:
     """Add the boundary outcome and safe machine error code fields."""
-    existing_table = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'telemetry_events'"
-    ).fetchone() is not None
-    existing_columns = {
-        str(row[1])
-        for row in cast(
-            list[tuple[object, ...]],
-            conn.execute("PRAGMA table_info(telemetry_events)").fetchall(),
-        )
-    } if existing_table else set()
+    existing_table = (
+        conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'telemetry_events'").fetchone()
+        is not None
+    )
+    existing_columns = (
+        {
+            str(row[1])
+            for row in cast(
+                list[tuple[object, ...]],
+                conn.execute("PRAGMA table_info(telemetry_events)").fetchall(),
+            )
+        }
+        if existing_table
+        else set()
+    )
     outcome_added = "outcome" not in existing_columns
     error_code_added = "error_code" not in existing_columns
     statements = []
@@ -2013,10 +2018,7 @@ def _apply_migration_47(conn: sqlite3.Connection, current: int) -> int:
     # ALTER and before the backfill while schema_version is still 46.
     statements.extend(
         [
-            (
-                "UPDATE telemetry_events SET outcome = 'exception' "
-                "WHERE outcome = 'success' AND error_type IS NOT NULL"
-            ),
+            ("UPDATE telemetry_events SET outcome = 'exception' WHERE outcome = 'success' AND error_type IS NOT NULL"),
             (
                 "UPDATE telemetry_events SET error_code = 'exception' "
                 "WHERE error_code IS NULL AND error_type IS NOT NULL"

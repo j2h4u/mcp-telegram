@@ -152,7 +152,9 @@ def _b64decode(value: str) -> bytes:
     return decoded
 
 
-def _legacy_text(conn: sqlite3.Connection, kind: object, dialog_id: object, message_id: object, version: object) -> object:
+def _legacy_text(
+    conn: sqlite3.Connection, kind: object, dialog_id: object, message_id: object, version: object
+) -> object:
     if kind == "deleted_message":
         row = cast(
             tuple[object, ...] | None,
@@ -299,9 +301,24 @@ def query_alerts(  # noqa: PLR0912, PLR0914, PLR0915 - assembles one bounded wir
     for item, _row in zip(alerts, page_rows, strict=True):
         kind, dialog_id, message_id, version = item["kind"], item["dialog_id"], item["message_id"], item["version"]
         if kind == "deleted_message":
-            deleted.append({"dialog_id": dialog_id, "message_id": message_id, "text": _legacy_text(conn, kind, dialog_id, message_id, version), "deleted_at": item["deleted_at"]})
+            deleted.append(
+                {
+                    "dialog_id": dialog_id,
+                    "message_id": message_id,
+                    "text": _legacy_text(conn, kind, dialog_id, message_id, version),
+                    "deleted_at": item["deleted_at"],
+                }
+            )
         elif kind == "edit":
-            edits.append({"dialog_id": dialog_id, "message_id": message_id, "version": version, "old_text": _legacy_text(conn, kind, dialog_id, message_id, version), "edit_date": item["edit_date"]})
+            edits.append(
+                {
+                    "dialog_id": dialog_id,
+                    "message_id": message_id,
+                    "version": version,
+                    "old_text": _legacy_text(conn, kind, dialog_id, message_id, version),
+                    "edit_date": item["edit_date"],
+                }
+            )
         else:
             access.append({"dialog_id": dialog_id, "access_lost_at": item["access_lost_at"]})
     data: dict[str, object] = {
@@ -309,7 +326,12 @@ def query_alerts(  # noqa: PLR0912, PLR0914, PLR0915 - assembles one bounded wir
         "deleted_messages": deleted,
         "edits": edits,
         "access_lost": access,
-        "counts": {"deleted_messages": len(deleted), "edits": len(edits), "access_lost": len(access), "total": len(alerts)},
+        "counts": {
+            "deleted_messages": len(deleted),
+            "edits": len(edits),
+            "access_lost": len(access),
+            "total": len(alerts),
+        },
         "count": len(alerts),
         "since": effective_since,
         "limit": effective_limit,
