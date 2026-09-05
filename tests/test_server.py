@@ -790,35 +790,6 @@ async def test_get_prompt_returns_telegram_workflows_guide() -> None:
     assert "own_only" in text
 
 
-@pytest.mark.asyncio
-async def test_run_mcp_server_invokes_stdio_transport(monkeypatch: pytest.MonkeyPatch) -> None:
-    from contextlib import asynccontextmanager
-
-    calls = {"enter": 0, "exit": 0, "run": 0}
-
-    @asynccontextmanager
-    async def fake_stdio_server():
-        calls["enter"] += 1
-        yield object(), object()
-        calls["exit"] += 1
-
-    async def fake_run(*_args: object, **_kwargs: object) -> None:
-        calls["run"] += 1
-
-    monkeypatch.setattr("mcp.server.stdio.stdio_server", fake_stdio_server)
-    monkeypatch.setattr(server.app, "run", fake_run)
-    monkeypatch.setattr(server.app, "create_initialization_options", lambda: "INIT")
-    monkeypatch.setattr("logging.basicConfig", lambda *args, **kwargs: None)
-    monkeypatch.setattr("mcp_telegram.server._build_server_instructions", AsyncMock(return_value="Built"))
-
-    await server.run_mcp_server()
-
-    assert calls["enter"] == 1
-    assert calls["exit"] == 1
-    assert calls["run"] == 1
-    assert server.app.instructions == "Built"
-
-
 class _FakeTransportSecuritySettings:
     def __init__(self, captured: dict[str, object], **kwargs: object) -> None:
         captured["security"] = kwargs

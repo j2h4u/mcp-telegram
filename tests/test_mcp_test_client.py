@@ -2,27 +2,17 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 from pathlib import Path
 from typing import cast
 
 import pytest
-from devtools.mcp_client.cli import main, print_json, redact_script_output
+from devtools.mcp_client.cli import print_json, redact_script_output
 from devtools.mcp_client.client import (
-    McpClientError,
-    StdioMcpClient,
     _assert_step_expectations,
-    _extract_prompt_text,
-    execute_script_steps,
     load_script_steps,
 )
 
 from mcp_telegram import server
-
-
-def _fake_server_command() -> list[str]:
-    fixture_path = Path(__file__).parent / "fixtures" / "fake_mcp_server.py"
-    return [sys.executable, str(fixture_path)]
 
 
 def _repo_root() -> Path:
@@ -35,125 +25,6 @@ def test_mcp_test_client_prints_utf8_without_json_ascii_escapes(capsys: pytest.C
     captured = capsys.readouterr()
     assert "Привет" in captured.out
     assert "\\u041f" not in captured.out
-
-
-@pytest.mark.asyncio
-async def test_mcp_test_client_lists_tools() -> None:
-    async with StdioMcpClient(_fake_server_command()) as client:
-        tools = await client.list_tools()
-
-    tool_names = [tool["name"] for tool in tools]
-    assert tool_names == ["Echo", "Fail"]
-
-
-@pytest.mark.asyncio
-async def test_mcp_test_client_lists_prompts() -> None:
-    async with StdioMcpClient(_fake_server_command()) as client:
-        prompts = await client.list_prompts()
-
-    prompt_names = [prompt["name"] for prompt in prompts]
-    assert prompt_names == ["Guide"]
-
-
-@pytest.mark.asyncio
-async def test_mcp_test_client_gets_prompt() -> None:
-    async with StdioMcpClient(_fake_server_command()) as client:
-        result = await client.get_prompt("Guide")
-
-    assert result["description"] == "Fake workflow prompt"
-    assert "get_prompt" in _extract_prompt_text(result)
-
-
-@pytest.mark.asyncio
-async def test_mcp_test_client_calls_tool() -> None:
-    async with StdioMcpClient(_fake_server_command()) as client:
-        result = await client.call_tool("Echo", {"value": "hello"})
-
-    assert result["isError"] is False
-    assert result["content"][0]["text"] == '{"value": "hello"}'
-
-
-@pytest.mark.asyncio
-async def test_mcp_test_client_surfaces_tool_errors() -> None:
-    async with StdioMcpClient(_fake_server_command()) as client:
-        with pytest.raises(McpClientError, match="tool failed: Fail"):
-            await client.call_tool("Fail", {})
-
-
-@pytest.mark.asyncio
-async def test_mcp_test_client_executes_script_steps() -> None:
-    steps = [
-        {
-            "action": "list_tools",
-            "expect": {
-                "tool_names_include": ["Echo", "Fail"],
-                "tool_expectations": {
-                    "Echo": {
-                        "inputSchema.properties.value.type": "string",
-                    }
-                },
-            },
-        },
-        {
-            "action": "call_tool",
-            "name": "Echo",
-            "arguments": {"value": "script"},
-            "expect": {
-                "is_error": False,
-                "path_equals": {
-                    "isError": False,
-                    "content.0.type": "text",
-                },
-                "content_text_contains": ['{"value": "script"}'],
-                "content_text_not_contains": ["missing"],
-            },
-        },
-        {
-            "action": "list_prompts",
-            "expect": {
-                "prompt_names_include": ["Guide"],
-            },
-        },
-        {
-            "action": "get_prompt",
-            "name": "Guide",
-            "expect": {
-                "path_equals": {
-                    "description": "Fake workflow prompt",
-                },
-                "prompt_text_contains": ["list_prompts", "get_prompt"],
-                "prompt_text_not_contains": ["missing"],
-            },
-        },
-    ]
-
-    async with StdioMcpClient(_fake_server_command()) as client:
-        results = await execute_script_steps(client, steps)
-
-    assert results[0]["action"] == "list_tools"
-    assert results[0]["result"][0]["name"] == "Echo"
-    assert results[1]["name"] == "Echo"
-    assert results[1]["result"]["content"][0]["text"] == '{"value": "script"}'
-    assert results[2]["action"] == "list_prompts"
-    assert results[3]["name"] == "Guide"
-
-
-@pytest.mark.asyncio
-async def test_mcp_test_client_script_assertions_fail() -> None:
-    steps = [
-        {
-            "action": "call_tool",
-            "name": "Echo",
-            "arguments": {"value": "script"},
-            "expect": {
-                "content_text_contains": ["not-there"],
-            },
-        },
-    ]
-
-    async with StdioMcpClient(_fake_server_command()) as client:
-        with pytest.raises(McpClientError, match="missing expected text fragment"):
-            await execute_script_steps(client, steps)
 
 
 def test_mcp_test_client_script_asserts_structured_paths() -> None:
@@ -176,118 +47,6 @@ def test_mcp_test_client_script_asserts_structured_paths() -> None:
             "path_nonempty": ["structuredContent.dialogs"],
         },
     )
-
-
-@pytest.mark.asyncio
-async def test_mcp_test_client_script_one_of_accepts_matching_branch() -> None:
-    steps = [
-        {
-            "action": "call_tool",
-            "name": "Echo",
-            "arguments": {"value": "script"},
-            "expect": {
-                "one_of": [
-                    {"content_text_contains": ["not-there"]},
-                    {"is_error": False, "content_text_contains": ["script"]},
-                ],
-            },
-        },
-    ]
-
-    async with StdioMcpClient(_fake_server_command()) as client:
-        results = await execute_script_steps(client, steps)
-
-    assert results[0]["result"]["isError"] is False
-
-
-@pytest.mark.asyncio
-async def test_mcp_test_client_script_one_of_fails_when_no_branch_matches() -> None:
-    steps = [
-        {
-            "action": "call_tool",
-            "name": "Echo",
-            "arguments": {"value": "script"},
-            "expect": {
-                "one_of": [
-                    {"content_text_contains": ["missing-a"]},
-                    {"content_text_contains": ["missing-b"]},
-                ],
-            },
-        },
-    ]
-
-    async with StdioMcpClient(_fake_server_command()) as client:
-        with pytest.raises(McpClientError, match="did not match any expect.one_of branch"):
-            await execute_script_steps(client, steps)
-
-
-def test_mcp_test_client_redacts_printed_script_output(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    script_path = tmp_path / "script.json"
-    script_path.write_text(
-        """
-        {
-          "steps": [
-            {
-              "action": "call_tool",
-              "name": "Echo",
-              "arguments": {"value": "sensitive text"},
-              "expect": {
-                "is_error": false,
-                "content_text_contains": ["sensitive text"]
-              }
-            }
-          ]
-        }
-        """,
-        encoding="utf-8",
-    )
-
-    exit_code = main(
-        [
-            "script",
-            "--redact",
-            "--file",
-            str(script_path),
-            "--",
-            *_fake_server_command(),
-        ]
-    )
-    captured = capsys.readouterr()
-
-    assert exit_code == 0
-    assert "[REDACTED " in captured.out
-    assert "sensitive text" not in captured.out
-
-
-def test_mcp_test_client_cli_lists_prompts(capsys: pytest.CaptureFixture[str]) -> None:
-    exit_code = main(
-        [
-            "list-prompts",
-            "--",
-            *_fake_server_command(),
-        ]
-    )
-    captured = capsys.readouterr()
-
-    assert exit_code == 0
-    assert '"name": "Guide"' in captured.out
-
-
-def test_mcp_test_client_cli_gets_prompt(capsys: pytest.CaptureFixture[str]) -> None:
-    exit_code = main(
-        [
-            "get-prompt",
-            "--name",
-            "Guide",
-            "--",
-            *_fake_server_command(),
-        ]
-    )
-    captured = capsys.readouterr()
-
-    assert exit_code == 0
-    assert "Fake workflow prompt" in captured.out
-    assert "get_prompt" in captured.out
 
 
 def test_mcp_test_client_redacts_structured_content() -> None:

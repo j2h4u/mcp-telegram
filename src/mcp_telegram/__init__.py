@@ -2,11 +2,11 @@ import asyncio
 import sqlite3
 from typing import Annotated, cast
 
-from typer import Argument, BadParameter, Context, Option, Typer
+from typer import Argument, BadParameter, Option, Typer
 
 from .config import ConfigError, HttpServerConfig, load_config, resolve_http_server_config, resolve_logging_config
 
-app = Typer()
+app = Typer(no_args_is_help=True)
 
 
 def _resolve_http_host(host: str | None, *, base: HttpServerConfig | None = None) -> str:
@@ -35,21 +35,6 @@ def _row_first_int(row: tuple[object | None, ...] | None) -> int:
     if isinstance(value, str) and value.isdecimal():
         return int(value)
     return 0
-
-
-@app.callback(invoke_without_command=True)
-def _run(ctx: Context) -> None:
-    if ctx.invoked_subcommand is None:
-        # This will run if no subcommand is specified
-        run()
-
-
-@app.command()
-def run() -> None:
-    """Run the mcp-telegram server."""
-    from . import server as _server
-
-    asyncio.run(_server.run_mcp_server())
 
 
 @app.command()

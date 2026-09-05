@@ -2,7 +2,7 @@
 
 Wires tool_runner (singledispatch) to the MCP Server, tracks per-request IDs
 via the public correlation context API for cross-process log correlation, and
-runs stdio or Streamable HTTP transport loops.
+runs the Streamable HTTP transport loop.
 """
 
 import asyncio
@@ -547,32 +547,6 @@ async def _build_server_instructions() -> str:
     except (AttributeError, DaemonNotRunningError, KeyError, TypeError, ValueError) as exc:
         logger.debug("server_instructions: could not fetch account info: %s", exc)
     return base
-
-
-async def run_mcp_server() -> None:
-    # Deferred: stdio_server touches the event loop at import time in some envs
-    from mcp.server.stdio import stdio_server
-
-    log_level = resolve_logging_config().level
-    logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
-        stream=sys.stderr,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        force=True,
-    )
-    install_telethon_log_filter()
-    _quiet_mcp_http_lifecycle_logs()
-
-    logger.info("MCP server starting — routing through daemon API")
-
-    mcp_server = bootstrap_server()
-    mcp_server.instructions = await _build_server_instructions()
-
-    try:
-        async with stdio_server() as (read_stream, write_stream):
-            await mcp_server.run(read_stream, write_stream, mcp_server.create_initialization_options())
-    finally:
-        await flush_telemetry()
 
 
 async def run_mcp_http_server(

@@ -6,7 +6,7 @@ runtime layers for the rest of the daemon. This is a deliberate hybrid, not a
 claim that every worker should become a package.
 
 ```text
-MCP stdio / HTTP / Unix socket     delivery transports
+MCP HTTP / Unix socket             delivery transports
               │
               ▼
 daemon                          composition root

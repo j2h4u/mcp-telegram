@@ -88,7 +88,7 @@ def parse_request(req: dict[str, object]) -> SyncAlertRequest:
 
 
 class SyncAlertTokenCodec:
-    """HMAC codec owned by the daemon process; stdio only forwards its token."""
+    """HMAC codec owned by the daemon process; MCP only forwards its token."""
 
     def __init__(self) -> None:
         self._secret = secrets.token_bytes(32)

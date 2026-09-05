@@ -177,11 +177,6 @@ rationale = "This explicit unsafe-exposure escape hatch remains an environment-o
 
 [[entry]]
 category = "environment_reads"
-key = "src/mcp_telegram/server.py:run_mcp_server:os.environ.get"
-rationale = "The stdio server's existing environment inputs are outside the TTL policy scope."
-
-[[entry]]
-category = "environment_reads"
 key = "src/mcp_telegram/server.py:run_mcp_http_server:os.environ.get"
 rationale = "The HTTP server's existing environment inputs are outside the TTL policy scope."
 

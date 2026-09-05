@@ -15,7 +15,7 @@ and understand how fresh or complete the local mirror is.
 ## What It Does
 
 - Mirrors Telegram dialogs into a local SQLite database (`sync.db`).
-- Serves MCP tools over stdio and Streamable HTTP.
+- Serves MCP tools over Streamable HTTP.
 - Returns successful tool responses as structured `structuredContent`; text
   `content` is reserved for recoverable tool errors.
 - Reads dialogs, Telegram folders, forum and bot-DM topics, messages, unread
@@ -49,17 +49,11 @@ mcp-telegram daemon / serve
     |-- sync.db, feedback.db, Telegram session
     |-- Unix socket API
     |-- Streamable HTTP MCP endpoint on /mcp
-    |
-    v
-MCP stdio server via docker exec
+    `-- MCP clients over Streamable HTTP
 ```
 
 The default Docker image starts `mcp-telegram serve`, which runs the sync daemon
-and the HTTP MCP endpoint in one process. Stdio MCP clients can still use:
-
-```bash
-docker exec -i mcp-telegram mcp-telegram run
-```
+and the HTTP MCP endpoint in one process.
 
 The deployed compose template publishes HTTP only on host loopback:
 
@@ -203,7 +197,7 @@ current workflow guide and important interpretation rules.
 - Python 3.14.6 (pinned by `.python-version`) and
   [uv](https://docs.astral.sh/uv/) for local development.
 - `just` for the checked-in developer workflow.
-- An MCP client that can run a stdio command or connect to Streamable HTTP.
+- An MCP client that supports Streamable HTTP.
 
 ## Setup
 
@@ -277,13 +271,7 @@ current workflow guide and important interpretation rules.
 
 ## MCP Client Configuration
 
-For stdio MCP clients, use this command:
-
-```bash
-docker exec -i mcp-telegram mcp-telegram run
-```
-
-For Streamable HTTP MCP clients, use:
+Configure MCP clients with this Streamable HTTP endpoint:
 
 ```text
 http://127.0.0.1:3100/mcp
@@ -339,13 +327,11 @@ but skip Python tests, CRAP analysis, CodeQL, dependency review, and Docker buil
 Use the devtools MCP client for local MCP validation:
 
 ```bash
-uv run python -m devtools.mcp_client.cli list-tools \
-  -- docker exec -i mcp-telegram mcp-telegram run
+uv run python -m devtools.mcp_client.cli list-tools
 
 uv run python -m devtools.mcp_client.cli call-tool \
   --name get_sync_status \
-  --arguments '{"dialog_id": 123456}' \
-  -- docker exec -i mcp-telegram mcp-telegram run
+  --arguments '{"dialog_id": 123456}'
 ```
 
 ## Project Structure
@@ -354,7 +340,7 @@ uv run python -m devtools.mcp_client.cli call-tool \
 | --- | --- |
 | `src/mcp_telegram/daemon.py` | Composition root and sole owner of the Telegram client and writable state. |
 | `src/mcp_telegram/daemon_api.py` | Internal Unix-socket application API. |
-| `src/mcp_telegram/server.py` | MCP stdio/HTTP transports and the `telegram_workflows` prompt. |
+| `src/mcp_telegram/server.py` | Streamable HTTP MCP transport and the `telegram_workflows` prompt. |
 | `src/mcp_telegram/tools/` | MCP schemas and structured agent-facing projections. |
 | `src/mcp_telegram/messages/` | Canonical Telegram message extraction and persistence. |
 | `src/mcp_telegram/reading/` | Read-only message query and projection capability. |
