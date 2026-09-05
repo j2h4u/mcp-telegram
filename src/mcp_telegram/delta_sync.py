@@ -31,6 +31,7 @@ from .access_lifecycle import (
 from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
 from .history_enrollment import full_history_enabled
 from .hydration_queue import HydrationPriority
+from .maintenance_logging import log_maintenance_cycle
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
@@ -330,7 +331,9 @@ class DeltaSyncWorker:
             if await _pause_after_probe(self._shutdown_event, policy):
                 break
         observability = self._delta_observability(int(time.time()))
-        logger.info(
+        log_maintenance_cycle(
+            logger,
+            any((total_new, observability.never_checked, observability.pending_refresh)),
             "delta_catch_up complete — new_messages=%d skipped=%d probed=%d "
             "total_synced=%d checked_total=%d never_checked=%d pending_refresh=%d "
             "oldest_delta_checked_age_s=%s newest_delta_checked_age_s=%s",
@@ -549,7 +552,9 @@ async def _probe_access_lost_dialogs(  # noqa: PLR0915
             except TimeoutError:
                 pass
 
-    logger.info(
+    log_maintenance_cycle(
+        logger,
+        any((rows, restored, errors, flood_wait_hit)),
         "access_probe complete — selected=%d checked=%d restored=%d still_lost=%d errors=%d flood_wait_hit=%s",
         len(rows),
         checked,

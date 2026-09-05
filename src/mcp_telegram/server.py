@@ -204,7 +204,7 @@ def _assert_http_exposure_allowed(host: str) -> None:
     if _is_loopback_http_host(host):
         return
     if _unsafe_http_exposure_enabled():
-        logger.warning(
+        logger.info(
             "MCP HTTP server binding to non-loopback host %s with explicit unsafe exposure opt-in",
             host,
         )

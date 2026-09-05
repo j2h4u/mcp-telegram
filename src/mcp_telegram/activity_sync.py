@@ -400,7 +400,7 @@ def _log_incremental_batch(
     progress: _IncrementalState, batch_log: _IncrementalBatchLog, batch_duration_s: float
 ) -> None:
     """Emit the per-batch incremental progress log."""
-    logger.info(
+    logger.debug(
         "activity_sync_incremental_batch batch=%d fetched=%d in_window=%d "
         "extracted=%d total_inserted=%d next_offset_id=%d past_window=%s"
         " batch_duration_s=%.3f pass_elapsed_s=%.3f next_sleep_s=%.3f",
@@ -514,7 +514,7 @@ async def _run_incremental(
     # 60-second buffer guards against messages at the exact boundary being
     # missed when the previous sync finished mid-second.
     progress = _IncrementalState(min_date=max(0, last_sync_at - 60), loop_start=time.monotonic())
-    logger.info(
+    logger.debug(
         "activity_sync_incremental_start min_date=%d window_s=%d",
         progress.min_date,
         int(time.time()) - progress.min_date,
@@ -581,7 +581,7 @@ async def _run_incremental(
             return
 
     _stamp_last_sync_at(conn)
-    logger.info(
+    logger.debug(
         "activity_sync_incremental_done batches=%d inserted=%d duration_s=%.3f",
         progress.batch_num,
         progress.inserted,
@@ -603,13 +603,13 @@ async def run_activity_sync_loop(
     Sleeps `interval` between passes, interruptible via shutdown_event.
     """
     while not shutdown_event.is_set():
-        logger.info("activity_sync_loop_start")
+        logger.debug("activity_sync_loop_start")
         try:
             await _run_backfill(client, conn, shutdown_event, timeout_s=timeout_s)
             await _run_incremental(client, conn, shutdown_event, timeout_s=timeout_s)
         except Exception:
             logger.warning("activity_sync_error", exc_info=True)
-        logger.info("activity_sync_loop_sleeping interval=%.0fs", interval)
+        logger.debug("activity_sync_loop_sleeping interval=%.0fs", interval)
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
             return

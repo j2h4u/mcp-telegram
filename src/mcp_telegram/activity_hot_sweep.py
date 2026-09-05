@@ -27,6 +27,7 @@ from .activity_peer_sweep import (
 from .activity_substrate import ActivityClient
 from .flood import TelegramRpcThrottled
 from .hydration_queue import HydrationPriority
+from .maintenance_logging import log_maintenance_cycle
 from .messages.sqlite_bundle import message_log_context
 
 logger = logging.getLogger(__name__)
@@ -605,7 +606,7 @@ async def run_hot_sweep_pass(  # noqa: PLR0914 - explicit pass telemetry counter
         ).fetchall(),
     )
 
-    logger.info("activity_hot_sweep_pass_start peers_selected=%d", len(rows))
+    logger.debug("activity_hot_sweep_pass_start peers_selected=%d", len(rows))
 
     peers_processed = 0
     flooded = False
@@ -668,7 +669,9 @@ async def run_hot_sweep_pass(  # noqa: PLR0914 - explicit pass telemetry counter
         "flood_wait_seconds": flood_wait_seconds,
         "duration_s": time.monotonic() - started_at,
     }
-    logger.info(
+    log_maintenance_cycle(
+        logger,
+        any((genuinely_new, flooded, working_set.flood_wait_seconds is not None, due_remaining)),
         "activity_hot_sweep_pass_done peers_selected=%d peers_processed=%d due_remaining=%d"
         " pages_fetched=%d rpc_calls=%d extracted=%d genuinely_new=%d yielding_peers=%d"
         " flooded=%s flood_wait_seconds=%r duration_s=%.3f",
@@ -700,11 +703,11 @@ async def run_hot_sweep_loop(
     Mirrors the structure of run_activity_sync_loop.
     """
     while not shutdown_event.is_set():
-        logger.info("activity_hot_sweep_loop_start")
+        logger.debug("activity_hot_sweep_loop_start")
         telemetry: dict[str, int | float | bool | None] = {"flood_wait_seconds": None}
         try:
             telemetry = await run_hot_sweep_pass(client, conn, shutdown_event, policy=policy, timeout_s=timeout_s)
-            logger.info(
+            logger.debug(
                 "activity_hot_sweep_loop_done genuinely_new=%d flood_wait_seconds=%r",
                 telemetry["genuinely_new"],
                 telemetry["flood_wait_seconds"],
@@ -714,7 +717,7 @@ async def run_hot_sweep_loop(
         except Exception:
             logger.warning("activity_hot_sweep_error", exc_info=True)
         wait_seconds = max(policy.loop_interval_seconds, float(telemetry.get("flood_wait_seconds") or 0))
-        logger.info("activity_hot_sweep_loop_sleeping interval=%.0fs", wait_seconds)
+        logger.debug("activity_hot_sweep_loop_sleeping interval=%.0fs", wait_seconds)
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=wait_seconds)
             return

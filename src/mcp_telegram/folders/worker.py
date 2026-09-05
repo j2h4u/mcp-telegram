@@ -13,6 +13,7 @@ from enum import StrEnum
 from typing import Protocol, cast
 
 from ..flood import TelegramRpcThrottled
+from ..maintenance_logging import log_maintenance_cycle
 from .contracts import FolderSourceUnavailableError
 from .ports import FolderSnapshotRepository
 from .refresh import FolderRefresher, FolderRefreshResult
@@ -193,7 +194,9 @@ class FolderProjectionWorker:
         return next_due_at
 
     def _log_attempt(self, attempt: _Attempt) -> None:
-        logger.info(
+        log_maintenance_cycle(
+            logger,
+            attempt.result != FolderAttemptResult.SUCCESS or attempt.reason != "scheduled",
             "folder_projection_complete reason=%s result=%s duration_s=%.3f folder_count=%d dialog_count=%d "
             "membership_count=%d failure_count=%d snapshot_age_seconds=%s next_due_at=%s",
             attempt.reason,
