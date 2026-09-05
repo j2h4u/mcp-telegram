@@ -1230,42 +1230,15 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _get_me(self, req: dict[str, object]) -> dict:
-        """Return current user info from Telegram.
+        """Return the daemon-owned account identity snapshot.
 
         Request: no parameters.
         Response data: {"id", "first_name", "last_name", "username"}.
-        Errors: telegram_error, not_found.
+        Errors: not_found.
         """
-        # Note: this path returns the full User object (name, username). The
-        # lightweight `self.self_id` cached at startup is used by query-build
-        # paths (Plan 39.1-02); this handler still fetches full profile on
-        # demand because callers want display fields, not just the id.
-        try:
-            me = await self._client.get_me()
-        except TelegramRpcThrottled as exc:
-            response: dict[str, object] = {
-                "ok": False,
-                "error": "flood_wait",
-                "message": "Telegram account info is temporarily throttled.",
-                "retryable": not exc.latched,
-            }
-            if exc.retry_after_seconds is not None:
-                response["retry_after"] = exc.retry_after_seconds
-            return response
-        except Exception as exc:
-            logger.warning("get_me_failed error=%s", exc, exc_info=True)
-            return {"ok": False, "error": "telegram_error", "message": "failed to retrieve account info"}
-        if me is None:
+        if self.self_profile is None:
             return {"ok": False, "error": "not_found", "message": "account info unavailable"}
-        return {
-            "ok": True,
-            "data": {
-                "id": int(cast(int | str, _attr(me, "id", 0))),
-                "first_name": _attr(me, "first_name", None),
-                "last_name": _attr(me, "last_name", None),
-                "username": _attr(me, "username", None),
-            },
-        }
+        return {"ok": True, "data": dict(self.self_profile)}
 
     # ------------------------------------------------------------------
     # mark_dialog_for_sync

@@ -183,6 +183,7 @@ class SchedulingConfig:
     """Intervals for local daemon maintenance loops."""
 
     scheduled_reconciliation_seconds: float = 900.0
+    self_profile_refresh_seconds: float = 86_400.0
     read_position_reconciliation_seconds: float = 900.0
     read_position_reconciliation_max_dialogs_per_pass: int = 100
     read_position_reconciliation_failure_cooldown_seconds: float = 3_600.0
@@ -1012,6 +1013,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
     defaults = SchedulingConfig()
     allowed = {
         "scheduled_reconciliation_seconds",
+        "self_profile_refresh_seconds",
         "read_position_reconciliation_seconds",
         "read_position_reconciliation_max_dialogs_per_pass",
         "read_position_reconciliation_failure_cooldown_seconds",
@@ -1050,6 +1052,13 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             "scheduling",
             path,
             defaults.scheduled_reconciliation_seconds,
+        ),
+        self_profile_refresh_seconds=_positive_float(
+            scheduling_data,
+            "self_profile_refresh_seconds",
+            "scheduling",
+            path,
+            defaults.self_profile_refresh_seconds,
         ),
         read_position_reconciliation_seconds=_positive_float(
             scheduling_data,
