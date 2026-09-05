@@ -1230,19 +1230,25 @@ async def test_search_messages_keeps_raw_text_while_list_projects_hidden_links()
 
 
 # ---------------------------------------------------------------------------
-# search_messages — empty query
+# search_messages — queries without searchable tokens
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_search_messages_empty_query() -> None:
-    """search_messages with empty query returns empty result."""
+@pytest.mark.parametrize("query", ["", "  ", "!!! ???", "😀👍"])
+async def test_search_messages_without_searchable_tokens(query: str) -> None:
+    """search_messages rejects queries that cannot produce an indexed token."""
     server = make_server(_make_db(with_fts=True))
-    result = await server._search_messages({"dialog_id": 1, "query": "", "limit": 10})
+    result = await server._search_messages({"dialog_id": 1, "query": query, "limit": 10})
 
-    assert result["ok"] is True
-    assert _response_messages(result) == []
-    assert result["data"]["total"] == 0
+    assert result == {
+        "ok": False,
+        "error": "invalid_query",
+        "message": (
+            "query must contain at least one Cyrillic or Latin letter or ASCII digit. "
+            "Action: pass a searchable query, or use list_messages."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------

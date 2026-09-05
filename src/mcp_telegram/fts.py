@@ -23,13 +23,15 @@ from typing import cast
 
 import snowballstemmer  # type: ignore[import-untyped]
 
+from .search_contracts import SEARCHABLE_QUERY_TOKEN_PATTERN
+
 # Module-level stemmer — Russian language model.
 # snowballstemmer is stateless for stemWords(), safe for concurrent reads.
 _russian_stemmer = snowballstemmer.stemmer("russian")
 
 # Matches Cyrillic (including ё/Ё), Latin, and ASCII-digit word characters.
 # Punctuation, whitespace, and emoji are intentionally excluded.
-_WORD_RE = re.compile(r"[а-яёА-ЯЁa-zA-Z0-9]+")
+_WORD_RE = re.compile(f"{SEARCHABLE_QUERY_TOKEN_PATTERN}+")
 
 # ---------------------------------------------------------------------------
 # DDL and SQL constants

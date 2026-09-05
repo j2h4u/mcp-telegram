@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock
 from urllib.parse import urlparse
 
 import pytest
-from jsonschema import validate
+from jsonschema import ValidationError, validate
 from mcp.types import CallToolResult, Prompt, TextContent, Tool
 
 from mcp_telegram import server
@@ -164,6 +164,25 @@ async def test_call_tool_validation_rejects_conflicting_list_messages_selectors(
     assert "exact_dialog_id" in message
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "expected_fragment"),
+    [
+        ("search_messages", {"query": "😀👍"}, "Cyrillic or Latin letter or ASCII digit"),
+        ("trace_account_messages", {"exact_account_id": True}, "exact_account_id"),
+    ],
+)
+async def test_public_tools_reject_invalid_boundary_arguments(
+    tool_name: str,
+    arguments: dict[str, object],
+    expected_fragment: str,
+) -> None:
+    result = _call_tool_result(await server.call_tool(tool_name, arguments))
+
+    assert result.is_error is True
+    assert expected_fragment in _call_tool_text(result)
+
+
 def test_search_messages_reflection_exposes_shared_navigation_schema() -> None:
     tool = server.tool_by_name["search_messages"]
     properties = cast(dict[str, object], _tool_input_schema(tool)["properties"])
@@ -179,6 +198,56 @@ def test_search_messages_reflection_exposes_shared_navigation_schema() -> None:
     assert navigation["type"] == "string"
     assert "first search page" in cast(str, navigation["description"])
     assert "next_navigation" in cast(str, navigation["description"])
+    query = cast(dict[str, object], properties["query"])
+    assert query["pattern"] == r"[A-Za-z0-9А-Яа-яЁё]"
+    assert "Cyrillic or Latin letter or ASCII digit" in cast(str, query["description"])
+
+
+@pytest.mark.parametrize("query", ["", "  ", "!!!", "😀👍"])
+def test_search_query_schema_rejects_unsearchable_values(query: str) -> None:
+    schema = _tool_input_schema(server.tool_by_name["search_messages"])
+    with pytest.raises(ValidationError):
+        validate({"query": query}, schema)
+
+
+@pytest.mark.asyncio
+async def test_search_invalid_query_preserves_error_code_and_telemetry_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mock_conn = AsyncMock()
+    mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_conn.__aexit__ = AsyncMock(return_value=False)
+    mock_conn.search_messages = AsyncMock(
+        return_value={
+            "ok": False,
+            "error": "invalid_query",
+            "message": "query has no searchable token",
+        }
+    )
+
+    @asynccontextmanager
+    async def _connection():
+        yield mock_conn
+
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", _connection)
+    send_mock = AsyncMock()
+    monkeypatch.setattr(server, "_send_telemetry_event", send_mock)
+    server._telemetry_tasks.clear()
+
+    result = _call_tool_result(await server.call_tool("search_messages", {"query": "needle"}))
+    await server.flush_telemetry()
+
+    assert result.is_error is True
+    assert send_mock.await_count == 1
+    event = cast(dict[str, object], send_mock.await_args.args[0])
+    assert event["outcome"] == "tool_error"
+    assert event["error_code"] == "invalid_query"
+
+
+@pytest.mark.parametrize("query", ["hello", "мир", "123"])
+def test_search_query_schema_accepts_searchable_values(query: str) -> None:
+    schema = _tool_input_schema(server.tool_by_name["search_messages"])
+    validate({"query": query}, schema)
 
 
 @pytest.mark.asyncio
@@ -1350,6 +1419,10 @@ def test_primary_tools_have_core_read_search_schema() -> None:
     trace_account = server.tool_by_name["trace_account_messages"]
     trace_props = cast(dict[str, object], _tool_input_schema(trace_account)["properties"])
     assert "exact_account_id" in trace_props, "trace_account_messages missing exact_account_id"
+    exact_account_schema = cast(dict[str, object], trace_props["exact_account_id"])
+    assert exact_account_schema["type"] == "integer"
+    assert exact_account_schema["minimum"] == 1
+    assert exact_account_schema["maximum"] == 9223372036854775807
     assert "exact_topic_id" in trace_props, "trace_account_messages missing exact_topic_id"
     assert "coverage_goal" in trace_props, "trace_account_messages missing coverage_goal"
 

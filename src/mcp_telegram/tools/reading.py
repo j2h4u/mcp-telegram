@@ -1,10 +1,11 @@
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import fields as dataclass_fields
 from datetime import UTC, datetime
 from typing import Literal, cast
 
-from pydantic import Field, StrictInt, model_validator
+from pydantic import Field, StrictInt, field_validator, model_validator
 
 from ..dialog_selector import DialogSelectorError, optional_dialog_selector, required_dialog_selector
 from ..errors import dialog_not_found_text, invalid_navigation_text
@@ -16,6 +17,7 @@ from ..formatter import (
 )
 from ..models import DialogType, ReadMessage
 from ..pagination import NavigationToken
+from ..search_contracts import SEARCHABLE_QUERY_TOKEN_PATTERN
 from ..temporal import parse_utc_boundary
 from ._base import (
     DaemonNotRunningError,
@@ -27,6 +29,7 @@ from ._base import (
     daemon_connection,
     error_result,
     mcp_tool,
+    safe_error_code,
     structured_result,
 )
 from .dialog_resolution import project_dialog_resolution_error
@@ -40,6 +43,7 @@ from .structured import (
 
 # Archive coverage values are expressed as percentages.
 _ARCHIVE_COVERAGE_COMPLETE_PERCENT = 100
+_SEARCHABLE_QUERY_TOKEN_RE = re.compile(SEARCHABLE_QUERY_TOKEN_PATTERN)
 
 # ---------------------------------------------------------------------------
 # Shared archived-dialog warning formatter
@@ -864,16 +868,19 @@ def _search_messages_error_result(
             structured_content=projection.structured_content,
             has_filter=True,
             has_cursor=has_cursor,
+            error_code=safe_error_code(error),
         )
     if error == "dialog_not_found":
         return error_result(
             dialog_not_found_text(dialog_label or "?", retry_tool="SearchMessages"),
+            error_code="dialog_not_found",
             has_filter=True,
             has_cursor=has_cursor,
         )
     return error_result(
         f"Error: {error}: {error_detail}\n"
         "Action: Retry search_messages with corrected arguments, or call list_dialogs first to discover a valid dialog id.",
+        error_code=safe_error_code(error),
         has_filter=True,
         has_cursor=has_cursor,
     )
@@ -1421,7 +1428,11 @@ class SearchMessages(ToolArgs):
             "the search to one dialog."
         ),
     )
-    query: str = Field(max_length=500)
+    query: str = Field(
+        max_length=500,
+        pattern=SEARCHABLE_QUERY_TOKEN_PATTERN,
+        description="Search text containing at least one Cyrillic or Latin letter or ASCII digit.",
+    )
     limit: int = Field(default=20, ge=1, le=200)
     navigation: str | None = Field(
         default=None,
@@ -1447,6 +1458,16 @@ class SearchMessages(ToolArgs):
         default=None,
         description="Exclusive RFC3339 UTC upper bound (Z or +00:00). Results use [since_utc, until_utc).",
     )
+
+    @field_validator("query", mode="before")
+    @classmethod
+    def validate_searchable_query(cls, value: object) -> object:
+        if not isinstance(value, str) or _SEARCHABLE_QUERY_TOKEN_RE.search(value) is None:
+            raise ValueError(
+                "query must contain at least one Cyrillic or Latin letter or ASCII digit. "
+                "Action: pass a searchable query, or use list_messages."
+            )
+        return value
 
     @model_validator(mode="after")
     def validate_time_range(self) -> SearchMessages:
