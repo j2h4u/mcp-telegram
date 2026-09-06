@@ -18,6 +18,7 @@ from mcp_telegram.sync_db import (
     _apply_migration_51,
     _apply_migration_52,
     _apply_migration_53,
+    _apply_migration_54,
     _open_sync_db,
     ensure_sync_schema,
 )
@@ -1753,6 +1754,21 @@ def _downgrade_message_versions_to_v47(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE message_versions_current")
 
 
+def _downgrade_event_tables_to_v53(conn: sqlite3.Connection) -> None:
+    trigger_rows = cast(
+        list[tuple[str]],
+        conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'conversation_history_%'"
+        ).fetchall(),
+    )
+    for row in trigger_rows:
+        conn.execute(f"DROP TRIGGER {row[0]}")
+    conn.execute("DROP TABLE event_recovery_ledger")
+    conn.execute("ALTER TABLE runtime_observations RENAME TO runtime_events")
+    conn.execute("ALTER TABLE conversation_history_events RENAME TO sync_alert_events")
+    conn.execute("DELETE FROM schema_version WHERE version >= 54")
+
+
 def test_v51_reconstructs_strict_dm_alerts_and_preserves_access_lost(tmp_path: Path) -> None:
     """v51 keeps only positively identified incoming human-DM changes."""
     db_path = tmp_path / "sync.db"
@@ -2217,3 +2233,74 @@ def test_v53_delete_failure_rolls_back_all_version_history(tmp_path: Path) -> No
 
         assert _fetchone_int(conn, "SELECT COUNT(*) FROM message_versions") == 2
         assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=53") is None
+
+
+def test_v54_moves_runtime_lifecycle_rows_into_durable_history(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        _downgrade_event_tables_to_v53(conn)
+        conn.execute(
+            "INSERT INTO runtime_events(observed_at_ms,kind,runtime_instance_id,reason_code,dialog_id,payload_json) "
+            "VALUES (10000,'sync.access_lost','old','ChannelPrivateError',1,'{\"previous_status\":\"full\"}'),"
+            "(11000,'sync.access_restored','old',NULL,1,'{}'),"
+            "(12000,'mcp.call','old',NULL,NULL,'{}')"
+        )
+        conn.commit()
+        _apply_migration_54(conn, 53)
+        assert _fetchall_rows(
+            conn,
+            "SELECT kind,occurred_at,reason_code,previous_status FROM conversation_history_events ORDER BY seq",
+        ) == [
+            ("access_lost", 10, "ChannelPrivateError", "full"),
+            ("access_restored", 11, None, None),
+        ]
+        assert _fetchall_rows(conn, "SELECT kind FROM runtime_observations") == [("mcp.call",)]
+
+
+@pytest.mark.parametrize(
+    ("action", "first", "second"),
+    [
+        (sqlite3.SQLITE_DROP_TABLE, "runtime_events", None),
+        (sqlite3.SQLITE_ALTER_TABLE, "main", "conversation_history_events_v54"),
+    ],
+)
+def test_v54_destructive_ddl_failure_rolls_back_event_cutover(
+    tmp_path: Path, action: int, first: str, second: str | None
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        _downgrade_event_tables_to_v53(conn)
+        conn.execute(
+            "INSERT INTO runtime_events(observed_at_ms,kind,runtime_instance_id,dialog_id) "
+            "VALUES (10000,'sync.access_lost','old',1)"
+        )
+        conn.commit()
+
+        def deny_target(
+            requested_action: int,
+            requested_first: str | None,
+            requested_second: str | None,
+            _database: str | None,
+            _trigger: str | None,
+        ) -> int:
+            if (
+                requested_action == action
+                and requested_first == first
+                and (second is None or requested_second == second)
+            ):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_target)
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            _apply_migration_54(conn, 53)
+        conn.set_authorizer(None)
+
+        tables = {row[0] for row in _fetchall_rows(conn, "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert {"runtime_events", "sync_alert_events"} <= tables
+        assert "runtime_observations" not in tables
+        assert "conversation_history_events" not in tables
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM runtime_events") == 1
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=54") is None

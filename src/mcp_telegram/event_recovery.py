@@ -156,20 +156,67 @@ def _import_telemetry(target: sqlite3.Connection, telemetry: list[tuple[object, 
         )
 
 
-def _write_coverage(source: sqlite3.Connection, target: sqlite3.Connection) -> None:
+def _write_coverage(target: sqlite3.Connection) -> None:
     bounds = cast(
-        tuple[float, float] | None,
-        source.execute("SELECT MIN(timestamp),MAX(timestamp) FROM telemetry_events").fetchone(),
+        tuple[int | None, int | None],
+        target.execute(
+            "SELECT MIN(observed_at_ms),MAX(observed_at_ms) FROM runtime_observations "
+            "WHERE source_namespace='backup-2026-09-06'"
+        ).fetchone(),
     )
-    assert bounds is not None
+    if bounds[0] is None:
+        target.execute(
+            "DELETE FROM daemon_state WHERE key IN "
+            "('runtime_observations_legacy_started_at_ms','runtime_observations_legacy_ended_at_ms')"
+        )
+        return
     target.execute(
         "INSERT OR REPLACE INTO daemon_state(key,value) VALUES ('runtime_observations_legacy_started_at_ms',?)",
-        (str(int(bounds[0] * 1000)),),
+        (str(bounds[0]),),
     )
     target.execute(
         "INSERT OR REPLACE INTO daemon_state(key,value) VALUES ('runtime_observations_legacy_ended_at_ms',?)",
-        (str(int(bounds[1] * 1000)),),
+        (str(bounds[1]),),
     )
+
+
+def _verify_recovery_state(
+    source: sqlite3.Connection,
+    target: sqlite3.Connection,
+    losses: list[tuple[object, ...]],
+    *,
+    cutoff_ms: int,
+) -> None:
+    for event_id, dialog_id, occurred_at, payload_json in losses:
+        payload = cast(dict[str, object], json.loads(cast(str, payload_json)))
+        row = cast(
+            tuple[object, ...] | None,
+            target.execute(
+                "SELECT reason_code,previous_status,source_namespace,source_event_id "
+                "FROM conversation_history_events WHERE kind='access_lost' AND dialog_id=? AND occurred_at=?",
+                (dialog_id, occurred_at),
+            ).fetchone(),
+        )
+        expected = (payload.get("reason"), payload.get("previous_status"), "backup-2026-09-06", event_id)
+        if row is None or tuple(row) != expected:
+            raise RuntimeError("recovered lifecycle metadata differs from sealed backup")
+
+    expected_rows = cast(
+        list[tuple[int]],
+        source.execute(
+            "SELECT id FROM telemetry_events WHERE CAST(timestamp * 1000 AS INTEGER) >= ?", (cutoff_ms,)
+        ).fetchall(),
+    )
+    actual_rows = cast(
+        list[tuple[int]],
+        target.execute(
+            "SELECT source_event_id FROM runtime_observations WHERE source_namespace='backup-2026-09-06'"
+        ).fetchall(),
+    )
+    expected_ids = {row[0] for row in expected_rows}
+    actual_ids = {row[0] for row in actual_rows}
+    if actual_ids != expected_ids:
+        raise RuntimeError("recovered telemetry differs from sealed backup retention window")
 
 
 def _recover(
@@ -182,6 +229,9 @@ def _recover(
     if target.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] != TARGET_SCHEMA_VERSION:
         raise RuntimeError("target must be schema 54")
     _verify_history(source, target)
+    telemetry, losses = _inventory(source)
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - retention_seconds * 1000
     existing = cast(
         tuple[int, int] | None,
         target.execute(
@@ -190,25 +240,30 @@ def _recover(
         ).fetchone(),
     )
     if existing is not None:
+        target.execute("BEGIN IMMEDIATE")
+        prune_runtime_observations(target, **{"ttl_seconds": retention_seconds}, now_ms=now_ms)  # noqa: PIE804
+        _write_coverage(target)
+        _verify_recovery_state(source, target, losses, cutoff_ms=cutoff_ms)
+        target.commit()
         return {"status": "no_op", "telemetry": existing[0], "lifecycle": existing[1]}
-    telemetry, losses = _inventory(source)
     target.execute("BEGIN IMMEDIATE")
     target.execute("DROP TRIGGER conversation_history_no_update")
     target.execute("DROP TRIGGER conversation_history_no_delete")
     _enrich_losses(target, losses)
     _import_telemetry(target, telemetry)
-    _write_coverage(source, target)
     prune_runtime_observations(
         target,
         **{"ttl_seconds": retention_seconds},  # noqa: PIE804
-        now_ms=int(time.time() * 1000),
+        now_ms=now_ms,
     )
+    _write_coverage(target)
     for statement in _CONVERSATION_HISTORY_TRIGGERS_V54[-2:]:
         target.execute(statement)
     target.execute(
         "INSERT INTO event_recovery_ledger VALUES (?,strftime('%s','now'),?,?)",
         (fingerprint, len(telemetry), len(losses)),
     )
+    _verify_recovery_state(source, target, losses, cutoff_ms=cutoff_ms)
     target.commit()
     return {"status": "imported", "telemetry": len(telemetry), "lifecycle": len(losses)}
 
@@ -220,9 +275,11 @@ def recover_events(
     if fingerprint != expected_fingerprint:
         raise RuntimeError("backup fingerprint mismatch")
     with tempfile.TemporaryDirectory(prefix="mcp-telegram-recovery-") as temp_dir:
-        working_source = Path(temp_dir) / "sync.db"
+        working_source = Path(temp_dir) / source_path.name
         for suffix in ("", "-wal", "-shm"):
             shutil.copy2(Path(f"{source_path}{suffix}"), Path(f"{working_source}{suffix}"))
+        if source_fingerprint(working_source) != fingerprint:
+            raise RuntimeError("backup changed while creating the recovery copy")
         source = sqlite3.connect(f"file:{working_source}?mode=ro", uri=True)
         target = sqlite3.connect(target_path)
         try:

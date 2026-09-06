@@ -2545,6 +2545,28 @@ def _apply_migration_53(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
+def _migrate_runtime_lifecycle_events_v54(conn: sqlite3.Connection) -> int:
+    predicate = """r.kind IN ('sync.access_lost', 'sync.access_restored')
+                  AND r.dialog_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sync_alert_events h
+                       WHERE h.kind = substr(r.kind, 6)
+                         AND h.dialog_id = r.dialog_id
+                         AND h.occurred_at = CAST(r.observed_at_ms / 1000 AS INTEGER)
+                  )"""
+    conn.execute(
+        f"""INSERT INTO conversation_history_events_v54(
+               kind, occurred_at, time_basis, dialog_id, reason_code, previous_status
+           )
+           SELECT substr(r.kind, 6), CAST(r.observed_at_ms / 1000 AS INTEGER), 'observed',
+                  r.dialog_id, r.reason_code, json_extract(r.payload_json, '$.previous_status')
+             FROM runtime_events r
+            WHERE {predicate}
+            ORDER BY r.observed_at_ms, r.id"""
+    )
+    return cast(int, conn.execute(f"SELECT COUNT(*) FROM runtime_events r WHERE {predicate}").fetchone()[0])
+
+
 def _apply_migration_54(conn: sqlite3.Connection, current: int) -> int:
     """Name event stores by durability and make conversation history append-only."""
     if current >= _EVENT_NAMES_MIGRATION_54:
@@ -2579,6 +2601,7 @@ def _apply_migration_54(conn: sqlite3.Connection, current: int) -> int:
                       dialog_id, message_id, version
                  FROM sync_alert_events"""
         )
+        runtime_lifecycle_count = _migrate_runtime_lifecycle_events_v54(conn)
         runtime_count = cast(
             int,
             conn.execute(
@@ -2590,7 +2613,7 @@ def _apply_migration_54(conn: sqlite3.Connection, current: int) -> int:
         copied_history_count = cast(
             int, conn.execute("SELECT COUNT(*) FROM conversation_history_events_v54").fetchone()[0]
         )
-        if runtime_count != copied_runtime_count or history_count != copied_history_count:
+        if runtime_count != copied_runtime_count or history_count + runtime_lifecycle_count != copied_history_count:
             raise RuntimeError("event store migration count mismatch")
         conn.execute("DROP TABLE runtime_events")
         conn.execute("ALTER TABLE runtime_observations_v54 RENAME TO runtime_observations")
@@ -2603,9 +2626,12 @@ def _apply_migration_54(conn: sqlite3.Connection, current: int) -> int:
             "INSERT INTO sqlite_sequence(name, seq) VALUES ('runtime_observations', ?)",
             (runtime_high_water,),
         )
+        migrated_history_max = cast(
+            int, conn.execute("SELECT COALESCE(MAX(seq), 0) FROM conversation_history_events").fetchone()[0]
+        )
         conn.execute(
             "INSERT INTO sqlite_sequence(name, seq) VALUES ('conversation_history_events', ?)",
-            (history_high_water,),
+            (max(history_high_water, migrated_history_max),),
         )
         conn.execute("CREATE INDEX idx_runtime_observations_time ON runtime_observations(observed_at_ms DESC, id DESC)")
         conn.execute(
