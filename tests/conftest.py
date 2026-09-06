@@ -23,6 +23,26 @@ import pytest
 from telethon.errors import RPCError
 
 
+def pytest_exception_interact(node: pytest.Item, call: pytest.CallInfo[object], report: pytest.TestReport) -> None:
+    """Expose SQLite extended error identity in CI failure logs."""
+    del node, report
+    if call.excinfo is None:
+        return
+    error: BaseException | None = call.excinfo.value
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, sqlite3.Error):
+            print(
+                "sqlite_diagnostic "
+                f"sqlite_errorcode={getattr(error, 'sqlite_errorcode', None)} "
+                f"sqlite_errorname={getattr(error, 'sqlite_errorname', None)}",
+                flush=True,
+            )
+            return
+        error = error.__cause__ or error.__context__
+
+
 @pytest.fixture(autouse=True)
 def _mcp_telegram_test_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Give tests an explicit state-dir config; production fails fast without one."""
