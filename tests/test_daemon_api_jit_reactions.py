@@ -713,6 +713,7 @@ def test_fetch_unread_group_sender_carries_raw_entity_username_to_projector(
                 "limit": 10,
                 "self_id": 777,
                 "since_utc": None,
+                "deleted_since_utc": 0,
             },
         ).fetchone(),
     )
@@ -753,6 +754,7 @@ def test_fetch_unread_group_carries_persisted_topic_title_or_id(
                 "limit": 10,
                 "self_id": 777,
                 "since_utc": None,
+                "deleted_since_utc": 0,
             },
         ).fetchone(),
     )
@@ -774,6 +776,7 @@ def test_fetch_unread_group_carries_persisted_topic_title_or_id(
                 "limit": 10,
                 "self_id": 777,
                 "since_utc": None,
+                "deleted_since_utc": 0,
             },
         ).fetchone(),
     )

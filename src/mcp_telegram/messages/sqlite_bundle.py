@@ -165,6 +165,28 @@ def mark_message_deleted(conn: sqlite3.Connection, dialog_id: int, message_id: i
     return cursor.rowcount > 0
 
 
+def find_unique_incoming_human_dm_dialogs(conn: sqlite3.Connection, message_ids: Sequence[int]) -> dict[int, int]:
+    """Resolve peer-less Telegram deletions whose local DM rows are unique."""
+    unique_ids = tuple(dict.fromkeys(int(message_id) for message_id in message_ids))
+    if not unique_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in unique_ids)
+    rows = cast(
+        Sequence[tuple[int, int]],
+        conn.execute(
+            f"""SELECT m.message_id, m.dialog_id
+                FROM messages m
+                WHERE m.message_id IN ({placeholders}) AND m.is_deleted = 0
+                  AND {incoming_human_dm_sql("m")}""",
+            unique_ids,
+        ).fetchall(),
+    )
+    candidates: dict[int, list[int]] = {}
+    for message_id, dialog_id in rows:
+        candidates.setdefault(int(message_id), []).append(int(dialog_id))
+    return {message_id: dialog_ids[0] for message_id, dialog_ids in candidates.items() if len(dialog_ids) == 1}
+
+
 def list_undeleted_message_ids(conn: sqlite3.Connection, dialog_id: int, sent_before: int) -> tuple[int, ...]:
     """List undeleted message IDs sent strictly before the caller's cutoff."""
     rows = cast(Sequence[tuple[int]], conn.execute(_SELECT_UNDELETED_MESSAGES_SQL, (dialog_id, sent_before)).fetchall())

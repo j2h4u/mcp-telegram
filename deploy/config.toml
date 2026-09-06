@@ -9,6 +9,10 @@ freshness_ttl_seconds = 600
 # Refresh Telegram read-at facts after ten minutes.
 read_at_ttl_seconds = 600
 
+[freshness.inbox]
+# Keep messages deleted before they were read visible in the inbox for one day.
+deleted_message_visibility_seconds = 86400
+
 [freshness.entities]
 # Entity details and resolver enrichment are short-lived; directory snapshots last longer.
 detail_ttl_seconds = 300

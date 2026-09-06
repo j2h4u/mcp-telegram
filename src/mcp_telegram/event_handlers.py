@@ -3,11 +3,11 @@
 Registers three async Telethon event handlers against a live TelegramClient:
   - on_new_message:    INSERT OR REPLACE new messages into sync.db messages table
   - on_message_edited: version the old text into message_versions, update messages row
-  - on_message_deleted: mark channel/supergroup messages as is_deleted=1
+  - on_message_deleted: tombstone deleted messages while retaining their last known text
 
-DM deletes cannot be tracked in real-time (MTProto UpdateDeleteMessages does not
-carry peer identity for personal chats).  Use run_dm_gap_scan() on a weekly
-schedule from the daemon heartbeat loop to detect and tombstone deleted DMs.
+Personal-chat deletion updates can omit peer identity. They are resolved against
+the durable incoming-human-DM policy when the local message ID has one unique
+candidate. A periodic gap scan verifies any update that cannot be resolved safely.
 
 Architecture:
 - Standalone module so daemon.py stays focused on process lifecycle.
@@ -67,6 +67,7 @@ from .flood import TelegramRpcThrottled
 from .history_enrollment import ensure_automatic_dm_enrollment
 from .hydration_queue import HydrationPriority
 from .messages.sqlite_bundle import (
+    find_unique_incoming_human_dm_dialogs,
     insert_messages_with_fts,
     list_undeleted_message_ids,
     mark_message_deleted,
@@ -1020,20 +1021,17 @@ class EventHandlerManager:
         return next_ver
 
     async def on_message_deleted(self, event: _DeletedMessagesEvent) -> None:
-        """Handle a MessageDeleted event: mark channel messages as is_deleted=1.
+        """Handle a MessageDeleted event and preserve the last known text.
 
-        chat_id is None for DMs and small groups (MTProto limitation).
-        Those cases are handled by run_dm_gap_scan().
+        When Telegram omits the peer, only a unique incoming human-DM candidate
+        is accepted. Ambiguous and irrelevant IDs remain for the gap scan.
         Preserves the last known text column.
         Only updates rows where is_deleted=0 to avoid re-stamping deleted_at.
         """
         dialog_id = event.chat_id
 
         if dialog_id is None:
-            logger.debug(
-                "message_deleted: chat_id unknown — DM/group delete not trackable "
-                "in real-time (MTProto limitation); weekly gap scan handles DMs"
-            )
+            self._handle_peerless_deletions(event.deleted_ids)
             return
 
         coverage = self._realtime_coverage(dialog_id)
@@ -1058,6 +1056,24 @@ class EventHandlerManager:
             logger.info("event_delete dialog_id=%d count=%d", dialog_id, len(event.deleted_ids))
         except Exception:
             logger.exception("event_delete_failed dialog_id=%s", dialog_id)
+
+    def _handle_peerless_deletions(self, deleted_ids: Sequence[int]) -> None:
+        now = int(time.time())
+        resolved: list[tuple[int, int]] = []
+        candidate_dialogs = find_unique_incoming_human_dm_dialogs(self._conn, deleted_ids)
+        with self._conn:
+            for raw_message_id in deleted_ids:
+                message_id = int(raw_message_id)
+                dialog_id = candidate_dialogs.get(message_id)
+                if dialog_id is not None and mark_message_deleted(self._conn, dialog_id, message_id, now):
+                    resolved.append((dialog_id, message_id))
+            for dialog_id in {item[0] for item in resolved}:
+                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+        logger.info(
+            "event_delete_peerless resolved=%d unresolved=%d",
+            len(resolved),
+            len(deleted_ids) - len(resolved),
+        )
 
     async def on_raw_new_scheduled_message(self, update: object) -> None:
         """Mirror create/edit/reschedule updates without touching sent history."""

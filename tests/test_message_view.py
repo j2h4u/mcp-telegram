@@ -97,6 +97,22 @@ def test_message_view_omits_optional_nulls_and_uses_identity_fallback() -> None:
     assert "forward" not in view
 
 
+def test_message_view_marks_deleted_message_and_retains_its_text() -> None:
+    view = project_message_view(
+        ReadMessage(
+            message_id=18,
+            sent_at=1_700_000_000,
+            dialog_id=42,
+            text="last known text",
+            is_deleted=1,
+            deleted_at=1_700_000_100,
+        )
+    )
+    assert view["is_deleted"] is True
+    assert view["deleted_at"] == 1_700_000_100
+    assert cast(dict[str, object], view["content"])["text"] == "last known text"
+
+
 def test_read_markers_are_projected_once_for_both_surfaces() -> None:
     rows = [
         {**_shared_message(), "message_id": 16, "sent_at": 1_699_999_900},

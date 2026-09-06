@@ -254,8 +254,10 @@ class GetUnreadSummary(ToolArgs):
 class GetInbox(ToolArgs):
     """Fetch unread messages from personal chats and small groups, prioritized by tier.
 
-    Reads local sync.db only. Prioritizes mentions, DMs, bots, services, and groups;
+    Uses the synchronized Telegram state. Prioritizes mentions, DMs, bots, services, and groups;
     channel dialogs are excluded unless explicitly included with include_dialog_types.
+    Incoming human-DM messages deleted before reading remain visible for the configured
+    recent-deletion period and include their last known content and deletion time.
     Messages inside each chat are chronological. ``@replies`` is classified as
     the ``service`` dialog type.
     Check read_position_pending_count and its bounded identities to detect

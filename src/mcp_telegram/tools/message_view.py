@@ -104,6 +104,8 @@ MESSAGE_VIEW_SCHEMA: dict[str, object] = {
         },
         "reaction_events_status": {"type": "string"},
         "read_at": {"type": "integer"},
+        "is_deleted": {"type": "boolean"},
+        "deleted_at": {"type": "integer"},
         "read_markers": {"type": "array", "items": READ_MARKER_SCHEMA},
     },
     "required": ["dialog_id", "msg_id", "sent_at", "out", "reaction_events", "reaction_events_status"],
@@ -224,6 +226,10 @@ def _event_facts(message: ReadMessage, *, read_marker: ReadMarker | None) -> dic
         }
     if message.read_at is not None:
         facts["read_at"] = message.read_at
+    if message.is_deleted:
+        facts["is_deleted"] = True
+        if message.deleted_at is not None:
+            facts["deleted_at"] = message.deleted_at
     if read_marker is not None:
         facts["read_markers"] = [read_marker]
     return facts

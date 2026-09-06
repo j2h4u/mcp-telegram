@@ -832,19 +832,19 @@ async def test_on_message_deleted_updates_last_event_at(
 
 
 @pytest.mark.asyncio
-async def test_on_message_deleted_dm_logs_debug(
+async def test_on_message_deleted_peerless_without_candidate_is_ignored(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """MessageDeleted with chat_id=None logs DEBUG and makes no DB changes."""
+    """A peer-less deletion without one safe DM candidate makes no DB changes."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
     event = make_message_deleted_event(chat_id=None, deleted_ids=[555, 556])
 
-    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.event_handlers"):
+    with caplog.at_level(logging.INFO, logger="mcp_telegram.event_handlers"):
         await manager.on_message_deleted(event)
 
     count_row = sync_db.execute("SELECT COUNT(*) FROM messages").fetchone()
@@ -852,8 +852,51 @@ async def test_on_message_deleted_dm_logs_debug(
     count = int(tuple(count_row)[0])
     assert count == 0
 
-    # Log should mention the MTProto limitation
-    assert any("MTProto limitation" in r.message for r in caplog.records)
+    assert any("resolved=0 unresolved=2" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_on_message_deleted_peerless_marks_unique_incoming_human_dm(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 2001
+    message_id = 555
+    insert_synced_dialog(sync_db, dialog_id)
+    insert_message(sync_db, dialog_id, message_id)
+    confirm_human_dm(sync_db, dialog_id, message_id)
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+
+    await manager.on_message_deleted(make_message_deleted_event(chat_id=None, deleted_ids=[message_id]))
+
+    assert sync_db.execute(
+        "SELECT is_deleted FROM messages WHERE dialog_id=? AND message_id=?", (dialog_id, message_id)
+    ).fetchone() == (1,)
+    assert sync_db.execute(
+        "SELECT kind FROM conversation_history_events WHERE dialog_id=? AND message_id=?",
+        (dialog_id, message_id),
+    ).fetchone() == ("deleted_message",)
+
+
+@pytest.mark.asyncio
+async def test_on_message_deleted_peerless_rejects_ambiguous_dm_message_id(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    message_id = 555
+    for dialog_id in (2001, 2002):
+        insert_synced_dialog(sync_db, dialog_id)
+        insert_message(sync_db, dialog_id, message_id)
+        confirm_human_dm(sync_db, dialog_id, message_id)
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+
+    await manager.on_message_deleted(make_message_deleted_event(chat_id=None, deleted_ids=[message_id]))
+
+    assert sync_db.execute(
+        "SELECT COUNT(*) FROM messages WHERE message_id=? AND is_deleted=1", (message_id,)
+    ).fetchone() == (0,)
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,7 @@ from mcp_telegram.config import (
     FolderProjectionConfig,
     FreshnessConfig,
     HttpServerConfig,
+    InboxConfig,
     ReactionsConfig,
     ReadReceiptsConfig,
     SchedulingConfig,
@@ -101,6 +102,9 @@ freshness_ttl_seconds = 40
 [freshness.read_receipts]
 read_at_ttl_seconds = 41
 
+[freshness.inbox]
+deleted_message_visibility_seconds = 42
+
 [freshness.entities]
 detail_ttl_seconds = 42
 user_directory_ttl_seconds = 43
@@ -180,6 +184,7 @@ daemon_api_slow_request_seconds = 2.5
     config = load_config(path)
     assert config.freshness.reactions == ReactionsConfig(freshness_ttl_seconds=40)
     assert config.freshness.read_receipts == ReadReceiptsConfig(read_at_ttl_seconds=41)
+    assert config.freshness.inbox == InboxConfig(deleted_message_visibility_seconds=42)
     assert config.freshness.entities == EntitiesConfig(42, 43, 44, 45)
     assert config.scheduling.folder_projection == FolderProjectionConfig(stale_after_seconds=46)
     assert config.telemetry == TelemetryConfig(retention_ttl_seconds=47)
