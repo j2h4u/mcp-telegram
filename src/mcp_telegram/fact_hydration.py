@@ -11,7 +11,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol
 
-from .access_lifecycle import set_access_lost
+from .access_lifecycle import record_access_lifecycle_event, set_access_lost
 from .flood import TelegramRpcThrottled
 from .hydration_queue import (
     MEDIA_METADATA_KIND,
@@ -571,9 +571,13 @@ class MessageFactHydrationWorker:
         summaries = tuple(
             summary for dialog_id in dialog_ids for summary in self._queue.summarize_for_dialog(dialog_id)
         )
-        for dialog_id in dialog_ids:
+        events = [
             set_access_lost(self._conn, dialog_id, effective_now, reason=descriptor.error_type)
+            for dialog_id in dialog_ids
+        ]
         self._conn.commit()
+        for event in events:
+            record_access_lifecycle_event(event)
         self._log_summaries(summaries, descriptor)
         drop_counts: dict[str, int] = defaultdict(int)
         for summary in summaries:

@@ -1008,7 +1008,19 @@ def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
         sync_alerts_schema,
         collection_name="alerts",
         required_fields=("kind",),
-        property_fields=("message_id", "deleted_at", "version", "edit_date", "access_lost_at"),
+        property_fields=(
+            "message_id",
+            "deleted_at",
+            "version",
+            "edit_date",
+            "access_lost_at",
+            "deleted_text",
+            "original_text",
+            "changed_text",
+            "text_provenance",
+            "text_confidence",
+            "text_status",
+        ),
     )
 
 

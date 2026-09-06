@@ -24,6 +24,7 @@ from telethon.errors import RPCError  # type: ignore[import-untyped]
 
 from .access_lifecycle import (
     due_access_revalidations,
+    record_access_lifecycle_event,
     restore_access_after_revalidation,
     set_access_lost,
     stamp_access_revalidation,
@@ -413,7 +414,9 @@ class DeltaSyncWorker:
             )
             now = int(time.time())
             if full_history_enabled(self._conn, dialog_id):
-                set_access_lost(self._conn, dialog_id, now, reason=type(exc).__name__)
+                event = set_access_lost(self._conn, dialog_id, now, reason=type(exc).__name__)
+                self._conn.commit()
+                record_access_lifecycle_event(event)
             return 0
         except RPCError as exc:
             logger.exception(
@@ -514,8 +517,9 @@ async def _probe_access_lost_dialogs(  # noqa: PLR0915
 
             if not full_history_enabled(conn, dialog_id):
                 logger.info("access_restored_disabled dialog_id=%d", dialog_id)
-                restore_access_after_revalidation(conn, dialog_id, int(time.time()), total_messages=total)
+                event = restore_access_after_revalidation(conn, dialog_id, int(time.time()), total_messages=total)
                 conn.commit()
+                record_access_lifecycle_event(event)
                 continue
 
             # Gap-fill FIRST, while status is still access_lost.
@@ -524,8 +528,9 @@ async def _probe_access_lost_dialogs(  # noqa: PLR0915
             logger.info("access_restored_gap_fill dialog_id=%d new=%d", dialog_id, new_msgs)
 
             # Gap-fill succeeded — NOW reset status to syncing.
-            restore_access_after_revalidation(conn, dialog_id, int(time.time()), total_messages=total)
+            event = restore_access_after_revalidation(conn, dialog_id, int(time.time()), total_messages=total)
             conn.commit()
+            record_access_lifecycle_event(event)
             logger.info("access_restored dialog_id=%d total=%s", dialog_id, total)
             restored += 1
         except ACCESS_LOST_ERRORS:

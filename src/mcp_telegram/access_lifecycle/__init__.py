@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from itertools import count
+from pathlib import Path
+from types import MappingProxyType
 from typing import cast
 
 from ..history_enrollment import reset_read_position_retry, restore_access_status
@@ -16,13 +19,60 @@ from ..runtime_events import record_runtime_event
 
 _SAVEPOINTS = count()
 logger = logging.getLogger(__name__)
+_DATABASE_LIST_PATH_INDEX = 2
 
 
-def _try_record_runtime_event(conn: sqlite3.Connection, **event: object) -> None:
+@dataclass(frozen=True, slots=True)
+class AccessLifecycleEvent:
+    """Immutable runtime event captured before the caller commits its work."""
+
+    db_path: Path | None
+    kind: str
+    dialog_id: int
+    outcome: str
+    reason_code: str | None
+    payload: Mapping[str, object]
+    observed_at_ms: int
+
+
+def _sync_db_path_from_connection(conn: sqlite3.Connection) -> Path | None:
+    rows = cast(list[tuple[object, ...]], conn.execute("PRAGMA database_list").fetchall())
+    for row in rows:
+        if len(row) > _DATABASE_LIST_PATH_INDEX and row[1] == "main" and row[_DATABASE_LIST_PATH_INDEX]:
+            return Path(str(row[_DATABASE_LIST_PATH_INDEX]))
+    return None
+
+
+def _try_record_runtime_event(event: AccessLifecycleEvent | None) -> None:
+    if event is None:
+        return
+    if event.db_path is None:
+        logger.warning("runtime_event_record_failed kind=%s reason=database_path_unavailable", event.kind)
+        return
     try:
-        record_runtime_event(conn, **event)  # type: ignore[arg-type]
+        conn = sqlite3.connect(event.db_path)
+        try:
+            conn.execute("PRAGMA busy_timeout=10000")
+            conn.execute("PRAGMA foreign_keys=ON")
+            with conn:
+                record_runtime_event(
+                    conn,
+                    kind=event.kind,
+                    dialog_id=event.dialog_id,
+                    outcome=event.outcome,
+                    reason_code=event.reason_code,
+                    payload=event.payload,
+                    observed_at_ms=event.observed_at_ms,
+                )
+        finally:
+            conn.close()
     except Exception:
-        logger.exception("runtime_event_record_failed kind=%s", event.get("kind"))
+        logger.exception("runtime_event_record_failed kind=%s", event.kind)
+
+
+def record_access_lifecycle_event(event: AccessLifecycleEvent | None) -> None:
+    """Persist a lifecycle diagnostic after the caller's transaction commits."""
+    _try_record_runtime_event(event)
 
 
 def _purge_hydration_jobs(conn: sqlite3.Connection, dialog_id: int) -> None:
@@ -44,8 +94,11 @@ def _lifecycle_savepoint(conn: sqlite3.Connection) -> Iterator[None]:
         conn.execute(f"RELEASE SAVEPOINT {name}")
 
 
-def set_access_lost(conn: sqlite3.Connection, dialog_id: int, now: int, *, reason: str | None = None) -> None:
+def set_access_lost(
+    conn: sqlite3.Connection, dialog_id: int, now: int, *, reason: str | None = None
+) -> AccessLifecycleEvent | None:
     """Atomically mark a peer inaccessible and hide its local snapshot."""
+    db_path = _sync_db_path_from_connection(conn)
     with _lifecycle_savepoint(conn):
         row = cast(
             tuple[str | None] | None,
@@ -82,22 +135,29 @@ def set_access_lost(conn: sqlite3.Connection, dialog_id: int, now: int, *, reaso
                     "INSERT INTO sync_alert_events(kind, occurred_at, dialog_id) VALUES ('access_lost', ?, ?)",
                     (now, dialog_id),
                 )
-            _try_record_runtime_event(
-                conn,
+            return AccessLifecycleEvent(
+                db_path=db_path,
                 kind="sync.access_lost",
                 dialog_id=dialog_id,
                 outcome="applied",
                 reason_code=reason,
-                payload=payload,
+                payload=MappingProxyType(payload),
                 observed_at_ms=now * 1000,
             )
+    return None
 
 
 def restore_access_after_revalidation(
     conn: sqlite3.Connection, dialog_id: int, now: int, *, total_messages: int | None = None
-) -> None:
+) -> AccessLifecycleEvent | None:
     """Restore access while preserving snapshot metadata and requesting refresh."""
+    db_path = _sync_db_path_from_connection(conn)
     with _lifecycle_savepoint(conn):
+        row = cast(
+            tuple[str | None] | None,
+            conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone(),
+        )
+        was_access_lost = row is not None and row[0] == "access_lost"
         conn.execute(
             "UPDATE synced_dialogs SET access_lost_at = NULL, access_last_revalidated_at = ?, access_next_revalidate_at = NULL WHERE dialog_id = ?",
             (now, dialog_id),
@@ -120,13 +180,17 @@ def restore_access_after_revalidation(
             due_at=now,
             priority=HydrationPriority.BACKFILL,
         )
-        _try_record_runtime_event(
-            conn,
-            kind="sync.access_restored",
-            dialog_id=dialog_id,
-            outcome="applied",
-            observed_at_ms=now * 1000,
-        )
+        if was_access_lost:
+            return AccessLifecycleEvent(
+                db_path=db_path,
+                kind="sync.access_restored",
+                dialog_id=dialog_id,
+                outcome="applied",
+                reason_code=None,
+                payload=MappingProxyType({}),
+                observed_at_ms=now * 1000,
+            )
+    return None
 
 
 def due_access_revalidations(conn: sqlite3.Connection, *, now: int, cooldown_seconds: int, limit: int) -> list[int]:
@@ -152,7 +216,9 @@ def stamp_access_revalidation(conn: sqlite3.Connection, dialog_id: int, checked_
 
 
 __all__ = [
+    "AccessLifecycleEvent",
     "due_access_revalidations",
+    "record_access_lifecycle_event",
     "restore_access_after_revalidation",
     "set_access_lost",
     "stamp_access_revalidation",

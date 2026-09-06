@@ -28,7 +28,7 @@ from typing import Protocol, cast
 from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 
-from .access_lifecycle import set_access_lost
+from .access_lifecycle import record_access_lifecycle_event, set_access_lost
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
 from .history_enrollment import ensure_automatic_dm_enrollment, full_history_enabled
@@ -288,7 +288,9 @@ class FullSyncWorker:
             logger.warning("access_lost dialog_id=%d — %s: %s", dialog_id, type(exc).__name__, exc)
             now = int(time.time())
             if full_history_enabled(self._conn, dialog_id):
-                set_access_lost(self._conn, dialog_id, now)
+                event = set_access_lost(self._conn, dialog_id, now)
+                self._conn.commit()
+                record_access_lifecycle_event(event)
             return sync_progress, True
         except RPCError as exc:
             logger.exception(

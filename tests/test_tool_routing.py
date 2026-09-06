@@ -2711,8 +2711,64 @@ async def test_get_sync_alerts_preserves_wire_provenance_and_page_depth():
     assert result.has_cursor is True
     assert result.has_filter is True
     payload = assert_structured_success_payload(result)
-    assert "text" not in _json_dict(_json_list(payload["alerts"])[0])
+    alert = _json_dict(_json_list(payload["alerts"])[0])
+    assert alert["text"] == "telegram secret"
+    assert alert["old_text"] == "older secret"
     conn.get_sync_alerts.assert_called_once_with(navigation="opaque")
+
+
+async def test_get_sync_alerts_structured_text_enrichment_preserves_candidates():
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "alerts": [
+                    {
+                        "kind": "edit",
+                        "dialog_id": 1,
+                        "message_id": 2,
+                        "deleted_at": None,
+                        "version": 1,
+                        "edit_date": 10,
+                        "access_lost_at": None,
+                        "occurred_at": 10,
+                        "source_id": 0,
+                        "severity": "low",
+                        "message": "safe metadata",
+                        "action": "inspect",
+                        "old_text": "before",
+                        "original_text": "before",
+                        "changed_text": "after candidate",
+                        "text_provenance": {
+                            "deleted": None,
+                            "original": "message_versions.old_text",
+                            "changed": "messages.text[current_candidate]",
+                        },
+                        "text_confidence": {"deleted": "unavailable", "original": "exact", "changed": "candidate"},
+                        "text_status": "complete_candidate",
+                    }
+                ],
+                "has_more": False,
+                "next_navigation": None,
+                "page_limit": 1,
+                "page_depth": 1,
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_sync_alerts(GetSyncAlerts())
+
+    assert result.content == ()
+    payload = assert_structured_success_payload(result)
+    alert = _json_dict(_json_list(payload["alerts"])[0])
+    assert alert["original_text"] == "before"
+    assert alert["changed_text"] == "after candidate"
+    assert _json_dict(alert["text_provenance"])["changed"] == "messages.text[current_candidate]"
+    assert _json_dict(alert["text_confidence"])["changed"] == "candidate"
+    assert alert["text_status"] == "complete_candidate"
+    edit = _json_dict(_json_list(payload["edits"])[0])
+    assert edit["old_text"] == "before"
+    assert edit["changed_text"] == "after candidate"
 
 
 async def test_get_sync_alerts_invalid_navigation_has_restart_action():
