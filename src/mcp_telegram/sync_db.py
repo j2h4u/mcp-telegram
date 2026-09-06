@@ -11,7 +11,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 51
+_CURRENT_SCHEMA_VERSION = 52
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS message_versions (
     version     INTEGER NOT NULL,
     old_text    TEXT,
     edit_date   INTEGER,
-    origin      TEXT NOT NULL DEFAULT 'telegram_edit' CHECK (origin IN ('telegram_edit', 'transcription')),
+    origin      TEXT NOT NULL DEFAULT 'legacy_unknown' CHECK (origin IN ('telegram_edit', 'transcription', 'legacy_unknown')),
     PRIMARY KEY (dialog_id, message_id, version)
 ) WITHOUT ROWID
 """
@@ -256,7 +256,16 @@ CREATE TABLE sync_alert_events_v51 (
 )
 """
 
-_HUMAN_DM_ALERT_PREDICATE = incoming_human_dm_sql("NEW")
+
+# Historical alert reconstruction requires positive evidence for every part of
+# an incoming human DM.  In particular, a missing entity row is unknown rather
+# than proof that a dialog is a user; service messages are never user alerts.
+def _strict_human_dm_alert_sql(alias: str) -> str:
+    return incoming_human_dm_sql(alias)
+
+
+_HUMAN_DM_ALERT_PREDICATE = _strict_human_dm_alert_sql("NEW")
+_LEGACY_HUMAN_DM_ALERT_PREDICATE = _strict_human_dm_alert_sql("m")
 
 
 _SYNC_ALERT_V51_TRIGGERS = (
@@ -2202,6 +2211,95 @@ def _sequence_high_water(conn: sqlite3.Connection, table: str, id_column: str) -
     return int(row[0]) if row and row[0] is not None else 0
 
 
+def _rebuild_message_versions(conn: sqlite3.Connection, origin_expression: str) -> None:
+    """Rebuild the version table when its origin CHECK/default is unsafe."""
+    conn.execute("ALTER TABLE message_versions RENAME TO message_versions_origin_migration")
+    conn.execute(_MESSAGE_VERSIONS_DDL)
+    conn.execute(
+        f"""INSERT INTO message_versions
+           (dialog_id, message_id, version, old_text, edit_date, origin)
+           SELECT dialog_id, message_id, version, old_text, edit_date, {origin_expression}
+             FROM message_versions_origin_migration"""
+    )
+    conn.execute("DROP TABLE message_versions_origin_migration")
+
+
+def _message_versions_has_safe_origin_contract(conn: sqlite3.Connection) -> bool:
+    row = cast(
+        tuple[str | None] | None,
+        conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'message_versions'").fetchone(),
+    )
+    sql = (row[0] or "").lower() if row is not None else ""
+    return "legacy_unknown" in sql
+
+
+def _legacy_alert_projection_v51(conn: sqlite3.Connection) -> None:
+    """Copy only defensible v50 alerts into the replacement projection."""
+    tables = {
+        str(row[0])
+        for row in cast(
+            list[tuple[object]], conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        )
+    }
+    if {"entities", "dialogs", "messages", "message_versions"} <= tables:
+        transcription_filter = ""
+        if "message_transcriptions" in tables:
+            transcription_filter = """AND NOT EXISTS (
+                       SELECT 1 FROM message_transcriptions mt
+                        WHERE mt.dialog_id = a.dialog_id
+                          AND mt.message_id = a.message_id
+                          AND mt.received_at = a.occurred_at
+                   )"""
+        conn.execute(
+            f"""WITH candidates(source_seq, kind, occurred_at, dialog_id, message_id, version) AS (
+                    SELECT MIN(a.seq), 'deleted_message', MIN(a.occurred_at), a.dialog_id, a.message_id, NULL
+                      FROM sync_alert_events a
+                      JOIN messages m ON m.dialog_id = a.dialog_id AND m.message_id = a.message_id
+                     WHERE a.kind = 'deleted_message'
+                       AND {_LEGACY_HUMAN_DM_ALERT_PREDICATE}
+                     GROUP BY a.dialog_id, a.message_id
+                    UNION ALL
+                    SELECT MIN(a.seq), 'edit', MIN(a.occurred_at), a.dialog_id, a.message_id, a.version
+                      FROM sync_alert_events a
+                      JOIN messages m ON m.dialog_id = a.dialog_id AND m.message_id = a.message_id
+                      JOIN message_versions mv
+                        ON mv.dialog_id = a.dialog_id AND mv.message_id = a.message_id AND mv.version = a.version
+                     WHERE a.kind = 'edit'
+                       AND {_LEGACY_HUMAN_DM_ALERT_PREDICATE}
+                       {transcription_filter}
+                     GROUP BY a.dialog_id, a.message_id, a.version
+                    UNION ALL
+                    SELECT a.seq, 'access_lost', a.occurred_at, a.dialog_id, NULL, NULL
+                      FROM sync_alert_events a
+                     WHERE a.kind = 'access_lost' AND a.dialog_id IS NOT NULL
+                )
+                INSERT INTO sync_alert_events_v51(kind, occurred_at, dialog_id, message_id, version)
+                SELECT kind, occurred_at, dialog_id, message_id, version
+                  FROM candidates
+                 ORDER BY source_seq"""
+        )
+    else:
+        conn.execute(
+            """INSERT INTO sync_alert_events_v51(kind, occurred_at, dialog_id, message_id, version)
+               SELECT 'access_lost', occurred_at, dialog_id, NULL, NULL
+                 FROM sync_alert_events
+                WHERE kind = 'access_lost' AND dialog_id IS NOT NULL
+                ORDER BY seq"""
+        )
+    # Carry daemon lifecycle rows that never received a durable projection.
+    conn.execute(
+        """INSERT INTO sync_alert_events_v51(kind, occurred_at, dialog_id, message_id, version)
+           SELECT 'access_lost', d.occurred_at, d.dialog_id, NULL, NULL
+             FROM daemon_events d
+            WHERE d.kind = 'access_lost' AND d.dialog_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM sync_alert_events a
+                   WHERE a.kind = 'access_lost'
+                     AND a.daemon_event_id = d.id
+              )"""
+    )
+
+
 def _complete_replayed_migration_51(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE IF EXISTS telemetry_events")
     conn.execute("DROP TABLE IF EXISTS daemon_events")
@@ -2216,9 +2314,11 @@ def _prepare_migration_51_schema(conn: sqlite3.Connection) -> int:
     version_column_rows = cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(message_versions)").fetchall())
     version_columns = {str(row[1]) for row in version_column_rows}
     if "origin" not in version_columns:
-        conn.execute(
-            "ALTER TABLE message_versions ADD COLUMN origin TEXT NOT NULL DEFAULT 'telegram_edit' "
-            "CHECK (origin IN ('telegram_edit', 'transcription'))"
+        _rebuild_message_versions(conn, "'legacy_unknown'")
+    elif not _message_versions_has_safe_origin_contract(conn):
+        _rebuild_message_versions(
+            conn,
+            "CASE WHEN origin IN ('telegram_edit', 'transcription') THEN origin ELSE 'legacy_unknown' END",
         )
     for trigger in (
         "sync_alert_events_message_insert_deleted",
@@ -2235,10 +2335,22 @@ def _prepare_migration_51_schema(conn: sqlite3.Connection) -> int:
 
 def _replace_alert_projection_v51(conn: sqlite3.Connection, source_high_water: int) -> None:
     conn.execute(_SYNC_ALERT_EVENTS_V51_DDL)
+    # Seed the replacement AUTOINCREMENT before copying rows so every
+    # migration-created alert is strictly above both old sequence domains.
+    conn.execute(
+        "INSERT INTO sqlite_sequence(name, seq) VALUES ('sync_alert_events_v51', ?)",
+        (source_high_water,),
+    )
+    _legacy_alert_projection_v51(conn)
     conn.execute("DROP TABLE sync_alert_events")
     conn.execute("ALTER TABLE sync_alert_events_v51 RENAME TO sync_alert_events")
+    max_seq_row = cast(tuple[int | None] | None, conn.execute("SELECT MAX(seq) FROM sync_alert_events").fetchone())
+    max_seq = int(max_seq_row[0]) if max_seq_row and max_seq_row[0] is not None else 0
     conn.execute("DELETE FROM sqlite_sequence WHERE name = 'sync_alert_events'")
-    conn.execute("INSERT INTO sqlite_sequence(name, seq) VALUES ('sync_alert_events', ?)", (source_high_water,))
+    conn.execute(
+        "INSERT INTO sqlite_sequence(name, seq) VALUES ('sync_alert_events', ?)",
+        (max(source_high_water, max_seq),),
+    )
     conn.execute(_SYNC_ALERT_DELETED_INDEX_DDL)
     conn.execute(_SYNC_ALERT_EDIT_INDEX_DDL)
     for stmt in _SYNC_ALERT_V51_TRIGGERS:
@@ -2282,6 +2394,31 @@ def _apply_migration_51(conn: sqlite3.Connection, current: int) -> int:
         _finish_migration_51(conn)
         conn.commit()
         return 51
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _apply_migration_52(conn: sqlite3.Connection, current: int) -> int:
+    """Allow honest legacy origins without guessing existing row provenance."""
+    if current >= _CURRENT_SCHEMA_VERSION:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        version_columns = {
+            str(row[1])
+            for row in cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(message_versions)").fetchall())
+        }
+        if "origin" not in version_columns:
+            _rebuild_message_versions(conn, "'legacy_unknown'")
+        elif not _message_versions_has_safe_origin_contract(conn):
+            # The deployed v51 did not persist insertion time.  edit_date is
+            # Telegram source time and can predate cutover for a later
+            # backfill, so it cannot safely identify legacy rows.
+            _rebuild_message_versions(conn, "origin")
+        conn.execute("INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))", (_CURRENT_SCHEMA_VERSION,))
+        conn.commit()
+        return 52
     except BaseException:
         conn.rollback()
         raise
@@ -2335,6 +2472,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_49(conn, current)
     current = _apply_migration_50(conn, current)
     current = _apply_migration_51(conn, current)
+    current = _apply_migration_52(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

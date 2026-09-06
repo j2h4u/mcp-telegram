@@ -2555,6 +2555,18 @@ async def test_get_sync_alerts_deleted_messages() -> None:
     deleted = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["deleted_messages"])
     assert len(deleted) == 1
     assert deleted[0]["text"] == "deleted msg"
+    assert deleted[0]["deleted_text"] == "deleted msg"
+    assert deleted[0]["text_provenance"] == {
+        "deleted": "messages.text[current_candidate]",
+        "original": None,
+        "changed": None,
+    }
+    assert deleted[0]["text_confidence"] == {
+        "deleted": "candidate",
+        "original": "unavailable",
+        "changed": "unavailable",
+    }
+    assert deleted[0]["text_status"] == "candidate"
     assert deleted[0]["deleted_at"] == 1700000500
 
 
@@ -2569,6 +2581,39 @@ async def test_get_sync_alerts_edits() -> None:
     edits = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["edits"])
     assert len(edits) == 1
     assert edits[0]["old_text"] == "before edit"
+    assert edits[0]["original_text"] == "before edit"
+    assert edits[0]["changed_text"] is None
+    confidence = cast(dict[str, object], edits[0]["text_confidence"])
+    assert confidence["original"] == "exact"
+    assert confidence["changed"] == "unavailable"
+    assert edits[0]["text_status"] == "original_only"
+
+
+@pytest.mark.asyncio
+async def test_get_sync_alerts_edit_candidates_have_explicit_provenance() -> None:
+    conn = _make_db()
+    _insert_message(conn, 1, 100, text="current text")
+    _insert_message_version(conn, 1, 100, version=1, old_text="original text", edit_date=1700000600)
+    _insert_message_version(conn, 1, 100, version=2, old_text="changed once", edit_date=1700000700)
+    server = make_server(conn)
+
+    result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 50})
+
+    assert result["ok"] is True
+    edits = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["edits"])
+    by_version = {cast(int, item["version"]): item for item in edits}
+    assert by_version[1]["original_text"] == "original text"
+    assert by_version[1]["changed_text"] == "changed once"
+    first_provenance = cast(dict[str, object], by_version[1]["text_provenance"])
+    first_confidence = cast(dict[str, object], by_version[1]["text_confidence"])
+    assert first_provenance["changed"] == "message_versions.old_text[next_version]"
+    assert first_confidence["changed"] == "candidate"
+    assert by_version[1]["text_status"] == "complete_candidate"
+    assert by_version[2]["changed_text"] == "current text"
+    second_provenance = cast(dict[str, object], by_version[2]["text_provenance"])
+    second_confidence = cast(dict[str, object], by_version[2]["text_confidence"])
+    assert second_provenance["changed"] == "messages.text[current_candidate]"
+    assert second_confidence["changed"] == "candidate"
 
 
 @pytest.mark.asyncio

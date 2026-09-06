@@ -15,6 +15,8 @@ import pytest
 
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
+    _apply_migration_51,
+    _apply_migration_52,
     _open_sync_db,
     ensure_sync_schema,
 )
@@ -701,7 +703,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 51
+        assert _CURRENT_SCHEMA_VERSION == 52
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1432,7 +1434,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 51
+        assert _CURRENT_SCHEMA_VERSION == 52
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:
@@ -1663,7 +1665,8 @@ def test_v51_human_dm_alert_policy_and_sequence_are_durable(tmp_path: Path) -> N
             conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (?, ?)", (dialog_id, dialog_type))
         conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (1, 'user', 1)")
         conn.execute(
-            "INSERT INTO messages(dialog_id,message_id,sent_at,out) VALUES (1,1,1,0),(1,2,1,1),(2,1,1,0),(3,1,1,0),(4,1,1,0)"
+            "INSERT INTO messages(dialog_id,message_id,sent_at,sender_id,out) VALUES "
+            "(1,1,1,1,0),(1,2,1,1,1),(2,1,1,2,0),(3,1,1,3,0),(4,1,1,4,0)"
         )
         before = _fetchone_int(conn, "SELECT seq FROM sqlite_sequence WHERE name='sync_alert_events'")
         for dialog_id, message_id in ((1, 1), (1, 2), (2, 1), (3, 1), (4, 1)):
@@ -1684,7 +1687,7 @@ def test_v51_replay_does_not_clear_new_alerts(tmp_path: Path) -> None:
         conn.execute(
             "INSERT INTO sync_alert_events(kind,occurred_at,dialog_id,message_id) VALUES ('deleted_message',1,1,1)"
         )
-        conn.execute("DELETE FROM schema_version WHERE version=51")
+        conn.execute("DELETE FROM schema_version WHERE version >= 51")
         conn.commit()
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
@@ -1712,10 +1715,176 @@ def _downgrade_event_tables_to_v50(conn: sqlite3.Connection) -> None:
                seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL,
                dialog_id INTEGER NOT NULL, message_id INTEGER, version INTEGER, daemon_event_id INTEGER);"""
     )
-    conn.execute("DELETE FROM schema_version WHERE version=51")
+    conn.execute("DELETE FROM schema_version WHERE version >= 51")
 
 
-def test_v51_clears_old_alerts_and_uses_both_sequence_high_water_marks(tmp_path: Path) -> None:
+def _downgrade_message_versions_to_v47(conn: sqlite3.Connection) -> None:
+    conn.execute("ALTER TABLE message_versions RENAME TO message_versions_current")
+    conn.execute(
+        """CREATE TABLE message_versions (
+               dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+               version INTEGER NOT NULL, old_text TEXT, edit_date INTEGER,
+               PRIMARY KEY (dialog_id, message_id, version)
+           ) WITHOUT ROWID"""
+    )
+    conn.execute(
+        """INSERT INTO message_versions(dialog_id, message_id, version, old_text, edit_date)
+           SELECT dialog_id, message_id, version, old_text, edit_date
+             FROM message_versions_current"""
+    )
+    conn.execute("DROP TABLE message_versions_current")
+
+
+def test_v51_reconstructs_strict_dm_alerts_and_preserves_access_lost(tmp_path: Path) -> None:
+    """v51 keeps only positively identified incoming human-DM changes."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        _downgrade_event_tables_to_v50(conn)
+        _downgrade_message_versions_to_v47(conn)
+        dialog_rows = [
+            (1, "user"),
+            (2, "user"),
+            (3, "bot"),
+            (4, "group"),
+            (5, "supergroup"),
+            (6, "channel"),
+            (7, "user"),
+            (8, None),
+        ]
+        conn.executemany("INSERT INTO dialogs(dialog_id, type) VALUES (?, ?)", dialog_rows)
+        conn.executemany("INSERT INTO entities(id, type, updated_at) VALUES (?, 'user', 1)", [(1,), (2,), (7,)])
+        conn.executemany(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, text, sender_id, out, is_service, is_deleted, deleted_at) "
+            "VALUES (?, 1, 1, 'old', ?, ?, ?, 1, 10)",
+            [(dialog_id, dialog_id, int(dialog_id == 2), int(dialog_id == 7)) for dialog_id, _ in dialog_rows],
+        )
+        conn.execute(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, text, sender_id, out, is_service, is_deleted, deleted_at) "
+            "VALUES (1, 2, 1, 'old', 1, 0, 0, 0, NULL)"
+        )
+        conn.execute(
+            "INSERT INTO message_versions(dialog_id, message_id, version, old_text, edit_date) VALUES (1, 1, 1, 'old', 20)"
+        )
+        conn.execute(
+            "INSERT INTO message_versions(dialog_id, message_id, version, old_text, edit_date) VALUES (1, 2, 1, 'old', 21)"
+        )
+        conn.execute(
+            "INSERT INTO message_transcriptions(dialog_id, message_id, text, transcription_id, received_at) "
+            "VALUES (1, 2, 'new', 1, 21)"
+        )
+        conn.executemany(
+            "INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, message_id, version, daemon_event_id) "
+            "VALUES ('deleted_message', 10, ?, 1, NULL, NULL)",
+            [(dialog_id,) for dialog_id, _ in dialog_rows],
+        )
+        conn.execute(
+            "INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, message_id, version, daemon_event_id) "
+            "VALUES ('edit', 20, 1, 1, 1, NULL)"
+        )
+        conn.execute(
+            "INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, message_id, version, daemon_event_id) "
+            "VALUES ('edit', 21, 1, 2, 1, NULL)"
+        )
+        conn.execute("INSERT INTO daemon_events(kind, occurred_at, dialog_id) VALUES ('access_lost', 30, 1)")
+        access_id = _fetchone_int(conn, "SELECT MAX(id) FROM daemon_events")
+        conn.execute(
+            "INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, daemon_event_id) "
+            "VALUES ('access_lost', 30, 1, ?)",
+            (access_id,),
+        )
+        conn.executemany(
+            "INSERT INTO daemon_events(kind, occurred_at, dialog_id) VALUES ('runtime_probe', 1, NULL)",
+            [() for _ in range(99)],
+        )
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        rows = _fetchall_rows(
+            conn,
+            "SELECT kind, dialog_id, message_id, version, occurred_at FROM sync_alert_events ORDER BY occurred_at, kind",
+        )
+        assert rows == [
+            ("deleted_message", 1, 1, None, 10),
+            ("edit", 1, 1, 1, 20),
+            ("access_lost", 1, None, None, 30),
+        ]
+        assert _fetchone_int(conn, "SELECT MIN(seq) FROM sync_alert_events") > 100
+        assert _fetchone_row(conn, "SELECT origin FROM message_versions WHERE dialog_id=1 AND message_id=1") == (
+            "legacy_unknown",
+        )
+        conn.execute("INSERT INTO sync_alert_events(kind, occurred_at, dialog_id) VALUES ('access_lost', 40, 1)")
+        assert _fetchone_int(conn, "SELECT MAX(seq) FROM sync_alert_events") > 100
+
+
+def test_v52_expands_origin_contract_without_guessing_from_edit_date(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    boundary_ms = 2_000_000_000_000
+    with _sync_db_connection(db_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO daemon_state(key, value) VALUES ('runtime_events_history_started_at_ms', ?)",
+            (str(boundary_ms),),
+        )
+        conn.execute("ALTER TABLE message_versions RENAME TO message_versions_current")
+        conn.execute(
+            """CREATE TABLE message_versions (
+                   dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+                   version INTEGER NOT NULL, old_text TEXT, edit_date INTEGER,
+                   origin TEXT NOT NULL DEFAULT 'telegram_edit'
+                     CHECK (origin IN ('telegram_edit', 'transcription')),
+                   PRIMARY KEY (dialog_id, message_id, version)
+               ) WITHOUT ROWID"""
+        )
+        conn.executemany(
+            "INSERT INTO message_versions VALUES (1, ?, 1, 'old', ?, ?)",
+            [
+                (1, 1_999_999_999, "telegram_edit"),
+                (2, 2_000_000_000, "telegram_edit"),
+                (3, 1_999_999_999, "transcription"),
+            ],
+        )
+        conn.execute("DROP TABLE message_versions_current")
+        conn.execute("DELETE FROM schema_version WHERE version >= 52")
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchall_rows(conn, "SELECT message_id, origin FROM message_versions ORDER BY message_id") == [
+            (1, "telegram_edit"),
+            (2, "telegram_edit"),
+            (3, "transcription"),
+        ]
+
+
+def test_v52_origin_repair_rolls_back_before_replacing_versions(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute("ALTER TABLE message_versions RENAME TO message_versions_current")
+        conn.execute(
+            """CREATE TABLE message_versions (
+                   dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+                   version INTEGER NOT NULL, old_text TEXT, edit_date INTEGER,
+                   origin TEXT NOT NULL DEFAULT 'telegram_edit'
+                     CHECK (origin IN ('telegram_edit', 'transcription')),
+                   PRIMARY KEY (dialog_id, message_id, version)
+               ) WITHOUT ROWID"""
+        )
+        conn.execute("INSERT INTO message_versions VALUES (1, 1, 1, 'old', 1, 'telegram_edit')")
+        conn.execute("DROP TABLE message_versions_current")
+        conn.execute("CREATE TABLE message_versions_origin_migration(blocker INTEGER)")
+        conn.execute("DELETE FROM schema_version WHERE version >= 52")
+        conn.commit()
+
+        with pytest.raises(sqlite3.OperationalError, match="already exists|already another table"):
+            ensure_sync_schema(db_path)
+        assert _fetchone_row(conn, "SELECT origin FROM message_versions WHERE dialog_id=1") == ("telegram_edit",)
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=52") is None
+
+
+def test_v51_preserves_access_alerts_and_uses_both_sequence_high_water_marks(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
@@ -1730,9 +1899,9 @@ def test_v51_clears_old_alerts_and_uses_both_sequence_high_water_marks(tmp_path:
         conn.commit()
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT COUNT(*) FROM sync_alert_events") == 0
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM sync_alert_events WHERE kind='access_lost'") == 1
         conn.execute("INSERT INTO sync_alert_events(kind,occurred_at,dialog_id) VALUES ('access_lost',2,1)")
-        assert _fetchone_int(conn, "SELECT seq FROM sync_alert_events") > 7
+        assert _fetchone_int(conn, "SELECT MAX(seq) FROM sync_alert_events") > 7
 
 
 def test_v51_failure_before_table_swap_rolls_back_all_prior_ddl(tmp_path: Path) -> None:
@@ -1748,3 +1917,224 @@ def test_v51_failure_before_table_swap_rolls_back_all_prior_ddl(tmp_path: Path) 
         assert {"telemetry_events", "daemon_events", "sync_alert_events"} <= tables
         assert "runtime_events" not in tables
         assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=51") is None
+
+
+@pytest.mark.parametrize(
+    ("action", "first", "second"),
+    [
+        (sqlite3.SQLITE_DROP_TABLE, "sync_alert_events", None),
+        (sqlite3.SQLITE_ALTER_TABLE, "main", "sync_alert_events_v51"),
+        (sqlite3.SQLITE_DROP_TABLE, "telemetry_events", None),
+        (sqlite3.SQLITE_DROP_TABLE, "daemon_events", None),
+    ],
+)
+def test_v51_each_destructive_ddl_failure_rolls_back_cutover(
+    tmp_path: Path, action: int, first: str, second: str | None
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        _downgrade_event_tables_to_v50(conn)
+        conn.execute(
+            "INSERT INTO telemetry_events(tool_name,timestamp,duration_ms,result_count,has_cursor,page_depth,has_filter,outcome) VALUES ('probe',1,1,0,0,0,0,'success')"
+        )
+        conn.execute("INSERT INTO daemon_events(kind,occurred_at,dialog_id) VALUES ('access_lost',1,1)")
+        daemon_id = _fetchone_int(conn, "SELECT id FROM daemon_events")
+        conn.execute(
+            "INSERT INTO sync_alert_events(kind,occurred_at,dialog_id,daemon_event_id) VALUES ('access_lost',1,1,?)",
+            (daemon_id,),
+        )
+        conn.commit()
+
+        def deny_target(
+            requested_action: int,
+            requested_first: str | None,
+            requested_second: str | None,
+            _database: str | None,
+            _trigger: str | None,
+        ) -> int:
+            if (
+                requested_action == action
+                and requested_first == first
+                and (second is None or requested_second == second)
+            ):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_target)
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            _apply_migration_51(conn, 50)
+        conn.set_authorizer(None)
+
+        tables = {row[0] for row in _fetchall_rows(conn, "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert {"telemetry_events", "daemon_events", "sync_alert_events"} <= tables
+        assert "runtime_events" not in tables
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM telemetry_events") == 1
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM daemon_events") == 1
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM sync_alert_events") == 1
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=51") is None
+
+
+@pytest.mark.parametrize(
+    ("action", "first", "second"),
+    [
+        (sqlite3.SQLITE_ALTER_TABLE, "main", "message_versions"),
+        (sqlite3.SQLITE_DROP_TABLE, "message_versions_origin_migration", None),
+    ],
+)
+def test_v51_message_version_rebuild_failure_rolls_back(
+    tmp_path: Path, action: int, first: str, second: str | None
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        _downgrade_event_tables_to_v50(conn)
+        _downgrade_message_versions_to_v47(conn)
+        conn.execute(
+            "INSERT INTO message_versions(dialog_id,message_id,version,old_text,edit_date) VALUES (1,1,1,'old',1)"
+        )
+        conn.commit()
+
+        def deny_target(
+            requested_action: int,
+            requested_first: str | None,
+            requested_second: str | None,
+            _database: str | None,
+            _trigger: str | None,
+        ) -> int:
+            if (
+                requested_action == action
+                and requested_first == first
+                and (second is None or requested_second == second)
+            ):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_target)
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            _apply_migration_51(conn, 50)
+        conn.set_authorizer(None)
+
+        columns = {row[1] for row in _fetchall_rows(conn, "PRAGMA table_info(message_versions)")}
+        assert "origin" not in columns
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM message_versions") == 1
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=51") is None
+
+
+@pytest.mark.parametrize(
+    "trigger_name",
+    [
+        "sync_alert_events_message_insert_deleted",
+        "sync_alert_events_message_delete_transition",
+        "sync_alert_events_message_edit",
+        "sync_alert_events_access_lost",
+    ],
+)
+def test_v51_trigger_drop_failure_rolls_back(tmp_path: Path, trigger_name: str) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        _downgrade_event_tables_to_v50(conn)
+        for name in (
+            "sync_alert_events_message_insert_deleted",
+            "sync_alert_events_message_delete_transition",
+            "sync_alert_events_message_edit",
+            "sync_alert_events_access_lost",
+        ):
+            conn.execute(f"CREATE TRIGGER {name} AFTER INSERT ON messages BEGIN SELECT 1; END")
+        conn.commit()
+
+        def deny_trigger(
+            action: int,
+            first: str | None,
+            _second: str | None,
+            _database: str | None,
+            _trigger: str | None,
+        ) -> int:
+            if action == sqlite3.SQLITE_DROP_TRIGGER and first == trigger_name:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_trigger)
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            _apply_migration_51(conn, 50)
+        conn.set_authorizer(None)
+
+        triggers = {row[0] for row in _fetchall_rows(conn, "SELECT name FROM sqlite_master WHERE type='trigger'")}
+        assert trigger_name in triggers
+        assert "runtime_events" not in {
+            row[0] for row in _fetchall_rows(conn, "SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=51") is None
+
+
+@pytest.mark.parametrize("legacy_table", ["telemetry_events", "daemon_events"])
+def test_v51_replay_cleanup_failure_rolls_back(tmp_path: Path, legacy_table: str) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute("CREATE TABLE telemetry_events(id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE daemon_events(id INTEGER PRIMARY KEY)")
+        conn.execute("DELETE FROM schema_version WHERE version >= 51")
+        conn.commit()
+
+        def deny_drop(
+            action: int,
+            first: str | None,
+            _second: str | None,
+            _database: str | None,
+            _trigger: str | None,
+        ) -> int:
+            if action == sqlite3.SQLITE_DROP_TABLE and first == legacy_table:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_drop)
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            _apply_migration_51(conn, 50)
+        conn.set_authorizer(None)
+
+        tables = {row[0] for row in _fetchall_rows(conn, "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert {"telemetry_events", "daemon_events"} <= tables
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=51") is None
+
+
+def test_v52_failure_after_rename_rolls_back_original_contract(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute("ALTER TABLE message_versions RENAME TO message_versions_current")
+        conn.execute(
+            """CREATE TABLE message_versions (
+                   dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+                   version INTEGER NOT NULL, old_text TEXT, edit_date INTEGER,
+                   origin TEXT NOT NULL DEFAULT 'telegram_edit'
+                     CHECK (origin IN ('telegram_edit', 'transcription')),
+                   PRIMARY KEY (dialog_id, message_id, version)
+               ) WITHOUT ROWID"""
+        )
+        conn.execute("INSERT INTO message_versions VALUES (1,1,1,'old',1,'telegram_edit')")
+        conn.execute("DROP TABLE message_versions_current")
+        conn.execute("DELETE FROM schema_version WHERE version >= 52")
+        conn.commit()
+
+        def deny_drop(
+            action: int,
+            first: str | None,
+            _second: str | None,
+            _database: str | None,
+            _trigger: str | None,
+        ) -> int:
+            if action == sqlite3.SQLITE_DROP_TABLE and first == "message_versions_origin_migration":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_drop)
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            _apply_migration_52(conn, 51)
+        conn.set_authorizer(None)
+
+        schema = _fetchone_row(conn, "SELECT sql FROM sqlite_master WHERE name='message_versions'")
+        assert schema is not None and "legacy_unknown" not in str(schema[0])
+        assert _fetchone_row(conn, "SELECT origin FROM message_versions") == ("telegram_edit",)
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=52") is None

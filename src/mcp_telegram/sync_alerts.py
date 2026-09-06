@@ -167,28 +167,27 @@ def _b64decode(value: str) -> bytes:
     return decoded
 
 
-def _legacy_text(
-    conn: sqlite3.Connection, kind: object, dialog_id: object, message_id: object, version: object
-) -> object:
-    if kind == "deleted_message":
-        row = cast(
-            tuple[object, ...] | None,
-            conn.execute(
-                "SELECT text FROM messages WHERE dialog_id = ? AND message_id = ?",
-                (dialog_id, message_id),
-            ).fetchone(),
-        )
-    elif kind == "edit":
-        row = cast(
-            tuple[object, ...] | None,
-            conn.execute(
-                "SELECT old_text FROM message_versions WHERE dialog_id = ? AND message_id = ? AND version = ?",
-                (dialog_id, message_id, version),
-            ).fetchone(),
-        )
-    else:
-        return None
-    return row[0] if row is not None else None
+def _empty_text_evidence(kind: object) -> dict[str, object]:
+    return {
+        "text": None,
+        "old_text": None,
+        "deleted_text": None,
+        "original_text": None,
+        "changed_text": None,
+        "text_provenance": {"deleted": None, "original": None, "changed": None},
+        "text_confidence": {"deleted": "unavailable", "original": "unavailable", "changed": "unavailable"},
+        "text_status": "not_applicable" if kind == "access_lost" else "unavailable",
+    }
+
+
+def _text_status(original_available: bool, changed_available: bool) -> str:
+    if original_available and changed_available:
+        return "complete_candidate"
+    if original_available:
+        return "original_only"
+    if changed_available:
+        return "changed_only"
+    return "unavailable"
 
 
 def _query_rows(
@@ -199,15 +198,22 @@ def _query_rows(
     after_seq: int | None,
     limit: int,
 ) -> list[tuple[object, ...]]:
-    query = (
-        "SELECT seq, kind, occurred_at, dialog_id, message_id, version "
-        "FROM sync_alert_events WHERE seq <= ? AND occurred_at > ?"
-    )
+    query = """SELECT a.seq, a.kind, a.occurred_at, a.dialog_id, a.message_id, a.version,
+                      m.text, mv.old_text, next_mv.old_text
+                 FROM sync_alert_events a
+                 LEFT JOIN messages m
+                   ON m.dialog_id = a.dialog_id AND m.message_id = a.message_id
+                 LEFT JOIN message_versions mv
+                   ON mv.dialog_id = a.dialog_id AND mv.message_id = a.message_id AND mv.version = a.version
+                 LEFT JOIN message_versions next_mv
+                   ON next_mv.dialog_id = a.dialog_id AND next_mv.message_id = a.message_id
+                  AND next_mv.version = a.version + 1
+                WHERE a.seq <= ? AND a.occurred_at > ?"""
     params: list[int] = [snapshot_seq, since]
     if after_seq is not None:
-        query += " AND seq < ?"
+        query += " AND a.seq < ?"
         params.append(after_seq)
-    query += " ORDER BY seq DESC LIMIT ?"
+    query += " ORDER BY a.seq DESC LIMIT ?"
     params.append(limit)
     return cast(list[tuple[object, ...]], conn.execute(query, params).fetchall())
 
@@ -285,9 +291,63 @@ def _alert_narrative(kind: object, message_id: object, version: object, occurred
     )
 
 
+def _row_text_evidence(row: tuple[object, ...]) -> dict[str, object]:
+    _, kind, _, _, _, _, current_text, original_text, next_original_text = row
+    if kind == "deleted_message":
+        evidence = _empty_text_evidence(kind)
+        evidence.update(
+            {
+                "text": current_text,
+                "deleted_text": current_text,
+                "text_provenance": {
+                    "deleted": "messages.text[current_candidate]",
+                    "original": None,
+                    "changed": None,
+                },
+                "text_confidence": {
+                    "deleted": "candidate" if current_text is not None else "unavailable",
+                    "original": "unavailable",
+                    "changed": "unavailable",
+                },
+                "text_status": "candidate" if current_text is not None else "unavailable",
+            }
+        )
+        return evidence
+    if kind != "edit":
+        return _empty_text_evidence(kind)
+    changed_text = next_original_text if next_original_text is not None else current_text
+    changed_source = (
+        "message_versions.old_text[next_version]"
+        if next_original_text is not None
+        else "messages.text[current_candidate]"
+    )
+    original_available, changed_available = original_text is not None, changed_text is not None
+    evidence = _empty_text_evidence(kind)
+    evidence.update(
+        {
+            "old_text": original_text,
+            "original_text": original_text,
+            "changed_text": changed_text,
+            "text_provenance": {
+                "deleted": None,
+                "original": "message_versions.old_text",
+                "changed": changed_source,
+            },
+            "text_confidence": {
+                "deleted": "unavailable",
+                "original": "exact" if original_available else "unavailable",
+                "changed": "candidate" if changed_available else "unavailable",
+            },
+            "text_status": _text_status(original_available, changed_available),
+        }
+    )
+    return evidence
+
+
 def _alert_from_row(row: tuple[object, ...]) -> dict[str, object]:
-    seq, kind, occurred_at, dialog_id, message_id, version = row
+    seq, kind, occurred_at, dialog_id, message_id, version, _, _, _ = row
     message, action = _alert_narrative(kind, message_id, version, occurred_at)
+    evidence = _row_text_evidence(row)
     item: dict[str, object] = {
         "kind": kind,
         "dialog_id": dialog_id,
@@ -302,6 +362,7 @@ def _alert_from_row(row: tuple[object, ...]) -> dict[str, object]:
         "message": message,
         "action": action,
     }
+    item.update(evidence)
     return item
 
 
@@ -330,9 +391,7 @@ def _next_navigation(
 
 
 def _legacy_projections(
-    conn: sqlite3.Connection,
-    alerts: list[dict[str, object]],
-    page_rows: list[tuple[object, ...]],
+    alerts: list[dict[str, object]], page_rows: list[tuple[object, ...]]
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
     deleted: list[dict[str, object]] = []
     edits: list[dict[str, object]] = []
@@ -344,7 +403,11 @@ def _legacy_projections(
                 {
                     "dialog_id": dialog_id,
                     "message_id": message_id,
-                    "text": _legacy_text(conn, kind, dialog_id, message_id, version),
+                    "text": item.get("text"),
+                    "deleted_text": item.get("deleted_text"),
+                    "text_provenance": item.get("text_provenance"),
+                    "text_confidence": item.get("text_confidence"),
+                    "text_status": item.get("text_status"),
                     "deleted_at": item["deleted_at"],
                 }
             )
@@ -354,7 +417,12 @@ def _legacy_projections(
                     "dialog_id": dialog_id,
                     "message_id": message_id,
                     "version": version,
-                    "old_text": _legacy_text(conn, kind, dialog_id, message_id, version),
+                    "old_text": item.get("old_text"),
+                    "original_text": item.get("original_text"),
+                    "changed_text": item.get("changed_text"),
+                    "text_provenance": item.get("text_provenance"),
+                    "text_confidence": item.get("text_confidence"),
+                    "text_status": item.get("text_status"),
                     "edit_date": item["edit_date"],
                 }
             )
@@ -416,7 +484,7 @@ def query_alerts(conn: sqlite3.Connection, req: dict[str, object], codec: SyncAl
     has_more = len(rows) > context.limit
     page_rows = rows[: context.limit]
     alerts = _project_alerts(page_rows)
-    projections = _legacy_projections(conn, alerts, page_rows)
+    projections = _legacy_projections(alerts, page_rows)
     data = _alert_page_data(
         context,
         alerts,

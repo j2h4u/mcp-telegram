@@ -56,7 +56,7 @@ def _message(  # noqa: PLR0913
             message_id=message_id,
             sent_at=sent_at,
             text=text,
-            sender_id=7,
+            sender_id=42,
             sender_first_name="Test",
             reply_to_msg_id=None,
             forum_topic_id=None,

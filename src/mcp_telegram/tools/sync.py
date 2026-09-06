@@ -231,6 +231,32 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                     "severity": {"type": "string"},
                     "message": {"type": "string"},
                     "action": {"type": ["string", "null"]},
+                    "text": {"type": ["string", "null"]},
+                    "old_text": {"type": ["string", "null"]},
+                    "deleted_text": {"type": ["string", "null"]},
+                    "original_text": {"type": ["string", "null"]},
+                    "changed_text": {"type": ["string", "null"]},
+                    "text_provenance": {
+                        "type": "object",
+                        "properties": {
+                            "deleted": {"type": ["string", "null"]},
+                            "original": {"type": ["string", "null"]},
+                            "changed": {"type": ["string", "null"]},
+                        },
+                        "required": ["deleted", "original", "changed"],
+                        "additionalProperties": False,
+                    },
+                    "text_confidence": {
+                        "type": "object",
+                        "properties": {
+                            "deleted": {"type": "string"},
+                            "original": {"type": "string"},
+                            "changed": {"type": "string"},
+                        },
+                        "required": ["deleted", "original", "changed"],
+                        "additionalProperties": False,
+                    },
+                    "text_status": {"type": "string"},
                 },
                 "required": [
                     "kind",
@@ -259,6 +285,11 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                     "message_id": {"type": ["integer", "null"]},
                     "deleted_at": {"type": ["integer", "null"]},
                     "action": {"type": "string"},
+                    "text": {"type": ["string", "null"]},
+                    "deleted_text": {"type": ["string", "null"]},
+                    "text_provenance": {"type": "object"},
+                    "text_confidence": {"type": "object"},
+                    "text_status": {"type": "string"},
                 },
                 "required": ["dialog_id", "message_id", "deleted_at", "action"],
                 "additionalProperties": False,
@@ -275,6 +306,12 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                     "version": {"type": ["integer", "null"]},
                     "edit_date": {"type": ["integer", "null"]},
                     "action": {"type": "string"},
+                    "old_text": {"type": ["string", "null"]},
+                    "original_text": {"type": ["string", "null"]},
+                    "changed_text": {"type": ["string", "null"]},
+                    "text_provenance": {"type": "object"},
+                    "text_confidence": {"type": "object"},
+                    "text_status": {"type": "string"},
                 },
                 "required": ["dialog_id", "message_id", "version", "edit_date", "action"],
                 "additionalProperties": False,
@@ -503,8 +540,10 @@ class GetSyncAlerts(ToolArgs):
     Use when investigating anomalies — e.g. after GetSyncStatus shows access_lost, or to
     audit what was deleted or silently edited since a given timestamp.
     Use since= (unix timestamp) to scope alerts to a time window. Default since=0 starts a full paginated traversal.
-    The MCP response intentionally exposes metadata only (IDs, timestamps,
-    kind, severity, and action); message text and prior text are not returned.
+    The response always exposes event metadata. When cached text exists it also
+    returns untrusted Telegram text with explicit provenance and confidence:
+    deleted text is the current local candidate, edit original text is exact,
+    and reconstructed changed text is a candidate.
     New events above a cursor snapshot are excluded; late historical backfills
     at or before that snapshot can be omitted from an in-progress traversal.
     Results follow immutable newest-observed sequence order; occurred_at remains
@@ -631,6 +670,11 @@ def _canonical_deleted(alerts: list[dict[str, object]]) -> list[dict[str, object
             "deleted_at": item.get("deleted_at"),
             "action": item.get("action")
             or "Inspect the dialog history around this message id if surrounding context is needed.",
+            **{
+                key: item[key]
+                for key in ("text", "deleted_text", "text_provenance", "text_confidence", "text_status")
+                if key in item
+            },
         }
         for item in alerts
         if item.get("kind") == "deleted_message"
@@ -646,6 +690,18 @@ def _canonical_edits(alerts: list[dict[str, object]]) -> list[dict[str, object]]
             "edit_date": item.get("edit_date"),
             "action": item.get("action")
             or "Treat cached text as versioned; inspect edit history before relying on older wording.",
+            **{
+                key: item[key]
+                for key in (
+                    "old_text",
+                    "original_text",
+                    "changed_text",
+                    "text_provenance",
+                    "text_confidence",
+                    "text_status",
+                )
+                if key in item
+            },
         }
         for item in alerts
         if item.get("kind") == "edit"
@@ -668,7 +724,7 @@ def _canonical_alerts(
     data: dict[str, object],
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
     raw_alerts = [item for item in t.cast(list[object], data["alerts"]) if isinstance(item, dict)]
-    alerts = [{key: value for key, value in item.items() if key not in {"text", "old_text"}} for item in raw_alerts]
+    alerts = [dict(item) for item in raw_alerts]
     return alerts, _canonical_deleted(alerts), _canonical_edits(alerts), _canonical_access(alerts)
 
 
@@ -741,90 +797,115 @@ def _canonical_alert_result(data: dict[str, object], args: GetSyncAlerts) -> Too
     )
 
 
+def _selected_fields(item: Mapping[str, object], names: tuple[str, ...]) -> dict[str, object]:
+    return {name: item[name] for name in names if name in item}
+
+
+def _legacy_deleted_items(values: object) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    projections: list[dict[str, object]] = []
+    alerts: list[dict[str, object]] = []
+    for item in t.cast(list[Mapping[str, object]], values or []):
+        action = "Inspect the dialog history around this message id if surrounding context is needed."
+        evidence = _selected_fields(item, ("text", "deleted_text", "text_provenance", "text_confidence", "text_status"))
+        projections.append(
+            {
+                "dialog_id": item.get("dialog_id"),
+                "message_id": item.get("message_id"),
+                "deleted_at": item.get("deleted_at"),
+                "action": action,
+                **evidence,
+            }
+        )
+        alerts.append(
+            {
+                "kind": "deleted_message",
+                "dialog_id": item.get("dialog_id"),
+                "message_id": item.get("message_id"),
+                "deleted_at": item.get("deleted_at"),
+                "version": None,
+                "edit_date": None,
+                "access_lost_at": None,
+                "severity": "medium",
+                "message": f"Deleted message msg={item['message_id']} deleted_at={item['deleted_at']}",
+                "action": action,
+                **evidence,
+            }
+        )
+    return projections, alerts
+
+
+def _legacy_edit_items(values: object) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    projections: list[dict[str, object]] = []
+    alerts: list[dict[str, object]] = []
+    for item in t.cast(list[Mapping[str, object]], values or []):
+        action = "Treat cached text as versioned; inspect edit history before relying on older wording."
+        evidence = _selected_fields(
+            item,
+            ("old_text", "original_text", "changed_text", "text_provenance", "text_confidence", "text_status"),
+        )
+        projections.append(
+            {
+                "dialog_id": item.get("dialog_id"),
+                "message_id": item.get("message_id"),
+                "version": item.get("version"),
+                "edit_date": item.get("edit_date"),
+                "action": action,
+                **evidence,
+            }
+        )
+        alerts.append(
+            {
+                "kind": "edit",
+                "dialog_id": item.get("dialog_id"),
+                "message_id": item.get("message_id"),
+                "deleted_at": None,
+                "version": item.get("version"),
+                "edit_date": item.get("edit_date"),
+                "access_lost_at": None,
+                "severity": "low",
+                "message": f"Edited message msg={item['message_id']} v{item['version']} edit_date={item['edit_date']}",
+                "action": action,
+                **evidence,
+            }
+        )
+    return projections, alerts
+
+
+def _legacy_access_items(values: object) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    projections: list[dict[str, object]] = []
+    alerts: list[dict[str, object]] = []
+    for item in t.cast(list[Mapping[str, object]], values or []):
+        action = "Use get_sync_status for coverage details."
+        projections.append(
+            {
+                "dialog_id": item.get("dialog_id"),
+                "access_lost_at": item.get("access_lost_at"),
+                "action": action,
+            }
+        )
+        alerts.append(
+            {
+                "kind": "access_lost",
+                "dialog_id": item.get("dialog_id"),
+                "message_id": None,
+                "deleted_at": None,
+                "version": None,
+                "edit_date": None,
+                "access_lost_at": item.get("access_lost_at"),
+                "severity": "high",
+                "message": f"Access lost at {item.get('access_lost_at')}",
+                "action": action,
+            }
+        )
+    return projections, alerts
+
+
 def _legacy_alert_result(data: object, args: GetSyncAlerts) -> ToolResult:
     data = t.cast(Mapping[str, object], data)
-    deleted = data.get("deleted_messages", [])
-    edits = data.get("edits", [])
-    access_lost = data.get("access_lost", [])
-    alerts: list[dict[str, object]] = []
-    deleted_messages: list[dict[str, object]] = []
-    edit_alerts: list[dict[str, object]] = []
-    access_lost_alerts: list[dict[str, object]] = []
-    if deleted:
-        for item in t.cast(list[Mapping[str, object]], deleted):
-            action = "Inspect the dialog history around this message id if surrounding context is needed."
-            deleted_messages.append(
-                {
-                    "dialog_id": item.get("dialog_id"),
-                    "message_id": item.get("message_id"),
-                    "deleted_at": item.get("deleted_at"),
-                    "action": action,
-                }
-            )
-            alerts.append(
-                {
-                    "kind": "deleted_message",
-                    "dialog_id": item.get("dialog_id"),
-                    "message_id": item.get("message_id"),
-                    "deleted_at": item.get("deleted_at"),
-                    "version": None,
-                    "edit_date": None,
-                    "access_lost_at": None,
-                    "severity": "medium",
-                    "message": f"Deleted message msg={item['message_id']} deleted_at={item['deleted_at']}",
-                    "action": action,
-                }
-            )
-    if edits:
-        for item in t.cast(list[Mapping[str, object]], edits):
-            action = "Treat cached text as versioned; inspect edit history before relying on older wording."
-            edit_alerts.append(
-                {
-                    "dialog_id": item.get("dialog_id"),
-                    "message_id": item.get("message_id"),
-                    "version": item.get("version"),
-                    "edit_date": item.get("edit_date"),
-                    "action": action,
-                }
-            )
-            alerts.append(
-                {
-                    "kind": "edit",
-                    "dialog_id": item.get("dialog_id"),
-                    "message_id": item.get("message_id"),
-                    "deleted_at": None,
-                    "version": item.get("version"),
-                    "edit_date": item.get("edit_date"),
-                    "access_lost_at": None,
-                    "severity": "low",
-                    "message": f"Edited message msg={item['message_id']} v{item['version']} edit_date={item['edit_date']}",
-                    "action": action,
-                }
-            )
-    if access_lost:
-        for item in t.cast(list[Mapping[str, object]], access_lost):
-            action = "Use get_sync_status for coverage details."
-            access_lost_alerts.append(
-                {
-                    "dialog_id": item.get("dialog_id"),
-                    "access_lost_at": item.get("access_lost_at"),
-                    "action": action,
-                }
-            )
-            alerts.append(
-                {
-                    "kind": "access_lost",
-                    "dialog_id": item.get("dialog_id"),
-                    "message_id": None,
-                    "deleted_at": None,
-                    "version": None,
-                    "edit_date": None,
-                    "access_lost_at": item.get("access_lost_at"),
-                    "severity": "high",
-                    "message": f"Access lost at {item.get('access_lost_at')}",
-                    "action": action,
-                }
-            )
+    deleted_messages, deleted_alerts = _legacy_deleted_items(data.get("deleted_messages", []))
+    edit_alerts, edit_items = _legacy_edit_items(data.get("edits", []))
+    access_lost_alerts, access_items = _legacy_access_items(data.get("access_lost", []))
+    alerts = deleted_alerts + edit_items + access_items
     for values in (deleted_messages, edit_alerts, access_lost_alerts, alerts):
         values.sort(key=_alert_timestamp)
     return _alert_result(

@@ -47,7 +47,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     InputPeerUser,
 )
 
-from .access_lifecycle import set_access_lost
+from .access_lifecycle import record_access_lifecycle_event, set_access_lost
 from .dialog_classification import EntityKind, classify_dialog_type
 from .flood import TelegramRpcThrottled, sleep_through_flood
 from .maintenance_logging import log_maintenance_cycle
@@ -820,7 +820,9 @@ class DialogReconciliationWorker:
                     dialog_id,
                     type(exc).__name__,
                 )
-                set_access_lost(self._conn, dialog_id, int(time.time()))
+                event = set_access_lost(self._conn, dialog_id, int(time.time()))
+                self._conn.commit()
+                record_access_lifecycle_event(event)
                 # do not increment count — refresh did not succeed
             except PeerIdInvalidError:
                 # Telethon session does not have access_hash cached for this
