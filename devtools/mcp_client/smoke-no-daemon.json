@@ -1,22 +1,21 @@
 {
   "steps": [
     {
-      "_comment": "All 18 tools registered with output schemas",
+      "_comment": "All 17 tools registered with output schemas",
       "action": "list_tools",
       "expect": {
         "tool_names_include": [
           "get_dialog_stats",
           "get_entity_info",
           "get_inbox",
-          "get_unread_summary",
           "get_my_recent_activity",
-          "get_sync_alerts",
           "get_sync_status",
+          "get_unread_summary",
           "get_usage_stats",
-          "list_folders",
-          "list_folder_messages",
-          "list_important_events",
+          "list_conversation_changes",
           "list_dialogs",
+          "list_folder_messages",
+          "list_folders",
           "list_messages",
           "list_topics",
           "mark_dialog_for_sync",
@@ -41,9 +40,6 @@
           "get_my_recent_activity": {
             "outputSchema.type": "object"
           },
-          "get_sync_alerts": {
-            "outputSchema.type": "object"
-          },
           "get_sync_status": {
             "inputSchema.properties.dialog_id.type": "integer",
             "outputSchema.type": "object"
@@ -61,10 +57,6 @@
           },
           "list_folder_messages": {
             "inputSchema.properties.folder_id.type": "integer",
-            "outputSchema.type": "object"
-          },
-          "list_important_events": {
-            "inputSchema.properties.last_hours.default": 24,
             "outputSchema.type": "object"
           },
           "search_messages": {
@@ -89,11 +81,14 @@
           },
           "trace_account_messages": {
             "outputSchema.type": "object"
+          },
+          "list_conversation_changes": {
+            "inputSchema.properties.page_limit.default": 50,
+            "outputSchema.type": "object"
           }
         }
       }
     },
-
     {
       "_comment": "list_dialogs — daemon route",
       "action": "call_tool",
@@ -101,97 +96,151 @@
       "arguments": {},
       "expect": {
         "is_error": true,
-        "content_text_contains": ["not running", "mcp-telegram sync"]
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
       }
     },
     {
       "_comment": "list_messages — daemon route",
       "action": "call_tool",
       "name": "list_messages",
-      "arguments": {"dialog": "test", "limit": 1},
+      "arguments": {
+        "dialog": "test",
+        "limit": 1
+      },
       "expect": {
         "is_error": true,
-        "content_text_contains": ["not running", "mcp-telegram sync"]
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
       }
     },
     {
       "_comment": "search_messages — daemon route",
       "action": "call_tool",
       "name": "search_messages",
-      "arguments": {"dialog": "test", "query": "hello", "limit": 1},
+      "arguments": {
+        "dialog": "test",
+        "query": "hello",
+        "limit": 1
+      },
       "expect": {
         "is_error": true,
-        "content_text_contains": ["not running", "mcp-telegram sync"]
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
       }
     },
     {
       "_comment": "list_topics — daemon route",
       "action": "call_tool",
       "name": "list_topics",
-      "arguments": {"dialog": "test"},
+      "arguments": {
+        "dialog": "test"
+      },
       "expect": {
         "is_error": true,
-        "content_text_contains": ["not running", "mcp-telegram sync"]
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
       }
     },
     {
       "_comment": "mark_dialog_for_sync — daemon route",
       "action": "call_tool",
       "name": "mark_dialog_for_sync",
-      "arguments": {"dialog_id": 12345, "enable": true},
+      "arguments": {
+        "dialog_id": 12345,
+        "enable": true
+      },
       "expect": {
         "is_error": true,
-        "content_text_contains": ["not running", "mcp-telegram sync"]
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
       }
     },
     {
       "_comment": "get_sync_status — daemon route",
       "action": "call_tool",
       "name": "get_sync_status",
-      "arguments": {"dialog_id": 12345},
+      "arguments": {
+        "dialog_id": 12345
+      },
       "expect": {
         "is_error": true,
-        "content_text_contains": ["not running", "mcp-telegram sync"]
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
       }
     },
     {
-      "_comment": "get_sync_alerts — daemon route",
+      "_comment": "list_conversation_changes — daemon route",
       "action": "call_tool",
-      "name": "get_sync_alerts",
-      "arguments": {"since": 0, "limit": 1},
+      "name": "list_conversation_changes",
+      "arguments": {
+        "page_limit": 1
+      },
       "expect": {
         "is_error": true,
-        "content_text_contains": ["not running", "mcp-telegram sync"]
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
       }
     },
     {
       "_comment": "get_entity_info — resolve first, daemon not running so returns not-running message",
       "action": "call_tool",
       "name": "get_entity_info",
-      "arguments": {"entity": "nonexistent_test_entity_12345"},
+      "arguments": {
+        "entity": "nonexistent_test_entity_12345"
+      },
       "expect": {
         "is_error": true,
-        "content_text_contains": ["not running", "mcp-telegram sync"]
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
       }
     },
     {
       "_comment": "get_dialog_stats — daemon route",
       "action": "call_tool",
       "name": "get_dialog_stats",
-      "arguments": {"dialog": "test", "top_n": 3},
+      "arguments": {
+        "dialog": "test",
+        "top_n": 3
+      },
       "expect": {
         "is_error": true,
-        "content_text_contains": ["not running", "mcp-telegram sync"]
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
       }
     },
     {
       "_comment": "get_my_recent_activity — daemon route",
       "action": "call_tool",
       "name": "get_my_recent_activity",
-      "arguments": {"since_hours": 24, "limit": 50},
+      "arguments": {
+        "since_hours": 24,
+        "limit": 50
+      },
       "expect": {
         "is_error": true,
-        "content_text_contains": ["not running", "mcp-telegram sync"]
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
       }
     },
     {
@@ -201,7 +250,10 @@
       "arguments": {},
       "expect": {
         "is_error": true,
-        "content_text_contains": ["not running", "mcp-telegram sync"]
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
       }
     },
     {
@@ -211,27 +263,42 @@
       "arguments": {},
       "expect": {
         "is_error": true,
-        "content_text_contains": ["not running", "mcp-telegram sync"]
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
       }
     },
     {
       "_comment": "submit_feedback — daemon route, fails gracefully when daemon is down",
       "action": "call_tool",
       "name": "submit_feedback",
-      "arguments": {"message": "smoke test from no-daemon harness", "severity": "bug"},
+      "arguments": {
+        "message": "smoke test from no-daemon harness",
+        "severity": "bug"
+      },
       "expect": {
         "is_error": true,
-        "content_text_contains": ["not running", "mcp-telegram sync"]
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
       }
     },
     {
       "_comment": "trace_account_messages — daemon route",
       "action": "call_tool",
       "name": "trace_account_messages",
-      "arguments": {"account": "12345", "limit": 5},
+      "arguments": {
+        "account": "12345",
+        "limit": 5
+      },
       "expect": {
         "is_error": true,
-        "content_text_contains": ["not running", "mcp-telegram sync"]
+        "content_text_contains": [
+          "not running",
+          "mcp-telegram sync"
+        ]
       }
     }
   ]

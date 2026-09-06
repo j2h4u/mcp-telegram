@@ -216,8 +216,11 @@ def _telemetry_event(  # noqa: PLR0913 - explicit telemetry fields keep the cont
         machine_code = safe_error_code(error_code)
     else:
         machine_code = outcome
+    tool_capability = "conversation_changes" if tool_name == "list_conversation_changes" else tool_name
     return {
         "tool_name": tool_name,
+        "tool_capability": tool_capability,
+        "contract_version": 1,
         "timestamp": time.time(),
         "duration_ms": duration_ms,
         "result_count": safe_result.result_count if safe_result is not None else 0,

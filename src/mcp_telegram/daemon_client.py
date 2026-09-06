@@ -408,26 +408,28 @@ class DaemonConnection:
         """Return sync status and message stats for a dialog."""
         return await self.request({"method": "get_sync_status", "dialog_id": dialog_id})
 
-    async def get_sync_alerts(
+    async def list_conversation_changes(  # noqa: PLR0913
         self,
         *,
-        since: int | None = None,
-        limit: int | None = None,
+        since_utc: int | None = None,
+        until_utc: int | None = None,
+        kinds: list[str] | None = None,
+        dialog_id: int | None = None,
         page_limit: int | None = None,
         navigation: str | None = None,
     ) -> dict:
-        """Return one globally paginated sync-alert page.
-
-        Optional values stay omitted on the wire so the daemon can preserve
-        whether a caller used a default or explicitly supplied a value.
-        """
-        payload: dict[str, object] = {"method": "get_sync_alerts"}
-        if since is not None:
-            payload["since"] = since
-        if limit is not None:
-            payload["limit"] = limit
+        """Return one snapshot-paginated conversation-change page."""
+        payload: dict[str, object] = {"method": "list_conversation_changes"}
         if page_limit is not None:
             payload["page_limit"] = page_limit
+        if since_utc is not None:
+            payload["since_utc"] = since_utc
+        if until_utc is not None:
+            payload["until_utc"] = until_utc
+        if kinds is not None:
+            payload["kinds"] = kinds
+        if dialog_id is not None:
+            payload["dialog_id"] = dialog_id
         if navigation is not None:
             payload["navigation"] = navigation
         return await self.request(payload)
@@ -470,10 +472,6 @@ class DaemonConnection:
     async def record_telemetry(self, *, event: dict) -> dict:
         """Write a telemetry event to sync.db."""
         return await self.request({"method": "record_telemetry", "event": event})
-
-    async def list_important_events(self, *, last_hours: int = 24, timezone: str = "UTC") -> dict:
-        """Return recent daemon-observed important events."""
-        return await self.request({"method": "list_important_events", "last_hours": last_hours, "timezone": timezone})
 
     async def get_usage_stats(self, *, since: int | None = None) -> dict:
         """Return usage statistics from sync.db."""

@@ -94,8 +94,7 @@ and Telegram-originated content.
 | `trace_account_messages` | Find observable messages authored by one account with explicit coverage and gap reporting. |
 | `mark_dialog_for_sync` | Enable or disable persistent sync for a dialog. |
 | `get_sync_status` | Inspect sync progress, coverage, access state, and local message counts. |
-| `get_sync_alerts` | Report locally observed delete, edit, and access-loss alerts. |
-| `list_important_events` | List recent persisted access-loss and access-restoration events. |
+| `list_conversation_changes` | List incoming human-DM edits and deletions plus durable access loss and restoration. |
 | `get_usage_stats` | Summarize local MCP tool telemetry for the last 30 days. |
 | `get_dialog_stats` | Show dialog-level reaction, mention, hashtag, and forward statistics. |
 | `submit_feedback` | Write agent feedback into the local operator queue. |
@@ -176,7 +175,7 @@ list_messages(exact_dialog_id=<dialog_id>, exact_topic_id=<topic_id>)
 Review recent important access changes:
 
 ```text
-list_important_events(last_hours=168)
+list_conversation_changes(since_utc="2026-09-01T00:00:00Z")
 ```
 
 Bring a dialog under full local sync:

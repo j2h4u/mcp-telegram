@@ -20,6 +20,7 @@ from mcp_telegram.sync_db import (
     _apply_migration_53,
     _apply_migration_54,
     _apply_migration_55,
+    _apply_migration_56,
     _open_sync_db,
     ensure_sync_schema,
 )
@@ -708,7 +709,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 55
+        assert _CURRENT_SCHEMA_VERSION == 56
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1439,7 +1440,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 55
+        assert _CURRENT_SCHEMA_VERSION == 56
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:
@@ -2325,3 +2326,23 @@ def test_v55_adds_access_cause_and_actor_atomically(tmp_path: Path) -> None:
         columns = {row[1] for row in _fetchall_rows(conn, "PRAGMA table_info(conversation_history_events)")}
         assert {"access_change_cause", "actor_id"} <= columns
         assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=55") == (55,)
+
+
+def test_v56_adds_stable_tool_telemetry_identity(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute("DELETE FROM schema_version WHERE version=56")
+        conn.execute("UPDATE runtime_observations SET tool_capability=NULL,contract_version=NULL")
+        conn.execute(
+            "INSERT INTO runtime_observations(observed_at_ms,kind,runtime_instance_id,tool_name,payload_json) "
+            "VALUES (1,'mcp.call','test','get_sync_alerts','{}')"
+        )
+        conn.commit()
+        _apply_migration_56(conn, 55)
+        row = _fetchone_row(
+            conn,
+            "SELECT tool_capability,contract_version FROM runtime_observations WHERE tool_name='get_sync_alerts'",
+        )
+        assert row == ("conversation_changes", 0)
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=56") == (56,)

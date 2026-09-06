@@ -143,6 +143,22 @@ def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict[str, object]:
             (since * 1000,),
         ).fetchall()
     )
+    capability_dist = dict(
+        cursor.execute(
+            "SELECT COALESCE(tool_capability,tool_name),COUNT(*) FROM runtime_observations "
+            "WHERE kind='mcp.call' AND observed_at_ms>=? "
+            "GROUP BY COALESCE(tool_capability,tool_name) ORDER BY COUNT(*) DESC",
+            (since * 1000,),
+        ).fetchall()
+    )
+    contract_dist = dict(
+        cursor.execute(
+            "SELECT COALESCE(tool_capability,tool_name)||':v'||COALESCE(contract_version,0),COUNT(*) "
+            "FROM runtime_observations WHERE kind='mcp.call' AND observed_at_ms>=? "
+            "GROUP BY COALESCE(tool_capability,tool_name),COALESCE(contract_version,0) ORDER BY COUNT(*) DESC",
+            (since * 1000,),
+        ).fetchall()
+    )
     error_dist = dict(
         cursor.execute(
             "SELECT COALESCE(NULLIF(reason_code, ''), error_type), COUNT(*) FROM runtime_observations "
@@ -201,6 +217,8 @@ def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict[str, object]:
     live_start = int(boundary_row[0]) if boundary_row and boundary_row[0] is not None else None
     return {
         "tool_distribution": tool_dist,
+        "capability_distribution": capability_dist,
+        "contract_distribution": contract_dist,
         "error_distribution": error_dist,
         "max_page_depth": max_depth,
         "total_calls": total_calls,

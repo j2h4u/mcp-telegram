@@ -28,6 +28,15 @@ ALLOWED_KINDS = frozenset(
 )
 
 
+def tool_telemetry_identity(tool_name: str) -> tuple[str, int]:
+    """Return the stable product capability and wire-contract generation."""
+    if tool_name in {"get_sync_alerts", "list_important_events"}:
+        return "conversation_changes", 0
+    if tool_name == "list_conversation_changes":
+        return "conversation_changes", 1
+    return tool_name, 1
+
+
 def encode_payload(payload: Mapping[str, object] | None) -> str:
     encoded = json.dumps(dict(payload or {}), ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     if len(encoded.encode("utf-8")) > MAX_PAYLOAD_BYTES:
@@ -45,6 +54,8 @@ def record_runtime_observation(  # noqa: PLR0913
     reason_code: str | None = None,
     duration_ms: float | None = None,
     tool_name: str | None = None,
+    tool_capability: str | None = None,
+    contract_version: int | None = None,
     result_count: int | None = None,
     has_cursor: bool | None = None,
     page_depth: int | None = None,
@@ -56,12 +67,16 @@ def record_runtime_observation(  # noqa: PLR0913
     """Append one allowlisted observation without committing the caller's transaction."""
     if kind not in ALLOWED_KINDS:
         raise ValueError(f"unsupported runtime event kind: {kind}")
+    if kind == "mcp.call" and tool_name is not None:
+        default_capability, default_contract = tool_telemetry_identity(tool_name)
+        tool_capability = default_capability if tool_capability is None else tool_capability
+        contract_version = default_contract if contract_version is None else contract_version
     cursor = conn.execute(
         """INSERT INTO runtime_observations(
                observed_at_ms, kind, runtime_instance_id, operation_id, outcome,
-               reason_code, dialog_id, duration_ms, tool_name, result_count,
+               reason_code, dialog_id, duration_ms, tool_name, tool_capability, contract_version, result_count,
                has_cursor, page_depth, has_filter, error_type, payload_json
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             int(time.time() * 1000) if observed_at_ms is None else observed_at_ms,
             kind,
@@ -72,6 +87,8 @@ def record_runtime_observation(  # noqa: PLR0913
             dialog_id,
             duration_ms,
             tool_name,
+            tool_capability,
+            contract_version,
             result_count,
             None if has_cursor is None else int(has_cursor),
             page_depth,
@@ -119,4 +136,5 @@ __all__ = [
     "encode_payload",
     "prune_runtime_observations",
     "record_runtime_observation",
+    "tool_telemetry_identity",
 ]

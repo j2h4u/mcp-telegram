@@ -552,30 +552,43 @@ async def test_get_dialog_stats_emits_exactly_one_selector_key() -> None:
     assert _dialog_selector_fields(captured[2]) == {}
 
 
+# ---------------------------------------------------------------------------
+# Convenience method: get_me
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
-async def test_list_important_events_convenience() -> None:
-    """list_important_events sends the compact recent-window request."""
+async def test_list_conversation_changes_omits_defaults_and_forwards_filters() -> None:
     reader = MagicMock(spec=asyncio.StreamReader)
     writer = MagicMock(spec=asyncio.StreamWriter)
     conn = DaemonConnection(reader, writer)
-
     captured: list[dict] = []
 
     async def _mock_request(payload: dict) -> dict:
         captured.append(payload)
-        return {"ok": True, "data": {"timezone": "Asia/Almaty", "last_hours": 6, "events": []}}
+        return {"ok": True, "data": {"events": []}}
 
     conn.request = _mock_request  # type: ignore[method-assign]
+    await conn.list_conversation_changes()
+    await conn.list_conversation_changes(
+        since_utc=10,
+        until_utc=20,
+        kinds=["edit"],
+        dialog_id=123,
+        page_limit=5,
+        navigation="cursor",
+    )
 
-    await conn.list_important_events(last_hours=6, timezone="Asia/Almaty")
-
-    req = captured[0]
-    assert req == {"method": "list_important_events", "last_hours": 6, "timezone": "Asia/Almaty"}
-
-
-# ---------------------------------------------------------------------------
-# Convenience method: get_me
-# ---------------------------------------------------------------------------
+    assert captured[0] == {"method": "list_conversation_changes"}
+    assert captured[1] == {
+        "method": "list_conversation_changes",
+        "since_utc": 10,
+        "until_utc": 20,
+        "kinds": ["edit"],
+        "dialog_id": 123,
+        "page_limit": 5,
+        "navigation": "cursor",
+    }
 
 
 @pytest.mark.asyncio
@@ -771,52 +784,6 @@ async def test_get_sync_status_convenience() -> None:
     req = captured[0]
     assert req["method"] == "get_sync_status"
     assert req["dialog_id"] == 228055330
-
-
-@pytest.mark.asyncio
-async def test_get_sync_alerts_convenience_defaults() -> None:
-    """get_sync_alerts omits defaults so the daemon sees caller provenance."""
-    reader = MagicMock(spec=asyncio.StreamReader)
-    writer = MagicMock(spec=asyncio.StreamWriter)
-    conn = DaemonConnection(reader, writer)
-
-    captured: list[dict] = []
-
-    async def _mock_request(payload: dict) -> dict:
-        captured.append(payload)
-        return {"ok": True, "data": {"alerts": []}}
-
-    conn.request = _mock_request  # type: ignore[method-assign]
-
-    await conn.get_sync_alerts()
-
-    req = captured[0]
-    assert req["method"] == "get_sync_alerts"
-    assert "since" not in req
-    assert "limit" not in req
-
-
-@pytest.mark.asyncio
-async def test_get_sync_alerts_convenience_custom_params() -> None:
-    """get_sync_alerts forwards custom since/limit values."""
-    reader = MagicMock(spec=asyncio.StreamReader)
-    writer = MagicMock(spec=asyncio.StreamWriter)
-    conn = DaemonConnection(reader, writer)
-
-    captured: list[dict] = []
-
-    async def _mock_request(payload: dict) -> dict:
-        captured.append(payload)
-        return {"ok": True, "data": {"alerts": []}}
-
-    conn.request = _mock_request  # type: ignore[method-assign]
-
-    await conn.get_sync_alerts(since=10, limit=5)
-
-    req = captured[0]
-    assert req["method"] == "get_sync_alerts"
-    assert req["since"] == 10
-    assert req["limit"] == 5
 
 
 @pytest.mark.asyncio

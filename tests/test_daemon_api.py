@@ -2251,47 +2251,6 @@ async def test_unknown_method() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_important_events_dispatch_returns_recent_access_events(tmp_path: Path) -> None:
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    conn = _register_sqlite_connection(sqlite3.connect(db_path))
-    conn.execute(
-        "INSERT INTO entities (id, type, name, updated_at) VALUES (?, ?, ?, ?)",
-        (123, "Channel", "Work Chat", 1_700_000_000),
-    )
-    conn.execute(
-        "INSERT INTO conversation_history_events(kind,occurred_at,time_basis,dialog_id) VALUES ('access_lost',?,'observed',123)",
-        (int(time.time()),),
-    )
-    conn.commit()
-
-    result = await make_server(conn)._dispatch(
-        {"method": "list_important_events", "last_hours": 24 * 30, "timezone": "Asia/Almaty"}
-    )
-
-    assert result["ok"] is True
-    data = cast(dict[str, object], result["data"])
-    assert data["timezone"] == "Asia/Almaty"
-    assert data["last_hours"] == 24 * 30
-    events = cast(list[dict[str, object]], data["events"])
-    assert len(events) == 1
-    assert events[0]["time_basis"] == "observed"
-    assert events[0]["type"] == "access_lost"
-    assert events[0]["summary"] == "Access lost"
-    assert events[0]["dialog_id"] == 123
-    assert events[0]["dialog_title"] == "Work Chat"
-    assert events[0]["message_id"] is None
-
-
-@pytest.mark.asyncio
-async def test_list_important_events_dispatch_rejects_bad_timezone() -> None:
-    result = await make_server()._dispatch({"method": "list_important_events", "timezone": 123})
-
-    assert result["ok"] is False
-    assert result["error"] == "invalid_input"
-
-
-@pytest.mark.asyncio
 async def test_daemon_api_returns_unhealthy_when_flood_wait_kill_switch_is_open() -> None:
     """Healthcheck method is blocked with a clear kill-switch error."""
     server = make_server()
@@ -2543,131 +2502,8 @@ async def test_get_sync_status_non_synced() -> None:
 
 
 # ---------------------------------------------------------------------------
-# get_sync_alerts
+# conversation change history
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_get_sync_alerts_deleted_messages() -> None:
-    """get_sync_alerts returns deleted messages with preserved text."""
-    conn = _make_db()
-    _insert_synced_dialog(conn, 1, status="synced")
-    _insert_message(conn, 1, 100, text="deleted msg")
-    conn.execute("UPDATE messages SET is_deleted = 1, deleted_at = 1700000500 WHERE message_id = 100")
-    conn.commit()
-    server = make_server(conn)
-    result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 50})
-    assert result["ok"] is True
-    deleted = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["deleted_messages"])
-    assert len(deleted) == 1
-    assert deleted[0]["text"] == "deleted msg"
-    assert deleted[0]["deleted_text"] == "deleted msg"
-    assert deleted[0]["text_provenance"] == {
-        "deleted": "messages.text[current_candidate]",
-        "original": None,
-        "changed": None,
-    }
-    assert deleted[0]["text_confidence"] == {
-        "deleted": "candidate",
-        "original": "unavailable",
-        "changed": "unavailable",
-    }
-    assert deleted[0]["text_status"] == "candidate"
-    assert deleted[0]["deleted_at"] == 1700000500
-
-
-@pytest.mark.asyncio
-async def test_get_sync_alerts_edits() -> None:
-    """get_sync_alerts returns edit history entries from message_versions."""
-    conn = _make_db()
-    _insert_message_version(conn, 1, 100, version=1, old_text="before edit", edit_date=1700000600)
-    server = make_server(conn)
-    result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 50})
-    assert result["ok"] is True
-    edits = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["edits"])
-    assert len(edits) == 1
-    assert edits[0]["old_text"] == "before edit"
-    assert edits[0]["original_text"] == "before edit"
-    assert edits[0]["changed_text"] is None
-    confidence = cast(dict[str, object], edits[0]["text_confidence"])
-    assert confidence["original"] == "exact"
-    assert confidence["changed"] == "unavailable"
-    assert edits[0]["text_status"] == "original_only"
-
-
-@pytest.mark.asyncio
-async def test_get_sync_alerts_edit_candidates_have_explicit_provenance() -> None:
-    conn = _make_db()
-    _insert_message(conn, 1, 100, text="current text")
-    _insert_message_version(conn, 1, 100, version=1, old_text="original text", edit_date=1700000600)
-    _insert_message_version(conn, 1, 100, version=2, old_text="changed once", edit_date=1700000700)
-    server = make_server(conn)
-
-    result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 50})
-
-    assert result["ok"] is True
-    edits = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["edits"])
-    by_version = {cast(int, item["version"]): item for item in edits}
-    assert by_version[1]["original_text"] == "original text"
-    assert by_version[1]["changed_text"] == "changed once"
-    first_provenance = cast(dict[str, object], by_version[1]["text_provenance"])
-    first_confidence = cast(dict[str, object], by_version[1]["text_confidence"])
-    assert first_provenance["changed"] == "message_versions.old_text[next_version]"
-    assert first_confidence["changed"] == "candidate"
-    assert by_version[1]["text_status"] == "complete_candidate"
-    assert by_version[2]["changed_text"] == "current text"
-    second_provenance = cast(dict[str, object], by_version[2]["text_provenance"])
-    second_confidence = cast(dict[str, object], by_version[2]["text_confidence"])
-    assert second_provenance["changed"] == "messages.text[current_candidate]"
-    assert second_confidence["changed"] == "candidate"
-
-
-@pytest.mark.asyncio
-async def test_get_sync_alerts_access_lost() -> None:
-    """get_sync_alerts returns access_lost dialogs."""
-    conn = _make_db()
-    _insert_synced_dialog(conn, 1, status="access_lost", access_lost_at=1700000700)
-    conn.execute(
-        "INSERT INTO conversation_history_events(kind, occurred_at, dialog_id, daemon_event_id) "
-        "VALUES ('access_lost', 1700000700, 1, 1)"
-    )
-    server = make_server(conn)
-    result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 50})
-    assert result["ok"] is True
-    lost = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["access_lost"])
-    assert len(lost) == 1
-    assert lost[0]["dialog_id"] == 1
-
-
-@pytest.mark.asyncio
-async def test_get_sync_alerts_since_filters() -> None:
-    """get_sync_alerts respects since parameter — only returns events after the timestamp."""
-    conn = _make_db()
-    _insert_synced_dialog(conn, 1, status="synced")
-    _insert_message(conn, 1, 100, text="old delete")
-    conn.execute("UPDATE messages SET is_deleted = 1, deleted_at = 1700000100 WHERE message_id = 100")
-    _insert_message(conn, 1, 200, text="new delete")
-    conn.execute("UPDATE messages SET is_deleted = 1, deleted_at = 1700000900 WHERE message_id = 200")
-    conn.commit()
-    server = make_server(conn)
-    result = await server._dispatch({"method": "get_sync_alerts", "since": 1700000500, "limit": 50})
-    deleted = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["deleted_messages"])
-    assert len(deleted) == 1
-    assert deleted[0]["message_id"] == 200
-
-
-@pytest.mark.asyncio
-async def test_get_sync_alerts_respects_limit() -> None:
-    """get_sync_alerts respects the limit parameter for deleted_messages."""
-    conn = _make_db()
-    _insert_synced_dialog(conn, 1, status="synced")
-    for i in range(10):
-        _insert_message(conn, 1, 100 + i, text=f"del {i}")
-        conn.execute(f"UPDATE messages SET is_deleted = 1, deleted_at = {1700000000 + i} WHERE message_id = {100 + i}")
-    conn.commit()
-    server = make_server(conn)
-    result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 3})
-    assert len(cast(list[dict[str, object]], cast(dict[str, object], result["data"])["deleted_messages"])) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -3358,6 +3194,8 @@ def _make_db_with_entities(*, with_fts: bool = False) -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_type_updated ON entities(type, updated_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_username ON entities(username)")
     conn.execute(_RUNTIME_OBSERVATIONS_V54_DDL.replace("runtime_observations_v54", "runtime_observations"))
+    conn.execute("ALTER TABLE runtime_observations ADD COLUMN tool_capability TEXT")
+    conn.execute("ALTER TABLE runtime_observations ADD COLUMN contract_version INTEGER")
     conn.execute("CREATE TABLE IF NOT EXISTS daemon_state (key TEXT PRIMARY KEY, value TEXT)")
     conn.commit()
     return conn

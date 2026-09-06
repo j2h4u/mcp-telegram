@@ -9,7 +9,7 @@ DaemonAPIServer listens on a Unix domain socket and handles seventeen methods:
   - get_me: current user info via Telegram API
   - mark_dialog_for_sync: add/remove dialog from sync scope
   - get_sync_status: sync status and message statistics for a dialog
-  - get_sync_alerts: deleted messages, edit history, access-lost dialogs
+  - list_conversation_changes: durable edits, deletions, and access changes
   - get_entity_info: type-tagged entity profile, DB-first with configured entity-detail TTL
   - list_unread_messages: prioritized unread messages across dialogs
   - record_telemetry: write telemetry event to sync.db
@@ -73,6 +73,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 
 from . import daemon_activity_stats as _activity_stats
+from .conversation_changes import ConversationChangesTokenCodec, query_conversation_changes
 from .daemon_account_trace import (
     DaemonAccountTraceDeps,
     DaemonAccountTraceService,
@@ -91,12 +92,10 @@ from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
 from .folders.read_model import dialog_placement, folder_snapshot, folders_by_dialog, list_folder_messages, list_folders
 from .history_enrollment import disable_history, enable_history, read_intent
-from .important_events.read_model import list_important_events as read_important_events
 from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
 from .reading.query_records import read_message_from_row
-from .runtime_observations import prune_runtime_observations, record_runtime_observation
-from .sync_alerts import SyncAlertTokenCodec, query_alerts
+from .runtime_observations import prune_runtime_observations, record_runtime_observation, tool_telemetry_identity
 from .sync_read_model import SyncStatus, build_sync_read_model
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
@@ -151,6 +150,7 @@ def _normalize_telemetry_event(
     if not isinstance(tool_name, str) or len(tool_name) > _TELEMETRY_TOOL_NAME_MAX_LEN:
         return None, _telemetry_input_error("tool_name must be a string (max 200 chars)")
     event["tool_name"] = tool_name
+    event["tool_capability"], event["contract_version"] = tool_telemetry_identity(tool_name)
     return event, None
 
 
@@ -163,6 +163,8 @@ def _insert_telemetry_row(
         kind="mcp.call",
         observed_at_ms=int(float(cast(float, event.get("timestamp", time.time()))) * 1000),
         tool_name=str(event["tool_name"]),
+        tool_capability=cast(str | None, event.get("tool_capability")),
+        contract_version=cast(int | None, event.get("contract_version")),
         duration_ms=float(cast(float, event.get("duration_ms", 0))),
         result_count=int(cast(int, event.get("result_count", 0))),
         has_cursor=bool(event.get("has_cursor")),
@@ -498,7 +500,7 @@ class DaemonAPIServer:
         self._policy = policy
         self._health_status = health_status
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
-        self._sync_alert_token_codec = SyncAlertTokenCodec()
+        self._conversation_changes_token_codec = ConversationChangesTokenCodec()
 
     def _get_reading_service(self) -> ReadingService:
         """Get memoized reading-service instance with explicit daemon dependencies."""
@@ -719,8 +721,7 @@ class DaemonAPIServer:
             "get_me": self._get_me,
             "mark_dialog_for_sync": self._mark_dialog_for_sync,
             "get_sync_status": self._get_sync_status,
-            "get_sync_alerts": self._get_sync_alerts,
-            "list_important_events": self._list_important_events,
+            "list_conversation_changes": self._list_conversation_changes,
             "get_entity_info": self._get_entity_info,
             "get_inbox": self._list_unread_messages,
             "record_telemetry": self._record_telemetry,
@@ -1408,28 +1409,16 @@ class DaemonAPIServer:
         return {"ok": True, "data": data}
 
     # ------------------------------------------------------------------
-    # get_sync_alerts
+    # list_conversation_changes
     # ------------------------------------------------------------------
 
-    async def _get_sync_alerts(self, req: dict[str, object]) -> dict:
-        """Return one globally ordered, snapshot-bounded sync-alert page."""
-        return query_alerts(self._conn, req, self._sync_alert_token_codec)
+    async def _list_conversation_changes(self, req: dict[str, object]) -> dict:
+        """Return one globally ordered, snapshot-bounded conversation-change page."""
+        return query_conversation_changes(self._conn, req, self._conversation_changes_token_codec)
 
     # ------------------------------------------------------------------
     # get_entity_info
     # ------------------------------------------------------------------
-
-    def _list_important_events(self, req: dict[str, object]) -> dict:
-        """Return recent daemon-observed important events."""
-        last_hours = _clamp(_coerce_int(req.get("last_hours", 24), 24), 1, 24 * 30)
-        timezone = req.get("timezone", "UTC")
-        if not isinstance(timezone, str):
-            return {"ok": False, "error": "invalid_input", "message": "timezone must be a string"}
-        try:
-            events = read_important_events(self._conn, last_hours=last_hours, timezone=timezone)
-        except ValueError, TypeError:
-            return {"ok": False, "error": "invalid_input", "message": "timezone must be a valid IANA timezone"}
-        return {"ok": True, "data": {"timezone": timezone, "last_hours": last_hours, "events": events}}
 
     async def _get_entity_info(self, req: dict[str, object]) -> dict:
         """Type-tagged entity inspector covering 5 Telegram entity kinds."""

@@ -30,13 +30,12 @@ from mcp_telegram.tools import (
     GetEntityInfo,
     GetInbox,
     GetMyRecentActivity,
-    GetSyncAlerts,
     GetSyncStatus,
     GetUnreadSummary,
+    ListConversationChanges,
     ListDialogs,
     ListFolderMessages,
     ListFolders,
-    ListImportantEvents,
     ListMessages,
     ListTopics,
     MarkDialogForSync,
@@ -46,13 +45,12 @@ from mcp_telegram.tools import (
     get_entity_info,
     get_inbox,
     get_my_recent_activity,
-    get_sync_alerts,
     get_sync_status,
     get_unread_summary,
+    list_conversation_changes,
     list_dialogs,
     list_folder_messages,
     list_folders,
-    list_important_events,
     list_messages,
     list_topics,
     mark_dialog_for_sync,
@@ -206,12 +204,11 @@ class _DaemonConnStub:
     list_dialogs: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_folders: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_folder_messages: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
-    list_important_events: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    list_conversation_changes: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_topics: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     get_me: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     mark_dialog_for_sync: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     get_sync_status: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
-    get_sync_alerts: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     get_entity_info: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     get_inbox: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     get_unread_summary: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
@@ -382,25 +379,36 @@ STRUCTURED_TOOL_CASES = {
         ListFolders(),
         {"ok": True, "data": {"folders": [{"id": 2, "title": "Work"}]}},
     ),
-    "list_important_events": (
-        list_important_events,
-        ListImportantEvents(last_hours=6, timezone="Asia/Almaty"),
+    "list_conversation_changes": (
+        list_conversation_changes,
+        ListConversationChanges(),
         {
             "ok": True,
             "data": {
-                "timezone": "Asia/Almaty",
-                "last_hours": 6,
                 "events": [
                     {
-                        "time": "2026-08-08T12:00:00+05:00",
+                        "event_id": 1,
+                        "occurred_at": 1_754_633_200,
                         "time_basis": "observed",
-                        "type": "access_lost",
+                        "kind": "access_lost",
                         "summary": "Access lost",
                         "dialog_id": 123,
                         "dialog_title": "Work Chat",
                         "message_id": None,
+                        "version": None,
+                        "reason_code": None,
+                        "access_change_cause": "unknown",
+                        "actor_id": None,
+                        "text_evidence": None,
                     }
                 ],
+                "count": 1,
+                "has_more": False,
+                "next_navigation": None,
+                "coverage": {
+                    "message_changes": "incoming_human_direct_messages",
+                    "access_changes": "synced_dialogs",
+                },
             },
         },
     ),
@@ -516,11 +524,6 @@ STRUCTURED_TOOL_CASES = {
                 "full_history_will_be_fetched": True,
             },
         },
-    ),
-    "get_sync_alerts": (
-        get_sync_alerts,
-        GetSyncAlerts(),
-        {"ok": True, "data": {"deleted_messages": [], "edits": [], "access_lost": []}},
     ),
     "get_inbox": (
         get_inbox,
@@ -896,12 +899,11 @@ def _make_daemon_conn(response: dict | None = None) -> _DaemonConnStub:
     conn.list_dialogs = _AsyncMethodMock(return_value=r)
     conn.list_folders = _AsyncMethodMock(return_value=r)
     conn.list_folder_messages = _AsyncMethodMock(return_value=r)
-    conn.list_important_events = _AsyncMethodMock(return_value=r)
+    conn.list_conversation_changes = _AsyncMethodMock(return_value=r)
     conn.list_topics = _AsyncMethodMock(return_value=r)
     conn.get_me = _AsyncMethodMock(return_value=r)
     conn.mark_dialog_for_sync = _AsyncMethodMock(return_value=r)
     conn.get_sync_status = _AsyncMethodMock(return_value=r)
-    conn.get_sync_alerts = _AsyncMethodMock(return_value=r)
     conn.get_entity_info = _AsyncMethodMock(return_value=r)
     conn.get_inbox = _AsyncMethodMock(return_value=inbox_response)
     conn.get_unread_summary = _AsyncMethodMock(return_value=r)
@@ -940,7 +942,7 @@ class _patch_daemon:
             "mcp_telegram.tools.account_trace.daemon_connection",
             "mcp_telegram.tools.feedback.daemon_connection",
             "mcp_telegram.tools.folders.daemon_connection",
-            "mcp_telegram.tools.important_events.daemon_connection",
+            "mcp_telegram.tools.conversation_changes.daemon_connection",
         ]
         for target in targets:
             p = patch(target, side_effect=lambda c=self._conn: _fake_daemon_cm(c))
@@ -975,7 +977,7 @@ class _patch_daemon_not_running:
             "mcp_telegram.tools.account_trace.daemon_connection",
             "mcp_telegram.tools.feedback.daemon_connection",
             "mcp_telegram.tools.folders.daemon_connection",
-            "mcp_telegram.tools.important_events.daemon_connection",
+            "mcp_telegram.tools.conversation_changes.daemon_connection",
         ]
         for target in targets:
             p = patch(target, return_value=_raise_not_running())
@@ -2484,142 +2486,6 @@ async def test_get_sync_status_daemon_not_running():
 # ---------------------------------------------------------------------------
 
 
-async def test_get_sync_alerts_via_daemon():
-    """GetSyncAlerts routes through daemon and formats alert sections."""
-    conn = _make_daemon_conn(
-        {
-            "ok": True,
-            "data": {
-                "deleted_messages": [
-                    {"dialog_id": 1, "message_id": 100, "deleted_at": 1700000800},
-                ],
-                "edits": [
-                    {"dialog_id": 1, "message_id": 200, "version": 1, "edit_date": 1700000600},
-                ],
-                "access_lost": [
-                    {"dialog_id": 2, "access_lost_at": 1700000700},
-                ],
-            },
-        }
-    )
-    with _patch_daemon(conn):
-        result = await get_sync_alerts(GetSyncAlerts(since=0, limit=50))
-    assert result.content == ()
-    assert result.structured_content is not None
-    payload = _json_dict(result.structured_content)
-    alerts = _json_list(payload["alerts"])
-    assert payload["count"] == 3
-    assert _json_dict(alerts[0]) == {
-        "kind": "edit",
-        "dialog_id": 1,
-        "message_id": 200,
-        "deleted_at": None,
-        "version": 1,
-        "edit_date": "2023-11-14T22:23:20+00:00",
-        "access_lost_at": None,
-        "severity": "low",
-        "message": "Edited message msg=200 v1 edit_date=1700000600",
-        "action": "Treat cached text as versioned; inspect edit history before relying on older wording.",
-    }
-    assert _json_dict(alerts[1]) == {
-        "kind": "access_lost",
-        "dialog_id": 2,
-        "message_id": None,
-        "deleted_at": None,
-        "version": None,
-        "edit_date": None,
-        "access_lost_at": "2023-11-14T22:25:00+00:00",
-        "severity": "high",
-        "message": "Access lost at 1700000700",
-        "action": "Use get_sync_status for coverage details.",
-    }
-    assert _json_dict(alerts[2]) == {
-        "kind": "deleted_message",
-        "dialog_id": 1,
-        "message_id": 100,
-        "deleted_at": "2023-11-14T22:26:40+00:00",
-        "version": None,
-        "edit_date": None,
-        "access_lost_at": None,
-        "severity": "medium",
-        "message": "Deleted message msg=100 deleted_at=1700000800",
-        "action": "Inspect the dialog history around this message id if surrounding context is needed.",
-    }
-    assert payload["deleted_messages"] == [
-        {
-            "dialog_id": 1,
-            "message_id": 100,
-            "deleted_at": "2023-11-14T22:26:40+00:00",
-            "action": "Inspect the dialog history around this message id if surrounding context is needed.",
-        }
-    ]
-    assert payload["edits"] == [
-        {
-            "dialog_id": 1,
-            "message_id": 200,
-            "version": 1,
-            "edit_date": "2023-11-14T22:23:20+00:00",
-            "action": "Treat cached text as versioned; inspect edit history before relying on older wording.",
-        }
-    ]
-    assert payload["access_lost"] == [
-        {
-            "dialog_id": 2,
-            "access_lost_at": "2023-11-14T22:25:00+00:00",
-            "action": "Use get_sync_status for coverage details.",
-        }
-    ]
-    assert payload["time_context"] == {
-        "timezone": "UTC",
-        "canonical": "UTC",
-        "query_boundaries": "UTC",
-        "telegram_event_timestamps": "source_provided_only",
-        "technical_timestamps": "not_telegram_events",
-    }
-    assert payload["since"] == 0
-    assert payload["limit"] == 50
-    assert _json_dict(_json_dict(payload["limited_by"])["deleted_messages"]) == {"since": 0, "limit": 50}
-    conn.get_sync_alerts.assert_called_once_with(since=0, limit=50)
-
-
-async def test_get_sync_alerts_empty():
-    """GetSyncAlerts returns 'no alerts' text when all lists empty."""
-    conn = _make_daemon_conn(
-        {
-            "ok": True,
-            "data": {"deleted_messages": [], "edits": [], "access_lost": []},
-        }
-    )
-    with _patch_daemon(conn):
-        result = await get_sync_alerts(GetSyncAlerts())
-    assert result.content == ()
-    assert result.is_error is False
-    assert result.structured_content == {
-        "alerts": [],
-        "deleted_messages": [],
-        "edits": [],
-        "access_lost": [],
-        "access_restored": [],
-        "counts": {
-            "deleted_messages": 0,
-            "edits": 0,
-            "access_lost": 0,
-            "access_restored": 0,
-            "total": 0,
-        },
-        "count": 0,
-        "since": 0,
-        "limit": 50,
-        "limited_by": {
-            "deleted_messages": {"since": 0, "limit": 50},
-            "edits": {"since": 0, "limit": 50},
-            "access_lost": {"since": 0, "limit": None},
-            "access_restored": {"since": 0, "limit": None},
-        },
-    }
-    conn.get_sync_alerts.assert_called_once_with()
-
-
 async def test_get_sync_status_recoverable_error_has_no_structured_content():
     """Recoverable sync status errors remain is_error=True and may omit structured content."""
     conn = _make_daemon_conn(
@@ -2634,158 +2500,6 @@ async def test_get_sync_status_recoverable_error_has_no_structured_content():
 
     assert result.is_error is True
     assert result.structured_content is None
-
-
-async def test_get_sync_alerts_recoverable_error_has_no_structured_content():
-    """Recoverable sync alert errors remain is_error=True and may omit structured content."""
-    conn = _make_daemon_conn(
-        {
-            "ok": False,
-            "error": "backend_error",
-            "message": "sync alerts unavailable",
-        }
-    )
-    with _patch_daemon(conn):
-        result = await get_sync_alerts(GetSyncAlerts())
-
-    assert result.is_error is True
-    assert result.structured_content is None
-    assert result.result_count == 0
-    assert result.has_cursor is False
-    assert result.page_depth == 1
-    assert result.has_filter is False
-
-
-async def test_get_sync_alerts_daemon_not_running():
-    """GetSyncAlerts returns actionable error when daemon is not running."""
-    with _patch_daemon_not_running():
-        result = await get_sync_alerts(GetSyncAlerts())
-    text = _result_text(result)
-    assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
-    assert result.result_count == 0
-    assert result.has_cursor is False
-    assert result.page_depth == 1
-    assert result.has_filter is False
-
-
-async def test_get_sync_alerts_preserves_wire_provenance_and_page_depth():
-    conn = _make_daemon_conn(
-        {
-            "ok": True,
-            "data": {
-                "alerts": [
-                    {
-                        "kind": "deleted_message",
-                        "dialog_id": 1,
-                        "message_id": 2,
-                        "deleted_at": 10,
-                        "version": None,
-                        "edit_date": None,
-                        "access_lost_at": None,
-                        "occurred_at": 10,
-                        "source_id": 0,
-                        "severity": "medium",
-                        "message": "safe metadata",
-                        "action": "inspect",
-                        "text": "telegram secret",
-                        "old_text": "older secret",
-                    }
-                ],
-                "deleted_messages": [],
-                "edits": [],
-                "access_lost": [],
-                "counts": {"deleted_messages": 1, "edits": 0, "access_lost": 0, "total": 1},
-                "count": 1,
-                "since": 12,
-                "limit": 1,
-                "page_limit": 1,
-                "limited_by": {},
-                "has_more": True,
-                "next_navigation": "next",
-                "snapshot_upper_event_at": 20,
-                "result_count_semantics": "count=len(alerts)=sum(counts)",
-                "page_depth": 3,
-            },
-        }
-    )
-    with _patch_daemon(conn):
-        result = await get_sync_alerts(GetSyncAlerts(navigation="opaque"))
-    assert result.page_depth == 3
-    assert result.has_cursor is True
-    assert result.has_filter is True
-    payload = assert_structured_success_payload(result)
-    alert = _json_dict(_json_list(payload["alerts"])[0])
-    assert alert["text"] == "telegram secret"
-    assert alert["old_text"] == "older secret"
-    conn.get_sync_alerts.assert_called_once_with(navigation="opaque")
-
-
-async def test_get_sync_alerts_structured_text_enrichment_preserves_candidates():
-    conn = _make_daemon_conn(
-        {
-            "ok": True,
-            "data": {
-                "alerts": [
-                    {
-                        "kind": "edit",
-                        "dialog_id": 1,
-                        "message_id": 2,
-                        "deleted_at": None,
-                        "version": 1,
-                        "edit_date": 10,
-                        "access_lost_at": None,
-                        "occurred_at": 10,
-                        "source_id": 0,
-                        "severity": "low",
-                        "message": "safe metadata",
-                        "action": "inspect",
-                        "old_text": "before",
-                        "original_text": "before",
-                        "changed_text": "after candidate",
-                        "text_provenance": {
-                            "deleted": None,
-                            "original": "message_versions.old_text",
-                            "changed": "messages.text[current_candidate]",
-                        },
-                        "text_confidence": {"deleted": "unavailable", "original": "exact", "changed": "candidate"},
-                        "text_status": "complete_candidate",
-                    }
-                ],
-                "has_more": False,
-                "next_navigation": None,
-                "page_limit": 1,
-                "page_depth": 1,
-            },
-        }
-    )
-    with _patch_daemon(conn):
-        result = await get_sync_alerts(GetSyncAlerts())
-
-    assert result.content == ()
-    payload = assert_structured_success_payload(result)
-    alert = _json_dict(_json_list(payload["alerts"])[0])
-    assert alert["original_text"] == "before"
-    assert alert["changed_text"] == "after candidate"
-    assert _json_dict(alert["text_provenance"])["changed"] == "messages.text[current_candidate]"
-    assert _json_dict(alert["text_confidence"])["changed"] == "candidate"
-    assert alert["text_status"] == "complete_candidate"
-    edit = _json_dict(_json_list(payload["edits"])[0])
-    assert edit["old_text"] == "before"
-    assert edit["changed_text"] == "after candidate"
-
-
-async def test_get_sync_alerts_invalid_navigation_has_restart_action():
-    conn = _make_daemon_conn({"ok": False, "error": "invalid_navigation", "message": "invalid_navigation"})
-    with _patch_daemon(conn):
-        result = await get_sync_alerts(GetSyncAlerts(since=5, navigation="opaque"))
-    assert result.is_error is True
-    assert result.result_count == 0
-    assert result.has_cursor is True
-    assert result.page_depth == 1
-    assert result.has_filter is True
-    text = _result_text(result)
-    assert "without navigation" in text
-    assert "opaque" not in text
 
 
 def test_no_connected_client_in_tools():
