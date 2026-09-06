@@ -199,7 +199,8 @@ def _query_rows(
     limit: int,
 ) -> list[tuple[object, ...]]:
     query = """SELECT a.seq, a.kind, a.occurred_at, a.dialog_id, a.message_id, a.version,
-                      m.text, mv.old_text, next_mv.old_text
+                      m.text, mv.old_text, next_mv.old_text,
+                      a.reason_code, a.access_change_cause, a.actor_id
                  FROM conversation_history_events a
                  LEFT JOIN messages m
                    ON m.dialog_id = a.dialog_id AND m.message_id = a.message_id
@@ -296,7 +297,7 @@ def _alert_narrative(kind: object, message_id: object, version: object, occurred
 
 
 def _row_text_evidence(row: tuple[object, ...]) -> dict[str, object]:
-    _, kind, _, _, _, _, current_text, original_text, next_original_text = row
+    _, kind, _, _, _, _, current_text, original_text, next_original_text = row[:9]
     if kind == "deleted_message":
         evidence = _empty_text_evidence(kind)
         evidence.update(
@@ -349,7 +350,7 @@ def _row_text_evidence(row: tuple[object, ...]) -> dict[str, object]:
 
 
 def _alert_from_row(row: tuple[object, ...]) -> dict[str, object]:
-    seq, kind, occurred_at, dialog_id, message_id, version, _, _, _ = row
+    seq, kind, occurred_at, dialog_id, message_id, version, _, _, _, reason_code, cause, actor_id = row
     message, action = _alert_narrative(kind, message_id, version, occurred_at)
     evidence = _row_text_evidence(row)
     item: dict[str, object] = {
@@ -367,8 +368,15 @@ def _alert_from_row(row: tuple[object, ...]) -> dict[str, object]:
         "message": message,
         "action": action,
     }
+    item.update(_access_metadata(kind, reason_code, cause, actor_id))
     item.update(evidence)
     return item
+
+
+def _access_metadata(kind: object, reason_code: object, cause: object, actor_id: object) -> dict[str, object]:
+    if kind not in ("access_lost", "access_restored"):
+        return {"reason_code": None, "access_change_cause": None, "actor_id": None}
+    return {"reason_code": reason_code, "access_change_cause": cause, "actor_id": actor_id}
 
 
 def _project_alerts(page_rows: list[tuple[object, ...]]) -> list[dict[str, object]]:
@@ -433,7 +441,15 @@ def _legacy_projections(
                 }
             )
         elif kind == "access_lost":
-            access.append({"dialog_id": dialog_id, "access_lost_at": item["access_lost_at"]})
+            access.append(
+                {
+                    "dialog_id": dialog_id,
+                    "access_lost_at": item["access_lost_at"],
+                    "reason_code": item["reason_code"],
+                    "access_change_cause": item["access_change_cause"],
+                    "actor_id": item["actor_id"],
+                }
+            )
         else:
             restored.append({"dialog_id": dialog_id, "access_restored_at": item["access_restored_at"]})
     return deleted, edits, access, restored

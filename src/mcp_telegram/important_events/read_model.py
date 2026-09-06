@@ -35,10 +35,11 @@ def list_important_events(
     """Return important events observed during the requested recent window."""
     cutoff = (int(time.time()) if now is None else now) - last_hours * 3600
     rows = cast(
-        list[tuple[int, str, int | None, str | None]],
+        list[tuple[int, str, int | None, str | None, str | None, int | None]],
         conn.execute(
             """
-            SELECT de.occurred_at, de.kind, de.dialog_id, e.name
+            SELECT de.occurred_at, de.kind, de.dialog_id, e.name,
+                   de.access_change_cause, de.actor_id
             FROM conversation_history_events AS de
             LEFT JOIN entities AS e ON e.id = de.dialog_id
             WHERE de.kind IN ('access_lost', 'access_restored')
@@ -51,7 +52,7 @@ def list_important_events(
 
     events: list[dict[str, object]] = []
     for row in rows:
-        occurred_at, kind, dialog_id, dialog_title = row
+        occurred_at, kind, dialog_id, dialog_title, access_change_cause, actor_id = row
         event_type = str(kind)
         events.append(
             {
@@ -62,6 +63,8 @@ def list_important_events(
                 "dialog_id": int(dialog_id) if dialog_id is not None else None,
                 "dialog_title": str(dialog_title) if dialog_title is not None else None,
                 "message_id": None,
+                "access_change_cause": access_change_cause,
+                "actor_id": actor_id,
             }
         )
     return events

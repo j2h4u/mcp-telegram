@@ -199,6 +199,7 @@ async def test_prime_runtime_keeps_serving_saved_folders_when_refresh_fails(
         own_only_context=None,
         socket_path=tmp_path / "daemon.sock",
         folder_projection_worker=SimpleNamespace(prime=AsyncMock()),
+        handler_manager=SimpleNamespace(set_self_id=MagicMock()),
     )
 
     try:
@@ -228,6 +229,7 @@ async def test_prime_runtime_propagates_unexpected_worker_failure(tmp_path: Path
         folder_projection_worker=SimpleNamespace(
             prime=AsyncMock(side_effect=RuntimeError("broken repository invariant"))
         ),
+        handler_manager=SimpleNamespace(set_self_id=MagicMock()),
     )
 
     try:

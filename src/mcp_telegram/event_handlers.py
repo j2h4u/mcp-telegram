@@ -31,6 +31,8 @@ from typing import Protocol, cast, runtime_checkable
 from telethon import events  # type: ignore[import-untyped]
 from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
+    ChannelParticipantBanned,
+    ChannelParticipantLeft,
     MessageActionTopicCreate,
     MessageActionTopicEdit,
     MessageService,
@@ -39,6 +41,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     TypeInputChannel,
     TypePeer,
     UpdateChannel,
+    UpdateChannelParticipant,
     UpdateChat,
     UpdateDeleteScheduledMessages,
     UpdateDialogPinned,
@@ -56,6 +59,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
+from .access_lifecycle import AccessLossEvidence, set_access_lost
 from .activity_contracts import InputPeerResolver
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
@@ -235,6 +239,14 @@ class _ChatUpdateLike(Protocol):
     chat_id: int
 
 
+class _ChannelParticipantUpdateLike(Protocol):
+    channel_id: int
+    date: datetime | None
+    actor_id: int
+    user_id: int
+    new_participant: object | None
+
+
 class _InboxReadUpdateLike(Protocol):
     peer: object
     max_id: int | None
@@ -318,6 +330,8 @@ class _EventHandlerClient(Protocol):
     def remove_event_handler(self, _callback: object) -> None: ...
 
     async def get_messages(self, *_args: object, **_kwargs: object) -> object: ...
+
+    async def get_me(self) -> object: ...
 
     async def __call__(self, _request: object) -> object: ...
 
@@ -433,6 +447,7 @@ class EventHandlerManager:
         self._synced_dialog_ids: set[int] = set()
         self._realtime_history_status: _RealtimeHistoryStatusReader = _SQLiteRealtimeHistoryStatusReader(conn)
         self._topic_metadata = SQLiteTopicMetadataRepository(conn)
+        self._self_id: int | None = None
 
     # ------------------------------------------------------------------
     # Registration
@@ -492,6 +507,10 @@ class EventHandlerManager:
             events.Raw(types=[UpdateChannel, UpdateChat]),
         )
         self._client.add_event_handler(
+            self.on_raw_channel_participant,
+            events.Raw(types=[UpdateChannelParticipant]),
+        )
+        self._client.add_event_handler(
             self.on_raw_inbox_read,
             events.Raw(types=[UpdateReadHistoryInbox, UpdateReadChannelInbox]),
         )
@@ -514,6 +533,7 @@ class EventHandlerManager:
         self._client.remove_event_handler(self.on_raw_delete_scheduled_messages)
         self._client.remove_event_handler(self.on_raw_dialog_pinned)
         self._client.remove_event_handler(self.on_raw_channel_chat_update)
+        self._client.remove_event_handler(self.on_raw_channel_participant)
         self._client.remove_event_handler(self.on_raw_inbox_read)
         self._client.remove_event_handler(self.on_raw_forum_topic_pinned)
 
@@ -525,6 +545,21 @@ class EventHandlerManager:
         handlers.
         """
         self._refresh_synced_dialogs()
+
+    def set_self_id(self, self_id: int) -> None:
+        self._self_id = self_id
+
+    async def _resolve_self_id(self) -> int | None:
+        if self._self_id is not None:
+            return self._self_id
+        try:
+            me = await self._client.get_me()
+            value = getattr(me, "id", None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                self._self_id = value
+        except Exception:
+            logger.exception("participant_update_self_id_unavailable")
+        return self._self_id
 
     def _refresh_synced_dialogs(self) -> None:
         rows = cast(list[tuple[int]], self._conn.execute(_SELECT_SYNCED_DIALOGS_SQL).fetchall())
@@ -1489,6 +1524,47 @@ class EventHandlerManager:
                 "event_dialog_pinned_failed update=%r",
                 type(update).__name__,
             )
+
+    @staticmethod
+    def _access_loss_cause(update: _ChannelParticipantUpdateLike, self_id: int) -> str | None:
+        participant = update.new_participant
+        if isinstance(participant, ChannelParticipantBanned):
+            rights = participant.banned_rights
+            if not bool(getattr(rights, "view_messages", False)):
+                return None
+            return "self_left" if update.actor_id == self_id else "banned_by_admin"
+        if participant is None or isinstance(participant, ChannelParticipantLeft):
+            return "self_left" if update.actor_id == self_id else "removed_by_admin"
+        return None
+
+    async def on_raw_channel_participant(self, update: _ChannelParticipantUpdateLike) -> None:
+        """Persist why this account lost a channel or supergroup membership."""
+        try:
+            self_id = await self._resolve_self_id()
+            if self_id is None or update.user_id != self_id:
+                return
+            cause = self._access_loss_cause(update, self_id)
+            if cause is None:
+                return
+            dialog_id = int(get_peer_id(PeerChannel(update.channel_id)))
+            occurred_at = int(update.date.timestamp()) if update.date is not None else int(time.time())
+            with self._conn:
+                changed = set_access_lost(
+                    self._conn,
+                    dialog_id,
+                    occurred_at,
+                    evidence=AccessLossEvidence("UpdateChannelParticipant", cause, update.actor_id),
+                )
+            if changed:
+                self._synced_dialog_ids.discard(dialog_id)
+                logger.info(
+                    "event_access_lost dialog_id=%d cause=%s actor_id=%d",
+                    dialog_id,
+                    cause,
+                    update.actor_id,
+                )
+        except Exception:
+            logger.exception("event_channel_participant_failed")
 
     async def on_raw_channel_chat_update(self, update: _ChannelChatUpdateLike | _ChatUpdateLike) -> None:
         """Phase 42 EVENTS-03: UpdateChannel / UpdateChat → dialogs.needs_refresh=1.

@@ -19,6 +19,7 @@ from mcp_telegram.sync_db import (
     _apply_migration_52,
     _apply_migration_53,
     _apply_migration_54,
+    _apply_migration_55,
     _open_sync_db,
     ensure_sync_schema,
 )
@@ -707,7 +708,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 54
+        assert _CURRENT_SCHEMA_VERSION == 55
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1438,7 +1439,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 54
+        assert _CURRENT_SCHEMA_VERSION == 55
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:
@@ -1647,6 +1648,8 @@ def test_v51_fresh_schema_has_runtime_store_and_focused_alert_projection(tmp_pat
             "previous_status",
             "source_namespace",
             "source_event_id",
+            "access_change_cause",
+            "actor_id",
         ]
         assert "origin" in {row[1] for row in _fetchall_rows(conn, "PRAGMA table_info(message_versions)")}
 
@@ -2308,3 +2311,17 @@ def test_v54_destructive_ddl_failure_rolls_back_event_cutover(
         assert "conversation_history_events" not in tables
         assert _fetchone_int(conn, "SELECT COUNT(*) FROM runtime_events") == 1
         assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=54") is None
+
+
+def test_v55_adds_access_cause_and_actor_atomically(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute("ALTER TABLE conversation_history_events DROP COLUMN actor_id")
+        conn.execute("ALTER TABLE conversation_history_events DROP COLUMN access_change_cause")
+        conn.execute("DELETE FROM schema_version WHERE version=55")
+        conn.commit()
+        _apply_migration_55(conn, 54)
+        columns = {row[1] for row in _fetchall_rows(conn, "PRAGMA table_info(conversation_history_events)")}
+        assert {"access_change_cause", "actor_id"} <= columns
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=55") == (55,)

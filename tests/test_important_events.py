@@ -35,6 +35,8 @@ def test_list_important_events_returns_recent_access_events_with_titles(tmp_path
                 "dialog_id": 123,
                 "dialog_title": "Work Chat",
                 "message_id": None,
+                "access_change_cause": None,
+                "actor_id": None,
             },
             {
                 "time": "2023-11-15T04:13:20+06:00",
@@ -44,6 +46,8 @@ def test_list_important_events_returns_recent_access_events_with_titles(tmp_path
                 "dialog_id": 123,
                 "dialog_title": "Work Chat",
                 "message_id": None,
+                "access_change_cause": None,
+                "actor_id": None,
             },
         ]
     finally:

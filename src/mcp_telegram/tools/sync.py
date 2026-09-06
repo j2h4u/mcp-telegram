@@ -287,6 +287,12 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                     "message_id": {"type": ["integer", "null"]},
                     "deleted_at": {"type": ["integer", "null"]},
                     "action": {"type": "string"},
+                    "reason_code": {"type": ["string", "null"]},
+                    "access_change_cause": {
+                        "type": ["string", "null"],
+                        "enum": ["self_left", "removed_by_admin", "banned_by_admin", "unknown", None],
+                    },
+                    "actor_id": {"type": ["integer", "null"]},
                     "text": {"type": ["string", "null"]},
                     "deleted_text": {"type": ["string", "null"]},
                     "text_provenance": {"type": "object"},
@@ -328,6 +334,12 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                     "dialog_id": {"type": ["integer", "null"]},
                     "access_lost_at": {"type": ["integer", "null"]},
                     "action": {"type": "string"},
+                    "reason_code": {"type": ["string", "null"]},
+                    "access_change_cause": {
+                        "type": ["string", "null"],
+                        "enum": ["self_left", "removed_by_admin", "banned_by_admin", "unknown", None],
+                    },
+                    "actor_id": {"type": ["integer", "null"]},
                 },
                 "required": ["dialog_id", "access_lost_at", "action"],
                 "additionalProperties": False,
@@ -744,6 +756,9 @@ def _canonical_access(alerts: list[dict[str, object]]) -> list[dict[str, object]
             "dialog_id": item.get("dialog_id"),
             "access_lost_at": item.get("access_lost_at"),
             "action": item.get("action") or "Use get_sync_status for coverage details.",
+            "reason_code": item.get("reason_code"),
+            "access_change_cause": item.get("access_change_cause"),
+            "actor_id": item.get("actor_id"),
         }
         for item in alerts
         if item.get("kind") == "access_lost"

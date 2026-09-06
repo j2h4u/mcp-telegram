@@ -32,6 +32,8 @@ LIST_IMPORTANT_EVENTS_OUTPUT_SCHEMA = {
                     "dialog_id": {"type": ["integer", "null"]},
                     "dialog_title": {"type": ["string", "null"]},
                     "message_id": {"type": ["integer", "null"]},
+                    "access_change_cause": {"type": ["string", "null"]},
+                    "actor_id": {"type": ["integer", "null"]},
                 },
                 "required": [
                     "time",
@@ -41,6 +43,8 @@ LIST_IMPORTANT_EVENTS_OUTPUT_SCHEMA = {
                     "dialog_id",
                     "dialog_title",
                     "message_id",
+                    "access_change_cause",
+                    "actor_id",
                 ],
                 "additionalProperties": False,
             },

@@ -939,7 +939,7 @@ def test_register_adds_handlers(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    assert mock_client.add_event_handler.call_count == 13
+    assert mock_client.add_event_handler.call_count == 14
 
 
 def test_unregister_removes_handlers(
@@ -952,7 +952,7 @@ def test_unregister_removes_handlers(
     manager.register()
     manager.unregister()
 
-    assert mock_client.remove_event_handler.call_count == 13
+    assert mock_client.remove_event_handler.call_count == 14
 
 
 def test_refresh_synced_dialogs(

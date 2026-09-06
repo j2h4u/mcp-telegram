@@ -1220,6 +1220,8 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     me = cast(_MeLike, await ctx.client.get_me())
     _update_self_profile(ctx.api_server, me)
     assert ctx.api_server.self_id is not None
+    assert ctx.handler_manager is not None
+    ctx.handler_manager.set_self_id(ctx.api_server.self_id)
     ctx.own_only_context = await _load_own_only_context(ctx.client, ctx.api_server.self_id)
     ensure_own_only_schema(ctx.conn)
     logger.info("daemon self_id cached: %s", ctx.api_server.self_id)
