@@ -2599,10 +2599,12 @@ async def test_get_sync_alerts_empty():
         "deleted_messages": [],
         "edits": [],
         "access_lost": [],
+        "access_restored": [],
         "counts": {
             "deleted_messages": 0,
             "edits": 0,
             "access_lost": 0,
+            "access_restored": 0,
             "total": 0,
         },
         "count": 0,
@@ -2612,6 +2614,7 @@ async def test_get_sync_alerts_empty():
             "deleted_messages": {"since": 0, "limit": 50},
             "edits": {"since": 0, "limit": 50},
             "access_lost": {"since": 0, "limit": None},
+            "access_restored": {"since": 0, "limit": None},
         },
     }
     conn.get_sync_alerts.assert_called_once_with()

@@ -159,7 +159,7 @@ async def test_delta_disable_race_discards_fetched_body_and_checkpoint(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_delta_stale_access_error_after_disable_does_not_mark_lost(
+async def test_delta_stale_access_error_records_lost_for_tracked_dialog(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db_path = tmp_path / "access-race.db"
@@ -188,7 +188,10 @@ async def test_delta_stale_access_error_after_disable_does_not_mark_lost(
     second.commit()
     release.set()
     assert await task == 0
-    assert first.execute("SELECT status FROM synced_dialogs WHERE dialog_id=80").fetchone() == ("synced",)
+    assert first.execute("SELECT status FROM synced_dialogs WHERE dialog_id=80").fetchone() == ("access_lost",)
+    assert first.execute("SELECT kind FROM conversation_history_events WHERE dialog_id=80").fetchone() == (
+        "access_lost",
+    )
     first.close()
     second.close()
 
@@ -486,10 +489,10 @@ async def test_delta_access_lost_handled(
     assert row[0] == "access_lost"
     assert row[1] is not None
     event = sync_db.execute(
-        "SELECT kind, dialog_id FROM runtime_events WHERE dialog_id=?",
+        "SELECT kind, dialog_id FROM conversation_history_events WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone()
-    assert event == ("sync.access_lost", dialog_id)
+    assert event == ("access_lost", dialog_id)
 
 
 @pytest.mark.asyncio
@@ -746,10 +749,10 @@ async def test_probe_restores_access_after_gap_fill(
     assert dialog_row[1] == 1  # queued for reconciliation refresh
     assert dialog_row[2] != 1000
     event = sync_db.execute(
-        "SELECT kind, dialog_id FROM runtime_events WHERE dialog_id=?",
+        "SELECT kind, dialog_id FROM conversation_history_events WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone()
-    assert event == ("sync.access_restored", dialog_id)
+    assert event == ("access_restored", dialog_id)
 
 
 @pytest.mark.asyncio

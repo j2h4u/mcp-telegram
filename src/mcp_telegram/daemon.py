@@ -109,7 +109,7 @@ from .reactions.sqlite_repository import SQLiteReactionSnapshotRepository
 from .reactions.telegram_adapter import TelethonTelegramReactionGateway
 from .read_state import apply_read_cursor, apply_reconciled_unread_count
 from .reconnect import run_reconnect_catch_up_loop
-from .runtime_events import prune_runtime_events, record_runtime_event
+from .runtime_observations import prune_runtime_observations, record_runtime_observation
 from .scheduled_messages import ScheduledReconciliationPolicy, run_scheduled_reconciliation_loop
 from .state import StatePaths, ensure_private_state_dir
 from .sync_db import (
@@ -630,7 +630,7 @@ def _record_read_reconciliation_event(
         ).fetchone(),
     )
     try:
-        record_runtime_event(
+        record_runtime_observation(
             conn,
             kind="sync.read_reconciliation",
             dialog_id=dialog_id,
@@ -934,7 +934,7 @@ def _create_tracked_task(
         if exc is not None:
             try:
                 with ctx.conn:
-                    record_runtime_event(
+                    record_runtime_observation(
                         ctx.conn,
                         kind="runtime.task_failed",
                         outcome="failed",
@@ -958,7 +958,7 @@ def _create_tracked_task(
 def _observe_runtime(ctx: _SyncMainContext, kind: str, outcome: str, reason_code: str | None) -> None:
     try:
         with ctx.conn:
-            record_runtime_event(ctx.conn, kind=kind, outcome=outcome, reason_code=reason_code)
+            record_runtime_observation(ctx.conn, kind=kind, outcome=outcome, reason_code=reason_code)
     except Exception:
         logger.exception("runtime_event_record_failed kind=%s", kind)
 
@@ -1039,8 +1039,8 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - com
         telemetry_retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
     )
     with conn:
-        prune_runtime_events(conn, ttl_seconds=config.telemetry.retention_ttl_seconds)
-        record_runtime_event(conn, kind="runtime.started", outcome="observed")
+        prune_runtime_observations(conn, ttl_seconds=config.telemetry.retention_ttl_seconds)
+        record_runtime_observation(conn, kind="runtime.started", outcome="observed")
 
     # Open feedback.db before registering the shutdown handler so the SIGTERM
     # handler can checkpoint it.  feedback_conn is opened on the asyncio thread
@@ -1466,7 +1466,7 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
         logger.debug("feedback_conn close error", exc_info=True)
     try:
         with ctx.conn:
-            record_runtime_event(ctx.conn, kind="runtime.stopped", outcome="observed")
+            record_runtime_observation(ctx.conn, kind="runtime.stopped", outcome="observed")
     except Exception:
         logger.exception("runtime_event_record_failed kind=runtime.stopped")
     ctx.conn.close()

@@ -43,8 +43,8 @@ _MARK_DELETED_SQL = (
     "UPDATE messages SET is_deleted = 1, deleted_at = ? WHERE dialog_id = ? AND message_id = ? AND is_deleted = 0"
 )
 _INSERT_HUMAN_DM_EDIT_ALERT_SQL = f"""
-INSERT OR IGNORE INTO sync_alert_events(kind, occurred_at, dialog_id, message_id, version)
-SELECT 'edit', ?, ?, ?, ?
+INSERT OR IGNORE INTO conversation_history_events(kind, occurred_at, time_basis, dialog_id, message_id, version)
+SELECT 'edit', ?, 'telegram', ?, ?, ?
 FROM messages m
 WHERE m.dialog_id = ? AND m.message_id = ?
   AND {incoming_human_dm_sql("m")}

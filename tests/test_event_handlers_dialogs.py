@@ -460,7 +460,7 @@ async def test_update_read_history_inbox_logs_still_unread_count(
     # last_event_at should be advanced
     assert _last_event_at(sync_db, dialog_id) is not None
     trace = sync_db.execute(
-        "SELECT kind, operation_id, outcome, payload_json FROM runtime_events WHERE dialog_id=? ORDER BY id",
+        "SELECT kind, operation_id, outcome, payload_json FROM runtime_observations WHERE dialog_id=? ORDER BY id",
         (dialog_id,),
     ).fetchall()
     assert [item[0] for item in trace] == ["telegram.inbox_read_received", "sync.inbox_read_finished"]

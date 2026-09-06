@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 
 import pytest
 
 from mcp_telegram.access_lifecycle import (
-    record_access_lifecycle_event,
     restore_access_after_revalidation,
     set_access_lost,
     stamp_access_revalidation,
@@ -32,26 +30,14 @@ def _db() -> sqlite3.Connection:
              dialog_id INTEGER PRIMARY KEY, hidden INTEGER, needs_refresh INTEGER,
              snapshot_at INTEGER, archived INTEGER, pinned INTEGER,
              unread_mentions_count INTEGER, unread_reactions_count INTEGER, name TEXT);
-        CREATE TABLE sync_alert_events (
+        CREATE TABLE conversation_history_events (
              seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, occurred_at INTEGER,
-             dialog_id INTEGER, message_id INTEGER, version INTEGER);
-        CREATE TABLE runtime_events (
-             id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL,
-             kind TEXT NOT NULL, runtime_instance_id TEXT NOT NULL, operation_id TEXT,
-             outcome TEXT, reason_code TEXT, dialog_id INTEGER, duration_ms REAL,
-             tool_name TEXT, result_count INTEGER, has_cursor INTEGER, page_depth INTEGER,
-             has_filter INTEGER, error_type TEXT, payload_json TEXT NOT NULL DEFAULT '{}');
+             time_basis TEXT, dialog_id INTEGER, message_id INTEGER, version INTEGER,
+             reason_code TEXT, previous_status TEXT,
+             source_namespace TEXT, source_event_id INTEGER);
         """
     )
     return conn
-
-
-def _file_db(path: Path) -> sqlite3.Connection:
-    source = _db()
-    target = sqlite3.connect(path)
-    source.backup(target)
-    source.close()
-    return target
 
 
 def test_nested_lifecycle_savepoint_preserves_outer_write() -> None:
@@ -110,49 +96,45 @@ def test_access_loss_clears_read_position_retry() -> None:
         conn.close()
 
 
-def test_runtime_event_failure_does_not_roll_back_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_durable_event_failure_rolls_back_lifecycle() -> None:
     conn = _db()
     conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (1, 'synced')")
     seed_full_history_enrollment(conn, 1, enabled=True)
     conn.execute("INSERT INTO dialogs VALUES (1, 0, 0, 1, 0, 0, 0, 0, 'x')")
-    conn.execute("CREATE TABLE unrelated (value INTEGER)")
     conn.commit()
-    conn.execute("INSERT INTO unrelated VALUES (7)")
-
-    def fail(*_args: object, **_kwargs: object) -> None:
-        raise RuntimeError("injected")
+    conn.execute(
+        "CREATE TRIGGER reject_history BEFORE INSERT ON conversation_history_events "
+        "BEGIN SELECT RAISE(ABORT, 'injected'); END"
+    )
 
     try:
-        monkeypatch.setattr("mcp_telegram.access_lifecycle.sqlite3.connect", fail)
-        event = set_access_lost(conn, 1, 10)
-        conn.commit()
-        record_access_lifecycle_event(event)
-        assert conn.execute("SELECT status FROM synced_dialogs").fetchone() == ("access_lost",)
-        assert conn.execute("SELECT hidden FROM dialogs").fetchone() == (1,)
-        assert conn.execute("SELECT value FROM unrelated").fetchone() == (7,)
+        with pytest.raises(sqlite3.IntegrityError, match="injected"):
+            set_access_lost(conn, 1, 10)
+        assert conn.execute("SELECT status FROM synced_dialogs").fetchone() == ("synced",)
+        assert conn.execute("SELECT hidden FROM dialogs").fetchone() == (0,)
     finally:
         conn.close()
 
 
-def test_runtime_event_is_recorded_after_caller_commit(tmp_path: Path) -> None:
-    path = tmp_path / "sync.db"
-    conn = _file_db(path)
+def test_lifecycle_history_is_ordered_and_deduplicated() -> None:
+    conn = _db()
     try:
         conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (1, 'synced')")
-        seed_full_history_enrollment(conn, 1, enabled=True)
         conn.execute("INSERT INTO dialogs VALUES (1, 0, 0, 1, 0, 0, 0, 0, 'x')")
         conn.commit()
 
-        event = set_access_lost(conn, 1, 10)
-        assert event is not None
-        assert conn.execute("SELECT COUNT(*) FROM runtime_events").fetchone() == (0,)
-        conn.commit()
-        record_access_lifecycle_event(event)
-
-        observer = sqlite3.connect(path)
-        try:
-            assert observer.execute("SELECT kind, dialog_id FROM runtime_events").fetchone() == ("sync.access_lost", 1)
-        finally:
-            observer.close()
+        assert set_access_lost(conn, 1, 10, reason="ChannelPrivateError")
+        assert not set_access_lost(conn, 1, 11)
+        assert restore_access_after_revalidation(conn, 1, 12)
+        assert not restore_access_after_revalidation(conn, 1, 13)
+        conn.execute("UPDATE synced_dialogs SET status = 'syncing' WHERE dialog_id = 1")
+        assert set_access_lost(conn, 1, 14)
+        assert conn.execute(
+            "SELECT kind, occurred_at, reason_code, previous_status FROM conversation_history_events ORDER BY seq"
+        ).fetchall() == [
+            ("access_lost", 10, "ChannelPrivateError", "synced"),
+            ("access_restored", 12, None, "access_lost"),
+            ("access_lost", 14, None, "syncing"),
+        ]
     finally:
         conn.close()

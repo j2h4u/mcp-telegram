@@ -147,7 +147,7 @@ async def test_full_sync_disable_race_discards_fetched_body_and_checkpoint(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_full_sync_stale_access_error_after_disable_does_not_mark_lost(
+async def test_full_sync_stale_access_error_records_lost_for_tracked_dialog(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db_path = tmp_path / "access-race.db"
@@ -174,7 +174,10 @@ async def test_full_sync_stale_access_error_after_disable_does_not_mark_lost(
     second.commit()
     release.set()
     assert await task == (0, True)
-    assert first.execute("SELECT status FROM synced_dialogs WHERE dialog_id=79").fetchone() == ("not_synced",)
+    assert first.execute("SELECT status FROM synced_dialogs WHERE dialog_id=79").fetchone() == ("access_lost",)
+    assert first.execute("SELECT kind FROM conversation_history_events WHERE dialog_id=79").fetchone() == (
+        "access_lost",
+    )
     first.close()
     second.close()
 

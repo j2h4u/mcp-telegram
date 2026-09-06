@@ -110,17 +110,42 @@ def _coerce_int(value: object, default: int) -> int:
         return default
 
 
+def _runtime_history_segments(cursor: sqlite3.Cursor, live_start: int | None) -> list[dict[str, object]]:
+    rows = cast(
+        list[tuple[str, str]],
+        cursor.execute(
+            "SELECT key,value FROM daemon_state WHERE key IN "
+            "('runtime_observations_legacy_started_at_ms','runtime_observations_legacy_ended_at_ms')"
+        ).fetchall(),
+    )
+    values: dict[str, str] = dict(rows)
+    segments: list[dict[str, object]] = []
+    if values.get("runtime_observations_legacy_started_at_ms") and values.get(
+        "runtime_observations_legacy_ended_at_ms"
+    ):
+        segments.append(
+            {
+                "kind": "legacy",
+                "started_at_ms": int(values["runtime_observations_legacy_started_at_ms"]),
+                "ended_at_ms": int(values["runtime_observations_legacy_ended_at_ms"]),
+            }
+        )
+    if live_start is not None:
+        segments.append({"kind": "live", "started_at_ms": live_start, "ended_at_ms": None})
+    return segments
+
+
 def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict[str, object]:
     tool_dist = dict(
         cursor.execute(
-            "SELECT tool_name, COUNT(*) FROM runtime_events "
+            "SELECT tool_name, COUNT(*) FROM runtime_observations "
             "WHERE kind = 'mcp.call' AND observed_at_ms >= ? GROUP BY tool_name ORDER BY COUNT(*) DESC",
             (since * 1000,),
         ).fetchall()
     )
     error_dist = dict(
         cursor.execute(
-            "SELECT COALESCE(NULLIF(reason_code, ''), error_type), COUNT(*) FROM runtime_events "
+            "SELECT COALESCE(NULLIF(reason_code, ''), error_type), COUNT(*) FROM runtime_observations "
             "WHERE kind = 'mcp.call' AND observed_at_ms >= ? "
             "AND (NULLIF(reason_code, '') IS NOT NULL OR error_type IS NOT NULL) "
             "GROUP BY COALESCE(NULLIF(reason_code, ''), error_type) ORDER BY COUNT(*) DESC",
@@ -133,22 +158,22 @@ def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict[str, object]:
         return default if row is None or row[0] is None else int(cast(int | str, row[0]))
 
     max_depth = _scalar(
-        "SELECT MAX(page_depth) FROM runtime_events WHERE kind = 'mcp.call' AND observed_at_ms >= ?",
+        "SELECT MAX(page_depth) FROM runtime_observations WHERE kind = 'mcp.call' AND observed_at_ms >= ?",
         (since * 1000,),
     )
     filter_count = _scalar(
-        "SELECT COUNT(*) FROM runtime_events WHERE kind = 'mcp.call' AND observed_at_ms >= ? AND has_filter = 1",
+        "SELECT COUNT(*) FROM runtime_observations WHERE kind = 'mcp.call' AND observed_at_ms >= ? AND has_filter = 1",
         (since * 1000,),
     )
     total_calls = _scalar(
-        "SELECT COUNT(*) FROM runtime_events WHERE kind = 'mcp.call' AND observed_at_ms >= ?",
+        "SELECT COUNT(*) FROM runtime_observations WHERE kind = 'mcp.call' AND observed_at_ms >= ?",
         (since * 1000,),
     )
 
     latencies = cast(
         list[tuple[int]],
         cursor.execute(
-            "SELECT duration_ms FROM runtime_events WHERE kind = 'mcp.call' AND observed_at_ms >= ? ORDER BY duration_ms",
+            "SELECT duration_ms FROM runtime_observations WHERE kind = 'mcp.call' AND observed_at_ms >= ? ORDER BY duration_ms",
             (since * 1000,),
         ).fetchall(),
     )
@@ -163,12 +188,17 @@ def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict[str, object]:
 
     boundary_row = cast(
         tuple[str | None] | None,
-        cursor.execute("SELECT value FROM daemon_state WHERE key = 'runtime_events_history_started_at_ms'").fetchone(),
+        cursor.execute(
+            "SELECT value FROM daemon_state WHERE key = 'runtime_observations_history_started_at_ms'"
+        ).fetchone(),
     )
     truncation_row = cast(
         tuple[str | None] | None,
-        cursor.execute("SELECT value FROM daemon_state WHERE key = 'runtime_events_last_cap_truncation_ms'").fetchone(),
+        cursor.execute(
+            "SELECT value FROM daemon_state WHERE key = 'runtime_observations_last_cap_truncation_ms'"
+        ).fetchone(),
     )
+    live_start = int(boundary_row[0]) if boundary_row and boundary_row[0] is not None else None
     return {
         "tool_distribution": tool_dist,
         "error_distribution": error_dist,
@@ -179,6 +209,7 @@ def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict[str, object]:
         "latency_p95_ms": latency_p95_ms,
         "history_started_at_ms": int(boundary_row[0]) if boundary_row and boundary_row[0] is not None else None,
         "last_cap_truncation_ms": int(truncation_row[0]) if truncation_row and truncation_row[0] is not None else None,
+        "history_segments": _runtime_history_segments(cursor, live_start),
     }
 
 

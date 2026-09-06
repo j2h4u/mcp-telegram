@@ -311,10 +311,10 @@ async def test_reconciliation_access_lost_candidate_log_has_dialog_context(
     assert status_row[0] == "access_lost"
     assert status_row[1] is not None
     event_row = conn.execute(
-        "SELECT kind, dialog_id FROM runtime_events WHERE dialog_id = ?",
+        "SELECT kind, dialog_id FROM conversation_history_events WHERE dialog_id = ?",
         (private_channel_id,),
     ).fetchone()
-    assert event_row == ("sync.access_lost", private_channel_id)
+    assert event_row == ("access_lost", private_channel_id)
     assert [row["dialog_id"] for row in query_own_only_candidates(conn, personal_channel_id=9001)] == []
 
 

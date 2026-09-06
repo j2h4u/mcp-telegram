@@ -44,6 +44,7 @@ MESSAGE_SQL_OWNER_PATHS = frozenset(
         "messages/sqlite_bundle.py",
         "messages/sqlite_hydration.py",
         "messages/sqlite_hydration_jobs.py",
+        "event_recovery.py",
     }
 )
 

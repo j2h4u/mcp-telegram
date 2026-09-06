@@ -226,6 +226,7 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                     "version": {"type": ["integer", "null"]},
                     "edit_date": {"type": ["integer", "null"]},
                     "access_lost_at": {"type": ["integer", "null"]},
+                    "access_restored_at": {"type": ["integer", "null"]},
                     "occurred_at": {"type": ["integer", "null"]},
                     "source_id": {"type": ["integer", "null"]},
                     "severity": {"type": "string"},
@@ -266,6 +267,7 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                     "version",
                     "edit_date",
                     "access_lost_at",
+                    "access_restored_at",
                     "occurred_at",
                     "source_id",
                     "severity",
@@ -331,6 +333,19 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "access_restored": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "dialog_id": {"type": ["integer", "null"]},
+                    "access_restored_at": {"type": ["integer", "null"]},
+                    "action": {"type": "string"},
+                },
+                "required": ["dialog_id", "access_restored_at", "action"],
+                "additionalProperties": False,
+            },
+        },
         "counts": {
             "description": "Deprecated compatibility projection; counts apply to the current alerts page.",
             "type": "object",
@@ -338,9 +353,10 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                 "deleted_messages": {"type": "integer"},
                 "edits": {"type": "integer"},
                 "access_lost": {"type": "integer"},
+                "access_restored": {"type": "integer"},
                 "total": {"type": "integer"},
             },
-            "required": ["deleted_messages", "edits", "access_lost", "total"],
+            "required": ["deleted_messages", "edits", "access_lost", "access_restored", "total"],
             "additionalProperties": False,
         },
         "count": {"type": "integer", "description": "Deprecated compatibility count for the current alerts page."},
@@ -385,8 +401,14 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                     "required": ["since", "limit"],
                     "additionalProperties": False,
                 },
+                "access_restored": {
+                    "type": "object",
+                    "properties": {"since": {"type": "integer"}, "limit": {"type": ["integer", "null"]}},
+                    "required": ["since", "limit"],
+                    "additionalProperties": False,
+                },
             },
-            "required": ["deleted_messages", "edits", "access_lost"],
+            "required": ["deleted_messages", "edits", "access_lost", "access_restored"],
             "additionalProperties": False,
         },
     },
@@ -395,6 +417,7 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
         "deleted_messages",
         "edits",
         "access_lost",
+        "access_restored",
         "counts",
         "count",
         "since",
@@ -585,6 +608,7 @@ class _SyncAlertPage:
     deleted: list[dict[str, object]]
     edits: list[dict[str, object]]
     access: list[dict[str, object]]
+    restored: list[dict[str, object]]
     since: object
     limit: object
     page_limit: object
@@ -615,7 +639,13 @@ def _as_int(value: object) -> int:
 
 
 def _alert_timestamp(alert: dict[str, object]) -> tuple[int, int, int, str]:
-    timestamp = alert.get("deleted_at") or alert.get("edit_date") or alert.get("access_lost_at") or 0
+    timestamp = (
+        alert.get("deleted_at")
+        or alert.get("edit_date")
+        or alert.get("access_lost_at")
+        or alert.get("access_restored_at")
+        or 0
+    )
     return (
         _as_int(timestamp),
         _as_int(alert.get("dialog_id")),
@@ -720,12 +750,36 @@ def _canonical_access(alerts: list[dict[str, object]]) -> list[dict[str, object]
     ]
 
 
+def _canonical_restored(alerts: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        {
+            "dialog_id": item.get("dialog_id"),
+            "access_restored_at": item.get("access_restored_at"),
+            "action": item.get("action") or "No action is required.",
+        }
+        for item in alerts
+        if item.get("kind") == "access_restored"
+    ]
+
+
 def _canonical_alerts(
     data: dict[str, object],
-) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+) -> tuple[
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
     raw_alerts = [item for item in t.cast(list[object], data["alerts"]) if isinstance(item, dict)]
     alerts = [dict(item) for item in raw_alerts]
-    return alerts, _canonical_deleted(alerts), _canonical_edits(alerts), _canonical_access(alerts)
+    return (
+        alerts,
+        _canonical_deleted(alerts),
+        _canonical_edits(alerts),
+        _canonical_access(alerts),
+        _canonical_restored(alerts),
+    )
 
 
 def _alert_result(page: _SyncAlertPage) -> ToolResult:
@@ -734,10 +788,12 @@ def _alert_result(page: _SyncAlertPage) -> ToolResult:
         "deleted_messages": page.deleted,
         "edits": page.edits,
         "access_lost": page.access,
+        "access_restored": page.restored,
         "counts": {
             "deleted_messages": len(page.deleted),
             "edits": len(page.edits),
             "access_lost": len(page.access),
+            "access_restored": len(page.restored),
             "total": len(page.alerts),
         },
         "count": len(page.alerts),
@@ -765,26 +821,23 @@ def _alert_result(page: _SyncAlertPage) -> ToolResult:
 
 
 def _canonical_alert_result(data: dict[str, object], args: GetSyncAlerts) -> ToolResult:
-    alerts, deleted, edits, access = _canonical_alerts(data)
+    alerts, deleted, edits, access, restored = _canonical_alerts(data)
     page_limit = data.get("page_limit", args.page_limit or args.limit)
     fallback_limit = args.page_limit or args.limit
+    limited_by = dict(t.cast(Mapping[str, object], data.get("limited_by", {})))
+    for kind in ("deleted_messages", "edits", "access_lost", "access_restored"):
+        limited_by.setdefault(kind, {"since": args.since, "limit": fallback_limit})
     return _alert_result(
         _SyncAlertPage(
             alerts,
             deleted,
             edits,
             access,
+            restored,
             data.get("since", args.since),
             data.get("limit", args.limit),
             page_limit,
-            data.get(
-                "limited_by",
-                {
-                    "deleted_messages": {"since": args.since, "limit": fallback_limit},
-                    "edits": {"since": args.since, "limit": fallback_limit},
-                    "access_lost": {"since": args.since, "limit": fallback_limit},
-                },
-            ),
+            limited_by,
             has_more=bool(data.get("has_more", False)),
             next_navigation=data.get("next_navigation"),
             snapshot_upper_event_at=data.get("snapshot_upper_event_at", 0),
@@ -914,6 +967,7 @@ def _legacy_alert_result(data: object, args: GetSyncAlerts) -> ToolResult:
             deleted_messages,
             edit_alerts,
             access_lost_alerts,
+            [],
             args.since,
             args.limit,
             args.limit,
@@ -921,6 +975,7 @@ def _legacy_alert_result(data: object, args: GetSyncAlerts) -> ToolResult:
                 "deleted_messages": {"since": args.since, "limit": args.limit},
                 "edits": {"since": args.since, "limit": args.limit},
                 "access_lost": {"since": args.since, "limit": None},
+                "access_restored": {"since": args.since, "limit": None},
             },
             has_cursor=args.navigation is not None,
             has_filter=args.since > 0,

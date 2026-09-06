@@ -29,7 +29,7 @@ from typing import Protocol, cast
 
 from telethon.tl.types import TypeInputPeer
 
-from .access_lifecycle import record_access_lifecycle_event, set_access_lost
+from .access_lifecycle import set_access_lost
 from .activity_peer_resolve import LinkedChatResolution, resolve_input_peer, resolve_linked_chat_id
 from .activity_substrate import ActivityClient, call_with_timeout
 from .flood import TelegramRpcThrottled, _raise_if_latched
@@ -343,9 +343,8 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, 
             early_result=_access_skip_result(rpc_calls=rpc_calls),
         )
     except ACCESS_LOST_ERRORS as exc:
-        event = set_access_lost(request.conn, request.dialog_id, int(time.time()))
+        set_access_lost(request.conn, request.dialog_id, int(time.time()))
         request.conn.commit()
-        record_access_lifecycle_event(event)
         logger.info(
             "sweep_peer_once_access_lost dialog_id=%r error_type=%s rpc_duration_s=%.3f",
             request.dialog_id,

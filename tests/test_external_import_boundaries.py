@@ -63,7 +63,8 @@ def test_sqlite_import_owners_name_split_persistence_modules() -> None:
         "messages/sqlite_bundle.py",
         "messages/sqlite_hydration.py",
         "messages/sqlite_hydration_jobs.py",
-        "runtime_events.py",
+        "runtime_observations.py",
+        "event_recovery.py",
     } <= gate.ALLOWED_IMPORTER_PATHS["sqlite3"]
     assert "messages/sqlite_repository.py" not in gate.ALLOWED_IMPORTER_PATHS["sqlite3"]
 
