@@ -654,11 +654,15 @@ class DaemonAPIServer:
         ok = bool(response.get("ok"))
         if ok and duration_s < self._policy.slow_request_seconds:
             return
-        logger.info(
-            "daemon_api_request_complete method=%s ok=%s duration_s=%.3f request_id=%s error=%s",
+        log = logger.warning if ok else logger.info
+        event = "daemon_api_slow_request" if ok else "daemon_api_request_complete"
+        log(
+            "%s method=%s ok=%s duration_s=%.3f threshold_s=%.3f request_id=%s error=%s",
+            event,
             method,
             ok,
             duration_s,
+            self._policy.slow_request_seconds,
             request_id,
             response.get("error"),
         )

@@ -291,17 +291,14 @@ async def test_reconciliation_access_lost_candidate_log_has_dialog_context(
         OwnOnlyContext(account_id=42, personal_channel_id=9001),
     )
 
-    with caplog.at_level("WARNING", logger="mcp_telegram.scheduled_messages"):
+    with caplog.at_level("WARNING", logger="mcp_telegram.access_lifecycle"):
         assert await worker.run_once() == 0
 
-    records = [record for record in caplog.records if "scheduled_own_only_access_lost" in record.message]
+    records = [record for record in caplog.records if record.message.startswith("access_lost ")]
     assert len(records) == 1
     assert f"dialog_id={private_channel_id}" in records[0].message
-    assert f"name='{channel_name}'" in records[0].message
-    assert "type=channel" in records[0].message
-    assert "archived=True" in records[0].message
-    assert "hidden=True" in records[0].message
-    assert "reason=ChannelPrivateError" in records[0].message
+    assert "reason_code=ChannelPrivateError" in records[0].message
+    assert channel_name not in records[0].message
     assert records[0].exc_info is None
     status_row = conn.execute(
         "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id = ?",

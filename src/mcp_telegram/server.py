@@ -53,6 +53,7 @@ _MCP_HTTP_SSE_ERROR_MESSAGE = "SSE response error"
 _ANYIO_CLOSED_RESOURCE_ERROR = ("anyio", "ClosedResourceError")
 _TELEMETRY_FLUSH_TIMEOUT_SECONDS = 1.0
 _TELEMETRY_OUTCOMES = frozenset({"success", "tool_error", "validation_error", "exception", "cancelled"})
+_SLOW_TOOL_CALL_SECONDS = resolve_logging_config().daemon_api_slow_request_seconds
 
 
 @dataclass
@@ -372,7 +373,25 @@ def _project_tool_result(
     telemetry.error_code = tool_result.error_code
     elapsed = time.monotonic() - started_at
     rid_str = ",".join(current_correlation_ids()) or "-"
-    logger.info("call_tool[%s] completed in %.3fs rids=%s", name, elapsed, rid_str)
+    slow_seconds = _SLOW_TOOL_CALL_SECONDS
+    if tool_result.is_error:
+        logger.info(
+            "call_tool[%s] tool_error duration_s=%.3f rids=%s error=%s",
+            name,
+            elapsed,
+            rid_str,
+            safe_error_code(tool_result.error_code),
+        )
+    elif elapsed >= slow_seconds:
+        logger.warning(
+            "call_tool[%s] slow_completed duration_s=%.3f threshold_s=%.3f rids=%s",
+            name,
+            elapsed,
+            slow_seconds,
+            rid_str,
+        )
+    else:
+        logger.debug("call_tool[%s] completed duration_s=%.3f rids=%s", name, elapsed, rid_str)
     return CallToolResult(
         content=list(tool_result.content) if tool_result.is_error else [],
         structured_content=(

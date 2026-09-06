@@ -763,7 +763,7 @@ def test_sweep_peer_once_access_lost_marks_dialog_without_traceback(
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.asyncio.sleep", fake_sleep)
 
-        with caplog.at_level(logging.INFO, logger="mcp_telegram.activity_peer_sweep"):
+        with caplog.at_level(logging.INFO, logger="mcp_telegram.access_lifecycle"):
             result = asyncio.run(
                 sweep_peer_once(
                     client=_FakeClient(),
@@ -787,7 +787,7 @@ def test_sweep_peer_once_access_lost_marks_dialog_without_traceback(
             tuple[int] | None,
             conn.execute("SELECT hidden FROM dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone(),
         )
-        access_lost_logs = [record for record in caplog.records if "sweep_peer_once_access_lost" in record.message]
+        access_lost_logs = [record for record in caplog.records if record.message.startswith("access_lost ")]
 
         assert sleep_calls == []
         assert result.rpc_calls == 2, "an access-lost SearchRequest still counts its attempt"

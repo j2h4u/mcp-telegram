@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -14,6 +15,7 @@ from ..hydration_queue import HydrationPriority, HydrationQueueRepository
 from ..messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
 
 _SAVEPOINTS = count()
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +53,8 @@ def set_access_lost(
     evidence: AccessLossEvidence | None = None,
 ) -> bool:
     """Atomically mark a peer inaccessible and hide its local snapshot."""
+    changed = False
+    reason_code = evidence.reason_code if evidence is not None else reason
     with _lifecycle_savepoint(conn):
         row = cast(
             tuple[str | None] | None,
@@ -79,20 +83,23 @@ def set_access_lost(
                 (
                     now,
                     dialog_id,
-                    evidence.reason_code if evidence is not None else reason,
+                    reason_code,
                     previous_status,
                     evidence.access_change_cause if evidence is not None else None,
                     evidence.actor_id if evidence is not None else None,
                 ),
             )
-            return True
-    return False
+            changed = True
+    if changed:
+        logger.warning("access_lost dialog_id=%d reason_code=%s", dialog_id, reason_code)
+    return changed
 
 
 def restore_access_after_revalidation(
     conn: sqlite3.Connection, dialog_id: int, now: int, *, total_messages: int | None = None
 ) -> bool:
     """Restore access while preserving snapshot metadata and requesting refresh."""
+    changed = False
     with _lifecycle_savepoint(conn):
         row = cast(
             tuple[str | None] | None,
@@ -128,8 +135,10 @@ def restore_access_after_revalidation(
                    ) VALUES ('access_restored', ?, 'observed', ?, 'access_lost')""",
                 (now, dialog_id),
             )
-            return True
-    return False
+            changed = True
+    if changed:
+        logger.info("access_restored dialog_id=%d total_messages=%s", dialog_id, total_messages)
+    return changed
 
 
 def due_access_revalidations(conn: sqlite3.Connection, *, now: int, cooldown_seconds: int, limit: int) -> list[int]:

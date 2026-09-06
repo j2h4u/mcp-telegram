@@ -406,11 +406,6 @@ class DeltaSyncWorker:
         except TelegramRpcThrottled as exc:
             return await self._handle_delta_throttling(dialog_id, new_message_rows, exc)
         except ACCESS_LOST_ERRORS as exc:
-            logger.warning(
-                "access_lost delta dialog_id=%d — %s",
-                dialog_id,
-                type(exc).__name__,
-            )
             now = int(time.time())
             set_access_lost(self._conn, dialog_id, now, reason=type(exc).__name__)
             self._conn.commit()
@@ -483,7 +478,7 @@ async def _handle_probe_throttling(
     await sleep_through_flood(shutdown_event, exc.retry_after_seconds or 1)
 
 
-async def _probe_access_lost_dialogs(  # noqa: PLR0915
+async def _probe_access_lost_dialogs(
     client: _DeltaSyncClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
@@ -513,21 +508,16 @@ async def _probe_access_lost_dialogs(  # noqa: PLR0915
             total = cast(int | None, getattr(result, "total", None))
 
             if not full_history_enabled(conn, dialog_id):
-                logger.info("access_restored_disabled dialog_id=%d", dialog_id)
-                restore_access_after_revalidation(conn, dialog_id, int(time.time()), total_messages=total)
-                conn.commit()
+                restored += _restore_revalidated_access(conn, dialog_id, total_messages=total)
                 continue
 
             # Gap-fill FIRST, while status is still access_lost.
             # If this fails, we skip the dialog — status stays access_lost.
             new_msgs = await delta_worker.fetch_delta_for_dialog(dialog_id)
-            logger.info("access_restored_gap_fill dialog_id=%d new=%d", dialog_id, new_msgs)
+            logger.debug("access_restore_gap_fill dialog_id=%d new=%d", dialog_id, new_msgs)
 
             # Gap-fill succeeded — NOW reset status to syncing.
-            restore_access_after_revalidation(conn, dialog_id, int(time.time()), total_messages=total)
-            conn.commit()
-            logger.info("access_restored dialog_id=%d total=%s", dialog_id, total)
-            restored += 1
+            restored += _restore_revalidated_access(conn, dialog_id, total_messages=total)
         except ACCESS_LOST_ERRORS:
             logger.debug("access_still_lost dialog_id=%d", dialog_id)
             still_lost += 1
@@ -564,6 +554,18 @@ async def _probe_access_lost_dialogs(  # noqa: PLR0915
         flood_wait_hit,
     )
     return restored
+
+
+def _restore_revalidated_access(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    total_messages: int | None,
+) -> int:
+    """Persist one verified restoration and return its counter contribution."""
+    changed = restore_access_after_revalidation(conn, dialog_id, int(time.time()), total_messages=total_messages)
+    conn.commit()
+    return int(changed)
 
 
 async def run_access_probe_loop(

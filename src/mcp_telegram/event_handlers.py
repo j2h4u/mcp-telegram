@@ -1570,12 +1570,6 @@ class EventHandlerManager:
                 )
             if changed:
                 self._synced_dialog_ids.discard(dialog_id)
-                logger.info(
-                    "event_access_lost dialog_id=%d cause=%s actor_id=%d",
-                    dialog_id,
-                    cause,
-                    update.actor_id,
-                )
         except Exception:
             logger.exception("event_channel_participant_failed")
 
