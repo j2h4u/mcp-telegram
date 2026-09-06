@@ -62,9 +62,7 @@ def apply_message_transcription(  # noqa: PLR0913
         conn, dialog_id, message_id, transcribed_text=text, transcription_id=transcription_id, received_at=received_at
     )
     if message.found and message.text != text:
-        persist_transcribed_text(
-            conn, dialog_id, message_id, old_text=message.text, transcribed_text=text, transcribed_at=received_at
-        )
+        persist_transcribed_text(conn, dialog_id, message_id, old_text=message.text, transcribed_text=text)
     _remove_transcription_hydration_job(conn, dialog_id, message_id)
     return True
 
@@ -128,9 +126,7 @@ def apply_message_transcription_if_absent(  # noqa: PLR0913
     )
     old_text = read_message_text(conn, dialog_id, message_id).text
     if old_text != text:
-        persist_transcribed_text(
-            conn, dialog_id, message_id, old_text=old_text, transcribed_text=text, transcribed_at=received_at
-        )
+        persist_transcribed_text(conn, dialog_id, message_id, old_text=old_text, transcribed_text=text)
     _remove_transcription_hydration_job(conn, dialog_id, message_id)
     return "applied"
 

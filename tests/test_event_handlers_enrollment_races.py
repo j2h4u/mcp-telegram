@@ -60,10 +60,12 @@ def _open_seeded_db(
         "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (?, 1, 'explicit', 1)",
         (dialog_id,),
     )
+    handler_conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (?, 'user')", (dialog_id,))
+    handler_conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (?, 'user', 1)", (dialog_id,))
     handler_conn.execute(
         "INSERT INTO messages(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, is_deleted) "
-        "VALUES (?, ?, 1704067200, ?, 42, 'Alice', 0)",
-        (dialog_id, message_id, text),
+        "VALUES (?, ?, 1704067200, ?, ?, 'Alice', 0)",
+        (dialog_id, message_id, text, dialog_id),
     )
     handler_conn.execute(
         "INSERT INTO messages_fts(dialog_id, message_id, stemmed_text) VALUES (?, ?, ?)",
@@ -145,6 +147,7 @@ async def test_edit_disable_after_precheck_skips_body_fts_and_version(
         msg = build_mock_message(
             id=message_id,
             text="after",
+            sender_id=dialog_id,
             edit_date=datetime(2024, 1, 1, 13, 0, tzinfo=UTC),
         )
         await manager.on_message_edited(cast(_EditedMessageEvent, SimpleNamespace(chat_id=dialog_id, message=msg)))
@@ -226,7 +229,7 @@ async def test_transcription_disable_after_precheck_skips_body_fts_and_version(
 
 
 @pytest.mark.asyncio
-async def test_transcription_enabled_path_still_updates_body_fts_and_version(
+async def test_transcription_enabled_path_updates_body_fts_without_version(
     tmp_path: Path, mock_client: MagicMock, shutdown_event: asyncio.Event
 ) -> None:
     dialog_id, message_id = 4202, 10
@@ -247,7 +250,7 @@ async def test_transcription_enabled_path_still_updates_body_fts_and_version(
 
         assert _message_text(handler_conn, dialog_id, message_id) == "voice after"
         assert _fts_text(handler_conn, dialog_id, message_id) != "old fts"
-        assert _version_rows(handler_conn, dialog_id, message_id) == [(1, "voice before")]
+        assert _version_rows(handler_conn, dialog_id, message_id) == []
         assert handler_conn.execute(
             "SELECT enabled FROM full_history_enrollment WHERE dialog_id = ?", (dialog_id,)
         ).fetchone() == (1,)

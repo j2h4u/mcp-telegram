@@ -17,6 +17,7 @@ from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
     _apply_migration_51,
     _apply_migration_52,
+    _apply_migration_53,
     _open_sync_db,
     ensure_sync_schema,
 )
@@ -703,7 +704,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 52
+        assert _CURRENT_SCHEMA_VERSION == 53
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1434,7 +1435,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 52
+        assert _CURRENT_SCHEMA_VERSION == 53
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:
@@ -1849,7 +1850,8 @@ def test_v52_expands_origin_contract_without_guessing_from_edit_date(tmp_path: P
         conn.execute("DELETE FROM schema_version WHERE version >= 52")
         conn.commit()
 
-    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        _apply_migration_52(conn, 51)
     with _sync_db_connection(db_path) as conn:
         assert _fetchall_rows(conn, "SELECT message_id, origin FROM message_versions ORDER BY message_id") == [
             (1, "telegram_edit"),
@@ -2138,3 +2140,60 @@ def test_v52_failure_after_rename_rolls_back_original_contract(tmp_path: Path) -
         assert schema is not None and "legacy_unknown" not in str(schema[0])
         assert _fetchone_row(conn, "SELECT origin FROM message_versions") == ("telegram_edit",)
         assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=52") is None
+
+
+def test_v53_keeps_only_versions_backing_durable_edit_alerts(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (1, 'user'), (2, 'group')")
+        conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (1, 'user', 1)")
+        conn.execute(
+            "INSERT INTO messages(dialog_id,message_id,sent_at,sender_id,out,is_service) VALUES "
+            "(1,1,1,1,0,0),(2,1,1,2,0,0)"
+        )
+        conn.execute(
+            "INSERT INTO message_versions(dialog_id,message_id,version,old_text,edit_date,origin) "
+            "VALUES (1,1,1,'kept',10,'telegram_edit'),(2,1,1,'discarded',10,'telegram_edit')"
+        )
+        conn.execute(
+            "INSERT INTO sync_alert_events(kind,occurred_at,dialog_id,message_id,version) VALUES ('edit',10,1,1,1)"
+        )
+        conn.execute("DELETE FROM schema_version WHERE version=53")
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchall_rows(conn, "SELECT dialog_id,message_id,old_text FROM message_versions") == [(1, 1, "kept")]
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=53") == (53,)
+
+
+def test_v53_delete_failure_rolls_back_all_version_history(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute(
+            "INSERT INTO message_versions(dialog_id,message_id,version,old_text,edit_date,origin) "
+            "VALUES (1,1,1,'first',10,'legacy_unknown'),(2,1,1,'second',10,'legacy_unknown')"
+        )
+        conn.execute("DELETE FROM schema_version WHERE version=53")
+        conn.commit()
+
+        def deny_delete(
+            action: int,
+            first: str | None,
+            _second: str | None,
+            _database: str | None,
+            _trigger: str | None,
+        ) -> int:
+            if action == sqlite3.SQLITE_DELETE and first == "message_versions":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_delete)
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            _apply_migration_53(conn, 52)
+        conn.set_authorizer(None)
+
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM message_versions") == 2
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=53") is None

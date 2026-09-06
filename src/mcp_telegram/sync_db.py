@@ -11,7 +11,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 52
+_CURRENT_SCHEMA_VERSION = 53
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -2416,9 +2416,34 @@ def _apply_migration_52(conn: sqlite3.Connection, current: int) -> int:
             # Telegram source time and can predate cutover for a later
             # backfill, so it cannot safely identify legacy rows.
             _rebuild_message_versions(conn, "origin")
-        conn.execute("INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))", (_CURRENT_SCHEMA_VERSION,))
+        conn.execute("INSERT INTO schema_version VALUES (52, strftime('%s', 'now'))")
         conn.commit()
         return 52
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _apply_migration_53(conn: sqlite3.Connection, current: int) -> int:
+    """Retain old message text only when it backs a durable human-DM edit alert."""
+    if current >= _CURRENT_SCHEMA_VERSION:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            """DELETE FROM message_versions AS mv
+                WHERE NOT EXISTS (
+                    SELECT 1
+                      FROM sync_alert_events AS alert
+                     WHERE alert.kind = 'edit'
+                       AND alert.dialog_id = mv.dialog_id
+                       AND alert.message_id = mv.message_id
+                       AND alert.version = mv.version
+                )"""
+        )
+        conn.execute("INSERT INTO schema_version VALUES (53, strftime('%s', 'now'))")
+        conn.commit()
+        return 53
     except BaseException:
         conn.rollback()
         raise
@@ -2473,6 +2498,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_50(conn, current)
     current = _apply_migration_51(conn, current)
     current = _apply_migration_52(conn, current)
+    current = _apply_migration_53(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
