@@ -45,7 +45,7 @@ def test_crap_remains_the_coverage_informed_gate() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
     assert re.search(r"(?m)^  crap:\s*$", workflow) is not None
-    assert "run: just crap-check" in workflow
+    assert "run: python3 scripts/ci_pytest_runner.py run -- just crap-check" in workflow
     assert workflow.count("needs: changes") == 4
     assert workflow.count("if: needs.changes.outputs.run_heavy == 'true'") == 4
     assert "needs: [changes, quality, unit, crap, docker-build]" in workflow

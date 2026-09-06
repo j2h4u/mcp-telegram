@@ -63,9 +63,9 @@ def classify_failure(log_text: str, runner_temp: Path) -> str:
 
 
 def _run_once(command: list[str], work_dir: Path, attempt: int) -> tuple[int, str]:
-    attempt_dir = work_dir / f"attempt-{attempt}"
-    pytest_temp = attempt_dir / "pytest"
-    process_temp = attempt_dir / "tmp"
+    attempt_dir = work_dir / f"a{attempt}"
+    pytest_temp = attempt_dir / "p"
+    process_temp = attempt_dir / "t"
     pytest_temp.mkdir(parents=True)
     process_temp.mkdir()
     log_path = attempt_dir / "pytest.log"
@@ -92,7 +92,9 @@ def _run_once(command: list[str], work_dir: Path, attempt: int) -> tuple[int, st
 def run_with_diagnostics(command: list[str]) -> int:
     """Run a pytest command and retry once only for a diagnosed runner failure."""
     runner_temp = _runner_temp()
-    work_dir = runner_temp / f"mcp-telegram-pytest-{os.environ.get('GITHUB_JOB', 'local')}"
+    job_name = os.environ.get("GITHUB_JOB", "local")
+    job_key = "u" if job_name == "unit" else "c" if job_name == "crap" else "l"
+    work_dir = runner_temp / "pt" / job_key
     if work_dir.exists():
         shutil.rmtree(work_dir)
     work_dir.mkdir(parents=True)
@@ -107,7 +109,7 @@ def run_with_diagnostics(command: list[str]) -> int:
         if attempt == _MAX_ATTEMPTS or outcome == "sqlite_application_failure":
             return return_code
         print(f"retrying_after={outcome}", flush=True)
-        shutil.rmtree(work_dir / f"attempt-{attempt}")
+        shutil.rmtree(work_dir / f"a{attempt}")
     return 1
 
 
