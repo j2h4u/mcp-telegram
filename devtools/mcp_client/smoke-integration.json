@@ -44,7 +44,9 @@
       "_comment": "list_topics — impossible exact @username validates recoverable not-found without fuzzy matching",
       "action": "call_tool",
       "name": "list_topics",
-      "arguments": {"dialog": "@__integration_smoke_missing__"},
+      "arguments": {
+        "dialog": "@__integration_smoke_missing__"
+      },
       "expect": {
         "is_error": true,
         "content_text_contains": [
@@ -56,7 +58,11 @@
       "_comment": "search_messages — placeholder dialog id and neutral query",
       "action": "call_tool",
       "name": "search_messages",
-      "arguments": {"dialog": "987654321", "query": "test", "limit": 3},
+      "arguments": {
+        "dialog": "987654321",
+        "query": "test",
+        "limit": 3
+      },
       "expect": {
         "one_of": [
           {
@@ -102,7 +108,9 @@
       "_comment": "get_sync_status — returns structured coverage and enrollment status",
       "action": "call_tool",
       "name": "get_sync_status",
-      "arguments": {"dialog_id": 12345},
+      "arguments": {
+        "dialog_id": 12345
+      },
       "expect": {
         "is_error": false,
         "path_equals": {
@@ -120,16 +128,18 @@
       }
     },
     {
-      "_comment": "get_sync_alerts — returns alerts or 'No sync alerts'",
+      "_comment": "list_conversation_changes — returns durable conversation history",
       "action": "call_tool",
-      "name": "get_sync_alerts",
-      "arguments": {"since": 0, "limit": 10},
+      "name": "list_conversation_changes",
+      "arguments": {
+        "page_limit": 10
+      },
       "expect": {
         "is_error": false,
         "path_exists": [
-          "structuredContent.alerts",
+          "structuredContent.events",
           "structuredContent.count",
-          "structuredContent.limited_by"
+          "structuredContent.coverage"
         ],
         "path_nonempty": [
           "structuredContent"
@@ -140,7 +150,10 @@
       "_comment": "get_dialog_stats — placeholder dialog id validates the actionable error path",
       "action": "call_tool",
       "name": "get_dialog_stats",
-      "arguments": {"dialog": "987654321", "top_n": 3},
+      "arguments": {
+        "dialog": "987654321",
+        "top_n": 3
+      },
       "expect": {
         "one_of": [
           {

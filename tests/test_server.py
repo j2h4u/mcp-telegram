@@ -354,6 +354,20 @@ async def test_call_tool_emits_one_boundary_telemetry_event_with_result_metadata
     assert event["has_cursor"] is True
     assert event["page_depth"] == 3
     assert event["has_filter"] is True
+    assert event["tool_capability"] == "list_dialogs"
+    assert event["contract_version"] == 1
+
+
+def test_conversation_changes_telemetry_keeps_stable_capability() -> None:
+    event = server._telemetry_event(
+        tool_name="list_conversation_changes",
+        outcome="success",
+        duration_ms=1.0,
+        result=None,
+    )
+    assert event["tool_name"] == "list_conversation_changes"
+    assert event["tool_capability"] == "conversation_changes"
+    assert event["contract_version"] == 1
 
 
 @pytest.mark.asyncio
@@ -522,14 +536,13 @@ def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
     expected_titles = {
         "list_dialogs": "List Dialogs",
         "list_topics": "List Topics",
-        "list_important_events": "Important Events",
+        "list_conversation_changes": "Conversation Changes",
         "list_messages": "List Messages",
         "search_messages": "Search Messages",
         "get_usage_stats": "Usage Stats",
         "get_dialog_stats": "Dialog Stats",
         "mark_dialog_for_sync": "Mark Sync",
         "get_sync_status": "Sync Status",
-        "get_sync_alerts": "Sync Alerts",
         "get_my_recent_activity": "Recent Activity",
         "get_inbox": "Inbox",
         "get_entity_info": "Entity Info",
@@ -1002,24 +1015,19 @@ def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
         property_fields=("title_content",),
     )
 
-    sync_alerts_schema = server.tool_by_name["get_sync_alerts"].output_schema
-    assert sync_alerts_schema is not None
+    changes_schema = server.tool_by_name["list_conversation_changes"].output_schema
+    assert changes_schema is not None
     assert_nested_item_fields(
-        sync_alerts_schema,
-        collection_name="alerts",
+        changes_schema,
+        collection_name="events",
         required_fields=("kind",),
         property_fields=(
             "message_id",
-            "deleted_at",
             "version",
-            "edit_date",
-            "access_lost_at",
-            "deleted_text",
-            "original_text",
-            "changed_text",
-            "text_provenance",
-            "text_confidence",
-            "text_status",
+            "occurred_at",
+            "access_change_cause",
+            "actor_id",
+            "text_evidence",
         ),
     )
 

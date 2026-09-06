@@ -549,6 +549,8 @@ def test_current_runtime_observations_preserve_mcp_analytics_columns(tmp_sync_db
         expected = {
             "id",
             "tool_name",
+            "tool_capability",
+            "contract_version",
             "observed_at_ms",
             "duration_ms",
             "result_count",
@@ -1697,7 +1699,7 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 55, f"_CURRENT_SCHEMA_VERSION must be 55, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 56, f"_CURRENT_SCHEMA_VERSION must be 56, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
 

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import cast
 
 from .alert_policy import incoming_human_dm_sql
-from .runtime_observations import prune_runtime_observations
+from .runtime_observations import prune_runtime_observations, tool_telemetry_identity
 from .sync_db import _CONVERSATION_HISTORY_TRIGGERS_V54
 
 EXPECTED_TELEMETRY = 1_271
@@ -20,7 +20,7 @@ EXPECTED_EDITS = 102
 EXPECTED_DELETES = 38
 EXPECTED_LOSSES = 9
 SOURCE_SCHEMA_VERSION = 50
-TARGET_SCHEMA_VERSION = 55
+TARGET_SCHEMA_VERSION = 56
 
 
 def source_fingerprint(path: Path) -> str:
@@ -132,10 +132,12 @@ def _import_telemetry(target: sqlite3.Connection, telemetry: list[tuple[object, 
             outcome,
             error_code,
         ) = row
+        capability, contract_version = tool_telemetry_identity(cast(str, tool_name))
         target.execute(
             """INSERT INTO runtime_observations(observed_at_ms,kind,runtime_instance_id,
-          operation_id,outcome,reason_code,duration_ms,tool_name,result_count,has_cursor,page_depth,
-          has_filter,error_type,source_namespace,source_event_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          operation_id,outcome,reason_code,duration_ms,tool_name,tool_capability,contract_version,
+          result_count,has_cursor,page_depth,has_filter,error_type,source_namespace,source_event_id)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 int(cast(float, timestamp) * 1000),
                 "mcp.call",
@@ -145,6 +147,8 @@ def _import_telemetry(target: sqlite3.Connection, telemetry: list[tuple[object, 
                 error_code,
                 duration_ms,
                 tool_name,
+                capability,
+                contract_version,
                 result_count,
                 has_cursor,
                 page_depth,

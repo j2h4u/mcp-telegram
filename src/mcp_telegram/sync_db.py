@@ -11,13 +11,14 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 55
+_CURRENT_SCHEMA_VERSION = 56
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
 _MESSAGE_HISTORY_MIGRATION_53 = 53
 _EVENT_NAMES_MIGRATION_54 = 54
 _ACCESS_CAUSE_MIGRATION_55 = 55
+_TOOL_CAPABILITY_MIGRATION_56 = 56
 
 logger = logging.getLogger(__name__)
 
@@ -2729,6 +2730,40 @@ def _apply_migration_55(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
+def _apply_migration_56(conn: sqlite3.Connection, current: int) -> int:
+    """Separate exact tool names from stable capability and contract identity."""
+    if current >= _TOOL_CAPABILITY_MIGRATION_56:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        column_rows = cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(runtime_observations)").fetchall())
+        columns = {str(row[1]) for row in column_rows}
+        if "tool_capability" not in columns:
+            conn.execute("ALTER TABLE runtime_observations ADD COLUMN tool_capability TEXT")
+        if "contract_version" not in columns:
+            conn.execute("ALTER TABLE runtime_observations ADD COLUMN contract_version INTEGER")
+        conn.execute(
+            """UPDATE runtime_observations
+                  SET tool_capability=CASE
+                        WHEN tool_name IN ('get_sync_alerts','list_important_events','list_conversation_changes')
+                          THEN 'conversation_changes'
+                        ELSE tool_name
+                      END,
+                      contract_version=CASE
+                        WHEN tool_name IN ('get_sync_alerts','list_important_events') THEN 0
+                        ELSE 1
+                      END
+                WHERE kind='mcp.call'
+                  AND (tool_capability IS NULL OR contract_version IS NULL)"""
+        )
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES (56, strftime('%s', 'now'))")
+        conn.commit()
+        return 56
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -2798,6 +2833,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_migration_53(conn, current)
     current = _apply_migration_54(conn, current)
     current = _apply_migration_55(conn, current)
+    current = _apply_migration_56(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
