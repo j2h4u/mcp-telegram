@@ -324,16 +324,6 @@ def _log_own_only_entity_rpc_error(conn: sqlite3.Connection, dialog_id: int, exc
         now = int(time.time())
         set_access_lost(conn, dialog_id, now, reason=type(exc).__name__)
         conn.commit()
-        logger.warning(
-            "scheduled_own_only_access_lost dialog_id=%d name=%r type=%s archived=%s hidden=%s reason=%s error=%s",
-            dialog_id,
-            log_context.name,
-            log_context.type,
-            log_context.archived,
-            log_context.hidden,
-            type(exc).__name__,
-            exc,
-        )
         return
     logger.warning(
         "scheduled_own_only_entity_error dialog_id=%d name=%r type=%s error_type=%s error=%s",

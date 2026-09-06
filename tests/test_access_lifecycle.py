@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 
 import pytest
@@ -118,24 +119,27 @@ def test_durable_event_failure_rolls_back_lifecycle() -> None:
         conn.close()
 
 
-def test_lifecycle_history_is_ordered_and_deduplicated() -> None:
+def test_lifecycle_history_and_operational_logs_are_ordered_and_deduplicated(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     conn = _db()
     try:
         conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (1, 'synced')")
         conn.execute("INSERT INTO dialogs VALUES (1, 0, 0, 1, 0, 0, 0, 0, 'x')")
         conn.commit()
 
-        assert set_access_lost(
-            conn,
-            1,
-            10,
-            evidence=AccessLossEvidence("UpdateChannelParticipant", "removed_by_admin", 99),
-        )
-        assert not set_access_lost(conn, 1, 11)
-        assert restore_access_after_revalidation(conn, 1, 12)
-        assert not restore_access_after_revalidation(conn, 1, 13)
-        conn.execute("UPDATE synced_dialogs SET status = 'syncing' WHERE dialog_id = 1")
-        assert set_access_lost(conn, 1, 14)
+        with caplog.at_level(logging.INFO, logger="mcp_telegram.access_lifecycle"):
+            assert set_access_lost(
+                conn,
+                1,
+                10,
+                evidence=AccessLossEvidence("UpdateChannelParticipant", "removed_by_admin", 99),
+            )
+            assert not set_access_lost(conn, 1, 11)
+            assert restore_access_after_revalidation(conn, 1, 12)
+            assert not restore_access_after_revalidation(conn, 1, 13)
+            conn.execute("UPDATE synced_dialogs SET status = 'syncing' WHERE dialog_id = 1")
+            assert set_access_lost(conn, 1, 14)
         assert conn.execute(
             "SELECT kind, occurred_at, reason_code, previous_status, access_change_cause, actor_id "
             "FROM conversation_history_events ORDER BY seq"
@@ -143,6 +147,12 @@ def test_lifecycle_history_is_ordered_and_deduplicated() -> None:
             ("access_lost", 10, "UpdateChannelParticipant", "synced", "removed_by_admin", 99),
             ("access_restored", 12, None, "access_lost", None, None),
             ("access_lost", 14, None, "syncing", None, None),
+        ]
+        lifecycle_logs = [record.getMessage() for record in caplog.records]
+        assert lifecycle_logs == [
+            "access_lost dialog_id=1 reason_code=UpdateChannelParticipant",
+            "access_restored dialog_id=1 total_messages=None",
+            "access_lost dialog_id=1 reason_code=None",
         ]
     finally:
         conn.close()

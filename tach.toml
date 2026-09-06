@@ -148,7 +148,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.daemon_entity_info"
 layer = "application"
-depends_on = ["mcp_telegram.daemon_log_context", "mcp_telegram.entity_store", "mcp_telegram.models", "mcp_telegram.telegram_access", "mcp_telegram.telethon_dialog"]
+depends_on = ["mcp_telegram.entity_store", "mcp_telegram.models", "mcp_telegram.telegram_access", "mcp_telegram.telethon_dialog"]
 
 [[modules]]
 path = "mcp_telegram.daemon_log_context"

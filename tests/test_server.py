@@ -640,6 +640,55 @@ def test_http_server_defaults_to_loopback_bind() -> None:
     assert default == "127.0.0.1"
 
 
+def test_fast_successful_tool_completion_is_debug_only(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(server.time, "monotonic", lambda: 10.1)
+    monkeypatch.setattr(server, "_SLOW_TOOL_CALL_SECONDS", 1.0)
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.server"):
+        server._project_tool_result("list_dialogs", ToolResult(), server._CallTelemetry(), 10.0)
+
+    records = [record for record in caplog.records if "call_tool[list_dialogs]" in record.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno == logging.DEBUG
+    assert "slow_completed" not in records[0].getMessage()
+
+
+def test_slow_successful_tool_completion_is_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(server.time, "monotonic", lambda: 11.001)
+    monkeypatch.setattr(server, "_SLOW_TOOL_CALL_SECONDS", 1.0)
+    with caplog.at_level(logging.INFO, logger="mcp_telegram.server"):
+        server._project_tool_result("list_dialogs", ToolResult(), server._CallTelemetry(), 10.0)
+
+    records = [record for record in caplog.records if "call_tool[list_dialogs]" in record.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert "slow_completed" in records[0].getMessage()
+    assert "threshold_s=1.000" in records[0].getMessage()
+
+
+def test_expected_tool_error_completion_remains_info(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(server.time, "monotonic", lambda: 10.1)
+    monkeypatch.setattr(server, "_SLOW_TOOL_CALL_SECONDS", 1.0)
+    with caplog.at_level(logging.INFO, logger="mcp_telegram.server"):
+        server._project_tool_result(
+            "list_dialogs",
+            ToolResult(is_error=True, error_code="invalid_query"),
+            server._CallTelemetry(),
+            10.0,
+        )
+
+    records = [record for record in caplog.records if "call_tool[list_dialogs]" in record.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    assert "tool_error" in records[0].getMessage()
+    assert "error=invalid_query" in records[0].getMessage()
+
+
 def test_http_server_rejects_non_loopback_bind_without_explicit_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

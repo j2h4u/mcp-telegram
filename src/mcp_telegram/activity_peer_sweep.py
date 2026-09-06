@@ -343,14 +343,8 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, 
             early_result=_access_skip_result(rpc_calls=rpc_calls),
         )
     except ACCESS_LOST_ERRORS as exc:
-        set_access_lost(request.conn, request.dialog_id, int(time.time()))
+        set_access_lost(request.conn, request.dialog_id, int(time.time()), reason=type(exc).__name__)
         request.conn.commit()
-        logger.info(
-            "sweep_peer_once_access_lost dialog_id=%r error_type=%s rpc_duration_s=%.3f",
-            request.dialog_id,
-            type(exc).__name__,
-            _elapsed_s(search_started_at),
-        )
         return _SearchOutcome(
             result=None,
             rpc_duration_s=_elapsed_s(search_started_at),

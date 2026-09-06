@@ -590,7 +590,9 @@ async def test_get_entity_info_entity_not_found() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_entity_info_access_lost_log_has_dialog_context(caplog: pytest.LogCaptureFixture) -> None:
+async def test_get_entity_info_access_lost_is_returned_without_duplicate_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     entity_id = -1000000009101
     channel_name = "Archived Fixture Channel"
     conn = _make_db()
@@ -619,15 +621,7 @@ async def test_get_entity_info_access_lost_log_has_dialog_context(caplog: pytest
 
     assert r["ok"] is False
     assert r["error"] == "telegram_api_error"
-    records = [record for record in caplog.records if "entity_info_access_lost" in record.message]
-    assert len(records) == 1
-    assert f"entity_id={entity_id}" in records[0].message
-    assert f"name='{channel_name}'" in records[0].message
-    assert "type=channel" in records[0].message
-    assert "archived=True" in records[0].message
-    assert "hidden=True" in records[0].message
-    assert "reason=ChannelPrivateError" in records[0].message
-    assert records[0].exc_info is None
+    assert not caplog.records
 
 
 @pytest.mark.asyncio

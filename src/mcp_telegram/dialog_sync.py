@@ -815,12 +815,7 @@ class DialogReconciliationWorker:
                 # semantics in class docstring). Do NOT retry the same dialog —
                 # its needs_refresh=1 will be picked up by the next hourly cycle.
             except ACCESS_LOST_ERRORS as exc:
-                logger.warning(
-                    "recon_light_access_lost dialog_id=%d — %s",
-                    dialog_id,
-                    type(exc).__name__,
-                )
-                set_access_lost(self._conn, dialog_id, int(time.time()))
+                set_access_lost(self._conn, dialog_id, int(time.time()), reason=type(exc).__name__)
                 self._conn.commit()
                 # do not increment count — refresh did not succeed
             except PeerIdInvalidError:

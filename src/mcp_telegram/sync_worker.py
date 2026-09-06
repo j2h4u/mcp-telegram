@@ -285,9 +285,8 @@ class FullSyncWorker:
                 await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
             return sync_progress, False
         except ACCESS_LOST_ERRORS as exc:
-            logger.warning("access_lost dialog_id=%d — %s: %s", dialog_id, type(exc).__name__, exc)
             now = int(time.time())
-            set_access_lost(self._conn, dialog_id, now)
+            set_access_lost(self._conn, dialog_id, now, reason=type(exc).__name__)
             self._conn.commit()
             return sync_progress, True
         except RPCError as exc:
