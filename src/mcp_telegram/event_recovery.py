@@ -20,7 +20,7 @@ EXPECTED_EDITS = 102
 EXPECTED_DELETES = 38
 EXPECTED_LOSSES = 9
 SOURCE_SCHEMA_VERSION = 50
-TARGET_SCHEMA_VERSION = 54
+TARGET_SCHEMA_VERSION = 55
 
 
 def source_fingerprint(path: Path) -> str:
@@ -227,7 +227,7 @@ def _recover(
     if source.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
         raise RuntimeError("backup is corrupt")
     if target.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] != TARGET_SCHEMA_VERSION:
-        raise RuntimeError("target must be schema 54")
+        raise RuntimeError(f"target must be schema {TARGET_SCHEMA_VERSION}")
     _verify_history(source, target)
     telemetry, losses = _inventory(source)
     now_ms = int(time.time() * 1000)

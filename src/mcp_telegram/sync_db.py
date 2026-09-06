@@ -11,12 +11,13 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 54
+_CURRENT_SCHEMA_VERSION = 55
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
 _MESSAGE_HISTORY_MIGRATION_53 = 53
 _EVENT_NAMES_MIGRATION_54 = 54
+_ACCESS_CAUSE_MIGRATION_55 = 55
 
 logger = logging.getLogger(__name__)
 
@@ -2702,6 +2703,32 @@ def _apply_migration_54(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
+def _apply_migration_55(conn: sqlite3.Connection, current: int) -> int:
+    """Persist Telegram's explanation for future access-loss transitions."""
+    if current >= _ACCESS_CAUSE_MIGRATION_55:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        column_rows = cast(
+            list[tuple[object, ...]],
+            conn.execute("PRAGMA table_info(conversation_history_events)").fetchall(),
+        )
+        columns = {str(row[1]) for row in column_rows}
+        if "access_change_cause" not in columns:
+            conn.execute(
+                "ALTER TABLE conversation_history_events ADD COLUMN access_change_cause TEXT "
+                "CHECK(access_change_cause IN ('self_left','removed_by_admin','banned_by_admin','unknown'))"
+            )
+        if "actor_id" not in columns:
+            conn.execute("ALTER TABLE conversation_history_events ADD COLUMN actor_id INTEGER")
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES (55, strftime('%s', 'now'))")
+        conn.commit()
+        return 55
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -2770,6 +2797,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_migration_52(conn, current)
     current = _apply_migration_53(conn, current)
     current = _apply_migration_54(conn, current)
+    current = _apply_migration_55(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

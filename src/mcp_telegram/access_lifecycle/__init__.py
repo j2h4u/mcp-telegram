@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from itertools import count
 from typing import cast
 
@@ -13,6 +14,13 @@ from ..hydration_queue import HydrationPriority, HydrationQueueRepository
 from ..messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
 
 _SAVEPOINTS = count()
+
+
+@dataclass(frozen=True, slots=True)
+class AccessLossEvidence:
+    reason_code: str
+    access_change_cause: str
+    actor_id: int
 
 
 def _purge_hydration_jobs(conn: sqlite3.Connection, dialog_id: int) -> None:
@@ -34,7 +42,14 @@ def _lifecycle_savepoint(conn: sqlite3.Connection) -> Iterator[None]:
         conn.execute(f"RELEASE SAVEPOINT {name}")
 
 
-def set_access_lost(conn: sqlite3.Connection, dialog_id: int, now: int, *, reason: str | None = None) -> bool:
+def set_access_lost(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    now: int,
+    *,
+    reason: str | None = None,
+    evidence: AccessLossEvidence | None = None,
+) -> bool:
     """Atomically mark a peer inaccessible and hide its local snapshot."""
     with _lifecycle_savepoint(conn):
         row = cast(
@@ -58,9 +73,17 @@ def set_access_lost(conn: sqlite3.Connection, dialog_id: int, now: int, *, reaso
         if previous_status != "access_lost":
             conn.execute(
                 """INSERT INTO conversation_history_events(
-                       kind, occurred_at, time_basis, dialog_id, reason_code, previous_status
-                   ) VALUES ('access_lost', ?, 'observed', ?, ?, ?)""",
-                (now, dialog_id, reason, previous_status),
+                       kind, occurred_at, time_basis, dialog_id, reason_code, previous_status,
+                       access_change_cause, actor_id
+                   ) VALUES ('access_lost', ?, 'observed', ?, ?, ?, ?, ?)""",
+                (
+                    now,
+                    dialog_id,
+                    evidence.reason_code if evidence is not None else reason,
+                    previous_status,
+                    evidence.access_change_cause if evidence is not None else None,
+                    evidence.actor_id if evidence is not None else None,
+                ),
             )
             return True
     return False
@@ -132,6 +155,7 @@ def stamp_access_revalidation(conn: sqlite3.Connection, dialog_id: int, checked_
 
 
 __all__ = [
+    "AccessLossEvidence",
     "due_access_revalidations",
     "restore_access_after_revalidation",
     "set_access_lost",

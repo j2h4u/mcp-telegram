@@ -42,7 +42,10 @@ def _db() -> sqlite3.Connection:
             dialog_id INTEGER NOT NULL,
             message_id INTEGER,
             version INTEGER,
-            daemon_event_id INTEGER
+            daemon_event_id INTEGER,
+            reason_code TEXT,
+            access_change_cause TEXT,
+            actor_id INTEGER
         );
         CREATE UNIQUE INDEX sync_alert_deleted ON conversation_history_events(dialog_id, message_id) WHERE kind = 'deleted_message';
         CREATE UNIQUE INDEX sync_alert_edit ON conversation_history_events(dialog_id, message_id, version) WHERE kind = 'edit';

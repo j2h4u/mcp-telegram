@@ -18,6 +18,7 @@ import logging
 import sqlite3
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TypedDict, cast
@@ -25,11 +26,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from telethon.tl.types import (  # type: ignore[import-untyped]
+    ChannelParticipantBanned,
+    ChatBannedRights,
     DialogPeer,
     PeerChannel,
     PeerChat,
     PeerUser,
     UpdateChannel,
+    UpdateChannelParticipant,
     UpdateChat,
     UpdateDialogPinned,
     UpdateDialogUnreadMark,
@@ -44,6 +48,7 @@ from mcp_telegram.event_handlers import (
     EventHandlerManager,
     _ChannelChatUpdateLike,
     _ChannelInboxReadUpdateLike,
+    _ChannelParticipantUpdateLike,
     _ChatUpdateLike,
     _InboxReadUpdateLike,
     _NewMessageEvent,
@@ -157,6 +162,93 @@ def _dialogs_count(conn: _SQLiteConnection) -> int:
     row = cast(tuple[object, ...] | None, conn.execute("SELECT COUNT(*) FROM dialogs").fetchone())
     assert row is not None
     return int(tuple(row)[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("actor_id", "expected_cause"),
+    [(42, "self_left"), (99, "removed_by_admin")],
+)
+async def test_self_participant_loss_records_actor_and_cause(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+    actor_id: int,
+    expected_cause: str,
+) -> None:
+    channel_id = 12345
+    dialog_id = int(get_peer_id(PeerChannel(channel_id)))
+    _enroll_synced(sync_db, dialog_id)
+    _insert_dialog(sync_db, dialog_id)
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    manager.set_self_id(42)
+    update = cast(
+        _ChannelParticipantUpdateLike,
+        UpdateChannelParticipant(
+            channel_id=channel_id,
+            date=datetime(2026, 9, 6, tzinfo=UTC),
+            actor_id=actor_id,
+            user_id=42,
+            qts=1,
+            prev_participant=None,
+            new_participant=None,
+        ),
+    )
+
+    await manager.on_raw_channel_participant(update)
+
+    assert sync_db.execute(
+        "SELECT status,access_lost_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == ("access_lost", 1788652800)
+    assert sync_db.execute(
+        "SELECT reason_code,access_change_cause,actor_id FROM conversation_history_events "
+        "WHERE dialog_id=? AND kind='access_lost'",
+        (dialog_id,),
+    ).fetchone() == ("UpdateChannelParticipant", expected_cause, actor_id)
+    assert dialog_id not in manager._synced_dialog_ids
+
+
+def test_self_participant_ban_is_classified_separately() -> None:
+    update = cast(
+        _ChannelParticipantUpdateLike,
+        SimpleNamespace(
+            actor_id=99,
+            new_participant=ChannelParticipantBanned(
+                peer=PeerUser(42),
+                kicked_by=99,
+                date=datetime(2026, 9, 6, tzinfo=UTC),
+                banned_rights=ChatBannedRights(until_date=None, view_messages=True),
+            ),
+        ),
+    )
+
+    assert EventHandlerManager._access_loss_cause(update, 42) == "banned_by_admin"
+
+
+@pytest.mark.asyncio
+async def test_participant_loss_for_another_user_is_ignored(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    manager.set_self_id(42)
+    update = cast(
+        _ChannelParticipantUpdateLike,
+        UpdateChannelParticipant(
+            channel_id=12345,
+            date=datetime(2026, 9, 6, tzinfo=UTC),
+            actor_id=99,
+            user_id=77,
+            qts=1,
+            prev_participant=None,
+            new_participant=None,
+        ),
+    )
+
+    await manager.on_raw_channel_participant(update)
+
+    assert sync_db.execute("SELECT COUNT(*) FROM conversation_history_events").fetchone() == (0,)
 
 
 def _last_event_at(conn: _SQLiteConnection, dialog_id: int) -> int | None:
@@ -840,7 +932,7 @@ def test_register_attaches_three_new_handlers(
     """Dialog, scheduled, and topic handlers bring the registration total to 14."""
     mgr = EventHandlerManager(mock_client, sync_db, shutdown_event, mock_client.get_input_entity)
     mgr.register()
-    assert mock_client.add_event_handler.call_count == 13
+    assert mock_client.add_event_handler.call_count == 14
 
 
 def test_unregister_detaches_all_new_handlers(

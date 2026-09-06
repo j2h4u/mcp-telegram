@@ -588,7 +588,10 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             dialog_id INTEGER NOT NULL,
             message_id INTEGER,
             version INTEGER,
-            daemon_event_id INTEGER
+            daemon_event_id INTEGER,
+            reason_code TEXT,
+            access_change_cause TEXT,
+            actor_id INTEGER
         );
         CREATE UNIQUE INDEX sync_alert_deleted_source ON conversation_history_events(dialog_id, message_id) WHERE kind = 'deleted_message';
         CREATE UNIQUE INDEX sync_alert_edit_source ON conversation_history_events(dialog_id, message_id, version) WHERE kind = 'edit';
