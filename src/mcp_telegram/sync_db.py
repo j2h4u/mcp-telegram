@@ -11,8 +11,12 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 53
+_CURRENT_SCHEMA_VERSION = 54
 _SCHEMA_VERSION_WITH_FTS = 3
+_EVENT_STORE_MIGRATION_51 = 51
+_MESSAGE_ORIGIN_MIGRATION_52 = 52
+_MESSAGE_HISTORY_MIGRATION_53 = 53
+_EVENT_NAMES_MIGRATION_54 = 54
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +289,93 @@ _SYNC_ALERT_V51_TRIGGERS = (
           INSERT OR IGNORE INTO sync_alert_events(kind, occurred_at, dialog_id, message_id)
           VALUES ('deleted_message', NEW.deleted_at, NEW.dialog_id, NEW.message_id);
         END""",
+)
+
+_RUNTIME_OBSERVATIONS_V54_DDL = """
+CREATE TABLE runtime_observations_v54 (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    observed_at_ms      INTEGER NOT NULL,
+    kind                TEXT NOT NULL,
+    runtime_instance_id TEXT NOT NULL,
+    operation_id        TEXT,
+    outcome             TEXT,
+    reason_code         TEXT,
+    dialog_id           INTEGER,
+    duration_ms         REAL,
+    tool_name           TEXT,
+    result_count        INTEGER,
+    has_cursor          INTEGER,
+    page_depth          INTEGER,
+    has_filter          INTEGER,
+    error_type          TEXT,
+    source_namespace    TEXT,
+    source_event_id     INTEGER,
+    payload_json        TEXT NOT NULL DEFAULT '{}'
+)
+"""
+
+_CONVERSATION_HISTORY_EVENTS_V54_DDL = """
+CREATE TABLE conversation_history_events_v54 (
+    seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind             TEXT NOT NULL CHECK (kind IN ('deleted_message', 'edit', 'access_lost', 'access_restored')),
+    occurred_at      INTEGER NOT NULL,
+    time_basis       TEXT NOT NULL CHECK (time_basis IN ('telegram', 'observed')),
+    dialog_id        INTEGER NOT NULL,
+    message_id       INTEGER,
+    version          INTEGER,
+    reason_code      TEXT,
+    previous_status  TEXT,
+    source_namespace TEXT,
+    source_event_id  INTEGER,
+    CHECK (
+        (kind = 'deleted_message' AND message_id IS NOT NULL AND version IS NULL)
+        OR (kind = 'edit' AND message_id IS NOT NULL AND version IS NOT NULL)
+        OR (kind IN ('access_lost', 'access_restored') AND message_id IS NULL AND version IS NULL)
+    )
+)
+"""
+
+_CONVERSATION_HISTORY_INDEXES_V54_DDL = (
+    "CREATE UNIQUE INDEX idx_conversation_history_deleted ON conversation_history_events(dialog_id, message_id) WHERE kind = 'deleted_message'",
+    "CREATE UNIQUE INDEX idx_conversation_history_edit ON conversation_history_events(dialog_id, message_id, version) WHERE kind = 'edit'",
+    "CREATE INDEX idx_conversation_history_lifecycle ON conversation_history_events(dialog_id, seq DESC) WHERE kind IN ('access_lost', 'access_restored')",
+    "CREATE UNIQUE INDEX idx_conversation_history_source ON conversation_history_events(source_namespace, source_event_id) WHERE source_namespace IS NOT NULL AND source_event_id IS NOT NULL",
+)
+
+_EVENT_RECOVERY_LEDGER_DDL = """
+CREATE TABLE event_recovery_ledger (
+    source_fingerprint TEXT PRIMARY KEY,
+    imported_at INTEGER NOT NULL,
+    legacy_observation_count INTEGER NOT NULL,
+    enriched_history_count INTEGER NOT NULL
+)
+"""
+
+_CONVERSATION_HISTORY_TRIGGERS_V54 = (
+    f"""CREATE TRIGGER conversation_history_message_insert_deleted
+        AFTER INSERT ON messages
+        WHEN NEW.is_deleted = 1 AND NEW.deleted_at IS NOT NULL
+         AND {_HUMAN_DM_ALERT_PREDICATE}
+        BEGIN
+          INSERT OR IGNORE INTO conversation_history_events(
+              kind, occurred_at, time_basis, dialog_id, message_id
+          ) VALUES ('deleted_message', NEW.deleted_at, 'observed', NEW.dialog_id, NEW.message_id);
+        END""",
+    f"""CREATE TRIGGER conversation_history_message_delete_transition
+        AFTER UPDATE OF is_deleted, deleted_at ON messages
+        WHEN OLD.is_deleted = 0 AND NEW.is_deleted = 1 AND NEW.deleted_at IS NOT NULL
+         AND {_HUMAN_DM_ALERT_PREDICATE}
+        BEGIN
+          INSERT OR IGNORE INTO conversation_history_events(
+              kind, occurred_at, time_basis, dialog_id, message_id
+          ) VALUES ('deleted_message', NEW.deleted_at, 'observed', NEW.dialog_id, NEW.message_id);
+        END""",
+    """CREATE TRIGGER conversation_history_no_update
+        BEFORE UPDATE ON conversation_history_events
+        BEGIN SELECT RAISE(ABORT, 'conversation history is append-only'); END""",
+    """CREATE TRIGGER conversation_history_no_delete
+        BEFORE DELETE ON conversation_history_events
+        BEGIN SELECT RAISE(ABORT, 'conversation history is append-only'); END""",
 )
 
 _SYNC_ALERT_EVENTS_DDL = """
@@ -918,8 +1009,13 @@ def _schema_ready(conn: sqlite3.Connection) -> bool:
     if row is None or str(row[0]).lower() != "wal":
         return False
     try:
-        row = cast(tuple[object | None, ...] | None, conn.execute("SELECT MAX(version) FROM schema_version").fetchone())
-        return _row_first_int(row) >= _CURRENT_SCHEMA_VERSION
+        row = cast(
+            tuple[object | None, ...] | None,
+            conn.execute("SELECT MAX(version), COUNT(DISTINCT version) FROM schema_version").fetchone(),
+        )
+        return bool(
+            row and _row_first_int(row) >= _CURRENT_SCHEMA_VERSION and int(cast(int, row[1])) == _CURRENT_SCHEMA_VERSION
+        )
     except sqlite3.OperationalError:
         return False
 
@@ -956,7 +1052,7 @@ def _apply_migration(
             else:
                 conn.execute(stmt)
         conn.execute(
-            "INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))",
+            "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
             (version,),
         )
         conn.commit()
@@ -2370,7 +2466,7 @@ def _finish_migration_51(conn: sqlite3.Connection) -> None:
 
 def _apply_migration_51(conn: sqlite3.Connection, current: int) -> int:
     """Atomically cut over runtime observations and the focused alert policy."""
-    if current >= _CURRENT_SCHEMA_VERSION:
+    if current >= _EVENT_STORE_MIGRATION_51:
         return current
     table_rows = cast(
         list[tuple[object]], conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
@@ -2401,7 +2497,7 @@ def _apply_migration_51(conn: sqlite3.Connection, current: int) -> int:
 
 def _apply_migration_52(conn: sqlite3.Connection, current: int) -> int:
     """Allow honest legacy origins without guessing existing row provenance."""
-    if current >= _CURRENT_SCHEMA_VERSION:
+    if current >= _MESSAGE_ORIGIN_MIGRATION_52:
         return current
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -2426,7 +2522,7 @@ def _apply_migration_52(conn: sqlite3.Connection, current: int) -> int:
 
 def _apply_migration_53(conn: sqlite3.Connection, current: int) -> int:
     """Retain old message text only when it backs a durable human-DM edit alert."""
-    if current >= _CURRENT_SCHEMA_VERSION:
+    if current >= _MESSAGE_HISTORY_MIGRATION_53:
         return current
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -2449,7 +2545,164 @@ def _apply_migration_53(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
-def _apply_migrations(conn: sqlite3.Connection) -> None:
+def _migrate_runtime_lifecycle_events_v54(conn: sqlite3.Connection) -> int:
+    conn.execute(
+        """UPDATE conversation_history_events_v54 AS h
+              SET reason_code = (
+                      SELECT r.reason_code FROM runtime_events r
+                       WHERE r.kind = 'sync.' || h.kind AND r.dialog_id = h.dialog_id
+                         AND CAST(r.observed_at_ms / 1000 AS INTEGER) = h.occurred_at
+                       ORDER BY r.id DESC LIMIT 1
+                  ),
+                  previous_status = (
+                      SELECT json_extract(r.payload_json, '$.previous_status') FROM runtime_events r
+                       WHERE r.kind = 'sync.' || h.kind AND r.dialog_id = h.dialog_id
+                         AND CAST(r.observed_at_ms / 1000 AS INTEGER) = h.occurred_at
+                       ORDER BY r.id DESC LIMIT 1
+                  )
+            WHERE h.kind IN ('access_lost', 'access_restored')
+              AND EXISTS (
+                  SELECT 1 FROM runtime_events r
+                   WHERE r.kind = 'sync.' || h.kind AND r.dialog_id = h.dialog_id
+                     AND CAST(r.observed_at_ms / 1000 AS INTEGER) = h.occurred_at
+              )"""
+    )
+    predicate = """r.kind IN ('sync.access_lost', 'sync.access_restored')
+                  AND r.dialog_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sync_alert_events h
+                       WHERE h.kind = substr(r.kind, 6)
+                         AND h.dialog_id = r.dialog_id
+                         AND h.occurred_at = CAST(r.observed_at_ms / 1000 AS INTEGER)
+                  )"""
+    conn.execute(
+        f"""INSERT INTO conversation_history_events_v54(
+               kind, occurred_at, time_basis, dialog_id, reason_code, previous_status
+           )
+           SELECT substr(r.kind, 6), CAST(r.observed_at_ms / 1000 AS INTEGER), 'observed',
+                  r.dialog_id, r.reason_code, json_extract(r.payload_json, '$.previous_status')
+             FROM runtime_events r
+            WHERE {predicate}
+            ORDER BY r.observed_at_ms, r.id"""
+    )
+    return cast(int, conn.execute(f"SELECT COUNT(*) FROM runtime_events r WHERE {predicate}").fetchone()[0])
+
+
+def _apply_migration_54(conn: sqlite3.Connection, current: int) -> int:
+    """Name event stores by durability and make conversation history append-only."""
+    if current >= _EVENT_NAMES_MIGRATION_54:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        runtime_high_water = _sequence_high_water(conn, "runtime_events", "id")
+        history_high_water = _sequence_high_water(conn, "sync_alert_events", "seq")
+        for trigger in (
+            "sync_alert_events_message_insert_deleted",
+            "sync_alert_events_message_delete_transition",
+            "sync_alert_events_message_edit",
+            "sync_alert_events_access_lost",
+        ):
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        conn.execute(_RUNTIME_OBSERVATIONS_V54_DDL)
+        conn.execute(
+            """INSERT INTO runtime_observations_v54
+               SELECT id, observed_at_ms, kind, runtime_instance_id, operation_id, outcome,
+                      reason_code, dialog_id, duration_ms, tool_name, result_count,
+                      has_cursor, page_depth, has_filter, error_type, NULL, NULL, payload_json
+                 FROM runtime_events
+                WHERE kind NOT IN ('sync.access_lost', 'sync.access_restored')"""
+        )
+        conn.execute(_CONVERSATION_HISTORY_EVENTS_V54_DDL)
+        conn.execute(
+            """INSERT INTO conversation_history_events_v54(
+                   seq, kind, occurred_at, time_basis, dialog_id, message_id, version
+               )
+               SELECT seq, kind, occurred_at,
+                      CASE WHEN kind = 'edit' THEN 'telegram' ELSE 'observed' END,
+                      dialog_id, message_id, version
+                 FROM sync_alert_events"""
+        )
+        runtime_lifecycle_count = _migrate_runtime_lifecycle_events_v54(conn)
+        runtime_count = cast(
+            int,
+            conn.execute(
+                "SELECT COUNT(*) FROM runtime_events WHERE kind NOT IN ('sync.access_lost', 'sync.access_restored')"
+            ).fetchone()[0],
+        )
+        copied_runtime_count = cast(int, conn.execute("SELECT COUNT(*) FROM runtime_observations_v54").fetchone()[0])
+        history_count = cast(int, conn.execute("SELECT COUNT(*) FROM sync_alert_events").fetchone()[0])
+        copied_history_count = cast(
+            int, conn.execute("SELECT COUNT(*) FROM conversation_history_events_v54").fetchone()[0]
+        )
+        if runtime_count != copied_runtime_count or history_count + runtime_lifecycle_count != copied_history_count:
+            raise RuntimeError("event store migration count mismatch")
+        conn.execute("DROP TABLE runtime_events")
+        conn.execute("ALTER TABLE runtime_observations_v54 RENAME TO runtime_observations")
+        conn.execute("DROP TABLE sync_alert_events")
+        conn.execute("ALTER TABLE conversation_history_events_v54 RENAME TO conversation_history_events")
+        conn.execute(
+            "DELETE FROM sqlite_sequence WHERE name IN ('runtime_observations', 'conversation_history_events')"
+        )
+        conn.execute(
+            "INSERT INTO sqlite_sequence(name, seq) VALUES ('runtime_observations', ?)",
+            (runtime_high_water,),
+        )
+        migrated_history_max = cast(
+            int, conn.execute("SELECT COALESCE(MAX(seq), 0) FROM conversation_history_events").fetchone()[0]
+        )
+        conn.execute(
+            "INSERT INTO sqlite_sequence(name, seq) VALUES ('conversation_history_events', ?)",
+            (max(history_high_water, migrated_history_max),),
+        )
+        conn.execute("CREATE INDEX idx_runtime_observations_time ON runtime_observations(observed_at_ms DESC, id DESC)")
+        conn.execute(
+            "CREATE INDEX idx_runtime_observations_kind_time ON runtime_observations(kind, observed_at_ms DESC, id DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX idx_runtime_observations_dialog_time ON runtime_observations(dialog_id, observed_at_ms DESC, id DESC) WHERE dialog_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_runtime_observations_source ON runtime_observations(source_namespace, source_event_id) WHERE source_namespace IS NOT NULL AND source_event_id IS NOT NULL"
+        )
+        for statement in _CONVERSATION_HISTORY_INDEXES_V54_DDL:
+            conn.execute(statement)
+        conn.execute(_EVENT_RECOVERY_LEDGER_DDL)
+        conn.execute(
+            """INSERT OR REPLACE INTO daemon_state(key, value)
+               SELECT 'runtime_observations_history_started_at_ms', value
+                 FROM daemon_state WHERE key = 'runtime_events_history_started_at_ms'"""
+        )
+        conn.execute(
+            """INSERT OR REPLACE INTO daemon_state(key, value)
+               SELECT 'runtime_observations_last_cap_truncation_ms', value
+                 FROM daemon_state WHERE key = 'runtime_events_last_cap_truncation_ms'"""
+        )
+        conn.execute(
+            "DELETE FROM daemon_state WHERE key IN ('runtime_events_history_started_at_ms', 'runtime_events_last_cap_truncation_ms')"
+        )
+        conn.execute(
+            """CREATE TABLE schema_version_v54 (
+                   version INTEGER PRIMARY KEY,
+                   applied_at INTEGER NOT NULL
+               )"""
+        )
+        conn.execute(
+            """INSERT INTO schema_version_v54(version, applied_at)
+               SELECT version, MIN(applied_at) FROM schema_version GROUP BY version"""
+        )
+        conn.execute("INSERT INTO schema_version_v54 VALUES (54, strftime('%s', 'now'))")
+        conn.execute("DROP TABLE schema_version")
+        conn.execute("ALTER TABLE schema_version_v54 RENAME TO schema_version")
+        for statement in _CONVERSATION_HISTORY_TRIGGERS_V54:
+            conn.execute(statement)
+        conn.commit()
+        return 54
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
         conn.execute("PRAGMA journal_mode=WAL")
@@ -2496,9 +2749,27 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_48(conn, current)
     current = _apply_migration_49(conn, current)
     current = _apply_migration_50(conn, current)
+    # A schema-version ledger can be manually damaged while the v54 tables
+    # remain intact. Never replay the destructive event-store migrations over
+    # that already-current physical schema; repair only the ledger.
+    v54_tables = {
+        str(item[0])
+        for item in cast(
+            list[tuple[object]], conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        )
+    }
+    if {"runtime_observations", "conversation_history_events", "event_recovery_ledger"} <= v54_tables:
+        for version in range(51, 55):
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
+                (version,),
+            )
+        conn.commit()
+        current = 54
     current = _apply_migration_51(conn, current)
     current = _apply_migration_52(conn, current)
     current = _apply_migration_53(conn, current)
+    current = _apply_migration_54(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

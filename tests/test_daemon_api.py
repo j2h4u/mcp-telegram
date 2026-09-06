@@ -44,8 +44,8 @@ from mcp_telegram.reading.sqlite_projection import (
     _build_list_messages_query,
     _ListMessagesDbRequest,
 )
-from mcp_telegram.runtime_events import record_runtime_event
-from mcp_telegram.sync_db import _RUNTIME_EVENTS_DDL, ensure_sync_schema
+from mcp_telegram.runtime_observations import record_runtime_observation
+from mcp_telegram.sync_db import _RUNTIME_OBSERVATIONS_V54_DDL, ensure_sync_schema
 from mcp_telegram.sync_read_model import compute_sync_coverage as _compute_sync_coverage
 from mcp_telegram.telethon_dialog import classify_dialog_type
 from mcp_telegram.topics.contracts import TopicFact
@@ -581,7 +581,7 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             occurred_at INTEGER NOT NULL,
             payload_json TEXT NOT NULL DEFAULT '{}'
         );
-        CREATE TABLE sync_alert_events (
+        CREATE TABLE conversation_history_events (
             seq INTEGER PRIMARY KEY AUTOINCREMENT,
             kind TEXT NOT NULL,
             occurred_at INTEGER NOT NULL,
@@ -590,27 +590,27 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             version INTEGER,
             daemon_event_id INTEGER
         );
-        CREATE UNIQUE INDEX sync_alert_deleted_source ON sync_alert_events(dialog_id, message_id) WHERE kind = 'deleted_message';
-        CREATE UNIQUE INDEX sync_alert_edit_source ON sync_alert_events(dialog_id, message_id, version) WHERE kind = 'edit';
-        CREATE UNIQUE INDEX sync_alert_access_source ON sync_alert_events(daemon_event_id) WHERE kind = 'access_lost';
+        CREATE UNIQUE INDEX sync_alert_deleted_source ON conversation_history_events(dialog_id, message_id) WHERE kind = 'deleted_message';
+        CREATE UNIQUE INDEX sync_alert_edit_source ON conversation_history_events(dialog_id, message_id, version) WHERE kind = 'edit';
+        CREATE UNIQUE INDEX sync_alert_access_source ON conversation_history_events(daemon_event_id) WHERE kind = 'access_lost';
         CREATE TRIGGER sync_alert_message_insert_deleted AFTER INSERT ON messages
         WHEN NEW.is_deleted = 1 AND NEW.deleted_at IS NOT NULL BEGIN
-            INSERT OR IGNORE INTO sync_alert_events(kind, occurred_at, dialog_id, message_id)
+            INSERT OR IGNORE INTO conversation_history_events(kind, occurred_at, dialog_id, message_id)
             VALUES ('deleted_message', NEW.deleted_at, NEW.dialog_id, NEW.message_id);
         END;
         CREATE TRIGGER sync_alert_message_delete_transition AFTER UPDATE OF is_deleted, deleted_at ON messages
         WHEN OLD.is_deleted = 0 AND NEW.is_deleted = 1 AND NEW.deleted_at IS NOT NULL BEGIN
-            INSERT OR IGNORE INTO sync_alert_events(kind, occurred_at, dialog_id, message_id)
+            INSERT OR IGNORE INTO conversation_history_events(kind, occurred_at, dialog_id, message_id)
             VALUES ('deleted_message', NEW.deleted_at, NEW.dialog_id, NEW.message_id);
         END;
         CREATE TRIGGER sync_alert_message_edit AFTER INSERT ON message_versions
         WHEN NEW.edit_date IS NOT NULL BEGIN
-            INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, message_id, version)
+            INSERT INTO conversation_history_events(kind, occurred_at, dialog_id, message_id, version)
             VALUES ('edit', NEW.edit_date, NEW.dialog_id, NEW.message_id, NEW.version);
         END;
         CREATE TRIGGER sync_alert_access_lost AFTER INSERT ON daemon_events
         WHEN NEW.kind = 'access_lost' BEGIN
-            INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, daemon_event_id)
+            INSERT INTO conversation_history_events(kind, occurred_at, dialog_id, daemon_event_id)
             VALUES ('access_lost', NEW.occurred_at, NEW.dialog_id, NEW.id);
         END;
         """
@@ -2256,7 +2256,10 @@ async def test_list_important_events_dispatch_returns_recent_access_events(tmp_p
         "INSERT INTO entities (id, type, name, updated_at) VALUES (?, ?, ?, ?)",
         (123, "Channel", "Work Chat", 1_700_000_000),
     )
-    record_runtime_event(conn, kind="sync.access_lost", dialog_id=123, observed_at_ms=int(time.time() * 1000))
+    conn.execute(
+        "INSERT INTO conversation_history_events(kind,occurred_at,time_basis,dialog_id) VALUES ('access_lost',?,'observed',123)",
+        (int(time.time()),),
+    )
     conn.commit()
 
     result = await make_server(conn)._dispatch(
@@ -2622,7 +2625,7 @@ async def test_get_sync_alerts_access_lost() -> None:
     conn = _make_db()
     _insert_synced_dialog(conn, 1, status="access_lost", access_lost_at=1700000700)
     conn.execute(
-        "INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, daemon_event_id) "
+        "INSERT INTO conversation_history_events(kind, occurred_at, dialog_id, daemon_event_id) "
         "VALUES ('access_lost', 1700000700, 1, 1)"
     )
     server = make_server(conn)
@@ -3351,7 +3354,7 @@ def _make_db_with_entities(*, with_fts: bool = False) -> sqlite3.Connection:
     conn = _make_db(with_fts=with_fts)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_type_updated ON entities(type, updated_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_username ON entities(username)")
-    conn.execute(_RUNTIME_EVENTS_DDL)
+    conn.execute(_RUNTIME_OBSERVATIONS_V54_DDL.replace("runtime_observations_v54", "runtime_observations"))
     conn.execute("CREATE TABLE IF NOT EXISTS daemon_state (key TEXT PRIMARY KEY, value TEXT)")
     conn.commit()
     return conn
@@ -3397,7 +3400,7 @@ def _insert_telemetry(
 
     if timestamp is None:
         timestamp = _time.time()
-    record_runtime_event(
+    record_runtime_observation(
         conn,
         kind="mcp.call",
         tool_name=tool_name,
@@ -3482,7 +3485,9 @@ async def test_record_telemetry_inserts_row() -> None:
     assert result["ok"] is True
     row = cast(
         tuple[object, ...] | None,
-        conn.execute("SELECT tool_name, duration_ms, has_filter FROM runtime_events WHERE kind='mcp.call'").fetchone(),
+        conn.execute(
+            "SELECT tool_name, duration_ms, has_filter FROM runtime_observations WHERE kind='mcp.call'"
+        ).fetchone(),
     )
     assert row is not None
     assert row[0] == "ListDialogs"
@@ -3541,7 +3546,7 @@ async def test_record_telemetry_does_not_prune_on_hot_write_path() -> None:
     assert result == {"ok": True}
     tool_name_rows = cast(
         list[tuple[str]],
-        conn.execute("SELECT tool_name FROM runtime_events WHERE kind='mcp.call' ORDER BY tool_name").fetchall(),
+        conn.execute("SELECT tool_name FROM runtime_observations WHERE kind='mcp.call' ORDER BY tool_name").fetchall(),
     )
     assert [row[0] for row in tool_name_rows] == ["AtBoundary", "Current", "Expired"]
 

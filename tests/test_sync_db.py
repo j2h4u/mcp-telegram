@@ -114,14 +114,14 @@ def test_synced_dialogs_schema(tmp_sync_db_path: Path) -> None:
         conn.close()
 
 
-def test_current_schema_has_access_revalidation_and_runtime_events(tmp_sync_db_path: Path) -> None:
+def test_current_schema_has_access_revalidation_and_runtime_observations(tmp_sync_db_path: Path) -> None:
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_db(tmp_sync_db_path)
     try:
         synced_columns = {row[1] for row in _table_info(conn, "synced_dialogs")}
         assert "access_last_revalidated_at" in synced_columns
         assert "access_next_revalidate_at" in synced_columns
-        event_columns = {row[1] for row in _table_info(conn, "runtime_events")}
+        event_columns = {row[1] for row in _table_info(conn, "runtime_observations")}
         assert {"id", "kind", "dialog_id", "observed_at_ms", "payload_json"} <= event_columns
     finally:
         conn.close()
@@ -539,12 +539,12 @@ def test_schema_v4_indexes_exist(tmp_sync_db_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_current_runtime_events_preserve_mcp_analytics_columns(tmp_sync_db_path: Path) -> None:
+def test_current_runtime_observations_preserve_mcp_analytics_columns(tmp_sync_db_path: Path) -> None:
     """The unified store retains every field consumed by MCP usage analytics."""
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_db(tmp_sync_db_path)
     try:
-        rows = _table_info(conn, "runtime_events")
+        rows = _table_info(conn, "runtime_observations")
         columns = {row[1] for row in rows}
         expected = {
             "id",
@@ -558,6 +558,8 @@ def test_current_runtime_events_preserve_mcp_analytics_columns(tmp_sync_db_path:
             "outcome",
             "reason_code",
             "error_type",
+            "source_namespace",
+            "source_event_id",
             "kind",
             "runtime_instance_id",
             "operation_id",
@@ -574,7 +576,7 @@ def test_runtime_event_indexes_exist(tmp_sync_db_path: Path) -> None:
     conn = _open_db(tmp_sync_db_path)
     try:
         row = _fetchone_row(
-            conn, "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_runtime_events_kind_time'"
+            conn, "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_runtime_observations_kind_time'"
         )
         assert row is not None
     finally:
@@ -870,7 +872,7 @@ def test_migrate_legacy_databases_discards_obsolete_analytics_history(tmp_path: 
     try:
         migrate_legacy_databases(conn, tmp_path, telemetry_retention_ttl_seconds=60)
         assert not analytics_path.exists()
-        assert _fetchall_rows(conn, "SELECT tool_name FROM runtime_events WHERE kind='mcp.call'") == []
+        assert _fetchall_rows(conn, "SELECT tool_name FROM runtime_observations WHERE kind='mcp.call'") == []
     finally:
         conn.close()
 
@@ -1695,7 +1697,7 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 53, f"_CURRENT_SCHEMA_VERSION must be 53, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 54, f"_CURRENT_SCHEMA_VERSION must be 53, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
 

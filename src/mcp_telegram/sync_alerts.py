@@ -176,7 +176,7 @@ def _empty_text_evidence(kind: object) -> dict[str, object]:
         "changed_text": None,
         "text_provenance": {"deleted": None, "original": None, "changed": None},
         "text_confidence": {"deleted": "unavailable", "original": "unavailable", "changed": "unavailable"},
-        "text_status": "not_applicable" if kind == "access_lost" else "unavailable",
+        "text_status": "not_applicable" if kind in ("access_lost", "access_restored") else "unavailable",
     }
 
 
@@ -200,7 +200,7 @@ def _query_rows(
 ) -> list[tuple[object, ...]]:
     query = """SELECT a.seq, a.kind, a.occurred_at, a.dialog_id, a.message_id, a.version,
                       m.text, mv.old_text, next_mv.old_text
-                 FROM sync_alert_events a
+                 FROM conversation_history_events a
                  LEFT JOIN messages m
                    ON m.dialog_id = a.dialog_id AND m.message_id = a.message_id
                  LEFT JOIN message_versions mv
@@ -222,7 +222,7 @@ def _snapshot_event_at(conn: sqlite3.Connection, snapshot_seq: int, since: int) 
     row = cast(
         tuple[object, ...] | None,
         conn.execute(
-            "SELECT MAX(occurred_at) FROM sync_alert_events WHERE seq <= ? AND occurred_at > ?",
+            "SELECT MAX(occurred_at) FROM conversation_history_events WHERE seq <= ? AND occurred_at > ?",
             (snapshot_seq, since),
         ).fetchone(),
     )
@@ -255,7 +255,9 @@ def _resolve_query_context(
             cursor.page_depth,
         )
     effective_since, effective_limit = parsed.since, parsed.page_limit
-    snapshot_seq = cast(int, conn.execute("SELECT COALESCE(MAX(seq), 0) FROM sync_alert_events").fetchone()[0])
+    snapshot_seq = cast(
+        int, conn.execute("SELECT COALESCE(MAX(seq), 0) FROM conversation_history_events").fetchone()[0]
+    )
     return _AlertQueryContext(
         effective_since,
         effective_limit,
@@ -280,6 +282,8 @@ def _query_error(exc: ValueError | sqlite3.OperationalError) -> dict[str, object
 def _alert_narrative(kind: object, message_id: object, version: object, occurred_at: object) -> tuple[str, str]:
     if kind == "access_lost":
         return f"Access lost at {occurred_at}", "Use get_sync_status for coverage details."
+    if kind == "access_restored":
+        return f"Access restored at {occurred_at}", "No action is required."
     if kind == "deleted_message":
         return (
             f"Deleted message msg={message_id} deleted_at={occurred_at}",
@@ -351,12 +355,13 @@ def _alert_from_row(row: tuple[object, ...]) -> dict[str, object]:
     item: dict[str, object] = {
         "kind": kind,
         "dialog_id": dialog_id,
-        "message_id": message_id if kind != "access_lost" else None,
+        "message_id": message_id if kind not in ("access_lost", "access_restored") else None,
         "version": version if kind == "edit" else None,
         "deleted_at": occurred_at if kind == "deleted_message" else None,
         "edit_date": occurred_at if kind == "edit" else None,
         "access_lost_at": occurred_at if kind == "access_lost" else None,
-        "source_id": seq if kind == "access_lost" else 0,
+        "access_restored_at": occurred_at if kind == "access_restored" else None,
+        "source_id": seq if kind in ("access_lost", "access_restored") else 0,
         "occurred_at": occurred_at,
         "severity": "high" if kind == "access_lost" else "medium" if kind == "deleted_message" else "low",
         "message": message,
@@ -392,10 +397,11 @@ def _next_navigation(
 
 def _legacy_projections(
     alerts: list[dict[str, object]], page_rows: list[tuple[object, ...]]
-) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
     deleted: list[dict[str, object]] = []
     edits: list[dict[str, object]] = []
     access: list[dict[str, object]] = []
+    restored: list[dict[str, object]] = []
     for item, _row in zip(alerts, page_rows, strict=True):
         kind, dialog_id, message_id, version = item["kind"], item["dialog_id"], item["message_id"], item["version"]
         if kind == "deleted_message":
@@ -426,29 +432,35 @@ def _legacy_projections(
                     "edit_date": item["edit_date"],
                 }
             )
-        else:
+        elif kind == "access_lost":
             access.append({"dialog_id": dialog_id, "access_lost_at": item["access_lost_at"]})
-    return deleted, edits, access
+        else:
+            restored.append({"dialog_id": dialog_id, "access_restored_at": item["access_restored_at"]})
+    return deleted, edits, access, restored
 
 
 def _alert_page_data(
     context: _AlertQueryContext,
     alerts: list[dict[str, object]],
-    projections: tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]],
+    projections: tuple[
+        list[dict[str, object]], list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]
+    ],
     *,
     has_more: bool,
     next_navigation: str | None,
 ) -> dict[str, object]:
-    deleted, edits, access = projections
+    deleted, edits, access, restored = projections
     return {
         "alerts": alerts,
         "deleted_messages": deleted,
         "edits": edits,
         "access_lost": access,
+        "access_restored": restored,
         "counts": {
             "deleted_messages": len(deleted),
             "edits": len(edits),
             "access_lost": len(access),
+            "access_restored": len(restored),
             "total": len(alerts),
         },
         "count": len(alerts),
@@ -459,6 +471,7 @@ def _alert_page_data(
             "deleted_messages": {"since": context.since, "limit": context.limit},
             "edits": {"since": context.since, "limit": context.limit},
             "access_lost": {"since": context.since, "limit": context.limit},
+            "access_restored": {"since": context.since, "limit": context.limit},
         },
         "has_more": has_more,
         "next_navigation": next_navigation,

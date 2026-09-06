@@ -148,9 +148,9 @@ def test_edit_alert_policy_accepts_only_incoming_confirmed_human_dm(conn: sqlite
         assert persist_edited_message(conn, _message(20, text="second"), old_text="first", edit_date=200) == 1
         assert persist_edited_message(conn, _message(21, text="changed", out=1), old_text="own", edit_date=201) is None
     assert conn.execute("SELECT message_id FROM message_versions ORDER BY message_id").fetchall() == [(20,)]
-    assert conn.execute("SELECT kind,dialog_id,message_id FROM sync_alert_events ORDER BY seq").fetchall() == [
-        ("edit", 42, 20)
-    ]
+    assert conn.execute(
+        "SELECT kind,dialog_id,message_id FROM conversation_history_events ORDER BY seq"
+    ).fetchall() == [("edit", 42, 20)]
 
 
 @pytest.mark.parametrize(
@@ -177,7 +177,7 @@ def test_irrelevant_edit_updates_message_without_storing_history(
         assert persist_edited_message(conn, _message(23, text="after"), old_text="before", edit_date=301) is None
     assert conn.execute("SELECT text FROM messages WHERE message_id=23").fetchone() == ("after",)
     assert conn.execute("SELECT COUNT(*) FROM message_versions WHERE message_id=23").fetchone() == (0,)
-    assert conn.execute("SELECT COUNT(*) FROM sync_alert_events WHERE message_id=23").fetchone() == (0,)
+    assert conn.execute("SELECT COUNT(*) FROM conversation_history_events WHERE message_id=23").fetchone() == (0,)
 
 
 def test_transcription_creates_neither_version_nor_change_alert(conn: sqlite3.Connection) -> None:
@@ -186,7 +186,7 @@ def test_transcription_creates_neither_version_nor_change_alert(conn: sqlite3.Co
         insert_messages_with_fts(conn, [_message(22, text=None)])
         assert persist_transcribed_text(conn, 42, 22, old_text=None, transcribed_text="local transcript")
     assert conn.execute("SELECT COUNT(*) FROM message_versions WHERE message_id=22").fetchone() == (0,)
-    assert conn.execute("SELECT COUNT(*) FROM sync_alert_events").fetchone() == (0,)
+    assert conn.execute("SELECT COUNT(*) FROM conversation_history_events").fetchone() == (0,)
 
 
 def _make_hydration_eligible(conn: sqlite3.Connection, status: str = "synced") -> None:

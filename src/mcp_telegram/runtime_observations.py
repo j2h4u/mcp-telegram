@@ -15,8 +15,6 @@ DEFAULT_ROW_CAP = 100_000
 ALLOWED_KINDS = frozenset(
     {
         "mcp.call",
-        "sync.access_lost",
-        "sync.access_restored",
         "telegram.inbox_read_received",
         "sync.inbox_read_finished",
         "sync.read_reconciliation",
@@ -37,7 +35,7 @@ def encode_payload(payload: Mapping[str, object] | None) -> str:
     return encoded
 
 
-def record_runtime_event(  # noqa: PLR0913
+def record_runtime_observation(  # noqa: PLR0913
     conn: sqlite3.Connection,
     *,
     kind: str,
@@ -59,7 +57,7 @@ def record_runtime_event(  # noqa: PLR0913
     if kind not in ALLOWED_KINDS:
         raise ValueError(f"unsupported runtime event kind: {kind}")
     cursor = conn.execute(
-        """INSERT INTO runtime_events(
+        """INSERT INTO runtime_observations(
                observed_at_ms, kind, runtime_instance_id, operation_id, outcome,
                reason_code, dialog_id, duration_ms, tool_name, result_count,
                has_cursor, page_depth, has_filter, error_type, payload_json
@@ -87,7 +85,7 @@ def record_runtime_event(  # noqa: PLR0913
     return cursor.lastrowid
 
 
-def prune_runtime_events(
+def prune_runtime_observations(
     conn: sqlite3.Connection, *, ttl_seconds: int, row_cap: int = DEFAULT_ROW_CAP, now_ms: int | None = None
 ) -> int:
     """Prune by age and emergency cap; record the resulting coverage boundary."""
@@ -95,18 +93,19 @@ def prune_runtime_events(
         raise ValueError("runtime event retention limits must be positive")
     effective_now = int(time.time() * 1000) if now_ms is None else now_ms
     deleted = conn.execute(
-        "DELETE FROM runtime_events WHERE observed_at_ms < ?", (effective_now - ttl_seconds * 1000,)
+        "DELETE FROM runtime_observations WHERE observed_at_ms < ?", (effective_now - ttl_seconds * 1000,)
     ).rowcount
-    count_row = cast(tuple[int] | None, conn.execute("SELECT COUNT(*) FROM runtime_events").fetchone())
+    count_row = cast(tuple[int] | None, conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone())
     event_count = int(count_row[0] or 0) if count_row is not None else 0
     excess = max(event_count - row_cap, 0)
     if excess:
         conn.execute(
-            "DELETE FROM runtime_events WHERE id IN (SELECT id FROM runtime_events ORDER BY id LIMIT ?)", (excess,)
+            "DELETE FROM runtime_observations WHERE id IN (SELECT id FROM runtime_observations ORDER BY id LIMIT ?)",
+            (excess,),
         )
         deleted += excess
         conn.execute(
-            "INSERT OR REPLACE INTO daemon_state(key, value) VALUES ('runtime_events_last_cap_truncation_ms', ?)",
+            "INSERT OR REPLACE INTO daemon_state(key, value) VALUES ('runtime_observations_last_cap_truncation_ms', ?)",
             (str(effective_now),),
         )
     return deleted
@@ -118,6 +117,6 @@ __all__ = [
     "MAX_PAYLOAD_BYTES",
     "RUNTIME_INSTANCE_ID",
     "encode_payload",
-    "prune_runtime_events",
-    "record_runtime_event",
+    "prune_runtime_observations",
+    "record_runtime_observation",
 ]

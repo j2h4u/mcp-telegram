@@ -95,7 +95,7 @@ from .important_events.read_model import list_important_events as read_important
 from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
 from .reading.query_records import read_message_from_row
-from .runtime_events import prune_runtime_events, record_runtime_event
+from .runtime_observations import prune_runtime_observations, record_runtime_observation
 from .sync_alerts import SyncAlertTokenCodec, query_alerts
 from .sync_read_model import SyncStatus, build_sync_read_model
 from .topics.contracts import TopicSourceUnavailableError
@@ -158,7 +158,7 @@ def _insert_telemetry_row(
     conn: sqlite3.Connection,
     event: Mapping[str, object],
 ) -> None:
-    record_runtime_event(
+    record_runtime_observation(
         conn,
         kind="mcp.call",
         observed_at_ms=int(float(cast(float, event.get("timestamp", time.time()))) * 1000),
@@ -183,7 +183,7 @@ def _write_telemetry(
     _insert_telemetry_row(conn, event)
     _runtime_event_write_count += 1
     if _runtime_event_write_count % 128 == 0:
-        prune_runtime_events(conn, ttl_seconds=policy.telemetry_retention_ttl_seconds)
+        prune_runtime_observations(conn, ttl_seconds=policy.telemetry_retention_ttl_seconds)
     conn.commit()
 
 
@@ -1485,7 +1485,7 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _record_telemetry(self, req: dict[str, object]) -> dict:
-        """Write one bounded ``mcp.call`` observation to ``runtime_events``.
+        """Write one bounded ``mcp.call`` observation to ``runtime_observations``.
 
         Retention runs on startup and every 128 MCP observations.
         """

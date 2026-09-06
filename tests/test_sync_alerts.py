@@ -35,7 +35,7 @@ def _db() -> sqlite3.Connection:
             id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, dialog_id INTEGER,
             occurred_at INTEGER, payload_json TEXT
         );
-        CREATE TABLE sync_alert_events (
+        CREATE TABLE conversation_history_events (
             seq INTEGER PRIMARY KEY AUTOINCREMENT,
             kind TEXT NOT NULL,
             occurred_at INTEGER NOT NULL,
@@ -44,27 +44,27 @@ def _db() -> sqlite3.Connection:
             version INTEGER,
             daemon_event_id INTEGER
         );
-        CREATE UNIQUE INDEX sync_alert_deleted ON sync_alert_events(dialog_id, message_id) WHERE kind = 'deleted_message';
-        CREATE UNIQUE INDEX sync_alert_edit ON sync_alert_events(dialog_id, message_id, version) WHERE kind = 'edit';
-        CREATE UNIQUE INDEX sync_alert_access ON sync_alert_events(daemon_event_id) WHERE kind = 'access_lost';
+        CREATE UNIQUE INDEX sync_alert_deleted ON conversation_history_events(dialog_id, message_id) WHERE kind = 'deleted_message';
+        CREATE UNIQUE INDEX sync_alert_edit ON conversation_history_events(dialog_id, message_id, version) WHERE kind = 'edit';
+        CREATE UNIQUE INDEX sync_alert_access ON conversation_history_events(daemon_event_id) WHERE kind = 'access_lost';
         CREATE TRIGGER sync_alert_deleted_insert AFTER INSERT ON messages
         WHEN NEW.is_deleted = 1 AND NEW.deleted_at IS NOT NULL BEGIN
-            INSERT OR IGNORE INTO sync_alert_events(kind, occurred_at, dialog_id, message_id)
+            INSERT OR IGNORE INTO conversation_history_events(kind, occurred_at, dialog_id, message_id)
             VALUES ('deleted_message', NEW.deleted_at, NEW.dialog_id, NEW.message_id);
         END;
         CREATE TRIGGER sync_alert_deleted_update AFTER UPDATE OF is_deleted, deleted_at ON messages
         WHEN OLD.is_deleted = 0 AND NEW.is_deleted = 1 AND NEW.deleted_at IS NOT NULL BEGIN
-            INSERT OR IGNORE INTO sync_alert_events(kind, occurred_at, dialog_id, message_id)
+            INSERT OR IGNORE INTO conversation_history_events(kind, occurred_at, dialog_id, message_id)
             VALUES ('deleted_message', NEW.deleted_at, NEW.dialog_id, NEW.message_id);
         END;
         CREATE TRIGGER sync_alert_edit AFTER INSERT ON message_versions
         WHEN NEW.edit_date IS NOT NULL BEGIN
-            INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, message_id, version)
+            INSERT INTO conversation_history_events(kind, occurred_at, dialog_id, message_id, version)
             VALUES ('edit', NEW.edit_date, NEW.dialog_id, NEW.message_id, NEW.version);
         END;
         CREATE TRIGGER sync_alert_access AFTER INSERT ON daemon_events
         WHEN NEW.kind = 'access_lost' BEGIN
-            INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, daemon_event_id)
+            INSERT INTO conversation_history_events(kind, occurred_at, dialog_id, daemon_event_id)
             VALUES ('access_lost', NEW.occurred_at, NEW.dialog_id, NEW.id);
         END;"""
     )

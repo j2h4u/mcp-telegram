@@ -20,7 +20,7 @@ from typing import Protocol, cast
 from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from .access_lifecycle import record_access_lifecycle_event, set_access_lost
+from .access_lifecycle import set_access_lost
 from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_substrate import ActivityClient
 from .daemon_log_context import dialog_log_context
@@ -322,9 +322,8 @@ def _log_own_only_entity_rpc_error(conn: sqlite3.Connection, dialog_id: int, exc
     log_context = dialog_log_context(conn, dialog_id)
     if isinstance(exc, ACCESS_LOST_ERRORS):
         now = int(time.time())
-        event = set_access_lost(conn, dialog_id, now, reason=type(exc).__name__)
+        set_access_lost(conn, dialog_id, now, reason=type(exc).__name__)
         conn.commit()
-        record_access_lifecycle_event(event)
         logger.warning(
             "scheduled_own_only_access_lost dialog_id=%d name=%r type=%s archived=%s hidden=%s reason=%s error=%s",
             dialog_id,

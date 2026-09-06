@@ -40,6 +40,7 @@ GET_USAGE_STATS_OUTPUT_SCHEMA = {
         "unobserved_tools": {"type": "array", "items": {"type": "string"}},
         "history_started_at_ms": {"type": ["integer", "null"]},
         "last_cap_truncation_ms": {"type": ["integer", "null"]},
+        "history_segments": {"type": "array", "items": {"type": "object"}},
     },
     "required": [
         "summary",
@@ -54,6 +55,7 @@ GET_USAGE_STATS_OUTPUT_SCHEMA = {
         "unobserved_tools",
         "history_started_at_ms",
         "last_cap_truncation_ms",
+        "history_segments",
     ],
     "additionalProperties": False,
 }
@@ -217,6 +219,7 @@ def _usage_structured_content(stats: dict, *, summary: str, empty: bool) -> dict
         "unobserved_tools": sorted(set(TOOL_REGISTRY) - observed),
         "history_started_at_ms": stats.get("history_started_at_ms"),
         "last_cap_truncation_ms": stats.get("last_cap_truncation_ms"),
+        "history_segments": stats.get("history_segments", []),
     }
 
 

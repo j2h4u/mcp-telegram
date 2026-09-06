@@ -82,7 +82,7 @@ depends_on = [
     "mcp_telegram.fts", "mcp_telegram.media_hydration", "mcp_telegram.message_fact_refresh", "mcp_telegram.messages.sqlite_hydration_jobs",
     "mcp_telegram.own_only", "mcp_telegram.read_state", "mcp_telegram.reconnect", "mcp_telegram.reactions.refresh",
     "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.reactions.telegram_adapter", "mcp_telegram.scheduled_messages",
-    "mcp_telegram.runtime_events", "mcp_telegram.state", "mcp_telegram.sync_db", "mcp_telegram.sync_worker", "mcp_telegram.telegram", "mcp_telegram.daemon_shutdown",
+    "mcp_telegram.runtime_observations", "mcp_telegram.state", "mcp_telegram.sync_db", "mcp_telegram.sync_worker", "mcp_telegram.telegram", "mcp_telegram.daemon_shutdown",
     "mcp_telegram.telegram_read_receipts", "mcp_telegram.topics.refresh", "mcp_telegram.transcription_hydration",
     "mcp_telegram.topics.sqlite_repository", "mcp_telegram.topics.telegram_adapter",
 ]
@@ -105,7 +105,7 @@ depends_on = [
     "mcp_telegram.flood",
     "mcp_telegram.topics.contracts", "mcp_telegram.topics.refresh",
     "mcp_telegram.folders.read_model", "mcp_telegram.reading.query_records",
-    "mcp_telegram.runtime_events", "mcp_telegram.sync_alerts",
+    "mcp_telegram.runtime_observations", "mcp_telegram.sync_alerts",
 ]
 cannot_depend_on = [
     "mcp_telegram.folders.telegram_adapter", "mcp_telegram.messages", "mcp_telegram.messages.telegram_adapter",
@@ -293,7 +293,7 @@ depends_on = [
     "mcp_telegram.activity_contracts", "mcp_telegram.entity_store", "mcp_telegram.history_enrollment", "mcp_telegram.hydration_queue", "mcp_telegram.messages.sqlite_bundle", "mcp_telegram.messages.sqlite_hydration",
     "mcp_telegram.messages.telegram_adapter", "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.persistence", "mcp_telegram.reactions.projection",
     "mcp_telegram.read_state", "mcp_telegram.realtime_history_policy", "mcp_telegram.resolver", "mcp_telegram.scheduled_messages",
-    "mcp_telegram.runtime_events", "mcp_telegram.telethon_dialog", "mcp_telegram.topics.sqlite_repository", "mcp_telegram.unread_state", "mcp_telegram.flood",
+    "mcp_telegram.runtime_observations", "mcp_telegram.telethon_dialog", "mcp_telegram.topics.sqlite_repository", "mcp_telegram.unread_state", "mcp_telegram.flood",
 ]
 
 [[modules]]
@@ -310,7 +310,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.access_lifecycle"
 layer = "capability"
-depends_on = ["mcp_telegram.history_enrollment", "mcp_telegram.hydration_queue", "mcp_telegram.messages.sqlite_hydration_jobs", "mcp_telegram.runtime_events"]
+depends_on = ["mcp_telegram.history_enrollment", "mcp_telegram.hydration_queue", "mcp_telegram.messages.sqlite_hydration_jobs"]
 
 [[modules]]
 path = "mcp_telegram.history_enrollment"
@@ -475,7 +475,7 @@ layer = "persistence"
 depends_on = ["mcp_telegram.alert_policy", "mcp_telegram.dialog_classification", "mcp_telegram.fts"]
 
 [[modules]]
-path = "mcp_telegram.runtime_events"
+path = "mcp_telegram.runtime_observations"
 layer = "persistence"
 depends_on = []
 
@@ -757,3 +757,8 @@ expose = ["ReadingDeps", "ReadingService"]
 [[interfaces]]
 from = ["mcp_telegram.reading.query_records"]
 expose = ["read_message_from_row"]
+
+[[modules]]
+path = "mcp_telegram.event_recovery"
+layer = "persistence"
+depends_on = ["mcp_telegram.alert_policy", "mcp_telegram.runtime_observations", "mcp_telegram.sync_db"]

@@ -95,7 +95,7 @@ from .realtime_history_policy import (
     realtime_history_coverage,
 )
 from .resolver import latinize
-from .runtime_events import record_runtime_event
+from .runtime_observations import record_runtime_observation
 from .scheduled_messages import (
     mark_scheduled_messages_removed,
     scheduled_dialog_id,
@@ -156,11 +156,11 @@ class _OutboxReadEvent(Protocol):
     max_id: int | None
 
 
-def _record_runtime_event_best_effort(conn: sqlite3.Connection, **event: object) -> None:
+def _record_runtime_observation_best_effort(conn: sqlite3.Connection, **event: object) -> None:
     """Record diagnostics without changing event-handler outcomes."""
     try:
         with conn:
-            record_runtime_event(conn, **event)  # type: ignore[arg-type]
+            record_runtime_observation(conn, **event)  # type: ignore[arg-type]
     except Exception:
         logger.exception("runtime_event_record_failed kind=%s", event.get("kind"))
 
@@ -205,7 +205,7 @@ def _apply_observed_inbox_read(  # noqa: PLR0913
         )
     after_cursor, after_unread = _read_state(conn, dialog_id)
     changed = before_cursor != after_cursor or before_unread != after_unread
-    _record_runtime_event_best_effort(
+    _record_runtime_observation_best_effort(
         conn,
         kind="sync.inbox_read_finished",
         dialog_id=dialog_id,
@@ -1611,7 +1611,7 @@ class EventHandlerManager:
         try:
             max_id_raw = getattr(update, "max_id", None)
             still_unread_raw = getattr(update, "still_unread_count", None)
-            _record_runtime_event_best_effort(
+            _record_runtime_observation_best_effort(
                 self._conn,
                 kind="telegram.inbox_read_received",
                 dialog_id=dialog_id,
@@ -1640,7 +1640,7 @@ class EventHandlerManager:
                     dialog_id,
                     max_id_raw,
                 )
-                _record_runtime_event_best_effort(
+                _record_runtime_observation_best_effort(
                     self._conn,
                     kind="sync.inbox_read_finished",
                     dialog_id=dialog_id,
@@ -1667,7 +1667,7 @@ class EventHandlerManager:
                 unread_rowcount,
             )
         except Exception:
-            _record_runtime_event_best_effort(
+            _record_runtime_observation_best_effort(
                 self._conn,
                 kind="sync.inbox_read_finished",
                 dialog_id=dialog_id,
