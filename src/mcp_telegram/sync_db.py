@@ -2546,6 +2546,27 @@ def _apply_migration_53(conn: sqlite3.Connection, current: int) -> int:
 
 
 def _migrate_runtime_lifecycle_events_v54(conn: sqlite3.Connection) -> int:
+    conn.execute(
+        """UPDATE conversation_history_events_v54 AS h
+              SET reason_code = (
+                      SELECT r.reason_code FROM runtime_events r
+                       WHERE r.kind = 'sync.' || h.kind AND r.dialog_id = h.dialog_id
+                         AND CAST(r.observed_at_ms / 1000 AS INTEGER) = h.occurred_at
+                       ORDER BY r.id DESC LIMIT 1
+                  ),
+                  previous_status = (
+                      SELECT json_extract(r.payload_json, '$.previous_status') FROM runtime_events r
+                       WHERE r.kind = 'sync.' || h.kind AND r.dialog_id = h.dialog_id
+                         AND CAST(r.observed_at_ms / 1000 AS INTEGER) = h.occurred_at
+                       ORDER BY r.id DESC LIMIT 1
+                  )
+            WHERE h.kind IN ('access_lost', 'access_restored')
+              AND EXISTS (
+                  SELECT 1 FROM runtime_events r
+                   WHERE r.kind = 'sync.' || h.kind AND r.dialog_id = h.dialog_id
+                     AND CAST(r.observed_at_ms / 1000 AS INTEGER) = h.occurred_at
+              )"""
+    )
     predicate = """r.kind IN ('sync.access_lost', 'sync.access_restored')
                   AND r.dialog_id IS NOT NULL
                   AND NOT EXISTS (

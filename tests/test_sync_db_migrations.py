@@ -2241,6 +2241,10 @@ def test_v54_moves_runtime_lifecycle_rows_into_durable_history(tmp_path: Path) -
     with _sync_db_connection(db_path) as conn:
         _downgrade_event_tables_to_v53(conn)
         conn.execute(
+            "INSERT INTO sync_alert_events(kind,occurred_at,time_basis,dialog_id) "
+            "VALUES ('access_lost',10,'observed',1)"
+        )
+        conn.execute(
             "INSERT INTO runtime_events(observed_at_ms,kind,runtime_instance_id,reason_code,dialog_id,payload_json) "
             "VALUES (10000,'sync.access_lost','old','ChannelPrivateError',1,'{\"previous_status\":\"full\"}'),"
             "(11000,'sync.access_restored','old',NULL,1,'{}'),"
