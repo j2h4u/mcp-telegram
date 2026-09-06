@@ -68,3 +68,25 @@ def apply_read_cursor(
     sql = f"UPDATE synced_dialogs SET {column} = MAX(COALESCE({column}, 0), ?) WHERE dialog_id = ?"
     cur = conn.execute(sql, (max_id, dialog_id))
     return cur.rowcount
+
+
+def apply_reconciled_unread_count(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    unread_count: int,
+    request_started_at: int,
+) -> int:
+    """Apply a Telegram snapshot only when no newer realtime fact exists.
+
+    The request start is the snapshot's observation boundary. Strict ``<``
+    deliberately rejects equal-second writes because SQLite timestamps have
+    only second precision and cannot order a racing realtime event safely.
+    """
+    cursor = conn.execute(
+        "UPDATE dialogs SET unread_count = ?, unread_count_observed_at = ? "
+        "WHERE dialog_id = ? AND "
+        "(unread_count_observed_at IS NULL OR unread_count_observed_at < ?)",
+        (unread_count, request_started_at, dialog_id, request_started_at),
+    )
+    return cursor.rowcount

@@ -7,6 +7,7 @@ import asyncio
 import sqlite3
 import time
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -28,6 +29,26 @@ def _seed_pending(conn: sqlite3.Connection, dialog_id: int, *, status: str = "sy
         (dialog_id, status),
     )
     seed_full_history_enrollment(conn, dialog_id, enabled=status == "synced")
+    conn.commit()
+
+
+def _seed_stale_unread(conn: sqlite3.Connection, dialog_id: int, *, cursor: int = 10) -> None:
+    conn.execute(
+        "INSERT INTO synced_dialogs"
+        "(dialog_id, status, read_inbox_max_id, read_outbox_max_id) VALUES (?, 'synced', ?, ?)",
+        (dialog_id, cursor, cursor),
+    )
+    seed_full_history_enrollment(conn, dialog_id, enabled=True)
+    conn.execute(
+        "INSERT INTO dialogs(dialog_id, name, type, unread_count, unread_count_observed_at) "
+        "VALUES (?, 'Test', 'user', 1, 100)",
+        (dialog_id,),
+    )
+    conn.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+        "VALUES (?, ?, 100, 'unread', 0, 0, 0)",
+        (dialog_id, cursor + 1),
+    )
     conn.commit()
 
 
@@ -239,9 +260,176 @@ async def test_none_input_peer_is_not_sent_and_mixed_batch_attempts_once() -> No
         assert conn.execute(
             "SELECT read_position_attempt_count FROM synced_dialogs WHERE dialog_id=1001"
         ).fetchone() == (1,)
-        assert conn.execute(
+        success_state = conn.execute(
             "SELECT read_position_next_attempt_at, read_position_attempt_count FROM synced_dialogs WHERE dialog_id=1002"
-        ).fetchone() == (None, 0)
+        ).fetchone()
+        assert success_state[0] is not None
+        assert success_state[1] == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_repairs_non_null_stale_unread_state() -> None:
+    """A missed realtime read update is repaired by the bounded durable sweep."""
+    from mcp_telegram.daemon import _initialize_read_positions
+
+    conn = _connection()
+    try:
+        _seed_stale_unread(conn, 1001)
+        client = AsyncMock()
+        client.get_input_entity.return_value = SimpleNamespace(_did=1001)
+        client.return_value = SimpleNamespace(
+            dialogs=[
+                SimpleNamespace(
+                    peer=SimpleNamespace(_did=1001),
+                    read_inbox_max_id=11,
+                    read_outbox_max_id=10,
+                    unread_count=0,
+                )
+            ]
+        )
+        with (
+            patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: peer._did),
+            patch("mcp_telegram.daemon._sleep_read_pos_batch", new=AsyncMock(return_value=True)),
+        ):
+            checked = await _initialize_read_positions(
+                client,
+                conn,
+                asyncio.Event(),
+                max_dialogs=10,
+                success_recheck_seconds=900,
+            )
+
+        assert checked == 1
+        assert (
+            conn.execute(
+                "SELECT read_inbox_max_id, read_position_next_attempt_at FROM synced_dialogs WHERE dialog_id=1001"
+            ).fetchone()[0]
+            == 11
+        )
+        assert conn.execute("SELECT unread_count FROM dialogs WHERE dialog_id=1001").fetchone() == (0,)
+    finally:
+        conn.close()
+
+
+def test_reconciliation_snapshot_cannot_overwrite_same_second_realtime_count() -> None:
+    """A snapshot racing a realtime fact advances the cursor but preserves the newer count."""
+    from mcp_telegram.daemon import _apply_read_position_dialog, _ReadPositionDialogLike
+
+    conn = _connection()
+    try:
+        _seed_stale_unread(conn, 1001)
+        conn.execute("UPDATE dialogs SET unread_count=2, unread_count_observed_at=200 WHERE dialog_id=1001")
+        conn.commit()
+        dialog = SimpleNamespace(
+            peer=SimpleNamespace(),
+            read_inbox_max_id=11,
+            read_outbox_max_id=10,
+            unread_count=0,
+        )
+        with patch("mcp_telegram.daemon.telethon_utils.get_peer_id", return_value=1001):
+            assert _apply_read_position_dialog(
+                conn,
+                cast(_ReadPositionDialogLike, dialog),
+                retry_at=300,
+                returned_ids=set(),
+                failed_ids=set(),
+                request_started_at=200,
+                success_due_at=1100,
+            )
+        assert conn.execute("SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=1001").fetchone() == (11,)
+        assert conn.execute(
+            "SELECT unread_count, unread_count_observed_at FROM dialogs WHERE dialog_id=1001"
+        ).fetchone() == (2, 200)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_success_due_time_keeps_bounded_queue_fair() -> None:
+    from mcp_telegram.daemon import _initialize_read_positions
+
+    conn = _connection()
+    try:
+        _seed_stale_unread(conn, 1001)
+        _seed_stale_unread(conn, 1002)
+        client = AsyncMock()
+        client.get_input_entity.side_effect = lambda dialog_id: SimpleNamespace(_did=dialog_id)
+        client.side_effect = [
+            SimpleNamespace(
+                dialogs=[
+                    SimpleNamespace(
+                        peer=SimpleNamespace(_did=1001),
+                        read_inbox_max_id=10,
+                        read_outbox_max_id=10,
+                        unread_count=1,
+                    )
+                ]
+            ),
+            SimpleNamespace(
+                dialogs=[
+                    SimpleNamespace(
+                        peer=SimpleNamespace(_did=1002),
+                        read_inbox_max_id=10,
+                        read_outbox_max_id=10,
+                        unread_count=1,
+                    )
+                ]
+            ),
+        ]
+        with (
+            patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: peer._did),
+            patch("mcp_telegram.daemon._sleep_read_pos_batch", new=AsyncMock(return_value=True)),
+        ):
+            await _initialize_read_positions(client, conn, asyncio.Event(), max_dialogs=1, success_recheck_seconds=900)
+            await _initialize_read_positions(client, conn, asyncio.Event(), max_dialogs=1, success_recheck_seconds=900)
+
+        assert [call.args[0] for call in client.get_input_entity.await_args_list] == [1001, 1002]
+        assert conn.execute("SELECT read_position_next_attempt_at FROM synced_dialogs WHERE dialog_id=1001").fetchone()[
+            0
+        ] > int(time.time())
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_response_preserves_failure_history() -> None:
+    from mcp_telegram.daemon import _initialize_read_positions
+
+    conn = _connection()
+    try:
+        _seed_stale_unread(conn, 1001)
+        conn.execute("UPDATE synced_dialogs SET read_position_attempt_count=5 WHERE dialog_id=1001")
+        conn.commit()
+        client = AsyncMock()
+        client.get_input_entity.return_value = SimpleNamespace(_did=1001)
+        client.return_value = SimpleNamespace(
+            dialogs=[
+                SimpleNamespace(
+                    peer=SimpleNamespace(_did=1001),
+                    read_inbox_max_id=11,
+                    read_outbox_max_id=None,
+                    unread_count=0,
+                )
+            ]
+        )
+        with (
+            patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=lambda peer: peer._did),
+            patch("mcp_telegram.daemon._sleep_read_pos_batch", new=AsyncMock(return_value=True)),
+        ):
+            await _initialize_read_positions(
+                client,
+                conn,
+                asyncio.Event(),
+                max_dialogs=1,
+                failure_cooldown_seconds=3600,
+                success_recheck_seconds=900,
+            )
+
+        assert conn.execute(
+            "SELECT read_position_attempt_count FROM synced_dialogs WHERE dialog_id=1001"
+        ).fetchone() == (6,)
     finally:
         conn.close()
 

@@ -107,7 +107,7 @@ from .own_only import OwnOnlyContext, ensure_own_only_schema
 from .reactions.refresh import ReactionFreshener
 from .reactions.sqlite_repository import SQLiteReactionSnapshotRepository
 from .reactions.telegram_adapter import TelethonTelegramReactionGateway
-from .read_state import apply_read_cursor
+from .read_state import apply_read_cursor, apply_reconciled_unread_count
 from .reconnect import run_reconnect_catch_up_loop
 from .scheduled_messages import ScheduledReconciliationPolicy, run_scheduled_reconciliation_loop
 from .state import StatePaths, ensure_private_state_dir
@@ -155,6 +155,7 @@ class _ReadPositionDialogLike(Protocol):
     peer: object
     read_inbox_max_id: int | None
     read_outbox_max_id: int | None
+    unread_count: int | None
 
 
 class _ReadPositionsResultLike(Protocol):
@@ -163,6 +164,12 @@ class _ReadPositionsResultLike(Protocol):
 
 class _MessagesTotalLike(Protocol):
     total: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _StoredReadPositionState:
+    inbox_max: int | None
+    unread_observed_at: int | None
 
 
 class _MeLike(Protocol):
@@ -201,14 +208,21 @@ _SELECT_NULL_TOTAL_SQL = (
 
 _UPDATE_TOTAL_SQL = "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ?"
 
-_SELECT_NULL_READ_CURSORS_SQL = (
-    # Phase 39.3-02: picks up dialogs with EITHER cursor NULL. Post-v12
-    # migration, every existing synced row has read_outbox_max_id = NULL, so
-    # this re-bootstraps all of them in batched GetPeerDialogsRequest calls.
+_SELECT_READ_POSITION_WORK_SQL = (
+    # NULL cursors require bootstrap. Non-NULL inbox cursors are reconciled
+    # when the local mirror still has an incoming unread candidate or Telegram's
+    # last exact unread count remains positive. This bounds recovery after a
+    # missed realtime read update without polling every enrolled dialog.
     "SELECT sd.dialog_id FROM synced_dialogs sd "
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
-    "WHERE (sd.read_inbox_max_id IS NULL OR sd.read_outbox_max_id IS NULL) "
-    "AND sd.status = 'synced'"
+    "LEFT JOIN dialogs d ON d.dialog_id = sd.dialog_id "
+    "WHERE sd.status = 'synced' AND ("
+    "sd.read_inbox_max_id IS NULL OR sd.read_outbox_max_id IS NULL "
+    "OR COALESCE(d.unread_count, 0) > 0 "
+    "OR EXISTS (SELECT 1 FROM messages m "
+    "WHERE m.dialog_id = sd.dialog_id AND m.is_deleted = 0 AND m.is_service = 0 "
+    "AND m.out = 0 AND m.message_id > COALESCE(sd.read_inbox_max_id, -1))"
+    ")"
 )
 
 
@@ -324,8 +338,9 @@ async def _initialize_read_positions(  # noqa: PLR0913
     failure_cooldown_seconds: float | None = None,
     batch_size: int | None = None,
     batch_pause_seconds: float | None = None,
+    success_recheck_seconds: float | None = None,
 ) -> int:
-    """One bounded sweep to populate BOTH read cursors for synced dialogs.
+    """One bounded sweep to bootstrap or reconcile read state.
 
     Phase 39.3-02 R4: the same GetPeerDialogsRequest sweep that already
     populates ``read_inbox_max_id`` also populates ``read_outbox_max_id``
@@ -351,14 +366,8 @@ async def _initialize_read_positions(  # noqa: PLR0913
     that arrives during the bootstrap window cannot be overwritten by a
     stale bootstrap reply (designed race safety, not accidental).
     """
-    scheduling_defaults = SchedulingConfig()
-    effective_batch_size = (
-        scheduling_defaults.read_position_reconciliation_batch_size if batch_size is None else batch_size
-    )
-    effective_batch_pause_seconds = (
-        scheduling_defaults.read_position_reconciliation_batch_pause_seconds
-        if batch_pause_seconds is None
-        else batch_pause_seconds
+    effective_batch_size, effective_batch_pause_seconds, effective_success_recheck_seconds = _read_position_pacing(
+        batch_size, batch_pause_seconds, success_recheck_seconds
     )
     if effective_batch_size < 1:
         raise ValueError("batch_size must be positive")
@@ -366,9 +375,9 @@ async def _initialize_read_positions(  # noqa: PLR0913
         raise ValueError("batch_pause_seconds must be positive")
 
     now = int(time.time())
-    rows = _select_null_read_position_rows(conn, max_dialogs, now=now)
+    rows = _select_read_position_work_rows(conn, max_dialogs, now=now)
     if not rows:
-        logger.debug("initialize_read_positions — no NULL rows, skipping")
+        logger.debug("initialize_read_positions — no due rows, skipping")
         return 0
 
     dialog_ids = [dialog_id for (dialog_id,) in rows]
@@ -377,9 +386,15 @@ async def _initialize_read_positions(  # noqa: PLR0913
     for i in range(0, len(dialog_ids), effective_batch_size):
         if shutdown_event.is_set():
             break
-        retry_at = _read_position_retry_at(now, failure_cooldown_seconds)
         batch_ids = dialog_ids[i : i + effective_batch_size]
-        batch_filled, stop = await _reconcile_read_position_batch(client, conn, shutdown_event, batch_ids, retry_at)
+        batch_filled, stop = await _reconcile_read_position_batch(
+            client,
+            conn,
+            shutdown_event,
+            batch_ids,
+            failure_cooldown_seconds,
+            success_recheck_seconds=effective_success_recheck_seconds,
+        )
         filled += batch_filled
         if stop:
             return filled
@@ -391,22 +406,48 @@ async def _initialize_read_positions(  # noqa: PLR0913
     return filled
 
 
-async def _reconcile_read_position_batch(
+def _read_position_pacing(
+    batch_size: int | None,
+    batch_pause_seconds: float | None,
+    success_recheck_seconds: float | None,
+) -> tuple[int, float, float]:
+    defaults = SchedulingConfig()
+    return (
+        defaults.read_position_reconciliation_batch_size if batch_size is None else batch_size,
+        defaults.read_position_reconciliation_batch_pause_seconds
+        if batch_pause_seconds is None
+        else batch_pause_seconds,
+        defaults.read_position_reconciliation_seconds if success_recheck_seconds is None else success_recheck_seconds,
+    )
+
+
+async def _reconcile_read_position_batch(  # noqa: PLR0913
     client: _DaemonClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     batch_ids: list[int],
-    retry_at: int | None,
+    failure_cooldown_seconds: float | None,
+    *,
+    success_recheck_seconds: float,
 ) -> tuple[int, bool]:
     retry_ids: set[int] = set()
     try:
         input_peers, unresolved_ids = await _build_read_position_input_peers(client, batch_ids)
         retry_ids.update(unresolved_ids)
         if input_peers:
+            request_started_at = int(time.time())
             result = cast(_ReadPositionsResultLike, await client(GetPeerDialogsRequest(peers=input_peers)))
             returned_ids: set[int] = set()
+            success_due_at = int(time.time()) + max(1, math.ceil(success_recheck_seconds))
+            retry_at = _read_position_retry_at(int(time.time()), failure_cooldown_seconds)
             filled = _apply_read_positions_from_dialogs(
-                conn, result, retry_at=retry_at, returned_ids=returned_ids, failed_ids=retry_ids
+                conn,
+                result,
+                retry_at=retry_at,
+                returned_ids=returned_ids,
+                failed_ids=retry_ids,
+                request_started_at=request_started_at,
+                success_due_at=success_due_at,
             )
             retry_ids.update(set(batch_ids) - returned_ids)
         else:
@@ -416,7 +457,11 @@ async def _reconcile_read_position_batch(
             raise
         logger.warning("read_pos_bootstrap flood_wait seconds=%s", exc.retry_after_seconds)
         retry_ids.update(batch_ids)
-        _mark_read_position_retry(conn, retry_ids, retry_at)
+        _mark_read_position_retry(
+            conn,
+            retry_ids,
+            _read_position_retry_at(int(time.time()), failure_cooldown_seconds),
+        )
         conn.commit()
         if exc.retry_after_seconds is not None:
             await sleep_through_flood(shutdown_event, exc.retry_after_seconds)
@@ -425,12 +470,16 @@ async def _reconcile_read_position_batch(
         logger.debug("read_pos_bootstrap batch_failed error=%s", exc)
         retry_ids.update(batch_ids)
         filled = 0
-    _mark_read_position_retry(conn, retry_ids, retry_at)
+    _mark_read_position_retry(
+        conn,
+        retry_ids,
+        _read_position_retry_at(int(time.time()), failure_cooldown_seconds),
+    )
     conn.commit()
     return filled, False
 
 
-def _select_null_read_position_rows(
+def _select_read_position_work_rows(
     conn: sqlite3.Connection,
     max_dialogs: int | None,
     *,
@@ -441,7 +490,7 @@ def _select_null_read_position_rows(
         return cast(
             list[tuple[int]],
             conn.execute(
-                f"{_SELECT_NULL_READ_CURSORS_SQL} "
+                f"{_SELECT_READ_POSITION_WORK_SQL} "
                 "AND (sd.read_position_next_attempt_at IS NULL OR sd.read_position_next_attempt_at <= ?) "
                 "ORDER BY COALESCE(sd.read_position_next_attempt_at, 0), "
                 "COALESCE(sd.read_position_attempt_count, 0), sd.dialog_id",
@@ -453,7 +502,7 @@ def _select_null_read_position_rows(
     return cast(
         list[tuple[int]],
         conn.execute(
-            f"{_SELECT_NULL_READ_CURSORS_SQL} "
+            f"{_SELECT_READ_POSITION_WORK_SQL} "
             "AND (sd.read_position_next_attempt_at IS NULL OR sd.read_position_next_attempt_at <= ?) "
             "ORDER BY COALESCE(sd.read_position_next_attempt_at, 0), "
             "COALESCE(sd.read_position_attempt_count, 0), sd.dialog_id LIMIT ?",
@@ -490,13 +539,12 @@ async def _run_read_position_reconciliation_loop(  # noqa: PLR0913 - daemon comp
     batch_size: int | None = None,
     batch_pause_seconds: float | None = None,
 ) -> None:
-    """Repeatedly reconcile durable NULL read-position work after startup.
+    """Repeatedly reconcile durable read-position work after startup.
 
     The first pass is immediate. Each subsequent pass waits for the configured
     interval, and all passes execute in this single daemon-owned task, so no
-    overlapping Telegram sweeps can occur. SQLite NULL rows are the durable
-    retry queue; access restoration and late enrollment naturally reappear in
-    the next selection.
+    overlapping Telegram sweeps can occur. SQLite due-times provide fairness
+    for bootstrap, stale-unread recovery, retries, and late enrollment.
     """
     while not shutdown_event.is_set():
         await _initialize_read_positions(
@@ -507,6 +555,7 @@ async def _run_read_position_reconciliation_loop(  # noqa: PLR0913 - daemon comp
             failure_cooldown_seconds=failure_cooldown_seconds,
             batch_size=batch_size,
             batch_pause_seconds=batch_pause_seconds,
+            success_recheck_seconds=interval_seconds,
         )
         if shutdown_event.is_set():
             break
@@ -537,29 +586,42 @@ async def _build_read_position_input_peers(
     return input_peers, unresolved_ids
 
 
-def _apply_read_positions_from_dialogs(
+def _apply_read_positions_from_dialogs(  # noqa: PLR0913
     conn: sqlite3.Connection,
     result: _ReadPositionsResultLike,
     *,
     retry_at: int | None = None,
     returned_ids: set[int] | None = None,
     failed_ids: set[int] | None = None,
+    request_started_at: int | None = None,
+    success_due_at: int | None = None,
 ) -> int:
     """Apply read cursors from a GetPeerDialogsRequest result."""
     filled = 0
     with conn:
         for dialog in result.dialogs:
-            if _apply_read_position_dialog(conn, dialog, retry_at, returned_ids, failed_ids):
+            if _apply_read_position_dialog(
+                conn,
+                dialog,
+                retry_at,
+                returned_ids,
+                failed_ids,
+                request_started_at=request_started_at,
+                success_due_at=success_due_at,
+            ):
                 filled += 1
     return filled
 
 
-def _apply_read_position_dialog(
+def _apply_read_position_dialog(  # noqa: PLR0913
     conn: sqlite3.Connection,
     dialog: _ReadPositionDialogLike,
     retry_at: int | None,
     returned_ids: set[int] | None,
     failed_ids: set[int] | None,
+    *,
+    request_started_at: int | None = None,
+    success_due_at: int | None = None,
 ) -> bool:
     chat_id = int(cast(int, telethon_utils.get_peer_id(dialog.peer)))
     # D-03 LOCKED: None -> skip (preserve NULL). NEVER fold None -> 0; that
@@ -567,28 +629,100 @@ def _apply_read_position_dialog(
     # distinct value (peer/me has read nothing) and is written as-is.
     inbox_max = cast(int | None, getattr(dialog, "read_inbox_max_id", None))
     outbox_max = cast(int | None, getattr(dialog, "read_outbox_max_id", None))
-    if (
-        conn.execute("SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1", (chat_id,)).fetchone()
-        is None
-    ):
-        return False
     _add_returned_read_position_id(returned_ids, chat_id)
+    state = _stored_reconcilable_read_position(conn, chat_id)
+    if state is None:
+        return False
     wrote_any = False
     if inbox_max is not None and apply_read_cursor(conn, chat_id, "inbox", inbox_max) > 0:
         wrote_any = True
     if outbox_max is not None and apply_read_cursor(conn, chat_id, "outbox", outbox_max) > 0:
         wrote_any = True
-    if retry_at is not None:
-        if inbox_max is None or outbox_max is None:
-            if failed_ids is not None:
-                failed_ids.add(chat_id)
-        else:
-            conn.execute(
-                "UPDATE synced_dialogs SET read_position_next_attempt_at = NULL, "
-                "read_position_attempt_count = 0 WHERE dialog_id = ?",
-                (chat_id,),
-            )
+    _apply_reconciled_unread_count(
+        conn,
+        chat_id,
+        dialog=dialog,
+        state=state,
+        inbox_max=inbox_max,
+        request_started_at=request_started_at,
+    )
+    _schedule_read_position_result(
+        conn,
+        chat_id,
+        inbox_max=inbox_max,
+        outbox_max=outbox_max,
+        retry_at=retry_at,
+        success_due_at=success_due_at,
+        failed_ids=failed_ids,
+    )
     return wrote_any
+
+
+def _stored_reconcilable_read_position(conn: sqlite3.Connection, dialog_id: int) -> _StoredReadPositionState | None:
+    row = cast(
+        tuple[str, int | None, int | None] | None,
+        conn.execute(
+            "SELECT sd.status, sd.read_inbox_max_id, d.unread_count_observed_at "
+            "FROM synced_dialogs sd "
+            "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
+            "LEFT JOIN dialogs d ON d.dialog_id = sd.dialog_id "
+            "WHERE sd.dialog_id = ?",
+            (dialog_id,),
+        ).fetchone(),
+    )
+    if row is None or row[0] != "synced":
+        return None
+    return _StoredReadPositionState(inbox_max=row[1], unread_observed_at=row[2])
+
+
+def _apply_reconciled_unread_count(  # noqa: PLR0913
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    dialog: _ReadPositionDialogLike,
+    state: _StoredReadPositionState,
+    inbox_max: int | None,
+    request_started_at: int | None,
+) -> None:
+    unread_count = getattr(dialog, "unread_count", None)
+    if request_started_at is None or inbox_max is None:
+        return
+    if not isinstance(unread_count, int) or isinstance(unread_count, bool) or unread_count < 0:
+        return
+    if state.inbox_max is not None and inbox_max < state.inbox_max:
+        return
+    if state.unread_observed_at is not None and state.unread_observed_at >= request_started_at:
+        return
+    apply_reconciled_unread_count(
+        conn,
+        dialog_id,
+        unread_count=unread_count,
+        request_started_at=request_started_at,
+    )
+
+
+def _schedule_read_position_result(  # noqa: PLR0913
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    inbox_max: int | None,
+    outbox_max: int | None,
+    retry_at: int | None,
+    success_due_at: int | None,
+    failed_ids: set[int] | None,
+) -> None:
+    if inbox_max is None or outbox_max is None:
+        if retry_at is not None and failed_ids is not None:
+            failed_ids.add(dialog_id)
+        return
+    due_at = success_due_at if success_due_at is not None else None
+    if success_due_at is None and retry_at is None:
+        return
+    conn.execute(
+        "UPDATE synced_dialogs SET read_position_next_attempt_at = ?, "
+        "read_position_attempt_count = 0 WHERE dialog_id = ?",
+        (due_at, dialog_id),
+    )
 
 
 def _add_returned_read_position_id(returned_ids: set[int] | None, chat_id: int) -> None:

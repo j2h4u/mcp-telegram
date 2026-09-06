@@ -72,7 +72,7 @@ def test_compact_runtime_success_records_and_important_paths_have_expected_level
     daemon_levels = _literal_log_levels(ROOT / "src/mcp_telegram/daemon.py")
     assert sorted(daemon_levels["initialize_read_positions"]) == ["debug", "info"]
     daemon_path = ROOT / "src/mcp_telegram/daemon.py"
-    assert _levels_for_message_prefix(daemon_path, "initialize_read_positions — no NULL rows") == ["debug"]
+    assert _levels_for_message_prefix(daemon_path, "initialize_read_positions — no due rows") == ["debug"]
     assert _levels_for_message_prefix(daemon_path, "initialize_read_positions filled=") == ["info"]
 
     reading_levels = _literal_log_levels(ROOT / "src/mcp_telegram/reading/service.py")
