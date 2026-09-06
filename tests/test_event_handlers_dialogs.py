@@ -35,6 +35,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     UpdateChannel,
     UpdateChannelParticipant,
     UpdateChat,
+    UpdateChatParticipant,
     UpdateDialogPinned,
     UpdateDialogUnreadMark,
     UpdatePinnedDialogs,
@@ -48,10 +49,10 @@ from mcp_telegram.event_handlers import (
     EventHandlerManager,
     _ChannelChatUpdateLike,
     _ChannelInboxReadUpdateLike,
-    _ChannelParticipantUpdateLike,
     _ChatUpdateLike,
     _InboxReadUpdateLike,
     _NewMessageEvent,
+    _ParticipantUpdateLike,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from tests.history_enrollment_helpers import seed_full_history_enrollment
@@ -182,20 +183,17 @@ async def test_self_participant_loss_records_actor_and_cause(
     _insert_dialog(sync_db, dialog_id)
     manager = _make_manager(mock_client, sync_db, shutdown_event)
     manager.set_self_id(42)
-    update = cast(
-        _ChannelParticipantUpdateLike,
-        UpdateChannelParticipant(
-            channel_id=channel_id,
-            date=datetime(2026, 9, 6, tzinfo=UTC),
-            actor_id=actor_id,
-            user_id=42,
-            qts=1,
-            prev_participant=None,
-            new_participant=None,
-        ),
+    update = UpdateChannelParticipant(
+        channel_id=channel_id,
+        date=datetime(2026, 9, 6, tzinfo=UTC),
+        actor_id=actor_id,
+        user_id=42,
+        qts=1,
+        prev_participant=None,
+        new_participant=None,
     )
 
-    await manager.on_raw_channel_participant(update)
+    await manager.on_raw_participant(update)
 
     assert sync_db.execute(
         "SELECT status,access_lost_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
@@ -210,7 +208,7 @@ async def test_self_participant_loss_records_actor_and_cause(
 
 def test_self_participant_ban_is_classified_separately() -> None:
     update = cast(
-        _ChannelParticipantUpdateLike,
+        _ParticipantUpdateLike,
         SimpleNamespace(
             actor_id=99,
             new_participant=ChannelParticipantBanned(
@@ -233,22 +231,49 @@ async def test_participant_loss_for_another_user_is_ignored(
 ) -> None:
     manager = _make_manager(mock_client, sync_db, shutdown_event)
     manager.set_self_id(42)
-    update = cast(
-        _ChannelParticipantUpdateLike,
-        UpdateChannelParticipant(
-            channel_id=12345,
-            date=datetime(2026, 9, 6, tzinfo=UTC),
-            actor_id=99,
-            user_id=77,
-            qts=1,
-            prev_participant=None,
-            new_participant=None,
-        ),
+    update = UpdateChannelParticipant(
+        channel_id=12345,
+        date=datetime(2026, 9, 6, tzinfo=UTC),
+        actor_id=99,
+        user_id=77,
+        qts=1,
+        prev_participant=None,
+        new_participant=None,
     )
 
-    await manager.on_raw_channel_participant(update)
+    await manager.on_raw_participant(update)
 
     assert sync_db.execute("SELECT COUNT(*) FROM conversation_history_events").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_basic_group_participant_loss_records_actor_and_cause(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    chat_id = 12345
+    dialog_id = int(get_peer_id(PeerChat(chat_id)))
+    _enroll_synced(sync_db, dialog_id)
+    _insert_dialog(sync_db, dialog_id)
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    manager.set_self_id(42)
+    update = UpdateChatParticipant(
+        chat_id=chat_id,
+        date=datetime(2026, 9, 6, tzinfo=UTC),
+        actor_id=99,
+        user_id=42,
+        qts=1,
+        prev_participant=None,
+        new_participant=None,
+    )
+
+    await manager.on_raw_participant(update)
+
+    assert sync_db.execute(
+        "SELECT access_change_cause,actor_id FROM conversation_history_events WHERE dialog_id=? AND kind='access_lost'",
+        (dialog_id,),
+    ).fetchone() == ("removed_by_admin", 99)
 
 
 def _last_event_at(conn: _SQLiteConnection, dialog_id: int) -> int | None:

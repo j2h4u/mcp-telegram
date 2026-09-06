@@ -43,6 +43,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     UpdateChannel,
     UpdateChannelParticipant,
     UpdateChat,
+    UpdateChatParticipant,
     UpdateDeleteScheduledMessages,
     UpdateDialogPinned,
     UpdateDialogUnreadMark,
@@ -239,12 +240,18 @@ class _ChatUpdateLike(Protocol):
     chat_id: int
 
 
-class _ChannelParticipantUpdateLike(Protocol):
-    channel_id: int
-    date: datetime | None
-    actor_id: int
-    user_id: int
-    new_participant: object | None
+class _ParticipantUpdateLike(Protocol):
+    @property
+    def date(self) -> datetime | None: ...
+
+    @property
+    def actor_id(self) -> int: ...
+
+    @property
+    def user_id(self) -> int: ...
+
+    @property
+    def new_participant(self) -> object | None: ...
 
 
 class _InboxReadUpdateLike(Protocol):
@@ -507,8 +514,8 @@ class EventHandlerManager:
             events.Raw(types=[UpdateChannel, UpdateChat]),
         )
         self._client.add_event_handler(
-            self.on_raw_channel_participant,
-            events.Raw(types=[UpdateChannelParticipant]),
+            self.on_raw_participant,
+            events.Raw(types=[UpdateChannelParticipant, UpdateChatParticipant]),
         )
         self._client.add_event_handler(
             self.on_raw_inbox_read,
@@ -533,7 +540,7 @@ class EventHandlerManager:
         self._client.remove_event_handler(self.on_raw_delete_scheduled_messages)
         self._client.remove_event_handler(self.on_raw_dialog_pinned)
         self._client.remove_event_handler(self.on_raw_channel_chat_update)
-        self._client.remove_event_handler(self.on_raw_channel_participant)
+        self._client.remove_event_handler(self.on_raw_participant)
         self._client.remove_event_handler(self.on_raw_inbox_read)
         self._client.remove_event_handler(self.on_raw_forum_topic_pinned)
 
@@ -1526,7 +1533,7 @@ class EventHandlerManager:
             )
 
     @staticmethod
-    def _access_loss_cause(update: _ChannelParticipantUpdateLike, self_id: int) -> str | None:
+    def _access_loss_cause(update: _ParticipantUpdateLike, self_id: int) -> str | None:
         participant = update.new_participant
         if isinstance(participant, ChannelParticipantBanned):
             rights = participant.banned_rights
@@ -1537,8 +1544,14 @@ class EventHandlerManager:
             return "self_left" if update.actor_id == self_id else "removed_by_admin"
         return None
 
-    async def on_raw_channel_participant(self, update: _ChannelParticipantUpdateLike) -> None:
-        """Persist why this account lost a channel or supergroup membership."""
+    @staticmethod
+    def _participant_dialog_id(update: UpdateChannelParticipant | UpdateChatParticipant) -> int:
+        if isinstance(update, UpdateChannelParticipant):
+            return int(get_peer_id(PeerChannel(update.channel_id)))
+        return int(get_peer_id(PeerChat(update.chat_id)))
+
+    async def on_raw_participant(self, update: UpdateChannelParticipant | UpdateChatParticipant) -> None:
+        """Persist why this account lost a group, supergroup, or channel membership."""
         try:
             self_id = await self._resolve_self_id()
             if self_id is None or update.user_id != self_id:
@@ -1546,7 +1559,7 @@ class EventHandlerManager:
             cause = self._access_loss_cause(update, self_id)
             if cause is None:
                 return
-            dialog_id = int(get_peer_id(PeerChannel(update.channel_id)))
+            dialog_id = self._participant_dialog_id(update)
             occurred_at = int(update.date.timestamp()) if update.date is not None else int(time.time())
             with self._conn:
                 changed = set_access_lost(
