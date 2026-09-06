@@ -28,7 +28,6 @@ from mcp_telegram.event_handlers import (
     _DeletedMessagesEvent,
     _EditedMessageEvent,
     _NewMessageEvent,
-    _ReadMessageEvent,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from tests.history_enrollment_helpers import seed_full_history_enrollment
@@ -56,11 +55,6 @@ def make_message_edited_event(chat_id: int | None, message: SimpleNamespace) -> 
 def make_message_deleted_event(chat_id: int | None, deleted_ids: list[int]) -> _DeletedMessagesEvent:
     """Build a minimal MessageDeleted.Event-like object."""
     return cast(_DeletedMessagesEvent, SimpleNamespace(chat_id=chat_id, deleted_ids=deleted_ids))
-
-
-def make_message_read_event(chat_id: int | None, max_id: int) -> _ReadMessageEvent:
-    """Build a minimal MessageRead.Event-like object."""
-    return cast(_ReadMessageEvent, SimpleNamespace(chat_id=chat_id, max_id=max_id))
 
 
 # ---------------------------------------------------------------------------
@@ -930,7 +924,7 @@ def test_register_adds_handlers(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    assert mock_client.add_event_handler.call_count == 14
+    assert mock_client.add_event_handler.call_count == 13
 
 
 def test_unregister_removes_handlers(
@@ -943,7 +937,7 @@ def test_unregister_removes_handlers(
     manager.register()
     manager.unregister()
 
-    assert mock_client.remove_event_handler.call_count == 14
+    assert mock_client.remove_event_handler.call_count == 13
 
 
 def test_refresh_synced_dialogs(
@@ -1204,191 +1198,6 @@ async def test_on_message_edited_updates_fts(
     assert fts_row is not None, "messages_fts row must exist after edit"
     # stemmed text must differ from the original stub
     assert fts_row[0] != "old text here", "FTS stemmed_text must be updated after message edit"
-
-
-# ---------------------------------------------------------------------------
-# MessageRead handler — monotonic writes, peerless contents-read handling
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_on_message_read_updates_read_inbox_max_id(
-    mock_client: MagicMock,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """on_message_read updates read_inbox_max_id and last_event_at for a synced dialog."""
-    dialog_id = 1001
-    insert_synced_dialog(sync_db, dialog_id)
-    manager = make_manager(mock_client, sync_db, shutdown_event)
-    manager.register()
-
-    event = make_message_read_event(chat_id=dialog_id, max_id=42)
-    await manager.on_message_read(event)
-
-    row = sync_db.execute(
-        "SELECT read_inbox_max_id, last_event_at FROM synced_dialogs WHERE dialog_id = ?",
-        (dialog_id,),
-    ).fetchone()
-    assert row is not None
-    assert row[0] == 42
-    assert row[1] is not None  # last_event_at updated
-
-
-@pytest.mark.asyncio
-async def test_on_message_read_is_monotonic_against_out_of_order_events(
-    mock_client: MagicMock,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """Review-mandated: stored value must never decrease, even if an older
-    MessageRead event arrives after a newer one.
-    """
-    dialog_id = 1001
-    insert_synced_dialog(sync_db, dialog_id)
-    # Pre-seed a high value
-    sync_db.execute(
-        "UPDATE synced_dialogs SET read_inbox_max_id=? WHERE dialog_id=?",
-        (100, dialog_id),
-    )
-    sync_db.commit()
-
-    manager = make_manager(mock_client, sync_db, shutdown_event)
-    manager.register()
-
-    # Stale event: lower max_id
-    event = make_message_read_event(chat_id=dialog_id, max_id=50)
-    await manager.on_message_read(event)
-
-    row = sync_db.execute(
-        "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?",
-        (dialog_id,),
-    ).fetchone()
-    assert row[0] == 100, f"Expected 100 (monotonic), got {row[0]} (regressed!)"
-
-
-@pytest.mark.asyncio
-async def test_on_message_read_updates_null_baseline(
-    mock_client: MagicMock,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """COALESCE path: NULL existing value should be replaced by event.max_id."""
-    dialog_id = 1001
-    insert_synced_dialog(sync_db, dialog_id)
-    # Ensure NULL
-    sync_db.execute(
-        "UPDATE synced_dialogs SET read_inbox_max_id=NULL WHERE dialog_id=?",
-        (dialog_id,),
-    )
-    sync_db.commit()
-
-    manager = make_manager(mock_client, sync_db, shutdown_event)
-    manager.register()
-
-    event = make_message_read_event(chat_id=dialog_id, max_id=42)
-    await manager.on_message_read(event)
-
-    row = sync_db.execute(
-        "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?",
-        (dialog_id,),
-    ).fetchone()
-    assert row[0] == 42
-
-
-@pytest.mark.asyncio
-async def test_on_message_read_ignores_unknown_dialog(
-    mock_client: MagicMock,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """on_message_read with a dialog_id not in _synced_dialog_ids is a no-op."""
-    manager = make_manager(mock_client, sync_db, shutdown_event)
-    manager.register()
-
-    event = make_message_read_event(chat_id=9999, max_id=42)
-    await manager.on_message_read(event)  # must not raise
-
-    row = sync_db.execute(
-        "SELECT COUNT(*) FROM synced_dialogs WHERE dialog_id = ?",
-        (9999,),
-    ).fetchone()
-    assert row[0] == 0  # no row created
-
-
-@pytest.mark.asyncio
-async def test_on_message_read_peerless_contents_read_is_not_warning(
-    mock_client: MagicMock,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Contents-read updates have no peer and must not look like lost PM reads."""
-    import logging
-
-    manager = make_manager(mock_client, sync_db, shutdown_event)
-    manager.register()
-
-    event = cast(_ReadMessageEvent, SimpleNamespace(chat_id=None, max_id=None, contents=True))
-    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.event_handlers"):
-        await manager.on_message_read(event)  # must not raise
-
-    assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
-    assert any("event_read_contents_ignored" in rec.message for rec in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_on_message_read_peerful_contents_read_does_not_move_cursor(
-    mock_client: MagicMock,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A content-read signal must not advance even when Telethon supplies a peer."""
-    dialog_id = 1001
-    insert_synced_dialog(sync_db, dialog_id)
-    sync_db.execute("UPDATE synced_dialogs SET read_inbox_max_id=10 WHERE dialog_id=?", (dialog_id,))
-    sync_db.commit()
-    manager = make_manager(mock_client, sync_db, shutdown_event)
-    manager.register()
-
-    event = cast(
-        _ReadMessageEvent,
-        SimpleNamespace(chat_id=dialog_id, max_id=42, contents=True),
-    )
-    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.event_handlers"):
-        await manager.on_message_read(event)
-
-    assert sync_db.execute(
-        "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
-    ).fetchone() == (10,)
-    assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
-    assert any("event_read_contents_ignored" in rec.message for rec in caplog.records)
-
-
-def test_register_adds_message_read_handler(
-    mock_client: MagicMock,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """register() preserves the on_message_read position and adds topic handlers."""
-    manager = make_manager(mock_client, sync_db, shutdown_event)
-    manager.register()
-    assert mock_client.add_event_handler.call_count == 14
-    message_read_call = mock_client.add_event_handler.call_args_list[4]
-    assert message_read_call.args[0] == manager.on_message_read
-
-
-def test_unregister_removes_message_read_handler(
-    mock_client: MagicMock,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """unregister() removes all registered handlers, including scheduled handlers."""
-    manager = make_manager(mock_client, sync_db, shutdown_event)
-    manager.register()
-    manager.unregister()
-    assert mock_client.remove_event_handler.call_count == 14
 
 
 # ---------------------------------------------------------------------------

@@ -95,6 +95,7 @@ from .important_events.read_model import list_important_events as read_important
 from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
 from .reading.query_records import read_message_from_row
+from .runtime_events import prune_runtime_events, record_runtime_event
 from .sync_alerts import SyncAlertTokenCodec, query_alerts
 from .sync_read_model import SyncStatus, build_sync_read_model
 from .topics.contracts import TopicSourceUnavailableError
@@ -116,6 +117,7 @@ _ALL_ENTITY_NAMES_NORMALIZED_SQL = (
 _ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, type FROM entities WHERE username = ? COLLATE NOCASE"
 _TELEMETRY_OUTCOMES = frozenset({"success", "tool_error", "validation_error", "exception", "cancelled"})
 _TELEMETRY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_runtime_event_write_count = 0
 
 
 def _telemetry_input_error(message: str) -> dict[str, object]:
@@ -152,55 +154,23 @@ def _normalize_telemetry_event(
     return event, None
 
 
-def _telemetry_columns(conn: sqlite3.Connection) -> set[str]:
-    try:
-        rows = cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(telemetry_events)").fetchall())
-    except sqlite3.Error:
-        return set()
-    return {str(row[1]) for row in rows}
-
-
 def _insert_telemetry_row(
     conn: sqlite3.Connection,
     event: Mapping[str, object],
-    *,
-    legacy: bool,
 ) -> None:
-    if legacy:
-        conn.execute(
-            "INSERT INTO telemetry_events "
-            "(tool_name, timestamp, duration_ms, result_count, "
-            "has_cursor, page_depth, has_filter, error_type) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                event["tool_name"],
-                event.get("timestamp"),
-                event.get("duration_ms"),
-                event.get("result_count"),
-                event.get("has_cursor"),
-                event.get("page_depth"),
-                event.get("has_filter"),
-                event.get("error_type"),
-            ),
-        )
-        return
-    conn.execute(
-        "INSERT INTO telemetry_events "
-        "(tool_name, timestamp, duration_ms, result_count, "
-        "has_cursor, page_depth, has_filter, outcome, error_code, error_type) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            event["tool_name"],
-            event.get("timestamp"),
-            event.get("duration_ms"),
-            event.get("result_count"),
-            event.get("has_cursor"),
-            event.get("page_depth"),
-            event.get("has_filter"),
-            event["outcome"],
-            event["error_code"],
-            event.get("error_type"),
-        ),
+    record_runtime_event(
+        conn,
+        kind="mcp.call",
+        observed_at_ms=int(float(cast(float, event.get("timestamp", time.time()))) * 1000),
+        tool_name=str(event["tool_name"]),
+        duration_ms=float(cast(float, event.get("duration_ms", 0))),
+        result_count=int(cast(int, event.get("result_count", 0))),
+        has_cursor=bool(event.get("has_cursor")),
+        page_depth=int(cast(int, event.get("page_depth", 1))),
+        has_filter=bool(event.get("has_filter")),
+        outcome=str(event.get("outcome", "success")),
+        reason_code=cast(str | None, event.get("error_code")),
+        error_type=cast(str | None, event.get("error_type")),
     )
 
 
@@ -208,12 +178,12 @@ def _write_telemetry(
     conn: sqlite3.Connection,
     policy: DaemonApiPolicy,
     event: Mapping[str, object],
-    *,
-    legacy: bool,
 ) -> None:
-    _insert_telemetry_row(conn, event, legacy=legacy)
-    cutoff = time.time() - policy.telemetry_retention_ttl_seconds
-    conn.execute("DELETE FROM telemetry_events WHERE timestamp < ?", (cutoff,))
+    global _runtime_event_write_count
+    _insert_telemetry_row(conn, event)
+    _runtime_event_write_count += 1
+    if _runtime_event_write_count % 128 == 0:
+        prune_runtime_events(conn, ttl_seconds=policy.telemetry_retention_ttl_seconds)
     conn.commit()
 
 
@@ -1515,22 +1485,20 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _record_telemetry(self, req: dict[str, object]) -> dict:
-        """Write a telemetry event row to sync.db telemetry_events table.
+        """Write one bounded ``mcp.call`` observation to ``runtime_events``.
 
-        Evicts rows older than the configured retention window on every write.
+        Retention runs on startup and every 128 MCP observations.
         """
         event, error = _normalize_telemetry_event(req)
         if error is not None:
             return error
         assert event is not None
-        legacy = not {"outcome", "error_code"} <= _telemetry_columns(self._conn)
-        if not legacy:
-            outcome = _normalize_telemetry_outcome(event)
-            if isinstance(outcome, dict):
-                return outcome
-            event["outcome"], event["error_code"] = outcome
+        outcome = _normalize_telemetry_outcome(event)
+        if isinstance(outcome, dict):
+            return outcome
+        event["outcome"], event["error_code"] = outcome
         try:
-            _write_telemetry(self._conn, self._policy, event, legacy=legacy)
+            _write_telemetry(self._conn, self._policy, event)
             return {"ok": True}
         except Exception as exc:
             logger.exception("record_telemetry failed: %s", exc)

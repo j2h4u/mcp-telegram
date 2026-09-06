@@ -459,6 +459,14 @@ async def test_update_read_history_inbox_logs_still_unread_count(
     assert row[0] == 7 and row[1] is not None and row[2] == 42
     # last_event_at should be advanced
     assert _last_event_at(sync_db, dialog_id) is not None
+    trace = sync_db.execute(
+        "SELECT kind, operation_id, outcome, payload_json FROM runtime_events WHERE dialog_id=? ORDER BY id",
+        (dialog_id,),
+    ).fetchall()
+    assert [item[0] for item in trace] == ["telegram.inbox_read_received", "sync.inbox_read_finished"]
+    assert trace[0][1] == trace[1][1]
+    assert trace[1][2] == "applied"
+    assert '"cursor_after":42' in trace[1][3]
 
 
 @pytest.mark.asyncio
@@ -558,13 +566,13 @@ async def test_raw_inbox_read_missing_max_id_does_not_fabricate_cursor(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("invalid_count", [True, 1.5, "1", -1])
-async def test_raw_inbox_read_invalid_unread_count_is_atomic_noop(
+async def test_raw_inbox_read_invalid_unread_count_applies_cursor_only(
     invalid_count: object,
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """Invalid unread counts cannot cause cursor-only or unread-only writes."""
+    """A valid cursor survives malformed optional unread metadata."""
     dialog_id = get_peer_id(PeerChannel(channel_id=99992))
     _enroll_synced(sync_db, dialog_id)
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
@@ -579,11 +587,14 @@ async def test_raw_inbox_read_invalid_unread_count_is_atomic_noop(
     )
     await mgr.on_raw_inbox_read(cast(_InboxReadUpdateLike, upd))
 
-    assert sync_db.execute(
-        "SELECT read_inbox_max_id, last_event_at FROM synced_dialogs WHERE dialog_id=?",
-        (dialog_id,),
-    ).fetchone() == (None, None)
-    assert sync_db.execute("SELECT unread_count FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is None
+    assert (
+        sync_db.execute(
+            "SELECT read_inbox_max_id, last_event_at FROM synced_dialogs WHERE dialog_id=?",
+            (dialog_id,),
+        ).fetchone()[0]
+        == 42
+    )
+    assert sync_db.execute("SELECT unread_count FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (None,)
 
 
 @pytest.mark.asyncio
@@ -829,7 +840,7 @@ def test_register_attaches_three_new_handlers(
     """Dialog, scheduled, and topic handlers bring the registration total to 14."""
     mgr = EventHandlerManager(mock_client, sync_db, shutdown_event, mock_client.get_input_entity)
     mgr.register()
-    assert mock_client.add_event_handler.call_count == 14
+    assert mock_client.add_event_handler.call_count == 13
 
 
 def test_unregister_detaches_all_new_handlers(

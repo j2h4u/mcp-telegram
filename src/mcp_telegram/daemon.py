@@ -109,6 +109,7 @@ from .reactions.sqlite_repository import SQLiteReactionSnapshotRepository
 from .reactions.telegram_adapter import TelethonTelegramReactionGateway
 from .read_state import apply_read_cursor, apply_reconciled_unread_count
 from .reconnect import run_reconnect_catch_up_loop
+from .runtime_events import prune_runtime_events, record_runtime_event
 from .scheduled_messages import ScheduledReconciliationPolicy, run_scheduled_reconciliation_loop
 from .state import StatePaths, ensure_private_state_dir
 from .sync_db import (
@@ -613,6 +614,38 @@ def _apply_read_positions_from_dialogs(  # noqa: PLR0913
     return filled
 
 
+def _record_read_reconciliation_event(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    state: _StoredReadPositionState,
+    *,
+    wrote_any: bool,
+) -> None:
+    after_row = cast(
+        tuple[int | None, int | None, int | None] | None,
+        conn.execute(
+            "SELECT sd.read_inbox_max_id, sd.read_outbox_max_id, d.unread_count "
+            "FROM synced_dialogs sd LEFT JOIN dialogs d ON d.dialog_id=sd.dialog_id WHERE sd.dialog_id=?",
+            (dialog_id,),
+        ).fetchone(),
+    )
+    try:
+        record_runtime_event(
+            conn,
+            kind="sync.read_reconciliation",
+            dialog_id=dialog_id,
+            outcome="applied" if wrote_any else "unchanged",
+            payload={
+                "cursor_before": state.inbox_max,
+                "cursor_after": after_row[0] if after_row else None,
+                "outbox_after": after_row[1] if after_row else None,
+                "unread_after": after_row[2] if after_row else None,
+            },
+        )
+    except Exception:
+        logger.exception("runtime_event_record_failed kind=sync.read_reconciliation dialog_id=%d", dialog_id)
+
+
 def _apply_read_position_dialog(  # noqa: PLR0913
     conn: sqlite3.Connection,
     dialog: _ReadPositionDialogLike,
@@ -655,6 +688,7 @@ def _apply_read_position_dialog(  # noqa: PLR0913
         success_due_at=success_due_at,
         failed_ids=failed_ids,
     )
+    _record_read_reconciliation_event(conn, chat_id, state, wrote_any=wrote_any)
     return wrote_any
 
 
@@ -898,6 +932,17 @@ def _create_tracked_task(
         ctx.background_tasks.discard(t)
         exc = t.exception() if not t.cancelled() else None
         if exc is not None:
+            try:
+                with ctx.conn:
+                    record_runtime_event(
+                        ctx.conn,
+                        kind="runtime.task_failed",
+                        outcome="failed",
+                        reason_code=type(exc).__name__,
+                        payload={"task_name": t.get_name()},
+                    )
+            except Exception:
+                logger.exception("runtime_event_record_failed kind=runtime.task_failed")
             if critical:
                 ctx.api_server._ready = False
                 ctx.api_server.startup_detail = f"critical background task failed: {t.get_name()}"
@@ -908,6 +953,14 @@ def _create_tracked_task(
 
     task.add_done_callback(_on_done)
     return task
+
+
+def _observe_runtime(ctx: _SyncMainContext, kind: str, outcome: str, reason_code: str | None) -> None:
+    try:
+        with ctx.conn:
+            record_runtime_event(ctx.conn, kind=kind, outcome=outcome, reason_code=reason_code)
+    except Exception:
+        logger.exception("runtime_event_record_failed kind=%s", kind)
 
 
 async def _monitor_flood_wait_kill_switch(ctx: _SyncMainContext) -> None:
@@ -985,6 +1038,9 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - com
         state_paths.state_dir,
         telemetry_retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
     )
+    with conn:
+        prune_runtime_events(conn, ttl_seconds=config.telemetry.retention_ttl_seconds)
+        record_runtime_event(conn, kind="runtime.started", outcome="observed")
 
     # Open feedback.db before registering the shutdown handler so the SIGTERM
     # handler can checkpoint it.  feedback_conn is opened on the asyncio thread
@@ -1408,6 +1464,11 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
         ctx.feedback_conn.close()
     except Exception:
         logger.debug("feedback_conn close error", exc_info=True)
+    try:
+        with ctx.conn:
+            record_runtime_event(ctx.conn, kind="runtime.stopped", outcome="observed")
+    except Exception:
+        logger.exception("runtime_event_record_failed kind=runtime.stopped")
     ctx.conn.close()
     logger.info("sync-daemon stopped")
 
@@ -1449,6 +1510,7 @@ async def sync_main() -> None:
                 ctx.client,
                 ctx.shutdown_event,
                 interval_seconds=ctx.scheduling.reconnect_catch_up_interval_seconds,
+                observe=lambda kind, outcome, reason: _observe_runtime(ctx, kind, outcome, reason),
             ),
             name="reconnect_catch_up_loop",
         )
@@ -1459,8 +1521,8 @@ async def sync_main() -> None:
         worker = FullSyncWorker(ctx.client, ctx.conn, ctx.shutdown_event)
         await _start_bootstrap_background_tasks(ctx, worker)
         # Must come AFTER handler_manager.register() (startup-ordering invariant):
-        # the on_message_read handler must be live before bootstrap starts so no
-        # real-time MessageRead events are dropped during the bootstrap window.
+        # the raw inbox read handler must be live before bootstrap starts so no
+        # real-time cursor updates are dropped during the bootstrap window.
         _create_tracked_task(
             ctx,
             _run_read_position_reconciliation_loop(

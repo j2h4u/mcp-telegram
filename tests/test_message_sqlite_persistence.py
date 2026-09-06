@@ -41,13 +41,14 @@ from mcp_telegram.messages.sqlite_hydration_jobs import (
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 
 
-def _message(
+def _message(  # noqa: PLR0913
     message_id: int,
     *,
     text: str | None,
     sent_at: int = 100,
     media_kind: str | None = None,
     media_payload: str | None = None,
+    out: int = 0,
 ) -> ExtractedMessage:
     return ExtractedMessage(
         message=StoredMessage(
@@ -62,7 +63,7 @@ def _message(
             edit_date=None,
             grouped_id=None,
             reply_to_peer_id=None,
-            out=0,
+            out=out,
             is_service=0,
             post_author=None,
             media_kind=media_kind,
@@ -130,6 +131,28 @@ def test_persist_edited_message_unchanged_is_noop(conn: sqlite3.Connection) -> N
     with conn:
         assert persist_edited_message(conn, _message(11, text="same"), old_text="same", edit_date=200) is None
     assert conn.execute("SELECT COUNT(*) FROM message_versions").fetchone() == (0,)
+
+
+def test_edit_alert_policy_accepts_only_incoming_confirmed_human_dm(conn: sqlite3.Connection) -> None:
+    with conn:
+        conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (42, 'user')")
+        conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (42, 'user', 1)")
+        insert_messages_with_fts(conn, [_message(20, text="first"), _message(21, text="own", out=1)])
+    with conn:
+        assert persist_edited_message(conn, _message(20, text="second"), old_text="first", edit_date=200) == 1
+        assert persist_edited_message(conn, _message(21, text="changed", out=1), old_text="own", edit_date=201) == 1
+    assert conn.execute("SELECT kind,dialog_id,message_id FROM sync_alert_events ORDER BY seq").fetchall() == [
+        ("edit", 42, 20)
+    ]
+
+
+def test_transcription_version_never_creates_change_alert(conn: sqlite3.Connection) -> None:
+    with conn:
+        conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (42, 'user')")
+        insert_messages_with_fts(conn, [_message(22, text=None)])
+        persist_transcribed_text(conn, 42, 22, old_text=None, transcribed_text="local transcript", transcribed_at=300)
+    assert conn.execute("SELECT origin FROM message_versions WHERE message_id=22").fetchone() == ("transcription",)
+    assert conn.execute("SELECT COUNT(*) FROM sync_alert_events").fetchone() == (0,)
 
 
 def _make_hydration_eligible(conn: sqlite3.Connection, status: str = "synced") -> None:

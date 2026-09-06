@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from typing import cast
 
 from .. import message_contracts as _message_contracts
+from ..alert_policy import incoming_human_dm_sql
 from ..fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
 from ..hydration_queue import HydrationPriority, HydrationQueueRepository
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
@@ -33,9 +34,7 @@ _SELECT_MESSAGE_EXISTS_SQL = "SELECT 1 FROM messages WHERE dialog_id = ? AND mes
 _SELECT_MESSAGE_OUT_SQL = "SELECT out FROM messages WHERE dialog_id = ? AND message_id = ?"
 _SELECT_MESSAGE_LOG_CONTEXT_SQL = "SELECT sent_at FROM messages WHERE dialog_id = ? AND message_id = ?"
 _NEXT_VERSION_SQL = "SELECT COALESCE(MAX(version), 0) + 1 FROM message_versions WHERE dialog_id = ? AND message_id = ?"
-_INSERT_VERSION_SQL = (
-    "INSERT INTO message_versions (dialog_id, message_id, version, old_text, edit_date) VALUES (?, ?, ?, ?, ?)"
-)
+_INSERT_VERSION_SQL = "INSERT INTO message_versions (dialog_id, message_id, version, old_text, edit_date, origin) VALUES (?, ?, ?, ?, ?, ?)"
 _UPDATE_MESSAGE_TEXT_SQL = "UPDATE messages SET text = ? WHERE dialog_id = ? AND message_id = ?"
 _SELECT_MESSAGE_TRANSCRIPTION_SQL = (
     "SELECT text, transcription_id FROM message_transcriptions WHERE dialog_id = ? AND message_id = ?"
@@ -43,6 +42,13 @@ _SELECT_MESSAGE_TRANSCRIPTION_SQL = (
 _MARK_DELETED_SQL = (
     "UPDATE messages SET is_deleted = 1, deleted_at = ? WHERE dialog_id = ? AND message_id = ? AND is_deleted = 0"
 )
+_INSERT_HUMAN_DM_EDIT_ALERT_SQL = f"""
+INSERT OR IGNORE INTO sync_alert_events(kind, occurred_at, dialog_id, message_id, version)
+SELECT 'edit', ?, ?, ?, ?
+FROM messages m
+WHERE m.dialog_id = ? AND m.message_id = ?
+  AND {incoming_human_dm_sql("m")}
+"""
 _SELECT_UNDELETED_MESSAGES_SQL = (
     "SELECT message_id FROM messages WHERE dialog_id = ? AND is_deleted = 0 AND sent_at < ?"
 )
@@ -108,13 +114,19 @@ def persist_edited_message(
     priority: HydrationPriority = HydrationPriority.FOREGROUND,
 ) -> int | None:
     """Version and persist a changed message in the caller's transaction."""
-    if old_text == extracted.message.text:
-        return None
     dialog_id, message_id = extracted.message.dialog_id, extracted.message.message_id
+    current = read_message_text(conn, dialog_id, message_id)
+    if not current.found or current.text == extracted.message.text:
+        return None
+    old_text = current.text
     version_row = cast(tuple[int], conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone())
     next_version = int(version_row[0])
-    conn.execute(_INSERT_VERSION_SQL, (dialog_id, message_id, next_version, old_text, edit_date))
+    conn.execute(_INSERT_VERSION_SQL, (dialog_id, message_id, next_version, old_text, edit_date, "telegram_edit"))
     insert_messages_with_fts(conn, [extracted], priority=priority)
+    conn.execute(
+        _INSERT_HUMAN_DM_EDIT_ALERT_SQL,
+        (edit_date, dialog_id, message_id, next_version, dialog_id, message_id),
+    )
     return next_version
 
 
@@ -132,7 +144,7 @@ def persist_transcribed_text(  # noqa: PLR0913
         return None
     version_row = cast(tuple[int], conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone())
     next_version = int(version_row[0])
-    conn.execute(_INSERT_VERSION_SQL, (dialog_id, message_id, next_version, old_text, transcribed_at))
+    conn.execute(_INSERT_VERSION_SQL, (dialog_id, message_id, next_version, old_text, transcribed_at, "transcription"))
     conn.execute(_UPDATE_MESSAGE_TEXT_SQL, (transcribed_text, dialog_id, message_id))
     conn.execute(DELETE_FTS_SQL, (dialog_id, message_id))
     conn.execute(INSERT_FTS_SQL, (dialog_id, message_id, stem_text(transcribed_text)))

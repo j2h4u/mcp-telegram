@@ -1,17 +1,17 @@
 import fcntl
-import json
 import logging
 import sqlite3
 from pathlib import Path
 from typing import cast
 
+from .alert_policy import incoming_human_dm_sql
 from .dialog_classification import (
     SERVICE_DIALOG_TYPE,
     is_bot_dialog_type,
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 50
+_CURRENT_SCHEMA_VERSION = 51
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS message_versions (
     version     INTEGER NOT NULL,
     old_text    TEXT,
     edit_date   INTEGER,
+    origin      TEXT NOT NULL DEFAULT 'telegram_edit' CHECK (origin IN ('telegram_edit', 'transcription')),
     PRIMARY KEY (dialog_id, message_id, version)
 ) WITHOUT ROWID
 """
@@ -211,6 +212,71 @@ _DAEMON_EVENTS_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_daemon_events_kind_time
 ON daemon_events(kind, occurred_at DESC)
 """
+
+_RUNTIME_EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS runtime_events (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    observed_at_ms      INTEGER NOT NULL,
+    kind                TEXT NOT NULL,
+    runtime_instance_id TEXT NOT NULL,
+    operation_id        TEXT,
+    outcome             TEXT,
+    reason_code         TEXT,
+    dialog_id           INTEGER,
+    duration_ms         REAL,
+    tool_name           TEXT,
+    result_count        INTEGER,
+    has_cursor          INTEGER,
+    page_depth          INTEGER,
+    has_filter          INTEGER,
+    error_type          TEXT,
+    payload_json        TEXT NOT NULL DEFAULT '{}'
+)
+"""
+
+_RUNTIME_EVENTS_INDEXES_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_runtime_events_time ON runtime_events(observed_at_ms DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_runtime_events_kind_time ON runtime_events(kind, observed_at_ms DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_runtime_events_dialog_time ON runtime_events(dialog_id, observed_at_ms DESC, id DESC) WHERE dialog_id IS NOT NULL",
+)
+
+_SYNC_ALERT_EVENTS_V51_DDL = """
+CREATE TABLE sync_alert_events_v51 (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL CHECK (kind IN ('deleted_message', 'edit', 'access_lost')),
+    occurred_at INTEGER NOT NULL,
+    dialog_id   INTEGER NOT NULL,
+    message_id  INTEGER,
+    version     INTEGER,
+    CHECK (
+        (kind = 'deleted_message' AND message_id IS NOT NULL AND version IS NULL)
+        OR (kind = 'edit' AND message_id IS NOT NULL AND version IS NOT NULL)
+        OR (kind = 'access_lost' AND message_id IS NULL AND version IS NULL)
+    )
+)
+"""
+
+_HUMAN_DM_ALERT_PREDICATE = incoming_human_dm_sql("NEW")
+
+
+_SYNC_ALERT_V51_TRIGGERS = (
+    f"""CREATE TRIGGER sync_alert_events_message_insert_deleted
+        AFTER INSERT ON messages
+        WHEN NEW.is_deleted = 1 AND NEW.deleted_at IS NOT NULL
+         AND {_HUMAN_DM_ALERT_PREDICATE}
+        BEGIN
+          INSERT OR IGNORE INTO sync_alert_events(kind, occurred_at, dialog_id, message_id)
+          VALUES ('deleted_message', NEW.deleted_at, NEW.dialog_id, NEW.message_id);
+        END""",
+    f"""CREATE TRIGGER sync_alert_events_message_delete_transition
+        AFTER UPDATE OF is_deleted, deleted_at ON messages
+        WHEN OLD.is_deleted = 0 AND NEW.is_deleted = 1 AND NEW.deleted_at IS NOT NULL
+         AND {_HUMAN_DM_ALERT_PREDICATE}
+        BEGIN
+          INSERT OR IGNORE INTO sync_alert_events(kind, occurred_at, dialog_id, message_id)
+          VALUES ('deleted_message', NEW.deleted_at, NEW.dialog_id, NEW.message_id);
+        END""",
+)
 
 _SYNC_ALERT_EVENTS_DDL = """
 CREATE TABLE IF NOT EXISTS sync_alert_events (
@@ -2047,6 +2113,14 @@ def _apply_migration_47(conn: sqlite3.Connection, current: int) -> int:
 
 def _apply_migration_48(conn: sqlite3.Connection, current: int) -> int:
     """Create the immutable observed-order alert projection and its writers."""
+    alert_column_rows = cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(sync_alert_events)").fetchall())
+    alert_columns = {str(row[1]) for row in alert_column_rows}
+    runtime_exists = cast(
+        tuple[int] | None,
+        conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runtime_events'").fetchone(),
+    )
+    if runtime_exists is not None and alert_columns and "daemon_event_id" not in alert_columns:
+        return _apply_migration(conn, current, 48, [])
     return _apply_migration(
         conn,
         current,
@@ -2116,6 +2190,103 @@ def _apply_migration_50(conn: sqlite3.Connection, current: int) -> int:
     return _apply_migration(conn, current, 50, [_MESSAGES_DIALOG_SUMMARY_INDEX_DDL])
 
 
+def _sequence_high_water(conn: sqlite3.Connection, table: str, id_column: str) -> int:
+    row = cast(
+        tuple[int | None] | None,
+        conn.execute(
+            f"SELECT MAX(value) FROM (SELECT COALESCE(MAX({id_column}), 0) AS value FROM {table} "
+            "UNION ALL SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = ?), 0))",
+            (table,),
+        ).fetchone(),
+    )
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def _complete_replayed_migration_51(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP TABLE IF EXISTS telemetry_events")
+    conn.execute("DROP TABLE IF EXISTS daemon_events")
+    conn.execute("INSERT INTO schema_version VALUES (51, strftime('%s', 'now'))")
+
+
+def _prepare_migration_51_schema(conn: sqlite3.Connection) -> int:
+    source_high_water = max(
+        _sequence_high_water(conn, "sync_alert_events", "seq"),
+        _sequence_high_water(conn, "daemon_events", "id"),
+    )
+    version_column_rows = cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(message_versions)").fetchall())
+    version_columns = {str(row[1]) for row in version_column_rows}
+    if "origin" not in version_columns:
+        conn.execute(
+            "ALTER TABLE message_versions ADD COLUMN origin TEXT NOT NULL DEFAULT 'telegram_edit' "
+            "CHECK (origin IN ('telegram_edit', 'transcription'))"
+        )
+    for trigger in (
+        "sync_alert_events_message_insert_deleted",
+        "sync_alert_events_message_delete_transition",
+        "sync_alert_events_message_edit",
+        "sync_alert_events_access_lost",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    conn.execute(_RUNTIME_EVENTS_DDL)
+    for stmt in _RUNTIME_EVENTS_INDEXES_DDL:
+        conn.execute(stmt)
+    return source_high_water
+
+
+def _replace_alert_projection_v51(conn: sqlite3.Connection, source_high_water: int) -> None:
+    conn.execute(_SYNC_ALERT_EVENTS_V51_DDL)
+    conn.execute("DROP TABLE sync_alert_events")
+    conn.execute("ALTER TABLE sync_alert_events_v51 RENAME TO sync_alert_events")
+    conn.execute("DELETE FROM sqlite_sequence WHERE name = 'sync_alert_events'")
+    conn.execute("INSERT INTO sqlite_sequence(name, seq) VALUES ('sync_alert_events', ?)", (source_high_water,))
+    conn.execute(_SYNC_ALERT_DELETED_INDEX_DDL)
+    conn.execute(_SYNC_ALERT_EDIT_INDEX_DDL)
+    for stmt in _SYNC_ALERT_V51_TRIGGERS:
+        conn.execute(stmt)
+
+
+def _finish_migration_51(conn: sqlite3.Connection) -> None:
+    conn.execute(_DAEMON_STATE_DDL)
+    conn.execute(
+        "INSERT OR REPLACE INTO daemon_state(key, value) VALUES "
+        "('runtime_events_history_started_at_ms', CAST(strftime('%s', 'now') AS INTEGER) * 1000)"
+    )
+    conn.execute("DROP TABLE telemetry_events")
+    conn.execute("DROP TABLE daemon_events")
+    conn.execute("INSERT INTO schema_version VALUES (51, strftime('%s', 'now'))")
+
+
+def _apply_migration_51(conn: sqlite3.Connection, current: int) -> int:
+    """Atomically cut over runtime observations and the focused alert policy."""
+    if current >= _CURRENT_SCHEMA_VERSION:
+        return current
+    table_rows = cast(
+        list[tuple[object]], conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    )
+    alert_column_rows = cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(sync_alert_events)").fetchall())
+    tables = {str(row[0]) for row in table_rows}
+    alert_columns = {str(row[1]) for row in alert_column_rows}
+    if "runtime_events" in tables and alert_columns and "daemon_event_id" not in alert_columns:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _complete_replayed_migration_51(conn)
+            conn.commit()
+            return 51
+        except BaseException:
+            conn.rollback()
+            raise
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        source_high_water = _prepare_migration_51_schema(conn)
+        _replace_alert_projection_v51(conn, source_high_water)
+        _finish_migration_51(conn)
+        conn.commit()
+        return 51
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -2163,6 +2334,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_48(conn, current)
     current = _apply_migration_49(conn, current)
     current = _apply_migration_50(conn, current)
+    current = _apply_migration_51(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
@@ -2280,26 +2452,6 @@ def repair_reserved_dialog_types(conn: sqlite3.Connection) -> None:
             _repair_reserved_dialogs(conn, reply_ids)
 
 
-def record_daemon_event(
-    conn: sqlite3.Connection,
-    *,
-    kind: str,
-    occurred_at: int,
-    dialog_id: int | None = None,
-    payload: dict[str, object] | None = None,
-) -> None:
-    """Append a compact local daemon event for non-lifecycle callers."""
-    conn.execute(
-        "INSERT INTO daemon_events (kind, dialog_id, occurred_at, payload_json) VALUES (?, ?, ?, ?)",
-        (
-            kind,
-            dialog_id,
-            occurred_at,
-            json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":")),
-        ),
-    )
-
-
 def ensure_sync_schema(db_path: Path) -> None:
     """Ensure sync.db exists and has the current schema.
 
@@ -2366,7 +2518,7 @@ def migrate_legacy_databases(
     *,
     telemetry_retention_ttl_seconds: int,
 ) -> None:
-    """One-shot migration from entity_cache.db and analytics.db into sync.db.
+    """One-shot migration of durable entities and removal of obsolete local databases.
 
     Called once at daemon startup after ensure_sync_schema(). Idempotent —
     INSERT OR IGNORE skips existing rows. Deletes legacy files after success.
@@ -2389,27 +2541,8 @@ def migrate_legacy_databases(
     if copied_entities:
         logger.info("migrated %d entities from entity_cache.db", copied_entities)
 
-    # Migrate telemetry events using the configured retention boundary.
-    telemetry_stmts = [
-        (
-            "INSERT OR IGNORE INTO telemetry_events "
-            "(tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, outcome, error_code, error_type) "
-            "SELECT tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, "
-            "CASE WHEN error_type IS NOT NULL THEN 'exception' ELSE 'success' END, "
-            "CASE WHEN error_type IS NOT NULL THEN 'exception' ELSE NULL END, error_type "
-            "FROM legacy.telemetry_events "
-            f"WHERE timestamp > strftime('%s', 'now') - {telemetry_retention_ttl_seconds}"
-        ),
-    ]
-    copied_telemetry = _migrate_from_legacy_db(
-        conn,
-        analytics_path,
-        telemetry_stmts,
-    )
-    if copied_telemetry:
-        logger.info("migrated %d telemetry events from analytics.db", copied_telemetry)
-
-    # Delete legacy files
+    # Runtime observations deliberately start at the v51 cutover boundary;
+    # analytics.db used a superseded event contract and is discarded below.
     for path in [entity_cache_path, entity_lock_path, analytics_path]:
         if path.exists():
             path.unlink()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from typing import Protocol
 
 logger = logging.getLogger(__name__)
@@ -17,11 +18,39 @@ class ReconnectClient(Protocol):
     async def catch_up(self) -> None: ...
 
 
+async def _request_catch_up(
+    client: ReconnectClient,
+    observe: Callable[[str, str, str | None], None] | None,
+) -> bool:
+    try:
+        await client.catch_up()
+    except Exception:
+        logger.warning("telegram reconnect catch_up failed", exc_info=True)
+        if observe is not None:
+            observe("runtime.catch_up_request_failed", "failed", "catch_up_exception")
+        return False
+    logger.info("telegram reconnect catch_up requested")
+    if observe is not None:
+        observe("runtime.catch_up_requested", "requested", None)
+    return True
+
+
+def _observe_connection_transition(
+    observe: Callable[[str, str, str | None], None] | None,
+    *,
+    connected: bool,
+    was_connected: bool,
+) -> None:
+    if connected != was_connected and observe is not None:
+        observe("runtime.connection_observed", "connected" if connected else "disconnected", None)
+
+
 async def run_reconnect_catch_up_loop(
     client: ReconnectClient,
     shutdown_event: asyncio.Event,
     *,
     interval_seconds: float,
+    observe: Callable[[str, str, str | None], None] | None = None,
 ) -> None:
     """Recover missed updates once for each observed reconnect transition.
 
@@ -45,18 +74,13 @@ async def run_reconnect_catch_up_loop(
             pass
 
         connected = bool(client.is_connected())
+        _observe_connection_transition(observe, connected=connected, was_connected=was_connected)
         if not connected:
             recovery_needed = False
         elif not was_connected:
             recovery_needed = True
-        if connected and recovery_needed:
-            try:
-                await client.catch_up()
-            except Exception:
-                logger.warning("telegram reconnect catch_up failed", exc_info=True)
-            else:
-                logger.info("telegram reconnect catch_up complete")
-                recovery_needed = False
+        if connected and recovery_needed and await _request_catch_up(client, observe):
+            recovery_needed = False
         was_connected = connected
 
 

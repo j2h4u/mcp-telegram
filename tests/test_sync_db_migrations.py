@@ -15,7 +15,6 @@ import pytest
 
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
-    _apply_migration_48,
     _open_sync_db,
     ensure_sync_schema,
 )
@@ -325,7 +324,7 @@ def test_migration_v44_accepts_custom_emoji_and_preserves_media_artifacts(db_pat
 
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 50
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
         assert conn.execute("SELECT media_kind, media_payload FROM messages WHERE message_id = 1").fetchone() == (
             "document",
             '{"size":4}',
@@ -364,7 +363,7 @@ def test_migration_v44_accepts_custom_emoji_and_preserves_media_artifacts(db_pat
 
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 50
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
         assert conn.execute("SELECT media_kind FROM messages WHERE message_id = 3").fetchone() == ("custom_emoji",)
         assert conn.execute("SELECT media_kind FROM scheduled_messages WHERE message_id = 4").fetchone() == (
             "custom_emoji",
@@ -672,12 +671,14 @@ def test_migration_v18_creates_daemon_state_table(tmp_path: Path) -> None:
         assert col_map["value"] == ("TEXT", 0, 0)
 
 
-def test_migration_v18_daemon_state_empty_after_migration(tmp_path: Path) -> None:
+def test_daemon_state_contains_runtime_history_boundary_after_migration(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        count = _fetchone_int(conn, "SELECT COUNT(*) FROM daemon_state")
-        assert count == 0
+        row = _fetchone_row(conn, "SELECT value FROM daemon_state WHERE key = 'runtime_events_history_started_at_ms'")
+        assert row is not None
+        assert isinstance(row[0], (int, str))
+        assert int(row[0]) > 0
 
 
 def test_migration_v18_idempotent(tmp_path: Path) -> None:
@@ -700,7 +701,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 50
+        assert _CURRENT_SCHEMA_VERSION == 51
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1431,7 +1432,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 50
+        assert _CURRENT_SCHEMA_VERSION == 51
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:
@@ -1618,21 +1619,18 @@ def test_startup_repair_reclassifies_persisted_replies_rows(tmp_path: Path) -> N
         assert _fetchone_row(conn, "SELECT type FROM dialogs WHERE dialog_id = ?", (777000,)) == ("service",)
 
 
-def test_v48_fresh_schema_has_sync_alert_projection(tmp_path: Path) -> None:
+def test_v51_fresh_schema_has_runtime_store_and_focused_alert_projection(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 50
-        columns = _fetchall_rows(conn, "PRAGMA table_info(sync_alert_events)")
-        assert [row[1] for row in columns] == [
-            "seq",
-            "kind",
-            "occurred_at",
-            "dialog_id",
-            "message_id",
-            "version",
-            "daemon_event_id",
-        ]
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
+        tables = {row[0] for row in _fetchall_rows(conn, "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "runtime_events" in tables
+        assert "telemetry_events" not in tables
+        assert "daemon_events" not in tables
+        columns = [row[1] for row in _fetchall_rows(conn, "PRAGMA table_info(sync_alert_events)")]
+        assert columns == ["seq", "kind", "occurred_at", "dialog_id", "message_id", "version"]
+        assert "origin" in {row[1] for row in _fetchall_rows(conn, "PRAGMA table_info(message_versions)")}
 
 
 def test_v49_adds_bounded_own_activity_index(tmp_path: Path) -> None:
@@ -1640,8 +1638,7 @@ def test_v49_adds_bounded_own_activity_index(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         row = _fetchone_row(
-            conn,
-            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_own_activity_sent'",
+            conn, "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_messages_own_activity_sent'"
         )
         assert row is not None
         assert "WHERE out = 1 AND is_service = 0 AND is_deleted = 0" in str(row[0])
@@ -1652,189 +1649,102 @@ def test_v50_adds_covering_dialog_summary_index(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         row = _fetchone_row(
-            conn,
-            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_dialog_summary'",
+            conn, "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_messages_dialog_summary'"
         )
         assert row is not None
         assert "dialog_id, is_deleted, is_service, out, message_id" in str(row[0])
-        assert _fetchone_row(conn, "SELECT name FROM sqlite_master WHERE name = 'sync_alert_events_message_edit'") == (
-            "sync_alert_events_message_edit",
-        )
 
 
-def test_v48_backfills_current_access_loss_and_replays_safely(tmp_path: Path) -> None:
+def test_v51_human_dm_alert_policy_and_sequence_are_durable(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        conn.execute("DELETE FROM schema_version WHERE version >= 48")
+        for dialog_id, dialog_type in ((1, "user"), (2, "bot"), (3, "group"), (4, None)):
+            conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (?, ?)", (dialog_id, dialog_type))
+        conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (1, 'user', 1)")
         conn.execute(
-            "INSERT INTO synced_dialogs(dialog_id, status, access_lost_at) VALUES (?, 'access_lost', ?)",
-            (902, 1700000100),
+            "INSERT INTO messages(dialog_id,message_id,sent_at,out) VALUES (1,1,1,0),(1,2,1,1),(2,1,1,0),(3,1,1,0),(4,1,1,0)"
         )
-        conn.execute(
-            "INSERT INTO daemon_events(kind, dialog_id, occurred_at, payload_json) VALUES (?, ?, ?, ?)",
-            ("access_lost", 902, 1700000100, '{"reason":"preserve"}'),
-        )
-        conn.commit()
-
-    ensure_sync_schema(db_path)
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        rows = _fetchall_rows(
-            conn,
-            "SELECT kind, dialog_id, occurred_at, payload_json FROM daemon_events WHERE dialog_id = ?",
-            (902,),
-        )
-        assert rows == [("access_lost", 902, 1700000100, '{"reason":"preserve"}')]
-
-
-def test_v48_backfill_preserves_historical_fixture_shape(tmp_path: Path) -> None:
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        conn.execute("DELETE FROM schema_version WHERE version >= 48")
-        conn.execute(
-            "INSERT INTO synced_dialogs(dialog_id, status, access_lost_at) VALUES (?, 'access_lost', ?)",
-            (903, 1700000200),
-        )
-        conn.execute(
-            "INSERT INTO daemon_events(kind, dialog_id, occurred_at, payload_json) VALUES (?, ?, ?, ?)",
-            ("access_lost", 904, 1700000000, '{"legacy":true}'),
-        )
-        conn.commit()
-
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        assert _fetchone_row(
-            conn,
-            "SELECT payload_json FROM daemon_events WHERE dialog_id = ? AND occurred_at = ?",
-            (904, 1700000000),
-        ) == ('{"legacy":true}',)
-        assert _fetchone_row(
-            conn,
-            "SELECT payload_json FROM daemon_events WHERE dialog_id = ? AND occurred_at = ?",
-            (903, 1700000200),
-        ) == ("{}",)
-
-
-def test_v48_backfills_all_sources_deterministically_and_idempotently(tmp_path: Path) -> None:
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        for trigger in (
-            "sync_alert_events_message_insert_deleted",
-            "sync_alert_events_message_delete_transition",
-            "sync_alert_events_message_edit",
-            "sync_alert_events_access_lost",
-        ):
-            conn.execute(f"DROP TRIGGER {trigger}")
-        conn.execute("DELETE FROM sync_alert_events")
-        conn.execute("DELETE FROM schema_version WHERE version >= 48")
-        conn.execute(
-            "INSERT INTO messages(dialog_id, message_id, sent_at, text, is_deleted, deleted_at) VALUES (?, ?, ?, ?, 1, ?)",
-            (901, 1, 1, "deleted", 100),
-        )
-        conn.execute(
-            "INSERT INTO message_versions(dialog_id, message_id, version, old_text, edit_date) VALUES (?, ?, ?, ?, ?)",
-            (902, 2, 1, "old", 200),
-        )
-        conn.execute(
-            "INSERT INTO daemon_events(kind, dialog_id, occurred_at, payload_json) VALUES ('access_lost', ?, ?, '{}')",
-            (903, 300),
-        )
-        conn.execute(
-            "INSERT INTO synced_dialogs(dialog_id, status, access_lost_at) VALUES (?, 'access_lost', ?)",
-            (904, 400),
-        )
-        conn.commit()
-
-    ensure_sync_schema(db_path)
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        rows = _fetchall_rows(
-            conn,
-            "SELECT kind, occurred_at, dialog_id, message_id, version, daemon_event_id "
-            "FROM sync_alert_events ORDER BY seq",
-        )
-        assert [row[:5] for row in rows] == [
-            ("deleted_message", 100, 901, 1, None),
-            ("edit", 200, 902, 2, 1),
-            ("access_lost", 300, 903, None, None),
-            ("access_lost", 400, 904, None, None),
-        ]
-        assert len(rows) == 4
-        assert _fetchone_int(conn, "SELECT COUNT(*) FROM daemon_events WHERE dialog_id = 904") == 1
-
-
-def test_v48_triggers_are_interleaved_strict_and_access_restore_is_new_event(tmp_path: Path) -> None:
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        conn.execute("INSERT INTO messages(dialog_id, message_id, sent_at, text) VALUES (1, 1, 1, 'raw')")
-        conn.execute("UPDATE messages SET is_deleted = 1, deleted_at = 10 WHERE dialog_id = 1 AND message_id = 1")
-        conn.execute(
-            "INSERT INTO message_versions(dialog_id, message_id, version, old_text, edit_date) VALUES (1, 1, 1, 'old', 20)"
-        )
-        conn.execute(
-            "INSERT INTO daemon_events(kind, dialog_id, occurred_at, payload_json) VALUES ('access_lost', 1, 30, '{}')"
-        )
-        conn.execute("UPDATE synced_dialogs SET status = 'access_lost', access_lost_at = 40 WHERE dialog_id = 1")
-        conn.commit()
-        seqs = _fetchall_rows(conn, "SELECT kind, seq FROM sync_alert_events ORDER BY seq")
-        assert [row[0] for row in seqs] == ["deleted_message", "edit", "access_lost"]
-        conn.execute("UPDATE messages SET is_deleted = 0 WHERE dialog_id = 1 AND message_id = 1")
-        conn.execute("UPDATE messages SET is_deleted = 1, deleted_at = 11 WHERE dialog_id = 1 AND message_id = 1")
-        conn.commit()
-        assert _fetchone_row(
-            conn, "SELECT is_deleted, deleted_at FROM messages WHERE dialog_id = 1 AND message_id = 1"
-        ) == (1, 11)
-        conn.execute("UPDATE synced_dialogs SET status = 'synced' WHERE dialog_id = 1")
-        conn.execute(
-            "INSERT INTO daemon_events(kind, dialog_id, occurred_at, payload_json) VALUES ('access_lost', 1, 50, '{}')"
-        )
-        conn.commit()
-        assert _fetchone_int(conn, "SELECT COUNT(*) FROM sync_alert_events WHERE kind = 'access_lost'") == 2
-
-
-def test_v48_migration_rolls_back_atomically_on_projection_invariant_conflict(tmp_path: Path) -> None:
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        conn.execute("DROP INDEX idx_sync_alert_events_deleted_source")
-        conn.execute("DELETE FROM sync_alert_events")
-        conn.execute(
-            "INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, message_id) VALUES ('deleted_message', 1, 1, 1), ('deleted_message', 2, 1, 1)"
-        )
-        conn.execute("DELETE FROM schema_version WHERE version >= 48")
-        conn.commit()
-        with pytest.raises(sqlite3.IntegrityError):
-            _apply_migration_48(conn, 47)
-        assert _fetchone_int(conn, "SELECT COUNT(*) FROM sync_alert_events") == 2
-        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version = 48") is None
-
-
-def test_v48_delete_resync_delete_is_idempotent_for_message_source(tmp_path: Path) -> None:
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    with _sync_db_connection(db_path) as conn:
-        conn.execute("INSERT INTO messages(dialog_id, message_id, sent_at, text) VALUES (1, 1, 1, 'first')")
-        conn.execute("UPDATE messages SET is_deleted = 1, deleted_at = 10 WHERE dialog_id = 1 AND message_id = 1")
-        conn.commit()
-        conn.execute(
-            "INSERT OR REPLACE INTO messages(dialog_id, message_id, sent_at, text, is_deleted, deleted_at) "
-            "VALUES (1, 1, 1, 'resynced', 0, NULL)"
-        )
-        conn.commit()
-        conn.execute("UPDATE messages SET is_deleted = 1, deleted_at = 20 WHERE dialog_id = 1 AND message_id = 1")
-        conn.commit()
-        assert _fetchone_row(
-            conn,
-            "SELECT is_deleted, deleted_at FROM messages WHERE dialog_id = 1 AND message_id = 1",
-        ) == (1, 20)
-        assert (
-            _fetchone_int(
-                conn,
-                "SELECT COUNT(*) FROM sync_alert_events WHERE kind = 'deleted_message' AND dialog_id = 1 AND message_id = 1",
+        before = _fetchone_int(conn, "SELECT seq FROM sqlite_sequence WHERE name='sync_alert_events'")
+        for dialog_id, message_id in ((1, 1), (1, 2), (2, 1), (3, 1), (4, 1)):
+            conn.execute(
+                "UPDATE messages SET is_deleted=1, deleted_at=10 WHERE dialog_id=? AND message_id=?",
+                (dialog_id, message_id),
             )
-            == 1
+        rows = _fetchall_rows(conn, "SELECT kind,dialog_id,message_id FROM sync_alert_events")
+        assert rows == [("deleted_message", 1, 1)]
+        after = _fetchone_int(conn, "SELECT seq FROM sqlite_sequence WHERE name='sync_alert_events'")
+        assert after == before + 1
+
+
+def test_v51_replay_does_not_clear_new_alerts(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute(
+            "INSERT INTO sync_alert_events(kind,occurred_at,dialog_id,message_id) VALUES ('deleted_message',1,1,1)"
         )
+        conn.execute("DELETE FROM schema_version WHERE version=51")
+        conn.commit()
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM sync_alert_events") == 1
+
+
+def _downgrade_event_tables_to_v50(conn: sqlite3.Connection) -> None:
+    for trigger in (
+        "sync_alert_events_message_insert_deleted",
+        "sync_alert_events_message_delete_transition",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    conn.execute("DROP TABLE runtime_events")
+    conn.execute("DROP TABLE sync_alert_events")
+    conn.executescript(
+        """CREATE TABLE telemetry_events (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, tool_name TEXT NOT NULL, timestamp REAL NOT NULL,
+               duration_ms REAL NOT NULL, result_count INTEGER NOT NULL, has_cursor INTEGER NOT NULL,
+               page_depth INTEGER NOT NULL, has_filter INTEGER NOT NULL, outcome TEXT NOT NULL,
+               error_code TEXT, error_type TEXT);
+           CREATE TABLE daemon_events (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, dialog_id INTEGER,
+               occurred_at INTEGER NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}');
+           CREATE TABLE sync_alert_events (
+               seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, occurred_at INTEGER NOT NULL,
+               dialog_id INTEGER NOT NULL, message_id INTEGER, version INTEGER, daemon_event_id INTEGER);"""
+    )
+    conn.execute("DELETE FROM schema_version WHERE version=51")
+
+
+def test_v51_clears_old_alerts_and_uses_both_sequence_high_water_marks(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        _downgrade_event_tables_to_v50(conn)
+        conn.executemany(
+            "INSERT INTO daemon_events(kind,occurred_at) VALUES ('access_lost',1)",
+            [() for _ in range(7)],
+        )
+        conn.execute(
+            "INSERT INTO sync_alert_events(kind,occurred_at,dialog_id,daemon_event_id) VALUES ('access_lost',1,1,7)"
+        )
+        conn.commit()
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM sync_alert_events") == 0
+        conn.execute("INSERT INTO sync_alert_events(kind,occurred_at,dialog_id) VALUES ('access_lost',2,1)")
+        assert _fetchone_int(conn, "SELECT seq FROM sync_alert_events") > 7
+
+
+def test_v51_failure_before_table_swap_rolls_back_all_prior_ddl(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        _downgrade_event_tables_to_v50(conn)
+        conn.execute("CREATE TABLE sync_alert_events_v51(blocker INTEGER)")
+        conn.commit()
+        with pytest.raises(sqlite3.OperationalError, match="already exists"):
+            ensure_sync_schema(db_path)
+        tables = {row[0] for row in _fetchall_rows(conn, "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert {"telemetry_events", "daemon_events", "sync_alert_events"} <= tables
+        assert "runtime_events" not in tables
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=51") is None

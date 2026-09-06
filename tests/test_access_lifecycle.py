@@ -26,8 +26,15 @@ def _db() -> sqlite3.Connection:
              dialog_id INTEGER PRIMARY KEY, hidden INTEGER, needs_refresh INTEGER,
              snapshot_at INTEGER, archived INTEGER, pinned INTEGER,
              unread_mentions_count INTEGER, unread_reactions_count INTEGER, name TEXT);
-        CREATE TABLE daemon_events (
-             kind TEXT, dialog_id INTEGER, occurred_at INTEGER, payload_json TEXT);
+        CREATE TABLE sync_alert_events (
+             seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, occurred_at INTEGER,
+             dialog_id INTEGER, message_id INTEGER, version INTEGER);
+        CREATE TABLE runtime_events (
+             id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at_ms INTEGER NOT NULL,
+             kind TEXT NOT NULL, runtime_instance_id TEXT NOT NULL, operation_id TEXT,
+             outcome TEXT, reason_code TEXT, dialog_id INTEGER, duration_ms REAL,
+             tool_name TEXT, result_count INTEGER, has_cursor INTEGER, page_depth INTEGER,
+             has_filter INTEGER, error_type TEXT, payload_json TEXT NOT NULL DEFAULT '{}');
         """
     )
     return conn
@@ -89,7 +96,7 @@ def test_access_loss_clears_read_position_retry() -> None:
         conn.close()
 
 
-def test_lifecycle_failure_rolls_back_only_its_savepoint(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_runtime_event_failure_does_not_roll_back_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
     conn = _db()
     conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (1, 'synced')")
     seed_full_history_enrollment(conn, 1, enabled=True)
@@ -102,11 +109,10 @@ def test_lifecycle_failure_rolls_back_only_its_savepoint(monkeypatch: pytest.Mon
         raise RuntimeError("injected")
 
     try:
-        monkeypatch.setattr("mcp_telegram.access_lifecycle._record_event", fail)
-        with pytest.raises(RuntimeError, match="injected"):
-            set_access_lost(conn, 1, 10)
-        assert conn.execute("SELECT status FROM synced_dialogs").fetchone() == ("synced",)
-        assert conn.execute("SELECT hidden FROM dialogs").fetchone() == (0,)
+        monkeypatch.setattr("mcp_telegram.access_lifecycle.record_runtime_event", fail)
+        set_access_lost(conn, 1, 10)
+        assert conn.execute("SELECT status FROM synced_dialogs").fetchone() == ("access_lost",)
+        assert conn.execute("SELECT hidden FROM dialogs").fetchone() == (1,)
         assert conn.execute("SELECT value FROM unrelated").fetchone() == (7,)
         conn.rollback()
     finally:
