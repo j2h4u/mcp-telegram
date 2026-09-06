@@ -105,6 +105,16 @@ def insert_synced_dialog(conn: _SQLiteConnection, dialog_id: int) -> None:
     conn.commit()
 
 
+def confirm_human_dm(conn: _SQLiteConnection, dialog_id: int, message_id: int) -> None:
+    conn.execute("INSERT OR REPLACE INTO dialogs(dialog_id, type) VALUES (?, 'user')", (dialog_id,))
+    conn.execute("INSERT OR REPLACE INTO entities(id, type, updated_at) VALUES (?, 'user', 1)", (dialog_id,))
+    conn.execute(
+        "UPDATE messages SET sender_id=?, out=0, is_service=0 WHERE dialog_id=? AND message_id=?",
+        (dialog_id, dialog_id, message_id),
+    )
+    conn.commit()
+
+
 @dataclass(frozen=True)
 class _MessageRowOptions:
     text: str | None = "some text"
@@ -578,6 +588,7 @@ async def test_on_message_edited_creates_version(
     dialog_id = 1001
     insert_synced_dialog(sync_db, dialog_id)
     insert_message(sync_db, dialog_id, message_id=100, text="old text")
+    confirm_human_dm(sync_db, dialog_id, 100)
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
@@ -673,6 +684,7 @@ async def test_on_message_edited_increments_version(
     dialog_id = 1001
     insert_synced_dialog(sync_db, dialog_id)
     insert_message(sync_db, dialog_id, message_id=200, text="v0 text")
+    confirm_human_dm(sync_db, dialog_id, 200)
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
@@ -680,6 +692,9 @@ async def test_on_message_edited_increments_version(
     edit_dt1 = datetime(2024, 1, 1, 13, 0, 0, tzinfo=UTC)
     msg1 = build_mock_message(id=200, text="v1 text", edit_date=edit_dt1)
     await manager.on_message_edited(make_message_edited_event(dialog_id, msg1))
+    # The generic mock sender is not this DM peer; restore the persisted
+    # human-DM identity before simulating the correspondent's second edit.
+    confirm_human_dm(sync_db, dialog_id, 200)
 
     edit_dt2 = datetime(2024, 1, 1, 14, 0, 0, tzinfo=UTC)
     msg2 = build_mock_message(id=200, text="v2 text", edit_date=edit_dt2)

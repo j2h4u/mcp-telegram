@@ -467,7 +467,7 @@ async def test_on_raw_transcribed_audio_updates_text_and_fts(
     await mgr.on_raw_transcribed_audio(update)
 
     assert _message_text(sync_db, dialog_id, message_id) == "speech to text"
-    assert _message_version_count(sync_db, dialog_id, message_id) == 1
+    assert _message_version_count(sync_db, dialog_id, message_id) == 0
     assert _fts_text(sync_db, dialog_id, message_id)
     assert sync_db.execute(
         "SELECT text, transcription_id FROM message_transcriptions WHERE dialog_id=? AND message_id=?",
@@ -483,7 +483,7 @@ async def test_on_raw_transcribed_audio_updates_text_and_fts(
             transcription_id=2,
         )
     )
-    assert _message_version_count(sync_db, dialog_id, message_id) == 1
+    assert _message_version_count(sync_db, dialog_id, message_id) == 0
     assert sync_db.execute(
         "SELECT transcription_id FROM message_transcriptions WHERE dialog_id=? AND message_id=?",
         (dialog_id, message_id),

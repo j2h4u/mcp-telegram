@@ -84,6 +84,11 @@ def conn(tmp_path: Path):
         connection.close()
 
 
+def _seed_human_dm(conn: sqlite3.Connection) -> None:
+    conn.execute("INSERT OR IGNORE INTO dialogs(dialog_id, type) VALUES (42, 'user')")
+    conn.execute("INSERT OR IGNORE INTO entities(id, type, updated_at) VALUES (42, 'user', 1)")
+
+
 def test_read_message_text_distinguishes_missing_from_null(conn: sqlite3.Connection) -> None:
     missing = read_message_text(conn, 42, 1)
     assert missing.found is False
@@ -110,6 +115,7 @@ def test_message_log_context_projects_only_safe_coordinates(conn: sqlite3.Connec
 
 def test_persist_edited_message_versions_sequentially_and_refreshes_fts(conn: sqlite3.Connection) -> None:
     with conn:
+        _seed_human_dm(conn)
         insert_messages_with_fts(conn, [_message(10, text="first")])
     with conn:
         assert persist_edited_message(conn, _message(10, text="second"), old_text="first", edit_date=200) == 1
@@ -140,18 +146,46 @@ def test_edit_alert_policy_accepts_only_incoming_confirmed_human_dm(conn: sqlite
         insert_messages_with_fts(conn, [_message(20, text="first"), _message(21, text="own", out=1)])
     with conn:
         assert persist_edited_message(conn, _message(20, text="second"), old_text="first", edit_date=200) == 1
-        assert persist_edited_message(conn, _message(21, text="changed", out=1), old_text="own", edit_date=201) == 1
+        assert persist_edited_message(conn, _message(21, text="changed", out=1), old_text="own", edit_date=201) is None
+    assert conn.execute("SELECT message_id FROM message_versions ORDER BY message_id").fetchall() == [(20,)]
     assert conn.execute("SELECT kind,dialog_id,message_id FROM sync_alert_events ORDER BY seq").fetchall() == [
         ("edit", 42, 20)
     ]
 
 
-def test_transcription_version_never_creates_change_alert(conn: sqlite3.Connection) -> None:
+@pytest.mark.parametrize(
+    ("dialog_type", "entity_type"),
+    [
+        ("bot", "bot"),
+        ("group", None),
+        ("supergroup", None),
+        ("forum", None),
+        ("channel", None),
+        ("service", "service"),
+        (None, None),
+        ("user", "bot"),
+    ],
+)
+def test_irrelevant_edit_updates_message_without_storing_history(
+    conn: sqlite3.Connection, dialog_type: str | None, entity_type: str | None
+) -> None:
+    with conn:
+        conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (42, ?)", (dialog_type,))
+        if entity_type is not None:
+            conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (42, ?, 1)", (entity_type,))
+        insert_messages_with_fts(conn, [_message(23, text="before")])
+        assert persist_edited_message(conn, _message(23, text="after"), old_text="before", edit_date=301) is None
+    assert conn.execute("SELECT text FROM messages WHERE message_id=23").fetchone() == ("after",)
+    assert conn.execute("SELECT COUNT(*) FROM message_versions WHERE message_id=23").fetchone() == (0,)
+    assert conn.execute("SELECT COUNT(*) FROM sync_alert_events WHERE message_id=23").fetchone() == (0,)
+
+
+def test_transcription_creates_neither_version_nor_change_alert(conn: sqlite3.Connection) -> None:
     with conn:
         conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (42, 'user')")
         insert_messages_with_fts(conn, [_message(22, text=None)])
-        persist_transcribed_text(conn, 42, 22, old_text=None, transcribed_text="local transcript", transcribed_at=300)
-    assert conn.execute("SELECT origin FROM message_versions WHERE message_id=22").fetchone() == ("transcription",)
+        assert persist_transcribed_text(conn, 42, 22, old_text=None, transcribed_text="local transcript")
+    assert conn.execute("SELECT COUNT(*) FROM message_versions WHERE message_id=22").fetchone() == (0,)
     assert conn.execute("SELECT COUNT(*) FROM sync_alert_events").fetchone() == (0,)
 
 
@@ -624,7 +658,7 @@ def test_message_persistence_does_not_enqueue_inactive_dialogs(conn: sqlite3.Con
     assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
 
 
-def test_persist_transcribed_text_versions_and_refreshes_fts(conn: sqlite3.Connection) -> None:
+def test_persist_transcribed_text_refreshes_fts_without_version_history(conn: sqlite3.Connection) -> None:
     with conn:
         insert_messages_with_fts(conn, [_message(12, text=None)])
     with conn:
@@ -635,17 +669,11 @@ def test_persist_transcribed_text_versions_and_refreshes_fts(conn: sqlite3.Conne
                 12,
                 old_text=None,
                 transcribed_text="voice words",
-                transcribed_at=400,
             )
-            == 1
+            is True
         )
     assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=12").fetchone() == ("voice words",)
-    assert conn.execute(
-        "SELECT old_text, version FROM message_versions WHERE dialog_id=42 AND message_id=12"
-    ).fetchone() == (
-        None,
-        1,
-    )
+    assert conn.execute("SELECT COUNT(*) FROM message_versions WHERE dialog_id=42 AND message_id=12").fetchone() == (0,)
     assert conn.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=42 AND message_id=12").fetchone() == (
         stem_text("voice words"),
     )
@@ -657,11 +685,10 @@ def test_persist_transcribed_text_versions_and_refreshes_fts(conn: sqlite3.Conne
                 12,
                 old_text="voice words",
                 transcribed_text="voice words",
-                transcribed_at=401,
             )
-            is None
+            is False
         )
-    assert conn.execute("SELECT COUNT(*) FROM message_versions WHERE dialog_id=42 AND message_id=12").fetchone() == (1,)
+    assert conn.execute("SELECT COUNT(*) FROM message_versions WHERE dialog_id=42 AND message_id=12").fetchone() == (0,)
 
 
 def test_message_transcription_is_applied_by_canonical_bundle_writer(conn: sqlite3.Connection) -> None:
@@ -726,6 +753,7 @@ def test_list_undeleted_message_ids_uses_strict_cutoff(conn: sqlite3.Connection)
 
 def test_repository_writes_rollback_with_caller_transaction(conn: sqlite3.Connection) -> None:
     with conn:
+        _seed_human_dm(conn)
         insert_messages_with_fts(conn, [_message(30, text="before")])
     with pytest.raises(RuntimeError, match="abort"):
         with conn:

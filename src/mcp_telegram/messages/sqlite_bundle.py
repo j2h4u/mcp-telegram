@@ -49,6 +49,12 @@ FROM messages m
 WHERE m.dialog_id = ? AND m.message_id = ?
   AND {incoming_human_dm_sql("m")}
 """
+_SELECT_HUMAN_DM_MESSAGE_SQL = f"""
+SELECT 1
+FROM messages m
+WHERE m.dialog_id = ? AND m.message_id = ?
+  AND {incoming_human_dm_sql("m")}
+"""
 _SELECT_UNDELETED_MESSAGES_SQL = (
     "SELECT message_id FROM messages WHERE dialog_id = ? AND is_deleted = 0 AND sent_at < ?"
 )
@@ -119,6 +125,10 @@ def persist_edited_message(
     if not current.found or current.text == extracted.message.text:
         return None
     old_text = current.text
+    keep_history = conn.execute(_SELECT_HUMAN_DM_MESSAGE_SQL, (dialog_id, message_id)).fetchone() is not None
+    if not keep_history:
+        insert_messages_with_fts(conn, [extracted], priority=priority)
+        return None
     version_row = cast(tuple[int], conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone())
     next_version = int(version_row[0])
     conn.execute(_INSERT_VERSION_SQL, (dialog_id, message_id, next_version, old_text, edit_date, "telegram_edit"))
@@ -130,25 +140,21 @@ def persist_edited_message(
     return next_version
 
 
-def persist_transcribed_text(  # noqa: PLR0913
+def persist_transcribed_text(
     conn: sqlite3.Connection,
     dialog_id: int,
     message_id: int,
     *,
     old_text: str | None,
     transcribed_text: str,
-    transcribed_at: int,
-) -> int | None:
-    """Persist a changed transcription, preserving all other message projections."""
+) -> bool:
+    """Persist changed transcription text without creating edit history."""
     if old_text == transcribed_text:
-        return None
-    version_row = cast(tuple[int], conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone())
-    next_version = int(version_row[0])
-    conn.execute(_INSERT_VERSION_SQL, (dialog_id, message_id, next_version, old_text, transcribed_at, "transcription"))
+        return False
     conn.execute(_UPDATE_MESSAGE_TEXT_SQL, (transcribed_text, dialog_id, message_id))
     conn.execute(DELETE_FTS_SQL, (dialog_id, message_id))
     conn.execute(INSERT_FTS_SQL, (dialog_id, message_id, stem_text(transcribed_text)))
-    return next_version
+    return True
 
 
 def mark_message_deleted(conn: sqlite3.Connection, dialog_id: int, message_id: int, deleted_at: int) -> bool:
