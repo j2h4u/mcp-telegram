@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+import logging
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -12,8 +12,17 @@ from typing import cast
 from ..history_enrollment import reset_read_position_retry, restore_access_status
 from ..hydration_queue import HydrationPriority, HydrationQueueRepository
 from ..messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
+from ..runtime_events import record_runtime_event
 
 _SAVEPOINTS = count()
+logger = logging.getLogger(__name__)
+
+
+def _try_record_runtime_event(conn: sqlite3.Connection, **event: object) -> None:
+    try:
+        record_runtime_event(conn, **event)  # type: ignore[arg-type]
+    except Exception:
+        logger.exception("runtime_event_record_failed kind=%s", event.get("kind"))
 
 
 def _purge_hydration_jobs(conn: sqlite3.Connection, dialog_id: int) -> None:
@@ -33,15 +42,6 @@ def _lifecycle_savepoint(conn: sqlite3.Connection) -> Iterator[None]:
         raise
     else:
         conn.execute(f"RELEASE SAVEPOINT {name}")
-
-
-def _record_event(
-    conn: sqlite3.Connection, *, kind: str, dialog_id: int, occurred_at: int, payload: dict[str, object]
-) -> None:
-    conn.execute(
-        "INSERT INTO daemon_events (kind, dialog_id, occurred_at, payload_json) VALUES (?, ?, ?, ?)",
-        (kind, dialog_id, occurred_at, json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
-    )
 
 
 def set_access_lost(conn: sqlite3.Connection, dialog_id: int, now: int, *, reason: str | None = None) -> None:
@@ -71,7 +71,26 @@ def set_access_lost(conn: sqlite3.Connection, dialog_id: int, now: int, *, reaso
                 payload["previous_status"] = previous_status
             if reason is not None:
                 payload["reason"] = reason
-            _record_event(conn, kind="access_lost", dialog_id=dialog_id, occurred_at=now, payload=payload)
+            enrolled = cast(
+                tuple[int] | None,
+                conn.execute(
+                    "SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1", (dialog_id,)
+                ).fetchone(),
+            )
+            if enrolled is not None:
+                conn.execute(
+                    "INSERT INTO sync_alert_events(kind, occurred_at, dialog_id) VALUES ('access_lost', ?, ?)",
+                    (now, dialog_id),
+                )
+            _try_record_runtime_event(
+                conn,
+                kind="sync.access_lost",
+                dialog_id=dialog_id,
+                outcome="applied",
+                reason_code=reason,
+                payload=payload,
+                observed_at_ms=now * 1000,
+            )
 
 
 def restore_access_after_revalidation(
@@ -101,7 +120,13 @@ def restore_access_after_revalidation(
             due_at=now,
             priority=HydrationPriority.BACKFILL,
         )
-        _record_event(conn, kind="access_restored", dialog_id=dialog_id, occurred_at=now, payload={})
+        _try_record_runtime_event(
+            conn,
+            kind="sync.access_restored",
+            dialog_id=dialog_id,
+            outcome="applied",
+            observed_at_ms=now * 1000,
+        )
 
 
 def due_access_revalidations(conn: sqlite3.Connection, *, now: int, cooldown_seconds: int, limit: int) -> list[int]:

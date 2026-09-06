@@ -65,6 +65,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "reactions/persistence.py",
             "reactions/sqlite_repository.py",
             "read_state.py",
+            "runtime_events.py",
             "resolver.py",
             "scheduled_messages.py",
             "sync_db.py",

@@ -44,7 +44,8 @@ from mcp_telegram.reading.sqlite_projection import (
     _build_list_messages_query,
     _ListMessagesDbRequest,
 )
-from mcp_telegram.sync_db import ensure_sync_schema, record_daemon_event
+from mcp_telegram.runtime_events import record_runtime_event
+from mcp_telegram.sync_db import _RUNTIME_EVENTS_DDL, ensure_sync_schema
 from mcp_telegram.sync_read_model import compute_sync_coverage as _compute_sync_coverage
 from mcp_telegram.telethon_dialog import classify_dialog_type
 from mcp_telegram.topics.contracts import TopicFact
@@ -2255,7 +2256,7 @@ async def test_list_important_events_dispatch_returns_recent_access_events(tmp_p
         "INSERT INTO entities (id, type, name, updated_at) VALUES (?, ?, ?, ?)",
         (123, "Channel", "Work Chat", 1_700_000_000),
     )
-    record_daemon_event(conn, kind="access_lost", dialog_id=123, occurred_at=int(time.time()))
+    record_runtime_event(conn, kind="sync.access_lost", dialog_id=123, observed_at_ms=int(time.time() * 1000))
     conn.commit()
 
     result = await make_server(conn)._dispatch(
@@ -2575,7 +2576,10 @@ async def test_get_sync_alerts_access_lost() -> None:
     """get_sync_alerts returns access_lost dialogs."""
     conn = _make_db()
     _insert_synced_dialog(conn, 1, status="access_lost", access_lost_at=1700000700)
-    record_daemon_event(conn, kind="access_lost", dialog_id=1, occurred_at=1700000700)
+    conn.execute(
+        "INSERT INTO sync_alert_events(kind, occurred_at, dialog_id, daemon_event_id) "
+        "VALUES ('access_lost', 1700000700, 1, 1)"
+    )
     server = make_server(conn)
     result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 50})
     assert result["ok"] is True
@@ -3302,22 +3306,8 @@ def _make_db_with_entities(*, with_fts: bool = False) -> sqlite3.Connection:
     conn = _make_db(with_fts=with_fts)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_type_updated ON entities(type, updated_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_username ON entities(username)")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS telemetry_events (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            tool_name   TEXT NOT NULL,
-            timestamp   REAL NOT NULL,
-            duration_ms REAL NOT NULL,
-            result_count INTEGER NOT NULL,
-            has_cursor  BOOLEAN NOT NULL,
-            page_depth  INTEGER NOT NULL,
-            has_filter  BOOLEAN NOT NULL,
-            error_type  TEXT
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_tool_timestamp ON telemetry_events(tool_name, timestamp)")
+    conn.execute(_RUNTIME_EVENTS_DDL)
+    conn.execute("CREATE TABLE IF NOT EXISTS daemon_state (key TEXT PRIMARY KEY, value TEXT)")
     conn.commit()
     return conn
 
@@ -3362,11 +3352,17 @@ def _insert_telemetry(
 
     if timestamp is None:
         timestamp = _time.time()
-    conn.execute(
-        "INSERT INTO telemetry_events "
-        "(tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type),
+    record_runtime_event(
+        conn,
+        kind="mcp.call",
+        tool_name=tool_name,
+        observed_at_ms=int(timestamp * 1000),
+        duration_ms=duration_ms,
+        result_count=result_count,
+        has_cursor=has_cursor,
+        page_depth=page_depth,
+        has_filter=has_filter,
+        error_type=error_type,
     )
     conn.commit()
 
@@ -3420,7 +3416,7 @@ def test_normalize_telemetry_outcome_falls_back_for_unsafe_error_codes(
 
 @pytest.mark.asyncio
 async def test_record_telemetry_inserts_row() -> None:
-    """record_telemetry inserts a row into telemetry_events with all 8 fields."""
+    """record_telemetry inserts a structured mcp.call runtime event."""
     conn = _make_db_with_entities()
     server = make_server(conn)
     result = await server._dispatch(
@@ -3441,7 +3437,7 @@ async def test_record_telemetry_inserts_row() -> None:
     assert result["ok"] is True
     row = cast(
         tuple[object, ...] | None,
-        conn.execute("SELECT tool_name, duration_ms, has_filter FROM telemetry_events").fetchone(),
+        conn.execute("SELECT tool_name, duration_ms, has_filter FROM runtime_events WHERE kind='mcp.call'").fetchone(),
     )
     assert row is not None
     assert row[0] == "ListDialogs"
@@ -3472,8 +3468,8 @@ async def test_record_telemetry_returns_ok() -> None:
 
 
 @pytest.mark.asyncio
-async def test_record_telemetry_prunes_only_rows_older_than_retention_boundary() -> None:
-    """The live prune keeps a row exactly at retention TTL and removes an older row."""
+async def test_record_telemetry_does_not_prune_on_hot_write_path() -> None:
+    """The hot telemetry writer leaves batched retention to maintenance."""
     conn = _make_db_with_entities()
     now = 2_000_000_000
     ttl = make_daemon_api_policy().telemetry_retention_ttl_seconds
@@ -3500,12 +3496,9 @@ async def test_record_telemetry_prunes_only_rows_older_than_retention_boundary()
     assert result == {"ok": True}
     tool_name_rows = cast(
         list[tuple[str]],
-        conn.execute("SELECT tool_name FROM telemetry_events ORDER BY tool_name").fetchall(),
+        conn.execute("SELECT tool_name FROM runtime_events WHERE kind='mcp.call' ORDER BY tool_name").fetchall(),
     )
-    assert [row[0] for row in tool_name_rows] == [
-        "AtBoundary",
-        "Current",
-    ]
+    assert [row[0] for row in tool_name_rows] == ["AtBoundary", "Current", "Expired"]
 
 
 @pytest.mark.asyncio

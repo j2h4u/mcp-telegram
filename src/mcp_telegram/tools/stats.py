@@ -8,6 +8,7 @@ from ..errors import (
     usage_stats_query_error_text,
 )
 from ._base import (
+    TOOL_REGISTRY,
     DaemonNotRunningError,
     ToolAnnotations,
     ToolArgs,
@@ -36,6 +37,9 @@ GET_USAGE_STATS_OUTPUT_SCHEMA = {
         "filter_count": {"type": "integer"},
         "latency_median_ms": {"type": ["number", "null"]},
         "latency_p95_ms": {"type": ["number", "null"]},
+        "unobserved_tools": {"type": "array", "items": {"type": "string"}},
+        "history_started_at_ms": {"type": ["integer", "null"]},
+        "last_cap_truncation_ms": {"type": ["integer", "null"]},
     },
     "required": [
         "summary",
@@ -47,6 +51,9 @@ GET_USAGE_STATS_OUTPUT_SCHEMA = {
         "filter_count",
         "latency_median_ms",
         "latency_p95_ms",
+        "unobserved_tools",
+        "history_started_at_ms",
+        "last_cap_truncation_ms",
     ],
     "additionalProperties": False,
 }
@@ -196,6 +203,7 @@ class GetUsageStats(ToolArgs):
 
 
 def _usage_structured_content(stats: dict, *, summary: str, empty: bool) -> dict[str, object]:
+    observed = set((stats.get("tool_distribution") or {}).keys())
     return {
         "summary": summary,
         "empty": empty,
@@ -206,6 +214,9 @@ def _usage_structured_content(stats: dict, *, summary: str, empty: bool) -> dict
         "filter_count": int(stats.get("filter_count", 0) or 0),
         "latency_median_ms": stats.get("latency_median_ms"),
         "latency_p95_ms": stats.get("latency_p95_ms"),
+        "unobserved_tools": sorted(set(TOOL_REGISTRY) - observed),
+        "history_started_at_ms": stats.get("history_started_at_ms"),
+        "last_cap_truncation_ms": stats.get("last_cap_truncation_ms"),
     }
 
 

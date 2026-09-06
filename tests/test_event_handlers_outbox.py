@@ -15,7 +15,7 @@ Telethon dispatch path LOCKED to Path A:
   lines 37-48 (``build()`` returns ``cls.Event(update.peer, update.max_id, True)``
   when the update is an ``UpdateReadHistoryOutbox``; filter at lines 57-61
   requires ``event.outbox == True`` when ``inbox=False``). This maximises
-  symmetry with the Phase 38 inbox handler (``on_message_read``).
+  symmetry with the raw inbox read handler.
 """
 
 # pyright: reportAny=false, reportArgumentType=false, reportOptionalSubscript=false, reportOperatorIssue=false, reportUndefinedVariable=false, reportMissingParameterType=false, reportReturnType=false, reportInvalidTypeForm=false, reportGeneralTypeIssues=false

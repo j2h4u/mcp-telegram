@@ -45,7 +45,6 @@ def test_compact_runtime_success_records_and_important_paths_have_expected_level
         name: event_levels[name]
         for name in (
             "event_new",
-            "event_read",
             "event_outbox_read",
             "event_raw_inbox_read",
             "event_edit",
@@ -55,7 +54,6 @@ def test_compact_runtime_success_records_and_important_paths_have_expected_level
         )
     } == {
         "event_new": ["debug"],
-        "event_read": ["debug"],
         "event_outbox_read": ["debug"],
         "event_raw_inbox_read": ["debug"],
         "event_edit": ["debug"],
@@ -64,7 +62,6 @@ def test_compact_runtime_success_records_and_important_paths_have_expected_level
         "event_raw_transcribed_audio": ["debug"],
     }
     assert event_levels["event_edit_new"] == ["info"]
-    assert event_levels["event_read_no_row"] == ["warning"]
     assert event_levels["event_outbox_read_no_row"] == ["warning"]
 
     assert _literal_log_levels(ROOT / "src/mcp_telegram/dialog_sync.py")["recon_topics_complete"] == ["debug"]

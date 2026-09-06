@@ -38,21 +38,22 @@ def list_important_events(
         list[tuple[int, str, int | None, str | None]],
         conn.execute(
             """
-            SELECT de.occurred_at, de.kind, de.dialog_id, e.name
-            FROM daemon_events AS de
+            SELECT de.observed_at_ms, de.kind, de.dialog_id, e.name
+            FROM runtime_events AS de
             LEFT JOIN entities AS e ON e.id = de.dialog_id
-            WHERE de.kind IN ('access_lost', 'access_restored')
-              AND de.occurred_at >= ?
-            ORDER BY de.occurred_at DESC, de.id DESC
+            WHERE de.kind IN ('sync.access_lost', 'sync.access_restored')
+              AND de.observed_at_ms >= ?
+            ORDER BY de.observed_at_ms DESC, de.id DESC
             """,
-            (cutoff,),
+            (cutoff * 1000,),
         ).fetchall(),  # type: ignore[union-attr]
     )
 
     events: list[dict[str, object]] = []
     for row in rows:
-        occurred_at, kind, dialog_id, dialog_title = row
-        event_type = str(kind)
+        occurred_at_ms, kind, dialog_id, dialog_title = row
+        occurred_at = int(occurred_at_ms) // 1000
+        event_type = str(kind).removeprefix("sync.")
         events.append(
             {
                 "time": format_timestamp(int(occurred_at), timezone),

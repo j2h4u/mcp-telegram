@@ -114,15 +114,15 @@ def test_synced_dialogs_schema(tmp_sync_db_path: Path) -> None:
         conn.close()
 
 
-def test_schema_v31_adds_access_revalidation_and_daemon_events(tmp_sync_db_path: Path) -> None:
+def test_current_schema_has_access_revalidation_and_runtime_events(tmp_sync_db_path: Path) -> None:
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_db(tmp_sync_db_path)
     try:
         synced_columns = {row[1] for row in _table_info(conn, "synced_dialogs")}
         assert "access_last_revalidated_at" in synced_columns
         assert "access_next_revalidate_at" in synced_columns
-        event_columns = {row[1] for row in _table_info(conn, "daemon_events")}
-        assert {"id", "kind", "dialog_id", "occurred_at", "payload_json"} <= event_columns
+        event_columns = {row[1] for row in _table_info(conn, "runtime_events")}
+        assert {"id", "kind", "dialog_id", "observed_at_ms", "payload_json"} <= event_columns
     finally:
         conn.close()
 
@@ -180,7 +180,7 @@ def test_message_versions_schema(tmp_sync_db_path: Path) -> None:
     try:
         rows = _table_info(conn, "message_versions")
         columns = {row[1]: row for row in rows}
-        expected = {"dialog_id", "message_id", "version", "old_text", "edit_date"}
+        expected = {"dialog_id", "message_id", "version", "old_text", "edit_date", "origin"}
         assert expected == set(columns.keys()), f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
         # dialog_id, message_id, version are all part of composite PK
         assert columns["dialog_id"][5] > 0, "dialog_id must be part of PRIMARY KEY"
@@ -539,40 +539,44 @@ def test_schema_v4_indexes_exist(tmp_sync_db_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_schema_v5_telemetry_events_table(tmp_sync_db_path: Path) -> None:
-    """After ensure_sync_schema(), telemetry_events table exists with all expected columns."""
+def test_current_runtime_events_preserve_mcp_analytics_columns(tmp_sync_db_path: Path) -> None:
+    """The unified store retains every field consumed by MCP usage analytics."""
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_db(tmp_sync_db_path)
     try:
-        rows = _table_info(conn, "telemetry_events")
+        rows = _table_info(conn, "runtime_events")
         columns = {row[1] for row in rows}
         expected = {
             "id",
             "tool_name",
-            "timestamp",
+            "observed_at_ms",
             "duration_ms",
             "result_count",
             "has_cursor",
             "page_depth",
             "has_filter",
             "outcome",
-            "error_code",
+            "reason_code",
             "error_type",
+            "kind",
+            "runtime_instance_id",
+            "operation_id",
+            "dialog_id",
+            "payload_json",
         }
         assert expected == columns, f"Got: {columns}, expected: {expected}"
     finally:
         conn.close()
 
 
-def test_schema_v5_telemetry_index_exists(tmp_sync_db_path: Path) -> None:
-    """After ensure_sync_schema(), idx_telemetry_tool_timestamp index exists."""
+def test_runtime_event_indexes_exist(tmp_sync_db_path: Path) -> None:
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_db(tmp_sync_db_path)
     try:
         row = _fetchone_row(
-            conn, "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_telemetry_tool_timestamp'"
+            conn, "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_runtime_events_kind_time'"
         )
-        assert row is not None, "idx_telemetry_tool_timestamp index missing"
+        assert row is not None
     finally:
         conn.close()
 
@@ -854,79 +858,19 @@ def test_migrate_from_legacy_db_insert_or_ignore_on_pk_conflict(tmp_path: Path) 
         conn.close()
 
 
-def test_migrate_legacy_databases_uses_injected_telemetry_retention(tmp_path: Path) -> None:
-    """A custom retention setting controls which analytics rows migrate."""
+def test_migrate_legacy_databases_discards_obsolete_analytics_history(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _open_db(db_path)
-
-    now = time.time()
-    recent = now - 40  # retained by the longer custom TTL
-    old = now - 70  # excluded by the longer custom TTL
-
     analytics_path = tmp_path / "analytics.db"
     _make_analytics_db(
         analytics_path,
-        [
-            ("ListMessages", recent, 100.0, 10, False, 1, False, None),
-            ("ListDialogs", old, 50.0, 5, False, 1, False, None),
-        ],
+        [("ListMessages", time.time(), 100.0, 10, False, 1, False, None)],
     )
-
     try:
         migrate_legacy_databases(conn, tmp_path, telemetry_retention_ttl_seconds=60)
-        rows = _fetchall_rows(conn, "SELECT tool_name FROM telemetry_events")
-        tool_names = [str(row[0]) for row in rows]
-        assert "ListMessages" in tool_names, "Recent event should be migrated"
-        assert "ListDialogs" not in tool_names, "Old event should be excluded"
-        migrated = _fetchone_row(
-            conn,
-            "SELECT outcome, error_code FROM telemetry_events WHERE tool_name = ?",
-            ("ListMessages",),
-        )
-        assert migrated == ("success", None)
-    finally:
-        conn.close()
-
-
-def test_migrate_legacy_databases_respects_shorter_telemetry_retention(tmp_path: Path) -> None:
-    """A shorter custom TTL excludes rows that a longer policy would retain."""
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    conn = _open_db(db_path)
-    analytics_path = tmp_path / "analytics.db"
-    _make_analytics_db(
-        analytics_path,
-        [("ListMessages", time.time() - 15, 100.0, 10, False, 1, False, None)],
-    )
-    try:
-        migrate_legacy_databases(conn, tmp_path, telemetry_retention_ttl_seconds=10)
-        assert _fetchall_rows(conn, "SELECT tool_name FROM telemetry_events") == []
-    finally:
-        conn.close()
-
-
-def test_migrate_legacy_databases_excludes_telemetry_at_exact_retention_boundary(tmp_path: Path) -> None:
-    """Legacy telemetry exactly at the cutoff is excluded, matching migration's strict predicate."""
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    conn = _open_db(db_path)
-    ttl = 60
-    cutoff = int(time.time()) - ttl
-    analytics_path = tmp_path / "analytics.db"
-    _make_analytics_db(
-        analytics_path,
-        [
-            ("AtBoundary", cutoff, 100.0, 10, False, 1, False, None),
-            ("InsideBoundary", cutoff + 2, 100.0, 10, False, 1, False, None),
-        ],
-    )
-
-    try:
-        migrate_legacy_databases(conn, tmp_path, telemetry_retention_ttl_seconds=ttl)
-        tool_names = [str(row[0]) for row in _fetchall_rows(conn, "SELECT tool_name FROM telemetry_events")]
-        assert "AtBoundary" not in tool_names
-        assert "InsideBoundary" in tool_names
+        assert not analytics_path.exists()
+        assert _fetchall_rows(conn, "SELECT tool_name FROM runtime_events WHERE kind='mcp.call'") == []
     finally:
         conn.close()
 
@@ -1751,7 +1695,7 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 50, f"_CURRENT_SCHEMA_VERSION must be 50, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 51, f"_CURRENT_SCHEMA_VERSION must be 51, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
 

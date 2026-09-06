@@ -486,10 +486,10 @@ async def test_delta_access_lost_handled(
     assert row[0] == "access_lost"
     assert row[1] is not None
     event = sync_db.execute(
-        "SELECT kind, dialog_id FROM daemon_events WHERE dialog_id=?",
+        "SELECT kind, dialog_id FROM runtime_events WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone()
-    assert event == ("access_lost", dialog_id)
+    assert event == ("sync.access_lost", dialog_id)
 
 
 @pytest.mark.asyncio
@@ -746,10 +746,10 @@ async def test_probe_restores_access_after_gap_fill(
     assert dialog_row[1] == 1  # queued for reconciliation refresh
     assert dialog_row[2] != 1000
     event = sync_db.execute(
-        "SELECT kind, dialog_id FROM daemon_events WHERE dialog_id=?",
+        "SELECT kind, dialog_id FROM runtime_events WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone()
-    assert event == ("access_restored", dialog_id)
+    assert event == ("sync.access_restored", dialog_id)
 
 
 @pytest.mark.asyncio

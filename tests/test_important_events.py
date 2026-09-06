@@ -6,7 +6,8 @@ import sqlite3
 from pathlib import Path
 
 from mcp_telegram.important_events.read_model import list_important_events
-from mcp_telegram.sync_db import ensure_sync_schema, record_daemon_event
+from mcp_telegram.runtime_events import record_runtime_event
+from mcp_telegram.sync_db import ensure_sync_schema
 
 
 def test_list_important_events_returns_recent_access_events_with_titles(tmp_path: Path) -> None:
@@ -18,9 +19,9 @@ def test_list_important_events_returns_recent_access_events_with_titles(tmp_path
             "INSERT INTO entities (id, type, name, updated_at) VALUES (?, ?, ?, ?)",
             (123, "Channel", "Work Chat", 1_700_000_000),
         )
-        record_daemon_event(conn, kind="access_lost", dialog_id=123, occurred_at=1_700_000_000)
-        record_daemon_event(conn, kind="access_restored", dialog_id=123, occurred_at=1_700_003_600)
-        record_daemon_event(conn, kind="irrelevant", dialog_id=123, occurred_at=1_700_003_700)
+        record_runtime_event(conn, kind="sync.access_lost", dialog_id=123, observed_at_ms=1_700_000_000_000)
+        record_runtime_event(conn, kind="sync.access_restored", dialog_id=123, observed_at_ms=1_700_003_600_000)
+        record_runtime_event(conn, kind="mcp.call", observed_at_ms=1_700_003_700_000, tool_name="irrelevant")
         conn.commit()
 
         assert list_important_events(conn, last_hours=2, timezone="Asia/Almaty", now=1_700_003_700) == [

@@ -200,7 +200,7 @@ def _query_rows(
     limit: int,
 ) -> list[tuple[object, ...]]:
     query = (
-        "SELECT seq, kind, occurred_at, dialog_id, message_id, version, daemon_event_id "
+        "SELECT seq, kind, occurred_at, dialog_id, message_id, version "
         "FROM sync_alert_events WHERE seq <= ? AND occurred_at > ?"
     )
     params: list[int] = [snapshot_seq, since]
@@ -286,7 +286,7 @@ def _alert_narrative(kind: object, message_id: object, version: object, occurred
 
 
 def _alert_from_row(row: tuple[object, ...]) -> dict[str, object]:
-    _seq, kind, occurred_at, dialog_id, message_id, version, daemon_event_id = row
+    seq, kind, occurred_at, dialog_id, message_id, version = row
     message, action = _alert_narrative(kind, message_id, version, occurred_at)
     item: dict[str, object] = {
         "kind": kind,
@@ -296,7 +296,7 @@ def _alert_from_row(row: tuple[object, ...]) -> dict[str, object]:
         "deleted_at": occurred_at if kind == "deleted_message" else None,
         "edit_date": occurred_at if kind == "edit" else None,
         "access_lost_at": occurred_at if kind == "access_lost" else None,
-        "source_id": daemon_event_id if kind == "access_lost" else 0,
+        "source_id": seq if kind == "access_lost" else 0,
         "occurred_at": occurred_at,
         "severity": "high" if kind == "access_lost" else "medium" if kind == "deleted_message" else "low",
         "message": message,

@@ -22,6 +22,7 @@ import asyncio
 import logging
 import sqlite3
 import time
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -94,6 +95,7 @@ from .realtime_history_policy import (
     realtime_history_coverage,
 )
 from .resolver import latinize
+from .runtime_events import record_runtime_event
 from .scheduled_messages import (
     mark_scheduled_messages_removed,
     scheduled_dialog_id,
@@ -148,16 +150,76 @@ class _DeletedMessagesEvent(Protocol):
     deleted_ids: Sequence[int]
 
 
-class _ReadMessageEvent(Protocol):
-    chat_id: int | None
-    max_id: int | None
-    contents: bool
-
-
 class _OutboxReadEvent(Protocol):
     chat_id: int | None
     is_private: bool | None
     max_id: int | None
+
+
+def _record_runtime_event_best_effort(conn: sqlite3.Connection, **event: object) -> None:
+    """Record diagnostics without changing event-handler outcomes."""
+    try:
+        with conn:
+            record_runtime_event(conn, **event)  # type: ignore[arg-type]
+    except Exception:
+        logger.exception("runtime_event_record_failed kind=%s", event.get("kind"))
+
+
+def _inbox_read_update_identity(update: object) -> tuple[int, str] | None:
+    if isinstance(update, UpdateReadHistoryInbox):
+        return int(get_peer_id(update.peer)), "UpdateReadHistoryInbox"
+    if isinstance(update, UpdateReadChannelInbox):
+        return int(get_peer_id(PeerChannel(update.channel_id))), "UpdateReadChannelInbox"
+    return None
+
+
+def _read_state(conn: sqlite3.Connection, dialog_id: int) -> tuple[object | None, object | None]:
+    cursor_row = cast(
+        tuple[object | None] | None,
+        conn.execute("SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone(),
+    )
+    unread_row = cast(
+        tuple[object | None] | None,
+        conn.execute("SELECT unread_count FROM dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone(),
+    )
+    return (cursor_row[0] if cursor_row else None, unread_row[0] if unread_row else None)
+
+
+def _apply_observed_inbox_read(  # noqa: PLR0913
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    max_id: int,
+    still_unread: int | None,
+    operation_id: str,
+    partial_reason: str | None,
+) -> tuple[int, int]:
+    before_cursor, before_unread = _read_state(conn, dialog_id)
+    with conn:
+        rowcounts = _apply_inbox_read_fact(
+            conn,
+            dialog_id,
+            max_id=max_id,
+            unread_count=still_unread,
+            observed_at=int(time.time()),
+        )
+    after_cursor, after_unread = _read_state(conn, dialog_id)
+    changed = before_cursor != after_cursor or before_unread != after_unread
+    _record_runtime_event_best_effort(
+        conn,
+        kind="sync.inbox_read_finished",
+        dialog_id=dialog_id,
+        operation_id=operation_id,
+        outcome="partial" if partial_reason else ("applied" if changed else "unchanged"),
+        reason_code=partial_reason,
+        payload={
+            "cursor_before": before_cursor,
+            "cursor_after": after_cursor,
+            "unread_before": before_unread,
+            "unread_after": after_unread,
+        },
+    )
+    return rowcounts
 
 
 class _RawReactionUpdate(Protocol):
@@ -391,7 +453,6 @@ class EventHandlerManager:
         )
         self._client.add_event_handler(self.on_message_edited, events.MessageEdited)
         self._client.add_event_handler(self.on_message_deleted, events.MessageDeleted)
-        self._client.add_event_handler(self.on_message_read, events.MessageRead(inbox=True))
         # Phase 39.3-02: outbox read handler (peer→me side).
         # Dispatch path LOCKED to Path A: events.MessageRead(inbox=False).
         # Verified against .venv/lib/python3.14/site-packages/telethon/events/
@@ -446,7 +507,6 @@ class EventHandlerManager:
         self._client.remove_event_handler(self.on_raw_topic_message)
         self._client.remove_event_handler(self.on_message_edited)
         self._client.remove_event_handler(self.on_message_deleted)
-        self._client.remove_event_handler(self.on_message_read)
         self._client.remove_event_handler(self.on_outbox_read)
         self._client.remove_event_handler(self.on_raw_reaction_update)
         self._client.remove_event_handler(self.on_raw_transcribed_audio)
@@ -991,61 +1051,6 @@ class EventHandlerManager:
         except Exception:
             logger.exception("scheduled_removed_failed dialog_id=%s", dialog_id)
 
-    async def on_message_read(self, event: _ReadMessageEvent) -> None:
-        """Handle MessageRead(inbox=True): update read_inbox_max_id monotonically.
-
-        Monotonic write via `MAX(COALESCE(existing, 0), incoming)` ensures the
-        stored value never regresses — protects against out-of-order events and
-        against bootstrap races where an older GetPeerDialogsRequest response
-        could otherwise overwrite a newer live event.
-
-        ``UpdateReadMessagesContents`` is also normalized as a
-        ``MessageRead(inbox=True)`` event, but it has no peer and only signals
-        that message contents were opened (for example, a voice note). It is
-        not a dialog read-cursor movement. Peerless synthetic or malformed
-        events are likewise ignored quietly at debug level.
-        """
-        contents = bool(getattr(event, "contents", False))
-        if contents:
-            logger.debug(
-                "event_read_contents_ignored chat_id=%s max_id=%s — no dialog read cursor applied",
-                getattr(event, "chat_id", None),
-                getattr(event, "max_id", None),
-            )
-            return
-
-        dialog_id = cast(int | None, getattr(event, "chat_id", None))
-
-        if dialog_id is None:
-            logger.debug(
-                "event_read_without_chat_id contents=%s max_id=%s — no dialog read cursor applied",
-                contents,
-                getattr(event, "max_id", None),
-            )
-            return
-
-        if dialog_id not in self._synced_dialog_ids:
-            return
-
-        try:
-            now = int(time.time())
-            with self._conn:
-                max_id = cast(int | None, getattr(event, "max_id", None))
-                if max_id is None:
-                    return
-                rowcount = apply_read_cursor(self._conn, dialog_id, "inbox", max_id)
-                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
-            if rowcount > 0:
-                logger.debug("event_read dialog_id=%d max_id=%d", dialog_id, max_id)
-            else:
-                logger.warning(
-                    "event_read_no_row dialog_id=%d max_id=%d — UPDATE matched 0 rows",
-                    dialog_id,
-                    max_id,
-                )
-        except Exception:
-            logger.exception("event_read_failed dialog_id=%s", dialog_id)
-
     async def on_outbox_read(self, event: _OutboxReadEvent) -> None:
         """Handle MessageRead(inbox=False): update read_outbox_max_id monotonically.
 
@@ -1056,7 +1061,7 @@ class EventHandlerManager:
         ``UpdateReadHistoryOutbox`` (lines 41-42); ``filter()`` at lines 57-61
         enforces ``event.outbox == True`` when ``inbox=False``. So this
         callback only ever fires on outbox reads — same shape as
-        :meth:`on_message_read`, just the mirrored direction.
+          the raw inbox path, just the mirrored direction.
 
         Semantics:
         - PeerUser-only: only DM events advance the cursor. Non-DM events are
@@ -1598,40 +1603,61 @@ class EventHandlerManager:
         converted into a fabricated cursor value. The metadata policy may
         create a thin ``dialogs`` row when the synced-dialog row is absent.
         """
+        operation_id = uuid.uuid4().hex
+        identity = _inbox_read_update_identity(update)
+        if identity is None:
+            return
+        dialog_id, update_type = identity
         try:
-            if isinstance(update, UpdateReadHistoryInbox):
-                dialog_id = int(get_peer_id(update.peer))
-            elif isinstance(update, UpdateReadChannelInbox):
-                dialog_id = int(get_peer_id(PeerChannel(update.channel_id)))
-            else:
-                return
+            max_id_raw = getattr(update, "max_id", None)
             still_unread_raw = getattr(update, "still_unread_count", None)
+            _record_runtime_event_best_effort(
+                self._conn,
+                kind="telegram.inbox_read_received",
+                dialog_id=dialog_id,
+                operation_id=operation_id,
+                payload={
+                    "update_type": update_type,
+                    "max_id": max_id_raw if isinstance(max_id_raw, int) else None,
+                    "still_unread_count": still_unread_raw if isinstance(still_unread_raw, int) else None,
+                    "pts": getattr(update, "pts", None),
+                },
+            )
             if not _is_valid_nonnegative_int(still_unread_raw, allow_none=True):
                 logger.debug(
                     "event_raw_inbox_read_invalid_still_unread_count dialog_id=%d value=%r",
                     dialog_id,
                     still_unread_raw,
                 )
-                return
-            still_unread = cast(int | None, still_unread_raw)
-            max_id_raw = getattr(update, "max_id", None)
+                still_unread = None
+                partial_reason = "invalid_still_unread_count"
+            else:
+                still_unread = cast(int | None, still_unread_raw)
+                partial_reason = None
             if not _is_valid_nonnegative_int(max_id_raw):
                 logger.debug(
                     "event_raw_inbox_read_invalid_max_id dialog_id=%d max_id=%r",
                     dialog_id,
                     max_id_raw,
                 )
+                _record_runtime_event_best_effort(
+                    self._conn,
+                    kind="sync.inbox_read_finished",
+                    dialog_id=dialog_id,
+                    operation_id=operation_id,
+                    outcome="ignored",
+                    reason_code="invalid_max_id",
+                )
                 return
             max_id = cast(int, max_id_raw)
-            now = int(time.time())
-            with self._conn:
-                cursor_rowcount, unread_rowcount = _apply_inbox_read_fact(
-                    self._conn,
-                    dialog_id,
-                    max_id=max_id,
-                    unread_count=still_unread,
-                    observed_at=now,
-                )
+            cursor_rowcount, unread_rowcount = _apply_observed_inbox_read(
+                self._conn,
+                dialog_id=dialog_id,
+                max_id=max_id,
+                still_unread=still_unread,
+                operation_id=operation_id,
+                partial_reason=partial_reason,
+            )
             logger.debug(
                 "event_raw_inbox_read dialog_id=%d max_id=%d still_unread_count=%s cursor_updated=%d unread_updated=%d",
                 dialog_id,
@@ -1641,6 +1667,14 @@ class EventHandlerManager:
                 unread_rowcount,
             )
         except Exception:
+            _record_runtime_event_best_effort(
+                self._conn,
+                kind="sync.inbox_read_finished",
+                dialog_id=dialog_id,
+                operation_id=operation_id,
+                outcome="failed",
+                reason_code="handler_exception",
+            )
             logger.exception(
                 "event_raw_inbox_read_failed update=%r",
                 type(update).__name__,
