@@ -165,6 +165,7 @@ class _SeedMessageKwargs(TypedDict, total=False):
     sender_first_name: str
     sent_at: int | None
     is_deleted: int
+    deleted_at: int | None
 
 
 class _InsertEntityKwargs(TypedDict, total=False):
@@ -2639,11 +2640,12 @@ def _seed_message(
     sender_first_name = kwargs.get("sender_first_name", "Alice")
     sent_at = kwargs.get("sent_at")
     is_deleted = kwargs.get("is_deleted", 0)
+    deleted_at = kwargs.get("deleted_at")
 
     conn.execute(
         "INSERT INTO messages "
-        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, is_deleted) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, is_deleted, deleted_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             dialog_id,
             message_id,
@@ -2652,6 +2654,7 @@ def _seed_message(
             sender_id,
             sender_first_name,
             is_deleted,
+            deleted_at,
         ),
     )
     conn.commit()
@@ -3038,14 +3041,15 @@ async def test_list_unread_messages_read_inbox_max_id_zero_returns_all() -> None
 
 
 @pytest.mark.asyncio
-async def test_list_unread_messages_excludes_deleted_messages() -> None:
-    """Deleted messages (is_deleted=1) must NOT count as unread or appear in messages.
-    Review-mandated test (Codex MEDIUM).
-    """
+async def test_list_unread_messages_includes_recent_deleted_human_dm() -> None:
+    """A human-DM message deleted before reading remains visible for the configured period."""
+    now = int(time.time())
     conn = _make_db()
     _seed_unread_state(conn, 1001, read_inbox_max_id=10)
+    _seed_unread_dialog(conn, 1001, type_="user")
     _seed_message(conn, 1001, message_id=11, is_deleted=0)
-    _seed_message(conn, 1001, message_id=12, is_deleted=1)
+    _seed_message(conn, 1001, message_id=12, sender_id=1001, is_deleted=1, deleted_at=now)
+    _seed_message(conn, 1001, message_id=14, sender_id=1001, is_deleted=1, deleted_at=now - 86_401)
     _seed_message(conn, 1001, message_id=13, is_deleted=0)
 
     client = _TestClient()
@@ -3061,10 +3065,11 @@ async def test_list_unread_messages_excludes_deleted_messages() -> None:
 
     groups = _response_groups(result)
     assert len(groups) == 1
-    assert groups[0]["unread_count"] == 2
-    returned_ids = [m["message_id"] for m in _group_messages(groups[0])]
-    assert 12 not in returned_ids
-    assert sorted(cast(list[int], returned_ids)) == [11, 13]
+    assert groups[0]["unread_count"] == 3
+    returned = {cast(int, m["message_id"]): m for m in _group_messages(groups[0])}
+    assert sorted(returned) == [11, 12, 13]
+    assert returned[12]["is_deleted"] == 1
+    assert returned[12]["deleted_at"] == now
     cast(MagicMock, client).assert_not_called()
 
 

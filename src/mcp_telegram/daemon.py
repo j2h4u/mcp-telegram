@@ -1091,6 +1091,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - com
         topic_refresher=topic_refresher,
         policy=DaemonApiPolicy(
             read_at_ttl_seconds=config.freshness.read_receipts.read_at_ttl_seconds,
+            deleted_message_visibility_seconds=config.freshness.inbox.deleted_message_visibility_seconds,
             entity_detail_ttl_seconds=config.freshness.entities.detail_ttl_seconds,
             user_directory_ttl_seconds=config.freshness.entities.user_directory_ttl_seconds,
             group_directory_ttl_seconds=config.freshness.entities.group_directory_ttl_seconds,

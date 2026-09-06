@@ -194,6 +194,7 @@ class DaemonApiPolicy:
     """Operator-controlled cache and retention policy supplied by the daemon root."""
 
     read_at_ttl_seconds: int
+    deleted_message_visibility_seconds: int
     entity_detail_ttl_seconds: int
     user_directory_ttl_seconds: int
     group_directory_ttl_seconds: int
@@ -518,6 +519,7 @@ class DaemonAPIServer:
                     history_gateway=TelethonTelegramHistoryGateway(self._client),
                     logger=cast(_LoggerLike, logger),
                     rid=_rid,
+                    deleted_message_visibility_seconds=self._policy.deleted_message_visibility_seconds,
                 )
             )
         return self._reading_service

@@ -9,6 +9,7 @@ def make_daemon_api_policy() -> DaemonApiPolicy:
     scheduling = SchedulingConfig()
     return DaemonApiPolicy(
         read_at_ttl_seconds=freshness.read_receipts.read_at_ttl_seconds,
+        deleted_message_visibility_seconds=freshness.inbox.deleted_message_visibility_seconds,
         entity_detail_ttl_seconds=freshness.entities.detail_ttl_seconds,
         user_directory_ttl_seconds=freshness.entities.user_directory_ttl_seconds,
         group_directory_ttl_seconds=freshness.entities.group_directory_ttl_seconds,

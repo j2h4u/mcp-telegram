@@ -174,6 +174,7 @@ class ReadingDeps:
     history_gateway: TelegramHistoryGateway
     logger: LoggerLike
     rid: Callable[[], str]
+    deleted_message_visibility_seconds: int
 
 
 @dataclass(frozen=True)
@@ -1977,7 +1978,13 @@ class ReadingService:
     ) -> tuple[list[dict], dict[int, int]]:
         rows = cast(
             list[tuple[object, object, object, object, object, object, object, object]],
-            self._conn.execute(_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL, {"since_utc": since_utc}).fetchall(),
+            self._conn.execute(
+                _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL,
+                {
+                    "since_utc": since_utc,
+                    "deleted_since_utc": int(time.time()) - self._deps.deleted_message_visibility_seconds,
+                },
+            ).fetchall(),
         )
         entries: list[dict] = []
         counts: dict[int, int] = {}
@@ -2060,6 +2067,7 @@ class ReadingService:
                             "limit": budget,
                             "self_id": self._deps.self_id,
                             "since_utc": since_utc,
+                            "deleted_since_utc": int(time.time()) - self._deps.deleted_message_visibility_seconds,
                         },
                     ).fetchall(),
                 )

@@ -7,6 +7,7 @@ import sqlite3
 import time
 from typing import Literal, Protocol, cast
 
+from ..alert_policy import incoming_human_dm_sql
 from ..models import DialogType, ReadMessage, ReadState
 from ..sync_read_model import compute_sync_coverage
 
@@ -264,10 +265,12 @@ _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
     "(SELECT COUNT(*) FROM messages m "
     " WHERE m.dialog_id = sd.dialog_id "
     "   AND m.message_id > sd.read_inbox_max_id "
-    "   AND m.is_deleted = 0"
     '   AND m."out" = 0'
     "   AND m.is_service = 0"
-    "   AND (:since_utc IS NULL OR m.sent_at >= :since_utc)) AS unread_count "
+    "   AND ((m.is_deleted = 0 AND (:since_utc IS NULL OR m.sent_at >= :since_utc))"
+    "     OR (m.is_deleted = 1 AND m.deleted_at >= :deleted_since_utc"
+    "       AND (:since_utc IS NULL OR m.deleted_at >= :since_utc)"
+    f"       AND {incoming_human_dm_sql('m')}))) AS unread_count "
     "FROM synced_dialogs sd "
     "LEFT JOIN entities e ON e.id = sd.dialog_id "
     "LEFT JOIN dialogs d ON d.dialog_id = sd.dialog_id "
@@ -370,14 +373,16 @@ _FETCH_UNREAD_MESSAGES_SQL = (
     f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
     f"{_SENDER_FIRST_NAME_SQL}, {_SENDER_USERNAME_SQL}, m.media_kind, m.media_payload, NULL AS content_kind, "
     f"m.forum_topic_id, COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
-    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
+    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id, m.is_deleted, m.deleted_at "
     f"FROM messages m "
     f"LEFT JOIN topic_metadata tm "
     f"  ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
     f"{_SENDER_ENTITY_JOINS_SQL}"
-    f"WHERE m.dialog_id = :dialog_id AND m.message_id > :after_msg_id AND m.is_deleted = 0 "
+    f"WHERE m.dialog_id = :dialog_id AND m.message_id > :after_msg_id "
     f'AND m."out" = 0 AND m.is_service = 0 '
-    f"AND (:since_utc IS NULL OR m.sent_at >= :since_utc) "
+    f"AND ((m.is_deleted = 0 AND (:since_utc IS NULL OR m.sent_at >= :since_utc)) "
+    f"OR (m.is_deleted = 1 AND m.deleted_at >= :deleted_since_utc "
+    f"AND (:since_utc IS NULL OR m.deleted_at >= :since_utc) AND {incoming_human_dm_sql('m')})) "
     f"ORDER BY m.message_id ASC LIMIT :limit"
 )
 

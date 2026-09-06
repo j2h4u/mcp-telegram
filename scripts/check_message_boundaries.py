@@ -101,6 +101,8 @@ CANONICAL_MESSAGE_VIEW_FIELDS = frozenset(
         "sender",
         "out",
         "is_service",
+        "is_deleted",
+        "deleted_at",
         "topic",
         "content",
         "media",

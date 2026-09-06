@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -13,6 +14,7 @@ from mcp_telegram.hydration_queue import HydrationPriority
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.messages.sqlite_bundle import (
     MessageLogContext,
+    find_unique_incoming_human_dm_dialogs,
     insert_messages_with_fts,
     list_undeleted_message_ids,
     mark_message_deleted,
@@ -734,6 +736,21 @@ def test_mark_message_deleted_is_idempotent_and_retains_text_and_fts(conn: sqlit
         500,
     )
     assert conn.execute("SELECT COUNT(*) FROM messages_fts WHERE dialog_id=42 AND message_id=13").fetchone() == (1,)
+
+
+def test_find_unique_incoming_human_dm_dialogs_requires_one_policy_match(conn: sqlite3.Connection) -> None:
+    with conn:
+        conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (42, 'user'), (43, 'user')")
+        conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (42, 'user', 1), (43, 'user', 1)")
+        insert_messages_with_fts(conn, [_message(13, text="one")])
+    assert find_unique_incoming_human_dm_dialogs(conn, [13]) == {13: 42}
+    with conn:
+        duplicate = replace(
+            _message(13, text="two"),
+            message=replace(_message(13, text="two").message, dialog_id=43, sender_id=43),
+        )
+        insert_messages_with_fts(conn, [duplicate])
+    assert find_unique_incoming_human_dm_dialogs(conn, [13]) == {}
 
 
 def test_list_undeleted_message_ids_uses_strict_cutoff(conn: sqlite3.Connection) -> None:

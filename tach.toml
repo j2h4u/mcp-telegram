@@ -183,7 +183,7 @@ cannot_depend_on = [
 [[modules]]
 path = "mcp_telegram.reading.sqlite_projection"
 layer = "application"
-depends_on = ["mcp_telegram.models", "mcp_telegram.sync_read_model"]
+depends_on = ["mcp_telegram.alert_policy", "mcp_telegram.models", "mcp_telegram.sync_read_model"]
 
 [[modules]]
 path = "mcp_telegram.sync_read_model"
