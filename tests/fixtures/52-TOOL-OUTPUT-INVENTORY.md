@@ -8,10 +8,10 @@ Inventory source command:
 uv run python -c "from mcp_telegram import server; print(len(server.tool_by_name)); print('\n'.join(sorted(server.tool_by_name)))"
 ```
 
-Runtime registry count: 18 tools.
+Historical Phase 52 baseline registry count: 18 tools.
 
 Current Phase 52 completion status:
-- All 18 registered tools declare `outputSchema` in the live MCP tool descriptors.
+- The historical Phase 52 baseline recorded 18 registered tools declaring `outputSchema` in the live MCP tool descriptors at that time.
 - Every successful tool path returns `structuredContent`; recoverable error paths may stay text-only.
 - The table below is the Plan 52-01 pre-implementation baseline and lossless migration map. Its
   `Baseline` columns intentionally preserve the state observed before later Phase 52 plans ran.

@@ -82,19 +82,6 @@ def _snapshot_status(complete: bool, age: int | None, stale_after_seconds: int) 
     return "fresh"
 
 
-def list_folders(conn: FolderReadConnection) -> list[dict[str, object]]:
-    try:
-        rows = cast(
-            list[tuple[int, str]],
-            conn.execute("SELECT folder_id, title FROM telegram_folders ORDER BY folder_id").fetchall(),
-        )
-    except sqlite3.OperationalError as exc:
-        if not _missing_table(exc):
-            raise
-        return []
-    return [{"id": int(row[0]), "title": str(row[1])} for row in rows]
-
-
 def folder_summaries(conn: FolderReadConnection) -> list[dict[str, object]]:
     """Return one compact structural summary per Telegram folder."""
     try:

@@ -571,7 +571,7 @@ class ListDialogs(ToolArgs):
       - 'own_only'    — only own-message-related history is stored
       - 'access_lost' — account no longer has access; read-only snapshot
       - 'fragment'    — no full sync; only point-fetched snippets from targeted
-                        ListMessages(context_message_id=...) calls (Phase 999.1)
+                        list_messages(anchor_message_id=...) calls (Phase 999.1)
 
     Call `get_sync_status` and inspect `realtime_history` when active realtime coverage matters.
     """
@@ -894,7 +894,7 @@ def _list_topics_payload(args: ListTopics, data: dict[str, object]) -> dict[str,
         "dialog_id": data.get("dialog_id"),
         "topics": topics,
         "count": len(topics),
-        "empty_reason": None if topics else data.get("empty_reason", "no_active_topics"),
+        "empty_reason": None if topics else data.get("empty_reason"),
     }
 
 

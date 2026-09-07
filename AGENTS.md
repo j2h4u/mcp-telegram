@@ -31,7 +31,7 @@ MCP serving code uses daemon APIs and read-only DB access for lightweight querie
 
 ### Core
 - `daemon.py` — `sync_main()` entry point; owns TelegramClient, heartbeat loop, gap scan scheduling
-- `daemon_api.py` — Unix socket server; 14+ API methods; `_build_list_messages_query()` dynamic SQL builder
+- `daemon_api.py` — Unix socket server; active MCP and daemon API methods; `_build_list_messages_query()` dynamic SQL builder
 - `daemon_client.py` — Unix socket client used by MCP tool runners
 - `sync_db.py` — `sync.db` schema + migrations; `open_sync_db()` / `open_sync_db_readonly()`
 - `sync_worker.py` — `FullSyncWorker`: batch history fetch, FloodWait handling, checkpoint progress
@@ -74,14 +74,15 @@ MCP serving code uses daemon APIs and read-only DB access for lightweight querie
 - `activity.py` — `get_my_recent_activity`
 - `discovery.py` — `list_dialogs`, `list_topics`
 - `entity_info.py` — `get_entity_info` (universal entity inspector: User/Bot/Channel/Supergroup/LegacyChat)
-- `feedback.py` — `submit_feedback` (write tool — agents report bugs/suggestions; daemon writes to feedback.db)
+- `feedback.py` — `submit_feedback` (write tool — agents report bugs/suggestions)
 - `account_trace.py` — `trace_account_messages` (observable authored-message evidence by account)
 - `reading.py` — `list_messages`, `search_messages`
 - `stats.py` — `get_usage_stats`, `get_dialog_stats`
-- `sync.py` — `mark_dialog_for_sync`, `get_sync_status`, `get_sync_alerts`
-- `unread.py` — `get_inbox`
+- `sync.py` — `mark_dialog_for_sync`, `get_sync_status`
+- `unread.py` — `get_inbox`, `get_unread_summary`
+- `conversation_changes.py` — `list_conversation_changes`
 
-Canonical tool registry: `tools/__init__.py`. Total: 14 MCP tools.
+Canonical tool registry: `tools/__init__.py`. Total: 15 MCP tools.
 All registered tools expose `outputSchema`. Successful MCP tool calls are
 structured-only: put all agent-facing data in `structuredContent` and return empty
 `content`. Text rendering belongs to non-MCP surfaces such as a future CLI.
