@@ -330,7 +330,7 @@ def test_search_messages_structured_payload_includes_dialog_anchor_read_state_wa
         "source_cursor": "search-token",
         "offset": 20,
     }
-    assert limits == {"requested_limit": 5, "applied_limit": 1, "offset": 20}
+    assert limits == {"requested_limit": 5, "applied_limit": 5, "returned_count": 1, "offset": 20}
     assert cast(dict[str, object], anchor_call["arguments_template"])["anchor_message_id"] == "<result.msg_id>"
     assert result["dialog_name"] == "Alice"
     assert result["content"] == {
@@ -393,13 +393,40 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
     assert presentation["is_chronological"] is True
     assert payload["limits"] == {
         "requested_limit": 10,
-        "applied_limit": 0,
+        "applied_limit": 10,
+        "returned_count": 0,
         "requested_context_size": 10,
         "applied_context_size": 10,
     }
     assert payload["count"] == 0
     assert payload["result_count_semantics"] == "count is the number of message rows returned in this response page"
     assert cast(dict[str, object], read_state)["header_lines"] == ["[read-state: all caught up]"]
+
+
+def test_list_messages_warns_when_exact_topic_is_empty_in_selected_dialog() -> None:
+    payload = _list_messages_structured_content(
+        _ListMessagesStructuredContentContext(
+            args=ListMessages(exact_dialog_id=591994976, exact_topic_id=306001, limit=10),
+            data={"messages": [], "source": "sync_db", "dialog_access": "live"},
+            rows=[],
+            dialog_id=591994976,
+            sender_id=None,
+            sender_name=None,
+            topic_id=306001,
+            direction="newest",
+            next_navigation=None,
+        )
+    )
+    warnings = cast(list[dict[str, object]], payload["warnings"])
+    assert warnings[0]["kind"] == "empty_exact_topic"
+    assert "list_topics" in cast(str, warnings[0]["action"])
+    assert payload["limits"] == {
+        "requested_limit": 10,
+        "applied_limit": 10,
+        "returned_count": 0,
+        "requested_context_size": 10,
+        "applied_context_size": None,
+    }
 
 
 def test_list_messages_always_presents_selected_page_chronologically_with_reply_refs():

@@ -131,6 +131,16 @@ def test_feedback_list_uses_config_state_dir(tmp_path: Path, monkeypatch: pytest
     assert "deployed state row" in result.stdout
 
 
+def test_feedback_list_missing_local_config_is_concise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "missing-config"))
+
+    result = runner.invoke(app, ["feedback", "list"])
+
+    assert result.exit_code != 0
+    assert "Local mcp-telegram config is unavailable" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_feedback_list_respects_limit(feedback_db):
     ids = [_insert(feedback_db, f"row {i}") for i in range(5)]
     result = runner.invoke(app, ["feedback", "list", "--limit", "2"])

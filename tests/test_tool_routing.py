@@ -1549,7 +1549,8 @@ async def test_list_messages_via_daemon():
     assert payload["source"] == "sync_db"
     assert payload["count"] == 1
     assert limits["requested_limit"] == 50
-    assert limits["applied_limit"] == 1
+    assert limits["applied_limit"] == 50
+    assert limits["returned_count"] == 1
     conn.list_messages.assert_called_once()
 
 

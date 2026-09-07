@@ -247,7 +247,12 @@ def feedback_list(
     from .config import load_config
     from .feedback_db import get_feedback_db_path
 
-    path = get_feedback_db_path(load_config().state.dir)
+    try:
+        path = get_feedback_db_path(load_config().state.dir)
+    except ConfigError as exc:
+        raise BadParameter(
+            "Local mcp-telegram config is unavailable. Run feedback list inside the production container."
+        ) from exc
     if not path.exists():
         print("No feedback recorded yet.")
         return

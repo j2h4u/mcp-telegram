@@ -274,10 +274,17 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
             "properties": {
                 "requested_limit": {"type": "integer"},
                 "applied_limit": {"type": "integer"},
+                "returned_count": {"type": "integer"},
                 "requested_context_size": {"type": "integer"},
                 "applied_context_size": {"type": ["integer", "null"]},
             },
-            "required": ["requested_limit", "applied_limit", "requested_context_size", "applied_context_size"],
+            "required": [
+                "requested_limit",
+                "applied_limit",
+                "returned_count",
+                "requested_context_size",
+                "applied_context_size",
+            ],
             "additionalProperties": False,
         },
         "navigation": {
@@ -445,6 +452,21 @@ def _list_messages_warnings(data: dict) -> list[StructuredWarning]:
     ]
 
 
+def _empty_exact_topic_warning(exact_topic_id: int | None, rows: list[dict]) -> StructuredWarning | None:
+    if exact_topic_id is None or rows:
+        return None
+    return structured_warning(
+        "empty_exact_topic",
+        f"Topic {exact_topic_id} has no published messages in the selected dialog.",
+        severity="warning",
+        action=(
+            "Call list_topics for the selected dialog and list_dialogs for the correspondent, then retry with "
+            "the matching exact_dialog_id and exact_topic_id. A delivery chat ID may identify the recipient "
+            "rather than the conversation peer used for reading."
+        ),
+    )
+
+
 def _navigation_direction_for_structured(direction: str, anchor_message_id: int | None) -> str:
     if anchor_message_id is not None:
         return "around"
@@ -585,6 +607,9 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
             "header_lines": header_lines,
         }
     ordered_rows = _chronological_message_rows(rows)
+    warnings = _list_messages_warnings(data)
+    if topic_warning := _empty_exact_topic_warning(args.exact_topic_id, rows):
+        warnings.append(topic_warning)
     return {
         "dialog_id": resolved_dialog_id,
         "dialog": {
@@ -595,7 +620,7 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
         },
         "source": data.get("source", "unknown"),
         "coverage": _list_messages_coverage(data),
-        "warnings": _list_messages_warnings(data),
+        "warnings": warnings,
         "filters": {
             "dialog": args.dialog,
             "exact_dialog_id": args.exact_dialog_id,
@@ -613,7 +638,8 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
         },
         "limits": {
             "requested_limit": args.limit,
-            "applied_limit": len(rows),
+            "applied_limit": args.limit,
+            "returned_count": len(rows),
             "requested_context_size": args.context_size,
             "applied_context_size": args.context_size if args.anchor_message_id is not None else None,
         },
@@ -687,9 +713,10 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
             "properties": {
                 "requested_limit": {"type": "integer"},
                 "applied_limit": {"type": "integer"},
+                "returned_count": {"type": "integer"},
                 "offset": {"type": "integer"},
             },
-            "required": ["requested_limit", "applied_limit", "offset"],
+            "required": ["requested_limit", "applied_limit", "returned_count", "offset"],
             "additionalProperties": False,
         },
         "anchor_call": {
@@ -907,7 +934,8 @@ def _search_structured_content(ctx: _SearchStructuredContentContext) -> dict[str
         },
         "limits": {
             "requested_limit": ctx.args.limit,
-            "applied_limit": len(ctx.rows),
+            "applied_limit": ctx.args.limit,
+            "returned_count": len(ctx.rows),
             "offset": ctx.offset,
         },
         "anchor_call": {
