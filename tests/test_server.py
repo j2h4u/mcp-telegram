@@ -1447,6 +1447,10 @@ def test_primary_tools_have_core_read_search_schema() -> None:
     assert "exact_topic_id" in lm_props, "list_messages missing exact_topic_id for direct topic access"
     assert "navigation" in lm_props, "list_messages missing shared navigation field"
 
+    list_topics_schema = _tool_input_schema(server.tool_by_name["list_topics"])
+    assert "oneOf" not in list_topics_schema
+    assert {"dialog", "exact_dialog_id"} <= set(cast(dict[str, object], list_topics_schema["properties"]))
+
     # search_messages: must keep dialog + query shape for direct scoping
     search_messages = server.tool_by_name["search_messages"]
     sm_props = cast(dict[str, object], _tool_input_schema(search_messages)["properties"])

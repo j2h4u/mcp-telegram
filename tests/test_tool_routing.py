@@ -1279,11 +1279,12 @@ def test_list_topics_rejects_missing_or_conflicting_dialog_selectors() -> None:
         ListTopics(dialog="Some Group", exact_dialog_id=8583106747)
 
 
-def test_list_topics_schema_exposes_one_dialog_selector() -> None:
+def test_list_topics_schema_avoids_client_incompatible_selector_union() -> None:
     schema = ListTopics.model_json_schema()
 
-    assert {"required": ["dialog"]} in schema["oneOf"]
-    assert {"required": ["exact_dialog_id"]} in schema["oneOf"]
+    assert "oneOf" not in schema
+    assert "dialog" in schema["properties"]
+    assert "exact_dialog_id" in schema["properties"]
 
 
 @pytest.mark.parametrize("exact_dialog_id", [True, False])

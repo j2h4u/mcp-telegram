@@ -517,6 +517,25 @@ def _status_from_row(row: object | None) -> str | None:
     return None if value is None else str(value)
 
 
+def _topic_known_for_dialog(conn: sqlite3.Connection, dialog_id: int, topic_id: int) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM topic_metadata WHERE dialog_id = ? AND topic_id = ? LIMIT 1",
+            (dialog_id, topic_id),
+        ).fetchone()
+        is not None
+    )
+
+
+def _should_fetch_topic_from_telegram(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    topic_id: int | None,
+    messages: Sequence[object],
+) -> bool:
+    return topic_id is not None and not messages and _topic_known_for_dialog(conn, dialog_id, topic_id)
+
+
 class ReadingService:
     """Domain service for list/search/list_dialogs and helper operations."""
 
@@ -910,7 +929,7 @@ class ReadingService:
             result["data"].update(_build_access_metadata(self._conn, dialog_id, status))
             result["data"]["dialog_type"] = dialog_type
             result["data"]["read_state"] = read_state
-            if request.topic_id is not None and not result["data"]["messages"]:
+            if _should_fetch_topic_from_telegram(self._conn, dialog_id, request.topic_id, result["data"]["messages"]):
                 telegram_result = await self._list_messages_from_telegram(_telegram_request_from_db_request(db_request))
                 if telegram_result.get("ok") and telegram_result["data"]["messages"]:
                     telegram_result["data"]["source"] = "telegram_topic_fallback"

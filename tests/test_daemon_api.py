@@ -4316,6 +4316,28 @@ async def test_list_messages_topic_filter_falls_back_to_telegram_when_synced_db_
     assert messages[0]["forum_topic_id"] == topic_id
 
 
+@pytest.mark.asyncio
+async def test_list_messages_unknown_topic_for_synced_dialog_does_not_call_telegram() -> None:
+    dialog_id = 9032
+    topic_id = 306001
+    conn = _make_db()
+    _insert_synced_dialog(conn, dialog_id, status="synced")
+
+    async def _unexpected_iter_messages(*args: object, **kwargs: object):  # type: ignore[misc]
+        raise AssertionError("unknown dialog/topic pair must remain a local empty result")
+        yield
+
+    client = _TestClient()
+    client.iter_messages = _unexpected_iter_messages
+    server = make_server(conn, client)
+
+    result = await server._list_messages({"dialog_id": dialog_id, "limit": 10, "topic_id": topic_id})
+
+    assert result["ok"] is True
+    assert result["data"]["source"] == "sync_db"
+    assert _response_messages(result) == []
+
+
 # ---------------------------------------------------------------------------
 # Phase 35-01: list_messages — unread filter (sync.db)
 # ---------------------------------------------------------------------------
