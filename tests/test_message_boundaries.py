@@ -153,7 +153,7 @@ def test_content_marker_dict_is_rejected_outside_wrapper() -> None:
 
 def test_raw_message_body_wrapper_is_rejected_in_delivery_tools() -> None:
     gate = _gate()
-    path = gate.SOURCE_ROOT / "tools" / "folders.py"
+    path = gate.SOURCE_ROOT / "tools" / "reading.py"
     findings = gate.violations_for(path, 'telegram_content(message.text, "message_text")')
     assert any("message bodies must use serialize_message_content" in finding.message for finding in findings)
 

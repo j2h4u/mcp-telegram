@@ -47,7 +47,7 @@ def _function_source(path: Path, names: set[str]) -> list[str]:
 def test_folder_read_handlers_have_no_telegram_refresh_or_dml_calls() -> None:
     functions = _function_source(
         ROOT / "src/mcp_telegram/daemon_api.py",
-        {"_list_dialogs", "_list_folders", "_list_folder_messages"},
+        {"_list_dialogs", "_list_folders"},
     )
     functions += _function_source(
         ROOT / "src/mcp_telegram/reading/service.py",
@@ -55,7 +55,7 @@ def test_folder_read_handlers_have_no_telegram_refresh_or_dml_calls() -> None:
     )
     functions += _function_source(
         ROOT / "src/mcp_telegram/folders/read_model.py",
-        {"list_folders", "list_folder_messages", "folder_snapshot", "folders_by_dialog", "dialog_placement"},
+        {"list_folders", "folder_summaries", "folder_snapshot", "folders_by_dialog", "dialog_placement"},
     )
 
     for source in functions:

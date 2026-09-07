@@ -5,8 +5,8 @@ from __future__ import annotations
 from .read_repository import FolderReadConnection
 from .read_repository import dialog_placement as _dialog_placement
 from .read_repository import folder_snapshot as _folder_snapshot
+from .read_repository import folder_summaries as _folder_summaries
 from .read_repository import folders_by_dialog as _folders_by_dialog
-from .read_repository import list_folder_messages as _list_folder_messages
 from .read_repository import list_folders as _list_folders
 
 
@@ -14,8 +14,8 @@ def list_folders(conn: FolderReadConnection) -> list[dict[str, object]]:
     return _list_folders(conn)
 
 
-def list_folder_messages(conn: FolderReadConnection, folder_id: int, limit: int) -> dict[str, object]:
-    return _list_folder_messages(conn, folder_id, limit)
+def folder_summaries(conn: FolderReadConnection) -> list[dict[str, object]]:
+    return _folder_summaries(conn)
 
 
 def folder_snapshot(

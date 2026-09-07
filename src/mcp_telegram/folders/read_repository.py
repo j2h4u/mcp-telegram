@@ -95,50 +95,40 @@ def list_folders(conn: FolderReadConnection) -> list[dict[str, object]]:
     return [{"id": int(row[0]), "title": str(row[1])} for row in rows]
 
 
-def list_folder_messages(conn: FolderReadConnection, folder_id: int, limit: int) -> dict[str, object]:
-    rows = cast(
-        list[tuple[int, int, int, str | None, str | None, str | None, str | None]],
-        conn.execute(
-            """SELECT m.dialog_id, m.message_id, m.sent_at, m.text, m.media_kind, m.media_payload, d.name
-           FROM telegram_folder_members fm JOIN messages m ON m.dialog_id = fm.dialog_id
-           LEFT JOIN dialogs d ON d.dialog_id = m.dialog_id
-           WHERE fm.folder_id = ? AND m.is_deleted = 0
-           ORDER BY m.sent_at DESC, m.message_id DESC LIMIT ?""",
-            (folder_id, limit),
-        ).fetchall(),
-    )
-    incomplete_rows = cast(
-        list[tuple[int]],
-        conn.execute(
-            """SELECT fm.dialog_id FROM telegram_folder_members fm
-           LEFT JOIN synced_dialogs sd ON sd.dialog_id = fm.dialog_id
-           WHERE fm.folder_id = ? AND (sd.dialog_id IS NULL OR sd.status != 'synced')
-           ORDER BY fm.dialog_id""",
-            (folder_id,),
-        ).fetchall(),
-    )
-    incomplete = [int(row[0]) for row in incomplete_rows]
-    return {
-        "folder_id": folder_id,
-        "messages": [
-            {
-                "dialog_id": int(dialog_id),
-                "message_id": int(message_id),
-                "sent_at": int(sent_at),
-                "text": text,
-                # The payload is an internal read-model field.  The daemon
-                # projects it through the canonical row decoder before the
-                # response crosses the API boundary.
-                "media_kind": media_kind,
-                "media_payload": media_payload,
-                "dialog_name": dialog_name,
-            }
-            for dialog_id, message_id, sent_at, text, media_kind, media_payload, dialog_name in rows
-        ],
-        "partial": bool(incomplete),
-        "incomplete_dialog_ids": incomplete,
-        "next_navigation": None,
-    }
+def folder_summaries(conn: FolderReadConnection) -> list[dict[str, object]]:
+    """Return one compact structural summary per Telegram folder."""
+    try:
+        rows = cast(
+            list[tuple[int, str, int, int, int, int | None]],
+            conn.execute(
+                """SELECT f.folder_id,
+                          f.title,
+                          COUNT(fm.dialog_id),
+                          COALESCE(SUM(CASE WHEN COALESCE(d.unread_count, 0) > 0 THEN 1 ELSE 0 END), 0),
+                          COALESCE(SUM(COALESCE(d.unread_count, 0)), 0),
+                          MAX(d.last_message_at)
+                   FROM telegram_folders AS f
+                   LEFT JOIN telegram_folder_members AS fm USING(folder_id)
+                   LEFT JOIN dialogs AS d ON d.dialog_id = fm.dialog_id
+                   GROUP BY f.folder_id, f.title
+                   ORDER BY f.folder_id"""
+            ).fetchall(),
+        )
+    except sqlite3.OperationalError as exc:
+        if not _missing_table(exc):
+            raise
+        return []
+    return [
+        {
+            "id": int(folder_id),
+            "title": str(title),
+            "dialog_count": int(dialog_count),
+            "unread_dialog_count": int(unread_dialog_count),
+            "unread_count": int(unread_count),
+            "last_message_at": None if last_message_at is None else int(last_message_at),
+        }
+        for folder_id, title, dialog_count, unread_dialog_count, unread_count, last_message_at in rows
+    ]
 
 
 def folders_by_dialog(conn: FolderReadConnection) -> dict[int, list[dict[str, object]]]:

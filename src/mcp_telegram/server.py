@@ -80,7 +80,7 @@ Core contract:
 Workflows:
 - SEARCH THEN READ: Use search_messages to find hits. Omit dialog for global search; add dialog or exact_dialog_id to scope. Use list_messages(exact_dialog_id=N, anchor_message_id=M) to read context around a hit.
 - BROWSE CHAT: Use list_messages with navigation="latest" or "start". Continue with next_navigation until it is absent. Pages are chronological, oldest-to-newest.
-- FOLDERS: Use list_folders to discover folder ids. Use list_dialogs(folder_id=N) to inspect chats, groups, channels, sync state, folder membership, and freshness. Use list_folder_messages(folder_id=N) for a unified recent-message feed across the folder.
+- FOLDERS: Use list_dialogs(view="folders") to review folder structure and discover ids. Use list_dialogs(folder_id=N) to inspect the chats, groups, channels, sync state, membership, and freshness within one folder.
 - PERSON OR ENTITY: Use get_entity_info for a user, bot, group, supergroup, or channel profile. Read dialog_placement.folders to see folder membership for that entity.
 - FIND DIALOGS: Prefer a name, @username, or Telegram link when the caller has not already obtained an id from mcp-telegram. Use list_dialogs to discover exact ids before direct reads. Never treat identifiers from another API as mcp-telegram dialog ids.
 - TOPICS: Use list_topics for forum/topic-capable dialogs, then pass exact_topic_id to scoped reads when needed.

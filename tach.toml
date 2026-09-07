@@ -39,7 +39,7 @@ depends_on = ["mcp_telegram.config", "mcp_telegram.correlation", "mcp_telegram.d
 [[modules]]
 path = "mcp_telegram.tools"
 layer = "delivery"
-depends_on = ["mcp_telegram.conversation_change_contracts", "mcp_telegram.daemon_client", "mcp_telegram.dialog_selector", "mcp_telegram.entity_identity", "mcp_telegram.errors", "mcp_telegram.formatter", "mcp_telegram.message_content", "mcp_telegram.models", "mcp_telegram.pagination", "mcp_telegram.search_contracts", "mcp_telegram.sync_read_model", "mcp_telegram.temporal", "mcp_telegram.tools.dialog_resolution", "mcp_telegram.tools.message_view", "mcp_telegram.tools.search_hit", "mcp_telegram.tools.structured"]
+depends_on = ["mcp_telegram.conversation_change_contracts", "mcp_telegram.daemon_client", "mcp_telegram.dialog_selector", "mcp_telegram.entity_identity", "mcp_telegram.errors", "mcp_telegram.formatter", "mcp_telegram.models", "mcp_telegram.pagination", "mcp_telegram.search_contracts", "mcp_telegram.sync_read_model", "mcp_telegram.temporal", "mcp_telegram.tools.dialog_resolution", "mcp_telegram.tools.message_view", "mcp_telegram.tools.search_hit", "mcp_telegram.tools.structured"]
 cannot_depend_on = [
     "mcp_telegram.daemon", "mcp_telegram.daemon_api", "mcp_telegram.feedback_db",
     "mcp_telegram.folders.sqlite_repository", "mcp_telegram.folders.telegram_adapter",
@@ -93,7 +93,7 @@ path = "mcp_telegram.daemon_api"
 layer = "application"
 depends_on = [
     "mcp_telegram.daemon_account_trace", "mcp_telegram.daemon_activity_stats",
-    "mcp_telegram.daemon_dialog_queries", "mcp_telegram.daemon_entity_info", "mcp_telegram.daemon_message", "mcp_telegram.dialog_selector",
+    "mcp_telegram.daemon_dialog_queries", "mcp_telegram.daemon_entity_info", "mcp_telegram.dialog_selector",
     "mcp_telegram.entity_store",
     "mcp_telegram.feedback_service",
     "mcp_telegram.reading",
@@ -104,7 +104,7 @@ depends_on = [
     "mcp_telegram.telegram_fragments", "mcp_telegram.telegram_history",
     "mcp_telegram.flood",
     "mcp_telegram.topics.contracts", "mcp_telegram.topics.refresh",
-    "mcp_telegram.folders.read_model", "mcp_telegram.reading.query_records",
+    "mcp_telegram.folders.read_model",
     "mcp_telegram.runtime_observations",
 ]
 cannot_depend_on = [

@@ -84,17 +84,13 @@ from .daemon_dialog_queries import (
     _LIST_TOPICS_SQL,
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
-from .daemon_message import (
-    project_cached_message_facts_by_dialog,
-)
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
-from .folders.read_model import dialog_placement, folder_snapshot, folders_by_dialog, list_folder_messages, list_folders
+from .folders.read_model import dialog_placement, folder_snapshot, folder_summaries, folders_by_dialog
 from .history_enrollment import disable_history, enable_history, read_intent
 from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
-from .reading.query_records import read_message_from_row
 from .runtime_observations import prune_runtime_observations, record_runtime_observation, tool_telemetry_identity
 from .sync_read_model import SyncStatus, build_sync_read_model
 from .topics.contracts import TopicSourceUnavailableError
@@ -722,7 +718,6 @@ class DaemonAPIServer:
             "list_dialogs": self._list_dialogs,
             "get_unread_summary": self._get_unread_summary,
             "list_folders": self._list_folders,
-            "list_folder_messages": self._list_folder_messages,
             "list_topics": self._list_topics,
             "get_me": self._get_me,
             "mark_dialog_for_sync": self._mark_dialog_for_sync,
@@ -1197,40 +1192,13 @@ class DaemonAPIServer:
         return {
             "ok": True,
             "data": {
-                "folders": list_folders(self._conn),
+                "folders": folder_summaries(self._conn),
                 "folder_snapshot": folder_snapshot(
                     self._conn,
                     stale_after_seconds=self._policy.folder_snapshot_stale_after_seconds,
                 ),
             },
         }
-
-    async def _list_folder_messages(self, req: dict[str, object]) -> dict:
-        folder_id = int(cast(int | str, req.get("folder_id", 0)))
-        limit = max(1, min(int(cast(int | str, req.get("limit", 20))), 100))
-        data = list_folder_messages(self._conn, folder_id, limit)
-        raw_messages = cast(list[dict[str, object]], data["messages"])
-        messages = [read_message_from_row(row) for row in raw_messages]
-        projected = project_cached_message_facts_by_dialog(self._conn, messages)
-        data["messages"] = [
-            {
-                **{
-                    key: value
-                    for key, value in row.items()
-                    if key not in {"text", "media_description", "media_kind", "media_payload"}
-                },
-                "text": message.text,
-                "media_description": message.media_description,
-                "media_kind": message.media_kind,
-                "content_kind": message.content_kind,
-            }
-            for row, message in zip(raw_messages, projected, strict=True)
-        ]
-        data["folder_snapshot"] = folder_snapshot(
-            self._conn,
-            stale_after_seconds=self._policy.folder_snapshot_stale_after_seconds,
-        )
-        return {"ok": True, "data": data}
 
     # list_topics
     # ------------------------------------------------------------------

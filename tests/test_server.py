@@ -847,7 +847,7 @@ async def test_get_prompt_returns_telegram_workflows_guide() -> None:
     text = message.content.text
     assert "SEARCH THEN READ" in text
     assert "FOLDERS" in text
-    assert "list_folder_messages(folder_id=N)" in text
+    assert 'list_dialogs(view="folders")' in text
     assert "get_entity_info" in text
     assert "trace_account_messages" in text
     assert "exact_topic_id" in text
