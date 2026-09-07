@@ -430,6 +430,23 @@ async def test_core_projection_uses_full_user_name_and_local_placement() -> None
 
 
 @pytest.mark.asyncio
+async def test_expected_enrichment_timeout_does_not_emit_traceback(caplog: pytest.LogCaptureFixture) -> None:
+    class TimeoutClient:
+        async def __call__(self, _request: object) -> object:
+            raise TimeoutError
+
+    conn = sqlite3.connect(":memory:")
+    service = _test_service(conn, limits=RefreshLimits())
+    service._deps = replace(service._deps, client=TimeoutClient())
+
+    with caplog.at_level(logging.WARNING):
+        assert await service._collect_common_chats(42) == []
+    assert caplog.records[-1].exc_info is False
+    await service.shutdown()
+    conn.close()
+
+
+@pytest.mark.asyncio
 async def test_cached_core_path_is_local_and_fast() -> None:
     conn = sqlite3.connect(":memory:")
     conn.execute(
