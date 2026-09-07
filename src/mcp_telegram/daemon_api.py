@@ -55,7 +55,6 @@ from telethon.tl.functions.channels import (
 )
 from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
     GetCommonChatsRequest,
-    GetDialogFiltersRequest,
     GetFullChatRequest,  # type: ignore[import-untyped]
 )
 from telethon.tl.functions.messages import SearchRequest as MessagesSearchRequest  # type: ignore[import-untyped]
@@ -85,6 +84,7 @@ from .daemon_dialog_queries import (
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
+from .entity_profile.refresh import RefreshLimits
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
 from .folders.read_model import dialog_placement, folder_snapshot, folder_summaries, folders_by_dialog
@@ -198,6 +198,7 @@ class DaemonApiPolicy:
     folder_snapshot_stale_after_seconds: int
     telemetry_retention_ttl_seconds: int
     slow_request_seconds: float
+    entity_profile: RefreshLimits
 
 
 def _attr(obj: object, name: str, default: object | None = None) -> object | None:
@@ -497,6 +498,7 @@ class DaemonAPIServer:
         self._policy = policy
         self._health_status = health_status
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
+        self._entity_info_service: DaemonEntityInfoService | None = None
         self._conversation_changes_token_codec = ConversationChangesTokenCodec()
 
     def _get_reading_service(self) -> ReadingService:
@@ -1398,46 +1400,56 @@ class DaemonAPIServer:
     # get_entity_info
     # ------------------------------------------------------------------
 
+    def _get_entity_info_service(self) -> DaemonEntityInfoService:
+        if self._entity_info_service is None:
+            self._entity_info_service = DaemonEntityInfoService(
+                EntityInfoDeps(
+                    conn=self._conn,
+                    client=cast(DaemonClientLike, self._client),
+                    dm_peer_ids=self._dm_peer_ids,
+                    self_id=self.self_id,
+                    self_profile=self.self_profile,
+                    get_peer_id=telethon_utils.get_peer_id,
+                    rid=_rid,
+                    logger=cast(logging.Logger, logger),
+                    now_provider=lambda: time.time(),
+                    detail_ttl_seconds=self._policy.entity_detail_ttl_seconds,
+                    slow_stage_seconds=self._policy.slow_request_seconds,
+                    get_common_chats_request=GetCommonChatsRequest,
+                    get_full_user_request=GetFullUserRequest,
+                    get_user_photos_request=GetUserPhotosRequest,
+                    get_messages_search_request=MessagesSearchRequest,
+                    get_full_channel_request=GetFullChannelRequest,
+                    get_participants_request=GetParticipantsRequest,
+                    channel_participants_contacts_request=ChannelParticipantsContacts,
+                    get_full_chat_request=GetFullChatRequest,
+                    input_messages_filter_chat_photos=InputMessagesFilterChatPhotos,
+                    message_action_chat_edit_photo=MessageActionChatEditPhoto,
+                    chat_reactions_all=ChatReactionsAll,
+                    chat_reactions_some=ChatReactionsSome,
+                    chat_reactions_none=ChatReactionsNone,
+                    channel_type=Channel,
+                    chat_type=Chat,
+                    get_dialog_placement=lambda entity_id: dialog_placement(self._conn, entity_id),
+                    refresh_limits=self._policy.entity_profile,
+                )
+            )
+        return self._entity_info_service
+
     async def _get_entity_info(self, req: dict[str, object]) -> dict:
         """Type-tagged entity inspector covering 5 Telegram entity kinds."""
-        service = DaemonEntityInfoService(
-            EntityInfoDeps(
-                conn=self._conn,
-                client=cast(DaemonClientLike, self._client),
-                dm_peer_ids=self._dm_peer_ids,
-                self_id=self.self_id,
-                self_profile=self.self_profile,
-                get_peer_id=telethon_utils.get_peer_id,
-                rid=_rid,
-                logger=cast(logging.Logger, logger),
-                now_provider=time.time,
-                detail_ttl_seconds=self._policy.entity_detail_ttl_seconds,
-                slow_stage_seconds=self._policy.slow_request_seconds,
-                get_common_chats_request=GetCommonChatsRequest,
-                get_dialog_filters_request=GetDialogFiltersRequest,
-                get_full_user_request=GetFullUserRequest,
-                get_user_photos_request=GetUserPhotosRequest,
-                get_messages_search_request=MessagesSearchRequest,
-                get_full_channel_request=GetFullChannelRequest,
-                get_participants_request=GetParticipantsRequest,
-                channel_participants_contacts_request=ChannelParticipantsContacts,
-                get_full_chat_request=GetFullChatRequest,
-                input_messages_filter_chat_photos=InputMessagesFilterChatPhotos,
-                message_action_chat_edit_photo=MessageActionChatEditPhoto,
-                chat_reactions_all=ChatReactionsAll,
-                chat_reactions_some=ChatReactionsSome,
-                chat_reactions_none=ChatReactionsNone,
-                channel_type=Channel,
-                chat_type=Chat,
-            )
-        )
-        result = await service.get_entity_info(req)
+        result = await self._get_entity_info_service().get_entity_info(req)
         if result.get("ok"):
             data = cast(dict[str, object], result.get("data", {}))
             entity_id = data.get("id")
             if isinstance(entity_id, int):
                 data["dialog_placement"] = dialog_placement(self._conn, entity_id)
         return result
+
+    async def shutdown(self) -> None:
+        """Stop profile refresh tasks before the daemon closes SQLite."""
+        if self._entity_info_service is not None:
+            await self._entity_info_service.shutdown()
 
     # ------------------------------------------------------------------
     # list_unread_messages

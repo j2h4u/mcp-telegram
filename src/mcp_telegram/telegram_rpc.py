@@ -25,6 +25,13 @@ from telethon.utils import is_list_like  # type: ignore[import-untyped]
 
 from .flood import TelegramRpcThrottled, flood_seconds
 
+
+def raise_if_flood_wait_error(error: BaseException) -> None:
+    """Re-raise vendor FloodWait outcomes before application catches."""
+    if isinstance(error, FloodWaitError):
+        raise error
+
+
 TransientRpcErrors = (
     ServerError,
     RpcCallFailError,

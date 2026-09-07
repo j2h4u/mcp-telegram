@@ -26,12 +26,14 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from typing import Literal, NotRequired, TypedDict, Unpack, cast
 
-from .config import load_config
+from . import config as _config
+from .config import ENTITY_PROFILE_DAEMON_TIMEOUT_SECONDS, load_config
 from .correlation import record_correlation_id
 from .daemon_ipc import get_daemon_socket_path
 
 logger = logging.getLogger(__name__)
-DEFAULT_DAEMON_TIMEOUT_SECONDS = 30.0
+DEFAULT_DAEMON_TIMEOUT_SECONDS = ENTITY_PROFILE_DAEMON_TIMEOUT_SECONDS
+ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS = _config.ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS
 type DaemonFailureKind = Literal[
     "not_running",
     "connect_timeout",

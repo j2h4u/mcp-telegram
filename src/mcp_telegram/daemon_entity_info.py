@@ -4,20 +4,28 @@ This module owns the full ``get_entity_info`` orchestration plus type-specific
 helpers for user/bot/channel/supergroup/group entity details.
 """
 
+import asyncio
 import json
 import logging
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Protocol, cast, runtime_checkable
 
 from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[import-untyped]
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
+from .entity_profile.contracts import PROFILE_SECTIONS, completeness
+from .entity_profile.refresh import EntityRefreshCoordinator, RefreshLimits
+from .entity_profile.repository import EntityProfileRepository
+from .entity_profile.telegram_gateway import BoundedTelegramGateway
 from .entity_store import EntitySnapshot, ensure_entity_stub
+from .flood import TelegramRpcThrottled
+from .folders.read_model import dialog_placement
 from .models import DialogType
 from .telegram_access import ACCESS_LOST_ERRORS
+from .telegram_rpc import raise_if_flood_wait_error
 from .telethon_dialog import classify_dialog_type
 
 _ENTITY_DETAIL_SCHEMA_VERSION = 1
@@ -58,10 +66,6 @@ class _EntityInfoClient(Protocol):
 
 class _CommonChatsResult(Protocol):
     chats: Sequence[object]
-
-
-class _DialogFiltersResult(Protocol):
-    filters: Sequence[object]
 
 
 class _FullUserResult(Protocol):
@@ -192,7 +196,6 @@ class EntityInfoDeps:
     detail_ttl_seconds: int
     slow_stage_seconds: float
     get_common_chats_request: Callable[..., object]
-    get_dialog_filters_request: Callable[..., object]
     get_full_user_request: Callable[..., object]
     get_user_photos_request: Callable[..., object]
     get_messages_search_request: Callable[..., object]
@@ -207,13 +210,26 @@ class EntityInfoDeps:
     chat_reactions_none: type[object]
     channel_type: type[object]
     chat_type: type[object]
+    get_dialog_placement: Callable[[int], dict[str, object]] | None = None
+    refresh_limits: RefreshLimits = field(default_factory=RefreshLimits)
 
 
 class DaemonEntityInfoService:
     """Entity-info extraction service used by ``DaemonAPIServer._get_entity_info``."""
 
-    def __init__(self, deps: EntityInfoDeps) -> None:
+    def __init__(self, deps: EntityInfoDeps, *, enable_refresh_coordinator: bool = True) -> None:
         self._deps = deps
+        self._profiles = EntityProfileRepository(deps.conn, section_ttl_seconds=deps.detail_ttl_seconds)
+        self._section_failures: dict[str, str] = {}
+        self._refresh = (
+            EntityRefreshCoordinator(
+                self._refresh_entity,
+                limits=deps.refresh_limits,
+                on_failure=self._refresh_failed,
+            )
+            if enable_refresh_coordinator
+            else None
+        )
 
     async def get_entity_info(self, req: Mapping[str, object]) -> dict[str, object]:
         """Type-tagged entity inspector covering 5 Telegram entity kinds."""
@@ -223,15 +239,53 @@ class DaemonEntityInfoService:
             return self._error("telegram_api_error", "entity_id missing or not an integer")
 
         now = int(self._deps.now_provider())
-        cached = self._load_cached_detail(entity_id, now)
-        if cached is not None:
-            return cached
+        if self._progressive_enabled():
+            cached_result = self._progressive_cached_result(entity_id, now=now)
+            if cached_result is not None:
+                return cached_result
+        else:
+            cached = self._load_cached_detail(entity_id, now)
+            if cached is not None:
+                return cached
 
         if self._deps.self_id == entity_id and self._deps.self_profile is not None:
-            self_detail = self._build_self_detail()
+            return self._self_snapshot_result(entity_id, now=now, started_at=started_at)
+
+        if self._progressive_enabled():
+            return await self._progressive_miss(entity_id, now=now, started_at=started_at)
+
+        return await self._legacy_entity_info(entity_id, now=now, started_at=started_at)
+
+    def _progressive_cached_result(self, entity_id: int, *, now: int) -> dict[str, object] | None:
+        cached = self._profiles.read(entity_id, now=now)
+        if cached is not None:
+            return self._progressive_result(entity_id, cached.detail, cached.sections, now=now)
+        refresh_state = self._profiles.refresh_state(entity_id, now=now)
+        if refresh_state is None:
+            return None
+        reason = str(refresh_state.get("reason", "entity refresh is temporarily unavailable"))
+        return self._pending_error(entity_id, reason)
+
+    def _self_snapshot_result(self, entity_id: int, *, now: int, started_at: float) -> dict[str, object]:
+        self_detail = self._build_self_detail()
+        if not self._progressive_enabled():
             self._log_stage(entity_id, "self_snapshot", started_at, detail_type=self_detail.get("type"))
             return {"ok": True, "data": self_detail}
+        self._profiles.save_core(self_detail, now=now)
+        self._profiles.mark_pending(entity_id, now=now)
+        sections: dict[str, dict[str, object]] = {
+            section: {"status": "pending", "observed_at": None, "reason": "refresh_queued"}
+            for section in PROFILE_SECTIONS
+        }
+        return self._progressive_result(entity_id, self_detail, sections, now=now)
 
+    async def _legacy_entity_info(
+        self,
+        entity_id: int,
+        *,
+        now: int,
+        started_at: float,
+    ) -> dict[str, object]:
         self._log_stage(entity_id, "cache_miss", started_at)
         stage_started_at = self._deps.now_provider()
         entity, resolve_error = await self._resolve_entity(entity_id)
@@ -252,6 +306,196 @@ class DaemonEntityInfoService:
         self._log_stage(entity_id, "complete", started_at, detail_type=detail.get("type"))
         return {"ok": True, "data": detail}
 
+    def _progressive_enabled(self) -> bool:
+        """Enable the new contract only after its additive table exists."""
+        row = cast(
+            object,
+            self._deps.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_detail_sections'"
+            ).fetchone(),
+        )
+        return row is not None
+
+    def _record_section_failure(self, section: str, reason: str) -> None:
+        self._section_failures.setdefault(section, reason)
+
+    async def _progressive_miss(self, entity_id: int, *, now: int, started_at: float) -> dict[str, object]:
+        try:
+            entity, resolve_error = await asyncio.wait_for(
+                self._resolve_entity(entity_id),
+                timeout=self._deps.refresh_limits.foreground_resolve_seconds,
+            )
+        except TimeoutError:
+            self._log_stage(entity_id, "resolve_timeout", started_at)
+            assert self._refresh is not None
+            self._refresh.enqueue(entity_id)
+            budget = self._deps.refresh_limits.foreground_resolve_seconds
+            return self._pending_error(entity_id, f"entity resolution exceeded the {budget:g} second foreground budget")
+        if resolve_error is not None or entity is None:
+            message = str((resolve_error or {}).get("message", "entity resolution is temporarily unavailable"))
+            return self._pending_error(entity_id, message)
+
+        core = self._core_from_entity(entity)
+        self._profiles.save_core(core, now=now)
+        self._profiles.mark_pending(entity_id, now=now)
+        assert self._refresh is not None
+        self._refresh.enqueue(entity_id)
+        sections: dict[str, dict[str, object]] = {
+            section: {"status": "pending", "observed_at": None, "reason": "refresh_queued"}
+            for section in PROFILE_SECTIONS
+        }
+        result = self._progressive_result(entity_id, core, sections, now=now)
+        self._log_stage(entity_id, "core_complete", started_at, detail_type=core.get("type"))
+        return result
+
+    async def _refresh_entity(self, entity_id: int) -> None:
+        started_at = self._deps.now_provider()
+        bounded_client = BoundedTelegramGateway(
+            self._deps.client,
+            timeout_seconds=self._deps.refresh_limits.per_rpc_seconds,
+        )
+        worker = DaemonEntityInfoService(
+            replace(self._deps, client=cast(_EntityInfoClient, bounded_client)),
+            enable_refresh_coordinator=False,
+        )
+        assert self._refresh is not None
+        entity = await self._refresh_resolved_entity(worker, entity_id)
+        core = self._core_from_entity(entity)
+        self._profiles.save_core(core, now=int(self._deps.now_provider()))
+        detail = await self._refresh_detail(worker, entity)
+        now = int(self._deps.now_provider())
+        self._profiles.save_detail(entity_id, detail, now=now, section_outcomes=worker._section_failures)
+        self._deps.logger.info(
+            "entity_profile.refresh outcome=success entity_id=%r duration_s=%.3f refreshed=%d timed_out=%d queue_depth=%d%s",
+            entity_id,
+            self._deps.now_provider() - started_at,
+            len(PROFILE_SECTIONS),
+            0,
+            self._refresh.queue_depth,
+            self._deps.rid(),
+        )
+
+    async def _refresh_resolved_entity(self, worker: DaemonEntityInfoService, entity_id: int) -> object:
+        assert self._refresh is not None
+        entity, error = await self._refresh.run_rpc(lambda: worker._resolve_entity(entity_id))
+        if error is None and entity is not None:
+            return entity
+        retry_after = (error or {}).get("_retry_after_seconds") if error else None
+        if isinstance(retry_after, int) and retry_after > 0:
+            raise TelegramRpcThrottled(retry_after_seconds=retry_after)
+        raise RuntimeError(str(error or "entity unavailable"))
+
+    async def _refresh_detail(self, worker: DaemonEntityInfoService, entity: object) -> dict[str, object]:
+        detail, detail_error = await worker._build_detail_by_type(entity)
+        if detail_error is not None or detail is None:
+            raise RuntimeError(str(detail_error or "detail unavailable"))
+        return detail
+
+    def _refresh_failed(self, entity_id: int, error: BaseException) -> None:
+        refresh = self._refresh
+        assert refresh is not None
+        retry_at = getattr(error, "retry_after_seconds", None)
+        if not isinstance(retry_at, int):
+            retry_at = getattr(error, "seconds", None)
+        now = int(self._deps.now_provider())
+        reason = "flood_wait" if retry_at is not None else type(error).__name__.lower()
+        self._profiles.mark_refresh_failure(
+            entity_id, now=now, reason=reason, retry_at=(now + retry_at if isinstance(retry_at, int) else None)
+        )
+        self._deps.logger.warning(
+            "entity_info.refresh outcome=failed entity_id=%r reason=%s queue_depth=%d%s",
+            entity_id,
+            reason,
+            refresh.queue_depth,
+            self._deps.rid(),
+        )
+
+    def _core_from_entity(self, entity: object) -> dict[str, object]:
+        entity_id = int(self._deps.get_peer_id(entity))
+        dispatch_kind = classify_dialog_type(entity)
+        name = _opt_str_attr(entity, "first_name") or _opt_str_attr(entity, "title")
+        last_name = _opt_str_attr(entity, "last_name")
+        if last_name:
+            name = " ".join(part for part in (name, last_name) if part)
+        return {
+            "id": entity_id,
+            "type": dispatch_kind.value,
+            "name": name,
+            "username": _opt_str_attr(entity, "username"),
+            "dialog_placement": (
+                self._deps.get_dialog_placement(entity_id)
+                if self._deps.get_dialog_placement
+                else dialog_placement(self._deps.conn, entity_id)
+            ),
+        }
+
+    def _progressive_result(
+        self,
+        entity_id: int,
+        detail: Mapping[str, object],
+        sections: dict[str, dict[str, object]],
+        *,
+        now: int,
+    ) -> dict[str, object]:
+        self._enqueue_section_refresh(entity_id, sections)
+        result = dict(detail)
+        result["id"] = entity_id
+        result["dialog_placement"] = result.get(
+            "dialog_placement",
+            self._deps.get_dialog_placement(entity_id)
+            if self._deps.get_dialog_placement
+            else dialog_placement(self._deps.conn, entity_id),
+        )
+        result["completeness"] = completeness(sections)
+        result["sections"] = self._section_summaries(sections)
+        self._deps.logger.info(
+            "entity_profile.request outcome=%s entity_id=%r duration_s=0.000 sections=%s%s",
+            result["completeness"],
+            entity_id,
+            self._section_counts(sections),
+            self._deps.rid(),
+        )
+        return {"ok": True, "data": result}
+
+    def _enqueue_section_refresh(self, entity_id: int, sections: Mapping[str, Mapping[str, object]]) -> None:
+        if any(
+            value.get("status") in {"pending", "stale"}
+            for value in sections.values()
+            if value.get("status") != "not_applicable"
+        ):
+            assert self._refresh is not None
+            self._refresh.enqueue(entity_id)
+
+    @staticmethod
+    def _section_summaries(sections: Mapping[str, Mapping[str, object]]) -> dict[str, dict[str, object]]:
+        return {
+            name: {
+                key: value[key]
+                for key in ("status", "observed_at", "reason")
+                if key == "status" or isinstance(value.get(key), int | str)
+            }
+            for name, value in sections.items()
+        }
+
+    @staticmethod
+    def _section_counts(sections: Mapping[str, Mapping[str, object]]) -> dict[str, int]:
+        statuses = {"fresh", "stale", "pending", "unavailable", "not_applicable"}
+        return {status: sum(value.get("status") == status for value in sections.values()) for status in statuses}
+
+    @staticmethod
+    def _pending_error(entity_id: int, message: str) -> dict[str, object]:
+        return {
+            "ok": False,
+            "error": "entity_info_pending",
+            "message": message,
+            "retryable": True,
+            "data": {"id": entity_id, "completeness": "partial", "sections": {}},
+        }
+
+    async def shutdown(self) -> None:
+        if self._refresh is not None:
+            await self._refresh.shutdown()
+
     def _build_self_detail(self) -> dict[str, object]:
         profile = self._deps.self_profile or {}
         first_name = _value_or_none(profile.get("first_name"), str)
@@ -259,7 +503,7 @@ class DaemonEntityInfoService:
         name = " ".join(part for part in (first_name, last_name) if part) or None
         return {
             "id": self._deps.self_id,
-            "type": "user",
+            "type": DialogType.USER.value,
             "name": name,
             "username": _value_or_none(profile.get("username"), str),
             "about": None,
@@ -373,7 +617,15 @@ class DaemonEntityInfoService:
                 self._deps.rid(),
             )
             return None, self._error("entity_not_found", str(exc))
-        except (RPCError, RuntimeError, TypeError, AttributeError) as exc:
+        except TelegramRpcThrottled:
+            raise
+        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError) as exc:
+            raise_if_flood_wait_error(exc)
+            raise_if_flood_wait_error(exc)
+            raise_if_flood_wait_error(exc)
+            raise_if_flood_wait_error(exc)
+            raise_if_flood_wait_error(exc)
+            raise_if_flood_wait_error(exc)
             if isinstance(exc, ACCESS_LOST_ERRORS):
                 return None, self._error("telegram_api_error", str(exc))
             self._deps.logger.warning(
@@ -383,7 +635,13 @@ class DaemonEntityInfoService:
                 self._deps.rid(),
                 exc_info=True,
             )
-            return None, self._error("telegram_api_error", str(exc))
+            error = self._error("telegram_api_error", str(exc))
+            retry_after = getattr(exc, "retry_after_seconds", None)
+            if not isinstance(retry_after, int):
+                retry_after = getattr(exc, "seconds", None)
+            if isinstance(retry_after, int) and retry_after > 0:
+                error["_retry_after_seconds"] = retry_after
+            return None, error
 
     async def _build_detail_by_type(self, entity: object) -> tuple[dict[str, object] | None, dict[str, object] | None]:
         dispatch_kind = classify_dialog_type(entity)
@@ -537,7 +795,11 @@ class DaemonEntityInfoService:
                 }
                 for chat in common_result.chats
             )
-        except (RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+        except TelegramRpcThrottled:
+            raise
+        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+            raise_if_flood_wait_error(exc)
+            self._record_section_failure("common_chats", type(exc).__name__.lower())
             self._deps.logger.warning(
                 "entity_info user common_chats_failed user_id=%r error=%s%s",
                 user_id,
@@ -549,10 +811,10 @@ class DaemonEntityInfoService:
 
     def _classify_chat_type(self, chat: object) -> str:
         if isinstance(chat, self._deps.channel_type):
-            return "supergroup" if _attr(chat, "megagroup", False) else "channel"
+            return DialogType.SUPERGROUP.value if _attr(chat, "megagroup", False) else DialogType.CHANNEL.value
         if isinstance(chat, self._deps.chat_type):
-            return "group"
-        return "user"
+            return DialogType.GROUP.value
+        return DialogType.USER.value
 
     async def _collect_user_profile(self, user_id: int) -> dict[str, object]:
         profile: dict[str, object] = {
@@ -598,7 +860,11 @@ class DaemonEntityInfoService:
             profile["personal_channel"] = personal_channel
             profile["personal_channel_unavailable_reason"] = reason
             profile["full_user_ok"] = True
-        except (RPCError, RuntimeError, TypeError, AttributeError, ValueError, KeyError) as exc:
+        except TelegramRpcThrottled:
+            raise
+        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError, KeyError) as exc:
+            raise_if_flood_wait_error(exc)
+            self._record_section_failure("full_profile", type(exc).__name__.lower())
             self._deps.logger.warning(
                 "entity_info user full_user_failed user_id=%r error=%s%s",
                 user_id,
@@ -721,7 +987,11 @@ class DaemonEntityInfoService:
     ) -> tuple[dict[str, object] | None, str]:
         try:
             fetched = await self._deps.client.get_messages(channel, ids=[message_id])
-        except (RPCError, TypeError, AttributeError, ValueError) as exc:
+        except TelegramRpcThrottled:
+            raise
+        except (TimeoutError, RPCError, TypeError, AttributeError, ValueError) as exc:
+            raise_if_flood_wait_error(exc)
+            self._record_section_failure("personal_channel", type(exc).__name__.lower())
             self._deps.logger.warning(
                 "entity_info personal_channel_message_failed channel_id=%r message_id=%r error=%s%s",
                 int(self._deps.get_peer_id(channel)),
@@ -883,16 +1153,15 @@ class DaemonEntityInfoService:
         if folder_id is None:
             return None
         try:
-            filters = cast(
-                _DialogFiltersResult,
-                await self._deps.client(self._deps.get_dialog_filters_request()),
+            row = cast(
+                tuple[object, ...] | None,
+                self._deps.conn.execute(
+                    "SELECT title FROM telegram_folders WHERE folder_id = ?", (folder_id,)
+                ).fetchone(),
             )
-            for item in filters.filters:
-                if _opt_int_attr(item, "id") != folder_id:
-                    continue
-                raw_title = _attr(item, "title", None)
-                return _text_or_none(raw_title)
-        except (RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+            if row is not None:
+                return str(row[0])
+        except (sqlite3.OperationalError, TypeError, ValueError) as exc:
             self._deps.logger.warning(
                 "entity_info user folder_resolve_failed folder_id=%r error=%s%s",
                 folder_id,
@@ -933,7 +1202,11 @@ class DaemonEntityInfoService:
                 if photo_id is None or photo_date is None:
                     continue
                 avatar_history.append({"photo_id": int(photo_id), "date": _isoformat_or_none(photo_date)})
-        except (RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+        except TelegramRpcThrottled:
+            raise
+        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+            raise_if_flood_wait_error(exc)
+            self._record_section_failure("avatar_history", type(exc).__name__.lower())
             self._deps.logger.warning(
                 "entity_info user photos_failed user_id=%r error=%s%s",
                 int(cast(int, self._deps.get_peer_id(user))),
@@ -1007,7 +1280,11 @@ class DaemonEntityInfoService:
                 avatar_history.append(
                     {"photo_id": int(_opt_int_attr(photo, "id") or 0), "date": _isoformat_or_none(photo_date)},
                 )
-        except (RPCError, TypeError, AttributeError, ValueError) as exc:
+        except TelegramRpcThrottled:
+            raise
+        except (TimeoutError, RPCError, TypeError, AttributeError, ValueError) as exc:
+            raise_if_flood_wait_error(exc)
+            self._record_section_failure("avatar_history", type(exc).__name__.lower())
             search_failed = True
             self._deps.logger.warning(
                 "entity_info avatar_search_failed peer_id=%r error=%s%s",
@@ -1016,6 +1293,21 @@ class DaemonEntityInfoService:
                 self._deps.rid(),
             )
 
+        return self._finalize_chat_photo_history(
+            avatar_history,
+            avatar_count,
+            full_chat=full_chat,
+            search_failed=search_failed,
+        )
+
+    def _finalize_chat_photo_history(
+        self,
+        avatar_history: list[dict[str, object]],
+        avatar_count: int,
+        *,
+        full_chat: object,
+        search_failed: bool,
+    ) -> tuple[list[dict[str, object]], int]:
         chat_photo = _attr(full_chat, "chat_photo", None) if full_chat is not None else None
         current_photo_id = _opt_int_attr(chat_photo, "id") if chat_photo is not None else None
         if current_photo_id is not None and not any(p["photo_id"] == int(current_photo_id) for p in avatar_history):
@@ -1053,7 +1345,7 @@ class DaemonEntityInfoService:
 
         return {
             "id": channel_id,
-            "type": "channel",
+            "type": DialogType.CHANNEL.value,
             "name": _attr(channel, "title", None),
             "username": _attr(channel, "username", None),
             "about": full_context["about"],
@@ -1100,7 +1392,11 @@ class DaemonEntityInfoService:
                     _attr(full_chat, "available_reactions", None),
                 )
             context["full_channel_ok"] = True
-        except (RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+        except TelegramRpcThrottled:
+            raise
+        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+            raise_if_flood_wait_error(exc)
+            self._record_section_failure("full_profile", type(exc).__name__.lower())
             self._deps.logger.warning(
                 "entity_info channel full_channel_failed channel_id=%r error=%s%s",
                 int(self._deps.get_peer_id(channel)),
@@ -1186,7 +1482,11 @@ class DaemonEntityInfoService:
             return self._enrich_contact_ids_with_names(intersect_ids), False, None
         except ChatAdminRequiredError:
             return None, False, not_admin_reason
-        except (RPCError, TypeError, AttributeError, ValueError) as exc:
+        except TelegramRpcThrottled:
+            raise
+        except (TimeoutError, RPCError, TypeError, AttributeError, ValueError) as exc:
+            raise_if_flood_wait_error(exc)
+            self._record_section_failure("contact_overlap", type(exc).__name__.lower())
             self._deps.logger.warning(
                 small_error_log,
                 int(cast(int, self._deps.get_peer_id(channel))),
@@ -1221,7 +1521,11 @@ class DaemonEntityInfoService:
             return self._enrich_contact_ids_with_names(intersect_ids), True, "too_large"
         except ChatAdminRequiredError:
             return None, False, not_admin_reason
-        except (RPCError, TypeError, AttributeError, ValueError) as exc:
+        except TelegramRpcThrottled:
+            raise
+        except (TimeoutError, RPCError, TypeError, AttributeError, ValueError) as exc:
+            raise_if_flood_wait_error(exc)
+            self._record_section_failure("contact_overlap", type(exc).__name__.lower())
             self._deps.logger.warning(
                 large_error_log,
                 int(self._deps.get_peer_id(channel)),
@@ -1261,7 +1565,7 @@ class DaemonEntityInfoService:
 
         return {
             "id": channel_id,
-            "type": "supergroup",
+            "type": DialogType.SUPERGROUP.value,
             "name": _attr(channel, "title", None),
             "username": _attr(channel, "username", None),
             "about": full_context["about"],
@@ -1307,7 +1611,11 @@ class DaemonEntityInfoService:
             return self._enrich_contact_ids_with_names(intersect_ids), False, None
         except ChatAdminRequiredError:
             return None, False, "hidden_by_admin"
-        except (RPCError, TypeError, AttributeError, ValueError) as exc:
+        except TelegramRpcThrottled:
+            raise
+        except (TimeoutError, RPCError, TypeError, AttributeError, ValueError) as exc:
+            raise_if_flood_wait_error(exc)
+            self._record_section_failure("contact_overlap", type(exc).__name__.lower())
             self._deps.logger.warning(
                 "entity_info supergroup iter_participants_failed channel_id=%r error=%s%s",
                 int(cast(int, self._deps.get_peer_id(channel))),
@@ -1329,6 +1637,7 @@ class DaemonEntityInfoService:
             intersect_ids = participant_ids & self._deps.dm_peer_ids()
             contacts_subscribed = self._enrich_contact_ids_with_names(intersect_ids)
         except (TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
+            self._record_section_failure("contact_overlap", type(exc).__name__.lower())
             self._deps.logger.warning(
                 "entity_info group contacts_intersect_failed chat_id=%r error=%s%s",
                 chat_id,
@@ -1342,7 +1651,7 @@ class DaemonEntityInfoService:
 
         return {
             "id": chat_id,
-            "type": "group",
+            "type": DialogType.GROUP.value,
             "name": _attr(chat, "title", None),
             "username": None,
             "about": group_meta["about"],
@@ -1402,7 +1711,11 @@ class DaemonEntityInfoService:
                 group_meta["members_count"] = len(participants)
             if group_meta["members_count"] is None:
                 group_meta["members_count"] = _attr(chat, "participants_count", None)
-        except (RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+        except TelegramRpcThrottled:
+            raise
+        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+            raise_if_flood_wait_error(exc)
+            self._record_section_failure("full_profile", type(exc).__name__.lower())
             self._deps.logger.warning(
                 "entity_info group full_chat_failed chat_id=%r error=%s%s",
                 int(self._deps.get_peer_id(chat)),

@@ -78,6 +78,7 @@ from .delta_sync import (
     run_delta_catch_up_loop,
 )
 from .dialog_sync import DialogsBootstrapWorker, run_reconciliation_loop
+from .entity_profile.refresh import RefreshLimits
 from .event_handlers import EventHandlerManager
 from .fact_hydration import MessageFactHydrationWorker
 from .feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
@@ -1099,6 +1100,12 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - com
             folder_snapshot_stale_after_seconds=config.scheduling.folder_projection.stale_threshold_seconds,
             telemetry_retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
             slow_request_seconds=config.logging.daemon_api_slow_request_seconds,
+            entity_profile=RefreshLimits(
+                foreground_resolve_seconds=config.entity_profile.foreground_resolve_seconds,
+                per_rpc_seconds=config.entity_profile.rpc_timeout_seconds,
+                whole_refresh_seconds=config.entity_profile.refresh_timeout_seconds,
+                max_concurrent_refreshes=config.entity_profile.max_concurrent_refreshes,
+            ),
         ),
         health_status=flood_wait_kill_switch_status,
     )
@@ -1448,6 +1455,9 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
     if ctx.unix_server is not None:
         ctx.unix_server.close()
         await ctx.unix_server.wait_closed()
+    shutdown = getattr(ctx.api_server, "shutdown", None)
+    if shutdown is not None:
+        await shutdown()
     ctx.socket_path.unlink(missing_ok=True)
     if ctx.handler_manager is not None:
         ctx.handler_manager.unregister()

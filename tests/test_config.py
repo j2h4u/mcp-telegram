@@ -11,6 +11,7 @@ from mcp_telegram.config import (
     ActivityHotSweepConfig,
     ConfigError,
     EntitiesConfig,
+    EntityProfileConfig,
     FactHydrationConfig,
     FloodWaitConfig,
     FolderProjectionConfig,
@@ -44,6 +45,7 @@ def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
     assert config.telemetry == TelemetryConfig()
     assert config.flood_wait == FloodWaitConfig()
     assert config.telegram_rpc == TelegramRpcConfig()
+    assert config.entity_profile == EntityProfileConfig()
     assert config.scheduling == SchedulingConfig()
     assert config.scheduling.activity_rpc_timeout_seconds == 120.0
     assert config.scheduling.fact_hydration == FactHydrationConfig()
@@ -58,6 +60,41 @@ def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
 
 def test_fact_hydration_config_accepts_positive_capacity_values() -> None:
     assert FactHydrationConfig(max_requests_per_cycle=1, max_jobs_per_cycle=1).max_requests_per_cycle == 1
+
+
+def test_load_config_reads_entity_profile_budgets_and_ipc_validation(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        """[state]
+dir = "/state"
+
+[entity_profile]
+foreground_resolve_seconds = 2
+rpc_timeout_seconds = 6
+refresh_timeout_seconds = 20
+max_concurrent_refreshes = 1
+""",
+    )
+    assert load_config(path).entity_profile == EntityProfileConfig(
+        foreground_resolve_seconds=2.0,
+        rpc_timeout_seconds=6.0,
+        refresh_timeout_seconds=20.0,
+        max_concurrent_refreshes=1,
+    )
+
+    invalid = _write_config(
+        tmp_path,
+        """[state]
+dir = "/state"
+
+[entity_profile]
+    refresh_timeout_seconds = 26
+""",
+    )
+    with pytest.raises(ConfigError, match="cannot exceed 25 seconds"):
+        load_config(invalid)
+    with pytest.raises(ValueError, match="below daemon IPC timeout"):
+        EntityProfileConfig(refresh_timeout_seconds=30)
 
 
 def test_fact_hydration_config_rejects_non_positive_values() -> None:

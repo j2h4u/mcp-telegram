@@ -5,18 +5,22 @@ LegacyChat. DB-first cache with the configured entity-detail TTL on the daemon s
 maps daemon data into the structured MCP response.
 """
 
+import asyncio
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import phonenumbers
 from pydantic import ConfigDict, Field, model_validator
 
+from ..daemon_client import ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS
 from ..errors import (
     entity_not_found_text,
     fetch_entity_info_error_text,
 )
 from ..models import DialogType
 from ._base import (
+    DaemonConnection,
     DaemonNotRunningError,
     ToolAnnotations,
     ToolArgs,
@@ -52,6 +56,23 @@ GET_ENTITY_INFO_OUTPUT_SCHEMA = {
         "entity_id": {"type": "integer"},
         "display_name": {"type": "string"},
         "type": {"type": "string", "enum": [item.value for item in DialogType]},
+        "completeness": {"type": "string", "enum": ["complete", "partial"]},
+        "sections": {
+            "type": "object",
+            "additionalProperties": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["fresh", "stale", "pending", "unavailable", "not_applicable"],
+                    },
+                    "observed_at": {"type": "integer"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["status"],
+                "additionalProperties": True,
+            },
+        },
         "common": {"type": "object", "additionalProperties": True},
         "avatar_history": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
         "type_specific": {"type": "object", "additionalProperties": True},
@@ -85,6 +106,8 @@ GET_ENTITY_INFO_OUTPUT_SCHEMA = {
         "entity_id",
         "display_name",
         "type",
+        "completeness",
+        "sections",
         "common",
         "avatar_history",
         "type_specific",
@@ -593,6 +616,8 @@ def _entity_structured_content(
         "entity_id": entity_id,
         "display_name": display_name,
         "type": data.get("type", "unknown"),
+        "completeness": data.get("completeness", "partial"),
+        "sections": data.get("sections", {}),
         "common": _common_structured(data, entity_id=entity_id),
         "avatar_history": data.get("avatar_history") or [],
         "type_specific": _type_specific_structured(data),
@@ -623,6 +648,19 @@ def _dialog_placement_structured(value: object) -> dict[str, object]:
 
 def _entity_input_label(args: GetEntityInfo) -> str:
     return args.entity if args.entity is not None else str(args.exact_entity_id)
+
+
+def _bounded_daemon_connection() -> AbstractAsyncContextManager[DaemonConnection]:
+    """Open entity-info IPC with the endpoint budget.
+
+    The fallback keeps narrow test doubles written for the original zero-argument
+    context manager compatible while production uses ``daemon_connection``'s
+    timeout-aware path.
+    """
+    try:
+        return daemon_connection(timeout_seconds=ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS)
+    except TypeError:
+        return daemon_connection()
 
 
 @dataclass(frozen=True, slots=True)
@@ -787,13 +825,22 @@ async def _get_entity_lookup(args: GetEntityInfo) -> ToolResult | _EntityLookup:
     output_schema=GET_ENTITY_INFO_OUTPUT_SCHEMA,
 )
 async def get_entity_info(args: GetEntityInfo) -> ToolResult:
+    try:
+        async with asyncio.timeout(ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS):
+            return await _get_entity_info_within_budget(args)
+    except TimeoutError:
+        entity = args.entity if args.entity is not None else str(args.exact_entity_id)
+        return error_result(fetch_entity_info_error_text(entity, "entity info exceeded the endpoint time budget"))
+
+
+async def _get_entity_info_within_budget(args: GetEntityInfo) -> ToolResult:
     resolved = await _get_entity_lookup(args)
     if isinstance(resolved, ToolResult):
         return resolved
     lookup = resolved
 
     try:
-        async with daemon_connection() as conn:
+        async with _bounded_daemon_connection() as conn:
             response = await conn.get_entity_info(entity_id=lookup.entity_id)
     except DaemonNotRunningError as exc:
         return error_result(_daemon_not_running_text(exc))
