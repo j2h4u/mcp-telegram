@@ -38,7 +38,6 @@ MESSAGE_SQL_OWNER_PATHS = frozenset(
         "daemon_entity_info.py",
         "account_trace_sqlite.py",
         "reading/sqlite_projection.py",
-        "folders/read_repository.py",
         "fts.py",
         "message_fact_refresh.py",
         "messages/sqlite_bundle.py",
@@ -77,7 +76,6 @@ MESSAGE_BODY_SERIALIZER_PATHS = frozenset(
     {
         "tools/reading.py",
         "tools/unread.py",
-        "tools/folders.py",
         "tools/activity.py",
         "tools/account_trace.py",
     }
@@ -85,7 +83,6 @@ MESSAGE_BODY_SERIALIZER_PATHS = frozenset(
 MESSAGE_BODY_ENTRYPOINTS = {
     "tools/reading.py": frozenset({"_list_message_structured_item"}),
     "tools/unread.py": frozenset({"_structured_messages"}),
-    "tools/folders.py": frozenset({"list_folder_messages"}),
     "tools/activity.py": frozenset({"_structured_comment"}),
     "tools/account_trace.py": frozenset({"_attach_trace_content_metadata"}),
 }
@@ -144,13 +141,10 @@ MESSAGE_VIEW_BYPASS_NAMES = frozenset(
 )
 TOOL_MESSAGE_PROJECTOR_PATHS = frozenset({"tools/activity.py", "tools/account_trace.py"})
 MESSAGE_METADATA_FUNCTIONS = {
-    "tools/folders.py": frozenset({"list_folders", "list_folder_messages"}),
     "tools/reading.py": frozenset({"_topic_candidate_payload"}),
     "tools/unread.py": frozenset({"_structured_reactions"}),
 }
-MESSAGE_BODY_SURFACE_FUNCTION_NAMES = frozenset(
-    {"get_inbox", "list_messages", "list_folder_messages", "_structured_messages"}
-)
+MESSAGE_BODY_SURFACE_FUNCTION_NAMES = frozenset({"get_inbox", "list_messages", "_structured_messages"})
 
 _EXECUTE_METHODS = frozenset({"execute", "executemany", "executescript"})
 _SQL_NAME = re.compile(r"(?:^|_)(?:SQL|DDL|QUERY)(?:$|_)", re.IGNORECASE)

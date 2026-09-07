@@ -18,8 +18,8 @@ from mcp_telegram.folders.membership import matches
 from mcp_telegram.folders.read_repository import (
     dialog_placement,
     folder_snapshot,
+    folder_summaries,
     folders_by_dialog,
-    list_folder_messages,
     list_folders,
 )
 from mcp_telegram.folders.refresh import FolderRefresher
@@ -107,69 +107,34 @@ def test_folder_snapshot_is_stale_at_threshold(tmp_path: Path) -> None:
         conn.close()
 
 
-def test_folder_messages_merge_local_rows_and_report_incomplete_dialogs(tmp_path: Path) -> None:
+def test_folder_summaries_cover_empty_membership_unread_and_activity(tmp_path: Path) -> None:
     conn = _connection(tmp_path / "sync.db")
     try:
         conn.executemany(
-            "INSERT INTO dialogs(dialog_id, name) VALUES (?, ?)",
-            [(10, "Alpha"), (20, "Beta")],
-        )
-        conn.executemany(
-            "INSERT INTO messages(dialog_id, message_id, sent_at, text) VALUES (?, ?, ?, ?)",
-            [(10, 1, 100, "older"), (20, 2, 200, "newer")],
-        )
-        conn.execute(
-            "INSERT INTO synced_dialogs(dialog_id, status, sync_progress, total_messages) VALUES (10, 'synced', 10, 10)"
+            "INSERT INTO dialogs(dialog_id, name, unread_count, last_message_at) VALUES (?, ?, ?, ?)",
+            [(10, "Alpha", 3, 100), (20, "Beta", 0, 200)],
         )
         conn.commit()
-        _replace_folder_snapshot(conn, [(1, "Work")], [(1, 10), (1, 20)])
+        _replace_folder_snapshot(conn, [(1, "Work"), (2, "Empty")], [(1, 10), (1, 20)])
 
-        assert list_folder_messages(conn, 1, 20) == {
-            "folder_id": 1,
-            "messages": [
-                {
-                    "dialog_id": 20,
-                    "message_id": 2,
-                    "sent_at": 200,
-                    "text": "newer",
-                    "media_kind": None,
-                    "media_payload": None,
-                    "dialog_name": "Beta",
-                },
-                {
-                    "dialog_id": 10,
-                    "message_id": 1,
-                    "sent_at": 100,
-                    "text": "older",
-                    "media_kind": None,
-                    "media_payload": None,
-                    "dialog_name": "Alpha",
-                },
-            ],
-            "partial": True,
-            "incomplete_dialog_ids": [20],
-            "next_navigation": None,
-        }
-    finally:
-        conn.close()
-
-
-def test_folder_messages_do_not_compare_sync_cursor_to_total_count(tmp_path: Path) -> None:
-    conn = _connection(tmp_path / "sync.db")
-    try:
-        conn.execute("INSERT INTO dialogs(dialog_id, name) VALUES (10, 'Alpha')")
-        conn.execute("INSERT INTO messages(dialog_id, message_id, sent_at, text) VALUES (10, 312233, 100, 'older')")
-        conn.execute(
-            "INSERT INTO synced_dialogs(dialog_id, status, sync_progress, total_messages) "
-            "VALUES (10, 'synced', 312233, 1)"
-        )
-        conn.commit()
-        _replace_folder_snapshot(conn, [(1, "Work")], [(1, 10)])
-
-        result = list_folder_messages(conn, 1, 20)
-
-        assert result["partial"] is False
-        assert result["incomplete_dialog_ids"] == []
+        assert folder_summaries(conn) == [
+            {
+                "id": 1,
+                "title": "Work",
+                "dialog_count": 2,
+                "unread_dialog_count": 1,
+                "unread_count": 3,
+                "last_message_at": 200,
+            },
+            {
+                "id": 2,
+                "title": "Empty",
+                "dialog_count": 0,
+                "unread_dialog_count": 0,
+                "unread_count": 0,
+                "last_message_at": None,
+            },
+        ]
     finally:
         conn.close()
 

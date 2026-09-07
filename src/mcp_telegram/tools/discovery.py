@@ -65,6 +65,7 @@ NULLABLE_TELEGRAM_CONTENT_OUTPUT_SCHEMA = {
 LIST_DIALOGS_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
+        "view": {"type": "string", "enum": ["dialogs", "folders"]},
         "dialogs": {
             "type": "array",
             "items": {
@@ -167,6 +168,29 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "folders": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "title": TELEGRAM_CONTENT_OUTPUT_SCHEMA,
+                    "dialog_count": {"type": "integer"},
+                    "unread_dialog_count": {"type": "integer"},
+                    "unread_count": {"type": "integer"},
+                    "last_message_at": {"type": ["integer", "string", "null"]},
+                },
+                "required": [
+                    "id",
+                    "title",
+                    "dialog_count",
+                    "unread_dialog_count",
+                    "unread_count",
+                    "last_message_at",
+                ],
+                "additionalProperties": False,
+            },
+        },
         "count": {"type": "integer"},
         "filters": {
             "type": "object",
@@ -182,8 +206,18 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                 "scope": {"type": "string", "enum": ["all", "own_only"]},
                 "folder_id": {"type": ["integer", "null"]},
                 "limit": {"type": ["integer", "null"]},
+                "view": {"type": "string", "enum": ["dialogs", "folders"]},
             },
-            "required": ["exclude_archived", "ignore_pinned", "filter", "message_state", "scope", "folder_id", "limit"],
+            "required": [
+                "exclude_archived",
+                "ignore_pinned",
+                "filter",
+                "message_state",
+                "scope",
+                "folder_id",
+                "limit",
+                "view",
+            ],
             "additionalProperties": False,
         },
         "snapshot_age_h": {"type": ["integer", "null"]},
@@ -206,7 +240,9 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
         },
     },
     "required": [
+        "view",
         "dialogs",
+        "folders",
         "count",
         "filters",
         "snapshot_age_h",
@@ -259,6 +295,16 @@ class _DialogSurface:
     folder_ids: list[int]
     folders: list[tuple[int, str]]
     archived: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _FolderSummarySurface:
+    folder_id: int
+    title: str
+    dialog_count: int
+    unread_dialog_count: int
+    unread_count: int
+    last_message_at: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,6 +466,34 @@ def _strict_list_dialogs_data(
     )
 
 
+def _strict_folder_summaries(response: Mapping[str, object]) -> tuple[list[_FolderSummarySurface], _FolderSnapshotSurface]:
+    raw_data = response.get("data")
+    if not isinstance(raw_data, Mapping):
+        raise SyncReadModelContractError("data must be an object")
+    raw_folders = _required(raw_data, "folders", context="list_folders")
+    if not isinstance(raw_folders, list):
+        raise SyncReadModelContractError("folders must be an array")
+    folders: list[_FolderSummarySurface] = []
+    for index, value in enumerate(raw_folders):
+        context = f"folders[{index}]"
+        if not isinstance(value, Mapping):
+            raise SyncReadModelContractError(f"{context} must be an object")
+        title = _required(value, "title", context=context)
+        if not isinstance(title, str):
+            raise SyncReadModelContractError(f"{context}.title must be a string")
+        folders.append(
+            _FolderSummarySurface(
+                folder_id=_strict_int(value, "id", context=context),
+                title=title,
+                dialog_count=_strict_int(value, "dialog_count", context=context),
+                unread_dialog_count=_strict_int(value, "unread_dialog_count", context=context),
+                unread_count=_strict_int(value, "unread_count", context=context),
+                last_message_at=_strict_optional_int(value, "last_message_at", context=context),
+            )
+        )
+    return folders, _strict_folder_snapshot(_required(raw_data, "folder_snapshot", context="list_folders"))
+
+
 LIST_TOPICS_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -466,7 +540,11 @@ LIST_TOPICS_OUTPUT_SCHEMA = {
 
 
 class ListDialogs(ToolArgs):
-    """List available dialogs, chats and channels with type and last message timestamp.
+    """Inspect Telegram dialogs or the custom-folder structure that organizes them.
+
+    Use view="folders" for a compact folder-level overview, including empty folders,
+    membership counts, unread counts, and last activity. Use the default view="dialogs"
+    with folder_id to inspect the chats contained in one folder.
 
     Returns both archived and non-archived dialogs by default (Telegram uses archiving as a UI
     organization tool, not data archival). Set exclude_archived=True to show only non-archived
@@ -496,6 +574,7 @@ class ListDialogs(ToolArgs):
     Call `get_sync_status` and inspect `realtime_history` when active realtime coverage matters.
     """
 
+    view: Literal["dialogs", "folders"] = "dialogs"
     exclude_archived: bool = False
     ignore_pinned: bool = False
     filter: str | None = Field(default=None, max_length=200)
@@ -507,6 +586,79 @@ class ListDialogs(ToolArgs):
         ge=1,
         le=500,
         description="Optional maximum number of dialogs to return after all filters are applied.",
+    )
+
+    @model_validator(mode="after")
+    def validate_view_filters(self) -> ListDialogs:
+        uses_dialog_filters = any(
+            (
+                self.exclude_archived,
+                self.ignore_pinned,
+                self.filter is not None,
+                self.message_state != "all",
+                self.scope != "all",
+                self.folder_id is not None,
+                self.limit is not None,
+            )
+        )
+        if self.view == "folders" and uses_dialog_filters:
+            raise ValueError("Dialog filters are only available with view='dialogs'.")
+        return self
+
+
+def _list_dialogs_filters(args: ListDialogs) -> dict[str, object]:
+    return {
+        "exclude_archived": args.exclude_archived,
+        "ignore_pinned": args.ignore_pinned,
+        "filter": args.filter,
+        "message_state": args.message_state,
+        "scope": args.scope,
+        "folder_id": args.folder_id,
+        "limit": args.limit,
+        "view": args.view,
+    }
+
+
+def _folder_view_result(args: ListDialogs, response: Mapping[str, object]) -> ToolResult:
+    try:
+        folders, snapshot = _strict_folder_summaries(response)
+    except SyncReadModelContractError as exc:
+        return _list_dialogs_contract_error(str(exc))
+    warnings: list[StructuredWarning] = []
+    if snapshot.status != "fresh":
+        warnings.append(
+            structured_warning(
+                "folder_snapshot_stale" if snapshot.status == "stale" else "folder_snapshot_unavailable",
+                f"Folder snapshot status is {snapshot.status}.",
+                severity="warning",
+                action="Treat this folder structure as incomplete until the daemon refreshes it.",
+            )
+        )
+    structured_folders = [
+        {
+            "id": folder.folder_id,
+            "title": telegram_content(folder.title, "message_text"),
+            "dialog_count": folder.dialog_count,
+            "unread_dialog_count": folder.unread_dialog_count,
+            "unread_count": folder.unread_count,
+            "last_message_at": folder.last_message_at,
+        }
+        for folder in folders
+    ]
+    return structured_result(
+        {
+            "view": "folders",
+            "dialogs": [],
+            "folders": structured_folders,
+            "count": len(structured_folders),
+            "filters": _list_dialogs_filters(args),
+            "snapshot_age_h": None,
+            "bootstrap_pending": not snapshot.complete,
+            "scope": "all",
+            "folder_snapshot": snapshot.to_wire(),
+            "warnings": warnings,
+        },
+        result_count=len(structured_folders),
     )
 
 
@@ -525,20 +677,25 @@ class ListDialogs(ToolArgs):
 async def list_dialogs(args: ListDialogs) -> ToolResult:
     try:
         async with daemon_connection() as conn:
-            response = await conn.list_dialogs(
-                exclude_archived=args.exclude_archived,
-                ignore_pinned=args.ignore_pinned,
-                filter=args.filter,
-                message_state=args.message_state,
-                scope=args.scope,
-                folder_id=args.folder_id,
-                limit=args.limit,
-            )
+            if args.view == "folders":
+                response = await conn.list_folders()
+            else:
+                response = await conn.list_dialogs(
+                    exclude_archived=args.exclude_archived,
+                    ignore_pinned=args.ignore_pinned,
+                    filter=args.filter,
+                    message_state=args.message_state,
+                    scope=args.scope,
+                    folder_id=args.folder_id,
+                    limit=args.limit,
+                )
     except DaemonNotRunningError as exc:
         return error_result(_daemon_not_running_text(exc))
 
     if err := _check_daemon_response(response):
         return err
+    if args.view == "folders":
+        return _folder_view_result(args, response)
 
     try:
         surface = _strict_list_dialogs_data(response)
@@ -599,17 +756,11 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
             }
         )
     structured_content = {
+        "view": "dialogs",
         "dialogs": structured_dialogs,
+        "folders": [],
         "count": len(structured_dialogs),
-        "filters": {
-            "exclude_archived": args.exclude_archived,
-            "ignore_pinned": args.ignore_pinned,
-            "filter": args.filter,
-            "message_state": args.message_state,
-            "scope": args.scope,
-            "folder_id": args.folder_id,
-            "limit": args.limit,
-        },
+        "filters": _list_dialogs_filters(args),
         "snapshot_age_h": surface.snapshot_age_h,
         "bootstrap_pending": surface.bootstrap_pending,
         "scope": surface.scope,

@@ -136,7 +136,7 @@ async def test_call_tool_omits_none_from_direct_tool_result(monkeypatch: pytest.
         )
 
     monkeypatch.setattr(server.tools, "tool_runner", fake_runner)
-    result = await server.call_tool("list_folders", {})
+    result = await server.call_tool("list_dialogs", {})
     assert isinstance(result, CallToolResult)
     assert cast(dict[str, object], result.structured_content) == {
         "nested": {"keep": 1},
@@ -154,7 +154,7 @@ async def test_call_tool_omits_none_from_direct_structured_error(monkeypatch: py
         )
 
     monkeypatch.setattr(server.tools, "tool_runner", fake_runner)
-    result = await server.call_tool("list_folders", {})
+    result = await server.call_tool("list_dialogs", {})
     assert result.is_error is True
     assert cast(dict[str, object], result.structured_content) == {"error": {"code": "bad_request"}}
 

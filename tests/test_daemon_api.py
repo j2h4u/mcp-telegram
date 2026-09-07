@@ -1507,44 +1507,6 @@ async def test_list_dialogs_serves_preserved_folder_snapshot_without_refresh(tmp
 
 
 @pytest.mark.asyncio
-async def test_list_folder_messages_projects_media_fact_without_payload_leak() -> None:
-    conn = _make_db()
-    conn.execute("INSERT INTO dialogs(dialog_id, name) VALUES (10, 'Media chat')")
-    conn.execute(
-        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
-        "VALUES (10, 1, 100, '', 'photo', '{}')"
-    )
-    conn.execute("CREATE TABLE telegram_folders(folder_id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
-    conn.execute(
-        "CREATE TABLE telegram_folder_members(folder_id INTEGER NOT NULL, dialog_id INTEGER NOT NULL, "
-        "PRIMARY KEY(folder_id, dialog_id))"
-    )
-    conn.execute("INSERT INTO telegram_folders(folder_id, title) VALUES (1, 'Work')")
-    conn.execute("INSERT INTO telegram_folder_members(folder_id, dialog_id) VALUES (1, 10)")
-    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (10, 'synced')")
-    conn.commit()
-    server = make_server(conn)
-
-    result = await server._list_folder_messages({"folder_id": 1, "limit": 20})
-
-    assert result["ok"] is True
-    rows = cast(list[dict[str, object]], _response_data(result)["messages"])
-    assert rows == [
-        {
-            "dialog_id": 10,
-            "message_id": 1,
-            "sent_at": 100,
-            "text": None,
-            "media_kind": "photo",
-            "dialog_name": "Media chat",
-            "media_description": "[фото]",
-            "content_kind": "media_description",
-        }
-    ]
-    assert all("media_payload" not in row for row in rows)
-
-
-@pytest.mark.asyncio
 async def test_list_dialogs_with_folder_filter_uses_preserved_snapshot(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)

@@ -75,16 +75,14 @@ this work themselves: they return the facts already persisted by the daemon.
 
 ## MCP Tools
 
-There are 18 MCP tools. Successful calls are machine-oriented: agents should
+There are 15 MCP tools. Successful calls are machine-oriented: agents should
 read `structuredContent` for IDs, counts, navigation tokens, coverage, warnings,
 and Telegram-originated content.
 
 | Tool | Purpose |
 | --- | --- |
-| `list_dialogs` | List dialogs with type, unread counters, sync status, draft text, and cached metadata. |
+| `list_dialogs` | List dialogs or summarize the custom-folder structure, with unread, activity, sync, draft, and cached metadata. |
 | `list_topics` | List threads for a topic-capable dialog, including forum topics and bot-DM topics. |
-| `list_folders` | List custom Telegram folders. Archive is represented separately. |
-| `list_folder_messages` | Read a unified recent-message feed across one folder, with explicit partial-coverage reporting. |
 | `list_messages` | Read one dialog in chronological order within each page, with pagination, topic/sender/unread filters, UTC time bounds, reply refs, reactions, read-state markers, and archive coverage. |
 | `search_messages` | Full-text search across synced dialogs or within one dialog, with optional UTC time bounds; results include anchors for `list_messages`. |
 | `get_inbox` | Fetch unread messages from personal chats and small groups with budgeted per-dialog output. |
@@ -159,9 +157,8 @@ list_messages(exact_dialog_id=<dialog_id>, unread=true)
 Browse a Telegram folder:
 
 ```text
-list_folders()
+list_dialogs(view="folders")
 list_dialogs(folder_id=<folder_id>)
-list_folder_messages(folder_id=<folder_id>, limit=50)
 ```
 
 Inspect threads without caring whether Telegram implements them as forum or

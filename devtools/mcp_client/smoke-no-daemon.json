@@ -1,7 +1,7 @@
 {
   "steps": [
     {
-      "_comment": "All 17 tools registered with output schemas",
+      "_comment": "All 15 tools registered with output schemas",
       "action": "list_tools",
       "expect": {
         "tool_names_include": [
@@ -14,8 +14,6 @@
           "get_usage_stats",
           "list_conversation_changes",
           "list_dialogs",
-          "list_folder_messages",
-          "list_folders",
           "list_messages",
           "list_topics",
           "mark_dialog_for_sync",
@@ -52,18 +50,12 @@
             "inputSchema.properties.navigation.type": "string",
             "outputSchema.type": "object"
           },
-          "list_folders": {
-            "outputSchema.type": "object"
-          },
-          "list_folder_messages": {
-            "inputSchema.properties.folder_id.type": "integer",
-            "outputSchema.type": "object"
-          },
           "search_messages": {
             "inputSchema.properties.navigation.type": "string",
             "outputSchema.type": "object"
           },
           "list_dialogs": {
+            "inputSchema.properties.view.default": "dialogs",
             "outputSchema.type": "object"
           },
           "list_topics": {

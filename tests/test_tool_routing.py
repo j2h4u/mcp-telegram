@@ -34,8 +34,6 @@ from mcp_telegram.tools import (
     GetUnreadSummary,
     ListConversationChanges,
     ListDialogs,
-    ListFolderMessages,
-    ListFolders,
     ListMessages,
     ListTopics,
     MarkDialogForSync,
@@ -49,8 +47,6 @@ from mcp_telegram.tools import (
     get_unread_summary,
     list_conversation_changes,
     list_dialogs,
-    list_folder_messages,
-    list_folders,
     list_messages,
     list_topics,
     mark_dialog_for_sync,
@@ -204,7 +200,6 @@ class _DaemonConnStub:
     search_messages: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_dialogs: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_folders: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
-    list_folder_messages: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_conversation_changes: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_topics: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     get_me: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
@@ -354,32 +349,6 @@ def _canonical_get_sync_status_data() -> dict[str, object]:
 
 
 STRUCTURED_TOOL_CASES = {
-    "list_folder_messages": (
-        list_folder_messages,
-        ListFolderMessages(folder_id=2),
-        {
-            "ok": True,
-            "data": {
-                "messages": [
-                    {
-                        "dialog_id": 123,
-                        "message_id": 5,
-                        "sent_at": 1705312800,
-                        "text": "hello world",
-                        "dialog_name": "Alice",
-                    }
-                ],
-                "partial": True,
-                "incomplete_dialog_ids": [456],
-                "next_navigation": None,
-            },
-        },
-    ),
-    "list_folders": (
-        list_folders,
-        ListFolders(),
-        {"ok": True, "data": {"folders": [{"id": 2, "title": "Work"}]}},
-    ),
     "list_conversation_changes": (
         list_conversation_changes,
         ListConversationChanges(),
@@ -772,76 +741,49 @@ async def test_registered_tool_outputs_match_their_null_free_schemas(tool_name: 
     validate(payload, output_schema)
 
 
-async def test_folder_tools_frame_telegram_labels_without_raw_duplicates():
-    folders_runner, folders_args, folders_response = STRUCTURED_TOOL_CASES["list_folders"]
-    messages_runner, messages_args, messages_response = STRUCTURED_TOOL_CASES["list_folder_messages"]
+async def test_list_dialogs_folder_view_returns_structural_summary():
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "folders": [
+                    {
+                        "id": 2,
+                        "title": "Work",
+                        "dialog_count": 12,
+                        "unread_dialog_count": 3,
+                        "unread_count": 7,
+                        "last_message_at": 1_705_312_800,
+                    }
+                ],
+                "folder_snapshot": _unavailable_folder_snapshot_payload(),
+            },
+        }
+    )
 
-    with _patch_daemon(_make_daemon_conn(folders_response)):
-        folders_payload = assert_structured_success_payload(await folders_runner(folders_args))
-    with _patch_daemon(_make_daemon_conn(messages_response)):
-        messages_payload = assert_structured_success_payload(await messages_runner(messages_args))
+    with _patch_daemon(conn):
+        result = await list_dialogs(ListDialogs(view="folders"))
 
-    assert "titles_content" not in folders_payload
-    assert folders_payload["folders"] == [
+    payload = assert_structured_success_payload(result)
+    assert payload["view"] == "folders"
+    assert payload["dialogs"] == []
+    assert payload["folders"] == [
         {
             "id": 2,
             "title": {"text": "Work", "is_telegram_content": True, "content_kind": "message_text"},
+            "dialog_count": 12,
+            "unread_dialog_count": 3,
+            "unread_count": 7,
+            "last_message_at": "2024-01-15T10:00:00+00:00",
         }
     ]
-    assert _field_path_value(messages_payload, "messages.0.dialog_name") == {
-        "text": "Alice",
-        "is_telegram_content": True,
-        "content_kind": "message_text",
-    }
+    conn.list_folders.assert_called_once_with()
+    conn.list_dialogs.assert_not_called()
 
 
-async def test_list_folder_messages_consumes_internal_content_kind_at_schema_boundary():
-    response = {
-        "ok": True,
-        "data": {
-            "messages": [
-                {
-                    "dialog_id": 123,
-                    "message_id": 5,
-                    "sent_at": 1705312800,
-                    "text": "[hidden](https://example.test)",
-                    "media_description": "photo",
-                    "media_kind": "other",
-                    "dialog_name": "Synthetic",
-                }
-            ],
-            "partial": True,
-            "incomplete_dialog_ids": [456],
-            "next_navigation": None,
-        },
-    }
-
-    arguments: dict[str, object] = {"folder_id": 5, "limit": 50}
-    with _patch_daemon(_make_daemon_conn(response)):
-        result = await server.call_tool("list_folder_messages", arguments)
-
-    assert isinstance(result, CallToolResult)
-    assert result.is_error is not True
-    payload = cast(dict[str, object], result.structured_content)
-    validate(payload, cast(dict[str, object], TOOL_REGISTRY["list_folder_messages"].output_schema))
-    message = _json_dict(_json_list(payload["messages"])[0])
-    assert "content_kind" not in message
-    assert "text" not in message
-    assert "media_description" not in message
-    assert _json_dict(message["content"])["text"] == "[hidden](https://example.test)"
-    assert _json_dict(message["media"]) == {"type": "other", "description": "photo"}
-    assert payload["partial"] is True
-    assert payload["incomplete_dialog_ids"] == [456]
-
-
-async def test_list_folders_non_utc_timezone_schema_allows_time_context():
-    conn = _make_daemon_conn({"ok": True, "data": {"folders": [{"id": 2, "title": "Work"}]}})
-
-    with _patch_daemon(conn):
-        result = await list_folders(ListFolders(timezone="Asia/Almaty"))
-
-    payload = assert_structured_success_payload(result)
-    assert _json_dict(payload["time_context"])["timezone"] == "Asia/Almaty"
+def test_list_dialogs_folder_view_rejects_dialog_filters() -> None:
+    with pytest.raises(ValueError, match="only available with view='dialogs'"):
+        ListDialogs(view="folders", folder_id=2)
 
 
 async def test_list_dialogs_exposes_folder_names_for_humans():
@@ -899,7 +841,6 @@ def _make_daemon_conn(response: dict | None = None) -> _DaemonConnStub:
     conn.search_messages = _AsyncMethodMock(return_value=r)
     conn.list_dialogs = _AsyncMethodMock(return_value=r)
     conn.list_folders = _AsyncMethodMock(return_value=r)
-    conn.list_folder_messages = _AsyncMethodMock(return_value=r)
     conn.list_conversation_changes = _AsyncMethodMock(return_value=r)
     conn.list_topics = _AsyncMethodMock(return_value=r)
     conn.get_me = _AsyncMethodMock(return_value=r)
@@ -942,7 +883,6 @@ class _patch_daemon:
             "mcp_telegram.tools.activity.daemon_connection",  # Phase 999.1 (B4b)
             "mcp_telegram.tools.account_trace.daemon_connection",
             "mcp_telegram.tools.feedback.daemon_connection",
-            "mcp_telegram.tools.folders.daemon_connection",
             "mcp_telegram.tools.conversation_changes.daemon_connection",
         ]
         for target in targets:
@@ -977,7 +917,6 @@ class _patch_daemon_not_running:
             "mcp_telegram.tools.activity.daemon_connection",  # Phase 999.1 (B4b)
             "mcp_telegram.tools.account_trace.daemon_connection",
             "mcp_telegram.tools.feedback.daemon_connection",
-            "mcp_telegram.tools.folders.daemon_connection",
             "mcp_telegram.tools.conversation_changes.daemon_connection",
         ]
         for target in targets:
@@ -1033,6 +972,7 @@ async def test_list_dialogs_via_daemon():
     assert payload["snapshot_age_h"] is None
     assert payload["bootstrap_pending"] is False
     assert payload["filters"] == {
+        "view": "dialogs",
         "exclude_archived": False,
         "folder_id": None,
         "ignore_pinned": False,

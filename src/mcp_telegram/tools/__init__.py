@@ -23,7 +23,6 @@ from .conversation_changes import ListConversationChanges, list_conversation_cha
 from .discovery import ListDialogs, ListTopics, list_dialogs, list_topics
 from .entity_info import GetEntityInfo, get_entity_info
 from .feedback import SubmitFeedback, submit_feedback
-from .folders import ListFolderMessages, ListFolders, list_folder_messages, list_folders
 from .reading import ListMessages, SearchMessages, list_messages, search_messages
 from .stats import GetDialogStats, GetUsageStats, get_dialog_stats, get_usage_stats
 from .sync import (
@@ -46,8 +45,6 @@ __all__ = [
     "GetUsageStats",
     "ListConversationChanges",
     "ListDialogs",
-    "ListFolderMessages",
-    "ListFolders",
     "ListMessages",
     "ListTopics",
     "MarkDialogForSync",
@@ -66,8 +63,6 @@ __all__ = [
     "get_usage_stats",
     "list_conversation_changes",
     "list_dialogs",
-    "list_folder_messages",
-    "list_folders",
     "list_messages",
     "list_topics",
     "mark_dialog_for_sync",
