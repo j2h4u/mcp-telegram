@@ -805,7 +805,7 @@ class DaemonEntityInfoService:
                 user_id,
                 exc,
                 self._deps.rid(),
-                exc_info=True,
+                exc_info=not isinstance(exc, TimeoutError),
             )
         return chats
 
@@ -870,7 +870,7 @@ class DaemonEntityInfoService:
                 user_id,
                 exc,
                 self._deps.rid(),
-                exc_info=True,
+                exc_info=not isinstance(exc, TimeoutError),
             )
         return profile
 
@@ -1212,7 +1212,7 @@ class DaemonEntityInfoService:
                 int(cast(int, self._deps.get_peer_id(user))),
                 exc,
                 self._deps.rid(),
-                exc_info=True,
+                exc_info=not isinstance(exc, TimeoutError),
             )
         return avatar_history, avatar_count
 
@@ -1402,7 +1402,7 @@ class DaemonEntityInfoService:
                 int(self._deps.get_peer_id(channel)),
                 exc,
                 self._deps.rid(),
-                exc_info=True,
+                exc_info=not isinstance(exc, TimeoutError),
             )
         return context
 
@@ -1721,7 +1721,7 @@ class DaemonEntityInfoService:
                 int(self._deps.get_peer_id(chat)),
                 exc,
                 self._deps.rid(),
-                exc_info=True,
+                exc_info=not isinstance(exc, TimeoutError),
             )
         return group_meta
 
