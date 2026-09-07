@@ -834,7 +834,11 @@ class ReadingService:
         row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)))
         current_status = _status_from_row(row)
         if current_status in (None, "not_synced", "fragment", "own_only"):
-            fragment_result = await self._deps.fragment_context.fetch(dialog_id, request.context_message_id or 0)
+            fragment_result = await self._deps.fragment_context.fetch(
+                dialog_id,
+                request.context_message_id or 0,
+                request.context_size,
+            )
             if not fragment_result.ok:
                 failure = fragment_result.failure
                 detail = failure.as_dict() if failure is not None else None
@@ -1346,7 +1350,8 @@ class ReadingService:
         until_utc: int | None = None,
     ) -> dict:
         """Return messages centred on anchor_message_id from sync.db."""
-        half = max(1, context_size // 2)
+        before_count = context_size // 2
+        after_count = context_size - before_count - 1
         before_rows = _fetchall_rows(
             self._conn.execute(
                 _LIST_MESSAGES_BASE_SQL
@@ -1355,7 +1360,7 @@ class ReadingService:
                     "dialog_id": dialog_id,
                     "self_id": self._deps.self_id,
                     "anchor": anchor_message_id,
-                    "limit": half + 1,
+                    "limit": context_size,
                     "since_utc": since_utc,
                     "until_utc": until_utc,
                 },
@@ -1370,14 +1375,22 @@ class ReadingService:
                     "dialog_id": dialog_id,
                     "self_id": self._deps.self_id,
                     "anchor": anchor_message_id,
-                    "limit": half,
+                    "limit": context_size,
                     "since_utc": since_utc,
                     "until_utc": until_utc,
                 },
             )
         )
 
-        rows = list(reversed(before_rows)) + list(after_rows)
+        selected_before = before_rows[: before_count + 1]
+        selected_after = after_rows[:after_count]
+        remaining = context_size - len(selected_before) - len(selected_after)
+        if remaining > 0:
+            selected_after.extend(after_rows[after_count : after_count + remaining])
+            remaining = context_size - len(selected_before) - len(selected_after)
+        if remaining > 0:
+            selected_before.extend(before_rows[before_count + 1 : before_count + 1 + remaining])
+        rows = list(reversed(selected_before)) + list(selected_after)
         messages, freshness = await self._build_read_messages_from_rows(dialog_id, rows, log_rendered=True)
 
         dialog_type = _dialog_type_from_db(self._conn, dialog_id)

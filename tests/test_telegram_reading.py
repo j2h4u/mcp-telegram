@@ -169,10 +169,10 @@ async def test_fragment_gateway_preserves_fixed_window_and_normalized_persistenc
         get_messages=AsyncMock(return_value=[_message(10), None, _message(12)]),
     )
 
-    result = await FragmentContextService(conn, TelethonTelegramFragmentGateway(client)).fetch(42, 10)
+    result = await FragmentContextService(conn, TelethonTelegramFragmentGateway(client)).fetch(42, 10, 6)
 
     assert result.ok is True
-    cast(AsyncMock, client.get_messages).assert_awaited_once_with("entity", ids=[10, 11, 12, 13, 14, 15])
+    cast(AsyncMock, client.get_messages).assert_awaited_once_with("entity", ids=[7, 8, 9, 10, 11, 12])
     assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=42").fetchone() == ("fragment",)
     assert conn.execute("SELECT message_id, text FROM messages ORDER BY message_id").fetchall() == [
         (10, "message 10"),
@@ -199,7 +199,7 @@ async def test_fragment_gateway_translates_floodwait_without_partial_persistence
         get_messages=AsyncMock(),
     )
 
-    result = await FragmentContextService(conn, TelethonTelegramFragmentGateway(client)).fetch(42, 10)
+    result = await FragmentContextService(conn, TelethonTelegramFragmentGateway(client)).fetch(42, 10, 6)
 
     assert result.ok is False
     assert result.failure == GatewayFailure(

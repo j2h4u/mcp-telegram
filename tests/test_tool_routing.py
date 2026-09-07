@@ -64,6 +64,7 @@ from mcp_telegram.tools._base import (
     _daemon_not_running_text,
     omit_none_mapping_values,
 )
+from mcp_telegram.tools.discovery import LIST_TOPICS_OUTPUT_SCHEMA
 from mcp_telegram.tools.stats import GetDialogStats, GetUsageStats, get_dialog_stats, get_usage_stats
 
 StructuredResult = ToolResult | CallToolResult
@@ -1285,6 +1286,12 @@ def test_list_topics_schema_avoids_client_incompatible_selector_union() -> None:
     assert "oneOf" not in schema
     assert "dialog" in schema["properties"]
     assert "exact_dialog_id" in schema["properties"]
+
+
+def test_list_topics_schema_explains_inconclusive_empty_catalog() -> None:
+    empty_reason = LIST_TOPICS_OUTPUT_SCHEMA["properties"]["empty_reason"]
+
+    assert "could not confirm whether topics exist" in empty_reason["description"]
 
 
 @pytest.mark.parametrize("exact_dialog_id", [True, False])
