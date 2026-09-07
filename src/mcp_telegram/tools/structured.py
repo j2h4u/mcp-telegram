@@ -112,16 +112,6 @@ def telegram_content(text: str, content_kind: TelegramContentKind) -> TelegramCo
     }
 
 
-def unavailable_folder_snapshot() -> dict[str, object]:
-    return {
-        "generation": None,
-        "status": "unavailable",
-        "completed_at": None,
-        "age_seconds": None,
-        "complete": False,
-    }
-
-
 def serialize_message_content(
     text: str | None,
     media_description: str | None,

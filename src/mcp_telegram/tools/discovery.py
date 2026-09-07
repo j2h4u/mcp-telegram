@@ -466,7 +466,9 @@ def _strict_list_dialogs_data(
     )
 
 
-def _strict_folder_summaries(response: Mapping[str, object]) -> tuple[list[_FolderSummarySurface], _FolderSnapshotSurface]:
+def _strict_folder_summaries(
+    response: Mapping[str, object],
+) -> tuple[list[_FolderSummarySurface], _FolderSnapshotSurface]:
     raw_data = response.get("data")
     if not isinstance(raw_data, Mapping):
         raise SyncReadModelContractError("data must be an object")
