@@ -3,7 +3,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, cast
 
-from pydantic import ConfigDict, Field, StrictInt, model_validator
+from pydantic import Field, StrictInt, model_validator
 
 from ..dialog_selector import (
     EXACT_DIALOG_ID_DESCRIPTION,
@@ -628,15 +628,6 @@ class ListTopics(ToolArgs):
     Use this before topic= when working with forum supergroups or bot DM topics so you
     can choose an exact topic name or numeric topic_id instead of guessing via fuzzy match.
     """
-
-    model_config = ConfigDict(
-        json_schema_extra={
-            "oneOf": [
-                {"required": ["dialog"]},
-                {"required": ["exact_dialog_id"]},
-            ]
-        }
-    )
 
     dialog: str | None = Field(default=None, max_length=500, description=NATURAL_DIALOG_SELECTOR_DESCRIPTION)
     exact_dialog_id: StrictInt | None = Field(

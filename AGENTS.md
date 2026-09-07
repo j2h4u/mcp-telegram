@@ -141,6 +141,12 @@ uv run pytest                              # full suite
 uv run pytest tests/test_daemon_api.py -v  # focused
 ```
 
+## Observability
+
+For retrospective windows, query `runtime_observations` first, then correlate anomalies in
+`journalctl -t mcp-telegram`. Use `docker logs` only for the current container after deploy;
+`conversation_history_events` is user history, not operational telemetry.
+
 ## Вызов MCP tools (devtools-клиент)
 
 **Всегда используй `devtools/mcp_client/cli.py` для ad-hoc проверок и E2E-валидации — не `docker exec python3` и не самодельные скрипты.**
