@@ -129,7 +129,8 @@ def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
     assert anchor_message_id["maximum"] == 2_147_483_647
     assert '"latest"' in cast(str, navigation["description"])
     assert '"start"' in cast(str, navigation["description"])
-    assert "already known" in cast(str, exact_dialog_id["description"])
+    assert "previously returned by mcp-telegram" in cast(str, exact_dialog_id["description"])
+    assert "another API" in cast(str, exact_dialog_id["description"])
     assert "Mutually exclusive with dialog" in cast(str, exact_dialog_id["description"])
     assert "full topic catalog" in cast(str, exact_topic_id["description"])
     assert "dialog" not in required

@@ -7,7 +7,13 @@ from typing import Literal, cast
 
 from pydantic import Field, StrictInt, field_validator, model_validator
 
-from ..dialog_selector import DialogSelectorError, optional_dialog_selector, required_dialog_selector
+from ..dialog_selector import (
+    EXACT_DIALOG_ID_DESCRIPTION,
+    NATURAL_DIALOG_SELECTOR_DESCRIPTION,
+    DialogSelectorError,
+    optional_dialog_selector,
+    required_dialog_selector,
+)
 from ..errors import dialog_not_found_text, invalid_navigation_text
 from ..formatter import (
     _render_read_state_header,
@@ -452,17 +458,32 @@ def _list_messages_warnings(data: dict) -> list[StructuredWarning]:
     ]
 
 
-def _empty_exact_topic_warning(exact_topic_id: int | None, rows: list[dict]) -> StructuredWarning | None:
-    if exact_topic_id is None or rows:
+def _empty_exact_topic_warning(args: ListMessages, rows: list[dict]) -> StructuredWarning | None:
+    if args.exact_topic_id is None or rows:
+        return None
+    has_other_filter = any(
+        (
+            args.sender is not None,
+            args.unread,
+            args.anchor_message_id is not None,
+            args.message_state != "sent",
+            args.since_utc is not None,
+            args.until_utc is not None,
+        )
+    )
+    if has_other_filter:
         return None
     return structured_warning(
-        "empty_exact_topic",
-        f"Topic {exact_topic_id} has no published messages in the selected dialog.",
-        severity="warning",
+        "dialog_identifier_mismatch",
+        (
+            f"Topic {args.exact_topic_id} has no published messages in this dialog. The supplied dialog id may "
+            "identify a recipient, sender, account, or chat in another API rather than a dialog in mcp-telegram."
+        ),
+        severity="action_required",
         action=(
-            "Call list_topics for the selected dialog and list_dialogs for the correspondent, then retry with "
-            "the matching exact_dialog_id and exact_topic_id. A delivery chat ID may identify the recipient "
-            "rather than the conversation peer used for reading."
+            "Retry with dialog set to the correspondent's name, @username, or Telegram link so mcp-telegram can "
+            "resolve it. If that identity is unknown, call list_dialogs first. Use exact_dialog_id only with an "
+            "id previously returned by mcp-telegram."
         ),
     )
 
@@ -608,7 +629,7 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
         }
     ordered_rows = _chronological_message_rows(rows)
     warnings = _list_messages_warnings(data)
-    if topic_warning := _empty_exact_topic_warning(args.exact_topic_id, rows):
+    if topic_warning := _empty_exact_topic_warning(args, rows):
         warnings.append(topic_warning)
     return {
         "dialog_id": resolved_dialog_id,
@@ -1030,17 +1051,11 @@ class ListMessages(ToolArgs):
     dialog: str | None = Field(
         default=None,
         max_length=500,
-        description=(
-            "Optional natural dialog selector: numeric id, @username, or fuzzy dialog name. "
-            "Use this for exploratory or ambiguity-safe reads. Mutually exclusive with exact_dialog_id."
-        ),
+        description=f"{NATURAL_DIALOG_SELECTOR_DESCRIPTION} Mutually exclusive with exact_dialog_id.",
     )
     exact_dialog_id: StrictInt | None = Field(
         default=None,
-        description=(
-            "Optional exact dialog id for direct reads when the target dialog is already known. "
-            "Bypasses fuzzy dialog resolution. Mutually exclusive with dialog."
-        ),
+        description=f"{EXACT_DIALOG_ID_DESCRIPTION} Mutually exclusive with dialog.",
     )
     limit: int = Field(default=50, ge=1, le=500)
     navigation: str | None = Field(

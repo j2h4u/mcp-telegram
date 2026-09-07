@@ -418,8 +418,10 @@ def test_list_messages_warns_when_exact_topic_is_empty_in_selected_dialog() -> N
         )
     )
     warnings = cast(list[dict[str, object]], payload["warnings"])
-    assert warnings[0]["kind"] == "empty_exact_topic"
-    assert "list_topics" in cast(str, warnings[0]["action"])
+    assert warnings[0]["kind"] == "dialog_identifier_mismatch"
+    assert warnings[0]["severity"] == "action_required"
+    assert "dialog set to" in cast(str, warnings[0]["action"])
+    assert "previously returned by mcp-telegram" in cast(str, warnings[0]["action"])
     assert payload["limits"] == {
         "requested_limit": 10,
         "applied_limit": 10,
@@ -427,6 +429,24 @@ def test_list_messages_warns_when_exact_topic_is_empty_in_selected_dialog() -> N
         "requested_context_size": 10,
         "applied_context_size": None,
     }
+
+
+def test_list_messages_does_not_diagnose_dialog_id_when_another_filter_makes_topic_empty() -> None:
+    payload = _list_messages_structured_content(
+        _ListMessagesStructuredContentContext(
+            args=ListMessages(exact_dialog_id=12, exact_topic_id=34, sender="Alice"),
+            data={"messages": [], "source": "sync_db", "dialog_access": "live"},
+            rows=[],
+            dialog_id=12,
+            sender_id=None,
+            sender_name="Alice",
+            topic_id=34,
+            direction="newest",
+            next_navigation=None,
+        )
+    )
+
+    assert payload["warnings"] == []
 
 
 def test_list_messages_always_presents_selected_page_chronologically_with_reply_refs():
