@@ -5,7 +5,12 @@ from typing import Literal, cast
 
 from pydantic import ConfigDict, Field, StrictInt, model_validator
 
-from ..dialog_selector import DialogSelectorError, required_dialog_selector
+from ..dialog_selector import (
+    EXACT_DIALOG_ID_DESCRIPTION,
+    NATURAL_DIALOG_SELECTOR_DESCRIPTION,
+    DialogSelectorError,
+    required_dialog_selector,
+)
 from ..sync_read_model import (
     CoverageState,
     HistoryDepthState,
@@ -633,12 +638,10 @@ class ListTopics(ToolArgs):
         }
     )
 
-    dialog: str | None = Field(default=None, max_length=500)
+    dialog: str | None = Field(default=None, max_length=500, description=NATURAL_DIALOG_SELECTOR_DESCRIPTION)
     exact_dialog_id: StrictInt | None = Field(
         default=None,
-        description=(
-            "Known numeric dialog id. Prefer this when available; do not pass sender_id values from messages."
-        ),
+        description=EXACT_DIALOG_ID_DESCRIPTION,
     )
 
     @model_validator(mode="after")

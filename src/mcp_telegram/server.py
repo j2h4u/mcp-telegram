@@ -82,7 +82,7 @@ Workflows:
 - BROWSE CHAT: Use list_messages with navigation="latest" or "start". Continue with next_navigation until it is absent. Pages are chronological, oldest-to-newest.
 - FOLDERS: Use list_folders to discover folder ids. Use list_dialogs(folder_id=N) to inspect chats, groups, channels, sync state, folder membership, and freshness. Use list_folder_messages(folder_id=N) for a unified recent-message feed across the folder.
 - PERSON OR ENTITY: Use get_entity_info for a user, bot, group, supergroup, or channel profile. Read dialog_placement.folders to see folder membership for that entity.
-- FIND IDS: Use list_dialogs to discover exact numeric dialog ids before direct reads. Numeric ids are preferable once known.
+- FIND DIALOGS: Prefer a name, @username, or Telegram link when the caller has not already obtained an id from mcp-telegram. Use list_dialogs to discover exact ids before direct reads. Never treat identifiers from another API as mcp-telegram dialog ids.
 - TOPICS: Use list_topics for forum/topic-capable dialogs, then pass exact_topic_id to scoped reads when needed.
 - SYNC STATE: Use get_sync_status when a result looks stale, incomplete, or surprising. Full synced history means complete as of history_complete_at; ongoing freshness is local_knowledge_at.
 - ENROLL SYNC: Use mark_dialog_for_sync only when a dialog needs local sync coverage for search or anchor-based reading. This mutates local MCP sync scope, not Telegram.

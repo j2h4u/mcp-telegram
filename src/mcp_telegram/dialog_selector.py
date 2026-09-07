@@ -8,6 +8,15 @@ from dataclasses import dataclass
 SQLITE_INT64_MIN = -(2**63)
 SQLITE_INT64_MAX = 2**63 - 1
 
+NATURAL_DIALOG_SELECTOR_DESCRIPTION = (
+    "Dialog name, @username, or Telegram link resolved by mcp-telegram. Use this when the caller has not "
+    "already obtained a dialog id from mcp-telegram; identifiers from other APIs may refer to a different entity."
+)
+EXACT_DIALOG_ID_DESCRIPTION = (
+    "Exact dialog id previously returned by mcp-telegram. Do not pass a chat, recipient, sender, or account id "
+    "from another API. Bypasses dialog resolution."
+)
+
 _SIGNED_ASCII_DECIMAL_RE = re.compile(r"^[+-]?[0-9]+$")
 
 

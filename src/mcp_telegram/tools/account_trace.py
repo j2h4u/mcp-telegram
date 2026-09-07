@@ -4,7 +4,12 @@ from typing import Literal, TypedDict, cast
 
 from pydantic import Field, StrictInt, model_validator
 
-from ..dialog_selector import DialogSelectorError, optional_dialog_selector
+from ..dialog_selector import (
+    EXACT_DIALOG_ID_DESCRIPTION,
+    NATURAL_DIALOG_SELECTOR_DESCRIPTION,
+    DialogSelectorError,
+    optional_dialog_selector,
+)
 from ..models import ContentKind
 from ._base import (
     DaemonNotRunningError,
@@ -225,11 +230,11 @@ class TraceAccountMessages(ToolArgs):
     dialog: str | None = Field(
         default=None,
         max_length=500,
-        description="Optional dialog selector for scoping by name, link, or numeric id.",
+        description=NATURAL_DIALOG_SELECTOR_DESCRIPTION,
     )
     exact_dialog_id: StrictInt | None = Field(
         default=None,
-        description="Optional numeric dialog id for exact dialog scoping.",
+        description=EXACT_DIALOG_ID_DESCRIPTION,
     )
     exact_topic_id: int | None = Field(
         default=None,
