@@ -11,7 +11,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 56
+_CURRENT_SCHEMA_VERSION = 57
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -19,6 +19,7 @@ _MESSAGE_HISTORY_MIGRATION_53 = 53
 _EVENT_NAMES_MIGRATION_54 = 54
 _ACCESS_CAUSE_MIGRATION_55 = 55
 _TOOL_CAPABILITY_MIGRATION_56 = 56
+_ENTITY_PROFILE_SECTIONS_MIGRATION_57 = 57
 
 logger = logging.getLogger(__name__)
 
@@ -2764,6 +2765,44 @@ def _apply_migration_56(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
+def _apply_migration_57(conn: sqlite3.Connection, current: int) -> int:
+    """Persist independent progressive entity-profile section outcomes."""
+    return _apply_migration(
+        conn,
+        current,
+        _ENTITY_PROFILE_SECTIONS_MIGRATION_57,
+        [
+            """CREATE TABLE IF NOT EXISTS entity_detail_sections (
+                entity_id INTEGER NOT NULL,
+                section TEXT NOT NULL CHECK(section IN (
+                    'full_profile', 'common_chats', 'contact_overlap',
+                    'avatar_history', 'personal_channel'
+                )),
+                status TEXT NOT NULL CHECK(status IN (
+                    'fresh', 'stale', 'pending', 'unavailable', 'not_applicable'
+                )),
+                observed_at INTEGER,
+                reason TEXT,
+                payload_json TEXT,
+                retry_at INTEGER,
+                PRIMARY KEY(entity_id, section),
+                FOREIGN KEY(entity_id) REFERENCES entities(id) ON DELETE CASCADE
+            ) WITHOUT ROWID""",
+            (
+                "CREATE INDEX IF NOT EXISTS idx_entity_detail_sections_status "
+                "ON entity_detail_sections(status, retry_at, observed_at)"
+            ),
+            """CREATE TABLE IF NOT EXISTS entity_profile_refresh_state (
+                entity_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL CHECK(status IN ('failed', 'pending')),
+                retry_at INTEGER,
+                reason TEXT,
+                updated_at INTEGER NOT NULL
+            ) WITHOUT ROWID""",
+        ],
+    )
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -2834,6 +2873,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_migration_54(conn, current)
     current = _apply_migration_55(conn, current)
     current = _apply_migration_56(conn, current)
+    current = _apply_migration_57(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

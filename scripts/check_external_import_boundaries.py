@@ -79,6 +79,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "topics/sqlite_repository.py",
             "unread_state.py",
             "daemon_shutdown.py",
+            "entity_profile/repository.py",
         }
     ),
     "telethon": frozenset(

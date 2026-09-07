@@ -1699,7 +1699,7 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 56, f"_CURRENT_SCHEMA_VERSION must be 56, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 57, f"_CURRENT_SCHEMA_VERSION must be 57, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
 

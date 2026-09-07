@@ -8,12 +8,16 @@ import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import cast
+from typing import Final, cast
 
 from xdg_base_dirs import xdg_config_home  # type: ignore[import-error]
 
 _VALID_HTTP_PORTS = range(1, 65_536)
 _MAX_FACT_HYDRATION_BATCH_SIZE = 100
+ENTITY_PROFILE_DAEMON_TIMEOUT_SECONDS: Final[float] = 30.0
+ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS: Final[float] = 5.0
+ENTITY_PROFILE_RPC_TIMEOUT_CAP_SECONDS: Final[float] = 8.0
+ENTITY_PROFILE_REFRESH_TIMEOUT_CAP_SECONDS: Final[float] = 25.0
 
 
 class ConfigError(RuntimeError):
@@ -56,6 +60,55 @@ class EntitiesConfig:
     user_directory_ttl_seconds: int = 2_592_000
     group_directory_ttl_seconds: int = 604_800
     resolver_enrichment_ttl_seconds: int = 300
+
+
+@dataclass(frozen=True, slots=True)
+class EntityProfileConfig:
+    """Budgets for the progressive entity-profile projection."""
+
+    foreground_resolve_seconds: float = 3.0
+    rpc_timeout_seconds: float = 8.0
+    refresh_timeout_seconds: float = 25.0
+    max_concurrent_refreshes: int = 1
+
+    def __post_init__(self) -> None:
+        self._validate_durations()
+        self._validate_caps()
+        self._validate_concurrency()
+
+    def _validate_durations(self) -> None:
+        durations = (
+            self.foreground_resolve_seconds,
+            self.rpc_timeout_seconds,
+            self.refresh_timeout_seconds,
+        )
+        if any(not math.isfinite(value) or value <= 0 for value in durations):
+            raise ValueError("entity profile budgets must be finite and positive")
+        if self.foreground_resolve_seconds > self.rpc_timeout_seconds:
+            raise ValueError("entity profile foreground budget cannot exceed RPC budget")
+        if self.rpc_timeout_seconds > self.refresh_timeout_seconds:
+            raise ValueError("entity profile RPC budget cannot exceed refresh budget")
+        if self.foreground_resolve_seconds > ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS:
+            raise ValueError("entity profile foreground budget cannot exceed endpoint budget")
+
+    def _validate_caps(self) -> None:
+        if self.refresh_timeout_seconds >= ENTITY_PROFILE_DAEMON_TIMEOUT_SECONDS:
+            raise ValueError("entity profile refresh budget must stay below daemon IPC timeout")
+        cap_errors = (
+            (self.rpc_timeout_seconds, ENTITY_PROFILE_RPC_TIMEOUT_CAP_SECONDS, "RPC"),
+            (self.refresh_timeout_seconds, ENTITY_PROFILE_REFRESH_TIMEOUT_CAP_SECONDS, "refresh"),
+        )
+        for value, cap, name in cap_errors:
+            if value > cap:
+                raise ValueError(f"entity profile {name} budget cannot exceed {cap:g} seconds")
+
+    def _validate_concurrency(self) -> None:
+        if (
+            isinstance(self.max_concurrent_refreshes, bool)
+            or not isinstance(self.max_concurrent_refreshes, int)
+            or self.max_concurrent_refreshes < 1
+        ):
+            raise ValueError("entity profile max_concurrent_refreshes must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +326,7 @@ class McpTelegramConfig:
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     flood_wait: FloodWaitConfig = field(default_factory=FloodWaitConfig)
     telegram_rpc: TelegramRpcConfig = field(default_factory=TelegramRpcConfig)
+    entity_profile: EntityProfileConfig = field(default_factory=EntityProfileConfig)
     scheduling: SchedulingConfig = field(default_factory=SchedulingConfig)
     http: HttpServerConfig = field(default_factory=HttpServerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
@@ -759,6 +813,40 @@ def _parse_freshness(data: dict[str, object], path: Path) -> FreshnessConfig:
             ),
         ),
     )
+
+
+def _parse_entity_profile(data: dict[str, object], path: Path) -> EntityProfileConfig:
+    """Parse progressive entity-profile budgets and validate IPC headroom."""
+    section = _table(data, "entity_profile", path, required=False) or {}
+    _reject_unknown_keys(
+        section,
+        {
+            "foreground_resolve_seconds",
+            "rpc_timeout_seconds",
+            "refresh_timeout_seconds",
+            "max_concurrent_refreshes",
+        },
+        "entity_profile",
+        path,
+    )
+    defaults = EntityProfileConfig()
+    try:
+        return EntityProfileConfig(
+            foreground_resolve_seconds=_positive_float(
+                section, "foreground_resolve_seconds", "entity_profile", path, defaults.foreground_resolve_seconds
+            ),
+            rpc_timeout_seconds=_positive_float(
+                section, "rpc_timeout_seconds", "entity_profile", path, defaults.rpc_timeout_seconds
+            ),
+            refresh_timeout_seconds=_positive_float(
+                section, "refresh_timeout_seconds", "entity_profile", path, defaults.refresh_timeout_seconds
+            ),
+            max_concurrent_refreshes=_positive_int(
+                section, "max_concurrent_refreshes", "entity_profile", path, defaults.max_concurrent_refreshes
+            ),
+        )
+    except ValueError as exc:
+        raise ConfigError(f"Invalid entity_profile policy in {path}: {exc}") from exc
 
 
 def _optional_section(data: dict[str, object], name: str, allowed: set[str], path: Path) -> dict[str, object]:
@@ -1276,7 +1364,17 @@ def load_config(path: Path | None = None) -> McpTelegramConfig:
     data = _read_config(config_path)
     _reject_unknown_keys(
         data,
-        {"state", "freshness", "telemetry", "flood_wait", "telegram_rpc", "scheduling", "http", "logging"},
+        {
+            "state",
+            "freshness",
+            "telemetry",
+            "flood_wait",
+            "telegram_rpc",
+            "entity_profile",
+            "scheduling",
+            "http",
+            "logging",
+        },
         "root",
         config_path,
     )
@@ -1286,6 +1384,7 @@ def load_config(path: Path | None = None) -> McpTelegramConfig:
         telemetry=_parse_telemetry(data, config_path),
         flood_wait=_parse_flood_wait(data, config_path),
         telegram_rpc=_parse_telegram_rpc(data, config_path),
+        entity_profile=_parse_entity_profile(data, config_path),
         scheduling=_parse_scheduling(data, config_path),
         http=_parse_http(data, config_path),
         logging=_parse_logging(data, config_path),

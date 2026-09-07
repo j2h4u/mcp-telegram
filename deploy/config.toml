@@ -20,6 +20,13 @@ user_directory_ttl_seconds = 2592000
 group_directory_ttl_seconds = 604800
 resolver_enrichment_ttl_seconds = 300
 
+[entity_profile]
+# Return the mandatory core quickly, then refresh detail sections in the daemon.
+foreground_resolve_seconds = 3.0
+rpc_timeout_seconds = 8.0
+refresh_timeout_seconds = 25.0
+max_concurrent_refreshes = 1
+
 [telemetry]
 # Retain local tool telemetry for 30 days. This never sends telemetry remotely.
 retention_ttl_seconds = 2592000
