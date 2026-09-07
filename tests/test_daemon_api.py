@@ -1988,7 +1988,7 @@ async def test_list_topics_through_daemon() -> None:
 
 @pytest.mark.asyncio
 async def test_list_topics_empty_snapshot() -> None:
-    """_list_topics returns empty list when no topic_metadata rows exist."""
+    """_list_topics reports that an empty catalog was never refreshed."""
     conn = _make_db_with_topics()
     client = _TestClient()
     server = make_server(conn, client)
@@ -1998,6 +1998,7 @@ async def test_list_topics_empty_snapshot() -> None:
     assert result["ok"] is True
     assert result["data"]["topics"] == []
     assert result["data"]["dialog_id"] == 456
+    assert result["data"]["empty_reason"] == "topic_catalog_not_refreshed"
     cast(AsyncMock, client.get_entity).assert_not_called()
 
 
@@ -2030,7 +2031,10 @@ async def test_list_topics_cached_display_name_resolves_without_rpc(selector: st
 
     result = await server._list_topics({"dialog": selector})
 
-    assert result == {"ok": True, "data": {"topics": [], "dialog_id": 321}}
+    assert result == {
+        "ok": True,
+        "data": {"topics": [], "dialog_id": 321, "empty_reason": "topic_catalog_not_refreshed"},
+    }
     cast(AsyncMock, client.get_entity).assert_not_called()
     cast(MagicMock, client.iter_dialogs).assert_not_called()
 
@@ -2048,7 +2052,10 @@ async def test_list_topics_cached_username_selectors_resolve_without_rpc(selecto
 
     result = await server._list_topics({"dialog": selector})
 
-    assert result == {"ok": True, "data": {"topics": [], "dialog_id": 322}}
+    assert result == {
+        "ok": True,
+        "data": {"topics": [], "dialog_id": 322, "empty_reason": "topic_catalog_not_refreshed"},
+    }
     cast(AsyncMock, client.get_entity).assert_not_called()
     cast(MagicMock, client.iter_dialogs).assert_not_called()
 

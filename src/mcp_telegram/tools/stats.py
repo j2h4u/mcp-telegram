@@ -296,7 +296,7 @@ class GetDialogStats(ToolArgs):
         read_only_hint=True,
         destructive_hint=False,
         idempotent_hint=True,
-        open_world_hint=False,
+        open_world_hint=True,
     ),
     output_schema=GET_DIALOG_STATS_OUTPUT_SCHEMA,
 )

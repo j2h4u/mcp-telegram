@@ -22,7 +22,7 @@ from mcp_telegram.daemon import (
     _run_sync_loop,
     sync_main,
 )
-from mcp_telegram.folders.read_repository import list_folders
+from mcp_telegram.folders.read_repository import folder_summaries
 from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.state import StatePaths
 from mcp_telegram.sync_db import ensure_sync_schema
@@ -207,7 +207,16 @@ async def test_prime_runtime_keeps_serving_saved_folders_when_refresh_fails(
             await _prime_runtime(ctx)  # type: ignore[arg-type]
 
         assert api_server._ready is True
-        assert list_folders(conn) == [{"id": 9, "title": "Saved"}]
+        assert folder_summaries(conn) == [
+            {
+                "id": 9,
+                "title": "Saved",
+                "dialog_count": 1,
+                "unread_dialog_count": 0,
+                "unread_count": 0,
+                "last_message_at": None,
+            }
+        ]
         cast(AsyncMock, ctx.folder_projection_worker.prime).assert_awaited_once()
     finally:
         conn.close()

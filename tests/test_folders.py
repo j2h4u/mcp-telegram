@@ -20,7 +20,6 @@ from mcp_telegram.folders.read_repository import (
     folder_snapshot,
     folder_summaries,
     folders_by_dialog,
-    list_folders,
 )
 from mcp_telegram.folders.refresh import FolderRefresher
 from mcp_telegram.folders.sqlite_repository import (
@@ -52,7 +51,6 @@ def test_snapshot_exposes_many_to_many_placement_and_archive_separately(tmp_path
         conn.commit()
         _replace_folder_snapshot(conn, [(1, "Work"), (2, "Unread")], [(1, 10), (2, 10)])
 
-        assert list_folders(conn) == [{"id": 1, "title": "Work"}, {"id": 2, "title": "Unread"}]
         assert folders_by_dialog(conn) == {
             10: [{"id": 1, "title": "Work"}, {"id": 2, "title": "Unread"}],
         }
@@ -72,7 +70,6 @@ def test_failed_snapshot_replacement_rolls_back_to_previous_snapshot(tmp_path: P
         with pytest.raises(sqlite3.IntegrityError):
             _replace_folder_snapshot(conn, [(2, "Duplicate"), (2, "Duplicate")], [])
 
-        assert list_folders(conn) == [{"id": 1, "title": "Existing"}]
         assert folders_by_dialog(conn) == {10: [{"id": 1, "title": "Existing"}]}
     finally:
         conn.close()
@@ -249,7 +246,6 @@ async def test_refresh_replaces_catalog_and_membership_together(tmp_path: Path) 
         _replace_folder_snapshot(conn, [(9, "Stale")], [(9, 999)])
         await FolderRefresher(_Gateway(), SQLiteFolderSnapshotRepository(conn)).refresh()
 
-        assert list_folders(conn) == [{"id": 2, "title": "Contacts"}]
         assert folders_by_dialog(conn) == {10: [{"id": 2, "title": "Contacts"}]}
     finally:
         conn.close()
@@ -263,7 +259,6 @@ async def test_refresh_failure_propagates_and_preserves_saved_snapshot(tmp_path:
         with pytest.raises(RuntimeError, match="Telegram unavailable"):
             await FolderRefresher(_FailingGateway(), SQLiteFolderSnapshotRepository(conn)).refresh()
 
-        assert list_folders(conn) == [{"id": 9, "title": "Saved"}]
         assert folders_by_dialog(conn) == {999: [{"id": 9, "title": "Saved"}]}
     finally:
         conn.close()

@@ -55,7 +55,7 @@ def test_folder_read_handlers_have_no_telegram_refresh_or_dml_calls() -> None:
     )
     functions += _function_source(
         ROOT / "src/mcp_telegram/folders/read_model.py",
-        {"list_folders", "folder_summaries", "folder_snapshot", "folders_by_dialog", "dialog_placement"},
+        {"folder_summaries", "folder_snapshot", "folders_by_dialog", "dialog_placement"},
     )
 
     for source in functions:

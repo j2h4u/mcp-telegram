@@ -1374,7 +1374,7 @@ async def test_list_topics_empty_is_structured_non_error():
         "dialog_id": 123,
         "topics": [],
         "count": 0,
-        "empty_reason": "no_active_topics",
+        "empty_reason": None,
     }
 
 
