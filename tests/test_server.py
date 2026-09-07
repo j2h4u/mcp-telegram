@@ -568,14 +568,17 @@ def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
         assert server.tool_by_name[name].title == title
 
     list_messages_annotations = server.tool_by_name["list_messages"].annotations
+    list_topics_annotations = server.tool_by_name["list_topics"].annotations
     mark_annotations = server.tool_by_name["mark_dialog_for_sync"].annotations
     submit_annotations = server.tool_by_name["submit_feedback"].annotations
     trace_annotations = server.tool_by_name["trace_account_messages"].annotations
     assert list_messages_annotations is not None
+    assert list_topics_annotations is not None
     assert mark_annotations is not None
     assert submit_annotations is not None
     assert trace_annotations is not None
     assert list_messages_annotations.read_only_hint is True
+    assert list_topics_annotations.open_world_hint is True
     assert mark_annotations.read_only_hint is False
     assert mark_annotations.idempotent_hint is True
     assert submit_annotations.read_only_hint is False

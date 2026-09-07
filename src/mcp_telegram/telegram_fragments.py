@@ -22,18 +22,18 @@ class _TelegramClientLike(Protocol):
 
 
 class FragmentContextService:
-    """Persist one fixed anchor-through-five window after a successful fetch."""
+    """Persist one bounded context window around an anchor after a successful fetch."""
 
     def __init__(self, conn: sqlite3.Connection, gateway: TelegramFragmentGateway) -> None:
         self._conn = conn
         self._gateway = gateway
 
-    async def fetch(self, dialog_id: int, anchor_message_id: int) -> FragmentFetchResult:
+    async def fetch(self, dialog_id: int, anchor_message_id: int, context_size: int) -> FragmentFetchResult:
         with self._conn:
             self._conn.execute(
                 "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'fragment')", (dialog_id,)
             )
-        result = await self._gateway.fetch_context(dialog_id, anchor_message_id, 5)
+        result = await self._gateway.fetch_context(dialog_id, anchor_message_id, context_size)
         if not result.ok or not result.messages:
             return result
         with self._conn:
@@ -42,7 +42,7 @@ class FragmentContextService:
 
 
 class TelethonTelegramFragmentGateway:
-    """Telethon adapter for the fixed anchor-through-five fragment fetch."""
+    """Telethon adapter for a bounded fragment centered on an anchor."""
 
     def __init__(self, client: object) -> None:
         self._client = cast(_TelegramClientLike, client)
@@ -50,9 +50,11 @@ class TelethonTelegramFragmentGateway:
     async def fetch_context(self, dialog_id: int, anchor_message_id: int, window_size: int) -> FragmentFetchResult:
         try:
             entity = await self._client.get_input_entity(dialog_id)
-            fetched = await self._client.get_messages(
-                entity, ids=list(range(anchor_message_id, anchor_message_id + window_size + 1))
-            )
+            before_count = window_size // 2
+            after_count = window_size - before_count - 1
+            first_message_id = max(1, anchor_message_id - before_count)
+            last_message_id = anchor_message_id + after_count
+            fetched = await self._client.get_messages(entity, ids=list(range(first_message_id, last_message_id + 1)))
             return FragmentFetchResult(
                 messages=tuple(
                     extract_message_row(dialog_id, message)

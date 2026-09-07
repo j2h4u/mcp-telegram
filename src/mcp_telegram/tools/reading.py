@@ -1036,8 +1036,9 @@ class ListMessages(ToolArgs):
     Omit navigation or use navigation="latest" for the recent tail; use
     navigation="start" for the beginning; pass next_navigation to continue.
     Every page is chronological (oldest-to-newest). Use anchor_message_id from
-    search_messages to read context around a hit; that path requires a synced
-    dialog and exact_dialog_id.
+    search_messages to read context around a hit. For a dialog without local history,
+    the daemon may fetch and retain a bounded fragment around the anchor; an access-lost
+    dialog cannot be fetched. Use exact_dialog_id with an anchor.
 
     Supports sender, topic/exact_topic_id, unread, and absolute UTC time-bound
     filters. ``since_utc`` is inclusive and ``until_utc`` is exclusive; both
@@ -1094,8 +1095,10 @@ class ListMessages(ToolArgs):
         le=2_147_483_647,
         description=(
             "Optional message id to centre the response on. Returns context_size messages "
-            "around this message (half before, half after). Requires the dialog to be synced. "
-            "When set, navigation and direction are ignored. "
+            "including the anchor, split as evenly as possible before and after it. If local "
+            "history is unavailable, the daemon may fetch and retain that bounded fragment "
+            "from Telegram. Access-lost dialogs cannot be fetched. When set, navigation and "
+            "direction are ignored. "
             "Obtain from msg_id: values in SearchMessages results."
         ),
     )
@@ -1103,7 +1106,7 @@ class ListMessages(ToolArgs):
         default=10,
         ge=2,
         le=50,
-        description="Number of messages to return around anchor_message_id (default 10).",
+        description="Maximum number of messages to return including anchor_message_id (default 10).",
     )
     since_utc: str | None = Field(
         default=None,

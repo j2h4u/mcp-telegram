@@ -1012,11 +1012,11 @@ async def test_reading_service_injects_fragment_context_caches_anchor_window() -
     )
     server = make_server(conn, client)
 
-    ok = (await server._get_reading_service()._deps.fragment_context.fetch(42, 10)).ok
+    ok = (await server._get_reading_service()._deps.fragment_context.fetch(42, 10, 6)).ok
 
     assert ok is True
     client.get_input_entity.assert_awaited_once_with(42)
-    client.get_messages.assert_awaited_once_with(entity, ids=[10, 11, 12, 13, 14, 15])
+    client.get_messages.assert_awaited_once_with(entity, ids=[7, 8, 9, 10, 11, 12])
     row = _fetchone_row(conn, "SELECT status FROM synced_dialogs WHERE dialog_id = 42")
     assert row is not None
     assert row[0] == "fragment"
@@ -1037,7 +1037,7 @@ async def test_reading_service_injects_empty_fragment_context() -> None:
     client.get_messages = AsyncMock(return_value=[None])
     server = make_server(conn, client)
 
-    ok = (await server._get_reading_service()._deps.fragment_context.fetch(43, 20)).ok
+    ok = (await server._get_reading_service()._deps.fragment_context.fetch(43, 20, 6)).ok
 
     assert ok is True
     row = _fetchone_row(conn, "SELECT status FROM synced_dialogs WHERE dialog_id = 43")
@@ -1055,7 +1055,7 @@ async def test_reading_service_injects_fragment_failure() -> None:
     client.get_messages = AsyncMock()
     server = make_server(conn, client)
 
-    ok = (await server._get_reading_service()._deps.fragment_context.fetch(44, 30)).ok
+    ok = (await server._get_reading_service()._deps.fragment_context.fetch(44, 30, 6)).ok
 
     assert ok is False
     client.get_messages.assert_not_called()
@@ -1089,7 +1089,7 @@ async def test_list_messages_context_window_own_only_uses_fragment_fetch() -> No
     assert [m["message_id"] for m in _response_messages(result)] == [10, 11]
     client.get_input_entity.assert_awaited_once_with(DIALOG_ID)
     assert _call_count(client.get_messages) == 1
-    client.get_messages.assert_any_await(entity, ids=[10, 11, 12, 13, 14, 15])
+    client.get_messages.assert_any_await(entity, ids=[8, 9, 10, 11])
 
 
 # ---------------------------------------------------------------------------
@@ -4613,9 +4613,8 @@ async def test_list_messages_context_window_centred() -> None:
     assert result["ok"] is True, f"Unexpected error: {result}"
     messages = _response_messages(result)
     ids = [m["message_id"] for m in messages]
-    # context_size=4 → half=2, so: ids <= 5 DESC LIMIT 3 → [5,4,3] → reversed [3,4,5]
-    # ids > 5 ASC LIMIT 2 → [6,7]
-    assert ids == [3, 4, 5, 6, 7]
+    # context_size=4 → two before, the anchor, and one after.
+    assert ids == [3, 4, 5, 6]
     assert result["data"]["anchor_message_id"] == 5
     assert result["data"]["source"] == "sync_db"
 
@@ -4636,7 +4635,7 @@ async def test_list_messages_context_window_near_start() -> None:
     assert result["ok"] is True, f"Unexpected error: {result}"
     messages = _response_messages(result)
     ids = [m["message_id"] for m in messages]
-    # half=3; before: ids <= 2 DESC LIMIT 4 → [2,1]; after: ids > 2 ASC LIMIT 3 → [3,4,5]
+    # The requested six-message window is clipped at the beginning of the dialog.
     assert ids == [1, 2, 3, 4, 5]
 
 

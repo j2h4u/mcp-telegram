@@ -451,7 +451,14 @@ LIST_TOPICS_OUTPUT_SCHEMA = {
             },
         },
         "count": {"type": "integer"},
-        "empty_reason": {"type": ["string", "null"]},
+        "empty_reason": {
+            "type": ["string", "null"],
+            "description": (
+                "Why topics is empty. no_active_topics confirms an empty refreshed catalog; "
+                "topic_catalog_deferred_flood_wait and topic_catalog_unavailable mean that "
+                "the daemon could not confirm whether topics exist."
+            ),
+        },
     },
     "required": ["dialog", "dialog_id", "topics", "count", "empty_reason"],
     "additionalProperties": False,
@@ -627,6 +634,9 @@ class ListTopics(ToolArgs):
 
     Use this before topic= when working with forum supergroups or bot DM topics so you
     can choose an exact topic name or numeric topic_id instead of guessing via fuzzy match.
+    The daemon may refresh missing topic metadata from Telegram. An empty response is
+    conclusive only when empty_reason is no_active_topics; deferred or unavailable catalog
+    reasons mean that topic existence could not be confirmed.
     """
 
     dialog: str | None = Field(default=None, max_length=500, description=NATURAL_DIALOG_SELECTOR_DESCRIPTION)
@@ -743,7 +753,7 @@ def _list_topics_payload(args: ListTopics, data: dict[str, object]) -> dict[str,
         read_only_hint=True,
         destructive_hint=False,
         idempotent_hint=True,
-        open_world_hint=False,
+        open_world_hint=True,
     ),
     output_schema=LIST_TOPICS_OUTPUT_SCHEMA,
 )
