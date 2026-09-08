@@ -220,19 +220,41 @@ class HydrationQueueRepository:
             ),
         )
 
-    def due_jobs(self, now: int, limit: int, *, kind: str | None = None) -> list[HydrationJob]:
-        """Return jobs due at or before *now* in deterministic queue order."""
+    def due_jobs(
+        self,
+        now: int,
+        limit: int,
+        *,
+        kind: str | None = None,
+        priority: HydrationPriority | None = None,
+    ) -> list[HydrationJob]:
+        """Return due jobs in deterministic queue order.
+
+        A priority-specific read lets a caller apply fairness after reading
+        both tiers.  Without it, a foreground ``LIMIT`` can hide every
+        backfill row before the caller gets a chance to select one.
+        """
         if limit <= 0:
             return []
         kind_clause = " AND hj.kind = ?" if kind is not None else ""
-        parameters: tuple[object, ...] = (now, kind, limit) if kind is not None else (now, limit)
+        priority_clause = " AND hj.priority = ?" if priority is not None else ""
+        parameters: tuple[object, ...] = (now,)
+        if kind is not None:
+            parameters += (kind,)
+        if priority is not None:
+            parameters += (int(priority),)
+        parameters += (limit,)
+        order_by = (
+            "hj.message_sent_at DESC, hj.due_at, hj.kind, hj.dialog_id, hj.message_id"
+            if priority is not None
+            else "hj.priority DESC, hj.message_sent_at DESC, hj.due_at, hj.kind, hj.dialog_id, hj.message_id"
+        )
         rows = cast(
             list[tuple[object, ...]],
             self._conn.execute(
                 f"SELECT {_SELECT_JOB_COLUMNS} FROM {HYDRATION_QUEUE_TABLE} AS hj "
-                f"WHERE hj.due_at <= ? AND hj.terminal = 0{kind_clause} "
-                "ORDER BY hj.priority DESC, hj.message_sent_at DESC, "
-                "hj.due_at, hj.kind, hj.dialog_id, hj.message_id LIMIT ?",
+                f"WHERE hj.due_at <= ? AND hj.terminal = 0{kind_clause}{priority_clause} "
+                f"ORDER BY {order_by} LIMIT ?",
                 parameters,
             ).fetchall(),
         )
@@ -284,6 +306,28 @@ class HydrationQueueRepository:
         cursor = self._conn.execute(
             f"UPDATE {HYDRATION_QUEUE_TABLE} SET due_at = ?, last_outcome = ?, last_error_code = ? "
             "WHERE kind = ? AND dialog_id = ? AND message_id = ? AND terminal = 0",
+            (due_at, outcome, error_code, *_identity(job)),
+        )
+        return cursor.rowcount > 0
+
+    def requeue_undispatched(
+        self,
+        job: HydrationJob,
+        due_at: int,
+        *,
+        outcome: HydrationOutcome = HydrationOutcome.TEMPORARY_FAILURE,
+        error_code: str | None = None,
+    ) -> bool:
+        """Return a started job to its pre-admission attempt state.
+
+        Admission can reject a request after ``start`` increments attempts but
+        before Telegram dispatch.  Such a rejection is scheduler pressure, not
+        a Telegram attempt, so restore the durable attempt count atomically.
+        """
+        cursor = self._conn.execute(
+            f"UPDATE {HYDRATION_QUEUE_TABLE} SET attempts = attempts - 1, due_at = ?, "
+            "last_outcome = ?, last_error_code = ? "
+            "WHERE kind = ? AND dialog_id = ? AND message_id = ? AND terminal = 0 AND attempts > 0",
             (due_at, outcome, error_code, *_identity(job)),
         )
         return cursor.rowcount > 0

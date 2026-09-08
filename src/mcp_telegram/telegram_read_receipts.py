@@ -10,6 +10,7 @@ from telethon.tl.types import TypeInputPeer
 
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES, translate_gateway_failure
 from .telegram_reading import ReadDateFetchResult, TelegramReadReceiptGateway
+from .telegram_rpc_scheduler import RpcAdmissionClosedError
 
 
 class _TelegramClientLike(Protocol):
@@ -19,7 +20,7 @@ class _TelegramClientLike(Protocol):
 
 
 class TelethonTelegramReadReceiptGateway:
-    """Fetch Telegram's exact read date without touching SQLite or MCP state."""
+    """Fetch exact read dates; the background fact probe owns the RPC scope."""
 
     def __init__(self, client: object) -> None:
         self._client = cast(_TelegramClientLike, client)
@@ -36,6 +37,8 @@ class TelethonTelegramReadReceiptGateway:
             if value.tzinfo is None:
                 value = value.replace(tzinfo=UTC)
             return ReadDateFetchResult(read_at=int(value.timestamp()), status="complete")
+        except RpcAdmissionClosedError:
+            raise
         except CATCHABLE_GATEWAY_FAILURES as exc:
             return ReadDateFetchResult(
                 status="unavailable",

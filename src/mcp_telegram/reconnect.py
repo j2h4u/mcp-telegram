@@ -7,6 +7,8 @@ import logging
 from collections.abc import Callable
 from typing import Protocol
 
+from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
+
 logger = logging.getLogger(__name__)
 
 
@@ -22,17 +24,20 @@ async def _request_catch_up(
     client: ReconnectClient,
     observe: Callable[[str, str, str | None], None] | None,
 ) -> bool:
-    try:
-        await client.catch_up()
-    except Exception:
-        logger.warning("telegram reconnect catch_up failed", exc_info=True)
+    with rpc_scope(TelegramRpcSource.RECONNECT_DIFFERENCE):
+        try:
+            await client.catch_up()
+        except RpcAdmissionClosedError:
+            raise
+        except Exception:
+            logger.warning("telegram reconnect catch_up failed", exc_info=True)
+            if observe is not None:
+                observe("runtime.catch_up_request_failed", "failed", "catch_up_exception")
+            return False
+        logger.info("telegram reconnect catch_up requested")
         if observe is not None:
-            observe("runtime.catch_up_request_failed", "failed", "catch_up_exception")
-        return False
-    logger.info("telegram reconnect catch_up requested")
-    if observe is not None:
-        observe("runtime.catch_up_requested", "requested", None)
-    return True
+            observe("runtime.catch_up_requested", "requested", None)
+        return True
 
 
 def _observe_connection_transition(

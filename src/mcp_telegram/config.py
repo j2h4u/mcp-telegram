@@ -14,6 +14,8 @@ from xdg_base_dirs import xdg_config_home  # type: ignore[import-error]
 
 _VALID_HTTP_PORTS = range(1, 65_536)
 _MAX_FACT_HYDRATION_BATCH_SIZE = 100
+_MAX_TELEGRAM_RPC_SCHEDULER_WEIGHT = 100
+_MAX_TELEMETRY_WRITER_BUSY_TIMEOUT_MS = 50
 ENTITY_PROFILE_DAEMON_TIMEOUT_SECONDS: Final[float] = 30.0
 ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS: Final[float] = 5.0
 ENTITY_PROFILE_RPC_TIMEOUT_CAP_SECONDS: Final[float] = 8.0
@@ -70,6 +72,7 @@ class EntityProfileConfig:
     rpc_timeout_seconds: float = 8.0
     refresh_timeout_seconds: float = 25.0
     max_concurrent_refreshes: int = 1
+    max_queued_refreshes: int = 128
 
     def __post_init__(self) -> None:
         self._validate_durations()
@@ -103,12 +106,9 @@ class EntityProfileConfig:
                 raise ValueError(f"entity profile {name} budget cannot exceed {cap:g} seconds")
 
     def _validate_concurrency(self) -> None:
-        if (
-            isinstance(self.max_concurrent_refreshes, bool)
-            or not isinstance(self.max_concurrent_refreshes, int)
-            or self.max_concurrent_refreshes < 1
-        ):
-            raise ValueError("entity profile max_concurrent_refreshes must be a positive integer")
+        bounds = (self.max_concurrent_refreshes, self.max_queued_refreshes)
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in bounds):
+            raise ValueError("entity profile concurrency and queue capacity must be positive integers")
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,10 +141,38 @@ class FreshnessConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimeObservationConfig:
+    """Bounded asynchronous persistence policy for runtime observations."""
+
+    prune_every_writes: int = 1_000
+    writer_busy_timeout_ms: int = 50
+    queue_capacity: int = 1_024
+    writer_startup_wait_seconds: float = 1.0
+    shutdown_drain_grace_seconds: float = 2.0
+
+    def __post_init__(self) -> None:
+        positive_integers = (
+            self.prune_every_writes,
+            self.writer_busy_timeout_ms,
+            self.queue_capacity,
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in positive_integers):
+            raise ValueError("runtime observation integer settings must be positive")
+        if self.writer_busy_timeout_ms > _MAX_TELEMETRY_WRITER_BUSY_TIMEOUT_MS:
+            raise ValueError(
+                f"runtime observation writer_busy_timeout_ms must be <= {_MAX_TELEMETRY_WRITER_BUSY_TIMEOUT_MS}"
+            )
+        durations = (self.writer_startup_wait_seconds, self.shutdown_drain_grace_seconds)
+        if any(not math.isfinite(value) or value <= 0 for value in durations):
+            raise ValueError("runtime observation durations must be finite and positive")
+
+
+@dataclass(frozen=True, slots=True)
 class TelemetryConfig:
-    """Retention policy for local telemetry."""
+    """Retention and bounded persistence policy for local telemetry."""
 
     retention_ttl_seconds: int = 2_592_000
+    runtime_observations: RuntimeObservationConfig = field(default_factory=RuntimeObservationConfig)
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +187,60 @@ class FloodWaitConfig:
     cooldown_buffer_seconds: float = 1.0
 
 
+def _validate_scheduler_positive_integers(values: tuple[int, ...]) -> None:
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in values):
+        raise ValueError("Telegram RPC scheduler integer settings must be positive")
+
+
+def _validate_scheduler_weights(weights: tuple[int, ...]) -> None:
+    if any(weight > _MAX_TELEGRAM_RPC_SCHEDULER_WEIGHT for weight in weights):
+        raise ValueError(f"Telegram RPC scheduler weights must be <= {_MAX_TELEGRAM_RPC_SCHEDULER_WEIGHT}")
+
+
+def _validate_scheduler_durations(durations: tuple[float, ...]) -> None:
+    if any(not math.isfinite(value) or value <= 0 for value in durations):
+        raise ValueError("Telegram RPC scheduler durations must be finite and positive")
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramRpcSchedulerConfig:
+    """Bounded weighted-fair admission policy for account RPC attempts."""
+
+    interactive_weight: int = 6
+    live_sync_weight: int = 3
+    background_weight: int = 1
+    interactive_queue_capacity: int = 64
+    live_sync_queue_capacity: int = 256
+    background_queue_capacity: int = 512
+    interactive_deadline_seconds: float = 15.0
+    live_sync_deadline_seconds: float = 60.0
+    background_deadline_seconds: float = 900.0
+    admission_retry_seconds: int = 1
+    update_loop_retry_seconds: float = 5.0
+
+    def __post_init__(self) -> None:
+        weights = (
+            self.interactive_weight,
+            self.live_sync_weight,
+            self.background_weight,
+        )
+        capacities = (
+            self.interactive_queue_capacity,
+            self.live_sync_queue_capacity,
+            self.background_queue_capacity,
+            self.admission_retry_seconds,
+        )
+        _validate_scheduler_positive_integers((*weights, *capacities))
+        _validate_scheduler_weights(weights)
+        durations = (
+            self.interactive_deadline_seconds,
+            self.live_sync_deadline_seconds,
+            self.background_deadline_seconds,
+            self.update_loop_retry_seconds,
+        )
+        _validate_scheduler_durations(durations)
+
+
 @dataclass(frozen=True, slots=True)
 class TelegramRpcConfig:
     """Account-level Telegram RPC budget and retry policy.
@@ -171,6 +253,7 @@ class TelegramRpcConfig:
     max_calls_per_period: int = 30
     period_seconds: float = 60.0
     transient_retry_delays_seconds: tuple[float, ...] = (0.0,)
+    scheduler: TelegramRpcSchedulerConfig = field(default_factory=TelegramRpcSchedulerConfig)
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +269,7 @@ class FactHydrationConfig:
     circuit_retry_seconds: int = 1_800
     max_attempts: int = 3
     transcription_recheck_delay_seconds: int = 86_400
+    backfill_debt_limit: int = 1
 
     def __post_init__(self) -> None:
         if any(
@@ -200,6 +284,7 @@ class FactHydrationConfig:
                 self.circuit_retry_seconds,
                 self.max_attempts,
                 self.transcription_recheck_delay_seconds,
+                self.backfill_debt_limit,
             )
         ):
             raise ValueError("fact hydration configuration values must be positive")
@@ -661,6 +746,7 @@ def resolve_scheduling_config(
                 "FACT_HYDRATION_TRANSCRIPTION_RECHECK_DELAY_SECONDS",
                 config.fact_hydration.transcription_recheck_delay_seconds,
             ),
+            backfill_debt_limit=config.fact_hydration.backfill_debt_limit,
         ),
     )
 
@@ -825,6 +911,7 @@ def _parse_entity_profile(data: dict[str, object], path: Path) -> EntityProfileC
             "rpc_timeout_seconds",
             "refresh_timeout_seconds",
             "max_concurrent_refreshes",
+            "max_queued_refreshes",
         },
         "entity_profile",
         path,
@@ -844,6 +931,9 @@ def _parse_entity_profile(data: dict[str, object], path: Path) -> EntityProfileC
             max_concurrent_refreshes=_positive_int(
                 section, "max_concurrent_refreshes", "entity_profile", path, defaults.max_concurrent_refreshes
             ),
+            max_queued_refreshes=_positive_int(
+                section, "max_queued_refreshes", "entity_profile", path, defaults.max_queued_refreshes
+            ),
         )
     except ValueError as exc:
         raise ConfigError(f"Invalid entity_profile policy in {path}: {exc}") from exc
@@ -856,12 +946,80 @@ def _optional_section(data: dict[str, object], name: str, allowed: set[str], pat
 
 
 def _parse_telemetry(data: dict[str, object], path: Path) -> TelemetryConfig:
-    telemetry_data = _optional_section(data, "telemetry", {"retention_ttl_seconds"}, path)
+    telemetry_data = _optional_section(
+        data,
+        "telemetry",
+        {"retention_ttl_seconds", "runtime_observations"},
+        path,
+    )
     defaults = TelemetryConfig()
+    runtime_data = (
+        _nested_table(
+            telemetry_data,
+            "runtime_observations",
+            "telemetry.runtime_observations",
+            path,
+        )
+        or {}
+    )
+    runtime_keys = {
+        "prune_every_writes",
+        "writer_busy_timeout_ms",
+        "queue_capacity",
+        "writer_startup_wait_seconds",
+        "shutdown_drain_grace_seconds",
+    }
+    _reject_unknown_keys(runtime_data, runtime_keys, "telemetry.runtime_observations", path)
+    runtime_defaults = defaults.runtime_observations
+    try:
+        runtime_policy = RuntimeObservationConfig(
+            prune_every_writes=_positive_int(
+                runtime_data,
+                "prune_every_writes",
+                "telemetry.runtime_observations",
+                path,
+                runtime_defaults.prune_every_writes,
+            ),
+            writer_busy_timeout_ms=_positive_int(
+                runtime_data,
+                "writer_busy_timeout_ms",
+                "telemetry.runtime_observations",
+                path,
+                runtime_defaults.writer_busy_timeout_ms,
+            ),
+            queue_capacity=_positive_int(
+                runtime_data,
+                "queue_capacity",
+                "telemetry.runtime_observations",
+                path,
+                runtime_defaults.queue_capacity,
+            ),
+            writer_startup_wait_seconds=_positive_float(
+                runtime_data,
+                "writer_startup_wait_seconds",
+                "telemetry.runtime_observations",
+                path,
+                runtime_defaults.writer_startup_wait_seconds,
+            ),
+            shutdown_drain_grace_seconds=_positive_float(
+                runtime_data,
+                "shutdown_drain_grace_seconds",
+                "telemetry.runtime_observations",
+                path,
+                runtime_defaults.shutdown_drain_grace_seconds,
+            ),
+        )
+    except ValueError as exc:
+        raise ConfigError(f"Invalid telemetry.runtime_observations policy in {path}: {exc}") from exc
     return TelemetryConfig(
         retention_ttl_seconds=_positive_int(
-            telemetry_data, "retention_ttl_seconds", "telemetry", path, defaults.retention_ttl_seconds
-        )
+            telemetry_data,
+            "retention_ttl_seconds",
+            "telemetry",
+            path,
+            defaults.retention_ttl_seconds,
+        ),
+        runtime_observations=runtime_policy,
     )
 
 
@@ -902,9 +1060,95 @@ def _parse_flood_wait(data: dict[str, object], path: Path) -> FloodWaitConfig:
 
 def _parse_telegram_rpc(data: dict[str, object], path: Path) -> TelegramRpcConfig:
     rpc_data = _optional_section(
-        data, "telegram_rpc", {"max_calls_per_period", "period_seconds", "transient_retry_delays_seconds"}, path
+        data,
+        "telegram_rpc",
+        {"max_calls_per_period", "period_seconds", "transient_retry_delays_seconds", "scheduler"},
+        path,
     )
     defaults = TelegramRpcConfig()
+    scheduler_data = _nested_table(rpc_data, "scheduler", "telegram_rpc.scheduler", path) or {}
+    scheduler_keys = {
+        "interactive_weight",
+        "live_sync_weight",
+        "background_weight",
+        "interactive_queue_capacity",
+        "live_sync_queue_capacity",
+        "background_queue_capacity",
+        "interactive_deadline_seconds",
+        "live_sync_deadline_seconds",
+        "background_deadline_seconds",
+        "admission_retry_seconds",
+        "update_loop_retry_seconds",
+    }
+    _reject_unknown_keys(scheduler_data, scheduler_keys, "telegram_rpc.scheduler", path)
+    scheduler_defaults = defaults.scheduler
+    scheduler = TelegramRpcSchedulerConfig(
+        interactive_weight=_positive_int(
+            scheduler_data, "interactive_weight", "telegram_rpc.scheduler", path, scheduler_defaults.interactive_weight
+        ),
+        live_sync_weight=_positive_int(
+            scheduler_data, "live_sync_weight", "telegram_rpc.scheduler", path, scheduler_defaults.live_sync_weight
+        ),
+        background_weight=_positive_int(
+            scheduler_data, "background_weight", "telegram_rpc.scheduler", path, scheduler_defaults.background_weight
+        ),
+        interactive_queue_capacity=_positive_int(
+            scheduler_data,
+            "interactive_queue_capacity",
+            "telegram_rpc.scheduler",
+            path,
+            scheduler_defaults.interactive_queue_capacity,
+        ),
+        live_sync_queue_capacity=_positive_int(
+            scheduler_data,
+            "live_sync_queue_capacity",
+            "telegram_rpc.scheduler",
+            path,
+            scheduler_defaults.live_sync_queue_capacity,
+        ),
+        background_queue_capacity=_positive_int(
+            scheduler_data,
+            "background_queue_capacity",
+            "telegram_rpc.scheduler",
+            path,
+            scheduler_defaults.background_queue_capacity,
+        ),
+        interactive_deadline_seconds=_positive_float(
+            scheduler_data,
+            "interactive_deadline_seconds",
+            "telegram_rpc.scheduler",
+            path,
+            scheduler_defaults.interactive_deadline_seconds,
+        ),
+        live_sync_deadline_seconds=_positive_float(
+            scheduler_data,
+            "live_sync_deadline_seconds",
+            "telegram_rpc.scheduler",
+            path,
+            scheduler_defaults.live_sync_deadline_seconds,
+        ),
+        background_deadline_seconds=_positive_float(
+            scheduler_data,
+            "background_deadline_seconds",
+            "telegram_rpc.scheduler",
+            path,
+            scheduler_defaults.background_deadline_seconds,
+        ),
+        admission_retry_seconds=_positive_int(
+            scheduler_data,
+            "admission_retry_seconds",
+            "telegram_rpc.scheduler",
+            path,
+            scheduler_defaults.admission_retry_seconds,
+        ),
+        update_loop_retry_seconds=_positive_float(
+            scheduler_data,
+            "update_loop_retry_seconds",
+            "telegram_rpc.scheduler",
+            path,
+            scheduler_defaults.update_loop_retry_seconds,
+        ),
+    )
     return TelegramRpcConfig(
         max_calls_per_period=_non_negative_int(
             rpc_data,
@@ -921,6 +1165,7 @@ def _parse_telegram_rpc(data: dict[str, object], path: Path) -> TelegramRpcConfi
             path,
             defaults.transient_retry_delays_seconds,
         ),
+        scheduler=scheduler,
     )
 
 
@@ -938,6 +1183,7 @@ def _parse_fact_hydration(data: dict[str, object], path: Path, defaults: Schedul
             "circuit_retry_seconds",
             "max_attempts",
             "transcription_recheck_delay_seconds",
+            "backfill_debt_limit",
         },
         "scheduling.fact_hydration",
         path,
@@ -999,6 +1245,13 @@ def _parse_fact_hydration(data: dict[str, object], path: Path, defaults: Schedul
             "scheduling.fact_hydration",
             path,
             hydration_defaults.transcription_recheck_delay_seconds,
+        ),
+        backfill_debt_limit=_positive_int(
+            hydration_data,
+            "backfill_debt_limit",
+            "scheduling.fact_hydration",
+            path,
+            hydration_defaults.backfill_debt_limit,
         ),
     )
 

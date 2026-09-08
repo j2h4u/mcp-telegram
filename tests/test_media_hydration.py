@@ -18,7 +18,7 @@ from telethon.errors.rpcerrorlist import (  # type: ignore[import-untyped]
 )
 
 from mcp_telegram.access_lifecycle import restore_access_after_revalidation, set_access_lost
-from mcp_telegram.config import FactHydrationConfig
+from mcp_telegram.config import FactHydrationConfig, TelegramRpcSchedulerConfig
 from mcp_telegram.fact_hydration import MessageFactHydrationWorker
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.history_enrollment import disable_history, enable_history
@@ -27,6 +27,17 @@ from mcp_telegram.media_hydration import MediaFactHydrationHandler
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.telegram_rpc import TelegramRpcGate
+from mcp_telegram.telegram_rpc_scheduler import (
+    RpcAdmissionClosedError,
+    RpcAdmissionError,
+    RpcAdmissionExpiredError,
+    RpcAdmissionSaturatedError,
+    TelegramRpcScope,
+    TelegramRpcSource,
+    current_rpc_scope,
+    rpc_scope,
+)
 from mcp_telegram.transcription_hydration import TranscriptionHydrationHandler
 
 
@@ -67,6 +78,16 @@ class _EchoClient(_Client):
                 raise AssertionError("message ids must be integers")
             ids.append(message_id)
         return [SimpleNamespace(id=int(message_id), media=None) for message_id in ids]
+
+
+class _AdmissionFailureClient(_Client):
+    def __init__(self, failure: type[RuntimeError]) -> None:
+        super().__init__()
+        self.failure = failure
+
+    async def get_messages(self, *_args: object, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        raise self.failure(current_rpc_scope(), "test admission failure")
 
 
 @pytest.fixture
@@ -154,6 +175,7 @@ def _worker(
         retry_delay_seconds=config.retry_delay_seconds,
         circuit_retry_seconds=config.circuit_retry_seconds,
         max_attempts=config.max_attempts,
+        backfill_debt_limit=config.backfill_debt_limit,
     )
 
 
@@ -172,6 +194,7 @@ def _transcription_worker(
         retry_delay_seconds=config.retry_delay_seconds,
         circuit_retry_seconds=config.circuit_retry_seconds,
         max_attempts=config.max_attempts,
+        backfill_debt_limit=config.backfill_debt_limit,
         pause_between_requests_seconds=config.pause_between_requests_seconds,
     )
 
@@ -192,6 +215,7 @@ def _mixed_worker(conn: sqlite3.Connection, client: _Client, policy: FactHydrati
         retry_delay_seconds=policy.retry_delay_seconds,
         circuit_retry_seconds=policy.circuit_retry_seconds,
         max_attempts=policy.max_attempts,
+        backfill_debt_limit=policy.backfill_debt_limit,
     )
 
 
@@ -789,6 +813,128 @@ async def test_voice_foreground_beats_large_media_backlog(db: sqlite3.Connection
 
 
 @pytest.mark.asyncio
+async def test_backfill_debt_promotes_backfill_after_foreground_cycle(db: sqlite3.Connection) -> None:
+    _seed(db, message_id=1)
+    _seed(db, message_id=2)
+    db.execute("UPDATE hydration_jobs SET priority = 1 WHERE message_id = 1")
+    db.commit()
+    client = _EchoClient()
+    policy = FactHydrationConfig(batch_size=1, max_jobs_per_cycle=1, max_requests_per_cycle=1)
+    worker = _worker(db, client, policy)
+
+    await worker.run_cycle(now=1)
+    _seed(db, message_id=3)
+    db.execute("UPDATE hydration_jobs SET priority = 1 WHERE message_id = 3")
+    db.commit()
+    await worker.run_cycle(now=1)
+
+    assert [call["ids"] for call in client.calls] == [[1], [2]]
+    assert db.execute("SELECT message_id FROM hydration_jobs ORDER BY message_id").fetchall() == [(3,)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RpcAdmissionSaturatedError, RpcAdmissionExpiredError])
+async def test_pre_dispatch_admission_rejection_does_not_consume_attempt(
+    failure: type[RuntimeError], db: sqlite3.Connection
+) -> None:
+    _seed(db)
+    client = _AdmissionFailureClient(failure)
+    policy = FactHydrationConfig(max_attempts=1, retry_delay_seconds=10, max_jobs_per_cycle=1, max_requests_per_cycle=1)
+    worker = _worker(db, client, policy)
+
+    first = await worker.run_cycle(now=1)
+    assert first.stopped is True
+    assert first.retried == 1
+    assert db.execute("SELECT attempts, due_at, terminal FROM hydration_jobs").fetchone() == (0, 11, 0)
+
+    second = await worker.run_cycle(now=11)
+    assert second.stopped is True
+    assert second.retried == 1
+    assert db.execute("SELECT attempts, due_at, terminal FROM hydration_jobs").fetchone() == (0, 21, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RpcAdmissionSaturatedError, RpcAdmissionExpiredError])
+async def test_gate_translated_admission_deferral_does_not_consume_attempt(
+    failure: type[RpcAdmissionError], db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed(db)
+    gate = object.__new__(TelegramRpcGate)
+    gate._scheduler_policy = TelegramRpcSchedulerConfig()
+
+    async def reject(_request: object, *, ordered: bool, scope: TelegramRpcScope) -> object:
+        del ordered
+        raise failure(scope, "live_sync admission is temporarily unavailable")
+
+    monkeypatch.setattr(gate, "_dispatch_attempt", reject)
+
+    class _GateClient(_Client):
+        async def get_messages(self, *_args: object, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            with rpc_scope(TelegramRpcSource.FACT_HYDRATION_LIVE):
+                scope = current_rpc_scope()
+                return await gate._call_with_source_policy("request", ordered=False, scope=scope)
+
+    worker = _worker(
+        db,
+        _GateClient(),
+        FactHydrationConfig(max_attempts=1, retry_delay_seconds=10, max_jobs_per_cycle=1, max_requests_per_cycle=1),
+    )
+
+    result = await worker.run_cycle(now=1)
+
+    assert result.stopped is True
+    assert result.retried == 1
+    assert db.execute("SELECT attempts, due_at, terminal FROM hydration_jobs").fetchone() == (0, 11, 0)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_closure_releases_attempt_and_propagates(
+    db: sqlite3.Connection,
+) -> None:
+    _seed(db)
+    worker = _worker(db, _AdmissionFailureClient(RpcAdmissionClosedError), FactHydrationConfig(max_attempts=1))
+
+    with pytest.raises(RpcAdmissionClosedError):
+        await worker.run_cycle(now=1)
+
+    assert db.execute("SELECT attempts, due_at, terminal FROM hydration_jobs").fetchone() == (0, 1, 0)
+
+
+@pytest.mark.asyncio
+async def test_gate_translated_scheduler_closure_releases_attempt_and_propagates(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed(db)
+    gate = object.__new__(TelegramRpcGate)
+    gate._scheduler_policy = TelegramRpcSchedulerConfig()
+
+    async def reject(_request: object, *, ordered: bool, scope: TelegramRpcScope) -> object:
+        del ordered
+        raise RpcAdmissionClosedError(scope, "scheduler closed")
+
+    monkeypatch.setattr(gate, "_dispatch_attempt", reject)
+
+    class _GateClient(_Client):
+        async def get_messages(self, *_args: object, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            with rpc_scope(TelegramRpcSource.FACT_HYDRATION_LIVE):
+                scope = current_rpc_scope()
+                return await gate._call_with_source_policy("request", ordered=False, scope=scope)
+
+    worker = _worker(
+        db,
+        _GateClient(),
+        FactHydrationConfig(max_attempts=1, max_jobs_per_cycle=1, max_requests_per_cycle=1),
+    )
+
+    with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
+        await worker.run_cycle(now=1)
+
+    assert db.execute("SELECT attempts, due_at, terminal FROM hydration_jobs").fetchone() == (0, 1, 0)
+
+
+@pytest.mark.asyncio
 async def test_foreground_batches_exhaust_before_backfill_floodwait(
     db: sqlite3.Connection,
 ) -> None:
@@ -898,6 +1044,7 @@ def test_worker_rejects_duplicate_handler_kinds(db: sqlite3.Connection) -> None:
             circuit_retry_seconds=config.circuit_retry_seconds,
             max_attempts=config.max_attempts,
             pause_between_requests_seconds=config.pause_between_requests_seconds,
+            backfill_debt_limit=config.backfill_debt_limit,
         )
 
 

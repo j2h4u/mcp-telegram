@@ -84,3 +84,11 @@ visit_AnnAssign
 # Telethon/Bot API field supplied by external message objects and read through
 # string-based getattr in the compatibility adapter (telegram_adapter.py:99,153).
 is_topic_message
+
+# Test-only state inspection hooks; tests are intentionally outside vulture's scan.
+worker_count
+fair_cycle
+queue_depths
+active_depths
+outstanding_depths
+expire_due

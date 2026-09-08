@@ -26,6 +26,12 @@ from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
 from mcp_telegram.messages.telegram_adapter import _PeerLike, extract_message_row
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_worker import FullSyncWorker
+from mcp_telegram.telegram_rpc_scheduler import (
+    RpcAdmissionClosedError,
+    RpcAdmissionSaturatedError,
+    TelegramRpcAdmissionDeferred,
+    current_rpc_scope,
+)
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -557,6 +563,50 @@ async def test_floodwait_no_progress_loss(
     ).fetchone()
     assert row is not None
     assert row[0] == initial_progress, "sync_progress must not change after FloodWait"
+
+
+@pytest.mark.asyncio
+async def test_admission_rejection_defers_without_checkpoint_or_transport_attempt(
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 60001
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', ?)", (dialog_id, 77)
+    )
+    sync_db.execute("INSERT INTO full_history_enrollment VALUES (?, 1, 'explicit', 1)", (dialog_id,))
+    sync_db.commit()
+
+    async def reject(**_kwargs: object) -> MockTotalList:
+        raise RpcAdmissionSaturatedError(current_rpc_scope(), "full-sync capacity is full")
+
+    mock_client.get_messages.side_effect = reject
+    result = await make_worker(mock_client, sync_db, shutdown_event)._fetch_batch(dialog_id, 77)
+
+    assert result == (77, False)
+    assert sync_db.execute("SELECT sync_progress FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone() == (
+        77,
+    )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_closure_propagates_from_full_sync(
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 60002
+    sync_db.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'syncing')", (dialog_id,))
+    sync_db.execute("INSERT INTO full_history_enrollment VALUES (?, 1, 'explicit', 1)", (dialog_id,))
+    sync_db.commit()
+
+    async def close(**_kwargs: object) -> MockTotalList:
+        raise RpcAdmissionClosedError(current_rpc_scope(), "scheduler closed")
+
+    mock_client.get_messages.side_effect = close
+    with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
+        await make_worker(mock_client, sync_db, shutdown_event)._fetch_batch(dialog_id, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1292,6 +1342,97 @@ async def test_dm_bootstrap_handles_network_error(
     worker = make_worker(mock_client, sync_db, shutdown_event)
     count = await worker.bootstrap_dms()
     assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_dm_bootstrap_retries_admission_deferred_after_committing_partial_progress(
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    from telethon.tl import types  # type: ignore[import-untyped]
+
+    first_user = MagicMock(spec=types.User)
+    second_user = MagicMock(spec=types.User)
+    first_dialog = SimpleNamespace(entity=first_user, id=40011)
+    second_dialog = SimpleNamespace(entity=second_user, id=40012)
+    calls = 0
+
+    async def _iter_dialogs():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            yield first_dialog
+            raise TelegramRpcAdmissionDeferred(retry_after_seconds=7)
+        yield second_dialog
+
+    mock_client.iter_dialogs = _iter_dialogs
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+
+    with patch("mcp_telegram.sync_worker.sleep_through_flood", new=AsyncMock(return_value=False)) as sleep:
+        count = await worker.bootstrap_dms()
+
+    assert count == 2
+    assert calls == 2
+    sleep.assert_awaited_once_with(shutdown_event, 7)
+    assert sync_db.execute("SELECT COUNT(*) FROM synced_dialogs WHERE dialog_id IN (40011, 40012)").fetchone() == (2,)
+
+
+@pytest.mark.asyncio
+async def test_dm_bootstrap_propagates_closed_admission_after_committing_partial_progress(
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    from telethon.tl import types  # type: ignore[import-untyped]
+
+    user = MagicMock(spec=types.User)
+    dialog = SimpleNamespace(entity=user, id=40013)
+
+    async def _iter_dialogs():
+        yield dialog
+        raise RpcAdmissionClosedError(current_rpc_scope(), "scheduler closed")
+
+    mock_client.iter_dialogs = _iter_dialogs
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+
+    with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
+        await worker.bootstrap_dms()
+
+    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id = 40013").fetchone() == (40013,)
+
+
+@pytest.mark.asyncio
+async def test_dm_bootstrap_stops_deferred_retry_when_shutdown_is_signalled(
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    from telethon.tl import types  # type: ignore[import-untyped]
+
+    user = MagicMock(spec=types.User)
+    dialog = SimpleNamespace(entity=user, id=40014)
+    calls = 0
+
+    async def _iter_dialogs():
+        nonlocal calls
+        calls += 1
+        yield dialog
+        raise TelegramRpcAdmissionDeferred(retry_after_seconds=120)
+
+    async def _stop_during_retry(event: asyncio.Event, seconds: float) -> bool:
+        assert seconds == 30
+        event.set()
+        return True
+
+    mock_client.iter_dialogs = _iter_dialogs
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    with patch("mcp_telegram.sync_worker.sleep_through_flood", new=_stop_during_retry):
+        count = await worker.bootstrap_dms()
+
+    assert count == 1
+    assert calls == 1
+    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id = 40014").fetchone() == (40014,)
 
 
 # ---------------------------------------------------------------------------

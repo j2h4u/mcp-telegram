@@ -12,9 +12,10 @@ import asyncio
 import logging
 import sqlite3
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
+from functools import wraps
 from typing import Protocol, cast
 
 from telethon.errors import RPCError  # type: ignore[import-untyped]
@@ -36,8 +37,24 @@ from .own_only import (
 )
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_gateway import ScheduledHistoryClient, fetch_scheduled_history_snapshot
+from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, preserve_or_rpc_scope
 
 logger = logging.getLogger(__name__)
+
+
+def _rpc_scope[**P, R](source: TelegramRpcSource) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    """Classify direct scheduled reconciliation while preserving an owner."""
+
+    def decorate(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+        @wraps(func)
+        async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            with preserve_or_rpc_scope(source):
+                return await func(*args, **kwargs)
+
+        return wrapped
+
+    return decorate
+
 
 _SCHEDULED_SYNC_KEY = "account"
 _DELETE_SCHEDULED_FTS_SQL = "DELETE FROM scheduled_messages_fts WHERE dialog_id=? AND message_id=?"
@@ -471,7 +488,9 @@ class ScheduledMessageReconciler:
                 self._conn.execute("DELETE FROM own_only_dialogs")
         return eligible
 
+    @_rpc_scope(TelegramRpcSource.SCHEDULED_MESSAGES)
     async def run_once(self) -> int:
+        """Reconcile one snapshot pass under the scheduled-message source."""
         now = int(time.time())
         retry_at = _retry_at(self._conn)
         if retry_at is not None and retry_at > now:
@@ -543,6 +562,8 @@ async def run_scheduled_reconciliation_loop(
                 own_only_context,
                 activity_rpc_timeout_seconds=policy.activity_rpc_timeout_seconds,
             ).run_once()
+        except RpcAdmissionClosedError:
+            raise
         except asyncio.CancelledError:
             raise
         except Exception:

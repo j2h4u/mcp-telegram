@@ -43,7 +43,8 @@ import logging
 import re
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
@@ -93,6 +94,16 @@ from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
 from .runtime_observations import prune_runtime_observations, record_runtime_observation, tool_telemetry_identity
 from .sync_read_model import SyncStatus, build_sync_read_model
+from .telegram_rpc_scheduler import (
+    RpcAdmissionError,
+    RpcAdmissionExpiredError,
+    RpcAdmissionSaturatedError,
+    TelegramRpcAdmissionDeferred,
+    TelegramRpcSource,
+    UnclassifiedTelegramRpcError,
+    current_rpc_scope,
+    rpc_scope,
+)
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
 
@@ -113,6 +124,40 @@ _ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, type FROM entities WHERE u
 _TELEMETRY_OUTCOMES = frozenset({"success", "tool_error", "validation_error", "exception", "cancelled"})
 _TELEMETRY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _runtime_event_write_count = 0
+
+
+@contextmanager
+def _preserve_or_rpc_scope(source: TelegramRpcSource) -> Iterator[None]:
+    """Classify a fallback unless a more-specific enclosing use case owns it."""
+    try:
+        active_scope = current_rpc_scope()
+    except UnclassifiedTelegramRpcError:
+        with rpc_scope(source):
+            yield
+        return
+    if active_scope.source is TelegramRpcSource.MCP_INTERACTIVE and source is not TelegramRpcSource.MCP_INTERACTIVE:
+        with rpc_scope(source):
+            yield
+    else:
+        yield
+
+
+def _rpc_busy_response() -> dict[str, object]:
+    """Project recoverable admission pressure without exposing scheduler internals."""
+    return {
+        "ok": False,
+        "error": "telegram_rpc_busy",
+        "message": "Telegram request capacity is currently busy; retry shortly or narrow the request.",
+        "retryable": True,
+        "required_action": "Retry shortly, or narrow the request scope.",
+    }
+
+
+def _rpc_admission_response(error: RpcAdmissionError) -> dict[str, object] | None:
+    """Project typed pre-transport admission rejection."""
+    if not isinstance(error, (RpcAdmissionSaturatedError, RpcAdmissionExpiredError)):
+        return None
+    return _rpc_busy_response()
 
 
 def _telemetry_input_error(message: str) -> dict[str, object]:
@@ -623,18 +668,7 @@ class DaemonAPIServer:
         token = _current_request_id.set(request_id)
         started_at = time.perf_counter()
         try:
-            response = await self._dispatch(req)
-        except Exception:
-            logger.exception(
-                "daemon_api_dispatch_error method=%s request_id=%s",
-                method,
-                request_id,
-            )
-            response = {
-                "ok": False,
-                "error": "internal",
-                "message": "internal error",
-            }
+            response = await self._dispatch_with_error_projection(req, method=method, request_id=request_id)
         finally:
             _current_request_id.reset(token)
 
@@ -643,6 +677,46 @@ class DaemonAPIServer:
         if request_id:
             response = {**response, "request_id": request_id}
         return response, method, request_id
+
+    async def _dispatch_with_error_projection(
+        self,
+        req: dict[str, object],
+        *,
+        method: str,
+        request_id: str | None,
+    ) -> dict[str, object]:
+        try:
+            return await self._dispatch(req)
+        except TelegramRpcAdmissionDeferred as exc:
+            logger.warning(
+                "daemon_api_rpc_admission_deferred retry_after=%s request_id=%s",
+                exc.retry_after_seconds,
+                request_id,
+            )
+            return _rpc_busy_response()
+        except RpcAdmissionError as exc:
+            logger.warning(
+                "daemon_api_rpc_admission_rejected source=%s service_class=%s error_type=%s request_id=%s",
+                exc.source.value,
+                exc.service_class.value,
+                type(exc).__name__,
+                request_id,
+            )
+            return _rpc_admission_response(exc) or {
+                "ok": False,
+                "error": "internal",
+                "message": "internal error",
+            }
+        except UnclassifiedTelegramRpcError:
+            logger.exception("daemon_api_unclassified_rpc method=%s request_id=%s", method, request_id)
+            return {"ok": False, "error": "internal", "message": "internal error"}
+        except Exception:
+            logger.exception(
+                "daemon_api_dispatch_error method=%s request_id=%s",
+                method,
+                request_id,
+            )
+            return {"ok": False, "error": "internal", "message": "internal error"}
 
     def _log_request_completion(
         self,
@@ -745,10 +819,11 @@ class DaemonAPIServer:
         if handler is None:
             return {"ok": False, "error": "unknown_method"}
 
-        result = handler(req)
-        if isinstance(result, dict):
-            return result
-        return cast(dict[str, object], await result)
+        with _preserve_or_rpc_scope(TelegramRpcSource.MCP_INTERACTIVE):
+            result = handler(req)
+            if isinstance(result, dict):
+                return result
+            return cast(dict[str, object], await result)
 
     # ------------------------------------------------------------------
     # Dialog name resolution
@@ -875,18 +950,19 @@ class DaemonAPIServer:
 
     async def _resolve_dialog_entity(self, dialog: str) -> int | None:
         """Resolve a dialog selector through the live Telegram entity lookup."""
-        try:
-            entity = await self._client.get_entity(dialog)
-            return int(cast(int, telethon_utils.get_peer_id(entity)))
-        except ValueError, KeyError:
-            return None
-        except TelegramRpcThrottled:
-            raise
-        except RPCError, TimeoutError:
-            raise
-        except Exception:
-            logger.exception("unexpected get_entity failure for %r", dialog)
-            raise
+        with _preserve_or_rpc_scope(TelegramRpcSource.DIALOG_RESOLUTION):
+            try:
+                entity = await self._client.get_entity(dialog)
+                return int(cast(int, telethon_utils.get_peer_id(entity)))
+            except ValueError, KeyError:
+                return None
+            except TelegramRpcThrottled:
+                raise
+            except RPCError, TimeoutError:
+                raise
+            except Exception:
+                logger.exception("unexpected get_entity failure for %r", dialog)
+                raise
 
     async def _remote_dialog_directory(
         self,
@@ -896,16 +972,17 @@ class DaemonAPIServer:
         """Enumerate the full visible remote directory before fuzzy resolution."""
         names: dict[int, str] = {}
         normalized: dict[int, str] = {}
-        async for remote_dialog in self._client.iter_dialogs():
-            name = _attr(remote_dialog, "name", "")
-            entity = _attr(remote_dialog, "entity", None)
-            if not isinstance(name, str) or not name.strip() or entity is None:
-                continue
-            entity_id = int(cast(int, telethon_utils.get_peer_id(entity)))
-            if entity_id in excluded_ids:
-                continue
-            names[entity_id] = name
-            normalized[entity_id] = latinize(name)
+        with _preserve_or_rpc_scope(TelegramRpcSource.DIALOG_RESOLUTION):
+            async for remote_dialog in self._client.iter_dialogs():
+                name = _attr(remote_dialog, "name", "")
+                entity = _attr(remote_dialog, "entity", None)
+                if not isinstance(name, str) or not name.strip() or entity is None:
+                    continue
+                entity_id = int(cast(int, telethon_utils.get_peer_id(entity)))
+                if entity_id in excluded_ids:
+                    continue
+                names[entity_id] = name
+                normalized[entity_id] = latinize(name)
         return names, normalized
 
     async def _resolve_dialog_username(
@@ -1262,19 +1339,20 @@ class DaemonAPIServer:
     async def _refresh_topic_catalog_for_list_topics(self, dialog_id: int) -> str:
         if self._topic_refresher is None:
             return "topic_catalog_not_refreshed"
-        try:
-            entity = await self._client.get_entity(dialog_id)
-            refreshed = await self._topic_refresher.refresh(dialog_id, entity)
-        except TelegramRpcThrottled as exc:
-            logger.info(
-                "list_topics_refresh_deferred_flood_wait dialog_id=%d seconds=%s",
-                dialog_id,
-                exc.retry_after_seconds,
-            )
-            return "topic_catalog_deferred_flood_wait"
-        except TopicSourceUnavailableError as exc:
-            logger.info("list_topics_refresh_unavailable dialog_id=%d error=%s", dialog_id, exc)
-            return "topic_catalog_unavailable"
+        with _preserve_or_rpc_scope(TelegramRpcSource.TOPIC_RESOLUTION):
+            try:
+                entity = await self._client.get_entity(dialog_id)
+                refreshed = await self._topic_refresher.refresh(dialog_id, entity)
+            except TelegramRpcThrottled as exc:
+                logger.info(
+                    "list_topics_refresh_deferred_flood_wait dialog_id=%d seconds=%s",
+                    dialog_id,
+                    exc.retry_after_seconds,
+                )
+                return "topic_catalog_deferred_flood_wait"
+            except TopicSourceUnavailableError as exc:
+                logger.info("list_topics_refresh_unavailable dialog_id=%d error=%s", dialog_id, exc)
+                return "topic_catalog_unavailable"
         return "no_active_topics" if refreshed == 0 else "topic_catalog_refreshed"
 
     # ------------------------------------------------------------------

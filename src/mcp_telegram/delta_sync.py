@@ -16,8 +16,9 @@ import asyncio
 import logging
 import sqlite3
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from functools import wraps
 from typing import Protocol, TypedDict, Unpack, cast
 
 from telethon.errors import RPCError  # type: ignore[import-untyped]
@@ -36,8 +37,28 @@ from .message_contracts import ExtractedMessage
 from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
 from .telegram_access import ACCESS_LOST_ERRORS
+from .telegram_rpc_scheduler import (
+    RpcAdmissionClosedError,
+    RpcAdmissionExpiredError,
+    RpcAdmissionSaturatedError,
+    TelegramRpcAdmissionDeferred,
+    TelegramRpcSource,
+    rpc_scope,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _delta_rpc_scope[**P, R](func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+    """Give delta and access-recovery operations an explicit RPC source."""
+
+    @wraps(func)
+    async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+        with rpc_scope(TelegramRpcSource.DELTA_SYNC):
+            return await func(*args, **kwargs)
+
+    return wrapped
+
 
 # ---------------------------------------------------------------------------
 # SQL constants
@@ -125,6 +146,32 @@ class _DeltaSyncClient(Protocol):
     def iter_messages(self, **_kwargs: object) -> AsyncIterator[object]: ...
 
     async def get_messages(self, **_kwargs: object) -> object: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _DeltaFetchOutcome:
+    rows: list[ExtractedMessage]
+    result: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _AccessProbeOutcome:
+    restored: int = 0
+    still_lost: int = 0
+    errors: int = 0
+    flood_wait_hit: bool = False
+    admission_deferred: bool = False
+    counts_as_checked: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class _AccessProbeRequest:
+    client: _DeltaSyncClient
+    conn: sqlite3.Connection
+    shutdown_event: asyncio.Event
+    delta_worker: DeltaSyncWorker
+    policy: AccessProbePolicy
+    dialog_id: int
 
 
 def _access_probe_rows(conn: sqlite3.Connection, policy: AccessProbePolicy, now: int) -> list[tuple[int]]:
@@ -246,6 +293,7 @@ class DeltaSyncWorker:
         self._client = client
         self._conn = conn
         self._shutdown_event = shutdown_event
+        self._last_fetch_admission_deferred = False
 
     def _stamp_delta_checkpoint(self, dialog_id: int, checked_at: int) -> None:
         self._conn.execute(_UPDATE_DELTA_CHECKPOINT_SQL, (checked_at, checked_at, dialog_id, dialog_id))
@@ -278,6 +326,7 @@ class DeltaSyncWorker:
             newest_delta_checked_age_s=_delta_checked_age(newest_checked_at, now),
         )
 
+    @_delta_rpc_scope
     async def run_delta_catch_up(
         self,
         *,
@@ -328,6 +377,9 @@ class DeltaSyncWorker:
                 continue
             probed += 1
             total_new += await self.fetch_delta_for_dialog(dialog_id)
+            if self._last_fetch_admission_deferred:
+                probed -= 1
+                break
             if await _pause_after_probe(self._shutdown_event, policy):
                 break
         observability = self._delta_observability(int(time.time()))
@@ -372,7 +424,51 @@ class DeltaSyncWorker:
         await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds or 1)
         return len(new_message_rows)
 
-    async def fetch_delta_for_dialog(self, dialog_id: int) -> int:  # noqa: PLR0911
+    async def _collect_delta_rows(self, dialog_id: int, max_known_id: int) -> _DeltaFetchOutcome:
+        new_message_rows: list[ExtractedMessage] = []
+        try:
+            async for msg in self._client.iter_messages(
+                entity=dialog_id, min_id=max_known_id, reverse=True, limit=None
+            ):
+                if self._shutdown_event.is_set():
+                    break
+                new_message_rows.append(extract_message_row(dialog_id, msg))
+        except TelegramRpcAdmissionDeferred as exc:
+            self._last_fetch_admission_deferred = True
+            logger.info(
+                "delta admission_deferred dialog_id=%d retry_after=%s — preserving checkpoint",
+                dialog_id,
+                exc.retry_after_seconds,
+            )
+            if exc.retry_after_seconds is not None:
+                await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
+            return _DeltaFetchOutcome([], 0)
+        except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
+            self._last_fetch_admission_deferred = True
+            logger.info(
+                "delta admission_deferred dialog_id=%d error_type=%s — preserving checkpoint",
+                dialog_id,
+                type(exc).__name__,
+            )
+            return _DeltaFetchOutcome([], 0)
+        except TelegramRpcThrottled as exc:
+            return _DeltaFetchOutcome([], await self._handle_delta_throttling(dialog_id, new_message_rows, exc))
+        except ACCESS_LOST_ERRORS as exc:
+            now = int(time.time())
+            set_access_lost(self._conn, dialog_id, now, reason=type(exc).__name__)
+            self._conn.commit()
+            return _DeltaFetchOutcome([], 0)
+        except RPCError as exc:
+            logger.exception(
+                "RPC error delta dialog_id=%d — skipping: %s",
+                dialog_id,
+                exc,
+            )
+            return _DeltaFetchOutcome([], 0)
+        return _DeltaFetchOutcome(new_message_rows)
+
+    @_delta_rpc_scope
+    async def fetch_delta_for_dialog(self, dialog_id: int) -> int:
         """Fetch all messages newer than max known message_id for one dialog.
 
         Public API: used by probe-worker for gap-fill after access recovery.
@@ -383,6 +479,7 @@ class DeltaSyncWorker:
         Returns:
             Count of new messages stored. 0 if no gap, no baseline, or error.
         """
+        self._last_fetch_admission_deferred = False
         if not full_history_enabled(self._conn, dialog_id):
             return 0
         row = cast(
@@ -395,28 +492,10 @@ class DeltaSyncWorker:
                 self._stamp_delta_checked(dialog_id, int(time.time()))
             return 0
 
-        new_message_rows: list[ExtractedMessage] = []
-        try:
-            async for msg in self._client.iter_messages(
-                entity=dialog_id, min_id=max_known_id, reverse=True, limit=None
-            ):
-                if self._shutdown_event.is_set():
-                    break
-                new_message_rows.append(extract_message_row(dialog_id, msg))
-        except TelegramRpcThrottled as exc:
-            return await self._handle_delta_throttling(dialog_id, new_message_rows, exc)
-        except ACCESS_LOST_ERRORS as exc:
-            now = int(time.time())
-            set_access_lost(self._conn, dialog_id, now, reason=type(exc).__name__)
-            self._conn.commit()
-            return 0
-        except RPCError as exc:
-            logger.exception(
-                "RPC error delta dialog_id=%d — skipping: %s",
-                dialog_id,
-                exc,
-            )
-            return 0
+        outcome = await self._collect_delta_rows(dialog_id, max_known_id)
+        if outcome.result is not None:
+            return outcome.result
+        new_message_rows = outcome.rows
 
         if new_message_rows:
             with self._conn:
@@ -435,6 +514,7 @@ class DeltaSyncWorker:
         return len(new_message_rows)
 
 
+@_delta_rpc_scope
 async def run_delta_catch_up_loop(
     worker: DeltaSyncWorker,
     shutdown_event: asyncio.Event,
@@ -478,6 +558,57 @@ async def _handle_probe_throttling(
     await sleep_through_flood(shutdown_event, exc.retry_after_seconds or 1)
 
 
+async def _probe_access_lost_dialog(request: _AccessProbeRequest) -> _AccessProbeOutcome:
+    client = request.client
+    conn = request.conn
+    dialog_id = request.dialog_id
+    try:
+        result = await client.get_messages(entity=dialog_id, limit=1)
+        total = cast(int | None, getattr(result, "total", None))
+        return await _finish_access_probe(conn, request.delta_worker, dialog_id, total)
+    except (TelegramRpcAdmissionDeferred, RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
+        deferred = isinstance(exc, TelegramRpcAdmissionDeferred)
+        logger.info(
+            "access_probe admission_deferred dialog_id=%d error_type=%s — preserving revalidation budget",
+            dialog_id,
+            type(exc).__name__,
+        )
+        retry_after = cast(float | None, getattr(exc, "retry_after_seconds", None))
+        if deferred and retry_after is not None:
+            await sleep_through_flood(request.shutdown_event, retry_after)
+        return _AccessProbeOutcome(admission_deferred=True, counts_as_checked=not deferred)
+    except RpcAdmissionClosedError:
+        raise
+    except ACCESS_LOST_ERRORS:
+        logger.debug("access_still_lost dialog_id=%d", dialog_id)
+        stamp_access_revalidation(conn, dialog_id, int(time.time()), request.policy.cooldown_seconds)
+        return _AccessProbeOutcome(still_lost=1)
+    except TelegramRpcThrottled as exc:
+        await _handle_probe_throttling(request.conn, request.shutdown_event, request.policy, dialog_id, exc)
+        return _AccessProbeOutcome(flood_wait_hit=True)
+    except (RPCError, TimeoutError, OSError) as exc:
+        error_kind = "probe_rpc_error" if isinstance(exc, RPCError) else "probe_network_error"
+        logger.warning("%s dialog_id=%d error=%s", error_kind, dialog_id, exc)
+        stamp_access_revalidation(request.conn, dialog_id, int(time.time()), request.policy.cooldown_seconds)
+        return _AccessProbeOutcome(errors=1)
+
+
+async def _finish_access_probe(
+    conn: sqlite3.Connection,
+    delta_worker: DeltaSyncWorker,
+    dialog_id: int,
+    total_messages: int | None,
+) -> _AccessProbeOutcome:
+    if not full_history_enabled(conn, dialog_id):
+        return _AccessProbeOutcome(restored=_restore_revalidated_access(conn, dialog_id, total_messages=total_messages))
+    new_msgs = await delta_worker.fetch_delta_for_dialog(dialog_id)
+    logger.debug("access_restore_gap_fill dialog_id=%d new=%d", dialog_id, new_msgs)
+    if delta_worker._last_fetch_admission_deferred:
+        return _AccessProbeOutcome(admission_deferred=True)
+    return _AccessProbeOutcome(restored=_restore_revalidated_access(conn, dialog_id, total_messages=total_messages))
+
+
+@_delta_rpc_scope
 async def _probe_access_lost_dialogs(
     client: _DeltaSyncClient,
     conn: sqlite3.Connection,
@@ -502,38 +633,19 @@ async def _probe_access_lost_dialogs(
         if shutdown_event.is_set():
             break
         checked += 1
-        try:
-            result = await client.get_messages(entity=dialog_id, limit=1)
-            # Success — access restored. Capture total before gap-fill.
-            total = cast(int | None, getattr(result, "total", None))
-
-            if not full_history_enabled(conn, dialog_id):
-                restored += _restore_revalidated_access(conn, dialog_id, total_messages=total)
-                continue
-
-            # Gap-fill FIRST, while status is still access_lost.
-            # If this fails, we skip the dialog — status stays access_lost.
-            new_msgs = await delta_worker.fetch_delta_for_dialog(dialog_id)
-            logger.debug("access_restore_gap_fill dialog_id=%d new=%d", dialog_id, new_msgs)
-
-            # Gap-fill succeeded — NOW reset status to syncing.
-            restored += _restore_revalidated_access(conn, dialog_id, total_messages=total)
-        except ACCESS_LOST_ERRORS:
-            logger.debug("access_still_lost dialog_id=%d", dialog_id)
-            still_lost += 1
-            stamp_access_revalidation(conn, dialog_id, int(time.time()), policy.cooldown_seconds)
-        except TelegramRpcThrottled as exc:
-            await _handle_probe_throttling(conn, shutdown_event, policy, dialog_id, exc)
-            flood_wait_hit = True
+        outcome = await _probe_access_lost_dialog(
+            _AccessProbeRequest(client, conn, shutdown_event, delta_worker, policy, dialog_id)
+        )
+        restored += outcome.restored
+        still_lost += outcome.still_lost
+        errors += outcome.errors
+        flood_wait_hit = outcome.flood_wait_hit
+        if outcome.admission_deferred:
+            if not outcome.counts_as_checked:
+                checked -= 1
             break
-        except RPCError as exc:
-            logger.warning("probe_rpc_error dialog_id=%d error=%s", dialog_id, exc)
-            errors += 1
-            stamp_access_revalidation(conn, dialog_id, int(time.time()), policy.cooldown_seconds)
-        except (TimeoutError, OSError) as exc:
-            logger.warning("probe_network_error dialog_id=%d error=%s", dialog_id, exc)
-            errors += 1
-            stamp_access_revalidation(conn, dialog_id, int(time.time()), policy.cooldown_seconds)
+        if outcome.flood_wait_hit:
+            break
 
         if policy.probe_pause_seconds > 0 and not shutdown_event.is_set():
             try:
@@ -568,6 +680,7 @@ def _restore_revalidated_access(
     return int(changed)
 
 
+@_delta_rpc_scope
 async def run_access_probe_loop(
     client: _DeltaSyncClient,
     conn: sqlite3.Connection,
@@ -596,6 +709,8 @@ async def run_access_probe_loop(
     while not shutdown_event.is_set():
         try:
             await _probe_access_lost_dialogs(client, conn, shutdown_event, delta_worker, policy)
+        except RpcAdmissionClosedError:
+            raise
         except Exception:
             logger.warning("access_probe_error", exc_info=True)
         try:

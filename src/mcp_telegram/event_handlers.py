@@ -23,9 +23,10 @@ import logging
 import sqlite3
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
+from functools import wraps
 from typing import Protocol, cast, runtime_checkable
 
 from telethon import events  # type: ignore[import-untyped]
@@ -109,11 +110,28 @@ from .scheduled_messages import (
     upsert_scheduled_message,
     verify_scheduled_publication,
 )
+from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
 from .telethon_dialog import classify_dialog_type
 from .topics.sqlite_repository import SQLiteTopicMetadataRepository
 from .unread_state import apply_unread_facts
 
 logger = logging.getLogger(__name__)
+
+
+def _rpc_scope[**P, R](
+    source: TelegramRpcSource,
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    """Give one async operation an explicit source for nested Telegram calls."""
+
+    def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+        @wraps(func)
+        async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            with rpc_scope(source):
+                return await func(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
 
 
 @runtime_checkable
@@ -557,6 +575,7 @@ class EventHandlerManager:
     def set_self_id(self, self_id: int) -> None:
         self._self_id = self_id
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def _resolve_self_id(self) -> int | None:
         if self._self_id is not None:
             return self._self_id
@@ -565,6 +584,8 @@ class EventHandlerManager:
             value = getattr(me, "id", None)
             if isinstance(value, int) and not isinstance(value, bool):
                 self._self_id = value
+        except RpcAdmissionClosedError:
+            raise
         except Exception:
             logger.exception("participant_update_self_id_unavailable")
         return self._self_id
@@ -659,6 +680,7 @@ class EventHandlerManager:
             else:
                 verify_scheduled_publication(conn, dialog_id, int(message.id), now=now)
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def on_new_message(self, event: _NewMessageEvent) -> None:
         """Handle a NewMessage event: INSERT OR REPLACE into messages table.
 
@@ -707,9 +729,12 @@ class EventHandlerManager:
                 self._record_body_event(dialog_id, now)
 
             logger.debug("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
+        except RpcAdmissionClosedError:
+            raise
         except Exception:
             logger.exception("event_new_failed dialog_id=%s", dialog_id)
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def _new_message_coverage(
         self,
         dialog_id: int,
@@ -757,6 +782,7 @@ class EventHandlerManager:
         self._update_last_message_timestamp(dialog_id, now, msg.date)
         self._handle_topic_message_action(dialog_id, msg, now)
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def on_raw_topic_message(self, update: object) -> None:
         """Project topic service messages omitted by Telethon's NewMessage builder."""
         try:
@@ -866,6 +892,7 @@ class EventHandlerManager:
             topic_id,
         )
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def on_message_edited(self, event: _EditedMessageEvent) -> None:
         """Handle a MessageEdited event: version old text, update messages row.
 
@@ -931,9 +958,12 @@ class EventHandlerManager:
                 message_id,
                 next_ver,
             )
+        except RpcAdmissionClosedError:
+            raise
         except Exception:
             logger.exception("event_edit_failed dialog_id=%s", dialog_id)
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def _insert_missing_edited_message(
         self,
         dialog_id: int,
@@ -985,6 +1015,7 @@ class EventHandlerManager:
             len(aggregates),
         )
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def _persist_changed_edit(  # noqa: PLR0913, PLR0917
         self,
         dialog_id: int,
@@ -1020,6 +1051,7 @@ class EventHandlerManager:
             self._record_body_event(dialog_id, now)
         return next_ver
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def on_message_deleted(self, event: _DeletedMessagesEvent) -> None:
         """Handle a MessageDeleted event and preserve the last known text.
 
@@ -1075,6 +1107,7 @@ class EventHandlerManager:
             len(deleted_ids) - len(resolved),
         )
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def on_raw_new_scheduled_message(self, update: object) -> None:
         """Mirror create/edit/reschedule updates without touching sent history."""
         message = cast(object | None, getattr(update, "message", None))
@@ -1096,6 +1129,7 @@ class EventHandlerManager:
         except Exception:
             logger.exception("scheduled_new_failed dialog_id=%s", dialog_id)
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def on_raw_delete_scheduled_messages(self, update: object) -> None:
         """Retain cancellation/publication evidence from a queue-removal update."""
         dialog_id = scheduled_dialog_id(getattr(update, "peer", None))
@@ -1109,6 +1143,7 @@ class EventHandlerManager:
         except Exception:
             logger.exception("scheduled_removed_failed dialog_id=%s", dialog_id)
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def on_outbox_read(self, event: _OutboxReadEvent) -> None:
         """Handle MessageRead(inbox=False): update read_outbox_max_id monotonically.
 
@@ -1192,6 +1227,7 @@ class EventHandlerManager:
                 exc,
             )
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def on_raw_reaction_update(self, update: _RawReactionUpdate) -> None:
         """Handle raw UpdateMessageReactions for synced dialogs.
 
@@ -1249,6 +1285,8 @@ class EventHandlerManager:
                 msg_id,
                 len(aggregates),
             )
+        except RpcAdmissionClosedError:
+            raise
         except Exception:
             logger.exception(
                 "event_raw_reaction_apply_failed dialog_id=%d message_id=%d",
@@ -1268,6 +1306,7 @@ class EventHandlerManager:
             logger.debug("raw_reaction_update_unparseable_peer peer=%r", peer)
             return None
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def _fetch_reaction_message(self, dialog_id: int, msg_id: int) -> _MessageLike | None:
         try:
             result = cast(Sequence[_MessageLike | None], await self._client.get_messages(dialog_id, ids=[msg_id]))
@@ -1279,6 +1318,8 @@ class EventHandlerManager:
                 exc.retry_after_seconds,
             )
             return None
+        except RpcAdmissionClosedError:
+            raise
         except RPCError, RuntimeError:
             logger.exception(
                 "event_raw_reaction_failed dialog_id=%d message_id=%d",
@@ -1306,6 +1347,7 @@ class EventHandlerManager:
             self._record_body_event(dialog_id, now)
         return True
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def on_raw_transcribed_audio(self, update: UpdateTranscribedAudio) -> None:
         """Capture one final Telegram transcription fact under current policy.
 
@@ -1521,6 +1563,7 @@ class EventHandlerManager:
             rowcount,
         )
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def on_raw_dialog_pinned(self, update: object) -> None:
         """Phase 42 EVENTS-01: dialogs.pinned + needs_refresh from raw updates.
 
@@ -1566,6 +1609,7 @@ class EventHandlerManager:
             return int(get_peer_id(PeerChannel(update.channel_id)))
         return int(get_peer_id(PeerChat(update.chat_id)))
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def on_raw_participant(self, update: UpdateChannelParticipant | UpdateChatParticipant) -> None:
         """Persist why this account lost a group, supergroup, or channel membership."""
         try:
@@ -1586,9 +1630,12 @@ class EventHandlerManager:
                 )
             if changed:
                 self._synced_dialog_ids.discard(dialog_id)
+        except RpcAdmissionClosedError:
+            raise
         except Exception:
             logger.exception("event_channel_participant_failed")
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def on_raw_channel_chat_update(self, update: _ChannelChatUpdateLike | _ChatUpdateLike) -> None:
         """Phase 42 EVENTS-03: UpdateChannel / UpdateChat → dialogs.needs_refresh=1.
 
@@ -1618,6 +1665,8 @@ class EventHandlerManager:
                     ).fetchone(),
                 )
             logger.info("event_channel_chat_dirty dialog_id=%d", dialog_id)
+        except RpcAdmissionClosedError:
+            raise
         except Exception:
             logger.exception(
                 "event_channel_chat_update_failed update=%r",
@@ -1633,6 +1682,7 @@ class EventHandlerManager:
         if isinstance(update, UpdateChannel) and row is not None and row[0] == "channel" and row[1] is not None:
             await self._refresh_linked_chat_id(dialog_id)
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def _refresh_linked_chat_id(self, dialog_id: int) -> None:
         """Phase 54: event-driven linked_chat_id refresh for a previously-resolved channel.
 
@@ -1662,6 +1712,8 @@ class EventHandlerManager:
                 exc.retry_after_seconds,
             )
             return
+        except RpcAdmissionClosedError:
+            raise
         except Exception:
             logger.debug("event_linked_chat_refresh_failed dialog_id=%d", dialog_id, exc_info=True)
             return
@@ -1691,6 +1743,7 @@ class EventHandlerManager:
             normalised,
         )
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def on_raw_inbox_read(self, update: _InboxReadUpdateLike | _ChannelInboxReadUpdateLike) -> None:
         """Phase 42 EVENTS-02: UpdateReadHistoryInbox / UpdateReadChannelInbox.
 
@@ -1779,6 +1832,7 @@ class EventHandlerManager:
                 type(update).__name__,
             )
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def on_raw_forum_topic_pinned(self, update: object) -> None:
         """Phase 42 EVENTS-05: UpdatePinnedForumTopic → topic_metadata.pinned.
 
@@ -1825,6 +1879,7 @@ class EventHandlerManager:
                 type(update).__name__,
             )
 
+    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def on_raw_forum_topics_pinned(self, update: object) -> None:
         """Apply UpdatePinnedForumTopics as a complete known-topic membership set."""
         try:
@@ -1861,6 +1916,7 @@ class EventHandlerManager:
     # DM gap scan
     # ------------------------------------------------------------------
 
+    @_rpc_scope(TelegramRpcSource.DELTA_SYNC)
     async def run_dm_gap_scan(self) -> int:
         """Scan all synced DM dialogs for deleted messages via live Telegram lookup.
 
@@ -1883,6 +1939,8 @@ class EventHandlerManager:
         for dialog_id in dialog_ids:
             try:
                 total_marked += await self._scan_dm_gap_dialog(dialog_id, scan_started_at)
+            except RpcAdmissionClosedError:
+                raise
             except Exception:
                 logger.warning(
                     "dm_gap_scan_dialog_failed dialog_id=%d",
@@ -1893,6 +1951,7 @@ class EventHandlerManager:
         logger.info("dm_gap_scan marked_deleted=%d", total_marked)
         return total_marked
 
+    @_rpc_scope(TelegramRpcSource.DELTA_SYNC)
     async def _scan_dm_gap_dialog(self, dialog_id: int, scan_started_at: int) -> int:
         message_ids = list(list_undeleted_message_ids(self._conn, dialog_id, scan_started_at))
         if not message_ids:

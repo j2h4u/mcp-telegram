@@ -22,6 +22,7 @@ from telethon.tl.types import TypeInputChannel, TypeInputPeer
 from .activity_substrate import ActivityClient, call_with_timeout
 from .entity_store import EntitySnapshot, ensure_entity_stub
 from .flood import TelegramRpcThrottled, _raise_if_latched
+from .telegram_rpc_scheduler import RpcAdmissionClosedError
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,8 @@ async def resolve_input_peer(client: _InputEntityResolverClient, dialog_id: int)
     """
     try:
         return cast(TypeInputPeer, await client.get_input_entity(dialog_id))
+    except RpcAdmissionClosedError:
+        raise
     except TelegramRpcThrottled as exc:
         _raise_if_latched(exc)
         logger.debug("activity_peer_resolve_input_peer_throttled dialog_id=%r", dialog_id)
@@ -321,6 +324,8 @@ async def resolve_linked_chat_id(
 
     try:
         return await _resolve_linked_chat_live(client, conn, channel_id, now, timeout_s)
+    except RpcAdmissionClosedError:
+        raise
     except TelegramRpcThrottled as exc:
         logger.warning(
             "activity_peer_resolve_linked_flood channel_id=%r flood_wait_seconds=%s",

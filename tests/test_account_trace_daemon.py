@@ -50,6 +50,7 @@ from mcp_telegram.pagination import (
     decode_account_trace_navigation,
     encode_account_trace_navigation,
 )
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
 from mcp_telegram.tools import TOOL_REGISTRY
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.reaction_helpers import make_reaction_freshener
@@ -94,6 +95,21 @@ def trace_service(
 
 def _dict(value: object) -> dict[str, object]:
     return cast(dict[str, object], value)
+
+
+@pytest.mark.asyncio
+async def test_account_trace_entrypoint_sets_rpc_source(
+    trace_service: DaemonAccountTraceService,
+) -> None:
+    observed: list[TelegramRpcSource] = []
+
+    async def implementation(_req: dict) -> dict[str, object]:
+        observed.append(current_rpc_scope().source)
+        return {"ok": True}
+
+    trace_service._trace_account_messages_impl = implementation  # type: ignore[method-assign]
+    assert await trace_service._trace_account_messages({}) == {"ok": True}
+    assert observed == [TelegramRpcSource.ACCOUNT_TRACE]
 
 
 def test_trace_typed_dict_contracts_are_importable() -> None:

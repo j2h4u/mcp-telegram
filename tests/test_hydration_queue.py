@@ -118,6 +118,17 @@ def test_due_jobs_prioritize_foreground_then_newest_message(db: sqlite3.Connecti
     assert repository.due_jobs(1, 10) == [jobs[2], jobs[3], jobs[1], jobs[0]]
 
 
+def test_priority_specific_limit_keeps_backfill_visible(db: sqlite3.Connection) -> None:
+    repository = HydrationQueueRepository(db)
+    foreground = _job("media", 1, 1, 1, message_sent_at=300)
+    backfill = _job("media", 1, 2, 1, message_sent_at=100, priority=HydrationPriority.BACKFILL)
+    for job in (foreground, backfill):
+        repository.enqueue(job)
+
+    assert repository.due_jobs(1, 1, priority=HydrationPriority.FOREGROUND) == [foreground]
+    assert repository.due_jobs(1, 1, priority=HydrationPriority.BACKFILL) == [backfill]
+
+
 def test_snapshot_distinguishes_active_ready_deferred_priority_and_terminal_jobs(db: sqlite3.Connection) -> None:
     repository = HydrationQueueRepository(db)
     repository.enqueue(_job("media", 1, 1, 90, attempts=2, message_sent_at=40, priority=HydrationPriority.BACKFILL))

@@ -80,6 +80,7 @@ def create_client(
         fallback_wait_seconds=config.flood_wait.fallback_wait_seconds,
         cooldown_buffer_seconds=config.flood_wait.cooldown_buffer_seconds,
         transient_retry_delays_seconds=config.telegram_rpc.transient_retry_delays_seconds,
+        scheduler_policy=config.telegram_rpc.scheduler,
         flood_observer=observe_flood_wait,
     )
 

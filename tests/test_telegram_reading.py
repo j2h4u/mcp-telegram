@@ -33,6 +33,12 @@ from mcp_telegram.telegram_reading import (
     GatewayFailureKind,
     ReadDateFetchResult,
 )
+from mcp_telegram.telegram_rpc_scheduler import (
+    RpcAdmissionClosedError,
+    TelegramRpcSource,
+    current_rpc_scope,
+    rpc_scope,
+)
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -254,6 +260,36 @@ async def test_reaction_freshener_refreshes_only_stale_active_window(
     ).fetchall() == [(3, "🔥", 4)]
 
 
+@pytest.mark.asyncio
+async def test_reaction_refresh_preserves_realtime_scope(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
+    conn = make_synced_db()
+    dialog_id = 1001
+    _seed_synced(conn, dialog_id)
+    conn.execute(
+        "INSERT INTO message_reactions_freshness (dialog_id, message_id, checked_at) VALUES (?, ?, ?)",
+        (dialog_id, 3, 0),
+    )
+    conn.commit()
+    sources: list[TelegramRpcSource] = []
+
+    async def fetch_reactions(_entity: object, _message_ids: list[int]) -> ReactionFetchResult:
+        sources.append(current_rpc_scope().source)
+        return ReactionFetchResult(messages=(ReactionSnapshot(3, (ReactionAggregate(emoji="🔥", count=1),)),))
+
+    try:
+        with rpc_scope(TelegramRpcSource.REALTIME_EVENT):
+            await ReactionFreshener(
+                SQLiteReactionSnapshotRepository(conn),
+                cast(TelegramReactionGateway, SimpleNamespace(fetch_reactions=fetch_reactions)),
+                freshness_ttl_seconds=600,
+                now=lambda: 1_000,
+            ).refresh(dialog_id, dialog_id, [3])
+    finally:
+        conn.close()
+
+    assert sources == [TelegramRpcSource.REALTIME_EVENT]
+
+
 def test_reaction_freshness_at_exact_ttl_age_is_stale(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
     """A reaction snapshot at exactly the cutoff is refreshed, never reused."""
     conn = make_synced_db()
@@ -408,6 +444,16 @@ async def test_reaction_gateway_translates_private_and_floodwait_failures() -> N
 
 
 @pytest.mark.asyncio
+async def test_reaction_gateway_propagates_scheduler_close() -> None:
+    with rpc_scope(TelegramRpcSource.REACTION_REFRESH) as scope:
+        closed = RpcAdmissionClosedError(scope, "scheduler closed")
+    client = SimpleNamespace(get_messages=AsyncMock(side_effect=closed))
+
+    with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
+        await TelethonTelegramReactionGateway(client).fetch_reactions(1, [10])
+
+
+@pytest.mark.asyncio
 async def test_reaction_detail_unavailable_keeps_aggregate_rows() -> None:
     class Client:
         async def get_messages(self, entity: object, ids: list[int]) -> list[object]:
@@ -506,6 +552,19 @@ async def test_read_receipt_gateway_keeps_telegram_date_nullable() -> None:
     result = await TelethonTelegramReadReceiptGateway(client).fetch_outbox_read_date(42, 10)
     assert result == ReadDateFetchResult(read_at=1_700_000_200, status="complete")
     assert client.resolved == [42]
+
+
+@pytest.mark.asyncio
+async def test_read_receipt_gateway_propagates_scheduler_close() -> None:
+    with rpc_scope(TelegramRpcSource.READ_RECEIPT_PROBE) as scope:
+        closed = RpcAdmissionClosedError(scope, "scheduler closed")
+
+    class Client:
+        async def get_input_entity(self, _entity: object) -> object:
+            raise closed
+
+    with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
+        await TelethonTelegramReadReceiptGateway(Client()).fetch_outbox_read_date(42, 10)
 
 
 @pytest.mark.asyncio

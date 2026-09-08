@@ -10,6 +10,7 @@ from telethon.errors.rpcbaseerrors import BadRequestError  # type: ignore[import
 from telethon.errors.rpcerrorlist import MsgIdInvalidError  # type: ignore[import-untyped]
 
 import mcp_telegram.telegram_rpc_error as rpc_error
+from mcp_telegram.config import FactHydrationConfig
 from mcp_telegram.fact_hydration import HydrationDropObservation, MessageFactHydrationWorker
 from mcp_telegram.hydration_queue import HydrationJob, HydrationPriority
 from mcp_telegram.telegram_rpc_error import describe_telegram_rpc_error
@@ -94,6 +95,7 @@ def test_hydration_drop_log_aggregates_bounded_coordinates(caplog: pytest.LogCap
             circuit_retry_seconds=1,
             max_attempts=1,
             pause_between_requests_seconds=0,
+            backfill_debt_limit=FactHydrationConfig().backfill_debt_limit,
         )
         jobs = [
             HydrationJob("media_metadata", 42, message_id, 1, 2, priority=HydrationPriority.BACKFILL)

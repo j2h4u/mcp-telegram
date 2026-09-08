@@ -170,7 +170,7 @@ class EntityProfileRepository:
                 self._conn.execute("DELETE FROM entity_profile_refresh_state WHERE entity_id = ?", (entity_id,))
 
     def refresh_state(self, entity_id: int, *, now: int) -> dict[str, object] | None:
-        """Return a durable unresolved-refresh failure while its retry is active."""
+        """Return a durable unresolved-refresh state while it is relevant."""
         try:
             row = cast(
                 tuple[object, object, object] | None,
@@ -184,7 +184,7 @@ class EntityProfileRepository:
         if row is None:
             return None
         status, retry_at, reason = row
-        if isinstance(retry_at, int) and retry_at > now:
+        if str(status) == "rejected" or (isinstance(retry_at, int) and retry_at > now):
             return {"status": str(status), "retry_at": retry_at, "reason": str(reason)}
         return None
 
@@ -196,6 +196,42 @@ class EntityProfileRepository:
                 "VALUES (?, ?, 'pending', NULL, ?, NULL, NULL) "
                 "ON CONFLICT(entity_id, section) DO UPDATE SET status='pending', reason=excluded.reason",
                 ((entity_id, section, reason) for section in PROFILE_SECTIONS),
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            return
+
+    def mark_refresh_queued(self, entity_id: int, *, reason: str = "refresh_queued") -> None:
+        """Clear rejection state and restore an honest queued reason."""
+        try:
+            self._conn.execute("DELETE FROM entity_profile_refresh_state WHERE entity_id = ?", (entity_id,))
+            self._conn.execute(
+                "UPDATE entity_detail_sections SET status='pending', reason=?, retry_at=NULL "
+                "WHERE entity_id=? AND status IN ('pending', 'stale', 'unavailable')",
+                (reason, entity_id),
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            return
+
+    def mark_refresh_rejected(self, entity_id: int, *, now: int, reason: str = "refresh_rejected") -> None:
+        """Persist queue rejection without claiming that work was queued."""
+        try:
+            self._conn.execute(
+                "INSERT INTO entity_profile_refresh_state(entity_id, status, retry_at, reason, updated_at) "
+                "VALUES (?, 'rejected', NULL, ?, ?) ON CONFLICT(entity_id) DO UPDATE SET status=excluded.status, "
+                "retry_at=NULL, reason=excluded.reason, updated_at=excluded.updated_at",
+                (entity_id, reason, now),
+            )
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO entity_detail_sections(entity_id, section, status, observed_at, reason, payload_json, retry_at) "
+                "VALUES (?, ?, 'unavailable', NULL, ?, NULL, NULL)",
+                ((entity_id, section, reason) for section in PROFILE_SECTIONS),
+            )
+            self._conn.execute(
+                "UPDATE entity_detail_sections SET status='unavailable', reason=?, retry_at=NULL "
+                "WHERE entity_id=? AND status <> 'not_applicable'",
+                (reason, entity_id),
             )
             self._conn.commit()
         except sqlite3.OperationalError:

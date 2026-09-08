@@ -47,6 +47,13 @@ from mcp_telegram.reading.sqlite_projection import (
 from mcp_telegram.runtime_observations import record_runtime_observation
 from mcp_telegram.sync_db import _RUNTIME_OBSERVATIONS_V54_DDL, ensure_sync_schema
 from mcp_telegram.sync_read_model import compute_sync_coverage as _compute_sync_coverage
+from mcp_telegram.telegram_rpc_scheduler import (
+    RpcAdmissionSaturatedError,
+    TelegramRpcAdmissionDeferred,
+    TelegramRpcSource,
+    current_rpc_scope,
+    rpc_scope,
+)
 from mcp_telegram.telethon_dialog import classify_dialog_type
 from mcp_telegram.topics.contracts import TopicFact
 from mcp_telegram.topics.refresh import TopicRefresher
@@ -417,6 +424,77 @@ async def test_daemon_api_logs_request_completion_for_errors(caplog: pytest.LogC
     assert "method=unknown_method" in records[0].message
     assert "ok=False" in records[0].message
     assert "error=unknown_method" in records[0].message
+
+
+@pytest.mark.asyncio
+async def test_daemon_api_projects_recoverable_rpc_admission_without_internal_names() -> None:
+    server = make_server()
+
+    async def reject(_req: dict[str, object]) -> dict[str, object]:
+        with rpc_scope(TelegramRpcSource.MCP_INTERACTIVE):
+            raise RpcAdmissionSaturatedError(current_rpc_scope(), "internal queue detail")
+
+    server._dispatch = reject  # type: ignore[method-assign]
+    response, _method, _request_id = await server._handle_client_line(
+        json.dumps({"method": "list_messages"}).encode(),
+        "",
+        None,
+    )
+
+    assert response == {
+        "ok": False,
+        "error": "telegram_rpc_busy",
+        "message": "Telegram request capacity is currently busy; retry shortly or narrow the request.",
+        "retryable": True,
+        "required_action": "Retry shortly, or narrow the request scope.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_daemon_api_hides_scheduler_failure_details_from_not_ready_response() -> None:
+    server = make_server()
+    server._ready = False
+    server.startup_detail = "Telegram service is temporarily unavailable; daemon is shutting down"
+
+    response, _method, _request_id = await server._handle_client_line(
+        json.dumps({"method": "list_messages"}).encode(),
+        "",
+        None,
+    )
+
+    assert response == {
+        "ok": False,
+        "error": "daemon_not_ready",
+        "detail": "Telegram service is temporarily unavailable; daemon is shutting down",
+    }
+    assert all(term not in str(response).lower() for term in ("scheduler", "limiter", "queue"))
+
+
+@pytest.mark.asyncio
+async def test_daemon_api_projects_gate_admission_deferral_without_internal_names() -> None:
+    """Translate the gate's public saturation outcome at the daemon boundary."""
+    server = make_server()
+
+    async def defer(_req: dict[str, object]) -> dict[str, object]:
+        raise TelegramRpcAdmissionDeferred(
+            retry_after_seconds=1,
+            detail="interactive queue class admission saturation; retry in 1s",
+        )
+
+    server._dispatch = defer  # type: ignore[method-assign]
+    response, _method, _request_id = await server._handle_client_line(
+        json.dumps({"method": "list_messages"}).encode(),
+        "",
+        None,
+    )
+
+    assert response == {
+        "ok": False,
+        "error": "telegram_rpc_busy",
+        "message": "Telegram request capacity is currently busy; retry shortly or narrow the request.",
+        "retryable": True,
+        "required_action": "Retry shortly, or narrow the request scope.",
+    }
 
 
 def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:
@@ -994,6 +1072,36 @@ async def test_list_messages_on_demand() -> None:
     messages = _response_messages(result)
     assert len(messages) == 1
     assert messages[0]["message_id"] == 200
+
+
+@pytest.mark.asyncio
+async def test_dispatch_uncached_list_messages_binds_interactive_rpc_source() -> None:
+    conn = _make_db()
+    seen_sources: list[TelegramRpcSource] = []
+    mock_msg = MagicMock()
+    mock_msg.id = 201
+    mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000001.0)
+    mock_msg.message = "Interactive fallback"
+    mock_msg.sender_id = None
+    mock_msg.sender = None
+    mock_msg.media = None
+    mock_msg.reply_to = None
+    mock_msg.reactions = None
+    mock_msg.reply_to_msg_id = None
+    mock_msg.forum_topic_id = None
+
+    async def iter_messages(*_args: object, **_kwargs: object):
+        seen_sources.append(current_rpc_scope().source)
+        yield mock_msg
+
+    client = _TestClient()
+    client.iter_messages = iter_messages
+    server = make_server(conn, client)
+
+    result = await server._dispatch({"method": "list_messages", "dialog_id": 2, "limit": 10})
+
+    assert result["ok"] is True
+    assert seen_sources == [TelegramRpcSource.MCP_INTERACTIVE]
 
 
 @pytest.mark.asyncio
@@ -2082,6 +2190,30 @@ async def test_list_topics_cached_selector_still_refreshes_topic_catalog() -> No
     assert result["data"]["dialog_id"] == 323
     assert result["data"]["topics"][0]["id"] == 306001
     cast(AsyncMock, client.get_entity).assert_awaited_once_with(323)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_list_topics_keeps_resolution_source_through_refresher() -> None:
+    class _Gateway:
+        def __init__(self) -> None:
+            self.sources: list[TelegramRpcSource] = []
+
+        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
+            del entity
+            self.sources.append(current_rpc_scope().source)
+            return (TopicFact(topic_id=306001, title="Topic"),)
+
+    conn = _make_db_with_topics()
+    client = _TestClient()
+    client.get_entity = AsyncMock(return_value=SimpleNamespace(forum=True))
+    gateway = _Gateway()
+    topic_refresher = TopicRefresher(gateway, SQLiteTopicSnapshotRepository(conn))
+    server = make_server(conn, client, topic_refresher=topic_refresher)
+
+    result = await server._dispatch({"method": "list_topics", "dialog_id": 323})
+
+    assert result["ok"] is True
+    assert gateway.sources == [TelegramRpcSource.TOPIC_RESOLUTION]
 
 
 @pytest.mark.asyncio
@@ -7263,6 +7395,28 @@ async def test_resolve_dialog_name_falls_through_to_iter_dialogs_when_miss() -> 
     # Came from iter_dialogs — step 3 fallback is still functional
     assert result == 42
     cast(MagicMock, client.iter_dialogs).assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_remote_dialog_resolution_has_explicit_rpc_source() -> None:
+    sources: list[TelegramRpcSource] = []
+
+    async def missing_entity(_dialog: str) -> object:
+        sources.append(current_rpc_scope().source)
+        raise ValueError("not found")
+
+    async def remote_dialogs():
+        sources.append(current_rpc_scope().source)
+        yield SimpleNamespace(name="Remote Chat", entity=SimpleNamespace(id=42))
+
+    client = _TestClient()
+    client.get_entity = AsyncMock(side_effect=missing_entity)
+    client.iter_dialogs = MagicMock(return_value=remote_dialogs())
+    server = make_server(_make_db_with_dialogs(), client)
+
+    assert await server._resolve_dialog_entity("Remote Chat") is None
+    assert await server._resolve_dialog_id(required_dialog_selector(dialog="Remote Chat")) == 42
+    assert sources == [TelegramRpcSource.DIALOG_RESOLUTION, TelegramRpcSource.DIALOG_RESOLUTION]
 
 
 @pytest.mark.asyncio

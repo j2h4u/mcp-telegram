@@ -11,6 +11,7 @@ from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES, translate_gateway_failure
 from .telegram_reading import FragmentFetchResult, TelegramFragmentGateway
+from .telegram_rpc_scheduler import TelegramRpcSource, preserve_or_rpc_scope
 
 
 class _TelegramClientLike(Protocol):
@@ -33,7 +34,8 @@ class FragmentContextService:
             self._conn.execute(
                 "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'fragment')", (dialog_id,)
             )
-        result = await self._gateway.fetch_context(dialog_id, anchor_message_id, context_size)
+        with preserve_or_rpc_scope(TelegramRpcSource.MESSAGE_READ_FALLBACK):
+            result = await self._gateway.fetch_context(dialog_id, anchor_message_id, context_size)
         if not result.ok or not result.messages:
             return result
         with self._conn:
@@ -42,7 +44,7 @@ class FragmentContextService:
 
 
 class TelethonTelegramFragmentGateway:
-    """Telethon adapter for a bounded fragment centered on an anchor."""
+    """Fragment adapter that inherits the interactive caller's RPC scope."""
 
     def __init__(self, client: object) -> None:
         self._client = cast(_TelegramClientLike, client)

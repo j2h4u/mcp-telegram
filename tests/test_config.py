@@ -20,9 +20,11 @@ from mcp_telegram.config import (
     InboxConfig,
     ReactionsConfig,
     ReadReceiptsConfig,
+    RuntimeObservationConfig,
     SchedulingConfig,
     StateConfig,
     TelegramRpcConfig,
+    TelegramRpcSchedulerConfig,
     TelemetryConfig,
     load_config,
     resolve_http_server_config,
@@ -73,6 +75,7 @@ foreground_resolve_seconds = 2
 rpc_timeout_seconds = 6
 refresh_timeout_seconds = 20
 max_concurrent_refreshes = 1
+max_queued_refreshes = 7
 """,
     )
     assert load_config(path).entity_profile == EntityProfileConfig(
@@ -80,6 +83,7 @@ max_concurrent_refreshes = 1
         rpc_timeout_seconds=6.0,
         refresh_timeout_seconds=20.0,
         max_concurrent_refreshes=1,
+        max_queued_refreshes=7,
     )
 
     invalid = _write_config(
@@ -109,6 +113,58 @@ def test_load_config_accepts_positive_fact_hydration_capacity(tmp_path: Path) ->
     )
 
     assert load_config(path).scheduling.fact_hydration.max_requests_per_cycle == 1
+
+
+def test_load_config_reads_scheduler_and_worker_fairness_bounds(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        """[state]
+dir = "/state"
+
+[telegram_rpc.scheduler]
+interactive_weight = 7
+live_sync_weight = 4
+background_weight = 2
+interactive_queue_capacity = 11
+live_sync_queue_capacity = 12
+background_queue_capacity = 13
+interactive_deadline_seconds = 14
+live_sync_deadline_seconds = 15
+background_deadline_seconds = 16
+admission_retry_seconds = 2
+update_loop_retry_seconds = 2
+
+[scheduling.fact_hydration]
+backfill_debt_limit = 3
+""",
+    )
+
+    config = load_config(path)
+    assert config.telegram_rpc.scheduler == TelegramRpcSchedulerConfig(
+        interactive_weight=7,
+        live_sync_weight=4,
+        background_weight=2,
+        interactive_queue_capacity=11,
+        live_sync_queue_capacity=12,
+        background_queue_capacity=13,
+        interactive_deadline_seconds=14.0,
+        live_sync_deadline_seconds=15.0,
+        background_deadline_seconds=16.0,
+        admission_retry_seconds=2,
+        update_loop_retry_seconds=2.0,
+    )
+    assert config.scheduling.fact_hydration.backfill_debt_limit == 3
+    assert resolve_scheduling_config(config.scheduling, {}).fact_hydration.backfill_debt_limit == 3
+
+
+def test_telegram_rpc_scheduler_rejects_unbounded_weight() -> None:
+    with pytest.raises(ValueError, match="weights must be <= 100"):
+        TelegramRpcSchedulerConfig(interactive_weight=101)
+
+
+def test_runtime_observation_config_rejects_blocking_writer_timeout() -> None:
+    with pytest.raises(ValueError, match="writer_busy_timeout_ms must be <= 50"):
+        RuntimeObservationConfig(writer_busy_timeout_ms=51)
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
@@ -158,6 +214,13 @@ stale_after_seconds = 46
 
 [telemetry]
 retention_ttl_seconds = 47
+
+[telemetry.runtime_observations]
+prune_every_writes = 48
+writer_busy_timeout_ms = 49
+queue_capacity = 50
+writer_startup_wait_seconds = 1.5
+shutdown_drain_grace_seconds = 2.5
 
 [flood_wait]
 kill_switch_enabled = true
@@ -224,7 +287,16 @@ daemon_api_slow_request_seconds = 2.5
     assert config.freshness.inbox == InboxConfig(deleted_message_visibility_seconds=42)
     assert config.freshness.entities == EntitiesConfig(42, 43, 44, 45)
     assert config.scheduling.folder_projection == FolderProjectionConfig(stale_after_seconds=46)
-    assert config.telemetry == TelemetryConfig(retention_ttl_seconds=47)
+    assert config.telemetry == TelemetryConfig(
+        retention_ttl_seconds=47,
+        runtime_observations=RuntimeObservationConfig(
+            prune_every_writes=48,
+            writer_busy_timeout_ms=49,
+            queue_capacity=50,
+            writer_startup_wait_seconds=1.5,
+            shutdown_drain_grace_seconds=2.5,
+        ),
+    )
     assert config.flood_wait == FloodWaitConfig(
         kill_switch_enabled=True,
         kill_switch_window_seconds=600,

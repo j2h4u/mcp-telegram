@@ -12,6 +12,7 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 from .flood import TelegramRpcThrottled
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_reading import GatewayFailure, GatewayFailureKind
+from .telegram_rpc_scheduler import RpcAdmissionClosedError, RpcAdmissionError, UnclassifiedTelegramRpcError
 
 CATCHABLE_GATEWAY_FAILURES = (Exception,)
 
@@ -24,15 +25,24 @@ class ScheduledHistoryClient(Protocol):
 
 def translate_gateway_failure(exc: BaseException) -> GatewayFailure:
     """Translate Telegram exceptions at the integration boundary."""
-    message = str(exc).replace("\n", "\\n") or type(exc).__name__
+    if isinstance(exc, RpcAdmissionClosedError):
+        raise exc
+    if isinstance(exc, (RpcAdmissionError, UnclassifiedTelegramRpcError)):
+        return GatewayFailure(
+            GatewayFailureKind.TRANSIENT,
+            "TelegramUnavailable",
+            "Telegram is temporarily unavailable; retry later",
+            True,
+        )
     if isinstance(exc, TelegramRpcThrottled):
         return GatewayFailure(
             GatewayFailureKind.FLOOD_WAIT,
-            type(exc).__name__,
-            message,
+            TelegramRpcThrottled.__name__,
+            "Telegram RPC throttled",
             not exc.latched,
             exc.retry_after_seconds,
         )
+    message = str(exc).replace("\n", "\\n") or type(exc).__name__
     if isinstance(exc, ACCESS_LOST_ERRORS):
         return GatewayFailure(GatewayFailureKind.ACCESS_LOST, type(exc).__name__, message, False)
     if isinstance(exc, ValueError):
@@ -48,6 +58,8 @@ async def fetch_scheduled_history_snapshot(
 
     The daemon-owned TelegramRpcGate configures Telethon's threshold to zero,
     so the gate owns account-wide flood admission and observation.
+    The scheduled reconciliation caller owns the ``SCHEDULED_MESSAGES`` scope;
+    this shared adapter deliberately inherits it.
     """
     input_entity = cast(TypeInputPeer, await client.get_input_entity(dialog_id))
     result = await client(GetScheduledHistoryRequest(peer=input_entity, hash=0))

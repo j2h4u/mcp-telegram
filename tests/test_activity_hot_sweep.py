@@ -29,7 +29,12 @@ from typing import cast
 
 import pytest
 
-from mcp_telegram.activity_hot_sweep import _HotSweepPeerOutcome, _log_recovered_messages, run_hot_sweep_pass
+from mcp_telegram.activity_hot_sweep import (
+    _HotSweepPeerOutcome,
+    _log_recovered_messages,
+    run_hot_sweep_loop,
+    run_hot_sweep_pass,
+)
 from mcp_telegram.activity_peer_sweep import (
     SkipReason,
     SweepResult,
@@ -40,6 +45,7 @@ from mcp_telegram.activity_peer_sweep import (
 )
 from mcp_telegram.config import ActivityHotSweepConfig
 from mcp_telegram.sync_db import _apply_migrations
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred
 
 _TEST_TIMEOUT_S = 120.0
 _POLICY = ActivityHotSweepConfig(jitter_max_seconds=0)
@@ -727,3 +733,110 @@ async def test_flood_halts_whole_pass_account_safety(monkeypatch: pytest.MonkeyP
         assert _get_state(conn, flood_first).get("hot_next_retry_at") is not None
         assert _get_state(conn, later_a).get("hot_next_retry_at") is None
         assert _get_state(conn, later_b).get("hot_next_retry_at") is None
+
+
+@pytest.mark.asyncio
+async def test_hot_loop_retries_admission_deferred_without_advancing_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _make_db() as conn:
+        dialog_id = -100100000099
+        now = int(time.time())
+        _enroll(conn, dialog_id, last_activity_at=now, hot_cursor=123)
+        pass_calls = 0
+        wait_timeouts: list[float] = []
+        shutdown = asyncio.Event()
+
+        async def deferred_then_success(*_args: object, **_kwargs: object) -> dict[str, int | float | bool | None]:
+            nonlocal pass_calls
+            pass_calls += 1
+            if pass_calls == 1:
+                raise TelegramRpcAdmissionDeferred(retry_after_seconds=7)
+            return {"genuinely_new": 0, "flood_wait_seconds": None}
+
+        async def fake_wait_for(awaitable: object, timeout: float) -> bool:
+            wait_timeouts.append(timeout)
+            if hasattr(awaitable, "close"):
+                awaitable.close()  # type: ignore[union-attr]
+            if len(wait_timeouts) == 1:
+                raise TimeoutError
+            if len(wait_timeouts) == 2:
+                shutdown.set()
+                return True
+            raise AssertionError("unexpected wait")
+
+        monkeypatch.setattr("mcp_telegram.activity_hot_sweep._run_hot_sweep_pass", deferred_then_success)
+        monkeypatch.setattr("mcp_telegram.activity_hot_sweep.asyncio.wait_for", fake_wait_for)
+
+        await run_hot_sweep_loop(
+            _FakeClient(),
+            conn,
+            shutdown,
+            policy=ActivityHotSweepConfig(loop_interval_seconds=1, jitter_max_seconds=0),
+            timeout_s=_TEST_TIMEOUT_S,
+        )
+
+        assert pass_calls == 2
+        assert wait_timeouts == [7, 1]
+        assert _get_state(conn, dialog_id)["hot_cursor"] == 123
+
+
+@pytest.mark.asyncio
+async def test_admission_deferred_preserves_partial_counters_and_retries_peer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _make_db() as conn:
+        first_peer = -100100000102
+        deferred_peer = -100100000101
+        now = int(time.time())
+        _enroll(conn, first_peer, last_activity_at=now)
+        _enroll(conn, deferred_peer, last_activity_at=now)
+        conn.execute("UPDATE activity_dialog_state SET hot_next_due_at = ?", (now - 1,))
+        conn.commit()
+        _patch_build_working_set(monkeypatch)
+
+        deferred_once = True
+        call_log: list[int] = []
+
+        async def sweep(
+            *args: object,
+            **_kwargs: object,
+        ) -> SweepResult:
+            nonlocal deferred_once
+            dialog_id = cast(int, args[2])
+            call_log.append(dialog_id)
+            if dialog_id == deferred_peer and deferred_once:
+                deferred_once = False
+                raise TelegramRpcAdmissionDeferred(retry_after_seconds=9)
+            result = _make_sweep_result([dialog_id * -1])
+            result.genuinely_new_keys = frozenset({(dialog_id, dialog_id * -1)})
+            return result
+
+        monkeypatch.setattr("mcp_telegram.activity_hot_sweep.sweep_peer_once", sweep)
+        policy = ActivityHotSweepConfig(max_peers_per_pass=2, jitter_max_seconds=0)
+        shutdown = asyncio.Event()
+
+        first_telemetry = await run_hot_sweep_pass(
+            _FakeClient(), conn, shutdown, policy=policy, timeout_s=_TEST_TIMEOUT_S
+        )
+
+        assert first_telemetry["peers_selected"] == 2
+        assert first_telemetry["peers_processed"] == 1
+        assert first_telemetry["pages_fetched"] == 1
+        assert first_telemetry["rpc_calls"] == 2
+        assert first_telemetry["extracted"] == 1
+        assert first_telemetry["genuinely_new"] == 1
+        assert first_telemetry["admission_deferred"] is True
+        assert first_telemetry["retry_after_seconds"] == 9
+        assert _get_state(conn, first_peer)["hot_cursor"] == 100100000102
+        assert _get_state(conn, deferred_peer)["hot_cursor"] is None
+
+        second_telemetry = await run_hot_sweep_pass(
+            _FakeClient(), conn, shutdown, policy=policy, timeout_s=_TEST_TIMEOUT_S
+        )
+
+        assert second_telemetry["peers_selected"] == 1
+        assert second_telemetry["peers_processed"] == 1
+        assert second_telemetry["admission_deferred"] is False
+        assert _get_state(conn, deferred_peer)["hot_cursor"] == 100100000101
+        assert call_log == [first_peer, deferred_peer, deferred_peer]

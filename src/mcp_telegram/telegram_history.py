@@ -15,6 +15,8 @@ class _TelegramClientLike(Protocol):
 
 
 class TelethonTelegramHistoryGateway:
+    """Shared history adapter; the interactive reading caller owns its RPC scope."""
+
     def __init__(self, client: object) -> None:
         self._client = cast(_TelegramClientLike, client)
 
