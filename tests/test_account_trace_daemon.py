@@ -33,6 +33,7 @@ from mcp_telegram.daemon_account_trace import (
     DaemonAccountTraceService,
     _build_trace_coverage,
     _LoggerLike,
+    _TraceCoverageBuildRequest,
     _TraceCoverageFragmentUpsertRequest,
     _upsert_trace_coverage_fragment,
 )
@@ -428,12 +429,52 @@ def test_trace_coverage_counts_access_lost_as_gap(
     seed_synced_dialog(conn, dialog_id=-100123, status="access_lost")
     conn.commit()
 
-    coverage = _build_trace_coverage(conn, 101, [])
+    coverage = _build_trace_coverage(
+        _TraceCoverageBuildRequest(conn=conn, target_user_id=101, rows=[], coverage_goal="best_effort_visible")
+    )
 
     assert coverage["state"] == "partial"
     assert coverage["dialogs_considered"] == 1
     assert coverage["dialogs_considered_basis"] == "evidence_or_fragments_or_access_lost"
     assert coverage["dialogs_with_gaps"] == 1
+
+
+def test_trace_observed_coverage_ignores_unrelated_historical_failures(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
+    _server, conn, _client = trace_server
+    seed_synced_dialog(conn, dialog_id=-100123, status="access_lost")
+    seed_synced_dialog(conn, dialog_id=-100124, status="synced")
+    _upsert_trace_coverage_fragment(
+        _TraceCoverageFragmentUpsertRequest(
+            conn=conn,
+            target_user_id=101,
+            dialog_id=-100125,
+            status="flood_wait",
+            next_retry_at=1_700_000_120,
+        )
+    )
+    conn.commit()
+
+    coverage = _build_trace_coverage(
+        _TraceCoverageBuildRequest(
+            conn=conn,
+            target_user_id=101,
+            rows=[{"dialog_id": -100124}],
+            coverage_goal="observed",
+        )
+    )
+
+    assert coverage == {
+        "state": "complete",
+        "observed_message_count": 1,
+        "dialogs_considered": 1,
+        "dialogs_considered_basis": "returned_evidence_dialogs",
+        "dialogs_with_hits": 1,
+        "dialogs_with_gaps": 0,
+        "as_of": coverage["as_of"],
+    }
 
 
 def test_trace_coverage_marks_fragment_and_own_only_partial(
@@ -445,8 +486,12 @@ def test_trace_coverage_marks_fragment_and_own_only_partial(
     seed_synced_dialog(conn, dialog_id=-100124, status="own_only")
     conn.commit()
 
-    fragment_coverage = _build_trace_coverage(conn, 101, [], exact_dialog_id=-100123)
-    own_only_coverage = _build_trace_coverage(conn, 101, [], exact_dialog_id=-100124)
+    fragment_coverage = _build_trace_coverage(
+        _TraceCoverageBuildRequest(conn=conn, target_user_id=101, rows=[], exact_dialog_id=-100123)
+    )
+    own_only_coverage = _build_trace_coverage(
+        _TraceCoverageBuildRequest(conn=conn, target_user_id=101, rows=[], exact_dialog_id=-100124)
+    )
 
     assert fragment_coverage["state"] == "partial"
     assert fragment_coverage["dialogs_considered"] == 1
@@ -463,7 +508,9 @@ def test_trace_coverage_exact_dialog_scope_counts_only_that_dialog(
     seed_synced_dialog(conn, dialog_id=-100124, status="synced")
     conn.commit()
 
-    coverage = _build_trace_coverage(conn, 101, [], exact_dialog_id=-100123)
+    coverage = _build_trace_coverage(
+        _TraceCoverageBuildRequest(conn=conn, target_user_id=101, rows=[], exact_dialog_id=-100123)
+    )
 
     assert coverage["state"] == "complete"
     assert coverage["dialogs_considered"] == 1
@@ -479,7 +526,7 @@ def test_trace_coverage_unscoped_zero_hit_does_not_count_every_synced_dialog(
     seed_synced_dialog(conn, dialog_id=-100124, status="synced")
     conn.commit()
 
-    coverage = _build_trace_coverage(conn, 101, [])
+    coverage = _build_trace_coverage(_TraceCoverageBuildRequest(conn=conn, target_user_id=101, rows=[]))
 
     assert coverage["state"] == "unknown"
     assert coverage["dialogs_considered"] == 0
@@ -765,6 +812,143 @@ async def test_trace_includes_outgoing_dm_effective_sender(
     assert evidence[0]["message_id"] == 10
     assert evidence[0]["effective_sender_id"] == 101
     assert evidence[0]["authorship_basis"] == "effective_sender_id"
+
+
+@pytest.mark.asyncio
+async def test_unscoped_trace_omits_target_direct_chat_but_explicit_scope_keeps_it(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
+    _server, conn, _client = trace_server
+    seed_entity(conn, entity_id=101, name="Alice", username="alice")
+    seed_dialog(conn, dialog_id=101, name="Alice", dialog_type="User")
+    seed_dialog(conn, dialog_id=-100123, name="Group", dialog_type="Supergroup")
+    seed_synced_dialog(conn, dialog_id=101)
+    seed_synced_dialog(conn, dialog_id=-100123)
+    seed_message(conn, dialog_id=101, message_id=1, sent_at=20, sender_id=101, text="direct")
+    seed_message(conn, dialog_id=-100123, message_id=2, sent_at=10, sender_id=101, text="group")
+    conn.commit()
+
+    unscoped = _dict(await trace_service._trace_account_messages({"exact_account_id": 101}))
+    scoped = _dict(await trace_service._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": 101}))
+
+    unscoped_data = _dict(unscoped["data"])
+    unscoped_evidence = cast(
+        list[dict[str, object]], cast(list[dict[str, object]], unscoped_data["groups"])[0]["evidence"]
+    )
+    scoped_data = _dict(scoped["data"])
+    scoped_evidence = cast(list[dict[str, object]], cast(list[dict[str, object]], scoped_data["groups"])[0]["evidence"])
+    assert [(item["dialog_id"], item["text"]) for item in unscoped_evidence] == [(-100123, "group")]
+    assert _dict(unscoped_data["provenance"])["direct_chat_excluded"] is True
+    assert [(item["dialog_id"], item["text"]) for item in scoped_evidence] == [(101, "direct")]
+    assert _dict(scoped_data["provenance"])["direct_chat_excluded"] is False
+
+
+@pytest.mark.asyncio
+async def test_unscoped_trace_paginates_across_excluded_direct_chat(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
+    _server, conn, _client = trace_server
+    seed_entity(conn, entity_id=101, name="Alice", username="alice")
+    seed_dialog(conn, dialog_id=101, name="Alice", dialog_type="User")
+    seed_dialog(conn, dialog_id=-100123, name="New Group", dialog_type="Supergroup")
+    seed_dialog(conn, dialog_id=-100124, name="Old Group", dialog_type="Supergroup")
+    seed_message(conn, dialog_id=-100123, message_id=1, sent_at=30, sender_id=101, text="new group")
+    seed_message(conn, dialog_id=101, message_id=2, sent_at=20, sender_id=101, text="direct")
+    seed_message(conn, dialog_id=-100124, message_id=3, sent_at=10, sender_id=101, text="old group")
+    conn.commit()
+
+    first = _dict(await trace_service._trace_account_messages({"exact_account_id": 101, "limit": 1}))
+    first_data = _dict(first["data"])
+    first_groups = cast(list[dict[str, object]], first_data["groups"])
+    first_evidence = cast(list[dict[str, object]], first_groups[0]["evidence"])
+    navigation = first_data["next_navigation"]
+
+    assert [(item["dialog_id"], item["message_id"]) for item in first_evidence] == [(-100123, 1)]
+    assert isinstance(navigation, str)
+
+    second = _dict(
+        await trace_service._trace_account_messages({"exact_account_id": 101, "limit": 1, "navigation": navigation})
+    )
+    second_data = _dict(second["data"])
+    second_groups = cast(list[dict[str, object]], second_data["groups"])
+    second_evidence = cast(list[dict[str, object]], second_groups[0]["evidence"])
+
+    assert [(item["dialog_id"], item["message_id"]) for item in second_evidence] == [(-100124, 3)]
+    assert second_data["next_navigation"] is None
+
+
+@pytest.mark.asyncio
+async def test_observed_trace_reports_only_current_evidence_dialog_problems(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
+    _server, conn, _client = trace_server
+    seed_entity(conn, entity_id=101, name="Alice", username="alice")
+    seed_dialog(conn, dialog_id=-100123, name="Current", dialog_type="Supergroup", hidden=1)
+    seed_dialog(conn, dialog_id=-100124, name="Historical Hidden", dialog_type="Supergroup", hidden=1)
+    seed_synced_dialog(conn, dialog_id=-100123, status="access_lost")
+    seed_synced_dialog(conn, dialog_id=-100124, status="access_lost")
+    seed_synced_dialog(conn, dialog_id=-100125, status="own_only")
+    seed_trace_fragment(conn, target_user_id=101, dialog_id=-100126, status="flood_wait")
+    seed_trace_fragment(conn, target_user_id=101, dialog_id=-100127, status="budget_exceeded")
+    seed_message(conn, dialog_id=-100123, message_id=1, sent_at=10, sender_id=101, text="current")
+    conn.commit()
+
+    result = _dict(await trace_service._trace_account_messages({"exact_account_id": 101}))
+    data = _dict(result["data"])
+    gaps = cast(list[dict[str, object]], data["gaps"])
+
+    assert _dict(data["coverage"])["dialogs_considered"] == 1
+    assert {gap["kind"] for gap in gaps} == {"access_lost", "hidden_dialog"}
+    assert {gap.get("dialog_id") for gap in gaps} == {-100123}
+
+
+@pytest.mark.asyncio
+async def test_best_effort_keeps_broad_warnings_but_excludes_direct_chat(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _server, conn, _client = trace_server
+    seed_entity(conn, entity_id=101, name="Alice", username="alice")
+    seed_dialog(conn, dialog_id=101, name="Alice", dialog_type="User")
+    seed_dialog(conn, dialog_id=-100123, name="Lost Group", dialog_type="Supergroup")
+    seed_synced_dialog(conn, dialog_id=101, status="synced")
+    seed_synced_dialog(conn, dialog_id=-100123, status="access_lost")
+    seed_synced_dialog(conn, dialog_id=-100124, status="synced")
+    seed_trace_fragment(conn, target_user_id=101, dialog_id=101, status="flood_wait")
+    seed_trace_fragment(conn, target_user_id=101, dialog_id=-100124, status="budget_exceeded")
+    conn.commit()
+
+    enrich = AsyncMock(
+        return_value={
+            "dialogs_attempted": 0,
+            "dialogs_skipped": 0,
+            "messages_seen": 0,
+            "messages_persisted": 0,
+            "duplicates_skipped": 0,
+            "deadline_ms": 15_000,
+            "concurrency": 2,
+            "coverage_bounds": {"max_dialogs": 10, "max_per_dialog": 100, "deadline_ms": 15_000},
+            "fragment_status_counts": {},
+        }
+    )
+    monkeypatch.setattr(DaemonAccountTraceService, "_trace_enrich_visible_dialogs", enrich)
+
+    result = _dict(
+        await trace_service._trace_account_messages({"exact_account_id": 101, "coverage_goal": "best_effort_visible"})
+    )
+    data = _dict(result["data"])
+    gaps = cast(list[dict[str, object]], data["gaps"])
+    await_args = enrich.await_args
+    assert await_args is not None
+    candidates = cast(list[dict[str, object]], await_args.args[1])
+
+    assert all(candidate["dialog_id"] != 101 for candidate in candidates)
+    assert {gap["kind"] for gap in gaps} == {"access_lost", "budget_exceeded"}
+    assert {gap.get("dialog_id") for gap in gaps} == {-100123, -100124}
 
 
 @pytest.mark.asyncio

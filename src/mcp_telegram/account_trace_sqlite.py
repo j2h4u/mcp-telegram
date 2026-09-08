@@ -72,6 +72,7 @@ class TraceMessageQueryRequest:
     sent_before_ts: int | None = None
     navigation: dict[str, int] | None = None
     scope_dialog_ids: list[int] | None = None
+    direct_chat_excluded: bool = False
 
 
 class TraceDialogMetadata(TypedDict):
@@ -124,32 +125,7 @@ def build_evidence_query(request: TraceMessageQueryRequest) -> tuple[str, dict[s
         "self_id": request.self_id,
         "limit": request.limit,
     }
-    candidate_queries = [
-        (
-            "SELECT dialog_id, message_id FROM messages "
-            "WHERE is_deleted = 0 AND is_service = 0 AND sender_id = :target_user_id"
-        ),
-        (
-            "SELECT dialog_id, message_id FROM messages "
-            "WHERE is_deleted = 0 AND is_service = 0 AND sender_id IS NULL "
-            "AND dialog_id > 0 AND out = 0 AND dialog_id = :target_user_id"
-        ),
-        (
-            "SELECT dialog_id, message_id FROM messages "
-            "WHERE is_deleted = 0 AND is_service = 0 AND sender_id IS NULL "
-            "AND dialog_id > 0 AND out = 1 AND :self_id = :target_user_id"
-        ),
-    ]
-    aliases = request.post_author_aliases or []
-    if aliases:
-        alias_params = ", ".join(f":post_author_alias_{index}" for index in range(len(aliases)))
-        candidate_queries.append(
-            "SELECT dialog_id, message_id FROM messages "
-            "WHERE is_deleted = 0 AND is_service = 0 "
-            f"AND post_author IN ({alias_params})"
-        )
-        for index, alias in enumerate(aliases):
-            params[f"post_author_alias_{index}"] = alias
+    candidate_queries = _trace_candidate_queries(request, params)
     sql = (
         f"WITH candidate_messages AS ({' UNION '.join(candidate_queries)}) "
         "SELECT m.dialog_id, m.message_id, m.sent_at, m.text, m.sender_id, "
@@ -169,13 +145,65 @@ def build_evidence_query(request: TraceMessageQueryRequest) -> tuple[str, dict[s
         "LEFT JOIN topic_metadata tm ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
         "WHERE 1 = 1"
     )
+    sql = _apply_trace_query_scope(sql, params, request)
+    sql = _apply_trace_query_bounds(sql, params, request)
+    return sql + " ORDER BY m.sent_at DESC, m.dialog_id DESC, m.message_id DESC LIMIT :limit", params
+
+
+def _trace_candidate_queries(request: TraceMessageQueryRequest, params: dict[str, object]) -> list[str]:
+    queries = [
+        (
+            "SELECT dialog_id, message_id FROM messages "
+            "WHERE is_deleted = 0 AND is_service = 0 AND sender_id = :target_user_id"
+        ),
+        (
+            "SELECT dialog_id, message_id FROM messages "
+            "WHERE is_deleted = 0 AND is_service = 0 AND sender_id IS NULL "
+            "AND dialog_id > 0 AND out = 0 AND dialog_id = :target_user_id"
+        ),
+        (
+            "SELECT dialog_id, message_id FROM messages "
+            "WHERE is_deleted = 0 AND is_service = 0 AND sender_id IS NULL "
+            "AND dialog_id > 0 AND out = 1 AND :self_id = :target_user_id"
+        ),
+    ]
+    aliases = request.post_author_aliases or []
+    if not aliases:
+        return queries
+    alias_params = ", ".join(f":post_author_alias_{index}" for index in range(len(aliases)))
+    queries.append(
+        "SELECT dialog_id, message_id FROM messages "
+        "WHERE is_deleted = 0 AND is_service = 0 "
+        f"AND post_author IN ({alias_params})"
+    )
+    for index, alias in enumerate(aliases):
+        params[f"post_author_alias_{index}"] = alias
+    return queries
+
+
+def _apply_trace_query_scope(
+    sql: str,
+    params: dict[str, object],
+    request: TraceMessageQueryRequest,
+) -> str:
     if request.scope_dialog_ids:
         placeholders = [f":scope_{index}" for index in range(len(request.scope_dialog_ids))]
-        sql += f" AND m.dialog_id IN ({', '.join(placeholders)})"
         params.update({f"scope_{index}": dialog_id for index, dialog_id in enumerate(request.scope_dialog_ids)})
-    elif request.exact_dialog_id is not None:
-        sql += " AND m.dialog_id = :exact_dialog_id"
+        return sql + f" AND m.dialog_id IN ({', '.join(placeholders)})"
+    if request.exact_dialog_id is not None:
         params["exact_dialog_id"] = request.exact_dialog_id
+        sql += " AND m.dialog_id = :exact_dialog_id"
+    if request.direct_chat_excluded:
+        params["direct_chat_excluded"] = request.direct_chat_excluded
+        sql += " AND (:direct_chat_excluded = 0 OR m.dialog_id != :target_user_id)"
+    return sql
+
+
+def _apply_trace_query_bounds(
+    sql: str,
+    params: dict[str, object],
+    request: TraceMessageQueryRequest,
+) -> str:
     if request.exact_topic_id is not None:
         sql += " AND m.forum_topic_id = :exact_topic_id"
         params["exact_topic_id"] = request.exact_topic_id
@@ -185,16 +213,17 @@ def build_evidence_query(request: TraceMessageQueryRequest) -> tuple[str, dict[s
     if request.sent_before_ts is not None:
         sql += " AND m.sent_at <= :sent_before"
         params["sent_before"] = request.sent_before_ts
-    if request.navigation is not None:
-        sql += " AND (m.sent_at < :nav_sent_at OR (m.sent_at = :nav_sent_at AND m.dialog_id < :nav_dialog_id) OR (m.sent_at = :nav_sent_at AND m.dialog_id = :nav_dialog_id AND m.message_id < :nav_message_id))"
-        params.update(
-            {
-                "nav_sent_at": request.navigation["sent_at"],
-                "nav_dialog_id": request.navigation["dialog_id"],
-                "nav_message_id": request.navigation["message_id"],
-            }
-        )
-    return sql + " ORDER BY m.sent_at DESC, m.dialog_id DESC, m.message_id DESC LIMIT :limit", params
+    if request.navigation is None:
+        return sql
+    sql += " AND (m.sent_at < :nav_sent_at OR (m.sent_at = :nav_sent_at AND m.dialog_id < :nav_dialog_id) OR (m.sent_at = :nav_sent_at AND m.dialog_id = :nav_dialog_id AND m.message_id < :nav_message_id))"
+    params.update(
+        {
+            "nav_sent_at": request.navigation["sent_at"],
+            "nav_dialog_id": request.navigation["dialog_id"],
+            "nav_message_id": request.navigation["message_id"],
+        }
+    )
+    return sql
 
 
 def account_by_id(conn: sqlite3.Connection, account_id: int) -> Mapping[str, object] | None:

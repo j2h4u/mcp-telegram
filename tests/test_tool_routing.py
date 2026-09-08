@@ -716,6 +716,7 @@ STRUCTURED_TOOL_CASES = {
                     "authorship_basis_counts": {"effective_sender_id": 1},
                     "dialogs_considered_basis": "evidence_or_fragments_or_access_lost",
                     "local_cache_writes": 0,
+                    "direct_chat_excluded": True,
                 },
                 "next_navigation": None,
             },
@@ -1740,6 +1741,7 @@ class _TraceDaemonPayloadOptions:
     account_id: int | None = 101
     coverage_goal: str = "observed"
     local_cache_writes: int = 0
+    direct_chat_excluded: bool = False
 
 
 def _trace_daemon_payload(*, opts: _TraceDaemonPayloadOptions | None = None, **kwargs: object) -> dict:
@@ -1784,6 +1786,7 @@ def _trace_daemon_payload(*, opts: _TraceDaemonPayloadOptions | None = None, **k
                 "authorship_basis_counts": {"effective_sender_id": 2} if opts.groups else {},
                 "dialogs_considered_basis": "exact_dialog_scope" if opts.groups else "none",
                 "local_cache_writes": opts.local_cache_writes,
+                "direct_chat_excluded": opts.direct_chat_excluded,
             },
             "next_navigation": None,
         },
