@@ -1183,6 +1183,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
             slow_request_seconds=config.logging.daemon_api_slow_request_seconds,
             entity_profile=RefreshLimits(
                 foreground_resolve_seconds=config.entity_profile.foreground_resolve_seconds,
+                foreground_refresh_wait_seconds=config.entity_profile.foreground_refresh_wait_seconds,
                 per_rpc_seconds=config.entity_profile.rpc_timeout_seconds,
                 whole_refresh_seconds=config.entity_profile.refresh_timeout_seconds,
                 max_concurrent_refreshes=config.entity_profile.max_concurrent_refreshes,

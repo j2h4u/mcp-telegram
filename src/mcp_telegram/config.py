@@ -17,7 +17,7 @@ _MAX_FACT_HYDRATION_BATCH_SIZE = 100
 _MAX_TELEGRAM_RPC_SCHEDULER_WEIGHT = 100
 _MAX_TELEMETRY_WRITER_BUSY_TIMEOUT_MS = 50
 ENTITY_PROFILE_DAEMON_TIMEOUT_SECONDS: Final[float] = 30.0
-ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS: Final[float] = 5.0
+ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS: Final[float] = 20.0
 ENTITY_PROFILE_RPC_TIMEOUT_CAP_SECONDS: Final[float] = 8.0
 ENTITY_PROFILE_REFRESH_TIMEOUT_CAP_SECONDS: Final[float] = 25.0
 
@@ -69,6 +69,7 @@ class EntityProfileConfig:
     """Budgets for the progressive entity-profile projection."""
 
     foreground_resolve_seconds: float = 3.0
+    foreground_refresh_wait_seconds: float = 15.0
     rpc_timeout_seconds: float = 8.0
     refresh_timeout_seconds: float = 25.0
     max_concurrent_refreshes: int = 1
@@ -82,6 +83,7 @@ class EntityProfileConfig:
     def _validate_durations(self) -> None:
         durations = (
             self.foreground_resolve_seconds,
+            self.foreground_refresh_wait_seconds,
             self.rpc_timeout_seconds,
             self.refresh_timeout_seconds,
         )
@@ -89,10 +91,15 @@ class EntityProfileConfig:
             raise ValueError("entity profile budgets must be finite and positive")
         if self.foreground_resolve_seconds > self.rpc_timeout_seconds:
             raise ValueError("entity profile foreground budget cannot exceed RPC budget")
+        if self.foreground_refresh_wait_seconds > self.refresh_timeout_seconds:
+            raise ValueError("entity profile foreground refresh wait cannot exceed refresh budget")
         if self.rpc_timeout_seconds > self.refresh_timeout_seconds:
             raise ValueError("entity profile RPC budget cannot exceed refresh budget")
-        if self.foreground_resolve_seconds > ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS:
-            raise ValueError("entity profile foreground budget cannot exceed endpoint budget")
+        if (
+            self.foreground_resolve_seconds + self.foreground_refresh_wait_seconds
+            > ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS
+        ):
+            raise ValueError("entity profile foreground budgets cannot exceed endpoint budget")
 
     def _validate_caps(self) -> None:
         if self.refresh_timeout_seconds >= ENTITY_PROFILE_DAEMON_TIMEOUT_SECONDS:
@@ -915,6 +922,7 @@ def _parse_entity_profile(data: dict[str, object], path: Path) -> EntityProfileC
         section,
         {
             "foreground_resolve_seconds",
+            "foreground_refresh_wait_seconds",
             "rpc_timeout_seconds",
             "refresh_timeout_seconds",
             "max_concurrent_refreshes",
@@ -928,6 +936,13 @@ def _parse_entity_profile(data: dict[str, object], path: Path) -> EntityProfileC
         return EntityProfileConfig(
             foreground_resolve_seconds=_positive_float(
                 section, "foreground_resolve_seconds", "entity_profile", path, defaults.foreground_resolve_seconds
+            ),
+            foreground_refresh_wait_seconds=_positive_float(
+                section,
+                "foreground_refresh_wait_seconds",
+                "entity_profile",
+                path,
+                defaults.foreground_refresh_wait_seconds,
             ),
             rpc_timeout_seconds=_positive_float(
                 section, "rpc_timeout_seconds", "entity_profile", path, defaults.rpc_timeout_seconds

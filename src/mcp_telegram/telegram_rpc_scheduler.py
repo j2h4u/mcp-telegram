@@ -104,7 +104,7 @@ RPC_SOURCE_SERVICE_CLASS: Mapping[TelegramRpcSource, RpcServiceClass] = {
     TelegramRpcSource.DIALOG_RESOLUTION: RpcServiceClass.INTERACTIVE,
     TelegramRpcSource.TOPIC_RESOLUTION: RpcServiceClass.INTERACTIVE,
     TelegramRpcSource.ENTITY_INFO_FOREGROUND: RpcServiceClass.INTERACTIVE,
-    TelegramRpcSource.ENTITY_INFO_REFRESH: RpcServiceClass.INTERACTIVE,
+    TelegramRpcSource.ENTITY_INFO_REFRESH: RpcServiceClass.BACKGROUND,
     TelegramRpcSource.ACCOUNT_TRACE: RpcServiceClass.INTERACTIVE,
     TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE: RpcServiceClass.LIVE_SYNC,
     TelegramRpcSource.RECONNECT_DIFFERENCE: RpcServiceClass.LIVE_SYNC,

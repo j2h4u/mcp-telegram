@@ -31,10 +31,12 @@ class RefreshLimits:
     whole_refresh_seconds: float = 25.0
     max_concurrent_refreshes: int = 1
     max_queued_refreshes: int = 128
+    foreground_refresh_wait_seconds: float = 15.0
 
     def __post_init__(self) -> None:
         for name, value in (
             ("foreground resolve budget", self.foreground_resolve_seconds),
+            ("foreground refresh wait", self.foreground_refresh_wait_seconds),
             ("per-RPC budget", self.per_rpc_seconds),
             ("whole-refresh budget", self.whole_refresh_seconds),
         ):
@@ -87,6 +89,7 @@ class EntityRefreshCoordinator:
         self._pending_entities: set[int] = set()
         self._active_entities: set[int] = set()
         self._workers: set[asyncio.Task[None]] = set()
+        self._completion_events: dict[int, asyncio.Event] = {}
         self._wake = asyncio.Event()
         self._closed = False
 
@@ -115,6 +118,7 @@ class EntityRefreshCoordinator:
             return RefreshEnqueueResult.REJECTED
 
         item = _RefreshItem(entity_id, loop.time() + self._limits.whole_refresh_seconds)
+        self._completion_events[entity_id] = asyncio.Event()
         self._queue.append(item)
         self._pending_entities.add(entity_id)
         self._ensure_workers()
@@ -132,6 +136,18 @@ class EntityRefreshCoordinator:
             )
             self._workers.add(task)
             task.add_done_callback(self._worker_done)
+
+    async def wait_for_completion(self, entity_id: int, timeout_seconds: float) -> bool:
+        """Wait for an admitted single-flight refresh without cancelling it on timeout."""
+        event = self._completion_events.get(entity_id)
+        if event is None:
+            return True
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                await event.wait()
+        except TimeoutError:
+            return False
+        return True
 
     def _worker_done(self, task: asyncio.Task[None]) -> None:
         self._workers.discard(task)
@@ -156,6 +172,9 @@ class EntityRefreshCoordinator:
         self._queue = retained
         for item in expired:
             self._report_failure(item.entity_id, TimeoutError("entity profile refresh expired in queue"))
+            event = self._completion_events.pop(item.entity_id, None)
+            if event is not None:
+                event.set()
 
     async def run_rpc[T](self, operation: Callable[[], Awaitable[T]]) -> T:
         """Apply the per-RPC budget to an operation owned by a refresh."""
@@ -176,6 +195,9 @@ class EntityRefreshCoordinator:
                 await self._run(item)
             finally:
                 self._active_entities.discard(item.entity_id)
+                event = self._completion_events.pop(item.entity_id, None)
+                if event is not None:
+                    event.set()
 
     async def _run(self, item: _RefreshItem) -> None:
         loop = asyncio.get_running_loop()
@@ -205,6 +227,9 @@ class EntityRefreshCoordinator:
         self._closed = True
         self._queue.clear()
         self._pending_entities.clear()
+        for event in self._completion_events.values():
+            event.set()
+        self._completion_events.clear()
         self._wake.set()
         workers = tuple(self._workers)
         if workers:

@@ -21,6 +21,7 @@ from mcp_telegram.sync_db import (
     _apply_migration_54,
     _apply_migration_55,
     _apply_migration_56,
+    _apply_migration_58,
     _open_sync_db,
     ensure_sync_schema,
 )
@@ -709,7 +710,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 57
+        assert _CURRENT_SCHEMA_VERSION == 58
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1440,7 +1441,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 57
+        assert _CURRENT_SCHEMA_VERSION == 58
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:
@@ -2346,3 +2347,28 @@ def test_v56_adds_stable_tool_telemetry_identity(tmp_path: Path) -> None:
         )
         assert row == ("conversation_changes", 0)
         assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=56") == (56,)
+
+
+def test_v58_adds_account_trace_author_indexes(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute("DROP INDEX idx_messages_account_trace_sender")
+        conn.execute("DROP INDEX idx_messages_account_trace_post_author")
+        conn.execute("DELETE FROM schema_version WHERE version=58")
+        conn.commit()
+
+        _apply_migration_58(conn, 57)
+
+        indexes = {
+            str(row[0])
+            for row in _fetchall_rows(
+                conn,
+                "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_messages_account_trace_%'",
+            )
+        }
+        assert indexes == {
+            "idx_messages_account_trace_sender",
+            "idx_messages_account_trace_post_author",
+        }
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=58") == (58,)

@@ -8,6 +8,7 @@ from typing import cast
 import pytest
 from devtools.mcp_client.cli import print_json, redact_script_output
 from devtools.mcp_client.client import (
+    DEFAULT_TIMEOUT_SECONDS,
     _assert_step_expectations,
     load_script_steps,
 )
@@ -17,6 +18,10 @@ from mcp_telegram import server
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def test_mcp_test_client_timeout_covers_bounded_long_running_tools() -> None:
+    assert DEFAULT_TIMEOUT_SECONDS == 30.0
 
 
 def test_mcp_test_client_prints_utf8_without_json_ascii_escapes(capsys: pytest.CaptureFixture[str]) -> None:
