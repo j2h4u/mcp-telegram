@@ -213,7 +213,7 @@ def test_runtime_observation_sink_logs_aggregate_queue_overflow(
     sink.close()
 
     assert sink.queue_full_drops > 0
-    assert "runtime_observation_sink_summary" in caplog.text
+    assert caplog.text.count("runtime_observation_sink_summary") == 1
 
 
 @pytest.mark.asyncio
