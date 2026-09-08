@@ -36,6 +36,7 @@ from mcp_telegram.delta_sync import (
 )
 from mcp_telegram.history_enrollment import disable_history
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.telegram_rpc_scheduler import RpcAdmissionSaturatedError, current_rpc_scope
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -245,6 +246,34 @@ async def test_delta_fills_gap(
     ).fetchall()
     ids = [r[0] for r in rows]
     assert ids == [100, 101, 102, 103]
+
+
+@pytest.mark.asyncio
+async def test_admission_rejection_defers_without_delta_checkpoint(
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 60003
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', 41)",
+        (dialog_id,),
+    )
+    sync_db.execute("INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 100, 1)", (dialog_id,))
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
+    sync_db.commit()
+
+    async def reject(**_kwargs: object) -> AsyncIterator[object]:
+        raise RpcAdmissionSaturatedError(current_rpc_scope(), "delta capacity is full")
+        yield
+
+    mock_client.iter_messages = reject
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+
+    assert await worker.fetch_delta_for_dialog(dialog_id) == 0
+    assert sync_db.execute(
+        "SELECT last_synced_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)
+    ).fetchone() == (41, None)
 
 
 @pytest.mark.asyncio

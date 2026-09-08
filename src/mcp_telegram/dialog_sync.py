@@ -34,8 +34,10 @@ import json
 import logging
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 from typing import Protocol, TypeVar, cast
 
@@ -54,11 +56,30 @@ from .maintenance_logging import log_maintenance_cycle
 from .read_state import apply_read_cursor
 from .sync_db import _open_sync_db
 from .telegram_access import ACCESS_LOST_ERRORS
+from .telegram_rpc_scheduler import (
+    RpcAdmissionClosedError,
+    RpcAdmissionExpiredError,
+    RpcAdmissionSaturatedError,
+    TelegramRpcAdmissionDeferred,
+    TelegramRpcSource,
+    rpc_scope,
+)
 from .topics.contracts import TopicSourceUnavailableError, is_topic_capable
 from .topics.refresh import TopicRefresher
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
+
+
+def _dialog_sync_rpc_scope[**P, R](func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+    """Give dialog snapshots and reconciliation an explicit RPC source."""
+
+    @wraps(func)
+    async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+        with rpc_scope(TelegramRpcSource.DIALOG_SYNC):
+            return await func(*args, **kwargs)
+
+    return wrapped
 
 
 class _EntityLike(Protocol):
@@ -128,6 +149,18 @@ class _ForumTopicsResultLike(Protocol):
 
 _BootstrapRow = dict[str, object]
 _EntityFields = dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class _BootstrapAttemptResult:
+    count: int
+    continue_sweep: bool = False
+    completed: bool = False
+
+
+@dataclass(slots=True)
+class _BootstrapAttempt:
+    count: int
 
 
 class _DialogSyncClient(Protocol):
@@ -602,12 +635,93 @@ class DialogsBootstrapWorker:
         await sleep_through_flood(self._shutdown_event, wait_s)
         return count
 
+    async def _consume_bootstrap_attempt(self, attempt: _BootstrapAttempt) -> bool:
+        """Consume one iterator pass and report whether it drained normally."""
+        offset_date, offset_id, offset_peer = self._reconstruct_cursor()
+        async for dialog in self._client.iter_dialogs(
+            offset_date=offset_date,
+            offset_id=offset_id,
+            offset_peer=offset_peer if offset_peer is not None else types.InputPeerEmpty(),
+        ):
+            if self._shutdown_event.is_set():
+                logger.info("bootstrap_sweep shutdown signal received — exiting (count=%d)", attempt.count)
+                return False
+
+            snapshot_at = int(time.time())
+            self._checkpoint_dialog(dialog, _extract_dialog_row(dialog, snapshot_at))
+            attempt.count += 1
+            if attempt.count % _PROGRESS_REPORT_EVERY == 0:
+                self._set_detail(f"bootstrap sweep: {attempt.count} dialogs processed")
+        return True
+
+    async def _handle_bootstrap_admission_deferred(
+        self, exc: TelegramRpcAdmissionDeferred, count: int
+    ) -> _BootstrapAttemptResult:
+        wait_s = exc.retry_after_seconds or 1
+        logger.info(
+            "bootstrap_sweep admission_deferred retry_after=%s processed_so_far=%d — preserving cursor",
+            wait_s,
+            count,
+        )
+        self._set_detail(f"bootstrap sweep: admission deferred {wait_s}s (processed {count})")
+        return _BootstrapAttemptResult(
+            count,
+            continue_sweep=not await sleep_through_flood(self._shutdown_event, wait_s),
+        )
+
+    def _checkpoint_dialog(self, dialog: _DialogLike, row: _BootstrapRow) -> None:
+        """Persist one dialog and its resume cursor atomically."""
+        with self._conn:
+            self._conn.execute(_UPSERT_DIALOG_SQL, row)
+            _apply_dialog_read_cursors(self._conn, dialog)
+            dialog_date = dialog.date
+            _set_state(
+                self._conn,
+                _KEY_OFFSET_DATE,
+                dialog_date.isoformat() if dialog_date is not None else None,
+            )
+            _set_state(self._conn, _KEY_OFFSET_ID, str(int(dialog.id)))
+            _set_state(self._conn, _KEY_OFFSET_PEER, _encode_offset_peer(dialog.entity))
+            _set_state(self._conn, _KEY_STATUS, _STATUS_IN_PROGRESS)
+
+    async def _run_bootstrap_attempt(self, count: int) -> _BootstrapAttemptResult:
+        """Run one iterator pass, returning whether local admission should retry."""
+        attempt = _BootstrapAttempt(count)
+        try:
+            completed = await self._consume_bootstrap_attempt(attempt)
+        except TelegramRpcAdmissionDeferred as exc:
+            return await self._handle_bootstrap_admission_deferred(exc, attempt.count)
+        except TelegramRpcThrottled as exc:
+            await self._handle_bootstrap_throttling(exc, attempt.count)
+            # The async generator cannot resume after a flood wait. Keep the
+            # durable in-progress state for the next daemon start.
+            return _BootstrapAttemptResult(attempt.count)
+        except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
+            logger.info(
+                "bootstrap_sweep admission_deferred error_type=%s processed_so_far=%d — preserving cursor",
+                type(exc).__name__,
+                attempt.count,
+            )
+            return _BootstrapAttemptResult(attempt.count)
+        except RPCError as exc:
+            logger.warning(
+                "bootstrap_sweep rpc_error=%s processed_so_far=%d — aborting sweep",
+                exc,
+                attempt.count,
+            )
+            self._set_detail("bootstrap sweep stalled (RPCError)")
+            return _BootstrapAttemptResult(attempt.count)
+        return _BootstrapAttemptResult(attempt.count, completed=completed)
+
+    @_dialog_sync_rpc_scope
     async def run(self) -> int:
         """Run (or skip) the bootstrap sweep. Returns count of dialogs processed.
 
         Returns 0 if the sweep is already complete or if it exits early on
-        TelegramRpcThrottled/RPCError/shutdown. Caller does not need to inspect the
-        return value — daemon_state holds the persistent state.
+        TelegramRpcThrottled/RPCError/shutdown. A local admission deferral is
+        retried in-process after a bounded, shutdown-aware wait; the durable
+        cursor is re-read before each fresh iterator. Caller does not need to
+        inspect the return value — daemon_state holds the persistent state.
 
         The dedicated connection is closed in the finally block.
         """
@@ -617,71 +731,20 @@ class DialogsBootstrapWorker:
                 logger.info("bootstrap_sweep already complete — skipping")
                 return 0
 
-            offset_date, offset_id, offset_peer = self._reconstruct_cursor()
-
             # Mark in_progress at the very start so a kill before the first dialog
             # still leaves a recognisable resume signal.
             with self._conn:
                 _set_state(self._conn, _KEY_STATUS, _STATUS_IN_PROGRESS)
 
             count = 0
-            try:
-                async for dialog in self._client.iter_dialogs(
-                    offset_date=offset_date,
-                    offset_id=offset_id,
-                    offset_peer=offset_peer if offset_peer is not None else types.InputPeerEmpty(),
-                ):
-                    if self._shutdown_event.is_set():
-                        logger.info(
-                            "bootstrap_sweep shutdown signal received — exiting (count=%d)",
-                            count,
-                        )
-                        return count
-
-                    snapshot_at = int(time.time())
-                    row = _extract_dialog_row(dialog, snapshot_at)
-
-                    # Atomic: UPSERT + cursor checkpoint in a single transaction.
-                    # BOOTSTRAP-04 requires the cursor to advance only with the
-                    # row, never separately, so a kill never leaves an
-                    # inconsistent state.
-                    with self._conn:
-                        self._conn.execute(_UPSERT_DIALOG_SQL, row)
-                        _apply_dialog_read_cursors(self._conn, dialog)
-                        dialog_date = dialog.date
-                        _set_state(
-                            self._conn,
-                            _KEY_OFFSET_DATE,
-                            dialog_date.isoformat() if dialog_date is not None else None,
-                        )
-                        _set_state(self._conn, _KEY_OFFSET_ID, str(int(dialog.id)))
-                        encoded_peer = _encode_offset_peer(dialog.entity)
-                        _set_state(self._conn, _KEY_OFFSET_PEER, encoded_peer)
-                        _set_state(self._conn, _KEY_STATUS, _STATUS_IN_PROGRESS)
-
-                    count += 1
-                    if count % _PROGRESS_REPORT_EVERY == 0:
-                        self._set_detail(f"bootstrap sweep: {count} dialogs processed")
-
-            except TelegramRpcThrottled as exc:
-                await self._handle_bootstrap_throttling(exc, count)
-                # Return without writing 'complete'. iter_dialogs() is an async
-                # generator and is not restartable mid-stream after throttling — the
-                # next daemon start re-enters this method, picks up the cursor,
-                # and calls iter_dialogs() afresh with the saved offset triple.
-                return count
-            except RPCError as exc:
-                logger.warning(
-                    "bootstrap_sweep rpc_error=%s processed_so_far=%d — aborting sweep",
-                    exc,
-                    count,
-                )
-                # Surface to operator via healthcheck startup_detail (review MEDIUM).
-                # The daemon will retry on every restart while bootstrap_sweep_status
-                # remains 'in_progress'; the operator must see the stall via
-                # /health rather than scanning logs.
-                self._set_detail("bootstrap sweep stalled (RPCError)")
-                return count
+            while True:
+                result = await self._run_bootstrap_attempt(count)
+                count = result.count
+                if result.continue_sweep:
+                    continue
+                if not result.completed:
+                    return count
+                break
 
             # Loop drained naturally — sweep is complete.
             with self._conn:
@@ -695,6 +758,10 @@ class DialogsBootstrapWorker:
                 self._conn.close()
             except Exception:
                 logger.debug("bootstrap_sweep conn close error", exc_info=True)
+
+
+def _full_pass_access_status(count: int) -> str:
+    return "source_unavailable" if count == 0 else "partial"
 
 
 # ---------------------------------------------------------------------------
@@ -747,14 +814,71 @@ class DialogReconciliationWorker:
         self._shutdown_event = shutdown_event
         self._topic_refresher = topic_refresher
 
-    async def _handle_light_throttling(self, exc: TelegramRpcThrottled, count: int, dialog_id: int) -> int:
+    async def _handle_light_throttling(self, exc: TelegramRpcThrottled, dialog_id: int) -> bool:
         if exc.retry_after_seconds is None:
-            return count
+            return False
         wait_s = exc.retry_after_seconds
         logger.warning("recon_light_flood_wait dialog_id=%d wait=%ds", dialog_id, wait_s)
-        await sleep_through_flood(self._shutdown_event, wait_s)
-        return count
+        return await sleep_through_flood(self._shutdown_event, wait_s)
 
+    async def _refresh_light_dialog(self, dialog_id: int) -> bool | None:
+        """Refresh one dirty dialog; None means shutdown interrupted a wait."""
+        try:
+            entity = await self._client.get_entity(dialog_id)
+            fields = _extract_entity_fields(entity)
+            snapshot_at = int(time.time())
+            with self._conn:
+                self._conn.execute(
+                    _UPDATE_DIALOG_ENTITY_SQL,
+                    (
+                        fields["name"],
+                        fields["type"],
+                        fields["members"],
+                        fields["created"],
+                        snapshot_at,
+                        dialog_id,
+                    ),
+                )
+            if self._topic_refresher is not None and is_topic_capable(entity):
+                topic_count = await self._refresh_forum_topics(dialog_id, entity)
+                logger.debug(
+                    "recon_light_pass_forum_topics dialog_id=%d count=%d",
+                    dialog_id,
+                    topic_count,
+                )
+            return True
+        except TelegramRpcThrottled as exc:
+            if await self._handle_light_throttling(exc, dialog_id):
+                return None
+        except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
+            logger.info(
+                "recon_light admission_deferred dialog_id=%d error_type=%s — preserving refresh flag",
+                dialog_id,
+                type(exc).__name__,
+            )
+        except ACCESS_LOST_ERRORS as exc:
+            set_access_lost(self._conn, dialog_id, int(time.time()), reason=type(exc).__name__)
+            self._conn.commit()
+            # do not increment count — refresh did not succeed
+        except PeerIdInvalidError:
+            # Telethon session does not have access_hash cached for this
+            # peer (typical for channels/supergroups after a session
+            # reset). Leave needs_refresh=1 — the next iter_dialogs
+            # sweep (full pass or bootstrap) will repopulate the cache.
+            logger.warning(
+                "recon_light_pass_peer_invalid dialog_id=%s (session cache miss; will retry next cycle)",
+                dialog_id,
+            )
+        except RPCError as exc:
+            logger.warning(
+                "recon_light_rpc_error dialog_id=%d error=%s",
+                dialog_id,
+                exc,
+            )
+            # leave needs_refresh=1 for next cycle
+        return False
+
+    @_dialog_sync_rpc_scope
     async def run_light_pass(self) -> int:
         """RECON-02: refresh dialogs flagged with needs_refresh=1.
 
@@ -783,142 +907,109 @@ class DialogReconciliationWorker:
                     count,
                 )
                 return count
-            try:
-                entity = await self._client.get_entity(dialog_id)
-                fields = _extract_entity_fields(entity)
-                snapshot_at = int(time.time())
-                with self._conn:
-                    self._conn.execute(
-                        _UPDATE_DIALOG_ENTITY_SQL,
-                        (
-                            fields["name"],
-                            fields["type"],
-                            fields["members"],
-                            fields["created"],
-                            snapshot_at,
-                            dialog_id,
-                        ),
-                    )
-                count += 1
-                if self._topic_refresher is not None and is_topic_capable(entity):
-                    topic_count = await self._refresh_forum_topics(dialog_id, entity)
-                    logger.debug(
-                        "recon_light_pass_forum_topics dialog_id=%d count=%d",
-                        dialog_id,
-                        topic_count,
-                    )
-            except TelegramRpcThrottled as exc:
-                count = await self._handle_light_throttling(exc, count, dialog_id)
-                if self._shutdown_event.is_set():
-                    return count
-                # Slept full duration; advance to NEXT dialog (per throttling
-                # semantics in class docstring). Do NOT retry the same dialog —
-                # its needs_refresh=1 will be picked up by the next hourly cycle.
-            except ACCESS_LOST_ERRORS as exc:
-                set_access_lost(self._conn, dialog_id, int(time.time()), reason=type(exc).__name__)
-                self._conn.commit()
-                # do not increment count — refresh did not succeed
-            except PeerIdInvalidError:
-                # Telethon session does not have access_hash cached for this
-                # peer (typical for channels/supergroups after a session
-                # reset). Leave needs_refresh=1 — the next iter_dialogs
-                # sweep (full pass or bootstrap) will repopulate the cache.
-                logger.warning(
-                    "recon_light_pass_peer_invalid dialog_id=%s (session cache miss; will retry next cycle)",
-                    dialog_id,
-                )
-            except RPCError as exc:
-                logger.warning(
-                    "recon_light_rpc_error dialog_id=%d error=%s",
-                    dialog_id,
-                    exc,
-                )
-                # leave needs_refresh=1 for next cycle
+            refreshed = await self._refresh_light_dialog(dialog_id)
+            if refreshed is None:
+                return count
+            count += int(refreshed)
         log_maintenance_cycle(logger, count > 0, "recon_light_pass_complete count=%d", count)
         return count
 
+    def _mark_full_pass_partial(self, count: int, *, status: str = "partial") -> None:
+        with self._conn:
+            _finish_unread_sweep(
+                self._conn,
+                status=status,
+                observed_count=count,
+                completed=False,
+            )
+
+    async def _handle_full_admission_deferred(self, exc: TelegramRpcAdmissionDeferred, count: int) -> None:
+        logger.info(
+            "recon_full admission_deferred retry_after=%s processed=%d — preserving sweep state",
+            exc.retry_after_seconds,
+            count,
+        )
+        if exc.retry_after_seconds is not None:
+            await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
+
+    async def _handle_full_throttling(self, exc: TelegramRpcThrottled, count: int) -> None:
+        if exc.retry_after_seconds is None:
+            return
+        logger.warning(
+            "recon_full_flood_wait wait=%ds processed=%d",
+            exc.retry_after_seconds,
+            count,
+        )
+        await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
+
+    async def _consume_full_dialog(
+        self,
+        dialog: _DialogLike,
+        seen_ids: set[int],
+        count: int,
+    ) -> tuple[int, bool]:
+        if self._shutdown_event.is_set():
+            return count, False
+        snapshot_at = int(time.time())  # fresh per dialog — avoids stale recency guard
+        row = _extract_dialog_row(dialog, snapshot_at)
+        with self._conn:
+            self._conn.execute(_UPSERT_DIALOG_SQL, row)
+            _apply_dialog_read_cursors(self._conn, dialog)
+        dialog_id = int(dialog.id)
+        seen_ids.add(dialog_id)
+        count += 1
+        if self._topic_refresher is not None and is_topic_capable(dialog.entity):
+            topic_count = await self._refresh_forum_topics(dialog_id, dialog.entity)
+            logger.debug(
+                "recon_full_pass_forum_topics dialog_id=%d count=%d",
+                dialog_id,
+                topic_count,
+            )
+        return count, True
+
+    @_dialog_sync_rpc_scope
     async def _enumerate_full_pass(self) -> tuple[set[int], int, bool]:
         """Enumerate dialogs and persist interrupted sweep state."""
         seen_ids: set[int] = set()
         count = 0
+        completed = True
+        partial_status = "partial"
         try:
             async for dialog in self._client.iter_dialogs():
-                if self._shutdown_event.is_set():
-                    with self._conn:
-                        _finish_unread_sweep(
-                            self._conn,
-                            status="partial",
-                            observed_count=count,
-                            completed=False,
-                        )
-                    return seen_ids, count, False
-                snapshot_at = int(time.time())  # fresh per dialog — avoids stale recency guard
-                row = _extract_dialog_row(dialog, snapshot_at)
-                with self._conn:
-                    self._conn.execute(_UPSERT_DIALOG_SQL, row)
-                    _apply_dialog_read_cursors(self._conn, dialog)
-                seen_ids.add(int(dialog.id))
-                count += 1
-                if self._topic_refresher is not None and is_topic_capable(dialog.entity):
-                    topic_count = await self._refresh_forum_topics(int(dialog.id), dialog.entity)
-                    logger.debug(
-                        "recon_full_pass_forum_topics dialog_id=%d count=%d",
-                        int(dialog.id),
-                        topic_count,
-                    )
-        except TelegramRpcThrottled as exc:
-            if exc.retry_after_seconds is None:
-                with self._conn:
-                    _finish_unread_sweep(
-                        self._conn,
-                        status="partial",
-                        observed_count=count,
-                        completed=False,
-                    )
-                return seen_ids, count, False
-            wait_s = exc.retry_after_seconds
-            logger.warning(
-                "recon_full_flood_wait wait=%ds processed=%d",
-                wait_s,
-                count,
-            )
-            await sleep_through_flood(self._shutdown_event, wait_s)
-            with self._conn:
-                _finish_unread_sweep(
-                    self._conn,
-                    status="partial",
-                    observed_count=count,
-                    completed=False,
-                )
-            return seen_ids, count, False
-        except ACCESS_LOST_ERRORS as exc:
-            status = "source_unavailable" if count == 0 else "partial"
-            logger.warning(
-                "recon_full_%s error=%s processed=%d",
-                status,
+                count, completed = await self._consume_full_dialog(dialog, seen_ids, count)
+                if not completed:
+                    break
+        except TelegramRpcAdmissionDeferred as exc:
+            await self._handle_full_admission_deferred(exc, count)
+            completed = False
+        except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
+            logger.info(
+                "recon_full admission_deferred error_type=%s processed=%d — preserving sweep state",
                 type(exc).__name__,
                 count,
             )
-            with self._conn:
-                _finish_unread_sweep(
-                    self._conn,
-                    status=status,
-                    observed_count=count,
-                    completed=False,
-                )
-            return seen_ids, count, False
+            completed = False
+        except TelegramRpcThrottled as exc:
+            await self._handle_full_throttling(exc, count)
+            completed = False
+        except ACCESS_LOST_ERRORS as exc:
+            partial_status = _full_pass_access_status(count)
+            logger.warning(
+                "recon_full_%s error=%s processed=%d",
+                partial_status,
+                type(exc).__name__,
+                count,
+            )
+            completed = False
         except Exception:
-            with self._conn:
-                _finish_unread_sweep(
-                    self._conn,
-                    status="partial",
-                    observed_count=count,
-                    completed=False,
-                )
+            self._mark_full_pass_partial(count, status=partial_status)
             logger.exception("recon_full_pass_unexpected_error processed=%d", count)
             raise
-        return seen_ids, count, True
+        if not completed:
+            self._mark_full_pass_partial(count, status=partial_status)
+        return seen_ids, count, completed
 
+    @_dialog_sync_rpc_scope
     async def run_full_pass(self) -> tuple[int, bool]:
         """RECON-03: full iter_dialogs() sweep with soft-delete of missing rows.
 
@@ -967,6 +1058,7 @@ class DialogReconciliationWorker:
         )
         return count, True
 
+    @_dialog_sync_rpc_scope
     async def _refresh_forum_topics(
         self,
         dialog_id: int,
@@ -1008,6 +1100,7 @@ class DialogReconciliationWorker:
         return count
 
 
+@_dialog_sync_rpc_scope
 async def run_reconciliation_loop(  # noqa: PLR0913
     client: object,
     conn: sqlite3.Connection,
@@ -1043,6 +1136,8 @@ async def run_reconciliation_loop(  # noqa: PLR0913
         worker = DialogReconciliationWorker(client, conn, shutdown_event, topic_refresher)
         try:
             await worker.run_light_pass()
+        except RpcAdmissionClosedError:
+            raise
         except Exception:
             logger.warning("recon_light_pass_error", exc_info=True)
         if last_full_pass is None or now - last_full_pass >= daily_interval:
@@ -1054,6 +1149,8 @@ async def run_reconciliation_loop(  # noqa: PLR0913
                 # unchanged so the next hourly tick retries the full pass.
                 if completed:
                     last_full_pass = time.monotonic()
+            except RpcAdmissionClosedError:
+                raise
             except Exception:
                 logger.warning("recon_full_pass_error", exc_info=True)
         try:

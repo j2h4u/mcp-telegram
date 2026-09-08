@@ -17,7 +17,7 @@ from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[imp
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
 from .entity_profile.contracts import PROFILE_SECTIONS, completeness
-from .entity_profile.refresh import EntityRefreshCoordinator, RefreshLimits
+from .entity_profile.refresh import EntityRefreshCoordinator, RefreshEnqueueResult, RefreshLimits
 from .entity_profile.repository import EntityProfileRepository
 from .entity_profile.telegram_gateway import BoundedTelegramGateway
 from .entity_store import EntitySnapshot, ensure_entity_stub
@@ -26,6 +26,7 @@ from .folders.read_model import dialog_placement
 from .models import DialogType
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_rpc import raise_if_flood_wait_error
+from .telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
 from .telethon_dialog import classify_dialog_type
 
 _ENTITY_DETAIL_SCHEMA_VERSION = 1
@@ -232,6 +233,11 @@ class DaemonEntityInfoService:
         )
 
     async def get_entity_info(self, req: Mapping[str, object]) -> dict[str, object]:
+        """Run one foreground entity-info use case under its RPC source."""
+        with rpc_scope(TelegramRpcSource.ENTITY_INFO_FOREGROUND):
+            return await self._get_entity_info(req)
+
+    async def _get_entity_info(self, req: Mapping[str, object]) -> dict[str, object]:
         """Type-tagged entity inspector covering 5 Telegram entity kinds."""
         started_at = self._deps.now_provider()
         entity_id = self._extract_entity_id(req)
@@ -272,9 +278,15 @@ class DaemonEntityInfoService:
             self._log_stage(entity_id, "self_snapshot", started_at, detail_type=self_detail.get("type"))
             return {"ok": True, "data": self_detail}
         self._profiles.save_core(self_detail, now=now)
-        self._profiles.mark_pending(entity_id, now=now)
+        assert self._refresh is not None
+        enqueue_result = self._refresh.enqueue(entity_id)
+        self._persist_refresh_admission(entity_id, enqueue_result, now=now)
         sections: dict[str, dict[str, object]] = {
-            section: {"status": "pending", "observed_at": None, "reason": "refresh_queued"}
+            section: {
+                "status": "pending",
+                "observed_at": None,
+                "reason": self._refresh_reason(enqueue_result),
+            }
             for section in PROFILE_SECTIONS
         }
         return self._progressive_result(entity_id, self_detail, sections, now=now)
@@ -328,7 +340,10 @@ class DaemonEntityInfoService:
         except TimeoutError:
             self._log_stage(entity_id, "resolve_timeout", started_at)
             assert self._refresh is not None
-            self._refresh.enqueue(entity_id)
+            enqueue_result = self._refresh.enqueue(entity_id)
+            if enqueue_result is RefreshEnqueueResult.REJECTED:
+                self._profiles.mark_refresh_rejected(entity_id, now=now)
+                return self._pending_error(entity_id, "entity profile refresh queue is full")
             budget = self._deps.refresh_limits.foreground_resolve_seconds
             return self._pending_error(entity_id, f"entity resolution exceeded the {budget:g} second foreground budget")
         if resolve_error is not None or entity is None:
@@ -337,11 +352,15 @@ class DaemonEntityInfoService:
 
         core = self._core_from_entity(entity)
         self._profiles.save_core(core, now=now)
-        self._profiles.mark_pending(entity_id, now=now)
         assert self._refresh is not None
-        self._refresh.enqueue(entity_id)
+        enqueue_result = self._refresh.enqueue(entity_id)
+        self._persist_refresh_admission(entity_id, enqueue_result, now=now)
         sections: dict[str, dict[str, object]] = {
-            section: {"status": "pending", "observed_at": None, "reason": "refresh_queued"}
+            section: {
+                "status": "pending",
+                "observed_at": None,
+                "reason": self._refresh_reason(enqueue_result),
+            }
             for section in PROFILE_SECTIONS
         }
         result = self._progressive_result(entity_id, core, sections, now=now)
@@ -349,6 +368,10 @@ class DaemonEntityInfoService:
         return result
 
     async def _refresh_entity(self, entity_id: int) -> None:
+        """Run one refresh under the coordinator-owned scope and deadline."""
+        await self._refresh_entity_impl(entity_id)
+
+    async def _refresh_entity_impl(self, entity_id: int) -> None:
         started_at = self._deps.now_provider()
         bounded_client = BoundedTelegramGateway(
             self._deps.client,
@@ -457,14 +480,59 @@ class DaemonEntityInfoService:
         )
         return {"ok": True, "data": result}
 
-    def _enqueue_section_refresh(self, entity_id: int, sections: Mapping[str, Mapping[str, object]]) -> None:
-        if any(
+    def _enqueue_section_refresh(self, entity_id: int, sections: dict[str, dict[str, object]]) -> None:
+        if not self._has_refreshable_sections(sections):
+            return
+        assert self._refresh is not None
+        enqueue_result = self._refresh.enqueue(entity_id)
+        self._record_section_admission(entity_id, sections, enqueue_result)
+
+    @staticmethod
+    def _has_refreshable_sections(sections: Mapping[str, Mapping[str, object]]) -> bool:
+        return any(
             value.get("status") in {"pending", "stale"}
+            or (value.get("status") == "unavailable" and value.get("reason") == "refresh_rejected")
             for value in sections.values()
-            if value.get("status") != "not_applicable"
-        ):
-            assert self._refresh is not None
-            self._refresh.enqueue(entity_id)
+        )
+
+    def _record_section_admission(
+        self,
+        entity_id: int,
+        sections: dict[str, dict[str, object]],
+        result: RefreshEnqueueResult,
+    ) -> None:
+        if result is RefreshEnqueueResult.REJECTED:
+            self._profiles.mark_refresh_rejected(entity_id, now=int(self._deps.now_provider()))
+            self._set_section_rejected(sections)
+            return
+        self._profiles.mark_refresh_queued(entity_id)
+        self._set_section_queued(sections)
+
+    @staticmethod
+    def _set_section_rejected(sections: dict[str, dict[str, object]]) -> None:
+        for section in sections.values():
+            if section.get("status") == "not_applicable":
+                continue
+            section.update(status="unavailable", reason="refresh_rejected")
+
+    @staticmethod
+    def _set_section_queued(sections: dict[str, dict[str, object]]) -> None:
+        for section in sections.values():
+            if section.get("status") not in {"pending", "stale", "unavailable"}:
+                continue
+            if section.get("status") == "unavailable" and section.get("reason") != "refresh_rejected":
+                continue
+            section.update(status="pending", reason="refresh_queued")
+
+    def _persist_refresh_admission(self, entity_id: int, result: RefreshEnqueueResult, *, now: int) -> None:
+        if result is RefreshEnqueueResult.REJECTED:
+            self._profiles.mark_refresh_rejected(entity_id, now=now)
+        else:
+            self._profiles.mark_pending(entity_id, now=now)
+
+    @staticmethod
+    def _refresh_reason(result: RefreshEnqueueResult) -> str:
+        return "refresh_rejected" if result is RefreshEnqueueResult.REJECTED else "refresh_queued"
 
     @staticmethod
     def _section_summaries(sections: Mapping[str, Mapping[str, object]]) -> dict[str, dict[str, object]]:

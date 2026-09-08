@@ -44,6 +44,7 @@ from .messages.telegram_adapter import extract_message_row
 from .models import DialogType
 from .resolver import Candidates, Resolved, _parse_tme_link, latinize, resolve
 from .telegram_access import ACCESS_LOST_ERRORS
+from .telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
 from .telethon_dialog import classify_dialog_type
 
 _TRACE_SCOPE_DIALOG_IDS_LEN = 2
@@ -775,6 +776,11 @@ class DaemonAccountTraceService:
         return result
 
     async def _trace_account_messages(self, req: dict) -> dict[str, object]:
+        """Run Account Trace under one explicit source classification."""
+        with rpc_scope(TelegramRpcSource.ACCOUNT_TRACE):
+            return await self._trace_account_messages_impl(req)
+
+    async def _trace_account_messages_impl(self, req: dict) -> dict[str, object]:
         exact_account_error = _validate_exact_account_id(req.get("exact_account_id"))
         if exact_account_error is not None:
             return exact_account_error
@@ -951,13 +957,14 @@ async def _run_trace_visible_candidates(
 
     async def run_candidate(candidate: dict[str, object]) -> _TraceCandidateEnrichmentResult:
         async with semaphore:
-            return await request.service._trace_enrich_one_candidate(
-                target_user_id=request.target_user_id,
-                candidate=candidate,
-                max_per_dialog=request.max_per_dialog,
-                deadline_ms=request.deadline_ms,
-                deadline_at=request.deadline_at,
-            )
+            with rpc_scope(TelegramRpcSource.ACCOUNT_TRACE, deadline=request.deadline_at):
+                return await request.service._trace_enrich_one_candidate(
+                    target_user_id=request.target_user_id,
+                    candidate=candidate,
+                    max_per_dialog=request.max_per_dialog,
+                    deadline_ms=request.deadline_ms,
+                    deadline_at=request.deadline_at,
+                )
 
     return cast(
         list[_TraceCandidateEnrichmentResult],

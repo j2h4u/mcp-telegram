@@ -39,6 +39,7 @@ from .messages.sqlite_bundle import insert_messages_with_fts, message_exists
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
 from .own_only import enroll_own_only_sync_dialog
 from .telegram_access import ACCESS_LOST_ERRORS
+from .telegram_rpc_scheduler import RpcAdmissionClosedError
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +173,8 @@ async def _resolve_peer_for_sweep(request: PeerSweepRequest) -> TypeInputPeer | 
     """Resolve one peer while preserving the governed-RPC error boundary."""
     try:
         return await resolve_input_peer(request.client, request.dialog_id)
+    except RpcAdmissionClosedError:
+        raise
     except TelegramRpcThrottled as exc:
         _raise_if_latched(exc)
         logger.warning("sweep_peer_once_resolution_throttled dialog_id=%r", request.dialog_id)
@@ -316,6 +319,8 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, 
             ),
             timeout_s=request.timeout_s,
         )
+    except RpcAdmissionClosedError:
+        raise
     except TelegramRpcThrottled as exc:
         _raise_if_latched(exc)
         assert exc.retry_after_seconds is not None

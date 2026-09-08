@@ -16,21 +16,117 @@ from mcp_telegram.config import McpTelegramConfig, StateConfig
 from mcp_telegram.daemon import (
     _create_telegram_client,
     _create_tracked_task,
+    _load_own_only_context,
     _log_heartbeat,
+    _mark_rpc_scheduler_failed,
     _prime_runtime,
     _run_self_profile_refresh_loop,
     _run_sync_loop,
+    _shutdown_sync_main_context,
     sync_main,
 )
 from mcp_telegram.folders.read_repository import folder_summaries
 from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.state import StatePaths
 from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.telegram_rpc_scheduler import (
+    RpcAdmissionClosedError,
+    RpcAdmissionEvent,
+    RpcAdmissionEventKind,
+    RpcServiceClass,
+    TelegramRpcAdmissionDeferred,
+    TelegramRpcSource,
+    current_rpc_scope,
+    rpc_scope,
+)
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
 class _PrimeRuntimeApiServerStub(SimpleNamespace):
     pass
+
+
+@pytest.mark.asyncio
+async def test_own_only_context_retries_local_admission_until_success() -> None:
+    client = AsyncMock()
+    client.get_input_entity = AsyncMock(return_value=SimpleNamespace(user_id=42))
+    full_user_calls = 0
+
+    async def fetch_full_user(_request: object) -> object:
+        nonlocal full_user_calls
+        full_user_calls += 1
+        if full_user_calls == 1:
+            raise TelegramRpcAdmissionDeferred(retry_after_seconds=1)
+        return SimpleNamespace(full_user=SimpleNamespace(personal_channel_id=777))
+
+    client.side_effect = fetch_full_user
+    shutdown_event = asyncio.Event()
+
+    async def immediate_wait(_awaitable: object, *, timeout: float) -> bool:
+        assert timeout == 1
+        if hasattr(_awaitable, "close"):
+            _awaitable.close()  # type: ignore[union-attr]
+        raise TimeoutError
+
+    with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=immediate_wait):
+        result = await _load_own_only_context(client, 42, shutdown_event)
+
+    assert result.personal_channel_id == -1000000000777
+    assert full_user_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_own_only_context_stops_startup_on_shutdown_during_admission_retry() -> None:
+    client = AsyncMock()
+    client.get_input_entity = AsyncMock(return_value=SimpleNamespace(user_id=42))
+    client.side_effect = TelegramRpcAdmissionDeferred(retry_after_seconds=1)
+    shutdown_event = asyncio.Event()
+
+    async def shutdown_wait(_awaitable: object, *, timeout: float) -> bool:
+        del timeout
+        if hasattr(_awaitable, "close"):
+            _awaitable.close()  # type: ignore[union-attr]
+        shutdown_event.set()
+        return True
+
+    with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=shutdown_wait):
+        with pytest.raises(asyncio.CancelledError):
+            await _load_own_only_context(client, 42, shutdown_event)
+
+
+@pytest.mark.asyncio
+async def test_own_only_context_propagates_permanent_scheduler_close() -> None:
+    client = AsyncMock()
+    client.get_input_entity = AsyncMock(return_value=SimpleNamespace(user_id=42))
+    with rpc_scope(TelegramRpcSource.MAINTENANCE):
+        closed = RpcAdmissionClosedError(current_rpc_scope(), "scheduler closed")
+    client.side_effect = closed
+
+    with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
+        await _load_own_only_context(client, 42, asyncio.Event())
+
+
+def test_rpc_scheduler_failure_marks_daemon_unready_and_shutdown() -> None:
+    shutdown_event = asyncio.Event()
+    api_server = SimpleNamespace(_ready=True, startup_detail="ready")
+    ctx = SimpleNamespace(api_server=api_server, shutdown_event=shutdown_event)
+    state: dict[str, str | None] = {"detail": None}
+    event = RpcAdmissionEvent(
+        kind=RpcAdmissionEventKind.CLOSED,
+        source=TelegramRpcSource.FULL_SYNC,
+        service_class=RpcServiceClass.BACKGROUND,
+        queue_depth=0,
+        total_depth=0,
+        reason="limiter_failure",
+    )
+
+    _mark_rpc_scheduler_failed(ctx, state, event)  # type: ignore[arg-type]
+
+    assert api_server._ready is False
+    assert api_server.startup_detail == "Telegram service is temporarily unavailable; daemon is shutting down"
+    assert all(term not in api_server.startup_detail.lower() for term in ("scheduler", "limiter", "queue"))
+    assert shutdown_event.is_set()
+    assert state["detail"] == api_server.startup_detail
 
 
 @pytest.mark.asyncio
@@ -113,6 +209,8 @@ def mock_client() -> MagicMock:
     client.is_connected.return_value = True  # sync method
     client.connect = AsyncMock()
     client.disconnect = AsyncMock()
+    client.close_rpc_scheduler = AsyncMock()
+    client.set_rpc_admission_observer = MagicMock()
     # get_messages used by backfill and probe-worker
     client.get_messages = AsyncMock(return_value=MockTotalList([], total=0))
     # Phase 39.1: sync_main caches self_id from client.get_me() at startup
@@ -503,6 +601,91 @@ def test_sync_main_disconnects_client_on_shutdown(
         asyncio.run(sync_main())
 
     mock_client.disconnect.assert_called_once()
+    mock_client.close_rpc_scheduler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drains_telemetry_after_scheduler_producers_quiesce(tmp_path: Path) -> None:
+    order: list[str] = []
+
+    async def disconnect() -> None:
+        order.append("disconnect")
+
+    async def close_scheduler() -> None:
+        order.append("scheduler_closed")
+
+    def detach(observer: object) -> None:
+        assert observer is None
+        order.append("observer_detached")
+
+    async def drain() -> None:
+        order.append("telemetry_drained")
+
+    client = SimpleNamespace(
+        disconnect=disconnect,
+        close_rpc_scheduler=close_scheduler,
+        set_rpc_admission_observer=detach,
+    )
+    ctx = SimpleNamespace(
+        client=client,
+        rpc_observation_sink=SimpleNamespace(aclose=drain),
+    )
+    with (
+        patch("mcp_telegram.daemon._stop_daemon_api", new=AsyncMock()),
+        patch("mcp_telegram.daemon._cancel_background_tasks", new=AsyncMock()),
+        patch("mcp_telegram.daemon._close_runtime_connections"),
+    ):
+        await _shutdown_sync_main_context(ctx)  # type: ignore[arg-type]
+
+    assert order == ["disconnect", "scheduler_closed", "observer_detached", "telemetry_drained"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_runs_all_cleanup_stages_after_disconnect_failure() -> None:
+    order: list[str] = []
+
+    async def disconnect() -> None:
+        order.append("disconnect")
+        raise RuntimeError("disconnect failed")
+
+    async def close_scheduler() -> None:
+        order.append("scheduler_closed")
+
+    def detach(observer: object) -> None:
+        assert observer is None
+        order.append("observer_detached")
+
+    async def drain() -> None:
+        order.append("telemetry_drained")
+
+    client = SimpleNamespace(
+        disconnect=disconnect,
+        close_rpc_scheduler=close_scheduler,
+        set_rpc_admission_observer=detach,
+    )
+    ctx = SimpleNamespace(client=client, rpc_observation_sink=SimpleNamespace(aclose=drain))
+    with (
+        patch("mcp_telegram.daemon._stop_daemon_api", new=AsyncMock()),
+        patch("mcp_telegram.daemon._cancel_background_tasks", new=AsyncMock()),
+        patch("mcp_telegram.daemon._close_runtime_connections", side_effect=lambda _ctx: order.append("db_closed")),
+        pytest.raises(RuntimeError, match="disconnect failed"),
+    ):
+        await _shutdown_sync_main_context(ctx)  # type: ignore[arg-type]
+
+    assert order == ["disconnect", "scheduler_closed", "observer_detached", "telemetry_drained", "db_closed"]
+
+
+@pytest.mark.asyncio
+async def test_sync_main_stops_before_starting_work_when_telemetry_sink_is_dead() -> None:
+    ctx = SimpleNamespace(rpc_observation_sink=SimpleNamespace(writer_error="unable to open database"))
+    shutdown = AsyncMock()
+    with (
+        patch("mcp_telegram.daemon._build_sync_main_context", new=AsyncMock(return_value=ctx)),
+        patch("mcp_telegram.daemon._shutdown_sync_main_context", new=shutdown),
+    ):
+        await sync_main()
+
+    shutdown.assert_awaited_once_with(ctx)
 
 
 def test_sync_main_heartbeat_logs_connection_state(
@@ -549,6 +732,7 @@ def test_sync_main_survives_connection_error(
     mock_client.is_connected.return_value = False
     mock_client.connect = AsyncMock(side_effect=ConnectionError("test connection failure"))
     mock_client.disconnect = AsyncMock()
+    mock_client.close_rpc_scheduler = AsyncMock()
 
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),

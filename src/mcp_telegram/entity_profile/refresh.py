@@ -4,10 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import StrEnum
+
+from ..telegram_rpc_scheduler import TelegramRpcSource, create_scoped_rpc_task, rpc_scope
 
 RefreshCallback = Callable[[int], Awaitable[None]]
+
+
+def _validate_positive_duration(value: object, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value <= 0:
+        raise ValueError(f"entity profile {name} must be positive")
+
+
+def _validate_positive_integer(value: object, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"entity profile {name} must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,27 +30,48 @@ class RefreshLimits:
     per_rpc_seconds: float = 8.0
     whole_refresh_seconds: float = 25.0
     max_concurrent_refreshes: int = 1
+    max_queued_refreshes: int = 128
 
     def __post_init__(self) -> None:
-        if any(
-            not math.isfinite(value) or value <= 0
-            for value in (self.foreground_resolve_seconds, self.per_rpc_seconds, self.whole_refresh_seconds)
+        for name, value in (
+            ("foreground resolve budget", self.foreground_resolve_seconds),
+            ("per-RPC budget", self.per_rpc_seconds),
+            ("whole-refresh budget", self.whole_refresh_seconds),
         ):
-            raise ValueError("entity profile budgets must be positive")
+            _validate_positive_duration(value, name)
         if self.foreground_resolve_seconds > self.per_rpc_seconds:
             raise ValueError("foreground resolve budget cannot exceed per-RPC budget")
         if self.per_rpc_seconds > self.whole_refresh_seconds:
             raise ValueError("per-RPC budget cannot exceed whole-refresh budget")
-        if (
-            isinstance(self.max_concurrent_refreshes, bool)
-            or not isinstance(self.max_concurrent_refreshes, int)
-            or self.max_concurrent_refreshes < 1
-        ):
-            raise ValueError("entity profile refresh concurrency must be positive")
+        _validate_positive_integer(self.max_concurrent_refreshes, "refresh concurrency")
+        _validate_positive_integer(self.max_queued_refreshes, "refresh queue capacity")
+
+
+class RefreshEnqueueResult(StrEnum):
+    """Result of attempting to admit one entity refresh."""
+
+    QUEUED = "queued"
+    COALESCED = "coalesced"
+    REJECTED = "rejected"
+
+    def __bool__(self) -> bool:
+        """Keep the pre-queue API's truthiness for existing callers."""
+        return self is RefreshEnqueueResult.QUEUED
+
+
+@dataclass(frozen=True, slots=True)
+class _RefreshItem:
+    entity_id: int
+    deadline: float
 
 
 class EntityRefreshCoordinator:
-    """Coordinate at most one refresh task per entity and track shutdown."""
+    """Run bounded, coalescing entity refreshes on a fixed worker pool.
+
+    The queue contains identifiers rather than tasks.  This keeps the number
+    of asyncio tasks fixed while still preserving single-flight behavior for an
+    entity that is requested repeatedly.
+    """
 
     def __init__(
         self,
@@ -48,51 +83,137 @@ class EntityRefreshCoordinator:
         self._callback = callback
         self._limits = limits or RefreshLimits()
         self._on_failure = on_failure
-        self._tasks: dict[int, asyncio.Task[None]] = {}
-        self._refresh_semaphore = asyncio.Semaphore(self._limits.max_concurrent_refreshes)
+        self._queue: deque[_RefreshItem] = deque()
+        self._pending_entities: set[int] = set()
+        self._active_entities: set[int] = set()
+        self._workers: set[asyncio.Task[None]] = set()
+        self._wake = asyncio.Event()
         self._closed = False
 
     @property
     def queue_depth(self) -> int:
-        return len(self._tasks)
+        """Return all admitted work, including refreshes currently running."""
+        return len(self._pending_entities) + len(self._active_entities)
 
-    def enqueue(self, entity_id: int) -> bool:
-        """Queue one refresh; duplicate entity requests share the existing task."""
-        if self._closed or entity_id in self._tasks:
-            return False
-        task = asyncio.create_task(self._run(entity_id), name=f"entity-profile-refresh-{entity_id}")
-        self._tasks[entity_id] = task
-        task.add_done_callback(lambda completed: self._task_done(entity_id, completed))
-        return True
+    @property
+    def worker_count(self) -> int:
+        return len(self._workers)
 
-    def _task_done(self, entity_id: int, task: asyncio.Task[None]) -> None:
-        self._tasks.pop(entity_id, None)
-        if task.cancelled():
+    def enqueue(self, entity_id: int) -> RefreshEnqueueResult:
+        """Admit one refresh, coalescing duplicates and rejecting saturation.
+
+        The deadline is captured before the item enters the queue.  Therefore
+        time spent waiting for a fixed worker is part of the refresh budget.
+        """
+        if self._closed:
+            return RefreshEnqueueResult.REJECTED
+        loop = asyncio.get_running_loop()
+        self._expire_pending(loop.time())
+        if entity_id in self._pending_entities or entity_id in self._active_entities:
+            return RefreshEnqueueResult.COALESCED
+        if len(self._pending_entities) >= self._limits.max_queued_refreshes:
+            return RefreshEnqueueResult.REJECTED
+
+        item = _RefreshItem(entity_id, loop.time() + self._limits.whole_refresh_seconds)
+        self._queue.append(item)
+        self._pending_entities.add(entity_id)
+        self._ensure_workers()
+        self._wake.set()
+        return RefreshEnqueueResult.QUEUED
+
+    def _ensure_workers(self) -> None:
+        required = self._limits.max_concurrent_refreshes
+        while len(self._workers) < required:
+            task = create_scoped_rpc_task(
+                self._worker(),
+                source=TelegramRpcSource.ENTITY_INFO_REFRESH,
+                name="entity-profile-refresh-worker",
+                sanitize_context=True,
+            )
+            self._workers.add(task)
+            task.add_done_callback(self._worker_done)
+
+    def _worker_done(self, task: asyncio.Task[None]) -> None:
+        self._workers.discard(task)
+        if not task.cancelled():
+            try:
+                task.exception()
+            except RuntimeError, asyncio.CancelledError:
+                return
+
+    def _expire_pending(self, now: float) -> None:
+        if not self._queue:
             return
-        try:
-            task.exception()
-        except RuntimeError, asyncio.CancelledError:
-            return
+        retained: deque[_RefreshItem] = deque()
+        expired: list[_RefreshItem] = []
+        while self._queue:
+            item = self._queue.popleft()
+            if item.deadline <= now:
+                self._pending_entities.remove(item.entity_id)
+                expired.append(item)
+            else:
+                retained.append(item)
+        self._queue = retained
+        for item in expired:
+            self._report_failure(item.entity_id, TimeoutError("entity profile refresh expired in queue"))
 
     async def run_rpc[T](self, operation: Callable[[], Awaitable[T]]) -> T:
         """Apply the per-RPC budget to an operation owned by a refresh."""
         return await asyncio.wait_for(operation(), timeout=self._limits.per_rpc_seconds)
 
-    async def _run(self, entity_id: int) -> None:
+    async def _worker(self) -> None:
+        while True:
+            while not self._queue and not self._closed:
+                await self._wake.wait()
+                self._wake.clear()
+            if self._closed:
+                return
+            item = self._queue.popleft()
+            self._pending_entities.remove(item.entity_id)
+            self._active_entities.add(item.entity_id)
+
+            try:
+                await self._run(item)
+            finally:
+                self._active_entities.discard(item.entity_id)
+
+    async def _run(self, item: _RefreshItem) -> None:
+        loop = asyncio.get_running_loop()
+        remaining = item.deadline - loop.time()
+        if remaining <= 0:
+            self._report_failure(item.entity_id, TimeoutError("entity profile refresh expired in queue"))
+            return
         try:
-            async with self._refresh_semaphore:
-                await asyncio.wait_for(self._callback(entity_id), timeout=self._limits.whole_refresh_seconds)
+            with rpc_scope(TelegramRpcSource.ENTITY_INFO_REFRESH, deadline=item.deadline):
+                await asyncio.wait_for(self._callback(item.entity_id), remaining)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - coordinator is the failure boundary
-            if self._on_failure is not None:
-                self._on_failure(entity_id, exc)
+            self._report_failure(item.entity_id, exc)
+
+    def _report_failure(self, entity_id: int, error: BaseException) -> None:
+        if self._on_failure is None:
+            return
+        try:
+            self._on_failure(entity_id, error)
+        except Exception:  # noqa: BLE001 - failure callback must not kill a worker
+            # Failure persistence is a best effort boundary; it must not kill
+            # a fixed worker and thereby strand all following queue entries.
+            return
 
     async def shutdown(self) -> None:
         self._closed = True
-        tasks = tuple(self._tasks.values())
-        for task in tasks:
+        self._queue.clear()
+        self._pending_entities.clear()
+        self._wake.set()
+        workers = tuple(self._workers)
+        if workers:
+            # Let scheduler-created wrappers enter their owned context before
+            # cancellation so the wrapped worker coroutine is always awaited.
+            await asyncio.sleep(0)
+        for task in workers:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._tasks.clear()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+        self._active_entities.clear()
+        self._workers.clear()

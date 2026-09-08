@@ -29,6 +29,12 @@ from .flood import TelegramRpcThrottled
 from .hydration_queue import HydrationPriority
 from .maintenance_logging import log_maintenance_cycle
 from .messages.sqlite_bundle import message_log_context
+from .telegram_rpc_scheduler import (
+    RpcAdmissionClosedError,
+    TelegramRpcAdmissionDeferred,
+    TelegramRpcSource,
+    rpc_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -451,7 +457,8 @@ async def _refresh_hot_working_set(
     *,
     timeout_s: float,
 ) -> WorkingSetResult:
-    return await build_working_set(client, conn, timeout_s=timeout_s)
+    with rpc_scope(TelegramRpcSource.ACTIVITY_HOT_SWEEP, timeout_seconds=timeout_s):
+        return await build_working_set(client, conn, timeout_s=timeout_s)
 
 
 def _seed_hot_schedule_after_refresh(
@@ -484,7 +491,10 @@ def _count_due_hot_peers(conn: sqlite3.Connection, *, now: int) -> int:
 
 async def _run_hot_sweep_peer_safe(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome:
     try:
-        return await _run_hot_sweep_peer(ctx)
+        with rpc_scope(TelegramRpcSource.ACTIVITY_HOT_SWEEP, timeout_seconds=ctx.timeout_s):
+            return await _run_hot_sweep_peer(ctx)
+    except RpcAdmissionClosedError, TelegramRpcAdmissionDeferred:
+        raise
     except TelegramRpcThrottled:
         raise
     except Exception:
@@ -498,6 +508,24 @@ async def _run_hot_sweep_peer_safe(ctx: _HotSweepPeerContext) -> _HotSweepPeerOu
             extracted=0,
             genuinely_new=0,
         )
+
+
+async def _run_hot_sweep_peer_for_pass(
+    ctx: _HotSweepPeerContext,
+) -> tuple[_HotSweepPeerOutcome | None, int | None]:
+    """Run one peer and turn recoverable admission pressure into a pass result."""
+    try:
+        return await _run_hot_sweep_peer_safe(ctx), None
+    except TelegramRpcAdmissionDeferred as exc:
+        return None, exc.retry_after_seconds
+
+
+def _select_hot_flood_wait_seconds(
+    current: int | None,
+    peer_result: _HotSweepPeerOutcome,
+) -> int | None:
+    """Keep the latest account-wide FloodWait duration for pass telemetry."""
+    return peer_result.flood_wait_seconds if peer_result.flood_wait_seconds is not None else current
 
 
 def _log_recovered_messages(
@@ -527,7 +555,7 @@ def _log_recovered_messages(
         )
 
 
-async def run_hot_sweep_pass(  # noqa: PLR0914 - explicit pass telemetry counters
+async def _run_hot_sweep_pass(  # noqa: PLR0914 - explicit pass telemetry counters
     client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
@@ -616,12 +644,14 @@ async def run_hot_sweep_pass(  # noqa: PLR0914 - explicit pass telemetry counter
     genuinely_new = 0
     yielding_peers = 0
     flood_wait_seconds = working_set.flood_wait_seconds
+    admission_deferred = False
+    retry_after_seconds: int | None = None
 
     for dialog_id, old_hot_cursor in rows:
         if shutdown_event.is_set():
             break
 
-        peer_result = await _run_hot_sweep_peer_safe(
+        peer_result, retry_after_seconds = await _run_hot_sweep_peer_for_pass(
             _HotSweepPeerContext(
                 client=client,
                 conn=conn,
@@ -633,6 +663,15 @@ async def run_hot_sweep_pass(  # noqa: PLR0914 - explicit pass telemetry counter
                 policy=policy,
             )
         )
+        if peer_result is None:
+            admission_deferred = True
+            logger.warning(
+                "activity_hot_sweep_admission_deferred dialog_id=%r retry_after_seconds=%s"
+                " — preserving deferred peer cursor",
+                dialog_id,
+                retry_after_seconds,
+            )
+            break
         peers_processed += 1
         pages_fetched += peer_result.pages_fetched
         rpc_calls += peer_result.rpc_calls
@@ -644,8 +683,7 @@ async def run_hot_sweep_pass(  # noqa: PLR0914 - explicit pass telemetry counter
             prior_hot_cursor=old_hot_cursor,
             discovered_at=int(time.time()),
         )
-        if peer_result.flood_wait_seconds is not None:
-            flood_wait_seconds = peer_result.flood_wait_seconds
+        flood_wait_seconds = _select_hot_flood_wait_seconds(flood_wait_seconds, peer_result)
         if peer_result.completed and peer_result.genuinely_new > 0:
             yielding_peers += 1
 
@@ -667,14 +705,16 @@ async def run_hot_sweep_pass(  # noqa: PLR0914 - explicit pass telemetry counter
         "yielding_peers": yielding_peers,
         "flooded": flooded or working_set.flood_wait_seconds is not None,
         "flood_wait_seconds": flood_wait_seconds,
+        "admission_deferred": admission_deferred,
+        "retry_after_seconds": retry_after_seconds,
         "duration_s": time.monotonic() - started_at,
     }
     log_maintenance_cycle(
         logger,
-        any((genuinely_new, flooded, working_set.flood_wait_seconds is not None, due_remaining)),
+        any((genuinely_new, flooded, admission_deferred, working_set.flood_wait_seconds is not None, due_remaining)),
         "activity_hot_sweep_pass_done peers_selected=%d peers_processed=%d due_remaining=%d"
         " pages_fetched=%d rpc_calls=%d extracted=%d genuinely_new=%d yielding_peers=%d"
-        " flooded=%s flood_wait_seconds=%r duration_s=%.3f",
+        " flooded=%s flood_wait_seconds=%r admission_deferred=%s retry_after_seconds=%r duration_s=%.3f",
         len(rows),
         peers_processed,
         due_remaining,
@@ -685,9 +725,51 @@ async def run_hot_sweep_pass(  # noqa: PLR0914 - explicit pass telemetry counter
         yielding_peers,
         flooded or working_set.flood_wait_seconds is not None,
         flood_wait_seconds,
+        admission_deferred,
+        retry_after_seconds,
         time.monotonic() - started_at,
     )
     return telemetry
+
+
+def _admission_deferred_telemetry(
+    conn: sqlite3.Connection, retry_after_seconds: int | None
+) -> dict[str, int | float | bool | None]:
+    """Return a retryable pass result without changing peer progress."""
+    return {
+        "peers_selected": 0,
+        "peers_processed": 0,
+        "due_remaining": _count_due_hot_peers(conn, now=int(time.time())),
+        "pages_fetched": 0,
+        "rpc_calls": 0,
+        "extracted": 0,
+        "genuinely_new": 0,
+        "yielding_peers": 0,
+        "flooded": False,
+        "flood_wait_seconds": None,
+        "retry_after_seconds": retry_after_seconds,
+        "admission_deferred": True,
+        "duration_s": 0.0,
+    }
+
+
+async def run_hot_sweep_pass(
+    client: ActivityClient,
+    conn: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+    *,
+    policy: HotSweepPolicy,
+    timeout_s: float,
+) -> dict[str, int | float | bool | None]:
+    """Run one pass, turning local admission deferral into retry telemetry."""
+    try:
+        return await _run_hot_sweep_pass(client, conn, shutdown_event, policy=policy, timeout_s=timeout_s)
+    except TelegramRpcAdmissionDeferred as exc:
+        logger.warning(
+            "activity_hot_sweep_admission_deferred retry_after_seconds=%s",
+            exc.retry_after_seconds,
+        )
+        return _admission_deferred_telemetry(conn, exc.retry_after_seconds)
 
 
 async def run_hot_sweep_loop(
@@ -712,11 +794,16 @@ async def run_hot_sweep_loop(
                 telemetry["genuinely_new"],
                 telemetry["flood_wait_seconds"],
             )
+        except RpcAdmissionClosedError:
+            raise
         except TelegramRpcThrottled:
             raise
         except Exception:
             logger.warning("activity_hot_sweep_error", exc_info=True)
-        wait_seconds = max(policy.loop_interval_seconds, float(telemetry.get("flood_wait_seconds") or 0))
+        wait_seconds = max(
+            policy.loop_interval_seconds,
+            float(telemetry.get("retry_after_seconds") or telemetry.get("flood_wait_seconds") or 0),
+        )
         logger.debug("activity_hot_sweep_loop_sleeping interval=%.0fs", wait_seconds)
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=wait_seconds)

@@ -26,6 +26,7 @@ from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
 from .models import DialogType
 from .own_only import enroll_own_only_sync_dialog
+from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
 from .telethon_dialog import classify_dialog_type
 
 logger = logging.getLogger(__name__)
@@ -264,24 +265,25 @@ async def _search_backfill_batch(
 ) -> object:
     """Run the backfill SearchRequest and translate control-flow exceptions."""
     try:
-        return await call_with_timeout(
-            client,
-            SearchRequest(
-                peer=InputPeerEmpty(),
-                q="",
-                filter=InputMessagesFilterEmpty(),
-                min_date=None,
-                max_date=None,
-                offset_id=checkpoint,
-                add_offset=0,
-                limit=_BACKFILL_BATCH_LIMIT,
-                max_id=0,
-                min_id=0,
-                hash=0,
-                from_id=InputPeerSelf(),
-            ),
-            timeout_s=timeout_s,
-        )
+        with rpc_scope(TelegramRpcSource.ACTIVITY_ARCHIVE, timeout_seconds=timeout_s):
+            return await call_with_timeout(
+                client,
+                SearchRequest(
+                    peer=InputPeerEmpty(),
+                    q="",
+                    filter=InputMessagesFilterEmpty(),
+                    min_date=None,
+                    max_date=None,
+                    offset_id=checkpoint,
+                    add_offset=0,
+                    limit=_BACKFILL_BATCH_LIMIT,
+                    max_id=0,
+                    min_id=0,
+                    hash=0,
+                    from_id=InputPeerSelf(),
+                ),
+                timeout_s=timeout_s,
+            )
     except TelegramRpcThrottled as exc:
         logger.warning(
             "activity_sync_floodwait seconds=%s total_fetched=%d",
@@ -293,6 +295,8 @@ async def _search_backfill_batch(
         if await sleep_through_flood(shutdown_event, exc.retry_after_seconds):
             return _SEARCH_BATCH_STOP
         return _SEARCH_BATCH_RETRY
+    except RpcAdmissionClosedError:
+        raise
     except TimeoutError:
         logger.warning(
             "activity_sync_backfill_rpc_timeout offset_id=%d total_fetched=%d",
@@ -313,24 +317,25 @@ async def _search_incremental_batch(  # noqa: PLR0913 - explicit worker state an
 ) -> object:
     """Run the incremental SearchRequest and translate control-flow exceptions."""
     try:
-        return await call_with_timeout(
-            client,
-            SearchRequest(
-                peer=InputPeerEmpty(),
-                q="",
-                filter=InputMessagesFilterEmpty(),
-                min_date=datetime.fromtimestamp(min_date, tz=UTC),
-                max_date=None,
-                offset_id=offset_id,
-                add_offset=0,
-                limit=_BACKFILL_BATCH_LIMIT,
-                max_id=0,
-                min_id=0,
-                hash=0,
-                from_id=InputPeerSelf(),
-            ),
-            timeout_s=timeout_s,
-        )
+        with rpc_scope(TelegramRpcSource.ACTIVITY_ARCHIVE, timeout_seconds=timeout_s):
+            return await call_with_timeout(
+                client,
+                SearchRequest(
+                    peer=InputPeerEmpty(),
+                    q="",
+                    filter=InputMessagesFilterEmpty(),
+                    min_date=datetime.fromtimestamp(min_date, tz=UTC),
+                    max_date=None,
+                    offset_id=offset_id,
+                    add_offset=0,
+                    limit=_BACKFILL_BATCH_LIMIT,
+                    max_id=0,
+                    min_id=0,
+                    hash=0,
+                    from_id=InputPeerSelf(),
+                ),
+                timeout_s=timeout_s,
+            )
     except TelegramRpcThrottled as exc:
         logger.warning("activity_sync_incremental_floodwait seconds=%s", exc.retry_after_seconds)
         if exc.retry_after_seconds is None:
@@ -338,6 +343,8 @@ async def _search_incremental_batch(  # noqa: PLR0913 - explicit worker state an
         if await sleep_through_flood(shutdown_event, exc.retry_after_seconds):
             return _SEARCH_BATCH_STOP
         return _SEARCH_BATCH_RETRY
+    except RpcAdmissionClosedError:
+        raise
     except TimeoutError:
         logger.warning("activity_sync_rpc_timeout offset_id=%d inserted=%d", offset_id, inserted)
         return _SEARCH_BATCH_STOP
@@ -607,6 +614,8 @@ async def run_activity_sync_loop(
         try:
             await _run_backfill(client, conn, shutdown_event, timeout_s=timeout_s)
             await _run_incremental(client, conn, shutdown_event, timeout_s=timeout_s)
+        except RpcAdmissionClosedError:
+            raise
         except Exception:
             logger.warning("activity_sync_error", exc_info=True)
         logger.debug("activity_sync_loop_sleeping interval=%.0fs", interval)

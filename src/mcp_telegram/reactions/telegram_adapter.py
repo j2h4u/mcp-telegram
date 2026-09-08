@@ -10,6 +10,7 @@ from telethon.tl import types
 from telethon.tl.functions.messages import GetMessageReactionsListRequest
 
 from ..telegram_gateway import CATCHABLE_GATEWAY_FAILURES, translate_gateway_failure
+from ..telegram_rpc_scheduler import RpcAdmissionClosedError
 from .contracts import ReactionEvent, ReactionFetchResult, ReactionSnapshot
 from .ports import TelegramReactionGateway
 from .projection import project_reaction_aggregates
@@ -22,7 +23,7 @@ class _TelegramClientLike(Protocol):
 
 
 class TelethonTelegramReactionGateway(TelegramReactionGateway):
-    """Telethon gateway that projects only reaction facts from each message."""
+    """Reaction adapter that inherits the caller's refresh RPC scope."""
 
     def __init__(self, client: object) -> None:
         self._client = cast(_TelegramClientLike, client)
@@ -87,6 +88,8 @@ class TelethonTelegramReactionGateway(TelegramReactionGateway):
                     for item in response.reactions
                 )
                 next_offset = response.next_offset
+            except RpcAdmissionClosedError:
+                raise
             except CATCHABLE_GATEWAY_FAILURES:
                 return tuple(events), "unavailable"
             if next_offset is None:
@@ -106,6 +109,8 @@ class TelethonTelegramReactionGateway(TelegramReactionGateway):
                     None if message is None else await self._snapshot_with_events(entity, message_id, message)
                 )
             return ReactionFetchResult(messages=tuple(snapshots))
+        except RpcAdmissionClosedError:
+            raise
         except CATCHABLE_GATEWAY_FAILURES as exc:
             return ReactionFetchResult(failure=translate_gateway_failure(exc))
 
@@ -114,6 +119,8 @@ class TelethonTelegramReactionGateway(TelegramReactionGateway):
         events_status = "unavailable"
         try:
             events, events_status = await self._fetch_reaction_events(entity, message_id)
+        except RpcAdmissionClosedError:
+            raise
         except CATCHABLE_GATEWAY_FAILURES:
             pass
         return ReactionSnapshot(

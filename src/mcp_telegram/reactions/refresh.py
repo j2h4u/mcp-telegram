@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable
 from typing import Protocol
 
+from ..telegram_rpc_scheduler import TelegramRpcSource, preserve_or_rpc_scope
 from .contracts import ReactionFreshness
 from .ports import ReactionSnapshotRepository, TelegramReactionGateway
 
@@ -52,7 +53,8 @@ class ReactionFreshener:
             return ReactionFreshness(
                 len(message_ids), len(fresh_ids), len(stale_ids), 0, "fresh" if not stale_ids else state
             )
-        result = await self._gateway.fetch_reactions(entity, stale_ids)
+        with preserve_or_rpc_scope(TelegramRpcSource.REACTION_REFRESH):
+            result = await self._gateway.fetch_reactions(entity, stale_ids)
         if result.ok:
             # The use case owns this atomic write. The repository implementation
             # scopes it with a savepoint so an unrelated outer transaction is not

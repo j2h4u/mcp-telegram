@@ -10,6 +10,7 @@ from telethon.tl.functions.messages import GetCustomEmojiDocumentsRequest, GetFo
 from telethon.tl.types import DocumentAttributeCustomEmoji, InputStickerSetEmpty
 
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_scope
 from mcp_telegram.topics.contracts import TopicFact, is_topic_capable
 from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway
@@ -25,9 +26,11 @@ class _Entity:
 class _Gateway:
     def __init__(self) -> None:
         self.entities: list[object] = []
+        self.sources: list[TelegramRpcSource] = []
 
     async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
         self.entities.append(entity)
+        self.sources.append(current_rpc_scope().source)
         return (TopicFact(topic_id=1, title="General", is_general=True),)
 
 
@@ -69,6 +72,17 @@ async def test_does_not_fetch_topics_for_ordinary_private_bot() -> None:
     assert count == 0
     assert gateway.entities == []
     assert repository.writes == []
+
+
+@pytest.mark.asyncio
+async def test_topic_refresh_preserves_interactive_resolution_scope() -> None:
+    gateway = _Gateway()
+    repository = _Repository()
+
+    with rpc_scope(TelegramRpcSource.TOPIC_RESOLUTION):
+        await TopicRefresher(gateway, repository).refresh(42, _Entity(forum=True))
+
+    assert gateway.sources == [TelegramRpcSource.TOPIC_RESOLUTION]
 
 
 @pytest.mark.asyncio

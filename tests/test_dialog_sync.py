@@ -32,6 +32,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from mcp_telegram.dialog_sync import (
+    _KEY_STATUS,
+    _STATUS_COMPLETE,
+    _STATUS_IN_PROGRESS,
     _UPSERT_DIALOG_SQL,
     DialogsBootstrapWorker,
     _clear_cursor,
@@ -42,6 +45,12 @@ from mcp_telegram.dialog_sync import (
     _set_state,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.telegram_rpc_scheduler import (
+    RpcAdmissionClosedError,
+    TelegramRpcAdmissionDeferred,
+    TelegramRpcSource,
+    rpc_scope,
+)
 from mcp_telegram.unread_state import apply_unread_facts
 
 # ---------------------------------------------------------------------------
@@ -541,6 +550,98 @@ class TestDialogsBootstrapWorker:
         elapsed = time.monotonic() - start
         # If sleep were uninterruptible the throttling wait of 120s would block.
         assert elapsed < 5.0
+
+    @pytest.mark.asyncio
+    async def test_admission_deferred_retries_from_durable_cursor(
+        self,
+        db_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = _make_dialog(11, _make_user_entity(11, first_name="A"))
+        second = _make_dialog(22, _make_user_entity(22, first_name="B"))
+        deferred = TelegramRpcAdmissionDeferred(retry_after_seconds=3)
+        calls: list[dict[str, object]] = []
+
+        async def first_attempt() -> AsyncIterator[object]:
+            yield first
+            raise deferred
+
+        client = MagicMock()
+
+        def iter_dialogs(**kwargs: object) -> AsyncIterator[object]:
+            calls.append(kwargs)
+            return first_attempt() if len(calls) == 1 else _async_gen([second])
+
+        client.iter_dialogs = MagicMock(side_effect=iter_dialogs)
+        shutdown_event = asyncio.Event()
+        sleep_mock = AsyncMock(return_value=False)
+        monkeypatch.setattr("mcp_telegram.dialog_sync.sleep_through_flood", sleep_mock)
+        worker = DialogsBootstrapWorker(client, db_path, shutdown_event)
+
+        assert await worker.run() == 2
+        assert len(calls) == 2
+        assert calls[0]["offset_id"] == 0
+        assert calls[1]["offset_id"] == first.id
+        sleep_mock.assert_awaited_once_with(shutdown_event, 3)
+
+        conn = _open_sync_db(db_path)
+        try:
+            assert _get_state(conn, _KEY_STATUS) == _STATUS_COMPLETE
+            assert conn.execute("SELECT COUNT(*) FROM dialogs").fetchone() == (2,)
+        finally:
+            conn.close()
+
+    @pytest.mark.asyncio
+    async def test_admission_deferred_stops_on_shutdown_without_retry(
+        self,
+        db_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        deferred = TelegramRpcAdmissionDeferred(retry_after_seconds=3)
+
+        async def deferred_attempt() -> AsyncIterator[object]:
+            raise deferred
+            yield  # pragma: no cover - keeps this an async generator
+
+        client = MagicMock()
+        client.iter_dialogs = MagicMock(side_effect=lambda **_: deferred_attempt())
+        shutdown_event = asyncio.Event()
+        shutdown_event.set()
+        sleep_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr("mcp_telegram.dialog_sync.sleep_through_flood", sleep_mock)
+        worker = DialogsBootstrapWorker(client, db_path, shutdown_event)
+
+        assert await worker.run() == 0
+        client.iter_dialogs.assert_called_once()
+        sleep_mock.assert_awaited_once_with(shutdown_event, 3)
+
+        conn = _open_sync_db(db_path)
+        try:
+            assert _get_state(conn, _KEY_STATUS) == _STATUS_IN_PROGRESS
+        finally:
+            conn.close()
+
+    @pytest.mark.asyncio
+    async def test_admission_closed_is_permanent_and_preserves_cursor(self, db_path: Path) -> None:
+        with rpc_scope(TelegramRpcSource.DIALOG_SYNC) as scope:
+            closed = RpcAdmissionClosedError(scope, "scheduler closed")
+
+        async def closed_attempt() -> AsyncIterator[object]:
+            raise closed
+            yield  # pragma: no cover - keeps this an async generator
+
+        client = MagicMock()
+        client.iter_dialogs = MagicMock(side_effect=lambda **_: closed_attempt())
+        worker = DialogsBootstrapWorker(client, db_path, asyncio.Event())
+
+        with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
+            await worker.run()
+
+        conn = _open_sync_db(db_path)
+        try:
+            assert _get_state(conn, _KEY_STATUS) == _STATUS_IN_PROGRESS
+        finally:
+            conn.close()
 
     @pytest.mark.asyncio
     async def test_rpcerror_aborts_without_complete_and_surfaces_via_startup_detail(

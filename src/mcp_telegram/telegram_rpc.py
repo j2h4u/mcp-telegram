@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Coroutine
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Never, Protocol, cast
 
 from aiolimiter import AsyncLimiter
 from telethon import TelegramClient  # type: ignore[import-untyped]
@@ -24,6 +25,22 @@ from telethon.errors import (  # type: ignore[import-untyped]
 from telethon.utils import is_list_like  # type: ignore[import-untyped]
 
 from .flood import TelegramRpcThrottled, flood_seconds
+from .telegram_rpc_scheduler import (
+    AdmissionObserver,
+    RpcAdmission,
+    RpcAdmissionError,
+    RpcAdmissionExpiredError,
+    RpcAdmissionSaturatedError,
+    RpcTransportReadiness,
+    TelegramRpcAdmissionDeferred,
+    TelegramRpcAdmissionScheduler,
+    TelegramRpcSchedulerPolicy,
+    TelegramRpcScope,
+    TelegramRpcSource,
+    UnclassifiedTelegramRpcError,
+    current_rpc_scope,
+    rpc_scope,
+)
 
 
 def raise_if_flood_wait_error(error: BaseException) -> None:
@@ -47,6 +64,51 @@ class CircuitStatus(Protocol):
     def open(self) -> bool: ...
 
     def detail(self) -> str: ...
+
+
+class _SendAttempt(Protocol):
+    def __call__(
+        self,
+        request: object,
+        *,
+        ordered: bool = False,
+    ) -> Awaitable[object] | list[asyncio.Future[object]]: ...
+
+
+class _AdmissionAwareSender:
+    """Admit each scalar attempt at Telethon's synchronous sender seam."""
+
+    def __init__(self, gate: TelegramRpcGate, send_attempt: _SendAttempt, scope: TelegramRpcScope) -> None:
+        self._gate = gate
+        self._send_attempt = send_attempt
+        self._scope = scope
+
+    def send(self, request: object, *, ordered: bool = False) -> Coroutine[object, object, object]:
+        return self._send(request, ordered=ordered)
+
+    async def _send(self, request: object, *, ordered: bool) -> object:
+        while True:
+            admission = await self._gate._admit(self._scope)
+            try:
+                if not self._gate._scheduler_transport_ready():
+                    self._gate._admission_scheduler.record_retry(
+                        self._scope,
+                        reason="transport_readiness_changed",
+                    )
+                    continue
+                self._gate._admission_scheduler.record_dispatch(admission)
+                future = self._send_attempt(request, ordered=ordered)
+                if isinstance(future, list):
+                    self._reject_batch(future)
+                return await future
+            finally:
+                self._gate._admission_scheduler.complete(admission)
+
+    @staticmethod
+    def _reject_batch(futures: list[asyncio.Future[object]]) -> Never:
+        for future in futures:
+            future.cancel()
+        raise RuntimeError("Telegram sender returned a future batch for a scalar request")
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +158,8 @@ class TelegramRpcGate(TelegramClient):
         fallback_wait_seconds: int,
         cooldown_buffer_seconds: float,
         transient_retry_delays_seconds: tuple[float, ...],
+        scheduler_policy: TelegramRpcSchedulerPolicy,
+        admission_observer: AdmissionObserver | None = None,
         flood_observer: Callable[..., None] | None = None,
         **kwargs: object,
     ) -> None:
@@ -115,9 +179,37 @@ class TelegramRpcGate(TelegramClient):
         self._cooldown_buffer_seconds = cooldown_buffer_seconds
         self._transient_retry_delays = transient_retry_delays_seconds
         self._flood_observer = flood_observer
+        self._scheduler_policy = scheduler_policy
         self._limiter = (
             AsyncLimiter(rpc_budget.max_calls_per_period, rpc_budget.period_seconds) if rpc_budget.enabled else None
         )
+        self._admission_scheduler = TelegramRpcAdmissionScheduler(
+            policy=self._scheduler_policy,
+            limiter=self._limiter,
+            observer=admission_observer,
+            readiness=RpcTransportReadiness(
+                probe=self._scheduler_transport_ready,
+                wait=self._wait_for_scheduler_transport,
+            ),
+        )
+
+    @staticmethod
+    def rpc_scope(
+        source: TelegramRpcSource,
+        *,
+        deadline: float | None = None,
+        timeout_seconds: float | None = None,
+    ) -> AbstractContextManager[TelegramRpcScope]:
+        """Return a source scope for application helpers using this client."""
+        return rpc_scope(source, deadline=deadline, timeout_seconds=timeout_seconds)
+
+    async def close_rpc_scheduler(self) -> None:
+        """Cancel queued admission work during final daemon shutdown."""
+        await self._admission_scheduler.close()
+
+    def set_rpc_admission_observer(self, observer: AdmissionObserver | None) -> None:
+        """Attach the daemon-owned operational telemetry sink."""
+        self._admission_scheduler.set_observer(observer)
 
     def check_circuit(self) -> None:
         status = self._rpc_circuit_status()
@@ -135,40 +227,121 @@ class TelegramRpcGate(TelegramClient):
         del flood_sleep_threshold  # The gate always uses the client-level zero threshold.
         if request is not None and is_list_like(request):
             raise ValueError("transport batching is forbidden; use sequential scalar calls")
+        scope = self._require_rpc_scope()
         for retry_index, delay in enumerate((0.0, *self._transient_retry_delays)):
             if retry_index and delay:
                 await asyncio.sleep(delay)
             try:
-                await self._admit()
-                return await super().__call__(request, ordered=ordered)
-            except (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError) as exc:
-                seconds = await self._observe_flood(exc)
-                raise TelegramRpcThrottled(
-                    retry_after_seconds=seconds,
-                    latched=False,
-                    detail=f"Telegram RPC throttled for {seconds}s",
-                ) from exc
+                return await self._call_with_source_policy(request, ordered=ordered, scope=scope)
             except TransientRpcErrors:
                 if retry_index >= len(self._transient_retry_delays):
                     raise
+                self._admission_scheduler.record_retry(scope, reason="server_transient")
         raise AssertionError("unreachable")
 
-    async def _admit(self) -> None:
-        self.check_circuit()
-        await self._wait_for_cooldown()
-        if self._limiter is not None:
-            await self._limiter.acquire()
-        self.check_circuit()
-        await self._wait_for_cooldown()
+    def _require_rpc_scope(self) -> TelegramRpcScope:
+        try:
+            return current_rpc_scope()
+        except UnclassifiedTelegramRpcError:
+            self._admission_scheduler.record_unclassified()
+            raise
 
-    async def _wait_for_cooldown(self) -> None:
+    async def _call_with_source_policy(
+        self,
+        request: object,
+        *,
+        ordered: bool,
+        scope: TelegramRpcScope,
+    ) -> object:
         while True:
-            self.check_circuit()
-            async with _COOLDOWN_LOCK:
-                remaining = _COOLDOWN_DEADLINE - time.monotonic()
-            if remaining <= 0:
-                return
-            await asyncio.sleep(remaining)
+            try:
+                return await self._dispatch_attempt(request, ordered=ordered, scope=scope)
+            except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
+                await self._handle_admission_deferral(scope, exc)
+            except TelegramRpcThrottled:
+                if scope.source is not TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
+                    raise
+                await self._retry_update_source(scope, reason="account_circuit")
+            except (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError) as exc:
+                await self._handle_flood_wait(scope, exc)
+
+    def _send_real_sender(
+        self,
+        request: object,
+        *,
+        ordered: bool = False,
+    ) -> Awaitable[object] | list[asyncio.Future[object]]:
+        return cast(_SendAttempt, self._sender.send)(request, ordered=ordered)
+
+    async def _handle_admission_deferral(self, scope: TelegramRpcScope, exc: RpcAdmissionError) -> None:
+        if scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
+            await self._retry_update_source(scope, reason=type(exc).__name__)
+            return
+        retry_seconds = self._scheduler_policy.admission_retry_seconds
+        raise TelegramRpcAdmissionDeferred(
+            retry_after_seconds=retry_seconds,
+            latched=False,
+            detail=f"Telegram is temporarily busy; retry in {retry_seconds:g}s",
+        ) from None
+
+    async def _retry_update_source(self, scope: TelegramRpcScope, *, reason: str) -> None:
+        self._admission_scheduler.record_retry(scope, reason=reason)
+        await asyncio.sleep(self._scheduler_policy.update_loop_retry_seconds)
+
+    async def _handle_flood_wait(self, scope: TelegramRpcScope, exc: BaseException) -> None:
+        seconds = await self._observe_flood(exc)
+        if scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
+            self._admission_scheduler.record_retry(scope, reason="flood_wait")
+            return
+        raise TelegramRpcThrottled(
+            retry_after_seconds=seconds,
+            latched=False,
+            detail=f"Telegram RPC throttled for {seconds}s",
+        ) from exc
+
+    async def _dispatch_attempt(
+        self,
+        request: object,
+        *,
+        ordered: bool,
+        scope: TelegramRpcScope,
+    ) -> object:
+        """Dispatch one Telethon attempt through the admission-aware sender.
+
+        Keeping this seam separate from the source policy makes the boundary
+        explicit and lets focused callers exercise admission translation
+        without constructing a live Telethon sender.
+        """
+        self.check_circuit()
+        sender = _AdmissionAwareSender(self, self._send_real_sender, scope)
+        return await super()._call(sender, request, ordered=ordered)  # type: ignore[misc]
+
+    async def _admit(self, scope: TelegramRpcScope) -> RpcAdmission:
+        self.check_circuit()
+        return await self._admission_scheduler.admit(scope)
+
+    async def _update_loop(self) -> None:
+        """Give Telethon difference RPCs a live scope and non-fatal policy waits."""
+        with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE):
+            await super()._update_loop()  # type: ignore[misc]
+
+    async def _dispatch_update(self, update: object) -> None:
+        """Give Telethon's update child task its own live scope ownership."""
+        with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE):
+            await super()._dispatch_update(update)  # type: ignore[misc]
+
+    def _scheduler_transport_ready(self) -> bool:
+        return not self._rpc_circuit_status().open and account_cooldown_deadline() <= time.monotonic()
+
+    async def _wait_for_scheduler_transport(self) -> None:
+        while not self._scheduler_transport_ready():
+            status = self._rpc_circuit_status()
+            delay = (
+                self._scheduler_policy.update_loop_retry_seconds
+                if status.open
+                else max(account_cooldown_deadline() - time.monotonic(), 0.0)
+            )
+            await asyncio.sleep(delay)
 
     async def _observe_flood(self, exc: BaseException) -> int:
         """Atomically extend cooldown and send exactly one telemetry event."""
@@ -192,9 +365,17 @@ class TelegramRpcGate(TelegramClient):
 
 
 __all__ = [
+    "RpcAdmissionError",
+    "RpcAdmissionExpiredError",
+    "RpcAdmissionSaturatedError",
+    "TelegramRpcAdmissionDeferred",
     "TelegramRpcBudget",
     "TelegramRpcGate",
+    "TelegramRpcSource",
     "TransientRpcErrors",
+    "UnclassifiedTelegramRpcError",
     "account_cooldown_deadline",
+    "current_rpc_scope",
     "reset_account_cooldown",
+    "rpc_scope",
 ]

@@ -26,10 +26,40 @@ foreground_resolve_seconds = 3.0
 rpc_timeout_seconds = 8.0
 refresh_timeout_seconds = 25.0
 max_concurrent_refreshes = 1
+max_queued_refreshes = 128
 
 [telemetry]
 # Retain local tool telemetry for 30 days. This never sends telemetry remotely.
 retention_ttl_seconds = 2592000
+
+[telemetry.runtime_observations]
+# Keep scheduler telemetry best-effort and bounded under SQLite contention.
+prune_every_writes = 1000
+writer_busy_timeout_ms = 50
+queue_capacity = 1024
+writer_startup_wait_seconds = 1.0
+shutdown_drain_grace_seconds = 2.0
+
+[telegram_rpc]
+# One account-wide limiter shared by every service class.
+max_calls_per_period = 30
+period_seconds = 60
+transient_retry_delays_seconds = [0]
+
+[telegram_rpc.scheduler]
+# Weighted FIFO admission with separately reserved queue capacity and deadlines.
+interactive_weight = 6
+live_sync_weight = 3
+background_weight = 1
+interactive_queue_capacity = 64
+live_sync_queue_capacity = 256
+background_queue_capacity = 512
+interactive_deadline_seconds = 15
+live_sync_deadline_seconds = 60
+background_deadline_seconds = 900
+# Stable product-level retry guidance when local admission is temporarily full.
+admission_retry_seconds = 1
+update_loop_retry_seconds = 5
 
 [scheduling]
 # Local daemon maintenance intervals. Compose environment variables can override these.
@@ -67,6 +97,7 @@ pause_between_requests_seconds = 5
 retry_delay_seconds = 21600
 circuit_retry_seconds = 1800
 max_attempts = 3
+backfill_debt_limit = 1
 
 [scheduling.folder_projection]
 # Folder membership acquisition runs in the daemon and never from read requests.

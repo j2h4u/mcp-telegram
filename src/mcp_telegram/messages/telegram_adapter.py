@@ -417,7 +417,8 @@ async def _resolve_peer_name(client: PeerNameClient, peer: _PeerLike) -> str | N
 
     Tries Telethon's session cache first; falls back to an API call when the
     entity is not cached. Returns None when the peer is permanently inaccessible
-    (private/deleted/banned account, unknown ID).
+    (private/deleted/banned account, unknown ID). The caller owns the operation
+    scope because this shared helper is used by multiple sync and event paths.
     """
     log_id = tl_utils.get_peer_id(peer)
     try:

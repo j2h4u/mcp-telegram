@@ -100,6 +100,8 @@ def _dialog_facts(dialog: object) -> DialogFacts:
 
 
 class TelethonTelegramFolderGateway(TelegramFolderGateway):
+    """Folder adapter that inherits the caller's reconciliation RPC scope."""
+
     def __init__(self, client: FolderClient) -> None:
         self._client = client
 

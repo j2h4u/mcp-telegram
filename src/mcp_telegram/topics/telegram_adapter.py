@@ -41,6 +41,8 @@ class _DocumentLike(Protocol):
 
 
 class TelethonTelegramTopicGateway(TelegramTopicGateway):
+    """Topic adapter that inherits the caller's reconciliation RPC scope."""
+
     def __init__(self, client: TopicClient) -> None:
         self._client = client
         self._emoji_alt_by_id: dict[int, str] = {}
