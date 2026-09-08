@@ -1844,6 +1844,7 @@ async def test_trace_account_messages_routes_flat_arguments_and_counts_evidence_
         result = await trace_account_messages(
             TraceAccountMessages(
                 account="@alice",
+                view="messages",
                 group_by="dialog",
                 dialog="Forum",
                 exact_topic_id=7,
@@ -1879,6 +1880,38 @@ async def test_trace_account_messages_routes_flat_arguments_and_counts_evidence_
     assert call_kwargs["account"] == "@alice"
     assert call_kwargs["dialog"] == "Forum"
     assert call_kwargs["exact_topic_id"] == 7
+
+
+async def test_trace_account_messages_defaults_to_content_free_dialog_view() -> None:
+    payload = _trace_daemon_payload()
+    data = _json_dict(payload["data"])
+    data.update(
+        {
+            "view": "dialogs",
+            "dialogs": [
+                {
+                    "dialog_id": -100123,
+                    "dialog_title": "Forum",
+                    "dialog_type": "Forum",
+                    "message_count": 12,
+                    "first_message_at": 100,
+                    "last_message_at": 200,
+                }
+            ],
+        }
+    )
+    conn = _make_daemon_conn(payload)
+
+    with _patch_daemon(conn):
+        result = await trace_account_messages(TraceAccountMessages(exact_account_id=101))
+
+    structured = _json_dict(result.structured_content)
+    assert structured["view"] == "dialogs"
+    assert structured["groups"] == []
+    assert len(_json_list(structured["dialogs"])) == 1
+    assert result.result_count == 1
+    call_kwargs = _call_kwargs(conn.trace_account_messages)
+    assert call_kwargs["view"] == "dialogs"
 
 
 async def test_trace_account_messages_overwrites_wrappers_without_reprojecting_evidence() -> None:

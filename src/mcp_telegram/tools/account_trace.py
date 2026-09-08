@@ -35,6 +35,30 @@ from .structured import (
 TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
+        "view": {"type": "string", "enum": ["dialogs", "messages"]},
+        "dialogs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "dialog_id": {"type": "integer"},
+                    "dialog_title": {"type": ["string", "null"]},
+                    "dialog_type": {"type": ["string", "null"]},
+                    "message_count": {"type": "integer"},
+                    "first_message_at": {"type": "integer"},
+                    "last_message_at": {"type": "integer"},
+                },
+                "required": [
+                    "dialog_id",
+                    "dialog_title",
+                    "dialog_type",
+                    "message_count",
+                    "first_message_at",
+                    "last_message_at",
+                ],
+                "additionalProperties": False,
+            },
+        },
         "resolved_account": {
             "type": "object",
             "properties": {
@@ -189,6 +213,8 @@ TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
         "is_error_conditions": {"type": "string"},
     },
     "required": [
+        "view",
+        "dialogs",
         "resolved_account",
         "groups",
         "coverage",
@@ -212,10 +238,12 @@ class _TraceDialogSelectorKwargs(TypedDict, total=False):
 
 class TraceAccountMessages(ToolArgs):
     """
-    Find observable authored-message evidence for one account across visible message history.
+    Find shared dialogs where one account authored messages, with optional message evidence.
 
     Use account for a name, username, or profile link when the numeric id is unknown; use
-    exact_account_id when it is already known. Scope with dialog/exact_dialog_id, and use
+    exact_account_id when it is already known. The default view="dialogs" returns compact,
+    content-free dialog summaries. Use view="messages" only when message text or a detailed
+    timeline is needed. Scope with dialog/exact_dialog_id, and use
     exact_topic_id only together with a dialog scope. coverage_goal="observed" reports the
     current archive view; coverage_goal="best_effort_visible" permits bounded visible sampling
     with daemon-enforced dialog, message, and time limits. An unscoped trace omits the direct
@@ -234,9 +262,15 @@ class TraceAccountMessages(ToolArgs):
         le=9_223_372_036_854_775_807,
         description="Known numeric account id. Prefer this when available to avoid ambiguity.",
     )
+    view: Literal["dialogs", "messages"] = Field(
+        default="dialogs",
+        description=(
+            "dialogs returns content-free shared-dialog summaries; messages returns authored-message evidence."
+        ),
+    )
     group_by: Literal["timeline", "dialog"] = Field(
         default="timeline",
-        description="Group evidence by timeline day or by dialog/topic.",
+        description="Used only with view=messages: group evidence by timeline day or by dialog/topic.",
     )
     dialog: str | None = Field(
         default=None,
@@ -259,7 +293,12 @@ class TraceAccountMessages(ToolArgs):
         default=None,
         description="Optional upper sent-time bound. ISO-8601 strings are accepted.",
     )
-    limit: int = Field(default=50, ge=1, le=200)
+    limit: int = Field(
+        default=50,
+        ge=1,
+        le=200,
+        description="Maximum dialogs for view=dialogs or message evidence items for view=messages.",
+    )
     navigation: str | None = Field(
         default=None,
         max_length=2000,
@@ -303,10 +342,12 @@ def _trace_preview(data: dict, *, evidence_count: int) -> dict[str, object]:
         gap_summary.extend(
             {"kind": gap.get("kind"), "severity": gap.get("severity")} for gap in gaps[:5] if isinstance(gap, dict)
         )
-    shown_count = min(evidence_count, 5)
+    dialogs = data.get("dialogs")
+    item_count = len(dialogs) if data.get("view") == "dialogs" and isinstance(dialogs, list) else evidence_count
+    shown_count = min(item_count, 5)
     return {
         "shown_count": shown_count,
-        "hidden_count": max(evidence_count - shown_count, 0),
+        "hidden_count": max(item_count - shown_count, 0),
         "gap_summary": gap_summary,
     }
 
@@ -418,11 +459,17 @@ def _normalize_trace_group_order(data: dict) -> None:
 
 
 def _trace_structured_content(data: dict, args: TraceAccountMessages) -> dict[str, object]:
+    data.setdefault("view", args.view)
+    data.setdefault("dialogs", [])
     _normalize_trace_group_order(data)
     _attach_trace_content_metadata(data)
     evidence_count = _trace_evidence_count(data)
+    dialog_count = len(data.get("dialogs", [])) if isinstance(data.get("dialogs"), list) else 0
     next_navigation = data.get("next_navigation")
-    data.setdefault("result_count_semantics", "current_page_evidence_items")
+    data.setdefault(
+        "result_count_semantics",
+        "current_page_dialog_summaries" if args.view == "dialogs" else "current_page_evidence_items",
+    )
     data.setdefault(
         "is_error_conditions",
         "Only tool validation, daemon-unavailable, and daemon protocol failures set is_error=true.",
@@ -430,6 +477,8 @@ def _trace_structured_content(data: dict, args: TraceAccountMessages) -> dict[st
     data.setdefault("preview", _trace_preview(data, evidence_count=evidence_count))
     data.setdefault("warnings", _trace_warnings(data))
     data.setdefault("limits", _trace_limits(data, args, evidence_count=evidence_count))
+    if isinstance(data["limits"], dict):
+        data["limits"]["returned_dialog_count"] = dialog_count
     data.setdefault("navigation", navigation_metadata(next_navigation if isinstance(next_navigation, str) else None))
     return data
 
@@ -456,6 +505,7 @@ async def trace_account_messages(args: TraceAccountMessages) -> ToolResult:
                 elif selector.query is not None:
                     selector_kwargs["dialog"] = selector.query
             response = await conn.trace_account_messages(
+                view=args.view,
                 account=args.account,
                 exact_account_id=args.exact_account_id,
                 group_by=args.group_by,
@@ -498,10 +548,12 @@ async def trace_account_messages(args: TraceAccountMessages) -> ToolResult:
 
     data = _trace_structured_content(dict(response.get("data", {})), args)
     evidence_count = _trace_evidence_count(data)
+    dialogs = data.get("dialogs")
+    result_count = len(dialogs) if args.view == "dialogs" and isinstance(dialogs, list) else evidence_count
     next_navigation = data.get("next_navigation")
     return structured_result(
         data,
-        result_count=evidence_count,
+        result_count=result_count,
         has_filter=True,
         has_cursor=args.navigation is not None or bool(next_navigation),
     )

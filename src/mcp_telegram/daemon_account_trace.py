@@ -24,6 +24,7 @@ from .account_trace_sqlite import (
     coverage_fragments,
     dialog_metadata,
     dialog_statuses,
+    dialog_summary_page,
     evidence_page,
     existing_message_bundle,
     fragment_next_retry_at,
@@ -118,6 +119,7 @@ class _TraceAccountLookup:
 
 @dataclass(frozen=True, slots=True)
 class _TraceAccountMessagesRequest:
+    view: str
     group_by: str
     coverage_goal: str
     dialog_selector: DialogSelector | None
@@ -144,6 +146,9 @@ class _TraceAccountMessagesScope:
 class _TraceAccountQueryResult:
     selected_rows: list[Mapping[str, object]]
     evidence: list[dict[str, object]]
+    dialog_summaries: list[dict[str, object]]
+    observed_message_count: int
+    authorship_basis_counts: dict[str, int]
     next_navigation: str | None
 
 
@@ -301,6 +306,84 @@ def _row_str_or_none(row: Mapping[str, object], key: str) -> str | None:
     return str(value)
 
 
+def _trace_query_rows(request: _TraceAccountQueryContext, *, limit: int) -> list[Mapping[str, object]]:
+    scope = request.scope
+    query = TraceMessageQueryRequest(
+        target_user_id=request.target_user_id,
+        self_id=request.self_id,
+        limit=limit,
+        post_author_aliases=request.post_author_aliases,
+        exact_dialog_id=scope.exact_dialog_id,
+        exact_topic_id=scope.exact_topic_id,
+        sent_after_ts=request.request.sent_after_ts,
+        sent_before_ts=request.request.sent_before_ts,
+        navigation=scope.navigation_payload,
+        scope_dialog_ids=scope.scope_dialog_ids,
+        direct_chat_excluded=request.direct_chat_excluded,
+    )
+    if request.request.view == "dialogs":
+        return dialog_summary_page(request.conn, query)
+    return evidence_page(request.conn, query)
+
+
+def _trace_next_navigation(
+    request: _TraceAccountQueryContext,
+    *,
+    rows: list[Mapping[str, object]],
+    selected_rows: list[Mapping[str, object]],
+    limit: int,
+) -> str | None:
+    from .pagination import AccountTraceNavigationRequest, encode_account_trace_navigation
+
+    if len(rows) <= limit or not selected_rows:
+        return None
+    last = selected_rows[-1]
+    dialogs_view = request.request.view == "dialogs"
+    return encode_account_trace_navigation(
+        AccountTraceNavigationRequest(
+            target_user_id=request.target_user_id,
+            sent_at=_row_int(last, "last_message_at" if dialogs_view else "sent_at"),
+            dialog_id=_row_int(last, "dialog_id"),
+            message_id=0 if dialogs_view else _row_int(last, "message_id"),
+            group_by=cast(Literal["timeline", "dialog"], request.request.group_by),
+            view=cast(Literal["dialogs", "messages"], request.request.view),
+            exact_dialog_id=request.scope.exact_dialog_id,
+            exact_topic_id=request.scope.exact_topic_id,
+            sent_after=cast(str | None, request.request.sent_after),
+            sent_before=cast(str | None, request.request.sent_before),
+            scope_dialog_ids=request.scope.scope_dialog_ids,
+        )
+    )
+
+
+def _trace_authorship_basis_counts(
+    rows: list[Mapping[str, object]],
+    *,
+    dialogs_view: bool,
+) -> dict[str, int]:
+    if not dialogs_view:
+        counts: dict[str, int] = {}
+        for row in rows:
+            basis = str(row["authorship_basis"])
+            counts[basis] = counts.get(basis, 0) + 1
+        return counts
+    signature_count = sum(_row_int(row, "signature_message_count") for row in rows)
+    total_count = sum(_row_int(row, "message_count") for row in rows)
+    result = {"effective_sender_id": total_count - signature_count}
+    if signature_count:
+        result["post_author_signature"] = signature_count
+    return {basis: count for basis, count in result.items() if count}
+
+
+def _trace_gap_evidence(query_result: _TraceAccountQueryResult) -> list[dict[str, object]]:
+    if query_result.evidence:
+        return query_result.evidence
+    summaries = list(query_result.dialog_summaries)
+    if summaries and query_result.authorship_basis_counts.get("post_author_signature", 0):
+        summaries[0] = {**summaries[0], "authorship_basis": "post_author_signature"}
+    return summaries
+
+
 class DaemonAccountTraceService:
     """Account Trace orchestration for daemon-side enrichment and evidence extraction."""
 
@@ -424,52 +507,32 @@ class DaemonAccountTraceService:
         self,
         request: _TraceAccountQueryContext,
     ) -> _TraceAccountQueryResult:
-        from .pagination import AccountTraceNavigationRequest, encode_account_trace_navigation
-
         limit = request.request.limit
-        scope = request.scope
-        conn = request.conn
-        rows = evidence_page(
-            conn,
-            TraceMessageQueryRequest(
-                target_user_id=request.target_user_id,
-                self_id=request.self_id,
-                limit=limit + 1,
-                post_author_aliases=request.post_author_aliases,
-                exact_dialog_id=scope.exact_dialog_id,
-                exact_topic_id=scope.exact_topic_id,
-                sent_after_ts=request.request.sent_after_ts,
-                sent_before_ts=request.request.sent_before_ts,
-                navigation=scope.navigation_payload,
-                scope_dialog_ids=scope.scope_dialog_ids,
-                direct_chat_excluded=request.direct_chat_excluded,
-            ),
+        rows = _trace_query_rows(request, limit=limit + 1)
+        selected_rows = list(rows[:limit])
+        evidence: list[dict[str, object]] = []
+        dialog_summaries: list[dict[str, object]] = []
+        if request.request.view == "dialogs":
+            dialog_summaries = [DaemonAccountTraceService._trace_row_to_dialog_summary(row) for row in selected_rows]
+        else:
+            selected_rows = _project_trace_content_rows(request.conn, selected_rows)
+            evidence = [DaemonAccountTraceService._trace_row_to_evidence(row) for row in selected_rows]
+        next_navigation = _trace_next_navigation(request, rows=rows, selected_rows=selected_rows, limit=limit)
+        observed_message_count = (
+            sum(_row_int(row, "message_count") for row in selected_rows)
+            if request.request.view == "dialogs"
+            else len(selected_rows)
         )
-        selected_rows = _project_trace_content_rows(conn, rows[:limit])
-        evidence = [DaemonAccountTraceService._trace_row_to_evidence(row) for row in selected_rows]
-        next_navigation: str | None = None
-        if len(rows) > limit and selected_rows:
-            last = selected_rows[-1]
-            group_by: Literal["timeline", "dialog"] = "timeline"
-            if request.request.group_by == "dialog":
-                group_by = "dialog"
-            next_navigation = encode_account_trace_navigation(
-                AccountTraceNavigationRequest(
-                    target_user_id=request.target_user_id,
-                    sent_at=_row_int(last, "sent_at"),
-                    dialog_id=_row_int(last, "dialog_id"),
-                    message_id=_row_int(last, "message_id"),
-                    group_by=group_by,
-                    exact_dialog_id=scope.exact_dialog_id,
-                    exact_topic_id=scope.exact_topic_id,
-                    sent_after=cast(str | None, request.request.sent_after),
-                    sent_before=cast(str | None, request.request.sent_before),
-                    scope_dialog_ids=scope.scope_dialog_ids,
-                )
-            )
+        authorship_basis_counts = _trace_authorship_basis_counts(
+            selected_rows,
+            dialogs_view=request.request.view == "dialogs",
+        )
         return _TraceAccountQueryResult(
             selected_rows=selected_rows,
             evidence=evidence,
+            dialog_summaries=dialog_summaries,
+            observed_message_count=observed_message_count,
+            authorship_basis_counts=authorship_basis_counts,
             next_navigation=next_navigation,
         )
 
@@ -477,13 +540,10 @@ class DaemonAccountTraceService:
         self,
         request: _TraceAccountPayloadContext,
     ) -> dict[str, object]:
-        basis_counts: dict[str, int] = {}
-        for item in request.query_result.evidence:
-            basis = str(item["authorship_basis"])
-            basis_counts[basis] = basis_counts.get(basis, 0) + 1
-
         data: dict[str, object] = {
+            "view": request.request.view,
             "resolved_account": request.resolved_account,
+            "dialogs": request.query_result.dialog_summaries,
             "groups": DaemonAccountTraceService._group_trace_evidence(
                 request.query_result.evidence,
                 request.request.group_by,
@@ -495,7 +555,7 @@ class DaemonAccountTraceService:
                 "query_basis": "effective_sender_id_or_post_author_signature",
                 "coverage_goal": request.request.coverage_goal,
                 "coverage_bounds": request.request.coverage_bounds,
-                "authorship_basis_counts": basis_counts,
+                "authorship_basis_counts": request.query_result.authorship_basis_counts,
                 "dialogs_considered_basis": request.coverage["dialogs_considered_basis"],
                 "post_author_aliases_considered": request.post_author_aliases,
                 "local_cache_writes": request.enrichment["messages_persisted"] if request.enrichment else 0,
@@ -528,6 +588,18 @@ class DaemonAccountTraceService:
             "text": row["text"],
             "media_description": row["media_description"],
             "media_kind": row["media_kind"],
+        }
+
+    @staticmethod
+    def _trace_row_to_dialog_summary(row: Mapping[str, object]) -> dict[str, object]:
+        """Convert one aggregate SQL row into a content-free dialog summary."""
+        return {
+            "dialog_id": row["dialog_id"],
+            "dialog_title": row["dialog_title"],
+            "dialog_type": row["dialog_type"],
+            "message_count": row["message_count"],
+            "first_message_at": row["first_message_at"],
+            "last_message_at": row["last_message_at"],
         }
 
     @staticmethod
@@ -593,7 +665,9 @@ class DaemonAccountTraceService:
         """Return a structurally complete empty Account Trace payload."""
         as_of = int(time.time())
         return {
+            "view": (coverage_bounds or {}).get("view", "messages"),
             "resolved_account": resolved_account,
+            "dialogs": [],
             "groups": [],
             "coverage": {
                 "state": "unknown",
@@ -871,11 +945,12 @@ class DaemonAccountTraceService:
                 direct_chat_excluded=direct_chat_excluded,
             )
         )
+        coverage["observed_message_count"] = query_result.observed_message_count
         gaps = _build_trace_gaps(
             _TraceGapBuildRequest(
                 conn=self._deps.conn,
                 target_user_id=target_user_id,
-                evidence=query_result.evidence,
+                evidence=_trace_gap_evidence(query_result),
                 coverage=coverage,
                 exact_dialog_id=scope.exact_dialog_id,
                 exact_topic_id=scope.exact_topic_id,
@@ -1112,13 +1187,24 @@ def _resolve_trace_account_by_fuzzy(
     return _unresolved_trace_account(query=query, resolution_source="entities_fuzzy_not_found")
 
 
-def _parse_trace_account_messages_request(req: dict) -> tuple[_TraceAccountMessagesRequest | None, dict | None]:
-    group_by = req.get("group_by", "timeline")
+def _invalid_trace_enum(view: object, group_by: object) -> tuple[str, str] | None:
+    if view not in ("dialogs", "messages"):
+        return "view", "dialogs or messages"
     if group_by not in ("timeline", "dialog"):
+        return "group_by", "timeline or dialog"
+    return None
+
+
+def _parse_trace_account_messages_request(req: dict) -> tuple[_TraceAccountMessagesRequest | None, dict | None]:
+    view = req.get("view", "messages")
+    group_by = req.get("group_by", "timeline")
+    invalid_enum = _invalid_trace_enum(view, group_by)
+    if invalid_enum is not None:
+        field, choices = invalid_enum
         return None, {
             "ok": False,
-            "error": "invalid_group_by",
-            "message": "group_by must be timeline or dialog",
+            "error": f"invalid_{field}",
+            "message": f"{field} must be {choices}",
         }
 
     coverage_goal = req.get("coverage_goal", "observed")
@@ -1149,6 +1235,7 @@ def _parse_trace_account_messages_request(req: dict) -> tuple[_TraceAccountMessa
         return None, {"ok": False, "error": "invalid_time_bound", "message": "sent_before is invalid"}
 
     coverage_bounds = {
+        "view": view,
         "limit": limit,
         "exact_dialog_id": exact_dialog_id,
         "exact_topic_id": exact_topic_id,
@@ -1157,6 +1244,7 @@ def _parse_trace_account_messages_request(req: dict) -> tuple[_TraceAccountMessa
     }
     return (
         _TraceAccountMessagesRequest(
+            view=view,
             group_by=group_by,
             coverage_goal=coverage_goal,
             dialog_selector=dialog_selector,
@@ -1311,6 +1399,7 @@ def _parse_trace_account_navigation_scope(
             AccountTraceNavigationContext(
                 expected_target_user_id=request.target_user_id,
                 expected_group_by=expected_group_by,
+                expected_view=cast(Literal["dialogs", "messages"], request.request.view),
                 expected_exact_dialog_id=exact_dialog_id,
                 expected_exact_topic_id=exact_topic_id,
                 expected_sent_after=cast(str | None, request.request.sent_after),
