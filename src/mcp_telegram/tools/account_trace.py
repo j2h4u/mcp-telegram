@@ -166,8 +166,18 @@ TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
                 "authorship_basis_counts": {"type": "object", "additionalProperties": {"type": "integer"}},
                 "dialogs_considered_basis": {"type": "string"},
                 "local_cache_writes": {"type": "integer"},
+                "direct_chat_excluded": {
+                    "type": "boolean",
+                    "description": "Whether the target account's direct chat was excluded from this trace.",
+                },
             },
-            "required": ["source", "query_basis", "coverage_goal", "authorship_basis_counts"],
+            "required": [
+                "source",
+                "query_basis",
+                "coverage_goal",
+                "authorship_basis_counts",
+                "direct_chat_excluded",
+            ],
             "additionalProperties": True,
         },
         "next_navigation": {"type": ["string", "null"]},
@@ -208,8 +218,9 @@ class TraceAccountMessages(ToolArgs):
     exact_account_id when it is already known. Scope with dialog/exact_dialog_id, and use
     exact_topic_id only together with a dialog scope. coverage_goal="observed" reports the
     current archive view; coverage_goal="best_effort_visible" permits bounded visible sampling
-    with daemon-enforced dialog, message, and time limits. Gaps describe visibility or sync limits,
-    not proof that no authored message exists.
+    with daemon-enforced dialog, message, and time limits. An unscoped trace omits the direct
+    conversation with the target account because list_messages already covers that dialog. Gaps
+    describe visibility or sync limits, not proof that no authored message exists.
     """
 
     account: str | None = Field(

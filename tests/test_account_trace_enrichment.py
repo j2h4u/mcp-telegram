@@ -29,6 +29,8 @@ from mcp_telegram.daemon_account_trace import (
     _project_trace_content_rows,
     _trace_candidate_dialogs,
     _TraceCandidateBuildRequest,
+    _TraceCoverageFragmentUpsertRequest,
+    _upsert_trace_coverage_fragment,
 )
 from mcp_telegram.daemon_api import DaemonAPIServer
 from mcp_telegram.flood import TelegramRpcThrottled
@@ -579,6 +581,15 @@ async def test_trace_account_observed_mode_does_not_call_enrichment(
 ) -> None:
     server, conn, _client = trace_enrichment_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
+    seed_synced_dialog(conn, dialog_id=-2002, status="access_lost")
+    _upsert_trace_coverage_fragment(
+        _TraceCoverageFragmentUpsertRequest(
+            conn=conn,
+            target_user_id=101,
+            dialog_id=-2003,
+            status="budget_exceeded",
+        )
+    )
     conn.commit()
     enrich = AsyncMock()
     monkeypatch.setattr(DaemonAccountTraceService, "_trace_enrich_visible_dialogs", enrich)
@@ -588,7 +599,9 @@ async def test_trace_account_observed_mode_does_not_call_enrichment(
     assert result["ok"] is True
     enrich.assert_not_called()
     provenance = _dict(_dict(result["data"])["provenance"])
+    gaps = cast(list[dict[str, object]], _dict(result["data"])["gaps"])
     assert provenance["local_cache_writes"] == 0
+    assert [gap["kind"] for gap in gaps] == ["observed_zero"]
 
 
 @pytest.mark.asyncio

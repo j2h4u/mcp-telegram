@@ -93,6 +93,29 @@ def test_evidence_page_preserves_effective_sender_fallbacks_and_signature_dedupl
         conn.close()
 
 
+def test_evidence_page_can_exclude_target_direct_chat_without_hiding_other_authorship() -> None:
+    conn = _conn()
+    try:
+        conn.executemany(
+            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, 0, 0)",
+            [(7, 1, 20, "direct", 7), (-100, 2, 10, "group", 7)],
+        )
+
+        rows = evidence_page(
+            conn,
+            TraceMessageQueryRequest(
+                target_user_id=7,
+                self_id=42,
+                limit=10,
+                direct_chat_excluded=True,
+            ),
+        )
+
+        assert [(row["dialog_id"], row["message_id"]) for row in rows] == [(-100, 2)]
+    finally:
+        conn.close()
+
+
 def test_sqlite_reads_preserve_scopes_and_metadata_defaults() -> None:
     conn = _conn()
     try:

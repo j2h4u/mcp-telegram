@@ -14,6 +14,7 @@ from telethon.tl.functions.contacts import ResolveUsernameRequest  # type: ignor
 
 from .account_trace_sqlite import (
     TRACE_MESSAGE_COMPARE_FIELDS,
+    TraceDialogMetadata,
     TraceMessageQueryRequest,
     access_lost_dialog_ids,
     account_by_id,
@@ -162,6 +163,7 @@ class _TraceAccountQueryContext:
     post_author_aliases: list[str] | None
     conn: sqlite3.Connection
     self_id: int | None
+    direct_chat_excluded: bool
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -173,6 +175,7 @@ class _TraceAccountPayloadContext:
     gaps: list[dict[str, object]]
     enrichment: _TraceVisibleEnrichmentResult | None
     post_author_aliases: list[str]
+    direct_chat_excluded: bool
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -413,6 +416,7 @@ class DaemonAccountTraceService:
                 gaps=[gap],
                 coverage_goal=request.coverage_goal,
                 coverage_bounds=request.coverage_bounds,
+                direct_chat_excluded=request.exact_dialog_id is None,
             ),
         }
 
@@ -438,6 +442,7 @@ class DaemonAccountTraceService:
                 sent_before_ts=request.request.sent_before_ts,
                 navigation=scope.navigation_payload,
                 scope_dialog_ids=scope.scope_dialog_ids,
+                direct_chat_excluded=request.direct_chat_excluded,
             ),
         )
         selected_rows = _project_trace_content_rows(conn, rows[:limit])
@@ -494,6 +499,7 @@ class DaemonAccountTraceService:
                 "dialogs_considered_basis": request.coverage["dialogs_considered_basis"],
                 "post_author_aliases_considered": request.post_author_aliases,
                 "local_cache_writes": request.enrichment["messages_persisted"] if request.enrichment else 0,
+                "direct_chat_excluded": request.direct_chat_excluded,
             },
             "next_navigation": request.query_result.next_navigation,
         }
@@ -582,6 +588,7 @@ class DaemonAccountTraceService:
         gaps: list[dict[str, object]] | None = None,
         coverage_goal: str = "observed",
         coverage_bounds: dict[str, object] | None = None,
+        direct_chat_excluded: bool = True,
     ) -> dict:
         """Return a structurally complete empty Account Trace payload."""
         as_of = int(time.time())
@@ -606,6 +613,7 @@ class DaemonAccountTraceService:
                 "authorship_basis_counts": {},
                 "dialogs_considered_basis": "no_resolved_account",
                 "local_cache_writes": 0,
+                "direct_chat_excluded": direct_chat_excluded,
             },
             "next_navigation": None,
         }
@@ -805,6 +813,7 @@ class DaemonAccountTraceService:
         if scope_error is not None:
             return scope_error
         assert scope is not None
+        direct_chat_excluded = scope.exact_dialog_id is None
 
         post_author_aliases = _trace_post_author_aliases(resolved_account)
         query_result = self._build_trace_account_query_result(
@@ -815,6 +824,7 @@ class DaemonAccountTraceService:
                 post_author_aliases=post_author_aliases,
                 conn=self._deps.conn,
                 self_id=self._deps.self_id,
+                direct_chat_excluded=direct_chat_excluded,
             )
         )
 
@@ -829,6 +839,7 @@ class DaemonAccountTraceService:
                     exact_dialog_id=scope.exact_dialog_id,
                     exact_topic_id=scope.exact_topic_id,
                     linked_chat_map=scope.linked_chat_map,
+                    direct_chat_excluded=direct_chat_excluded,
                 )
             )
             enrichment = await self._trace_enrich_visible_dialogs(
@@ -843,17 +854,22 @@ class DaemonAccountTraceService:
                     post_author_aliases=post_author_aliases,
                     conn=self._deps.conn,
                     self_id=self._deps.self_id,
+                    direct_chat_excluded=direct_chat_excluded,
                 )
             )
 
         selected_rows = query_result.selected_rows
 
         coverage = _build_trace_coverage(
-            self._deps.conn,
-            target_user_id,
-            selected_rows,
-            exact_dialog_id=scope.exact_dialog_id,
-            exact_topic_id=scope.exact_topic_id,
+            _TraceCoverageBuildRequest(
+                conn=self._deps.conn,
+                target_user_id=target_user_id,
+                rows=selected_rows,
+                exact_dialog_id=scope.exact_dialog_id,
+                exact_topic_id=scope.exact_topic_id,
+                coverage_goal=request.coverage_goal,
+                direct_chat_excluded=direct_chat_excluded,
+            )
         )
         gaps = _build_trace_gaps(
             _TraceGapBuildRequest(
@@ -863,6 +879,8 @@ class DaemonAccountTraceService:
                 coverage=coverage,
                 exact_dialog_id=scope.exact_dialog_id,
                 exact_topic_id=scope.exact_topic_id,
+                coverage_goal=request.coverage_goal,
+                direct_chat_excluded=direct_chat_excluded,
             )
         )
         return self._build_trace_account_success_payload(
@@ -874,6 +892,7 @@ class DaemonAccountTraceService:
                 gaps=gaps,
                 enrichment=enrichment,
                 post_author_aliases=post_author_aliases,
+                direct_chat_excluded=direct_chat_excluded,
             )
         )
 
@@ -1555,6 +1574,19 @@ class _TraceGapBuildRequest:
     coverage: dict[str, object]
     exact_dialog_id: int | None = None
     exact_topic_id: int | None = None
+    coverage_goal: str = "observed"
+    direct_chat_excluded: bool = False
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _TraceCoverageBuildRequest:
+    conn: sqlite3.Connection
+    target_user_id: int
+    rows: list[Mapping[str, object]] | list[dict[str, object]]
+    exact_dialog_id: int | None = None
+    exact_topic_id: int | None = None
+    coverage_goal: str = "observed"
+    direct_chat_excluded: bool = False
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1566,6 +1598,7 @@ class _TraceCandidateBuildRequest:
     exact_topic_id: int | None = None
     max_dialogs: int = _TRACE_ENRICHMENT_MAX_DIALOGS
     linked_chat_map: dict[int, int] | None = None
+    direct_chat_excluded: bool = False
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1727,51 +1760,68 @@ def _row_dict(row: object) -> dict[str, object]:
     return dict(_row_mapping(row))
 
 
-def _build_trace_coverage(
-    conn: sqlite3.Connection,
-    target_user_id: int,
-    rows: list[Mapping[str, object]] | list[dict[str, object]],
-    *,
-    exact_dialog_id: int | None = None,
-    exact_topic_id: int | None = None,
-) -> dict:
-    """Build bounded Account Trace coverage semantics for the current response."""
-    observed_dialogs = {_row_int(cast(Mapping[str, object], row), "dialog_id") for row in rows}
+def _trace_coverage_fragments(request: _TraceCoverageBuildRequest) -> list[dict[str, object]]:
+    if request.coverage_goal != "best_effort_visible":
+        return []
     fragments = coverage_fragments(
-        conn,
-        target_user_id=target_user_id,
-        exact_dialog_id=exact_dialog_id,
-        exact_topic_id=exact_topic_id,
+        request.conn,
+        target_user_id=request.target_user_id,
+        exact_dialog_id=request.exact_dialog_id,
+        exact_topic_id=request.exact_topic_id,
     )
-    fragment_dialogs = {_row_int(fragment, "dialog_id") for fragment in fragments}
+    if request.direct_chat_excluded:
+        return [fragment for fragment in fragments if _row_int(fragment, "dialog_id") != request.target_user_id]
+    return fragments
 
-    if exact_dialog_id is not None:
-        considered_dialogs = {exact_dialog_id}
-        basis = "exact_dialog_scope"
-    else:
-        access_lost_dialogs = access_lost_dialog_ids(conn)
-        considered_dialogs = observed_dialogs | fragment_dialogs | access_lost_dialogs
-        basis = "evidence_or_fragments_or_access_lost" if considered_dialogs else "none"
 
+def _trace_coverage_dialogs(
+    request: _TraceCoverageBuildRequest,
+    observed_dialogs: set[int],
+    fragment_dialogs: set[int],
+) -> tuple[set[int], str]:
+    if request.exact_dialog_id is not None:
+        return {request.exact_dialog_id}, "exact_dialog_scope"
+    if request.coverage_goal == "best_effort_visible":
+        access_lost_dialogs = access_lost_dialog_ids(request.conn)
+        if request.direct_chat_excluded:
+            access_lost_dialogs.discard(request.target_user_id)
+        considered = observed_dialogs | fragment_dialogs | access_lost_dialogs
+        return considered, "evidence_or_fragments_or_access_lost" if considered else "none"
+    return observed_dialogs, "returned_evidence_dialogs" if observed_dialogs else "none"
+
+
+def _trace_coverage_gap_dialogs(
+    conn: sqlite3.Connection,
+    considered_dialogs: set[int],
+    fragments: list[dict[str, object]],
+) -> set[int]:
     status_by_dialog = dialog_statuses(conn, considered_dialogs)
-    gap_dialogs: set[int] = set()
-    for dialog_id, status in status_by_dialog.items():
-        if status is None or status in _TRACE_PARTIAL_SYNC_STATUSES:
-            gap_dialogs.add(dialog_id)
-    for fragment in fragments:
-        if str(fragment["status"]) in _TRACE_PARTIAL_FRAGMENT_STATUSES:
-            gap_dialogs.add(_row_int(fragment, "dialog_id"))
+    gaps = {dialog_id for dialog_id, status in status_by_dialog.items() if status is None}
+    gaps.update(dialog_id for dialog_id, status in status_by_dialog.items() if status in _TRACE_PARTIAL_SYNC_STATUSES)
+    gaps.update(
+        _row_int(fragment, "dialog_id")
+        for fragment in fragments
+        if str(fragment["status"]) in _TRACE_PARTIAL_FRAGMENT_STATUSES
+    )
+    return gaps
 
-    if not considered_dialogs:
-        state = "unknown"
-    elif gap_dialogs:
-        state = "partial"
-    else:
-        state = "complete"
 
+def _build_trace_coverage(request: _TraceCoverageBuildRequest) -> dict:
+    """Build bounded Account Trace coverage semantics for the current response."""
+    observed_dialogs = {_row_int(cast(Mapping[str, object], row), "dialog_id") for row in request.rows}
+    if request.direct_chat_excluded:
+        observed_dialogs.discard(request.target_user_id)
+    fragments = _trace_coverage_fragments(request)
+    considered_dialogs, basis = _trace_coverage_dialogs(
+        request,
+        observed_dialogs,
+        {_row_int(fragment, "dialog_id") for fragment in fragments},
+    )
+    gap_dialogs = _trace_coverage_gap_dialogs(request.conn, considered_dialogs, fragments)
+    state = "unknown" if not considered_dialogs else "partial" if gap_dialogs else "complete"
     return {
         "state": state,
-        "observed_message_count": len(rows),
+        "observed_message_count": len(request.rows),
         "dialogs_considered": len(considered_dialogs),
         "dialogs_considered_basis": basis,
         "dialogs_with_hits": len(observed_dialogs),
@@ -1882,12 +1932,20 @@ def _build_trace_gaps(
     request: _TraceGapBuildRequest,
 ) -> list[dict[str, object]]:
     """Build controlled Account Trace coverage gaps and actions."""
-    fragment_rows = coverage_fragments(
-        request.conn,
-        target_user_id=request.target_user_id,
-        exact_dialog_id=request.exact_dialog_id,
-        exact_topic_id=request.exact_topic_id,
+    fragment_rows = (
+        coverage_fragments(
+            request.conn,
+            target_user_id=request.target_user_id,
+            exact_dialog_id=request.exact_dialog_id,
+            exact_topic_id=request.exact_topic_id,
+        )
+        if request.coverage_goal == "best_effort_visible"
+        else []
     )
+    if request.direct_chat_excluded:
+        fragment_rows = [
+            fragment for fragment in fragment_rows if _row_int(fragment, "dialog_id") != request.target_user_id
+        ]
     considered_dialogs = _collect_trace_gap_dialogs(request, fragment_rows=fragment_rows)
     status_by_dialog = dialog_statuses(request.conn, considered_dialogs)
     gaps = _collect_trace_gaps_for_dialog_statuses(
@@ -1911,8 +1969,11 @@ def _collect_trace_gap_dialogs(
     dialog_ids.update(_row_int(row, "dialog_id") for row in fragment_rows)
     if request.exact_dialog_id is not None:
         dialog_ids.add(request.exact_dialog_id)
-    elif request.coverage.get("dialogs_considered", 0):
-        dialog_ids.update(access_lost_dialog_ids(request.conn))
+    elif request.coverage_goal == "best_effort_visible" and request.coverage.get("dialogs_considered", 0):
+        access_lost_dialogs = access_lost_dialog_ids(request.conn)
+        if request.direct_chat_excluded:
+            access_lost_dialogs.discard(request.target_user_id)
+        dialog_ids.update(access_lost_dialogs)
     return dialog_ids
 
 
@@ -2087,10 +2148,12 @@ def _add_trace_candidate_dialog(
     include_inaccessible: bool = False,
 ) -> None:
     request = state.request
-    if dialog_id in state.seen or len(state.candidates) >= request.max_dialogs:
-        return
-    meta = dialog_metadata(request.conn, dialog_id)
-    if not include_inaccessible and (meta["status"] == "access_lost" or meta["hidden"]):
+    meta = _trace_candidate_metadata(
+        state,
+        dialog_id=dialog_id,
+        include_inaccessible=include_inaccessible,
+    )
+    if meta is None:
         return
     strategy = _trace_strategy_for_dialog(
         meta["dialog_type"],
@@ -2109,21 +2172,39 @@ def _add_trace_candidate_dialog(
         }
     )
     state.seen.add(dialog_id)
+    _trace_add_linked_chat_candidate(state, dialog_id=dialog_id, strategy=strategy)
 
-    linked_chat_map = state.linked_chat_map
-    if strategy == "signature_only" and dialog_id in linked_chat_map:
-        linked_id = linked_chat_map[dialog_id]
-        if linked_id not in state.seen:
-            enroll_activity_dialog(
-                request.conn,
-                linked_id,
-                source="linked_chat",
-            )
-            _add_trace_candidate_dialog(
-                state=state,
-                dialog_id=linked_id,
-                origin="linked_chat",
-            )
+
+def _trace_candidate_metadata(
+    state: _TraceCandidateBuildState,
+    *,
+    dialog_id: int,
+    include_inaccessible: bool,
+) -> TraceDialogMetadata | None:
+    request = state.request
+    if request.direct_chat_excluded and dialog_id == request.target_user_id:
+        return None
+    if dialog_id in state.seen or len(state.candidates) >= request.max_dialogs:
+        return None
+    meta = dialog_metadata(request.conn, dialog_id)
+    if not include_inaccessible and (meta["status"] == "access_lost" or meta["hidden"]):
+        return None
+    return meta
+
+
+def _trace_add_linked_chat_candidate(
+    state: _TraceCandidateBuildState,
+    *,
+    dialog_id: int,
+    strategy: str,
+) -> None:
+    if strategy != "signature_only" or dialog_id not in state.linked_chat_map:
+        return
+    linked_id = state.linked_chat_map[dialog_id]
+    if linked_id in state.seen:
+        return
+    enroll_activity_dialog(state.request.conn, linked_id, source="linked_chat")
+    _add_trace_candidate_dialog(state=state, dialog_id=linked_id, origin="linked_chat")
 
 
 def _add_trace_candidate_fragments(
