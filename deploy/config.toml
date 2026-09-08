@@ -39,6 +39,9 @@ writer_busy_timeout_ms = 50
 queue_capacity = 1024
 writer_startup_wait_seconds = 1.0
 shutdown_drain_grace_seconds = 2.0
+# Five-minute per-source summaries keep the 30-day window within this cap.
+rpc_summary_interval_seconds = 300
+row_cap = 250000
 
 [telegram_rpc]
 # One account-wide limiter shared by every service class.

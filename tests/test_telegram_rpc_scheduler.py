@@ -4,7 +4,6 @@ import asyncio
 from collections import Counter, deque
 from contextvars import ContextVar
 from dataclasses import replace
-from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -510,9 +509,8 @@ async def test_detached_task_must_replace_inherited_scope_and_deadline() -> None
     assert detached_context == "clean"
 
 
-def test_daemon_observer_persists_content_free_dispatch_metrics() -> None:
-    sink = MagicMock()
-    record = cast(MagicMock, sink.record)
+def test_daemon_observer_forwards_dispatch_event_to_aggregator() -> None:
+    observer = MagicMock()
     event = RpcAdmissionEvent(
         kind=RpcAdmissionEventKind.DISPATCHED,
         source=TelegramRpcSource.MCP_INTERACTIVE,
@@ -522,19 +520,6 @@ def test_daemon_observer_persists_content_free_dispatch_metrics() -> None:
         wait_seconds=0.125,
     )
 
-    _record_rpc_admission(sink, event)
+    _record_rpc_admission(observer, event)
 
-    record.assert_called_once_with(
-        kind="telegram.rpc_admission",
-        outcome="dispatched",
-        reason_code=None,
-        duration_ms=125.0,
-        payload={
-            "source": "mcp_interactive",
-            "service_class": "interactive",
-            "queue_depth": 2,
-            "total_depth": 5,
-            "active_depth": 0,
-            "total_outstanding": 0,
-        },
-    )
+    observer.observe.assert_called_once_with(event)

@@ -110,6 +110,7 @@ from .reactions.sqlite_repository import SQLiteReactionSnapshotRepository
 from .reactions.telegram_adapter import TelethonTelegramReactionGateway
 from .read_state import apply_read_cursor, apply_reconciled_unread_count
 from .reconnect import run_reconnect_catch_up_loop
+from .rpc_admission_observations import RpcAdmissionObservationAggregator
 from .runtime_observations import RuntimeObservationSink, prune_runtime_observations, record_runtime_observation
 from .scheduled_messages import ScheduledReconciliationPolicy, run_scheduled_reconciliation_loop
 from .state import StatePaths, ensure_private_state_dir
@@ -271,6 +272,7 @@ class _SyncMainContext:
     shutdown_event: asyncio.Event
     client: _DaemonClient
     reaction_freshener: ReactionFreshener
+    reaction_freshness_ttl_seconds: int
     message_fact_refresh_policy: MessageFactRefreshPolicy
     api_server: DaemonAPIServer
     topic_refresher: TopicRefresher
@@ -278,6 +280,7 @@ class _SyncMainContext:
     fact_hydration_worker: MessageFactHydrationWorker
     socket_path: Path
     rpc_observation_sink: RuntimeObservationSink | None = None
+    rpc_admission_observer: RpcAdmissionObservationAggregator | None = None
     unix_server: asyncio.AbstractServer | None = None
     handler_manager: EventHandlerManager | None = None
     own_only_context: OwnOnlyContext | None = None
@@ -1000,31 +1003,14 @@ def _observe_runtime(ctx: _SyncMainContext, kind: str, outcome: str, reason_code
 
 
 def _record_rpc_admission(
-    sink: RuntimeObservationSink,
+    observer: RpcAdmissionObservationAggregator,
     event: RpcAdmissionEvent,
     fatal_callback: Callable[[RpcAdmissionEvent], None] | None = None,
 ) -> None:
     """Persist bounded scheduler outcomes without Telegram request content."""
     if fatal_callback is not None and event.kind is RpcAdmissionEventKind.CLOSED and event.reason == "limiter_failure":
         fatal_callback(event)
-    try:
-        sink.record(
-            kind="telegram.rpc_admission",
-            outcome=event.kind.value,
-            reason_code=event.reason,
-            duration_ms=None if event.wait_seconds is None else event.wait_seconds * 1000,
-            payload={
-                "source": None if event.source is None else event.source.value,
-                "service_class": None if event.service_class is None else event.service_class.value,
-                "queue_depth": event.queue_depth,
-                "total_depth": event.total_depth,
-                "active_depth": event.active_depth,
-                "total_outstanding": event.total_outstanding,
-            },
-        )
-    except Exception:  # noqa: BLE001 - telemetry is best effort at the callback boundary
-        # Admission telemetry is best effort and must never affect the caller.
-        pass
+    observer.observe(event)
 
 
 def _mark_rpc_scheduler_failed(
@@ -1124,7 +1110,11 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         telemetry_retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
     )
     with conn:
-        prune_runtime_observations(conn, ttl_seconds=config.telemetry.retention_ttl_seconds)
+        prune_runtime_observations(
+            conn,
+            ttl_seconds=config.telemetry.retention_ttl_seconds,
+            row_cap=config.telemetry.runtime_observations.row_cap,
+        )
         record_runtime_observation(conn, kind="runtime.started", outcome="observed")
 
     # Open feedback.db before registering the shutdown handler so the SIGTERM
@@ -1219,6 +1209,10 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
         policy=config.telemetry.runtime_observations,
     )
+    rpc_admission_observer = RpcAdmissionObservationAggregator(
+        rpc_observation_sink,
+        summary_interval_seconds=config.telemetry.runtime_observations.rpc_summary_interval_seconds,
+    )
     ctx = _SyncMainContext(
         db_path=db_path,
         conn=conn,
@@ -1226,6 +1220,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         shutdown_event=shutdown_event,
         client=client,
         reaction_freshener=reaction_freshener,
+        reaction_freshness_ttl_seconds=config.freshness.reactions.freshness_ttl_seconds,
         message_fact_refresh_policy=_message_fact_refresh_policy_from_config(config),
         api_server=api_server,
         topic_refresher=topic_refresher,
@@ -1256,6 +1251,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         ),
         socket_path=socket_path,
         rpc_observation_sink=rpc_observation_sink,
+        rpc_admission_observer=rpc_admission_observer,
         unix_server=unix_server,
         scheduling=scheduling,
         flood_wait_kill_switch_event=flood_wait_kill_switch_event,
@@ -1273,7 +1269,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         client.set_rpc_admission_observer(
             partial(
                 _record_rpc_admission,
-                rpc_observation_sink,
+                rpc_admission_observer,
                 fatal_callback=partial(_mark_rpc_scheduler_failed, ctx, rpc_scheduler_failure),
             )
         )
@@ -1500,6 +1496,27 @@ async def _start_bootstrap_background_tasks(
         _create_tracked_task(ctx, coro, name=name, rpc_source=source)
 
 
+async def _run_message_fact_refresh_with_dedicated_connection(ctx: _SyncMainContext) -> None:
+    """Keep optional fact writes off the daemon's shared SQLite connection."""
+    conn = _open_sync_db(ctx.db_path)
+    reaction_freshener = ReactionFreshener(
+        SQLiteReactionSnapshotRepository(conn),
+        TelethonTelegramReactionGateway(ctx.client),
+        freshness_ttl_seconds=ctx.reaction_freshness_ttl_seconds,
+        log=logger,
+    )
+    try:
+        await run_message_fact_refresh_loop(
+            conn,
+            reaction_freshener,
+            TelethonTelegramReadReceiptGateway(ctx.client),
+            ctx.shutdown_event,
+            ctx.message_fact_refresh_policy,
+        )
+    finally:
+        conn.close()
+
+
 async def _start_followup_background_tasks(
     ctx: _SyncMainContext,
     delta_worker: DeltaSyncWorker,
@@ -1531,13 +1548,7 @@ async def _start_followup_background_tasks(
     )
     _create_tracked_task(
         ctx,
-        run_message_fact_refresh_loop(
-            ctx.conn,
-            ctx.reaction_freshener,
-            TelethonTelegramReadReceiptGateway(ctx.client),
-            ctx.shutdown_event,
-            ctx.message_fact_refresh_policy,
-        ),
+        _run_message_fact_refresh_with_dedicated_connection(ctx),
         name="message_fact_refresh_loop",
         rpc_source=TelegramRpcSource.MESSAGE_FACT_REFRESH,
     )
@@ -1690,6 +1701,8 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
         ctx.client.set_rpc_admission_observer(None)
 
     async def drain_telemetry() -> None:
+        if ctx.rpc_admission_observer is not None:
+            ctx.rpc_admission_observer.flush()
         if ctx.rpc_observation_sink is not None:
             await ctx.rpc_observation_sink.aclose()
 
