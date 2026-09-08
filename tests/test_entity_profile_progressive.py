@@ -103,6 +103,61 @@ async def test_refresh_coordinator_single_flight_and_shutdown() -> None:
 
 
 @pytest.mark.asyncio
+async def test_refresh_coordinator_waits_for_single_flight_completion() -> None:
+    release = asyncio.Event()
+
+    async def refresh(_entity_id: int) -> None:
+        await release.wait()
+
+    coordinator = EntityRefreshCoordinator(refresh)
+    assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
+    waiter = asyncio.create_task(coordinator.wait_for_completion(42, 1.0))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    release.set()
+
+    assert await waiter is True
+    await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_get_entity_info_waits_for_fresh_profile_after_cache_miss() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+    )
+    _sections_schema(conn)
+    conn.execute("INSERT INTO entities VALUES (42, 'User', 'Local User', 'local', NULL, 100)")
+    limits = RefreshLimits(foreground_refresh_wait_seconds=0.1)
+    service = _test_service(conn, limits=limits)
+    service._deps = replace(service._deps, get_dialog_placement=lambda _entity_id: {})
+
+    async def refresh(entity_id: int) -> None:
+        service._profiles.save_detail(
+            entity_id,
+            {"id": entity_id, "type": "user", "name": "Fresh User", "common_chats": []},
+            now=100,
+        )
+
+    service._refresh = EntityRefreshCoordinator(refresh, limits=limits)
+
+    result = await service.get_entity_info({"entity_id": 42})
+
+    data = cast(dict[str, object], result["data"])
+    sections = cast(dict[str, dict[str, object]], data["sections"])
+    assert data["name"] == "Fresh User"
+    assert sections["full_profile"]["status"] == "fresh"
+    assert sections["common_chats"]["status"] == "fresh"
+    await service.shutdown()
+    conn.close()
+
+
+@pytest.mark.asyncio
 async def test_refresh_coordinator_reports_coalescing_and_queue_saturation() -> None:
     release = asyncio.Event()
     started = asyncio.Event()
@@ -826,7 +881,7 @@ def test_progressive_projection_schema_upgrades_from_v56(tmp_path: Path) -> None
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_profile_refresh_state'"
     ).fetchone() == (1,)
-    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (57,)
+    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (58,)
     conn.close()
 
 

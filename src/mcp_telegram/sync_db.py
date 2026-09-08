@@ -11,7 +11,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 57
+_CURRENT_SCHEMA_VERSION = 58
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -20,6 +20,7 @@ _EVENT_NAMES_MIGRATION_54 = 54
 _ACCESS_CAUSE_MIGRATION_55 = 55
 _TOOL_CAPABILITY_MIGRATION_56 = 56
 _ENTITY_PROFILE_SECTIONS_MIGRATION_57 = 57
+_ACCOUNT_TRACE_INDEXES_MIGRATION_58 = 58
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,18 @@ WHERE out = 1 AND is_service = 0 AND is_deleted = 0
 _MESSAGES_DIALOG_SUMMARY_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_messages_dialog_summary
 ON messages(dialog_id, is_deleted, is_service, out, message_id)
+"""
+
+_MESSAGES_ACCOUNT_TRACE_SENDER_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_messages_account_trace_sender
+ON messages(sender_id, sent_at DESC, dialog_id DESC, message_id DESC)
+WHERE is_deleted = 0 AND is_service = 0
+"""
+
+_MESSAGES_ACCOUNT_TRACE_POST_AUTHOR_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_messages_account_trace_post_author
+ON messages(post_author, sent_at DESC, dialog_id DESC, message_id DESC)
+WHERE is_deleted = 0 AND is_service = 0 AND post_author IS NOT NULL
 """
 
 _MESSAGE_VERSIONS_DDL = """
@@ -2803,6 +2816,19 @@ def _apply_migration_57(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_58(conn: sqlite3.Connection, current: int) -> int:
+    """Add ordered author lookup paths used by Account Trace."""
+    return _apply_migration(
+        conn,
+        current,
+        _ACCOUNT_TRACE_INDEXES_MIGRATION_58,
+        [
+            _MESSAGES_ACCOUNT_TRACE_SENDER_INDEX_DDL,
+            _MESSAGES_ACCOUNT_TRACE_POST_AUTHOR_INDEX_DDL,
+        ],
+    )
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -2874,6 +2900,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_migration_55(conn, current)
     current = _apply_migration_56(conn, current)
     current = _apply_migration_57(conn, current)
+    current = _apply_migration_58(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

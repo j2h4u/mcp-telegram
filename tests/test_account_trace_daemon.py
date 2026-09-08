@@ -707,10 +707,11 @@ def test_trace_query_uses_effective_sender_topic_and_signature_params() -> None:
     )
 
     assert "CASE WHEN m.is_service = 1 THEN NULL" in sql
-    assert "m.sender_id = :target_user_id" not in sql
+    assert "sender_id = :target_user_id" in sql
+    assert "sender_id IS NULL" in sql
     assert "m.forum_topic_id = :exact_topic_id" in sql
     assert "m.post_author AS author_signature" in sql
-    assert "m.post_author IN (:post_author_alias_0, :post_author_alias_1)" in sql
+    assert "post_author IN (:post_author_alias_0, :post_author_alias_1)" in sql
     assert "ORDER BY m.sent_at DESC, m.dialog_id DESC, m.message_id DESC" in sql
     assert params["self_id"] == 101
     assert params["target_user_id"] == 101

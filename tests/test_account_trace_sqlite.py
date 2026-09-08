@@ -63,6 +63,36 @@ def test_evidence_page_keeps_limit_plus_one_order_and_row_mapping() -> None:
         conn.close()
 
 
+def test_evidence_page_preserves_effective_sender_fallbacks_and_signature_deduplication() -> None:
+    conn = _conn()
+    try:
+        conn.executemany(
+            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, 0, 0, ?)",
+            [
+                (7, 1, 10, "incoming DM", None, None, 0),
+                (7, 2, 20, "outgoing DM", None, None, 1),
+                (-100, 3, 30, "signed", 99, "Alice", 0),
+                (-100, 4, 40, "sender and signature", 7, "Alice", 0),
+            ],
+        )
+
+        target_rows = evidence_page(
+            conn,
+            TraceMessageQueryRequest(target_user_id=7, self_id=42, limit=10, post_author_aliases=["Alice"]),
+        )
+        self_rows = evidence_page(conn, TraceMessageQueryRequest(target_user_id=42, self_id=42, limit=10))
+
+        assert [row["message_id"] for row in target_rows] == [4, 3, 1]
+        assert [row["authorship_basis"] for row in target_rows] == [
+            "effective_sender_id",
+            "post_author_signature",
+            "effective_sender_id",
+        ]
+        assert [row["message_id"] for row in self_rows] == [2]
+    finally:
+        conn.close()
+
+
 def test_sqlite_reads_preserve_scopes_and_metadata_defaults() -> None:
     conn = _conn()
     try:

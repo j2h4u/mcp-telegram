@@ -248,7 +248,7 @@ class DaemonEntityInfoService:
         if self._progressive_enabled():
             cached_result = self._progressive_cached_result(entity_id, now=now)
             if cached_result is not None:
-                return cached_result
+                return await self._await_progressive_refresh(entity_id, cached_result)
         else:
             cached = self._load_cached_detail(entity_id, now)
             if cached is not None:
@@ -258,9 +258,26 @@ class DaemonEntityInfoService:
             return self._self_snapshot_result(entity_id, now=now, started_at=started_at)
 
         if self._progressive_enabled():
-            return await self._progressive_miss(entity_id, now=now, started_at=started_at)
+            result = await self._progressive_miss(entity_id, now=now, started_at=started_at)
+            return await self._await_progressive_refresh(entity_id, result)
 
         return await self._legacy_entity_info(entity_id, now=now, started_at=started_at)
+
+    async def _await_progressive_refresh(
+        self,
+        entity_id: int,
+        fallback: dict[str, object],
+    ) -> dict[str, object]:
+        """Return the refreshed projection when foreground wait headroom permits it."""
+        assert self._refresh is not None
+        completed = await self._refresh.wait_for_completion(
+            entity_id,
+            self._deps.refresh_limits.foreground_refresh_wait_seconds,
+        )
+        if not completed:
+            return fallback
+        refreshed = self._progressive_cached_result(entity_id, now=int(self._deps.now_provider()))
+        return fallback if refreshed is None else refreshed
 
     def _progressive_cached_result(self, entity_id: int, *, now: int) -> dict[str, object] | None:
         cached = self._profiles.read(entity_id, now=now)

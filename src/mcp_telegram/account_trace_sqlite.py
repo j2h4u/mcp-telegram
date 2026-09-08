@@ -124,7 +124,34 @@ def build_evidence_query(request: TraceMessageQueryRequest) -> tuple[str, dict[s
         "self_id": request.self_id,
         "limit": request.limit,
     }
+    candidate_queries = [
+        (
+            "SELECT dialog_id, message_id FROM messages "
+            "WHERE is_deleted = 0 AND is_service = 0 AND sender_id = :target_user_id"
+        ),
+        (
+            "SELECT dialog_id, message_id FROM messages "
+            "WHERE is_deleted = 0 AND is_service = 0 AND sender_id IS NULL "
+            "AND dialog_id > 0 AND out = 0 AND dialog_id = :target_user_id"
+        ),
+        (
+            "SELECT dialog_id, message_id FROM messages "
+            "WHERE is_deleted = 0 AND is_service = 0 AND sender_id IS NULL "
+            "AND dialog_id > 0 AND out = 1 AND :self_id = :target_user_id"
+        ),
+    ]
+    aliases = request.post_author_aliases or []
+    if aliases:
+        alias_params = ", ".join(f":post_author_alias_{index}" for index in range(len(aliases)))
+        candidate_queries.append(
+            "SELECT dialog_id, message_id FROM messages "
+            "WHERE is_deleted = 0 AND is_service = 0 "
+            f"AND post_author IN ({alias_params})"
+        )
+        for index, alias in enumerate(aliases):
+            params[f"post_author_alias_{index}"] = alias
     sql = (
+        f"WITH candidate_messages AS ({' UNION '.join(candidate_queries)}) "
         "SELECT m.dialog_id, m.message_id, m.sent_at, m.text, m.sender_id, "
         "m.media_kind, m.media_payload, m.forum_topic_id AS topic_id, "
         "COALESCE(d.name, e_dialog.name, CAST(m.dialog_id AS TEXT)) AS dialog_title, "
@@ -135,21 +162,13 @@ def build_evidence_query(request: TraceMessageQueryRequest) -> tuple[str, dict[s
         "CASE "
         f"WHEN {_EFFECTIVE_SENDER_ID_EXPR} = :target_user_id THEN 'effective_sender_id' "
         "ELSE 'post_author_signature' END AS authorship_basis "
-        "FROM messages m "
+        "FROM candidate_messages candidate "
+        "JOIN messages m ON m.dialog_id = candidate.dialog_id AND m.message_id = candidate.message_id "
         "LEFT JOIN dialogs d ON d.dialog_id = m.dialog_id "
         "LEFT JOIN entities e_dialog ON e_dialog.id = m.dialog_id "
         "LEFT JOIN topic_metadata tm ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
-        "WHERE m.is_deleted = 0 AND m.is_service = 0"
+        "WHERE 1 = 1"
     )
-    predicates = [f"{_EFFECTIVE_SENDER_ID_EXPR} = :target_user_id"]
-    aliases = request.post_author_aliases or []
-    if aliases:
-        predicates.append(
-            f"m.post_author IN ({', '.join(f':post_author_alias_{index}' for index in range(len(aliases)))})"
-        )
-        for index, alias in enumerate(aliases):
-            params[f"post_author_alias_{index}"] = alias
-    sql += f" AND ({' OR '.join(predicates)})"
     if request.scope_dialog_ids:
         placeholders = [f":scope_{index}" for index in range(len(request.scope_dialog_ids))]
         sql += f" AND m.dialog_id IN ({', '.join(placeholders)})"

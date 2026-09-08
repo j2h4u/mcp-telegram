@@ -21,8 +21,9 @@ group_directory_ttl_seconds = 604800
 resolver_enrichment_ttl_seconds = 300
 
 [entity_profile]
-# Return the mandatory core quickly, then refresh detail sections in the daemon.
+# Wait briefly for a full profile, then fall back to the available progressive projection.
 foreground_resolve_seconds = 3.0
+foreground_refresh_wait_seconds = 15.0
 rpc_timeout_seconds = 8.0
 refresh_timeout_seconds = 25.0
 max_concurrent_refreshes = 1

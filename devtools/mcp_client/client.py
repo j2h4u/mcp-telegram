@@ -10,7 +10,7 @@ from typing import Any, Protocol
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-DEFAULT_TIMEOUT_SECONDS = 10.0
+DEFAULT_TIMEOUT_SECONDS = 30.0
 _ENV_PLACEHOLDER_RE = re.compile(r"^\$\{([A-Z_][A-Z0-9_]*)\}$")
 
 

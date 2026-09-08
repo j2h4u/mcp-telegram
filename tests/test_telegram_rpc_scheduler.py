@@ -11,6 +11,7 @@ from mcp_telegram.config import RuntimeObservationConfig, TelegramRpcSchedulerCo
 from mcp_telegram.daemon import _record_rpc_admission
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.telegram_rpc_scheduler import (
+    RPC_SOURCE_SERVICE_CLASS,
     RpcAdmission,
     RpcAdmissionClosedError,
     RpcAdmissionEvent,
@@ -27,6 +28,11 @@ from mcp_telegram.telegram_rpc_scheduler import (
     current_rpc_scope,
     rpc_scope,
 )
+
+
+def test_entity_profile_refresh_uses_background_service_class() -> None:
+    assert RPC_SOURCE_SERVICE_CLASS[TelegramRpcSource.ENTITY_INFO_FOREGROUND] is RpcServiceClass.INTERACTIVE
+    assert RPC_SOURCE_SERVICE_CLASS[TelegramRpcSource.ENTITY_INFO_REFRESH] is RpcServiceClass.BACKGROUND
 
 
 class _ControlledLimiter:
