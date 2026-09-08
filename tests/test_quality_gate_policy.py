@@ -50,7 +50,9 @@ def test_crap_remains_the_coverage_informed_gate() -> None:
     assert workflow.count("if: needs.changes.outputs.run_heavy == 'true'") == 4
     assert "needs: [changes, quality, unit, crap, docker-build]" in workflow
     assert re.search(r"(?m)^crap-ratchet:\s*$", justfile) is not None
-    assert justfile.count("--cov-report=;") == 3
+    assert re.search(r"(?m)^coverage-data:\s*$", justfile) is not None
+    assert "--cov-append --cov-report=" in justfile
+    assert justfile.count("just coverage-data;") == 3
     assert justfile.count('uv run coverage json -o "$coverage_file";') == 3
     assert "--cov-report=json:" not in justfile
     assert "python -m devtools.crap_ratchet" in justfile
