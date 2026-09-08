@@ -4,12 +4,12 @@ import asyncio
 from collections import Counter, deque
 from contextvars import ContextVar
 from dataclasses import replace
-from unittest.mock import MagicMock
 
 import pytest
 
 from mcp_telegram.config import TelegramRpcSchedulerConfig
 from mcp_telegram.daemon import _record_rpc_admission
+from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmission,
     RpcAdmissionClosedError,
@@ -510,7 +510,15 @@ async def test_detached_task_must_replace_inherited_scope_and_deadline() -> None
 
 
 def test_daemon_observer_forwards_dispatch_event_to_aggregator() -> None:
-    observer = MagicMock()
+    class _Recorder:
+        def __init__(self) -> None:
+            self.rows: list[dict[str, object]] = []
+
+        def record(self, **values: object) -> None:
+            self.rows.append(values)
+
+    recorder = _Recorder()
+    observer = RpcAdmissionObservationAggregator(recorder, summary_interval_seconds=300, clock=lambda: 0.0)
     event = RpcAdmissionEvent(
         kind=RpcAdmissionEventKind.DISPATCHED,
         source=TelegramRpcSource.MCP_INTERACTIVE,
@@ -521,5 +529,6 @@ def test_daemon_observer_forwards_dispatch_event_to_aggregator() -> None:
     )
 
     _record_rpc_admission(observer, event)
+    observer.flush(now=300.0)
 
-    observer.observe.assert_called_once_with(event)
+    assert recorder.rows[0]["result_count"] == 1
