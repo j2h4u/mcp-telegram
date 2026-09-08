@@ -1179,7 +1179,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
             group_directory_ttl_seconds=config.freshness.entities.group_directory_ttl_seconds,
             resolver_enrichment_ttl_seconds=config.freshness.entities.resolver_enrichment_ttl_seconds,
             folder_snapshot_stale_after_seconds=config.scheduling.folder_projection.stale_threshold_seconds,
-            telemetry_retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
+            telemetry=config.telemetry,
             slow_request_seconds=config.logging.daemon_api_slow_request_seconds,
             entity_profile=RefreshLimits(
                 foreground_resolve_seconds=config.entity_profile.foreground_resolve_seconds,
@@ -1211,7 +1211,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
     )
     rpc_admission_observer = RpcAdmissionObservationAggregator(
         rpc_observation_sink,
-        summary_interval_seconds=config.telemetry.runtime_observations.rpc_summary_interval_seconds,
+        policy=config.telemetry.runtime_observations,
     )
     ctx = _SyncMainContext(
         db_path=db_path,
@@ -1523,6 +1523,12 @@ async def _start_followup_background_tasks(
 ) -> None:
     activity_client = cast(ActivityClient, ctx.client)
     delta_client = cast(_DeltaSyncClient, ctx.client)
+    if ctx.rpc_admission_observer is not None:
+        _create_tracked_task(
+            ctx,
+            ctx.rpc_admission_observer.run_periodic_flush(ctx.shutdown_event),
+            name="rpc_admission_observation_flush_loop",
+        )
     _create_tracked_task(
         ctx,
         ctx.folder_projection_worker.run(),

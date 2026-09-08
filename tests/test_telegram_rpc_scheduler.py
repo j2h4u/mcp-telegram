@@ -7,7 +7,7 @@ from dataclasses import replace
 
 import pytest
 
-from mcp_telegram.config import TelegramRpcSchedulerConfig
+from mcp_telegram.config import RuntimeObservationConfig, TelegramRpcSchedulerConfig
 from mcp_telegram.daemon import _record_rpc_admission
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.telegram_rpc_scheduler import (
@@ -518,7 +518,7 @@ def test_daemon_observer_forwards_dispatch_event_to_aggregator() -> None:
             self.rows.append(values)
 
     recorder = _Recorder()
-    observer = RpcAdmissionObservationAggregator(recorder, summary_interval_seconds=300, clock=lambda: 0.0)
+    observer = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), clock=lambda: 0.0)
     event = RpcAdmissionEvent(
         kind=RpcAdmissionEventKind.DISPATCHED,
         source=TelegramRpcSource.MCP_INTERACTIVE,

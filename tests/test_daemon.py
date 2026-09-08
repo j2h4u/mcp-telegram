@@ -608,7 +608,7 @@ def test_self_id_cached_at_startup(
     )
     assert instance._policy.read_at_ttl_seconds == 600  # type: ignore[attr-defined]
     assert instance._policy.entity_detail_ttl_seconds == 300  # type: ignore[attr-defined]
-    assert instance._policy.telemetry_retention_ttl_seconds == 2_592_000  # type: ignore[attr-defined]
+    assert instance._policy.telemetry.retention_ttl_seconds == 2_592_000  # type: ignore[attr-defined]
     assert mock_client.get_me.call_count == 1, (
         f"get_me must be called exactly once at startup, got {mock_client.get_me.call_count}"
     )

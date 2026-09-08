@@ -63,6 +63,9 @@ class RuntimeObservationPolicy(Protocol):
     @property
     def row_cap(self) -> int: ...
 
+    @property
+    def rpc_summary_interval_seconds(self) -> float: ...
+
 
 def tool_telemetry_identity(tool_name: str) -> tuple[str, int]:
     """Return the stable product capability and wire-contract generation."""
