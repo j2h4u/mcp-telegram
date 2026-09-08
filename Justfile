@@ -122,13 +122,23 @@ crap:
 # CI/regression CRAP gate that checks the tracked baseline.
 crap-check: crap-ratchet
 
+# Build cumulative coverage in two bounded processes.  The full instrumented
+# suite can exhaust memory on GitHub runners even though the uninstrumented
+# suite and both halves pass independently.
+[private]
+coverage-data:
+    test_files=(tests/test_*.py); \
+    split=$(((${#test_files[@]} + 1) / 2)); \
+    uv run pytest "${test_files[@]:0:split}" --cov=src/mcp_telegram --cov-report=; \
+    uv run pytest "${test_files[@]:split}" --cov=src/mcp_telegram --cov-append --cov-report=
+
 # Keep JSON serialization out of pytest's memory-heavy process. The standalone
 # coverage command reads the same .coverage data and preserves function regions.
 # Migrate/tighten the tracked CRAP baseline from the current coverage state.
 crap-baseline:
     coverage_file="$(mktemp /tmp/mcp-telegram-crap-coverage.XXXXXX.json)"; \
     trap 'rm -f "$coverage_file"' EXIT; \
-    uv run pytest --cov=src/mcp_telegram --cov-report=; \
+    just coverage-data; \
     uv run coverage json -o "$coverage_file"; \
     uv run python -m devtools.crap_ratchet --coverage "$coverage_file" --baseline reports/crap-baseline.json --src src/mcp_telegram --threshold 30 --tighten-baseline
 
@@ -137,7 +147,7 @@ crap-baseline:
 crap-tighten:
     coverage_file="$(mktemp /tmp/mcp-telegram-crap-coverage.XXXXXX.json)"; \
     trap 'rm -f "$coverage_file"' EXIT; \
-    uv run pytest --cov=src/mcp_telegram --cov-report=; \
+    just coverage-data; \
     uv run coverage json -o "$coverage_file"; \
     uv run python -m devtools.crap_ratchet --coverage "$coverage_file" --baseline reports/crap-baseline.json --src src/mcp_telegram --threshold 30 --tighten-baseline
 
@@ -145,7 +155,7 @@ crap-tighten:
 crap-ratchet:
     coverage_file="$(mktemp /tmp/mcp-telegram-crap-coverage.XXXXXX.json)"; \
     trap 'rm -f "$coverage_file"' EXIT; \
-    uv run pytest --cov=src/mcp_telegram --cov-report=; \
+    just coverage-data; \
     uv run coverage json -o "$coverage_file"; \
     uv run python -m devtools.crap_ratchet --coverage "$coverage_file" --baseline reports/crap-baseline.json --src src/mcp_telegram --threshold 30
 

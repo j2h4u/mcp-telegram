@@ -222,6 +222,7 @@ class RuntimeObservationSink:
         self._counter_lock = threading.Lock()
         self._log_lock = threading.Lock()
         self._last_log_at = 0.0
+        self._last_logged_counters = RuntimeObservationCounters()
         self._accepting = True
         self._closed = False
         self._writer_error: BaseException | None = None
@@ -392,7 +393,10 @@ class RuntimeObservationSink:
                 )
             ):
                 return
+            if counters == self._last_logged_counters:
+                return
             self._last_log_at = now
+            self._last_logged_counters = counters
         logger.warning(
             "runtime_observation_sink_summary queue_full_drops=%d shutdown_grace_drops=%d "
             "busy_retries=%d permanent_failures=%d startup_failures=%d rejected_submissions=%d startup_drops=%d",

@@ -66,7 +66,18 @@ async def test_runtime_observation_sink_skips_prune_after_close_is_requested(
     conn = _open_sync_db(path)
     record_runtime_observation(conn, kind="telegram.rpc_admission", observed_at_ms=1_000)
     conn.commit()
+    inserted = threading.Event()
+    release = threading.Event()
+    original_record = runtime_observations.record_runtime_observation
+
+    def record_then_wait(conn: sqlite3.Connection, **kwargs: object) -> int:
+        result = original_record(conn, **kwargs)  # type: ignore[arg-type]
+        inserted.set()
+        release.wait(timeout=2)
+        return result
+
     monkeypatch.setattr("mcp_telegram.runtime_observations.time.time", lambda: 10.0)
+    monkeypatch.setattr(runtime_observations, "record_runtime_observation", record_then_wait)
     sink = RuntimeObservationSink(
         conn,
         retention_ttl_seconds=5,
@@ -74,7 +85,12 @@ async def test_runtime_observation_sink_skips_prune_after_close_is_requested(
     )
 
     sink.record(kind="telegram.rpc_admission", outcome="queued")
-    await sink.aclose()
+    assert inserted.wait(timeout=0.5)
+    close_task = asyncio.create_task(sink.aclose())
+    await asyncio.sleep(0.05)
+    assert sink._close_requested.is_set()
+    release.set()
+    await asyncio.wait_for(close_task, timeout=1.0)
 
     assert conn.execute("SELECT outcome FROM runtime_observations ORDER BY id").fetchall() == [(None,), ("queued",)]
     conn.close()
@@ -213,7 +229,7 @@ def test_runtime_observation_sink_logs_aggregate_queue_overflow(
     sink.close()
 
     assert sink.queue_full_drops > 0
-    assert "runtime_observation_sink_summary" in caplog.text
+    assert caplog.text.count("runtime_observation_sink_summary") == 1
 
 
 @pytest.mark.asyncio
