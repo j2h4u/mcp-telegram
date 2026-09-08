@@ -4,13 +4,12 @@ import asyncio
 from collections import Counter, deque
 from contextvars import ContextVar
 from dataclasses import replace
-from typing import cast
-from unittest.mock import MagicMock
 
 import pytest
 
 from mcp_telegram.config import TelegramRpcSchedulerConfig
 from mcp_telegram.daemon import _record_rpc_admission
+from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmission,
     RpcAdmissionClosedError,
@@ -510,9 +509,16 @@ async def test_detached_task_must_replace_inherited_scope_and_deadline() -> None
     assert detached_context == "clean"
 
 
-def test_daemon_observer_persists_content_free_dispatch_metrics() -> None:
-    sink = MagicMock()
-    record = cast(MagicMock, sink.record)
+def test_daemon_observer_forwards_dispatch_event_to_aggregator() -> None:
+    class _Recorder:
+        def __init__(self) -> None:
+            self.rows: list[dict[str, object]] = []
+
+        def record(self, **values: object) -> None:
+            self.rows.append(values)
+
+    recorder = _Recorder()
+    observer = RpcAdmissionObservationAggregator(recorder, summary_interval_seconds=300, clock=lambda: 0.0)
     event = RpcAdmissionEvent(
         kind=RpcAdmissionEventKind.DISPATCHED,
         source=TelegramRpcSource.MCP_INTERACTIVE,
@@ -522,19 +528,7 @@ def test_daemon_observer_persists_content_free_dispatch_metrics() -> None:
         wait_seconds=0.125,
     )
 
-    _record_rpc_admission(sink, event)
+    _record_rpc_admission(observer, event)
+    observer.flush(now=300.0)
 
-    record.assert_called_once_with(
-        kind="telegram.rpc_admission",
-        outcome="dispatched",
-        reason_code=None,
-        duration_ms=125.0,
-        payload={
-            "source": "mcp_interactive",
-            "service_class": "interactive",
-            "queue_depth": 2,
-            "total_depth": 5,
-            "active_depth": 0,
-            "total_outstanding": 0,
-        },
-    )
+    assert recorder.rows[0]["result_count"] == 1

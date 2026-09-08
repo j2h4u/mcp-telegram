@@ -107,10 +107,10 @@ async def test_runtime_observation_sink_waits_for_python_prune_then_joins_writer
     release = threading.Event()
     original_prune = runtime_observations.prune_runtime_observations
 
-    def blocked_prune(conn: sqlite3.Connection, *, ttl_seconds: int) -> int:
+    def blocked_prune(conn: sqlite3.Connection, *, ttl_seconds: int, row_cap: int) -> int:
         started.set()
         release.wait(timeout=2)
-        return original_prune(conn, ttl_seconds=ttl_seconds)
+        return original_prune(conn, ttl_seconds=ttl_seconds, row_cap=row_cap)
 
     monkeypatch.setattr(runtime_observations, "prune_runtime_observations", blocked_prune)
     sink = RuntimeObservationSink(

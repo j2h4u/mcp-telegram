@@ -60,6 +60,9 @@ class RuntimeObservationPolicy(Protocol):
     @property
     def shutdown_drain_grace_seconds(self) -> float: ...
 
+    @property
+    def row_cap(self) -> int: ...
+
 
 def tool_telemetry_identity(tool_name: str) -> tuple[str, int]:
     """Return the stable product capability and wire-contract generation."""
@@ -203,6 +206,7 @@ class RuntimeObservationSink:
             policy.queue_capacity,
             policy.writer_startup_wait_seconds,
             policy.shutdown_drain_grace_seconds,
+            policy.row_cap,
         )
         if any(value <= 0 for value in positive_values):
             raise ValueError("runtime observation sink limits must be positive")
@@ -213,6 +217,7 @@ class RuntimeObservationSink:
         self._busy_timeout_ms = policy.writer_busy_timeout_ms
         self._writer_startup_wait_seconds = policy.writer_startup_wait_seconds
         self._shutdown_drain_grace_seconds = policy.shutdown_drain_grace_seconds
+        self._row_cap = policy.row_cap
         self._jobs: queue.Queue[_ObservationJob] = queue.Queue(maxsize=policy.queue_capacity)
         self._close_requested = threading.Event()
         self._abort_requested = threading.Event()
@@ -554,7 +559,11 @@ class RuntimeObservationSink:
                         observed_at_ms=job.observed_at_ms,
                     )
                     if writes_since_prune + 1 >= self._prune_every_writes and not self._close_requested.is_set():
-                        prune_runtime_observations(conn, ttl_seconds=self._retention_ttl_seconds)
+                        prune_runtime_observations(
+                            conn,
+                            ttl_seconds=self._retention_ttl_seconds,
+                            row_cap=self._row_cap,
+                        )
                 self._increment("successful_writes")
                 return True
             except sqlite3.OperationalError as exc:

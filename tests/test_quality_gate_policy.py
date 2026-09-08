@@ -16,10 +16,13 @@ class _CoverageConfig(TypedDict):
 
 class _ToolConfig(TypedDict):
     coverage: _CoverageConfig
+    importlinter: dict[str, list[dict[str, str]]]
 
 
-class _ProjectConfig(TypedDict):
-    tool: _ToolConfig
+_ProjectConfig = TypedDict(
+    "_ProjectConfig",
+    {"tool": _ToolConfig, "dependency-groups": dict[str, list[str]]},
+)
 
 
 def test_aggregate_coverage_is_informational_only() -> None:
@@ -57,3 +60,24 @@ def test_crap_remains_the_coverage_informed_gate() -> None:
     assert "--cov-report=json:" not in justfile
     assert "python -m devtools.crap_ratchet" in justfile
     assert "verify: check crap-ratchet runtime-verify" in justfile
+
+
+def test_import_linter_and_tach_are_both_required_static_gates() -> None:
+    pyproject_text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    pyproject = cast(_ProjectConfig, tomllib.loads(pyproject_text))
+    justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
+
+    dev_dependencies = pyproject["dependency-groups"]["dev"]
+    contracts = pyproject["tool"]["importlinter"]["contracts"]
+    assert any(str(dependency).startswith("import-linter>=") for dependency in dev_dependencies)
+    assert {contract["id"] for contract in contracts} == {
+        "telegram-transport-layers",
+        "scheduler-independent-from-runtime",
+        "runtime-observations-independent",
+        "admission-observer-independent-from-composition",
+    }
+    check_recipe = justfile.partition("check:")[2].partition("\n")[0]
+    assert "import-contracts" in check_recipe
+    assert "module-boundaries" in check_recipe
+    assert "uv run lint-imports" in justfile
+    assert "uv run tach check --dependencies --interfaces --exact" in justfile

@@ -221,6 +221,8 @@ writer_busy_timeout_ms = 49
 queue_capacity = 50
 writer_startup_wait_seconds = 1.5
 shutdown_drain_grace_seconds = 2.5
+row_cap = 250001
+rpc_summary_interval_seconds = 301
 
 [flood_wait]
 kill_switch_enabled = true
@@ -295,6 +297,8 @@ daemon_api_slow_request_seconds = 2.5
             queue_capacity=50,
             writer_startup_wait_seconds=1.5,
             shutdown_drain_grace_seconds=2.5,
+            row_cap=250001,
+            rpc_summary_interval_seconds=301.0,
         ),
     )
     assert config.flood_wait == FloodWaitConfig(

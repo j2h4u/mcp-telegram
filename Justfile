@@ -8,7 +8,7 @@ default:
     @just --list
 
 # Run all local source checks.
-check: fmt-check lint complexity-ratchet lock-check typecheck typecheck-pyright typecheck-tests module-boundaries semantic-boundaries message-boundaries telegram-rpc-boundaries config-imports policy-placement runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
+check: fmt-check lint complexity-ratchet lock-check typecheck typecheck-pyright typecheck-tests import-contracts module-boundaries semantic-boundaries message-boundaries telegram-rpc-boundaries config-imports policy-placement runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
 
 # Verify uv.lock is synchronized with pyproject.toml.
 lock-check:
@@ -37,6 +37,10 @@ typecheck-pyright:
 # Type-check tests with basedpyright.
 typecheck-tests:
     uv run basedpyright tests --warnings
+
+# Enforce named architecture contracts that should remain stable across refactors.
+import-contracts:
+    uv run lint-imports
 
 # Enforce the explicit current-state module graph and named cleanup frontier.
 module-boundaries:

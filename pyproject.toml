@@ -44,6 +44,7 @@ dev = [
     "setuptools>=84.0.0",
     "deptry>=0.25.1",
     "tach>=0.35",
+    "import-linter>=2.13",
 ]
 
 [project.scripts]
@@ -161,6 +162,56 @@ max-statements = 45
 
 [tool.ruff.format]
 quote-style = "double"
+
+[tool.importlinter]
+root_package = "mcp_telegram"
+
+[[tool.importlinter.contracts]]
+id = "telegram-transport-layers"
+name = "Daemon composition stays above the Telegram transport and scheduler"
+type = "layers"
+layers = [
+  "mcp_telegram.daemon",
+  "mcp_telegram.telegram_rpc",
+  "mcp_telegram.telegram_rpc_scheduler",
+  "mcp_telegram.flood",
+]
+
+[[tool.importlinter.contracts]]
+id = "scheduler-independent-from-runtime"
+name = "Scheduler policy stays independent from runtime composition and persistence"
+type = "forbidden"
+source_modules = ["mcp_telegram.telegram_rpc_scheduler"]
+forbidden_modules = [
+  "mcp_telegram.config",
+  "mcp_telegram.daemon",
+  "mcp_telegram.runtime_observations",
+  "mcp_telegram.telegram_rpc",
+]
+
+[[tool.importlinter.contracts]]
+id = "runtime-observations-independent"
+name = "Runtime observation persistence stays below scheduler and composition"
+type = "forbidden"
+source_modules = ["mcp_telegram.runtime_observations"]
+forbidden_modules = [
+  "mcp_telegram.config",
+  "mcp_telegram.daemon",
+  "mcp_telegram.telegram_rpc",
+  "mcp_telegram.telegram_rpc_scheduler",
+]
+
+[[tool.importlinter.contracts]]
+id = "admission-observer-independent-from-composition"
+name = "Admission aggregation depends on scheduler events through an injected recorder"
+type = "forbidden"
+source_modules = ["mcp_telegram.rpc_admission_observations"]
+forbidden_modules = [
+  "mcp_telegram.config",
+  "mcp_telegram.daemon",
+  "mcp_telegram.runtime_observations",
+  "mcp_telegram.telegram_rpc",
+]
 indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"

@@ -149,12 +149,15 @@ class RuntimeObservationConfig:
     queue_capacity: int = 1_024
     writer_startup_wait_seconds: float = 1.0
     shutdown_drain_grace_seconds: float = 2.0
+    row_cap: int = 250_000
+    rpc_summary_interval_seconds: float = 300.0
 
     def __post_init__(self) -> None:
         positive_integers = (
             self.prune_every_writes,
             self.writer_busy_timeout_ms,
             self.queue_capacity,
+            self.row_cap,
         )
         if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in positive_integers):
             raise ValueError("runtime observation integer settings must be positive")
@@ -162,7 +165,11 @@ class RuntimeObservationConfig:
             raise ValueError(
                 f"runtime observation writer_busy_timeout_ms must be <= {_MAX_TELEMETRY_WRITER_BUSY_TIMEOUT_MS}"
             )
-        durations = (self.writer_startup_wait_seconds, self.shutdown_drain_grace_seconds)
+        durations = (
+            self.writer_startup_wait_seconds,
+            self.shutdown_drain_grace_seconds,
+            self.rpc_summary_interval_seconds,
+        )
         if any(not math.isfinite(value) or value <= 0 for value in durations):
             raise ValueError("runtime observation durations must be finite and positive")
 
@@ -968,6 +975,8 @@ def _parse_telemetry(data: dict[str, object], path: Path) -> TelemetryConfig:
         "queue_capacity",
         "writer_startup_wait_seconds",
         "shutdown_drain_grace_seconds",
+        "row_cap",
+        "rpc_summary_interval_seconds",
     }
     _reject_unknown_keys(runtime_data, runtime_keys, "telemetry.runtime_observations", path)
     runtime_defaults = defaults.runtime_observations
@@ -1007,6 +1016,20 @@ def _parse_telemetry(data: dict[str, object], path: Path) -> TelemetryConfig:
                 "telemetry.runtime_observations",
                 path,
                 runtime_defaults.shutdown_drain_grace_seconds,
+            ),
+            row_cap=_positive_int(
+                runtime_data,
+                "row_cap",
+                "telemetry.runtime_observations",
+                path,
+                runtime_defaults.row_cap,
+            ),
+            rpc_summary_interval_seconds=_positive_float(
+                runtime_data,
+                "rpc_summary_interval_seconds",
+                "telemetry.runtime_observations",
+                path,
+                runtime_defaults.rpc_summary_interval_seconds,
             ),
         )
     except ValueError as exc:

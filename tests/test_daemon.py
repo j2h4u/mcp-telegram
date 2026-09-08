@@ -20,6 +20,7 @@ from mcp_telegram.daemon import (
     _log_heartbeat,
     _mark_rpc_scheduler_failed,
     _prime_runtime,
+    _run_message_fact_refresh_with_dedicated_connection,
     _run_self_profile_refresh_loop,
     _run_sync_loop,
     _shutdown_sync_main_context,
@@ -127,6 +128,33 @@ def test_rpc_scheduler_failure_marks_daemon_unready_and_shutdown() -> None:
     assert all(term not in api_server.startup_detail.lower() for term in ("scheduler", "limiter", "queue"))
     assert shutdown_event.is_set()
     assert state["detail"] == api_server.startup_detail
+
+
+@pytest.mark.asyncio
+async def test_message_fact_refresh_owns_and_closes_a_dedicated_connection() -> None:
+    dedicated_conn = MagicMock(spec=sqlite3.Connection)
+    shared_conn = MagicMock(spec=sqlite3.Connection)
+    run_loop = AsyncMock()
+    ctx = SimpleNamespace(
+        db_path=Path("/state/sync.db"),
+        conn=shared_conn,
+        client=MagicMock(),
+        shutdown_event=asyncio.Event(),
+        message_fact_refresh_policy=MagicMock(),
+        reaction_freshness_ttl_seconds=60,
+    )
+
+    with (
+        patch("mcp_telegram.daemon._open_sync_db", return_value=dedicated_conn),
+        patch("mcp_telegram.daemon.run_message_fact_refresh_loop", new=run_loop),
+    ):
+        await _run_message_fact_refresh_with_dedicated_connection(ctx)  # type: ignore[arg-type]
+
+    await_args = run_loop.await_args
+    assert await_args is not None
+    assert await_args.args[0] is dedicated_conn
+    assert await_args.args[0] is not shared_conn
+    dedicated_conn.close.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -621,6 +649,9 @@ async def test_shutdown_drains_telemetry_after_scheduler_producers_quiesce(tmp_p
     async def drain() -> None:
         order.append("telemetry_drained")
 
+    def flush() -> None:
+        order.append("telemetry_flushed")
+
     client = SimpleNamespace(
         disconnect=disconnect,
         close_rpc_scheduler=close_scheduler,
@@ -629,6 +660,7 @@ async def test_shutdown_drains_telemetry_after_scheduler_producers_quiesce(tmp_p
     ctx = SimpleNamespace(
         client=client,
         rpc_observation_sink=SimpleNamespace(aclose=drain),
+        rpc_admission_observer=SimpleNamespace(flush=flush),
     )
     with (
         patch("mcp_telegram.daemon._stop_daemon_api", new=AsyncMock()),
@@ -637,7 +669,7 @@ async def test_shutdown_drains_telemetry_after_scheduler_producers_quiesce(tmp_p
     ):
         await _shutdown_sync_main_context(ctx)  # type: ignore[arg-type]
 
-    assert order == ["disconnect", "scheduler_closed", "observer_detached", "telemetry_drained"]
+    assert order == ["disconnect", "scheduler_closed", "observer_detached", "telemetry_flushed", "telemetry_drained"]
 
 
 @pytest.mark.asyncio
@@ -658,12 +690,19 @@ async def test_shutdown_runs_all_cleanup_stages_after_disconnect_failure() -> No
     async def drain() -> None:
         order.append("telemetry_drained")
 
+    def flush() -> None:
+        order.append("telemetry_flushed")
+
     client = SimpleNamespace(
         disconnect=disconnect,
         close_rpc_scheduler=close_scheduler,
         set_rpc_admission_observer=detach,
     )
-    ctx = SimpleNamespace(client=client, rpc_observation_sink=SimpleNamespace(aclose=drain))
+    ctx = SimpleNamespace(
+        client=client,
+        rpc_observation_sink=SimpleNamespace(aclose=drain),
+        rpc_admission_observer=SimpleNamespace(flush=flush),
+    )
     with (
         patch("mcp_telegram.daemon._stop_daemon_api", new=AsyncMock()),
         patch("mcp_telegram.daemon._cancel_background_tasks", new=AsyncMock()),
@@ -672,7 +711,14 @@ async def test_shutdown_runs_all_cleanup_stages_after_disconnect_failure() -> No
     ):
         await _shutdown_sync_main_context(ctx)  # type: ignore[arg-type]
 
-    assert order == ["disconnect", "scheduler_closed", "observer_detached", "telemetry_drained", "db_closed"]
+    assert order == [
+        "disconnect",
+        "scheduler_closed",
+        "observer_detached",
+        "telemetry_flushed",
+        "telemetry_drained",
+        "db_closed",
+    ]
 
 
 @pytest.mark.asyncio
