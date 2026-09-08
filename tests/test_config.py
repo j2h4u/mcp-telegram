@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from mcp_telegram.config import (
     resolve_logging_config,
     resolve_scheduling_config,
 )
+from mcp_telegram.telegram_rpc_scheduler import RPC_SOURCE_SERVICE_CLASS
 
 
 def _write_config(tmp_path: Path, contents: str) -> Path:
@@ -58,6 +60,16 @@ def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
     assert config.logging.daemon_api_slow_request_seconds == 1.0
     with pytest.raises(FrozenInstanceError):
         config.freshness.reactions.freshness_ttl_seconds = 1  # type: ignore[misc]
+
+
+def test_runtime_observation_row_cap_covers_rpc_summary_retention_budget() -> None:
+    telemetry = TelemetryConfig()
+    summary_policy = telemetry.runtime_observations
+    windows_per_source = math.ceil(telemetry.retention_ttl_seconds / summary_policy.rpc_summary_interval_seconds)
+    sources = len(RPC_SOURCE_SERVICE_CLASS)
+    retained_summary_rows = sources * windows_per_source
+
+    assert retained_summary_rows + sources <= summary_policy.row_cap
 
 
 def test_fact_hydration_config_accepts_positive_capacity_values() -> None:

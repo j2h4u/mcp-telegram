@@ -39,7 +39,7 @@ REQUIRED_POLICY_FIELDS = {
     "user_directory_ttl_seconds",
     "group_directory_ttl_seconds",
     "resolver_enrichment_ttl_seconds",
-    "telemetry_retention_ttl_seconds",
+    "telemetry",
 }
 REQUIRED_POLICY_SINKS = {
     "daemon_api.py": ("DaemonApiPolicy", REQUIRED_POLICY_FIELDS),

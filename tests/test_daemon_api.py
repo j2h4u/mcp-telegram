@@ -12,7 +12,7 @@ import json
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,11 +24,13 @@ from telethon.errors import ServerError
 from telethon.tl.types import PeerUser, UpdateReadHistoryInbox
 
 from mcp_telegram.activity_contracts import InputPeerResolver
+from mcp_telegram.config import RuntimeObservationConfig, TelemetryConfig
 from mcp_telegram.daemon_api import (
     DaemonAPIServer,
     DaemonClientLike,
     _normalize_telemetry_outcome,
     _ResolverEntityCache,
+    _write_telemetry,
 )
 from mcp_telegram.daemon_ipc import get_daemon_socket_path
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
@@ -3469,7 +3471,7 @@ async def test_record_telemetry_does_not_prune_on_hot_write_path() -> None:
     """The hot telemetry writer leaves batched retention to maintenance."""
     conn = _make_db_with_entities()
     now = 2_000_000_000
-    ttl = make_daemon_api_policy().telemetry_retention_ttl_seconds
+    ttl = make_daemon_api_policy().telemetry.retention_ttl_seconds
     _insert_telemetry(conn, tool_name="AtBoundary", timestamp=now - ttl)
     _insert_telemetry(conn, tool_name="Expired", timestamp=now - ttl - 1)
     server = make_server(conn)
@@ -3496,6 +3498,25 @@ async def test_record_telemetry_does_not_prune_on_hot_write_path() -> None:
         conn.execute("SELECT tool_name FROM runtime_observations WHERE kind='mcp.call' ORDER BY tool_name").fetchall(),
     )
     assert [row[0] for row in tool_name_rows] == ["AtBoundary", "Current", "Expired"]
+
+
+def test_batched_daemon_api_prune_uses_configured_row_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = _make_db_with_entities()
+    for tool_name in ("Oldest", "Older", "Recent"):
+        record_runtime_observation(conn, kind="mcp.call", tool_name=tool_name)
+    conn.commit()
+    telemetry = TelemetryConfig(
+        runtime_observations=replace(RuntimeObservationConfig(), row_cap=2),
+    )
+    policy = replace(make_daemon_api_policy(), telemetry=telemetry)
+    monkeypatch.setattr("mcp_telegram.daemon_api._runtime_event_write_count", 127)
+
+    _write_telemetry(conn, policy, {"tool_name": "Current"})
+
+    assert conn.execute("SELECT tool_name FROM runtime_observations ORDER BY id").fetchall() == [
+        ("Recent",),
+        ("Current",),
+    ]
 
 
 @pytest.mark.asyncio

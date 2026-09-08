@@ -92,7 +92,12 @@ from .folders.read_model import dialog_placement, folder_snapshot, folder_summar
 from .history_enrollment import disable_history, enable_history, read_intent
 from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
-from .runtime_observations import prune_runtime_observations, record_runtime_observation, tool_telemetry_identity
+from .runtime_observations import (
+    RuntimeObservationPolicy,
+    prune_runtime_observations,
+    record_runtime_observation,
+    tool_telemetry_identity,
+)
 from .sync_read_model import SyncStatus, build_sync_read_model
 from .telegram_rpc_scheduler import (
     RpcAdmissionError,
@@ -226,8 +231,22 @@ def _write_telemetry(
     _insert_telemetry_row(conn, event)
     _runtime_event_write_count += 1
     if _runtime_event_write_count % 128 == 0:
-        prune_runtime_observations(conn, ttl_seconds=policy.telemetry_retention_ttl_seconds)
+        prune_runtime_observations(
+            conn,
+            ttl_seconds=policy.telemetry.retention_ttl_seconds,
+            row_cap=policy.telemetry.runtime_observations.row_cap,
+        )
     conn.commit()
+
+
+class TelemetryPolicy(Protocol):
+    """Hierarchical telemetry policy supplied by the typed config root."""
+
+    @property
+    def retention_ttl_seconds(self) -> int: ...
+
+    @property
+    def runtime_observations(self) -> RuntimeObservationPolicy: ...
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -241,7 +260,7 @@ class DaemonApiPolicy:
     group_directory_ttl_seconds: int
     resolver_enrichment_ttl_seconds: int
     folder_snapshot_stale_after_seconds: int
-    telemetry_retention_ttl_seconds: int
+    telemetry: TelemetryPolicy
     slow_request_seconds: float
     entity_profile: RefreshLimits
 
