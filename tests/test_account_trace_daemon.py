@@ -880,6 +880,53 @@ async def test_unscoped_trace_paginates_across_excluded_direct_chat(
 
 
 @pytest.mark.asyncio
+async def test_dialog_view_returns_content_free_summaries_and_paginates_by_dialog(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
+    _server, conn, _client = trace_server
+    seed_entity(conn, entity_id=101, name="Alice", username="alice")
+    seed_dialog(conn, dialog_id=-100123, name="New Group", dialog_type="Supergroup")
+    seed_dialog(conn, dialog_id=-100124, name="Old Group", dialog_type="Supergroup")
+    seed_synced_dialog(conn, dialog_id=-100123)
+    seed_synced_dialog(conn, dialog_id=-100124)
+    seed_message(conn, dialog_id=-100123, message_id=1, sent_at=30, sender_id=101, text="newest")
+    seed_message(conn, dialog_id=-100123, message_id=2, sent_at=20, sender_id=101, text="also new")
+    seed_message(conn, dialog_id=-100124, message_id=3, sent_at=10, sender_id=101, text="old")
+    conn.commit()
+
+    first = _dict(await trace_service._trace_account_messages({"exact_account_id": 101, "view": "dialogs", "limit": 1}))
+    first_data = _dict(first["data"])
+    first_dialogs = cast(list[dict[str, object]], first_data["dialogs"])
+    navigation = first_data["next_navigation"]
+
+    assert first_data["view"] == "dialogs"
+    assert first_data["groups"] == []
+    assert first_dialogs == [
+        {
+            "dialog_id": -100123,
+            "dialog_title": "New Group",
+            "dialog_type": "Supergroup",
+            "message_count": 2,
+            "first_message_at": 20,
+            "last_message_at": 30,
+        }
+    ]
+    assert _dict(first_data["coverage"])["observed_message_count"] == 2
+    assert isinstance(navigation, str)
+
+    second = _dict(
+        await trace_service._trace_account_messages(
+            {"exact_account_id": 101, "view": "dialogs", "limit": 1, "navigation": navigation}
+        )
+    )
+    second_data = _dict(second["data"])
+    second_dialogs = cast(list[dict[str, object]], second_data["dialogs"])
+    assert [item["dialog_id"] for item in second_dialogs] == [-100124]
+    assert second_data["next_navigation"] is None
+
+
+@pytest.mark.asyncio
 async def test_observed_trace_reports_only_current_evidence_dialog_problems(
     trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
     trace_service: DaemonAccountTraceService,

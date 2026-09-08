@@ -118,6 +118,47 @@ def evidence_page(conn: sqlite3.Connection, request: TraceMessageQueryRequest) -
     return [cast(Mapping[str, object], row) for row in _rows(conn.execute(sql, params))]
 
 
+def dialog_summary_page(conn: sqlite3.Connection, request: TraceMessageQueryRequest) -> list[Mapping[str, object]]:
+    """Return one bounded aggregate row per dialog containing matching evidence."""
+    sql, params = build_dialog_summary_query(request)
+    return [cast(Mapping[str, object], row) for row in _rows(conn.execute(sql, params))]
+
+
+def build_dialog_summary_query(request: TraceMessageQueryRequest) -> tuple[str, dict[str, object]]:
+    """Build the Account Trace dialog-summary query with keyset pagination."""
+    params: dict[str, object] = {
+        "target_user_id": request.target_user_id,
+        "self_id": request.self_id,
+        "limit": request.limit,
+    }
+    candidate_queries = _trace_candidate_queries(request, params)
+    filtered = (
+        f"WITH candidate_messages AS ({' UNION '.join(candidate_queries)}), matching_messages AS ("
+        "SELECT m.dialog_id, m.sent_at, m.post_author "
+        "FROM candidate_messages candidate "
+        "JOIN messages m ON m.dialog_id = candidate.dialog_id AND m.message_id = candidate.message_id "
+        "WHERE 1 = 1"
+    )
+    filtered = _apply_trace_query_scope(filtered, params, request)
+    filtered = _apply_trace_query_bounds(filtered, params, request, include_navigation=False) + ") "
+    sql = (
+        filtered + "SELECT mm.dialog_id, "
+        "COALESCE(d.name, e.name, CAST(mm.dialog_id AS TEXT)) AS dialog_title, "
+        "COALESCE(d.type, e.type) AS dialog_type, "
+        "COUNT(*) AS message_count, MIN(mm.sent_at) AS first_message_at, MAX(mm.sent_at) AS last_message_at, "
+        "SUM(CASE WHEN mm.post_author IS NOT NULL THEN 1 ELSE 0 END) AS signature_message_count "
+        "FROM matching_messages mm "
+        "LEFT JOIN dialogs d ON d.dialog_id = mm.dialog_id "
+        "LEFT JOIN entities e ON e.id = mm.dialog_id "
+        "GROUP BY mm.dialog_id"
+    )
+    if request.navigation is not None:
+        sql += " HAVING (MAX(mm.sent_at) < :nav_sent_at OR (MAX(mm.sent_at) = :nav_sent_at AND mm.dialog_id < :nav_dialog_id))"
+        params["nav_sent_at"] = request.navigation["sent_at"]
+        params["nav_dialog_id"] = request.navigation["dialog_id"]
+    return sql + " ORDER BY last_message_at DESC, mm.dialog_id DESC LIMIT :limit", params
+
+
 def build_evidence_query(request: TraceMessageQueryRequest) -> tuple[str, dict[str, object]]:
     """Build the canonical ordered Account Trace evidence query."""
     params: dict[str, object] = {
@@ -203,6 +244,8 @@ def _apply_trace_query_bounds(
     sql: str,
     params: dict[str, object],
     request: TraceMessageQueryRequest,
+    *,
+    include_navigation: bool = True,
 ) -> str:
     if request.exact_topic_id is not None:
         sql += " AND m.forum_topic_id = :exact_topic_id"
@@ -213,7 +256,7 @@ def _apply_trace_query_bounds(
     if request.sent_before_ts is not None:
         sql += " AND m.sent_at <= :sent_before"
         params["sent_before"] = request.sent_before_ts
-    if request.navigation is None:
+    if request.navigation is None or not include_navigation:
         return sql
     sql += " AND (m.sent_at < :nav_sent_at OR (m.sent_at = :nav_sent_at AND m.dialog_id < :nav_dialog_id) OR (m.sent_at = :nav_sent_at AND m.dialog_id = :nav_dialog_id AND m.message_id < :nav_message_id))"
     params.update(

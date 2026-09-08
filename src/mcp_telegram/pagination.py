@@ -16,6 +16,7 @@ _TOKEN_SECRET: bytes = os.urandom(32)
 
 NavigationKind = Literal["history", "search"]
 AccountTraceGroupBy = Literal["timeline", "dialog"]
+AccountTraceView = Literal["dialogs", "messages"]
 _MAX_SCOPE_DIALOG_IDS = 2
 
 
@@ -75,6 +76,7 @@ class AccountTraceNavigationToken:
     dialog_id: int
     message_id: int
     group_by: AccountTraceGroupBy
+    view: AccountTraceView = "messages"
     exact_dialog_id: int | None = None
     exact_topic_id: int | None = None
     sent_after: str | None = None
@@ -91,6 +93,7 @@ class AccountTraceNavigationRequest:
     dialog_id: int
     message_id: int
     group_by: AccountTraceGroupBy
+    view: AccountTraceView = "messages"
     exact_dialog_id: int | None = None
     exact_topic_id: int | None = None
     sent_after: str | None = None
@@ -104,6 +107,7 @@ class AccountTraceNavigationContext:
 
     expected_target_user_id: int
     expected_group_by: AccountTraceGroupBy
+    expected_view: AccountTraceView = "messages"
     expected_exact_dialog_id: int | None = None
     expected_exact_topic_id: int | None = None
     expected_sent_after: str | None = None
@@ -327,6 +331,7 @@ def encode_account_trace_navigation(request: AccountTraceNavigationRequest) -> s
         "dialog_id": request.dialog_id,
         "message_id": request.message_id,
         "group_by": request.group_by,
+        "view": request.view,
     }
     if request.exact_dialog_id is not None:
         payload["exact_dialog_id"] = request.exact_dialog_id
@@ -373,6 +378,12 @@ def _require_account_trace_group_by(value: object) -> AccountTraceGroupBy:
     return cast("AccountTraceGroupBy", value)
 
 
+def _require_account_trace_view(value: object) -> AccountTraceView:
+    if value not in {"dialogs", "messages"}:
+        raise ValueError("Invalid navigation token: view must be dialogs or messages")
+    return cast("AccountTraceView", value)
+
+
 def _require_scope_dialog_ids(value: object) -> list[int] | None:
     if value is None:
         return None
@@ -410,6 +421,13 @@ def decode_account_trace_navigation(
         group_by,
         context.expected_group_by,
         f"Navigation token belongs to group_by {group_by}, not {context.expected_group_by}",
+    )
+
+    view = _require_account_trace_view(data.get("view", "messages"))
+    _require_navigation_value_matches(
+        view,
+        context.expected_view,
+        f"Navigation token belongs to view {view}, not {context.expected_view}",
     )
 
     sent_at = _require_navigation_int_field(data, "sent_at")
@@ -452,6 +470,7 @@ def decode_account_trace_navigation(
         dialog_id=dialog_id,
         message_id=message_id,
         group_by=group_by,
+        view=view,
         exact_dialog_id=exact_dialog_id,
         exact_topic_id=exact_topic_id,
         sent_after=sent_after,

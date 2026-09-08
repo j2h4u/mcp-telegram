@@ -75,6 +75,7 @@ class _SearchMessagesKwargs(TypedDict):
 
 
 class _TraceAccountMessagesKwargs(TypedDict, total=False):
+    view: str
     account: str | None
     exact_account_id: int | None
     group_by: str
@@ -321,6 +322,7 @@ class DaemonConnection:
         """Send trace_account_messages request to the daemon."""
         payload: dict = {
             "method": "trace_account_messages",
+            "view": kwargs.get("view", "dialogs"),
             "group_by": kwargs.get("group_by", "timeline"),
             "limit": kwargs.get("limit", 50),
             "coverage_goal": kwargs.get("coverage_goal", "observed"),
