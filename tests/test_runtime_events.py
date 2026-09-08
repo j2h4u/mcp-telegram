@@ -231,6 +231,12 @@ def test_runtime_observation_sink_logs_aggregate_queue_overflow(
     assert sink.queue_full_drops > 0
     assert caplog.text.count("runtime_observation_sink_summary") == 1
 
+    sink._increment("successful_writes")
+    monkeypatch.setattr("mcp_telegram.runtime_observations.time.monotonic", lambda: 10_000.0)
+    sink._maybe_log_summary()
+
+    assert caplog.text.count("runtime_observation_sink_summary") == 1
+
 
 @pytest.mark.asyncio
 async def test_runtime_observation_sink_survives_a_permanent_job_failure(

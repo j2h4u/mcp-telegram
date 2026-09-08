@@ -222,7 +222,7 @@ class RuntimeObservationSink:
         self._counter_lock = threading.Lock()
         self._log_lock = threading.Lock()
         self._last_log_at = 0.0
-        self._last_logged_counters = RuntimeObservationCounters()
+        self._last_logged_summary = self._summary_snapshot(RuntimeObservationCounters())
         self._accepting = True
         self._closed = False
         self._writer_error: BaseException | None = None
@@ -393,13 +393,26 @@ class RuntimeObservationSink:
                 )
             ):
                 return
-            if counters == self._last_logged_counters:
+            summary = self._summary_snapshot(counters)
+            if summary == self._last_logged_summary:
                 return
             self._last_log_at = now
-            self._last_logged_counters = counters
+            self._last_logged_summary = summary
         logger.warning(
             "runtime_observation_sink_summary queue_full_drops=%d shutdown_grace_drops=%d "
             "busy_retries=%d permanent_failures=%d startup_failures=%d rejected_submissions=%d startup_drops=%d",
+            counters.queue_full_drops,
+            counters.shutdown_grace_drops,
+            counters.busy_retries,
+            counters.permanent_failures,
+            counters.startup_failures,
+            counters.rejected_submissions,
+            counters.startup_drops,
+        )
+
+    @staticmethod
+    def _summary_snapshot(counters: RuntimeObservationCounters) -> tuple[int, ...]:
+        return (
             counters.queue_full_drops,
             counters.shutdown_grace_drops,
             counters.busy_retries,
