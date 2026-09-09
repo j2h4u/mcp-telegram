@@ -63,6 +63,7 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .access_lifecycle import AccessLossEvidence, set_access_lost
 from .activity_contracts import InputPeerResolver
+from .demand_shadow_wiring import DemandShadow, offer_durable_demand
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
 from .history_enrollment import ensure_automatic_dm_enrollment
@@ -518,6 +519,22 @@ class EventHandlerManager:
         self._realtime_history_status: _RealtimeHistoryStatusReader = _SQLiteRealtimeHistoryStatusReader(conn)
         self._topic_metadata = SQLiteTopicMetadataRepository(conn)
         self._self_id: int | None = None
+        self._demand_shadow: DemandShadow | None = None
+
+    def bind_demand_shadow(self, shadow: DemandShadow) -> None:
+        """Attach post-commit durable wakeups after daemon composition."""
+        self._demand_shadow = shadow
+
+    def _offer(self, *kinds: DemandKind) -> None:
+        offer_durable_demand(self._demand_shadow, *kinds)
+
+    def _offer_message_ingestion(self) -> None:
+        self._offer(
+            DemandKind.LIVE_HYDRATION_BATCH,
+            DemandKind.BACKFILL_HYDRATION_BATCH,
+            DemandKind.MESSAGE_FACT_REFRESH,
+            DemandKind.READ_RECEIPT_BATCH,
+        )
 
     # ------------------------------------------------------------------
     # Registration
@@ -664,6 +681,7 @@ class EventHandlerManager:
             outcome = ensure_automatic_dm_enrollment(self._conn, dialog_id)
             self._conn.commit()
             if outcome.enabled and outcome.action in {"queue_full_history", "preserved_enabled_intent"}:
+                self._offer(DemandKind.FULL_SYNC_PAGE)
                 # status='syncing' is stable once inserted — FullSyncWorker only
                 # advances it to 'synced', never back to 'not_synced'. Adding to
                 # _synced_dialog_ids here is safe: the real-time handler path only
@@ -772,6 +790,9 @@ class EventHandlerManager:
                 self._project_new_message_metadata(dialog_id, msg, now)
                 self._record_body_event(dialog_id, now)
 
+            self._offer_message_ingestion()
+            if bool(getattr(msg, "from_scheduled", False)):
+                self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
             logger.debug("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
         except RpcAdmissionClosedError:
             raise
@@ -787,6 +808,8 @@ class EventHandlerManager:
         if coverage is not RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
             return coverage
         self._verify_scheduled_publication_if_needed(self._conn, dialog_id, event.message)
+        if bool(getattr(event.message, "from_scheduled", False)):
+            self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
         status, _ = self._realtime_history_status.read_status(dialog_id)
         if event.is_private and status is None:
             sender = None
@@ -1029,6 +1052,7 @@ class EventHandlerManager:
                 return False
             insert_messages_with_fts(self._conn, [extracted], priority=HydrationPriority.FOREGROUND)
             self._record_body_event(dialog_id, now)
+        self._offer_message_ingestion()
         return True
 
     def _apply_reaction_only_edit(  # noqa: PLR0913, PLR0917
@@ -1091,6 +1115,7 @@ class EventHandlerManager:
                 priority=HydrationPriority.FOREGROUND,
             )
             self._record_body_event(dialog_id, now)
+        self._offer_message_ingestion()
         return next_ver
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
@@ -1162,6 +1187,7 @@ class EventHandlerManager:
         try:
             with self._conn:
                 upsert_scheduled_message(self._conn, dialog_id, message)
+            self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
             message_id_attr = "id"
             logger.info(
                 "scheduled_new dialog_id=%d message_id=%d",
@@ -1181,6 +1207,7 @@ class EventHandlerManager:
         sent_message_ids = cast(Sequence[int] | None, getattr(update, "sent_messages", None))
         try:
             mark_scheduled_messages_removed(self._conn, dialog_id, message_ids, sent_message_ids)
+            self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
             logger.info("scheduled_removed dialog_id=%d count=%d", dialog_id, len(message_ids))
         except Exception:
             logger.exception("scheduled_removed_failed dialog_id=%s", dialog_id)
@@ -1598,6 +1625,8 @@ class EventHandlerManager:
                 mark_needs_refresh=True,
                 create_missing=True,
             )
+        if rowcount:
+            self._offer(DemandKind.DIALOG_LIGHT_RECONCILIATION)
         logger.info(
             "event_dialog_unread_mark dialog_id=%d unread=%s updated=%d",
             dialog_id,
@@ -1673,6 +1702,7 @@ class EventHandlerManager:
                 )
             if changed:
                 self._synced_dialog_ids.discard(dialog_id)
+                self._offer(DemandKind.DELTA_ACCESS_PROBE)
         except RpcAdmissionClosedError:
             raise
         except Exception:
@@ -1700,7 +1730,7 @@ class EventHandlerManager:
                 return
             now = int(time.time())
             with self._conn:
-                self._conn.execute(_UPDATE_DIALOG_NEEDS_REFRESH_SQL, (now, dialog_id))
+                changed = self._conn.execute(_UPDATE_DIALOG_NEEDS_REFRESH_SQL, (now, dialog_id)).rowcount
                 row = cast(
                     tuple[str | None, int | None] | None,
                     self._conn.execute(
@@ -1708,6 +1738,8 @@ class EventHandlerManager:
                         (dialog_id,),
                     ).fetchone(),
                 )
+            if changed:
+                self._offer(DemandKind.DIALOG_LIGHT_RECONCILIATION)
             logger.info("event_channel_chat_dirty dialog_id=%d", dialog_id)
         except RpcAdmissionClosedError:
             raise

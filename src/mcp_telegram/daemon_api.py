@@ -84,6 +84,7 @@ from .daemon_dialog_queries import (
     _LIST_TOPICS_SQL,
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
+from .demand_shadow_wiring import DemandShadow, offer_durable_demand
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
 from .entity_profile.refresh import RefreshLimits
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
@@ -100,6 +101,7 @@ from .runtime_observations import (
 )
 from .sync_read_model import SyncStatus, build_sync_read_model
 from .telegram_demand import AcquisitionKind
+from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
     RpcAdmissionError,
     RpcAdmissionExpiredError,
@@ -558,7 +560,14 @@ class DaemonAPIServer:
         self._health_status = health_status
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
         self._entity_info_service: DaemonEntityInfoService | None = None
+        self._demand_shadow: DemandShadow | None = None
         self._conversation_changes_token_codec = ConversationChangesTokenCodec()
+
+    def bind_demand_shadow(self, shadow: DemandShadow) -> None:
+        """Attach post-commit durable wakeups after daemon composition."""
+        self._demand_shadow = shadow
+        if self._entity_info_service is not None:
+            self._entity_info_service.bind_demand_shadow(shadow)
 
     def _get_reading_service(self) -> ReadingService:
         """Get memoized reading-service instance with explicit daemon dependencies."""
@@ -1406,6 +1415,20 @@ class DaemonAPIServer:
         if enable and self._hydration_requester is not None:
             self._hydration_requester(self._conn, dialog_id, now)
         self._conn.commit()
+        if enable:
+            if outcome.action in {
+                "queue_full_history",
+                "already_syncing",
+                "preserved_explicit_enable",
+            }:
+                offer_durable_demand(self._demand_shadow, DemandKind.FULL_SYNC_PAGE)
+            elif outcome.action == "request_delta_refresh":
+                offer_durable_demand(self._demand_shadow, DemandKind.DELTA_GAP_FILL)
+            offer_durable_demand(
+                self._demand_shadow,
+                DemandKind.BACKFILL_HYDRATION_BATCH,
+                DemandKind.READ_RECEIPT_BATCH,
+            )
         logger.info("mark_dialog_for_sync dialog_id=%d enable=%s", dialog_id, enable)
         return {
             "ok": True,
@@ -1535,6 +1558,8 @@ class DaemonAPIServer:
                     refresh_limits=self._policy.entity_profile,
                 )
             )
+            if self._demand_shadow is not None:
+                self._entity_info_service.bind_demand_shadow(self._demand_shadow)
         return self._entity_info_service
 
     async def _get_entity_info(self, req: dict[str, object]) -> dict:

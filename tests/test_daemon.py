@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -22,7 +23,9 @@ from mcp_telegram.daemon import (
     _mark_rpc_scheduler_failed,
     _persist_runtime_observation_loss,
     _prime_runtime,
+    _run_dialog_reconciliation_loop,
     _run_message_fact_refresh_with_dedicated_connection,
+    _run_scheduled_reconciliation_loop,
     _run_self_profile_refresh_loop,
     _run_sync_loop,
     _shutdown_sync_main_context,
@@ -34,7 +37,7 @@ from mcp_telegram.folders.read_repository import folder_summaries
 from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.state import StatePaths
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_demand import current_demand_token
+from mcp_telegram.telegram_demand import current_demand_token, demand_context
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
@@ -148,6 +151,7 @@ async def test_message_fact_refresh_owns_and_closes_a_dedicated_connection() -> 
         )[1]
     )
     dependencies = SimpleNamespace(conn=dedicated_conn)
+    observed: list[DemandKind] = []
     ctx = SimpleNamespace(
         db_path=Path("/state/sync.db"),
         conn=shared_conn,
@@ -161,9 +165,19 @@ async def test_message_fact_refresh_owns_and_closes_a_dedicated_connection() -> 
         reaction_freshness_ttl_seconds=60,
     )
 
+    async def run_cycle(
+        _ctx: object,
+        kind: DemandKind,
+        operation: Callable[[], Awaitable[object]],
+    ) -> object:
+        observed.append(kind)
+        with demand_context(kind):
+            return await operation()
+
     with (
         patch("mcp_telegram.daemon._build_message_fact_refresh_dependencies", return_value=dependencies),
         patch("mcp_telegram.daemon.refresh_message_facts_once", new=refresh_once),
+        patch("mcp_telegram.daemon._run_ctx_demand_cycle", side_effect=run_cycle),
     ):
         await _run_message_fact_refresh_with_dedicated_connection(ctx)  # type: ignore[arg-type]
 
@@ -172,6 +186,7 @@ async def test_message_fact_refresh_owns_and_closes_a_dedicated_connection() -> 
     assert await_args is not None
     assert await_args.args[0].conn is dedicated_conn
     assert await_args.args[0].conn is not shared_conn
+    assert observed == [DemandKind.MESSAGE_FACT_REFRESH]
     dedicated_conn.close.assert_called_once_with()
 
 
@@ -186,12 +201,25 @@ async def test_self_profile_refresh_updates_snapshot_after_interval() -> None:
 
     ctx = SimpleNamespace(
         shutdown_event=shutdown_event,
+        demand_shadow=None,
         scheduling=SimpleNamespace(self_profile_refresh_seconds=0.001),
         client=SimpleNamespace(get_me=_get_me),
         api_server=SimpleNamespace(self_id=123, self_profile={"id": 123, "first_name": "Old"}),
     )
 
-    await _run_self_profile_refresh_loop(ctx)
+    observed: list[DemandKind] = []
+
+    async def run_cycle(
+        _ctx: object,
+        kind: DemandKind,
+        operation: Callable[[], Awaitable[object]],
+    ) -> object:
+        observed.append(kind)
+        with demand_context(kind):
+            return await operation()
+
+    with patch("mcp_telegram.daemon._run_ctx_demand_cycle", side_effect=run_cycle):
+        await _run_self_profile_refresh_loop(ctx)
 
     assert ctx.api_server.self_profile == {
         "id": 123,
@@ -199,6 +227,7 @@ async def test_self_profile_refresh_updates_snapshot_after_interval() -> None:
         "last_name": None,
         "username": "new_name",
     }
+    assert observed == [DemandKind.SELF_PROFILE_MAINTENANCE]
 
 
 @pytest.mark.asyncio
@@ -216,6 +245,70 @@ async def test_self_profile_refresh_does_not_call_telegram_during_shutdown() -> 
     await _run_self_profile_refresh_loop(ctx)
 
     get_me.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_loop_reports_both_demand_kinds() -> None:
+    shutdown_event = asyncio.Event()
+    observed: list[DemandKind] = []
+
+    async def run_slice(kind: DemandKind) -> int:
+        if kind is DemandKind.SCHEDULED_DISCOVERY:
+            shutdown_event.set()
+        return 0
+
+    async def run_cycle(
+        _ctx: object,
+        kind: DemandKind,
+        operation: Callable[[], Awaitable[object]],
+    ) -> object:
+        observed.append(kind)
+        return await operation()
+
+    ctx = SimpleNamespace(shutdown_event=shutdown_event)
+    reconciler = SimpleNamespace(run_demand_slice=run_slice, _wait_timeout=lambda: 60.0)
+    with patch("mcp_telegram.daemon._run_ctx_demand_cycle", side_effect=run_cycle):
+        await _run_scheduled_reconciliation_loop(ctx, reconciler)  # type: ignore[arg-type]
+
+    assert observed == [DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY]
+
+
+@pytest.mark.asyncio
+async def test_dialog_loop_reports_light_and_full_demand_kinds() -> None:
+    shutdown_event = asyncio.Event()
+    observed: list[DemandKind] = []
+
+    async def run_light_pass() -> int:
+        return 0
+
+    async def run_full_pass() -> tuple[int, bool]:
+        shutdown_event.set()
+        return 0, True
+
+    async def run_cycle(
+        _ctx: object,
+        kind: DemandKind,
+        operation: Callable[[], Awaitable[object]],
+    ) -> object:
+        observed.append(kind)
+        return await operation()
+
+    ctx = SimpleNamespace(
+        shutdown_event=shutdown_event,
+        conn=MagicMock(),
+        scheduling=SimpleNamespace(reconciliation_hourly_seconds=60.0),
+    )
+    worker = SimpleNamespace(run_light_pass=run_light_pass, run_full_pass=run_full_pass)
+    with (
+        patch("mcp_telegram.daemon._read_last_full_reconciliation_at", return_value=None),
+        patch("mcp_telegram.daemon._run_ctx_demand_cycle", side_effect=run_cycle),
+    ):
+        await _run_dialog_reconciliation_loop(ctx, worker)  # type: ignore[arg-type]
+
+    assert observed == [
+        DemandKind.DIALOG_LIGHT_RECONCILIATION,
+        DemandKind.DIALOG_FULL_RECONCILIATION,
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +563,40 @@ async def test_heartbeat_initialization_and_periodic_logging_avoid_messages_sql(
     assert all("rate=" not in message for message in heartbeat_logs)
 
 
+@pytest.mark.asyncio
+async def test_sync_loop_reports_full_page_demand_kind() -> None:
+    shutdown_event = asyncio.Event()
+    observed: list[DemandKind] = []
+    worker = MagicMock()
+
+    async def process_one_batch() -> bool:
+        shutdown_event.set()
+        return True
+
+    async def run_cycle(kind: DemandKind, operation: Callable[[], Awaitable[object]]) -> object:
+        observed.append(kind)
+        return await operation()
+
+    worker.process_one_batch = process_one_batch
+    client = MagicMock()
+    client.is_connected.return_value = True
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE synced_dialogs (status TEXT NOT NULL)")
+        await _run_sync_loop(
+            worker,
+            MagicMock(),
+            shutdown_event,
+            conn,
+            client,
+            demand_cycle_runner=run_cycle,
+        )
+    finally:
+        conn.close()
+
+    assert observed == [DemandKind.FULL_SYNC_PAGE]
+
+
 def test_sync_main_runs_fts_backfill_before_connect(
     mock_client: AsyncMock,
     instant_shutdown_event: asyncio.Event,
@@ -613,6 +740,9 @@ def test_self_id_cached_at_startup(
 
         def _get_entity_info_service(self):
             return self._entity_info_service
+
+        def bind_demand_shadow(self, shadow: object) -> None:
+            self._demand_shadow = shadow
 
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
@@ -1421,6 +1551,10 @@ async def test_ensure_demand_runtime_installs_one_tracked_shadow_task() -> None:
         demand_shadow=None,
         background_tasks=set(),
         conn=MagicMock(),
+        api_server=MagicMock(),
+        handler_manager=MagicMock(),
+        fact_hydration_worker=MagicMock(),
+        folder_projection_worker=MagicMock(),
     )
     full_sync_worker = MagicMock()
     delta_sync_worker = MagicMock()
@@ -1443,6 +1577,10 @@ async def test_ensure_demand_runtime_installs_one_tracked_shadow_task() -> None:
     assert installed_again is runtime
     assert ctx.demand_runtime is runtime
     assert ctx.demand_shadow is shadow
+    ctx.api_server.bind_demand_shadow.assert_called_once_with(shadow)
+    ctx.handler_manager.bind_demand_shadow.assert_called_once_with(shadow)
+    ctx.fact_hydration_worker.bind_demand_shadow.assert_called_once_with(shadow)
+    ctx.folder_projection_worker.bind_demand_shadow.assert_called_once_with(shadow)
     assert len(ctx.background_tasks) == 1
     shadow_task = next(iter(ctx.background_tasks))
     assert shadow_task.get_name() == "telegram_demand_shadow"

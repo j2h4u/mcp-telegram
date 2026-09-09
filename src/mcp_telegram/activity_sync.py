@@ -20,6 +20,7 @@ from telethon.tl.functions.messages import SearchRequest
 from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, InputPeerSelf
 
 from .activity_substrate import ActivityClient, call_with_timeout
+from .demand_shadow_wiring import DemandCycleRunner
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled, sleep_through_flood
 from .hydration_queue import HydrationPriority
@@ -874,13 +875,14 @@ async def _run_incremental_in_scope(
     )
 
 
-async def run_activity_sync_loop(
+async def run_activity_sync_loop(  # noqa: PLR0913 - explicit loop dependencies and observation hook
     client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
     interval: float = _DEFAULT_INTERVAL_S,
     timeout_s: float,
+    demand_cycle_runner: DemandCycleRunner | None = None,
 ) -> None:
     """Background task: keep own-message rows (out=1) in messages up-to-date.
 
@@ -890,8 +892,18 @@ async def run_activity_sync_loop(
     while not shutdown_event.is_set():
         logger.debug("activity_sync_loop_start")
         try:
-            await _run_backfill(client, conn, shutdown_event, timeout_s=timeout_s)
-            await _run_incremental(client, conn, shutdown_event, timeout_s=timeout_s)
+            if demand_cycle_runner is None:
+                await _run_backfill(client, conn, shutdown_event, timeout_s=timeout_s)
+                await _run_incremental(client, conn, shutdown_event, timeout_s=timeout_s)
+            else:
+                await demand_cycle_runner(
+                    DemandKind.ARCHIVE_BACKFILL,
+                    lambda: _run_backfill_in_scope(client, conn, shutdown_event, timeout_s=timeout_s),
+                )
+                await demand_cycle_runner(
+                    DemandKind.ARCHIVE_INCREMENTAL,
+                    lambda: _run_incremental_in_scope(client, conn, shutdown_event, timeout_s=timeout_s),
+                )
         except RpcAdmissionClosedError:
             raise
         except Exception:

@@ -28,6 +28,7 @@ from .activity_peer_sweep import (
     sweep_peer_once,
 )
 from .activity_substrate import ActivityClient
+from .demand_shadow_wiring import DemandCycleRunner
 from .flood import TelegramRpcThrottled
 from .hydration_queue import HydrationPriority
 from .maintenance_logging import log_maintenance_cycle
@@ -1034,13 +1035,14 @@ async def run_hot_sweep_pass(
         return _admission_deferred_telemetry(conn, exc.retry_after_seconds)
 
 
-async def run_hot_sweep_loop(
+async def run_hot_sweep_loop(  # noqa: PLR0913 - explicit loop dependencies and observation hook
     client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
     policy: HotSweepPolicy,
     timeout_s: float,
+    demand_cycle_runner: DemandCycleRunner | None = None,
 ) -> None:
     """Background task: run Tier-A HotSweep hourly, interruptible via shutdown_event.
 
@@ -1050,7 +1052,28 @@ async def run_hot_sweep_loop(
         logger.debug("activity_hot_sweep_loop_start")
         telemetry: dict[str, int | float | bool | None] = {"flood_wait_seconds": None}
         try:
-            telemetry = await run_hot_sweep_pass(client, conn, shutdown_event, policy=policy, timeout_s=timeout_s)
+            if demand_cycle_runner is None:
+                telemetry = await run_hot_sweep_pass(
+                    client,
+                    conn,
+                    shutdown_event,
+                    policy=policy,
+                    timeout_s=timeout_s,
+                )
+            else:
+                telemetry = cast(
+                    dict[str, int | float | bool | None],
+                    await demand_cycle_runner(
+                        DemandKind.HOT_ACTIVITY_PAGE,
+                        lambda: run_hot_sweep_pass(
+                            client,
+                            conn,
+                            shutdown_event,
+                            policy=policy,
+                            timeout_s=timeout_s,
+                        ),
+                    ),
+                )
             logger.debug(
                 "activity_hot_sweep_loop_done genuinely_new=%d flood_wait_seconds=%r",
                 telemetry["genuinely_new"],

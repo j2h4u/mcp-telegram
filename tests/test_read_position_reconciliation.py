@@ -6,12 +6,14 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
+from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -129,6 +131,37 @@ async def test_reconciliation_stops_cleanly_on_shutdown() -> None:
             client, conn, shutdown, interval_seconds=60, max_dialogs_per_pass=2
         )
         client.assert_not_awaited()
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_loop_reports_read_receipt_demand_kind() -> None:
+    from mcp_telegram.daemon import _run_read_position_reconciliation_loop
+
+    conn = _connection()
+    try:
+        shutdown = asyncio.Event()
+        observed: list[DemandKind] = []
+
+        async def run_batch() -> None:
+            shutdown.set()
+
+        async def run_cycle(kind: DemandKind, operation: Callable[[], Awaitable[object]]) -> object:
+            observed.append(kind)
+            return await operation()
+
+        await _run_read_position_reconciliation_loop(
+            AsyncMock(),
+            conn,
+            shutdown,
+            interval_seconds=60,
+            max_dialogs_per_pass=2,
+            demand_cycle_runner=run_cycle,
+            run_batch=run_batch,
+        )
+
+        assert observed == [DemandKind.READ_RECEIPT_BATCH]
     finally:
         conn.close()
 

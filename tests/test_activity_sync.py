@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -375,6 +375,39 @@ async def test_loop_shutdown_between_passes(conn: sqlite3.Connection) -> None:
         run_activity_sync_loop(client, conn, shutdown, interval=60.0, timeout_s=120.0),
         _flip(),
     )
+
+
+@pytest.mark.asyncio
+async def test_loop_reports_each_archive_demand_kind(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shutdown = asyncio.Event()
+    observed: list[DemandKind] = []
+
+    async def backfill(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def incremental(*_args: object, **_kwargs: object) -> None:
+        shutdown.set()
+
+    async def run_cycle(kind: DemandKind, operation: Callable[[], Awaitable[object]]) -> object:
+        observed.append(kind)
+        return await operation()
+
+    monkeypatch.setattr(activity_sync, "_run_backfill_in_scope", backfill)
+    monkeypatch.setattr(activity_sync, "_run_incremental_in_scope", incremental)
+
+    await run_activity_sync_loop(
+        _FakeClient(batches=[]),
+        conn,
+        shutdown,
+        interval=60.0,
+        timeout_s=120.0,
+        demand_cycle_runner=run_cycle,
+    )
+
+    assert observed == [DemandKind.ARCHIVE_BACKFILL, DemandKind.ARCHIVE_INCREMENTAL]
 
 
 @pytest.mark.asyncio

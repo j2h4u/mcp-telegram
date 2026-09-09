@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from typing import cast
 
@@ -52,6 +52,34 @@ from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred, cu
 
 _TEST_TIMEOUT_S = 120.0
 _POLICY = ActivityHotSweepConfig(jitter_max_seconds=0)
+
+
+@pytest.mark.asyncio
+async def test_loop_reports_hot_activity_demand_kind(monkeypatch: pytest.MonkeyPatch) -> None:
+    shutdown = asyncio.Event()
+    observed: list[DemandKind] = []
+
+    async def pass_once(*_args: object, **_kwargs: object) -> dict[str, int | float | bool | None]:
+        shutdown.set()
+        return {"genuinely_new": 0, "flood_wait_seconds": None}
+
+    async def run_cycle(kind: DemandKind, operation: Callable[[], Awaitable[object]]) -> object:
+        observed.append(kind)
+        return await operation()
+
+    monkeypatch.setattr("mcp_telegram.activity_hot_sweep.run_hot_sweep_pass", pass_once)
+    with _make_db() as conn:
+        await run_hot_sweep_loop(
+            _FakeClient(),
+            conn,
+            shutdown,
+            policy=_POLICY,
+            timeout_s=_TEST_TIMEOUT_S,
+            demand_cycle_runner=run_cycle,
+        )
+
+    assert observed == [DemandKind.HOT_ACTIVITY_PAGE]
+
 
 # ---------------------------------------------------------------------------
 # DB and enrollment helpers
@@ -629,10 +657,13 @@ async def test_hot_activity_adapter_resumes_page_window_before_advancing_cursor(
         await adapter.run_slice(RpcAttemptBudget(limit=1))
 
         state = _get_state(conn, dialog_id)
-        resume = conn.execute(
-            "SELECT hot_page_offset_id, hot_window_max_id FROM activity_dialog_state WHERE dialog_id=?",
-            (dialog_id,),
-        ).fetchone()
+        resume = cast(
+            tuple[int | None, int | None] | None,
+            conn.execute(
+                "SELECT hot_page_offset_id, hot_window_max_id FROM activity_dialog_state WHERE dialog_id=?",
+                (dialog_id,),
+            ).fetchone(),
+        )
         assert state["hot_cursor"] == 10
         assert resume == (min(first_page), max(first_page))
 
@@ -640,10 +671,13 @@ async def test_hot_activity_adapter_resumes_page_window_before_advancing_cursor(
         await restarted.run_slice(RpcAttemptBudget(limit=1))
 
         state = _get_state(conn, dialog_id)
-        resume = conn.execute(
-            "SELECT hot_page_offset_id, hot_window_max_id FROM activity_dialog_state WHERE dialog_id=?",
-            (dialog_id,),
-        ).fetchone()
+        resume = cast(
+            tuple[int | None, int | None] | None,
+            conn.execute(
+                "SELECT hot_page_offset_id, hot_window_max_id FROM activity_dialog_state WHERE dialog_id=?",
+                (dialog_id,),
+            ).fetchone(),
+        )
         assert call_log[dialog_id] == [(0, 11), (min(first_page), 11)]
         assert state["hot_cursor"] == max(first_page)
         assert resume == (None, None)

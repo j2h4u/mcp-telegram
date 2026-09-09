@@ -346,6 +346,16 @@ async def test_reconciliation_access_lost_candidate_log_has_dialog_context(
 async def test_raw_scheduled_updates_ingest_without_messages_row(conn: sqlite3.Connection) -> None:
     client = MagicMock()
     manager = EventHandlerManager(client, conn, asyncio.Event(), client.get_input_entity)
+    offered: list[DemandKind] = []
+    shadow = MagicMock()
+
+    def offer(kind: DemandKind) -> bool:
+        assert not conn.in_transaction
+        offered.append(kind)
+        return True
+
+    shadow.offer.side_effect = offer
+    manager.bind_demand_shadow(shadow)
     scheduled = _message(21, "created", scheduled_at=1_900_000_021)
     await manager.on_raw_new_scheduled_message(SimpleNamespace(message=scheduled))
     await manager.on_raw_delete_scheduled_messages(
@@ -356,6 +366,12 @@ async def test_raw_scheduled_updates_ingest_without_messages_row(conn: sqlite3.C
     assert conn.execute(
         "SELECT message_state, visibility, unpublished FROM scheduled_messages WHERE dialog_id=42 AND message_id=21"
     ).fetchone() == ("cancelled", "author_only", 1)
+    assert offered == [
+        DemandKind.SCHEDULED_REPAIR,
+        DemandKind.SCHEDULED_DISCOVERY,
+        DemandKind.SCHEDULED_REPAIR,
+        DemandKind.SCHEDULED_DISCOVERY,
+    ]
 
 
 @pytest.mark.asyncio
@@ -472,7 +488,8 @@ async def test_concurrent_event_prevents_stale_snapshot_apply(conn: sqlite3.Conn
     conn.commit()
 
     class _ConcurrentClient(_ScheduledSnapshotClient):
-        async def __call__(self, request: object) -> object:
+        async def __call__(self, _request: object, **_kwargs: object) -> object:
+            del _request, _kwargs
             upsert_scheduled_message(conn, 42, _message(12), now=200)
             conn.commit()
             return SimpleNamespace(messages=[])

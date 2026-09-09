@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
 from .access_lifecycle import set_access_lost
+from .demand_shadow_wiring import DemandShadow, offer_durable_demand, run_legacy_demand_cycle
 from .flood import TelegramRpcThrottled
 from .hydration_queue import (
     MEDIA_METADATA_KIND,
@@ -31,7 +32,13 @@ from .messages.sqlite_hydration_jobs import (
     repair_transcription_hydration_jobs,
 )
 from .telegram_access import ACCESS_LOST_ERRORS
-from .telegram_demand import AcquisitionKind, DemandStatus, DurableDemandAdapter, RpcAttemptBudget
+from .telegram_demand import (
+    AcquisitionKind,
+    DemandStatus,
+    DurableDemandAdapter,
+    RpcAttemptBudget,
+    current_demand_token,
+)
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_error import TelegramRpcErrorDescriptor, describe_telegram_rpc_error
 from .telegram_rpc_scheduler import (
@@ -353,12 +360,29 @@ class MessageFactHydrationWorker:
         self._backfill_debt = 0
         self._backfill_waiting = False
         self._queue = HydrationQueueRepository(conn)
+        self._demand_shadow: DemandShadow | None = None
+
+    def bind_demand_shadow(self, shadow: DemandShadow) -> None:
+        """Attach the observation-only coordinator after daemon composition."""
+        self._demand_shadow = shadow
 
     async def run_cycle(self, *, now: int | None = None) -> FactHydrationCycleResult:
         effective_now = int(self._clock()) if now is None else now
         transcription_repair, media_repair = self._run_repair_producers(effective_now)
         # The repair is a producer transaction. Commit before any awaited RPC.
         self._conn.commit()
+        if transcription_repair is not None and transcription_repair.enqueued:
+            offer_durable_demand(
+                self._demand_shadow,
+                DemandKind.LIVE_HYDRATION_BATCH,
+                DemandKind.BACKFILL_HYDRATION_BATCH,
+            )
+        if media_repair is not None and media_repair.enqueued:
+            offer_durable_demand(
+                self._demand_shadow,
+                DemandKind.LIVE_HYDRATION_BATCH,
+                DemandKind.BACKFILL_HYDRATION_BATCH,
+            )
         due = self._fair_due_jobs(effective_now)
         repair_fields = self._repair_result_fields(transcription_repair, media_repair)
         if not due:
@@ -430,11 +454,7 @@ class MessageFactHydrationWorker:
         )
         batches = batch_jobs(selected, self._handlers, backfill_first=priority is HydrationPriority.BACKFILL)
         batch = next(
-            (
-                candidate
-                for candidate in batches
-                if self._handlers[candidate[0].kind].request_cost <= budget.remaining
-            ),
+            (candidate for candidate in batches if self._handlers[candidate[0].kind].request_cost <= budget.remaining),
             None,
         )
         if batch is None:
@@ -714,10 +734,24 @@ class MessageFactHydrationWorker:
                 with rpc_attempt_budget(attempt_budget):
                     return await handler.request(self._client, jobs)
 
-        return await create_scoped_rpc_task(
-            request(),
-            source=source,
-            name=f"fact-hydration-{jobs[0].priority.name.lower()}-batch",
+        async def dispatch() -> object:
+            return await create_scoped_rpc_task(
+                request(),
+                source=source,
+                name=f"fact-hydration-{jobs[0].priority.name.lower()}-batch",
+                demand_token=current_demand_token(),
+            )
+
+        if self._demand_shadow is None:
+            return await create_scoped_rpc_task(
+                request(),
+                source=source,
+                name=f"fact-hydration-{jobs[0].priority.name.lower()}-batch",
+            )
+        return await run_legacy_demand_cycle(
+            self._demand_shadow,
+            _hydration_demand_kind(jobs[0].priority),
+            dispatch,
         )
 
     def _handle_admission_rejection(  # noqa: PLR0913, PLR0917

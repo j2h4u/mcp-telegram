@@ -36,6 +36,7 @@ from mcp_telegram.delta_sync import (
 )
 from mcp_telegram.history_enrollment import disable_history
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import RpcAdmissionSaturatedError, current_rpc_scope
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
@@ -1002,6 +1003,33 @@ async def test_probe_loop_runs_immediately_then_shutdown(shutdown_event: asyncio
 
 
 @pytest.mark.asyncio
+async def test_probe_loop_reports_access_probe_demand_kind(shutdown_event: asyncio.Event) -> None:
+    from mcp_telegram.delta_sync import DeltaSyncWorker, run_access_probe_loop
+
+    observed: list[DemandKind] = []
+
+    async def probe(*_args: object, **_kwargs: object) -> None:
+        shutdown_event.set()
+
+    async def run_cycle(kind: DemandKind, operation: Callable[[], Awaitable[object]]) -> object:
+        observed.append(kind)
+        return await operation()
+
+    with patch("mcp_telegram.delta_sync._probe_access_lost_dialogs", side_effect=probe):
+        await run_access_probe_loop(
+            cast(_DeltaSyncClient, MagicMock()),
+            cast(sqlite3.Connection, MagicMock()),
+            shutdown_event,
+            MagicMock(spec=DeltaSyncWorker),
+            _access_probe_policy(),
+            initial_delay=0.0,
+            demand_cycle_runner=run_cycle,
+        )
+
+    assert observed == [DemandKind.DELTA_ACCESS_PROBE]
+
+
+@pytest.mark.asyncio
 async def test_probe_selects_only_due_access_lost_with_cycle_budget(
     sync_db: _SQLiteConnection,
     mock_client: _MockClient,
@@ -1851,6 +1879,30 @@ async def test_delta_catch_up_loop_does_not_emit_redundant_info_completion(
     cycle_logs = [record for record in caplog.records if "delta_catch_up_cycle complete" in record.getMessage()]
     assert len(cycle_logs) == 1
     assert cycle_logs[0].levelno == logging.DEBUG
+
+
+@pytest.mark.asyncio
+async def test_delta_catch_up_loop_reports_gap_fill_demand_kind(shutdown_event: asyncio.Event) -> None:
+    observed: list[DemandKind] = []
+
+    class _Worker:
+        async def run_delta_catch_up(self, *, policy: DeltaCatchUpPolicy) -> int:
+            del policy
+            shutdown_event.set()
+            return 0
+
+    async def run_cycle(kind: DemandKind, operation: Callable[[], Awaitable[object]]) -> object:
+        observed.append(kind)
+        return await operation()
+
+    await run_delta_catch_up_loop(
+        _Worker(),
+        shutdown_event,
+        DeltaCatchUpPolicy(interval_seconds=300.0, max_probes_per_cycle=1, probe_pause_seconds=0.01),
+        demand_cycle_runner=run_cycle,
+    )
+
+    assert observed == [DemandKind.DELTA_GAP_FILL]
 
 
 @pytest.mark.asyncio

@@ -31,6 +31,7 @@ from .access_lifecycle import (
     set_access_lost,
     stamp_access_revalidation,
 )
+from .demand_shadow_wiring import DemandCycleRunner, run_legacy_demand_cycle
 from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
 from .history_enrollment import full_history_enabled
 from .hydration_queue import HydrationPriority
@@ -181,6 +182,7 @@ _REQUEST_DELTA_CONTINUATION_SQL = (
 
 class AccessProbeLoopOptions(TypedDict, total=False):
     initial_delay: float
+    demand_cycle_runner: DemandCycleRunner
 
 
 class _DeltaSyncClient(Protocol):
@@ -680,11 +682,12 @@ class DeltaGapFillDemandAdapter:
                     return
 
 
-@_delta_rpc_scope(DemandKind.DELTA_GAP_FILL, AcquisitionKind.MESSAGE_HISTORY_PAGE)
 async def run_delta_catch_up_loop(
     worker: DeltaSyncWorker,
     shutdown_event: asyncio.Event,
     policy: DeltaCatchUpPolicy,
+    *,
+    demand_cycle_runner: DemandCycleRunner | None = None,
 ) -> None:
     """Run forward gap-fill as a bounded maintenance loop, not startup burst."""
     if not policy.enabled:
@@ -692,7 +695,14 @@ async def run_delta_catch_up_loop(
         return
 
     while not shutdown_event.is_set():
-        total_new = await worker.run_delta_catch_up(policy=policy)
+
+        async def catch_up() -> object:
+            return await worker.run_delta_catch_up(policy=policy)
+
+        if demand_cycle_runner is None:
+            total_new = cast(int, await run_legacy_demand_cycle(None, DemandKind.DELTA_GAP_FILL, catch_up))
+        else:
+            total_new = cast(int, await demand_cycle_runner(DemandKind.DELTA_GAP_FILL, catch_up))
         logger.debug("delta_catch_up_cycle complete — new_messages=%d", total_new)
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=policy.interval_seconds)
@@ -1058,7 +1068,6 @@ class DeltaAccessProbeDemandAdapter:
             )
 
 
-@_delta_rpc_scope(DemandKind.DELTA_ACCESS_PROBE, AcquisitionKind.MESSAGE_LOOKUP)
 async def run_access_probe_loop(
     client: _DeltaSyncClient,
     conn: sqlite3.Connection,
@@ -1086,7 +1095,15 @@ async def run_access_probe_loop(
 
     while not shutdown_event.is_set():
         try:
-            await _probe_access_lost_dialogs(client, conn, shutdown_event, delta_worker, policy)
+
+            async def probe() -> object:
+                return await _probe_access_lost_dialogs(client, conn, shutdown_event, delta_worker, policy)
+
+            demand_cycle_runner = options.get("demand_cycle_runner")
+            if demand_cycle_runner is None:
+                await run_legacy_demand_cycle(None, DemandKind.DELTA_ACCESS_PROBE, probe)
+            else:
+                await demand_cycle_runner(DemandKind.DELTA_ACCESS_PROBE, probe)
         except RpcAdmissionClosedError:
             raise
         except Exception:

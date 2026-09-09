@@ -16,6 +16,7 @@ from typing import Protocol, cast, runtime_checkable
 from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[import-untyped]
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
+from .demand_shadow_wiring import DemandShadow, offer_durable_demand, run_legacy_demand_cycle
 from .entity_profile.contracts import PROFILE_SECTIONS, completeness
 from .entity_profile.refresh import EntityRefreshCoordinator, RefreshEnqueueResult, RefreshLimits
 from .entity_profile.repository import EntityProfileRepository, EntityRefreshCursor, EntitySectionCommit
@@ -27,6 +28,7 @@ from .models import DialogType
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
 from .telegram_rpc import raise_if_flood_wait_error
+from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
 from .telethon_dialog import classify_dialog_type
 
@@ -223,6 +225,7 @@ class DaemonEntityInfoService:
         self._deps = deps
         self._profiles = EntityProfileRepository(deps.conn, section_ttl_seconds=deps.detail_ttl_seconds)
         self._section_failures: dict[str, str] = {}
+        self._demand_shadow: DemandShadow | None = None
         self._refresh = (
             EntityRefreshCoordinator(
                 self._refresh_entity,
@@ -234,6 +237,10 @@ class DaemonEntityInfoService:
         )
         if self._refresh is not None:
             self._refresh.bind_durable_executor(self._durable_refresh_status, self._run_durable_refresh_slice)
+
+    def bind_demand_shadow(self, shadow: DemandShadow) -> None:
+        """Attach post-commit wakeups and legacy-cycle evidence."""
+        self._demand_shadow = shadow
 
     @property
     def refresh_coordinator(self) -> EntityRefreshCoordinator | None:
@@ -397,7 +404,11 @@ class DaemonEntityInfoService:
 
     async def _refresh_entity(self, entity_id: int) -> None:
         """Run one refresh under the coordinator-owned scope and deadline."""
-        await self._refresh_entity_impl(entity_id)
+        await run_legacy_demand_cycle(
+            self._demand_shadow,
+            DemandKind.ENTITY_PROFILE_REFRESH,
+            lambda: self._refresh_entity_impl(entity_id),
+        )
 
     async def _refresh_entity_impl(self, entity_id: int) -> None:
         started_at = self._deps.now_provider()
@@ -952,6 +963,7 @@ class DaemonEntityInfoService:
             return
         self._profiles.mark_refresh_queued(entity_id)
         self._set_section_queued(sections)
+        offer_durable_demand(self._demand_shadow, DemandKind.ENTITY_PROFILE_REFRESH)
 
     @staticmethod
     def _set_section_rejected(sections: dict[str, dict[str, object]]) -> None:
@@ -974,6 +986,7 @@ class DaemonEntityInfoService:
             self._profiles.mark_refresh_rejected(entity_id, now=now)
         else:
             self._profiles.mark_pending(entity_id, now=now)
+            offer_durable_demand(self._demand_shadow, DemandKind.ENTITY_PROFILE_REFRESH)
 
     @staticmethod
     def _refresh_reason(result: RefreshEnqueueResult) -> str:

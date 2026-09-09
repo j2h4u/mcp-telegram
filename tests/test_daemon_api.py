@@ -2479,6 +2479,16 @@ async def test_mark_dialog_for_sync_enable() -> None:
     """mark_dialog_for_sync with enable=True queues full-history enrollment."""
     conn = _make_db()
     server = make_server(conn)
+    offered: list[DemandKind] = []
+    shadow = MagicMock()
+
+    def offer(kind: DemandKind) -> bool:
+        assert not conn.in_transaction
+        offered.append(kind)
+        return True
+
+    shadow.offer.side_effect = offer
+    server.bind_demand_shadow(shadow)
     result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 42, "enable": True})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
@@ -2489,6 +2499,11 @@ async def test_mark_dialog_for_sync_enable() -> None:
     )
     assert row is not None
     assert row[0] == "not_synced"
+    assert offered == [
+        DemandKind.FULL_SYNC_PAGE,
+        DemandKind.BACKFILL_HYDRATION_BATCH,
+        DemandKind.READ_RECEIPT_BATCH,
+    ]
 
 
 @pytest.mark.asyncio
@@ -2498,6 +2513,16 @@ async def test_mark_dialog_for_sync_ignores_existing() -> None:
     _insert_synced_dialog(conn, 42, status="synced")
     hydration_requests: list[tuple[sqlite3.Connection, int, int]] = []
     server = make_server(conn, hydration_requester=lambda *request: hydration_requests.append(request))
+    offered: list[DemandKind] = []
+    shadow = MagicMock()
+
+    def offer(kind: DemandKind) -> bool:
+        assert not conn.in_transaction
+        offered.append(kind)
+        return True
+
+    shadow.offer.side_effect = offer
+    server.bind_demand_shadow(shadow)
     result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 42, "enable": True})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
@@ -2515,6 +2540,11 @@ async def test_mark_dialog_for_sync_ignores_existing() -> None:
     assert requested_conn is conn
     assert requested_dialog_id == 42
     assert isinstance(requested_at, int)
+    assert offered == [
+        DemandKind.DELTA_GAP_FILL,
+        DemandKind.BACKFILL_HYDRATION_BATCH,
+        DemandKind.READ_RECEIPT_BATCH,
+    ]
 
 
 @pytest.mark.asyncio
