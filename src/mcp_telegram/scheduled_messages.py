@@ -40,8 +40,23 @@ from .own_only import (
 )
 from .sync_db import SCHEDULED_ACTIVE_REPAIR_SECONDS, SCHEDULED_QUIET_DISCOVERY_SECONDS
 from .telegram_access import ACCESS_LOST_ERRORS
+from .telegram_demand import (
+    AcquisitionKind,
+    DemandStatus,
+    DurableDemandAdapter,
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+    demand_context,
+)
 from .telegram_gateway import ScheduledHistoryClient, fetch_scheduled_history_snapshot
-from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, preserve_or_rpc_scope
+from .telegram_rpc_consumers import DemandKind
+from .telegram_rpc_scheduler import (
+    RpcAdmissionClosedError,
+    TelegramRpcSource,
+    preserve_or_rpc_scope,
+    rpc_attempt_budget,
+    rpc_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +129,11 @@ async def _load_candidate_entity(
     if dialog_type != "channel" or dialog_id == personal_channel_id:
         return None, False, False
     try:
-        return await client.get_entity(dialog_id), False, False
+        with rpc_scope(
+            TelegramRpcSource.SCHEDULED_MESSAGES,
+            acquisition_kind=AcquisitionKind.ENTITY_LOOKUP,
+        ):
+            return await client.get_entity(dialog_id), False, False
     except TelegramRpcThrottled as exc:
         _raise_if_latched(exc)
         assert exc.retry_after_seconds is not None
@@ -550,19 +569,31 @@ class ScheduledMessageReconciler:
 
     async def _fetch_scheduled_snapshot(self, dialog_id: int) -> list[object]:
         """Fetch one scheduled queue snapshot through the Telegram gateway."""
-        return await fetch_scheduled_history_snapshot(
-            self._client,
-            dialog_id,
-        )
+        with rpc_scope(
+            TelegramRpcSource.SCHEDULED_MESSAGES,
+            acquisition_kind=AcquisitionKind.SCHEDULED_MESSAGES_SNAPSHOT,
+        ):
+            return await fetch_scheduled_history_snapshot(self._client, dialog_id)
 
-    def _due_rows(self, now: int) -> list[tuple[int, int, bool]]:
+    def _due_rows(self, now: int, demand_kind: DemandKind | None = None) -> list[tuple[int, int, bool]]:
+        if demand_kind is None:
+            due_predicate = "repair_due_at <= :now OR discovery_due_at <= :now"
+            discovery_expression = "discovery_due_at <= :now"
+        elif demand_kind is DemandKind.SCHEDULED_REPAIR:
+            due_predicate = "repair_due_at <= :now"
+            discovery_expression = "0"
+        elif demand_kind is DemandKind.SCHEDULED_DISCOVERY:
+            due_predicate = "discovery_due_at <= :now"
+            discovery_expression = "1"
+        else:
+            raise ValueError("demand_kind must be scheduled repair or discovery")
         rows = cast(
             list[tuple[object, object, object]],
             self._conn.execute(
-                """
-                SELECT dialog_id, dirty_generation, discovery_due_at <= :now
+                f"""
+                SELECT dialog_id, dirty_generation, {discovery_expression}
                 FROM scheduled_reconciliation_state
-                WHERE repair_due_at <= :now OR discovery_due_at <= :now
+                WHERE {due_predicate}
                 ORDER BY CASE WHEN dirty_since IS NULL THEN 1 ELSE 0 END,
                          CASE
                              WHEN dirty_since IS NULL
@@ -585,12 +616,15 @@ class ScheduledMessageReconciler:
         retry_at = _retry_at(self._conn)
         if retry_at is not None and retry_at > current:
             return min(scan_seconds, float(retry_at - current))
-        due = self._conn.execute(
-            "SELECT 1 FROM scheduled_reconciliation_state "
-            "WHERE (repair_due_at <= ? OR discovery_due_at <= ?) "
-            "AND (? IS NULL OR ? <= ?) LIMIT 1",
-            (current, current, retry_at, retry_at, current),
-        ).fetchone()
+        due = cast(
+            tuple[object] | None,
+            self._conn.execute(
+                "SELECT 1 FROM scheduled_reconciliation_state "
+                "WHERE (repair_due_at <= ? OR discovery_due_at <= ?) "
+                "AND (? IS NULL OR ? <= ?) LIMIT 1",
+                (current, current, retry_at, retry_at, current),
+            ).fetchone(),
+        )
         return 0.0 if due else scan_seconds
 
     def _record_dialog_failure(self, dialog_id: int, kind: str, _code: str, now: int) -> None:
@@ -729,12 +763,22 @@ class ScheduledMessageReconciler:
     @_rpc_scope(TelegramRpcSource.SCHEDULED_MESSAGES)
     async def run_once(self) -> int:
         """Process one bounded slice of due per-dialog work."""
+        return await self._run_slice()
+
+    async def run_demand_slice(self, demand_kind: DemandKind) -> int:
+        """Process one bounded slice for one scheduled demand contract."""
+        if demand_kind not in (DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY):
+            raise ValueError("demand_kind must be scheduled repair or discovery")
+        return await self._run_slice(demand_kind)
+
+    async def _run_slice(self, demand_kind: DemandKind | None = None) -> int:
+        """Process one bounded slice, optionally restricted to one demand kind."""
         now = int(time.time())
         retry_at = _retry_at(self._conn)
         if retry_at is not None and retry_at > now:
             return 0
         self._seed_candidates_if_due(now)
-        due_rows = self._due_rows(now)
+        due_rows = self._due_rows(now, demand_kind)
         total = 0
         flood_waited = False
         for dialog_id, generation, discovery in due_rows:
@@ -748,6 +792,56 @@ class ScheduledMessageReconciler:
         if due_rows and not self._shutdown_event.is_set() and not flood_waited:
             _clear_retry(self._conn, int(time.time()))
         return total
+
+
+class _ScheduledDemandAdapter(DurableDemandAdapter):
+    """Expose one scheduled queue as durable demand over existing state."""
+
+    demand_kind: DemandKind
+
+    def __init__(self, reconciler: ScheduledMessageReconciler) -> None:
+        self._reconciler = reconciler
+
+    def status(self, now: float) -> DemandStatus | None:
+        """Read the earliest due row without claiming or changing state."""
+        del now
+        column = "repair_due_at" if self.demand_kind is DemandKind.SCHEDULED_REPAIR else "discovery_due_at"
+        row = cast(
+            tuple[object] | None,
+            self._reconciler._conn.execute(
+                f"SELECT MIN({column}) FROM scheduled_reconciliation_state WHERE {column} IS NOT NULL"
+            ).fetchone(),
+        )
+        release_at = None if row is None or row[0] is None else float(cast(int | float, row[0]))
+        if release_at is None:
+            return None
+        return DemandStatus(release_at=release_at, freshness_deadline=release_at)
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Run one bounded scheduled slice under its exact demand and budget."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        status = self.status(time.time())
+        if status is None or not status.is_ready(time.time()):
+            return
+        with demand_context(self.demand_kind):
+            with rpc_attempt_budget(budget):
+                try:
+                    await self._reconciler.run_demand_slice(self.demand_kind)
+                except RpcAttemptBudgetExhaustedError:
+                    return
+
+
+class ScheduledRepairDemandAdapter(_ScheduledDemandAdapter):
+    """Durable demand adapter for active scheduled queue repair."""
+
+    demand_kind = DemandKind.SCHEDULED_REPAIR
+
+
+class ScheduledDiscoveryDemandAdapter(_ScheduledDemandAdapter):
+    """Durable demand adapter for quiet scheduled queue discovery."""
+
+    demand_kind = DemandKind.SCHEDULED_DISCOVERY
 
 
 async def run_scheduled_reconciliation_loop(
@@ -782,8 +876,10 @@ async def run_scheduled_reconciliation_loop(
 
 
 __all__ = [
+    "ScheduledDiscoveryDemandAdapter",
     "ScheduledMessageReconciler",
     "ScheduledReconciliationPolicy",
+    "ScheduledRepairDemandAdapter",
     "mark_missing_from_snapshot",
     "mark_scheduled_messages_removed",
     "run_scheduled_reconciliation_loop",
