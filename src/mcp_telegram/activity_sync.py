@@ -169,6 +169,9 @@ class _IncrementalBatchLog:
 
 _SEARCH_BATCH_RETRY = object()
 _SEARCH_BATCH_STOP = object()
+_INCREMENTAL_BATCH_CONTINUE = object()
+_INCREMENTAL_BATCH_BREAK = object()
+_INCREMENTAL_BATCH_RETURN = object()
 
 
 class _SearchEntityLike(Protocol):
@@ -549,6 +552,75 @@ def _log_incremental_batch(
     )
 
 
+def _prepare_incremental_slice(
+    conn: sqlite3.Connection,
+    state: dict[str, str | None],
+    shutdown_event: asyncio.Event,
+) -> tuple[int, int] | None:
+    """Load and, for a new window, durably initialize incremental state."""
+    if shutdown_event.is_set() or state.get("backfill_complete") != "1":
+        return None
+    last_sync_at = int(state.get("last_sync_at") or 0)
+    if last_sync_at == 0:
+        return None
+
+    raw_min_date = state.get(_INCREMENTAL_MIN_DATE_KEY)
+    min_date = int(raw_min_date) if raw_min_date is not None else max(0, last_sync_at - 60)
+    offset_id = int(state.get(_INCREMENTAL_OFFSET_ID_KEY) or 0)
+    if raw_min_date is None:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
+                (_INCREMENTAL_MIN_DATE_KEY, str(min_date)),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, '0')",
+                (_INCREMENTAL_OFFSET_ID_KEY,),
+            )
+    return min_date, offset_id
+
+
+def _commit_incremental_slice_result(
+    conn: sqlite3.Connection,
+    search_result: _SearchResultLike,
+    min_date: int,
+    batch_started_at: float,
+) -> None:
+    """Persist one incremental page and its restart-safe continuation."""
+    batch = list(search_result.messages or [])
+    if not batch:
+        _finish_incremental_slice(conn)
+        return
+
+    in_window, past_window = _trim_incremental_batch(batch, min_date)
+    extracted = _extract_own_message_rows(in_window)
+    _persist_own_message_rows(conn, extracted, priority=HydrationPriority.FOREGROUND)
+    _upsert_entities_from_search(conn, search_result)
+    next_offset_id = min(message.id for message in batch)
+    _log_incremental_batch(
+        _IncrementalState(
+            min_date=min_date,
+            inserted=len(in_window),
+            batch_num=1,
+            offset_id=next_offset_id,
+            loop_start=batch_started_at,
+        ),
+        _IncrementalBatchLog(
+            fetched=len(batch),
+            in_window=len(in_window),
+            extracted=len(extracted),
+            inserted=len(in_window),
+            next_offset_id=next_offset_id,
+            past_window=past_window,
+        ),
+        time.monotonic() - batch_started_at,
+    )
+    if past_window:
+        _finish_incremental_slice(conn)
+        return
+    _set_state(conn, _INCREMENTAL_OFFSET_ID_KEY, str(next_offset_id))
+
+
 async def _run_backfill_slice(
     client: ActivityClient,
     conn: sqlite3.Connection,
@@ -612,24 +684,10 @@ async def _run_incremental_slice(
 ) -> None:
     """Fetch one restart-safe page from the current incremental window."""
     state = _load_state(conn)
-    if shutdown_event.is_set() or state.get("backfill_complete") != "1":
+    window = _prepare_incremental_slice(conn, state, shutdown_event)
+    if window is None:
         return
-    last_sync_at = int(state.get("last_sync_at") or 0)
-    if last_sync_at == 0:
-        return
-    raw_min_date = state.get(_INCREMENTAL_MIN_DATE_KEY)
-    min_date = int(raw_min_date) if raw_min_date is not None else max(0, last_sync_at - 60)
-    offset_id = int(state.get(_INCREMENTAL_OFFSET_ID_KEY) or 0)
-    if raw_min_date is None:
-        with conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
-                (_INCREMENTAL_MIN_DATE_KEY, str(min_date)),
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, '0')",
-                (_INCREMENTAL_OFFSET_ID_KEY,),
-            )
+    min_date, offset_id = window
 
     batch_started_at = time.monotonic()
     result = await _search_incremental_batch(
@@ -645,38 +703,7 @@ async def _run_incremental_slice(
     if result is _SEARCH_BATCH_STOP:
         _finish_incremental_slice(conn)
         return
-    search_result = cast(_SearchResultLike, result)
-    batch = list(search_result.messages or [])
-    if not batch:
-        _finish_incremental_slice(conn)
-        return
-    in_window, past_window = _trim_incremental_batch(batch, min_date)
-    extracted = _extract_own_message_rows(in_window)
-    _persist_own_message_rows(conn, extracted, priority=HydrationPriority.FOREGROUND)
-    _upsert_entities_from_search(conn, search_result)
-    next_offset_id = min(message.id for message in batch)
-    _log_incremental_batch(
-        _IncrementalState(
-            min_date=min_date,
-            inserted=len(in_window),
-            batch_num=1,
-            offset_id=next_offset_id,
-            loop_start=batch_started_at,
-        ),
-        _IncrementalBatchLog(
-            fetched=len(batch),
-            in_window=len(in_window),
-            extracted=len(extracted),
-            inserted=len(in_window),
-            next_offset_id=next_offset_id,
-            past_window=past_window,
-        ),
-        time.monotonic() - batch_started_at,
-    )
-    if past_window:
-        _finish_incremental_slice(conn)
-    else:
-        _set_state(conn, _INCREMENTAL_OFFSET_ID_KEY, str(next_offset_id))
+    _commit_incremental_slice_result(conn, cast(_SearchResultLike, result), min_date, batch_started_at)
 
 
 async def _run_backfill(
@@ -719,50 +746,69 @@ async def _run_backfill_in_scope(
     logger.info("activity_sync_backfill_start offset_id=%d", progress.checkpoint)
 
     while not shutdown_event.is_set():
-        batch_started_at = time.monotonic()
-        result = await _search_backfill_batch(
-            client,
-            progress.checkpoint,
-            shutdown_event,
-            total_fetched=progress.total_fetched,
-            timeout_s=timeout_s,
+        if not await _run_backfill_batch(client, conn, shutdown_event, progress, timeout_s=timeout_s):
+            return
+
+
+async def _run_backfill_batch(
+    client: ActivityClient,
+    conn: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+    progress: _BackfillState,
+    *,
+    timeout_s: float,
+) -> bool:
+    """Fetch, commit, and pace one legacy backfill iteration."""
+    batch_started_at = time.monotonic()
+    result = await _search_backfill_batch(
+        client,
+        progress.checkpoint,
+        shutdown_event,
+        total_fetched=progress.total_fetched,
+        timeout_s=timeout_s,
+    )
+    if result is _SEARCH_BATCH_STOP:
+        return False
+    if result is _SEARCH_BATCH_RETRY:
+        return True
+    if not _commit_backfill_result(conn, progress, cast(_SearchResultLike, result), batch_started_at):
+        return False
+    return not await _wait_for_shutdown(shutdown_event, timeout=_PACING.search.batch_s)
+
+
+def _commit_backfill_result(
+    conn: sqlite3.Connection,
+    progress: _BackfillState,
+    search_result: _SearchResultLike,
+    batch_started_at: float,
+) -> bool:
+    """Persist one backfill page, returning whether the pass should continue."""
+    batch = list(search_result.messages or [])
+    if progress.total_known is None:
+        progress.total_known = cast(int | None, getattr(search_result, "count", None))
+        if progress.total_known is not None:
+            logger.info("activity_sync_backfill_total total=%d", progress.total_known)
+
+    if not batch:
+        _set_state(conn, "backfill_complete", "1")
+        _stamp_last_sync_at(conn)
+        logger.info(
+            "activity_sync_backfill_complete total_fetched=%d batches=%d duration_s=%.3f",
+            progress.total_fetched,
+            progress.batch_num,
+            time.monotonic() - progress.loop_start,
         )
-        if result is _SEARCH_BATCH_STOP:
-            return
-        if result is _SEARCH_BATCH_RETRY:
-            continue
+        return False
 
-        search_result = cast(_SearchResultLike, result)
-        batch = list(search_result.messages or [])
-        if progress.total_known is None:
-            progress.total_known = cast(int | None, getattr(search_result, "count", None))
-            if progress.total_known is not None:
-                logger.info("activity_sync_backfill_total total=%d", progress.total_known)
-
-        if not batch:
-            _set_state(conn, "backfill_complete", "1")
-            _stamp_last_sync_at(conn)
-            logger.info(
-                "activity_sync_backfill_complete total_fetched=%d batches=%d duration_s=%.3f",
-                progress.total_fetched,
-                progress.batch_num,
-                time.monotonic() - progress.loop_start,
-            )
-            return
-
-        progress.batch_num += 1
-        extracted = _extract_own_message_rows(batch)
-        _persist_own_message_rows(conn, extracted, priority=HydrationPriority.BACKFILL)
-
-        _upsert_entities_from_search(conn, search_result)
-
-        progress.total_fetched += len(batch)
-        progress.checkpoint = min(m.id for m in batch)
-        _set_state(conn, "backfill_offset_id", str(progress.checkpoint))
-        _log_backfill_batch(progress, len(batch), time.monotonic() - batch_started_at)
-
-        if await _wait_for_shutdown(shutdown_event, timeout=_PACING.search.batch_s):
-            return
+    progress.batch_num += 1
+    extracted = _extract_own_message_rows(batch)
+    _persist_own_message_rows(conn, extracted, priority=HydrationPriority.BACKFILL)
+    _upsert_entities_from_search(conn, search_result)
+    progress.total_fetched += len(batch)
+    progress.checkpoint = min(m.id for m in batch)
+    _set_state(conn, "backfill_offset_id", str(progress.checkpoint))
+    _log_backfill_batch(progress, len(batch), time.monotonic() - batch_started_at)
+    return True
 
 
 async def _run_incremental(
@@ -807,64 +853,12 @@ async def _run_incremental_in_scope(
     )
 
     while not shutdown_event.is_set():
-        batch_started_at = time.monotonic()
-        result = await _search_incremental_batch(
-            client,
-            progress.min_date,
-            progress.offset_id,
-            shutdown_event,
-            inserted=progress.inserted,
-            timeout_s=timeout_s,
-        )
-        if result is _SEARCH_BATCH_STOP:
-            _stamp_last_sync_at(conn)
-            break
-        if result is _SEARCH_BATCH_RETRY:
+        outcome = await _run_incremental_batch(client, conn, shutdown_event, progress, timeout_s=timeout_s)
+        if outcome is _INCREMENTAL_BATCH_CONTINUE:
             continue
-
-        search_result = cast(_SearchResultLike, result)
-        batch = list(search_result.messages or [])
-        if not batch:
-            break
-
-        # messages.search(InputPeerEmpty) silently ignores min_date — canonical
-        # Telegram-API behavior, see Telethon #218. Apply the date bound
-        # client-side. Batch is ordered newest-first by offset_id, so dates
-        # are monotonically decreasing: once we hit one older than min_date,
-        # every later batch will be older too — break the outer loop.
-        in_window, past_window = _trim_incremental_batch(batch, progress.min_date)
-        extracted = _extract_own_message_rows(in_window)
-        _persist_own_message_rows(conn, extracted, priority=HydrationPriority.FOREGROUND)
-
-        _upsert_entities_from_search(conn, search_result)
-        progress.inserted += len(in_window)
-        progress.batch_num += 1
-        # Always advance offset_id by the full batch — even messages outside
-        # the window must be skipped past so we don't re-fetch them.
-        progress.offset_id = min(m.id for m in batch)
-
-        # last_sync_at is stamped once at end-of-loop, not per batch:
-        # with the client-side min_date filter the loop terminates within
-        # a few iterations anyway, and a mid-loop shutdown just means the
-        # next incremental re-fetches the in-progress window (UPSERT no-op).
-        _log_incremental_batch(
-            progress,
-            _IncrementalBatchLog(
-                fetched=len(batch),
-                in_window=len(in_window),
-                extracted=len(extracted),
-                inserted=progress.inserted,
-                next_offset_id=progress.offset_id,
-                past_window=past_window,
-            ),
-            time.monotonic() - batch_started_at,
-        )
-
-        if past_window:
-            break
-
-        if await _wait_for_shutdown(shutdown_event, timeout=_PACING.search.batch_s):
+        if outcome is _INCREMENTAL_BATCH_RETURN:
             return
+        break
 
     _stamp_last_sync_at(conn)
     logger.debug(
@@ -873,6 +867,73 @@ async def _run_incremental_in_scope(
         progress.inserted,
         time.monotonic() - progress.loop_start,
     )
+
+
+async def _run_incremental_batch(
+    client: ActivityClient,
+    conn: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+    progress: _IncrementalState,
+    *,
+    timeout_s: float,
+) -> object:
+    """Fetch, commit, and pace one legacy incremental iteration."""
+    batch_started_at = time.monotonic()
+    result = await _search_incremental_batch(
+        client,
+        progress.min_date,
+        progress.offset_id,
+        shutdown_event,
+        inserted=progress.inserted,
+        timeout_s=timeout_s,
+    )
+    if result is _SEARCH_BATCH_STOP:
+        _stamp_last_sync_at(conn)
+        return _INCREMENTAL_BATCH_BREAK
+    if result is _SEARCH_BATCH_RETRY:
+        return _INCREMENTAL_BATCH_CONTINUE
+
+    search_result = cast(_SearchResultLike, result)
+    batch = list(search_result.messages or [])
+    if not batch:
+        return _INCREMENTAL_BATCH_BREAK
+
+    # messages.search(InputPeerEmpty) silently ignores min_date — canonical
+    # Telegram-API behavior, see Telethon #218. Apply the date bound
+    # client-side. Batch is ordered newest-first by offset_id, so dates
+    # are monotonically decreasing: once we hit one older than min_date,
+    # every later batch will be older too — break the outer loop.
+    in_window, past_window = _trim_incremental_batch(batch, progress.min_date)
+    extracted = _extract_own_message_rows(in_window)
+    _persist_own_message_rows(conn, extracted, priority=HydrationPriority.FOREGROUND)
+    _upsert_entities_from_search(conn, search_result)
+    progress.inserted += len(in_window)
+    progress.batch_num += 1
+    # Always advance offset_id by the full batch — even messages outside
+    # the window must be skipped past so we don't re-fetch them.
+    progress.offset_id = min(m.id for m in batch)
+
+    # last_sync_at is stamped once at end-of-loop, not per batch:
+    # with the client-side min_date filter the loop terminates within
+    # a few iterations anyway, and a mid-loop shutdown just means the
+    # next incremental re-fetches the in-progress window (UPSERT no-op).
+    _log_incremental_batch(
+        progress,
+        _IncrementalBatchLog(
+            fetched=len(batch),
+            in_window=len(in_window),
+            extracted=len(extracted),
+            inserted=progress.inserted,
+            next_offset_id=progress.offset_id,
+            past_window=past_window,
+        ),
+        time.monotonic() - batch_started_at,
+    )
+    if past_window:
+        return _INCREMENTAL_BATCH_BREAK
+    if await _wait_for_shutdown(shutdown_event, timeout=_PACING.search.batch_s):
+        return _INCREMENTAL_BATCH_RETURN
+    return _INCREMENTAL_BATCH_CONTINUE
 
 
 async def run_activity_sync_loop(  # noqa: PLR0913 - explicit loop dependencies and observation hook
