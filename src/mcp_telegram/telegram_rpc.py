@@ -25,6 +25,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
 from telethon.utils import is_list_like  # type: ignore[import-untyped]
 
 from .flood import TelegramRpcThrottled, flood_seconds
+from .telegram_demand import AcquisitionKind
 from .telegram_rpc_scheduler import (
     AdmissionObserver,
     RpcAdmission,
@@ -39,6 +40,7 @@ from .telegram_rpc_scheduler import (
     TelegramRpcSource,
     UnclassifiedTelegramRpcError,
     current_rpc_scope,
+    rpc_attempt_budget,
     rpc_scope,
 )
 
@@ -88,6 +90,10 @@ class _AdmissionAwareSender:
 
     async def _send(self, request: object, *, ordered: bool) -> object:
         while True:
+            budget = self._scope.attempt_budget
+            if budget is not None and budget.exhausted:
+                self._gate._admission_scheduler.record_attempt_budget_exhausted(self._scope)
+                budget.debit()
             admission = await self._gate._admit(self._scope)
             try:
                 if not self._gate._scheduler_transport_ready():
@@ -96,6 +102,10 @@ class _AdmissionAwareSender:
                         reason="transport_readiness_changed",
                     )
                     continue
+                if budget is not None:
+                    if budget.exhausted:
+                        self._gate._admission_scheduler.record_attempt_budget_exhausted(self._scope)
+                    budget.debit()
                 self._gate._admission_scheduler.record_dispatch(admission)
                 future = self._send_attempt(request, ordered=ordered)
                 if isinstance(future, list):
@@ -199,9 +209,15 @@ class TelegramRpcGate(TelegramClient):
         *,
         deadline: float | None = None,
         timeout_seconds: float | None = None,
+        acquisition_kind: AcquisitionKind | None = None,
     ) -> AbstractContextManager[TelegramRpcScope]:
         """Return a source scope for application helpers using this client."""
-        return rpc_scope(source, deadline=deadline, timeout_seconds=timeout_seconds)
+        return rpc_scope(
+            source,
+            deadline=deadline,
+            timeout_seconds=timeout_seconds,
+            acquisition_kind=acquisition_kind,
+        )
 
     async def close_rpc_scheduler(self) -> None:
         """Cancel queued admission work during final daemon shutdown."""
@@ -242,8 +258,10 @@ class TelegramRpcGate(TelegramClient):
     def _require_rpc_scope(self) -> TelegramRpcScope:
         try:
             return current_rpc_scope()
-        except UnclassifiedTelegramRpcError:
+        except UnclassifiedTelegramRpcError as exc:
             self._admission_scheduler.record_unclassified()
+            if "no demand context" in str(exc):
+                raise UnclassifiedTelegramRpcError("Telegram RPC has no explicit operation source") from exc
             raise
 
     async def _call_with_source_policy(
@@ -377,5 +395,6 @@ __all__ = [
     "account_cooldown_deadline",
     "current_rpc_scope",
     "reset_account_cooldown",
+    "rpc_attempt_budget",
     "rpc_scope",
 ]

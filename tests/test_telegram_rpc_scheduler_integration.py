@@ -11,10 +11,19 @@ from typing import cast
 
 import pytest
 from aiolimiter import AsyncLimiter
+from telethon.errors import ServerError
 from telethon.tl.tlobject import TLRequest
 
 from mcp_telegram.config import TelegramRpcSchedulerConfig
+from mcp_telegram.telegram_demand import (
+    AcquisitionKind,
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+    acquisition_context,
+    demand_context,
+)
 from mcp_telegram.telegram_rpc import TelegramRpcGate, reset_account_cooldown
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionEvent,
     RpcAdmissionEventKind,
@@ -23,6 +32,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcAdmissionScheduler,
     TelegramRpcSource,
     current_rpc_scope,
+    rpc_attempt_budget,
     rpc_scope,
 )
 
@@ -42,6 +52,14 @@ class _ControlledLimiter:
         await _wait_until(lambda: bool(self._waiters))
         self._waiters.popleft().set_result(None)
         await asyncio.sleep(0)
+
+
+class _ImmediateLimiter:
+    def __init__(self) -> None:
+        self.acquisitions = 0
+
+    async def acquire(self) -> None:
+        self.acquisitions += 1
 
 
 class _SynchronousSender:
@@ -128,7 +146,7 @@ async def _shutdown_cleanly(gate: TelegramRpcGate, backlog: list[asyncio.Task[ob
 
 
 def _make_gate(
-    limiter: _ControlledLimiter,
+    limiter: _ControlledLimiter | _ImmediateLimiter,
     policy: TelegramRpcSchedulerConfig,
     events: list[RpcAdmissionEvent],
 ) -> TelegramRpcGate:
@@ -190,8 +208,8 @@ async def test_gate_shared_scheduler_keeps_interactive_bounded_and_shutdown_clea
         with rpc_scope(source):
             return await gate(_ScalarRequest(request))
 
-    backlog = [asyncio.create_task(send(TelegramRpcSource.REALTIME_EVENT, object())) for _ in range(12)] + [
-        asyncio.create_task(send(TelegramRpcSource.FULL_SYNC, object())) for _ in range(12)
+    backlog = [asyncio.create_task(send(TelegramRpcSource.REALTIME_EVENT, object())) for _ in range(8)] + [
+        asyncio.create_task(send(TelegramRpcSource.FULL_SYNC, object())) for _ in range(8)
     ]
     await _wait_until(lambda: sum(gate._admission_scheduler.queue_depths().values()) == len(backlog))
 
@@ -208,3 +226,39 @@ async def test_gate_shared_scheduler_keeps_interactive_bounded_and_shutdown_clea
     assert released <= worst_case_slots
     _assert_scalar_progress(sent, events)
     await _shutdown_cleanly(gate, backlog)
+
+
+@pytest.mark.asyncio
+async def test_sender_debits_actual_attempts_and_stops_transport_retry_at_slice_bound() -> None:
+    limiter = _ImmediateLimiter()
+    events: list[RpcAdmissionEvent] = []
+    gate = _make_gate(limiter, TelegramRpcSchedulerConfig(), events)
+    gate._transient_retry_delays = (0.0,)
+    attempts: list[tuple[DemandKind | None, AcquisitionKind | None]] = []
+
+    class _FailingSender:
+        def send(self, _request: object, *, ordered: bool = False) -> asyncio.Future[object]:
+            del ordered
+            scope = current_rpc_scope()
+            attempts.append((scope.demand_kind, scope.acquisition_kind))
+            result = asyncio.get_running_loop().create_future()
+            result.set_exception(ServerError(None, "temporary"))
+            return result
+
+    gate._sender = _FailingSender()
+    budget = RpcAttemptBudget(limit=1)
+    with demand_context(DemandKind.FULL_SYNC_PAGE):
+        with acquisition_context(AcquisitionKind.MESSAGE_HISTORY_PAGE):
+            with rpc_attempt_budget(budget):
+                with pytest.raises(RpcAttemptBudgetExhaustedError):
+                    await gate(_ScalarRequest("page"))
+
+    assert attempts == [(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)]
+    assert budget.attempts == 1
+    assert limiter.acquisitions == 1
+    assert [event.kind for event in events].count(RpcAdmissionEventKind.DISPATCHED) == 1
+    exhausted = [event for event in events if event.reason == "attempt_budget_exhausted"]
+    assert len(exhausted) == 1
+    assert exhausted[0].demand_kind is DemandKind.FULL_SYNC_PAGE
+    assert exhausted[0].acquisition_kind is AcquisitionKind.MESSAGE_HISTORY_PAGE
+    await gate.close_rpc_scheduler()
