@@ -294,15 +294,16 @@ def preserve_or_rpc_scope(source: TelegramRpcSource) -> Iterator[None]:
         yield
 
 
-def create_detached_rpc_task[T](
+def create_detached_rpc_task[T](  # noqa: PLR0913 - explicit detached transport context
     awaitable: Coroutine[object, object, T],
     *,
     source: TelegramRpcSource,
     timeout_seconds: float,
     name: str | None = None,
     demand_token: DemandToken | None = None,
+    attempt_budget: RpcAttemptBudget | None = None,
 ) -> asyncio.Task[T]:
-    """Create detached work with a new source, owner, and bounded lifetime."""
+    """Create detached work with explicit identity, budget, and lifetime."""
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
 
@@ -312,6 +313,7 @@ def create_detached_rpc_task[T](
         deadline=_expires_at(timeout_seconds),
         name=name,
         demand_token=demand_token,
+        attempt_budget=attempt_budget,
     )
 
 
@@ -328,6 +330,7 @@ def create_scoped_rpc_task[T](  # noqa: PLR0913 - compatibility task factory car
     name: str | None = None,
     sanitize_context: bool = True,
     demand_token: DemandToken | None = None,
+    attempt_budget: RpcAttemptBudget | None = None,
 ) -> asyncio.Task[T]:
     """Create a task in a sanitized context with an explicit source.
 
@@ -340,17 +343,25 @@ def create_scoped_rpc_task[T](  # noqa: PLR0913 - compatibility task factory car
     _validate_deadline(deadline)
     if demand_token is not None and demand_token.source is not source:
         raise ValueError("transferred demand token source must match the task source")
+    if attempt_budget is not None and not isinstance(attempt_budget, RpcAttemptBudget):
+        raise TypeError("attempt_budget must be an RpcAttemptBudget")
     started = False
 
-    async def run_scoped() -> T:
-        nonlocal started
-        started = True
+    async def run_with_identity() -> T:
         if demand_token is None:
             with rpc_scope(source, deadline=deadline):
                 return await awaitable
         with transferred_demand_context(demand_token):
             with _rpc_scope_details(deadline, None):
                 return await awaitable
+
+    async def run_scoped() -> T:
+        nonlocal started
+        started = True
+        if attempt_budget is None:
+            return await run_with_identity()
+        with rpc_attempt_budget(attempt_budget):
+            return await run_with_identity()
 
     task = asyncio.get_running_loop().create_task(run_scoped(), name=name, context=Context())
 

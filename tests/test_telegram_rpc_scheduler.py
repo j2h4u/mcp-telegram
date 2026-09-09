@@ -10,7 +10,13 @@ import pytest
 from mcp_telegram.config import RuntimeObservationConfig, TelegramRpcSchedulerConfig
 from mcp_telegram.daemon import _record_rpc_admission
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
-from mcp_telegram.telegram_demand import AcquisitionKind, current_demand_token, demand_context
+from mcp_telegram.telegram_demand import (
+    AcquisitionKind,
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+    current_demand_token,
+    demand_context,
+)
 from mcp_telegram.telegram_rpc_consumers import TELEGRAM_DEMAND_CONTRACTS, DemandKind, demand_contract
 from mcp_telegram.telegram_rpc_scheduler import (
     LEGACY_DEMAND_KIND_BY_SOURCE,
@@ -28,6 +34,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcSource,
     UnclassifiedTelegramRpcError,
     create_detached_rpc_task,
+    create_scoped_rpc_task,
     current_rpc_scope,
     rpc_scope,
 )
@@ -651,23 +658,53 @@ async def test_detached_task_must_replace_inherited_scope_and_deadline() -> None
 
 @pytest.mark.asyncio
 async def test_detached_task_can_explicitly_transfer_precise_root_demand() -> None:
-    async def inspect_scope() -> TelegramRpcScope:
-        return current_rpc_scope()
+    request_context: ContextVar[str] = ContextVar("detached_request_context", default="clean")
+    budget = RpcAttemptBudget(limit=1)
+
+    async def inspect_scope() -> tuple[TelegramRpcScope, str]:
+        scope = current_rpc_scope()
+        assert scope.attempt_budget is budget
+        budget.debit()
+        with pytest.raises(RpcAttemptBudgetExhaustedError):
+            budget.debit()
+        return scope, request_context.get()
 
     with demand_context(DemandKind.SCHEDULED_DISCOVERY) as root:
+        request_context.set("caller")
         detached = create_detached_rpc_task(
             inspect_scope(),
             source=root.source,
             timeout_seconds=10.0,
             demand_token=root,
+            attempt_budget=budget,
         )
 
-    scope = await detached
+    scope, detached_context = await detached
     assert scope.demand_kind is DemandKind.SCHEDULED_DISCOVERY
     assert scope.source is root.source
     assert scope.service_class is root.service_class
     assert scope.owner_task is detached
     assert scope.deadline is not None and scope.deadline <= root.admission_deadline
+    assert scope.attempt_budget is budget
+    assert budget.attempts == 1
+    assert detached_context == "clean"
+
+
+@pytest.mark.asyncio
+async def test_scoped_task_rejects_invalid_explicit_attempt_budget_before_creation() -> None:
+    async def operation() -> None:
+        return None
+
+    awaitable = operation()
+    try:
+        with pytest.raises(TypeError, match="attempt_budget"):
+            create_scoped_rpc_task(
+                awaitable,
+                source=TelegramRpcSource.FULL_SYNC,
+                attempt_budget=object(),  # type: ignore[arg-type]
+            )
+    finally:
+        awaitable.close()
 
 
 def test_daemon_observer_forwards_dispatch_event_to_aggregator() -> None:
