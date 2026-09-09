@@ -37,6 +37,7 @@ from mcp_telegram.telegram import create_client
 from mcp_telegram.telegram_rpc import (
     TelegramRpcAdmissionDeferred,
     TelegramRpcBudget,
+    TelegramRpcCooldownPersistence,
     TelegramRpcGate,
     TelegramRpcSource,
     UnclassifiedTelegramRpcError,
@@ -610,6 +611,108 @@ async def test_gate_flood_cooldown_uses_buffer_and_extends_monotonically(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_gate_restores_persisted_cooldown_and_blocks_transport_until_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_now = [200.0]
+    loaded = 0
+    saved: list[float] = []
+    monkeypatch.setattr("mcp_telegram.telegram_rpc.time.monotonic", lambda: monotonic_now[0])
+    monkeypatch.setattr("mcp_telegram.telegram_rpc.time.time", lambda: 1_000.0)
+
+    def load_until_utc() -> float:
+        nonlocal loaded
+        loaded += 1
+        return 1_005.0
+
+    gate = TelegramRpcGate(
+        StringSession(),
+        1,
+        "hash",
+        rpc_budget=TelegramRpcBudget(max_calls_per_period=0, period_seconds=60),
+        circuit_status=lambda: _CircuitStatus(open=False),
+        fallback_wait_seconds=60,
+        cooldown_buffer_seconds=1.0,
+        transient_retry_delays_seconds=(),
+        scheduler_policy=TelegramRpcSchedulerConfig(),
+        cooldown_persistence=TelegramRpcCooldownPersistence(load_until_utc, saved.append),
+    )
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+
+    async def wait_for_readiness() -> None:
+        waiting.set()
+        await release.wait()
+
+    gate._admission_scheduler = TelegramRpcAdmissionScheduler(
+        policy=gate._scheduler_policy,
+        limiter=gate._limiter,
+        clock=lambda: monotonic_now[0],
+        readiness=RpcTransportReadiness(
+            probe=gate._scheduler_transport_ready,
+            wait=wait_for_readiness,
+        ),
+    )
+    sender = _set_sender(gate, _request_value)
+    try:
+        caller = asyncio.create_task(_call(gate, "request"))
+        await waiting.wait()
+
+        assert loaded == 1
+        assert account_cooldown_deadline() == 205.0
+        assert sender.calls == 0
+        assert saved == []
+
+        monotonic_now[0] = 206.0
+        release.set()
+        assert await caller == "request"
+        assert sender.calls == 1
+    finally:
+        await gate.close_rpc_scheduler()
+        gate.session.close()
+
+
+@pytest.mark.asyncio
+async def test_finite_flood_wait_persists_effective_max_utc_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_now = [100.0]
+    utc_now = [1_000.0]
+    saved: list[float] = []
+    gate = _gate()
+    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: None, saved.append)
+    monkeypatch.setattr("mcp_telegram.telegram_rpc.time.monotonic", lambda: monotonic_now[0])
+    monkeypatch.setattr("mcp_telegram.telegram_rpc.time.time", lambda: utc_now[0])
+
+    await gate._observe_flood(FloodWaitError(request=None, capture=7))
+    monotonic_now[0] = 101.0
+    utc_now[0] = 1_001.0
+    await gate._observe_flood(FloodWaitError(request=None, capture=2))
+    monotonic_now[0] = 102.0
+    utc_now[0] = 1_002.0
+    await gate._observe_flood(FloodWaitError(request=None, capture=10))
+
+    assert account_cooldown_deadline() == 113.0
+    assert saved == [1_008.0, 1_008.0, 1_013.0]
+
+
+@pytest.mark.asyncio
+async def test_latched_circuit_never_persists_a_cooldown() -> None:
+    saved: list[float] = []
+    gate = _gate(_CircuitStatus(open=True))
+    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: None, saved.append)
+    sender = _set_sender(gate, _request_value)
+
+    with pytest.raises(TelegramRpcThrottled) as caught:
+        await _call(gate, "request")
+
+    assert caught.value.latched
+    assert sender.calls == 0
+    assert account_cooldown_deadline() == 0.0
+    assert saved == []
+
+
+@pytest.mark.asyncio
 async def test_gate_concurrent_observation_marks_one_exception_once() -> None:
     gate = _gate()
     observed: list[dict[str, object]] = []
@@ -688,6 +791,7 @@ def test_gate_factory_invariants_without_connecting() -> None:
     )
     assert isinstance(gate, TelegramClient)
     assert gate._request_retries == 0
+    assert gate._cooldown_persistence is None
     assert gate.flood_sleep_threshold == 0
     assert gate._raise_last_call_error is True
     assert gate._auto_reconnect is True

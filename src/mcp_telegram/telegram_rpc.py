@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import AbstractContextManager
@@ -43,6 +45,8 @@ from .telegram_rpc_scheduler import (
     rpc_attempt_budget,
     rpc_scope,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def raise_if_flood_wait_error(error: BaseException) -> None:
@@ -133,6 +137,20 @@ class TelegramRpcBudget:
         return self.max_calls_per_period > 0
 
 
+@dataclass(frozen=True, slots=True)
+class TelegramRpcCooldownPersistence:
+    """Synchronous persistence port for one account-wide UTC cooldown."""
+
+    load_until_utc: Callable[[], float | None]
+    save_until_utc: Callable[[float], None]
+
+    def __post_init__(self) -> None:
+        if not callable(self.load_until_utc):
+            raise TypeError("load_until_utc must be callable")
+        if not callable(self.save_until_utc):
+            raise TypeError("save_until_utc must be callable")
+
+
 _COOLDOWN_LOCK = asyncio.Lock()
 _COOLDOWN_DEADLINE = 0.0
 _OBSERVED_FLOOD_IDS: set[int] = set()
@@ -148,6 +166,17 @@ def reset_account_cooldown() -> None:
     global _COOLDOWN_DEADLINE
     _COOLDOWN_DEADLINE = 0.0
     _OBSERVED_FLOOD_IDS.clear()
+
+
+def _validate_cooldown_until_utc(deadline_utc: float) -> float:
+    if (
+        isinstance(deadline_utc, bool)
+        or not isinstance(deadline_utc, (int, float))
+        or not math.isfinite(deadline_utc)
+        or deadline_utc < 0
+    ):
+        raise ValueError("persisted Telegram RPC cooldown deadline must be a finite UTC timestamp")
+    return float(deadline_utc)
 
 
 class TelegramRpcGate(TelegramClient):
@@ -171,6 +200,7 @@ class TelegramRpcGate(TelegramClient):
         scheduler_policy: TelegramRpcSchedulerPolicy,
         admission_observer: AdmissionObserver | None = None,
         flood_observer: Callable[..., None] | None = None,
+        cooldown_persistence: TelegramRpcCooldownPersistence | None = None,
         **kwargs: object,
     ) -> None:
         kwargs["request_retries"] = 0
@@ -189,6 +219,8 @@ class TelegramRpcGate(TelegramClient):
         self._cooldown_buffer_seconds = cooldown_buffer_seconds
         self._transient_retry_delays = transient_retry_delays_seconds
         self._flood_observer = flood_observer
+        self._cooldown_persistence = cooldown_persistence
+        self._restore_account_cooldown()
         self._scheduler_policy = scheduler_policy
         self._limiter = (
             AsyncLimiter(rpc_budget.max_calls_per_period, rpc_budget.period_seconds) if rpc_budget.enabled else None
@@ -235,6 +267,35 @@ class TelegramRpcGate(TelegramClient):
                 latched=True,
                 detail=status.detail(),
             )
+
+    def _restore_account_cooldown(self) -> None:
+        """Translate a persisted UTC deadline into current monotonic time."""
+        persistence = self._cooldown_persistence
+        if persistence is None:
+            return
+        persisted = persistence.load_until_utc()
+        if persisted is None:
+            return
+        deadline_utc = _validate_cooldown_until_utc(persisted)
+        remaining = deadline_utc - time.time()
+        if remaining <= 0:
+            return
+        global _COOLDOWN_DEADLINE
+        _COOLDOWN_DEADLINE = max(_COOLDOWN_DEADLINE, time.monotonic() + remaining)
+
+    def _persist_account_cooldown(self, *, monotonic_now: float) -> None:
+        """Persist the effective process deadline without changing FloodWait semantics."""
+        persistence = cast(
+            TelegramRpcCooldownPersistence | None,
+            getattr(self, "_cooldown_persistence", None),
+        )
+        if persistence is None:
+            return
+        deadline_utc = time.time() + max(0.0, _COOLDOWN_DEADLINE - monotonic_now)
+        try:
+            persistence.save_until_utc(deadline_utc)
+        except Exception:
+            logger.exception("telegram_rpc_cooldown_persist_failed")
 
     async def __call__(
         self, request: object, ordered: bool = False, flood_sleep_threshold: int | None = None
@@ -368,6 +429,7 @@ class TelegramRpcGate(TelegramClient):
         global _COOLDOWN_DEADLINE
         async with _COOLDOWN_LOCK:
             _COOLDOWN_DEADLINE = max(_COOLDOWN_DEADLINE, now + seconds + self._cooldown_buffer_seconds)
+            self._persist_account_cooldown(monotonic_now=now)
             identity = id(exc)
             if getattr(exc, "_mcp_telegram_flood_observed", False) or identity in _OBSERVED_FLOOD_IDS:
                 return seconds
@@ -388,6 +450,7 @@ __all__ = [
     "RpcAdmissionSaturatedError",
     "TelegramRpcAdmissionDeferred",
     "TelegramRpcBudget",
+    "TelegramRpcCooldownPersistence",
     "TelegramRpcGate",
     "TelegramRpcSource",
     "TransientRpcErrors",
