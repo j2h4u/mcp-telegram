@@ -10,7 +10,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-from ..telegram_rpc_scheduler import TelegramRpcSource, preserve_or_rpc_scope
+from ..telegram_demand import AcquisitionKind
+from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
 from .contracts import ReactionFreshness, ReactionSnapshot
 from .ports import ReactionSnapshotRepository, TelegramReactionGateway
 
@@ -102,7 +103,10 @@ class ReactionFreshener:
             return ReactionFreshness(
                 len(message_ids), len(fresh_ids), len(stale_ids), 0, "fresh" if not stale_ids else state
             )
-        with preserve_or_rpc_scope(TelegramRpcSource.REACTION_REFRESH):
+        with rpc_scope(
+            TelegramRpcSource.REACTION_REFRESH,
+            acquisition_kind=AcquisitionKind.REACTION_SNAPSHOT,
+        ):
             result = await self._gateway.fetch_reactions(entity, stale_ids)
         if result.ok:
             return await self._persist_fetched_snapshot(

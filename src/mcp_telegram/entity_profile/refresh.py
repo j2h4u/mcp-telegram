@@ -9,6 +9,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
+from ..telegram_demand import AcquisitionKind, DemandStatus, DurableDemandAdapter, RpcAttemptBudget
+from ..telegram_rpc_consumers import DemandKind
 from ..telegram_rpc_scheduler import TelegramRpcSource, create_scoped_rpc_task, rpc_scope
 
 RefreshCallback = Callable[[int], Awaitable[None]]
@@ -177,8 +179,12 @@ class EntityRefreshCoordinator:
                 event.set()
 
     async def run_rpc[T](self, operation: Callable[[], Awaitable[T]]) -> T:
-        """Apply the per-RPC budget to an operation owned by a refresh."""
-        return await asyncio.wait_for(operation(), timeout=self._limits.per_rpc_seconds)
+        """Apply the per-RPC budget to the refresh's entity lookup."""
+        with rpc_scope(
+            TelegramRpcSource.ENTITY_INFO_REFRESH,
+            acquisition_kind=AcquisitionKind.ENTITY_LOOKUP,
+        ):
+            return await asyncio.wait_for(operation(), timeout=self._limits.per_rpc_seconds)
 
     async def _worker(self) -> None:
         while True:
@@ -242,3 +248,38 @@ class EntityRefreshCoordinator:
             await asyncio.gather(*workers, return_exceptions=True)
         self._active_entities.clear()
         self._workers.clear()
+
+
+class EntityProfileResumeStateRequiredError(RuntimeError):
+    """Raised before cutover because a profile cannot resume after one RPC."""
+
+
+class EntityProfileDemandAdapter(DurableDemandAdapter):
+    """Expose the existing coalescing queue to PR1 shadow selection.
+
+    Entity refresh currently keeps execution identity in this process-local
+    bounded queue. The durable profile section rows describe data outcomes but
+    do not form a restart-safe executable queue, so this adapter deliberately
+    does not manufacture work from them.
+    """
+
+    demand_kind = DemandKind.ENTITY_PROFILE_REFRESH
+
+    def __init__(self, coordinator: EntityRefreshCoordinator) -> None:
+        self._coordinator = coordinator
+
+    def status(self, now: float) -> DemandStatus | None:
+        """Report admitted or active work without expiring or claiming it."""
+        if self._coordinator.queue_depth == 0:
+            return None
+        return DemandStatus(release_at=now)
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Refuse execution until multi-RPC profile progress is durable."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        if self.status(asyncio.get_running_loop().time()) is None:
+            return
+        raise EntityProfileResumeStateRequiredError(
+            "entity profile slices require durable per-section acquisition progress"
+        )
