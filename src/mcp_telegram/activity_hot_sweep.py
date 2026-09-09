@@ -248,19 +248,18 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
             return None
         return DemandStatus(release_at=release_at)
 
-    async def run_slice(self, budget: RpcAttemptBudget) -> None:
-        """Fetch at most the supplied actual-attempt budget and persist progress."""
-        if not isinstance(budget, RpcAttemptBudget):
-            raise TypeError("budget must be an RpcAttemptBudget")
-        state = _select_due_hot_window(self.conn, now=int(time.time()))
-        if state is None or self.shutdown_event.is_set():
-            return
+    async def _fetch_hot_page(
+        self,
+        state: _HotWindowState,
+        budget: RpcAttemptBudget,
+    ) -> SweepResult | None:
+        """Fetch one page under the exact hot demand and admission scopes."""
         with demand_context(DemandKind.HOT_ACTIVITY_PAGE):
             with rpc_attempt_budget(budget):
                 with acquisition_context(AcquisitionKind.MESSAGE_SEARCH_PAGE):
                     with rpc_scope(TelegramRpcSource.ACTIVITY_HOT_SWEEP, timeout_seconds=self.timeout_s):
                         try:
-                            result = await sweep_peer_once(
+                            return await sweep_peer_once(
                                 self.client,
                                 self.conn,
                                 state.dialog_id,
@@ -271,8 +270,10 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
                                 hydration_priority=HydrationPriority.FOREGROUND,
                             )
                         except RpcAttemptBudgetExhaustedError:
-                            return
+                            return None
 
+    def _persist_hot_page_result(self, state: _HotWindowState, result: SweepResult) -> None:
+        """Persist the page outcome while keeping an incomplete window resumable."""
         max_seen = max(state.window_max_id, result.max_id or 0)
         had_new = state.had_new or result.genuinely_new > 0
         if result.flood_wait_seconds is not None:
@@ -309,6 +310,18 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
             window_max_id=max_seen,
             had_new=had_new,
         )
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Fetch at most the supplied actual-attempt budget and persist progress."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        state = _select_due_hot_window(self.conn, now=int(time.time()))
+        if state is None or self.shutdown_event.is_set():
+            return
+        result = await self._fetch_hot_page(state, budget)
+        if result is None:
+            return
+        self._persist_hot_page_result(state, result)
 
 
 @dataclass
@@ -693,12 +706,21 @@ def _seed_hot_schedule_after_refresh(
         seed_hot_sweep_schedule(conn, policy.initial_spread_seconds, now=now)
 
 
-def _next_hot_release_at(conn: sqlite3.Connection, *, now: float) -> float | None:
-    """Return the earliest authoritative hot-page release boundary."""
+def _hot_release_cutoff(now: float) -> int:
+    """Validate a status timestamp and return the active peer cutoff."""
     if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now) or now < 0:
         raise ValueError("now must be a finite non-negative timestamp")
-    cutoff = int(now) - 30 * 86400
-    rows = cast(
+
+    return int(now) - 30 * 86400
+
+
+def _load_hot_release_rows(
+    conn: sqlite3.Connection,
+    *,
+    cutoff: int,
+) -> list[tuple[int | None, int | None, int | None, int | None, int | None]]:
+    """Load eligible hot peers and their scheduling boundaries."""
+    return cast(
         list[tuple[int | None, int | None, int | None, int | None, int | None]],
         conn.execute(
             """
@@ -715,12 +737,21 @@ def _next_hot_release_at(conn: sqlite3.Connection, *, now: float) -> float | Non
             {"cutoff": cutoff},
         ).fetchall(),
     )
-    releases: list[float] = []
-    for next_due_at, next_retry_at, last_sync_at, last_event_at, page_offset_id in rows:
-        event_due = last_sync_at is not None and last_event_at is not None and last_event_at > last_sync_at
-        due_at = 0 if page_offset_id is not None or next_due_at is None or event_due else next_due_at
-        releases.append(float(max(due_at, next_retry_at or 0)))
-    return min(releases, default=None)
+
+
+def _hot_row_release_at(row: tuple[int | None, int | None, int | None, int | None, int | None]) -> float:
+    """Return the effective release boundary for one eligible hot peer."""
+    next_due_at, next_retry_at, last_sync_at, last_event_at, page_offset_id = row
+    event_due = last_sync_at is not None and last_event_at is not None and last_event_at > last_sync_at
+    due_at = 0 if page_offset_id is not None or next_due_at is None or event_due else next_due_at
+    return float(max(due_at, next_retry_at or 0))
+
+
+def _next_hot_release_at(conn: sqlite3.Connection, *, now: float) -> float | None:
+    """Return the earliest authoritative hot-page release boundary."""
+    cutoff = _hot_release_cutoff(now)
+    rows = _load_hot_release_rows(conn, cutoff=cutoff)
+    return min((_hot_row_release_at(row) for row in rows), default=None)
 
 
 def _count_due_hot_peers(conn: sqlite3.Connection, *, now: int) -> int:
