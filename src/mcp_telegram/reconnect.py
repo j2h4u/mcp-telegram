@@ -7,7 +7,9 @@ import logging
 from collections.abc import Callable
 from typing import Protocol
 
-from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
+from .telegram_demand import AcquisitionKind, acquisition_context, current_demand_token, require_execution_mode
+from .telegram_rpc_consumers import DemandKind, ExecutionMode
+from .telegram_rpc_scheduler import RpcAdmissionClosedError
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +26,10 @@ async def _request_catch_up(
     client: ReconnectClient,
     observe: Callable[[str, str, str | None], None] | None,
 ) -> bool:
-    with rpc_scope(TelegramRpcSource.RECONNECT_DIFFERENCE):
+    token = require_execution_mode(ExecutionMode.DURABLE)
+    if token.kind is not DemandKind.RECONNECT_DIFFERENCE:
+        raise RuntimeError("reconnect catch-up requires reconnect_difference demand")
+    with acquisition_context(AcquisitionKind.UPDATE_DIFFERENCE):
         try:
             await client.catch_up()
         except RpcAdmissionClosedError:
@@ -68,6 +73,10 @@ async def run_reconnect_catch_up_loop(
     """
     if interval_seconds <= 0:
         raise ValueError("interval_seconds must be positive")
+    token = current_demand_token()
+    if token.kind is not DemandKind.RECONNECT_DIFFERENCE:
+        raise RuntimeError("reconnect loop requires reconnect_difference demand")
+    require_execution_mode(ExecutionMode.DURABLE)
 
     was_connected = bool(client.is_connected())
     recovery_needed = False

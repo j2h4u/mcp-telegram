@@ -110,6 +110,14 @@ from .scheduled_messages import (
     upsert_scheduled_message,
     verify_scheduled_publication,
 )
+from .telegram_demand import (
+    AcquisitionKind,
+    UnclassifiedTelegramDemandError,
+    acquisition_context,
+    current_demand_token,
+    demand_context,
+)
+from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
 from .telethon_dialog import classify_dialog_type
 from .topics.sqlite_repository import SQLiteTopicMetadataRepository
@@ -127,6 +135,42 @@ def _rpc_scope[**P, R](
         @wraps(func)
         async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
             with rpc_scope(source):
+                return await func(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
+
+
+def _demand_root[**P, R](
+    kind: DemandKind,
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    """Install the code-owned root identity for one Telethon event callback."""
+
+    def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+        @wraps(func)
+        async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            try:
+                current_demand_token()
+            except UnclassifiedTelegramDemandError:
+                with demand_context(kind):
+                    return await func(*args, **kwargs)
+            return await func(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
+
+
+def _acquisition[**P, R](
+    kind: AcquisitionKind,
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    """Refine a nested Telegram acquisition without replacing its event root."""
+
+    def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+        @wraps(func)
+        async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            with acquisition_context(kind):
                 return await func(*args, **kwargs)
 
         return wrapped
@@ -575,7 +619,6 @@ class EventHandlerManager:
     def set_self_id(self, self_id: int) -> None:
         self._self_id = self_id
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def _resolve_self_id(self) -> int | None:
         if self._self_id is not None:
             return self._self_id
@@ -680,7 +723,8 @@ class EventHandlerManager:
             else:
                 verify_scheduled_publication(conn, dialog_id, int(message.id), now=now)
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
+    @_acquisition(AcquisitionKind.ENTITY_LOOKUP)
     async def on_new_message(self, event: _NewMessageEvent) -> None:
         """Handle a NewMessage event: INSERT OR REPLACE into messages table.
 
@@ -734,7 +778,6 @@ class EventHandlerManager:
         except Exception:
             logger.exception("event_new_failed dialog_id=%s", dialog_id)
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def _new_message_coverage(
         self,
         dialog_id: int,
@@ -782,7 +825,7 @@ class EventHandlerManager:
         self._update_last_message_timestamp(dialog_id, now, msg.date)
         self._handle_topic_message_action(dialog_id, msg, now)
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_topic_message(self, update: object) -> None:
         """Project topic service messages omitted by Telethon's NewMessage builder."""
         try:
@@ -892,7 +935,8 @@ class EventHandlerManager:
             topic_id,
         )
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
+    @_acquisition(AcquisitionKind.ENTITY_LOOKUP)
     async def on_message_edited(self, event: _EditedMessageEvent) -> None:
         """Handle a MessageEdited event: version old text, update messages row.
 
@@ -963,7 +1007,6 @@ class EventHandlerManager:
         except Exception:
             logger.exception("event_edit_failed dialog_id=%s", dialog_id)
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def _insert_missing_edited_message(
         self,
         dialog_id: int,
@@ -1015,7 +1058,6 @@ class EventHandlerManager:
             len(aggregates),
         )
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def _persist_changed_edit(  # noqa: PLR0913, PLR0917
         self,
         dialog_id: int,
@@ -1051,7 +1093,7 @@ class EventHandlerManager:
             self._record_body_event(dialog_id, now)
         return next_ver
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_message_deleted(self, event: _DeletedMessagesEvent) -> None:
         """Handle a MessageDeleted event and preserve the last known text.
 
@@ -1107,7 +1149,7 @@ class EventHandlerManager:
             len(deleted_ids) - len(resolved),
         )
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_new_scheduled_message(self, update: object) -> None:
         """Mirror create/edit/reschedule updates without touching sent history."""
         message = cast(object | None, getattr(update, "message", None))
@@ -1129,7 +1171,7 @@ class EventHandlerManager:
         except Exception:
             logger.exception("scheduled_new_failed dialog_id=%s", dialog_id)
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_delete_scheduled_messages(self, update: object) -> None:
         """Retain cancellation/publication evidence from a queue-removal update."""
         dialog_id = scheduled_dialog_id(getattr(update, "peer", None))
@@ -1143,7 +1185,7 @@ class EventHandlerManager:
         except Exception:
             logger.exception("scheduled_removed_failed dialog_id=%s", dialog_id)
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_outbox_read(self, event: _OutboxReadEvent) -> None:
         """Handle MessageRead(inbox=False): update read_outbox_max_id monotonically.
 
@@ -1227,7 +1269,8 @@ class EventHandlerManager:
                 exc,
             )
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
+    @_acquisition(AcquisitionKind.MESSAGE_LOOKUP)
     async def on_raw_reaction_update(self, update: _RawReactionUpdate) -> None:
         """Handle raw UpdateMessageReactions for synced dialogs.
 
@@ -1306,7 +1349,6 @@ class EventHandlerManager:
             logger.debug("raw_reaction_update_unparseable_peer peer=%r", peer)
             return None
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def _fetch_reaction_message(self, dialog_id: int, msg_id: int) -> _MessageLike | None:
         try:
             result = cast(Sequence[_MessageLike | None], await self._client.get_messages(dialog_id, ids=[msg_id]))
@@ -1347,7 +1389,7 @@ class EventHandlerManager:
             self._record_body_event(dialog_id, now)
         return True
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_transcribed_audio(self, update: UpdateTranscribedAudio) -> None:
         """Capture one final Telegram transcription fact under current policy.
 
@@ -1563,7 +1605,7 @@ class EventHandlerManager:
             rowcount,
         )
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_dialog_pinned(self, update: object) -> None:
         """Phase 42 EVENTS-01: dialogs.pinned + needs_refresh from raw updates.
 
@@ -1609,7 +1651,8 @@ class EventHandlerManager:
             return int(get_peer_id(PeerChannel(update.channel_id)))
         return int(get_peer_id(PeerChat(update.chat_id)))
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
+    @_acquisition(AcquisitionKind.ACCOUNT_SELF_PROFILE)
     async def on_raw_participant(self, update: UpdateChannelParticipant | UpdateChatParticipant) -> None:
         """Persist why this account lost a group, supergroup, or channel membership."""
         try:
@@ -1635,7 +1678,8 @@ class EventHandlerManager:
         except Exception:
             logger.exception("event_channel_participant_failed")
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
+    @_acquisition(AcquisitionKind.ENTITY_LOOKUP)
     async def on_raw_channel_chat_update(self, update: _ChannelChatUpdateLike | _ChatUpdateLike) -> None:
         """Phase 42 EVENTS-03: UpdateChannel / UpdateChat → dialogs.needs_refresh=1.
 
@@ -1682,7 +1726,6 @@ class EventHandlerManager:
         if isinstance(update, UpdateChannel) and row is not None and row[0] == "channel" and row[1] is not None:
             await self._refresh_linked_chat_id(dialog_id)
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def _refresh_linked_chat_id(self, dialog_id: int) -> None:
         """Phase 54: event-driven linked_chat_id refresh for a previously-resolved channel.
 
@@ -1743,7 +1786,7 @@ class EventHandlerManager:
             normalised,
         )
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_inbox_read(self, update: _InboxReadUpdateLike | _ChannelInboxReadUpdateLike) -> None:
         """Phase 42 EVENTS-02: UpdateReadHistoryInbox / UpdateReadChannelInbox.
 
@@ -1832,7 +1875,7 @@ class EventHandlerManager:
                 type(update).__name__,
             )
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_forum_topic_pinned(self, update: object) -> None:
         """Phase 42 EVENTS-05: UpdatePinnedForumTopic → topic_metadata.pinned.
 
@@ -1879,7 +1922,6 @@ class EventHandlerManager:
                 type(update).__name__,
             )
 
-    @_rpc_scope(TelegramRpcSource.REALTIME_EVENT)
     async def on_raw_forum_topics_pinned(self, update: object) -> None:
         """Apply UpdatePinnedForumTopics as a complete known-topic membership set."""
         try:

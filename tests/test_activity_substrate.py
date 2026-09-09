@@ -5,7 +5,8 @@ import asyncio
 import pytest
 
 from mcp_telegram.activity_substrate import ActivityClient, call_with_timeout
-from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_scope
+from mcp_telegram.telegram_demand import AcquisitionKind, acquisition_context, current_demand_token, demand_context
+from mcp_telegram.telegram_rpc_consumers import DemandKind, TelegramRpcSource
 
 _TEST_TIMEOUT_S = 0.01
 
@@ -29,7 +30,7 @@ async def test_call_with_timeout_cancels_a_wedged_rpc_without_waiting() -> None:
 
     client: ActivityClient = HangingClient()
     with pytest.raises(TimeoutError):
-        with rpc_scope(TelegramRpcSource.ACTIVITY_ARCHIVE):
+        with demand_context(DemandKind.ARCHIVE_INCREMENTAL):
             await call_with_timeout(client, object(), timeout_s=_TEST_TIMEOUT_S)
 
     await asyncio.wait_for(cancelled.wait(), timeout=1.0)
@@ -49,25 +50,29 @@ async def test_call_with_timeout_preserves_rpc_exception() -> None:
             return object()
 
     with pytest.raises(RuntimeError, match="rpc failed"):
-        with rpc_scope(TelegramRpcSource.ACTIVITY_ARCHIVE):
+        with demand_context(DemandKind.ARCHIVE_INCREMENTAL):
             await call_with_timeout(FailingClient(), object(), timeout_s=1.0)
 
 
 @pytest.mark.asyncio
 async def test_call_with_timeout_rebinds_caller_source_to_detached_task() -> None:
-    observed: list[TelegramRpcSource] = []
+    observed: list[tuple[DemandKind, TelegramRpcSource, AcquisitionKind | None]] = []
 
     class ScopedClient:
         async def __call__(self, request: object) -> object:
             del request
-            observed.append(current_rpc_scope().source)
+            token = current_demand_token()
+            observed.append((token.kind, token.source, token.acquisition_kind))
             return object()
 
         async def get_input_entity(self, dialog_id: int) -> object:
             del dialog_id
             return object()
 
-    with rpc_scope(TelegramRpcSource.ACTIVITY_HOT_SWEEP):
-        await call_with_timeout(ScopedClient(), object(), timeout_s=1.0)
+    with demand_context(DemandKind.HOT_ACTIVITY_PAGE):
+        with acquisition_context(AcquisitionKind.MESSAGE_SEARCH_PAGE):
+            await call_with_timeout(ScopedClient(), object(), timeout_s=1.0)
 
-    assert observed == [TelegramRpcSource.ACTIVITY_HOT_SWEEP]
+    assert observed == [
+        (DemandKind.HOT_ACTIVITY_PAGE, TelegramRpcSource.ACTIVITY_HOT_SWEEP, AcquisitionKind.MESSAGE_SEARCH_PAGE)
+    ]
