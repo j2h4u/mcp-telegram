@@ -8,7 +8,7 @@ default:
     @just --list
 
 # Run all local source checks.
-check: fmt-check lint complexity-ratchet lock-check typecheck typecheck-pyright typecheck-tests import-contracts module-boundaries semantic-boundaries message-boundaries telegram-rpc-boundaries config-imports policy-placement runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
+check: fmt-check lint complexity-ratchet lock-check typecheck typecheck-pyright typecheck-tests import-contracts module-boundaries semantic-boundaries message-boundaries telegram-rpc-boundaries config-imports policy-placement demand-cutover runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
 
 # Verify uv.lock is synchronized with pyproject.toml.
 lock-check:
@@ -69,6 +69,10 @@ module-map:
 # Check that operator-controlled policy remains in typed config and is injected.
 policy-placement:
     uv run python scripts/check_policy_placement.py
+
+# Enforce removal of PR1 shadow bridges and all legacy durable launchers.
+demand-cutover:
+    uv run python scripts/check_demand_cutover.py
 
 # Check the public correlation/bootstrap seams and their stdlib import closure.
 runtime-seams:
