@@ -259,10 +259,17 @@ def test_demand_evidence_keeps_demand_and_attempt_units_separate() -> None:
         oldest_overdue_seconds=3.5,
         reason="capacity",
     )
+    aggregator.observe_demand(
+        outcome=DemandEvidenceOutcome.PREDICTED_SELECTION,
+        demand_kind=DemandKind.SCHEDULED_DISCOVERY,
+        predicted_kind=DemandKind.SCHEDULED_REPAIR,
+        selection_match=False,
+        queue_age_seconds=8.0,
+    )
     aggregator.flush(now=300.0)
 
-    assert [row["kind"] for row in recorder.rows] == ["telegram.demand", "telegram.demand"]
-    offered, deferred = recorder.rows
+    assert [row["kind"] for row in recorder.rows] == ["telegram.demand"] * 3
+    offered, deferred, predicted = recorder.rows
     assert offered["payload"] == {
         "demand_kind": "scheduled_repair",
         "acquisition_kind": "scheduled_messages_snapshot",
@@ -277,6 +284,15 @@ def test_demand_evidence_keeps_demand_and_attempt_units_separate() -> None:
         "demand_units": 2,
         "actual_attempts": 1,
         "oldest_overdue_seconds": 3.5,
+        "window_seconds": 300,
+    }
+    assert predicted["payload"] == {
+        "demand_kind": "scheduled_discovery",
+        "demand_units": 1,
+        "actual_attempts": 0,
+        "queue_age_seconds": 8.0,
+        "predicted_kind": "scheduled_repair",
+        "selection_match": False,
         "window_seconds": 300,
     }
 

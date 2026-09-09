@@ -20,6 +20,7 @@ from .telegram_demand import (
     AcquisitionKind,
     DemandToken,
     RpcAttemptBudget,
+    RpcAttemptEvidence,
     UnclassifiedTelegramDemandError,
     acquisition_context,
     current_demand_token,
@@ -137,6 +138,7 @@ class TelegramRpcScope:
     acquisition_kind: AcquisitionKind | None = None
     source_outstanding_limit: int | None = None
     attempt_budget: RpcAttemptBudget | None = None
+    attempt_evidence: RpcAttemptEvidence | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +266,7 @@ def current_rpc_scope() -> TelegramRpcScope:
         acquisition_kind=token.acquisition_kind,
         source_outstanding_limit=contract.source_outstanding_limit,
         attempt_budget=_RPC_ATTEMPT_BUDGET.get(),
+        attempt_evidence=token.attempt_evidence,
     )
 
 
@@ -688,6 +691,8 @@ class TelegramRpcAdmissionScheduler:
         if active is None or active.dispatch_recorded:
             return
         active.dispatch_recorded = True
+        if active.scope.attempt_evidence is not None:
+            active.scope.attempt_evidence.record_dispatch()
         self._emit_for_scope(
             RpcAdmissionEventKind.DISPATCHED,
             active.scope,
@@ -1061,8 +1066,7 @@ class TelegramRpcAdmissionScheduler:
         source: TelegramRpcSource,
     ) -> bool:
         return owner_task is not None and any(
-            active.owner_task is owner_task and active.scope.source is source
-            for active in self._active.values()
+            active.owner_task is owner_task and active.scope.source is source for active in self._active.values()
         )
 
     @staticmethod

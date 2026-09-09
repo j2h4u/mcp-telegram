@@ -8,6 +8,7 @@ import pytest
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
     DemandStatus,
+    DemandToken,
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
     UnclassifiedTelegramDemandError,
@@ -44,6 +45,7 @@ def test_nested_acquisition_preserves_root_identity_and_restores_context() -> No
             assert nested.service_class is root.service_class
             assert nested.admission_deadline == root.admission_deadline
             assert nested.acquisition_kind is AcquisitionKind.ENTITY_LOOKUP
+            assert nested.attempt_evidence is root.attempt_evidence
             assert current_demand_token() is nested
 
         assert current_demand_token() is root
@@ -63,13 +65,13 @@ def test_root_context_and_tokens_are_immutable() -> None:
 
 @pytest.mark.asyncio
 async def test_detached_task_requires_explicit_context_transfer() -> None:
-    async def inspect() -> object:
+    async def inspect() -> DemandToken:
         return current_demand_token()
 
     with demand_context(DemandKind.MCP_REMOTE_ACQUISITION) as root:
         inherited = asyncio.create_task(inspect())
 
-        async def inspect_transferred() -> object:
+        async def inspect_transferred() -> DemandToken:
             with transferred_demand_context(root):
                 return current_demand_token()
 
@@ -82,6 +84,7 @@ async def test_detached_task_requires_explicit_context_transfer() -> None:
     assert transferred_token.source is root.source
     assert transferred_token.service_class is root.service_class
     assert transferred_token.owner_task is transferred
+    assert transferred_token.attempt_evidence is root.attempt_evidence
 
 
 def test_rpc_attempt_budget_fails_before_exceeding_contract() -> None:

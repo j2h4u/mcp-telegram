@@ -64,6 +64,9 @@ class DemandSummary:
     counts: dict[str, int]
     actual_attempts: int
     oldest_overdue_seconds: float | None
+    oldest_queue_age_seconds: float | None
+    selection_matches: int
+    selection_mismatches: int
     reasons: dict[str, int]
     by_kind: dict[tuple[str, str | None], dict[str, int]]
 
@@ -182,13 +185,16 @@ def _rpc_summary(observations: list[Observation]) -> tuple[int, int, dict[str, R
     return len(summaries), cancelled, sources
 
 
-def _demand_summary(observations: list[Observation]) -> DemandSummary:
+def _demand_summary(observations: list[Observation]) -> DemandSummary:  # noqa: PLR0914
     rows = _rows_for_kind(observations, "telegram.demand")
     counts: dict[str, int] = defaultdict(int)
     reasons: dict[str, int] = defaultdict(int)
     by_kind: dict[tuple[str, str | None], dict[str, int]] = defaultdict(lambda: defaultdict(int))
     actual_attempts = 0
     oldest_overdue_seconds: float | None = None
+    oldest_queue_age_seconds: float | None = None
+    selection_matches = 0
+    selection_mismatches = 0
     for row in rows:
         outcome = str(row["outcome"] or "observed")
         payload = json.loads(str(row["payload_json"] or "{}"))
@@ -199,20 +205,43 @@ def _demand_summary(observations: list[Observation]) -> DemandSummary:
         acquisition = None if acquisition_kind is None else str(acquisition_kind)
         by_kind[(demand_kind, acquisition)][outcome] += units
         actual_attempts += _as_int(payload.get("actual_attempts") or 0)
-        overdue = payload.get("oldest_overdue_seconds")
-        if overdue is not None:
-            value = _as_float(overdue)
-            oldest_overdue_seconds = max(oldest_overdue_seconds or 0.0, value)
-        reason = row["reason_code"]
-        if reason:
-            reasons[str(reason)] += units or 1
+        oldest_overdue_seconds = _max_payload_float(oldest_overdue_seconds, payload, "oldest_overdue_seconds")
+        oldest_queue_age_seconds = _max_payload_float(oldest_queue_age_seconds, payload, "queue_age_seconds")
+        matches, mismatches = _selection_counts(outcome, payload, units)
+        selection_matches += matches
+        selection_mismatches += mismatches
+        _add_demand_reason(reasons, row["reason_code"], units)
     return DemandSummary(
         counts=dict(counts),
         actual_attempts=actual_attempts,
         oldest_overdue_seconds=oldest_overdue_seconds,
+        oldest_queue_age_seconds=oldest_queue_age_seconds,
+        selection_matches=selection_matches,
+        selection_mismatches=selection_mismatches,
         reasons=dict(reasons),
         by_kind={key: dict(value) for key, value in by_kind.items()},
     )
+
+
+def _max_payload_float(current: float | None, payload: Mapping[str, object], key: str) -> float | None:
+    value = payload.get(key)
+    return current if value is None else max(current or 0.0, _as_float(value))
+
+
+def _selection_counts(outcome: str, payload: Mapping[str, object], units: int) -> tuple[int, int]:
+    if outcome != "predicted_selection":
+        return 0, 0
+    match = payload.get("selection_match")
+    if match is True:
+        return units, 0
+    if match is False:
+        return 0, units
+    return 0, 0
+
+
+def _add_demand_reason(reasons: dict[str, int], reason: object, units: int) -> None:
+    if reason:
+        reasons[str(reason)] += units or 1
 
 
 def _sync_counts(observations: list[Observation]) -> dict[tuple[str, str], int]:
@@ -261,10 +290,9 @@ def _mcp_lines(summary: McpSummary) -> list[str]:
 
 def _rpc_lines(summary_count: int, cancelled: int, sources: dict[str, RpcSourceSummary]) -> list[str]:
     actual_attempts = sum(summary.dispatched for summary in sources.values())
-    lines = [(
-        f"Telegram RPC admission: summaries={summary_count}, cancelled={cancelled}, "
-        f"actual attempts={actual_attempts}"
-    )]
+    lines = [
+        (f"Telegram RPC admission: summaries={summary_count}, cancelled={cancelled}, actual attempts={actual_attempts}")
+    ]
     ordered = sorted(sources.items(), key=lambda item: item[1].worst_wait_ms, reverse=True)
     if not ordered:
         return [*lines, "  none"]
@@ -284,21 +312,36 @@ def _demand_lines(summary: DemandSummary) -> list[str]:
         "locally_satisfied",
         "ready",
         "coalesced_wakeup",
+        "predicted_selection",
         "completed",
         "deferred",
         "failed",
     )
+    fields = _demand_fields(summary, labels)
+    lines = ["Demand: " + ", ".join(fields)]
+    lines.extend(_demand_kind_lines(summary, labels))
+    return lines
+
+
+def _demand_fields(summary: DemandSummary, labels: tuple[str, ...]) -> list[str]:
     fields = [f"{label.replace('_', ' ')}={summary.counts[label]}" for label in labels if summary.counts.get(label)]
     fields.append(f"actual attempts={summary.actual_attempts}")
+    if summary.selection_matches or summary.selection_mismatches:
+        fields.append(f"selection matches={summary.selection_matches}")
+        fields.append(f"mismatches={summary.selection_mismatches}")
+    if summary.oldest_queue_age_seconds is not None:
+        fields.append(f"oldest queue age={_ms(summary.oldest_queue_age_seconds * _MILLISECONDS_PER_SECOND)}")
     if summary.oldest_overdue_seconds is not None:
         fields.append(f"oldest overdue={_ms(summary.oldest_overdue_seconds * _MILLISECONDS_PER_SECOND)}")
     if summary.reasons:
         fields.append("reasons=" + ",".join(f"{key}={value}" for key, value in sorted(summary.reasons.items())))
-    lines = ["Demand: " + ", ".join(fields)]
+    return fields
+
+
+def _demand_kind_lines(summary: DemandSummary, labels: tuple[str, ...]) -> list[str]:
+    lines: list[str] = []
     for (demand_kind, acquisition_kind), counts in sorted(summary.by_kind.items()):
-        detail = ", ".join(
-            f"{label.replace('_', ' ')}={counts[label]}" for label in labels if counts.get(label)
-        )
+        detail = ", ".join(f"{label.replace('_', ' ')}={counts[label]}" for label in labels if counts.get(label))
         if detail:
             suffix = f"/{acquisition_kind}" if acquisition_kind else ""
             lines.append(f"  {demand_kind}{suffix}: {detail}")

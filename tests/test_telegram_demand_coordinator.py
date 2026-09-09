@@ -81,6 +81,64 @@ def test_all_shadow_scan_paths_are_authoritative_and_never_execute() -> None:
     assert _run_calls(adapters) == 0
 
 
+def test_cycle_prediction_rotates_fifo_head_only_after_authoritative_rescan() -> None:
+    now = [100.0]
+    adapters = _adapters()
+    adapters[DemandKind.SCHEDULED_REPAIR].current_status = DemandStatus(
+        release_at=90.0,
+        freshness_deadline=95.0,
+    )
+    adapters[DemandKind.SCHEDULED_DISCOVERY].current_status = DemandStatus(release_at=90.0)
+    coordinator = TelegramDemandCoordinator(adapters, clock=lambda: now[0])
+    assert coordinator.ready_kinds == (
+        DemandKind.SCHEDULED_REPAIR,
+        DemandKind.SCHEDULED_DISCOVERY,
+    )
+
+    now[0] = 110.0
+    first = coordinator.begin_cycle(DemandKind.SCHEDULED_REPAIR)
+    assert first.prediction is not None
+    assert first.prediction.predicted_kind is DemandKind.SCHEDULED_REPAIR
+    assert first.prediction.queue_age_seconds == 10.0
+    assert first.prediction.overdue_seconds == 15.0
+    assert coordinator.ready_kinds == (DemandKind.SCHEDULED_DISCOVERY,)
+    assert set(coordinator.authoritative_ready_kinds) == {
+        DemandKind.SCHEDULED_REPAIR,
+        DemandKind.SCHEDULED_DISCOVERY,
+    }
+
+    coordinator.after_cycle_scan(first, actual_kind=DemandKind.SCHEDULED_REPAIR, now=111.0)
+    assert coordinator.ready_kinds == (
+        DemandKind.SCHEDULED_DISCOVERY,
+        DemandKind.SCHEDULED_REPAIR,
+    )
+
+    second = coordinator.begin_cycle(DemandKind.SCHEDULED_REPAIR)
+    assert second.prediction is not None
+    assert second.prediction.predicted_kind is DemandKind.SCHEDULED_DISCOVERY
+    coordinator.after_cycle_scan(second, actual_kind=DemandKind.SCHEDULED_REPAIR, now=112.0)
+    assert coordinator.ready_kinds == (
+        DemandKind.SCHEDULED_REPAIR,
+        DemandKind.SCHEDULED_DISCOVERY,
+    )
+    assert _run_calls(adapters) == 0
+
+
+def test_completed_prediction_is_not_reappended_when_domain_is_satisfied() -> None:
+    adapters = _adapters()
+    adapter = adapters[DemandKind.SCHEDULED_REPAIR]
+    adapter.current_status = DemandStatus(release_at=0.0)
+    coordinator = TelegramDemandCoordinator(adapters, clock=lambda: 100.0)
+
+    token = coordinator.begin_cycle(DemandKind.SCHEDULED_REPAIR)
+    adapter.current_status = None
+    coordinator.after_cycle_scan(token, actual_kind=DemandKind.SCHEDULED_REPAIR, now=101.0)
+
+    assert coordinator.ready_kinds == ()
+    with pytest.raises(RuntimeError, match="already completed"):
+        coordinator.after_cycle_scan(token, actual_kind=DemandKind.SCHEDULED_REPAIR, now=102.0)
+
+
 def test_startup_validation_requires_exact_durable_adapter_coverage() -> None:
     adapters = _adapters()
     adapters.pop(DemandKind.SCHEDULED_REPAIR)

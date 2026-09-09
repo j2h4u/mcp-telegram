@@ -48,9 +48,7 @@ def test_entity_profile_refresh_uses_background_service_class() -> None:
 def test_legacy_bridge_is_explicit_complete_and_contract_consistent() -> None:
     assert set(LEGACY_DEMAND_KIND_BY_SOURCE) == set(TelegramRpcSource)
     assert set(LEGACY_DEMAND_KIND_BY_SOURCE.values()) <= set(TELEGRAM_DEMAND_CONTRACTS)
-    assert all(
-        demand_contract(kind).source is source for source, kind in LEGACY_DEMAND_KIND_BY_SOURCE.items()
-    )
+    assert all(demand_contract(kind).source is source for source, kind in LEGACY_DEMAND_KIND_BY_SOURCE.items())
 
 
 def test_legacy_deadline_only_tightens_contract_and_nested_scope_keeps_root_identity() -> None:
@@ -307,10 +305,7 @@ async def test_source_bound_rejects_one_producer_without_blocking_its_class_peer
     limiter = _ControlledLimiter()
     scheduler = TelegramRpcAdmissionScheduler(policy=TelegramRpcSchedulerConfig(), limiter=limiter)
     source_limit = demand_contract(DemandKind.FULL_SYNC_PAGE).source_outstanding_limit
-    full_sync = [
-        asyncio.create_task(scheduler.admit(_scope(TelegramRpcSource.FULL_SYNC)))
-        for _ in range(source_limit)
-    ]
+    full_sync = [asyncio.create_task(scheduler.admit(_scope(TelegramRpcSource.FULL_SYNC))) for _ in range(source_limit)]
     await _wait_until(lambda: scheduler.source_queue_depths()[TelegramRpcSource.FULL_SYNC] == source_limit)
 
     with pytest.raises(RpcAdmissionSaturatedError, match="source outstanding capacity"):
@@ -686,8 +681,35 @@ async def test_detached_task_can_explicitly_transfer_precise_root_demand() -> No
     assert scope.owner_task is detached
     assert scope.deadline is not None and scope.deadline <= root.admission_deadline
     assert scope.attempt_budget is budget
+    assert scope.attempt_evidence is root.attempt_evidence
     assert budget.attempts == 1
     assert detached_context == "clean"
+
+
+@pytest.mark.asyncio
+async def test_detached_dispatch_updates_root_evidence_once_at_dispatch_boundary() -> None:
+    scheduler = TelegramRpcAdmissionScheduler(policy=TelegramRpcSchedulerConfig(), limiter=None)
+
+    async def dispatch() -> None:
+        scope = current_rpc_scope()
+        admission = await scheduler.admit(scope)
+        try:
+            scheduler.record_dispatch(admission)
+            scheduler.record_dispatch(admission)
+        finally:
+            scheduler.complete(admission)
+
+    with demand_context(DemandKind.SCHEDULED_DISCOVERY) as root:
+        detached = create_detached_rpc_task(
+            dispatch(),
+            source=root.source,
+            timeout_seconds=10.0,
+            demand_token=root,
+        )
+
+    await detached
+    assert root.attempt_evidence.actual_attempts == 1
+    await scheduler.close()
 
 
 @pytest.mark.asyncio

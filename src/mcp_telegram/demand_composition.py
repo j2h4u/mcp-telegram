@@ -51,7 +51,13 @@ from mcp_telegram.self_profile_maintenance import (
 )
 from mcp_telegram.sync_db import SyncDatabaseConnection
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter, FullSyncWorker
-from mcp_telegram.telegram_demand import DemandStatus, DurableDemandAdapter, RpcAttemptBudget
+from mcp_telegram.telegram_demand import (
+    DemandPrediction,
+    DemandStatus,
+    DemandToken,
+    DurableDemandAdapter,
+    RpcAttemptBudget,
+)
 from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator, validate_durable_adapters
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 
@@ -77,6 +83,9 @@ class DemandEvidenceObserver(Protocol):
         demand_units: int = 1,
         actual_attempts: int = 0,
         oldest_overdue_seconds: float | None = None,
+        queue_age_seconds: float | None = None,
+        predicted_kind: DemandKind | None = None,
+        selection_match: bool | None = None,
         reason: str | None = None,
     ) -> None: ...
 
@@ -243,7 +252,7 @@ class TelegramDemandShadow:
             kind: _ShadowStatusAdapter(kind, adapter, self._status_failed) for kind, adapter in adapters.items()
         }
         self.coordinator = TelegramDemandCoordinator(shadow_adapters, clock=clock)
-        self._observe_transitions(self.coordinator.ready_kinds, now=self._clock())
+        self._observe_transitions(self.coordinator.authoritative_ready_kinds, now=self._clock())
 
     def offer(self, kind: DemandKind) -> bool:
         """Forward one wakeup hint, record coalescing, and wake the scan loop."""
@@ -252,15 +261,45 @@ class TelegramDemandShadow:
             DemandEvidenceOutcome.OFFERED if accepted else DemandEvidenceOutcome.COALESCED_WAKEUP,
             kind,
         )
-        self._observe_transitions(self.coordinator.ready_kinds, now=self._clock())
+        self._observe_transitions(self.coordinator.authoritative_ready_kinds, now=self._clock())
         self._wakeup.set()
         return accepted
 
-    def after_cycle_scan(self) -> tuple[DemandKind, ...]:
-        """Refresh shadow state after a legacy executor completes a cycle."""
+    def begin_cycle(self, kind: DemandKind) -> DemandToken:
+        """Predict one FIFO head and return the actual legacy cycle root."""
+        token = self.coordinator.begin_cycle(kind)
+        prediction = self._require_prediction(token)
+        self._observe_cycle(DemandEvidenceOutcome.PREDICTED_SELECTION, token, prediction)
+        return token
+
+    def after_cycle_scan(
+        self,
+        token: DemandToken | None = None,
+        *,
+        actual_kind: DemandKind | None = None,
+        outcome: DemandEvidenceOutcome | str | None = None,
+        reason: str | None = None,
+    ) -> tuple[DemandKind, ...]:
+        """Record a legacy outcome, then rescan and rotate the prediction."""
         now = self._clock()
-        ready = self.coordinator.after_cycle_scan(now=now)
-        self._observe_transitions(ready, now=now)
+        if token is None:
+            if actual_kind is not None or outcome is not None or reason is not None:
+                raise TypeError("cycle evidence requires token, actual_kind, and outcome")
+            ready = self.coordinator.after_cycle_scan(now=now)
+        else:
+            if actual_kind is None or outcome is None:
+                raise TypeError("actual_kind and outcome are required with a cycle token")
+            terminal = DemandEvidenceOutcome(outcome)
+            if terminal not in {
+                DemandEvidenceOutcome.COMPLETED,
+                DemandEvidenceOutcome.DEFERRED,
+                DemandEvidenceOutcome.FAILED,
+            }:
+                raise ValueError("cycle outcome must be completed, deferred, or failed")
+            prediction = self._require_prediction(token)
+            ready = self.coordinator.after_cycle_scan(token, actual_kind=actual_kind, now=now)
+            self._observe_cycle(terminal, token, prediction, actual_kind=actual_kind, reason=reason)
+        self._observe_transitions(self.coordinator.authoritative_ready_kinds, now=now)
         self._wakeup.set()
         return ready
 
@@ -268,8 +307,8 @@ class TelegramDemandShadow:
         """Scan at the nearest release, on offers, and on a bounded safety cadence."""
         while not self._shutdown_event.is_set():
             now = self._clock()
-            ready = self.coordinator.timer_scan(now=now)
-            self._observe_transitions(ready, now=now)
+            self.coordinator.timer_scan(now=now)
+            self._observe_transitions(self.coordinator.authoritative_ready_kinds, now=now)
             self._wakeup.clear()
             delay = self._next_scan_delay(now)
             if await self._wait_for_signal(delay):
@@ -312,12 +351,16 @@ class TelegramDemandShadow:
             self._observe(DemandEvidenceOutcome.LOCALLY_SATISFIED, kind)
         self._ready = current
 
-    def _observe(
+    def _observe(  # noqa: PLR0913 - mirrors the bounded evidence boundary
         self,
         outcome: DemandEvidenceOutcome,
         kind: DemandKind,
         *,
+        actual_attempts: int = 0,
         oldest_overdue_seconds: float | None = None,
+        queue_age_seconds: float | None = None,
+        predicted_kind: DemandKind | None = None,
+        selection_match: bool | None = None,
         reason: str | None = None,
     ) -> None:
         if self._observer is None:
@@ -326,11 +369,42 @@ class TelegramDemandShadow:
             self._observer.observe_demand(
                 outcome=outcome,
                 demand_kind=kind,
+                actual_attempts=actual_attempts,
                 oldest_overdue_seconds=oldest_overdue_seconds,
+                queue_age_seconds=queue_age_seconds,
+                predicted_kind=predicted_kind,
+                selection_match=selection_match,
                 reason=reason,
             )
         except Exception:  # noqa: BLE001 - telemetry cannot affect shadow selection
             logger.warning("telegram_demand_shadow_observation_failed kind=%s", kind.value)
+
+    def _observe_cycle(
+        self,
+        outcome: DemandEvidenceOutcome,
+        token: DemandToken,
+        prediction: DemandPrediction,
+        *,
+        actual_kind: DemandKind | None = None,
+        reason: str | None = None,
+    ) -> None:
+        actual = token.kind if actual_kind is None else actual_kind
+        self._observe(
+            outcome,
+            actual,
+            actual_attempts=token.attempt_evidence.actual_attempts,
+            oldest_overdue_seconds=prediction.overdue_seconds,
+            queue_age_seconds=prediction.queue_age_seconds,
+            predicted_kind=prediction.predicted_kind,
+            selection_match=prediction.predicted_kind is actual,
+            reason=reason,
+        )
+
+    @staticmethod
+    def _require_prediction(token: DemandToken) -> DemandPrediction:
+        if not isinstance(token, DemandToken) or token.prediction is None:
+            raise ValueError("cycle token has no shadow prediction")
+        return token.prediction
 
     def _status_failed(self, kind: DemandKind, exc: Exception) -> None:
         logger.warning(

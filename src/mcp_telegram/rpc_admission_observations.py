@@ -48,6 +48,7 @@ class DemandEvidenceOutcome(StrEnum):
     LOCALLY_SATISFIED = "locally_satisfied"
     READY = "ready"
     COALESCED_WAKEUP = "coalesced_wakeup"
+    PREDICTED_SELECTION = "predicted_selection"
     COMPLETED = "completed"
     DEFERRED = "deferred"
     FAILED = "failed"
@@ -119,7 +120,8 @@ class RpcAdmissionObservationAggregator:
             _AdmissionAggregate,
         ] = {}
         self._demand_aggregates: dict[
-            tuple[DemandKind, AcquisitionKind | None, DemandEvidenceOutcome], _DemandAggregate
+            tuple[DemandKind, AcquisitionKind | None, DemandEvidenceOutcome, DemandKind | None, bool | None],
+            _DemandAggregate,
         ] = {}
         self._state_lock = threading.Lock()
         self._flush_lock = threading.Lock()
@@ -145,6 +147,9 @@ class RpcAdmissionObservationAggregator:
         demand_units: int = 1,
         actual_attempts: int = 0,
         oldest_overdue_seconds: float | None = None,
+        queue_age_seconds: float | None = None,
+        predicted_kind: DemandKind | None = None,
+        selection_match: bool | None = None,
         reason: str | None = None,
     ) -> None:
         """Aggregate bounded shadow demand evidence without storing work identity.
@@ -160,20 +165,21 @@ class RpcAdmissionObservationAggregator:
                 raise TypeError("acquisition_kind must be an AcquisitionKind")
             _validate_nonnegative_int(demand_units, "demand_units")
             _validate_nonnegative_int(actual_attempts, "actual_attempts")
-            if oldest_overdue_seconds is not None and (
-                not isinstance(oldest_overdue_seconds, (int, float))
-                or oldest_overdue_seconds < 0
-                or not _is_finite(oldest_overdue_seconds)
-            ):
-                raise ValueError("oldest_overdue_seconds must be a finite non-negative number")
+            _validate_optional_nonnegative_number(oldest_overdue_seconds, "oldest_overdue_seconds")
+            _validate_optional_nonnegative_number(queue_age_seconds, "queue_age_seconds")
+            if predicted_kind is not None and not isinstance(predicted_kind, DemandKind):
+                raise TypeError("predicted_kind must be a DemandKind")
+            if selection_match is not None and not isinstance(selection_match, bool):
+                raise TypeError("selection_match must be a boolean")
             normalized_reason = _normalize_reason(reason)
-            key = (demand_kind, acquisition_kind, normalized_outcome)
+            key = (demand_kind, acquisition_kind, normalized_outcome, predicted_kind, selection_match)
             with self._state_lock:
                 aggregate = self._demand_aggregates.setdefault(key, _DemandAggregate())
                 aggregate.add(
                     demand_units=demand_units,
                     actual_attempts=actual_attempts,
                     oldest_overdue_seconds=oldest_overdue_seconds,
+                    queue_age_seconds=queue_age_seconds,
                     reason=normalized_reason,
                 )
             self.flush_if_due()
@@ -257,30 +263,35 @@ class RpcAdmissionObservationAggregator:
                     source.value,
                     service_class.value,
                 )
-        for (demand_kind, acquisition_kind, outcome), aggregate in demand_aggregates.items():
+        for (
+            demand_kind,
+            acquisition_kind,
+            outcome,
+            predicted_kind,
+            selection_match,
+        ), demand_aggregate in demand_aggregates.items():
             try:
-                payload = {
-                    "demand_kind": demand_kind.value,
-                    "demand_units": aggregate.demand_units,
-                    "actual_attempts": aggregate.actual_attempts,
-                    "window_seconds": self._summary_interval_seconds,
-                }
-                if acquisition_kind is not None:
-                    payload["acquisition_kind"] = acquisition_kind.value
-                if aggregate.oldest_overdue_seconds is not None:
-                    payload["oldest_overdue_seconds"] = aggregate.oldest_overdue_seconds
+                payload = _demand_payload(
+                    demand_kind=demand_kind,
+                    acquisition_kind=acquisition_kind,
+                    aggregate=demand_aggregate,
+                    predicted_kind=predicted_kind,
+                    selection_match=selection_match,
+                    window_seconds=self._summary_interval_seconds,
+                )
                 self._recorder.record(
                     kind="telegram.demand",
                     outcome=outcome.value,
-                    reason_code=aggregate.reason,
+                    reason_code=demand_aggregate.reason,
                     result_count=None,
                     payload=payload,
                 )
             except Exception:
                 with self._state_lock:
-                    self._demand_aggregates.setdefault((demand_kind, acquisition_kind, outcome), _DemandAggregate()).merge(
-                        aggregate
-                    )
+                    self._demand_aggregates.setdefault(
+                        (demand_kind, acquisition_kind, outcome, predicted_kind, selection_match),
+                        _DemandAggregate(),
+                    ).merge(demand_aggregate)
                 logger.exception(
                     "demand_observation_flush_failed demand_kind=%s acquisition_kind=%s outcome=%s",
                     demand_kind.value,
@@ -320,6 +331,7 @@ class _DemandAggregate:
     demand_units: int = 0
     actual_attempts: int = 0
     oldest_overdue_seconds: float | None = None
+    queue_age_seconds: float | None = None
     reason: str | None = None
 
     def add(
@@ -328,12 +340,15 @@ class _DemandAggregate:
         demand_units: int,
         actual_attempts: int,
         oldest_overdue_seconds: float | None,
+        queue_age_seconds: float | None,
         reason: str | None,
     ) -> None:
         self.demand_units += demand_units
         self.actual_attempts += actual_attempts
         if oldest_overdue_seconds is not None:
             self.oldest_overdue_seconds = max(self.oldest_overdue_seconds or 0.0, oldest_overdue_seconds)
+        if queue_age_seconds is not None:
+            self.queue_age_seconds = max(self.queue_age_seconds or 0.0, queue_age_seconds)
         if self.reason is None:
             self.reason = reason
 
@@ -342,8 +357,37 @@ class _DemandAggregate:
             demand_units=other.demand_units,
             actual_attempts=other.actual_attempts,
             oldest_overdue_seconds=other.oldest_overdue_seconds,
+            queue_age_seconds=other.queue_age_seconds,
             reason=other.reason,
         )
+
+
+def _demand_payload(  # noqa: PLR0913 - serialization keeps every bounded dimension explicit
+    *,
+    demand_kind: DemandKind,
+    acquisition_kind: AcquisitionKind | None,
+    aggregate: _DemandAggregate,
+    predicted_kind: DemandKind | None,
+    selection_match: bool | None,
+    window_seconds: float,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "demand_kind": demand_kind.value,
+        "demand_units": aggregate.demand_units,
+        "actual_attempts": aggregate.actual_attempts,
+        "window_seconds": window_seconds,
+    }
+    if acquisition_kind is not None:
+        payload["acquisition_kind"] = acquisition_kind.value
+    if aggregate.oldest_overdue_seconds is not None:
+        payload["oldest_overdue_seconds"] = aggregate.oldest_overdue_seconds
+    if aggregate.queue_age_seconds is not None:
+        payload["queue_age_seconds"] = aggregate.queue_age_seconds
+    if predicted_kind is not None or selection_match is not None:
+        payload["predicted_kind"] = None if predicted_kind is None else predicted_kind.value
+    if selection_match is not None:
+        payload["selection_match"] = selection_match
+    return payload
 
 
 def _is_finite(value: int | float) -> bool:
@@ -353,6 +397,13 @@ def _is_finite(value: int | float) -> bool:
 def _validate_nonnegative_int(value: int, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
+
+
+def _validate_optional_nonnegative_number(value: float | None, name: str) -> None:
+    if value is not None and (
+        isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or not _is_finite(value)
+    ):
+        raise ValueError(f"{name} must be a finite non-negative number")
 
 
 def _normalize_demand_outcome(value: DemandEvidenceOutcome | str) -> DemandEvidenceOutcome:

@@ -140,15 +140,42 @@ def test_summary_reports_demand_units_capacity_and_overdue_reason(tmp_path: Path
                 ),
             ),
         )
+        conn.execute(
+            "INSERT INTO runtime_observations("
+            "observed_at_ms,kind,runtime_instance_id,outcome,reason_code,payload_json"
+            ") VALUES (?,?,?,?,?,?)",
+            (
+                int(now * 1000) - 2_000,
+                "telegram.demand",
+                "current",
+                "predicted_selection",
+                None,
+                json.dumps(
+                    {
+                        "demand_kind": "scheduled_discovery",
+                        "demand_units": 1,
+                        "actual_attempts": 0,
+                        "queue_age_seconds": 8.0,
+                        "predicted_kind": "scheduled_repair",
+                        "selection_match": False,
+                    }
+                ),
+            ),
+        )
         conn.commit()
 
     report = build_operator_summary(db_path, since_seconds=15 * 3600, now=now)
 
-    assert "Demand: offered=4, deferred=2, actual attempts=1, oldest overdue=3.5s, reasons=capacity=2" in report.text
+    assert (
+        "Demand: offered=4, predicted selection=1, deferred=2, actual attempts=1, selection matches=0, "
+        "mismatches=1, oldest queue age=8.0s, oldest overdue=3.5s, reasons=capacity=2" in report.text
+    )
     assert "scheduled_repair: offered=4, deferred=2" in report.text
 
 
-def test_summary_marks_window_unreliable_when_snapshot_reports_loss(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_summary_marks_window_unreliable_when_snapshot_reports_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     now = 2_000_000_000.0
     db_path = tmp_path / "sync.db"
     _database(db_path, now_ms=int(now * 1000))

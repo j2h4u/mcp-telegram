@@ -9,7 +9,15 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from types import MappingProxyType
 
-from mcp_telegram.telegram_demand import DemandStatus, DemandToken, DurableDemandAdapter, demand_context
+from mcp_telegram.telegram_demand import (
+    DemandPrediction,
+    DemandStatus,
+    DemandToken,
+    DurableDemandAdapter,
+    RpcAttemptEvidence,
+    create_demand_token,
+    demand_context,
+)
 from mcp_telegram.telegram_rpc_consumers import (
     TELEGRAM_DEMAND_CONTRACTS,
     DemandContract,
@@ -60,6 +68,10 @@ class TelegramDemandCoordinator:
         self._clock = clock
         self._ready = deque[DemandKind]()
         self._ready_set: set[DemandKind] = set()
+        self._ready_since: dict[DemandKind, float] = {}
+        self._held: set[DemandKind] = set()
+        self._authoritative_ready: set[DemandKind] = set()
+        self._active_cycles: dict[int, tuple[RpcAttemptEvidence, DemandPrediction]] = {}
         self._offered: set[DemandKind] = set()
         self._statuses: dict[DemandKind, DemandStatus] = {}
         self._next_release_at: float | None = None
@@ -79,6 +91,11 @@ class TelegramDemandCoordinator:
     def statuses(self) -> Mapping[DemandKind, DemandStatus]:
         """Return the latest immutable status snapshot for kinds with work."""
         return MappingProxyType(dict(self._statuses))
+
+    @property
+    def authoritative_ready_kinds(self) -> tuple[DemandKind, ...]:
+        """Return ready domain kinds, including a head held for comparison."""
+        return tuple(kind for kind in DemandKind if kind in self._authoritative_ready)
 
     @property
     def next_release_at(self) -> float | None:
@@ -114,13 +131,40 @@ class TelegramDemandCoordinator:
             raise TypeError("kind must be a DemandKind")
         if demand_contract(kind).execution_mode is not ExecutionMode.DURABLE:
             raise RuntimeError(f"{kind.value} is not registered for durable execution")
-        if kind in self._ready_set or kind in self._offered:
+        if kind in self._ready_set or kind in self._held or kind in self._offered:
             return False
         self._offered.add(kind)
         now = self._now()
         self._refresh_kind(kind, now)
         self._recompute_next_release(now)
         return True
+
+    def begin_cycle(self, kind: DemandKind) -> DemandToken:
+        """Pop one predicted FIFO head and create the actual cycle root token."""
+        if not isinstance(kind, DemandKind):
+            raise TypeError("kind must be a DemandKind")
+        if demand_contract(kind).execution_mode is not ExecutionMode.DURABLE:
+            raise RuntimeError(f"{kind.value} is not registered for durable execution")
+        now = self._now()
+        predicted_kind = self._ready.popleft() if self._ready else None
+        queue_age: float | None = None
+        overdue: float | None = None
+        if predicted_kind is not None:
+            self._ready_set.remove(predicted_kind)
+            queued_at = self._ready_since.pop(predicted_kind)
+            queue_age = max(0.0, now - queued_at)
+            overdue_value = self._statuses[predicted_kind].overdue_seconds(now)
+            overdue = overdue_value if overdue_value > 0 else None
+            self._held.add(predicted_kind)
+        prediction = DemandPrediction(
+            predicted_kind=predicted_kind,
+            selected_at=now,
+            queue_age_seconds=queue_age,
+            overdue_seconds=overdue,
+        )
+        token = create_demand_token(kind, prediction=prediction)
+        self._active_cycles[id(token.attempt_evidence)] = (token.attempt_evidence, prediction)
+        return token
 
     def scan(self, *, now: float | None = None) -> tuple[DemandKind, ...]:
         """Reconstruct all shadow readiness from authoritative domain state."""
@@ -136,9 +180,54 @@ class TelegramDemandCoordinator:
         """Scan all adapters when a timer or periodic safety wakeup fires."""
         return self.scan(now=now)
 
-    def after_cycle_scan(self, *, now: float | None = None) -> tuple[DemandKind, ...]:
-        """Scan all adapters after a legacy execution cycle reports an outcome."""
-        return self.scan(now=now)
+    def after_cycle_scan(
+        self,
+        token: DemandToken | None = None,
+        *,
+        actual_kind: DemandKind | None = None,
+        now: float | None = None,
+    ) -> tuple[DemandKind, ...]:
+        """Rescan after a cycle and rotate its predicted head if still ready."""
+        if token is None:
+            if actual_kind is not None:
+                raise TypeError("actual_kind requires a cycle token")
+            return self.scan(now=now)
+        cycle_key, prediction = self._require_active_cycle(token, actual_kind)
+        observed_at = self._now() if now is None else self._validate_now(now)
+        self.scan(now=observed_at)
+        self._active_cycles.pop(cycle_key)
+        self._release_prediction(prediction, observed_at)
+        self._recompute_next_release(observed_at)
+        return self.ready_kinds
+
+    def _require_active_cycle(
+        self,
+        token: DemandToken,
+        actual_kind: DemandKind | None,
+    ) -> tuple[int, DemandPrediction]:
+        if not isinstance(token, DemandToken):
+            raise TypeError("token must be a DemandToken")
+        if actual_kind is None:
+            raise TypeError("actual_kind is required with a cycle token")
+        if not isinstance(actual_kind, DemandKind):
+            raise TypeError("actual_kind must be a DemandKind")
+        if token.kind is not actual_kind:
+            raise ValueError("actual_kind conflicts with the cycle root token")
+        cycle_key = id(token.attempt_evidence)
+        active = self._active_cycles.get(cycle_key)
+        if active is None or active[0] is not token.attempt_evidence:
+            raise RuntimeError("cycle token is unknown or already completed")
+        return cycle_key, active[1]
+
+    def _release_prediction(self, prediction: DemandPrediction, observed_at: float) -> None:
+        predicted_kind = prediction.predicted_kind
+        if predicted_kind is not None:
+            self._held.remove(predicted_kind)
+            status = self._statuses.get(predicted_kind)
+            if status is not None and status.is_ready(observed_at):
+                self._ready.append(predicted_kind)
+                self._ready_set.add(predicted_kind)
+                self._ready_since[predicted_kind] = observed_at
 
     def _now(self) -> float:
         return self._validate_now(self._clock())
@@ -155,14 +244,18 @@ class TelegramDemandCoordinator:
             raise TypeError(f"durable adapter {kind.value} returned an invalid status")
         if status is None:
             self._statuses.pop(kind, None)
+            self._authoritative_ready.discard(kind)
             self._remove_ready(kind)
             return
         self._statuses[kind] = status
         if status.is_ready(now):
-            if kind not in self._ready_set:
+            self._authoritative_ready.add(kind)
+            if kind not in self._ready_set and kind not in self._held:
                 self._ready.append(kind)
                 self._ready_set.add(kind)
+                self._ready_since[kind] = now
         else:
+            self._authoritative_ready.discard(kind)
             self._remove_ready(kind)
 
     def _remove_ready(self, kind: DemandKind) -> None:
@@ -170,6 +263,7 @@ class TelegramDemandCoordinator:
             return
         self._ready_set.remove(kind)
         self._ready.remove(kind)
+        self._ready_since.pop(kind, None)
 
     def _recompute_next_release(self, now: float) -> None:
         future_releases = [status.release_at for status in self._statuses.values() if status.release_at > now]

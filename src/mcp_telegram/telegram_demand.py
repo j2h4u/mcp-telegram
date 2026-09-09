@@ -41,6 +41,36 @@ class AcquisitionKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class DemandPrediction:
+    """Content-free shadow selection evidence attached to one legacy cycle."""
+
+    predicted_kind: DemandKind | None
+    selected_at: float
+    queue_age_seconds: float | None
+    overdue_seconds: float | None
+
+    def __post_init__(self) -> None:
+        _validate_timestamp(self.selected_at, "selected_at")
+        for value, name in (
+            (self.queue_age_seconds, "queue_age_seconds"),
+            (self.overdue_seconds, "overdue_seconds"),
+        ):
+            if value is not None:
+                _validate_timestamp(value, name)
+
+
+@dataclass(slots=True, eq=False)
+class RpcAttemptEvidence:
+    """Mutable, non-enforcing count of real sends attributed to one root."""
+
+    actual_attempts: int = 0
+
+    def record_dispatch(self) -> None:
+        """Record one sender dispatch without changing transport behavior."""
+        self.actual_attempts += 1
+
+
+@dataclass(frozen=True, slots=True)
 class DemandToken:
     """Opaque, process-local causal identity inherited by nested helpers."""
 
@@ -50,6 +80,8 @@ class DemandToken:
     admission_deadline: float
     acquisition_kind: AcquisitionKind | None
     owner_task: asyncio.Task[object] | None
+    attempt_evidence: RpcAttemptEvidence
+    prediction: DemandPrediction | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,24 +204,40 @@ def _validate_token(token: DemandToken) -> None:
     contract = demand_contract(token.kind)
     if token.source is not contract.source or token.service_class is not contract.service_class:
         raise ValueError("demand token conflicts with its registered root contract")
+    if not isinstance(token.attempt_evidence, RpcAttemptEvidence):
+        raise TypeError("demand token must carry RPC attempt evidence")
 
 
-@contextmanager
-def demand_context(kind: DemandKind, *, deadline: float | None = None) -> Iterator[DemandToken]:
-    """Install one registered root identity for caller- or protocol-owned work."""
+def create_demand_token(
+    kind: DemandKind,
+    *,
+    deadline: float | None = None,
+    prediction: DemandPrediction | None = None,
+) -> DemandToken:
+    """Create an uninstalled root token for explicit cycle transfer."""
     if not isinstance(kind, DemandKind):
         raise TypeError("kind must be a DemandKind")
-    if _DEMAND_CONTEXT.get() is not None:
-        raise RuntimeError("nested root demand is invalid; use acquisition_context for nested helpers")
+    if prediction is not None and not isinstance(prediction, DemandPrediction):
+        raise TypeError("prediction must be DemandPrediction")
     contract = demand_contract(kind)
-    token = DemandToken(
+    return DemandToken(
         kind=kind,
         source=contract.source,
         service_class=contract.service_class,
         admission_deadline=resolve_admission_deadline(contract, deadline, now=time.monotonic()),
         acquisition_kind=None,
         owner_task=_current_task(),
+        attempt_evidence=RpcAttemptEvidence(),
+        prediction=prediction,
     )
+
+
+@contextmanager
+def demand_context(kind: DemandKind, *, deadline: float | None = None) -> Iterator[DemandToken]:
+    """Install one registered root identity for caller- or protocol-owned work."""
+    if _DEMAND_CONTEXT.get() is not None:
+        raise RuntimeError("nested root demand is invalid; use acquisition_context for nested helpers")
+    token = create_demand_token(kind, deadline=deadline)
     reset_token = _DEMAND_CONTEXT.set(token)
     try:
         yield token

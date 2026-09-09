@@ -165,6 +165,69 @@ def test_shadow_records_transitions_and_never_executes_adapters() -> None:
     assert all(not adapter.run_calls for adapter in adapters.values())
 
 
+def test_shadow_compares_predictions_and_records_cycle_attempts_and_outcomes() -> None:
+    adapters = _shadow_adapters()
+    adapters[DemandKind.SCHEDULED_REPAIR].current_status = DemandStatus(
+        release_at=50.0,
+        freshness_deadline=75.0,
+    )
+    adapters[DemandKind.SCHEDULED_DISCOVERY].current_status = DemandStatus(release_at=50.0)
+    observer = _Observer()
+    shadow = TelegramDemandShadow(adapters, asyncio.Event(), observer=observer, clock=lambda: 100.0)
+
+    completed = shadow.begin_cycle(DemandKind.SCHEDULED_REPAIR)
+    completed.attempt_evidence.record_dispatch()
+    completed.attempt_evidence.record_dispatch()
+    adapters[DemandKind.SCHEDULED_REPAIR].current_status = None
+    shadow.after_cycle_scan(
+        completed,
+        actual_kind=DemandKind.SCHEDULED_REPAIR,
+        outcome=DemandEvidenceOutcome.COMPLETED,
+    )
+
+    deferred = shadow.begin_cycle(DemandKind.SCHEDULED_REPAIR)
+    shadow.after_cycle_scan(
+        deferred,
+        actual_kind=DemandKind.SCHEDULED_REPAIR,
+        outcome=DemandEvidenceOutcome.DEFERRED,
+        reason="capacity",
+    )
+
+    failed = shadow.begin_cycle(DemandKind.SCHEDULED_DISCOVERY)
+    failed.attempt_evidence.record_dispatch()
+    shadow.after_cycle_scan(
+        failed,
+        actual_kind=DemandKind.SCHEDULED_DISCOVERY,
+        outcome=DemandEvidenceOutcome.FAILED,
+        reason="transport",
+    )
+
+    cycles = [
+        event
+        for event in observer.events
+        if event["outcome"]
+        in {
+            DemandEvidenceOutcome.PREDICTED_SELECTION,
+            DemandEvidenceOutcome.COMPLETED,
+            DemandEvidenceOutcome.DEFERRED,
+            DemandEvidenceOutcome.FAILED,
+        }
+    ]
+    predicted, terminal, mismatch, deferred_terminal, matched_again, failed_terminal = cycles
+    assert predicted["predicted_kind"] is DemandKind.SCHEDULED_REPAIR
+    assert predicted["selection_match"] is True
+    assert terminal["actual_attempts"] == 2
+    assert terminal["oldest_overdue_seconds"] == 25.0
+    assert mismatch["predicted_kind"] is DemandKind.SCHEDULED_DISCOVERY
+    assert mismatch["selection_match"] is False
+    assert deferred_terminal["actual_attempts"] == 0
+    assert deferred_terminal["reason"] == "capacity"
+    assert matched_again["selection_match"] is True
+    assert failed_terminal["actual_attempts"] == 1
+    assert failed_terminal["reason"] == "transport"
+    assert all(not adapter.run_calls for adapter in adapters.values())
+
+
 def test_shadow_status_failures_are_bounded_and_do_not_block_scans() -> None:
     adapters = _shadow_adapters()
     adapters[DemandKind.SCHEDULED_REPAIR].fail_status = True
