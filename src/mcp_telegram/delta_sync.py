@@ -18,7 +18,7 @@ import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import wraps
 from typing import Protocol, TypedDict, Unpack, cast
 
@@ -195,6 +195,7 @@ class _DeltaSyncClient(Protocol):
 class _DeltaFetchOutcome:
     rows: list[ExtractedMessage]
     result: int | None = None
+    completed: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,25 +573,40 @@ class DeltaSyncWorker:
         return len(new_message_rows)
 
     @_delta_rpc_scope(DemandKind.DELTA_GAP_FILL, AcquisitionKind.MESSAGE_HISTORY_PAGE)
-    async def fetch_delta_slice_for_dialog(self, dialog_id: int) -> int:  # noqa: PLR0911, PLR0912
+    async def fetch_delta_slice_for_dialog(self, dialog_id: int) -> int:
         """Fetch and commit one resumable forward-history page."""
+        self._reset_delta_slice_state()
+        if not full_history_enabled(self._conn, dialog_id):
+            return 0
+        max_known_id = self._max_known_message_id(dialog_id)
+        if max_known_id == 0:
+            self._complete_empty_delta_slice(dialog_id)
+            return 0
+
+        outcome = await self._collect_delta_slice(dialog_id, max_known_id)
+        if outcome.result is not None:
+            return outcome.result
+        return self._commit_delta_slice(dialog_id, outcome)
+
+    def _reset_delta_slice_state(self) -> None:
         self._last_fetch_admission_deferred = False
         self._last_delta_slice_completed = False
         self._last_delta_slice_succeeded = False
-        if not full_history_enabled(self._conn, dialog_id):
-            return 0
+
+    def _max_known_message_id(self, dialog_id: int) -> int:
         row = cast(
             tuple[object | None, ...] | None,
             self._conn.execute(_SELECT_MAX_MESSAGE_ID_SQL, (dialog_id,)).fetchone(),
         )
-        max_known_id = _row_first_int(row)
-        if max_known_id == 0:
-            with self._conn:
-                self._stamp_delta_checked(dialog_id, int(time.time()))
-            self._last_delta_slice_completed = True
-            self._last_delta_slice_succeeded = True
-            return 0
+        return _row_first_int(row)
 
+    def _complete_empty_delta_slice(self, dialog_id: int) -> None:
+        with self._conn:
+            self._stamp_delta_checked(dialog_id, int(time.time()))
+        self._last_delta_slice_completed = True
+        self._last_delta_slice_succeeded = True
+
+    async def _collect_delta_slice(self, dialog_id: int, max_known_id: int) -> _DeltaFetchOutcome:
         rows: list[ExtractedMessage] = []
         completed = True
         try:
@@ -606,35 +622,37 @@ class DeltaSyncWorker:
                 rows.append(extract_message_row(dialog_id, message))
         except TelegramRpcAdmissionDeferred:
             self._last_fetch_admission_deferred = True
-            return 0
+            return _DeltaFetchOutcome([], 0)
         except RpcAdmissionSaturatedError, RpcAdmissionExpiredError:
             self._last_fetch_admission_deferred = True
-            return 0
+            return _DeltaFetchOutcome([], 0)
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
-            return 0
+            return _DeltaFetchOutcome([], 0)
         except ACCESS_LOST_ERRORS as exc:
             set_access_lost(self._conn, dialog_id, int(time.time()), reason=type(exc).__name__)
             self._conn.commit()
-            return 0
+            return _DeltaFetchOutcome([], 0)
         except RPCError as exc:
             logger.warning("delta_slice_rpc_error dialog_id=%d error=%s", dialog_id, exc)
-            return 0
+            return _DeltaFetchOutcome([], 0)
+        return _DeltaFetchOutcome(rows, completed=completed)
 
-        continuation_required = not completed or len(rows) == _DELTA_SLICE_MESSAGE_LIMIT
+    def _commit_delta_slice(self, dialog_id: int, outcome: _DeltaFetchOutcome) -> int:
+        continuation_required = not outcome.completed or len(outcome.rows) == _DELTA_SLICE_MESSAGE_LIMIT
         now = int(time.time())
         with self._conn:
             if not full_history_enabled(self._conn, dialog_id):
                 return 0
-            if rows:
-                insert_messages_with_fts(self._conn, rows, priority=HydrationPriority.BACKFILL)
+            if outcome.rows:
+                insert_messages_with_fts(self._conn, outcome.rows, priority=HydrationPriority.BACKFILL)
             if continuation_required:
                 self._conn.execute(_REQUEST_DELTA_CONTINUATION_SQL, (now, dialog_id, dialog_id))
             else:
                 self._stamp_delta_checkpoint(dialog_id, now)
         self._last_delta_slice_completed = not continuation_required
         self._last_delta_slice_succeeded = True
-        return len(rows)
+        return len(outcome.rows)
 
 
 class DeltaGapFillDemandAdapter:
@@ -961,9 +979,15 @@ class DeltaAccessProbeDemandAdapter:
                     return
                 await self._run_probe_slice()
 
-    async def _run_probe_slice(self) -> None:  # noqa: PLR0911 - each Telegram outcome persists distinct state
+    async def _run_probe_slice(self) -> None:
         now = int(time.time())
-        policy = replace(self._policy, max_dialogs_per_cycle=1, probe_pause_seconds=0.0)
+        dialog_id = self._due_probe_dialog_id(now)
+        if dialog_id is None:
+            return
+        await self._probe_dialog_for_recovery(dialog_id, now)
+
+    def _due_probe_dialog_id(self, now: int) -> int | None:
+        policy = self._policy
         row = cast(
             tuple[int] | None,
             self._worker._conn.execute(
@@ -984,41 +1008,70 @@ class DeltaAccessProbeDemandAdapter:
                 (policy.cooldown_seconds, now, policy.cooldown_seconds),
             ).fetchone(),
         )
-        if row is None:
-            return
-        dialog_id = row[0]
+        return None if row is None else row[0]
+
+    async def _request_probe(self, dialog_id: int) -> object:
+        with acquisition_context(AcquisitionKind.MESSAGE_LOOKUP):
+            with rpc_scope(TelegramRpcSource.DELTA_SYNC):
+                return await self._worker._client.get_messages(entity=dialog_id, limit=1)
+
+    async def _probe_dialog_for_recovery(self, dialog_id: int, now: int) -> None:
         try:
-            with acquisition_context(AcquisitionKind.MESSAGE_LOOKUP):
-                with rpc_scope(TelegramRpcSource.DELTA_SYNC):
-                    result = await self._worker._client.get_messages(entity=dialog_id, limit=1)
+            result = await self._request_probe(dialog_id)
         except RpcAttemptBudgetExhaustedError:
             return
         except RpcAdmissionClosedError:
             raise
-        except TelegramRpcAdmissionDeferred as exc:
-            retry = max(1, int(exc.retry_after_seconds or 1))
-            stamp_access_revalidation(self._worker._conn, dialog_id, now, retry)
-            self._worker._conn.commit()
+        except (
+            TelegramRpcAdmissionDeferred,
+            RpcAdmissionSaturatedError,
+            RpcAdmissionExpiredError,
+            TelegramRpcThrottled,
+            TimeoutError,
+            OSError,
+        ) as exc:
+            self._handle_probe_error(dialog_id, now, exc)
             return
-        except RpcAdmissionSaturatedError, RpcAdmissionExpiredError:
+        except ACCESS_LOST_ERRORS as exc:
+            self._handle_probe_error(dialog_id, now, exc)
             return
-        except ACCESS_LOST_ERRORS:
-            stamp_access_revalidation(self._worker._conn, dialog_id, now, policy.cooldown_seconds)
-            self._worker._conn.commit()
-            return
-        except TelegramRpcThrottled as exc:
-            _raise_if_latched(exc)
-            retry = max(policy.cooldown_seconds, exc.retry_after_seconds or policy.cooldown_seconds)
-            stamp_access_revalidation(self._worker._conn, dialog_id, now, retry)
-            self._worker._conn.commit()
-            return
-        except (RPCError, TimeoutError, OSError) as exc:
-            logger.warning("access_probe_slice_error dialog_id=%d error=%s", dialog_id, exc)
-            stamp_access_revalidation(self._worker._conn, dialog_id, now, policy.cooldown_seconds)
-            self._worker._conn.commit()
+        except RPCError as exc:
+            self._handle_probe_error(dialog_id, now, exc)
             return
 
         total_messages = cast(int | None, getattr(result, "total", None))
+        self._persist_probe_success(dialog_id, now, total_messages)
+
+    def _handle_probe_error(self, dialog_id: int, now: int, exc: BaseException) -> None:
+        conn = self._worker._conn
+        if isinstance(exc, (TelegramRpcAdmissionDeferred, RpcAdmissionSaturatedError, RpcAdmissionExpiredError)):
+            logger.info(
+                "access_probe admission_deferred dialog_id=%d error_type=%s — preserving revalidation budget",
+                dialog_id,
+                type(exc).__name__,
+            )
+            if isinstance(exc, TelegramRpcAdmissionDeferred):
+                retry = max(1, int(exc.retry_after_seconds or 1))
+                stamp_access_revalidation(conn, dialog_id, now, retry)
+                conn.commit()
+            return
+        if isinstance(exc, ACCESS_LOST_ERRORS):
+            logger.debug("access_still_lost dialog_id=%d", dialog_id)
+            stamp_access_revalidation(conn, dialog_id, now, self._policy.cooldown_seconds)
+            conn.commit()
+            return
+        if isinstance(exc, TelegramRpcThrottled):
+            _raise_if_latched(exc)
+            retry = max(self._policy.cooldown_seconds, exc.retry_after_seconds or self._policy.cooldown_seconds)
+            stamp_access_revalidation(conn, dialog_id, now, retry)
+            conn.commit()
+            return
+        error_kind = "probe_rpc_error" if isinstance(exc, RPCError) else "probe_network_error"
+        logger.warning("%s dialog_id=%d error=%s", error_kind, dialog_id, exc)
+        stamp_access_revalidation(conn, dialog_id, now, self._policy.cooldown_seconds)
+        conn.commit()
+
+    def _persist_probe_success(self, dialog_id: int, now: int, total_messages: int | None) -> None:
         if not full_history_enabled(self._worker._conn, dialog_id):
             _restore_revalidated_access(
                 self._worker._conn,
