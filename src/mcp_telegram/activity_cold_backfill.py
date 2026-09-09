@@ -26,6 +26,8 @@ import logging
 import math
 import sqlite3
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, cast
@@ -39,11 +41,33 @@ from .activity_peer_sweep import (
 from .activity_substrate import ActivityClient
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
-from .telegram_demand import AcquisitionKind, DemandStatus, DurableDemandAdapter, RpcAttemptBudget
+from .telegram_demand import (
+    AcquisitionKind,
+    DemandStatus,
+    DurableDemandAdapter,
+    RpcAttemptBudget,
+    UnclassifiedTelegramDemandError,
+    current_demand_token,
+    demand_context,
+)
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_attempt_budget, rpc_scope
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _cold_demand_scope() -> Iterator[None]:
+    """Install the cold-page root for direct legacy or adapter execution."""
+    try:
+        token = current_demand_token()
+    except UnclassifiedTelegramDemandError:
+        with demand_context(DemandKind.COLD_PEER_PAGE):
+            yield
+        return
+    if token.kind is not DemandKind.COLD_PEER_PAGE:
+        raise RuntimeError(f"active demand kind {token.kind.value} cannot execute cold peer page")
+    yield
 
 
 class _ColdBackfillScheduling(Protocol):
@@ -219,12 +243,13 @@ async def _maybe_enroll_activity_peers(
         return last_enroll_at, None
 
     try:
-        with rpc_scope(
-            TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
-            timeout_seconds=timeout_s,
-            acquisition_kind=AcquisitionKind.DIALOG_TRAVERSAL,
-        ):
-            result = await build_working_set(client, conn, timeout_s=timeout_s)
+        with _cold_demand_scope():
+            with rpc_scope(
+                TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
+                timeout_seconds=timeout_s,
+                acquisition_kind=AcquisitionKind.DIALOG_TRAVERSAL,
+            ):
+                result = await build_working_set(client, conn, timeout_s=timeout_s)
         logger.debug("activity_cold_backfill_enroll enrolled=%d", result.enrolled_count)
         return asyncio.get_running_loop().time(), result.flood_wait_seconds
     except TelegramRpcThrottled as exc:
@@ -389,6 +414,25 @@ def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfill
 
 
 async def run_cold_backfill_pass(
+    client: ActivityClient,
+    conn: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+    *,
+    pacing: ColdBackfillPacing,
+    timeout_s: float,
+) -> ColdPassResult:
+    """Run one cold peer-page operation under its precise durable root."""
+    with _cold_demand_scope():
+        return await _run_cold_backfill_pass(
+            client,
+            conn,
+            shutdown_event,
+            pacing=pacing,
+            timeout_s=timeout_s,
+        )
+
+
+async def _run_cold_backfill_pass(
     client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,

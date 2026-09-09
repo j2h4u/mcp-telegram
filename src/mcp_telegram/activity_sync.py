@@ -83,13 +83,14 @@ class ArchiveBackfillDemandAdapter(DurableDemandAdapter):
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
         """Fetch and commit at most one backfill search page."""
-        with rpc_attempt_budget(budget):
-            await _run_backfill_slice(
-                self.client,
-                self.conn,
-                self.shutdown_event,
-                timeout_s=self.timeout_s,
-            )
+        with _archive_demand_scope(DemandKind.ARCHIVE_BACKFILL):
+            with rpc_attempt_budget(budget):
+                await _run_backfill_slice(
+                    self.client,
+                    self.conn,
+                    self.shutdown_event,
+                    timeout_s=self.timeout_s,
+                )
 
 
 @dataclass(slots=True)
@@ -121,13 +122,14 @@ class ArchiveIncrementalDemandAdapter(DurableDemandAdapter):
         status = self.status(time.time())
         if status is None or not status.is_ready(time.time()):
             return
-        with rpc_attempt_budget(budget):
-            await _run_incremental_slice(
-                self.client,
-                self.conn,
-                self.shutdown_event,
-                timeout_s=self.timeout_s,
-            )
+        with _archive_demand_scope(DemandKind.ARCHIVE_INCREMENTAL):
+            with rpc_attempt_budget(budget):
+                await _run_incremental_slice(
+                    self.client,
+                    self.conn,
+                    self.shutdown_event,
+                    timeout_s=self.timeout_s,
+                )
 
 
 @dataclass
@@ -683,6 +685,18 @@ async def _run_backfill(
     *,
     timeout_s: float,
 ) -> None:
+    """Run the legacy archive backfill under its exact operation root."""
+    with _archive_demand_scope(DemandKind.ARCHIVE_BACKFILL):
+        await _run_backfill_in_scope(client, conn, shutdown_event, timeout_s=timeout_s)
+
+
+async def _run_backfill_in_scope(
+    client: ActivityClient,
+    conn: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+    *,
+    timeout_s: float,
+) -> None:
     state = _load_state(conn)
     if state.get("backfill_complete") == "1":
         logger.debug("activity_sync_backfill_skip reason=already_complete")
@@ -751,6 +765,18 @@ async def _run_backfill(
 
 
 async def _run_incremental(
+    client: ActivityClient,
+    conn: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+    *,
+    timeout_s: float,
+) -> None:
+    """Run the legacy incremental archive under its exact operation root."""
+    with _archive_demand_scope(DemandKind.ARCHIVE_INCREMENTAL):
+        await _run_incremental_in_scope(client, conn, shutdown_event, timeout_s=timeout_s)
+
+
+async def _run_incremental_in_scope(
     client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,

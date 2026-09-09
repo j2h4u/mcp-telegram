@@ -45,7 +45,9 @@ from mcp_telegram.activity_peer_sweep import (
     enroll_activity_dialog,
 )
 from mcp_telegram.sync_db import _apply_migrations
-from mcp_telegram.telegram_demand import RpcAttemptBudget
+from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
+from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 
 _TEST_TIMEOUT_S = 120.0
 
@@ -390,6 +392,28 @@ async def test_cold_adapter_runs_one_peer_page(monkeypatch: pytest.MonkeyPatch) 
 
         assert calls[dialog_id] == [(0, 0)]
         assert _get_state(conn, dialog_id)["cold_offset_id"] == 50
+
+
+@pytest.mark.asyncio
+async def test_legacy_cold_pass_installs_exact_root_and_nested_acquisition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _make_db() as conn:
+        dialog_id = -100100000024
+        _enroll(conn, dialog_id)
+        observed: list[tuple[DemandKind | None, AcquisitionKind | None]] = []
+
+        async def _capture_scope(*args: object, **kwargs: object) -> SweepResult:
+            del args, kwargs
+            scope = current_rpc_scope()
+            observed.append((scope.demand_kind, scope.acquisition_kind))
+            return _normal_result([70, 80])
+
+        monkeypatch.setattr("mcp_telegram.activity_cold_backfill.sweep_peer_once", _capture_scope)
+
+        await run_cold_backfill_pass(_FakeClient(), conn, asyncio.Event(), pacing=_PACING, timeout_s=_TEST_TIMEOUT_S)
+
+        assert observed == [(DemandKind.COLD_PEER_PAGE, AcquisitionKind.MESSAGE_SEARCH_PAGE)]
 
 
 # ---------------------------------------------------------------------------

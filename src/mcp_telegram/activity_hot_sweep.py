@@ -14,6 +14,8 @@ import logging
 import math
 import sqlite3
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Protocol, cast
 
@@ -36,7 +38,9 @@ from .telegram_demand import (
     DurableDemandAdapter,
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
+    UnclassifiedTelegramDemandError,
     acquisition_context,
+    current_demand_token,
     demand_context,
 )
 from .telegram_rpc_consumers import DemandKind
@@ -119,6 +123,20 @@ class HotSweepPolicy(Protocol):
 
     @property
     def initial_spread_seconds(self) -> float: ...
+
+
+@contextmanager
+def _hot_demand_scope() -> Iterator[None]:
+    """Install the exact hot-page root for a legacy pass."""
+    try:
+        token = current_demand_token()
+    except UnclassifiedTelegramDemandError:
+        with demand_context(DemandKind.HOT_ACTIVITY_PAGE):
+            yield
+        return
+    if token.kind is not DemandKind.HOT_ACTIVITY_PAGE:
+        raise RuntimeError(f"active demand kind {token.kind.value} cannot execute hot activity page")
+    yield
 
 
 @dataclass(frozen=True, slots=True)
@@ -1006,7 +1024,8 @@ async def run_hot_sweep_pass(
 ) -> dict[str, int | float | bool | None]:
     """Run one pass, turning local admission deferral into retry telemetry."""
     try:
-        return await _run_hot_sweep_pass(client, conn, shutdown_event, policy=policy, timeout_s=timeout_s)
+        with _hot_demand_scope():
+            return await _run_hot_sweep_pass(client, conn, shutdown_event, policy=policy, timeout_s=timeout_s)
     except TelegramRpcAdmissionDeferred as exc:
         logger.warning(
             "activity_hot_sweep_admission_deferred retry_after_seconds=%s",

@@ -27,7 +27,7 @@ from mcp_telegram.activity_sync import (
 )
 from mcp_telegram.hydration_queue import HydrationPriority
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_demand import RpcAttemptBudget
+from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcScope, current_rpc_scope
 
@@ -747,3 +747,19 @@ async def test_archive_incremental_adapter_resumes_from_key_value_state(conn: sq
     assert "incremental_min_date" not in final_state
     assert "incremental_offset_id" not in final_state
     assert int(final_state["last_sync_at"] or 0) > last_sync_at
+
+
+@pytest.mark.asyncio
+async def test_legacy_archive_operations_install_distinct_exact_roots(conn: sqlite3.Connection) -> None:
+    backfill_client = _FakeClient(batches=[FakeSearchResult(messages=[])])
+
+    await _run_backfill(backfill_client, conn, asyncio.Event(), timeout_s=_TEST_TIMEOUT_S)
+
+    assert backfill_client.scopes[0].demand_kind is DemandKind.ARCHIVE_BACKFILL
+    assert backfill_client.scopes[0].acquisition_kind is AcquisitionKind.MESSAGE_SEARCH_PAGE
+
+    incremental_client = _FakeClient(batches=[FakeSearchResult(messages=[])])
+    await _run_incremental(incremental_client, conn, asyncio.Event(), timeout_s=_TEST_TIMEOUT_S)
+
+    assert incremental_client.scopes[0].demand_kind is DemandKind.ARCHIVE_INCREMENTAL
+    assert incremental_client.scopes[0].acquisition_kind is AcquisitionKind.MESSAGE_SEARCH_PAGE

@@ -46,8 +46,9 @@ from mcp_telegram.activity_peer_sweep import (
 )
 from mcp_telegram.config import ActivityHotSweepConfig
 from mcp_telegram.sync_db import _apply_migrations
-from mcp_telegram.telegram_demand import RpcAttemptBudget
-from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred
+from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
+from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred, current_rpc_scope
 
 _TEST_TIMEOUT_S = 120.0
 _POLICY = ActivityHotSweepConfig(jitter_max_seconds=0)
@@ -280,6 +281,38 @@ async def test_stale_peer_not_selected(monkeypatch: pytest.MonkeyPatch) -> None:
         assert telemetry["extracted"] == 0
         assert stale_dialog_id not in call_log, "Stale peer must not be swept — it is outside the 30-day window"
         assert timeout_calls == [_TEST_TIMEOUT_S]
+
+
+@pytest.mark.asyncio
+async def test_legacy_hot_pass_installs_exact_root_for_nested_acquisitions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _make_db() as conn:
+        dialog_id = -100100000025
+        _enroll(conn, dialog_id, last_activity_at=int(time.time()))
+        observed: list[tuple[DemandKind | None, AcquisitionKind | None]] = []
+
+        async def capture_working_set(*args: object, **kwargs: object) -> WorkingSetResult:
+            del args, kwargs
+            scope = current_rpc_scope()
+            observed.append((scope.demand_kind, scope.acquisition_kind))
+            return WorkingSetResult(enrolled_count=0)
+
+        async def capture_page(*args: object, **kwargs: object) -> SweepResult:
+            del args, kwargs
+            scope = current_rpc_scope()
+            observed.append((scope.demand_kind, scope.acquisition_kind))
+            return _make_sweep_result([])
+
+        monkeypatch.setattr("mcp_telegram.activity_hot_sweep.build_working_set", capture_working_set)
+        monkeypatch.setattr("mcp_telegram.activity_hot_sweep.sweep_peer_once", capture_page)
+
+        await run_hot_sweep_pass(_FakeClient(), conn, asyncio.Event(), policy=_POLICY, timeout_s=_TEST_TIMEOUT_S)
+
+        assert observed == [
+            (DemandKind.HOT_ACTIVITY_PAGE, AcquisitionKind.DIALOG_TRAVERSAL),
+            (DemandKind.HOT_ACTIVITY_PAGE, AcquisitionKind.MESSAGE_SEARCH_PAGE),
+        ]
 
 
 @pytest.mark.asyncio
