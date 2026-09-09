@@ -8,7 +8,6 @@ projection by read tools.
 from __future__ import annotations
 
 import asyncio
-import logging
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -30,9 +29,6 @@ from .telegram_fact_queries import enrich_read_at
 from .telegram_reading import TelegramReadReceiptGateway
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import rpc_attempt_budget
-
-logger = logging.getLogger(__name__)
-
 
 _REACTION_CANDIDATES_SQL = """
 SELECT m.dialog_id, m.message_id
@@ -370,38 +366,3 @@ async def refresh_message_facts_once(
         reaction_refreshed=reaction_refreshed,
         read_at_candidates=len(read_at_messages),
     )
-
-
-async def run_message_fact_refresh_loop(
-    conn: sqlite3.Connection,
-    reaction_freshener: ReactionFreshener,
-    read_receipt_gateway: TelegramReadReceiptGateway,
-    shutdown_event: asyncio.Event,
-    policy: MessageFactRefreshPolicy,
-) -> None:
-    """Run low-priority optional fact acquisition until shutdown."""
-    if policy.reaction_max_messages_per_cycle <= 0 and policy.read_at_max_messages_per_cycle <= 0:
-        logger.info(
-            "message_fact_refresh_loop disabled — reaction_max_messages_per_cycle=%d read_at_max_messages_per_cycle=%d",
-            policy.reaction_max_messages_per_cycle,
-            policy.read_at_max_messages_per_cycle,
-        )
-        return
-
-    while not shutdown_event.is_set():
-        try:
-            result = await refresh_message_facts_once(
-                MessageFactRefreshDeps(conn, reaction_freshener, read_receipt_gateway),
-                policy,
-                shutdown_event=shutdown_event,
-            )
-            logger.debug(
-                "message_fact_refresh_cycle complete — reaction_candidates=%d reaction_refreshed=%d "
-                "read_at_candidates=%d",
-                result.reaction_candidates,
-                result.reaction_refreshed,
-                result.read_at_candidates,
-            )
-        except Exception:
-            logger.warning("message_fact_refresh_cycle failed", exc_info=True)
-        await _interruptible_pause(shutdown_event, policy.interval_seconds)

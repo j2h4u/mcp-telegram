@@ -1769,16 +1769,6 @@ def _build_message_fact_refresh_dependencies(ctx: _SyncMainContext) -> MessageFa
     )
 
 
-def _scan_demand_shadow(ctx: _SyncMainContext) -> None:
-    """Run an authoritative recovery scan outside a concrete legacy cycle."""
-    shadow = cast(TelegramDemandShadow | None, getattr(ctx, "demand_shadow", None))
-    if shadow is not None:
-        try:
-            shadow.after_cycle_scan()
-        except Exception:
-            logger.warning("telegram_demand_shadow_scan_failed", exc_info=True)
-
-
 async def _run_ctx_demand_cycle[T](
     ctx: _SyncMainContext,
     kind: DemandKind,
