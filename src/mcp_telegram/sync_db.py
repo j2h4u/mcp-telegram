@@ -11,6 +11,7 @@ from .dialog_classification import (
     is_bot_dialog_type,
     is_reserved_replies_username,
 )
+from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
 _CURRENT_SCHEMA_VERSION = 60
 _SCHEMA_VERSION_WITH_FTS = 3
@@ -30,8 +31,8 @@ _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
 
 # Product-owned scheduled reconciliation targets.  Keep these values here so
 # schema bootstrap and the legacy worker cannot drift apart.
-SCHEDULED_ACTIVE_REPAIR_SECONDS = 15 * 60
-SCHEDULED_QUIET_DISCOVERY_SECONDS = 24 * 60 * 60
+SCHEDULED_ACTIVE_REPAIR_SECONDS = demand_freshness_seconds(DemandKind.SCHEDULED_REPAIR)
+SCHEDULED_QUIET_DISCOVERY_SECONDS = demand_freshness_seconds(DemandKind.SCHEDULED_DISCOVERY)
 
 logger = logging.getLogger(__name__)
 

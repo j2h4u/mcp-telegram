@@ -837,6 +837,17 @@ def demand_contract(kind: DemandKind) -> DemandContract:
     return TELEGRAM_DEMAND_CONTRACTS[kind]
 
 
+def demand_freshness_seconds(kind: DemandKind) -> int:
+    """Return a durable demand freshness target as whole seconds."""
+    target = demand_contract(kind).freshness_target
+    if target is None:
+        raise ValueError(f"{kind.value} has no freshness target")
+    seconds = target.total_seconds()
+    if not math.isfinite(seconds) or seconds <= 0 or not seconds.is_integer():
+        raise ValueError(f"{kind.value} freshness target must be a positive whole number of seconds")
+    return int(seconds)
+
+
 __all__ = [
     "TELEGRAM_DEMAND_CONTRACTS",
     "TELEGRAM_RPC_CONSUMERS",
@@ -856,6 +867,7 @@ __all__ = [
     "TelegramRpcConsumerSpec",
     "TelegramRpcSource",
     "demand_contract",
+    "demand_freshness_seconds",
     "telegram_rpc_consumer",
     "validate_demand_contracts",
 ]

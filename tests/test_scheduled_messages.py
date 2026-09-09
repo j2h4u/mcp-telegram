@@ -38,7 +38,7 @@ from mcp_telegram.sync_db import (
     ensure_sync_schema,
 )
 from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
-from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_consumers import DemandKind, demand_contract
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 
 
@@ -489,8 +489,12 @@ async def test_concurrent_event_prevents_stale_snapshot_apply(conn: sqlite3.Conn
 
 def test_scheduled_policy_targets_have_one_code_owned_definition() -> None:
     policy = ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10)
-    assert SCHEDULED_ACTIVE_REPAIR_SECONDS == 15 * 60
-    assert SCHEDULED_QUIET_DISCOVERY_SECONDS == 24 * 60 * 60
+    repair_target = demand_contract(DemandKind.SCHEDULED_REPAIR).freshness_target
+    discovery_target = demand_contract(DemandKind.SCHEDULED_DISCOVERY).freshness_target
+    assert repair_target is not None
+    assert discovery_target is not None
+    assert int(repair_target.total_seconds()) == SCHEDULED_ACTIVE_REPAIR_SECONDS
+    assert int(discovery_target.total_seconds()) == SCHEDULED_QUIET_DISCOVERY_SECONDS
     assert not hasattr(policy, "active_repair_seconds")
     assert not hasattr(policy, "quiet_discovery_seconds")
 
@@ -586,9 +590,9 @@ async def test_scheduled_repair_adapter_runs_only_repair_rows_with_precise_scope
     assert client.scopes[0].demand_kind is DemandKind.SCHEDULED_REPAIR
     assert client.scopes[0].acquisition_kind is AcquisitionKind.SCHEDULED_MESSAGES_SNAPSHOT
     assert client.scopes[0].attempt_budget is budget
-    assert conn.execute(
-        "SELECT repair_due_at FROM scheduled_reconciliation_state WHERE dialog_id=42"
-    ).fetchone() == (None,)
+    assert conn.execute("SELECT repair_due_at FROM scheduled_reconciliation_state WHERE dialog_id=42").fetchone() == (
+        None,
+    )
 
 
 @pytest.mark.asyncio
@@ -614,9 +618,9 @@ async def test_scheduled_discovery_adapter_runs_only_discovery_rows_with_precise
     assert len(client.requests) == 1
     assert client.scopes[0].demand_kind is DemandKind.SCHEDULED_DISCOVERY
     assert client.scopes[0].acquisition_kind is AcquisitionKind.SCHEDULED_MESSAGES_SNAPSHOT
-    assert conn.execute(
-        "SELECT repair_due_at FROM scheduled_reconciliation_state WHERE dialog_id=42"
-    ).fetchone() == (None,)
+    assert conn.execute("SELECT repair_due_at FROM scheduled_reconciliation_state WHERE dialog_id=42").fetchone() == (
+        None,
+    )
 
 
 @pytest.mark.asyncio
