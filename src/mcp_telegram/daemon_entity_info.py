@@ -661,7 +661,7 @@ class DaemonEntityInfoService:
         full_chat = _attr(result, "full_chat", None)
         if full_chat is None:
             raise ValueError("full channel payload is missing")
-        patch = {
+        patch: dict[str, object] = {
             "about": _opt_str_attr(full_chat, "about"),
             "linked_chat_id": self._normalize_linked_chat_id(_opt_int_attr(full_chat, "linked_chat_id")),
             "pinned_msg_id": _opt_int_attr(full_chat, "pinned_msg_id"),
