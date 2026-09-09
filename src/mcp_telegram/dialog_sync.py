@@ -1319,9 +1319,7 @@ class DialogReconciliationWorker:
             self._record_full_pass_error(state, exc)
             raise
 
-    async def _run_full_pass_slice(
-        self, *, refresh_topics: bool, wait_on_throttle: bool
-    ) -> tuple[int, bool]:
+    async def _run_full_pass_slice(self, *, refresh_topics: bool, wait_on_throttle: bool) -> tuple[int, bool]:
         state = self._load_or_begin_full_generation()
         result = await self._consume_full_pass(
             state,
