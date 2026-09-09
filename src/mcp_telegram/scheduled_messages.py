@@ -412,6 +412,38 @@ def _retry_at(conn: sqlite3.Connection) -> int | None:
     return _as_int(row[0]) if row and row[0] is not None else None
 
 
+def _snapshot_message_ids(snapshot: Sequence[object]) -> set[int]:
+    return {int(cast(_ScheduledSnapshotMessage, message).id) for message in snapshot if getattr(message, "id", None)}
+
+
+def _missing_scheduled_ids(conn: sqlite3.Connection, dialog_id: int, snapshot_ids: set[int]) -> list[int]:
+    active_rows = cast(
+        list[tuple[object]],
+        conn.execute(
+            "SELECT message_id FROM scheduled_messages WHERE dialog_id=? AND message_state='scheduled'",
+            (dialog_id,),
+        ).fetchall(),
+    )
+    return [_as_int(row[0]) for row in active_rows if _as_int(row[0]) not in snapshot_ids]
+
+
+def _upsert_snapshot_messages(conn: sqlite3.Connection, dialog_id: int, snapshot: Sequence[object], now: int) -> None:
+    for message in snapshot:
+        if getattr(message, "id", None):
+            upsert_scheduled_message(conn, dialog_id, message, now=now, mark_dirty=False)
+
+
+def _has_active_scheduled_messages(conn: sqlite3.Connection, dialog_id: int) -> bool:
+    active = cast(
+        tuple[object] | None,
+        conn.execute(
+            "SELECT 1 FROM scheduled_messages WHERE dialog_id=? AND message_state='scheduled' LIMIT 1",
+            (dialog_id,),
+        ).fetchone(),
+    )
+    return active is not None
+
+
 class ScheduledMessageReconciler:
     """Durable per-dialog scheduled-history reconciliation worker."""
 
@@ -661,28 +693,11 @@ class ScheduledMessageReconciler:
             if current is None or _as_int(current[0]) != generation:
                 self._conn.rollback()
                 return None
-            snapshot_ids = {
-                int(cast(_ScheduledSnapshotMessage, message).id) for message in snapshot if getattr(message, "id", None)
-            }
-            active_rows = cast(
-                list[tuple[object]],
-                self._conn.execute(
-                    "SELECT message_id FROM scheduled_messages WHERE dialog_id=? AND message_state='scheduled'",
-                    (dialog_id,),
-                ).fetchall(),
-            )
-            missing_ids = [_as_int(row[0]) for row in active_rows if _as_int(row[0]) not in snapshot_ids]
-            for message in snapshot:
-                if getattr(message, "id", None):
-                    upsert_scheduled_message(self._conn, dialog_id, message, now=now, mark_dirty=False)
+            snapshot_ids = _snapshot_message_ids(snapshot)
+            missing_ids = _missing_scheduled_ids(self._conn, dialog_id, snapshot_ids)
+            _upsert_snapshot_messages(self._conn, dialog_id, snapshot, now)
             changed = mark_missing_from_snapshot(self._conn, dialog_id, missing_ids, now=now)
-            active = cast(
-                tuple[object] | None,
-                self._conn.execute(
-                    "SELECT 1 FROM scheduled_messages WHERE dialog_id=? AND message_state='scheduled' LIMIT 1",
-                    (dialog_id,),
-                ).fetchone(),
-            )
+            active = _has_active_scheduled_messages(self._conn, dialog_id)
             self._conn.execute(
                 """
                 UPDATE scheduled_reconciliation_state
@@ -728,38 +743,51 @@ class ScheduledMessageReconciler:
             )
         return True
 
-    async def _process_due_dialog(self, dialog_id: int, generation: int, discovery: bool, now: int) -> tuple[int, bool]:
-        if discovery:
-            try:
-                eligible = await self._discover_eligibility(dialog_id)
-            except TelegramRpcThrottled as exc:
-                _raise_if_latched(exc)
-                assert exc.retry_after_seconds is not None
-                retry_at = int(time.time()) + exc.retry_after_seconds
-                _record_retry(self._conn, retry_at, "TelegramRpcThrottled")
-                return 0, True
-            if eligible is None:
-                self._record_dialog_failure(dialog_id, "discovery", "classification_unavailable", now)
-                return 0, False
-            if not eligible and self._finish_excluded_discovery(dialog_id, now):
-                return 0, False
+    async def _prepare_discovery(self, dialog_id: int, now: int) -> tuple[int, bool] | None:
         try:
-            snapshot = await self._fetch_scheduled_snapshot(dialog_id)
+            eligible = await self._discover_eligibility(dialog_id)
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
             assert exc.retry_after_seconds is not None
-            retry_at = int(time.time()) + exc.retry_after_seconds
-            _record_retry(self._conn, retry_at, "TelegramRpcThrottled")
+            _record_retry(self._conn, int(time.time()) + exc.retry_after_seconds, "TelegramRpcThrottled")
+            return 0, True
+        if eligible is None:
+            self._record_dialog_failure(dialog_id, "discovery", "classification_unavailable", now)
+            return 0, False
+        if not eligible and self._finish_excluded_discovery(dialog_id, now):
+            return 0, False
+        return None
+
+    async def _fetch_snapshot_or_stop(
+        self, dialog_id: int, discovery: bool, now: int
+    ) -> tuple[list[object] | None, bool]:
+        try:
+            return await self._fetch_scheduled_snapshot(dialog_id), False
+        except TelegramRpcThrottled as exc:
+            _raise_if_latched(exc)
+            assert exc.retry_after_seconds is not None
+            wake_at = int(time.time()) + exc.retry_after_seconds
+            _record_retry(self._conn, wake_at, "TelegramRpcThrottled")
             logger.warning(
                 "scheduled_reconcile_flood_wait dialog_id=%d retry_at=%d — stopping account pass",
                 dialog_id,
-                retry_at,
+                wake_at,
             )
-            return 0, True
+            return None, True
         except RPCError as exc:
-            self._record_dialog_failure(dialog_id, "discovery" if discovery else "repair", type(exc).__name__, now)
+            kind = "discovery" if discovery else "repair"
+            self._record_dialog_failure(dialog_id, kind, type(exc).__name__, now)
             logger.warning("scheduled_reconcile_rpc_error dialog_id=%d error_type=%s", dialog_id, type(exc).__name__)
-            return 0, False
+            return None, False
+
+    async def _process_due_dialog(self, dialog_id: int, generation: int, discovery: bool, now: int) -> tuple[int, bool]:
+        if discovery:
+            outcome = await self._prepare_discovery(dialog_id, now)
+            if outcome is not None:
+                return outcome
+        snapshot, stopped = await self._fetch_snapshot_or_stop(dialog_id, discovery, now)
+        if snapshot is None:
+            return 0, stopped
         changed = self._apply_snapshot(dialog_id, generation, snapshot, discovery=discovery, now=now)
         return (0 if changed is None else changed), False
 
@@ -773,6 +801,34 @@ class ScheduledMessageReconciler:
             raise ValueError("demand_kind must be scheduled repair or discovery")
         return await self._run_slice(demand_kind)
 
+    async def _process_due_row(
+        self,
+        dialog_id: int,
+        generation: int,
+        discovery: bool,
+        now: int,
+        demand_kind: DemandKind | None,
+    ) -> tuple[int, bool]:
+        if demand_kind is None:
+            row_demand_kind = DemandKind.SCHEDULED_DISCOVERY if discovery else DemandKind.SCHEDULED_REPAIR
+            with demand_context(row_demand_kind):
+                return await self._process_due_dialog(dialog_id, generation, discovery, now)
+        return await self._process_due_dialog(dialog_id, generation, discovery, now)
+
+    async def _process_due_rows(
+        self, due_rows: Sequence[tuple[int, int, bool]], now: int, demand_kind: DemandKind | None
+    ) -> tuple[int, bool]:
+        total = 0
+        flood_waited = False
+        for dialog_id, generation, discovery in due_rows:
+            if self._shutdown_event.is_set():
+                break
+            changed, flood_waited = await self._process_due_row(dialog_id, generation, discovery, now, demand_kind)
+            total += changed
+            if flood_waited:
+                break
+        return total, flood_waited
+
     async def _run_slice(self, demand_kind: DemandKind | None = None) -> int:
         """Process one bounded slice, optionally restricted to one demand kind."""
         now = int(time.time())
@@ -781,20 +837,7 @@ class ScheduledMessageReconciler:
             return 0
         self._seed_candidates_if_due(now)
         due_rows = self._due_rows(now, demand_kind)
-        total = 0
-        flood_waited = False
-        for dialog_id, generation, discovery in due_rows:
-            if self._shutdown_event.is_set():
-                break
-            if demand_kind is None:
-                row_demand_kind = DemandKind.SCHEDULED_DISCOVERY if discovery else DemandKind.SCHEDULED_REPAIR
-                with demand_context(row_demand_kind):
-                    changed, flood_waited = await self._process_due_dialog(dialog_id, generation, discovery, now)
-            else:
-                changed, flood_waited = await self._process_due_dialog(dialog_id, generation, discovery, now)
-            total += changed
-            if flood_waited:
-                break
+        total, flood_waited = await self._process_due_rows(due_rows, now, demand_kind)
 
         if due_rows and not self._shutdown_event.is_set() and not flood_waited:
             _clear_retry(self._conn, int(time.time()))
