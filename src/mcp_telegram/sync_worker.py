@@ -376,55 +376,68 @@ class FullSyncWorker:
         )
         return await sleep_through_flood(self._shutdown_event, retry_after)
 
-    async def _run_dm_enrollment(self, *, start_new_if_complete: bool) -> int:  # noqa: PLR0912
+    def _prepare_dm_enrollment(self, *, start_new_if_complete: bool) -> bool:
         status = _dm_enrollment_state(self._conn, _DM_ENROLLMENT_KEY_STATUS)
         if status == _DM_ENROLLMENT_COMPLETE:
             if not start_new_if_complete:
-                return 0
+                return False
             with self._conn:
                 _clear_dm_enrollment_cursor(self._conn)
                 _set_dm_enrollment_state(self._conn, _DM_ENROLLMENT_KEY_STATUS, _DM_ENROLLMENT_IN_PROGRESS)
         elif status != _DM_ENROLLMENT_IN_PROGRESS:
             with self._conn:
                 _set_dm_enrollment_state(self._conn, _DM_ENROLLMENT_KEY_STATUS, _DM_ENROLLMENT_IN_PROGRESS)
+        return True
 
-        progress = _BootstrapProgress()
-        now = int(time.time())
-        completed = False
+    async def _handle_dm_enrollment_error(self, exc: Exception, progress: _BootstrapProgress) -> bool | None:
+        if isinstance(exc, TelegramRpcAdmissionDeferred):
+            return False if await self._retry_dm_bootstrap_admission(exc, progress) else None
+        if isinstance(exc, (TelegramRpcThrottled, RPCError)):
+            _raise_if_latched(exc)
+            wait_seconds = getattr(exc, "retry_after_seconds", None)
+            logger.warning(
+                "dm_bootstrap flood_wait=%ss enrolled_so_far=%d — committing partial progress",
+                wait_seconds,
+                progress.enrolled,
+            )
+            return False
+        if isinstance(exc, (RpcAdmissionSaturatedError, RpcAdmissionExpiredError)):
+            logger.info(
+                "dm_bootstrap admission_deferred error_type=%s enrolled_so_far=%d — preserving enrollment progress",
+                type(exc).__name__,
+                progress.enrolled,
+            )
+            return False
+        logger.warning(
+            "dm_bootstrap network_error=%s enrolled_so_far=%d — committing partial progress",
+            exc,
+            progress.enrolled,
+        )
+        return False
+
+    async def _run_dm_enrollment_passes(self, now: int, progress: _BootstrapProgress) -> bool:
         while not self._shutdown_event.is_set():
             try:
-                completed = await self._bootstrap_dm_pass(now, progress)
-                break
-            except TelegramRpcAdmissionDeferred as exc:
-                if await self._retry_dm_bootstrap_admission(exc, progress):
-                    break
+                return await self._bootstrap_dm_pass(now, progress)
             except RpcAdmissionClosedError:
                 self._conn.commit()
                 logger.info("dm_bootstrap admission_closed enrolled_so_far=%d", progress.enrolled)
                 raise
-            except (TelegramRpcThrottled, RPCError) as exc:
-                _raise_if_latched(exc)
-                wait_seconds = getattr(exc, "retry_after_seconds", None)
-                logger.warning(
-                    "dm_bootstrap flood_wait=%ss enrolled_so_far=%d — committing partial progress",
-                    wait_seconds,
-                    progress.enrolled,
-                )
-                break
-            except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
-                logger.info(
-                    "dm_bootstrap admission_deferred error_type=%s enrolled_so_far=%d — preserving enrollment progress",
-                    type(exc).__name__,
-                    progress.enrolled,
-                )
-                break
-            except (TimeoutError, OSError) as exc:
-                logger.warning(
-                    "dm_bootstrap network_error=%s enrolled_so_far=%d — committing partial progress",
-                    exc,
-                    progress.enrolled,
-                )
-                break
+            except (
+                TelegramRpcAdmissionDeferred,
+                TelegramRpcThrottled,
+                RPCError,
+                RpcAdmissionSaturatedError,
+                RpcAdmissionExpiredError,
+                TimeoutError,
+                OSError,
+            ) as exc:
+                outcome = await self._handle_dm_enrollment_error(exc, progress)
+                if outcome is not None:
+                    return outcome
+        return False
+
+    def _finish_dm_enrollment(self, completed: bool, progress: _BootstrapProgress) -> int:
         if completed:
             with self._conn:
                 _clear_dm_enrollment_cursor(self._conn)
@@ -434,6 +447,15 @@ class FullSyncWorker:
             self._conn.commit()
         logger.info("dm_bootstrap enrolled=%d new DM dialogs", progress.enrolled)
         return progress.enrolled
+
+    async def _run_dm_enrollment(self, *, start_new_if_complete: bool) -> int:
+        if not self._prepare_dm_enrollment(start_new_if_complete=start_new_if_complete):
+            return 0
+
+        progress = _BootstrapProgress()
+        now = int(time.time())
+        completed = await self._run_dm_enrollment_passes(now, progress)
+        return self._finish_dm_enrollment(completed, progress)
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_DM_ENROLLMENT, AcquisitionKind.DIALOG_TRAVERSAL)
     async def bootstrap_dms(self) -> int:
