@@ -3073,81 +3073,96 @@ def _apply_migration_59(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
+def _table_column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in cast(list[tuple[object, ...]], conn.execute(f"PRAGMA table_info({table})"))}
+
+
+def _migrate_activity_resume_state_v60(conn: sqlite3.Connection) -> None:
+    activity_columns = _table_column_names(conn, "activity_dialog_state")
+    if "hot_page_offset_id" not in activity_columns:
+        conn.execute("ALTER TABLE activity_dialog_state ADD COLUMN hot_page_offset_id INTEGER")
+    if "hot_window_max_id" not in activity_columns:
+        conn.execute("ALTER TABLE activity_dialog_state ADD COLUMN hot_window_max_id INTEGER")
+    if "hot_window_had_new" not in activity_columns:
+        conn.execute(
+            "ALTER TABLE activity_dialog_state ADD COLUMN hot_window_had_new "
+            "INTEGER NOT NULL DEFAULT 0 CHECK(hot_window_had_new IN (0, 1))"
+        )
+
+
+def _migrate_dialog_reconciliation_state_v60(conn: sqlite3.Connection) -> None:
+    if "revision" not in _table_column_names(conn, "dialogs"):
+        conn.execute("ALTER TABLE dialogs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0)")
+    conn.execute(_DIALOG_FULL_RECONCILIATION_STATE_DDL)
+    conn.execute(_DIALOG_FULL_RECONCILIATION_BASELINE_DDL)
+    conn.execute(_DIALOG_FULL_RECONCILIATION_UNSEEN_INDEX_DDL)
+    conn.execute(_DIALOGS_REVISION_TRIGGER_DDL)
+    conn.execute(
+        "INSERT OR IGNORE INTO dialog_full_reconciliation_state(singleton, generation, status) VALUES (1, 0, 'idle')"
+    )
+
+
+def _migrate_delta_access_recovery_state_v60(conn: sqlite3.Connection) -> None:
+    conn.execute(_DELTA_ACCESS_RECOVERY_STATE_DDL)
+    conn.execute(_DELTA_ACCESS_RECOVERY_DUE_INDEX_DDL)
+    conn.execute(_DELTA_ACCESS_RECOVERY_CLEAR_TRIGGER_DDL)
+
+
+def _rebuild_entity_profile_refresh_state_v60(
+    conn: sqlite3.Connection,
+    refresh_columns: set[str],
+) -> None:
+    next_section_expr = "next_section" if "next_section" in refresh_columns else "'full_profile'"
+    cursor_expr = "acquisition_cursor" if "acquisition_cursor" in refresh_columns else "0"
+    # Copy through TEMP instead of renaming the old table.  ALTER TABLE
+    # RENAME makes SQLite reparse every trigger in sqlite_schema.  Some
+    # supported historical databases contain trigger definitions whose
+    # referenced tables are introduced later in the migration chain;
+    # reparsing those otherwise inert definitions aborts this upgrade.
+    conn.execute(
+        "CREATE TEMP TABLE entity_profile_refresh_state_v59_copy AS "
+        "SELECT entity_id, status, retry_at, reason, updated_at, "
+        f"{next_section_expr} AS next_section, {cursor_expr} AS acquisition_cursor "
+        "FROM entity_profile_refresh_state"
+    )
+    conn.execute("DROP TABLE entity_profile_refresh_state")
+    conn.execute(_ENTITY_PROFILE_REFRESH_STATE_V60_DDL)
+    conn.execute(
+        "INSERT INTO entity_profile_refresh_state("
+        "entity_id, status, retry_at, reason, updated_at, next_section, acquisition_cursor) "
+        "SELECT entity_id, status, retry_at, reason, updated_at, "
+        "next_section, acquisition_cursor FROM entity_profile_refresh_state_v59_copy"
+    )
+    conn.execute("DROP TABLE entity_profile_refresh_state_v59_copy")
+
+
+def _migrate_entity_profile_resume_state_v60(conn: sqlite3.Connection) -> None:
+    refresh_columns = _table_column_names(conn, "entity_profile_refresh_state")
+    refresh_schema_row = cast(
+        tuple[str] | None,
+        conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='entity_profile_refresh_state'"
+        ).fetchone(),
+    )
+    refresh_schema = refresh_schema_row[0] if refresh_schema_row is not None else ""
+    if {"next_section", "acquisition_cursor"} - refresh_columns or "'rejected'" not in refresh_schema:
+        _rebuild_entity_profile_refresh_state_v60(conn, refresh_columns)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_entity_profile_refresh_due "
+        "ON entity_profile_refresh_state(status, retry_at, updated_at, entity_id)"
+    )
+
+
 def _apply_migration_60(conn: sqlite3.Connection, current: int) -> int:
     """Add restart-safe cursors for domain-owned durable demand slices."""
     if current >= _DOMAIN_RESUME_STATE_MIGRATION_60:
         return current
     conn.execute("BEGIN IMMEDIATE")
     try:
-        activity_columns = {
-            str(row[1])
-            for row in cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(activity_dialog_state)"))
-        }
-        if "hot_page_offset_id" not in activity_columns:
-            conn.execute("ALTER TABLE activity_dialog_state ADD COLUMN hot_page_offset_id INTEGER")
-        if "hot_window_max_id" not in activity_columns:
-            conn.execute("ALTER TABLE activity_dialog_state ADD COLUMN hot_window_max_id INTEGER")
-        if "hot_window_had_new" not in activity_columns:
-            conn.execute(
-                "ALTER TABLE activity_dialog_state ADD COLUMN hot_window_had_new "
-                "INTEGER NOT NULL DEFAULT 0 CHECK(hot_window_had_new IN (0, 1))"
-            )
-
-        dialog_columns = {
-            str(row[1]) for row in cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(dialogs)"))
-        }
-        if "revision" not in dialog_columns:
-            conn.execute("ALTER TABLE dialogs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0)")
-        conn.execute(_DIALOG_FULL_RECONCILIATION_STATE_DDL)
-        conn.execute(_DIALOG_FULL_RECONCILIATION_BASELINE_DDL)
-        conn.execute(_DIALOG_FULL_RECONCILIATION_UNSEEN_INDEX_DDL)
-        conn.execute(_DIALOGS_REVISION_TRIGGER_DDL)
-        conn.execute(
-            "INSERT OR IGNORE INTO dialog_full_reconciliation_state(singleton, generation, status) "
-            "VALUES (1, 0, 'idle')"
-        )
-
-        conn.execute(_DELTA_ACCESS_RECOVERY_STATE_DDL)
-        conn.execute(_DELTA_ACCESS_RECOVERY_DUE_INDEX_DDL)
-        conn.execute(_DELTA_ACCESS_RECOVERY_CLEAR_TRIGGER_DDL)
-        refresh_columns = {
-            str(row[1])
-            for row in cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(entity_profile_refresh_state)"))
-        }
-        refresh_schema_row = cast(
-            tuple[str] | None,
-            conn.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='entity_profile_refresh_state'"
-            ).fetchone(),
-        )
-        refresh_schema = refresh_schema_row[0] if refresh_schema_row is not None else ""
-        if {"next_section", "acquisition_cursor"} - refresh_columns or "'rejected'" not in refresh_schema:
-            next_section_expr = "next_section" if "next_section" in refresh_columns else "'full_profile'"
-            cursor_expr = "acquisition_cursor" if "acquisition_cursor" in refresh_columns else "0"
-            # Copy through TEMP instead of renaming the old table.  ALTER TABLE
-            # RENAME makes SQLite reparse every trigger in sqlite_schema.  Some
-            # supported historical databases contain trigger definitions whose
-            # referenced tables are introduced later in the migration chain;
-            # reparsing those otherwise inert definitions aborts this upgrade.
-            conn.execute(
-                "CREATE TEMP TABLE entity_profile_refresh_state_v59_copy AS "
-                "SELECT entity_id, status, retry_at, reason, updated_at, "
-                f"{next_section_expr} AS next_section, {cursor_expr} AS acquisition_cursor "
-                "FROM entity_profile_refresh_state"
-            )
-            conn.execute("DROP TABLE entity_profile_refresh_state")
-            conn.execute(_ENTITY_PROFILE_REFRESH_STATE_V60_DDL)
-            conn.execute(
-                "INSERT INTO entity_profile_refresh_state("
-                "entity_id, status, retry_at, reason, updated_at, next_section, acquisition_cursor) "
-                "SELECT entity_id, status, retry_at, reason, updated_at, "
-                "next_section, acquisition_cursor FROM entity_profile_refresh_state_v59_copy"
-            )
-            conn.execute("DROP TABLE entity_profile_refresh_state_v59_copy")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_entity_profile_refresh_due "
-            "ON entity_profile_refresh_state(status, retry_at, updated_at, entity_id)"
-        )
+        _migrate_activity_resume_state_v60(conn)
+        _migrate_dialog_reconciliation_state_v60(conn)
+        _migrate_delta_access_recovery_state_v60(conn)
+        _migrate_entity_profile_resume_state_v60(conn)
         conn.execute(
             "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
             (_DOMAIN_RESUME_STATE_MIGRATION_60,),
