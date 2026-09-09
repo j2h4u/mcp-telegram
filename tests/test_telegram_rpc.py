@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,7 @@ from mcp_telegram.config import (
     TelegramRpcSchedulerConfig,
 )
 from mcp_telegram.flood import FloodWaitAccumulator, FloodWaitKillSwitchPolicy, TelegramRpcThrottled
+from mcp_telegram.sync_db import ensure_sync_schema, load_account_cooldown_until_utc, save_account_cooldown_until_utc
 from mcp_telegram.telegram import create_client
 from mcp_telegram.telegram_rpc import (
     TelegramRpcAdmissionDeferred,
@@ -629,17 +631,24 @@ async def test_gate_flood_cooldown_uses_buffer_and_extends_monotonically(monkeyp
 @pytest.mark.asyncio
 async def test_gate_restores_persisted_cooldown_and_blocks_transport_until_ready(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monotonic_now = [200.0]
     loaded = 0
-    saved: list[float] = []
     monkeypatch.setattr("mcp_telegram.telegram_rpc.time.monotonic", lambda: monotonic_now[0])
     monkeypatch.setattr("mcp_telegram.telegram_rpc.time.time", lambda: 1_000.0)
 
-    def load_until_utc() -> float:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    seed_conn = sqlite3.connect(str(db_path))
+    save_account_cooldown_until_utc(seed_conn, 1_005.0)
+    seed_conn.close()
+    reopened_conn = sqlite3.connect(str(db_path))
+
+    def load_until_utc() -> float | None:
         nonlocal loaded
         loaded += 1
-        return 1_005.0
+        return load_account_cooldown_until_utc(reopened_conn)
 
     gate = TelegramRpcGate(
         StringSession(),
@@ -651,7 +660,10 @@ async def test_gate_restores_persisted_cooldown_and_blocks_transport_until_ready
         cooldown_buffer_seconds=1.0,
         transient_retry_delays_seconds=(),
         scheduler_policy=TelegramRpcSchedulerConfig(),
-        cooldown_persistence=TelegramRpcCooldownPersistence(load_until_utc, saved.append),
+        cooldown_persistence=TelegramRpcCooldownPersistence(
+            load_until_utc,
+            lambda deadline: save_account_cooldown_until_utc(reopened_conn, deadline),
+        ),
     )
     waiting = asyncio.Event()
     release = asyncio.Event()
@@ -677,7 +689,7 @@ async def test_gate_restores_persisted_cooldown_and_blocks_transport_until_ready
         assert loaded == 1
         assert account_cooldown_deadline() == 205.0
         assert sender.calls == 0
-        assert saved == []
+        assert load_account_cooldown_until_utc(reopened_conn) == 1_005.0
 
         monotonic_now[0] = 206.0
         release.set()
@@ -686,6 +698,7 @@ async def test_gate_restores_persisted_cooldown_and_blocks_transport_until_ready
     finally:
         await gate.close_rpc_scheduler()
         gate.session.close()
+        reopened_conn.close()
 
 
 @pytest.mark.asyncio
