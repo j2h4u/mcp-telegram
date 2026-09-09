@@ -23,6 +23,7 @@ from mcp_telegram.sync_db import (
     _apply_migration_56,
     _apply_migration_58,
     _apply_migration_59,
+    _apply_migration_60,
     _open_sync_db,
     ensure_sync_schema,
 )
@@ -711,7 +712,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 59
+        assert _CURRENT_SCHEMA_VERSION == 60
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1442,7 +1443,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 59
+        assert _CURRENT_SCHEMA_VERSION == 60
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:
@@ -2404,3 +2405,55 @@ def test_v59_seeds_active_scheduled_repairs_and_staggers_discovery(tmp_path: Pat
             "dirty_generation",
             "updated_at",
         }
+
+
+def test_v60_adds_restart_safe_domain_state_and_preserves_profile_retry(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.executescript(
+            """
+            DROP TRIGGER dialogs_revision_after_update;
+            DROP TRIGGER synced_dialogs_clear_access_recovery;
+            DROP TABLE dialog_full_reconciliation_baseline;
+            DROP TABLE dialog_full_reconciliation_state;
+            DROP TABLE delta_access_recovery_state;
+            DROP INDEX idx_entity_profile_refresh_due;
+            DROP TABLE entity_profile_refresh_state;
+            CREATE TABLE entity_profile_refresh_state (
+                entity_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL CHECK(status IN ('failed', 'pending')),
+                retry_at INTEGER,
+                reason TEXT,
+                updated_at INTEGER NOT NULL
+            ) WITHOUT ROWID;
+            INSERT INTO entity_profile_refresh_state VALUES (42, 'failed', 123, 'timeout', 100);
+            ALTER TABLE activity_dialog_state DROP COLUMN hot_page_offset_id;
+            ALTER TABLE activity_dialog_state DROP COLUMN hot_window_max_id;
+            ALTER TABLE activity_dialog_state DROP COLUMN hot_window_had_new;
+            ALTER TABLE dialogs DROP COLUMN revision;
+            DELETE FROM schema_version WHERE version=60;
+            """
+        )
+        conn.commit()
+
+        assert _apply_migration_60(conn, 59) == 60
+
+        activity_columns = {row[1] for row in _table_info(conn, "activity_dialog_state")}
+        assert {"hot_page_offset_id", "hot_window_max_id", "hot_window_had_new"} <= activity_columns
+        assert "revision" in {row[1] for row in _table_info(conn, "dialogs")}
+        assert _fetchone_row(
+            conn,
+            "SELECT generation, status FROM dialog_full_reconciliation_state WHERE singleton=1",
+        ) == (0, "idle")
+        assert _fetchone_row(
+            conn,
+            "SELECT status, retry_at, next_section, acquisition_cursor "
+            "FROM entity_profile_refresh_state WHERE entity_id=42",
+        ) == ("failed", 123, "full_profile", 0)
+        conn.execute(
+            "INSERT INTO entity_profile_refresh_state("
+            "entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor) "
+            "VALUES (43,'rejected',NULL,'full',100,'avatar_history',2)"
+        )
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=60") == (60,)
