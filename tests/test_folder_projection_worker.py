@@ -120,6 +120,20 @@ async def test_restart_honors_future_persisted_retry_without_rpc(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_restart_honors_fresh_success_without_rpc(tmp_path: Path) -> None:
+    conn, repository = _db(tmp_path)
+    repository.replace_snapshot(_snapshot(), ((1, 10),), completed_at=90)
+    gateway = _Gateway()
+    try:
+        worker = _worker(gateway, repository, now=[100.0])
+        await worker.prime()
+        assert gateway.calls == 0
+        assert worker._next_due_at == 190  # type: ignore[attr-defined]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
 async def test_success_completion_is_after_acquisition_and_drives_due_time(tmp_path: Path) -> None:
     conn, repository = _db(tmp_path)
     now = [100.0]
@@ -163,7 +177,7 @@ async def test_concurrent_attempts_are_single_flight(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("error", "outcome", "expected_retry_at"),
     [
-        (TimeoutError("network"), "source_unavailable", 160),
+        (TimeoutError("network"), "source_unavailable", 260),
         (TelegramRpcThrottled(latched=True, detail="open"), "circuit_open", None),
     ],
 )
@@ -176,7 +190,7 @@ async def test_expected_failures_preserve_snapshot_and_retry_state(
     conn, repository = _db(tmp_path)
     repository.replace_snapshot(_snapshot(), ((1, 10),), completed_at=90)
     gateway = _Gateway(error)
-    worker = _worker(gateway, repository, now=[100.0])
+    worker = _worker(gateway, repository, now=[200.0])
     try:
         await worker.prime()
         assert repository.read_last_outcome() == outcome

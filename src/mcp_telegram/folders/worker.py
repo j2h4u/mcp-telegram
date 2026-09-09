@@ -87,7 +87,15 @@ class FolderProjectionWorker:
         self._jitter = jitter
         self._failure_count = repository.read_consecutive_failures()
         self._last_outcome = repository.read_last_outcome()
-        self._next_due_at = repository.read_next_retry_at()
+        retry_at = repository.read_next_retry_at()
+        last_success_at = repository.read_last_success_at()
+        self._next_due_at = (
+            retry_at
+            if retry_at is not None
+            else None
+            if last_success_at is None or self._last_outcome not in {None, FolderAttemptResult.SUCCESS}
+            else math.ceil(last_success_at + policy.refresh_interval_seconds)
+        )
         self._warning_bucket: int | None = None
         self._primed = False
         self._attempt_lock = asyncio.Lock()

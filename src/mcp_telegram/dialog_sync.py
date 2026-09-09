@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -69,6 +70,25 @@ from .topics.refresh import TopicRefresher
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
+_LAST_FULL_RECONCILIATION_KEY = "dialog_reconciliation_last_full_at"
+
+
+def _read_last_full_reconciliation_at(conn: sqlite3.Connection) -> float | None:
+    row = cast(
+        tuple[object] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key=?", (_LAST_FULL_RECONCILIATION_KEY,)).fetchone(),
+    )
+    if row is None:
+        return None
+    try:
+        value = float(row[0])
+    except (TypeError, ValueError):
+        logger.warning("invalid persisted dialog reconciliation timestamp")
+        return None
+    if not math.isfinite(value) or value < 0:
+        logger.warning("invalid persisted dialog reconciliation timestamp")
+        return None
+    return value
 
 
 def _dialog_sync_rpc_scope[**P, R](func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
@@ -1112,7 +1132,7 @@ async def run_reconciliation_loop(  # noqa: PLR0913
 ) -> None:
     """Background loop: light pass every hourly_interval, full pass every daily_interval.
 
-    First iteration always runs a full pass (last_full_pass starts at None).
+    The first iteration runs a full pass when no valid completion timestamp is persisted.
     Shutdown-responsive: returns from inside asyncio.wait_for as soon as
     shutdown_event fires.
 
@@ -1126,13 +1146,9 @@ async def run_reconciliation_loop(  # noqa: PLR0913
     supplied by the daemon scheduling configuration so an operator can observe a
     needs_refresh=1 -> 0 transition without waiting an hour.
     """
-    # None (not 0.0) forces the full pass on the first iteration: time.monotonic()
-    # is seconds-since-boot, so on a freshly-booted host monotonic() < daily_interval
-    # and `now - 0.0 >= daily_interval` would be False — the daily pass would never
-    # run until the host had been up for a full day.
-    last_full_pass: float | None = None
+    last_full_pass = _read_last_full_reconciliation_at(conn)
     while not shutdown_event.is_set():
-        now = time.monotonic()
+        now = time.time()
         worker = DialogReconciliationWorker(client, conn, shutdown_event, topic_refresher)
         try:
             await worker.run_light_pass()
@@ -1148,7 +1164,12 @@ async def run_reconciliation_loop(  # noqa: PLR0913
                 # mid-stream returns completed=False, leaving last_full_pass
                 # unchanged so the next hourly tick retries the full pass.
                 if completed:
-                    last_full_pass = time.monotonic()
+                    last_full_pass = time.time()
+                    with conn:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO daemon_state(key, value) VALUES (?, ?)",
+                            (_LAST_FULL_RECONCILIATION_KEY, str(last_full_pass)),
+                        )
             except RpcAdmissionClosedError:
                 raise
             except Exception:
