@@ -163,8 +163,19 @@ def stamp_access_revalidation(conn: sqlite3.Connection, dialog_id: int, checked_
         )
 
 
+def complete_access_revalidation(conn: sqlite3.Connection, dialog_id: int, checked_at: int) -> None:
+    """Record a successful probe while retaining the access-lost status."""
+    with _lifecycle_savepoint(conn):
+        conn.execute(
+            "UPDATE synced_dialogs SET access_last_revalidated_at = ?, access_next_revalidate_at = NULL "
+            "WHERE dialog_id = ? AND status = 'access_lost'",
+            (checked_at, dialog_id),
+        )
+
+
 __all__ = [
     "AccessLossEvidence",
+    "complete_access_revalidation",
     "due_access_revalidations",
     "restore_access_after_revalidation",
     "set_access_lost",

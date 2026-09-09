@@ -25,6 +25,7 @@ from typing import Protocol, TypedDict, Unpack, cast
 from telethon.errors import RPCError  # type: ignore[import-untyped]
 
 from .access_lifecycle import (
+    complete_access_revalidation,
     due_access_revalidations,
     restore_access_after_revalidation,
     set_access_lost,
@@ -1028,11 +1029,7 @@ class DeltaAccessProbeDemandAdapter:
                 """,
                 (dialog_id, total_messages, now, now),
             )
-            self._worker._conn.execute(
-                "UPDATE synced_dialogs SET access_last_revalidated_at=?, access_next_revalidate_at=NULL "
-                "WHERE dialog_id=? AND status='access_lost'",
-                (now, dialog_id),
-            )
+            complete_access_revalidation(self._worker._conn, dialog_id, now)
 
     async def _run_gap_fill_slice(self, recovery: _DurableAccessRecovery) -> None:
         if not full_history_enabled(self._worker._conn, recovery.dialog_id):

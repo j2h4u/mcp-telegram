@@ -7,6 +7,7 @@ import pytest
 
 from mcp_telegram.access_lifecycle import (
     AccessLossEvidence,
+    complete_access_revalidation,
     restore_access_after_revalidation,
     set_access_lost,
     stamp_access_revalidation,
@@ -77,6 +78,23 @@ def test_access_restore_clears_read_position_retry() -> None:
         assert conn.execute(
             "SELECT read_position_next_attempt_at, read_position_attempt_count FROM synced_dialogs WHERE dialog_id=2"
         ).fetchone() == (None, 0)
+    finally:
+        conn.close()
+
+
+def test_complete_access_revalidation_keeps_access_lost_and_clears_retry() -> None:
+    conn = _db()
+    conn.execute(
+        "INSERT INTO synced_dialogs "
+        "(dialog_id, status, access_lost_at, access_next_revalidate_at) VALUES (4, 'access_lost', 10, 20)"
+    )
+    conn.commit()
+    try:
+        complete_access_revalidation(conn, 4, 30)
+        assert conn.execute(
+            "SELECT status, access_lost_at, access_last_revalidated_at, access_next_revalidate_at "
+            "FROM synced_dialogs WHERE dialog_id=4"
+        ).fetchone() == ("access_lost", 10, 30, None)
     finally:
         conn.close()
 
