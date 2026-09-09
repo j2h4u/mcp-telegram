@@ -20,7 +20,12 @@ from mcp_telegram.rpc_admission_observations import DemandEvidenceOutcome
 from mcp_telegram.self_profile_maintenance import SelfProfileCadenceState
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import DemandStatus, RpcAttemptBudget
-from mcp_telegram.telegram_rpc_consumers import TELEGRAM_DEMAND_CONTRACTS, DemandKind, ExecutionMode
+from mcp_telegram.telegram_rpc_consumers import (
+    TELEGRAM_DEMAND_CONTRACTS,
+    DemandKind,
+    ExecutionMode,
+    demand_freshness_seconds,
+)
 
 
 class _Adapter:
@@ -123,6 +128,14 @@ def test_adapter_map_is_exact_and_reuses_legacy_owned_objects() -> None:
     assert adapters[DemandKind.DELTA_ACCESS_PROBE]._worker is objects["delta"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DIALOG_LIGHT_RECONCILIATION]._worker is objects["dialog"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DIALOG_FULL_RECONCILIATION]._worker is objects["dialog"]  # type: ignore[attr-defined]
+    assert (
+        adapters[DemandKind.DIALOG_FULL_RECONCILIATION]._interval_seconds  # type: ignore[attr-defined]
+        == demand_freshness_seconds(DemandKind.DIALOG_FULL_RECONCILIATION)
+    )
+    assert (
+        adapters[DemandKind.ARCHIVE_INCREMENTAL].interval_s  # type: ignore[attr-defined]
+        == demand_freshness_seconds(DemandKind.ARCHIVE_INCREMENTAL)
+    )
     assert adapters[DemandKind.LIVE_HYDRATION_BATCH]._worker is objects["hydration"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.BACKFILL_HYDRATION_BATCH]._worker is objects["hydration"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.FOLDER_SNAPSHOT]._worker is objects["folder"]  # type: ignore[attr-defined]

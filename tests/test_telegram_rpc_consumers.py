@@ -20,6 +20,7 @@ from mcp_telegram.telegram_rpc_consumers import (
     TelegramFactDomain,
     TelegramRpcSource,
     demand_contract,
+    demand_freshness_seconds,
     telegram_rpc_consumer,
     validate_demand_contracts,
 )
@@ -121,6 +122,10 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
 
     assert demand_contract(DemandKind.SCHEDULED_REPAIR).freshness_target == timedelta(minutes=15)
     assert demand_contract(DemandKind.SCHEDULED_DISCOVERY).freshness_target == timedelta(hours=24)
+    assert demand_contract(DemandKind.ARCHIVE_INCREMENTAL).freshness_target == timedelta(hours=1)
+    assert demand_contract(DemandKind.DIALOG_FULL_RECONCILIATION).freshness_target == timedelta(days=1)
+    assert demand_freshness_seconds(DemandKind.ARCHIVE_INCREMENTAL) == 3_600
+    assert demand_freshness_seconds(DemandKind.DIALOG_FULL_RECONCILIATION) == 86_400
     assert demand_contract(DemandKind.FULL_SYNC_DM_ENROLLMENT).max_rpc_attempts_per_slice == 32
     assert demand_contract(DemandKind.LIVE_HYDRATION_BATCH).max_rpc_attempts_per_slice == 2
     assert demand_contract(DemandKind.BACKFILL_HYDRATION_BATCH).max_rpc_attempts_per_slice == 2

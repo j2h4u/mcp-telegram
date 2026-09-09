@@ -663,6 +663,7 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.DIALOG_FULL_RECONCILIATION,
         TelegramRpcSource.DIALOG_SYNC,
         _DURABLE,
+        freshness_target=timedelta(days=1),
         max_rpc_attempts_per_slice=32,
     ),
     DemandKind.ARCHIVE_BACKFILL: _contract(
@@ -675,6 +676,7 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.ARCHIVE_INCREMENTAL,
         TelegramRpcSource.ACTIVITY_ARCHIVE,
         _DURABLE,
+        freshness_target=timedelta(hours=1),
         max_rpc_attempts_per_slice=1,
     ),
     DemandKind.COLD_PEER_PAGE: _contract(

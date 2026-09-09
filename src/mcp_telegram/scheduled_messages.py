@@ -422,13 +422,13 @@ class ScheduledMessageReconciler:
         shutdown_event: asyncio.Event,
         own_only_context: OwnOnlyContext | None = None,
         *,
-        policy: ScheduledReconciliationPolicy | None = None,
+        policy: ScheduledReconciliationPolicy,
     ) -> None:
         self._client = client
         self._conn = conn
         self._shutdown_event = shutdown_event
         self._own_only_context = own_only_context
-        self._policy = policy or ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0)
+        self._policy = policy
         self._resolved_context = own_only_context
         self._next_candidate_seed_at = 0
 

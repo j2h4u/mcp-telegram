@@ -68,7 +68,7 @@ from .telegram_demand import (
     current_demand_token,
     demand_context,
 )
-from .telegram_rpc_consumers import DemandKind
+from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 from .telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
     RpcAdmissionExpiredError,
@@ -1353,11 +1353,12 @@ class DialogFullReconciliationDemandAdapter:
 
     demand_kind = DemandKind.DIALOG_FULL_RECONCILIATION
 
-    def __init__(self, worker: DialogReconciliationWorker, *, interval_seconds: float = 86_400.0) -> None:
-        if interval_seconds <= 0:
+    def __init__(self, worker: DialogReconciliationWorker, *, interval_seconds: float | None = None) -> None:
+        resolved_interval = demand_freshness_seconds(self.demand_kind) if interval_seconds is None else interval_seconds
+        if resolved_interval <= 0:
             raise ValueError("interval_seconds must be positive")
         self._worker = worker
-        self._interval_seconds = interval_seconds
+        self._interval_seconds = resolved_interval
 
     def status(self, now: float) -> DemandStatus:
         """Report the persisted daily release boundary without writes."""

@@ -59,12 +59,13 @@ from mcp_telegram.telegram_demand import (
     RpcAttemptBudget,
 )
 from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator, validate_durable_adapters
-from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
 logger = logging.getLogger(__name__)
 
-ACTIVITY_ARCHIVE_INTERVAL_SECONDS = 3_600.0
-DIALOG_FULL_RECONCILIATION_INTERVAL_SECONDS = 86_400.0
+# Legacy daemon loop compatibility: the policy lives in the exhaustive demand
+# contract and this value is only its seconds-based projection.
+DIALOG_FULL_RECONCILIATION_INTERVAL_SECONDS = demand_freshness_seconds(DemandKind.DIALOG_FULL_RECONCILIATION)
 SHADOW_SAFETY_SCAN_SECONDS = 60.0
 
 
@@ -176,7 +177,6 @@ def build_durable_adapter_map(
         ),
         DemandKind.DIALOG_FULL_RECONCILIATION: DialogFullReconciliationDemandAdapter(
             dependencies.dialog_reconciliation_worker,
-            interval_seconds=DIALOG_FULL_RECONCILIATION_INTERVAL_SECONDS,
         ),
         DemandKind.ARCHIVE_BACKFILL: ArchiveBackfillDemandAdapter(
             dependencies.client,
@@ -188,7 +188,7 @@ def build_durable_adapter_map(
             dependencies.client,
             dependencies.conn,
             dependencies.shutdown_event,
-            ACTIVITY_ARCHIVE_INTERVAL_SECONDS,
+            demand_freshness_seconds(DemandKind.ARCHIVE_INCREMENTAL),
             dependencies.activity_rpc_timeout_seconds,
         ),
         DemandKind.COLD_PEER_PAGE: ColdPeerPageDemandAdapter(
