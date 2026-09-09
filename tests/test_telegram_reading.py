@@ -24,6 +24,7 @@ from mcp_telegram.reactions.refresh import ReactionFreshener
 from mcp_telegram.reactions.sqlite_repository import SQLiteReactionSnapshotRepository
 from mcp_telegram.reactions.telegram_adapter import TelethonTelegramReactionGateway
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.telegram_demand import AcquisitionKind
 from mcp_telegram.telegram_fact_queries import enrich_read_at, stale_read_at_ids
 from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from mcp_telegram.telegram_history import TelethonTelegramHistoryGateway
@@ -33,6 +34,7 @@ from mcp_telegram.telegram_reading import (
     GatewayFailureKind,
     ReadDateFetchResult,
 )
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
     TelegramRpcSource,
@@ -170,9 +172,23 @@ async def test_fragment_gateway_preserves_fixed_window_and_normalized_persistenc
     make_synced_db: Callable[[], sqlite3.Connection],
 ) -> None:
     conn = make_synced_db()
+    scopes: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
+
+    async def get_input_entity(_dialog_id: int) -> str:
+        scope = current_rpc_scope()
+        assert scope.demand_kind is not None
+        scopes.append((scope.source, scope.demand_kind, scope.acquisition_kind))
+        return "entity"
+
+    async def get_messages(_entity: object, *, ids: list[int]) -> list[object | None]:
+        scope = current_rpc_scope()
+        assert scope.demand_kind is not None
+        scopes.append((scope.source, scope.demand_kind, scope.acquisition_kind))
+        return [_message(10), None, _message(12)]
+
     client = SimpleNamespace(
-        get_input_entity=AsyncMock(return_value="entity"),
-        get_messages=AsyncMock(return_value=[_message(10), None, _message(12)]),
+        get_input_entity=AsyncMock(side_effect=get_input_entity),
+        get_messages=AsyncMock(side_effect=get_messages),
     )
 
     result = await FragmentContextService(conn, TelethonTelegramFragmentGateway(client)).fetch(42, 10, 6)
@@ -191,6 +207,18 @@ async def test_fragment_gateway_preserves_fixed_window_and_normalized_persistenc
     assert conn.execute("SELECT dialog_id, message_id FROM messages_fts ORDER BY message_id").fetchall() == [
         (42, 10),
         (42, 12),
+    ]
+    assert scopes == [
+        (
+            TelegramRpcSource.MESSAGE_READ_FALLBACK,
+            DemandKind.MESSAGE_READ_FALLBACK,
+            AcquisitionKind.ENTITY_LOOKUP,
+        ),
+        (
+            TelegramRpcSource.MESSAGE_READ_FALLBACK,
+            DemandKind.MESSAGE_READ_FALLBACK,
+            AcquisitionKind.MESSAGE_LOOKUP,
+        ),
     ]
 
 

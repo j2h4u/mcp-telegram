@@ -25,6 +25,7 @@ from .flood import TelegramRpcThrottled
 from .folders.read_model import dialog_placement
 from .models import DialogType
 from .telegram_access import ACCESS_LOST_ERRORS
+from .telegram_demand import AcquisitionKind
 from .telegram_rpc import raise_if_flood_wait_error
 from .telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
 from .telethon_dialog import classify_dialog_type
@@ -234,7 +235,10 @@ class DaemonEntityInfoService:
 
     async def get_entity_info(self, req: Mapping[str, object]) -> dict[str, object]:
         """Run one foreground entity-info use case under its RPC source."""
-        with rpc_scope(TelegramRpcSource.ENTITY_INFO_FOREGROUND):
+        with rpc_scope(
+            TelegramRpcSource.ENTITY_INFO_FOREGROUND,
+            acquisition_kind=AcquisitionKind.ENTITY_LOOKUP,
+        ):
             return await self._get_entity_info(req)
 
     async def _get_entity_info(self, req: Mapping[str, object]) -> dict[str, object]:

@@ -49,6 +49,8 @@ from mcp_telegram.reading.sqlite_projection import (
 from mcp_telegram.runtime_observations import record_runtime_observation
 from mcp_telegram.sync_db import _RUNTIME_OBSERVATIONS_V54_DDL, ensure_sync_schema
 from mcp_telegram.sync_read_model import compute_sync_coverage as _compute_sync_coverage
+from mcp_telegram.telegram_demand import AcquisitionKind
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionSaturatedError,
     TelegramRpcAdmissionDeferred,
@@ -2198,11 +2200,13 @@ async def test_list_topics_cached_selector_still_refreshes_topic_catalog() -> No
 async def test_dispatch_list_topics_keeps_resolution_source_through_refresher() -> None:
     class _Gateway:
         def __init__(self) -> None:
-            self.sources: list[TelegramRpcSource] = []
+            self.scopes: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
 
         async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
             del entity
-            self.sources.append(current_rpc_scope().source)
+            scope = current_rpc_scope()
+            assert scope.demand_kind is not None
+            self.scopes.append((scope.source, scope.demand_kind, scope.acquisition_kind))
             return (TopicFact(topic_id=306001, title="Topic"),)
 
     conn = _make_db_with_topics()
@@ -2215,7 +2219,13 @@ async def test_dispatch_list_topics_keeps_resolution_source_through_refresher() 
     result = await server._dispatch({"method": "list_topics", "dialog_id": 323})
 
     assert result["ok"] is True
-    assert gateway.sources == [TelegramRpcSource.TOPIC_RESOLUTION]
+    assert gateway.scopes == [
+        (
+            TelegramRpcSource.MCP_INTERACTIVE,
+            DemandKind.MCP_REMOTE_ACQUISITION,
+            AcquisitionKind.TOPIC_SNAPSHOT,
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -7420,14 +7430,18 @@ async def test_resolve_dialog_name_falls_through_to_iter_dialogs_when_miss() -> 
 
 @pytest.mark.asyncio
 async def test_remote_dialog_resolution_has_explicit_rpc_source() -> None:
-    sources: list[TelegramRpcSource] = []
+    scopes: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
 
     async def missing_entity(_dialog: str) -> object:
-        sources.append(current_rpc_scope().source)
+        scope = current_rpc_scope()
+        assert scope.demand_kind is not None
+        scopes.append((scope.source, scope.demand_kind, scope.acquisition_kind))
         raise ValueError("not found")
 
     async def remote_dialogs():
-        sources.append(current_rpc_scope().source)
+        scope = current_rpc_scope()
+        assert scope.demand_kind is not None
+        scopes.append((scope.source, scope.demand_kind, scope.acquisition_kind))
         yield SimpleNamespace(name="Remote Chat", entity=SimpleNamespace(id=42))
 
     client = _TestClient()
@@ -7437,7 +7451,18 @@ async def test_remote_dialog_resolution_has_explicit_rpc_source() -> None:
 
     assert await server._resolve_dialog_entity("Remote Chat") is None
     assert await server._resolve_dialog_id(required_dialog_selector(dialog="Remote Chat")) == 42
-    assert sources == [TelegramRpcSource.DIALOG_RESOLUTION, TelegramRpcSource.DIALOG_RESOLUTION]
+    assert scopes == [
+        (
+            TelegramRpcSource.DIALOG_RESOLUTION,
+            DemandKind.DIALOG_TRAVERSAL,
+            AcquisitionKind.ENTITY_LOOKUP,
+        ),
+        (
+            TelegramRpcSource.DIALOG_RESOLUTION,
+            DemandKind.DIALOG_TRAVERSAL,
+            AcquisitionKind.DIALOG_TRAVERSAL,
+        ),
+    ]
 
 
 @pytest.mark.asyncio

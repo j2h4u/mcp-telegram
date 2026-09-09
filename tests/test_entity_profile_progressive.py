@@ -24,6 +24,8 @@ from mcp_telegram.entity_profile.repository import EntityProfileRepository
 from mcp_telegram.entity_profile.telegram_gateway import BoundedTelegramGateway
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import _apply_migration_57, _apply_migrations, ensure_sync_schema
+from mcp_telegram.telegram_demand import AcquisitionKind
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_scope
 from mcp_telegram.tools.entity_info import GET_ENTITY_INFO_OUTPUT_SCHEMA, GetEntityInfo, _entity_structured_content
 
@@ -625,15 +627,23 @@ def _test_service(conn: sqlite3.Connection, *, limits: RefreshLimits) -> DaemonE
 async def test_entity_info_foreground_entrypoint_sets_rpc_source() -> None:
     conn = sqlite3.connect(":memory:")
     service = _test_service(conn, limits=RefreshLimits())
-    observed: list[TelegramRpcSource] = []
+    observed: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
 
     async def implementation(_req: object) -> dict[str, object]:
-        observed.append(current_rpc_scope().source)
+        scope = current_rpc_scope()
+        assert scope.demand_kind is not None
+        observed.append((scope.source, scope.demand_kind, scope.acquisition_kind))
         return {"ok": True}
 
     service._get_entity_info = implementation  # type: ignore[method-assign]
     assert await service.get_entity_info({"entity_id": 42}) == {"ok": True}
-    assert observed == [TelegramRpcSource.ENTITY_INFO_FOREGROUND]
+    assert observed == [
+        (
+            TelegramRpcSource.ENTITY_INFO_FOREGROUND,
+            DemandKind.FOREGROUND_ENTITY_FACTS,
+            AcquisitionKind.ENTITY_LOOKUP,
+        )
+    ]
     await service.shutdown()
     conn.close()
 

@@ -27,6 +27,9 @@ from mcp_telegram.folders.sqlite_repository import (
 )
 from mcp_telegram.folders.telegram_adapter import TelethonTelegramFolderGateway, _dialog_facts
 from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.telegram_demand import AcquisitionKind
+from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
 
 
 def _connection(path: Path) -> sqlite3.Connection:
@@ -225,7 +228,13 @@ async def test_telegram_adapter_does_not_map_programming_failure() -> None:
 
 
 class _Gateway:
+    def __init__(self) -> None:
+        self.scopes: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
+
     async def fetch_snapshot(self) -> FolderSourceSnapshot:
+        scope = current_rpc_scope()
+        assert scope.demand_kind is not None
+        self.scopes.append((scope.source, scope.demand_kind, scope.acquisition_kind))
         return FolderSourceSnapshot(
             folders=(FolderRule(2, "Contacts", categories=frozenset({DialogCategory.CONTACT})),),
             dialogs=(
@@ -244,9 +253,17 @@ async def test_refresh_replaces_catalog_and_membership_together(tmp_path: Path) 
     conn = _connection(tmp_path / "sync.db")
     try:
         _replace_folder_snapshot(conn, [(9, "Stale")], [(9, 999)])
-        await FolderRefresher(_Gateway(), SQLiteFolderSnapshotRepository(conn)).refresh()
+        gateway = _Gateway()
+        await FolderRefresher(gateway, SQLiteFolderSnapshotRepository(conn)).refresh()
 
         assert folders_by_dialog(conn) == {10: [{"id": 2, "title": "Contacts"}]}
+        assert gateway.scopes == [
+            (
+                TelegramRpcSource.FOLDER_RECONCILIATION,
+                DemandKind.FOLDER_SNAPSHOT,
+                AcquisitionKind.FOLDER_SNAPSHOT,
+            )
+        ]
     finally:
         conn.close()
 

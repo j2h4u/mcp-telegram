@@ -99,6 +99,7 @@ from .runtime_observations import (
     tool_telemetry_identity,
 )
 from .sync_read_model import SyncStatus, build_sync_read_model
+from .telegram_demand import AcquisitionKind
 from .telegram_rpc_scheduler import (
     RpcAdmissionError,
     RpcAdmissionExpiredError,
@@ -106,7 +107,6 @@ from .telegram_rpc_scheduler import (
     TelegramRpcAdmissionDeferred,
     TelegramRpcSource,
     UnclassifiedTelegramRpcError,
-    current_rpc_scope,
     rpc_scope,
 )
 from .topics.contracts import TopicSourceUnavailableError
@@ -132,18 +132,13 @@ _runtime_event_write_count = 0
 
 
 @contextmanager
-def _preserve_or_rpc_scope(source: TelegramRpcSource) -> Iterator[None]:
-    """Classify a fallback unless a more-specific enclosing use case owns it."""
-    try:
-        active_scope = current_rpc_scope()
-    except UnclassifiedTelegramRpcError:
-        with rpc_scope(source):
-            yield
-        return
-    if active_scope.source is TelegramRpcSource.MCP_INTERACTIVE and source is not TelegramRpcSource.MCP_INTERACTIVE:
-        with rpc_scope(source):
-            yield
-    else:
+def _preserve_or_rpc_scope(
+    source: TelegramRpcSource,
+    *,
+    acquisition_kind: AcquisitionKind | None = None,
+) -> Iterator[None]:
+    """Classify direct calls and refine, but never replace, an active root."""
+    with rpc_scope(source, acquisition_kind=acquisition_kind):
         yield
 
 
@@ -969,7 +964,10 @@ class DaemonAPIServer:
 
     async def _resolve_dialog_entity(self, dialog: str) -> int | None:
         """Resolve a dialog selector through the live Telegram entity lookup."""
-        with _preserve_or_rpc_scope(TelegramRpcSource.DIALOG_RESOLUTION):
+        with _preserve_or_rpc_scope(
+            TelegramRpcSource.DIALOG_RESOLUTION,
+            acquisition_kind=AcquisitionKind.ENTITY_LOOKUP,
+        ):
             try:
                 entity = await self._client.get_entity(dialog)
                 return int(cast(int, telethon_utils.get_peer_id(entity)))
@@ -991,7 +989,10 @@ class DaemonAPIServer:
         """Enumerate the full visible remote directory before fuzzy resolution."""
         names: dict[int, str] = {}
         normalized: dict[int, str] = {}
-        with _preserve_or_rpc_scope(TelegramRpcSource.DIALOG_RESOLUTION):
+        with _preserve_or_rpc_scope(
+            TelegramRpcSource.DIALOG_RESOLUTION,
+            acquisition_kind=AcquisitionKind.DIALOG_TRAVERSAL,
+        ):
             async for remote_dialog in self._client.iter_dialogs():
                 name = _attr(remote_dialog, "name", "")
                 entity = _attr(remote_dialog, "entity", None)
@@ -1358,7 +1359,10 @@ class DaemonAPIServer:
     async def _refresh_topic_catalog_for_list_topics(self, dialog_id: int) -> str:
         if self._topic_refresher is None:
             return "topic_catalog_not_refreshed"
-        with _preserve_or_rpc_scope(TelegramRpcSource.TOPIC_RESOLUTION):
+        with _preserve_or_rpc_scope(
+            TelegramRpcSource.TOPIC_RESOLUTION,
+            acquisition_kind=AcquisitionKind.TOPIC_LOOKUP,
+        ):
             try:
                 entity = await self._client.get_entity(dialog_id)
                 refreshed = await self._topic_refresher.refresh(dialog_id, entity)

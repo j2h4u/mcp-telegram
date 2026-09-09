@@ -5,7 +5,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from ..telegram_rpc_scheduler import TelegramRpcSource, preserve_or_rpc_scope
+from ..telegram_demand import AcquisitionKind
+from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
 from .membership import matches
 from .ports import FolderSnapshotRepository, FolderSourceSnapshot, TelegramFolderGateway
 
@@ -34,7 +35,10 @@ class FolderRefresher:
         self._repository = repository
 
     async def acquire(self) -> FolderProjection:
-        with preserve_or_rpc_scope(TelegramRpcSource.FOLDER_RECONCILIATION):
+        with rpc_scope(
+            TelegramRpcSource.FOLDER_RECONCILIATION,
+            acquisition_kind=AcquisitionKind.FOLDER_SNAPSHOT,
+        ):
             source = await self._gateway.fetch_snapshot()
         memberships = tuple(
             (folder.folder_id, dialog.dialog_id)
