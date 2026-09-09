@@ -294,45 +294,6 @@ class EntityProfileRepository:
             return None
         return EntityRefreshCursor(*row) if row is not None else None
 
-    def checkpoint_section(
-        self,
-        cursor: EntityRefreshCursor,
-        *,
-        payload: object,
-        next_acquisition_cursor: int,
-        now: int,
-        reason: str = "refresh_in_progress",
-    ) -> bool:
-        """Atomically retain intermediate section data and advance its RPC cursor."""
-        if next_acquisition_cursor <= cursor.acquisition_cursor:
-            raise ValueError("next_acquisition_cursor must advance")
-        with self._conn:
-            if not self._cursor_matches(cursor):
-                return False
-            self._conn.execute(
-                """
-                INSERT INTO entity_detail_sections(
-                    entity_id, section, status, observed_at, reason, payload_json, retry_at
-                ) VALUES (?, ?, 'pending', NULL, ?, ?, NULL)
-                ON CONFLICT(entity_id, section) DO UPDATE SET
-                    status='pending', reason=excluded.reason, payload_json=excluded.payload_json, retry_at=NULL
-                """,
-                (cursor.entity_id, cursor.next_section, reason, _encode_payload(payload)),
-            )
-            changed = self._conn.execute(
-                "UPDATE entity_profile_refresh_state SET status='pending', retry_at=NULL, reason=?, "
-                "updated_at=?, acquisition_cursor=? WHERE entity_id=? AND next_section=? AND acquisition_cursor=?",
-                (
-                    reason,
-                    now,
-                    next_acquisition_cursor,
-                    cursor.entity_id,
-                    cursor.next_section,
-                    cursor.acquisition_cursor,
-                ),
-            ).rowcount
-        return changed == 1
-
     def advance_acquisition_cursor(
         self,
         cursor: EntityRefreshCursor,
@@ -426,21 +387,6 @@ class EntityProfileRepository:
                     ),
                 ).rowcount
         return changed == 1
-
-    def pending_section_payload(self, cursor: EntityRefreshCursor) -> object | None:
-        """Load an intermediate payload only for the cursor's current section."""
-        try:
-            row = cast(
-                tuple[str | None] | None,
-                self._conn.execute(
-                    "SELECT payload_json FROM entity_detail_sections "
-                    "WHERE entity_id=? AND section=? AND status='pending'",
-                    (cursor.entity_id, cursor.next_section),
-                ).fetchone(),
-            )
-        except sqlite3.OperationalError:
-            return None
-        return _decode_payload(row[0]) if row is not None else None
 
     def _cursor_matches(self, cursor: EntityRefreshCursor) -> bool:
         row = cast(
