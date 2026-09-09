@@ -9,14 +9,16 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from mcp_telegram.daemon import SQLiteSelfProfileCadence
 from mcp_telegram.demand_composition import (
     DemandCompositionClient,
     DemandCompositionDependencies,
-    SQLiteSelfProfileCadence,
     TelegramDemandShadow,
     build_durable_adapter_map,
 )
 from mcp_telegram.rpc_admission_observations import DemandEvidenceOutcome
+from mcp_telegram.self_profile_maintenance import SelfProfileCadenceState
+from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import DemandStatus, RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import TELEGRAM_DEMAND_CONTRACTS, DemandKind, ExecutionMode
 
@@ -97,7 +99,7 @@ def _dependencies() -> tuple[DemandCompositionDependencies, dict[str, object]]:
         cold_backfill_pacing=cast(object, objects["cold_pacing"]),  # type: ignore[arg-type]
         activity_rpc_timeout_seconds=30.0,
         read_receipt_batch=cast(Callable[[], Awaitable[object]], read_receipt_batch),
-        self_profile_cadence=cast(SQLiteSelfProfileCadence, objects["cadence"]),
+        self_profile_cadence=cast(SelfProfileCadenceState, objects["cadence"]),
         update_self_profile=update_profile,
     )
     objects["read_receipt_batch"] = read_receipt_batch
@@ -111,9 +113,7 @@ def test_adapter_map_is_exact_and_reuses_legacy_owned_objects() -> None:
     adapters = build_durable_adapter_map(dependencies)
 
     expected = {
-        kind
-        for kind, contract in TELEGRAM_DEMAND_CONTRACTS.items()
-        if contract.execution_mode is ExecutionMode.DURABLE
+        kind for kind, contract in TELEGRAM_DEMAND_CONTRACTS.items() if contract.execution_mode is ExecutionMode.DURABLE
     }
     assert set(adapters) == expected
     assert all(getattr(adapter, "demand_kind", None) is kind for kind, adapter in adapters.items())
@@ -197,12 +197,21 @@ async def test_shadow_timer_exits_cleanly_without_executing() -> None:
     assert all(not adapter.run_calls for adapter in adapters.values())
 
 
-def test_self_profile_cadence_is_persisted_in_daemon_state() -> None:
-    conn = sqlite3.connect(":memory:")
-    conn.execute("CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT)")
+def test_self_profile_cadence_survives_database_restart(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(str(db_path))
     cadence = SQLiteSelfProfileCadence(conn, 60.0)
 
     assert cadence.status(100.0).release_at == 0.0
     cadence.mark_refreshed(100.0)
-    assert cadence.status(110.0).release_at == 160.0
     conn.close()
+
+    restarted_conn = sqlite3.connect(str(db_path))
+    try:
+        restarted_cadence = SQLiteSelfProfileCadence(restarted_conn, 60.0)
+        assert restarted_cadence.status(110.0).release_at == 160.0
+        assert not restarted_cadence.status(159.0).is_ready(159.0)
+        assert restarted_cadence.status(160.0).is_ready(160.0)
+    finally:
+        restarted_conn.close()

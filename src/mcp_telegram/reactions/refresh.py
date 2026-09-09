@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sqlite3
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -12,7 +11,7 @@ from typing import Protocol
 
 from ..telegram_demand import AcquisitionKind
 from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
-from .contracts import ReactionFreshness, ReactionSnapshot
+from .contracts import ReactionFreshness, ReactionPersistenceBusyError, ReactionSnapshot
 from .ports import ReactionSnapshotRepository, TelegramReactionGateway
 
 logger = logging.getLogger(__name__)
@@ -78,12 +77,8 @@ class ReactionFreshener:
                     refreshed,
                     "refreshed",
                 )
-            except sqlite3.OperationalError as exc:
-                message = str(exc).lower()
-                if (
-                    ("locked" not in message and "busy" not in message)
-                    or attempt == len(_PERSISTENCE_RETRY_DELAYS_SECONDS)
-                ):
+            except ReactionPersistenceBusyError:
+                if attempt == len(_PERSISTENCE_RETRY_DELAYS_SECONDS):
                     raise
                 self._logger.warning(
                     "reaction_snapshot_persist_busy dialog_id=%d attempt=%d",

@@ -82,7 +82,6 @@ from .demand_composition import (
     DIALOG_FULL_RECONCILIATION_INTERVAL_SECONDS,
     DemandCompositionClient,
     DemandCompositionDependencies,
-    SQLiteSelfProfileCadence,
     TelegramDemandShadow,
     build_durable_adapter_map,
 )
@@ -132,13 +131,15 @@ from .sync_db import (
     _open_sync_db,
     ensure_sync_schema,
     load_account_cooldown_until_utc,
+    load_self_profile_last_success_at,
     migrate_legacy_databases,
     open_sync_db_reader,
     save_account_cooldown_until_utc,
+    save_self_profile_last_success_at,
 )
 from .sync_worker import FullSyncWorker
 from .telegram import create_client
-from .telegram_demand import AcquisitionKind, acquisition_context, demand_context
+from .telegram_demand import AcquisitionKind, DemandStatus, acquisition_context, demand_context
 from .telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from .telegram_rpc import TelegramRpcCooldownPersistence
 from .telegram_rpc_consumers import DemandKind
@@ -386,6 +387,29 @@ class _DemandRuntime:
     dialog_reconciliation_worker: DialogReconciliationWorker
     message_fact_refresh_deps: MessageFactRefreshDeps
     read_receipt_batch: Callable[[], Awaitable[object]]
+
+
+@dataclass(frozen=True, slots=True)
+class SQLiteSelfProfileCadence:
+    """Persist self-profile cadence through the daemon-owned sync database."""
+
+    conn: sqlite3.Connection
+    interval_seconds: float
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.interval_seconds) or self.interval_seconds <= 0:
+            raise ValueError("self-profile interval_seconds must be finite and positive")
+
+    def status(self, now: float) -> DemandStatus:
+        """Return the persisted release boundary without changing cadence state."""
+        del now
+        last_success_at = load_self_profile_last_success_at(self.conn)
+        release_at = 0.0 if last_success_at is None else last_success_at + self.interval_seconds
+        return DemandStatus(release_at=release_at)
+
+    def mark_refreshed(self, completed_at: float) -> None:
+        """Commit a successful refresh timestamp atomically."""
+        save_self_profile_last_success_at(self.conn, completed_at)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1827,7 +1851,7 @@ async def _run_scheduled_reconciliation_loop(
     while not ctx.shutdown_event.is_set():
         try:
             await reconciler.run_once()
-        except (RpcAdmissionClosedError, asyncio.CancelledError):
+        except RpcAdmissionClosedError, asyncio.CancelledError:
             raise
         except Exception:
             logger.warning("scheduled_reconcile_failed", exc_info=True)
@@ -1853,10 +1877,7 @@ async def _run_dialog_reconciliation_loop(
         except Exception:
             logger.warning("recon_light_pass_error", exc_info=True)
         _scan_demand_shadow(ctx)
-        if (
-            last_full_pass is None
-            or now - last_full_pass >= DIALOG_FULL_RECONCILIATION_INTERVAL_SECONDS
-        ):
+        if last_full_pass is None or now - last_full_pass >= DIALOG_FULL_RECONCILIATION_INTERVAL_SECONDS:
             try:
                 _count, completed = await worker.run_full_pass()
                 if completed:

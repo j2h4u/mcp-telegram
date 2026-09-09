@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -46,10 +45,11 @@ from mcp_telegram.scheduled_messages import (
     ScheduledRepairDemandAdapter,
 )
 from mcp_telegram.self_profile_maintenance import (
+    SelfProfileCadenceState,
     SelfProfileMaintenanceDemandAdapter,
     SelfProfileMaintenanceDependencies,
 )
-from mcp_telegram.sync_db import load_self_profile_last_success_at, save_self_profile_last_success_at
+from mcp_telegram.sync_db import SyncDatabaseConnection
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter, FullSyncWorker
 from mcp_telegram.telegram_demand import DemandStatus, DurableDemandAdapter, RpcAttemptBudget
 from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator, validate_durable_adapters
@@ -105,33 +105,11 @@ class _ShadowStatusAdapter:
 
 
 @dataclass(frozen=True, slots=True)
-class SQLiteSelfProfileCadence:
-    """Persist self-profile success cadence in its existing daemon state."""
-
-    conn: sqlite3.Connection
-    interval_seconds: float
-
-    def __post_init__(self) -> None:
-        if not math.isfinite(self.interval_seconds) or self.interval_seconds <= 0:
-            raise ValueError("self-profile interval_seconds must be finite and positive")
-
-    def status(self, now: float) -> DemandStatus:
-        """Return the persisted release boundary without changing cadence state."""
-        last_success_at = load_self_profile_last_success_at(self.conn)
-        release_at = 0.0 if last_success_at is None else last_success_at + self.interval_seconds
-        return DemandStatus(release_at=release_at)
-
-    def mark_refreshed(self, completed_at: float) -> None:
-        """Commit a successful refresh timestamp atomically."""
-        save_self_profile_last_success_at(self.conn, completed_at)
-
-
-@dataclass(frozen=True, slots=True)
 class DemandCompositionDependencies:
     """Existing daemon objects shared by legacy launchers and shadow adapters."""
 
     client: DemandCompositionClient
-    conn: sqlite3.Connection
+    conn: SyncDatabaseConnection
     db_path: Path
     shutdown_event: asyncio.Event
     full_sync_worker: FullSyncWorker
@@ -148,7 +126,7 @@ class DemandCompositionDependencies:
     cold_backfill_pacing: ColdBackfillPacing
     activity_rpc_timeout_seconds: float
     read_receipt_batch: Callable[[], Awaitable[object]]
-    self_profile_cadence: SQLiteSelfProfileCadence
+    self_profile_cadence: SelfProfileCadenceState
     update_self_profile: Callable[[object], None]
     startup_detail_setter: Callable[[str], None] | None = None
 
@@ -158,9 +136,7 @@ def build_durable_adapter_map(
 ) -> Mapping[DemandKind, DurableDemandAdapter]:
     """Build and validate the exhaustive PR1 durable adapter map."""
     adapters: dict[DemandKind, DurableDemandAdapter] = {
-        DemandKind.ENTITY_PROFILE_REFRESH: EntityProfileDemandAdapter(
-            dependencies.entity_refresh_coordinator
-        ),
+        DemandKind.ENTITY_PROFILE_REFRESH: EntityProfileDemandAdapter(dependencies.entity_refresh_coordinator),
         DemandKind.DELTA_GAP_FILL: DeltaGapFillDemandAdapter(dependencies.delta_sync_worker),
         DemandKind.DELTA_ACCESS_PROBE: DeltaAccessProbeDemandAdapter(
             dependencies.delta_sync_worker,
@@ -177,9 +153,7 @@ def build_durable_adapter_map(
             dependencies.fact_hydration_worker,
             HydrationPriority.FOREGROUND,
         ),
-        DemandKind.FULL_SYNC_DM_ENROLLMENT: FullSyncDmEnrollmentDemandAdapter(
-            dependencies.full_sync_worker
-        ),
+        DemandKind.FULL_SYNC_DM_ENROLLMENT: FullSyncDmEnrollmentDemandAdapter(dependencies.full_sync_worker),
         DemandKind.FULL_SYNC_PAGE: FullSyncDemandAdapter(dependencies.full_sync_worker),
         DemandKind.DIALOG_BOOTSTRAP: DialogBootstrapDemandAdapter(
             dependencies.client,
@@ -219,9 +193,7 @@ def build_durable_adapter_map(
             dependencies.fact_hydration_worker,
             HydrationPriority.BACKFILL,
         ),
-        DemandKind.FOLDER_SNAPSHOT: FolderProjectionDemandAdapter(
-            dependencies.folder_projection_worker
-        ),
+        DemandKind.FOLDER_SNAPSHOT: FolderProjectionDemandAdapter(dependencies.folder_projection_worker),
         DemandKind.MESSAGE_FACT_REFRESH: MessageFactRefreshDemandAdapter(
             dependencies.message_fact_refresh_deps,
             dependencies.message_fact_refresh_policy,
@@ -230,12 +202,8 @@ def build_durable_adapter_map(
             dependencies.conn,
             dependencies.read_receipt_batch,
         ),
-        DemandKind.SCHEDULED_REPAIR: ScheduledRepairDemandAdapter(
-            dependencies.scheduled_reconciler
-        ),
-        DemandKind.SCHEDULED_DISCOVERY: ScheduledDiscoveryDemandAdapter(
-            dependencies.scheduled_reconciler
-        ),
+        DemandKind.SCHEDULED_REPAIR: ScheduledRepairDemandAdapter(dependencies.scheduled_reconciler),
+        DemandKind.SCHEDULED_DISCOVERY: ScheduledDiscoveryDemandAdapter(dependencies.scheduled_reconciler),
         DemandKind.SELF_PROFILE_MAINTENANCE: SelfProfileMaintenanceDemandAdapter(
             SelfProfileMaintenanceDependencies(
                 cadence=dependencies.self_profile_cadence,
@@ -272,8 +240,7 @@ class TelegramDemandShadow:
         self._wakeup = asyncio.Event()
         self._ready: set[DemandKind] = set()
         shadow_adapters = {
-            kind: _ShadowStatusAdapter(kind, adapter, self._status_failed)
-            for kind, adapter in adapters.items()
+            kind: _ShadowStatusAdapter(kind, adapter, self._status_failed) for kind, adapter in adapters.items()
         }
         self.coordinator = TelegramDemandCoordinator(shadow_adapters, clock=clock)
         self._observe_transitions(self.coordinator.ready_kinds, now=self._clock())
@@ -378,7 +345,6 @@ __all__ = [
     "DIALOG_FULL_RECONCILIATION_INTERVAL_SECONDS",
     "DemandCompositionClient",
     "DemandCompositionDependencies",
-    "SQLiteSelfProfileCadence",
     "TelegramDemandShadow",
     "build_durable_adapter_map",
 ]

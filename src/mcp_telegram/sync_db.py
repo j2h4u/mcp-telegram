@@ -35,6 +35,8 @@ SCHEDULED_QUIET_DISCOVERY_SECONDS = 24 * 60 * 60
 
 logger = logging.getLogger(__name__)
 
+type SyncDatabaseConnection = sqlite3.Connection
+
 # ---------------------------------------------------------------------------
 # DDL constants
 # ---------------------------------------------------------------------------
