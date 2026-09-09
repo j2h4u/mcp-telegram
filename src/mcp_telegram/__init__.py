@@ -39,7 +39,7 @@ def _row_first_int(row: tuple[object | None, ...] | None) -> int:
 
 @app.command()
 def summary(
-    since: Annotated[str, Option("--since", help="Telemetry window: 30m, 15h, or 2d.")] = "15h",
+    since: Annotated[str, Option("--since", help="Telemetry window: 30m, 24h, or 2d.")] = "24h",
 ) -> None:
     """Print one coherent operational report from durable telemetry."""
     from .operator_summary import build_operator_summary, parse_since
