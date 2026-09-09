@@ -12,8 +12,10 @@ from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.folders.contracts import DialogCategory, DialogFacts, FolderRule, FolderSourceSnapshot
 from mcp_telegram.folders.refresh import FolderRefresher
 from mcp_telegram.folders.sqlite_repository import SQLiteFolderSnapshotRepository
-from mcp_telegram.folders.worker import FolderProjectionWorker
+from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker
 from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.telegram_demand import RpcAttemptBudget
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +79,77 @@ def _worker(
         clock=clock,
         jitter=lambda interval, _ratio: interval,
     )
+
+
+def _demand_adapter(repository: SQLiteFolderSnapshotRepository) -> FolderProjectionDemandAdapter:
+    return FolderProjectionDemandAdapter(repository, _Policy())
+
+
+@pytest.mark.asyncio
+async def test_demand_adapter_reports_startup_demand_without_running_legacy_worker(tmp_path: Path) -> None:
+    conn, repository = _db(tmp_path)
+    try:
+        adapter = _demand_adapter(repository)
+        status = adapter.status(100.0)
+        budget = RpcAttemptBudget(limit=1)
+
+        await adapter.run_slice(budget)
+
+        assert adapter.demand_kind is DemandKind.FOLDER_SNAPSHOT
+        assert status.release_at == 100.0
+        assert status.freshness_deadline is None
+        assert budget.attempts == 0
+        assert repository.read_last_outcome() is None
+    finally:
+        conn.close()
+
+
+def test_demand_adapter_reconstructs_success_and_retry_cadence(tmp_path: Path) -> None:
+    conn, repository = _db(tmp_path)
+    try:
+        repository.replace_snapshot(_snapshot(), ((1, 10),), completed_at=90)
+        adapter = _demand_adapter(repository)
+
+        status = adapter.status(100.0)
+
+        assert status.release_at == 190.0
+        assert status.freshness_deadline == 1890
+
+        repository.record_attempt(
+            attempted_at=100,
+            outcome="source_unavailable",
+            next_retry_at=200,
+            consecutive_failures=1,
+        )
+        retry_status = adapter.status(150.0)
+        assert retry_status.release_at == 200.0
+        assert retry_status.freshness_deadline == 1890
+    finally:
+        conn.close()
+
+
+def test_demand_adapter_reports_freshness_debt_from_durable_state(tmp_path: Path) -> None:
+    conn, repository = _db(tmp_path)
+    try:
+        repository.replace_snapshot(_snapshot(), ((1, 10),), completed_at=90)
+        status = _demand_adapter(repository).status(2_000.0)
+        assert status.overdue_seconds(2_000.0) == 110.0
+    finally:
+        conn.close()
+
+
+def test_demand_adapter_suppresses_terminal_failure_until_legacy_restart(tmp_path: Path) -> None:
+    conn, repository = _db(tmp_path)
+    try:
+        repository.record_attempt(
+            attempted_at=100,
+            outcome="circuit_open",
+            next_retry_at=None,
+            consecutive_failures=1,
+        )
+        assert _demand_adapter(repository).status(100.0) is None
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio
