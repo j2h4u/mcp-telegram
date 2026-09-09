@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
-from .sync_db import open_sync_db_reader
+from .daemon import read_operator_summary_snapshot
 
 _DURATION_UNITS = {"m": 60, "h": 3600, "d": 86400}
 _MIN_DURATION_LENGTH = 2
@@ -92,25 +92,8 @@ def _as_int(value: object) -> int:
     return int(cast(float | int | str, value))
 
 
-def _dict_factory(cursor: object, row: tuple[object, ...]) -> Observation:
-    description = cursor.description  # type: ignore[attr-defined]
-    return {column[0]: row[index] for index, column in enumerate(description)}
-
-
 def _load_snapshot(db_path: Path, since_ms: int) -> SummarySnapshot:
-    conn = open_sync_db_reader(db_path)
-    conn.row_factory = _dict_factory
-    try:
-        observations = conn.execute(
-            "SELECT * FROM runtime_observations WHERE observed_at_ms>=? ORDER BY observed_at_ms,id",
-            (since_ms,),
-        ).fetchall()
-        history_row = conn.execute(
-            "SELECT value FROM daemon_state WHERE key='runtime_observations_history_started_at_ms'"
-        ).fetchone()
-        dialog_rows = conn.execute("SELECT status,COUNT(*) count FROM synced_dialogs GROUP BY status").fetchall()
-    finally:
-        conn.close()
+    observations, history_row, dialog_rows = read_operator_summary_snapshot(db_path, since_ms)
     history_started_ms = _as_int(history_row["value"]) if history_row is not None else None
     dialog_counts = [(str(row["status"]), _as_int(row["count"])) for row in dialog_rows]
     return SummarySnapshot(
