@@ -41,6 +41,7 @@ from .activity_peer_sweep import (
 from .activity_substrate import ActivityClient
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
+from .sync_read_model import SyncStatus
 from .telegram_demand import (
     AcquisitionKind,
     DemandStatus,
@@ -275,8 +276,9 @@ def _next_cold_release_at(conn: sqlite3.Connection, *, now: float) -> float | No
             FROM activity_dialog_state AS ads
             LEFT JOIN synced_dialogs AS sd ON sd.dialog_id = ads.dialog_id
             WHERE ads.cold_status != 'complete'
-              AND COALESCE(sd.status, '') != 'access_lost'
-            """
+              AND COALESCE(sd.status, '') != :ineligible_status
+            """,
+            {"ineligible_status": SyncStatus.ACCESS_LOST.value},
         ).fetchone(),
     )
     if row is None or row[0] is None:
@@ -306,7 +308,7 @@ def _claim_cold_backfill_peer(
                     LEFT JOIN synced_dialogs AS sd ON sd.dialog_id = ads.dialog_id
                     WHERE ads.cold_status != 'complete'
                       AND (ads.cold_next_retry_at IS NULL OR ads.cold_next_retry_at <= :now)
-                      AND COALESCE(sd.status, '') != 'access_lost'
+                      AND COALESCE(sd.status, '') != :ineligible_status
                     ORDER BY ads.updated_at ASC, ads.dialog_id ASC
                     LIMIT 1
                 )
@@ -314,7 +316,11 @@ def _claim_cold_backfill_peer(
                   AND (cold_next_retry_at IS NULL OR cold_next_retry_at <= :now)
                 RETURNING dialog_id, cold_offset_id
                 """,
-                {"now": now, "claim_until": claim_until},
+                {
+                    "now": now,
+                    "claim_until": claim_until,
+                    "ineligible_status": SyncStatus.ACCESS_LOST.value,
+                },
             ).fetchone(),
         )
 
