@@ -104,7 +104,8 @@ async def test_demand_adapter_reports_startup_demand_and_runs_one_worker_attempt
         assert adapter.demand_kind is DemandKind.FOLDER_SNAPSHOT
         assert status.release_at == 100.0
         assert status.freshness_deadline is None
-        assert budget.attempts == 1
+        # The mock gateway bypasses the transport sender, which owns debit.
+        assert budget.attempts == 0
         assert gateway.calls == 1
         assert repository.read_last_outcome() == "success"
     finally:
@@ -172,7 +173,10 @@ async def test_demand_adapter_runs_one_worker_attempt_with_precise_context(tmp_p
 
     async def fetch_with_context() -> FolderSourceSnapshot:
         seen.append(current_demand_token())
-        scopes.append(current_rpc_scope())
+        scope = current_rpc_scope()
+        scopes.append(scope)
+        assert scope.attempt_budget is not None
+        scope.attempt_budget.debit()  # emulate the transport sender boundary
         return await original_fetch()
 
     gateway.fetch_snapshot = fetch_with_context  # type: ignore[method-assign]
@@ -189,6 +193,23 @@ async def test_demand_adapter_runs_one_worker_attempt_with_precise_context(tmp_p
         assert scopes[0].attempt_budget is budget
         assert repository.read_last_outcome() == "success"
         assert repository.read_last_success_at() is not None
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_demand_adapter_does_not_consume_exhausted_budget(tmp_path: Path) -> None:
+    conn, repository = _db(tmp_path)
+    gateway = _Gateway()
+    try:
+        adapter = _demand_adapter(repository, gateway)
+        budget = RpcAttemptBudget(limit=1, attempts=1)
+
+        await adapter.run_slice(budget)
+
+        assert budget.attempts == 1
+        assert gateway.calls == 0
+        assert repository.read_last_outcome() is None
     finally:
         conn.close()
 

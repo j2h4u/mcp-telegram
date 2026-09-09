@@ -283,7 +283,7 @@ class FolderProjectionDemandAdapter(DurableDemandAdapter):
         """Run one existing worker attempt under the precise durable demand."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
-        if not budget.try_debit():
+        if budget.exhausted:
             return
         with demand_context(self.demand_kind), rpc_attempt_budget(budget):
             await self._worker._attempt("demand")
