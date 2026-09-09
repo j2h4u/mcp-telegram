@@ -38,6 +38,22 @@ def _row_first_int(row: tuple[object | None, ...] | None) -> int:
 
 
 @app.command()
+def summary(
+    since: Annotated[str, Option("--since", help="Telemetry window: 30m, 15h, or 2d.")] = "15h",
+) -> None:
+    """Print one coherent operational report from durable telemetry."""
+    from .operator_summary import build_operator_summary, parse_since
+
+    try:
+        since_seconds = parse_since(since)
+        state_dir = load_config().state.dir
+        report = build_operator_summary(state_dir / "sync.db", since_seconds=since_seconds)
+    except (ConfigError, OSError, sqlite3.Error, ValueError) as exc:
+        raise BadParameter(str(exc)) from exc
+    print(report.text)
+
+
+@app.command()
 def logout() -> None:
     """Logout from Telegram API."""
     from .telegram import logout_from_telegram
