@@ -37,7 +37,7 @@ from mcp_telegram.sync_db import (
     _open_sync_db,
     ensure_sync_schema,
 )
-from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
+from mcp_telegram.telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind, demand_contract
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 
@@ -550,6 +550,39 @@ def test_scheduled_demand_status_reads_repair_and_discovery_due_state(conn: sqli
     assert discovery is not None
     assert discovery.release_at == 200
     assert discovery.freshness_deadline == 200
+
+
+def test_scheduled_discovery_status_wakes_for_unseeded_candidate_after_reopen(tmp_path: Path) -> None:
+    db_path = tmp_path / "cold-start.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    conn.execute("INSERT INTO dialogs(dialog_id, type, hidden) VALUES (42, 'user', 0)")
+    conn.execute(
+        "INSERT INTO own_only_dialogs(dialog_id, inclusion_basis, updated_at) VALUES (42, ?, 1)",
+        ('["direct_message"]',),
+    )
+    conn.commit()
+    policy = ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10)
+    try:
+        adapter = ScheduledDiscoveryDemandAdapter(
+            ScheduledMessageReconciler(_ScheduledSnapshotClient(), conn, asyncio.Event(), policy=policy)
+        )
+        changes_before = conn.total_changes
+        status = adapter.status(100.0)
+        assert status == DemandStatus(release_at=0.0)
+        assert conn.total_changes == changes_before
+    finally:
+        conn.close()
+
+    reopened = _open_sync_db(db_path)
+    try:
+        adapter = ScheduledDiscoveryDemandAdapter(
+            ScheduledMessageReconciler(_ScheduledSnapshotClient(), reopened, asyncio.Event(), policy=policy)
+        )
+        assert adapter.status(100.0) == DemandStatus(release_at=0.0)
+        assert reopened.execute("SELECT COUNT(*) FROM scheduled_reconciliation_state").fetchone() == (0,)
+    finally:
+        reopened.close()
 
 
 @pytest.mark.parametrize(

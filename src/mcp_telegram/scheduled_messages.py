@@ -434,21 +434,7 @@ class ScheduledMessageReconciler:
 
     def _seed_candidates(self, now: int) -> None:
         """Enroll newly visible candidates without making them immediately due."""
-        candidate_ids = {
-            int(cast(int, row["dialog_id"]))
-            for row in query_own_only_candidates(
-                self._conn,
-                personal_channel_id=None
-                if self._own_only_context is None
-                else self._own_only_context.personal_channel_id,
-            )
-        }
-        candidate_ids.update(
-            _as_int(row[0])
-            for row in cast(
-                list[tuple[object]], self._conn.execute("SELECT dialog_id FROM own_only_dialogs").fetchall()
-            )
-        )
+        candidate_ids = self._candidate_ids()
         active_ids = {
             _as_int(row[0])
             for row in cast(
@@ -475,6 +461,39 @@ class ScheduledMessageReconciler:
                     ),
                 )
         self._next_candidate_seed_at = now + max(1, int(self._policy.state_scan_seconds))
+
+    def _candidate_ids(self) -> set[int]:
+        """Return local dialogs eligible for scheduled-queue discovery."""
+        candidate_ids = {
+            int(cast(int, row["dialog_id"]))
+            for row in query_own_only_candidates(
+                self._conn,
+                personal_channel_id=None
+                if self._own_only_context is None
+                else self._own_only_context.personal_channel_id,
+            )
+        }
+        candidate_ids.update(
+            _as_int(row[0])
+            for row in cast(
+                list[tuple[object]], self._conn.execute("SELECT dialog_id FROM own_only_dialogs").fetchall()
+            )
+        )
+        return candidate_ids
+
+    def _has_unseeded_candidate(self) -> bool:
+        """Report an unseeded candidate without mutating reconciliation state."""
+        candidate_ids = self._candidate_ids()
+        if not candidate_ids:
+            return False
+        seeded_ids = {
+            _as_int(row[0])
+            for row in cast(
+                list[tuple[object]],
+                self._conn.execute("SELECT dialog_id FROM scheduled_reconciliation_state").fetchall(),
+            )
+        }
+        return bool(candidate_ids - seeded_ids)
 
     def _seed_candidates_if_due(self, now: int) -> None:
         if now >= self._next_candidate_seed_at:
@@ -800,14 +819,22 @@ class _ScheduledDemandAdapter(DurableDemandAdapter):
                 f"SELECT MIN({column}) FROM scheduled_reconciliation_state WHERE {column} IS NOT NULL"
             ).fetchone(),
         )
+        unseeded = self.demand_kind is DemandKind.SCHEDULED_DISCOVERY and self._reconciler._has_unseeded_candidate()
+        original_release_at: float | None = None
         if row is None or row[0] is None:
-            return None
-        queue_release_at = float(cast(int | float, row[0]))
+            if not unseeded:
+                return None
+            queue_release_at = 0.0
+        else:
+            queue_release_at = float(cast(int | float, row[0]))
+            original_release_at = queue_release_at
+            if unseeded:
+                queue_release_at = 0.0
         release_at = queue_release_at
         account_retry_at = _retry_at(self._reconciler._conn)
         if account_retry_at is not None:
             release_at = max(release_at, float(account_retry_at))
-        return DemandStatus(release_at=release_at, freshness_deadline=queue_release_at)
+        return DemandStatus(release_at, original_release_at)
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
         """Run one bounded scheduled slice under its exact demand and budget."""
