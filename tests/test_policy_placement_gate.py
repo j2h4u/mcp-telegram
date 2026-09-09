@@ -38,11 +38,83 @@ def _load_gate() -> _PolicyGate:
     return cast(_PolicyGate, module)
 
 
-def _findings(source: str) -> set[tuple[str, str]]:
+def _findings_at(relative_path: str, source: str) -> set[tuple[str, str]]:
     gate = _load_gate()
-    visitor = gate._PolicyVisitor("src/mcp_telegram/capability.py")
+    visitor = gate._PolicyVisitor(relative_path)
     visitor.visit(ast.parse(source))
     return {(finding.category, finding.key) for finding in visitor.findings}
+
+
+def _findings(source: str) -> set[tuple[str, str]]:
+    return _findings_at("src/mcp_telegram/capability.py", source)
+
+
+NON_OPERATOR_POLICY_CASES = (
+    ("src/mcp_telegram/delta_sync.py", "_DELTA_SLICE_MESSAGE_LIMIT = 100\n"),
+    (
+        "src/mcp_telegram/dialog_sync.py",
+        (
+            "class DialogReconciliationWorker:\n"
+            "    async def run_full_pass(self) -> None:\n"
+            "        await work(wait_on_throttle=True)\n"
+        ),
+    ),
+    (
+        "src/mcp_telegram/dialog_sync.py",
+        (
+            "class DialogFullReconciliationDemandAdapter:\n"
+            "    async def run_slice(self) -> None:\n"
+            "        await work(wait_on_throttle=False)\n"
+        ),
+    ),
+    (
+        "src/mcp_telegram/reactions/refresh.py",
+        "_PERSISTENCE_RETRY_DELAYS_SECONDS = (0.25, 1.0, 2.0)\n",
+    ),
+    (
+        "src/mcp_telegram/scheduled_messages.py",
+        "class ScheduledReconciliationPolicy:\n    failure_retry_seconds: int = 300\n",
+    ),
+    (
+        "src/mcp_telegram/scheduled_messages.py",
+        (
+            "class ScheduledMessageReconciler:\n"
+            "    async def _process_due_dialog(self) -> None:\n"
+            "        retry_at = int(time.time()) + exc.retry_after_seconds\n"
+        ),
+    ),
+    (
+        "src/mcp_telegram/sync_db.py",
+        '_ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"\n',
+    ),
+    (
+        "src/mcp_telegram/telegram_demand.py",
+        (
+            "def resolve_admission_deadline(now, contract):\n"
+            "    policy_deadline = now + contract.admission_timeout_seconds\n"
+        ),
+    ),
+    (
+        "src/mcp_telegram/telegram_rpc.py",
+        (
+            "class TelegramRpcGate:\n"
+            "    def _persist_account_cooldown(self) -> None:\n"
+            "        deadline_utc = time.time() + max(0.0, remaining)\n"
+        ),
+    ),
+    (
+        "src/mcp_telegram/telegram_rpc_consumers.py",
+        "_ADMISSION_TIMEOUT_SECONDS = {service_class: 15.0}\n",
+    ),
+    (
+        "src/mcp_telegram/telegram_rpc_consumers.py",
+        "_SOURCE_OUTSTANDING_LIMIT = {service_class: 8}\n",
+    ),
+    (
+        "src/mcp_telegram/telegram_rpc_consumers.py",
+        "def validate_demand_contracts():\n    source_limits = {}\n",
+    ),
+)
 
 
 @pytest.mark.parametrize(
@@ -72,6 +144,62 @@ def _findings(source: str) -> set[tuple[str, str]]:
 )
 def test_policy_placement_gate_rejects_straightforward_literal_evasions(source: str, expected: tuple[str, str]) -> None:
     assert expected in _findings(source)
+
+
+@pytest.mark.parametrize(("relative_path", "source"), NON_OPERATOR_POLICY_CASES)
+def test_policy_placement_gate_ignores_exact_non_operator_policy_findings(relative_path: str, source: str) -> None:
+    assert _findings_at(relative_path, source) == set()
+
+
+@pytest.mark.parametrize(("_relative_path", "source"), NON_OPERATOR_POLICY_CASES)
+def test_non_operator_policy_exclusions_do_not_apply_in_neighbor_modules(_relative_path: str, source: str) -> None:
+    assert _findings_at("src/mcp_telegram/neighbor.py", source)
+
+
+def test_demand_cadence_and_injected_timeout_remain_policy_findings() -> None:
+    composition_findings = _findings_at(
+        "src/mcp_telegram/demand_composition.py",
+        "ACTIVITY_ARCHIVE_INTERVAL_SECONDS = 3_600.0\n"
+        "DIALOG_FULL_RECONCILIATION_INTERVAL_SECONDS = 86_400.0\n"
+        "def build_durable_adapter_map():\n"
+        "    return Adapter(interval_seconds=DIALOG_FULL_RECONCILIATION_INTERVAL_SECONDS)\n",
+    )
+    assert composition_findings == {
+        (
+            "policy_assignments",
+            "src/mcp_telegram/demand_composition.py:<module>:ACTIVITY_ARCHIVE_INTERVAL_SECONDS",
+        ),
+        (
+            "policy_assignments",
+            "src/mcp_telegram/demand_composition.py:<module>:DIALOG_FULL_RECONCILIATION_INTERVAL_SECONDS",
+        ),
+        (
+            "policy_call_keywords",
+            "src/mcp_telegram/demand_composition.py:build_durable_adapter_map:interval_seconds",
+        ),
+    }
+    assert _findings_at(
+        "src/mcp_telegram/dialog_sync.py",
+        "class DialogFullReconciliationDemandAdapter:\n"
+        "    def __init__(self, *, interval_seconds: float = 86_400.0) -> None:\n"
+        "        pass\n",
+    ) == {
+        (
+            "policy_defaults",
+            "src/mcp_telegram/dialog_sync.py:DialogFullReconciliationDemandAdapter.__init__:interval_seconds",
+        )
+    }
+    assert _findings_at(
+        "src/mcp_telegram/scheduled_messages.py",
+        "class ScheduledMessageReconciler:\n"
+        "    def __init__(self) -> None:\n"
+        "        self.policy = Policy(activity_rpc_timeout_seconds=120.0)\n",
+    ) == {
+        (
+            "policy_call_keywords",
+            "src/mcp_telegram/scheduled_messages.py:ScheduledMessageReconciler.__init__:activity_rpc_timeout_seconds",
+        )
+    }
 
 
 def test_grouped_allowlist_entries_reject_whitespace_only_rationale(

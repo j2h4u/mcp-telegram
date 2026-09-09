@@ -46,6 +46,56 @@ REQUIRED_POLICY_SINKS = {
     "resolver.py": ("ResolverEnrichmentPolicy", {"entity_cache", "ttl_seconds"}),
 }
 
+# Exact AST findings whose policy-shaped names describe protocol/domain state,
+# computed timestamps, or the code-owned Telegram demand contract.  Keeping
+# these keys here makes the detector reject the same spelling everywhere else.
+NON_OPERATOR_POLICY_FINDINGS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("policy_assignments", "src/mcp_telegram/delta_sync.py:<module>:_DELTA_SLICE_MESSAGE_LIMIT"),
+        (
+            "policy_call_keywords",
+            "src/mcp_telegram/dialog_sync.py:DialogReconciliationWorker.run_full_pass:wait_on_throttle",
+        ),
+        (
+            "policy_call_keywords",
+            "src/mcp_telegram/dialog_sync.py:DialogFullReconciliationDemandAdapter.run_slice:wait_on_throttle",
+        ),
+        (
+            "policy_assignments",
+            "src/mcp_telegram/reactions/refresh.py:<module>:_PERSISTENCE_RETRY_DELAYS_SECONDS",
+        ),
+        (
+            "policy_assignments",
+            "src/mcp_telegram/scheduled_messages.py:ScheduledReconciliationPolicy:failure_retry_seconds",
+        ),
+        (
+            "policy_assignments",
+            "src/mcp_telegram/scheduled_messages.py:ScheduledMessageReconciler._process_due_dialog:retry_at",
+        ),
+        ("policy_assignments", "src/mcp_telegram/sync_db.py:<module>:_ACCOUNT_COOLDOWN_UNTIL_UTC_KEY"),
+        (
+            "policy_assignments",
+            "src/mcp_telegram/telegram_demand.py:resolve_admission_deadline:policy_deadline",
+        ),
+        (
+            "policy_assignments",
+            "src/mcp_telegram/telegram_rpc.py:TelegramRpcGate._persist_account_cooldown:deadline_utc",
+        ),
+        (
+            "policy_assignments",
+            "src/mcp_telegram/telegram_rpc_consumers.py:<module>:_ADMISSION_TIMEOUT_SECONDS",
+        ),
+        (
+            "policy_assignments",
+            "src/mcp_telegram/telegram_rpc_consumers.py:<module>:_SOURCE_OUTSTANDING_LIMIT",
+        ),
+        (
+            "policy_assignments",
+            "src/mcp_telegram/telegram_rpc_consumers.py:validate_demand_contracts:source_limits",
+        ),
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class Finding:
@@ -106,6 +156,11 @@ class _PolicyVisitor(ast.NodeVisitor):
     def _key(self, name: str) -> str:
         return f"{self.relative_path}:{_qualified_name(self.stack)}:{name}"
 
+    def _add_finding(self, category: str, name: str, line: int) -> None:
+        finding = Finding(category, self._key(name), line)
+        if (finding.category, finding.key) not in NON_OPERATOR_POLICY_FINDINGS:
+            self.findings.append(finding)
+
     def _is_policy_value(self, value: ast.expr | None) -> bool:
         if _is_literal_policy_value(value):
             return True
@@ -133,10 +188,10 @@ class _PolicyVisitor(ast.NodeVisitor):
         defaults = [None] * (len(positional) - len(node.args.defaults)) + list(node.args.defaults)
         for arg, default in zip(positional, defaults, strict=True):
             if POLICY_NAME.search(arg.arg) and self._is_policy_value(default):
-                self.findings.append(Finding("policy_defaults", self._key(arg.arg), node.lineno))
+                self._add_finding("policy_defaults", arg.arg, node.lineno)
         for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults, strict=True):
             if POLICY_NAME.search(arg.arg) and self._is_policy_value(default):
-                self.findings.append(Finding("policy_defaults", self._key(arg.arg), node.lineno))
+                self._add_finding("policy_defaults", arg.arg, node.lineno)
         self.literal_alias_scopes.append({})
         self.generic_visit(node)
         self.literal_alias_scopes.pop()
@@ -199,14 +254,14 @@ class _PolicyVisitor(ast.NodeVisitor):
         if name is None or not isinstance(value, ast.Call) or not self._is_field_call(value):
             return
         if any(keyword.arg in {"default", "default_factory"} for keyword in value.keywords):
-            self.findings.append(Finding("dataclass_field_defaults", self._key(name), node.lineno))
+            self._add_finding("dataclass_field_defaults", name, node.lineno)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         if self._is_policy_value(node.value):
             for target in node.targets:
                 name = self._target_name(target)
                 if name and POLICY_NAME.search(name):
-                    self.findings.append(Finding("policy_assignments", self._key(name), node.lineno))
+                    self._add_finding("policy_assignments", name, node.lineno)
         self._record_literal_aliases(node)
         self._record_field_default(node)
         self.generic_visit(node)
@@ -217,7 +272,7 @@ class _PolicyVisitor(ast.NodeVisitor):
             and POLICY_NAME.search(name)
             and self._is_policy_value(node.value)
         ):
-            self.findings.append(Finding("policy_assignments", self._key(name), node.lineno))
+            self._add_finding("policy_assignments", name, node.lineno)
         self._record_literal_aliases(node)
         self._record_field_default(node)
         self.generic_visit(node)
@@ -230,7 +285,7 @@ class _PolicyVisitor(ast.NodeVisitor):
                 and PLACEMENT_POLICY_NAME.search(key.value)
                 and self._is_policy_value(value)
             ):
-                self.findings.append(Finding("policy_dict_values", self._key(key.value), node.lineno))
+                self._add_finding("policy_dict_values", key.value, node.lineno)
         self.generic_visit(node)
 
     def _is_environ_value(self, node: ast.expr) -> bool:
@@ -256,15 +311,15 @@ class _PolicyVisitor(ast.NodeVisitor):
         ):
             environment_key = "getenv"
         if environment_key:
-            self.findings.append(Finding("environment_reads", self._key(environment_key), node.lineno))
+            self._add_finding("environment_reads", environment_key, node.lineno)
         for keyword in node.keywords:
             if keyword.arg and PLACEMENT_POLICY_NAME.search(keyword.arg) and self._is_policy_value(keyword.value):
-                self.findings.append(Finding("policy_call_keywords", self._key(keyword.arg), node.lineno))
+                self._add_finding("policy_call_keywords", keyword.arg, node.lineno)
         self.generic_visit(node)
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
         if self._is_environ_value(node.value):
-            self.findings.append(Finding("environment_reads", self._key("environ[]"), node.lineno))
+            self._add_finding("environment_reads", "environ[]", node.lineno)
         self.generic_visit(node)
 
 
