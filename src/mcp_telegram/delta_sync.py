@@ -16,8 +16,9 @@ import asyncio
 import logging
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from functools import wraps
 from typing import Protocol, TypedDict, Unpack, cast
 
@@ -37,27 +38,60 @@ from .message_contracts import ExtractedMessage
 from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
 from .telegram_access import ACCESS_LOST_ERRORS
+from .telegram_demand import (
+    AcquisitionKind,
+    DemandStatus,
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+    UnclassifiedTelegramDemandError,
+    acquisition_context,
+    current_demand_token,
+    demand_context,
+)
+from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
     RpcAdmissionExpiredError,
     RpcAdmissionSaturatedError,
     TelegramRpcAdmissionDeferred,
     TelegramRpcSource,
+    rpc_attempt_budget,
     rpc_scope,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _delta_rpc_scope[**P, R](func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
-    """Give delta and access-recovery operations an explicit RPC source."""
+@contextmanager
+def _delta_demand_scope(kind: DemandKind, acquisition_kind: AcquisitionKind) -> Iterator[None]:
+    """Install a precise root for direct calls while preserving an adapter root."""
+    try:
+        current_demand_token()
+    except UnclassifiedTelegramDemandError:
+        with demand_context(kind):
+            with acquisition_context(acquisition_kind):
+                yield
+    else:
+        with acquisition_context(acquisition_kind):
+            yield
 
-    @wraps(func)
-    async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
-        with rpc_scope(TelegramRpcSource.DELTA_SYNC):
-            return await func(*args, **kwargs)
 
-    return wrapped
+def _delta_rpc_scope[**P, R](
+    kind: DemandKind,
+    acquisition_kind: AcquisitionKind,
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    """Give delta and access-recovery operations precise demand identity."""
+
+    def decorate(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+        @wraps(func)
+        async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            with _delta_demand_scope(kind, acquisition_kind):
+                with rpc_scope(TelegramRpcSource.DELTA_SYNC):
+                    return await func(*args, **kwargs)
+
+        return wrapped
+
+    return decorate
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +134,7 @@ class AccessProbePolicy:
 # 1h covers typical dev iteration cycles (rebuild + edit + rebuild) where
 # the user's account hasn't received meaningful new traffic worth probing.
 RECENT_SYNC_SKIP_THRESHOLD_S: int = 3600
+_DELTA_SLICE_MESSAGE_LIMIT = 100
 
 _SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL = """
 SELECT sd.dialog_id, sd.last_synced_at, sd.last_delta_checked_at, sd.delta_refresh_requested_at
@@ -134,6 +169,11 @@ _UPDATE_DELTA_CHECKPOINT_SQL = (
 )
 _UPDATE_DELTA_CHECKED_SQL = (
     "UPDATE synced_dialogs SET last_delta_checked_at = ?, delta_refresh_requested_at = NULL WHERE dialog_id = ? "
+    "AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
+)
+_REQUEST_DELTA_CONTINUATION_SQL = (
+    "UPDATE synced_dialogs SET delta_refresh_requested_at = COALESCE(delta_refresh_requested_at, ?) "
+    "WHERE dialog_id = ? "
     "AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
 )
 
@@ -233,6 +273,19 @@ def _delta_skip_anchor(last_synced_at: int | None, last_delta_checked_at: int | 
     return last_synced_at
 
 
+def _delta_release_at(
+    last_synced_at: int | None,
+    last_delta_checked_at: int | None,
+    refresh_requested_at: int | None,
+) -> float:
+    if refresh_requested_at is not None:
+        return float(refresh_requested_at)
+    anchor = _delta_skip_anchor(last_synced_at, last_delta_checked_at)
+    if anchor is None:
+        return 0.0
+    return float(anchor + RECENT_SYNC_SKIP_THRESHOLD_S)
+
+
 def _remaining_probe_candidates(*, total_rows: int, skipped: int, probed: int) -> int:
     return max(0, total_rows - skipped - probed)
 
@@ -326,7 +379,7 @@ class DeltaSyncWorker:
             newest_delta_checked_age_s=_delta_checked_age(newest_checked_at, now),
         )
 
-    @_delta_rpc_scope
+    @_delta_rpc_scope(DemandKind.DELTA_GAP_FILL, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def run_delta_catch_up(
         self,
         *,
@@ -467,7 +520,7 @@ class DeltaSyncWorker:
             return _DeltaFetchOutcome([], 0)
         return _DeltaFetchOutcome(new_message_rows)
 
-    @_delta_rpc_scope
+    @_delta_rpc_scope(DemandKind.DELTA_GAP_FILL, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def fetch_delta_for_dialog(self, dialog_id: int) -> int:
         """Fetch all messages newer than max known message_id for one dialog.
 
@@ -513,8 +566,113 @@ class DeltaSyncWorker:
             self._stamp_delta_checkpoint(dialog_id, now)
         return len(new_message_rows)
 
+    @_delta_rpc_scope(DemandKind.DELTA_GAP_FILL, AcquisitionKind.MESSAGE_HISTORY_PAGE)
+    async def fetch_delta_slice_for_dialog(self, dialog_id: int) -> int:  # noqa: PLR0911, PLR0912
+        """Fetch and commit one resumable forward-history page."""
+        self._last_fetch_admission_deferred = False
+        if not full_history_enabled(self._conn, dialog_id):
+            return 0
+        row = cast(
+            tuple[object | None, ...] | None,
+            self._conn.execute(_SELECT_MAX_MESSAGE_ID_SQL, (dialog_id,)).fetchone(),
+        )
+        max_known_id = _row_first_int(row)
+        if max_known_id == 0:
+            with self._conn:
+                self._stamp_delta_checked(dialog_id, int(time.time()))
+            return 0
 
-@_delta_rpc_scope
+        rows: list[ExtractedMessage] = []
+        completed = True
+        try:
+            async for message in self._client.iter_messages(
+                entity=dialog_id,
+                min_id=max_known_id,
+                reverse=True,
+                limit=_DELTA_SLICE_MESSAGE_LIMIT,
+            ):
+                if self._shutdown_event.is_set():
+                    completed = False
+                    break
+                rows.append(extract_message_row(dialog_id, message))
+        except TelegramRpcAdmissionDeferred:
+            self._last_fetch_admission_deferred = True
+            return 0
+        except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError):
+            self._last_fetch_admission_deferred = True
+            return 0
+        except TelegramRpcThrottled as exc:
+            _raise_if_latched(exc)
+            return 0
+        except ACCESS_LOST_ERRORS as exc:
+            set_access_lost(self._conn, dialog_id, int(time.time()), reason=type(exc).__name__)
+            self._conn.commit()
+            return 0
+        except RPCError as exc:
+            logger.warning("delta_slice_rpc_error dialog_id=%d error=%s", dialog_id, exc)
+            return 0
+
+        continuation_required = not completed or len(rows) == _DELTA_SLICE_MESSAGE_LIMIT
+        now = int(time.time())
+        with self._conn:
+            if not full_history_enabled(self._conn, dialog_id):
+                return 0
+            if rows:
+                insert_messages_with_fts(self._conn, rows, priority=HydrationPriority.BACKFILL)
+            if continuation_required:
+                self._conn.execute(_REQUEST_DELTA_CONTINUATION_SQL, (now, dialog_id, dialog_id))
+            else:
+                self._stamp_delta_checkpoint(dialog_id, now)
+        return len(rows)
+
+
+class DeltaGapFillDemandAdapter:
+    """One-page durable adapter over delta timestamps and refresh requests."""
+
+    demand_kind = DemandKind.DELTA_GAP_FILL
+
+    def __init__(self, worker: DeltaSyncWorker) -> None:
+        self._worker = worker
+
+    def status(self, now: float) -> DemandStatus | None:
+        """Report the oldest local delta release boundary without writes."""
+        del now
+        rows = cast(
+            list[tuple[int, int | None, int | None, int | None]],
+            self._worker._conn.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL).fetchall(),
+        )
+        if not rows:
+            return None
+        release_at = min(
+            _delta_release_at(last_synced, last_checked, requested)
+            for _, last_synced, last_checked, requested in rows
+        )
+        return DemandStatus(release_at=release_at)
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Fetch one due dialog page and leave continuation in domain state."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        now = time.time()
+        rows = cast(
+            list[tuple[int, int | None, int | None, int | None]],
+            self._worker._conn.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL).fetchall(),
+        )
+        dialog_id = next(
+            (row[0] for row in rows if _delta_release_at(row[1], row[2], row[3]) <= now),
+            None,
+        )
+        if dialog_id is None:
+            return
+        with demand_context(DemandKind.DELTA_GAP_FILL):
+            with rpc_attempt_budget(budget):
+                try:
+                    await self._worker.fetch_delta_slice_for_dialog(dialog_id)
+                except RpcAttemptBudgetExhaustedError:
+                    return
+
+
+@_delta_rpc_scope(DemandKind.DELTA_GAP_FILL, AcquisitionKind.MESSAGE_HISTORY_PAGE)
 async def run_delta_catch_up_loop(
     worker: DeltaSyncWorker,
     shutdown_event: asyncio.Event,
@@ -608,7 +766,7 @@ async def _finish_access_probe(
     return _AccessProbeOutcome(restored=_restore_revalidated_access(conn, dialog_id, total_messages=total_messages))
 
 
-@_delta_rpc_scope
+@_delta_rpc_scope(DemandKind.DELTA_ACCESS_PROBE, AcquisitionKind.MESSAGE_LOOKUP)
 async def _probe_access_lost_dialogs(
     client: _DeltaSyncClient,
     conn: sqlite3.Connection,
@@ -680,7 +838,64 @@ def _restore_revalidated_access(
     return int(changed)
 
 
-@_delta_rpc_scope
+class DurableAccessRecoveryStateRequiredError(RuntimeError):
+    """Raised until successful probes can hand off to bounded gap fill."""
+
+
+class DeltaAccessProbeDemandAdapter:
+    """Durable access probe over access-loss retry timestamps."""
+
+    demand_kind = DemandKind.DELTA_ACCESS_PROBE
+
+    def __init__(self, worker: DeltaSyncWorker, policy: AccessProbePolicy) -> None:
+        self._worker = worker
+        self._policy = policy
+
+    def status(self, now: float) -> DemandStatus | None:
+        """Report the earliest access revalidation boundary without writes."""
+        del now
+        if not self._policy.enabled:
+            return None
+        row = cast(
+            tuple[int | None] | None,
+            self._worker._conn.execute(
+                "SELECT MIN(COALESCE(access_next_revalidate_at, COALESCE(access_lost_at, 0) + ?)) "
+                "FROM synced_dialogs WHERE status = 'access_lost'",
+                (self._policy.cooldown_seconds,),
+            ).fetchone(),
+        )
+        if row is None or row[0] is None:
+            return None
+        return DemandStatus(release_at=float(row[0]))
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Probe one due peer when restoration is one-attempt atomic."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        policy = replace(self._policy, max_dialogs_per_cycle=1, probe_pause_seconds=0.0)
+        rows = _access_probe_rows(self._worker._conn, policy, int(time.time()))
+        if not rows:
+            return
+        dialog_id = rows[0][0]
+        if full_history_enabled(self._worker._conn, dialog_id):
+            raise DurableAccessRecoveryStateRequiredError(
+                "access-probe slice needs a durable probe-success-to-gap-fill handoff before enrolled dialogs can run"
+            )
+        request = _AccessProbeRequest(
+            self._worker._client,
+            self._worker._conn,
+            self._worker._shutdown_event,
+            self._worker,
+            policy,
+            dialog_id,
+        )
+        with demand_context(DemandKind.DELTA_ACCESS_PROBE):
+            with rpc_attempt_budget(budget):
+                with acquisition_context(AcquisitionKind.MESSAGE_LOOKUP):
+                    await _probe_access_lost_dialog(request)
+
+
+@_delta_rpc_scope(DemandKind.DELTA_ACCESS_PROBE, AcquisitionKind.MESSAGE_LOOKUP)
 async def run_access_probe_loop(
     client: _DeltaSyncClient,
     conn: sqlite3.Connection,
@@ -722,8 +937,11 @@ async def run_access_probe_loop(
 
 _EXPORTED_SYMBOLS = (
     AccessProbePolicy,
+    DeltaAccessProbeDemandAdapter,
     DeltaCatchUpPolicy,
+    DeltaGapFillDemandAdapter,
     DeltaSyncWorker,
+    DurableAccessRecoveryStateRequiredError,
     DeltaSyncWorker.run_delta_catch_up,
     run_access_probe_loop,
     run_delta_catch_up_loop,

@@ -22,6 +22,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
@@ -39,12 +40,24 @@ from .messages.sqlite_bundle import insert_messages_with_fts
 from .messages.telegram_adapter import PeerNameClient, extract_message_row, resolve_forward_entity_name_map
 from .resolver import latinize
 from .telegram_access import ACCESS_LOST_ERRORS
+from .telegram_demand import (
+    AcquisitionKind,
+    DemandStatus,
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+    UnclassifiedTelegramDemandError,
+    acquisition_context,
+    current_demand_token,
+    demand_context,
+)
+from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
     RpcAdmissionExpiredError,
     RpcAdmissionSaturatedError,
     TelegramRpcAdmissionDeferred,
     TelegramRpcSource,
+    rpc_attempt_budget,
     rpc_scope,
 )
 from .telethon_dialog import classify_dialog_type
@@ -54,15 +67,36 @@ _BATCH_SIZE = 100
 _DM_BOOTSTRAP_MAX_ADMISSION_WAIT_SECONDS = 30
 
 
-def _full_sync_rpc_scope[**P, R](func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
-    """Give full/history synchronization an explicit RPC source."""
+@contextmanager
+def _full_sync_demand_scope(kind: DemandKind, acquisition_kind: AcquisitionKind) -> Iterator[None]:
+    """Install a precise root for direct calls while preserving an adapter root."""
+    try:
+        current_demand_token()
+    except UnclassifiedTelegramDemandError:
+        with demand_context(kind):
+            with acquisition_context(acquisition_kind):
+                yield
+    else:
+        with acquisition_context(acquisition_kind):
+            yield
 
-    @wraps(func)
-    async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
-        with rpc_scope(TelegramRpcSource.FULL_SYNC):
-            return await func(*args, **kwargs)
 
-    return wrapped
+def _full_sync_rpc_scope[**P, R](
+    kind: DemandKind,
+    acquisition_kind: AcquisitionKind,
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    """Give full/history synchronization precise demand identity."""
+
+    def decorate(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+        @wraps(func)
+        async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            with _full_sync_demand_scope(kind, acquisition_kind):
+                with rpc_scope(TelegramRpcSource.FULL_SYNC):
+                    return await func(*args, **kwargs)
+
+        return wrapped
+
+    return decorate
 
 
 _NEXT_PENDING_SQL = (
@@ -233,7 +267,7 @@ class FullSyncWorker:
         )
         return await sleep_through_flood(self._shutdown_event, retry_after)
 
-    @_full_sync_rpc_scope
+    @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.DIALOG_TRAVERSAL)
     async def bootstrap_dms(self) -> int:
         """Enroll all DM dialogs into synced_dialogs with status='syncing'.
 
@@ -287,7 +321,7 @@ class FullSyncWorker:
         logger.info("dm_bootstrap enrolled=%d new DM dialogs", progress.enrolled)
         return progress.enrolled
 
-    @_full_sync_rpc_scope
+    @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def process_one_batch(self) -> bool:
         """Fetch one batch of messages for the next pending dialog.
 
@@ -364,7 +398,7 @@ class FullSyncWorker:
             )
             return _FetchedBatchPage(None, [], (sync_progress, False))
 
-    @_full_sync_rpc_scope
+    @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def _fetch_batch(self, dialog_id: int, sync_progress: int) -> tuple[int, bool]:
         """Fetch up to 100 messages for dialog_id older than sync_progress.
 
@@ -389,12 +423,12 @@ class FullSyncWorker:
             return page.retry
         return await self._store_batch_page(dialog_id, sync_progress, page.total_messages, page.batch)
 
-    @_full_sync_rpc_scope
+    @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.ENTITY_LOOKUP)
     async def _resolve_batch_entity_name_map(self, batch: Sequence[_MessageLike]) -> dict[int, str]:
         """Resolve forward source names for messages in a fetched batch."""
         return await resolve_forward_entity_name_map(batch, cast(PeerNameClient, self._client))
 
-    @_full_sync_rpc_scope
+    @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def _store_batch_page(
         self,
         dialog_id: int,
@@ -454,7 +488,37 @@ class FullSyncWorker:
         return new_progress, is_done
 
 
+class FullSyncDemandAdapter:
+    """Bounded durable adapter over ``synced_dialogs.sync_progress``."""
+
+    demand_kind = DemandKind.FULL_SYNC_PAGE
+
+    def __init__(self, worker: FullSyncWorker) -> None:
+        self._worker = worker
+
+    def status(self, now: float) -> DemandStatus | None:
+        """Report pending history without changing local or Telegram state."""
+        del now
+        if self._worker._next_pending_dialog() is None:
+            return None
+        return DemandStatus(release_at=0.0)
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Fetch at most one history page under the transport attempt budget."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        if self.status(time.time()) is None:
+            return
+        with demand_context(DemandKind.FULL_SYNC_PAGE):
+            with rpc_attempt_budget(budget):
+                try:
+                    await self._worker.process_one_batch()
+                except RpcAttemptBudgetExhaustedError:
+                    return
+
+
 _EXPORTED_SYMBOLS = (
+    FullSyncDemandAdapter,
     FullSyncWorker,
     FullSyncWorker.bootstrap_dms,
     FullSyncWorker.process_one_batch,

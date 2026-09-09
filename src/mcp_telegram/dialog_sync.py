@@ -35,7 +35,8 @@ import logging
 import math
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
@@ -57,12 +58,24 @@ from .maintenance_logging import log_maintenance_cycle
 from .read_state import apply_read_cursor
 from .sync_db import _open_sync_db
 from .telegram_access import ACCESS_LOST_ERRORS
+from .telegram_demand import (
+    AcquisitionKind,
+    DemandStatus,
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+    UnclassifiedTelegramDemandError,
+    acquisition_context,
+    current_demand_token,
+    demand_context,
+)
+from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
     RpcAdmissionExpiredError,
     RpcAdmissionSaturatedError,
     TelegramRpcAdmissionDeferred,
     TelegramRpcSource,
+    rpc_attempt_budget,
     rpc_scope,
 )
 from .topics.contracts import TopicSourceUnavailableError, is_topic_capable
@@ -81,7 +94,7 @@ def _read_last_full_reconciliation_at(conn: sqlite3.Connection) -> float | None:
     if row is None:
         return None
     try:
-        value = float(row[0])
+        value = float(cast(str | bytes | int | float, row[0]))
     except (TypeError, ValueError):
         logger.warning("invalid persisted dialog reconciliation timestamp")
         return None
@@ -91,15 +104,36 @@ def _read_last_full_reconciliation_at(conn: sqlite3.Connection) -> float | None:
     return value
 
 
-def _dialog_sync_rpc_scope[**P, R](func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
-    """Give dialog snapshots and reconciliation an explicit RPC source."""
+@contextmanager
+def _dialog_demand_scope(kind: DemandKind, acquisition_kind: AcquisitionKind) -> Iterator[None]:
+    """Install a precise root for direct calls while preserving an adapter root."""
+    try:
+        current_demand_token()
+    except UnclassifiedTelegramDemandError:
+        with demand_context(kind):
+            with acquisition_context(acquisition_kind):
+                yield
+    else:
+        with acquisition_context(acquisition_kind):
+            yield
 
-    @wraps(func)
-    async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
-        with rpc_scope(TelegramRpcSource.DIALOG_SYNC):
-            return await func(*args, **kwargs)
 
-    return wrapped
+def _dialog_sync_rpc_scope[**P, R](
+    kind: DemandKind,
+    acquisition_kind: AcquisitionKind,
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    """Give dialog snapshots and reconciliation precise demand identity."""
+
+    def decorate(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+        @wraps(func)
+        async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            with _dialog_demand_scope(kind, acquisition_kind):
+                with rpc_scope(TelegramRpcSource.DIALOG_SYNC):
+                    return await func(*args, **kwargs)
+
+        return wrapped
+
+    return decorate
 
 
 class _EntityLike(Protocol):
@@ -300,6 +334,7 @@ _PROGRESS_REPORT_EVERY = 50
 # ---------------------------------------------------------------------------
 
 _SELECT_DIRTY_DIALOGS_SQL = "SELECT dialog_id FROM dialogs WHERE needs_refresh = 1 AND hidden = 0"
+_SELECT_DIRTY_DIALOG_EXISTS_SQL = "SELECT 1 FROM dialogs WHERE needs_refresh = 1 AND hidden = 0 LIMIT 1"
 
 _UPDATE_DIALOG_ENTITY_SQL = (
     "UPDATE dialogs SET name=?, type=?, members=?, created=?, needs_refresh=0, snapshot_at=? WHERE dialog_id=?"
@@ -733,7 +768,7 @@ class DialogsBootstrapWorker:
             return _BootstrapAttemptResult(attempt.count)
         return _BootstrapAttemptResult(attempt.count, completed=completed)
 
-    @_dialog_sync_rpc_scope
+    @_dialog_sync_rpc_scope(DemandKind.DIALOG_BOOTSTRAP, AcquisitionKind.DIALOG_TRAVERSAL)
     async def run(self) -> int:
         """Run (or skip) the bootstrap sweep. Returns count of dialogs processed.
 
@@ -778,6 +813,53 @@ class DialogsBootstrapWorker:
                 self._conn.close()
             except Exception:
                 logger.debug("bootstrap_sweep conn close error", exc_info=True)
+
+
+class DialogBootstrapDemandAdapter:
+    """Resumable bootstrap adapter over the daemon-state cursor."""
+
+    demand_kind = DemandKind.DIALOG_BOOTSTRAP
+
+    def __init__(
+        self,
+        client: object,
+        conn: sqlite3.Connection,
+        db_path: Path,
+        shutdown_event: asyncio.Event,
+        *,
+        startup_detail_setter: Callable[[str], None] | None = None,
+    ) -> None:
+        self._client = client
+        self._conn = conn
+        self._db_path = db_path
+        self._shutdown_event = shutdown_event
+        self._startup_detail_setter = startup_detail_setter
+
+    def status(self, now: float) -> DemandStatus | None:
+        """Read bootstrap completion without opening an iterator or writing."""
+        del now
+        if _get_state(self._conn, _KEY_STATUS) == _STATUS_COMPLETE:
+            return None
+        return DemandStatus(release_at=0.0)
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Resume one bounded traversal slice from its committed cursor."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        if self.status(time.time()) is None:
+            return
+        worker = DialogsBootstrapWorker(
+            self._client,
+            self._db_path,
+            self._shutdown_event,
+            startup_detail_setter=self._startup_detail_setter,
+        )
+        with demand_context(DemandKind.DIALOG_BOOTSTRAP):
+            with rpc_attempt_budget(budget):
+                try:
+                    await worker.run()
+                except RpcAttemptBudgetExhaustedError:
+                    return
 
 
 def _full_pass_access_status(count: int) -> str:
@@ -841,7 +923,7 @@ class DialogReconciliationWorker:
         logger.warning("recon_light_flood_wait dialog_id=%d wait=%ds", dialog_id, wait_s)
         return await sleep_through_flood(self._shutdown_event, wait_s)
 
-    async def _refresh_light_dialog(self, dialog_id: int) -> bool | None:
+    async def _refresh_light_dialog(self, dialog_id: int, *, refresh_topics: bool = True) -> bool | None:
         """Refresh one dirty dialog; None means shutdown interrupted a wait."""
         try:
             entity = await self._client.get_entity(dialog_id)
@@ -859,7 +941,7 @@ class DialogReconciliationWorker:
                         dialog_id,
                     ),
                 )
-            if self._topic_refresher is not None and is_topic_capable(entity):
+            if refresh_topics and self._topic_refresher is not None and is_topic_capable(entity):
                 topic_count = await self._refresh_forum_topics(dialog_id, entity)
                 logger.debug(
                     "recon_light_pass_forum_topics dialog_id=%d count=%d",
@@ -898,8 +980,8 @@ class DialogReconciliationWorker:
             # leave needs_refresh=1 for next cycle
         return False
 
-    @_dialog_sync_rpc_scope
-    async def run_light_pass(self) -> int:
+    @_dialog_sync_rpc_scope(DemandKind.DIALOG_LIGHT_RECONCILIATION, AcquisitionKind.ENTITY_LOOKUP)
+    async def run_light_pass(self, *, refresh_topics: bool = True) -> int:
         """RECON-02: refresh dialogs flagged with needs_refresh=1.
 
         Returns count of dialogs successfully refreshed.
@@ -927,7 +1009,7 @@ class DialogReconciliationWorker:
                     count,
                 )
                 return count
-            refreshed = await self._refresh_light_dialog(dialog_id)
+            refreshed = await self._refresh_light_dialog(dialog_id, refresh_topics=refresh_topics)
             if refreshed is None:
                 return count
             count += int(refreshed)
@@ -987,7 +1069,7 @@ class DialogReconciliationWorker:
             )
         return count, True
 
-    @_dialog_sync_rpc_scope
+    @_dialog_sync_rpc_scope(DemandKind.DIALOG_FULL_RECONCILIATION, AcquisitionKind.DIALOG_TRAVERSAL)
     async def _enumerate_full_pass(self) -> tuple[set[int], int, bool]:
         """Enumerate dialogs and persist interrupted sweep state."""
         seen_ids: set[int] = set()
@@ -1029,7 +1111,7 @@ class DialogReconciliationWorker:
             self._mark_full_pass_partial(count, status=partial_status)
         return seen_ids, count, completed
 
-    @_dialog_sync_rpc_scope
+    @_dialog_sync_rpc_scope(DemandKind.DIALOG_FULL_RECONCILIATION, AcquisitionKind.DIALOG_TRAVERSAL)
     async def run_full_pass(self) -> tuple[int, bool]:
         """RECON-03: full iter_dialogs() sweep with soft-delete of missing rows.
 
@@ -1078,7 +1160,7 @@ class DialogReconciliationWorker:
         )
         return count, True
 
-    @_dialog_sync_rpc_scope
+    @_dialog_sync_rpc_scope(DemandKind.DIALOG_LIGHT_RECONCILIATION, AcquisitionKind.TOPIC_SNAPSHOT)
     async def _refresh_forum_topics(
         self,
         dialog_id: int,
@@ -1120,7 +1202,70 @@ class DialogReconciliationWorker:
         return count
 
 
-@_dialog_sync_rpc_scope
+class DialogLightReconciliationDemandAdapter:
+    """Bounded dirty-dialog adapter over ``dialogs.needs_refresh``."""
+
+    demand_kind = DemandKind.DIALOG_LIGHT_RECONCILIATION
+
+    def __init__(self, worker: DialogReconciliationWorker) -> None:
+        self._worker = worker
+
+    def status(self, now: float) -> DemandStatus | None:
+        """Report dirty visible dialogs without mutating their flags."""
+        del now
+        row = cast(tuple[int] | None, self._worker._conn.execute(_SELECT_DIRTY_DIALOG_EXISTS_SQL).fetchone())
+        if row is None:
+            return None
+        return DemandStatus(release_at=0.0)
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Refresh dirty entity rows until the attempt budget yields."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        if self.status(time.time()) is None:
+            return
+        with demand_context(DemandKind.DIALOG_LIGHT_RECONCILIATION):
+            with rpc_attempt_budget(budget):
+                try:
+                    await self._worker.run_light_pass(refresh_topics=False)
+                except RpcAttemptBudgetExhaustedError:
+                    return
+
+
+class DurableDialogSweepStateRequiredError(RuntimeError):
+    """Raised until full-sweep membership and cursor state are durable."""
+
+
+class DialogFullReconciliationDemandAdapter:
+    """Shadow status for the daily full dialog traversal."""
+
+    demand_kind = DemandKind.DIALOG_FULL_RECONCILIATION
+
+    def __init__(self, worker: DialogReconciliationWorker, *, interval_seconds: float = 86_400.0) -> None:
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be positive")
+        self._worker = worker
+        self._interval_seconds = interval_seconds
+
+    def status(self, now: float) -> DemandStatus:
+        """Report the persisted daily release boundary without writes."""
+        del now
+        completed_at = _read_last_full_reconciliation_at(self._worker._conn)
+        release_at = 0.0 if completed_at is None else completed_at + self._interval_seconds
+        return DemandStatus(release_at=release_at, freshness_deadline=release_at)
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Refuse an unsafe traversal until exact resume state is durable."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        now = time.time()
+        if not self.status(now).is_ready(now):
+            return
+        raise DurableDialogSweepStateRequiredError(
+            "full dialog reconciliation needs durable generation, cursor, and seen-membership state"
+        )
+
+
 async def run_reconciliation_loop(  # noqa: PLR0913
     client: object,
     conn: sqlite3.Connection,
@@ -1182,7 +1327,12 @@ async def run_reconciliation_loop(  # noqa: PLR0913
 
 
 _EXPORTED_SYMBOLS = (
+    DialogBootstrapDemandAdapter,
+    DialogFullReconciliationDemandAdapter,
+    DialogLightReconciliationDemandAdapter,
+    DialogReconciliationWorker,
     DialogsBootstrapWorker,
     DialogsBootstrapWorker.run,
+    DurableDialogSweepStateRequiredError,
     run_reconciliation_loop,
 )
