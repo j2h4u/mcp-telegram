@@ -89,6 +89,14 @@ workers as immutable policy. Application/capability code does not read the
 configuration tree for local fallback policy; `check_config_imports.py`
 ratchets that rule.
 
+Every application-owned Telegram RPC reason is declared in the immutable
+consumer registry. Its admission view classifies transport work, while its
+acquisition and demand views describe fact ownership, overlap with recovery
+paths, fan-out, and where offered work is bounded. The transport gate rejects
+unclassified calls before Telegram sees them. Producer-specific cadence and
+work selection remain with the producer rather than turning the registry into
+a second scheduler.
+
 ## Invariants
 
 - Delivery may not directly use Telegram or SQLite adapters.

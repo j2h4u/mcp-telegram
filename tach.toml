@@ -622,7 +622,12 @@ depends_on = ["mcp_telegram.message_contracts"]
 [[modules]]
 path = "mcp_telegram.telegram_rpc_scheduler"
 layer = "foundation"
-depends_on = ["mcp_telegram.flood"]
+depends_on = ["mcp_telegram.flood", "mcp_telegram.telegram_rpc_consumers"]
+
+[[modules]]
+path = "mcp_telegram.telegram_rpc_consumers"
+layer = "foundation"
+depends_on = []
 
 [[modules]]
 path = "mcp_telegram.config"

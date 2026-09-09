@@ -50,6 +50,7 @@ MCP serving code uses daemon APIs and read-only DB access for lightweight querie
 - `activity_peer_sweep.py` — shared substrate for per-peer self-search sweeps and working-set enrollment
 - `activity_peer_resolve.py` — low-level peer and linked-chat resolution primitives (`GetFullChannelRequest`)
 - `flood.py` — shared FloodWait helpers
+- `telegram_rpc_consumers.py` — exhaustive immutable RPC consumer registry: admission, acquisition semantics, demand bounds
 
 ### Shared Utilities
 - `models.py` — TypedDict schemas, dataclasses (`StoredMessage`, `ReadMessage`)
