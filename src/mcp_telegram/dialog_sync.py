@@ -95,7 +95,7 @@ def _read_last_full_reconciliation_at(conn: sqlite3.Connection) -> float | None:
         return None
     try:
         value = float(cast(str | bytes | int | float, row[0]))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         logger.warning("invalid persisted dialog reconciliation timestamp")
         return None
     if not math.isfinite(value) or value < 0:
@@ -165,6 +165,7 @@ def _extract_draft_text(draft: object) -> str | None:
 
 
 class _MessageLike(Protocol):
+    id: int
     date: datetime | None
 
 
@@ -341,6 +342,12 @@ _UPDATE_DIALOG_ENTITY_SQL = (
 )
 _HIDE_DIALOG_SQL = "UPDATE dialogs SET hidden=1, snapshot_at=? WHERE dialog_id=? AND hidden=0"
 _SELECT_VISIBLE_DIALOG_IDS_SQL = "SELECT dialog_id FROM dialogs WHERE hidden = 0"
+
+_SELECT_FULL_RECONCILIATION_STATE_SQL = """
+SELECT generation, status, offset_date, offset_id, offset_peer, started_at, observed_count
+FROM dialog_full_reconciliation_state
+WHERE singleton = 1
+"""
 
 # ---------------------------------------------------------------------------
 # State helpers
@@ -866,6 +873,15 @@ def _full_pass_access_status(count: int) -> str:
     return "source_unavailable" if count == 0 else "partial"
 
 
+@dataclass(frozen=True, slots=True)
+class _FullReconciliationState:
+    generation: int
+    offset_date: datetime | None
+    offset_id: int
+    offset_peer: object | None
+    observed_count: int
+
+
 # ---------------------------------------------------------------------------
 # Reconciliation Worker (Phase 43)
 # ---------------------------------------------------------------------------
@@ -897,11 +913,10 @@ class DialogReconciliationWorker:
       - Light pass: sleep, then advance to next dialog. Does NOT retry the
         same dialog. The needs_refresh=1 flag remains set on the dialog that
         triggered throttling, so the NEXT hourly cycle picks it up.
-      - Full pass: sleep, then return. Does NOT resume the iter_dialogs
-        stream (Telethon's iter_dialogs is a generator and cannot be resumed
-        mid-stream). The next daily cycle re-runs the full pass from
-        scratch. last_full_pass is NOT updated when the pass is interrupted
-        this way — see run_reconciliation_loop's success-only update logic.
+      - Full pass: checkpoint each consumed dialog, then sleep and return.
+        A later slice or legacy cycle reconstructs the Telegram cursor and
+        resumes the same durable generation. last_full_pass advances only
+        after the iterator drains and the unchanged unseen baseline is hidden.
     """
 
     def __init__(
@@ -1025,140 +1040,241 @@ class DialogReconciliationWorker:
                 completed=False,
             )
 
-    async def _handle_full_admission_deferred(self, exc: TelegramRpcAdmissionDeferred, count: int) -> None:
-        logger.info(
-            "recon_full admission_deferred retry_after=%s processed=%d — preserving sweep state",
-            exc.retry_after_seconds,
-            count,
+    def _full_observed_count(self, generation: int, *, fallback: int) -> int:
+        row = cast(
+            tuple[int] | None,
+            self._conn.execute(
+                "SELECT observed_count FROM dialog_full_reconciliation_state WHERE singleton=1 AND generation=?",
+                (generation,),
+            ).fetchone(),
         )
-        if exc.retry_after_seconds is not None:
-            await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
+        return row[0] if row is not None else fallback
 
-    async def _handle_full_throttling(self, exc: TelegramRpcThrottled, count: int) -> None:
-        if exc.retry_after_seconds is None:
-            return
-        logger.warning(
-            "recon_full_flood_wait wait=%ds processed=%d",
-            exc.retry_after_seconds,
-            count,
-        )
-        await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
-
-    async def _consume_full_dialog(
-        self,
-        dialog: _DialogLike,
-        seen_ids: set[int],
-        count: int,
-    ) -> tuple[int, bool]:
-        if self._shutdown_event.is_set():
-            return count, False
-        snapshot_at = int(time.time())  # fresh per dialog — avoids stale recency guard
-        row = _extract_dialog_row(dialog, snapshot_at)
+    def _reset_corrupt_full_generation(self, generation: int) -> None:
         with self._conn:
-            self._conn.execute(_UPSERT_DIALOG_SQL, row)
-            _apply_dialog_read_cursors(self._conn, dialog)
-        dialog_id = int(dialog.id)
-        seen_ids.add(dialog_id)
-        count += 1
-        if self._topic_refresher is not None and is_topic_capable(dialog.entity):
-            topic_count = await self._refresh_forum_topics(dialog_id, dialog.entity)
-            logger.debug(
-                "recon_full_pass_forum_topics dialog_id=%d count=%d",
-                dialog_id,
-                topic_count,
+            self._conn.execute(
+                "UPDATE dialog_full_reconciliation_state "
+                "SET status='idle', offset_date=NULL, offset_id=0, offset_peer=NULL, "
+                "started_at=NULL, observed_count=0 WHERE singleton=1 AND generation=?",
+                (generation,),
             )
-        return count, True
+            self._conn.execute(
+                "DELETE FROM dialog_full_reconciliation_baseline WHERE generation=?",
+                (generation,),
+            )
 
-    @_dialog_sync_rpc_scope(DemandKind.DIALOG_FULL_RECONCILIATION, AcquisitionKind.DIALOG_TRAVERSAL)
-    async def _enumerate_full_pass(self) -> tuple[set[int], int, bool]:
-        """Enumerate dialogs and persist interrupted sweep state."""
-        seen_ids: set[int] = set()
-        count = 0
-        completed = True
-        partial_status = "partial"
+    def _load_or_begin_full_generation(self) -> _FullReconciliationState:
+        """Atomically resume a generation or snapshot a new visible baseline."""
+        with self._conn:
+            row = cast(
+                tuple[int, str, str | None, int, str | None, int | None, int] | None,
+                self._conn.execute(_SELECT_FULL_RECONCILIATION_STATE_SQL).fetchone(),
+            )
+            if row is None:
+                raise RuntimeError("dialog full reconciliation state row is missing")
+            generation, status, offset_date_raw, offset_id, offset_peer_raw, _started_at, observed_count = row
+            if status == "idle":
+                generation += 1
+                started_at = int(time.time())
+                self._conn.execute("DELETE FROM dialog_full_reconciliation_baseline")
+                self._conn.execute(
+                    "INSERT INTO dialog_full_reconciliation_baseline "
+                    "(generation, dialog_id, baseline_revision, seen) "
+                    "SELECT ?, dialog_id, revision, 0 FROM dialogs WHERE hidden=0",
+                    (generation,),
+                )
+                visible_count = cast(
+                    int,
+                    self._conn.execute(
+                        "SELECT COUNT(*) FROM dialog_full_reconciliation_baseline WHERE generation=?",
+                        (generation,),
+                    ).fetchone()[0],
+                )
+                self._conn.execute(
+                    "UPDATE dialog_full_reconciliation_state "
+                    "SET generation=?, status='in_progress', offset_date=NULL, offset_id=0, "
+                    "offset_peer=NULL, started_at=?, observed_count=0 WHERE singleton=1",
+                    (generation, started_at),
+                )
+                _begin_unread_sweep(self._conn, visible_count=visible_count)
+                return _FullReconciliationState(generation, None, 0, None, 0)
+
         try:
-            async for dialog in self._client.iter_dialogs():
-                count, completed = await self._consume_full_dialog(dialog, seen_ids, count)
-                if not completed:
-                    break
-        except TelegramRpcAdmissionDeferred as exc:
-            await self._handle_full_admission_deferred(exc, count)
-            completed = False
-        except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
-            logger.info(
-                "recon_full admission_deferred error_type=%s processed=%d — preserving sweep state",
-                type(exc).__name__,
-                count,
-            )
-            completed = False
-        except TelegramRpcThrottled as exc:
-            await self._handle_full_throttling(exc, count)
-            completed = False
-        except ACCESS_LOST_ERRORS as exc:
-            partial_status = _full_pass_access_status(count)
-            logger.warning(
-                "recon_full_%s error=%s processed=%d",
-                partial_status,
-                type(exc).__name__,
-                count,
-            )
-            completed = False
-        except Exception:
-            self._mark_full_pass_partial(count, status=partial_status)
-            logger.exception("recon_full_pass_unexpected_error processed=%d", count)
-            raise
-        if not completed:
-            self._mark_full_pass_partial(count, status=partial_status)
-        return seen_ids, count, completed
+            offset_date = datetime.fromisoformat(offset_date_raw) if offset_date_raw else None
+            offset_peer = _decode_offset_peer(offset_peer_raw) if offset_peer_raw else None
+        except ValueError, TypeError, json.JSONDecodeError:
+            logger.warning("recon_full cursor corrupt — starting a new generation", exc_info=True)
+            self._reset_corrupt_full_generation(generation)
+            return self._load_or_begin_full_generation()
+        return _FullReconciliationState(generation, offset_date, offset_id, offset_peer, observed_count)
 
-    @_dialog_sync_rpc_scope(DemandKind.DIALOG_FULL_RECONCILIATION, AcquisitionKind.DIALOG_TRAVERSAL)
-    async def run_full_pass(self) -> tuple[int, bool]:
-        """RECON-03: full iter_dialogs() sweep with soft-delete of missing rows.
-
-        Returns (count, completed) where count is the number of dialogs UPSERTed
-        and completed is True only when the sweep finished normally (soft-delete
-        phase ran). Dialogs visible before the sweep but not returned by
-        iter_dialogs() get hidden=1 when completed=True.
-
-        Throttling behavior: iter_dialogs is a generator — it cannot be
-        resumed mid-stream. On TelegramRpcThrottled we sleep (interruptible by
-        shutdown_event) and return (count, False). Soft-deletes are NOT
-        applied (we cannot tell which dialogs are truly missing vs simply
-        not yet streamed). The caller (run_reconciliation_loop) only advances
-        last_full_pass when completed=True, so the next hourly tick retries
-        the full pass instead of waiting a full day.
-        """
-        pre_pass_ids = {
-            row[0] for row in cast(list[tuple[int]], self._conn.execute(_SELECT_VISIBLE_DIALOG_IDS_SQL).fetchall())
-        }
+    def _checkpoint_full_dialog(self, state: _FullReconciliationState, dialog: _DialogLike) -> bool:
+        """Apply a dialog, seen membership, and resume cursor in one transaction."""
+        snapshot_at = int(time.time())
         with self._conn:
-            _begin_unread_sweep(self._conn, visible_count=len(pre_pass_ids))
-        seen_ids, count, completed = await self._enumerate_full_pass()
-        if not completed:
-            return count, False
+            current = cast(
+                tuple[int, str] | None,
+                self._conn.execute(
+                    "SELECT generation, status FROM dialog_full_reconciliation_state WHERE singleton=1"
+                ).fetchone(),
+            )
+            if current != (state.generation, "in_progress"):
+                return False
+            self._conn.execute(_UPSERT_DIALOG_SQL, _extract_dialog_row(dialog, snapshot_at))
+            _apply_dialog_read_cursors(self._conn, dialog)
+            dialog_id = int(dialog.id)
+            seen_update = self._conn.execute(
+                "UPDATE dialog_full_reconciliation_baseline SET seen=1 WHERE generation=? AND dialog_id=? AND seen=0",
+                (state.generation, dialog_id),
+            )
+            first_observation = seen_update.rowcount == 1
+            if not first_observation:
+                inserted = self._conn.execute(
+                    "INSERT OR IGNORE INTO dialog_full_reconciliation_baseline "
+                    "(generation, dialog_id, baseline_revision, seen) "
+                    "SELECT ?, dialog_id, revision, 1 FROM dialogs WHERE dialog_id=?",
+                    (state.generation, dialog_id),
+                )
+                first_observation = inserted.rowcount == 1
+            dialog_date = dialog.date if isinstance(dialog.date, datetime) else None
+            message = dialog.message
+            message_id = message.id if message is not None and isinstance(message.id, int) else 0
+            self._conn.execute(
+                "UPDATE dialog_full_reconciliation_state "
+                "SET offset_date=?, offset_id=?, offset_peer=?, observed_count=observed_count+? "
+                "WHERE singleton=1 AND generation=? AND status='in_progress'",
+                (
+                    dialog_date.isoformat() if dialog_date is not None else None,
+                    message_id,
+                    _encode_offset_peer(dialog.entity),
+                    int(first_observation),
+                    state.generation,
+                ),
+            )
+        return True
 
-        # Soft-delete dialogs visible pre-pass but not returned by iter_dialogs.
+    def _complete_full_generation(self, generation: int) -> tuple[int, int] | None:
+        """Hide only unchanged unseen baseline rows after a generation match."""
         now = int(time.time())
-        missing = pre_pass_ids - seen_ids
-        for dialog_id in missing:
-            with self._conn:
-                self._conn.execute(_HIDE_DIALOG_SQL, (now, dialog_id))
         with self._conn:
+            row = cast(
+                tuple[int, str, int] | None,
+                self._conn.execute(
+                    "SELECT generation, status, observed_count FROM dialog_full_reconciliation_state WHERE singleton=1"
+                ).fetchone(),
+            )
+            if row is None or row[0] != generation or row[1] != "in_progress":
+                return None
+            observed_count = row[2]
+            cursor = self._conn.execute(
+                """
+                UPDATE dialogs
+                   SET hidden=1, snapshot_at=:now
+                 WHERE hidden=0
+                   AND EXISTS (
+                       SELECT 1
+                         FROM dialog_full_reconciliation_baseline AS baseline
+                        WHERE baseline.generation=:generation
+                          AND baseline.dialog_id=dialogs.dialog_id
+                          AND baseline.seen=0
+                          AND baseline.baseline_revision=dialogs.revision
+                   )
+                """,
+                {"generation": generation, "now": now},
+            )
+            hidden = cursor.rowcount
             _finish_unread_sweep(
                 self._conn,
                 status="complete",
-                observed_count=count,
+                observed_count=observed_count,
                 completed=True,
-                visible_count=len(seen_ids),
+                visible_count=observed_count,
             )
+            _set_state(self._conn, _LAST_FULL_RECONCILIATION_KEY, str(float(now)))
+            self._conn.execute(
+                "UPDATE dialog_full_reconciliation_state "
+                "SET status='idle', offset_date=NULL, offset_id=0, offset_peer=NULL, "
+                "started_at=NULL, observed_count=0 WHERE singleton=1 AND generation=?",
+                (generation,),
+            )
+            self._conn.execute(
+                "DELETE FROM dialog_full_reconciliation_baseline WHERE generation=?",
+                (generation,),
+            )
+        return observed_count, hidden
+
+    async def _run_full_pass_slice(  # noqa: PLR0912 - explicit Telegram outcome handling
+        self, *, refresh_topics: bool, wait_on_throttle: bool
+    ) -> tuple[int, bool]:
+        state = self._load_or_begin_full_generation()
+        partial_status = "partial"
+        completed = True
+        try:
+            async for dialog in self._client.iter_dialogs(
+                offset_date=state.offset_date,
+                offset_id=state.offset_id,
+                offset_peer=state.offset_peer if state.offset_peer is not None else types.InputPeerEmpty(),
+            ):
+                if self._shutdown_event.is_set() or not self._checkpoint_full_dialog(state, dialog):
+                    completed = False
+                    break
+                if refresh_topics and self._topic_refresher is not None and is_topic_capable(dialog.entity):
+                    await self._refresh_forum_topics(int(dialog.id), dialog.entity)
+        except RpcAttemptBudgetExhaustedError:
+            completed = False
+        except TelegramRpcAdmissionDeferred as exc:
+            logger.info(
+                "recon_full admission_deferred retry_after=%s generation=%d",
+                exc.retry_after_seconds,
+                state.generation,
+            )
+            if wait_on_throttle and exc.retry_after_seconds is not None:
+                await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
+            completed = False
+        except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
+            logger.info("recon_full admission_deferred error_type=%s", type(exc).__name__)
+            completed = False
+        except TelegramRpcThrottled as exc:
+            logger.warning("recon_full_flood_wait wait=%s", exc.retry_after_seconds)
+            if wait_on_throttle and exc.retry_after_seconds is not None:
+                await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
+            completed = False
+        except ACCESS_LOST_ERRORS as exc:
+            partial_status = _full_pass_access_status(
+                self._full_observed_count(state.generation, fallback=state.observed_count)
+            )
+            logger.warning("recon_full_%s error=%s", partial_status, type(exc).__name__)
+            completed = False
+        except Exception:
+            self._mark_full_pass_partial(
+                self._full_observed_count(state.generation, fallback=state.observed_count),
+                status=partial_status,
+            )
+            logger.exception("recon_full_pass_unexpected_error generation=%d", state.generation)
+            raise
+        if not completed:
+            count = self._full_observed_count(state.generation, fallback=state.observed_count)
+            self._mark_full_pass_partial(count, status=partial_status)
+            return count, False
+
+        result = self._complete_full_generation(state.generation)
+        if result is None:
+            return state.observed_count, False
+        count, hidden = result
         log_maintenance_cycle(
             logger,
-            bool(missing),
-            "recon_full_pass_complete count=%d hidden=%d",
+            hidden > 0,
+            "recon_full_pass_complete count=%d hidden=%d generation=%d",
             count,
-            len(missing),
+            hidden,
+            state.generation,
         )
         return count, True
+
+    @_dialog_sync_rpc_scope(DemandKind.DIALOG_FULL_RECONCILIATION, AcquisitionKind.DIALOG_TRAVERSAL)
+    async def run_full_pass(self) -> tuple[int, bool]:
+        """Resume a full sweep and atomically soft-hide its unchanged baseline."""
+        return await self._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     @_dialog_sync_rpc_scope(DemandKind.DIALOG_LIGHT_RECONCILIATION, AcquisitionKind.TOPIC_SNAPSHOT)
     async def _refresh_forum_topics(
@@ -1232,12 +1348,8 @@ class DialogLightReconciliationDemandAdapter:
                     return
 
 
-class DurableDialogSweepStateRequiredError(RuntimeError):
-    """Raised until full-sweep membership and cursor state are durable."""
-
-
 class DialogFullReconciliationDemandAdapter:
-    """Shadow status for the daily full dialog traversal."""
+    """Execute bounded, generation-safe slices of the daily dialog traversal."""
 
     demand_kind = DemandKind.DIALOG_FULL_RECONCILIATION
 
@@ -1252,18 +1364,30 @@ class DialogFullReconciliationDemandAdapter:
         del now
         completed_at = _read_last_full_reconciliation_at(self._worker._conn)
         release_at = 0.0 if completed_at is None else completed_at + self._interval_seconds
+        state = cast(
+            tuple[str] | None,
+            self._worker._conn.execute(
+                "SELECT status FROM dialog_full_reconciliation_state WHERE singleton=1"
+            ).fetchone(),
+        )
+        if state == ("in_progress",):
+            return DemandStatus(release_at=0.0, freshness_deadline=release_at)
         return DemandStatus(release_at=release_at, freshness_deadline=release_at)
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
-        """Refuse an unsafe traversal until exact resume state is durable."""
+        """Resume from the committed cursor until the actual-attempt budget yields."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
         now = time.time()
         if not self.status(now).is_ready(now):
             return
-        raise DurableDialogSweepStateRequiredError(
-            "full dialog reconciliation needs durable generation, cursor, and seen-membership state"
-        )
+        with demand_context(DemandKind.DIALOG_FULL_RECONCILIATION):
+            with rpc_attempt_budget(budget):
+                with rpc_scope(
+                    TelegramRpcSource.DIALOG_SYNC,
+                    acquisition_kind=AcquisitionKind.DIALOG_TRAVERSAL,
+                ):
+                    await self._worker._run_full_pass_slice(refresh_topics=False, wait_on_throttle=False)
 
 
 async def run_reconciliation_loop(  # noqa: PLR0913
@@ -1333,6 +1457,5 @@ _EXPORTED_SYMBOLS = (
     DialogReconciliationWorker,
     DialogsBootstrapWorker,
     DialogsBootstrapWorker.run,
-    DurableDialogSweepStateRequiredError,
     run_reconciliation_loop,
 )

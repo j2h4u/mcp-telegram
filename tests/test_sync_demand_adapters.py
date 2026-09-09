@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from telethon.tl import types
@@ -20,7 +20,6 @@ from mcp_telegram.delta_sync import (
     DeltaAccessProbeDemandAdapter,
     DeltaGapFillDemandAdapter,
     DeltaSyncWorker,
-    DurableAccessRecoveryStateRequiredError,
     _DeltaSyncClient,
 )
 from mcp_telegram.dialog_sync import (
@@ -28,7 +27,6 @@ from mcp_telegram.dialog_sync import (
     DialogFullReconciliationDemandAdapter,
     DialogLightReconciliationDemandAdapter,
     DialogReconciliationWorker,
-    DurableDialogSweepStateRequiredError,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter, FullSyncWorker
@@ -192,17 +190,22 @@ async def test_delta_gap_slice_commits_one_page_and_keeps_durable_continuation(
         for message in pages.pop(0):
             yield message
 
-    worker = DeltaSyncWorker(cast(_DeltaSyncClient, SimpleNamespace(iter_messages=iter_messages)), conn, asyncio.Event())
+    worker = DeltaSyncWorker(
+        cast(_DeltaSyncClient, SimpleNamespace(iter_messages=iter_messages)), conn, asyncio.Event()
+    )
     adapter = DeltaGapFillDemandAdapter(worker)
     budget = RpcAttemptBudget(limit=1)
 
     await adapter.run_slice(budget)
 
     assert conn.execute("SELECT MAX(message_id) FROM messages WHERE dialog_id = ?", (dialog_id,)).fetchone() == (200,)
-    assert conn.execute(
-        "SELECT delta_refresh_requested_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id = ?",
-        (dialog_id,),
-    ).fetchone()[0] is not None
+    assert (
+        conn.execute(
+            "SELECT delta_refresh_requested_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id = ?",
+            (dialog_id,),
+        ).fetchone()[0]
+        is not None
+    )
     assert adapter.status(10_000.0).is_ready(10_000.0)  # type: ignore[union-attr]
     assert observed_limits == [100]
     assert observed_scopes[0].demand_kind is DemandKind.DELTA_GAP_FILL
@@ -210,10 +213,13 @@ async def test_delta_gap_slice_commits_one_page_and_keeps_durable_continuation(
     assert observed_scopes[0].attempt_budget is budget
 
     await adapter.run_slice(RpcAttemptBudget(limit=1))
-    assert conn.execute(
-        "SELECT delta_refresh_requested_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id = ?",
-        (dialog_id,),
-    ).fetchone()[0] is None
+    assert (
+        conn.execute(
+            "SELECT delta_refresh_requested_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id = ?",
+            (dialog_id,),
+        ).fetchone()[0]
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -250,7 +256,7 @@ async def test_access_probe_adapter_restores_non_enrolled_peer_with_precise_scop
 
 
 @pytest.mark.asyncio
-async def test_access_probe_adapter_refuses_enrolled_peer_before_telegram(conn: sqlite3.Connection) -> None:
+async def test_access_probe_adapter_persists_probe_to_gap_fill_handoff(conn: sqlite3.Connection) -> None:
     dialog_id = 302
     conn.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at) VALUES (?, 'access_lost', 1)",
@@ -258,13 +264,34 @@ async def test_access_probe_adapter_refuses_enrolled_peer_before_telegram(conn: 
     )
     seed_full_history_enrollment(conn, dialog_id, enabled=True)
     conn.commit()
-    get_messages = AsyncMock()
-    worker = DeltaSyncWorker(cast(_DeltaSyncClient, SimpleNamespace(get_messages=get_messages)), conn, asyncio.Event())
+    get_messages = AsyncMock(return_value=MockTotalList([], total=12))
+
+    async def iter_messages(**_kwargs: object) -> AsyncIterator[object]:
+        return
+        yield  # pragma: no cover
+
+    worker = DeltaSyncWorker(
+        cast(_DeltaSyncClient, SimpleNamespace(get_messages=get_messages, iter_messages=iter_messages)),
+        conn,
+        asyncio.Event(),
+    )
     adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy())
 
-    with pytest.raises(DurableAccessRecoveryStateRequiredError, match="durable probe-success-to-gap-fill handoff"):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-    get_messages.assert_not_awaited()
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    get_messages.assert_awaited_once()
+    assert conn.execute(
+        "SELECT stage, total_messages FROM delta_access_recovery_state WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == ("gap_fill", 12)
+    assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        "access_lost",
+    )
+
+    restarted = DeltaAccessProbeDemandAdapter(worker, _delta_policy())
+    await restarted.run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute("SELECT 1 FROM delta_access_recovery_state WHERE dialog_id=?", (dialog_id,)).fetchone() is None
+    assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == ("syncing",)
 
 
 @pytest.mark.asyncio
@@ -338,12 +365,16 @@ async def test_dialog_light_adapter_clears_one_durable_dirty_flag(conn: sqlite3.
 
 
 @pytest.mark.asyncio
-async def test_dialog_full_adapter_reports_due_state_but_refuses_unsafe_slice(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        "INSERT INTO daemon_state (key, value) VALUES ('dialog_reconciliation_last_full_at', '100')"
-    )
+async def test_dialog_full_adapter_completes_generation_under_precise_scope(conn: sqlite3.Connection) -> None:
+    conn.execute("INSERT INTO daemon_state (key, value) VALUES ('dialog_reconciliation_last_full_at', '100')")
     conn.commit()
-    iter_dialogs = MagicMock()
+    observed_scopes: list[TelegramRpcScope] = []
+
+    async def iter_dialogs(**_kwargs: object) -> AsyncIterator[object]:
+        observed_scopes.append(current_rpc_scope())
+        return
+        yield  # pragma: no cover
+
     worker = DialogReconciliationWorker(SimpleNamespace(iter_dialogs=iter_dialogs), conn, asyncio.Event())
     adapter = DialogFullReconciliationDemandAdapter(worker, interval_seconds=50.0)
     changes_before = conn.total_changes
@@ -352,7 +383,73 @@ async def test_dialog_full_adapter_reports_due_state_but_refuses_unsafe_slice(co
     assert status.release_at == 150.0
     assert status.freshness_deadline == 150.0
     assert conn.total_changes == changes_before
-    with pytest.raises(DurableDialogSweepStateRequiredError, match="generation, cursor, and seen-membership"):
-        await adapter.run_slice(RpcAttemptBudget(limit=32))
-    iter_dialogs.assert_not_called()
-    assert conn.total_changes == changes_before
+    budget = RpcAttemptBudget(limit=32)
+    await adapter.run_slice(budget)
+
+    scope = observed_scopes[0]
+    assert scope.demand_kind is DemandKind.DIALOG_FULL_RECONCILIATION
+    assert scope.acquisition_kind is AcquisitionKind.DIALOG_TRAVERSAL
+    assert scope.attempt_budget is budget
+    assert conn.execute(
+        "SELECT status, generation FROM dialog_full_reconciliation_state WHERE singleton=1"
+    ).fetchone() == ("idle", 1)
+    assert conn.execute("SELECT value FROM daemon_state WHERE key='dialog_reconciliation_last_full_at'").fetchone() != (
+        "100",
+    )
+
+
+@pytest.mark.asyncio
+async def test_dialog_full_adapter_resumes_message_cursor_and_preserves_changed_unseen_row(
+    conn: sqlite3.Connection,
+) -> None:
+    cursor_date = datetime(2026, 1, 2, tzinfo=UTC)
+    user = types.User(id=401, first_name="Seen", access_hash=999)
+    dialog = SimpleNamespace(
+        id=401,
+        dialog=SimpleNamespace(read_inbox_max_id=None, read_outbox_max_id=None, unread_mark=False),
+        entity=user,
+        message=SimpleNamespace(id=777, date=cursor_date),
+        pinned=False,
+        folder_id=None,
+        read_inbox_max_id=None,
+        read_outbox_max_id=None,
+        unread_mentions_count=0,
+        unread_reactions_count=0,
+        unread_count=0,
+        unread_mark=False,
+        draft=None,
+        date=cursor_date,
+    )
+    conn.executemany(
+        "INSERT INTO dialogs(dialog_id, name, type, hidden) VALUES (?, ?, 'user', 0)",
+        ((401, "Old seen"), (402, "Locally changed")),
+    )
+    conn.commit()
+    observed_options: list[dict[str, object]] = []
+
+    async def iter_dialogs(**kwargs: object) -> AsyncIterator[object]:
+        observed_options.append(kwargs)
+        if len(observed_options) == 1:
+            yield dialog
+            raise RpcAttemptBudgetExhaustedError("slice complete")
+
+    worker = DialogReconciliationWorker(SimpleNamespace(iter_dialogs=iter_dialogs), conn, asyncio.Event())
+    adapter = DialogFullReconciliationDemandAdapter(worker, interval_seconds=50.0)
+
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute(
+        "SELECT status, offset_id, observed_count FROM dialog_full_reconciliation_state WHERE singleton=1"
+    ).fetchone() == ("in_progress", 777, 1)
+    conn.execute("UPDATE dialogs SET name='Changed during sweep' WHERE dialog_id=402")
+    conn.commit()
+
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert observed_options[1]["offset_date"] == cursor_date
+    assert observed_options[1]["offset_id"] == 777
+    assert isinstance(observed_options[1]["offset_peer"], types.InputPeerUser)
+    assert conn.execute("SELECT hidden FROM dialogs WHERE dialog_id=402").fetchone() == (0,)
+    assert conn.execute(
+        "SELECT status, generation FROM dialog_full_reconciliation_state WHERE singleton=1"
+    ).fetchone() == ("idle", 1)

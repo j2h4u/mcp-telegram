@@ -18,14 +18,14 @@ from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
 from .entity_profile.contracts import PROFILE_SECTIONS, completeness
 from .entity_profile.refresh import EntityRefreshCoordinator, RefreshEnqueueResult, RefreshLimits
-from .entity_profile.repository import EntityProfileRepository
+from .entity_profile.repository import EntityProfileRepository, EntityRefreshCursor, EntitySectionCommit
 from .entity_profile.telegram_gateway import BoundedTelegramGateway
 from .entity_store import EntitySnapshot, ensure_entity_stub
 from .flood import TelegramRpcThrottled
 from .folders.read_model import dialog_placement
 from .models import DialogType
 from .telegram_access import ACCESS_LOST_ERRORS
-from .telegram_demand import AcquisitionKind
+from .telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
 from .telegram_rpc import raise_if_flood_wait_error
 from .telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
 from .telethon_dialog import classify_dialog_type
@@ -232,6 +232,13 @@ class DaemonEntityInfoService:
             if enable_refresh_coordinator
             else None
         )
+        if self._refresh is not None:
+            self._refresh.bind_durable_executor(self._durable_refresh_status, self._run_durable_refresh_slice)
+
+    @property
+    def refresh_coordinator(self) -> EntityRefreshCoordinator | None:
+        """Return the service-owned coordinator used by demand composition."""
+        return self._refresh
 
     async def get_entity_info(self, req: Mapping[str, object]) -> dict[str, object]:
         """Run one foreground entity-info use case under its RPC source."""
@@ -418,6 +425,423 @@ class DaemonEntityInfoService:
             self._refresh.queue_depth,
             self._deps.rid(),
         )
+
+    def _durable_refresh_status(self, now: float) -> DemandStatus | None:
+        del now
+        release_at = self._profiles.next_refresh_release_at()
+        return DemandStatus(release_at=release_at) if release_at is not None else None
+
+    async def _run_durable_refresh_slice(self, budget: RpcAttemptBudget) -> None:
+        """Execute and commit at most one profile acquisition for one entity."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        now = int(self._deps.now_provider())
+        cursor = self._profiles.next_due_refresh(now=now)
+        if cursor is None:
+            return
+        stored = self._profiles.read(cursor.entity_id, now=now)
+        raw_type = stored.detail.get("type") if stored is not None else None
+        entity_type = DialogType.parse(raw_type if isinstance(raw_type, str) else None)
+        if stored is None or entity_type is DialogType.UNKNOWN:
+            await self._acquire_durable_refresh_core(cursor, now=now)
+            return
+        if not self._section_applies(entity_type, cursor.next_section):
+            self._profiles.commit_section(
+                cursor,
+                EntitySectionCommit(
+                    self._not_applicable_section_patch(cursor.next_section),
+                    status="not_applicable",
+                ),
+                now=now,
+            )
+            return
+        try:
+            result = await self._acquire_profile_section(cursor, entity_type)
+        except RpcAttemptBudgetExhaustedError:
+            raise
+        except TelegramRpcThrottled as exc:
+            retry_seconds = max(1, int(exc.retry_after_seconds or 1))
+            self._profiles.mark_section_failure(
+                cursor,
+                now=now,
+                reason="flood_wait",
+                retry_at=now + retry_seconds,
+            )
+            return
+        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+            raise_if_flood_wait_error(exc)
+            self._profiles.mark_section_failure(
+                cursor,
+                now=now,
+                reason=type(exc).__name__.lower(),
+                retry_at=now + 60,
+            )
+            return
+        self._profiles.commit_section(
+            cursor,
+            result,
+            now=now,
+        )
+
+    async def _acquire_durable_refresh_core(self, cursor: EntityRefreshCursor, *, now: int) -> None:
+        """Persist one resolved core so later raw section requests can resume by id."""
+        try:
+            entity, error = await self._resolve_entity(cursor.entity_id)
+        except RpcAttemptBudgetExhaustedError:
+            raise
+        except TelegramRpcThrottled as exc:
+            retry_seconds = max(1, int(exc.retry_after_seconds or 1))
+            self._profiles.mark_refresh_failure(
+                cursor.entity_id,
+                now=now,
+                reason="flood_wait",
+                retry_at=now + retry_seconds,
+            )
+            return
+        if entity is None or error is not None:
+            retry_after = (error or {}).get("_retry_after_seconds") if error is not None else None
+            self._profiles.mark_refresh_failure(
+                cursor.entity_id,
+                now=now,
+                reason="entity_unavailable",
+                retry_at=now + retry_after if isinstance(retry_after, int) and retry_after > 0 else now + 60,
+            )
+            return
+        self._profiles.save_core(self._core_from_entity(entity), now=now)
+        self._profiles.advance_acquisition_cursor(
+            cursor,
+            next_acquisition_cursor=cursor.acquisition_cursor + 1,
+            now=now,
+        )
+
+    async def _acquire_profile_section(
+        self,
+        cursor: EntityRefreshCursor,
+        entity_type: DialogType,
+    ) -> EntitySectionCommit:
+        section = cursor.next_section
+        if section == "full_profile":
+            return await self._acquire_full_profile(cursor.entity_id, entity_type)
+        if section == "common_chats":
+            return await self._acquire_common_chats(cursor.entity_id)
+        if section == "contact_overlap":
+            return await self._acquire_contact_overlap(cursor.entity_id, entity_type)
+        if section == "avatar_history":
+            return await self._acquire_avatar_history(cursor.entity_id, entity_type)
+        if section == "personal_channel":
+            return await self._acquire_personal_channel(cursor.entity_id)
+        raise ValueError(f"unsupported entity profile section: {section}")
+
+    @staticmethod
+    def _section_applies(entity_type: DialogType, section: str) -> bool:
+        if section in {"full_profile", "avatar_history"}:
+            return entity_type is not DialogType.UNKNOWN
+        if section == "common_chats":
+            return entity_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}
+        if section == "personal_channel":
+            return entity_type in {DialogType.USER, DialogType.BOT}
+        if section == "contact_overlap":
+            return entity_type in {
+                DialogType.CHANNEL,
+                DialogType.SUPERGROUP,
+                DialogType.FORUM,
+                DialogType.GROUP,
+            }
+        return False
+
+    @staticmethod
+    def _not_applicable_section_patch(section: str) -> Mapping[str, object]:
+        if section == "common_chats":
+            return {"common_chats": []}
+        if section == "contact_overlap":
+            return {
+                "contacts_subscribed": None,
+                "contacts_subscribed_partial": False,
+                "contacts_reason": "not_applicable",
+            }
+        if section == "avatar_history":
+            return {"avatar_history": [], "avatar_count": 0}
+        if section == "personal_channel":
+            return {
+                "personal_channel_id": None,
+                "personal_channel": None,
+                "personal_channel_unavailable_reason": None,
+            }
+        return {}
+
+    async def _acquire_full_profile(
+        self,
+        entity_id: int,
+        entity_type: DialogType,
+    ) -> EntitySectionCommit:
+        if entity_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}:
+            result = await self._deps.client(self._deps.get_full_user_request(id=entity_id))
+            full_user = _attr(result, "full_user", None)
+            if full_user is None:
+                raise ValueError("full user payload is missing")
+            folder_id = _opt_int_attr(full_user, "folder_id")
+            blocked = _bool_attr(full_user, "blocked")
+            patch: dict[str, object] = {
+                "about": _opt_str_attr(full_user, "about"),
+                "blocked": blocked,
+                "ttl_period": _opt_int_attr(full_user, "ttl_period"),
+                "private_forward_name": _opt_str_attr(full_user, "private_forward_name"),
+                "folder_id": folder_id,
+                "folder_name": await self._resolve_folder_name(folder_id),
+                "birthday": self._extract_user_birthday(full_user),
+                "bot_info": self._extract_user_bot_info(full_user),
+                "business_location": self._extract_user_business_location(full_user),
+                "business_intro": self._extract_user_business_intro(full_user),
+                "business_work_hours": self._extract_user_business_work_hours(full_user),
+                "note": self._extract_user_note(full_user),
+            }
+            user = self._find_result_entity(result, entity_id)
+            if user is not None:
+                first_name = _opt_str_attr(user, "first_name")
+                last_name = _opt_str_attr(user, "last_name")
+                patch.update(
+                    name=" ".join(part for part in (first_name, last_name) if part) or None,
+                    username=_opt_str_attr(user, "username"),
+                    first_name=first_name,
+                    last_name=last_name,
+                    extra_usernames=self._collect_extra_usernames(user),
+                    emoji_status_id=self._collect_emoji_status_id(user),
+                    status=self._format_user_status(_attr(user, "status", None)),
+                    phone=_opt_str_attr(user, "phone"),
+                    lang_code=_opt_str_attr(user, "lang_code"),
+                    contact=_bool_attr(user, "contact"),
+                    mutual_contact=_bool_attr(user, "mutual_contact"),
+                    close_friend=_bool_attr(user, "close_friend"),
+                    send_paid_messages_stars=_opt_int_attr(user, "send_paid_messages_stars"),
+                    verified=_bool_attr(user, "verified"),
+                    premium=_bool_attr(user, "premium"),
+                    bot=_bool_attr(user, "bot"),
+                    scam=_bool_attr(user, "scam"),
+                    fake=_bool_attr(user, "fake"),
+                    restricted=_bool_attr(user, "restricted"),
+                    restriction_reason=self._collect_restrictions(user),
+                    my_membership=self._build_user_membership(user, blocked),
+                )
+            return EntitySectionCommit(patch)
+
+        if entity_type in {DialogType.CHANNEL, DialogType.SUPERGROUP, DialogType.FORUM}:
+            result = await self._deps.client(self._deps.get_full_channel_request(channel=entity_id))
+            full_chat = _attr(result, "full_chat", None)
+            if full_chat is None:
+                raise ValueError("full channel payload is missing")
+            patch = {
+                "about": _opt_str_attr(full_chat, "about"),
+                "linked_chat_id": self._normalize_linked_chat_id(_opt_int_attr(full_chat, "linked_chat_id")),
+                "pinned_msg_id": _opt_int_attr(full_chat, "pinned_msg_id"),
+                "slow_mode_seconds": _opt_int_attr(full_chat, "slowmode_seconds"),
+            }
+            member_count = _opt_int_attr(full_chat, "participants_count")
+            if entity_type is DialogType.CHANNEL:
+                patch.update(
+                    subscribers_count=member_count,
+                    available_reactions=self._collect_reactions(_attr(full_chat, "available_reactions", None)),
+                )
+            else:
+                patch.update(members_count=member_count, linked_broadcast_id=patch.pop("linked_chat_id"))
+            return EntitySectionCommit(patch)
+
+        if entity_type is DialogType.GROUP:
+            result = await self._deps.client(
+                self._deps.get_full_chat_request(chat_id=self._legacy_chat_raw_id(entity_id))
+            )
+            full_chat = _attr(result, "full_chat", None)
+            if full_chat is None:
+                raise ValueError("full chat payload is missing")
+            participants = _sequence_attr(_attr(full_chat, "participants", None), "participants")
+            exported_invite = _attr(full_chat, "exported_invite", None)
+            return EntitySectionCommit(
+                {
+                    "about": _opt_str_attr(full_chat, "about"),
+                    "invite_link": _opt_str_attr(exported_invite, "link") if exported_invite is not None else None,
+                    "members_count": len(participants) if participants else None,
+                }
+            )
+        return EntitySectionCommit({}, status="unavailable", reason="unsupported_entity_type")
+
+    async def _acquire_common_chats(self, entity_id: int) -> EntitySectionCommit:
+        result = await self._deps.client(self._deps.get_common_chats_request(user_id=entity_id, max_id=0, limit=100))
+        chats = [
+            {
+                "id": int(self._deps.get_peer_id(chat)),
+                "name": _opt_str_attr(chat, "title") or str(_attr(chat, "id", "")),
+                "type": self._classify_chat_type(chat),
+            }
+            for chat in _sequence_attr(result, "chats")
+        ]
+        return EntitySectionCommit({"common_chats": chats}, payload=chats)
+
+    async def _acquire_contact_overlap(
+        self,
+        entity_id: int,
+        entity_type: DialogType,
+    ) -> EntitySectionCommit:
+        if entity_type is DialogType.GROUP:
+            result = await self._deps.client(
+                self._deps.get_full_chat_request(chat_id=self._legacy_chat_raw_id(entity_id))
+            )
+            full_chat = _attr(result, "full_chat", None)
+            if full_chat is None:
+                raise ValueError("full chat payload is missing")
+            raw_participants = _attr(full_chat, "participants", None)
+            participant_ids = self._extract_group_participants(
+                _sequence_attr(raw_participants, "participants") if raw_participants is not None else ()
+            )
+            contacts = self._enrich_contact_ids_with_names(participant_ids & self._deps.dm_peer_ids())
+            return EntitySectionCommit(
+                {
+                    "contacts_subscribed": contacts,
+                    "contacts_subscribed_partial": False,
+                    "contacts_reason": None,
+                },
+                payload=contacts,
+            )
+
+        result = await self._deps.client(
+            self._deps.get_participants_request(
+                channel=entity_id,
+                filter=self._deps.channel_participants_contacts_request(q=""),
+                offset=0,
+                limit=200,
+                hash=0,
+            )
+        )
+        contact_ids = {
+            user_id for user in _sequence_attr(result, "users") if (user_id := _opt_int_attr(user, "id")) is not None
+        }
+        contacts = self._enrich_contact_ids_with_names(contact_ids & self._deps.dm_peer_ids())
+        return EntitySectionCommit(
+            {
+                "contacts_subscribed": contacts,
+                "contacts_subscribed_partial": True,
+                "contacts_reason": "bounded_contacts_page",
+            },
+            payload=contacts,
+        )
+
+    async def _acquire_avatar_history(
+        self,
+        entity_id: int,
+        entity_type: DialogType,
+    ) -> EntitySectionCommit:
+        if entity_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}:
+            result = await self._deps.client(
+                self._deps.get_user_photos_request(user_id=entity_id, offset=0, max_id=0, limit=100)
+            )
+            photos = _sequence_attr(result, "photos")
+            user_history = [
+                {"photo_id": photo_id, "date": _isoformat_or_none(_attr(photo, "date", None))}
+                for photo in photos
+                if (photo_id := _opt_int_attr(photo, "id")) is not None
+            ]
+            count = _opt_int_attr(result, "count")
+            return EntitySectionCommit(
+                {
+                    "avatar_history": user_history,
+                    "avatar_count": count if count is not None else len(user_history),
+                },
+                payload=user_history,
+            )
+
+        result = await self._deps.client(
+            self._deps.get_messages_search_request(
+                peer=entity_id,
+                q="",
+                filter=self._deps.input_messages_filter_chat_photos(),
+                min_date=None,
+                max_date=None,
+                offset_id=0,
+                add_offset=0,
+                limit=100,
+                max_id=0,
+                min_id=0,
+                hash=0,
+                from_id=None,
+            )
+        )
+        chat_history: list[dict[str, object]] = []
+        for message in _sequence_attr(result, "messages"):
+            action = _attr(message, "action", None)
+            if not isinstance(action, self._deps.message_action_chat_edit_photo):
+                continue
+            photo = _attr(action, "photo", None)
+            photo_id = _opt_int_attr(photo, "id") if photo is not None else None
+            if photo_id is not None:
+                chat_history.append({"photo_id": photo_id, "date": _isoformat_or_none(_attr(message, "date", None))})
+        count = _opt_int_attr(result, "count")
+        return EntitySectionCommit(
+            {
+                "avatar_history": chat_history,
+                "avatar_count": count if count is not None else len(chat_history),
+            },
+            payload=chat_history,
+        )
+
+    async def _acquire_personal_channel(self, entity_id: int) -> EntitySectionCommit:
+        result = await self._deps.client(self._deps.get_full_user_request(id=entity_id))
+        full_user = _attr(result, "full_user", None)
+        if full_user is None:
+            raise ValueError("full user payload is missing")
+        raw_channel_id = _positive_int_attr(full_user, "personal_channel_id")
+        if raw_channel_id is None:
+            patch: dict[str, object] = {
+                "personal_channel_id": None,
+                "personal_channel": None,
+                "personal_channel_unavailable_reason": None,
+            }
+            return EntitySectionCommit(patch, payload=None)
+        dialog_id = self._normalize_channel_dialog_id(raw_channel_id)
+        channel = self._find_personal_channel_chat(
+            _sequence_attr(result, "chats"),
+            raw_channel_id=raw_channel_id,
+            dialog_id=dialog_id,
+        )
+        metadata = self._personal_channel_metadata(channel, dialog_id=dialog_id)
+        if metadata is None:
+            patch = {
+                "personal_channel_id": raw_channel_id,
+                "personal_channel": None,
+                "personal_channel_unavailable_reason": "channel_metadata_unavailable",
+            }
+            return EntitySectionCommit(patch, status="unavailable", reason="channel_metadata_unavailable")
+        local_preview, local_reason = self._latest_local_personal_channel_post(dialog_id)
+        attached_message_id = _positive_int_attr(full_user, "personal_channel_message")
+        card = _compact_dict(
+            {
+                "channel_id": raw_channel_id,
+                "dialog_id": dialog_id,
+                "title": metadata.get("title"),
+                "username": metadata.get("username"),
+                "url": self._tme_url(cast(str | None, metadata.get("username"))),
+                "metadata_source": "user_full_chats" if channel is not None else "local_entities",
+                "attached_message_id": attached_message_id,
+                "latest_or_attached_post": local_preview,
+                "post_preview_unavailable_reason": local_reason if local_preview is None else None,
+            }
+        )
+        patch = {
+            "personal_channel_id": raw_channel_id,
+            "personal_channel": card,
+            "personal_channel_unavailable_reason": None,
+        }
+        return EntitySectionCommit(patch, payload=card)
+
+    def _find_result_entity(self, result: object, entity_id: int) -> object | None:
+        for entity in _sequence_attr(result, "users"):
+            try:
+                if int(self._deps.get_peer_id(entity)) == entity_id:
+                    return entity
+            except TypeError, ValueError:
+                continue
+        return None
+
+    @staticmethod
+    def _legacy_chat_raw_id(entity_id: int) -> int:
+        return -entity_id if entity_id < 0 else entity_id
 
     async def _refresh_resolved_entity(self, worker: DaemonEntityInfoService, entity_id: int) -> object:
         assert self._refresh is not None
@@ -707,6 +1131,8 @@ class DaemonEntityInfoService:
             )
             return None, self._error("entity_not_found", str(exc))
         except TelegramRpcThrottled:
+            raise
+        except RpcAttemptBudgetExhaustedError:
             raise
         except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError) as exc:
             raise_if_flood_wait_error(exc)

@@ -30,12 +30,21 @@ from .flood import TelegramRpcThrottled
 from .hydration_queue import HydrationPriority
 from .maintenance_logging import log_maintenance_cycle
 from .messages.sqlite_bundle import message_log_context
-from .telegram_demand import AcquisitionKind, DemandStatus, DurableDemandAdapter, RpcAttemptBudget
+from .telegram_demand import (
+    AcquisitionKind,
+    DemandStatus,
+    DurableDemandAdapter,
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+    acquisition_context,
+    demand_context,
+)
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
     TelegramRpcAdmissionDeferred,
     TelegramRpcSource,
+    rpc_attempt_budget,
     rpc_scope,
 )
 
@@ -112,18 +121,99 @@ class HotSweepPolicy(Protocol):
     def initial_spread_seconds(self) -> float: ...
 
 
-class HotActivityResumeStateRequiredError(RuntimeError):
-    """Raised before cutover when a bounded hot page cannot resume safely."""
+@dataclass(frozen=True, slots=True)
+class _HotWindowState:
+    dialog_id: int
+    committed_cursor: int
+    page_offset_id: int
+    window_max_id: int
+    had_new: bool
+
+
+def _begin_hot_window(conn: sqlite3.Connection, dialog_id: int) -> _HotWindowState | None:
+    """Atomically initialize or reload one peer's in-progress hot window."""
+    with conn:
+        row = cast(
+            tuple[int | None, int | None, int | None, int] | None,
+            conn.execute(
+                "SELECT hot_cursor, hot_page_offset_id, hot_window_max_id, hot_window_had_new "
+                "FROM activity_dialog_state WHERE dialog_id = ?",
+                (dialog_id,),
+            ).fetchone(),
+        )
+        if row is None:
+            return None
+        committed_cursor = row[0] or 0
+        page_offset_id = row[1]
+        window_max_id = row[2]
+        had_new = bool(row[3])
+        if page_offset_id is None or window_max_id is None:
+            page_offset_id = 0
+            window_max_id = committed_cursor
+            had_new = False
+            conn.execute(
+                "UPDATE activity_dialog_state "
+                "SET hot_page_offset_id = 0, hot_window_max_id = ?, hot_window_had_new = 0, updated_at = ? "
+                "WHERE dialog_id = ? AND hot_page_offset_id IS NULL",
+                (window_max_id, int(time.time()), dialog_id),
+            )
+    return _HotWindowState(dialog_id, committed_cursor, page_offset_id, window_max_id, had_new)
+
+
+def _select_due_hot_window(conn: sqlite3.Connection, *, now: int) -> _HotWindowState | None:
+    """Claim the oldest due peer by durably opening its newest-side window."""
+    cutoff = now - 30 * 86400
+    row = cast(
+        tuple[int] | None,
+        conn.execute(
+            """
+            SELECT ads.dialog_id
+            FROM activity_dialog_state AS ads
+            LEFT JOIN synced_dialogs AS sd ON sd.dialog_id = ads.dialog_id
+            WHERE (ads.last_activity_at IS NULL OR ads.last_activity_at >= :cutoff)
+              AND (ads.hot_next_retry_at IS NULL OR ads.hot_next_retry_at <= :now)
+              AND (
+                    ads.hot_page_offset_id IS NOT NULL
+                    OR ads.hot_next_due_at IS NULL
+                    OR ads.hot_next_due_at <= :now
+                    OR (ads.hot_last_sync_at IS NOT NULL AND sd.last_event_at > ads.hot_last_sync_at)
+              )
+              AND COALESCE(sd.status, '') != 'access_lost'
+            ORDER BY
+              CASE WHEN ads.hot_page_offset_id IS NULL THEN 1 ELSE 0 END,
+              COALESCE(ads.hot_next_retry_at, ads.hot_next_due_at, 0),
+              ads.dialog_id
+            LIMIT 1
+            """,
+            {"cutoff": cutoff, "now": now},
+        ).fetchone(),
+    )
+    if row is None:
+        return None
+    return _begin_hot_window(conn, row[0])
+
+
+def _save_hot_window_progress(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    page_offset_id: int,
+    window_max_id: int,
+    had_new: bool,
+) -> None:
+    """Commit one complete page's continuation and observed window maximum."""
+    with conn:
+        conn.execute(
+            "UPDATE activity_dialog_state "
+            "SET hot_page_offset_id = ?, hot_window_max_id = ?, hot_window_had_new = ?, updated_at = ? "
+            "WHERE dialog_id = ?",
+            (page_offset_id, window_max_id, int(had_new), int(time.time()), dialog_id),
+        )
 
 
 @dataclass(slots=True)
 class HotActivityDemandAdapter(DurableDemandAdapter):
-    """Read durable hot-page readiness without competing with the legacy loop.
-
-    PR1 shadow selection calls only :meth:`status`.  A one-attempt executable
-    slice needs durable in-progress page state before it can replace the legacy
-    multi-page window runner, so :meth:`run_slice` fails before any mutation.
-    """
+    """Execute one restart-safe page of the oldest due hot window."""
 
     client: ActivityClient
     conn: sqlite3.Connection
@@ -140,13 +230,65 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
         return DemandStatus(release_at=release_at)
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
-        """Refuse execution until page resume state can be committed safely."""
+        """Fetch at most the supplied actual-attempt budget and persist progress."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
-        if self.status(time.time()) is None:
+        state = _select_due_hot_window(self.conn, now=int(time.time()))
+        if state is None or self.shutdown_event.is_set():
             return
-        raise HotActivityResumeStateRequiredError(
-            "hot activity slices require durable hot_page_offset_id and hot_window_max_id state"
+        with demand_context(DemandKind.HOT_ACTIVITY_PAGE):
+            with rpc_attempt_budget(budget):
+                with acquisition_context(AcquisitionKind.MESSAGE_SEARCH_PAGE):
+                    with rpc_scope(TelegramRpcSource.ACTIVITY_HOT_SWEEP, timeout_seconds=self.timeout_s):
+                        try:
+                            result = await sweep_peer_once(
+                                self.client,
+                                self.conn,
+                                state.dialog_id,
+                                offset_id=state.page_offset_id,
+                                min_id=state.committed_cursor + 1 if state.committed_cursor else 0,
+                                limit=_BACKFILL_BATCH_LIMIT,
+                                timeout_s=self.timeout_s,
+                                hydration_priority=HydrationPriority.FOREGROUND,
+                            )
+                        except RpcAttemptBudgetExhaustedError:
+                            return
+
+        max_seen = max(state.window_max_id, result.max_id or 0)
+        had_new = state.had_new or result.genuinely_new > 0
+        if result.flood_wait_seconds is not None:
+            _save_hot_flood_state(
+                self.conn,
+                state.dialog_id,
+                next_retry_at=int(time.time()) + result.flood_wait_seconds,
+            )
+            return
+        if result.skip_reason is SkipReason.ACCESS_SKIP:
+            _save_hot_access_skip_state(
+                self.conn,
+                state.dialog_id,
+                retry_at=int(time.time()) + _ACCESS_SKIP_RETRY_S,
+            )
+            return
+        if _is_hot_page_drained(result) and not self.shutdown_event.is_set():
+            _save_hot_completed_state(
+                self.conn,
+                state.dialog_id,
+                hot_cursor=max_seen,
+                completion_at=int(time.time()),
+                genuinely_new=int(had_new),
+                policy=self.policy,
+            )
+            return
+        if result.min_id is None:
+            _save_hot_min_id_gap_state(self.conn, state.dialog_id, now=int(time.time()))
+            return
+        _save_hot_window_progress(
+            self.conn,
+            state.dialog_id,
+            page_offset_id=result.min_id,
+            window_max_id=max_seen,
+            had_new=had_new,
         )
 
 
@@ -234,24 +376,26 @@ def _save_hot_completed_state(  # noqa: PLR0913
     policy: HotSweepPolicy,
 ) -> None:
     """Persist cursor and exponential empty-yield cadence after completion."""
-    row = cast(
-        tuple[int],
-        conn.execute("SELECT hot_empty_streak FROM activity_dialog_state WHERE dialog_id = ?", (dialog_id,)).fetchone(),
-    )
-    streak = 0 if genuinely_new > 0 else int(row[0]) + 1
-    base_due_seconds = float(policy.base_due_seconds)
-    max_due_seconds = float(policy.max_due_seconds)
-    interval = _capped_empty_interval(base_due_seconds, max_due_seconds, streak)
-    next_due_at = int(completion_at + interval + _stable_jitter_seconds(dialog_id, policy.jitter_max_seconds))
-    _save_dialog_state(
-        conn,
-        dialog_id,
-        hot_cursor=hot_cursor,
-        hot_last_sync_at=completion_at,
-        hot_next_retry_at=None,
-        hot_next_due_at=next_due_at,
-        hot_empty_streak=streak,
-    )
+    with conn:
+        row = cast(
+            tuple[int],
+            conn.execute(
+                "SELECT hot_empty_streak FROM activity_dialog_state WHERE dialog_id = ?", (dialog_id,)
+            ).fetchone(),
+        )
+        streak = 0 if genuinely_new > 0 else int(row[0]) + 1
+        base_due_seconds = float(policy.base_due_seconds)
+        max_due_seconds = float(policy.max_due_seconds)
+        interval = _capped_empty_interval(base_due_seconds, max_due_seconds, streak)
+        next_due_at = int(completion_at + interval + _stable_jitter_seconds(dialog_id, policy.jitter_max_seconds))
+        conn.execute(
+            "UPDATE activity_dialog_state "
+            "SET hot_cursor = ?, hot_last_sync_at = ?, hot_next_retry_at = NULL, "
+            "hot_next_due_at = ?, hot_empty_streak = ?, hot_page_offset_id = NULL, "
+            "hot_window_max_id = NULL, hot_window_had_new = 0, updated_at = ? "
+            "WHERE dialog_id = ?",
+            (hot_cursor, completion_at, next_due_at, streak, completion_at, dialog_id),
+        )
 
 
 def _capped_empty_interval(base_due_seconds: float, max_due_seconds: float, streak: int) -> float:
@@ -268,15 +412,12 @@ def _save_hot_min_id_gap_state(
     conn: sqlite3.Connection,
     dialog_id: int,
     *,
-    hot_cursor: int,
     now: int,
 ) -> None:
-    """Persist an empty-but-non-drained page without logging a completion event."""
+    """Back off a malformed page without committing its incomplete window."""
     _save_dialog_state(
         conn,
         dialog_id,
-        hot_cursor=hot_cursor,
-        hot_last_sync_at=now,
         hot_next_retry_at=int(now + _ACCESS_SKIP_RETRY_S),
     )
 
@@ -370,7 +511,7 @@ def _handle_hot_sweep_page_result(ctx: _HotPageContext) -> tuple[_HotSweepPeerOu
         )
 
     if result.min_id is None:
-        _save_hot_min_id_gap_state(peer.conn, peer.dialog_id, hot_cursor=max_seen, now=peer.now)
+        _save_hot_min_id_gap_state(peer.conn, peer.dialog_id, now=peer.now)
         logger.debug(
             "activity_hot_sweep_min_id_gap dialog_id=%r hot_cursor=%d pages_fetched=%d duration_s=%.3f",
             peer.dialog_id,
@@ -410,9 +551,13 @@ def _handle_hot_sweep_page_result(ctx: _HotPageContext) -> tuple[_HotSweepPeerOu
 async def _run_hot_sweep_peer(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome:
     """Process one peer across all needed pages for the current hot sweep pass."""
     started_at = time.monotonic()
-    pass_min_id = (ctx.old_hot_cursor + 1) if ctx.old_hot_cursor else 0
-    max_seen = ctx.old_hot_cursor or 0
-    page_offset = 0
+    state = _begin_hot_window(ctx.conn, ctx.dialog_id)
+    if state is None:
+        return _HotSweepPeerOutcome(False, False, 0, 0, 0, 0)
+    pass_min_id = state.committed_cursor + 1 if state.committed_cursor else 0
+    max_seen = state.window_max_id
+    page_offset = state.page_offset_id
+    window_had_new = state.had_new
     pages_fetched = 0
     total_rpc_calls = 0
     total_extracted = 0
@@ -442,10 +587,18 @@ async def _run_hot_sweep_peer(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome
         total_rpc_calls += result.rpc_calls
         total_extracted += result.extracted
         genuinely_new_keys.update(result.genuinely_new_keys)
+        window_had_new = window_had_new or result.genuinely_new > 0
         if next_offset is None:
             if outcome.completed:
                 if ctx.shutdown_event.is_set():
-                    _save_hot_min_id_gap_state(ctx.conn, ctx.dialog_id, hot_cursor=max_seen, now=ctx.now)
+                    _save_hot_min_id_gap_state(ctx.conn, ctx.dialog_id, now=ctx.now)
+                    _save_hot_window_progress(
+                        ctx.conn,
+                        ctx.dialog_id,
+                        page_offset_id=page_offset,
+                        window_max_id=max_seen,
+                        had_new=window_had_new,
+                    )
                 else:
                     completion_at = int(time.time())
                     _save_hot_completed_state(
@@ -453,9 +606,17 @@ async def _run_hot_sweep_peer(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome
                         ctx.dialog_id,
                         hot_cursor=max_seen,
                         completion_at=completion_at,
-                        genuinely_new=len(genuinely_new_keys),
+                        genuinely_new=int(window_had_new),
                         policy=ctx.policy,
                     )
+            elif result.flood_wait_seconds is None and result.skip_reason is not SkipReason.ACCESS_SKIP:
+                _save_hot_window_progress(
+                    ctx.conn,
+                    ctx.dialog_id,
+                    page_offset_id=page_offset,
+                    window_max_id=max_seen,
+                    had_new=window_had_new,
+                )
             return _HotSweepPeerOutcome(
                 flooded=outcome.flooded,
                 completed=outcome.completed,
@@ -466,6 +627,13 @@ async def _run_hot_sweep_peer(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome
                 genuinely_new_keys=frozenset(genuinely_new_keys),
                 flood_wait_seconds=outcome.flood_wait_seconds,
             )
+        _save_hot_window_progress(
+            ctx.conn,
+            ctx.dialog_id,
+            page_offset_id=next_offset,
+            window_max_id=max_seen,
+            had_new=window_had_new,
+        )
         page_offset = next_offset
 
     logger.debug(
@@ -512,13 +680,14 @@ def _next_hot_release_at(conn: sqlite3.Connection, *, now: float) -> float | Non
         raise ValueError("now must be a finite non-negative timestamp")
     cutoff = int(now) - 30 * 86400
     rows = cast(
-        list[tuple[int | None, int | None, int | None, int | None]],
+        list[tuple[int | None, int | None, int | None, int | None, int | None]],
         conn.execute(
             """
             SELECT ads.hot_next_due_at,
                    ads.hot_next_retry_at,
                    ads.hot_last_sync_at,
-                   sd.last_event_at
+                   sd.last_event_at,
+                   ads.hot_page_offset_id
             FROM activity_dialog_state AS ads
             LEFT JOIN synced_dialogs AS sd ON sd.dialog_id = ads.dialog_id
             WHERE (ads.last_activity_at IS NULL OR ads.last_activity_at >= :cutoff)
@@ -528,9 +697,9 @@ def _next_hot_release_at(conn: sqlite3.Connection, *, now: float) -> float | Non
         ).fetchall(),
     )
     releases: list[float] = []
-    for next_due_at, next_retry_at, last_sync_at, last_event_at in rows:
+    for next_due_at, next_retry_at, last_sync_at, last_event_at, page_offset_id in rows:
         event_due = last_sync_at is not None and last_event_at is not None and last_event_at > last_sync_at
-        due_at = 0 if next_due_at is None or event_due else next_due_at
+        due_at = 0 if page_offset_id is not None or next_due_at is None or event_due else next_due_at
         releases.append(float(max(due_at, next_retry_at or 0)))
     return min(releases, default=None)
 
@@ -546,7 +715,8 @@ def _count_due_hot_peers(conn: sqlite3.Connection, *, now: int) -> int:
         LEFT JOIN synced_dialogs AS sd ON sd.dialog_id = ads.dialog_id
         WHERE (ads.last_activity_at IS NULL OR ads.last_activity_at >= :cutoff)
           AND (ads.hot_next_retry_at IS NULL OR ads.hot_next_retry_at <= :now)
-          AND (ads.hot_next_due_at IS NULL OR ads.hot_next_due_at <= :now
+          AND (ads.hot_page_offset_id IS NOT NULL
+               OR ads.hot_next_due_at IS NULL OR ads.hot_next_due_at <= :now
                OR (ads.hot_last_sync_at IS NOT NULL AND sd.last_event_at > ads.hot_last_sync_at))
           AND COALESCE(sd.status, '') != 'access_lost'
         """,
@@ -682,7 +852,8 @@ async def _run_hot_sweep_pass(  # noqa: PLR0914 - explicit pass telemetry counte
         WHERE (ads.last_activity_at IS NULL OR ads.last_activity_at >= :cutoff)
           AND (ads.hot_next_retry_at IS NULL OR ads.hot_next_retry_at <= :now)
           AND (
-                ads.hot_next_due_at IS NULL
+                ads.hot_page_offset_id IS NOT NULL
+                OR ads.hot_next_due_at IS NULL
                 OR ads.hot_next_due_at <= :now
                 OR (
                     ads.hot_last_sync_at IS NOT NULL
@@ -692,6 +863,7 @@ async def _run_hot_sweep_pass(  # noqa: PLR0914 - explicit pass telemetry counte
           AND COALESCE(sd.status, '') != 'access_lost'
           AND :working_set_flooded = 0
             ORDER BY
+            CASE WHEN ads.hot_page_offset_id IS NULL THEN 1 ELSE 0 END,
             COALESCE(ads.hot_next_retry_at, ads.hot_next_due_at, 0) ASC,
             ads.dialog_id ASC
         LIMIT :max_peers

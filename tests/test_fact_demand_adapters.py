@@ -12,7 +12,6 @@ import pytest
 
 from mcp_telegram.entity_profile.refresh import (
     EntityProfileDemandAdapter,
-    EntityProfileResumeStateRequiredError,
     EntityRefreshCoordinator,
 )
 from mcp_telegram.fact_hydration import (
@@ -29,7 +28,7 @@ from mcp_telegram.message_fact_refresh import (
 )
 from mcp_telegram.reactions.contracts import ReactionFetchResult, ReactionFreshness, ReactionSnapshot
 from mcp_telegram.reactions.refresh import ReactionFreshener
-from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
+from mcp_telegram.telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget
 from mcp_telegram.telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from mcp_telegram.telegram_reading import TelegramReadReceiptGateway
 from mcp_telegram.telegram_rpc_consumers import DemandKind
@@ -177,26 +176,29 @@ async def test_live_hydration_batch_gets_fresh_root_inside_backfill_launcher() -
 @pytest.mark.asyncio
 async def test_entity_profile_adapter_observes_queue_and_entity_lookup_context() -> None:
     observed: list[tuple[DemandKind | None, AcquisitionKind | None]] = []
-    coordinator: EntityRefreshCoordinator
+    pending = True
 
     async def refresh(_entity_id: int) -> None:
-        async def lookup() -> None:
-            scope = current_rpc_scope()
-            observed.append((scope.demand_kind, scope.acquisition_kind))
+        raise AssertionError("process-local refresh worker must not execute")
 
-        await coordinator.run_rpc(lookup)
+    def status(_now: float) -> DemandStatus | None:
+        return DemandStatus(release_at=0.0) if pending else None
+
+    async def run_slice(_budget: RpcAttemptBudget) -> None:
+        nonlocal pending
+        scope = current_rpc_scope()
+        observed.append((scope.demand_kind, scope.acquisition_kind))
+        pending = False
 
     coordinator = EntityRefreshCoordinator(refresh)
+    coordinator.bind_durable_executor(status, run_slice)
     adapter = EntityProfileDemandAdapter(coordinator)
-    assert coordinator.enqueue(42)
     budget = RpcAttemptBudget(limit=1)
 
     status = adapter.status(100.0)
-    with pytest.raises(EntityProfileResumeStateRequiredError):
-        await adapter.run_slice(budget)
-    await coordinator.wait_for_completion(42, 1.0)
+    await adapter.run_slice(budget)
 
-    assert status is not None and status.release_at == 100.0
+    assert status is not None and status.release_at == 0.0
     assert adapter.demand_kind is DemandKind.ENTITY_PROFILE_REFRESH
     assert budget.attempts == 0
     assert observed == [(DemandKind.ENTITY_PROFILE_REFRESH, AcquisitionKind.ENTITY_LOOKUP)]

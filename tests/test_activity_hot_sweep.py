@@ -31,7 +31,6 @@ import pytest
 
 from mcp_telegram.activity_hot_sweep import (
     HotActivityDemandAdapter,
-    HotActivityResumeStateRequiredError,
     _HotSweepPeerOutcome,
     _log_recovered_messages,
     run_hot_sweep_loop,
@@ -574,17 +573,47 @@ def test_hot_activity_adapter_reports_retry_gated_release() -> None:
 
 
 @pytest.mark.asyncio
-async def test_hot_activity_adapter_refuses_slice_before_mutation() -> None:
+async def test_hot_activity_adapter_resumes_page_window_before_advancing_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     with _make_db() as conn:
         now = int(time.time())
         dialog_id = -100100000100
         _enroll(conn, dialog_id, last_activity_at=now, hot_cursor=10)
+        first_page = list(range(101, 201))
+        second_page = [11, 12]
+        call_log = _patch_sweep(
+            monkeypatch,
+            {
+                dialog_id: [
+                    _make_sweep_result(first_page),
+                    _make_sweep_result(second_page),
+                ]
+            },
+        )
         adapter = HotActivityDemandAdapter(_FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S)
 
-        with pytest.raises(HotActivityResumeStateRequiredError, match="hot_page_offset_id"):
-            await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
 
-        assert _get_state(conn, dialog_id)["hot_cursor"] == 10
+        state = _get_state(conn, dialog_id)
+        resume = conn.execute(
+            "SELECT hot_page_offset_id, hot_window_max_id FROM activity_dialog_state WHERE dialog_id=?",
+            (dialog_id,),
+        ).fetchone()
+        assert state["hot_cursor"] == 10
+        assert resume == (min(first_page), max(first_page))
+
+        restarted = HotActivityDemandAdapter(_FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S)
+        await restarted.run_slice(RpcAttemptBudget(limit=1))
+
+        state = _get_state(conn, dialog_id)
+        resume = conn.execute(
+            "SELECT hot_page_offset_id, hot_window_max_id FROM activity_dialog_state WHERE dialog_id=?",
+            (dialog_id,),
+        ).fetchone()
+        assert call_log[dialog_id] == [(0, 11), (min(first_page), 11)]
+        assert state["hot_cursor"] == max(first_page)
+        assert resume == (None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -627,8 +656,8 @@ async def test_access_skip_does_not_advance_cursor(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.asyncio
-async def test_full_page_without_min_id_persists_hot_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A defensive min_id gap still commits max_seen and exits the peer cleanly."""
+async def test_full_page_without_min_id_preserves_committed_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An ambiguous full page is retried without committing its incomplete window."""
     with _make_db() as conn:
         dialog_id = -100100000017
         now = int(time.time())
@@ -665,7 +694,7 @@ async def test_full_page_without_min_id_persists_hot_cursor(monkeypatch: pytest.
 
         state = _get_state(conn, dialog_id)
         assert telemetry["extracted"] == len(fetched_ids)
-        assert state["hot_cursor"] == max(fetched_ids)
+        assert state["hot_cursor"] == prior_cursor
         assert cast(int, state["hot_next_retry_at"]) > now
         assert state["hot_next_due_at"] == now - 1
         assert state["hot_empty_streak"] == 3
