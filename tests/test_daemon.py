@@ -35,9 +35,17 @@ from mcp_telegram.daemon import (
 )
 from mcp_telegram.folders.read_repository import folder_summaries
 from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
+from mcp_telegram.own_only import OwnOnlyContext
+from mcp_telegram.rpc_admission_observations import DemandEvidenceOutcome
 from mcp_telegram.state import StatePaths
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_demand import current_demand_token, demand_context
+from mcp_telegram.telegram_demand import (
+    DemandPrediction,
+    DemandToken,
+    create_demand_token,
+    current_demand_token,
+    demand_context,
+)
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
@@ -459,6 +467,105 @@ async def test_prime_runtime_keeps_serving_saved_folders_when_refresh_fails(
         conn.close()
 
 
+@pytest.mark.asyncio
+async def test_prime_runtime_records_self_profile_and_folder_cycle_evidence(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    begun: list[DemandKind] = []
+    terminal: list[tuple[DemandKind, DemandEvidenceOutcome, int, DemandKind | None]] = []
+
+    class _Shadow:
+        def offer(self, _kind: DemandKind) -> bool:
+            return True
+
+        def begin_cycle(self, kind: DemandKind) -> DemandToken:
+            begun.append(kind)
+            return create_demand_token(
+                kind,
+                prediction=DemandPrediction(
+                    predicted_kind=kind,
+                    selected_at=1.0,
+                    queue_age_seconds=0.0,
+                    overdue_seconds=None,
+                ),
+            )
+
+        def after_cycle_scan(
+            self,
+            token: DemandToken | None = None,
+            *,
+            actual_kind: DemandKind | None = None,
+            outcome: DemandEvidenceOutcome | str | None = None,
+            reason: str | None = None,
+        ) -> tuple[DemandKind, ...]:
+            del reason
+            assert token is not None
+            assert actual_kind is not None
+            assert outcome is not None
+            terminal.append(
+                (
+                    actual_kind,
+                    DemandEvidenceOutcome(outcome),
+                    token.attempt_evidence.actual_attempts,
+                    None if token.prediction is None else token.prediction.predicted_kind,
+                )
+            )
+            return ()
+
+    shadow = _Shadow()
+
+    async def get_me() -> object:
+        current_demand_token().attempt_evidence.record_dispatch()
+        return SimpleNamespace(id=11111)
+
+    async def prime_folder() -> None:
+        from mcp_telegram.demand_shadow_wiring import run_legacy_demand_cycle
+
+        async def acquire() -> None:
+            current_demand_token().attempt_evidence.record_dispatch()
+
+        await run_legacy_demand_cycle(shadow, DemandKind.FOLDER_SNAPSHOT, acquire)
+
+    ctx = SimpleNamespace(
+        conn=conn,
+        client=SimpleNamespace(get_me=get_me),
+        api_server=_PrimeRuntimeApiServerStub(startup_detail="", self_id=None, _ready=False),
+        own_only_context=None,
+        socket_path=tmp_path / "daemon.sock",
+        folder_projection_worker=SimpleNamespace(prime=prime_folder),
+        handler_manager=SimpleNamespace(set_self_id=MagicMock()),
+        demand_shadow=shadow,
+        self_profile_cadence=None,
+        shutdown_event=asyncio.Event(),
+    )
+
+    try:
+        with patch(
+            "mcp_telegram.daemon._load_own_only_context",
+            new=AsyncMock(return_value=OwnOnlyContext(account_id=11111)),
+        ):
+            await _prime_runtime(ctx)  # type: ignore[arg-type]
+
+        assert begun == [DemandKind.SELF_PROFILE_MAINTENANCE, DemandKind.FOLDER_SNAPSHOT]
+        assert terminal == [
+            (
+                DemandKind.SELF_PROFILE_MAINTENANCE,
+                DemandEvidenceOutcome.COMPLETED,
+                1,
+                DemandKind.SELF_PROFILE_MAINTENANCE,
+            ),
+            (
+                DemandKind.FOLDER_SNAPSHOT,
+                DemandEvidenceOutcome.COMPLETED,
+                1,
+                DemandKind.FOLDER_SNAPSHOT,
+            ),
+        ]
+    finally:
+        conn.close()
+
+
 async def test_prime_runtime_propagates_unexpected_worker_failure(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
@@ -615,8 +722,22 @@ def test_sync_main_runs_fts_backfill_before_connect(
         call_order.append("connect")
         return True
 
-    async def _noop(*args, **kwargs) -> None:
-        return None
+    async def _fake_prime(ctx: object) -> None:
+        cast(SimpleNamespace, ctx).own_only_context = OwnOnlyContext(account_id=777)
+        call_order.append("prime")
+
+    async def _noop(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    demand_runtime = SimpleNamespace(
+        read_receipt_batch=AsyncMock(return_value=None),
+        scheduled_reconciler=SimpleNamespace(_own_only_context=None, _resolved_context=None),
+    )
+
+    def _ensure_runtime(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        call_order.append("shadow")
+        return demand_runtime
 
     mock_handler_manager = MagicMock()
     mock_handler_manager.register = MagicMock()
@@ -630,7 +751,8 @@ def test_sync_main_runs_fts_backfill_before_connect(
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon._run_fts_backfill", side_effect=_fake_fts_backfill),
         patch("mcp_telegram.daemon._connect_telegram", side_effect=_fake_connect_telegram),
-        patch("mcp_telegram.daemon._prime_runtime", side_effect=_noop),
+        patch("mcp_telegram.daemon._prime_runtime", side_effect=_fake_prime),
+        patch("mcp_telegram.daemon._ensure_demand_runtime", side_effect=_ensure_runtime),
         patch("mcp_telegram.daemon.EventHandlerManager", return_value=mock_handler_manager) as mock_handler_class,
         patch("mcp_telegram.daemon._start_bootstrap_background_tasks", side_effect=_noop),
         patch("mcp_telegram.daemon._start_followup_background_tasks", side_effect=_noop),
@@ -638,7 +760,9 @@ def test_sync_main_runs_fts_backfill_before_connect(
     ):
         asyncio.run(sync_main())
 
-    assert call_order == ["fts", "connect"], call_order
+    assert call_order == ["fts", "connect", "shadow", "prime"], call_order
+    assert demand_runtime.scheduled_reconciler._own_only_context == OwnOnlyContext(account_id=777)
+    assert demand_runtime.scheduled_reconciler._resolved_context == OwnOnlyContext(account_id=777)
     mock_handler_class.assert_called_once()
     handler_args = mock_handler_class.call_args.args
     assert handler_args[2] is instant_shutdown_event

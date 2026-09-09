@@ -1563,7 +1563,8 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     # correctly without a stable self_id.
     ctx.api_server.startup_detail = "fetching account info"
     _ = ctx.api_server.startup_detail
-    with demand_context(DemandKind.SELF_PROFILE_MAINTENANCE):
+
+    async def prime_account() -> object:
         with acquisition_context(AcquisitionKind.ACCOUNT_SELF_PROFILE):
             me = cast(_MeLike, await ctx.client.get_me())
             _update_self_profile(ctx.api_server, me)
@@ -1575,15 +1576,17 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
             ctx.api_server.self_id,
             getattr(ctx, "shutdown_event", None),
         )
-    cadence = cast(SQLiteSelfProfileCadence | None, getattr(ctx, "self_profile_cadence", None))
-    if cadence is not None:
-        cadence.mark_refreshed(time.time())
+        cadence = cast(SQLiteSelfProfileCadence | None, getattr(ctx, "self_profile_cadence", None))
+        if cadence is not None:
+            cadence.mark_refreshed(time.time())
+        return me
+
+    await _run_ctx_demand_cycle(ctx, DemandKind.SELF_PROFILE_MAINTENANCE, prime_account)
     ensure_own_only_schema(ctx.conn)
     logger.info("daemon self_id cached: %s", ctx.api_server.self_id)
 
     ctx.api_server.startup_detail = "refreshing Telegram folders"
-    with demand_context(DemandKind.FOLDER_SNAPSHOT):
-        await ctx.folder_projection_worker.prime()
+    await ctx.folder_projection_worker.prime()
 
     # Post-v10 runtime backfill: mark historical outgoing DM rows as out=1
     # using sender_id=self_id (the authoritative signal). Pure-SQL v10
@@ -2240,11 +2243,15 @@ async def sync_main() -> None:
             name="reconnect_catch_up_loop",
         )
 
-        await _prime_runtime(ctx)
-
         delta_worker = DeltaSyncWorker(cast(_DeltaSyncClient, ctx.client), ctx.conn, ctx.shutdown_event)
         worker = FullSyncWorker(ctx.client, ctx.conn, ctx.shutdown_event)
         demand_runtime = _ensure_demand_runtime(ctx, worker, delta_worker)
+        await _prime_runtime(ctx)
+        # Demand composition must exist before startup Telegram calls so those
+        # calls emit shadow evidence. Account identity is learned by that first
+        # observed cycle, before the scheduled reconciler can run.
+        demand_runtime.scheduled_reconciler._own_only_context = ctx.own_only_context
+        demand_runtime.scheduled_reconciler._resolved_context = ctx.own_only_context
         await _start_bootstrap_background_tasks(ctx, worker)
         # Must come AFTER handler_manager.register() (startup-ordering invariant):
         # the raw inbox read handler must be live before bootstrap starts so no
