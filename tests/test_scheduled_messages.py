@@ -514,6 +514,61 @@ def test_scheduled_demand_status_reads_repair_and_discovery_due_state(conn: sqli
     assert discovery.freshness_deadline == 200
 
 
+@pytest.mark.parametrize(
+    ("adapter_type", "queue_due_at"),
+    [
+        (ScheduledRepairDemandAdapter, 100),
+        (ScheduledDiscoveryDemandAdapter, 200),
+    ],
+)
+def test_scheduled_demand_status_honors_future_account_retry(
+    conn: sqlite3.Connection,
+    adapter_type: type[ScheduledRepairDemandAdapter] | type[ScheduledDiscoveryDemandAdapter],
+    queue_due_at: int,
+) -> None:
+    conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id, repair_due_at, discovery_due_at, updated_at) "
+        "VALUES (42, 100, 200, 0)"
+    )
+    conn.execute("UPDATE scheduled_sync_state SET next_retry_at=300 WHERE key='account'")
+    conn.commit()
+    reconciler = ScheduledMessageReconciler(_ScheduledSnapshotClient(), conn, asyncio.Event())
+
+    status = adapter_type(reconciler).status(100)
+
+    assert status is not None
+    assert status.release_at == 300
+    assert status.freshness_deadline == queue_due_at
+
+
+@pytest.mark.parametrize(
+    ("adapter_type", "queue_due_at"),
+    [
+        (ScheduledRepairDemandAdapter, 300),
+        (ScheduledDiscoveryDemandAdapter, 400),
+    ],
+)
+def test_scheduled_demand_status_keeps_later_queue_release(
+    conn: sqlite3.Connection,
+    adapter_type: type[ScheduledRepairDemandAdapter] | type[ScheduledDiscoveryDemandAdapter],
+    queue_due_at: int,
+) -> None:
+    conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id, repair_due_at, discovery_due_at, updated_at) "
+        "VALUES (42, ?, ?, 0)",
+        (300, 400),
+    )
+    conn.execute("UPDATE scheduled_sync_state SET next_retry_at=200 WHERE key='account'")
+    conn.commit()
+    reconciler = ScheduledMessageReconciler(_ScheduledSnapshotClient(), conn, asyncio.Event())
+
+    status = adapter_type(reconciler).status(100)
+
+    assert status is not None
+    assert status.release_at == queue_due_at
+    assert status.freshness_deadline == queue_due_at
+
+
 @pytest.mark.asyncio
 async def test_scheduled_repair_adapter_runs_only_repair_rows_with_precise_scope(conn: sqlite3.Connection) -> None:
     upsert_scheduled_message(conn, 42, _message(11), now=100)

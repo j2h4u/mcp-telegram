@@ -804,10 +804,14 @@ class _ScheduledDemandAdapter(DurableDemandAdapter):
                 f"SELECT MIN({column}) FROM scheduled_reconciliation_state WHERE {column} IS NOT NULL"
             ).fetchone(),
         )
-        release_at = None if row is None or row[0] is None else float(cast(int | float, row[0]))
-        if release_at is None:
+        if row is None or row[0] is None:
             return None
-        return DemandStatus(release_at=release_at, freshness_deadline=release_at)
+        queue_release_at = float(cast(int | float, row[0]))
+        release_at = queue_release_at
+        account_retry_at = _retry_at(self._reconciler._conn)
+        if account_retry_at is not None:
+            release_at = max(release_at, float(account_retry_at))
+        return DemandStatus(release_at=release_at, freshness_deadline=queue_release_at)
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
         """Run one bounded scheduled slice under its exact demand and budget."""
