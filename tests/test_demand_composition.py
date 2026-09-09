@@ -259,6 +259,38 @@ def test_shadow_status_failures_are_bounded_and_do_not_block_scans() -> None:
     assert all("sensitive domain failure" not in str(value) for event in observer.events for value in event.values())
 
 
+def test_ready_status_error_retains_honest_debt_without_false_satisfaction() -> None:
+    adapters = _shadow_adapters()
+    adapter = adapters[DemandKind.SCHEDULED_REPAIR]
+    adapter.current_status = DemandStatus(release_at=50.0, freshness_deadline=75.0)
+    observer = _Observer()
+    shadow = TelegramDemandShadow(adapters, asyncio.Event(), observer=observer, clock=lambda: 100.0)
+    assert shadow.coordinator.ready_kinds == (DemandKind.SCHEDULED_REPAIR,)
+    observer.events.clear()
+
+    adapter.fail_status = True
+    shadow.after_cycle_scan()
+
+    assert shadow.coordinator.ready_kinds == (DemandKind.SCHEDULED_REPAIR,)
+    assert shadow.coordinator.statuses[DemandKind.SCHEDULED_REPAIR] == DemandStatus(
+        release_at=50.0,
+        freshness_deadline=75.0,
+    )
+    assert observer.events == [
+        {
+            "outcome": DemandEvidenceOutcome.FAILED,
+            "demand_kind": DemandKind.SCHEDULED_REPAIR,
+            "actual_attempts": 0,
+            "oldest_overdue_seconds": None,
+            "queue_age_seconds": None,
+            "predicted_kind": None,
+            "selection_match": None,
+            "reason": "status_error",
+        }
+    ]
+    assert all(not item.run_calls for item in adapters.values())
+
+
 @pytest.mark.asyncio
 async def test_shadow_timer_exits_cleanly_without_executing() -> None:
     adapters = _shadow_adapters()

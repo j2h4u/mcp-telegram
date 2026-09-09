@@ -7,7 +7,7 @@ import logging
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Protocol
@@ -91,23 +91,25 @@ class DemandEvidenceObserver(Protocol):
     ) -> None: ...
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _ShadowStatusAdapter:
     """Make status observation incapable of disrupting legacy execution."""
 
     demand_kind: DemandKind
     adapter: DurableDemandAdapter
     on_status_error: Callable[[DemandKind, Exception], None]
+    _last_known_status: DemandStatus | None = field(default=None, init=False)
 
     def status(self, now: float) -> DemandStatus | None:
         try:
             status = self.adapter.status(now)
             if status is not None and not isinstance(status, DemandStatus):
                 raise TypeError("adapter returned an invalid status")
+            self._last_known_status = status
             return status
         except Exception as exc:  # noqa: BLE001 - PR1 shadow cannot affect production work
             self.on_status_error(self.demand_kind, exc)
-            return None
+            return self._last_known_status
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
         del budget
