@@ -710,26 +710,30 @@ class DaemonEntityInfoService:
         entity_type: DialogType,
     ) -> EntitySectionCommit:
         if entity_type is DialogType.GROUP:
-            result = await self._deps.client(
-                self._deps.get_full_chat_request(chat_id=self._legacy_chat_raw_id(entity_id))
-            )
-            full_chat = _attr(result, "full_chat", None)
-            if full_chat is None:
-                raise ValueError("full chat payload is missing")
-            raw_participants = _attr(full_chat, "participants", None)
-            participant_ids = self._extract_group_participants(
-                _sequence_attr(raw_participants, "participants") if raw_participants is not None else ()
-            )
-            contacts = self._enrich_contact_ids_with_names(participant_ids & self._deps.dm_peer_ids())
-            return EntitySectionCommit(
-                {
-                    "contacts_subscribed": contacts,
-                    "contacts_subscribed_partial": False,
-                    "contacts_reason": None,
-                },
-                payload=contacts,
-            )
+            return await self._acquire_group_contact_overlap(entity_id)
 
+        return await self._acquire_channel_contact_overlap(entity_id)
+
+    async def _acquire_group_contact_overlap(self, entity_id: int) -> EntitySectionCommit:
+        result = await self._deps.client(self._deps.get_full_chat_request(chat_id=self._legacy_chat_raw_id(entity_id)))
+        full_chat = _attr(result, "full_chat", None)
+        if full_chat is None:
+            raise ValueError("full chat payload is missing")
+        raw_participants = _attr(full_chat, "participants", None)
+        participant_ids = self._extract_group_participants(
+            _sequence_attr(raw_participants, "participants") if raw_participants is not None else ()
+        )
+        contacts = self._enrich_contact_ids_with_names(participant_ids & self._deps.dm_peer_ids())
+        return EntitySectionCommit(
+            {
+                "contacts_subscribed": contacts,
+                "contacts_subscribed_partial": False,
+                "contacts_reason": None,
+            },
+            payload=contacts,
+        )
+
+    async def _acquire_channel_contact_overlap(self, entity_id: int) -> EntitySectionCommit:
         result = await self._deps.client(
             self._deps.get_participants_request(
                 channel=entity_id,
@@ -758,24 +762,30 @@ class DaemonEntityInfoService:
         entity_type: DialogType,
     ) -> EntitySectionCommit:
         if entity_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}:
-            result = await self._deps.client(
-                self._deps.get_user_photos_request(user_id=entity_id, offset=0, max_id=0, limit=100)
-            )
-            photos = _sequence_attr(result, "photos")
-            user_history = [
-                {"photo_id": photo_id, "date": _isoformat_or_none(_attr(photo, "date", None))}
-                for photo in photos
-                if (photo_id := _opt_int_attr(photo, "id")) is not None
-            ]
-            count = _opt_int_attr(result, "count")
-            return EntitySectionCommit(
-                {
-                    "avatar_history": user_history,
-                    "avatar_count": count if count is not None else len(user_history),
-                },
-                payload=user_history,
-            )
+            return await self._acquire_user_avatar_history(entity_id)
 
+        return await self._acquire_chat_avatar_history(entity_id)
+
+    async def _acquire_user_avatar_history(self, entity_id: int) -> EntitySectionCommit:
+        result = await self._deps.client(
+            self._deps.get_user_photos_request(user_id=entity_id, offset=0, max_id=0, limit=100)
+        )
+        photos = _sequence_attr(result, "photos")
+        user_history = [
+            {"photo_id": photo_id, "date": _isoformat_or_none(_attr(photo, "date", None))}
+            for photo in photos
+            if (photo_id := _opt_int_attr(photo, "id")) is not None
+        ]
+        count = _opt_int_attr(result, "count")
+        return EntitySectionCommit(
+            {
+                "avatar_history": user_history,
+                "avatar_count": count if count is not None else len(user_history),
+            },
+            payload=user_history,
+        )
+
+    async def _acquire_chat_avatar_history(self, entity_id: int) -> EntitySectionCommit:
         result = await self._deps.client(
             self._deps.get_messages_search_request(
                 peer=entity_id,
@@ -792,15 +802,7 @@ class DaemonEntityInfoService:
                 from_id=None,
             )
         )
-        chat_history: list[dict[str, object]] = []
-        for message in _sequence_attr(result, "messages"):
-            action = _attr(message, "action", None)
-            if not isinstance(action, self._deps.message_action_chat_edit_photo):
-                continue
-            photo = _attr(action, "photo", None)
-            photo_id = _opt_int_attr(photo, "id") if photo is not None else None
-            if photo_id is not None:
-                chat_history.append({"photo_id": photo_id, "date": _isoformat_or_none(_attr(message, "date", None))})
+        chat_history = self._chat_avatar_history_from_result(result)
         count = _opt_int_attr(result, "count")
         return EntitySectionCommit(
             {
@@ -809,6 +811,21 @@ class DaemonEntityInfoService:
             },
             payload=chat_history,
         )
+
+    def _chat_avatar_history_from_result(self, result: object) -> list[dict[str, object]]:
+        chat_history: list[dict[str, object]] = []
+        for message in _sequence_attr(result, "messages"):
+            action = _attr(message, "action", None)
+            if not isinstance(action, self._deps.message_action_chat_edit_photo):
+                continue
+            photo = _attr(action, "photo", None)
+            if photo is None:
+                continue
+            photo_id = _opt_int_attr(photo, "id")
+            if photo_id is None:
+                continue
+            chat_history.append({"photo_id": photo_id, "date": _isoformat_or_none(_attr(message, "date", None))})
+        return chat_history
 
     async def _acquire_personal_channel(self, entity_id: int) -> EntitySectionCommit:
         result = await self._deps.client(self._deps.get_full_user_request(id=entity_id))
@@ -824,6 +841,16 @@ class DaemonEntityInfoService:
             }
             return EntitySectionCommit(patch, payload=None)
         dialog_id = self._normalize_channel_dialog_id(raw_channel_id)
+        return self._build_personal_channel_commit(result, full_user, raw_channel_id, dialog_id=dialog_id)
+
+    def _build_personal_channel_commit(
+        self,
+        result: object,
+        full_user: object,
+        raw_channel_id: int,
+        *,
+        dialog_id: int,
+    ) -> EntitySectionCommit:
         channel = self._find_personal_channel_chat(
             _sequence_attr(result, "chats"),
             raw_channel_id=raw_channel_id,
@@ -831,7 +858,7 @@ class DaemonEntityInfoService:
         )
         metadata = self._personal_channel_metadata(channel, dialog_id=dialog_id)
         if metadata is None:
-            patch = {
+            patch: dict[str, object] = {
                 "personal_channel_id": raw_channel_id,
                 "personal_channel": None,
                 "personal_channel_unavailable_reason": "channel_metadata_unavailable",
