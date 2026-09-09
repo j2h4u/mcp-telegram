@@ -10,7 +10,7 @@ from collections.abc import Coroutine
 from typing import Protocol
 
 from .telegram_demand import current_demand_token
-from .telegram_rpc_scheduler import create_detached_rpc_task
+from .telegram_rpc_scheduler import create_detached_rpc_task, current_rpc_scope
 
 
 class ActivityClient(Protocol):
@@ -33,12 +33,14 @@ async def call_with_timeout(client: ActivityClient, request: object, *, timeout_
     # owner, which the gate correctly rejects. Transfer the complete token so a
     # timed-out activity call keeps its exact root and nested acquisition.
     token = current_demand_token()
+    attempt_budget = current_rpc_scope().attempt_budget
     task = create_detached_rpc_task(
         client(request),
         source=token.source,
         timeout_seconds=timeout_s,
         name="activity-telegram-rpc",
         demand_token=token,
+        attempt_budget=attempt_budget,
     )
     done, _pending = await asyncio.wait({task}, timeout=timeout_s)
     if not done:
