@@ -226,7 +226,7 @@ def add_own_only_basis(
         )
         return
     try:
-        raw = json.loads(str(row[0]))
+        raw = cast(object, json.loads(str(row[0])))
     except TypeError, ValueError:
         raw = []
     existing = [item for item in raw if isinstance(item, str)] if isinstance(raw, list) else []
@@ -255,7 +255,7 @@ def remove_own_only_basis(
     if row is None:
         return
     try:
-        raw = json.loads(str(row[0]))
+        raw = cast(object, json.loads(str(row[0])))
     except TypeError, ValueError:
         return
     if not isinstance(raw, list):
