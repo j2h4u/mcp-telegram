@@ -22,6 +22,7 @@ from mcp_telegram.sync_db import (
     _apply_migration_55,
     _apply_migration_56,
     _apply_migration_58,
+    _apply_migration_59,
     _open_sync_db,
     ensure_sync_schema,
 )
@@ -710,7 +711,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 58
+        assert _CURRENT_SCHEMA_VERSION == 59
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1441,7 +1442,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 58
+        assert _CURRENT_SCHEMA_VERSION == 59
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:
@@ -2372,3 +2373,34 @@ def test_v58_adds_account_trace_author_indexes(tmp_path: Path) -> None:
             "idx_messages_account_trace_post_author",
         }
         assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=58") == (58,)
+
+
+def test_v59_seeds_active_scheduled_repairs_and_staggers_discovery(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute("DROP TABLE scheduled_reconciliation_state")
+        conn.execute("DELETE FROM schema_version WHERE version=59")
+        conn.execute("INSERT INTO dialogs(dialog_id, type, hidden) VALUES (42, 'user', 0)")
+        conn.execute(
+            "INSERT INTO scheduled_messages(dialog_id, message_id, scheduled_at, first_seen_at, updated_at) "
+            "VALUES (42, 7, 2000000000, 1, 1)"
+        )
+        conn.commit()
+
+        _apply_migration_59(conn, 58)
+
+        now = _fetchone_int(conn, "SELECT applied_at FROM schema_version WHERE version=59")
+        state = _fetchone_row(
+            conn,
+            "SELECT repair_due_at, discovery_due_at FROM scheduled_reconciliation_state WHERE dialog_id=42",
+        )
+        assert state == (now, now + 42)
+        assert {row[1] for row in _table_info(conn, "scheduled_reconciliation_state")} == {
+            "dialog_id",
+            "repair_due_at",
+            "discovery_due_at",
+            "dirty_since",
+            "dirty_generation",
+            "updated_at",
+        }

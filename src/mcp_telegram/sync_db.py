@@ -11,7 +11,7 @@ from .dialog_classification import (
     is_reserved_replies_username,
 )
 
-_CURRENT_SCHEMA_VERSION = 58
+_CURRENT_SCHEMA_VERSION = 59
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -21,6 +21,12 @@ _ACCESS_CAUSE_MIGRATION_55 = 55
 _TOOL_CAPABILITY_MIGRATION_56 = 56
 _ENTITY_PROFILE_SECTIONS_MIGRATION_57 = 57
 _ACCOUNT_TRACE_INDEXES_MIGRATION_58 = 58
+_SCHEDULED_RECONCILIATION_MIGRATION_59 = 59
+
+# Product-owned scheduled reconciliation targets.  Keep these values here so
+# schema bootstrap and the legacy worker cannot drift apart.
+SCHEDULED_ACTIVE_REPAIR_SECONDS = 15 * 60
+SCHEDULED_QUIET_DISCOVERY_SECONDS = 24 * 60 * 60
 
 logger = logging.getLogger(__name__)
 
@@ -881,6 +887,31 @@ CREATE TABLE IF NOT EXISTS scheduled_sync_state (
 
 _SCHEDULED_SYNC_STATE_SEED = """
 INSERT OR IGNORE INTO scheduled_sync_state (key) VALUES ('account')
+"""
+
+_SCHEDULED_RECONCILIATION_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS scheduled_reconciliation_state (
+    dialog_id             INTEGER PRIMARY KEY,
+    repair_due_at         INTEGER,
+    discovery_due_at      INTEGER NOT NULL,
+    dirty_since           INTEGER,
+    dirty_generation      INTEGER NOT NULL DEFAULT 0 CHECK(dirty_generation >= 0),
+    -- Retained for compatibility with the first unreleased v59 shape.  It is
+    -- an audit timestamp, not a scheduling input.
+    updated_at            INTEGER NOT NULL,
+    CHECK(dirty_since IS NULL OR repair_due_at IS NOT NULL)
+) WITHOUT ROWID
+"""
+
+_SCHEDULED_RECONCILIATION_REPAIR_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_scheduled_reconciliation_repair_due
+ON scheduled_reconciliation_state(repair_due_at, dialog_id)
+WHERE repair_due_at IS NOT NULL
+"""
+
+_SCHEDULED_RECONCILIATION_DISCOVERY_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_scheduled_reconciliation_discovery_due
+ON scheduled_reconciliation_state(discovery_due_at, dialog_id)
 """
 
 # v37: durable media-fact hydration scheduling.  The queue identity includes
@@ -2829,6 +2860,51 @@ def _apply_migration_58(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_59(conn: sqlite3.Connection, current: int) -> int:
+    """Add durable per-dialog scheduling for scheduled-message reconciliation."""
+    if current >= _SCHEDULED_RECONCILIATION_MIGRATION_59:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(_SCHEDULED_RECONCILIATION_STATE_DDL)
+        conn.execute(_SCHEDULED_RECONCILIATION_REPAIR_INDEX_DDL)
+        conn.execute(_SCHEDULED_RECONCILIATION_DISCOVERY_INDEX_DDL)
+        conn.execute(_OWN_ONLY_DIALOGS_DDL)
+        now = _row_first_int(cast(tuple[object] | None, conn.execute("SELECT unixepoch()").fetchone()))
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO scheduled_reconciliation_state (
+                dialog_id, repair_due_at, discovery_due_at, updated_at
+            )
+            SELECT candidate.dialog_id,
+                   CASE WHEN active.dialog_id IS NULL THEN NULL ELSE :now END,
+                   :now + (((candidate.dialog_id % :quiet_seconds) + :quiet_seconds) % :quiet_seconds),
+                   :now
+            FROM (
+                SELECT dialog_id FROM dialogs
+                 WHERE hidden = 0 AND type IN ('user', 'bot', 'channel')
+                UNION
+                SELECT dialog_id FROM own_only_dialogs
+                UNION
+                SELECT dialog_id FROM scheduled_messages WHERE message_state = 'scheduled'
+            ) AS candidate
+            LEFT JOIN (
+                SELECT DISTINCT dialog_id FROM scheduled_messages WHERE message_state = 'scheduled'
+            ) AS active ON active.dialog_id = candidate.dialog_id
+            """,
+            {"now": now, "quiet_seconds": SCHEDULED_QUIET_DISCOVERY_SECONDS},
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
+            (_SCHEDULED_RECONCILIATION_MIGRATION_59,),
+        )
+        conn.commit()
+        return _SCHEDULED_RECONCILIATION_MIGRATION_59
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -2901,6 +2977,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_migration_56(conn, current)
     current = _apply_migration_57(conn, current)
     current = _apply_migration_58(conn, current)
+    current = _apply_migration_59(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
