@@ -74,7 +74,7 @@ def _database(path: Path, *, now_ms: int) -> None:
     conn.close()
 
 
-@pytest.mark.parametrize(("value", "seconds"), [("30m", 1800), ("15h", 54000), ("2d", 172800)])
+@pytest.mark.parametrize(("value", "seconds"), [("30m", 1800), ("15h", 54000), ("24h", 86400), ("2d", 172800)])
 def test_parse_since(value: str, seconds: int) -> None:
     assert parse_since(value) == seconds
 
@@ -118,3 +118,28 @@ def test_summary_cli_reads_configured_runtime_database(tmp_path: Path, monkeypat
     assert "mcp-telegram operational summary" in result.output
     assert "Runtime:" in result.output
     assert "MCP:" in result.output
+
+
+def test_summary_cli_defaults_to_one_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    config_home = tmp_path / "config"
+    config_dir = config_home / "mcp-telegram"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.toml").write_text(f'[state]\ndir = "{state_dir}"\n', encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+
+    captured: list[int] = []
+
+    def fake_build_operator_summary(db_path: Path, *, since_seconds: int):
+        captured.append(since_seconds)
+        from mcp_telegram.operator_summary import OperatorSummary
+
+        return OperatorSummary(text="ok", window_complete=True)
+
+    monkeypatch.setattr("mcp_telegram.operator_summary.build_operator_summary", fake_build_operator_summary)
+
+    result = runner.invoke(app, ["summary"])
+
+    assert result.exit_code == 0, result.output
+    assert captured == [24 * 3600]

@@ -55,7 +55,7 @@ class RpcSourceSummary:
 
 
 def parse_since(value: str) -> int:
-    """Parse a compact operator window such as 30m, 15h, or 2d."""
+    """Parse a compact operator window such as 30m, 24h, or 2d."""
     normalized = value.strip().lower()
     if len(normalized) < _MIN_DURATION_LENGTH or normalized[-1] not in _DURATION_UNITS:
         raise ValueError("--since must use m, h, or d, for example: 30m, 15h, 2d")
