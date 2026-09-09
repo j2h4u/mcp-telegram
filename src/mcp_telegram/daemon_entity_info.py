@@ -678,9 +678,7 @@ class DaemonEntityInfoService:
         return EntitySectionCommit(patch)
 
     async def _acquire_group_full_profile(self, entity_id: int) -> EntitySectionCommit:
-        result = await self._deps.client(
-            self._deps.get_full_chat_request(chat_id=self._legacy_chat_raw_id(entity_id))
-        )
+        result = await self._deps.client(self._deps.get_full_chat_request(chat_id=self._legacy_chat_raw_id(entity_id)))
         full_chat = _attr(result, "full_chat", None)
         if full_chat is None:
             raise ValueError("full chat payload is missing")

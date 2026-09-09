@@ -1928,37 +1928,60 @@ async def _run_dialog_reconciliation_loop(
     last_full_pass = _read_last_full_reconciliation_at(ctx.conn)
     while not ctx.shutdown_event.is_set():
         now = time.time()
-        try:
-            await _run_ctx_demand_cycle(
-                ctx,
-                DemandKind.DIALOG_LIGHT_RECONCILIATION,
-                worker.run_light_pass,
-            )
-        except RpcAdmissionClosedError:
-            raise
-        except Exception:
-            logger.warning("recon_light_pass_error", exc_info=True)
-        if last_full_pass is None or now - last_full_pass >= DIALOG_FULL_RECONCILIATION_INTERVAL_SECONDS:
-            try:
-                _count, completed = await _run_ctx_demand_cycle(
-                    ctx,
-                    DemandKind.DIALOG_FULL_RECONCILIATION,
-                    worker.run_full_pass,
-                )
-                if completed:
-                    last_full_pass = _read_last_full_reconciliation_at(ctx.conn) or time.time()
-            except RpcAdmissionClosedError:
-                raise
-            except Exception:
-                logger.warning("recon_full_pass_error", exc_info=True)
-        try:
-            await asyncio.wait_for(
-                ctx.shutdown_event.wait(),
-                timeout=ctx.scheduling.reconciliation_hourly_seconds,
-            )
+        await _run_dialog_light_pass(ctx, worker)
+        if _full_reconciliation_is_due(last_full_pass, now):
+            last_full_pass = await _run_dialog_full_pass(ctx, worker, last_full_pass)
+        if await _wait_for_reconciliation(ctx):
             return
-        except TimeoutError:
-            continue
+
+
+async def _run_dialog_light_pass(ctx: _SyncMainContext, worker: DialogReconciliationWorker) -> None:
+    try:
+        await _run_ctx_demand_cycle(
+            ctx,
+            DemandKind.DIALOG_LIGHT_RECONCILIATION,
+            worker.run_light_pass,
+        )
+    except RpcAdmissionClosedError:
+        raise
+    except Exception:
+        logger.warning("recon_light_pass_error", exc_info=True)
+
+
+def _full_reconciliation_is_due(last_full_pass: float | None, now: float) -> bool:
+    return last_full_pass is None or now - last_full_pass >= DIALOG_FULL_RECONCILIATION_INTERVAL_SECONDS
+
+
+async def _run_dialog_full_pass(
+    ctx: _SyncMainContext,
+    worker: DialogReconciliationWorker,
+    last_full_pass: float | None,
+) -> float | None:
+    try:
+        _count, completed = await _run_ctx_demand_cycle(
+            ctx,
+            DemandKind.DIALOG_FULL_RECONCILIATION,
+            worker.run_full_pass,
+        )
+    except RpcAdmissionClosedError:
+        raise
+    except Exception:
+        logger.warning("recon_full_pass_error", exc_info=True)
+        return last_full_pass
+    if completed:
+        return _read_last_full_reconciliation_at(ctx.conn) or time.time()
+    return last_full_pass
+
+
+async def _wait_for_reconciliation(ctx: _SyncMainContext) -> bool:
+    try:
+        await asyncio.wait_for(
+            ctx.shutdown_event.wait(),
+            timeout=ctx.scheduling.reconciliation_hourly_seconds,
+        )
+    except TimeoutError:
+        return False
+    return True
 
 
 async def _start_followup_background_tasks(

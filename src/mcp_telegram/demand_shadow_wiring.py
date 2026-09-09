@@ -59,50 +59,74 @@ async def run_legacy_demand_cycle[T](
 ) -> T:
     """Attribute one real legacy cycle and preserve its original failure behavior."""
     if shadow is None:
-        try:
-            active = current_demand_token()
-        except UnclassifiedTelegramDemandError:
-            active = None
-        if active is not None:
-            if active.kind is not kind:
-                raise RuntimeError(f"active demand kind {active.kind.value} cannot execute {kind.value}")
-            return await operation()
-        with demand_context(kind):
-            return await operation()
+        return await _run_without_shadow(kind, operation)
 
     try:
         token = shadow.begin_cycle(kind)
     except Exception:
         logger.warning("telegram_demand_shadow_begin_failed kind=%s", kind.value, exc_info=True)
-        with demand_context(kind):
-            return await operation()
+        return await _run_in_demand_context(kind, operation)
 
+    return await _run_shadowed_cycle(shadow, token, kind, operation)
+
+
+async def _run_without_shadow[T](kind: DemandKind, operation: Callable[[], Awaitable[T]]) -> T:
+    active = _active_demand_token()
+    if active is None:
+        return await _run_in_demand_context(kind, operation)
+    if active.kind is not kind:
+        raise RuntimeError(f"active demand kind {active.kind.value} cannot execute {kind.value}")
+    return await operation()
+
+
+async def _run_in_demand_context[T](kind: DemandKind, operation: Callable[[], Awaitable[T]]) -> T:
+    with demand_context(kind):
+        return await operation()
+
+
+def _active_demand_token() -> DemandToken | None:
+    try:
+        return current_demand_token()
+    except UnclassifiedTelegramDemandError:
+        return None
+
+
+async def _run_shadowed_cycle[T](
+    shadow: DemandShadow,
+    token: DemandToken,
+    kind: DemandKind,
+    operation: Callable[[], Awaitable[T]],
+) -> T:
+    try:
+        result = await _execute_shadow_operation(token, operation)
+    except asyncio.CancelledError:
+        _finish_cycle(shadow, token, kind, DemandEvidenceOutcome.DEFERRED, "cancelled")
+        raise
+    except Exception as exc:
+        outcome, reason = _cycle_error_outcome(exc)
+        _finish_cycle(shadow, token, kind, outcome, reason)
+        raise
+    _finish_cycle(shadow, token, kind, DemandEvidenceOutcome.COMPLETED, None)
+    return result
+
+
+def _cycle_error_outcome(exc: Exception) -> tuple[DemandEvidenceOutcome, str]:
+    if isinstance(exc, TelegramRpcAdmissionDeferred):
+        return DemandEvidenceOutcome.DEFERRED, "admission_deferred"
+    if isinstance(exc, TelegramRpcThrottled):
+        reason = "circuit_open" if exc.retry_after_seconds is None else "flood_wait"
+        return DemandEvidenceOutcome.DEFERRED, reason
+    return DemandEvidenceOutcome.FAILED, type(exc).__name__
+
+
+async def _execute_shadow_operation[T](token: DemandToken, operation: Callable[[], Awaitable[T]]) -> T:
     async def execute() -> T:
         with transferred_demand_context(token):
             return await operation()
 
-    try:
-        try:
-            current_demand_token()
-        except UnclassifiedTelegramDemandError:
-            result = await execute()
-        else:
-            result = await asyncio.get_running_loop().create_task(execute(), context=Context())
-    except asyncio.CancelledError:
-        _finish_cycle(shadow, token, kind, DemandEvidenceOutcome.DEFERRED, "cancelled")
-        raise
-    except TelegramRpcAdmissionDeferred:
-        _finish_cycle(shadow, token, kind, DemandEvidenceOutcome.DEFERRED, "admission_deferred")
-        raise
-    except TelegramRpcThrottled as exc:
-        reason = "circuit_open" if exc.retry_after_seconds is None else "flood_wait"
-        _finish_cycle(shadow, token, kind, DemandEvidenceOutcome.DEFERRED, reason)
-        raise
-    except Exception as exc:
-        _finish_cycle(shadow, token, kind, DemandEvidenceOutcome.FAILED, type(exc).__name__)
-        raise
-    _finish_cycle(shadow, token, kind, DemandEvidenceOutcome.COMPLETED, None)
-    return result
+    if _active_demand_token() is None:
+        return await execute()
+    return await asyncio.get_running_loop().create_task(execute(), context=Context())
 
 
 def _finish_cycle(
