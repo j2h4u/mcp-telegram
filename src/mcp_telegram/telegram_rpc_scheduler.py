@@ -12,53 +12,18 @@ from contextlib import contextmanager
 from contextvars import Context, ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Protocol
 
 from .flood import TelegramRpcThrottled
+from .telegram_rpc_consumers import (
+    TELEGRAM_RPC_CONSUMERS,
+    RpcServiceClass,
+    TelegramRpcSource,
+    telegram_rpc_consumer,
+)
 
 logger = logging.getLogger(__name__)
-
-
-class RpcServiceClass(StrEnum):
-    """Internal service classes for account-wide Telegram RPC admission."""
-
-    INTERACTIVE = "interactive"
-    LIVE_SYNC = "live_sync"
-    BACKGROUND = "background"
-
-
-class TelegramRpcSource(StrEnum):
-    """Application-owned reasons for issuing Telegram RPCs.
-
-    Request constructors deliberately do not appear here: the use case, rather
-    than the Telegram method, owns service classification.
-    """
-
-    MCP_INTERACTIVE = "mcp_interactive"
-    MESSAGE_READ_FALLBACK = "message_read_fallback"
-    DIALOG_RESOLUTION = "dialog_resolution"
-    TOPIC_RESOLUTION = "topic_resolution"
-    ENTITY_INFO_FOREGROUND = "entity_info_foreground"
-    ENTITY_INFO_REFRESH = "entity_info_refresh"
-    ACCOUNT_TRACE = "account_trace"
-    TELETHON_UPDATE_DIFFERENCE = "telethon_update_difference"
-    RECONNECT_DIFFERENCE = "reconnect_difference"
-    REALTIME_EVENT = "realtime_event"
-    DELTA_SYNC = "delta_sync"
-    ACTIVITY_HOT_SWEEP = "activity_hot_sweep"
-    FACT_HYDRATION_LIVE = "fact_hydration_live"
-    FULL_SYNC = "full_sync"
-    DIALOG_SYNC = "dialog_sync"
-    ACTIVITY_ARCHIVE = "activity_archive"
-    ACTIVITY_COLD_BACKFILL = "activity_cold_backfill"
-    FACT_HYDRATION_BACKFILL = "fact_hydration_backfill"
-    FOLDER_RECONCILIATION = "folder_reconciliation"
-    TOPIC_RECONCILIATION = "topic_reconciliation"
-    MESSAGE_FACT_REFRESH = "message_fact_refresh"
-    REACTION_REFRESH = "reaction_refresh"
-    READ_RECEIPT_PROBE = "read_receipt_probe"
-    SCHEDULED_MESSAGES = "scheduled_messages"
-    MAINTENANCE = "maintenance"
 
 
 class TelegramRpcSchedulerPolicy(Protocol):
@@ -98,33 +63,9 @@ class TelegramRpcSchedulerPolicy(Protocol):
     def update_loop_retry_seconds(self) -> float: ...
 
 
-RPC_SOURCE_SERVICE_CLASS: Mapping[TelegramRpcSource, RpcServiceClass] = {
-    TelegramRpcSource.MCP_INTERACTIVE: RpcServiceClass.INTERACTIVE,
-    TelegramRpcSource.MESSAGE_READ_FALLBACK: RpcServiceClass.INTERACTIVE,
-    TelegramRpcSource.DIALOG_RESOLUTION: RpcServiceClass.INTERACTIVE,
-    TelegramRpcSource.TOPIC_RESOLUTION: RpcServiceClass.INTERACTIVE,
-    TelegramRpcSource.ENTITY_INFO_FOREGROUND: RpcServiceClass.INTERACTIVE,
-    TelegramRpcSource.ENTITY_INFO_REFRESH: RpcServiceClass.BACKGROUND,
-    TelegramRpcSource.ACCOUNT_TRACE: RpcServiceClass.INTERACTIVE,
-    TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE: RpcServiceClass.LIVE_SYNC,
-    TelegramRpcSource.RECONNECT_DIFFERENCE: RpcServiceClass.LIVE_SYNC,
-    TelegramRpcSource.REALTIME_EVENT: RpcServiceClass.LIVE_SYNC,
-    TelegramRpcSource.DELTA_SYNC: RpcServiceClass.LIVE_SYNC,
-    TelegramRpcSource.ACTIVITY_HOT_SWEEP: RpcServiceClass.LIVE_SYNC,
-    TelegramRpcSource.FACT_HYDRATION_LIVE: RpcServiceClass.LIVE_SYNC,
-    TelegramRpcSource.FULL_SYNC: RpcServiceClass.BACKGROUND,
-    TelegramRpcSource.DIALOG_SYNC: RpcServiceClass.BACKGROUND,
-    TelegramRpcSource.ACTIVITY_ARCHIVE: RpcServiceClass.BACKGROUND,
-    TelegramRpcSource.ACTIVITY_COLD_BACKFILL: RpcServiceClass.BACKGROUND,
-    TelegramRpcSource.FACT_HYDRATION_BACKFILL: RpcServiceClass.BACKGROUND,
-    TelegramRpcSource.FOLDER_RECONCILIATION: RpcServiceClass.BACKGROUND,
-    TelegramRpcSource.TOPIC_RECONCILIATION: RpcServiceClass.BACKGROUND,
-    TelegramRpcSource.MESSAGE_FACT_REFRESH: RpcServiceClass.BACKGROUND,
-    TelegramRpcSource.REACTION_REFRESH: RpcServiceClass.BACKGROUND,
-    TelegramRpcSource.READ_RECEIPT_PROBE: RpcServiceClass.BACKGROUND,
-    TelegramRpcSource.SCHEDULED_MESSAGES: RpcServiceClass.BACKGROUND,
-    TelegramRpcSource.MAINTENANCE: RpcServiceClass.BACKGROUND,
-}
+RPC_SOURCE_SERVICE_CLASS: Mapping[TelegramRpcSource, RpcServiceClass] = MappingProxyType(
+    {source: spec.admission.service_class for source, spec in TELEGRAM_RPC_CONSUMERS.items()}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,7 +137,7 @@ def rpc_scope(
     resolved_deadline = time.monotonic() + float(timeout_seconds) if timeout_seconds is not None else deadline
     scope = TelegramRpcScope(
         source=source,
-        service_class=RPC_SOURCE_SERVICE_CLASS[source],
+        service_class=telegram_rpc_consumer(source).admission.service_class,
         deadline=None if resolved_deadline is None else float(resolved_deadline),
         owner_task=_current_task(),
     )
