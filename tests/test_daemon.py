@@ -16,6 +16,7 @@ from mcp_telegram.config import McpTelegramConfig, StateConfig
 from mcp_telegram.daemon import (
     _create_telegram_client,
     _create_tracked_task,
+    _ensure_demand_runtime,
     _load_own_only_context,
     _log_heartbeat,
     _mark_rpc_scheduler_failed,
@@ -25,6 +26,7 @@ from mcp_telegram.daemon import (
     _run_self_profile_refresh_loop,
     _run_sync_loop,
     _shutdown_sync_main_context,
+    _start_followup_background_tasks,
     read_operator_summary_snapshot,
     sync_main,
 )
@@ -1400,6 +1402,104 @@ async def test_tracked_task_installs_the_exact_durable_root() -> None:
     await task
 
     assert observed == [DemandKind.FOLDER_SNAPSHOT]
+
+
+@pytest.mark.asyncio
+async def test_ensure_demand_runtime_installs_one_tracked_shadow_task() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _Shadow:
+        async def run(self) -> None:
+            started.set()
+            await release.wait()
+
+    shadow = _Shadow()
+    runtime = SimpleNamespace(shadow=shadow)
+    ctx = SimpleNamespace(
+        demand_runtime=None,
+        demand_shadow=None,
+        background_tasks=set(),
+        conn=MagicMock(),
+    )
+    full_sync_worker = MagicMock()
+    delta_sync_worker = MagicMock()
+
+    with patch("mcp_telegram.daemon._build_demand_runtime", return_value=runtime) as build_runtime:
+        installed = _ensure_demand_runtime(
+            cast(object, ctx),
+            full_sync_worker,
+            delta_sync_worker,
+        )  # type: ignore[arg-type]
+        installed_again = _ensure_demand_runtime(
+            cast(object, ctx),
+            full_sync_worker,
+            delta_sync_worker,
+        )  # type: ignore[arg-type]
+        await started.wait()
+
+    build_runtime.assert_called_once_with(ctx, full_sync_worker, delta_sync_worker)
+    assert installed is runtime
+    assert installed_again is runtime
+    assert ctx.demand_runtime is runtime
+    assert ctx.demand_shadow is shadow
+    assert len(ctx.background_tasks) == 1
+    shadow_task = next(iter(ctx.background_tasks))
+    assert shadow_task.get_name() == "telegram_demand_shadow"
+
+    release.set()
+    await shadow_task
+    await asyncio.sleep(0)
+    assert ctx.background_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_followup_launchers_reuse_workers_and_demand_runtime_dependencies(tmp_path: Path) -> None:
+    message_fact_refresh_deps = object()
+    scheduled_reconciler = object()
+    dialog_reconciliation_worker = object()
+    runtime = SimpleNamespace(
+        message_fact_refresh_deps=message_fact_refresh_deps,
+        scheduled_reconciler=scheduled_reconciler,
+        dialog_reconciliation_worker=dialog_reconciliation_worker,
+    )
+    ctx = SimpleNamespace(
+        client=MagicMock(),
+        conn=MagicMock(),
+        shutdown_event=asyncio.Event(),
+        scheduling=McpTelegramConfig(state=StateConfig(dir=tmp_path)).scheduling,
+        rpc_admission_observer=None,
+        folder_projection_worker=SimpleNamespace(run=AsyncMock(return_value=None)),
+        fact_hydration_worker=SimpleNamespace(run=AsyncMock(return_value=None)),
+    )
+    full_sync_worker = MagicMock()
+    delta_sync_worker = MagicMock()
+
+    def close_tracked_coroutine(_ctx: object, coro: object, **_kwargs: object) -> MagicMock:
+        close = getattr(coro, "close", None)
+        if close is not None:
+            close()
+        return MagicMock()
+
+    with (
+        patch("mcp_telegram.daemon._ensure_demand_runtime", return_value=runtime) as ensure_runtime,
+        patch("mcp_telegram.daemon._create_tracked_task", side_effect=close_tracked_coroutine),
+        patch(
+            "mcp_telegram.daemon._run_message_fact_refresh_with_dedicated_connection", new_callable=AsyncMock
+        ) as fact_loop,
+        patch("mcp_telegram.daemon._run_scheduled_reconciliation_loop", new_callable=AsyncMock) as scheduled_loop,
+        patch("mcp_telegram.daemon._run_dialog_reconciliation_loop", new_callable=AsyncMock) as dialog_loop,
+    ):
+        await _start_followup_background_tasks(
+            cast(object, ctx),
+            delta_sync_worker,
+            full_sync_worker,
+        )  # type: ignore[arg-type]
+
+    ensure_runtime.assert_called_once_with(ctx, full_sync_worker, delta_sync_worker)
+    fact_loop.assert_called_once_with(ctx, message_fact_refresh_deps)
+    scheduled_loop.assert_called_once_with(ctx, scheduled_reconciler)
+    dialog_loop.assert_called_once_with(ctx, dialog_reconciliation_worker)
 
 
 def test_runtime_loss_and_retention_markers_reach_summary_snapshot(tmp_path: Path) -> None:
