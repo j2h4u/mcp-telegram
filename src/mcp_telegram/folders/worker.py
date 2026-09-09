@@ -16,6 +16,7 @@ from ..flood import TelegramRpcThrottled
 from ..maintenance_logging import log_maintenance_cycle
 from ..telegram_demand import DemandStatus, DurableDemandAdapter, RpcAttemptBudget, demand_context
 from ..telegram_rpc_consumers import DemandKind
+from ..telegram_rpc_scheduler import rpc_attempt_budget
 from .contracts import FolderSourceUnavailableError
 from .ports import FolderSnapshotRepository
 from .refresh import FolderRefresher, FolderRefreshResult
@@ -284,5 +285,5 @@ class FolderProjectionDemandAdapter(DurableDemandAdapter):
             raise TypeError("budget must be an RpcAttemptBudget")
         if not budget.try_debit():
             return
-        with demand_context(self.demand_kind):
+        with demand_context(self.demand_kind), rpc_attempt_budget(budget):
             await self._worker._attempt("demand")

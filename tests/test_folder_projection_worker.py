@@ -16,6 +16,7 @@ from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderPro
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import RpcAttemptBudget, current_demand_token
 from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcScope, current_rpc_scope
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +97,7 @@ async def test_demand_adapter_reports_startup_demand_and_runs_one_worker_attempt
         adapter = _demand_adapter(repository, gateway)
         status = adapter.status(100.0)
         budget = RpcAttemptBudget(limit=1)
+        assert status is not None
 
         await adapter.run_slice(budget)
 
@@ -116,6 +118,7 @@ def test_demand_adapter_reconstructs_success_and_retry_cadence(tmp_path: Path) -
         adapter = _demand_adapter(repository)
 
         status = adapter.status(100.0)
+        assert status is not None
 
         assert status.release_at == 190.0
         assert status.freshness_deadline == 1890
@@ -127,6 +130,7 @@ def test_demand_adapter_reconstructs_success_and_retry_cadence(tmp_path: Path) -
             consecutive_failures=1,
         )
         retry_status = adapter.status(150.0)
+        assert retry_status is not None
         assert retry_status.release_at == 200.0
         assert retry_status.freshness_deadline == 1890
     finally:
@@ -138,6 +142,7 @@ def test_demand_adapter_reports_freshness_debt_from_durable_state(tmp_path: Path
     try:
         repository.replace_snapshot(_snapshot(), ((1, 10),), completed_at=90)
         status = _demand_adapter(repository).status(2_000.0)
+        assert status is not None
         assert status.overdue_seconds(2_000.0) == 110.0
     finally:
         conn.close()
@@ -162,10 +167,12 @@ async def test_demand_adapter_runs_one_worker_attempt_with_precise_context(tmp_p
     conn, repository = _db(tmp_path)
     gateway = _Gateway()
     seen: list[object] = []
+    scopes: list[TelegramRpcScope] = []
     original_fetch = gateway.fetch_snapshot
 
     async def fetch_with_context() -> FolderSourceSnapshot:
         seen.append(current_demand_token())
+        scopes.append(current_rpc_scope())
         return await original_fetch()
 
     gateway.fetch_snapshot = fetch_with_context  # type: ignore[method-assign]
@@ -178,6 +185,8 @@ async def test_demand_adapter_runs_one_worker_attempt_with_precise_context(tmp_p
         assert budget.attempts == 1
         assert gateway.calls == 1
         assert seen[0].kind is DemandKind.FOLDER_SNAPSHOT  # type: ignore[union-attr]
+        assert scopes[0].demand_kind is DemandKind.FOLDER_SNAPSHOT
+        assert scopes[0].attempt_budget is budget
         assert repository.read_last_outcome() == "success"
         assert repository.read_last_success_at() is not None
     finally:
