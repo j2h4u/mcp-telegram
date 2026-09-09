@@ -817,7 +817,8 @@ async def test_durable_profile_adapter_checkpoints_core_resolution_before_sectio
 @pytest.mark.asyncio
 async def test_durable_profile_budget_exhaustion_leaves_core_cursor_ready() -> None:
     class ExhaustedClient(_UnusedClient):
-        async def get_entity(self, _entity_id: int) -> object:
+        async def get_entity(self, entity_id: int) -> object:
+            del entity_id
             raise RpcAttemptBudgetExhaustedError("slice complete")
 
     conn = sqlite3.connect(":memory:")

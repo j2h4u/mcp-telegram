@@ -195,10 +195,10 @@ async def test_entity_profile_adapter_observes_queue_and_entity_lookup_context()
     adapter = EntityProfileDemandAdapter(coordinator)
     budget = RpcAttemptBudget(limit=1)
 
-    status = adapter.status(100.0)
+    initial_status = adapter.status(100.0)
     await adapter.run_slice(budget)
 
-    assert status is not None and status.release_at == 0.0
+    assert initial_status is not None and initial_status.release_at == 0.0
     assert adapter.demand_kind is DemandKind.ENTITY_PROFILE_REFRESH
     assert budget.attempts == 0
     assert observed == [(DemandKind.ENTITY_PROFILE_REFRESH, AcquisitionKind.ENTITY_LOOKUP)]
