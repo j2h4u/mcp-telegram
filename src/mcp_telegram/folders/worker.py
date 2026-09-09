@@ -14,7 +14,7 @@ from typing import Protocol, cast
 
 from ..flood import TelegramRpcThrottled
 from ..maintenance_logging import log_maintenance_cycle
-from ..telegram_demand import DemandStatus, DurableDemandAdapter, RpcAttemptBudget
+from ..telegram_demand import DemandStatus, DurableDemandAdapter, RpcAttemptBudget, demand_context
 from ..telegram_rpc_consumers import DemandKind
 from .contracts import FolderSourceUnavailableError
 from .ports import FolderSnapshotRepository
@@ -66,49 +66,6 @@ class _Attempt:
 
 def _default_jitter(interval: float, ratio: float) -> float:
     return interval * (1.0 + random.uniform(-ratio, ratio))
-
-
-class FolderProjectionDemandAdapter(DurableDemandAdapter):
-    """Read folder refresh demand while the legacy worker remains the executor.
-
-    ``run_slice`` is intentionally a shadow no-op for PR1. The daemon's existing
-    ``FolderProjectionWorker`` launcher owns all Telegram acquisition and local
-    projection writes until execution is migrated explicitly.
-    """
-
-    demand_kind = DemandKind.FOLDER_SNAPSHOT
-
-    def __init__(
-        self,
-        repository: FolderSnapshotRepository,
-        policy: FolderProjectionScheduling,
-    ) -> None:
-        self._repository = repository
-        self._policy = policy
-
-    def status(self, now: float) -> DemandStatus | None:
-        retry_at = self._repository.read_next_retry_at()
-        last_success_at = self._repository.read_last_success_at()
-        outcome = self._repository.read_last_outcome()
-        if retry_at is not None:
-            release_at = float(retry_at)
-        elif last_success_at is not None and outcome in {None, FolderAttemptResult.SUCCESS}:
-            release_at = math.ceil(last_success_at + self._policy.refresh_interval_seconds)
-        elif outcome in {FolderAttemptResult.CIRCUIT_OPEN, FolderAttemptResult.UNEXPECTED}:
-            return None
-        else:
-            release_at = now
-        freshness_deadline = (
-            None
-            if last_success_at is None
-            else last_success_at + self._policy.stale_threshold_seconds
-        )
-        return DemandStatus(release_at=release_at, freshness_deadline=freshness_deadline)
-
-    async def run_slice(self, budget: RpcAttemptBudget) -> None:
-        """Observe a shadow slice without invoking RPCs or changing local state."""
-        if not isinstance(budget, RpcAttemptBudget):
-            raise TypeError("budget must be an RpcAttemptBudget")
 
 
 class FolderProjectionWorker:
@@ -292,3 +249,40 @@ class FolderProjectionWorker:
             threshold,
             outcome or "persisted",
         )
+
+
+class FolderProjectionDemandAdapter(DurableDemandAdapter):
+    """Expose folder demand and run one bounded attempt through the worker."""
+
+    demand_kind = DemandKind.FOLDER_SNAPSHOT
+
+    def __init__(self, worker: FolderProjectionWorker) -> None:
+        self._worker = worker
+
+    def status(self, now: float) -> DemandStatus | None:
+        repository = self._worker._repository
+        policy = self._worker._policy
+        retry_at = repository.read_next_retry_at()
+        last_success_at = repository.read_last_success_at()
+        outcome = repository.read_last_outcome()
+        if retry_at is not None:
+            release_at = float(retry_at)
+        elif last_success_at is not None and outcome in {None, FolderAttemptResult.SUCCESS}:
+            release_at = math.ceil(last_success_at + policy.refresh_interval_seconds)
+        elif outcome in {FolderAttemptResult.CIRCUIT_OPEN, FolderAttemptResult.UNEXPECTED}:
+            return None
+        else:
+            release_at = now
+        freshness_deadline = (
+            None if last_success_at is None else last_success_at + policy.stale_threshold_seconds
+        )
+        return DemandStatus(release_at=release_at, freshness_deadline=freshness_deadline)
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Run one existing worker attempt under the precise durable demand."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        if not budget.try_debit():
+            return
+        with demand_context(self.demand_kind):
+            await self._worker._attempt("demand")

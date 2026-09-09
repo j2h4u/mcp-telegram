@@ -14,7 +14,7 @@ from mcp_telegram.folders.refresh import FolderRefresher
 from mcp_telegram.folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_demand import RpcAttemptBudget
+from mcp_telegram.telegram_demand import RpcAttemptBudget, current_demand_token
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 
 
@@ -81,15 +81,19 @@ def _worker(
     )
 
 
-def _demand_adapter(repository: SQLiteFolderSnapshotRepository) -> FolderProjectionDemandAdapter:
-    return FolderProjectionDemandAdapter(repository, _Policy())
+def _demand_adapter(
+    repository: SQLiteFolderSnapshotRepository,
+    gateway: _Gateway | None = None,
+) -> FolderProjectionDemandAdapter:
+    return FolderProjectionDemandAdapter(_worker(gateway or _Gateway(), repository))
 
 
 @pytest.mark.asyncio
-async def test_demand_adapter_reports_startup_demand_without_running_legacy_worker(tmp_path: Path) -> None:
+async def test_demand_adapter_reports_startup_demand_and_runs_one_worker_attempt(tmp_path: Path) -> None:
     conn, repository = _db(tmp_path)
     try:
-        adapter = _demand_adapter(repository)
+        gateway = _Gateway()
+        adapter = _demand_adapter(repository, gateway)
         status = adapter.status(100.0)
         budget = RpcAttemptBudget(limit=1)
 
@@ -98,8 +102,9 @@ async def test_demand_adapter_reports_startup_demand_without_running_legacy_work
         assert adapter.demand_kind is DemandKind.FOLDER_SNAPSHOT
         assert status.release_at == 100.0
         assert status.freshness_deadline is None
-        assert budget.attempts == 0
-        assert repository.read_last_outcome() is None
+        assert budget.attempts == 1
+        assert gateway.calls == 1
+        assert repository.read_last_outcome() == "success"
     finally:
         conn.close()
 
@@ -148,6 +153,33 @@ def test_demand_adapter_suppresses_terminal_failure_until_legacy_restart(tmp_pat
             consecutive_failures=1,
         )
         assert _demand_adapter(repository).status(100.0) is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_demand_adapter_runs_one_worker_attempt_with_precise_context(tmp_path: Path) -> None:
+    conn, repository = _db(tmp_path)
+    gateway = _Gateway()
+    seen: list[object] = []
+    original_fetch = gateway.fetch_snapshot
+
+    async def fetch_with_context() -> FolderSourceSnapshot:
+        seen.append(current_demand_token())
+        return await original_fetch()
+
+    gateway.fetch_snapshot = fetch_with_context  # type: ignore[method-assign]
+    try:
+        adapter = _demand_adapter(repository, gateway)
+        budget = RpcAttemptBudget(limit=1)
+
+        await adapter.run_slice(budget)
+
+        assert budget.attempts == 1
+        assert gateway.calls == 1
+        assert seen[0].kind is DemandKind.FOLDER_SNAPSHOT  # type: ignore[union-attr]
+        assert repository.read_last_outcome() == "success"
+        assert repository.read_last_success_at() is not None
     finally:
         conn.close()
 
