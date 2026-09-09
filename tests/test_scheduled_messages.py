@@ -565,6 +565,37 @@ async def test_scheduled_discovery_adapter_runs_only_discovery_rows_with_precise
 
 
 @pytest.mark.asyncio
+async def test_legacy_run_once_attributes_each_selected_row_to_its_demand_kind(
+    conn: sqlite3.Connection,
+) -> None:
+    upsert_scheduled_message(conn, 42, _message(11), now=100)
+    conn.execute(
+        "UPDATE scheduled_reconciliation_state SET repair_due_at=0, discovery_due_at=9999999999 WHERE dialog_id=42"
+    )
+    conn.execute("INSERT INTO dialogs(dialog_id, type, hidden) VALUES (43, 'user', 0)")
+    conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id, repair_due_at, discovery_due_at, updated_at) "
+        "VALUES (43, NULL, 0, 0)"
+    )
+    conn.commit()
+    client = _ScheduledSnapshotClient({42: [], 43: []})
+    worker = ScheduledMessageReconciler(
+        client,
+        conn,
+        asyncio.Event(),
+        OwnOnlyContext(account_id=999),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10, max_dialogs_per_slice=2),
+    )
+
+    await worker.run_once()
+
+    assert [scope.demand_kind for scope in client.scopes] == [
+        DemandKind.SCHEDULED_REPAIR,
+        DemandKind.SCHEDULED_DISCOVERY,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_future_account_retry_does_not_appear_runnable(conn: sqlite3.Connection) -> None:
     now = int(time.time())
     conn.execute(

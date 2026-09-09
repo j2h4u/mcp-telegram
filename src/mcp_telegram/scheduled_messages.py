@@ -12,10 +12,9 @@ import asyncio
 import logging
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
-from functools import wraps
 from typing import Protocol, cast
 
 from telethon.errors import RPCError  # type: ignore[import-untyped]
@@ -53,26 +52,11 @@ from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
     TelegramRpcSource,
-    preserve_or_rpc_scope,
     rpc_attempt_budget,
     rpc_scope,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _rpc_scope[**P, R](source: TelegramRpcSource) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
-    """Classify direct scheduled reconciliation while preserving an owner."""
-
-    def decorate(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
-        @wraps(func)
-        async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
-            with preserve_or_rpc_scope(source):
-                return await func(*args, **kwargs)
-
-        return wrapped
-
-    return decorate
 
 
 _SCHEDULED_SYNC_KEY = "account"
@@ -760,7 +744,6 @@ class ScheduledMessageReconciler:
         changed = self._apply_snapshot(dialog_id, generation, snapshot, discovery=discovery, now=now)
         return (0 if changed is None else changed), False
 
-    @_rpc_scope(TelegramRpcSource.SCHEDULED_MESSAGES)
     async def run_once(self) -> int:
         """Process one bounded slice of due per-dialog work."""
         return await self._run_slice()
@@ -784,7 +767,16 @@ class ScheduledMessageReconciler:
         for dialog_id, generation, discovery in due_rows:
             if self._shutdown_event.is_set():
                 break
-            changed, flood_waited = await self._process_due_dialog(dialog_id, generation, discovery, now)
+            if demand_kind is None:
+                row_demand_kind = (
+                    DemandKind.SCHEDULED_DISCOVERY if discovery else DemandKind.SCHEDULED_REPAIR
+                )
+                with demand_context(row_demand_kind):
+                    changed, flood_waited = await self._process_due_dialog(
+                        dialog_id, generation, discovery, now
+                    )
+            else:
+                changed, flood_waited = await self._process_due_dialog(dialog_id, generation, discovery, now)
             total += changed
             if flood_waited:
                 break
