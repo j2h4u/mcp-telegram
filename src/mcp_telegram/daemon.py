@@ -44,6 +44,7 @@ import os
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from contextvars import Context
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -77,7 +78,19 @@ from .delta_sync import (
     run_access_probe_loop,
     run_delta_catch_up_loop,
 )
-from .dialog_sync import DialogsBootstrapWorker, run_reconciliation_loop
+from .demand_composition import (
+    DIALOG_FULL_RECONCILIATION_INTERVAL_SECONDS,
+    DemandCompositionClient,
+    DemandCompositionDependencies,
+    SQLiteSelfProfileCadence,
+    TelegramDemandShadow,
+    build_durable_adapter_map,
+)
+from .dialog_sync import (
+    DialogReconciliationWorker,
+    DialogsBootstrapWorker,
+    _read_last_full_reconciliation_at,
+)
 from .entity_profile.refresh import RefreshLimits
 from .event_handlers import EventHandlerManager
 from .fact_hydration import MessageFactHydrationWorker
@@ -100,8 +113,9 @@ from .fts import backfill_fts_index
 from .hydration_queue import HydrationPriority
 from .media_hydration import MediaFactHydrationHandler
 from .message_fact_refresh import (
+    MessageFactRefreshDeps,
     MessageFactRefreshPolicy,
-    run_message_fact_refresh_loop,
+    refresh_message_facts_once,
 )
 from .messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
 from .own_only import OwnOnlyContext, ensure_own_only_schema
@@ -112,17 +126,22 @@ from .read_state import apply_read_cursor, apply_reconciled_unread_count
 from .reconnect import run_reconnect_catch_up_loop
 from .rpc_admission_observations import RpcAdmissionObservationAggregator
 from .runtime_observations import RuntimeObservationSink, prune_runtime_observations, record_runtime_observation
-from .scheduled_messages import ScheduledReconciliationPolicy, run_scheduled_reconciliation_loop
+from .scheduled_messages import ScheduledMessageReconciler, ScheduledReconciliationPolicy
 from .state import StatePaths, ensure_private_state_dir
 from .sync_db import (
     _open_sync_db,
     ensure_sync_schema,
+    load_account_cooldown_until_utc,
     migrate_legacy_databases,
     open_sync_db_reader,
+    save_account_cooldown_until_utc,
 )
 from .sync_worker import FullSyncWorker
 from .telegram import create_client
+from .telegram_demand import AcquisitionKind, acquisition_context, demand_context
 from .telegram_read_receipts import TelethonTelegramReadReceiptGateway
+from .telegram_rpc import TelegramRpcCooldownPersistence
+from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
     AdmissionObserver,
     RpcAdmissionClosedError,
@@ -130,7 +149,6 @@ from .telegram_rpc_scheduler import (
     RpcAdmissionEventKind,
     TelegramRpcAdmissionDeferred,
     TelegramRpcSource,
-    create_scoped_rpc_task,
     rpc_scope,
 )
 from .topics.refresh import TopicRefresher
@@ -150,7 +168,12 @@ def _operator_summary_row_factory(cursor: sqlite3.Cursor, row: tuple[object, ...
 
 def read_operator_summary_snapshot(
     db_path: Path, since_ms: int
-) -> tuple[list[dict[str, object]], dict[str, object] | None, list[dict[str, object]]]:
+) -> tuple[
+    list[dict[str, object]],
+    dict[str, object] | None,
+    list[dict[str, object]],
+    dict[str, object],
+]:
     """Read the durable rows needed by the standalone operator summary."""
     conn = open_sync_db_reader(db_path)
     conn.row_factory = _operator_summary_row_factory
@@ -172,9 +195,36 @@ def read_operator_summary_snapshot(
             list[dict[str, object]],
             conn.execute("SELECT status,COUNT(*) count FROM synced_dialogs GROUP BY status").fetchall(),
         )
+        marker_rows = cast(
+            list[dict[str, object]],
+            conn.execute(
+                "SELECT key,value FROM daemon_state "
+                "WHERE key IN ("
+                "'runtime_observations_last_cap_truncation_ms',"
+                "'runtime_observations_last_loss_ms',"
+                "'runtime_observations_last_queue_full_drops',"
+                "'runtime_observations_last_writer_failures'"
+                ")"
+            ).fetchall(),
+        )
     finally:
         conn.close()
-    return observations, history_row, dialog_rows
+    persisted_markers = {str(row["key"]): row["value"] for row in marker_rows}
+    coverage_markers: dict[str, object] = {}
+    cap_ms = persisted_markers.get("runtime_observations_last_cap_truncation_ms")
+    if cap_ms is not None:
+        coverage_markers["last_cap_truncation_ms"] = cap_ms
+    loss_ms = persisted_markers.get("runtime_observations_last_loss_ms")
+    if loss_ms is not None and int(str(loss_ms)) >= since_ms:
+        coverage_markers["loss_observed"] = True
+        coverage_markers["telemetry_gap_ms"] = loss_ms
+        queue_full_drops = persisted_markers.get("runtime_observations_last_queue_full_drops")
+        writer_failures = persisted_markers.get("runtime_observations_last_writer_failures")
+        if queue_full_drops is not None:
+            coverage_markers["queue_full_drops"] = int(str(queue_full_drops))
+        if writer_failures is not None:
+            coverage_markers["writer_failures"] = int(str(writer_failures))
+    return observations, history_row, dialog_rows, coverage_markers
 
 
 class _DaemonClient(Protocol):
@@ -314,14 +364,28 @@ class _SyncMainContext:
     folder_projection_worker: FolderProjectionWorker
     fact_hydration_worker: MessageFactHydrationWorker
     socket_path: Path
+    self_profile_cadence: SQLiteSelfProfileCadence
     rpc_observation_sink: RuntimeObservationSink | None = None
     rpc_admission_observer: RpcAdmissionObservationAggregator | None = None
+    demand_shadow: TelegramDemandShadow | None = None
+    demand_runtime: _DemandRuntime | None = None
     unix_server: asyncio.AbstractServer | None = None
     handler_manager: EventHandlerManager | None = None
     own_only_context: OwnOnlyContext | None = None
     scheduling: SchedulingConfig = field(default_factory=SchedulingConfig)
     background_tasks: set[asyncio.Task[object]] = field(default_factory=set)
     flood_wait_kill_switch_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass(frozen=True, slots=True)
+class _DemandRuntime:
+    """Objects shared by PR1 shadow adapters and legacy launchers."""
+
+    shadow: TelegramDemandShadow
+    scheduled_reconciler: ScheduledMessageReconciler
+    dialog_reconciliation_worker: DialogReconciliationWorker
+    message_fact_refresh_deps: MessageFactRefreshDeps
+    read_receipt_batch: Callable[[], Awaitable[object]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -606,6 +670,8 @@ async def _run_read_position_reconciliation_loop(  # noqa: PLR0913 - daemon comp
     failure_cooldown_seconds: float | None = None,
     batch_size: int | None = None,
     batch_pause_seconds: float | None = None,
+    after_cycle: Callable[[], object] | None = None,
+    run_batch: Callable[[], Awaitable[object]] | None = None,
 ) -> None:
     """Repeatedly reconcile durable read-position work after startup.
 
@@ -615,16 +681,22 @@ async def _run_read_position_reconciliation_loop(  # noqa: PLR0913 - daemon comp
     for bootstrap, stale-unread recovery, retries, and late enrollment.
     """
     while not shutdown_event.is_set():
-        await _initialize_read_positions(
-            client,
-            conn,
-            shutdown_event,
-            max_dialogs=max_dialogs_per_pass,
-            failure_cooldown_seconds=failure_cooldown_seconds,
-            batch_size=batch_size,
-            batch_pause_seconds=batch_pause_seconds,
-            success_recheck_seconds=interval_seconds,
-        )
+        with demand_context(DemandKind.READ_RECEIPT_BATCH):
+            if run_batch is None:
+                await _initialize_read_positions(
+                    client,
+                    conn,
+                    shutdown_event,
+                    max_dialogs=max_dialogs_per_pass,
+                    failure_cooldown_seconds=failure_cooldown_seconds,
+                    batch_size=batch_size,
+                    batch_pause_seconds=batch_pause_seconds,
+                    success_recheck_seconds=interval_seconds,
+                )
+            else:
+                await run_batch()
+        if after_cycle is not None:
+            after_cycle()
         if shutdown_event.is_set():
             break
         try:
@@ -920,20 +992,23 @@ async def _maybe_heartbeat_and_gap_scan(
         state.last_heartbeat = now_mono
 
     if now_mono - state.last_gap_scan >= GAP_SCAN_INTERVAL_S:
-        with rpc_scope(TelegramRpcSource.DELTA_SYNC):
-            deleted_count = await handler_manager.run_dm_gap_scan()
+        with demand_context(DemandKind.DELTA_GAP_FILL):
+            with rpc_scope(TelegramRpcSource.DELTA_SYNC):
+                deleted_count = await handler_manager.run_dm_gap_scan()
         logger.info("gap_scan complete — marked_deleted=%d", deleted_count)
         state.last_gap_scan = now_mono
 
     return state
 
 
-async def _run_sync_loop(
+async def _run_sync_loop(  # noqa: PLR0913 - explicit legacy loop dependencies
     worker: FullSyncWorker,
     handler_manager: EventHandlerManager,
     shutdown_event: asyncio.Event,
     conn: sqlite3.Connection,
     client: _DaemonClient,
+    *,
+    after_cycle: Callable[[], object] | None = None,
 ) -> None:
     """Run the batch-sync loop with periodic heartbeat and gap scan."""
     sync_start = time.monotonic()
@@ -953,7 +1028,10 @@ async def _run_sync_loop(
                 continue
             break
 
-        all_synced = await worker.process_one_batch()
+        with demand_context(DemandKind.FULL_SYNC_PAGE):
+            all_synced = await worker.process_one_batch()
+        if after_cycle is not None:
+            after_cycle()
         await asyncio.sleep(0)
 
         state = await _maybe_heartbeat_and_gap_scan(
@@ -991,18 +1069,26 @@ def _create_tracked_task(
     *,
     name: str | None = None,
     critical: bool = False,
-    rpc_source: TelegramRpcSource | None = None,
+    demand_kind: DemandKind | None = None,
 ) -> asyncio.Task[object]:
     """Create an asyncio task and track it for shutdown cancellation."""
     concrete_coro = cast(Coroutine[object, object, object], coro)
-    task = (
-        asyncio.create_task(concrete_coro, name=name)
-        if rpc_source is None
-        else create_scoped_rpc_task(concrete_coro, source=rpc_source, name=name)
-    )
+    started = False
+
+    async def run_with_demand() -> object:
+        nonlocal started
+        started = True
+        if demand_kind is None:
+            return await concrete_coro
+        with demand_context(demand_kind):
+            return await concrete_coro
+
+    task = asyncio.get_running_loop().create_task(run_with_demand(), name=name, context=Context())
     ctx.background_tasks.add(task)
 
     def _on_done(t: asyncio.Task[object]) -> None:
+        if not started:
+            concrete_coro.close()
         ctx.background_tasks.discard(t)
         exc = t.exception() if not t.cancelled() else None
         if exc is not None:
@@ -1126,9 +1212,25 @@ def _message_fact_refresh_policy_from_config(config: McpTelegramConfig) -> Messa
     )
 
 
-def _create_telegram_client(config: McpTelegramConfig) -> _DaemonClient:
+def _create_telegram_client(
+    config: McpTelegramConfig,
+    conn: sqlite3.Connection | None = None,
+) -> _DaemonClient:
     """Create the daemon-owned Telethon subclass with account-wide policy."""
-    return cast(_DaemonClient, create_client(catch_up=True, config=config))
+    if conn is None:
+        return cast(_DaemonClient, create_client(catch_up=True, config=config))
+    cooldown_persistence = TelegramRpcCooldownPersistence(
+        load_until_utc=partial(load_account_cooldown_until_utc, conn),
+        save_until_utc=partial(save_account_cooldown_until_utc, conn),
+    )
+    return cast(
+        _DaemonClient,
+        create_client(
+            catch_up=True,
+            config=config,
+            cooldown_persistence=cooldown_persistence,
+        ),
+    )
 
 
 async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0915 - composition root wires all daemon-owned services
@@ -1169,7 +1271,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
     flood_wait_kill_switch_event = asyncio.Event()
     _install_flood_wait_kill_switch(config, flood_wait_kill_switch_event)
 
-    client = _create_telegram_client(config)
+    client = _create_telegram_client(config, conn)
     rpc_scheduler_failure: dict[str, str | None] = {"detail": None}
 
     def health_status() -> DaemonHealthStatus:
@@ -1286,6 +1388,10 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
             backfill_debt_limit=scheduling.fact_hydration.backfill_debt_limit,
         ),
         socket_path=socket_path,
+        self_profile_cadence=SQLiteSelfProfileCadence(
+            conn,
+            scheduling.self_profile_refresh_seconds,
+        ),
         rpc_observation_sink=rpc_observation_sink,
         rpc_admission_observer=rpc_admission_observer,
         unix_server=unix_server,
@@ -1413,9 +1519,10 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     # correctly without a stable self_id.
     ctx.api_server.startup_detail = "fetching account info"
     _ = ctx.api_server.startup_detail
-    with rpc_scope(TelegramRpcSource.MAINTENANCE):
-        me = cast(_MeLike, await ctx.client.get_me())
-        _update_self_profile(ctx.api_server, me)
+    with demand_context(DemandKind.SELF_PROFILE_MAINTENANCE):
+        with acquisition_context(AcquisitionKind.ACCOUNT_SELF_PROFILE):
+            me = cast(_MeLike, await ctx.client.get_me())
+            _update_self_profile(ctx.api_server, me)
         assert ctx.api_server.self_id is not None
         assert ctx.handler_manager is not None
         ctx.handler_manager.set_self_id(ctx.api_server.self_id)
@@ -1424,11 +1531,14 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
             ctx.api_server.self_id,
             getattr(ctx, "shutdown_event", None),
         )
+    cadence = cast(SQLiteSelfProfileCadence | None, getattr(ctx, "self_profile_cadence", None))
+    if cadence is not None:
+        cadence.mark_refreshed(time.time())
     ensure_own_only_schema(ctx.conn)
     logger.info("daemon self_id cached: %s", ctx.api_server.self_id)
 
     ctx.api_server.startup_detail = "refreshing Telegram folders"
-    with rpc_scope(TelegramRpcSource.FOLDER_RECONCILIATION):
+    with demand_context(DemandKind.FOLDER_SNAPSHOT):
         await ctx.folder_projection_worker.prime()
 
     # Post-v10 runtime backfill: mark historical outgoing DM rows as out=1
@@ -1479,8 +1589,14 @@ async def _run_self_profile_refresh_loop(ctx: _SyncMainContext) -> None:
             pass
 
         try:
-            me = cast(_MeLike, await ctx.client.get_me())
-            _update_self_profile(ctx.api_server, me)
+            with demand_context(DemandKind.SELF_PROFILE_MAINTENANCE):
+                with acquisition_context(AcquisitionKind.ACCOUNT_SELF_PROFILE):
+                    me = cast(_MeLike, await ctx.client.get_me())
+                    _update_self_profile(ctx.api_server, me)
+            cadence = cast(SQLiteSelfProfileCadence | None, getattr(ctx, "self_profile_cadence", None))
+            if cadence is not None:
+                cadence.mark_refreshed(time.time())
+            _scan_demand_shadow(ctx)
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
             logger.info("self_profile_refresh_deferred retry_after=%s", exc.retry_after_seconds)
@@ -1496,9 +1612,10 @@ async def _start_bootstrap_background_tasks(
 
     ctx.api_server.startup_detail = "bootstrapping DMs"
     _ = ctx.api_server.startup_detail
-    with rpc_scope(TelegramRpcSource.DIALOG_SYNC):
+    with demand_context(DemandKind.FULL_SYNC_DM_ENROLLMENT):
         enrolled = await worker.bootstrap_dms()
     logger.info("dm_bootstrap complete — enrolled=%d", enrolled)
+    _scan_demand_shadow(ctx)
 
     ctx.handler_manager.refresh_synced_dialogs()
 
@@ -1511,7 +1628,7 @@ async def _start_bootstrap_background_tasks(
     # Phase 41 review HIGH: pass db_path (NOT conn) — the worker opens its own
     # dedicated SQLite connection inside __init__, isolating it from the
     # daemon's main conn used by the other background tasks.
-    task_specs: list[tuple[Awaitable[object], str, TelegramRpcSource]] = [
+    task_specs: list[tuple[Awaitable[object], str, DemandKind | None]] = [
         (
             DialogsBootstrapWorker(
                 ctx.client,
@@ -1520,45 +1637,253 @@ async def _start_bootstrap_background_tasks(
                 startup_detail_setter=lambda s: setattr(ctx.api_server, "startup_detail", s),
             ).run(),
             "dialogs_bootstrap_sweep",
-            TelegramRpcSource.DIALOG_SYNC,
+            None,
         ),
         (
             _backfill_total_messages(ctx.client, ctx.conn, ctx.shutdown_event),
             "backfill_total_messages",
-            TelegramRpcSource.FULL_SYNC,
+            DemandKind.FULL_SYNC_PAGE,
         ),
     ]
-    for coro, name, source in task_specs:
-        _create_tracked_task(ctx, coro, name=name, rpc_source=source)
+    for coro, name, demand_kind in task_specs:
+        _create_tracked_task(ctx, coro, name=name, demand_kind=demand_kind)
 
 
-async def _run_message_fact_refresh_with_dedicated_connection(ctx: _SyncMainContext) -> None:
-    """Keep optional fact writes off the daemon's shared SQLite connection."""
-    conn = _open_sync_db(ctx.db_path)
-    reaction_freshener = ReactionFreshener(
-        SQLiteReactionSnapshotRepository(conn),
-        TelethonTelegramReactionGateway(ctx.client),
-        freshness_ttl_seconds=ctx.reaction_freshness_ttl_seconds,
-        log=logger,
-    )
+async def _run_message_fact_refresh_with_dedicated_connection(
+    ctx: _SyncMainContext,
+    dependencies: MessageFactRefreshDeps | None = None,
+) -> None:
+    """Run legacy fact refresh with the same dependencies exposed to shadow."""
+    owns_dependencies = dependencies is None
+    deps = dependencies or _build_message_fact_refresh_dependencies(ctx)
     try:
-        await run_message_fact_refresh_loop(
-            conn,
-            reaction_freshener,
-            TelethonTelegramReadReceiptGateway(ctx.client),
-            ctx.shutdown_event,
-            ctx.message_fact_refresh_policy,
-        )
+        policy = ctx.message_fact_refresh_policy
+        if policy.reaction_max_messages_per_cycle <= 0 and policy.read_at_max_messages_per_cycle <= 0:
+            logger.info(
+                "message_fact_refresh_loop disabled — reaction_max_messages_per_cycle=%d "
+                "read_at_max_messages_per_cycle=%d",
+                policy.reaction_max_messages_per_cycle,
+                policy.read_at_max_messages_per_cycle,
+            )
+            return
+        while not ctx.shutdown_event.is_set():
+            try:
+                with demand_context(DemandKind.MESSAGE_FACT_REFRESH):
+                    result = await refresh_message_facts_once(
+                        deps,
+                        policy,
+                        shutdown_event=ctx.shutdown_event,
+                    )
+                logger.debug(
+                    "message_fact_refresh_cycle complete — reaction_candidates=%d reaction_refreshed=%d "
+                    "read_at_candidates=%d",
+                    result.reaction_candidates,
+                    result.reaction_refreshed,
+                    result.read_at_candidates,
+                )
+            except Exception:
+                logger.warning("message_fact_refresh_cycle failed", exc_info=True)
+            _scan_demand_shadow(ctx)
+            try:
+                await asyncio.wait_for(ctx.shutdown_event.wait(), timeout=policy.interval_seconds)
+            except TimeoutError:
+                continue
     finally:
-        conn.close()
+        if owns_dependencies:
+            deps.conn.close()
+
+
+def _build_message_fact_refresh_dependencies(ctx: _SyncMainContext) -> MessageFactRefreshDeps:
+    conn = _open_sync_db(ctx.db_path)
+    return MessageFactRefreshDeps(
+        conn,
+        ReactionFreshener(
+            SQLiteReactionSnapshotRepository(conn),
+            TelethonTelegramReactionGateway(ctx.client),
+            freshness_ttl_seconds=ctx.reaction_freshness_ttl_seconds,
+            log=logger,
+        ),
+        TelethonTelegramReadReceiptGateway(ctx.client),
+    )
+
+
+def _scan_demand_shadow(ctx: _SyncMainContext) -> None:
+    shadow = cast(TelegramDemandShadow | None, getattr(ctx, "demand_shadow", None))
+    if shadow is not None:
+        try:
+            shadow.after_cycle_scan()
+        except Exception:
+            logger.warning("telegram_demand_shadow_scan_failed", exc_info=True)
+
+
+def _build_demand_runtime(
+    ctx: _SyncMainContext,
+    full_sync_worker: FullSyncWorker,
+    delta_sync_worker: DeltaSyncWorker,
+) -> _DemandRuntime:
+    """Build exhaustive shadow adapters over the exact legacy-owned objects."""
+    entity_service = ctx.api_server._get_entity_info_service()
+    entity_refresh_coordinator = entity_service.refresh_coordinator
+    if entity_refresh_coordinator is None:
+        raise RuntimeError("entity profile refresh coordinator is unavailable")
+
+    message_fact_refresh_deps = _build_message_fact_refresh_dependencies(ctx)
+    scheduled_reconciler = ScheduledMessageReconciler(
+        ctx.client,
+        ctx.conn,
+        ctx.shutdown_event,
+        ctx.own_only_context,
+        policy=ScheduledReconciliationPolicy(
+            activity_rpc_timeout_seconds=ctx.scheduling.activity_rpc_timeout_seconds,
+            state_scan_seconds=ctx.scheduling.scheduled_reconciliation_seconds,
+        ),
+    )
+    dialog_reconciliation_worker = DialogReconciliationWorker(
+        ctx.client,
+        ctx.conn,
+        ctx.shutdown_event,
+        ctx.topic_refresher,
+    )
+
+    async def read_receipt_batch() -> object:
+        return await _initialize_read_positions(
+            ctx.client,
+            ctx.conn,
+            ctx.shutdown_event,
+            max_dialogs=ctx.scheduling.read_position_reconciliation_max_dialogs_per_pass,
+            failure_cooldown_seconds=ctx.scheduling.read_position_reconciliation_failure_cooldown_seconds,
+            batch_size=ctx.scheduling.read_position_reconciliation_batch_size,
+            batch_pause_seconds=ctx.scheduling.read_position_reconciliation_batch_pause_seconds,
+            success_recheck_seconds=ctx.scheduling.read_position_reconciliation_seconds,
+        )
+
+    try:
+        adapters = build_durable_adapter_map(
+            DemandCompositionDependencies(
+                client=cast(DemandCompositionClient, ctx.client),
+                conn=ctx.conn,
+                db_path=ctx.db_path,
+                shutdown_event=ctx.shutdown_event,
+                full_sync_worker=full_sync_worker,
+                delta_sync_worker=delta_sync_worker,
+                dialog_reconciliation_worker=dialog_reconciliation_worker,
+                entity_refresh_coordinator=entity_refresh_coordinator,
+                fact_hydration_worker=ctx.fact_hydration_worker,
+                folder_projection_worker=ctx.folder_projection_worker,
+                message_fact_refresh_deps=message_fact_refresh_deps,
+                message_fact_refresh_policy=ctx.message_fact_refresh_policy,
+                scheduled_reconciler=scheduled_reconciler,
+                access_probe_policy=_access_probe_policy_from_scheduling(ctx.scheduling),
+                hot_sweep_policy=ctx.scheduling.activity_hot_sweep,
+                cold_backfill_pacing=ColdBackfillPacing.from_scheduling(ctx.scheduling),
+                activity_rpc_timeout_seconds=ctx.scheduling.activity_rpc_timeout_seconds,
+                read_receipt_batch=read_receipt_batch,
+                self_profile_cadence=ctx.self_profile_cadence,
+                update_self_profile=lambda me: _update_self_profile(ctx.api_server, cast(_MeLike, me)),
+                startup_detail_setter=lambda detail: setattr(ctx.api_server, "startup_detail", detail),
+            )
+        )
+        shadow = TelegramDemandShadow(
+            adapters,
+            ctx.shutdown_event,
+            observer=ctx.rpc_admission_observer,
+        )
+    except BaseException:
+        message_fact_refresh_deps.conn.close()
+        raise
+    return _DemandRuntime(
+        shadow=shadow,
+        scheduled_reconciler=scheduled_reconciler,
+        dialog_reconciliation_worker=dialog_reconciliation_worker,
+        message_fact_refresh_deps=message_fact_refresh_deps,
+        read_receipt_batch=read_receipt_batch,
+    )
+
+
+def _ensure_demand_runtime(
+    ctx: _SyncMainContext,
+    full_sync_worker: FullSyncWorker,
+    delta_sync_worker: DeltaSyncWorker,
+) -> _DemandRuntime:
+    """Install the always-on shadow once, before legacy background launchers."""
+    if ctx.demand_runtime is not None:
+        return ctx.demand_runtime
+    demand_runtime = _build_demand_runtime(ctx, full_sync_worker, delta_sync_worker)
+    ctx.demand_runtime = demand_runtime
+    ctx.demand_shadow = demand_runtime.shadow
+    _create_tracked_task(
+        ctx,
+        demand_runtime.shadow.run(),
+        name="telegram_demand_shadow",
+    )
+    return demand_runtime
+
+
+async def _run_scheduled_reconciliation_loop(
+    ctx: _SyncMainContext,
+    reconciler: ScheduledMessageReconciler,
+) -> None:
+    """Preserve the legacy scheduler around the shared reconciler instance."""
+    while not ctx.shutdown_event.is_set():
+        try:
+            await reconciler.run_once()
+        except (RpcAdmissionClosedError, asyncio.CancelledError):
+            raise
+        except Exception:
+            logger.warning("scheduled_reconcile_failed", exc_info=True)
+        _scan_demand_shadow(ctx)
+        try:
+            await asyncio.wait_for(ctx.shutdown_event.wait(), timeout=reconciler._wait_timeout())
+        except TimeoutError:
+            continue
+
+
+async def _run_dialog_reconciliation_loop(
+    ctx: _SyncMainContext,
+    worker: DialogReconciliationWorker,
+) -> None:
+    """Preserve legacy dialog cadence around the shared worker instance."""
+    last_full_pass = _read_last_full_reconciliation_at(ctx.conn)
+    while not ctx.shutdown_event.is_set():
+        now = time.time()
+        try:
+            await worker.run_light_pass()
+        except RpcAdmissionClosedError:
+            raise
+        except Exception:
+            logger.warning("recon_light_pass_error", exc_info=True)
+        _scan_demand_shadow(ctx)
+        if (
+            last_full_pass is None
+            or now - last_full_pass >= DIALOG_FULL_RECONCILIATION_INTERVAL_SECONDS
+        ):
+            try:
+                _count, completed = await worker.run_full_pass()
+                if completed:
+                    last_full_pass = _read_last_full_reconciliation_at(ctx.conn) or time.time()
+            except RpcAdmissionClosedError:
+                raise
+            except Exception:
+                logger.warning("recon_full_pass_error", exc_info=True)
+            _scan_demand_shadow(ctx)
+        try:
+            await asyncio.wait_for(
+                ctx.shutdown_event.wait(),
+                timeout=ctx.scheduling.reconciliation_hourly_seconds,
+            )
+            return
+        except TimeoutError:
+            continue
 
 
 async def _start_followup_background_tasks(
     ctx: _SyncMainContext,
     delta_worker: DeltaSyncWorker,
+    full_sync_worker: FullSyncWorker,
 ) -> None:
     activity_client = cast(ActivityClient, ctx.client)
     delta_client = cast(_DeltaSyncClient, ctx.client)
+    demand_runtime = _ensure_demand_runtime(ctx, full_sync_worker, delta_worker)
     if ctx.rpc_admission_observer is not None:
         _create_tracked_task(
             ctx,
@@ -1570,13 +1895,12 @@ async def _start_followup_background_tasks(
         ctx.folder_projection_worker.run(),
         name="folder_projection_worker",
         critical=True,
-        rpc_source=TelegramRpcSource.FOLDER_RECONCILIATION,
+        demand_kind=DemandKind.FOLDER_SNAPSHOT,
     )
     _create_tracked_task(
         ctx,
         _run_self_profile_refresh_loop(ctx),
         name="self_profile_refresh_loop",
-        rpc_source=TelegramRpcSource.MAINTENANCE,
     )
     _create_tracked_task(
         ctx,
@@ -1586,19 +1910,19 @@ async def _start_followup_background_tasks(
             _delta_catch_up_policy_from_scheduling(ctx.scheduling),
         ),
         name="delta_catch_up_loop",
-        rpc_source=TelegramRpcSource.DELTA_SYNC,
     )
     _create_tracked_task(
         ctx,
-        _run_message_fact_refresh_with_dedicated_connection(ctx),
+        _run_message_fact_refresh_with_dedicated_connection(
+            ctx,
+            demand_runtime.message_fact_refresh_deps,
+        ),
         name="message_fact_refresh_loop",
-        rpc_source=TelegramRpcSource.MESSAGE_FACT_REFRESH,
     )
     _create_tracked_task(
         ctx,
         ctx.fact_hydration_worker.run(),
         name="message_fact_hydration_worker",
-        rpc_source=TelegramRpcSource.FACT_HYDRATION_BACKFILL,
     )
     _create_tracked_task(
         ctx,
@@ -1610,7 +1934,6 @@ async def _start_followup_background_tasks(
             _access_probe_policy_from_scheduling(ctx.scheduling),
         ),
         name="access_probe_loop",
-        rpc_source=TelegramRpcSource.DELTA_SYNC,
     )
     _create_tracked_task(
         ctx,
@@ -1621,7 +1944,6 @@ async def _start_followup_background_tasks(
             timeout_s=ctx.scheduling.activity_rpc_timeout_seconds,
         ),
         name="activity_sync_loop",
-        rpc_source=TelegramRpcSource.ACTIVITY_ARCHIVE,
     )
     _create_tracked_task(
         ctx,
@@ -1633,7 +1955,7 @@ async def _start_followup_background_tasks(
             timeout_s=ctx.scheduling.activity_rpc_timeout_seconds,
         ),
         name="activity_hot_sweep",
-        rpc_source=TelegramRpcSource.ACTIVITY_HOT_SWEEP,
+        demand_kind=DemandKind.HOT_ACTIVITY_PAGE,
     )
     _create_tracked_task(
         ctx,
@@ -1645,22 +1967,14 @@ async def _start_followup_background_tasks(
             timeout_s=ctx.scheduling.activity_rpc_timeout_seconds,
         ),
         name="activity_cold_backfill",
-        rpc_source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
     )
     _create_tracked_task(
         ctx,
-        run_scheduled_reconciliation_loop(
-            ctx.client,
-            ctx.conn,
-            ctx.shutdown_event,
-            policy=ScheduledReconciliationPolicy(
-                interval_seconds=ctx.scheduling.scheduled_reconciliation_seconds,
-                activity_rpc_timeout_seconds=ctx.scheduling.activity_rpc_timeout_seconds,
-            ),
-            own_only_context=ctx.own_only_context,
+        _run_scheduled_reconciliation_loop(
+            ctx,
+            demand_runtime.scheduled_reconciler,
         ),
         name="scheduled_message_reconciliation",
-        rpc_source=TelegramRpcSource.SCHEDULED_MESSAGES,
     )
 
     # Phase 43 / RECON-01: hourly light pass + daily full pass keeps the
@@ -1675,15 +1989,11 @@ async def _start_followup_background_tasks(
     # regardless of last_full_pass anyway.
     _create_tracked_task(
         ctx,
-        run_reconciliation_loop(
-            ctx.client,
-            ctx.conn,
-            ctx.shutdown_event,
-            hourly_interval=ctx.scheduling.reconciliation_hourly_seconds,
-            topic_refresher=ctx.topic_refresher,
+        _run_dialog_reconciliation_loop(
+            ctx,
+            demand_runtime.dialog_reconciliation_worker,
         ),
         name="reconciliation_loop",
-        rpc_source=TelegramRpcSource.DIALOG_SYNC,
     )
 
 
@@ -1710,6 +2020,9 @@ async def _cancel_background_tasks(ctx: _SyncMainContext) -> None:
         except Exception:
             logger.warning("background_task_shutdown_error name=%s", task.get_name(), exc_info=True)
     ctx.background_tasks.clear()
+    demand_runtime = cast(_DemandRuntime | None, getattr(ctx, "demand_runtime", None))
+    if demand_runtime is not None:
+        demand_runtime.message_fact_refresh_deps.conn.close()
 
 
 def _close_runtime_connections(ctx: _SyncMainContext) -> None:
@@ -1723,6 +2036,29 @@ def _close_runtime_connections(ctx: _SyncMainContext) -> None:
     except Exception:
         logger.exception("runtime_event_record_failed kind=runtime.stopped")
     ctx.conn.close()
+
+
+def _persist_runtime_observation_loss(ctx: _SyncMainContext) -> None:
+    """Persist a content-free boundary when the async telemetry sink lost rows."""
+    sink = ctx.rpc_observation_sink
+    if sink is None:
+        return
+    queue_full_drops = int(getattr(sink, "queue_full_drops", 0) or 0)
+    shutdown_drops = int(getattr(sink, "shutdown_grace_drops", 0) or 0)
+    startup_drops = int(getattr(sink, "startup_drops", 0) or 0)
+    rejected_submissions = int(getattr(sink, "rejected_submissions", 0) or 0)
+    writer_failures = int(getattr(sink, "permanent_failures", 0) or 0)
+    if not any((queue_full_drops, shutdown_drops, startup_drops, rejected_submissions, writer_failures)):
+        return
+    with ctx.conn:
+        ctx.conn.executemany(
+            "INSERT OR REPLACE INTO daemon_state(key,value) VALUES (?,?)",
+            (
+                ("runtime_observations_last_loss_ms", str(int(time.time() * 1000))),
+                ("runtime_observations_last_queue_full_drops", str(queue_full_drops)),
+                ("runtime_observations_last_writer_failures", str(writer_failures)),
+            ),
+        )
 
 
 async def _run_shutdown_stage(
@@ -1739,6 +2075,10 @@ async def _run_shutdown_stage(
 
 
 async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
+    shutdown_event = cast(asyncio.Event | None, getattr(ctx, "shutdown_event", None))
+    if shutdown_event is not None:
+        shutdown_event.set()
+
     async def detach_observer() -> None:
         ctx.client.set_rpc_admission_observer(None)
 
@@ -1746,7 +2086,10 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
         if ctx.rpc_admission_observer is not None:
             ctx.rpc_admission_observer.flush()
         if ctx.rpc_observation_sink is not None:
-            await ctx.rpc_observation_sink.aclose()
+            try:
+                await ctx.rpc_observation_sink.aclose()
+            finally:
+                _persist_runtime_observation_loss(ctx)
 
     async def close_runtime_connections() -> None:
         _close_runtime_connections(ctx)
@@ -1810,7 +2153,6 @@ async def sync_main() -> None:
                 observe=lambda kind, outcome, reason: _observe_runtime(ctx, kind, outcome, reason),
             ),
             name="reconnect_catch_up_loop",
-            rpc_source=TelegramRpcSource.RECONNECT_DIFFERENCE,
         )
 
         await _prime_runtime(ctx)
@@ -1818,6 +2160,7 @@ async def sync_main() -> None:
         delta_worker = DeltaSyncWorker(cast(_DeltaSyncClient, ctx.client), ctx.conn, ctx.shutdown_event)
         worker = FullSyncWorker(ctx.client, ctx.conn, ctx.shutdown_event)
         await _start_bootstrap_background_tasks(ctx, worker)
+        demand_runtime = _ensure_demand_runtime(ctx, worker, delta_worker)
         # Must come AFTER handler_manager.register() (startup-ordering invariant):
         # the raw inbox read handler must be live before bootstrap starts so no
         # real-time cursor updates are dropped during the bootstrap window.
@@ -1832,13 +2175,20 @@ async def sync_main() -> None:
                 failure_cooldown_seconds=ctx.scheduling.read_position_reconciliation_failure_cooldown_seconds,
                 batch_size=ctx.scheduling.read_position_reconciliation_batch_size,
                 batch_pause_seconds=ctx.scheduling.read_position_reconciliation_batch_pause_seconds,
+                after_cycle=partial(_scan_demand_shadow, ctx),
+                run_batch=demand_runtime.read_receipt_batch,
             ),
             name="initialize_read_positions",
-            rpc_source=TelegramRpcSource.READ_RECEIPT_PROBE,
         )
-        await _start_followup_background_tasks(ctx, delta_worker)
-        with rpc_scope(TelegramRpcSource.FULL_SYNC):
-            await _run_sync_loop(worker, ctx.handler_manager, ctx.shutdown_event, ctx.conn, ctx.client)
+        await _start_followup_background_tasks(ctx, delta_worker, worker)
+        await _run_sync_loop(
+            worker,
+            ctx.handler_manager,
+            ctx.shutdown_event,
+            ctx.conn,
+            ctx.client,
+            after_cycle=partial(_scan_demand_shadow, ctx),
+        )
     finally:
         await _shutdown_sync_main_context(ctx)
 

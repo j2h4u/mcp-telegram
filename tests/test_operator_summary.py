@@ -157,7 +157,7 @@ def test_summary_marks_window_unreliable_when_snapshot_reports_loss(tmp_path: Pa
     original = summary_module.read_operator_summary_snapshot
 
     def with_loss(path: Path, since_ms: int):
-        observations, history_row, dialog_rows = original(path, since_ms)
+        observations, history_row, dialog_rows, _coverage = original(path, since_ms)
         return observations, history_row, dialog_rows, {"loss_observed": True}
 
     monkeypatch.setattr(summary_module, "read_operator_summary_snapshot", with_loss)
