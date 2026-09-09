@@ -36,6 +36,7 @@ from mcp_telegram.config import (
 from mcp_telegram.flood import FloodWaitAccumulator, FloodWaitKillSwitchPolicy, TelegramRpcThrottled
 from mcp_telegram.sync_db import ensure_sync_schema, load_account_cooldown_until_utc, save_account_cooldown_until_utc
 from mcp_telegram.telegram import create_client
+from mcp_telegram.telegram_demand import AcquisitionKind
 from mcp_telegram.telegram_rpc import (
     TelegramRpcAdmissionDeferred,
     TelegramRpcBudget,
@@ -48,6 +49,7 @@ from mcp_telegram.telegram_rpc import (
     reset_account_cooldown,
     rpc_scope,
 )
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmission,
     RpcAdmissionClosedError,
@@ -1111,31 +1113,63 @@ async def test_update_difference_open_circuit_waits_without_fatal_exception(
 
 
 @pytest.mark.asyncio
-async def test_telethon_update_loop_binds_live_difference_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_telethon_update_loop_scopes_difference_and_live_dispatch_separately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     gate = _gate()
-    seen: list[TelegramRpcSource] = []
+    seen: list[TelegramRpcScope] = []
 
-    async def base_update_loop(_self: TelegramClient) -> None:
-        seen.append(current_rpc_scope().source)
+    async def call_with_policy(
+        _request: object,
+        *,
+        ordered: bool,
+        scope: TelegramRpcScope,
+    ) -> object:
+        del ordered
+        seen.append(scope)
+        return object()
 
+    async def base_dispatch_update(_self: TelegramClient, _update: object) -> None:
+        seen.append(current_rpc_scope())
+
+    async def base_update_loop(client: TelegramClient) -> None:
+        await client(functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0))
+        await client._dispatch_update("ordinary-live-update")
+
+    monkeypatch.setattr(gate, "_call_with_source_policy", call_with_policy)
+    monkeypatch.setattr(TelegramClient, "_dispatch_update", base_dispatch_update)
     monkeypatch.setattr(TelegramClient, "_update_loop", base_update_loop)
     await gate._update_loop()
 
-    assert seen == [TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE]
+    assert [(scope.demand_kind, scope.source, scope.acquisition_kind) for scope in seen] == [
+        (
+            DemandKind.TELETHON_UPDATE_DIFFERENCE,
+            TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE,
+            AcquisitionKind.UPDATE_DIFFERENCE,
+        ),
+        (
+            DemandKind.REALTIME_EVENT_ACQUISITION,
+            TelegramRpcSource.REALTIME_EVENT,
+            None,
+        ),
+    ]
+    with pytest.raises(UnclassifiedTelegramRpcError):
+        current_rpc_scope()
 
 
 @pytest.mark.asyncio
-async def test_telethon_update_child_task_rebinds_live_scope_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_telethon_update_child_task_owns_realtime_scope(monkeypatch: pytest.MonkeyPatch) -> None:
     gate = _gate()
-    seen: list[tuple[TelegramRpcSource, asyncio.Task[object] | None, asyncio.Task[object] | None]] = []
+    seen: list[
+        tuple[DemandKind | None, TelegramRpcSource, asyncio.Task[object] | None, asyncio.Task[object] | None]
+    ] = []
 
     async def base_dispatch_update(_self: TelegramClient, _update: object) -> None:
         scope = current_rpc_scope()
-        seen.append((scope.source, scope.owner_task, asyncio.current_task()))
+        seen.append((scope.demand_kind, scope.source, scope.owner_task, asyncio.current_task()))
 
     monkeypatch.setattr(TelegramClient, "_dispatch_update", base_dispatch_update)
-    with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE):
-        child = asyncio.create_task(gate._dispatch_update("update"))
+    child = asyncio.create_task(gate._dispatch_update("update"))
     await child
 
-    assert seen == [(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE, child, child)]
+    assert seen == [(DemandKind.REALTIME_EVENT_ACQUISITION, TelegramRpcSource.REALTIME_EVENT, child, child)]

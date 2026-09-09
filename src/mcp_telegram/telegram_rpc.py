@@ -24,10 +24,22 @@ from telethon.errors import (  # type: ignore[import-untyped]
     ServerError,
     TimedOutError,
 )
+from telethon.tl.functions.updates import (  # type: ignore[import-untyped]
+    GetChannelDifferenceRequest,
+    GetDifferenceRequest,
+)
 from telethon.utils import is_list_like  # type: ignore[import-untyped]
 
 from .flood import TelegramRpcThrottled, flood_seconds
-from .telegram_demand import AcquisitionKind
+from .telegram_demand import (
+    AcquisitionKind,
+    UnclassifiedTelegramDemandError,
+    acquisition_context,
+    current_demand_token,
+    demand_context,
+    require_execution_mode,
+)
+from .telegram_rpc_consumers import DemandKind, ExecutionMode
 from .telegram_rpc_scheduler import (
     AdmissionObserver,
     RpcAdmission,
@@ -304,6 +316,26 @@ class TelegramRpcGate(TelegramClient):
         del flood_sleep_threshold  # The gate always uses the client-level zero threshold.
         if request is not None and is_list_like(request):
             raise ValueError("transport batching is forbidden; use sequential scalar calls")
+        if isinstance(request, (GetDifferenceRequest, GetChannelDifferenceRequest)):
+            return await self._call_update_difference(request, ordered=ordered)
+        return await self._call_registered(request, ordered=ordered)
+
+    async def _call_update_difference(self, request: object, *, ordered: bool) -> object:
+        """Give only Telethon's actual difference request its protocol identity."""
+        try:
+            token = current_demand_token()
+        except UnclassifiedTelegramDemandError:
+            with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE):
+                with acquisition_context(AcquisitionKind.UPDATE_DIFFERENCE):
+                    return await self._call_registered(request, ordered=ordered)
+        if token.kind is not DemandKind.TELETHON_UPDATE_DIFFERENCE:
+            raise RuntimeError("Telethon update difference request inherited an incompatible demand root")
+        require_execution_mode(ExecutionMode.PROTOCOL)
+        with acquisition_context(AcquisitionKind.UPDATE_DIFFERENCE):
+            return await self._call_registered(request, ordered=ordered)
+
+    async def _call_registered(self, request: object, *, ordered: bool) -> object:
+        """Run one logical RPC after its root demand context is established."""
         scope = self._require_rpc_scope()
         for retry_index, delay in enumerate((0.0, *self._transient_retry_delays)):
             if retry_index and delay:
@@ -400,13 +432,12 @@ class TelegramRpcGate(TelegramClient):
         return await self._admission_scheduler.admit(scope)
 
     async def _update_loop(self) -> None:
-        """Give Telethon difference RPCs a live scope and non-fatal policy waits."""
-        with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE):
-            await super()._update_loop()  # type: ignore[misc]
+        """Let each difference RPC and dispatched update establish its own root."""
+        await super()._update_loop()  # type: ignore[misc]
 
     async def _dispatch_update(self, update: object) -> None:
-        """Give Telethon's update child task its own live scope ownership."""
-        with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE):
+        """Give one ordinary or replayed update its event-owned demand root."""
+        with demand_context(DemandKind.REALTIME_EVENT_ACQUISITION):
             await super()._dispatch_update(update)  # type: ignore[misc]
 
     def _scheduler_transport_ready(self) -> bool:
