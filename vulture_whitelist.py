@@ -89,6 +89,10 @@ is_topic_message
 worker_count
 fair_cycle
 queue_depths
+source_queue_depths
 active_depths
 outstanding_depths
+source_outstanding_depths
 expire_due
+offered_kinds
+protocol_scope
