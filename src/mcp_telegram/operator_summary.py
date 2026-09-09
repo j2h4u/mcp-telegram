@@ -8,6 +8,7 @@ import json
 import math
 import time
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ _MIN_DURATION_LENGTH = 2
 _MILLISECONDS_PER_SECOND = 1000
 _SLOW_MCP_MS = 1000
 _RUNTIME_FAILURE_KINDS = {"runtime.task_failed", "runtime.catch_up_request_failed"}
+_SNAPSHOT_METADATA_INDEX = 3
 
 Observation = dict[str, object]
 
@@ -37,6 +39,7 @@ class SummarySnapshot:
     observations: list[Observation]
     history_started_ms: int | None
     dialog_counts: list[tuple[str, int]]
+    coverage_markers: dict[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +55,17 @@ class RpcSourceSummary:
     dispatched: int = 0
     worst_wait_ms: float = 0
     max_queue: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DemandSummary:
+    """Demand units and actual Telegram attempts kept as separate measures."""
+
+    counts: dict[str, int]
+    actual_attempts: int
+    oldest_overdue_seconds: float | None
+    reasons: dict[str, int]
+    by_kind: dict[tuple[str, str | None], dict[str, int]]
 
 
 def parse_since(value: str) -> int:
@@ -93,11 +107,22 @@ def _as_int(value: object) -> int:
 
 
 def _load_snapshot(db_path: Path, since_ms: int) -> SummarySnapshot:
-    observations, history_row, dialog_rows = read_operator_summary_snapshot(db_path, since_ms)
+    snapshot_result = cast(tuple[object, ...], read_operator_summary_snapshot(db_path, since_ms))
+    observations = cast(list[Observation], snapshot_result[0])
+    history_row = cast(dict[str, object] | None, snapshot_result[1])
+    dialog_rows = cast(list[dict[str, object]], snapshot_result[2])
+    coverage_markers = (
+        dict(cast(Mapping[str, object], snapshot_result[_SNAPSHOT_METADATA_INDEX]))
+        if len(snapshot_result) > _SNAPSHOT_METADATA_INDEX
+        else {}
+    )
     history_started_ms = _as_int(history_row["value"]) if history_row is not None else None
     dialog_counts = [(str(row["status"]), _as_int(row["count"])) for row in dialog_rows]
     return SummarySnapshot(
-        observations=list(observations), history_started_ms=history_started_ms, dialog_counts=dialog_counts
+        observations=list(observations),
+        history_started_ms=history_started_ms,
+        dialog_counts=dialog_counts,
+        coverage_markers=coverage_markers,
     )
 
 
@@ -157,6 +182,39 @@ def _rpc_summary(observations: list[Observation]) -> tuple[int, int, dict[str, R
     return len(summaries), cancelled, sources
 
 
+def _demand_summary(observations: list[Observation]) -> DemandSummary:
+    rows = _rows_for_kind(observations, "telegram.demand")
+    counts: dict[str, int] = defaultdict(int)
+    reasons: dict[str, int] = defaultdict(int)
+    by_kind: dict[tuple[str, str | None], dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    actual_attempts = 0
+    oldest_overdue_seconds: float | None = None
+    for row in rows:
+        outcome = str(row["outcome"] or "observed")
+        payload = json.loads(str(row["payload_json"] or "{}"))
+        units = _as_int(payload.get("demand_units") or 0)
+        counts[outcome] += units
+        demand_kind = str(payload.get("demand_kind") or "unknown")
+        acquisition_kind = payload.get("acquisition_kind")
+        acquisition = None if acquisition_kind is None else str(acquisition_kind)
+        by_kind[(demand_kind, acquisition)][outcome] += units
+        actual_attempts += _as_int(payload.get("actual_attempts") or 0)
+        overdue = payload.get("oldest_overdue_seconds")
+        if overdue is not None:
+            value = _as_float(overdue)
+            oldest_overdue_seconds = max(oldest_overdue_seconds or 0.0, value)
+        reason = row["reason_code"]
+        if reason:
+            reasons[str(reason)] += units or 1
+    return DemandSummary(
+        counts=dict(counts),
+        actual_attempts=actual_attempts,
+        oldest_overdue_seconds=oldest_overdue_seconds,
+        reasons=dict(reasons),
+        by_kind={key: dict(value) for key, value in by_kind.items()},
+    )
+
+
 def _sync_counts(observations: list[Observation]) -> dict[tuple[str, str], int]:
     counts: dict[tuple[str, str], int] = defaultdict(int)
     for row in observations:
@@ -202,7 +260,11 @@ def _mcp_lines(summary: McpSummary) -> list[str]:
 
 
 def _rpc_lines(summary_count: int, cancelled: int, sources: dict[str, RpcSourceSummary]) -> list[str]:
-    lines = [f"Telegram RPC admission: summaries={summary_count}, cancelled={cancelled}"]
+    actual_attempts = sum(summary.dispatched for summary in sources.values())
+    lines = [(
+        f"Telegram RPC admission: summaries={summary_count}, cancelled={cancelled}, "
+        f"actual attempts={actual_attempts}"
+    )]
     ordered = sorted(sources.items(), key=lambda item: item[1].worst_wait_ms, reverse=True)
     if not ordered:
         return [*lines, "  none"]
@@ -212,6 +274,51 @@ def _rpc_lines(summary_count: int, cancelled: int, sources: dict[str, RpcSourceS
         for source, summary in ordered
     )
     return lines
+
+
+def _demand_lines(summary: DemandSummary) -> list[str]:
+    if not summary.counts and summary.actual_attempts == 0:
+        return []
+    labels = (
+        "offered",
+        "locally_satisfied",
+        "ready",
+        "coalesced_wakeup",
+        "completed",
+        "deferred",
+        "failed",
+    )
+    fields = [f"{label.replace('_', ' ')}={summary.counts[label]}" for label in labels if summary.counts.get(label)]
+    fields.append(f"actual attempts={summary.actual_attempts}")
+    if summary.oldest_overdue_seconds is not None:
+        fields.append(f"oldest overdue={_ms(summary.oldest_overdue_seconds * _MILLISECONDS_PER_SECOND)}")
+    if summary.reasons:
+        fields.append("reasons=" + ",".join(f"{key}={value}" for key, value in sorted(summary.reasons.items())))
+    lines = ["Demand: " + ", ".join(fields)]
+    for (demand_kind, acquisition_kind), counts in sorted(summary.by_kind.items()):
+        detail = ", ".join(
+            f"{label.replace('_', ' ')}={counts[label]}" for label in labels if counts.get(label)
+        )
+        if detail:
+            suffix = f"/{acquisition_kind}" if acquisition_kind else ""
+            lines.append(f"  {demand_kind}{suffix}: {detail}")
+    return lines
+
+
+def _coverage_complete(snapshot: SummarySnapshot, since_ms: int) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    if snapshot.history_started_ms is None or snapshot.history_started_ms > since_ms:
+        reasons.append("history boundary")
+    markers = snapshot.coverage_markers
+    cap_ms = markers.get("last_cap_truncation_ms")
+    if cap_ms is not None and _as_int(cap_ms) >= since_ms:
+        reasons.append("retention cap truncation")
+    gap_ms = markers.get("telemetry_gap_ms")
+    if gap_ms is not None and _as_int(gap_ms) >= since_ms:
+        reasons.append("telemetry gap")
+    if markers.get("loss_observed") or markers.get("queue_full_drops") or markers.get("writer_failures"):
+        reasons.append("telemetry loss")
+    return not reasons, reasons
 
 
 def _is_notable(row: Observation) -> bool:
@@ -238,25 +345,32 @@ def _notable_lines(observations: list[Observation]) -> list[str]:
     return lines
 
 
-def build_operator_summary(db_path: Path, *, since_seconds: int, now: float | None = None) -> OperatorSummary:
+def build_operator_summary(  # noqa: PLR0914
+    db_path: Path, *, since_seconds: int, now: float | None = None
+) -> OperatorSummary:
     """Build a content-free operational report from one read-only DB connection."""
     effective_now = time.time() if now is None else now
     since_ms = int((effective_now - since_seconds) * 1000)
     snapshot = _load_snapshot(db_path, since_ms)
     observations = snapshot.observations
-    window_complete = snapshot.history_started_ms is not None and snapshot.history_started_ms <= since_ms
+    window_complete, coverage_reasons = _coverage_complete(snapshot, since_ms)
     last_ms = max((_as_int(row["observed_at_ms"]) for row in observations), default=None)
     last_event = _utc(last_ms / 1000) if last_ms is not None else "none"
     status_text = ", ".join(f"{status}={count}" for status, count in snapshot.dialog_counts) or "none"
     rpc_count, rpc_cancelled, rpc_sources = _rpc_summary(observations)
+    demand_summary = _demand_summary(observations)
+    coverage_text = "complete" if window_complete else "partial/unreliable"
+    if coverage_reasons:
+        coverage_text += " (" + ", ".join(coverage_reasons) + ")"
 
     lines = [
         f"mcp-telegram operational summary: {_utc(effective_now - since_seconds)} .. {_utc(effective_now)}",
-        f"Telemetry: {len(observations)} events; window={'complete' if window_complete else 'partial'}; last event={last_event}",
+        f"Telemetry: {len(observations)} events; window={coverage_text}; last event={last_event}",
         *_runtime_lines(observations),
         f"Dialog state: {status_text}",
         *_mcp_lines(_mcp_summary(observations)),
         *_rpc_lines(rpc_count, rpc_cancelled, rpc_sources),
+        *_demand_lines(demand_summary),
     ]
     sync_counts = _sync_counts(observations)
     lines.append("Sync observations:")

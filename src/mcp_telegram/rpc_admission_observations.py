@@ -8,8 +8,11 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol
 
+from .telegram_demand import AcquisitionKind
+from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import RpcAdmissionEvent, RpcAdmissionEventKind, RpcServiceClass, TelegramRpcSource
 
 logger = logging.getLogger(__name__)
@@ -36,6 +39,21 @@ class RpcAdmissionObservationPolicy(Protocol):
 
     @property
     def rpc_summary_interval_seconds(self) -> float: ...
+
+
+class DemandEvidenceOutcome(StrEnum):
+    """Bounded lifecycle labels for process-local demand evidence."""
+
+    OFFERED = "offered"
+    LOCALLY_SATISFIED = "locally_satisfied"
+    READY = "ready"
+    COALESCED_WAKEUP = "coalesced_wakeup"
+    COMPLETED = "completed"
+    DEFERRED = "deferred"
+    FAILED = "failed"
+
+
+_DEMAND_EVIDENCE_OUTCOMES = frozenset(DemandEvidenceOutcome)
 
 
 @dataclass(slots=True)
@@ -91,7 +109,18 @@ class RpcAdmissionObservationAggregator:
         self._summary_interval_seconds = summary_interval_seconds
         self._clock = clock
         self._last_flush_at = clock()
-        self._aggregates: dict[tuple[TelegramRpcSource, RpcServiceClass], _AdmissionAggregate] = {}
+        self._aggregates: dict[
+            tuple[
+                TelegramRpcSource,
+                RpcServiceClass,
+                DemandKind | None,
+                AcquisitionKind | None,
+            ],
+            _AdmissionAggregate,
+        ] = {}
+        self._demand_aggregates: dict[
+            tuple[DemandKind, AcquisitionKind | None, DemandEvidenceOutcome], _DemandAggregate
+        ] = {}
         self._state_lock = threading.Lock()
         self._flush_lock = threading.Lock()
 
@@ -105,6 +134,50 @@ class RpcAdmissionObservationAggregator:
             self.flush_if_due()
         except Exception:  # noqa: BLE001 - telemetry cannot break scheduler admission
             # Operational telemetry remains best effort at the scheduler callback boundary.
+            return
+
+    def observe_demand(  # noqa: PLR0913 - explicit bounded evidence dimensions
+        self,
+        *,
+        outcome: DemandEvidenceOutcome | str,
+        demand_kind: DemandKind,
+        acquisition_kind: AcquisitionKind | None = None,
+        demand_units: int = 1,
+        actual_attempts: int = 0,
+        oldest_overdue_seconds: float | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Aggregate bounded shadow demand evidence without storing work identity.
+
+        ``demand_units`` counts product demand and ``actual_attempts`` counts
+        Telegram attempts.  They intentionally remain separate fields.
+        """
+        try:
+            normalized_outcome = _normalize_demand_outcome(outcome)
+            if not isinstance(demand_kind, DemandKind):
+                raise TypeError("demand_kind must be a DemandKind")
+            if acquisition_kind is not None and not isinstance(acquisition_kind, AcquisitionKind):
+                raise TypeError("acquisition_kind must be an AcquisitionKind")
+            _validate_nonnegative_int(demand_units, "demand_units")
+            _validate_nonnegative_int(actual_attempts, "actual_attempts")
+            if oldest_overdue_seconds is not None and (
+                not isinstance(oldest_overdue_seconds, (int, float))
+                or oldest_overdue_seconds < 0
+                or not _is_finite(oldest_overdue_seconds)
+            ):
+                raise ValueError("oldest_overdue_seconds must be a finite non-negative number")
+            normalized_reason = _normalize_reason(reason)
+            key = (demand_kind, acquisition_kind, normalized_outcome)
+            with self._state_lock:
+                aggregate = self._demand_aggregates.setdefault(key, _DemandAggregate())
+                aggregate.add(
+                    demand_units=demand_units,
+                    actual_attempts=actual_attempts,
+                    oldest_overdue_seconds=oldest_overdue_seconds,
+                    reason=normalized_reason,
+                )
+            self.flush_if_due()
+        except Exception:  # noqa: BLE001 - telemetry cannot break demand producers
             return
 
     def flush_if_due(self) -> None:
@@ -142,45 +215,84 @@ class RpcAdmissionObservationAggregator:
         flush_at = self._clock() if now is None else now
         with self._state_lock:
             aggregates, self._aggregates = self._aggregates, {}
+            demand_aggregates, self._demand_aggregates = self._demand_aggregates, {}
             self._last_flush_at = flush_at
-        for (source, service_class), aggregate in aggregates.items():
+        for (source, service_class, demand_kind, acquisition_kind), aggregate in aggregates.items():
             dispatched = aggregate.dispatched_count
             average_wait_ms = (
                 aggregate.wait_total_seconds * _MILLISECONDS_PER_SECOND / dispatched if dispatched else None
             )
             try:
+                payload: dict[str, object] = {
+                    "source": source.value,
+                    "service_class": service_class.value,
+                    "queued_count": aggregate.queued_count,
+                    "dispatched_count": dispatched,
+                    "max_wait_ms": aggregate.wait_max_seconds * _MILLISECONDS_PER_SECOND,
+                    "queue_depth_max": aggregate.queue_depth_max,
+                    "total_depth_max": aggregate.total_depth_max,
+                    "active_depth_max": aggregate.active_depth_max,
+                    "total_outstanding_max": aggregate.total_outstanding_max,
+                    "window_seconds": self._summary_interval_seconds,
+                }
+                if demand_kind is not None:
+                    payload["demand_kind"] = demand_kind.value
+                    payload["actual_attempts"] = dispatched
+                if acquisition_kind is not None:
+                    payload["acquisition_kind"] = acquisition_kind.value
                 self._recorder.record(
                     kind="telegram.rpc_admission",
                     outcome="summary",
                     duration_ms=average_wait_ms,
                     result_count=dispatched,
-                    payload={
-                        "source": source.value,
-                        "service_class": service_class.value,
-                        "queued_count": aggregate.queued_count,
-                        "dispatched_count": dispatched,
-                        "max_wait_ms": aggregate.wait_max_seconds * _MILLISECONDS_PER_SECOND,
-                        "queue_depth_max": aggregate.queue_depth_max,
-                        "total_depth_max": aggregate.total_depth_max,
-                        "active_depth_max": aggregate.active_depth_max,
-                        "total_outstanding_max": aggregate.total_outstanding_max,
-                        "window_seconds": self._summary_interval_seconds,
-                    },
+                    payload=payload,
                 )
             except Exception:
                 with self._state_lock:
-                    self._aggregates.setdefault((source, service_class), _AdmissionAggregate()).merge(aggregate)
+                    self._aggregates.setdefault(
+                        (source, service_class, demand_kind, acquisition_kind), _AdmissionAggregate()
+                    ).merge(aggregate)
                 logger.exception(
                     "rpc_admission_summary_flush_failed source=%s service_class=%s",
                     source.value,
                     service_class.value,
+                )
+        for (demand_kind, acquisition_kind, outcome), aggregate in demand_aggregates.items():
+            try:
+                payload = {
+                    "demand_kind": demand_kind.value,
+                    "demand_units": aggregate.demand_units,
+                    "actual_attempts": aggregate.actual_attempts,
+                    "window_seconds": self._summary_interval_seconds,
+                }
+                if acquisition_kind is not None:
+                    payload["acquisition_kind"] = acquisition_kind.value
+                if aggregate.oldest_overdue_seconds is not None:
+                    payload["oldest_overdue_seconds"] = aggregate.oldest_overdue_seconds
+                self._recorder.record(
+                    kind="telegram.demand",
+                    outcome=outcome.value,
+                    reason_code=aggregate.reason,
+                    result_count=None,
+                    payload=payload,
+                )
+            except Exception:
+                with self._state_lock:
+                    self._demand_aggregates.setdefault((demand_kind, acquisition_kind, outcome), _DemandAggregate()).merge(
+                        aggregate
+                    )
+                logger.exception(
+                    "demand_observation_flush_failed demand_kind=%s acquisition_kind=%s outcome=%s",
+                    demand_kind.value,
+                    None if acquisition_kind is None else acquisition_kind.value,
+                    outcome.value,
                 )
 
     def _aggregate(self, event: RpcAdmissionEvent) -> None:
         if event.source is None or event.service_class is None:
             self._record_raw(event)
             return
-        key = (event.source, event.service_class)
+        key = (event.source, event.service_class, event.demand_kind, event.acquisition_kind)
         with self._state_lock:
             self._aggregates.setdefault(key, _AdmissionAggregate()).add(event)
 
@@ -197,8 +309,74 @@ class RpcAdmissionObservationAggregator:
                 "total_depth": event.total_depth,
                 "active_depth": event.active_depth,
                 "total_outstanding": event.total_outstanding,
+                **({"demand_kind": event.demand_kind.value} if event.demand_kind is not None else {}),
+                **({"acquisition_kind": event.acquisition_kind.value} if event.acquisition_kind is not None else {}),
             },
         )
 
 
-__all__ = ["ObservationRecorder", "RpcAdmissionObservationAggregator", "RpcAdmissionObservationPolicy"]
+@dataclass(slots=True)
+class _DemandAggregate:
+    demand_units: int = 0
+    actual_attempts: int = 0
+    oldest_overdue_seconds: float | None = None
+    reason: str | None = None
+
+    def add(
+        self,
+        *,
+        demand_units: int,
+        actual_attempts: int,
+        oldest_overdue_seconds: float | None,
+        reason: str | None,
+    ) -> None:
+        self.demand_units += demand_units
+        self.actual_attempts += actual_attempts
+        if oldest_overdue_seconds is not None:
+            self.oldest_overdue_seconds = max(self.oldest_overdue_seconds or 0.0, oldest_overdue_seconds)
+        if self.reason is None:
+            self.reason = reason
+
+    def merge(self, other: _DemandAggregate) -> None:
+        self.add(
+            demand_units=other.demand_units,
+            actual_attempts=other.actual_attempts,
+            oldest_overdue_seconds=other.oldest_overdue_seconds,
+            reason=other.reason,
+        )
+
+
+def _is_finite(value: int | float) -> bool:
+    return value == value and value not in {float("inf"), float("-inf")}
+
+
+def _validate_nonnegative_int(value: int, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+
+
+def _normalize_demand_outcome(value: DemandEvidenceOutcome | str) -> DemandEvidenceOutcome:
+    try:
+        outcome = DemandEvidenceOutcome(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"unsupported demand evidence outcome: {value}") from exc
+    if outcome not in _DEMAND_EVIDENCE_OUTCOMES:
+        raise ValueError(f"unsupported demand evidence outcome: {value}")
+    return outcome
+
+
+def _normalize_reason(reason: str | None) -> str | None:
+    if reason is None:
+        return None
+    if not isinstance(reason, str):
+        raise TypeError("reason must be a string")
+    normalized = reason.strip()
+    return normalized[:64] if normalized else None
+
+
+__all__ = [
+    "DemandEvidenceOutcome",
+    "ObservationRecorder",
+    "RpcAdmissionObservationAggregator",
+    "RpcAdmissionObservationPolicy",
+]
