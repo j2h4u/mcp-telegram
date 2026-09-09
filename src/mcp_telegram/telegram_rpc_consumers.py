@@ -699,8 +699,7 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
     DemandKind.TOPIC_SNAPSHOT: _contract(
         DemandKind.TOPIC_SNAPSHOT,
         TelegramRpcSource.TOPIC_RECONCILIATION,
-        _DURABLE,
-        max_rpc_attempts_per_slice=4,
+        _INLINE,
     ),
     DemandKind.MESSAGE_FACT_REFRESH: _contract(
         DemandKind.MESSAGE_FACT_REFRESH,

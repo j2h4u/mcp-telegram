@@ -87,10 +87,11 @@ def test_startup_validation_requires_exact_durable_adapter_coverage() -> None:
     with pytest.raises(RuntimeError, match="coverage mismatch"):
         validate_durable_adapters(adapters)
 
-    complete = _adapters()
-    complete[DemandKind.REACTION_REFRESH_BATCH] = _Adapter()
-    with pytest.raises(RuntimeError, match="unexpected"):
-        validate_durable_adapters(complete)
+    for inline_kind in (DemandKind.REACTION_REFRESH_BATCH, DemandKind.TOPIC_SNAPSHOT):
+        complete = _adapters()
+        complete[inline_kind] = _Adapter()
+        with pytest.raises(RuntimeError, match="unexpected"):
+            validate_durable_adapters(complete)
 
 
 @pytest.mark.asyncio
