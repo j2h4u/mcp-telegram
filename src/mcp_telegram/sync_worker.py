@@ -18,6 +18,7 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 import time
@@ -65,6 +66,18 @@ from .telethon_dialog import classify_dialog_type
 logger = logging.getLogger(__name__)
 _BATCH_SIZE = 100
 _DM_BOOTSTRAP_MAX_ADMISSION_WAIT_SECONDS = 30
+_DM_ENROLLMENT_KEY_STATUS = "full_sync_dm_enrollment_status"
+_DM_ENROLLMENT_KEY_OFFSET_DATE = "full_sync_dm_enrollment_offset_date"
+_DM_ENROLLMENT_KEY_OFFSET_ID = "full_sync_dm_enrollment_offset_id"
+_DM_ENROLLMENT_KEY_OFFSET_PEER = "full_sync_dm_enrollment_offset_peer"
+_DM_ENROLLMENT_KEY_COMPLETED_AT = "full_sync_dm_enrollment_completed_at"
+_DM_ENROLLMENT_CURSOR_KEYS = (
+    _DM_ENROLLMENT_KEY_OFFSET_DATE,
+    _DM_ENROLLMENT_KEY_OFFSET_ID,
+    _DM_ENROLLMENT_KEY_OFFSET_PEER,
+)
+_DM_ENROLLMENT_IN_PROGRESS = "in_progress"
+_DM_ENROLLMENT_COMPLETE = "complete"
 
 
 @contextmanager
@@ -191,6 +204,54 @@ class _BootstrapProgress:
     enrolled: int = 0
 
 
+def _dm_enrollment_state(conn: sqlite3.Connection, key: str) -> str | None:
+    row = cast(tuple[str | None] | None, conn.execute("SELECT value FROM daemon_state WHERE key = ?", (key,)).fetchone())
+    return None if row is None else row[0]
+
+
+def _set_dm_enrollment_state(conn: sqlite3.Connection, key: str, value: str | None) -> None:
+    conn.execute("INSERT OR REPLACE INTO daemon_state(key, value) VALUES (?, ?)", (key, value))
+
+
+def _clear_dm_enrollment_cursor(conn: sqlite3.Connection) -> None:
+    conn.executemany("DELETE FROM daemon_state WHERE key = ?", [(key,) for key in _DM_ENROLLMENT_CURSOR_KEYS])
+
+
+def _encode_dm_enrollment_peer(entity: _EntityLike, dialog_id: int) -> str | None:
+    entity_id = getattr(entity, "id", None)
+    peer_id = entity_id if isinstance(entity_id, int) else dialog_id
+    access_hash = getattr(entity, "access_hash", None) or 0
+    if isinstance(entity, types.User):
+        kind = "user"
+    elif isinstance(entity, (types.Chat, types.ChatForbidden)):
+        kind = "chat"
+    elif isinstance(entity, (types.Channel, types.ChannelForbidden)):
+        kind = "channel"
+    else:
+        return None
+    return json.dumps({"type": kind, "id": peer_id, "access_hash": access_hash})
+
+
+def _decode_dm_enrollment_peer(value: str) -> object:
+    payload = cast(dict[str, object], json.loads(value))
+    kind = payload["type"]
+    peer_id = int(cast(int | str, payload["id"]))
+    access_hash = int(cast(int | str, payload.get("access_hash", 0) or 0))
+    if kind == "user":
+        return types.InputPeerUser(peer_id, access_hash)
+    if kind == "chat":
+        return types.InputPeerChat(peer_id)
+    if kind == "channel":
+        return types.InputPeerChannel(peer_id, access_hash)
+    raise ValueError(f"unknown DM enrollment peer type: {kind!r}")
+
+
+def _dm_enrollment_offset_id(dialog: _DialogLike) -> int:
+    if not hasattr(dialog, "message") or dialog.message is None:
+        return 0
+    return int(dialog.message.id)
+
+
 def _enroll_dm_dialog(conn: sqlite3.Connection, dialog: _DialogLike, now: int) -> int:
     if not isinstance(dialog.entity, types.User):
         return 0
@@ -248,9 +309,55 @@ class FullSyncWorker:
     # Public API
     # ------------------------------------------------------------------
 
-    async def _bootstrap_dm_pass(self, now: int, progress: _BootstrapProgress) -> None:
-        async for dialog in self._client.iter_dialogs():
-            progress.enrolled += _enroll_dm_dialog(self._conn, dialog, now)
+    def _reconstruct_dm_enrollment_cursor(self) -> tuple[datetime | None, int, object | None]:
+        offset_date_text = _dm_enrollment_state(self._conn, _DM_ENROLLMENT_KEY_OFFSET_DATE)
+        offset_id_text = _dm_enrollment_state(self._conn, _DM_ENROLLMENT_KEY_OFFSET_ID)
+        offset_peer_text = _dm_enrollment_state(self._conn, _DM_ENROLLMENT_KEY_OFFSET_PEER)
+        try:
+            offset_date = datetime.fromisoformat(offset_date_text) if offset_date_text else None
+            offset_id = int(offset_id_text) if offset_id_text else 0
+            offset_peer = _decode_dm_enrollment_peer(offset_peer_text) if offset_peer_text else None
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            logger.warning("dm_bootstrap cursor corrupt (%s) — restarting traversal", exc)
+            with self._conn:
+                _clear_dm_enrollment_cursor(self._conn)
+            return None, 0, None
+        return offset_date, offset_id, offset_peer
+
+    def _checkpoint_dm_enrollment(self, dialog: _DialogLike, now: int) -> int:
+        with self._conn:
+            enrolled = _enroll_dm_dialog(self._conn, dialog, now)
+            dialog_date = getattr(dialog, "date", None)
+            _set_dm_enrollment_state(
+                self._conn,
+                _DM_ENROLLMENT_KEY_OFFSET_DATE,
+                dialog_date.isoformat() if isinstance(dialog_date, datetime) else None,
+            )
+            _set_dm_enrollment_state(self._conn, _DM_ENROLLMENT_KEY_OFFSET_ID, str(_dm_enrollment_offset_id(dialog)))
+            _set_dm_enrollment_state(
+                self._conn,
+                _DM_ENROLLMENT_KEY_OFFSET_PEER,
+                _encode_dm_enrollment_peer(dialog.entity, int(dialog.id)),
+            )
+            _set_dm_enrollment_state(self._conn, _DM_ENROLLMENT_KEY_STATUS, _DM_ENROLLMENT_IN_PROGRESS)
+        return enrolled
+
+    async def _bootstrap_dm_pass(self, now: int, progress: _BootstrapProgress) -> bool:
+        offset_date, offset_id, offset_peer = self._reconstruct_dm_enrollment_cursor()
+        cursor_present = any((offset_date is not None, offset_id != 0, offset_peer is not None))
+        iterator_options: dict[str, object] = {}
+        if cursor_present:
+            iterator_options = {
+                "offset_date": offset_date,
+                "offset_id": offset_id,
+                "offset_peer": offset_peer if offset_peer is not None else types.InputPeerEmpty(),
+                "ignore_pinned": True,
+            }
+        async for dialog in self._client.iter_dialogs(**iterator_options):
+            if self._shutdown_event.is_set():
+                return False
+            progress.enrolled += self._checkpoint_dm_enrollment(dialog, now)
+        return True
 
     async def _retry_dm_bootstrap_admission(
         self, exc: TelegramRpcAdmissionDeferred, progress: _BootstrapProgress
@@ -267,25 +374,24 @@ class FullSyncWorker:
         )
         return await sleep_through_flood(self._shutdown_event, retry_after)
 
-    @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.DIALOG_TRAVERSAL)
-    async def bootstrap_dms(self) -> int:
-        """Enroll all DM dialogs into synced_dialogs with status='syncing'.
+    async def _run_dm_enrollment(self, *, start_new_if_complete: bool) -> int:  # noqa: PLR0912
+        status = _dm_enrollment_state(self._conn, _DM_ENROLLMENT_KEY_STATUS)
+        if status == _DM_ENROLLMENT_COMPLETE:
+            if not start_new_if_complete:
+                return 0
+            with self._conn:
+                _clear_dm_enrollment_cursor(self._conn)
+                _set_dm_enrollment_state(self._conn, _DM_ENROLLMENT_KEY_STATUS, _DM_ENROLLMENT_IN_PROGRESS)
+        elif status != _DM_ENROLLMENT_IN_PROGRESS:
+            with self._conn:
+                _set_dm_enrollment_state(self._conn, _DM_ENROLLMENT_KEY_STATUS, _DM_ENROLLMENT_IN_PROGRESS)
 
-        Idempotent — uses INSERT OR IGNORE so existing rows (with real
-        progress) are not overwritten.  Only types.User dialogs are
-        enrolled; groups and channels require explicit opt-in (Phase 30).
-
-        Handles TelegramRpcThrottled with interruptible sleep and RPCError
-        gracefully — a transient Telegram error does not kill the daemon.
-
-        Returns:
-            Count of newly enrolled dialogs (0 if all already present).
-        """
         progress = _BootstrapProgress()
         now = int(time.time())
+        completed = False
         while not self._shutdown_event.is_set():
             try:
-                await self._bootstrap_dm_pass(now, progress)
+                completed = await self._bootstrap_dm_pass(now, progress)
                 break
             except TelegramRpcAdmissionDeferred as exc:
                 if await self._retry_dm_bootstrap_admission(exc, progress):
@@ -317,9 +423,36 @@ class FullSyncWorker:
                     progress.enrolled,
                 )
                 break
-        self._conn.commit()
+        if completed:
+            with self._conn:
+                _clear_dm_enrollment_cursor(self._conn)
+                _set_dm_enrollment_state(self._conn, _DM_ENROLLMENT_KEY_STATUS, _DM_ENROLLMENT_COMPLETE)
+                _set_dm_enrollment_state(self._conn, _DM_ENROLLMENT_KEY_COMPLETED_AT, str(int(time.time())))
+        else:
+            self._conn.commit()
         logger.info("dm_bootstrap enrolled=%d new DM dialogs", progress.enrolled)
         return progress.enrolled
+
+    @_full_sync_rpc_scope(DemandKind.FULL_SYNC_DM_ENROLLMENT, AcquisitionKind.DIALOG_TRAVERSAL)
+    async def bootstrap_dms(self) -> int:
+        """Enroll all DM dialogs into synced_dialogs with status='syncing'.
+
+        Idempotent — uses INSERT OR IGNORE so existing rows (with real
+        progress) are not overwritten.  Only types.User dialogs are
+        enrolled; groups and channels require explicit opt-in (Phase 30).
+
+        Handles TelegramRpcThrottled with interruptible sleep and RPCError
+        gracefully — a transient Telegram error does not kill the daemon.
+
+        Returns:
+            Count of newly enrolled dialogs (0 if all already present).
+        """
+        return await self._run_dm_enrollment(start_new_if_complete=True)
+
+    @_full_sync_rpc_scope(DemandKind.FULL_SYNC_DM_ENROLLMENT, AcquisitionKind.DIALOG_TRAVERSAL)
+    async def resume_dm_enrollment(self) -> int:
+        """Resume a coordinator slice without reopening a completed cycle."""
+        return await self._run_dm_enrollment(start_new_if_complete=False)
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def process_one_batch(self) -> bool:
@@ -517,9 +650,41 @@ class FullSyncDemandAdapter:
                     return
 
 
+class FullSyncDmEnrollmentDemandAdapter:
+    """Bounded DM enrollment traversal over its committed daemon-state cursor."""
+
+    demand_kind = DemandKind.FULL_SYNC_DM_ENROLLMENT
+
+    def __init__(self, worker: FullSyncWorker) -> None:
+        self._worker = worker
+
+    def status(self, now: float) -> DemandStatus | None:
+        """Report incomplete enrollment without scanning Telegram or writing."""
+        del now
+        status = _dm_enrollment_state(self._worker._conn, _DM_ENROLLMENT_KEY_STATUS)
+        if status == _DM_ENROLLMENT_COMPLETE:
+            return None
+        return DemandStatus(release_at=0.0)
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Resume traversal until completion or the sender exhausts the slice."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        if self.status(time.time()) is None:
+            return
+        with demand_context(DemandKind.FULL_SYNC_DM_ENROLLMENT):
+            with rpc_attempt_budget(budget):
+                try:
+                    await self._worker.resume_dm_enrollment()
+                except RpcAttemptBudgetExhaustedError:
+                    return
+
+
 _EXPORTED_SYMBOLS = (
+    FullSyncDmEnrollmentDemandAdapter,
     FullSyncDemandAdapter,
     FullSyncWorker,
     FullSyncWorker.bootstrap_dms,
     FullSyncWorker.process_one_batch,
+    FullSyncWorker.resume_dm_enrollment,
 )

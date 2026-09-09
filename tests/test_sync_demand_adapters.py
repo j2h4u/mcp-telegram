@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import AsyncIterator, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from telethon.tl import types
 
 from helpers import MockTotalList, build_mock_message
 from mcp_telegram.delta_sync import (
@@ -29,8 +31,8 @@ from mcp_telegram.dialog_sync import (
     DurableDialogSweepStateRequiredError,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncWorker
-from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
+from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter, FullSyncWorker
+from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcScope, current_rpc_scope
 from tests.history_enrollment_helpers import seed_full_history_enrollment
@@ -105,6 +107,54 @@ async def test_full_sync_adapter_status_is_read_only_and_slice_has_precise_scope
     assert scope.acquisition_kind is AcquisitionKind.MESSAGE_HISTORY_PAGE
     assert scope.attempt_budget is budget
     assert adapter.status(500.0) is None
+
+
+@pytest.mark.asyncio
+async def test_dm_enrollment_adapter_resumes_committed_cursor_with_distinct_root(conn: sqlite3.Connection) -> None:
+    user = types.User(id=111, first_name="Alice", access_hash=999)
+    dialog = SimpleNamespace(
+        id=111,
+        entity=user,
+        message=SimpleNamespace(id=777),
+        date=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    observed_options: list[dict[str, object]] = []
+    observed_scopes: list[TelegramRpcScope] = []
+
+    async def iter_dialogs(**kwargs: object) -> AsyncIterator[object]:
+        observed_options.append(kwargs)
+        observed_scopes.append(current_rpc_scope())
+        if len(observed_options) == 1:
+            yield dialog
+            raise RpcAttemptBudgetExhaustedError("slice complete")
+
+    worker = FullSyncWorker(SimpleNamespace(iter_dialogs=iter_dialogs), conn, asyncio.Event())
+    adapter = FullSyncDmEnrollmentDemandAdapter(worker)
+    changes_before = conn.total_changes
+    assert adapter.status(10.0) is not None
+    assert conn.total_changes == changes_before
+
+    first_budget = RpcAttemptBudget(limit=32)
+    await adapter.run_slice(first_budget)
+
+    assert adapter.status(10.0) is not None
+    assert observed_options[0] == {}
+    assert observed_scopes[0].demand_kind is DemandKind.FULL_SYNC_DM_ENROLLMENT
+    assert observed_scopes[0].acquisition_kind is AcquisitionKind.DIALOG_TRAVERSAL
+    assert observed_scopes[0].attempt_budget is first_budget
+    assert conn.execute(
+        "SELECT value FROM daemon_state WHERE key = 'full_sync_dm_enrollment_offset_id'"
+    ).fetchone() == ("777",)
+
+    restarted_adapter = FullSyncDmEnrollmentDemandAdapter(
+        FullSyncWorker(SimpleNamespace(iter_dialogs=iter_dialogs), conn, asyncio.Event())
+    )
+    await restarted_adapter.run_slice(RpcAttemptBudget(limit=32))
+
+    assert observed_options[1]["offset_id"] == 777
+    assert isinstance(observed_options[1]["offset_peer"], types.InputPeerUser)
+    assert observed_options[1]["ignore_pinned"] is True
+    assert restarted_adapter.status(10.0) is None
 
 
 def test_delta_gap_status_uses_refresh_or_recency_boundary_without_writes(conn: sqlite3.Connection) -> None:
