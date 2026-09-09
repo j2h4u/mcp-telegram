@@ -146,13 +146,6 @@ class RpcAttemptBudget:
             raise RpcAttemptBudgetExhaustedError("Telegram RPC attempt budget is exhausted")
         self.attempts += 1
 
-    def try_debit(self) -> bool:
-        """Charge one attempt and return false when the slice must yield."""
-        if self.exhausted:
-            return False
-        self.attempts += 1
-        return True
-
 
 class DurableDemandAdapter(Protocol):
     """Narrow view over durable state owned by one demand kind."""

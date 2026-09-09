@@ -91,9 +91,8 @@ def test_rpc_attempt_budget_fails_before_exceeding_contract() -> None:
     budget = RpcAttemptBudget(limit=2)
     budget.debit()
     assert budget.remaining == 1
-    assert budget.try_debit()
+    budget.debit()
     assert budget.exhausted
-    assert not budget.try_debit()
     with pytest.raises(RpcAttemptBudgetExhaustedError):
         budget.debit()
     assert budget.attempts == 2
