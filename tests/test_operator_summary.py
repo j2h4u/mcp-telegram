@@ -173,6 +173,31 @@ def test_summary_reports_demand_units_capacity_and_overdue_reason(tmp_path: Path
     assert "scheduled_repair: offered=4, deferred=2" in report.text
 
 
+def test_summary_omits_overdue_debt_when_demand_has_no_freshness_deadline(tmp_path: Path) -> None:
+    now = 2_000_000_000.0
+    db_path = tmp_path / "sync.db"
+    _database(db_path, now_ms=int(now * 1000))
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            "INSERT INTO runtime_observations("
+            "observed_at_ms,kind,runtime_instance_id,outcome,payload_json"
+            ") VALUES (?,?,?,?,?)",
+            (
+                int(now * 1000) - 1_000,
+                "telegram.demand",
+                "current",
+                "ready",
+                json.dumps({"demand_kind": "dialog_full_reconciliation", "demand_units": 1}),
+            ),
+        )
+        conn.commit()
+
+    report = build_operator_summary(db_path, since_seconds=15 * 3600, now=now)
+
+    assert "dialog_full_reconciliation: ready=1" in report.text
+    assert "oldest overdue" not in report.text
+
+
 def test_summary_marks_window_unreliable_when_snapshot_reports_loss(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

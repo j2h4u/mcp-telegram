@@ -460,6 +460,27 @@ async def test_dialog_full_adapter_completes_generation_under_precise_scope(conn
     )
 
 
+@pytest.mark.parametrize("state", ["idle", "in_progress"])
+def test_dialog_full_adapter_never_completed_has_no_freshness_debt(
+    conn: sqlite3.Connection,
+    state: str,
+) -> None:
+    conn.execute(
+        "UPDATE dialog_full_reconciliation_state SET status=? WHERE singleton=1",
+        (state,),
+    )
+    conn.commit()
+    worker = DialogReconciliationWorker(SimpleNamespace(iter_dialogs=AsyncMock()), conn, asyncio.Event())
+    adapter = DialogFullReconciliationDemandAdapter(worker, interval_seconds=50.0)
+
+    status = adapter.status(1_700_000_000.0)
+
+    assert status.release_at == 0.0
+    assert status.freshness_deadline is None
+    assert status.is_ready(1_700_000_000.0)
+    assert status.overdue_seconds(1_700_000_000.0) == 0.0
+
+
 @pytest.mark.asyncio
 async def test_dialog_full_adapter_resumes_message_cursor_and_preserves_changed_unseen_row(
     conn: sqlite3.Connection,

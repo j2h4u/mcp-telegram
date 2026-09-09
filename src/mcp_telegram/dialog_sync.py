@@ -1439,6 +1439,7 @@ class DialogFullReconciliationDemandAdapter:
         del now
         completed_at = _read_last_full_reconciliation_at(self._worker._conn)
         release_at = 0.0 if completed_at is None else completed_at + self._interval_seconds
+        freshness_deadline = None if completed_at is None else release_at
         state = cast(
             tuple[str] | None,
             self._worker._conn.execute(
@@ -1446,8 +1447,8 @@ class DialogFullReconciliationDemandAdapter:
             ).fetchone(),
         )
         if state == ("in_progress",):
-            return DemandStatus(release_at=0.0, freshness_deadline=release_at)
-        return DemandStatus(release_at=release_at, freshness_deadline=release_at)
+            return DemandStatus(release_at=0.0, freshness_deadline=freshness_deadline)
+        return DemandStatus(release_at=release_at, freshness_deadline=freshness_deadline)
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
         """Resume from the committed cursor until the actual-attempt budget yields."""

@@ -259,6 +259,23 @@ def test_shadow_status_failures_are_bounded_and_do_not_block_scans() -> None:
     assert all("sensitive domain failure" not in str(value) for event in observer.events for value in event.values())
 
 
+def test_shadow_does_not_report_overdue_debt_for_never_completed_demand() -> None:
+    adapters = _shadow_adapters()
+    kind = DemandKind.DIALOG_FULL_RECONCILIATION
+    adapters[kind].current_status = DemandStatus(release_at=0.0)
+    observer = _Observer()
+
+    TelegramDemandShadow(adapters, asyncio.Event(), observer=observer, clock=lambda: 1_700_000_000.0)
+
+    ready_events = [
+        event
+        for event in observer.events
+        if event["outcome"] is DemandEvidenceOutcome.READY and event["demand_kind"] is kind
+    ]
+    assert ready_events
+    assert all(event["oldest_overdue_seconds"] is None for event in ready_events)
+
+
 def test_ready_status_error_retains_honest_debt_without_false_satisfaction() -> None:
     adapters = _shadow_adapters()
     adapter = adapters[DemandKind.SCHEDULED_REPAIR]
