@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import AsyncIterator, Iterator
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +17,8 @@ from telethon.tl.types import PeerUser
 
 from mcp_telegram import activity_sync
 from mcp_telegram.activity_sync import (
+    ArchiveBackfillDemandAdapter,
+    ArchiveIncrementalDemandAdapter,
     _run_backfill,
     _run_incremental,
     _SearchResultLike,
@@ -24,6 +27,9 @@ from mcp_telegram.activity_sync import (
 )
 from mcp_telegram.hydration_queue import HydrationPriority
 from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
+from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcScope, current_rpc_scope
 
 _TEST_TIMEOUT_S = 0.05
 
@@ -90,9 +96,12 @@ class _FakeClient:
         self._batches: list[FakeSearchResult | Exception] = list(batches)
         self._iter_msgs: list[FakeMessage] = list(iter_msgs or [])
         self.calls = 0
+        self.scopes: list[TelegramRpcScope] = []
 
     async def __call__(self, request: object) -> FakeSearchResult:
+        del request
         self.calls += 1
+        self.scopes.append(current_rpc_scope())
         if not self._batches:
             return FakeSearchResult(messages=[])
         item = self._batches.pop(0)
@@ -366,6 +375,39 @@ async def test_loop_shutdown_between_passes(conn: sqlite3.Connection) -> None:
         run_activity_sync_loop(client, conn, shutdown, interval=60.0, timeout_s=120.0),
         _flip(),
     )
+
+
+@pytest.mark.asyncio
+async def test_loop_reports_each_archive_demand_kind(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shutdown = asyncio.Event()
+    observed: list[DemandKind] = []
+
+    async def backfill(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def incremental(*_args: object, **_kwargs: object) -> None:
+        shutdown.set()
+
+    async def run_cycle(kind: DemandKind, operation: Callable[[], Awaitable[object]]) -> object:
+        observed.append(kind)
+        return await operation()
+
+    monkeypatch.setattr(activity_sync, "_run_backfill_in_scope", backfill)
+    monkeypatch.setattr(activity_sync, "_run_incremental_in_scope", incremental)
+
+    await run_activity_sync_loop(
+        _FakeClient(batches=[]),
+        conn,
+        shutdown,
+        interval=60.0,
+        timeout_s=120.0,
+        demand_cycle_runner=run_cycle,
+    )
+
+    assert observed == [DemandKind.ARCHIVE_BACKFILL, DemandKind.ARCHIVE_INCREMENTAL]
 
 
 @pytest.mark.asyncio
@@ -670,3 +712,87 @@ async def test_run_backfill_search_request_timeout(
     assert len(timeout_logs) >= 1, (
         f"Expected 'activity_sync_backfill_rpc_timeout' log; got: {[r.getMessage() for r in caplog.records]}"
     )
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_adapter_commits_one_page_with_precise_scope(conn: sqlite3.Connection) -> None:
+    client = _FakeClient(
+        batches=[FakeSearchResult(messages=[_msg(100, 42, 1_700_000_100)]), FakeSearchResult(messages=[])]
+    )
+    budget = RpcAttemptBudget(limit=1)
+    adapter = ArchiveBackfillDemandAdapter(client, conn, asyncio.Event(), _TEST_TIMEOUT_S)
+
+    assert adapter.status(1_700_000_000.0) is not None
+    await adapter.run_slice(budget)
+    state = dict(
+        cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    )
+    assert state["backfill_offset_id"] == "100"
+    assert state["backfill_complete"] == "0"
+    assert client.scopes[0].demand_kind is DemandKind.ARCHIVE_BACKFILL
+    assert client.scopes[0].attempt_budget is budget
+
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert adapter.status(1_700_000_000.0) is None
+
+
+@pytest.mark.asyncio
+async def test_archive_incremental_adapter_resumes_from_key_value_state(conn: sqlite3.Connection) -> None:
+    last_sync_at = int(time.time()) - 7_200
+    with conn:
+        conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        conn.execute(
+            "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)",
+            (str(last_sync_at),),
+        )
+    client = _FakeClient(
+        batches=[
+            FakeSearchResult(messages=[_msg(12, 42, last_sync_at + 30)]),
+            FakeSearchResult(messages=[]),
+        ]
+    )
+    first_budget = RpcAttemptBudget(limit=1)
+    adapter = ArchiveIncrementalDemandAdapter(
+        client,
+        conn,
+        asyncio.Event(),
+        3_600.0,
+        _TEST_TIMEOUT_S,
+    )
+
+    initial = adapter.status(float(last_sync_at))
+    assert initial is not None
+    assert initial.release_at == last_sync_at + 3_600
+    await adapter.run_slice(first_budget)
+    state = dict(
+        cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    )
+    assert state["incremental_min_date"] == str(last_sync_at - 60)
+    assert state["incremental_offset_id"] == "12"
+    assert adapter.status(time.time()) is not None
+    assert client.scopes[0].demand_kind is DemandKind.ARCHIVE_INCREMENTAL
+    assert client.scopes[0].attempt_budget is first_budget
+
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    final_state = dict(
+        cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    )
+    assert "incremental_min_date" not in final_state
+    assert "incremental_offset_id" not in final_state
+    assert int(final_state["last_sync_at"] or 0) > last_sync_at
+
+
+@pytest.mark.asyncio
+async def test_legacy_archive_operations_install_distinct_exact_roots(conn: sqlite3.Connection) -> None:
+    backfill_client = _FakeClient(batches=[FakeSearchResult(messages=[])])
+
+    await _run_backfill(backfill_client, conn, asyncio.Event(), timeout_s=_TEST_TIMEOUT_S)
+
+    assert backfill_client.scopes[0].demand_kind is DemandKind.ARCHIVE_BACKFILL
+    assert backfill_client.scopes[0].acquisition_kind is AcquisitionKind.MESSAGE_SEARCH_PAGE
+
+    incremental_client = _FakeClient(batches=[FakeSearchResult(messages=[])])
+    await _run_incremental(incremental_client, conn, asyncio.Event(), timeout_s=_TEST_TIMEOUT_S)
+
+    assert incremental_client.scopes[0].demand_kind is DemandKind.ARCHIVE_INCREMENTAL
+    assert incremental_client.scopes[0].acquisition_kind is AcquisitionKind.MESSAGE_SEARCH_PAGE

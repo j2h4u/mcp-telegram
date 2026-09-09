@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -768,6 +769,64 @@ async def test_run_reconciliation_loop_runs_full_pass_first(
 
     # First iteration always runs full pass (last_full_pass=0.0).
     assert mock_client.iter_dialogs.called
+
+
+@pytest.mark.asyncio
+async def test_run_reconciliation_loop_preserves_daily_schedule_across_restart(
+    sync_db: sqlite3.Connection,
+    mock_client: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mcp_telegram import dialog_sync
+
+    sync_db.execute(
+        "INSERT OR REPLACE INTO daemon_state(key, value) VALUES ('dialog_reconciliation_last_full_at', ?)",
+        (str(int(time.time())),),
+    )
+    sync_db.commit()
+    shutdown = asyncio.Event()
+
+    async def _light(_self: object) -> int:
+        shutdown.set()
+        return 0
+
+    full = AsyncMock(return_value=(0, True))
+    monkeypatch.setattr(dialog_sync.DialogReconciliationWorker, "run_light_pass", _light)
+    monkeypatch.setattr(dialog_sync.DialogReconciliationWorker, "run_full_pass", full)
+
+    await run_reconciliation_loop(mock_client, sync_db, shutdown)
+
+    full.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["not-a-timestamp", "nan", "inf", "-1"])
+async def test_run_reconciliation_loop_retries_when_persisted_schedule_is_invalid(
+    sync_db: sqlite3.Connection,
+    mock_client: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    from mcp_telegram import dialog_sync
+
+    sync_db.execute(
+        "INSERT OR REPLACE INTO daemon_state(key, value) VALUES ('dialog_reconciliation_last_full_at', ?)",
+        (value,),
+    )
+    sync_db.commit()
+    shutdown = asyncio.Event()
+
+    async def _light(_self: object) -> int:
+        shutdown.set()
+        return 0
+
+    full = AsyncMock(return_value=(0, True))
+    monkeypatch.setattr(dialog_sync.DialogReconciliationWorker, "run_light_pass", _light)
+    monkeypatch.setattr(dialog_sync.DialogReconciliationWorker, "run_full_pass", full)
+
+    await run_reconciliation_loop(mock_client, sync_db, shutdown)
+
+    full.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,7 @@ from typing import Protocol, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
+from telethon.errors import ChannelPrivateError, RPCError  # type: ignore[import-untyped]
 
 from helpers import build_mock_message
 from mcp_telegram.delta_sync import (
@@ -34,9 +35,16 @@ from mcp_telegram.delta_sync import (
     _log_probe_budget_exhausted,
     run_delta_catch_up_loop,
 )
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.history_enrollment import disable_history
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-from mcp_telegram.telegram_rpc_scheduler import RpcAdmissionSaturatedError, current_rpc_scope
+from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_scheduler import (
+    RpcAdmissionExpiredError,
+    RpcAdmissionSaturatedError,
+    TelegramRpcAdmissionDeferred,
+    current_rpc_scope,
+)
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -426,6 +434,86 @@ async def test_delta_uses_min_id_and_reverse(
 
     assert captured_kwargs.get("min_id") == 200, f"Expected min_id=200, got {captured_kwargs.get('min_id')}"
     assert captured_kwargs.get("reverse") is True, f"Expected reverse=True, got {captured_kwargs.get('reverse')}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_kind", ["deferred", "saturated", "expired", "flood", "access", "rpc"])
+async def test_delta_slice_error_paths_preserve_or_record_state(
+    error_kind: str,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """A failed page leaves its cursor durable, while access loss is recorded."""
+    dialog_id = 1010
+    sync_db.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,))
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
+    sync_db.execute("INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1)", (dialog_id,))
+    sync_db.commit()
+
+    async def _fail(**_kwargs: object) -> AsyncIterator[object]:
+        if error_kind == "deferred":
+            raise TelegramRpcAdmissionDeferred(retry_after_seconds=7)
+        if error_kind == "saturated":
+            raise RpcAdmissionSaturatedError(current_rpc_scope(), "delta capacity is full")
+        if error_kind == "expired":
+            raise RpcAdmissionExpiredError(current_rpc_scope(), "delta deadline elapsed")
+        if error_kind == "flood":
+            raise TelegramRpcThrottled(retry_after_seconds=3)
+        if error_kind == "access":
+            raise ChannelPrivateError(request=None)
+        raise RPCError(None, "delta RPC failed")
+        yield
+
+    mock_client.iter_messages = _fail
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+
+    assert await worker.fetch_delta_slice_for_dialog(dialog_id) == 0
+    row = sync_db.execute(
+        "SELECT status, last_synced_at, last_delta_checked_at, delta_refresh_requested_at "
+        "FROM synced_dialogs WHERE dialog_id = ?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None
+    if error_kind == "access":
+        assert row[0] == "access_lost"
+    else:
+        assert row == ("synced", None, None, None)
+    assert worker._last_fetch_admission_deferred is (error_kind in {"deferred", "saturated", "expired"})
+
+
+@pytest.mark.asyncio
+async def test_delta_slice_shutdown_commits_partial_page_and_continuation(
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Shutdown after a yielded message preserves that message for the next page."""
+    dialog_id = 1011
+    sync_db.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,))
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
+    sync_db.execute("INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1)", (dialog_id,))
+    sync_db.commit()
+
+    async def _partial(**_kwargs: object) -> AsyncIterator[object]:
+        yield build_mock_message(id=11, text="first")
+        shutdown_event.set()
+        yield build_mock_message(id=12, text="not consumed")
+
+    mock_client.iter_messages = _partial
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+
+    assert await worker.fetch_delta_slice_for_dialog(dialog_id) == 1
+    assert sync_db.execute(
+        "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND message_id = 11", (dialog_id,)
+    ).fetchone() == (1,)
+    continuation = sync_db.execute(
+        "SELECT delta_refresh_requested_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id = ?",
+        (dialog_id,),
+    ).fetchone()
+    assert continuation is not None
+    assert continuation[0] is not None
+    assert worker._last_delta_slice_completed is False
 
 
 @pytest.mark.asyncio
@@ -999,6 +1087,33 @@ async def test_probe_loop_runs_immediately_then_shutdown(shutdown_event: asyncio
         )
         # Probe was called exactly once (immediate run, then shutdown)
         mock_probe.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_probe_loop_reports_access_probe_demand_kind(shutdown_event: asyncio.Event) -> None:
+    from mcp_telegram.delta_sync import DeltaSyncWorker, run_access_probe_loop
+
+    observed: list[DemandKind] = []
+
+    async def probe(*_args: object, **_kwargs: object) -> None:
+        shutdown_event.set()
+
+    async def run_cycle(kind: DemandKind, operation: Callable[[], Awaitable[object]]) -> object:
+        observed.append(kind)
+        return await operation()
+
+    with patch("mcp_telegram.delta_sync._probe_access_lost_dialogs", side_effect=probe):
+        await run_access_probe_loop(
+            cast(_DeltaSyncClient, MagicMock()),
+            cast(sqlite3.Connection, MagicMock()),
+            shutdown_event,
+            MagicMock(spec=DeltaSyncWorker),
+            _access_probe_policy(),
+            initial_delay=0.0,
+            demand_cycle_runner=run_cycle,
+        )
+
+    assert observed == [DemandKind.DELTA_ACCESS_PROBE]
 
 
 @pytest.mark.asyncio
@@ -1851,6 +1966,30 @@ async def test_delta_catch_up_loop_does_not_emit_redundant_info_completion(
     cycle_logs = [record for record in caplog.records if "delta_catch_up_cycle complete" in record.getMessage()]
     assert len(cycle_logs) == 1
     assert cycle_logs[0].levelno == logging.DEBUG
+
+
+@pytest.mark.asyncio
+async def test_delta_catch_up_loop_reports_gap_fill_demand_kind(shutdown_event: asyncio.Event) -> None:
+    observed: list[DemandKind] = []
+
+    class _Worker:
+        async def run_delta_catch_up(self, *, policy: DeltaCatchUpPolicy) -> int:
+            del policy
+            shutdown_event.set()
+            return 0
+
+    async def run_cycle(kind: DemandKind, operation: Callable[[], Awaitable[object]]) -> object:
+        observed.append(kind)
+        return await operation()
+
+    await run_delta_catch_up_loop(
+        _Worker(),
+        shutdown_event,
+        DeltaCatchUpPolicy(interval_seconds=300.0, max_probes_per_cycle=1, probe_pause_seconds=0.01),
+        demand_cycle_runner=run_cycle,
+    )
+
+    assert observed == [DemandKind.DELTA_GAP_FILL]
 
 
 @pytest.mark.asyncio

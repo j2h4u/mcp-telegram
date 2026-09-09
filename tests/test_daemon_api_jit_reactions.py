@@ -20,6 +20,7 @@ import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.reactions.sqlite_repository import SQLiteReactionSnapshotRepository
 from mcp_telegram.reading.query_records import read_message_from_row
 from mcp_telegram.reading.sqlite_projection import _FETCH_UNREAD_MESSAGES_SQL
 from mcp_telegram.tools.message_view import project_message_view
@@ -167,6 +168,42 @@ async def test_jit_cold_fetch_updates_state(make_synced_db: Callable[[], sqlite3
 
     rxn = _fetchone_tuple(conn, "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=?", (dialog_id,))[0]
     assert rxn == 30
+
+
+@pytest.mark.asyncio
+async def test_reaction_persistence_busy_retries_without_refetch(
+    make_synced_db: Callable[[], sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = make_synced_db()
+    dialog_id = 1002
+    _seed_synced(conn, dialog_id)
+    _seed_message(conn, dialog_id, 1)
+    _seed_reaction(conn, dialog_id, 1, "👍", 1)
+    client = _TestClient()
+    client.get_messages = AsyncMock(return_value=[_msg_with_reactions(1, "🔥", 2)])
+    original = SQLiteReactionSnapshotRepository.persist_reaction_snapshots
+    attempts = 0
+
+    def persist(self: SQLiteReactionSnapshotRepository, *args: object, **kwargs: object) -> int:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("database is busy")
+        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(SQLiteReactionSnapshotRepository, "persist_reaction_snapshots", persist)
+    monkeypatch.setattr("mcp_telegram.reactions.refresh.asyncio.sleep", AsyncMock())
+
+    result = await make_reaction_freshener(conn, client).refresh(dialog_id, dialog_id, [1])
+
+    assert result.status == "refreshed"
+    assert attempts == 2
+    assert cast(AsyncMock, client.get_messages).call_count == 1
+    assert _fetchone_tuple(
+        conn,
+        "SELECT emoji, count FROM message_reactions WHERE dialog_id=? AND message_id=1",
+        (dialog_id,),
+    ) == ("🔥", 2)
 
 
 @pytest.mark.asyncio

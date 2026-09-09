@@ -13,6 +13,7 @@ import pytest
 import mcp_telegram.runtime_observations as runtime_observations
 from mcp_telegram.config import RuntimeObservationConfig
 from mcp_telegram.runtime_observations import (
+    ALLOWED_KINDS,
     RuntimeObservationSink,
     encode_payload,
     prune_runtime_observations,
@@ -23,6 +24,7 @@ from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 
 def test_runtime_event_payload_is_bounded_and_kind_is_allowlisted() -> None:
     assert encode_payload({"value": 1}) == '{"value":1}'
+    assert "telegram.demand" in ALLOWED_KINDS
     with pytest.raises(ValueError, match="1024"):
         encode_payload({"value": "x" * 1024})
     with closing(sqlite3.connect(":memory:")) as conn:

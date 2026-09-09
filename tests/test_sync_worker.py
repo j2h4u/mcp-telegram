@@ -1358,7 +1358,7 @@ async def test_dm_bootstrap_retries_admission_deferred_after_committing_partial_
     second_dialog = SimpleNamespace(entity=second_user, id=40012)
     calls = 0
 
-    async def _iter_dialogs():
+    async def _iter_dialogs(**_kwargs: object):
         nonlocal calls
         calls += 1
         if calls == 1:

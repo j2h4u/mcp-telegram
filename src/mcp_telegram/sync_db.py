@@ -1,5 +1,6 @@
 import fcntl
 import logging
+import math
 import sqlite3
 from pathlib import Path
 from typing import cast
@@ -10,8 +11,9 @@ from .dialog_classification import (
     is_bot_dialog_type,
     is_reserved_replies_username,
 )
+from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 58
+_CURRENT_SCHEMA_VERSION = 60
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -21,8 +23,20 @@ _ACCESS_CAUSE_MIGRATION_55 = 55
 _TOOL_CAPABILITY_MIGRATION_56 = 56
 _ENTITY_PROFILE_SECTIONS_MIGRATION_57 = 57
 _ACCOUNT_TRACE_INDEXES_MIGRATION_58 = 58
+_SCHEDULED_RECONCILIATION_MIGRATION_59 = 59
+_DOMAIN_RESUME_STATE_MIGRATION_60 = 60
+
+_ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
+_SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
+
+# Product-owned scheduled reconciliation targets.  Keep these values here so
+# schema bootstrap and the legacy worker cannot drift apart.
+SCHEDULED_ACTIVE_REPAIR_SECONDS = demand_freshness_seconds(DemandKind.SCHEDULED_REPAIR)
+SCHEDULED_QUIET_DISCOVERY_SECONDS = demand_freshness_seconds(DemandKind.SCHEDULED_DISCOVERY)
 
 logger = logging.getLogger(__name__)
+
+type SyncDatabaseConnection = sqlite3.Connection
 
 # ---------------------------------------------------------------------------
 # DDL constants
@@ -666,6 +680,92 @@ ON activity_dialog_state(cold_status, cold_next_retry_at)
 # Tier-B selection: pending/running due peers
 # WHERE cold_status IN ('pending', 'running') AND (cold_next_retry_at IS NULL OR cold_next_retry_at <= :now)
 
+
+# ---------------------------------------------------------------------------
+# DDL for v60: restart-safe domain cursors used by durable demand adapters.
+#
+# The tables remain owned by their domains.  They intentionally do not form a
+# generic job/lifecycle store.
+# ---------------------------------------------------------------------------
+
+_DIALOG_FULL_RECONCILIATION_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS dialog_full_reconciliation_state (
+    singleton       INTEGER PRIMARY KEY CHECK(singleton = 1),
+    generation      INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+    status          TEXT NOT NULL DEFAULT 'idle' CHECK(status IN ('idle', 'in_progress')),
+    offset_date     TEXT,
+    offset_id       INTEGER NOT NULL DEFAULT 0,
+    offset_peer     TEXT,
+    started_at      INTEGER,
+    observed_count  INTEGER NOT NULL DEFAULT 0 CHECK(observed_count >= 0)
+)
+"""
+
+_DIALOG_FULL_RECONCILIATION_BASELINE_DDL = """
+CREATE TABLE IF NOT EXISTS dialog_full_reconciliation_baseline (
+    generation        INTEGER NOT NULL,
+    dialog_id         INTEGER NOT NULL,
+    baseline_revision INTEGER NOT NULL CHECK(baseline_revision >= 0),
+    seen              INTEGER NOT NULL DEFAULT 0 CHECK(seen IN (0, 1)),
+    PRIMARY KEY(generation, dialog_id)
+) WITHOUT ROWID
+"""
+
+_DIALOG_FULL_RECONCILIATION_UNSEEN_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_dialog_full_reconciliation_unseen
+ON dialog_full_reconciliation_baseline(generation, seen, dialog_id)
+"""
+
+_DIALOGS_REVISION_TRIGGER_DDL = """
+CREATE TRIGGER IF NOT EXISTS dialogs_revision_after_update
+AFTER UPDATE ON dialogs
+WHEN NEW.revision = OLD.revision
+BEGIN
+    UPDATE dialogs
+       SET revision = OLD.revision + 1
+     WHERE dialog_id = NEW.dialog_id;
+END
+"""
+
+_DELTA_ACCESS_RECOVERY_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS delta_access_recovery_state (
+    dialog_id          INTEGER PRIMARY KEY,
+    stage              TEXT NOT NULL CHECK(stage = 'gap_fill'),
+    total_messages     INTEGER,
+    probe_succeeded_at INTEGER NOT NULL,
+    retry_at           INTEGER,
+    updated_at         INTEGER NOT NULL
+) WITHOUT ROWID
+"""
+
+_DELTA_ACCESS_RECOVERY_DUE_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_delta_access_recovery_due
+ON delta_access_recovery_state(retry_at, probe_succeeded_at, dialog_id)
+"""
+
+_DELTA_ACCESS_RECOVERY_CLEAR_TRIGGER_DDL = """
+CREATE TRIGGER IF NOT EXISTS synced_dialogs_clear_access_recovery
+AFTER UPDATE OF status ON synced_dialogs
+WHEN NEW.status = 'access_lost'
+BEGIN
+    DELETE FROM delta_access_recovery_state WHERE dialog_id = NEW.dialog_id;
+END
+"""
+
+_ENTITY_PROFILE_REFRESH_STATE_V60_DDL = """
+CREATE TABLE entity_profile_refresh_state (
+    entity_id          INTEGER PRIMARY KEY,
+    status             TEXT NOT NULL CHECK(status IN ('failed', 'pending', 'rejected')),
+    retry_at           INTEGER,
+    reason             TEXT,
+    updated_at         INTEGER NOT NULL,
+    next_section       TEXT NOT NULL DEFAULT 'full_profile' CHECK(next_section IN (
+        'full_profile', 'common_chats', 'contact_overlap', 'avatar_history', 'personal_channel'
+    )),
+    acquisition_cursor INTEGER NOT NULL DEFAULT 0 CHECK(acquisition_cursor >= 0)
+) WITHOUT ROWID
+"""
+
 # ---------------------------------------------------------------------------
 # DDL for v24: linked-chat columns on dialogs (Phase 54)
 #
@@ -883,6 +983,31 @@ _SCHEDULED_SYNC_STATE_SEED = """
 INSERT OR IGNORE INTO scheduled_sync_state (key) VALUES ('account')
 """
 
+_SCHEDULED_RECONCILIATION_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS scheduled_reconciliation_state (
+    dialog_id             INTEGER PRIMARY KEY,
+    repair_due_at         INTEGER,
+    discovery_due_at      INTEGER NOT NULL,
+    dirty_since           INTEGER,
+    dirty_generation      INTEGER NOT NULL DEFAULT 0 CHECK(dirty_generation >= 0),
+    -- Retained for compatibility with the first unreleased v59 shape.  It is
+    -- an audit timestamp, not a scheduling input.
+    updated_at            INTEGER NOT NULL,
+    CHECK(dirty_since IS NULL OR repair_due_at IS NOT NULL)
+) WITHOUT ROWID
+"""
+
+_SCHEDULED_RECONCILIATION_REPAIR_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_scheduled_reconciliation_repair_due
+ON scheduled_reconciliation_state(repair_due_at, dialog_id)
+WHERE repair_due_at IS NOT NULL
+"""
+
+_SCHEDULED_RECONCILIATION_DISCOVERY_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_scheduled_reconciliation_discovery_due
+ON scheduled_reconciliation_state(discovery_due_at, dialog_id)
+"""
+
 # v37: durable media-fact hydration scheduling.  The queue identity includes
 # the fact kind so future hydration workers can use separate policies without
 # introducing another table or a nullable discriminator.
@@ -1012,6 +1137,80 @@ def open_sync_db_reader(db_path: Path) -> sqlite3.Connection:
     Caller is responsible for closing the connection.
     """
     return _open_sync_db(db_path, read_only=True)
+
+
+def load_account_cooldown_until_utc(conn: sqlite3.Connection) -> float | None:
+    """Load the persisted finite account cooldown as a Unix UTC deadline."""
+    row = cast(
+        tuple[object | None] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key = ?", (_ACCOUNT_COOLDOWN_UNTIL_UTC_KEY,)).fetchone(),
+    )
+    if row is None or row[0] is None:
+        return None
+    try:
+        deadline = float(cast(str | bytes | int | float, row[0]))
+    except TypeError, ValueError:
+        logger.warning("invalid persisted Telegram account cooldown deadline")
+        return None
+    if not math.isfinite(deadline) or deadline < 0:
+        logger.warning("invalid persisted Telegram account cooldown deadline")
+        return None
+    return deadline
+
+
+def save_account_cooldown_until_utc(conn: sqlite3.Connection, deadline_utc: float | None) -> None:
+    """Atomically replace or clear the finite account cooldown UTC deadline."""
+    if deadline_utc is None:
+        with conn:
+            conn.execute("DELETE FROM daemon_state WHERE key = ?", (_ACCOUNT_COOLDOWN_UNTIL_UTC_KEY,))
+        return
+    if (
+        isinstance(deadline_utc, bool)
+        or not isinstance(deadline_utc, (int, float))
+        or not math.isfinite(float(deadline_utc))
+        or deadline_utc < 0
+    ):
+        raise ValueError("deadline_utc must be a finite non-negative Unix timestamp or None")
+    with conn:
+        conn.execute(
+            "INSERT INTO daemon_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_ACCOUNT_COOLDOWN_UNTIL_UTC_KEY, repr(float(deadline_utc))),
+        )
+
+
+def load_self_profile_last_success_at(conn: sqlite3.Connection) -> float | None:
+    """Load the last successful account self-profile refresh epoch."""
+    row = cast(
+        tuple[object | None] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key = ?", (_SELF_PROFILE_LAST_SUCCESS_AT_KEY,)).fetchone(),
+    )
+    if row is None or row[0] is None:
+        return None
+    try:
+        completed_at = float(cast(str | bytes | int | float, row[0]))
+    except TypeError, ValueError:
+        logger.warning("invalid persisted self-profile success timestamp")
+        return None
+    if not math.isfinite(completed_at) or completed_at < 0:
+        logger.warning("invalid persisted self-profile success timestamp")
+        return None
+    return completed_at
+
+
+def save_self_profile_last_success_at(conn: sqlite3.Connection, completed_at: float) -> None:
+    """Atomically persist a finite account self-profile refresh epoch."""
+    if (
+        isinstance(completed_at, bool)
+        or not isinstance(completed_at, (int, float))
+        or not math.isfinite(float(completed_at))
+        or completed_at < 0
+    ):
+        raise ValueError("completed_at must be a finite non-negative Unix timestamp")
+    with conn:
+        conn.execute(
+            "INSERT INTO daemon_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_SELF_PROFILE_LAST_SUCCESS_AT_KEY, repr(float(completed_at))),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2829,6 +3028,152 @@ def _apply_migration_58(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_59(conn: sqlite3.Connection, current: int) -> int:
+    """Add durable per-dialog scheduling for scheduled-message reconciliation."""
+    if current >= _SCHEDULED_RECONCILIATION_MIGRATION_59:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(_SCHEDULED_RECONCILIATION_STATE_DDL)
+        conn.execute(_SCHEDULED_RECONCILIATION_REPAIR_INDEX_DDL)
+        conn.execute(_SCHEDULED_RECONCILIATION_DISCOVERY_INDEX_DDL)
+        conn.execute(_OWN_ONLY_DIALOGS_DDL)
+        now = _row_first_int(cast(tuple[object] | None, conn.execute("SELECT unixepoch()").fetchone()))
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO scheduled_reconciliation_state (
+                dialog_id, repair_due_at, discovery_due_at, updated_at
+            )
+            SELECT candidate.dialog_id,
+                   CASE WHEN active.dialog_id IS NULL THEN NULL ELSE :now END,
+                   :now + (((candidate.dialog_id % :quiet_seconds) + :quiet_seconds) % :quiet_seconds),
+                   :now
+            FROM (
+                SELECT dialog_id FROM dialogs
+                 WHERE hidden = 0 AND type IN ('user', 'bot', 'channel')
+                UNION
+                SELECT dialog_id FROM own_only_dialogs
+                UNION
+                SELECT dialog_id FROM scheduled_messages WHERE message_state = 'scheduled'
+            ) AS candidate
+            LEFT JOIN (
+                SELECT DISTINCT dialog_id FROM scheduled_messages WHERE message_state = 'scheduled'
+            ) AS active ON active.dialog_id = candidate.dialog_id
+            """,
+            {"now": now, "quiet_seconds": SCHEDULED_QUIET_DISCOVERY_SECONDS},
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
+            (_SCHEDULED_RECONCILIATION_MIGRATION_59,),
+        )
+        conn.commit()
+        return _SCHEDULED_RECONCILIATION_MIGRATION_59
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _table_column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in cast(list[tuple[object, ...]], conn.execute(f"PRAGMA table_info({table})"))}
+
+
+def _migrate_activity_resume_state_v60(conn: sqlite3.Connection) -> None:
+    activity_columns = _table_column_names(conn, "activity_dialog_state")
+    if "hot_page_offset_id" not in activity_columns:
+        conn.execute("ALTER TABLE activity_dialog_state ADD COLUMN hot_page_offset_id INTEGER")
+    if "hot_window_max_id" not in activity_columns:
+        conn.execute("ALTER TABLE activity_dialog_state ADD COLUMN hot_window_max_id INTEGER")
+    if "hot_window_had_new" not in activity_columns:
+        conn.execute(
+            "ALTER TABLE activity_dialog_state ADD COLUMN hot_window_had_new "
+            "INTEGER NOT NULL DEFAULT 0 CHECK(hot_window_had_new IN (0, 1))"
+        )
+
+
+def _migrate_dialog_reconciliation_state_v60(conn: sqlite3.Connection) -> None:
+    if "revision" not in _table_column_names(conn, "dialogs"):
+        conn.execute("ALTER TABLE dialogs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0)")
+    conn.execute(_DIALOG_FULL_RECONCILIATION_STATE_DDL)
+    conn.execute(_DIALOG_FULL_RECONCILIATION_BASELINE_DDL)
+    conn.execute(_DIALOG_FULL_RECONCILIATION_UNSEEN_INDEX_DDL)
+    conn.execute(_DIALOGS_REVISION_TRIGGER_DDL)
+    conn.execute(
+        "INSERT OR IGNORE INTO dialog_full_reconciliation_state(singleton, generation, status) VALUES (1, 0, 'idle')"
+    )
+
+
+def _migrate_delta_access_recovery_state_v60(conn: sqlite3.Connection) -> None:
+    conn.execute(_DELTA_ACCESS_RECOVERY_STATE_DDL)
+    conn.execute(_DELTA_ACCESS_RECOVERY_DUE_INDEX_DDL)
+    conn.execute(_DELTA_ACCESS_RECOVERY_CLEAR_TRIGGER_DDL)
+
+
+def _rebuild_entity_profile_refresh_state_v60(
+    conn: sqlite3.Connection,
+    refresh_columns: set[str],
+) -> None:
+    next_section_expr = "next_section" if "next_section" in refresh_columns else "'full_profile'"
+    cursor_expr = "acquisition_cursor" if "acquisition_cursor" in refresh_columns else "0"
+    # Copy through TEMP instead of renaming the old table.  ALTER TABLE
+    # RENAME makes SQLite reparse every trigger in sqlite_schema.  Some
+    # supported historical databases contain trigger definitions whose
+    # referenced tables are introduced later in the migration chain;
+    # reparsing those otherwise inert definitions aborts this upgrade.
+    conn.execute(
+        "CREATE TEMP TABLE entity_profile_refresh_state_v59_copy AS "
+        "SELECT entity_id, status, retry_at, reason, updated_at, "
+        f"{next_section_expr} AS next_section, {cursor_expr} AS acquisition_cursor "
+        "FROM entity_profile_refresh_state"
+    )
+    conn.execute("DROP TABLE entity_profile_refresh_state")
+    conn.execute(_ENTITY_PROFILE_REFRESH_STATE_V60_DDL)
+    conn.execute(
+        "INSERT INTO entity_profile_refresh_state("
+        "entity_id, status, retry_at, reason, updated_at, next_section, acquisition_cursor) "
+        "SELECT entity_id, status, retry_at, reason, updated_at, "
+        "next_section, acquisition_cursor FROM entity_profile_refresh_state_v59_copy"
+    )
+    conn.execute("DROP TABLE entity_profile_refresh_state_v59_copy")
+
+
+def _migrate_entity_profile_resume_state_v60(conn: sqlite3.Connection) -> None:
+    refresh_columns = _table_column_names(conn, "entity_profile_refresh_state")
+    refresh_schema_row = cast(
+        tuple[str] | None,
+        conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='entity_profile_refresh_state'"
+        ).fetchone(),
+    )
+    refresh_schema = refresh_schema_row[0] if refresh_schema_row is not None else ""
+    if {"next_section", "acquisition_cursor"} - refresh_columns or "'rejected'" not in refresh_schema:
+        _rebuild_entity_profile_refresh_state_v60(conn, refresh_columns)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_entity_profile_refresh_due "
+        "ON entity_profile_refresh_state(status, retry_at, updated_at, entity_id)"
+    )
+
+
+def _apply_migration_60(conn: sqlite3.Connection, current: int) -> int:
+    """Add restart-safe cursors for domain-owned durable demand slices."""
+    if current >= _DOMAIN_RESUME_STATE_MIGRATION_60:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _migrate_activity_resume_state_v60(conn)
+        _migrate_dialog_reconciliation_state_v60(conn)
+        _migrate_delta_access_recovery_state_v60(conn)
+        _migrate_entity_profile_resume_state_v60(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
+            (_DOMAIN_RESUME_STATE_MIGRATION_60,),
+        )
+        conn.commit()
+        return _DOMAIN_RESUME_STATE_MIGRATION_60
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -2901,6 +3246,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_migration_56(conn, current)
     current = _apply_migration_57(conn, current)
     current = _apply_migration_58(conn, current)
+    current = _apply_migration_59(conn, current)
+    current = _apply_migration_60(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

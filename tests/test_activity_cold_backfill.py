@@ -19,7 +19,7 @@ import contextlib
 import logging
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from typing import cast
 
 import pytest
@@ -29,6 +29,7 @@ from mcp_telegram.activity_cold_backfill import (
     ColdBackfillPacing,
     ColdPassOutcome,
     ColdPassResult,
+    ColdPeerPageDemandAdapter,
     _cold_backfill_sleep_seconds,
     _maybe_enroll_activity_peers,
     _run_cold_backfill_pass_safe,
@@ -44,6 +45,9 @@ from mcp_telegram.activity_peer_sweep import (
     enroll_activity_dialog,
 )
 from mcp_telegram.sync_db import _apply_migrations
+from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
+from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 
 _TEST_TIMEOUT_S = 120.0
 
@@ -267,6 +271,37 @@ async def test_cold_loop_skips_peer_search_after_working_set_flood(monkeypatch: 
         await run_cold_backfill_loop(_FakeClient(), conn, shutdown, pacing=_PACING, timeout_s=1)
 
 
+@pytest.mark.asyncio
+async def test_cold_loop_reports_cold_peer_demand_kind(monkeypatch: pytest.MonkeyPatch) -> None:
+    shutdown = asyncio.Event()
+    observed: list[DemandKind] = []
+
+    async def enroll(*_args: object, **_kwargs: object) -> tuple[float, None]:
+        return 1.0, None
+
+    async def pass_once(*_args: object, **_kwargs: object) -> ColdPassResult:
+        shutdown.set()
+        return ColdPassResult(ColdPassOutcome.NO_DUE_PEER, 0)
+
+    async def run_cycle(kind: DemandKind, operation: Callable[[], Awaitable[object]]) -> object:
+        observed.append(kind)
+        return await operation()
+
+    monkeypatch.setattr("mcp_telegram.activity_cold_backfill._maybe_enroll_activity_peers", enroll)
+    monkeypatch.setattr("mcp_telegram.activity_cold_backfill._run_cold_backfill_pass_safe", pass_once)
+    with _make_db() as conn:
+        await run_cold_backfill_loop(
+            _FakeClient(),
+            conn,
+            shutdown,
+            pacing=_PACING,
+            timeout_s=1,
+            demand_cycle_runner=run_cycle,
+        )
+
+    assert observed == [DemandKind.COLD_PEER_PAGE]
+
+
 # ---------------------------------------------------------------------------
 # (f/idle) NO_DUE_PEER when no peer enrolled
 # ---------------------------------------------------------------------------
@@ -324,6 +359,92 @@ async def test_no_due_peer_when_access_lost(monkeypatch: pytest.MonkeyPatch) -> 
 
         assert result.outcome == ColdPassOutcome.NO_DUE_PEER
         assert call_log == {}
+
+
+def test_cold_adapter_status_uses_retry_lease_and_access_filter() -> None:
+    with _make_db() as conn:
+        now = int(time.time())
+        immediate_id = -100100000020
+        delayed_id = -100100000021
+        _enroll(conn, immediate_id)
+        _enroll(conn, delayed_id, cold_next_retry_at=now + 120)
+        adapter = ColdPeerPageDemandAdapter(_FakeClient(), conn, asyncio.Event(), _PACING, _TEST_TIMEOUT_S)
+
+        status = adapter.status(float(now))
+        assert status is not None
+        assert status.release_at == 0
+
+        conn.execute("UPDATE synced_dialogs SET status = 'access_lost' WHERE dialog_id = ?", (immediate_id,))
+        conn.commit()
+        status = adapter.status(float(now))
+        assert status is not None
+        assert status.release_at == now + 120
+
+
+@pytest.mark.asyncio
+async def test_atomic_cold_claim_excludes_overlapping_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    with _make_db() as conn:
+        dialog_id = -100100000022
+        _enroll(conn, dialog_id)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _blocking_sweep(*args: object, **kwargs: object) -> SweepResult:
+            del args, kwargs
+            entered.set()
+            await release.wait()
+            return _normal_result([10])
+
+        monkeypatch.setattr("mcp_telegram.activity_cold_backfill.sweep_peer_once", _blocking_sweep)
+        first = asyncio.create_task(
+            run_cold_backfill_pass(_FakeClient(), conn, asyncio.Event(), pacing=_PACING, timeout_s=_TEST_TIMEOUT_S)
+        )
+        await entered.wait()
+
+        overlapping = await run_cold_backfill_pass(
+            _FakeClient(), conn, asyncio.Event(), pacing=_PACING, timeout_s=_TEST_TIMEOUT_S
+        )
+        release.set()
+        completed = await first
+
+        assert overlapping.outcome is ColdPassOutcome.NO_DUE_PEER
+        assert completed.outcome is ColdPassOutcome.WROTE
+
+
+@pytest.mark.asyncio
+async def test_cold_adapter_runs_one_peer_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    with _make_db() as conn:
+        dialog_id = -100100000023
+        _enroll(conn, dialog_id)
+        calls = _patch_sweep(monkeypatch, {dialog_id: [_normal_result([50, 60])]})
+        adapter = ColdPeerPageDemandAdapter(_FakeClient(), conn, asyncio.Event(), _PACING, _TEST_TIMEOUT_S)
+
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+        assert calls[dialog_id] == [(0, 0)]
+        assert _get_state(conn, dialog_id)["cold_offset_id"] == 50
+
+
+@pytest.mark.asyncio
+async def test_legacy_cold_pass_installs_exact_root_and_nested_acquisition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _make_db() as conn:
+        dialog_id = -100100000024
+        _enroll(conn, dialog_id)
+        observed: list[tuple[DemandKind | None, AcquisitionKind | None]] = []
+
+        async def _capture_scope(*args: object, **kwargs: object) -> SweepResult:
+            del args, kwargs
+            scope = current_rpc_scope()
+            observed.append((scope.demand_kind, scope.acquisition_kind))
+            return _normal_result([70, 80])
+
+        monkeypatch.setattr("mcp_telegram.activity_cold_backfill.sweep_peer_once", _capture_scope)
+
+        await run_cold_backfill_pass(_FakeClient(), conn, asyncio.Event(), pacing=_PACING, timeout_s=_TEST_TIMEOUT_S)
+
+        assert observed == [(DemandKind.COLD_PEER_PAGE, AcquisitionKind.MESSAGE_SEARCH_PAGE)]
 
 
 # ---------------------------------------------------------------------------

@@ -7,7 +7,16 @@ import logging
 from collections.abc import Callable
 from typing import Protocol
 
-from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
+from .telegram_demand import (
+    AcquisitionKind,
+    UnclassifiedTelegramDemandError,
+    acquisition_context,
+    current_demand_token,
+    demand_context,
+    require_execution_mode,
+)
+from .telegram_rpc_consumers import DemandKind, ExecutionMode
+from .telegram_rpc_scheduler import RpcAdmissionClosedError
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +33,22 @@ async def _request_catch_up(
     client: ReconnectClient,
     observe: Callable[[str, str, str | None], None] | None,
 ) -> bool:
-    with rpc_scope(TelegramRpcSource.RECONNECT_DIFFERENCE):
+    try:
+        current_demand_token()
+    except UnclassifiedTelegramDemandError:
+        with demand_context(DemandKind.RECONNECT_DIFFERENCE):
+            return await _request_catch_up_in_context(client, observe)
+    return await _request_catch_up_in_context(client, observe)
+
+
+async def _request_catch_up_in_context(
+    client: ReconnectClient,
+    observe: Callable[[str, str, str | None], None] | None,
+) -> bool:
+    token = require_execution_mode(ExecutionMode.INLINE)
+    if token.kind is not DemandKind.RECONNECT_DIFFERENCE:
+        raise RuntimeError("reconnect catch-up requires reconnect_difference demand")
+    with acquisition_context(AcquisitionKind.UPDATE_DIFFERENCE):
         try:
             await client.catch_up()
         except RpcAdmissionClosedError:

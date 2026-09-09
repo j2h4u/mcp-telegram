@@ -19,11 +19,18 @@ from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from mcp_telegram.entity_profile.contracts import PROFILE_SECTIONS
-from mcp_telegram.entity_profile.refresh import EntityRefreshCoordinator, RefreshEnqueueResult, RefreshLimits
-from mcp_telegram.entity_profile.repository import EntityProfileRepository
+from mcp_telegram.entity_profile.refresh import (
+    EntityProfileDemandAdapter,
+    EntityRefreshCoordinator,
+    RefreshEnqueueResult,
+    RefreshLimits,
+)
+from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.entity_profile.telegram_gateway import BoundedTelegramGateway
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import _apply_migration_57, _apply_migrations, ensure_sync_schema
+from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_scope
 from mcp_telegram.tools.entity_info import GET_ENTITY_INFO_OUTPUT_SCHEMA, GetEntityInfo, _entity_structured_content
 
@@ -56,7 +63,9 @@ def _sections_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """CREATE TABLE entity_profile_refresh_state (
             entity_id INTEGER PRIMARY KEY, status TEXT NOT NULL,
-            retry_at INTEGER, reason TEXT, updated_at INTEGER NOT NULL
+            retry_at INTEGER, reason TEXT, updated_at INTEGER NOT NULL,
+            next_section TEXT NOT NULL DEFAULT 'full_profile',
+            acquisition_cursor INTEGER NOT NULL DEFAULT 0
         ) WITHOUT ROWID"""
     )
 
@@ -372,6 +381,37 @@ def test_last_good_survives_refresh_failure() -> None:
     conn.close()
 
 
+def test_durable_section_failure_preserves_completed_sections_and_cursor() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+    )
+    _sections_schema(conn)
+    conn.execute("INSERT INTO entities VALUES (42, 'user', 'Known', 'known', NULL, 1)")
+    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    assert repo.commit_section(cursor, EntitySectionCommit({"about": "complete"}), now=101)
+    failed_cursor = repo.next_due_refresh(now=101)
+    assert failed_cursor is not None and failed_cursor.next_section == "common_chats"
+
+    assert repo.mark_section_failure(failed_cursor, now=102, reason="timeout", retry_at=162)
+
+    rows = dict(conn.execute("SELECT section, status FROM entity_detail_sections WHERE entity_id=42").fetchall())
+    assert rows["full_profile"] == "fresh"
+    assert rows["common_chats"] == "unavailable"
+    assert rows["avatar_history"] == "pending"
+    assert repo.next_due_refresh(now=161) is None
+    resumed = repo.next_due_refresh(now=162)
+    assert resumed is not None and resumed.next_section == "common_chats"
+    conn.close()
+
+
 def test_independent_section_failure_preserves_last_good_payload() -> None:
     conn = sqlite3.connect(":memory:")
     conn.execute(
@@ -622,18 +662,215 @@ def _test_service(conn: sqlite3.Connection, *, limits: RefreshLimits) -> DaemonE
 
 
 @pytest.mark.asyncio
+async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt() -> None:
+    class BudgetedClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.scopes: list[tuple[DemandKind | None, AcquisitionKind | None]] = []
+
+        async def __call__(self, request: object) -> object:
+            scope = current_rpc_scope()
+            assert scope.attempt_budget is not None
+            scope.attempt_budget.debit()
+            self.scopes.append((scope.demand_kind, scope.acquisition_kind))
+            kind = cast(tuple[str, object], request)[0]
+            self.calls.append(kind)
+            if kind == "full_user":
+                return SimpleNamespace(
+                    full_user=SimpleNamespace(about="fresh", blocked=False, folder_id=None),
+                    users=[],
+                    chats=[],
+                )
+            if kind == "common_chats":
+                return SimpleNamespace(chats=[SimpleNamespace(id=7, title="Shared")])
+            raise AssertionError(f"unexpected request: {kind}")
+
+        async def get_entity(self, _entity_id: int) -> object:
+            raise AssertionError("stored core must avoid a resolve acquisition")
+
+        async def get_messages(self, entity: object, ids: list[int]) -> object:
+            raise AssertionError((entity, ids))
+
+        def iter_participants(self, peer: object, limit: int = 0) -> AsyncIterator[object]:
+            raise AssertionError((peer, limit))
+
+        def iter_dialogs(self) -> AsyncIterator[object]:
+            raise AssertionError("dialog traversal is not part of a profile section")
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+    )
+    _sections_schema(conn)
+    conn.execute("INSERT INTO entities VALUES (42, 'user', 'Known', 'known', NULL, 1)")
+    repository = EntityProfileRepository(conn, section_ttl_seconds=300)
+    repository.mark_pending(42, now=100)
+    client = BudgetedClient()
+
+    service = _test_service(conn, limits=RefreshLimits())
+    service._deps = replace(
+        service._deps,
+        client=cast(object, client),
+        get_peer_id=lambda value: int(value.id),
+        get_full_user_request=lambda **_kwargs: ("full_user", _kwargs),
+        get_common_chats_request=lambda **_kwargs: ("common_chats", _kwargs),
+    )
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    adapter = EntityProfileDemandAdapter(coordinator)
+
+    first_budget = RpcAttemptBudget(limit=1)
+    await adapter.run_slice(first_budget)
+
+    assert first_budget.attempts == 1
+    assert client.calls == ["full_user"]
+    assert conn.execute(
+        "SELECT next_section, acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == ("common_chats", 0)
+    assert conn.execute(
+        "SELECT status FROM entity_detail_sections WHERE entity_id=42 AND section='full_profile'"
+    ).fetchone() == ("fresh",)
+    await service.shutdown()
+
+    restarted = _test_service(conn, limits=RefreshLimits())
+    restarted._deps = replace(
+        restarted._deps,
+        client=cast(object, client),
+        get_peer_id=lambda value: int(value.id),
+        get_full_user_request=lambda **_kwargs: ("full_user", _kwargs),
+        get_common_chats_request=lambda **_kwargs: ("common_chats", _kwargs),
+    )
+    restarted_coordinator = restarted.refresh_coordinator
+    assert restarted_coordinator is not None
+    restarted_adapter = EntityProfileDemandAdapter(restarted_coordinator)
+    second_budget = RpcAttemptBudget(limit=1)
+    await restarted_adapter.run_slice(second_budget)
+
+    assert second_budget.attempts == 1
+    assert client.calls == ["full_user", "common_chats"]
+    assert conn.execute(
+        "SELECT next_section, acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == ("contact_overlap", 0)
+    local_budget = RpcAttemptBudget(limit=1)
+    await restarted_adapter.run_slice(local_budget)
+    assert local_budget.attempts == 0
+    assert conn.execute("SELECT next_section FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+        "avatar_history",
+    )
+    assert client.scopes == [
+        (DemandKind.ENTITY_PROFILE_REFRESH, AcquisitionKind.ENTITY_LOOKUP),
+        (DemandKind.ENTITY_PROFILE_REFRESH, AcquisitionKind.ENTITY_LOOKUP),
+    ]
+    await restarted.shutdown()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_profile_adapter_checkpoints_core_resolution_before_section() -> None:
+    class ResolvingClient(_UnusedClient):
+        async def get_entity(self, entity_id: int) -> object:
+            scope = current_rpc_scope()
+            assert scope.attempt_budget is not None
+            scope.attempt_budget.debit()
+            return User(id=entity_id, first_name="Resolved", username="resolved")
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+    )
+    _sections_schema(conn)
+    conn.execute(
+        "INSERT INTO entity_profile_refresh_state("
+        "entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor) "
+        "VALUES (42,'pending',NULL,'refresh_queued',100,'full_profile',0)"
+    )
+    service = _test_service(conn, limits=RefreshLimits())
+    service._deps = replace(
+        service._deps,
+        client=ResolvingClient(),
+        get_peer_id=lambda value: int(value.id),
+        get_dialog_placement=lambda _entity_id: {},
+    )
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    budget = RpcAttemptBudget(limit=1)
+
+    await EntityProfileDemandAdapter(coordinator).run_slice(budget)
+
+    assert budget.attempts == 1
+    assert conn.execute("SELECT type, name FROM entities WHERE id=42").fetchone() == ("user", "Resolved")
+    assert conn.execute(
+        "SELECT next_section, acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == ("full_profile", 1)
+    await service.shutdown()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_profile_budget_exhaustion_leaves_core_cursor_ready() -> None:
+    class ExhaustedClient(_UnusedClient):
+        async def get_entity(self, entity_id: int) -> object:
+            del entity_id
+            raise RpcAttemptBudgetExhaustedError("slice complete")
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+    )
+    _sections_schema(conn)
+    conn.execute(
+        "INSERT INTO entity_profile_refresh_state("
+        "entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor) "
+        "VALUES (42,'pending',NULL,'refresh_queued',100,'full_profile',0)"
+    )
+    service = _test_service(conn, limits=RefreshLimits())
+    service._deps = replace(service._deps, client=ExhaustedClient())
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute(
+        "SELECT status, retry_at, next_section, acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == ("pending", None, "full_profile", 0)
+    assert conn.execute("SELECT COUNT(*) FROM entities").fetchone() == (0,)
+    await service.shutdown()
+    conn.close()
+
+
+@pytest.mark.asyncio
 async def test_entity_info_foreground_entrypoint_sets_rpc_source() -> None:
     conn = sqlite3.connect(":memory:")
     service = _test_service(conn, limits=RefreshLimits())
-    observed: list[TelegramRpcSource] = []
+    observed: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
 
     async def implementation(_req: object) -> dict[str, object]:
-        observed.append(current_rpc_scope().source)
+        scope = current_rpc_scope()
+        assert scope.demand_kind is not None
+        observed.append((scope.source, scope.demand_kind, scope.acquisition_kind))
         return {"ok": True}
 
     service._get_entity_info = implementation  # type: ignore[method-assign]
     assert await service.get_entity_info({"entity_id": 42}) == {"ok": True}
-    assert observed == [TelegramRpcSource.ENTITY_INFO_FOREGROUND]
+    assert observed == [
+        (
+            TelegramRpcSource.ENTITY_INFO_FOREGROUND,
+            DemandKind.FOREGROUND_ENTITY_FACTS,
+            AcquisitionKind.ENTITY_LOOKUP,
+        )
+    ]
     await service.shutdown()
     conn.close()
 
@@ -881,7 +1118,7 @@ def test_progressive_projection_schema_upgrades_from_v56(tmp_path: Path) -> None
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_profile_refresh_state'"
     ).fetchone() == (1,)
-    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (58,)
+    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (60,)
     conn.close()
 
 

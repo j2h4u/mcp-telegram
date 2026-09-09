@@ -2,20 +2,34 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Protocol
 
-from ..telegram_rpc_scheduler import TelegramRpcSource, preserve_or_rpc_scope
-from .contracts import ReactionFreshness
+from ..telegram_demand import AcquisitionKind
+from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
+from .contracts import ReactionFreshness, ReactionPersistenceBusyError, ReactionSnapshot
 from .ports import ReactionSnapshotRepository, TelegramReactionGateway
 
 logger = logging.getLogger(__name__)
+_PERSISTENCE_RETRY_DELAYS_SECONDS = (0.25, 1.0, 2.0)
 
 
 class _LoggerLike(Protocol):
     def warning(self, msg: str, *args: object) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _FetchedPersistence:
+    dialog_id: int
+    requested_ids: list[int]
+    fresh_ids: set[int]
+    stale_ids: list[int]
+    messages: Sequence[ReactionSnapshot | None]
+    checked_at: int
 
 
 class ReactionFreshener:
@@ -42,6 +56,37 @@ class ReactionFreshener:
         self._now = now
         self._logger = log
 
+    async def _persist_fetched_snapshot(self, fetched: _FetchedPersistence) -> ReactionFreshness:
+        """Persist one fetched result, retrying local writer contention only."""
+        for attempt, delay in enumerate((0.0, *_PERSISTENCE_RETRY_DELAYS_SECONDS)):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                with self._repository.transaction():
+                    if not self._repository.history_enabled(fetched.dialog_id):
+                        return ReactionFreshness(
+                            len(fetched.requested_ids), len(fetched.fresh_ids), len(fetched.stale_ids), 0, "disabled"
+                        )
+                    refreshed = self._repository.persist_reaction_snapshots(
+                        fetched.dialog_id, fetched.messages, fetched.checked_at
+                    )
+                return ReactionFreshness(
+                    len(fetched.requested_ids),
+                    len(fetched.fresh_ids),
+                    len(fetched.stale_ids),
+                    refreshed,
+                    "refreshed",
+                )
+            except ReactionPersistenceBusyError:
+                if attempt == len(_PERSISTENCE_RETRY_DELAYS_SECONDS):
+                    raise
+                self._logger.warning(
+                    "reaction_snapshot_persist_busy dialog_id=%d attempt=%d",
+                    fetched.dialog_id,
+                    attempt + 1,
+                )
+        raise AssertionError("unreachable")
+
     async def refresh(self, dialog_id: int, entity: object, message_ids: list[int]) -> ReactionFreshness:
         if not message_ids:
             return ReactionFreshness(0, 0, 0, 0, "not_requested")
@@ -53,17 +98,15 @@ class ReactionFreshener:
             return ReactionFreshness(
                 len(message_ids), len(fresh_ids), len(stale_ids), 0, "fresh" if not stale_ids else state
             )
-        with preserve_or_rpc_scope(TelegramRpcSource.REACTION_REFRESH):
+        with rpc_scope(
+            TelegramRpcSource.REACTION_REFRESH,
+            acquisition_kind=AcquisitionKind.REACTION_SNAPSHOT,
+        ):
             result = await self._gateway.fetch_reactions(entity, stale_ids)
         if result.ok:
-            # The use case owns this atomic write. The repository implementation
-            # scopes it with a savepoint so an unrelated outer transaction is not
-            # committed as a side effect of refreshing a read result.
-            with self._repository.transaction():
-                if not self._repository.history_enabled(dialog_id):
-                    return ReactionFreshness(len(message_ids), len(fresh_ids), len(stale_ids), 0, "disabled")
-                refreshed = self._repository.persist_reaction_snapshots(dialog_id, result.messages, now)
-            return ReactionFreshness(len(message_ids), len(fresh_ids), len(stale_ids), refreshed, "refreshed")
+            return await self._persist_fetched_snapshot(
+                _FetchedPersistence(dialog_id, message_ids, fresh_ids, stale_ids, result.messages, now)
+            )
         failure = result.failure
         assert failure is not None
         if failure.kind.value == "flood_wait":

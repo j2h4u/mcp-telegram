@@ -9,6 +9,7 @@ import asyncio
 from collections.abc import Coroutine
 from typing import Protocol
 
+from .telegram_demand import current_demand_token
 from .telegram_rpc_scheduler import create_detached_rpc_task, current_rpc_scope
 
 
@@ -28,16 +29,18 @@ async def call_with_timeout(client: ActivityClient, request: object, *, timeout_
     and explicitly cancel the pending task instead.  Completed tasks propagate
     their original exception through ``task.result()``.
     """
-    # The scheduler scope is owned by the caller task.  A plain create_task()
-    # copies that context but keeps the caller as its owner, which the gate
-    # correctly rejects.  Rebind the same source to an explicitly detached
-    # task so timed-out activity calls remain classified at the transport.
-    scope = current_rpc_scope()
+    # A plain create_task() copies the caller token but leaves the caller as its
+    # owner, which the gate correctly rejects. Transfer the complete token so a
+    # timed-out activity call keeps its exact root and nested acquisition.
+    token = current_demand_token()
+    attempt_budget = current_rpc_scope().attempt_budget
     task = create_detached_rpc_task(
         client(request),
-        source=scope.source,
+        source=token.source,
         timeout_seconds=timeout_s,
         name="activity-telegram-rpc",
+        demand_token=token,
+        attempt_budget=attempt_budget,
     )
     done, _pending = await asyncio.wait({task}, timeout=timeout_s)
     if not done:

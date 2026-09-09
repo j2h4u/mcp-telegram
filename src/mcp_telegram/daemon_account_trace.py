@@ -46,6 +46,7 @@ from .messages.telegram_adapter import extract_message_row
 from .models import DialogType
 from .resolver import Candidates, Resolved, _parse_tme_link, latinize, resolve
 from .telegram_access import ACCESS_LOST_ERRORS
+from .telegram_demand import AcquisitionKind
 from .telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
 from .telethon_dialog import classify_dialog_type
 
@@ -429,7 +430,11 @@ class DaemonAccountTraceService:
     async def _resolve_trace_username(self, username: str) -> dict:
         """Resolve an explicit username with one daemon-owned Telegram lookup."""
         try:
-            result = await self._deps.client(ResolveUsernameRequest(username=username))
+            with rpc_scope(
+                TelegramRpcSource.ACCOUNT_TRACE,
+                acquisition_kind=AcquisitionKind.ENTITY_LOOKUP,
+            ):
+                result = await self._deps.client(ResolveUsernameRequest(username=username))
         except (RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
             _raise_if_latched(exc)
             self._deps.logger.info(
@@ -1051,7 +1056,11 @@ async def _run_trace_visible_candidates(
 
     async def run_candidate(candidate: dict[str, object]) -> _TraceCandidateEnrichmentResult:
         async with semaphore:
-            with rpc_scope(TelegramRpcSource.ACCOUNT_TRACE, deadline=request.deadline_at):
+            with rpc_scope(
+                TelegramRpcSource.ACCOUNT_TRACE,
+                deadline=request.deadline_at,
+                acquisition_kind=AcquisitionKind.MESSAGE_HISTORY_PAGE,
+            ):
                 return await request.service._trace_enrich_one_candidate(
                     target_user_id=request.target_user_id,
                     candidate=candidate,

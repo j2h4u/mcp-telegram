@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,10 +34,13 @@ from mcp_telegram.config import (
     TelegramRpcSchedulerConfig,
 )
 from mcp_telegram.flood import FloodWaitAccumulator, FloodWaitKillSwitchPolicy, TelegramRpcThrottled
+from mcp_telegram.sync_db import ensure_sync_schema, load_account_cooldown_until_utc, save_account_cooldown_until_utc
 from mcp_telegram.telegram import create_client
+from mcp_telegram.telegram_demand import AcquisitionKind
 from mcp_telegram.telegram_rpc import (
     TelegramRpcAdmissionDeferred,
     TelegramRpcBudget,
+    TelegramRpcCooldownPersistence,
     TelegramRpcGate,
     TelegramRpcSource,
     UnclassifiedTelegramRpcError,
@@ -45,6 +49,7 @@ from mcp_telegram.telegram_rpc import (
     reset_account_cooldown,
     rpc_scope,
 )
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmission,
     RpcAdmissionClosedError,
@@ -255,6 +260,22 @@ def test_factory_uses_supplied_snapshot_without_loading_config_again(
         assert gate._fallback_wait_seconds == 17
         assert gate._cooldown_buffer_seconds == 2.5
         assert gate._transient_retry_delays == (0.0,)
+        assert gate._cooldown_persistence is None
+    finally:
+        gate.session.close()
+
+
+def test_factory_forwards_optional_cooldown_persistence(tmp_path: Path) -> None:
+    persistence = TelegramRpcCooldownPersistence(lambda: None, lambda _deadline: None)
+    gate = create_client.__wrapped__(
+        "1",
+        "hash",
+        session_name="persistent-cooldown",
+        config=McpTelegramConfig(state=StateConfig(dir=tmp_path)),
+        cooldown_persistence=persistence,
+    )
+    try:
+        assert gate._cooldown_persistence is persistence
     finally:
         gate.session.close()
 
@@ -610,6 +631,119 @@ async def test_gate_flood_cooldown_uses_buffer_and_extends_monotonically(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_gate_restores_persisted_cooldown_and_blocks_transport_until_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monotonic_now = [200.0]
+    loaded = 0
+    monkeypatch.setattr("mcp_telegram.telegram_rpc.time.monotonic", lambda: monotonic_now[0])
+    monkeypatch.setattr("mcp_telegram.telegram_rpc.time.time", lambda: 1_000.0)
+
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    seed_conn = sqlite3.connect(str(db_path))
+    save_account_cooldown_until_utc(seed_conn, 1_005.0)
+    seed_conn.close()
+    reopened_conn = sqlite3.connect(str(db_path))
+
+    def load_until_utc() -> float | None:
+        nonlocal loaded
+        loaded += 1
+        return load_account_cooldown_until_utc(reopened_conn)
+
+    gate = TelegramRpcGate(
+        StringSession(),
+        1,
+        "hash",
+        rpc_budget=TelegramRpcBudget(max_calls_per_period=0, period_seconds=60),
+        circuit_status=lambda: _CircuitStatus(open=False),
+        fallback_wait_seconds=60,
+        cooldown_buffer_seconds=1.0,
+        transient_retry_delays_seconds=(),
+        scheduler_policy=TelegramRpcSchedulerConfig(),
+        cooldown_persistence=TelegramRpcCooldownPersistence(
+            load_until_utc,
+            lambda deadline: save_account_cooldown_until_utc(reopened_conn, deadline),
+        ),
+    )
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+
+    async def wait_for_readiness() -> None:
+        waiting.set()
+        await release.wait()
+
+    gate._admission_scheduler = TelegramRpcAdmissionScheduler(
+        policy=gate._scheduler_policy,
+        limiter=gate._limiter,
+        clock=lambda: monotonic_now[0],
+        readiness=RpcTransportReadiness(
+            probe=gate._scheduler_transport_ready,
+            wait=wait_for_readiness,
+        ),
+    )
+    sender = _set_sender(gate, _request_value)
+    try:
+        caller = asyncio.create_task(_call(gate, "request"))
+        await waiting.wait()
+
+        assert loaded == 1
+        assert account_cooldown_deadline() == 205.0
+        assert sender.calls == 0
+        assert load_account_cooldown_until_utc(reopened_conn) == 1_005.0
+
+        monotonic_now[0] = 206.0
+        release.set()
+        assert await caller == "request"
+        assert sender.calls == 1
+    finally:
+        await gate.close_rpc_scheduler()
+        gate.session.close()
+        reopened_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_finite_flood_wait_persists_effective_max_utc_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_now = [100.0]
+    utc_now = [1_000.0]
+    saved: list[float] = []
+    gate = _gate()
+    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: None, saved.append)
+    monkeypatch.setattr("mcp_telegram.telegram_rpc.time.monotonic", lambda: monotonic_now[0])
+    monkeypatch.setattr("mcp_telegram.telegram_rpc.time.time", lambda: utc_now[0])
+
+    await gate._observe_flood(FloodWaitError(request=None, capture=7))
+    monotonic_now[0] = 101.0
+    utc_now[0] = 1_001.0
+    await gate._observe_flood(FloodWaitError(request=None, capture=2))
+    monotonic_now[0] = 102.0
+    utc_now[0] = 1_002.0
+    await gate._observe_flood(FloodWaitError(request=None, capture=10))
+
+    assert account_cooldown_deadline() == 113.0
+    assert saved == [1_008.0, 1_008.0, 1_013.0]
+
+
+@pytest.mark.asyncio
+async def test_latched_circuit_never_persists_a_cooldown() -> None:
+    saved: list[float] = []
+    gate = _gate(_CircuitStatus(open=True))
+    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: None, saved.append)
+    sender = _set_sender(gate, _request_value)
+
+    with pytest.raises(TelegramRpcThrottled) as caught:
+        await _call(gate, "request")
+
+    assert caught.value.latched
+    assert sender.calls == 0
+    assert account_cooldown_deadline() == 0.0
+    assert saved == []
+
+
+@pytest.mark.asyncio
 async def test_gate_concurrent_observation_marks_one_exception_once() -> None:
     gate = _gate()
     observed: list[dict[str, object]] = []
@@ -688,6 +822,7 @@ def test_gate_factory_invariants_without_connecting() -> None:
     )
     assert isinstance(gate, TelegramClient)
     assert gate._request_retries == 0
+    assert gate._cooldown_persistence is None
     assert gate.flood_sleep_threshold == 0
     assert gate._raise_last_call_error is True
     assert gate._auto_reconnect is True
@@ -978,31 +1113,63 @@ async def test_update_difference_open_circuit_waits_without_fatal_exception(
 
 
 @pytest.mark.asyncio
-async def test_telethon_update_loop_binds_live_difference_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_telethon_update_loop_scopes_difference_and_live_dispatch_separately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     gate = _gate()
-    seen: list[TelegramRpcSource] = []
+    seen: list[TelegramRpcScope] = []
 
-    async def base_update_loop(_self: TelegramClient) -> None:
-        seen.append(current_rpc_scope().source)
+    async def call_with_policy(
+        _request: object,
+        *,
+        ordered: bool,
+        scope: TelegramRpcScope,
+    ) -> object:
+        del ordered
+        seen.append(scope)
+        return object()
 
+    async def base_dispatch_update(_self: TelegramClient, _update: object) -> None:
+        seen.append(current_rpc_scope())
+
+    async def base_update_loop(client: TelegramClient) -> None:
+        await client(functions.updates.GetDifferenceRequest(pts=1, date=None, qts=0))
+        await client._dispatch_update("ordinary-live-update")
+
+    monkeypatch.setattr(gate, "_call_with_source_policy", call_with_policy)
+    monkeypatch.setattr(TelegramClient, "_dispatch_update", base_dispatch_update)
     monkeypatch.setattr(TelegramClient, "_update_loop", base_update_loop)
     await gate._update_loop()
 
-    assert seen == [TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE]
+    assert [(scope.demand_kind, scope.source, scope.acquisition_kind) for scope in seen] == [
+        (
+            DemandKind.TELETHON_UPDATE_DIFFERENCE,
+            TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE,
+            AcquisitionKind.UPDATE_DIFFERENCE,
+        ),
+        (
+            DemandKind.REALTIME_EVENT_ACQUISITION,
+            TelegramRpcSource.REALTIME_EVENT,
+            None,
+        ),
+    ]
+    with pytest.raises(UnclassifiedTelegramRpcError):
+        current_rpc_scope()
 
 
 @pytest.mark.asyncio
-async def test_telethon_update_child_task_rebinds_live_scope_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_telethon_update_child_task_owns_realtime_scope(monkeypatch: pytest.MonkeyPatch) -> None:
     gate = _gate()
-    seen: list[tuple[TelegramRpcSource, asyncio.Task[object] | None, asyncio.Task[object] | None]] = []
+    seen: list[
+        tuple[DemandKind | None, TelegramRpcSource, asyncio.Task[object] | None, asyncio.Task[object] | None]
+    ] = []
 
     async def base_dispatch_update(_self: TelegramClient, _update: object) -> None:
         scope = current_rpc_scope()
-        seen.append((scope.source, scope.owner_task, asyncio.current_task()))
+        seen.append((scope.demand_kind, scope.source, scope.owner_task, asyncio.current_task()))
 
     monkeypatch.setattr(TelegramClient, "_dispatch_update", base_dispatch_update)
-    with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE):
-        child = asyncio.create_task(gate._dispatch_update("update"))
+    child = asyncio.create_task(gate._dispatch_update("update"))
     await child
 
-    assert seen == [(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE, child, child)]
+    assert seen == [(DemandKind.REALTIME_EVENT_ACQUISITION, TelegramRpcSource.REALTIME_EVENT, child, child)]

@@ -12,8 +12,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, cast
 
+from ..demand_shadow_wiring import DemandShadow, run_legacy_demand_cycle
 from ..flood import TelegramRpcThrottled
 from ..maintenance_logging import log_maintenance_cycle
+from ..telegram_demand import DemandStatus, DurableDemandAdapter, RpcAttemptBudget, demand_context
+from ..telegram_rpc_consumers import DemandKind
+from ..telegram_rpc_scheduler import rpc_attempt_budget
 from .contracts import FolderSourceUnavailableError
 from .ports import FolderSnapshotRepository
 from .refresh import FolderRefresher, FolderRefreshResult
@@ -87,10 +91,23 @@ class FolderProjectionWorker:
         self._jitter = jitter
         self._failure_count = repository.read_consecutive_failures()
         self._last_outcome = repository.read_last_outcome()
-        self._next_due_at = repository.read_next_retry_at()
+        retry_at = repository.read_next_retry_at()
+        last_success_at = repository.read_last_success_at()
+        self._next_due_at = (
+            retry_at
+            if retry_at is not None
+            else None
+            if last_success_at is None or self._last_outcome not in {None, FolderAttemptResult.SUCCESS}
+            else math.ceil(last_success_at + policy.refresh_interval_seconds)
+        )
         self._warning_bucket: int | None = None
         self._primed = False
         self._attempt_lock = asyncio.Lock()
+        self._demand_shadow: DemandShadow | None = None
+
+    def bind_demand_shadow(self, shadow: DemandShadow) -> None:
+        """Attach the observation-only coordinator after daemon composition."""
+        self._demand_shadow = shadow
 
     async def prime(self) -> None:
         """Perform the one startup attempt; the run loop must not duplicate it."""
@@ -120,8 +137,11 @@ class FolderProjectionWorker:
             await self._attempt("scheduled")
 
     async def _attempt(self, reason: str) -> None:
-        async with self._attempt_lock:
-            await self._attempt_once(reason)
+        async def perform() -> None:
+            async with self._attempt_lock:
+                await self._attempt_once(reason)
+
+        await run_legacy_demand_cycle(self._demand_shadow, DemandKind.FOLDER_SNAPSHOT, perform)
 
     async def _attempt_once(self, reason: str) -> None:
         started = self._clock()
@@ -239,3 +259,38 @@ class FolderProjectionWorker:
             threshold,
             outcome or "persisted",
         )
+
+
+class FolderProjectionDemandAdapter(DurableDemandAdapter):
+    """Expose folder demand and run one bounded attempt through the worker."""
+
+    demand_kind = DemandKind.FOLDER_SNAPSHOT
+
+    def __init__(self, worker: FolderProjectionWorker) -> None:
+        self._worker = worker
+
+    def status(self, now: float) -> DemandStatus | None:
+        repository = self._worker._repository
+        policy = self._worker._policy
+        retry_at = repository.read_next_retry_at()
+        last_success_at = repository.read_last_success_at()
+        outcome = repository.read_last_outcome()
+        if retry_at is not None:
+            release_at = float(retry_at)
+        elif last_success_at is not None and outcome in {None, FolderAttemptResult.SUCCESS}:
+            release_at = math.ceil(last_success_at + policy.refresh_interval_seconds)
+        elif outcome in {FolderAttemptResult.CIRCUIT_OPEN, FolderAttemptResult.UNEXPECTED}:
+            return None
+        else:
+            release_at = now
+        freshness_deadline = None if last_success_at is None else last_success_at + policy.stale_threshold_seconds
+        return DemandStatus(release_at=release_at, freshness_deadline=freshness_deadline)
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Run one existing worker attempt under the precise durable demand."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        if budget.exhausted:
+            return
+        with demand_context(self.demand_kind), rpc_attempt_budget(budget):
+            await self._worker._attempt("demand")

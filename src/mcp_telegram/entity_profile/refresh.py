@@ -4,14 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
-from ..telegram_rpc_scheduler import TelegramRpcSource, create_scoped_rpc_task, rpc_scope
+from ..telegram_demand import (
+    AcquisitionKind,
+    DemandStatus,
+    DurableDemandAdapter,
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+    demand_context,
+)
+from ..telegram_rpc_consumers import DemandKind
+from ..telegram_rpc_scheduler import TelegramRpcSource, create_scoped_rpc_task, rpc_attempt_budget, rpc_scope
 
 RefreshCallback = Callable[[int], Awaitable[None]]
+DurableRefreshStatusCallback = Callable[[float], DemandStatus | None]
+DurableRefreshSliceCallback = Callable[[RpcAttemptBudget], Awaitable[None]]
 
 
 def _validate_positive_duration(value: object, name: str) -> None:
@@ -92,6 +104,8 @@ class EntityRefreshCoordinator:
         self._completion_events: dict[int, asyncio.Event] = {}
         self._wake = asyncio.Event()
         self._closed = False
+        self._durable_status_callback: DurableRefreshStatusCallback | None = None
+        self._durable_slice_callback: DurableRefreshSliceCallback | None = None
 
     @property
     def queue_depth(self) -> int:
@@ -124,6 +138,26 @@ class EntityRefreshCoordinator:
         self._ensure_workers()
         self._wake.set()
         return RefreshEnqueueResult.QUEUED
+
+    def bind_durable_executor(
+        self,
+        status: DurableRefreshStatusCallback,
+        run_slice: DurableRefreshSliceCallback,
+    ) -> None:
+        """Attach the domain-owned durable selector and one-acquisition runner."""
+        self._durable_status_callback = status
+        self._durable_slice_callback = run_slice
+
+    def durable_status(self, now: float) -> DemandStatus | None:
+        """Read durable entity refresh readiness without touching the queue."""
+        if self._durable_status_callback is None:
+            return None
+        return self._durable_status_callback(now)
+
+    async def run_durable_slice(self, budget: RpcAttemptBudget) -> None:
+        """Run the bound restart-safe entity acquisition slice, when available."""
+        if self._durable_slice_callback is not None:
+            await self._durable_slice_callback(budget)
 
     def _ensure_workers(self) -> None:
         required = self._limits.max_concurrent_refreshes
@@ -177,8 +211,12 @@ class EntityRefreshCoordinator:
                 event.set()
 
     async def run_rpc[T](self, operation: Callable[[], Awaitable[T]]) -> T:
-        """Apply the per-RPC budget to an operation owned by a refresh."""
-        return await asyncio.wait_for(operation(), timeout=self._limits.per_rpc_seconds)
+        """Apply the per-RPC budget to the refresh's entity lookup."""
+        with rpc_scope(
+            TelegramRpcSource.ENTITY_INFO_REFRESH,
+            acquisition_kind=AcquisitionKind.ENTITY_LOOKUP,
+        ):
+            return await asyncio.wait_for(operation(), timeout=self._limits.per_rpc_seconds)
 
     async def _worker(self) -> None:
         while True:
@@ -242,3 +280,35 @@ class EntityRefreshCoordinator:
             await asyncio.gather(*workers, return_exceptions=True)
         self._active_entities.clear()
         self._workers.clear()
+
+
+class EntityProfileDemandAdapter(DurableDemandAdapter):
+    """Execute one restart-safe entity-profile acquisition from durable state."""
+
+    demand_kind = DemandKind.ENTITY_PROFILE_REFRESH
+
+    def __init__(self, coordinator: EntityRefreshCoordinator) -> None:
+        self._coordinator = coordinator
+
+    def status(self, now: float) -> DemandStatus | None:
+        """Report the oldest persisted entity-section release boundary."""
+        return self._coordinator.durable_status(now)
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Run at most the supplied actual-attempt budget and retain its cursor."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        now = time.time()
+        status = self.status(now)
+        if status is None or not status.is_ready(now):
+            return
+        with demand_context(DemandKind.ENTITY_PROFILE_REFRESH):
+            with rpc_attempt_budget(budget):
+                with rpc_scope(
+                    TelegramRpcSource.ENTITY_INFO_REFRESH,
+                    acquisition_kind=AcquisitionKind.ENTITY_LOOKUP,
+                ):
+                    try:
+                        await self._coordinator.run_durable_slice(budget)
+                    except RpcAttemptBudgetExhaustedError:
+                        return

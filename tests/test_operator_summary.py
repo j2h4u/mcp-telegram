@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,98 @@ def test_summary_is_one_coherent_content_free_report(tmp_path: Path) -> None:
     assert "scheduled_messages: dispatched=12, worst wait=9.0s, max queue=2" in report.text
     assert "sync.read_reconciliation applied=1" in report.text
     assert "get_entity_info: tool_error" in report.text
+
+
+def test_summary_reports_demand_units_capacity_and_overdue_reason(tmp_path: Path) -> None:
+    now = 2_000_000_000.0
+    db_path = tmp_path / "sync.db"
+    _database(db_path, now_ms=int(now * 1000))
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            "INSERT INTO runtime_observations("
+            "observed_at_ms,kind,runtime_instance_id,outcome,reason_code,payload_json"
+            ") VALUES (?,?,?,?,?,?)",
+            (
+                int(now * 1000) - 4_000,
+                "telegram.demand",
+                "current",
+                "offered",
+                None,
+                json.dumps({"demand_kind": "scheduled_repair", "demand_units": 4, "actual_attempts": 0}),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO runtime_observations("
+            "observed_at_ms,kind,runtime_instance_id,outcome,reason_code,payload_json"
+            ") VALUES (?,?,?,?,?,?)",
+            (
+                int(now * 1000) - 3_000,
+                "telegram.demand",
+                "current",
+                "deferred",
+                "capacity",
+                json.dumps(
+                    {
+                        "demand_kind": "scheduled_repair",
+                        "demand_units": 2,
+                        "actual_attempts": 1,
+                        "oldest_overdue_seconds": 3.5,
+                    }
+                ),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO runtime_observations("
+            "observed_at_ms,kind,runtime_instance_id,outcome,reason_code,payload_json"
+            ") VALUES (?,?,?,?,?,?)",
+            (
+                int(now * 1000) - 2_000,
+                "telegram.demand",
+                "current",
+                "predicted_selection",
+                None,
+                json.dumps(
+                    {
+                        "demand_kind": "scheduled_discovery",
+                        "demand_units": 1,
+                        "actual_attempts": 0,
+                        "queue_age_seconds": 8.0,
+                        "predicted_kind": "scheduled_repair",
+                        "selection_match": False,
+                    }
+                ),
+            ),
+        )
+        conn.commit()
+
+    report = build_operator_summary(db_path, since_seconds=15 * 3600, now=now)
+
+    assert (
+        "Demand: offered=4, predicted selection=1, deferred=2, actual attempts=1, selection matches=0, "
+        "mismatches=1, oldest queue age=8.0s, oldest overdue=3.5s, reasons=capacity=2" in report.text
+    )
+    assert "scheduled_repair: offered=4, deferred=2" in report.text
+
+
+def test_summary_marks_window_unreliable_when_snapshot_reports_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 2_000_000_000.0
+    db_path = tmp_path / "sync.db"
+    _database(db_path, now_ms=int(now * 1000))
+    import mcp_telegram.operator_summary as summary_module
+
+    original = summary_module.read_operator_summary_snapshot
+
+    def with_loss(path: Path, since_ms: int):
+        observations, history_row, dialog_rows, _coverage = original(path, since_ms)
+        return observations, history_row, dialog_rows, {"loss_observed": True}
+
+    monkeypatch.setattr(summary_module, "read_operator_summary_snapshot", with_loss)
+    report = build_operator_summary(db_path, since_seconds=15 * 3600, now=now)
+
+    assert report.window_complete is False
+    assert "window=partial/unreliable (telemetry loss)" in report.text
 
 
 def test_summary_cli_reads_configured_runtime_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import cast
 
@@ -13,8 +14,12 @@ from mcp_telegram.sync_db import (
     _migrate_from_legacy_db,
     _open_sync_db,
     ensure_sync_schema,
+    load_account_cooldown_until_utc,
+    load_self_profile_last_success_at,
     migrate_legacy_databases,
     open_sync_db_reader,
+    save_account_cooldown_until_utc,
+    save_self_profile_last_success_at,
 )
 
 TableInfoRow = tuple[int, str, str, int, object, int]
@@ -1599,6 +1604,7 @@ def test_schema_v17_dialogs_columns(tmp_sync_db_path: Path) -> None:
             # v24 (Phase 54): linked-chat resolution columns
             "linked_chat_id",
             "linked_chat_resolved_at",
+            "revision",
         }
         assert required == set(columns.keys()), (
             f"Column mismatch.\nExpected: {sorted(required)}\nGot: {sorted(columns.keys())}"
@@ -1699,9 +1705,35 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 58, f"_CURRENT_SCHEMA_VERSION must be 58, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 60, f"_CURRENT_SCHEMA_VERSION must be 60, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
+
+
+def test_finite_account_cooldown_round_trips_and_clears(tmp_sync_db_path: Path) -> None:
+    ensure_sync_schema(tmp_sync_db_path)
+    with closing(_open_db(tmp_sync_db_path)) as conn:
+        assert load_account_cooldown_until_utc(conn) is None
+        save_account_cooldown_until_utc(conn, 123.5)
+        assert load_account_cooldown_until_utc(conn) == 123.5
+        save_account_cooldown_until_utc(conn, None)
+        assert load_account_cooldown_until_utc(conn) is None
+        for invalid in (float("inf"), float("nan"), -1.0, True):
+            with pytest.raises(ValueError, match="finite non-negative"):
+                save_account_cooldown_until_utc(conn, invalid)
+
+
+def test_self_profile_success_timestamp_round_trips_and_rejects_non_finite(
+    tmp_sync_db_path: Path,
+) -> None:
+    ensure_sync_schema(tmp_sync_db_path)
+    with closing(_open_db(tmp_sync_db_path)) as conn:
+        assert load_self_profile_last_success_at(conn) is None
+        save_self_profile_last_success_at(conn, 456.25)
+        assert load_self_profile_last_success_at(conn) == 456.25
+        for invalid in (float("inf"), float("nan"), -1.0, False):
+            with pytest.raises(ValueError, match="finite non-negative"):
+                save_self_profile_last_success_at(conn, invalid)
 
 
 def test_synced_dialogs_has_delta_freshness_columns(tmp_sync_db_path: Path) -> None:

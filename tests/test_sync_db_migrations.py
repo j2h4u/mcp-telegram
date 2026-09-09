@@ -13,6 +13,7 @@ from typing import cast
 
 import pytest
 
+import mcp_telegram.sync_db as sync_db_module
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
     _apply_migration_51,
@@ -22,6 +23,8 @@ from mcp_telegram.sync_db import (
     _apply_migration_55,
     _apply_migration_56,
     _apply_migration_58,
+    _apply_migration_59,
+    _apply_migration_60,
     _open_sync_db,
     ensure_sync_schema,
 )
@@ -710,7 +713,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 58
+        assert _CURRENT_SCHEMA_VERSION == 60
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1441,7 +1444,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 58
+        assert _CURRENT_SCHEMA_VERSION == 60
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:
@@ -2372,3 +2375,170 @@ def test_v58_adds_account_trace_author_indexes(tmp_path: Path) -> None:
             "idx_messages_account_trace_post_author",
         }
         assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=58") == (58,)
+
+
+def test_v59_seeds_active_scheduled_repairs_and_staggers_discovery(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute("DROP TABLE scheduled_reconciliation_state")
+        conn.execute("DELETE FROM schema_version WHERE version=59")
+        conn.execute("INSERT INTO dialogs(dialog_id, type, hidden) VALUES (42, 'user', 0)")
+        conn.execute(
+            "INSERT INTO scheduled_messages(dialog_id, message_id, scheduled_at, first_seen_at, updated_at) "
+            "VALUES (42, 7, 2000000000, 1, 1)"
+        )
+        conn.commit()
+
+        _apply_migration_59(conn, 58)
+
+        now = _fetchone_int(conn, "SELECT applied_at FROM schema_version WHERE version=59")
+        state = _fetchone_row(
+            conn,
+            "SELECT repair_due_at, discovery_due_at FROM scheduled_reconciliation_state WHERE dialog_id=42",
+        )
+        assert state == (now, now + 42)
+        assert {row[1] for row in _table_info(conn, "scheduled_reconciliation_state")} == {
+            "dialog_id",
+            "repair_due_at",
+            "discovery_due_at",
+            "dirty_since",
+            "dirty_generation",
+            "updated_at",
+        }
+
+
+def test_v60_adds_restart_safe_domain_state_and_preserves_profile_retry(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.executescript(
+            """
+            DROP TRIGGER dialogs_revision_after_update;
+            DROP TRIGGER synced_dialogs_clear_access_recovery;
+            DROP TABLE dialog_full_reconciliation_baseline;
+            DROP TABLE dialog_full_reconciliation_state;
+            DROP TABLE delta_access_recovery_state;
+            DROP INDEX idx_entity_profile_refresh_due;
+            DROP TABLE entity_profile_refresh_state;
+            CREATE TABLE entity_profile_refresh_state (
+                entity_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL CHECK(status IN ('failed', 'pending')),
+                retry_at INTEGER,
+                reason TEXT,
+                updated_at INTEGER NOT NULL
+            ) WITHOUT ROWID;
+            INSERT INTO entity_profile_refresh_state VALUES (42, 'failed', 123, 'timeout', 100);
+            ALTER TABLE activity_dialog_state DROP COLUMN hot_page_offset_id;
+            ALTER TABLE activity_dialog_state DROP COLUMN hot_window_max_id;
+            ALTER TABLE activity_dialog_state DROP COLUMN hot_window_had_new;
+            ALTER TABLE dialogs DROP COLUMN revision;
+            DELETE FROM schema_version WHERE version=60;
+            """
+        )
+        conn.commit()
+
+        assert _apply_migration_60(conn, 59) == 60
+
+        activity_columns = {row[1] for row in _table_info(conn, "activity_dialog_state")}
+        assert {"hot_page_offset_id", "hot_window_max_id", "hot_window_had_new"} <= activity_columns
+        assert "revision" in {row[1] for row in _table_info(conn, "dialogs")}
+        assert _fetchone_row(
+            conn,
+            "SELECT generation, status FROM dialog_full_reconciliation_state WHERE singleton=1",
+        ) == (0, "idle")
+        assert _fetchone_row(
+            conn,
+            "SELECT status, retry_at, next_section, acquisition_cursor "
+            "FROM entity_profile_refresh_state WHERE entity_id=42",
+        ) == ("failed", 123, "full_profile", 0)
+        conn.execute(
+            "INSERT INTO entity_profile_refresh_state("
+            "entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor) "
+            "VALUES (43,'rejected',NULL,'full',100,'avatar_history',2)"
+        )
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=60") == (60,)
+
+
+def test_genuine_v59_schema_upgrades_to_v60_and_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "sync.db"
+    with monkeypatch.context() as v59:
+        v59.setattr(sync_db_module, "_CURRENT_SCHEMA_VERSION", 59)
+        v59.setattr(sync_db_module, "_DOMAIN_RESUME_STATE_MIGRATION_60", 59)
+        ensure_sync_schema(db_path)
+
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 59
+        assert "revision" not in {row[1] for row in _table_info(conn, "dialogs")}
+        assert "next_section" not in {row[1] for row in _table_info(conn, "entity_profile_refresh_state")}
+        conn.execute("INSERT INTO dialogs(dialog_id, name, type) VALUES (42, 'kept dialog', 'user')")
+        conn.execute(
+            "INSERT INTO activity_dialog_state("
+            "dialog_id, source, hot_cursor, created_at, updated_at) "
+            "VALUES (42, 'supergroup', 77, 100, 200)"
+        )
+        conn.execute(
+            "INSERT INTO entity_profile_refresh_state("
+            "entity_id, status, retry_at, reason, updated_at) "
+            "VALUES (42, 'failed', 123, 'timeout', 100)"
+        )
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchone_row(
+            conn,
+            "SELECT name, revision FROM dialogs WHERE dialog_id=42",
+        ) == ("kept dialog", 0)
+        assert _fetchone_row(
+            conn,
+            "SELECT source, hot_cursor, hot_page_offset_id, hot_window_max_id, hot_window_had_new "
+            "FROM activity_dialog_state WHERE dialog_id=42",
+        ) == ("supergroup", 77, None, None, 0)
+        assert _fetchone_row(
+            conn,
+            "SELECT status, retry_at, reason, updated_at, next_section, acquisition_cursor "
+            "FROM entity_profile_refresh_state WHERE entity_id=42",
+        ) == ("failed", 123, "timeout", 100, "full_profile", 0)
+        assert _fetchone_row(
+            conn,
+            "SELECT generation, status, offset_id, observed_count "
+            "FROM dialog_full_reconciliation_state WHERE singleton=1",
+        ) == (0, "idle", 0, 0)
+        conn.execute(
+            "UPDATE dialog_full_reconciliation_state "
+            "SET generation=1, status='in_progress', observed_count=1 WHERE singleton=1"
+        )
+        conn.execute(
+            "INSERT INTO dialog_full_reconciliation_baseline("
+            "generation, dialog_id, baseline_revision, seen) VALUES (1, 42, 0, 1)"
+        )
+        conn.execute(
+            "INSERT INTO delta_access_recovery_state("
+            "dialog_id, stage, total_messages, probe_succeeded_at, retry_at, updated_at) "
+            "VALUES (42, 'gap_fill', 10, 300, 400, 500)"
+        )
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM schema_version WHERE version=60") == 1
+        assert _fetchone_row(
+            conn,
+            "SELECT generation, status, observed_count FROM dialog_full_reconciliation_state WHERE singleton=1",
+        ) == (1, "in_progress", 1)
+        assert _fetchone_row(
+            conn,
+            "SELECT baseline_revision, seen FROM dialog_full_reconciliation_baseline "
+            "WHERE generation=1 AND dialog_id=42",
+        ) == (0, 1)
+        assert _fetchone_row(
+            conn,
+            "SELECT stage, total_messages, probe_succeeded_at, retry_at, updated_at "
+            "FROM delta_access_recovery_state WHERE dialog_id=42",
+        ) == ("gap_fill", 10, 300, 400, 500)

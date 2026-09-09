@@ -9,9 +9,10 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import Protocol, cast
 
 from .access_lifecycle import set_access_lost
+from .demand_shadow_wiring import DemandShadow, offer_durable_demand, run_legacy_demand_cycle
 from .flood import TelegramRpcThrottled
 from .hydration_queue import (
     MEDIA_METADATA_KIND,
@@ -31,6 +32,14 @@ from .messages.sqlite_hydration_jobs import (
     repair_transcription_hydration_jobs,
 )
 from .telegram_access import ACCESS_LOST_ERRORS
+from .telegram_demand import (
+    AcquisitionKind,
+    DemandStatus,
+    DurableDemandAdapter,
+    RpcAttemptBudget,
+    current_demand_token,
+)
+from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_error import TelegramRpcErrorDescriptor, describe_telegram_rpc_error
 from .telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
@@ -38,6 +47,8 @@ from .telegram_rpc_scheduler import (
     RpcAdmissionSaturatedError,
     TelegramRpcAdmissionDeferred,
     TelegramRpcSource,
+    create_scoped_rpc_task,
+    rpc_attempt_budget,
     rpc_scope,
 )
 
@@ -157,6 +168,15 @@ def _hydration_rpc_source(priority: HydrationPriority) -> TelegramRpcSource:
     raise ValueError(f"unsupported hydration priority: {priority!r}")
 
 
+def _hydration_demand_kind(priority: HydrationPriority) -> DemandKind:
+    """Map one durable queue tier to its registered root demand."""
+    if priority is HydrationPriority.FOREGROUND:
+        return DemandKind.LIVE_HYDRATION_BATCH
+    if priority is HydrationPriority.BACKFILL:
+        return DemandKind.BACKFILL_HYDRATION_BATCH
+    raise ValueError(f"unsupported hydration priority: {priority!r}")
+
+
 def _due_job_order_key(job: HydrationJob) -> tuple[int, int, str, int, int]:
     return (-job.message_sent_at, job.due_at, job.kind, job.dialog_id, job.message_id)
 
@@ -257,6 +277,43 @@ def _has_due_priority(jobs: Sequence[HydrationJob], priority: HydrationPriority)
     return any(job.priority == priority for job in jobs)
 
 
+class FactHydrationDemandAdapter(DurableDemandAdapter):
+    """Read one durable hydration tier while the legacy worker executes it.
+
+    Live and backfill rows share ``hydration_jobs`` but have distinct demand
+    contracts. The priority column is therefore the authoritative partition;
+    this adapter neither selects nor claims rows in PR1 shadow mode.
+    """
+
+    def __init__(self, worker: MessageFactHydrationWorker, priority: HydrationPriority) -> None:
+        if not isinstance(priority, HydrationPriority):
+            raise TypeError("priority must be a HydrationPriority")
+        self._worker = worker
+        self._priority = priority
+        self.demand_kind = _hydration_demand_kind(priority)
+
+    def status(self, now: float) -> DemandStatus | None:
+        """Return the earliest active row in this durable priority tier."""
+        del now
+        row = cast(
+            tuple[object] | None,
+            self._worker._conn.execute(
+                "SELECT MIN(due_at) FROM hydration_jobs WHERE terminal = 0 AND priority = ?",
+                (int(self._priority),),
+            ).fetchone(),
+        )
+        release_at = None if row is None else row[0]
+        if release_at is None:
+            return None
+        return DemandStatus(release_at=float(cast(int | float, release_at)))
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Run one compatible queue batch under the actual-attempt budget."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        await self._worker.run_priority_slice(self._priority, budget)
+
+
 class MessageFactHydrationWorker:
     """Process all registered fact kinds through one bounded runner."""
 
@@ -303,12 +360,29 @@ class MessageFactHydrationWorker:
         self._backfill_debt = 0
         self._backfill_waiting = False
         self._queue = HydrationQueueRepository(conn)
+        self._demand_shadow: DemandShadow | None = None
+
+    def bind_demand_shadow(self, shadow: DemandShadow) -> None:
+        """Attach the observation-only coordinator after daemon composition."""
+        self._demand_shadow = shadow
 
     async def run_cycle(self, *, now: int | None = None) -> FactHydrationCycleResult:
         effective_now = int(self._clock()) if now is None else now
         transcription_repair, media_repair = self._run_repair_producers(effective_now)
         # The repair is a producer transaction. Commit before any awaited RPC.
         self._conn.commit()
+        if transcription_repair is not None and transcription_repair.enqueued:
+            offer_durable_demand(
+                self._demand_shadow,
+                DemandKind.LIVE_HYDRATION_BATCH,
+                DemandKind.BACKFILL_HYDRATION_BATCH,
+            )
+        if media_repair is not None and media_repair.enqueued:
+            offer_durable_demand(
+                self._demand_shadow,
+                DemandKind.LIVE_HYDRATION_BATCH,
+                DemandKind.BACKFILL_HYDRATION_BATCH,
+            )
         due = self._fair_due_jobs(effective_now)
         repair_fields = self._repair_result_fields(transcription_repair, media_repair)
         if not due:
@@ -352,6 +426,45 @@ class MessageFactHydrationWorker:
             selected_by_kind=selected_by_kind,
         )
         return result
+
+    async def run_priority_slice(self, priority: HydrationPriority, budget: RpcAttemptBudget) -> None:
+        """Run at most one due batch from a single durable priority tier."""
+        if not isinstance(priority, HydrationPriority):
+            raise TypeError("priority must be a HydrationPriority")
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        if budget.exhausted or self._shutdown_event.is_set():
+            return
+        effective_now = int(self._clock())
+        per_kind = {
+            kind: self._queue.due_jobs(
+                effective_now,
+                self._max_jobs_per_cycle,
+                kind=kind,
+                priority=priority,
+            )
+            for kind in self._handlers
+        }
+        selected: list[HydrationJob] = []
+        _append_due_priority_tier(
+            selected,
+            per_kind,
+            priority,
+            self._max_jobs_per_cycle,
+        )
+        batches = batch_jobs(selected, self._handlers, backfill_first=priority is HydrationPriority.BACKFILL)
+        batch = next(
+            (candidate for candidate in batches if self._handlers[candidate[0].kind].request_cost <= budget.remaining),
+            None,
+        )
+        if batch is None:
+            return
+        await self._process_batch(
+            self._handlers[batch[0].kind],
+            batch,
+            effective_now,
+            attempt_budget=budget,
+        )
 
     def _run_repair_producers(
         self, effective_now: int
@@ -566,18 +679,15 @@ class MessageFactHydrationWorker:
         handler: HydrationHandler,
         batch: Sequence[HydrationJob],
         effective_now: int,
+        *,
+        attempt_budget: RpcAttemptBudget | None = None,
     ) -> _BatchOutcome:
         started, preflight_observations = self._start_batch(handler, batch)
         if not started:
             self._log_drops(batch, preflight_observations)
             return _BatchOutcome(dropped=len(preflight_observations))
         try:
-            # Keep the source binding exactly around the Telegram-backed
-            # request.  Local queue state and result application stay outside
-            # the scope, while foreground and backfill jobs remain distinct
-            # scheduler classes even when they share one handler.
-            with rpc_scope(_hydration_rpc_source(batch[0].priority)):
-                result = await handler.request(self._client, started)
+            result = await self._request_batch(handler, started, attempt_budget=attempt_budget)
         except TelegramRpcAdmissionDeferred as exc:
             return self._handle_admission_rejection(handler, batch, started, preflight_observations, exc, effective_now)
         except TelegramRpcThrottled as exc:
@@ -601,6 +711,48 @@ class MessageFactHydrationWorker:
 
         applied = handler.apply(self._conn, self._queue, started, result, now=effective_now)
         return self._finish_applied(handler, batch, started, preflight_observations, applied, effective_now)
+
+    async def _request_batch(
+        self,
+        handler: HydrationHandler,
+        jobs: Sequence[HydrationJob],
+        *,
+        attempt_budget: RpcAttemptBudget | None = None,
+    ) -> object:
+        """Run one tier-specific request under a fresh root demand context.
+
+        The legacy worker loop is launched under the backfill source, but a
+        cycle may select live rows. A short child task clears that loop context
+        so the selected priority, rather than the launcher, owns attribution.
+        """
+        source = _hydration_rpc_source(jobs[0].priority)
+
+        async def request() -> object:
+            with rpc_scope(source, acquisition_kind=AcquisitionKind.MESSAGE_LOOKUP):
+                if attempt_budget is None:
+                    return await handler.request(self._client, jobs)
+                with rpc_attempt_budget(attempt_budget):
+                    return await handler.request(self._client, jobs)
+
+        async def dispatch() -> object:
+            return await create_scoped_rpc_task(
+                request(),
+                source=source,
+                name=f"fact-hydration-{jobs[0].priority.name.lower()}-batch",
+                demand_token=current_demand_token(),
+            )
+
+        if self._demand_shadow is None:
+            return await create_scoped_rpc_task(
+                request(),
+                source=source,
+                name=f"fact-hydration-{jobs[0].priority.name.lower()}-batch",
+            )
+        return await run_legacy_demand_cycle(
+            self._demand_shadow,
+            _hydration_demand_kind(jobs[0].priority),
+            dispatch,
+        )
 
     def _handle_admission_rejection(  # noqa: PLR0913, PLR0917
         self,
@@ -985,6 +1137,7 @@ class MessageFactHydrationWorker:
 __all__ = [
     "AppliedFacts",
     "FactHydrationCycleResult",
+    "FactHydrationDemandAdapter",
     "HydrationDrop",
     "HydrationDropObservation",
     "HydrationHandler",

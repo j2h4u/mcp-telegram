@@ -5,7 +5,9 @@ import threading
 from dataclasses import dataclass, field, replace
 
 from mcp_telegram.config import RuntimeObservationConfig
-from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
+from mcp_telegram.rpc_admission_observations import DemandEvidenceOutcome, RpcAdmissionObservationAggregator
+from mcp_telegram.telegram_demand import AcquisitionKind
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RPC_SOURCE_SERVICE_CLASS,
     RpcAdmissionEvent,
@@ -236,3 +238,79 @@ async def test_periodic_flush_persists_a_quiet_window() -> None:
         await flush_task
 
     assert recorder.rows[0]["outcome"] == "summary"
+
+
+def test_demand_evidence_keeps_demand_and_attempt_units_separate() -> None:
+    recorder = _Recorder()
+    aggregator = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), clock=lambda: 0.0)
+
+    aggregator.observe_demand(
+        outcome=DemandEvidenceOutcome.OFFERED,
+        demand_kind=DemandKind.SCHEDULED_REPAIR,
+        acquisition_kind=AcquisitionKind.SCHEDULED_MESSAGES_SNAPSHOT,
+        demand_units=4,
+    )
+    aggregator.observe_demand(
+        outcome="deferred",
+        demand_kind=DemandKind.SCHEDULED_REPAIR,
+        acquisition_kind=AcquisitionKind.SCHEDULED_MESSAGES_SNAPSHOT,
+        demand_units=2,
+        actual_attempts=1,
+        oldest_overdue_seconds=3.5,
+        reason="capacity",
+    )
+    aggregator.observe_demand(
+        outcome=DemandEvidenceOutcome.PREDICTED_SELECTION,
+        demand_kind=DemandKind.SCHEDULED_DISCOVERY,
+        predicted_kind=DemandKind.SCHEDULED_REPAIR,
+        selection_match=False,
+        queue_age_seconds=8.0,
+    )
+    aggregator.flush(now=300.0)
+
+    assert [row["kind"] for row in recorder.rows] == ["telegram.demand"] * 3
+    offered, deferred, predicted = recorder.rows
+    assert offered["payload"] == {
+        "demand_kind": "scheduled_repair",
+        "acquisition_kind": "scheduled_messages_snapshot",
+        "demand_units": 4,
+        "actual_attempts": 0,
+        "window_seconds": 300,
+    }
+    assert deferred["reason_code"] == "capacity"
+    assert deferred["payload"] == {
+        "demand_kind": "scheduled_repair",
+        "acquisition_kind": "scheduled_messages_snapshot",
+        "demand_units": 2,
+        "actual_attempts": 1,
+        "oldest_overdue_seconds": 3.5,
+        "window_seconds": 300,
+    }
+    assert predicted["payload"] == {
+        "demand_kind": "scheduled_discovery",
+        "demand_units": 1,
+        "actual_attempts": 0,
+        "queue_age_seconds": 8.0,
+        "predicted_kind": "scheduled_repair",
+        "selection_match": False,
+        "window_seconds": 300,
+    }
+
+
+def test_transport_summary_carries_root_and_acquisition_dimensions() -> None:
+    recorder = _Recorder()
+    aggregator = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), clock=lambda: 0.0)
+    event = _event(RpcAdmissionEventKind.DISPATCHED, wait_seconds=0.1)
+    event = replace(
+        event,
+        demand_kind=DemandKind.MCP_REMOTE_ACQUISITION,
+        acquisition_kind=AcquisitionKind.MESSAGE_LOOKUP,
+    )
+    aggregator.observe(event)
+    aggregator.flush(now=300.0)
+
+    payload = recorder.rows[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["demand_kind"] == "mcp_remote_acquisition"
+    assert payload["acquisition_kind"] == "message_lookup"
+    assert payload["actual_attempts"] == 1

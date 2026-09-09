@@ -25,6 +25,7 @@ class OwnOnlyBasis(StrEnum):
     PERSONAL_CHANNEL = "personal_channel"
     OWNED_CHANNEL = "owned_channel"
     PERSONAL_CHANNEL_DISCUSSION = "personal_channel_discussion"
+    SCHEDULED_EVENT = "scheduled_event"
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +200,76 @@ def own_only_basis_by_dialog(conn: sqlite3.Connection) -> dict[int, tuple[str, .
     return result
 
 
+def add_own_only_basis(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    basis: OwnOnlyBasis | str,
+    *,
+    now: int | None = None,
+) -> None:
+    """Add one ownership reason while preserving all existing reasons.
+
+    This helper deliberately leaves transaction ownership to the caller so a
+    scheduled event can coalesce its queue state and ownership evidence in one
+    commit.
+    """
+    timestamp = int(time.time()) if now is None else int(now)
+    value = str(basis.value if isinstance(basis, OwnOnlyBasis) else basis)
+    row = cast(
+        tuple[object] | None,
+        conn.execute("SELECT inclusion_basis FROM own_only_dialogs WHERE dialog_id=?", (int(dialog_id),)).fetchone(),
+    )
+    if row is None:
+        conn.execute(
+            "INSERT INTO own_only_dialogs(dialog_id, inclusion_basis, updated_at) VALUES (?, ?, ?)",
+            (int(dialog_id), json.dumps([value], separators=(",", ":")), timestamp),
+        )
+        return
+    try:
+        raw = cast(object, json.loads(str(row[0])))
+    except TypeError, ValueError:
+        raw = []
+    existing = [item for item in raw if isinstance(item, str)] if isinstance(raw, list) else []
+    if value not in existing:
+        existing.append(value)
+    conn.execute(
+        "UPDATE own_only_dialogs SET inclusion_basis=?, updated_at=? WHERE dialog_id=?",
+        (json.dumps(existing, separators=(",", ":")), timestamp, int(dialog_id)),
+    )
+
+
+def remove_own_only_basis(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    basis: OwnOnlyBasis | str,
+    *,
+    now: int | None = None,
+) -> None:
+    """Remove one ownership reason without discarding unrelated evidence."""
+    timestamp = int(time.time()) if now is None else int(now)
+    value = str(basis.value if isinstance(basis, OwnOnlyBasis) else basis)
+    row = cast(
+        tuple[object] | None,
+        conn.execute("SELECT inclusion_basis FROM own_only_dialogs WHERE dialog_id=?", (int(dialog_id),)).fetchone(),
+    )
+    if row is None:
+        return
+    try:
+        raw = cast(object, json.loads(str(row[0])))
+    except TypeError, ValueError:
+        return
+    if not isinstance(raw, list):
+        return
+    retained = [item for item in raw if isinstance(item, str) and item != value]
+    if retained:
+        conn.execute(
+            "UPDATE own_only_dialogs SET inclusion_basis=?, updated_at=? WHERE dialog_id=?",
+            (json.dumps(retained, separators=(",", ":")), timestamp, int(dialog_id)),
+        )
+    else:
+        conn.execute("DELETE FROM own_only_dialogs WHERE dialog_id=?", (int(dialog_id),))
+
+
 def query_own_only_candidates(
     conn: sqlite3.Connection,
     *,
@@ -231,10 +302,12 @@ __all__ = [
     "OwnOnlyBasis",
     "OwnOnlyClassification",
     "OwnOnlyContext",
+    "add_own_only_basis",
     "classify_own_only_dialog",
     "enroll_own_only_dialog",
     "enroll_own_only_sync_dialog",
     "ensure_own_only_schema",
     "own_only_basis_by_dialog",
     "query_own_only_candidates",
+    "remove_own_only_basis",
 ]

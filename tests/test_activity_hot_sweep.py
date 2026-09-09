@@ -23,13 +23,14 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from typing import cast
 
 import pytest
 
 from mcp_telegram.activity_hot_sweep import (
+    HotActivityDemandAdapter,
     _HotSweepPeerOutcome,
     _log_recovered_messages,
     run_hot_sweep_loop,
@@ -45,10 +46,40 @@ from mcp_telegram.activity_peer_sweep import (
 )
 from mcp_telegram.config import ActivityHotSweepConfig
 from mcp_telegram.sync_db import _apply_migrations
-from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred
+from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
+from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred, current_rpc_scope
 
 _TEST_TIMEOUT_S = 120.0
 _POLICY = ActivityHotSweepConfig(jitter_max_seconds=0)
+
+
+@pytest.mark.asyncio
+async def test_loop_reports_hot_activity_demand_kind(monkeypatch: pytest.MonkeyPatch) -> None:
+    shutdown = asyncio.Event()
+    observed: list[DemandKind] = []
+
+    async def pass_once(*_args: object, **_kwargs: object) -> dict[str, int | float | bool | None]:
+        shutdown.set()
+        return {"genuinely_new": 0, "flood_wait_seconds": None}
+
+    async def run_cycle(kind: DemandKind, operation: Callable[[], Awaitable[object]]) -> object:
+        observed.append(kind)
+        return await operation()
+
+    monkeypatch.setattr("mcp_telegram.activity_hot_sweep.run_hot_sweep_pass", pass_once)
+    with _make_db() as conn:
+        await run_hot_sweep_loop(
+            _FakeClient(),
+            conn,
+            shutdown,
+            policy=_POLICY,
+            timeout_s=_TEST_TIMEOUT_S,
+            demand_cycle_runner=run_cycle,
+        )
+
+    assert observed == [DemandKind.HOT_ACTIVITY_PAGE]
+
 
 # ---------------------------------------------------------------------------
 # DB and enrollment helpers
@@ -281,6 +312,38 @@ async def test_stale_peer_not_selected(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_legacy_hot_pass_installs_exact_root_for_nested_acquisitions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _make_db() as conn:
+        dialog_id = -100100000025
+        _enroll(conn, dialog_id, last_activity_at=int(time.time()))
+        observed: list[tuple[DemandKind | None, AcquisitionKind | None]] = []
+
+        async def capture_working_set(*args: object, **kwargs: object) -> WorkingSetResult:
+            del args, kwargs
+            scope = current_rpc_scope()
+            observed.append((scope.demand_kind, scope.acquisition_kind))
+            return WorkingSetResult(enrolled_count=0)
+
+        async def capture_page(*args: object, **kwargs: object) -> SweepResult:
+            del args, kwargs
+            scope = current_rpc_scope()
+            observed.append((scope.demand_kind, scope.acquisition_kind))
+            return _make_sweep_result([])
+
+        monkeypatch.setattr("mcp_telegram.activity_hot_sweep.build_working_set", capture_working_set)
+        monkeypatch.setattr("mcp_telegram.activity_hot_sweep.sweep_peer_once", capture_page)
+
+        await run_hot_sweep_pass(_FakeClient(), conn, asyncio.Event(), policy=_POLICY, timeout_s=_TEST_TIMEOUT_S)
+
+        assert observed == [
+            (DemandKind.HOT_ACTIVITY_PAGE, AcquisitionKind.DIALOG_TRAVERSAL),
+            (DemandKind.HOT_ACTIVITY_PAGE, AcquisitionKind.MESSAGE_SEARCH_PAGE),
+        ]
+
+
+@pytest.mark.asyncio
 async def test_access_lost_peer_not_selected(monkeypatch: pytest.MonkeyPatch) -> None:
     """HotSweep must not keep retrying dialogs already marked access_lost."""
     with _make_db() as conn:
@@ -498,8 +561,8 @@ async def test_own_messages_persisted_with_out_flag(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
-async def test_flood_wait_sets_retry_at_and_persists_progress(monkeypatch: pytest.MonkeyPatch) -> None:
-    """On FloodWait: hot_next_retry_at is set, already-drained progress kept, no raise."""
+async def test_later_page_flood_wait_preserves_committed_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A later-page FloodWait must retry from the old committed window floor."""
     with _make_db() as conn:
         dialog_id = -100100000006
         now = int(time.time())
@@ -507,8 +570,8 @@ async def test_flood_wait_sets_retry_at_and_persists_progress(monkeypatch: pytes
         _enroll(conn, dialog_id, last_activity_at=now - 1200, hot_cursor=prior_cursor)
 
         flood_seconds = 120
-        # First page is FULL (100 messages) — so the inner loop continues to a second page
-        # which then returns FloodWait. max_seen must be committed from the first page.
+        # First page is full, so the unprocessed middle can only be reached by
+        # retaining the old floor and replaying this page after the FloodWait.
         page1_ids = list(range(201, 301))  # 100 messages — full page triggers next iteration
         results = {
             dialog_id: [
@@ -548,16 +611,76 @@ async def test_flood_wait_sets_retry_at_and_persists_progress(monkeypatch: pytes
         assert state.get("cold_offset_id") is None
         assert state.get("cold_next_retry_at") is None
 
-        # Already-drained page 1 progress must be persisted (hot_cursor advanced past prior_cursor)
-        assert state["hot_cursor"] is not None, "hot_cursor should be persisted for drained page 1"
-        assert cast(int, state["hot_cursor"]) == max(page1_ids), (
-            f"Drained page 1 max={max(page1_ids)} should be persisted, got {state['hot_cursor']}"
-        )
+        assert state["hot_cursor"] == prior_cursor
 
         # Page 1 messages counted (flood page contributes 0)
         assert telemetry["extracted"] == len(page1_ids), (
             f"Expected {len(page1_ids)} extracted (page 1 only), got {telemetry['extracted']}"
         )
+
+
+def test_hot_activity_adapter_reports_retry_gated_release() -> None:
+    with _make_db() as conn:
+        now = int(time.time())
+        dialog_id = -100100000099
+        _enroll(conn, dialog_id, last_activity_at=now, hot_cursor=10)
+        _save_dialog_state(conn, dialog_id, hot_next_retry_at=now + 90)
+        adapter = HotActivityDemandAdapter(_FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S)
+
+        status = adapter.status(float(now))
+
+        assert status is not None
+        assert status.release_at == now + 90
+
+
+@pytest.mark.asyncio
+async def test_hot_activity_adapter_resumes_page_window_before_advancing_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _make_db() as conn:
+        now = int(time.time())
+        dialog_id = -100100000100
+        _enroll(conn, dialog_id, last_activity_at=now, hot_cursor=10)
+        first_page = list(range(101, 201))
+        second_page = [11, 12]
+        call_log = _patch_sweep(
+            monkeypatch,
+            {
+                dialog_id: [
+                    _make_sweep_result(first_page),
+                    _make_sweep_result(second_page),
+                ]
+            },
+        )
+        adapter = HotActivityDemandAdapter(_FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S)
+
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+        state = _get_state(conn, dialog_id)
+        resume = cast(
+            tuple[int | None, int | None] | None,
+            conn.execute(
+                "SELECT hot_page_offset_id, hot_window_max_id FROM activity_dialog_state WHERE dialog_id=?",
+                (dialog_id,),
+            ).fetchone(),
+        )
+        assert state["hot_cursor"] == 10
+        assert resume == (min(first_page), max(first_page))
+
+        restarted = HotActivityDemandAdapter(_FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S)
+        await restarted.run_slice(RpcAttemptBudget(limit=1))
+
+        state = _get_state(conn, dialog_id)
+        resume = cast(
+            tuple[int | None, int | None] | None,
+            conn.execute(
+                "SELECT hot_page_offset_id, hot_window_max_id FROM activity_dialog_state WHERE dialog_id=?",
+                (dialog_id,),
+            ).fetchone(),
+        )
+        assert call_log[dialog_id] == [(0, 11), (min(first_page), 11)]
+        assert state["hot_cursor"] == max(first_page)
+        assert resume == (None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -600,8 +723,8 @@ async def test_access_skip_does_not_advance_cursor(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.asyncio
-async def test_full_page_without_min_id_persists_hot_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A defensive min_id gap still commits max_seen and exits the peer cleanly."""
+async def test_full_page_without_min_id_preserves_committed_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An ambiguous full page is retried without committing its incomplete window."""
     with _make_db() as conn:
         dialog_id = -100100000017
         now = int(time.time())
@@ -638,7 +761,7 @@ async def test_full_page_without_min_id_persists_hot_cursor(monkeypatch: pytest.
 
         state = _get_state(conn, dialog_id)
         assert telemetry["extracted"] == len(fetched_ids)
-        assert state["hot_cursor"] == max(fetched_ids)
+        assert state["hot_cursor"] == prior_cursor
         assert cast(int, state["hot_next_retry_at"]) > now
         assert state["hot_next_due_at"] == now - 1
         assert state["hot_empty_streak"] == 3

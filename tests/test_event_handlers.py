@@ -30,6 +30,13 @@ from mcp_telegram.event_handlers import (
     _NewMessageEvent,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.telegram_demand import (
+    AcquisitionKind,
+    UnclassifiedTelegramDemandError,
+    current_demand_token,
+    demand_context,
+)
+from mcp_telegram.telegram_rpc_consumers import DemandKind, TelegramRpcSource
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 _SQLiteConnection = sqlite3.Connection
@@ -105,6 +112,27 @@ def insert_synced_dialog(conn: _SQLiteConnection, dialog_id: int) -> None:
     conn.commit()
 
 
+def test_auto_enrollment_offers_full_sync_only_after_commit(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    offered: list[DemandKind] = []
+    shadow = MagicMock()
+
+    def offer(kind: DemandKind) -> bool:
+        assert not sync_db.in_transaction
+        offered.append(kind)
+        return True
+
+    shadow.offer.side_effect = offer
+    manager.bind_demand_shadow(shadow)
+
+    assert manager._auto_enroll_dm(42)
+    assert offered == [DemandKind.FULL_SYNC_PAGE]
+
+
 def confirm_human_dm(conn: _SQLiteConnection, dialog_id: int, message_id: int) -> None:
     conn.execute("INSERT OR REPLACE INTO dialogs(dialog_id, type) VALUES (?, 'user')", (dialog_id,))
     conn.execute("INSERT OR REPLACE INTO entities(id, type, updated_at) VALUES (?, 'user', 1)", (dialog_id,))
@@ -162,6 +190,16 @@ async def test_on_new_message_inserts_row(
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
+    offered: list[DemandKind] = []
+    shadow = MagicMock()
+
+    def offer(kind: DemandKind) -> bool:
+        assert not sync_db.in_transaction
+        offered.append(kind)
+        return True
+
+    shadow.offer.side_effect = offer
+    manager.bind_demand_shadow(shadow)
 
     msg = build_mock_message(id=500, text="hello")
     event = make_new_message_event(chat_id=dialog_id, message=msg)
@@ -175,6 +213,98 @@ async def test_on_new_message_inserts_row(
     assert row[0] == dialog_id
     assert row[1] == 500
     assert row[2] == "hello"
+    assert offered == [
+        DemandKind.LIVE_HYDRATION_BATCH,
+        DemandKind.BACKFILL_HYDRATION_BATCH,
+        DemandKind.MESSAGE_FACT_REFRESH,
+        DemandKind.READ_RECEIPT_BATCH,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_realtime_event_root_refines_nested_entity_acquisition(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dialog_id = 1003
+    insert_synced_dialog(sync_db, dialog_id)
+    observed: list[tuple[DemandKind, TelegramRpcSource, AcquisitionKind | None]] = []
+
+    async def inspect_acquisition(_message: object, _client: object) -> dict[int, str]:
+        token = current_demand_token()
+        observed.append((token.kind, token.source, token.acquisition_kind))
+        return {}
+
+    monkeypatch.setattr("mcp_telegram.event_handlers._build_fwd_entity_map", inspect_acquisition)
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    await manager.on_new_message(make_new_message_event(dialog_id, build_mock_message(id=503, text="root")))
+
+    assert observed == [
+        (
+            DemandKind.REALTIME_EVENT_ACQUISITION,
+            TelegramRpcSource.REALTIME_EVENT,
+            AcquisitionKind.ENTITY_LOOKUP,
+        )
+    ]
+    with pytest.raises(UnclassifiedTelegramDemandError):
+        current_demand_token()
+
+
+@pytest.mark.asyncio
+async def test_realtime_event_preserves_existing_protocol_root(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dialog_id = 1005
+    insert_synced_dialog(sync_db, dialog_id)
+    observed: list[tuple[DemandKind, TelegramRpcSource, AcquisitionKind | None]] = []
+
+    async def inspect_acquisition(_message: object, _client: object) -> dict[int, str]:
+        token = current_demand_token()
+        observed.append((token.kind, token.source, token.acquisition_kind))
+        return {}
+
+    monkeypatch.setattr("mcp_telegram.event_handlers._build_fwd_entity_map", inspect_acquisition)
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE):
+        await manager.on_new_message(make_new_message_event(dialog_id, build_mock_message(id=505, text="catch-up")))
+
+    assert observed == [
+        (
+            DemandKind.TELETHON_UPDATE_DIFFERENCE,
+            TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE,
+            AcquisitionKind.ENTITY_LOOKUP,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_realtime_event_cancellation_propagates_and_clears_context(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dialog_id = 1004
+    insert_synced_dialog(sync_db, dialog_id)
+
+    async def cancel_acquisition(_message: object, _client: object) -> dict[int, str]:
+        token = current_demand_token()
+        assert token.kind is DemandKind.REALTIME_EVENT_ACQUISITION
+        assert token.acquisition_kind is AcquisitionKind.ENTITY_LOOKUP
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("mcp_telegram.event_handlers._build_fwd_entity_map", cancel_acquisition)
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+
+    with pytest.raises(asyncio.CancelledError):
+        await manager.on_new_message(make_new_message_event(dialog_id, build_mock_message(id=504, text="cancel")))
+    with pytest.raises(UnclassifiedTelegramDemandError):
+        current_demand_token()
 
 
 @pytest.mark.asyncio

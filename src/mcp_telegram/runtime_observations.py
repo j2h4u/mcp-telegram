@@ -32,6 +32,7 @@ ALLOWED_KINDS = frozenset(
         "runtime.catch_up_request_failed",
         "runtime.task_failed",
         "telegram.rpc_admission",
+        "telegram.demand",
     }
 )
 

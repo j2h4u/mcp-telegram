@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from ..telegram_reading import GatewayFailure
 
 
+class ReactionPersistenceBusyError(RuntimeError):
+    """Raised when local reaction persistence is temporarily contended."""
+
+
 @dataclass(frozen=True, slots=True)
 class ReactionAggregate:
     """One aggregate counter reported by Telegram for a message."""

@@ -84,6 +84,7 @@ from .daemon_dialog_queries import (
     _LIST_TOPICS_SQL,
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
+from .demand_shadow_wiring import DemandShadow, offer_durable_demand
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
 from .entity_profile.refresh import RefreshLimits
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
@@ -99,6 +100,8 @@ from .runtime_observations import (
     tool_telemetry_identity,
 )
 from .sync_read_model import SyncStatus, build_sync_read_model
+from .telegram_demand import AcquisitionKind
+from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
     RpcAdmissionError,
     RpcAdmissionExpiredError,
@@ -106,7 +109,6 @@ from .telegram_rpc_scheduler import (
     TelegramRpcAdmissionDeferred,
     TelegramRpcSource,
     UnclassifiedTelegramRpcError,
-    current_rpc_scope,
     rpc_scope,
 )
 from .topics.contracts import TopicSourceUnavailableError
@@ -132,18 +134,13 @@ _runtime_event_write_count = 0
 
 
 @contextmanager
-def _preserve_or_rpc_scope(source: TelegramRpcSource) -> Iterator[None]:
-    """Classify a fallback unless a more-specific enclosing use case owns it."""
-    try:
-        active_scope = current_rpc_scope()
-    except UnclassifiedTelegramRpcError:
-        with rpc_scope(source):
-            yield
-        return
-    if active_scope.source is TelegramRpcSource.MCP_INTERACTIVE and source is not TelegramRpcSource.MCP_INTERACTIVE:
-        with rpc_scope(source):
-            yield
-    else:
+def _preserve_or_rpc_scope(
+    source: TelegramRpcSource,
+    *,
+    acquisition_kind: AcquisitionKind | None = None,
+) -> Iterator[None]:
+    """Classify direct calls and refine, but never replace, an active root."""
+    with rpc_scope(source, acquisition_kind=acquisition_kind):
         yield
 
 
@@ -563,7 +560,14 @@ class DaemonAPIServer:
         self._health_status = health_status
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
         self._entity_info_service: DaemonEntityInfoService | None = None
+        self._demand_shadow: DemandShadow | None = None
         self._conversation_changes_token_codec = ConversationChangesTokenCodec()
+
+    def bind_demand_shadow(self, shadow: DemandShadow) -> None:
+        """Attach post-commit durable wakeups after daemon composition."""
+        self._demand_shadow = shadow
+        if self._entity_info_service is not None:
+            self._entity_info_service.bind_demand_shadow(shadow)
 
     def _get_reading_service(self) -> ReadingService:
         """Get memoized reading-service instance with explicit daemon dependencies."""
@@ -969,7 +973,10 @@ class DaemonAPIServer:
 
     async def _resolve_dialog_entity(self, dialog: str) -> int | None:
         """Resolve a dialog selector through the live Telegram entity lookup."""
-        with _preserve_or_rpc_scope(TelegramRpcSource.DIALOG_RESOLUTION):
+        with _preserve_or_rpc_scope(
+            TelegramRpcSource.DIALOG_RESOLUTION,
+            acquisition_kind=AcquisitionKind.ENTITY_LOOKUP,
+        ):
             try:
                 entity = await self._client.get_entity(dialog)
                 return int(cast(int, telethon_utils.get_peer_id(entity)))
@@ -991,7 +998,10 @@ class DaemonAPIServer:
         """Enumerate the full visible remote directory before fuzzy resolution."""
         names: dict[int, str] = {}
         normalized: dict[int, str] = {}
-        with _preserve_or_rpc_scope(TelegramRpcSource.DIALOG_RESOLUTION):
+        with _preserve_or_rpc_scope(
+            TelegramRpcSource.DIALOG_RESOLUTION,
+            acquisition_kind=AcquisitionKind.DIALOG_TRAVERSAL,
+        ):
             async for remote_dialog in self._client.iter_dialogs():
                 name = _attr(remote_dialog, "name", "")
                 entity = _attr(remote_dialog, "entity", None)
@@ -1358,7 +1368,10 @@ class DaemonAPIServer:
     async def _refresh_topic_catalog_for_list_topics(self, dialog_id: int) -> str:
         if self._topic_refresher is None:
             return "topic_catalog_not_refreshed"
-        with _preserve_or_rpc_scope(TelegramRpcSource.TOPIC_RESOLUTION):
+        with _preserve_or_rpc_scope(
+            TelegramRpcSource.TOPIC_RESOLUTION,
+            acquisition_kind=AcquisitionKind.TOPIC_LOOKUP,
+        ):
             try:
                 entity = await self._client.get_entity(dialog_id)
                 refreshed = await self._topic_refresher.refresh(dialog_id, entity)
@@ -1402,6 +1415,20 @@ class DaemonAPIServer:
         if enable and self._hydration_requester is not None:
             self._hydration_requester(self._conn, dialog_id, now)
         self._conn.commit()
+        if enable:
+            if outcome.action in {
+                "queue_full_history",
+                "already_syncing",
+                "preserved_explicit_enable",
+            }:
+                offer_durable_demand(self._demand_shadow, DemandKind.FULL_SYNC_PAGE)
+            elif outcome.action == "request_delta_refresh":
+                offer_durable_demand(self._demand_shadow, DemandKind.DELTA_GAP_FILL)
+            offer_durable_demand(
+                self._demand_shadow,
+                DemandKind.BACKFILL_HYDRATION_BATCH,
+                DemandKind.READ_RECEIPT_BATCH,
+            )
         logger.info("mark_dialog_for_sync dialog_id=%d enable=%s", dialog_id, enable)
         return {
             "ok": True,
@@ -1531,6 +1558,8 @@ class DaemonAPIServer:
                     refresh_limits=self._policy.entity_profile,
                 )
             )
+            if self._demand_shadow is not None:
+                self._entity_info_service.bind_demand_shadow(self._demand_shadow)
         return self._entity_info_service
 
     async def _get_entity_info(self, req: dict[str, object]) -> dict:

@@ -51,6 +51,8 @@ from mcp_telegram.pagination import (
     decode_account_trace_navigation,
     encode_account_trace_navigation,
 )
+from mcp_telegram.telegram_demand import AcquisitionKind
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
 from mcp_telegram.tools import TOOL_REGISTRY
 from tests.daemon_api_policy import make_daemon_api_policy
@@ -102,15 +104,17 @@ def _dict(value: object) -> dict[str, object]:
 async def test_account_trace_entrypoint_sets_rpc_source(
     trace_service: DaemonAccountTraceService,
 ) -> None:
-    observed: list[TelegramRpcSource] = []
+    observed: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
 
     async def implementation(_req: dict) -> dict[str, object]:
-        observed.append(current_rpc_scope().source)
+        scope = current_rpc_scope()
+        assert scope.demand_kind is not None
+        observed.append((scope.source, scope.demand_kind, scope.acquisition_kind))
         return {"ok": True}
 
     trace_service._trace_account_messages_impl = implementation  # type: ignore[method-assign]
     assert await trace_service._trace_account_messages({}) == {"ok": True}
-    assert observed == [TelegramRpcSource.ACCOUNT_TRACE]
+    assert observed == [(TelegramRpcSource.ACCOUNT_TRACE, DemandKind.ACCOUNT_TRACE_PAGE, None)]
 
 
 def test_trace_typed_dict_contracts_are_importable() -> None:

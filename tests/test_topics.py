@@ -10,6 +10,8 @@ from telethon.tl.functions.messages import GetCustomEmojiDocumentsRequest, GetFo
 from telethon.tl.types import DocumentAttributeCustomEmoji, InputStickerSetEmpty
 
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.telegram_demand import AcquisitionKind
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_scope
 from mcp_telegram.topics.contracts import TopicFact, is_topic_capable
 from mcp_telegram.topics.refresh import TopicRefresher
@@ -26,11 +28,13 @@ class _Entity:
 class _Gateway:
     def __init__(self) -> None:
         self.entities: list[object] = []
-        self.sources: list[TelegramRpcSource] = []
+        self.scopes: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
 
     async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
         self.entities.append(entity)
-        self.sources.append(current_rpc_scope().source)
+        scope = current_rpc_scope()
+        assert scope.demand_kind is not None
+        self.scopes.append((scope.source, scope.demand_kind, scope.acquisition_kind))
         return (TopicFact(topic_id=1, title="General", is_general=True),)
 
 
@@ -82,7 +86,13 @@ async def test_topic_refresh_preserves_interactive_resolution_scope() -> None:
     with rpc_scope(TelegramRpcSource.TOPIC_RESOLUTION):
         await TopicRefresher(gateway, repository).refresh(42, _Entity(forum=True))
 
-    assert gateway.sources == [TelegramRpcSource.TOPIC_RESOLUTION]
+    assert gateway.scopes == [
+        (
+            TelegramRpcSource.TOPIC_RESOLUTION,
+            DemandKind.TOPIC_LOOKUP,
+            AcquisitionKind.TOPIC_SNAPSHOT,
+        )
+    ]
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import cast
 
-from .contracts import ReactionSnapshot
+from .contracts import ReactionPersistenceBusyError, ReactionSnapshot
 from .persistence import replace_reaction_aggregates
 
 
@@ -20,15 +20,21 @@ class SQLiteReactionSnapshotRepository:
     @contextmanager
     def transaction(self) -> Iterator[None]:
         """Isolate one refresh without committing a surrounding caller transaction."""
-        self._conn.execute("SAVEPOINT reaction_refresh")
         try:
-            yield
-        except BaseException:
-            self._conn.execute("ROLLBACK TO SAVEPOINT reaction_refresh")
-            self._conn.execute("RELEASE SAVEPOINT reaction_refresh")
+            self._conn.execute("SAVEPOINT reaction_refresh")
+            try:
+                yield
+            except BaseException:
+                self._conn.execute("ROLLBACK TO SAVEPOINT reaction_refresh")
+                self._conn.execute("RELEASE SAVEPOINT reaction_refresh")
+                raise
+            else:
+                self._conn.execute("RELEASE SAVEPOINT reaction_refresh")
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" in message or "busy" in message:
+                raise ReactionPersistenceBusyError("reaction persistence is temporarily busy") from exc
             raise
-        else:
-            self._conn.execute("RELEASE SAVEPOINT reaction_refresh")
 
     def history_enabled(self, dialog_id: int) -> bool:
         row = cast(

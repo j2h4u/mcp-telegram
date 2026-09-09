@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from ..telegram_rpc_scheduler import TelegramRpcSource, preserve_or_rpc_scope
+from ..telegram_demand import AcquisitionKind
+from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
 from .contracts import is_topic_capable
 from .ports import TelegramTopicGateway, TopicSnapshotRepository
 
@@ -15,7 +16,10 @@ class TopicRefresher:
     async def refresh(self, dialog_id: int, entity: object) -> int:
         if not is_topic_capable(entity):
             return 0
-        with preserve_or_rpc_scope(TelegramRpcSource.TOPIC_RECONCILIATION):
+        with rpc_scope(
+            TelegramRpcSource.TOPIC_RECONCILIATION,
+            acquisition_kind=AcquisitionKind.TOPIC_SNAPSHOT,
+        ):
             topics = await self._gateway.fetch_topics(entity)
         self._repository.upsert_topics(dialog_id, topics)
         return len(topics)
