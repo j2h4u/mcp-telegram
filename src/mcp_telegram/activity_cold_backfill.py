@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -32,14 +33,15 @@ from typing import Protocol, cast
 from .activity_peer_sweep import (
     SkipReason,
     SweepResult,
-    _save_dialog_state,
     build_working_set,
     sweep_peer_once,
 )
 from .activity_substrate import ActivityClient
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
-from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
+from .telegram_demand import AcquisitionKind, DemandStatus, DurableDemandAdapter, RpcAttemptBudget
+from .telegram_rpc_consumers import DemandKind
+from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_attempt_budget, rpc_scope
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,36 @@ class ColdBackfillPacing:
         )
 
 
+@dataclass(slots=True)
+class ColdPeerPageDemandAdapter(DurableDemandAdapter):
+    """Expose cold peer-page readiness over ``activity_dialog_state``."""
+
+    client: ActivityClient
+    conn: sqlite3.Connection
+    shutdown_event: asyncio.Event
+    pacing: ColdBackfillPacing
+    timeout_s: float
+    demand_kind = DemandKind.COLD_PEER_PAGE
+
+    def status(self, now: float) -> DemandStatus | None:
+        """Return the earliest release among incomplete accessible peers."""
+        release_at = _next_cold_release_at(self.conn, now=now)
+        if release_at is None:
+            return None
+        return DemandStatus(release_at=release_at)
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Run at most one claimed peer page under the transport budget."""
+        with rpc_attempt_budget(budget):
+            await run_cold_backfill_pass(
+                self.client,
+                self.conn,
+                self.shutdown_event,
+                pacing=self.pacing,
+                timeout_s=self.timeout_s,
+            )
+
+
 _BACKFILL_BATCH_LIMIT = 100
 
 
@@ -125,6 +157,7 @@ class _ColdPeerFinishContext:
     offset_id: int
     started_at: float
     now: int
+    claim_until: int
     result: SweepResult
 
 
@@ -186,7 +219,11 @@ async def _maybe_enroll_activity_peers(
         return last_enroll_at, None
 
     try:
-        with rpc_scope(TelegramRpcSource.ACTIVITY_COLD_BACKFILL, timeout_seconds=timeout_s):
+        with rpc_scope(
+            TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
+            timeout_seconds=timeout_s,
+            acquisition_kind=AcquisitionKind.DIALOG_TRAVERSAL,
+        ):
             result = await build_working_set(client, conn, timeout_s=timeout_s)
         logger.debug("activity_cold_backfill_enroll enrolled=%d", result.enrolled_count)
         return asyncio.get_running_loop().time(), result.flood_wait_seconds
@@ -201,15 +238,87 @@ async def _maybe_enroll_activity_peers(
     return asyncio.get_running_loop().time(), None
 
 
+def _next_cold_release_at(conn: sqlite3.Connection, *, now: float) -> float | None:
+    """Return the earliest authoritative cold-page release boundary."""
+    if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now) or now < 0:
+        raise ValueError("now must be a finite non-negative timestamp")
+    row = cast(
+        tuple[int] | None,
+        conn.execute(
+            """
+            SELECT MIN(COALESCE(ads.cold_next_retry_at, 0))
+            FROM activity_dialog_state AS ads
+            LEFT JOIN synced_dialogs AS sd ON sd.dialog_id = ads.dialog_id
+            WHERE ads.cold_status != 'complete'
+              AND COALESCE(sd.status, '') != 'access_lost'
+            """
+        ).fetchone(),
+    )
+    if row is None or row[0] is None:
+        return None
+    return float(row[0])
+
+
+def _claim_cold_backfill_peer(
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+    claim_until: int,
+) -> tuple[int, int | None] | None:
+    """Atomically claim the oldest due peer using the existing retry field as a lease."""
+    with conn:
+        return cast(
+            tuple[int, int | None] | None,
+            conn.execute(
+                """
+                UPDATE activity_dialog_state
+                SET cold_status = 'running',
+                    cold_next_retry_at = :claim_until,
+                    updated_at = :now
+                WHERE dialog_id = (
+                    SELECT ads.dialog_id
+                    FROM activity_dialog_state AS ads
+                    LEFT JOIN synced_dialogs AS sd ON sd.dialog_id = ads.dialog_id
+                    WHERE ads.cold_status != 'complete'
+                      AND (ads.cold_next_retry_at IS NULL OR ads.cold_next_retry_at <= :now)
+                      AND COALESCE(sd.status, '') != 'access_lost'
+                    ORDER BY ads.updated_at ASC, ads.dialog_id ASC
+                    LIMIT 1
+                )
+                  AND cold_status != 'complete'
+                  AND (cold_next_retry_at IS NULL OR cold_next_retry_at <= :now)
+                RETURNING dialog_id, cold_offset_id
+                """,
+                {"now": now, "claim_until": claim_until},
+            ).fetchone(),
+        )
+
+
+def _save_claimed_cold_state(ctx: _ColdPeerFinishContext, **fields: object) -> bool:
+    """Apply a result only while this slice still owns the peer lease."""
+    allowed = {"cold_offset_id", "cold_status", "cold_next_retry_at", "cold_last_error"}
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f"unknown claimed cold fields {unknown!r}")
+    assignments = ", ".join(f"{column} = ?" for column in fields)
+    values = [*fields.values(), int(time.time()), ctx.dialog_id, ctx.claim_until]
+    with ctx.conn:
+        cursor = ctx.conn.execute(
+            f"UPDATE activity_dialog_state SET {assignments}, updated_at = ? "
+            "WHERE dialog_id = ? AND cold_status = 'running' AND cold_next_retry_at = ?",
+            values,
+        )
+    return cursor.rowcount == 1
+
+
 def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfillPacing) -> ColdPassResult:
     """Apply one peer result and emit the matching telemetry."""
     result = ctx.result
     if result.skip_reason is SkipReason.FLOOD_WAIT:
         flood_wait_seconds = cast(int, result.flood_wait_seconds)
         next_retry_at = ctx.now + flood_wait_seconds
-        _save_dialog_state(
-            ctx.conn,
-            ctx.dialog_id,
+        _save_claimed_cold_state(
+            ctx,
             cold_status="pending",
             cold_next_retry_at=next_retry_at,
         )
@@ -230,9 +339,8 @@ def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfill
 
     if result.skip_reason is SkipReason.ACCESS_SKIP:
         next_retry_at = int(ctx.now + pacing.history.access_retry_s)
-        _save_dialog_state(
-            ctx.conn,
-            ctx.dialog_id,
+        _save_claimed_cold_state(
+            ctx,
             cold_status="pending",
             cold_next_retry_at=next_retry_at,
             cold_last_error="access_skip",
@@ -247,9 +355,8 @@ def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfill
         return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
 
     if result.skip_reason is SkipReason.HISTORY_FLOOR:
-        _save_dialog_state(
-            ctx.conn,
-            ctx.dialog_id,
+        _save_claimed_cold_state(
+            ctx,
             cold_status="complete",
             cold_next_retry_at=None,
         )
@@ -262,9 +369,8 @@ def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfill
         return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
 
     new_offset = result.min_id
-    _save_dialog_state(
-        ctx.conn,
-        ctx.dialog_id,
+    _save_claimed_cold_state(
+        ctx,
         cold_offset_id=new_offset,
         cold_status="pending",
         cold_next_retry_at=None,
@@ -309,32 +415,14 @@ async def run_cold_backfill_pass(
     started_at = time.monotonic()
     now = int(time.time())
 
-    # Select ONE due peer — oldest-updated first (round-robin anti-starvation)
-    row = cast(
-        tuple[int, int | None] | None,
-        conn.execute(
-            """
-        SELECT ads.dialog_id, ads.cold_offset_id
-        FROM activity_dialog_state AS ads
-        LEFT JOIN synced_dialogs AS sd ON sd.dialog_id = ads.dialog_id
-        WHERE ads.cold_status != 'complete'
-          AND (ads.cold_next_retry_at IS NULL OR ads.cold_next_retry_at <= :now)
-          AND COALESCE(sd.status, '') != 'access_lost'
-        ORDER BY ads.updated_at ASC, ads.dialog_id ASC
-        LIMIT 1
-        """,
-            {"now": now},
-        ).fetchone(),
-    )
+    claim_until = now + max(1, math.ceil(timeout_s + pacing.history.batch_s))
+    row = _claim_cold_backfill_peer(conn, now=now, claim_until=claim_until)
 
     if row is None:
         logger.debug("activity_cold_backfill_pass_no_due_peer")
         return ColdPassResult(outcome=ColdPassOutcome.NO_DUE_PEER, persisted=0)
 
     dialog_id, cold_offset_id = row
-
-    # Mark as running so the peer is not double-selected if the pass is slow
-    _save_dialog_state(conn, dialog_id, cold_status="running")
 
     # offset_id=0 means "start from newest and walk down"; thereafter use the
     # stored cold_offset_id which shrinks toward the history floor each pass.
@@ -346,7 +434,11 @@ async def run_cold_backfill_pass(
         offset_id,
     )
 
-    with rpc_scope(TelegramRpcSource.ACTIVITY_COLD_BACKFILL, timeout_seconds=timeout_s):
+    with rpc_scope(
+        TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
+        timeout_seconds=timeout_s,
+        acquisition_kind=AcquisitionKind.MESSAGE_SEARCH_PAGE,
+    ):
         result = await sweep_peer_once(
             client,
             conn,
@@ -365,6 +457,7 @@ async def run_cold_backfill_pass(
             offset_id=offset_id,
             started_at=started_at,
             now=now,
+            claim_until=claim_until,
             result=result,
         ),
         pacing,

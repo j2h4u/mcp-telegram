@@ -29,6 +29,7 @@ from mcp_telegram.activity_cold_backfill import (
     ColdBackfillPacing,
     ColdPassOutcome,
     ColdPassResult,
+    ColdPeerPageDemandAdapter,
     _cold_backfill_sleep_seconds,
     _maybe_enroll_activity_peers,
     _run_cold_backfill_pass_safe,
@@ -44,6 +45,7 @@ from mcp_telegram.activity_peer_sweep import (
     enroll_activity_dialog,
 )
 from mcp_telegram.sync_db import _apply_migrations
+from mcp_telegram.telegram_demand import RpcAttemptBudget
 
 _TEST_TIMEOUT_S = 120.0
 
@@ -324,6 +326,70 @@ async def test_no_due_peer_when_access_lost(monkeypatch: pytest.MonkeyPatch) -> 
 
         assert result.outcome == ColdPassOutcome.NO_DUE_PEER
         assert call_log == {}
+
+
+def test_cold_adapter_status_uses_retry_lease_and_access_filter() -> None:
+    with _make_db() as conn:
+        now = int(time.time())
+        immediate_id = -100100000020
+        delayed_id = -100100000021
+        _enroll(conn, immediate_id)
+        _enroll(conn, delayed_id, cold_next_retry_at=now + 120)
+        adapter = ColdPeerPageDemandAdapter(_FakeClient(), conn, asyncio.Event(), _PACING, _TEST_TIMEOUT_S)
+
+        status = adapter.status(float(now))
+        assert status is not None
+        assert status.release_at == 0
+
+        conn.execute("UPDATE synced_dialogs SET status = 'access_lost' WHERE dialog_id = ?", (immediate_id,))
+        conn.commit()
+        status = adapter.status(float(now))
+        assert status is not None
+        assert status.release_at == now + 120
+
+
+@pytest.mark.asyncio
+async def test_atomic_cold_claim_excludes_overlapping_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    with _make_db() as conn:
+        dialog_id = -100100000022
+        _enroll(conn, dialog_id)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _blocking_sweep(*args: object, **kwargs: object) -> SweepResult:
+            del args, kwargs
+            entered.set()
+            await release.wait()
+            return _normal_result([10])
+
+        monkeypatch.setattr("mcp_telegram.activity_cold_backfill.sweep_peer_once", _blocking_sweep)
+        first = asyncio.create_task(
+            run_cold_backfill_pass(_FakeClient(), conn, asyncio.Event(), pacing=_PACING, timeout_s=_TEST_TIMEOUT_S)
+        )
+        await entered.wait()
+
+        overlapping = await run_cold_backfill_pass(
+            _FakeClient(), conn, asyncio.Event(), pacing=_PACING, timeout_s=_TEST_TIMEOUT_S
+        )
+        release.set()
+        completed = await first
+
+        assert overlapping.outcome is ColdPassOutcome.NO_DUE_PEER
+        assert completed.outcome is ColdPassOutcome.WROTE
+
+
+@pytest.mark.asyncio
+async def test_cold_adapter_runs_one_peer_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    with _make_db() as conn:
+        dialog_id = -100100000023
+        _enroll(conn, dialog_id)
+        calls = _patch_sweep(monkeypatch, {dialog_id: [_normal_result([50, 60])]})
+        adapter = ColdPeerPageDemandAdapter(_FakeClient(), conn, asyncio.Event(), _PACING, _TEST_TIMEOUT_S)
+
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+        assert calls[dialog_id] == [(0, 0)]
+        assert _get_state(conn, dialog_id)["cold_offset_id"] == 50
 
 
 # ---------------------------------------------------------------------------

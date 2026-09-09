@@ -30,6 +30,8 @@ from typing import cast
 import pytest
 
 from mcp_telegram.activity_hot_sweep import (
+    HotActivityDemandAdapter,
+    HotActivityResumeStateRequiredError,
     _HotSweepPeerOutcome,
     _log_recovered_messages,
     run_hot_sweep_loop,
@@ -45,6 +47,7 @@ from mcp_telegram.activity_peer_sweep import (
 )
 from mcp_telegram.config import ActivityHotSweepConfig
 from mcp_telegram.sync_db import _apply_migrations
+from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred
 
 _TEST_TIMEOUT_S = 120.0
@@ -498,8 +501,8 @@ async def test_own_messages_persisted_with_out_flag(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
-async def test_flood_wait_sets_retry_at_and_persists_progress(monkeypatch: pytest.MonkeyPatch) -> None:
-    """On FloodWait: hot_next_retry_at is set, already-drained progress kept, no raise."""
+async def test_later_page_flood_wait_preserves_committed_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A later-page FloodWait must retry from the old committed window floor."""
     with _make_db() as conn:
         dialog_id = -100100000006
         now = int(time.time())
@@ -507,8 +510,8 @@ async def test_flood_wait_sets_retry_at_and_persists_progress(monkeypatch: pytes
         _enroll(conn, dialog_id, last_activity_at=now - 1200, hot_cursor=prior_cursor)
 
         flood_seconds = 120
-        # First page is FULL (100 messages) — so the inner loop continues to a second page
-        # which then returns FloodWait. max_seen must be committed from the first page.
+        # First page is full, so the unprocessed middle can only be reached by
+        # retaining the old floor and replaying this page after the FloodWait.
         page1_ids = list(range(201, 301))  # 100 messages — full page triggers next iteration
         results = {
             dialog_id: [
@@ -548,16 +551,40 @@ async def test_flood_wait_sets_retry_at_and_persists_progress(monkeypatch: pytes
         assert state.get("cold_offset_id") is None
         assert state.get("cold_next_retry_at") is None
 
-        # Already-drained page 1 progress must be persisted (hot_cursor advanced past prior_cursor)
-        assert state["hot_cursor"] is not None, "hot_cursor should be persisted for drained page 1"
-        assert cast(int, state["hot_cursor"]) == max(page1_ids), (
-            f"Drained page 1 max={max(page1_ids)} should be persisted, got {state['hot_cursor']}"
-        )
+        assert state["hot_cursor"] == prior_cursor
 
         # Page 1 messages counted (flood page contributes 0)
         assert telemetry["extracted"] == len(page1_ids), (
             f"Expected {len(page1_ids)} extracted (page 1 only), got {telemetry['extracted']}"
         )
+
+
+def test_hot_activity_adapter_reports_retry_gated_release() -> None:
+    with _make_db() as conn:
+        now = int(time.time())
+        dialog_id = -100100000099
+        _enroll(conn, dialog_id, last_activity_at=now, hot_cursor=10)
+        _save_dialog_state(conn, dialog_id, hot_next_retry_at=now + 90)
+        adapter = HotActivityDemandAdapter(_FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S)
+
+        status = adapter.status(float(now))
+
+        assert status is not None
+        assert status.release_at == now + 90
+
+
+@pytest.mark.asyncio
+async def test_hot_activity_adapter_refuses_slice_before_mutation() -> None:
+    with _make_db() as conn:
+        now = int(time.time())
+        dialog_id = -100100000100
+        _enroll(conn, dialog_id, last_activity_at=now, hot_cursor=10)
+        adapter = HotActivityDemandAdapter(_FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S)
+
+        with pytest.raises(HotActivityResumeStateRequiredError, match="hot_page_offset_id"):
+            await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+        assert _get_state(conn, dialog_id)["hot_cursor"] == 10
 
 
 # ---------------------------------------------------------------------------

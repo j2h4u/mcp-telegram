@@ -11,6 +11,7 @@ No scheduling state from Tier B (cold_*) is touched here.
 import asyncio
 import hashlib
 import logging
+import math
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -29,6 +30,8 @@ from .flood import TelegramRpcThrottled
 from .hydration_queue import HydrationPriority
 from .maintenance_logging import log_maintenance_cycle
 from .messages.sqlite_bundle import message_log_context
+from .telegram_demand import AcquisitionKind, DemandStatus, DurableDemandAdapter, RpcAttemptBudget
+from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
     TelegramRpcAdmissionDeferred,
@@ -109,6 +112,44 @@ class HotSweepPolicy(Protocol):
     def initial_spread_seconds(self) -> float: ...
 
 
+class HotActivityResumeStateRequiredError(RuntimeError):
+    """Raised before cutover when a bounded hot page cannot resume safely."""
+
+
+@dataclass(slots=True)
+class HotActivityDemandAdapter(DurableDemandAdapter):
+    """Read durable hot-page readiness without competing with the legacy loop.
+
+    PR1 shadow selection calls only :meth:`status`.  A one-attempt executable
+    slice needs durable in-progress page state before it can replace the legacy
+    multi-page window runner, so :meth:`run_slice` fails before any mutation.
+    """
+
+    client: ActivityClient
+    conn: sqlite3.Connection
+    shutdown_event: asyncio.Event
+    policy: HotSweepPolicy
+    timeout_s: float
+    demand_kind = DemandKind.HOT_ACTIVITY_PAGE
+
+    def status(self, now: float) -> DemandStatus | None:
+        """Return the earliest release among eligible hot peers."""
+        release_at = _next_hot_release_at(self.conn, now=now)
+        if release_at is None:
+            return None
+        return DemandStatus(release_at=release_at)
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Refuse execution until page resume state can be committed safely."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        if self.status(time.time()) is None:
+            return
+        raise HotActivityResumeStateRequiredError(
+            "hot activity slices require durable hot_page_offset_id and hot_window_max_id state"
+        )
+
+
 @dataclass
 class _HotSweepPeerOutcome:
     """Outcome for one peer within a hot sweep pass."""
@@ -159,15 +200,10 @@ def _save_hot_flood_state(
     conn: sqlite3.Connection,
     dialog_id: int,
     *,
-    old_hot_cursor: int,
-    max_seen: int,
     next_retry_at: int,
 ) -> None:
-    """Persist hot-state after a FloodWait and keep already-drained progress."""
-    save_fields: dict[str, object] = {"hot_next_retry_at": next_retry_at}
-    if max_seen > old_hot_cursor:
-        save_fields["hot_cursor"] = max_seen
-    _save_dialog_state(conn, dialog_id, **save_fields)
+    """Persist retry timing without committing an incomplete newest window."""
+    _save_dialog_state(conn, dialog_id, hot_next_retry_at=next_retry_at)
 
 
 def _save_hot_access_skip_state(
@@ -255,8 +291,6 @@ def _handle_hot_sweep_page_result(ctx: _HotPageContext) -> tuple[_HotSweepPeerOu
         _save_hot_flood_state(
             peer.conn,
             peer.dialog_id,
-            old_hot_cursor=peer.old_hot_cursor or 0,
-            max_seen=max_seen,
             next_retry_at=next_retry_at,
         )
         logger.warning(
@@ -457,7 +491,11 @@ async def _refresh_hot_working_set(
     *,
     timeout_s: float,
 ) -> WorkingSetResult:
-    with rpc_scope(TelegramRpcSource.ACTIVITY_HOT_SWEEP, timeout_seconds=timeout_s):
+    with rpc_scope(
+        TelegramRpcSource.ACTIVITY_HOT_SWEEP,
+        timeout_seconds=timeout_s,
+        acquisition_kind=AcquisitionKind.DIALOG_TRAVERSAL,
+    ):
         return await build_working_set(client, conn, timeout_s=timeout_s)
 
 
@@ -466,6 +504,35 @@ def _seed_hot_schedule_after_refresh(
 ) -> None:
     if working_set.flood_wait_seconds is None:
         seed_hot_sweep_schedule(conn, policy.initial_spread_seconds, now=now)
+
+
+def _next_hot_release_at(conn: sqlite3.Connection, *, now: float) -> float | None:
+    """Return the earliest authoritative hot-page release boundary."""
+    if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now) or now < 0:
+        raise ValueError("now must be a finite non-negative timestamp")
+    cutoff = int(now) - 30 * 86400
+    rows = cast(
+        list[tuple[int | None, int | None, int | None, int | None]],
+        conn.execute(
+            """
+            SELECT ads.hot_next_due_at,
+                   ads.hot_next_retry_at,
+                   ads.hot_last_sync_at,
+                   sd.last_event_at
+            FROM activity_dialog_state AS ads
+            LEFT JOIN synced_dialogs AS sd ON sd.dialog_id = ads.dialog_id
+            WHERE (ads.last_activity_at IS NULL OR ads.last_activity_at >= :cutoff)
+              AND COALESCE(sd.status, '') != 'access_lost'
+            """,
+            {"cutoff": cutoff},
+        ).fetchall(),
+    )
+    releases: list[float] = []
+    for next_due_at, next_retry_at, last_sync_at, last_event_at in rows:
+        event_due = last_sync_at is not None and last_event_at is not None and last_event_at > last_sync_at
+        due_at = 0 if next_due_at is None or event_due else next_due_at
+        releases.append(float(max(due_at, next_retry_at or 0)))
+    return min(releases, default=None)
 
 
 def _count_due_hot_peers(conn: sqlite3.Connection, *, now: int) -> int:
@@ -491,7 +558,11 @@ def _count_due_hot_peers(conn: sqlite3.Connection, *, now: int) -> int:
 
 async def _run_hot_sweep_peer_safe(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome:
     try:
-        with rpc_scope(TelegramRpcSource.ACTIVITY_HOT_SWEEP, timeout_seconds=ctx.timeout_s):
+        with rpc_scope(
+            TelegramRpcSource.ACTIVITY_HOT_SWEEP,
+            timeout_seconds=ctx.timeout_s,
+            acquisition_kind=AcquisitionKind.MESSAGE_SEARCH_PAGE,
+        ):
             return await _run_hot_sweep_peer(ctx)
     except RpcAdmissionClosedError, TelegramRpcAdmissionDeferred:
         raise
