@@ -3123,15 +3123,26 @@ def _apply_migration_60(conn: sqlite3.Connection, current: int) -> int:
         if {"next_section", "acquisition_cursor"} - refresh_columns or "'rejected'" not in refresh_schema:
             next_section_expr = "next_section" if "next_section" in refresh_columns else "'full_profile'"
             cursor_expr = "acquisition_cursor" if "acquisition_cursor" in refresh_columns else "0"
-            conn.execute("ALTER TABLE entity_profile_refresh_state RENAME TO entity_profile_refresh_state_v59")
+            # Copy through TEMP instead of renaming the old table.  ALTER TABLE
+            # RENAME makes SQLite reparse every trigger in sqlite_schema.  Some
+            # supported historical databases contain trigger definitions whose
+            # referenced tables are introduced later in the migration chain;
+            # reparsing those otherwise inert definitions aborts this upgrade.
+            conn.execute(
+                "CREATE TEMP TABLE entity_profile_refresh_state_v59_copy AS "
+                "SELECT entity_id, status, retry_at, reason, updated_at, "
+                f"{next_section_expr} AS next_section, {cursor_expr} AS acquisition_cursor "
+                "FROM entity_profile_refresh_state"
+            )
+            conn.execute("DROP TABLE entity_profile_refresh_state")
             conn.execute(_ENTITY_PROFILE_REFRESH_STATE_V60_DDL)
             conn.execute(
                 "INSERT INTO entity_profile_refresh_state("
                 "entity_id, status, retry_at, reason, updated_at, next_section, acquisition_cursor) "
                 "SELECT entity_id, status, retry_at, reason, updated_at, "
-                f"{next_section_expr}, {cursor_expr} FROM entity_profile_refresh_state_v59"
+                "next_section, acquisition_cursor FROM entity_profile_refresh_state_v59_copy"
             )
-            conn.execute("DROP TABLE entity_profile_refresh_state_v59")
+            conn.execute("DROP TABLE entity_profile_refresh_state_v59_copy")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_entity_profile_refresh_due "
             "ON entity_profile_refresh_state(status, retry_at, updated_at, entity_id)"

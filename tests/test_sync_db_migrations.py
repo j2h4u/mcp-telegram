@@ -13,6 +13,7 @@ from typing import cast
 
 import pytest
 
+import mcp_telegram.sync_db as sync_db_module
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
     _apply_migration_51,
@@ -2457,3 +2458,87 @@ def test_v60_adds_restart_safe_domain_state_and_preserves_profile_retry(tmp_path
             "VALUES (43,'rejected',NULL,'full',100,'avatar_history',2)"
         )
         assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=60") == (60,)
+
+
+def test_genuine_v59_schema_upgrades_to_v60_and_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "sync.db"
+    with monkeypatch.context() as v59:
+        v59.setattr(sync_db_module, "_CURRENT_SCHEMA_VERSION", 59)
+        v59.setattr(sync_db_module, "_DOMAIN_RESUME_STATE_MIGRATION_60", 59)
+        ensure_sync_schema(db_path)
+
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 59
+        assert "revision" not in {row[1] for row in _table_info(conn, "dialogs")}
+        assert "next_section" not in {row[1] for row in _table_info(conn, "entity_profile_refresh_state")}
+        conn.execute("INSERT INTO dialogs(dialog_id, name, type) VALUES (42, 'kept dialog', 'user')")
+        conn.execute(
+            "INSERT INTO activity_dialog_state("
+            "dialog_id, source, hot_cursor, created_at, updated_at) "
+            "VALUES (42, 'supergroup', 77, 100, 200)"
+        )
+        conn.execute(
+            "INSERT INTO entity_profile_refresh_state("
+            "entity_id, status, retry_at, reason, updated_at) "
+            "VALUES (42, 'failed', 123, 'timeout', 100)"
+        )
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchone_row(
+            conn,
+            "SELECT name, revision FROM dialogs WHERE dialog_id=42",
+        ) == ("kept dialog", 0)
+        assert _fetchone_row(
+            conn,
+            "SELECT source, hot_cursor, hot_page_offset_id, hot_window_max_id, hot_window_had_new "
+            "FROM activity_dialog_state WHERE dialog_id=42",
+        ) == ("supergroup", 77, None, None, 0)
+        assert _fetchone_row(
+            conn,
+            "SELECT status, retry_at, reason, updated_at, next_section, acquisition_cursor "
+            "FROM entity_profile_refresh_state WHERE entity_id=42",
+        ) == ("failed", 123, "timeout", 100, "full_profile", 0)
+        assert _fetchone_row(
+            conn,
+            "SELECT generation, status, offset_id, observed_count "
+            "FROM dialog_full_reconciliation_state WHERE singleton=1",
+        ) == (0, "idle", 0, 0)
+        conn.execute(
+            "UPDATE dialog_full_reconciliation_state "
+            "SET generation=1, status='in_progress', observed_count=1 WHERE singleton=1"
+        )
+        conn.execute(
+            "INSERT INTO dialog_full_reconciliation_baseline("
+            "generation, dialog_id, baseline_revision, seen) VALUES (1, 42, 0, 1)"
+        )
+        conn.execute(
+            "INSERT INTO delta_access_recovery_state("
+            "dialog_id, stage, total_messages, probe_succeeded_at, retry_at, updated_at) "
+            "VALUES (42, 'gap_fill', 10, 300, 400, 500)"
+        )
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM schema_version WHERE version=60") == 1
+        assert _fetchone_row(
+            conn,
+            "SELECT generation, status, observed_count FROM dialog_full_reconciliation_state WHERE singleton=1",
+        ) == (1, "in_progress", 1)
+        assert _fetchone_row(
+            conn,
+            "SELECT baseline_revision, seen FROM dialog_full_reconciliation_baseline "
+            "WHERE generation=1 AND dialog_id=42",
+        ) == (0, 1)
+        assert _fetchone_row(
+            conn,
+            "SELECT stage, total_messages, probe_succeeded_at, retry_at, updated_at "
+            "FROM delta_access_recovery_state WHERE dialog_id=42",
+        ) == ("gap_fill", 10, 300, 400, 500)
