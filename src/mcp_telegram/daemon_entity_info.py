@@ -450,22 +450,37 @@ class DaemonEntityInfoService:
         cursor = self._profiles.next_due_refresh(now=now)
         if cursor is None:
             return
-        stored = self._profiles.read(cursor.entity_id, now=now)
-        raw_type = stored.detail.get("type") if stored is not None else None
-        entity_type = DialogType.parse(raw_type if isinstance(raw_type, str) else None)
-        if stored is None or entity_type is DialogType.UNKNOWN:
+        entity_type = self._stored_entity_type(cursor.entity_id, now=now)
+        if entity_type is DialogType.UNKNOWN:
             await self._acquire_durable_refresh_core(cursor, now=now)
             return
         if not self._section_applies(entity_type, cursor.next_section):
-            self._profiles.commit_section(
-                cursor,
-                EntitySectionCommit(
-                    self._not_applicable_section_patch(cursor.next_section),
-                    status="not_applicable",
-                ),
-                now=now,
-            )
+            self._commit_not_applicable_section(cursor, now=now)
             return
+        await self._acquire_and_commit_profile_section(cursor, entity_type, now=now)
+
+    def _stored_entity_type(self, entity_id: int, *, now: int) -> DialogType:
+        stored = self._profiles.read(entity_id, now=now)
+        raw_type = stored.detail.get("type") if stored is not None else None
+        return DialogType.parse(raw_type if isinstance(raw_type, str) else None)
+
+    def _commit_not_applicable_section(self, cursor: EntityRefreshCursor, *, now: int) -> None:
+        self._profiles.commit_section(
+            cursor,
+            EntitySectionCommit(
+                self._not_applicable_section_patch(cursor.next_section),
+                status="not_applicable",
+            ),
+            now=now,
+        )
+
+    async def _acquire_and_commit_profile_section(
+        self,
+        cursor: EntityRefreshCursor,
+        entity_type: DialogType,
+        *,
+        now: int,
+    ) -> None:
         try:
             result = await self._acquire_profile_section(cursor, entity_type)
         except RpcAttemptBudgetExhaustedError:
@@ -488,11 +503,7 @@ class DaemonEntityInfoService:
                 retry_at=now + 60,
             )
             return
-        self._profiles.commit_section(
-            cursor,
-            result,
-            now=now,
-        )
+        self._profiles.commit_section(cursor, result, now=now)
 
     async def _acquire_durable_refresh_core(self, cursor: EntityRefreshCursor, *, now: int) -> None:
         """Persist one resolved core so later raw section requests can resume by id."""
@@ -586,93 +597,102 @@ class DaemonEntityInfoService:
         entity_type: DialogType,
     ) -> EntitySectionCommit:
         if entity_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}:
-            result = await self._deps.client(self._deps.get_full_user_request(id=entity_id))
-            full_user = _attr(result, "full_user", None)
-            if full_user is None:
-                raise ValueError("full user payload is missing")
-            folder_id = _opt_int_attr(full_user, "folder_id")
-            blocked = _bool_attr(full_user, "blocked")
-            patch: dict[str, object] = {
-                "about": _opt_str_attr(full_user, "about"),
-                "blocked": blocked,
-                "ttl_period": _opt_int_attr(full_user, "ttl_period"),
-                "private_forward_name": _opt_str_attr(full_user, "private_forward_name"),
-                "folder_id": folder_id,
-                "folder_name": await self._resolve_folder_name(folder_id),
-                "birthday": self._extract_user_birthday(full_user),
-                "bot_info": self._extract_user_bot_info(full_user),
-                "business_location": self._extract_user_business_location(full_user),
-                "business_intro": self._extract_user_business_intro(full_user),
-                "business_work_hours": self._extract_user_business_work_hours(full_user),
-                "note": self._extract_user_note(full_user),
-            }
-            user = self._find_result_entity(result, entity_id)
-            if user is not None:
-                first_name = _opt_str_attr(user, "first_name")
-                last_name = _opt_str_attr(user, "last_name")
-                patch.update(
-                    name=" ".join(part for part in (first_name, last_name) if part) or None,
-                    username=_opt_str_attr(user, "username"),
-                    first_name=first_name,
-                    last_name=last_name,
-                    extra_usernames=self._collect_extra_usernames(user),
-                    emoji_status_id=self._collect_emoji_status_id(user),
-                    status=self._format_user_status(_attr(user, "status", None)),
-                    phone=_opt_str_attr(user, "phone"),
-                    lang_code=_opt_str_attr(user, "lang_code"),
-                    contact=_bool_attr(user, "contact"),
-                    mutual_contact=_bool_attr(user, "mutual_contact"),
-                    close_friend=_bool_attr(user, "close_friend"),
-                    send_paid_messages_stars=_opt_int_attr(user, "send_paid_messages_stars"),
-                    verified=_bool_attr(user, "verified"),
-                    premium=_bool_attr(user, "premium"),
-                    bot=_bool_attr(user, "bot"),
-                    scam=_bool_attr(user, "scam"),
-                    fake=_bool_attr(user, "fake"),
-                    restricted=_bool_attr(user, "restricted"),
-                    restriction_reason=self._collect_restrictions(user),
-                    my_membership=self._build_user_membership(user, blocked),
-                )
-            return EntitySectionCommit(patch)
+            return await self._acquire_user_full_profile(entity_id)
 
         if entity_type in {DialogType.CHANNEL, DialogType.SUPERGROUP, DialogType.FORUM}:
-            result = await self._deps.client(self._deps.get_full_channel_request(channel=entity_id))
-            full_chat = _attr(result, "full_chat", None)
-            if full_chat is None:
-                raise ValueError("full channel payload is missing")
-            patch = {
-                "about": _opt_str_attr(full_chat, "about"),
-                "linked_chat_id": self._normalize_linked_chat_id(_opt_int_attr(full_chat, "linked_chat_id")),
-                "pinned_msg_id": _opt_int_attr(full_chat, "pinned_msg_id"),
-                "slow_mode_seconds": _opt_int_attr(full_chat, "slowmode_seconds"),
-            }
-            member_count = _opt_int_attr(full_chat, "participants_count")
-            if entity_type is DialogType.CHANNEL:
-                patch.update(
-                    subscribers_count=member_count,
-                    available_reactions=self._collect_reactions(_attr(full_chat, "available_reactions", None)),
-                )
-            else:
-                patch.update(members_count=member_count, linked_broadcast_id=patch.pop("linked_chat_id"))
-            return EntitySectionCommit(patch)
+            return await self._acquire_channel_full_profile(entity_id, entity_type)
 
         if entity_type is DialogType.GROUP:
-            result = await self._deps.client(
-                self._deps.get_full_chat_request(chat_id=self._legacy_chat_raw_id(entity_id))
-            )
-            full_chat = _attr(result, "full_chat", None)
-            if full_chat is None:
-                raise ValueError("full chat payload is missing")
-            participants = _sequence_attr(_attr(full_chat, "participants", None), "participants")
-            exported_invite = _attr(full_chat, "exported_invite", None)
-            return EntitySectionCommit(
-                {
-                    "about": _opt_str_attr(full_chat, "about"),
-                    "invite_link": _opt_str_attr(exported_invite, "link") if exported_invite is not None else None,
-                    "members_count": len(participants) if participants else None,
-                }
-            )
+            return await self._acquire_group_full_profile(entity_id)
         return EntitySectionCommit({}, status="unavailable", reason="unsupported_entity_type")
+
+    async def _acquire_user_full_profile(self, entity_id: int) -> EntitySectionCommit:
+        result = await self._deps.client(self._deps.get_full_user_request(id=entity_id))
+        full_user = _attr(result, "full_user", None)
+        if full_user is None:
+            raise ValueError("full user payload is missing")
+        folder_id = _opt_int_attr(full_user, "folder_id")
+        blocked = _bool_attr(full_user, "blocked")
+        patch: dict[str, object] = {
+            "about": _opt_str_attr(full_user, "about"),
+            "blocked": blocked,
+            "ttl_period": _opt_int_attr(full_user, "ttl_period"),
+            "private_forward_name": _opt_str_attr(full_user, "private_forward_name"),
+            "folder_id": folder_id,
+            "folder_name": await self._resolve_folder_name(folder_id),
+            "birthday": self._extract_user_birthday(full_user),
+            "bot_info": self._extract_user_bot_info(full_user),
+            "business_location": self._extract_user_business_location(full_user),
+            "business_intro": self._extract_user_business_intro(full_user),
+            "business_work_hours": self._extract_user_business_work_hours(full_user),
+            "note": self._extract_user_note(full_user),
+        }
+        user = self._find_result_entity(result, entity_id)
+        if user is not None:
+            first_name = _opt_str_attr(user, "first_name")
+            last_name = _opt_str_attr(user, "last_name")
+            patch.update(
+                name=" ".join(part for part in (first_name, last_name) if part) or None,
+                username=_opt_str_attr(user, "username"),
+                first_name=first_name,
+                last_name=last_name,
+                extra_usernames=self._collect_extra_usernames(user),
+                emoji_status_id=self._collect_emoji_status_id(user),
+                status=self._format_user_status(_attr(user, "status", None)),
+                phone=_opt_str_attr(user, "phone"),
+                lang_code=_opt_str_attr(user, "lang_code"),
+                contact=_bool_attr(user, "contact"),
+                mutual_contact=_bool_attr(user, "mutual_contact"),
+                close_friend=_bool_attr(user, "close_friend"),
+                send_paid_messages_stars=_opt_int_attr(user, "send_paid_messages_stars"),
+                verified=_bool_attr(user, "verified"),
+                premium=_bool_attr(user, "premium"),
+                bot=_bool_attr(user, "bot"),
+                scam=_bool_attr(user, "scam"),
+                fake=_bool_attr(user, "fake"),
+                restricted=_bool_attr(user, "restricted"),
+                restriction_reason=self._collect_restrictions(user),
+                my_membership=self._build_user_membership(user, blocked),
+            )
+        return EntitySectionCommit(patch)
+
+    async def _acquire_channel_full_profile(self, entity_id: int, entity_type: DialogType) -> EntitySectionCommit:
+        result = await self._deps.client(self._deps.get_full_channel_request(channel=entity_id))
+        full_chat = _attr(result, "full_chat", None)
+        if full_chat is None:
+            raise ValueError("full channel payload is missing")
+        patch = {
+            "about": _opt_str_attr(full_chat, "about"),
+            "linked_chat_id": self._normalize_linked_chat_id(_opt_int_attr(full_chat, "linked_chat_id")),
+            "pinned_msg_id": _opt_int_attr(full_chat, "pinned_msg_id"),
+            "slow_mode_seconds": _opt_int_attr(full_chat, "slowmode_seconds"),
+        }
+        member_count = _opt_int_attr(full_chat, "participants_count")
+        if entity_type is DialogType.CHANNEL:
+            patch.update(
+                subscribers_count=member_count,
+                available_reactions=self._collect_reactions(_attr(full_chat, "available_reactions", None)),
+            )
+        else:
+            patch.update(members_count=member_count, linked_broadcast_id=patch.pop("linked_chat_id"))
+        return EntitySectionCommit(patch)
+
+    async def _acquire_group_full_profile(self, entity_id: int) -> EntitySectionCommit:
+        result = await self._deps.client(
+            self._deps.get_full_chat_request(chat_id=self._legacy_chat_raw_id(entity_id))
+        )
+        full_chat = _attr(result, "full_chat", None)
+        if full_chat is None:
+            raise ValueError("full chat payload is missing")
+        participants = _sequence_attr(_attr(full_chat, "participants", None), "participants")
+        exported_invite = _attr(full_chat, "exported_invite", None)
+        return EntitySectionCommit(
+            {
+                "about": _opt_str_attr(full_chat, "about"),
+                "invite_link": _opt_str_attr(exported_invite, "link") if exported_invite is not None else None,
+                "members_count": len(participants) if participants else None,
+            }
+        )
 
     async def _acquire_common_chats(self, entity_id: int) -> EntitySectionCommit:
         result = await self._deps.client(self._deps.get_common_chats_request(user_id=entity_id, max_id=0, limit=100))

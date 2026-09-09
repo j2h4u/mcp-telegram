@@ -354,6 +354,21 @@ def _validated_topic_pin_order(value: object) -> tuple[int, ...] | None:
     return tuple(int(topic_id) for topic_id in value)
 
 
+def _channel_chat_dialog_id(update: _ChannelChatUpdateLike | _ChatUpdateLike) -> int | None:
+    if isinstance(update, UpdateChannel):
+        return int(get_peer_id(PeerChannel(update.channel_id)))
+    if isinstance(update, UpdateChat):
+        return int(get_peer_id(PeerChat(update.chat_id)))
+    return None
+
+
+def _should_refresh_linked_chat_id(
+    update: _ChannelChatUpdateLike | _ChatUpdateLike,
+    row: tuple[str | None, int | None] | None,
+) -> bool:
+    return isinstance(update, UpdateChannel) and row is not None and row[0] == "channel" and row[1] is not None
+
+
 def _apply_inbox_read_fact(
     conn: sqlite3.Connection,
     dialog_id: int,
@@ -1720,24 +1735,13 @@ class EventHandlerManager:
         Gated on _synced_dialog_ids; UPDATE-only.
         """
         try:
-            if isinstance(update, UpdateChannel):
-                dialog_id = int(get_peer_id(PeerChannel(update.channel_id)))
-            elif isinstance(update, UpdateChat):
-                dialog_id = int(get_peer_id(PeerChat(update.chat_id)))
-            else:
+            dialog_id = _channel_chat_dialog_id(update)
+            if dialog_id is None:
                 return
             if dialog_id not in self._synced_dialog_ids:
                 return
             now = int(time.time())
-            with self._conn:
-                changed = self._conn.execute(_UPDATE_DIALOG_NEEDS_REFRESH_SQL, (now, dialog_id)).rowcount
-                row = cast(
-                    tuple[str | None, int | None] | None,
-                    self._conn.execute(
-                        "SELECT type, linked_chat_resolved_at FROM dialogs WHERE dialog_id = ?",
-                        (dialog_id,),
-                    ).fetchone(),
-                )
+            changed, row = self._mark_channel_chat_update(dialog_id, now=now)
             if changed:
                 self._offer(DemandKind.DIALOG_LIGHT_RECONCILIATION)
             logger.info("event_channel_chat_dirty dialog_id=%d", dialog_id)
@@ -1755,8 +1759,25 @@ class EventHandlerManager:
         # sweep's cold path (D-11) — we must not amplify bursts into resolution storms.
         # This await is deliberately OUTSIDE the with self._conn: block above to avoid
         # holding a write transaction open across an async round-trip.
-        if isinstance(update, UpdateChannel) and row is not None and row[0] == "channel" and row[1] is not None:
+        if _should_refresh_linked_chat_id(update, row):
             await self._refresh_linked_chat_id(dialog_id)
+
+    def _mark_channel_chat_update(
+        self,
+        dialog_id: int,
+        *,
+        now: int,
+    ) -> tuple[int, tuple[str | None, int | None] | None]:
+        with self._conn:
+            changed = self._conn.execute(_UPDATE_DIALOG_NEEDS_REFRESH_SQL, (now, dialog_id)).rowcount
+            row = cast(
+                tuple[str | None, int | None] | None,
+                self._conn.execute(
+                    "SELECT type, linked_chat_resolved_at FROM dialogs WHERE dialog_id = ?",
+                    (dialog_id,),
+                ).fetchone(),
+            )
+        return changed, row
 
     async def _refresh_linked_chat_id(self, dialog_id: int) -> None:
         """Phase 54: event-driven linked_chat_id refresh for a previously-resolved channel.
