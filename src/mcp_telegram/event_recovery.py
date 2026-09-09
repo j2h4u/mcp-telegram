@@ -13,14 +13,14 @@ from typing import cast
 
 from .alert_policy import incoming_human_dm_sql
 from .runtime_observations import prune_runtime_observations, tool_telemetry_identity
-from .sync_db import _CONVERSATION_HISTORY_TRIGGERS_V54
+from .sync_db import _CONVERSATION_HISTORY_TRIGGERS_V54, _CURRENT_SCHEMA_VERSION
 
 EXPECTED_TELEMETRY = 1_271
 EXPECTED_EDITS = 102
 EXPECTED_DELETES = 38
 EXPECTED_LOSSES = 9
 SOURCE_SCHEMA_VERSION = 50
-TARGET_SCHEMA_VERSION = 58
+TARGET_SCHEMA_VERSION = _CURRENT_SCHEMA_VERSION
 
 
 def source_fingerprint(path: Path) -> str:
