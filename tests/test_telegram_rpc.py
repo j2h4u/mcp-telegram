@@ -256,6 +256,22 @@ def test_factory_uses_supplied_snapshot_without_loading_config_again(
         assert gate._fallback_wait_seconds == 17
         assert gate._cooldown_buffer_seconds == 2.5
         assert gate._transient_retry_delays == (0.0,)
+        assert gate._cooldown_persistence is None
+    finally:
+        gate.session.close()
+
+
+def test_factory_forwards_optional_cooldown_persistence(tmp_path: Path) -> None:
+    persistence = TelegramRpcCooldownPersistence(lambda: None, lambda _deadline: None)
+    gate = create_client.__wrapped__(
+        "1",
+        "hash",
+        session_name="persistent-cooldown",
+        config=McpTelegramConfig(state=StateConfig(dir=tmp_path)),
+        cooldown_persistence=persistence,
+    )
+    try:
+        assert gate._cooldown_persistence is persistence
     finally:
         gate.session.close()
 

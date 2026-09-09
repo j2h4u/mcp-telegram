@@ -8,7 +8,7 @@ from telethon import TelegramClient  # type: ignore[import-untyped]
 from .config import McpTelegramConfig, load_config
 from .flood import flood_wait_kill_switch_status, observe_flood_wait
 from .state import ensure_private_state_dir
-from .telegram_rpc import TelegramRpcBudget, TelegramRpcGate
+from .telegram_rpc import TelegramRpcBudget, TelegramRpcCooldownPersistence, TelegramRpcGate
 
 logger = logging.getLogger(__name__)
 
@@ -35,18 +35,20 @@ async def logout_from_telegram() -> None:
 
 
 @cache
-def create_client(
+def create_client(  # noqa: PLR0913 - explicit cached client construction dependencies
     api_id: str | None = None,
     api_hash: str | None = None,
     session_name: str = "mcp_telegram_session",
     catch_up: bool = False,
     *,
     config: McpTelegramConfig,
+    cooldown_persistence: TelegramRpcCooldownPersistence | None = None,
 ) -> TelegramRpcGate:
     """Return a cached TelegramClient singleton for the given credentials.
 
     ``@cache`` means the same instance is returned for identical
-    ``(api_id, api_hash, session_name, catch_up, config)`` arguments within the process lifetime.
+    ``(api_id, api_hash, session_name, catch_up, config, cooldown_persistence)``
+    arguments within the process lifetime.
     Callers should use ``connected_client()`` for connection lifecycle management.
 
     Single-session by design: all tool calls within one process share the same
@@ -82,6 +84,7 @@ def create_client(
         transient_retry_delays_seconds=config.telegram_rpc.transient_retry_delays_seconds,
         scheduler_policy=config.telegram_rpc.scheduler,
         flood_observer=observe_flood_wait,
+        cooldown_persistence=cooldown_persistence,
     )
 
 
