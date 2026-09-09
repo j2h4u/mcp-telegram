@@ -9,9 +9,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from telethon.errors import ChannelPrivateError, RPCError  # type: ignore[import-untyped]
 from telethon.tl import types
 
 from helpers import MockTotalList, build_mock_message
@@ -28,11 +29,18 @@ from mcp_telegram.dialog_sync import (
     DialogLightReconciliationDemandAdapter,
     DialogReconciliationWorker,
 )
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter, FullSyncWorker
 from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
 from mcp_telegram.telegram_rpc_consumers import DemandKind
-from mcp_telegram.telegram_rpc_scheduler import TelegramRpcScope, current_rpc_scope
+from mcp_telegram.telegram_rpc_scheduler import (
+    RpcAdmissionExpiredError,
+    RpcAdmissionSaturatedError,
+    TelegramRpcAdmissionDeferred,
+    TelegramRpcScope,
+    current_rpc_scope,
+)
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -292,6 +300,60 @@ async def test_access_probe_adapter_persists_probe_to_gap_fill_handoff(conn: sql
 
     assert conn.execute("SELECT 1 FROM delta_access_recovery_state WHERE dialog_id=?", (dialog_id,)).fetchone() is None
     assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == ("syncing",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_kind", "expected_retry"),
+    [
+        ("deferred", 1007),
+        ("saturated", None),
+        ("expired", None),
+        ("access", 1100),
+        ("flood", 1200),
+        ("network", 1100),
+        ("rpc", 1100),
+    ],
+)
+async def test_access_probe_slice_records_retry_policy_for_probe_outcomes(
+    conn: sqlite3.Connection,
+    error_kind: str,
+    expected_retry: int | None,
+) -> None:
+    """Probe failures preserve access_lost and apply their documented retry policy."""
+    dialog_id = 303
+    _seed_history_dialog(conn, dialog_id, status="access_lost")
+    get_messages = AsyncMock()
+
+    async def fail(**_kwargs: object) -> object:
+        if error_kind == "deferred":
+            raise TelegramRpcAdmissionDeferred(retry_after_seconds=7)
+        if error_kind == "saturated":
+            raise RpcAdmissionSaturatedError(current_rpc_scope(), "probe capacity is full")
+        if error_kind == "expired":
+            raise RpcAdmissionExpiredError(current_rpc_scope(), "probe deadline elapsed")
+        if error_kind == "access":
+            raise ChannelPrivateError(request=None)
+        if error_kind == "flood":
+            raise TelegramRpcThrottled(retry_after_seconds=200)
+        if error_kind == "network":
+            raise OSError("probe connection reset")
+        raise RPCError(None, "probe RPC failed")
+
+    get_messages.side_effect = fail
+    worker = DeltaSyncWorker(cast(_DeltaSyncClient, SimpleNamespace(get_messages=get_messages)), conn, asyncio.Event())
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy())
+
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        "access_lost",
+    )
+    assert conn.execute(
+        "SELECT access_next_revalidate_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (expected_retry,)
+    assert conn.execute("SELECT 1 FROM delta_access_recovery_state WHERE dialog_id=?", (dialog_id,)).fetchone() is None
 
 
 @pytest.mark.asyncio
