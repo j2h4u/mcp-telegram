@@ -882,6 +882,12 @@ class _FullReconciliationState:
     observed_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class _FullPassSliceResult:
+    completed: bool
+    partial_status: str = "partial"
+
+
 # ---------------------------------------------------------------------------
 # Reconciliation Worker (Phase 43)
 # ---------------------------------------------------------------------------
@@ -1203,64 +1209,134 @@ class DialogReconciliationWorker:
             )
         return observed_count, hidden
 
-    async def _run_full_pass_slice(  # noqa: PLR0912 - explicit Telegram outcome handling
-        self, *, refresh_topics: bool, wait_on_throttle: bool
-    ) -> tuple[int, bool]:
-        state = self._load_or_begin_full_generation()
-        partial_status = "partial"
-        completed = True
-        try:
-            async for dialog in self._client.iter_dialogs(
-                offset_date=state.offset_date,
-                offset_id=state.offset_id,
-                offset_peer=state.offset_peer if state.offset_peer is not None else types.InputPeerEmpty(),
-            ):
-                if self._shutdown_event.is_set() or not self._checkpoint_full_dialog(state, dialog):
-                    completed = False
-                    break
-                if refresh_topics and self._topic_refresher is not None and is_topic_capable(dialog.entity):
-                    await self._refresh_forum_topics(int(dialog.id), dialog.entity)
-        except RpcAttemptBudgetExhaustedError:
-            completed = False
-        except TelegramRpcAdmissionDeferred as exc:
+    async def _wait_full_pass_throttle(
+        self,
+        retry_after_seconds: int | None,
+        *,
+        wait_on_throttle: bool,
+    ) -> None:
+        if wait_on_throttle and retry_after_seconds is not None:
+            await sleep_through_flood(self._shutdown_event, retry_after_seconds)
+
+    async def _handle_full_pass_exception(
+        self,
+        state: _FullReconciliationState,
+        exc: Exception,
+        *,
+        wait_on_throttle: bool,
+    ) -> _FullPassSliceResult:
+        if isinstance(exc, RpcAttemptBudgetExhaustedError):
+            return _FullPassSliceResult(False)
+        if isinstance(exc, TelegramRpcAdmissionDeferred):
             logger.info(
                 "recon_full admission_deferred retry_after=%s generation=%d",
                 exc.retry_after_seconds,
                 state.generation,
             )
-            if wait_on_throttle and exc.retry_after_seconds is not None:
-                await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
-            completed = False
-        except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
+            await self._wait_full_pass_throttle(
+                exc.retry_after_seconds,
+                wait_on_throttle=wait_on_throttle,
+            )
+            return _FullPassSliceResult(False)
+        if isinstance(exc, (RpcAdmissionSaturatedError, RpcAdmissionExpiredError)):
             logger.info("recon_full admission_deferred error_type=%s", type(exc).__name__)
-            completed = False
-        except TelegramRpcThrottled as exc:
+            return _FullPassSliceResult(False)
+        if isinstance(exc, TelegramRpcThrottled):
             logger.warning("recon_full_flood_wait wait=%s", exc.retry_after_seconds)
-            if wait_on_throttle and exc.retry_after_seconds is not None:
-                await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
-            completed = False
+            await self._wait_full_pass_throttle(
+                exc.retry_after_seconds,
+                wait_on_throttle=wait_on_throttle,
+            )
+            return _FullPassSliceResult(False)
+        count = self._full_observed_count(state.generation, fallback=state.observed_count)
+        partial_status = _full_pass_access_status(count)
+        logger.warning("recon_full_%s error=%s", partial_status, type(exc).__name__)
+        return _FullPassSliceResult(False, partial_status)
+
+    def _record_full_pass_error(
+        self,
+        state: _FullReconciliationState,
+        exc: Exception,
+    ) -> None:
+        self._mark_full_pass_partial(
+            self._full_observed_count(state.generation, fallback=state.observed_count),
+        )
+        logger.error(
+            "recon_full_pass_unexpected_error generation=%d",
+            state.generation,
+            exc_info=exc,
+        )
+        raise exc
+
+    async def _iterate_full_pass(
+        self,
+        state: _FullReconciliationState,
+        *,
+        refresh_topics: bool,
+    ) -> _FullPassSliceResult:
+        async for dialog in self._client.iter_dialogs(
+            offset_date=state.offset_date,
+            offset_id=state.offset_id,
+            offset_peer=state.offset_peer if state.offset_peer is not None else types.InputPeerEmpty(),
+        ):
+            if self._shutdown_event.is_set() or not self._checkpoint_full_dialog(state, dialog):
+                return _FullPassSliceResult(False)
+            if refresh_topics and self._topic_refresher is not None and is_topic_capable(dialog.entity):
+                await self._refresh_forum_topics(int(dialog.id), dialog.entity)
+        return _FullPassSliceResult(True)
+
+    async def _consume_full_pass(
+        self,
+        state: _FullReconciliationState,
+        *,
+        refresh_topics: bool,
+        wait_on_throttle: bool,
+    ) -> _FullPassSliceResult:
+        try:
+            return await self._iterate_full_pass(
+                state,
+                refresh_topics=refresh_topics,
+            )
+        except (
+            RpcAttemptBudgetExhaustedError,
+            TelegramRpcAdmissionDeferred,
+            RpcAdmissionSaturatedError,
+            RpcAdmissionExpiredError,
+            TelegramRpcThrottled,
+        ) as exc:
+            return await self._handle_full_pass_exception(
+                state,
+                exc,
+                wait_on_throttle=wait_on_throttle,
+            )
         except ACCESS_LOST_ERRORS as exc:
-            partial_status = _full_pass_access_status(
-                self._full_observed_count(state.generation, fallback=state.observed_count)
+            return await self._handle_full_pass_exception(
+                state,
+                exc,
+                wait_on_throttle=wait_on_throttle,
             )
-            logger.warning("recon_full_%s error=%s", partial_status, type(exc).__name__)
-            completed = False
-        except Exception:
-            self._mark_full_pass_partial(
-                self._full_observed_count(state.generation, fallback=state.observed_count),
-                status=partial_status,
-            )
-            logger.exception("recon_full_pass_unexpected_error generation=%d", state.generation)
+        except Exception as exc:
+            self._record_full_pass_error(state, exc)
             raise
-        if not completed:
+
+    async def _run_full_pass_slice(
+        self, *, refresh_topics: bool, wait_on_throttle: bool
+    ) -> tuple[int, bool]:
+        state = self._load_or_begin_full_generation()
+        result = await self._consume_full_pass(
+            state,
+            refresh_topics=refresh_topics,
+            wait_on_throttle=wait_on_throttle,
+        )
+        if not result.completed:
             count = self._full_observed_count(state.generation, fallback=state.observed_count)
-            self._mark_full_pass_partial(count, status=partial_status)
+            self._mark_full_pass_partial(count, status=result.partial_status)
             return count, False
 
-        result = self._complete_full_generation(state.generation)
-        if result is None:
+        completion = self._complete_full_generation(state.generation)
+        if completion is None:
             return state.observed_count, False
-        count, hidden = result
+        count, hidden = completion
         log_maintenance_cycle(
             logger,
             hidden > 0,
