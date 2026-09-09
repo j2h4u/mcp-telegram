@@ -126,6 +126,7 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
     assert demand_contract(DemandKind.BACKFILL_HYDRATION_BATCH).max_rpc_attempts_per_slice == 2
     assert demand_contract(DemandKind.REACTION_REFRESH_BATCH).execution_mode is ExecutionMode.INLINE
     assert demand_contract(DemandKind.TOPIC_SNAPSHOT).execution_mode is ExecutionMode.INLINE
+    assert demand_contract(DemandKind.RECONNECT_DIFFERENCE).execution_mode is ExecutionMode.INLINE
 
 
 def test_hydration_slice_bounds_cover_every_registered_handler_cost() -> None:

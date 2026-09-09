@@ -131,7 +131,7 @@ The initial exhaustive mapping is:
 | `ENTITY_INFO_REFRESH` | Entity profile refresh | `DURABLE` | Entity refresh state |
 | `ACCOUNT_TRACE` | Account trace page | `INLINE` | — |
 | `TELETHON_UPDATE_DIFFERENCE` | Telethon update difference | `PROTOCOL` | — |
-| `RECONNECT_DIFFERENCE` | Reconnect difference request | `DURABLE` | Reconnect state |
+| `RECONNECT_DIFFERENCE` | Connection-event reconnect difference request | `INLINE` | — |
 | `REALTIME_EVENT` | Realtime event acquisition | `INLINE` | — |
 | `DELTA_SYNC` | Delta gap fill; access probe | `DURABLE` | Delta state |
 | `ACTIVITY_HOT_SWEEP` | Hot activity page | `DURABLE` | Activity dialog state |

@@ -606,8 +606,7 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
     DemandKind.RECONNECT_DIFFERENCE: _contract(
         DemandKind.RECONNECT_DIFFERENCE,
         TelegramRpcSource.RECONNECT_DIFFERENCE,
-        _DURABLE,
-        max_rpc_attempts_per_slice=1,
+        _INLINE,
     ),
     DemandKind.REALTIME_EVENT_ACQUISITION: _contract(
         DemandKind.REALTIME_EVENT_ACQUISITION, TelegramRpcSource.REALTIME_EVENT, _INLINE
