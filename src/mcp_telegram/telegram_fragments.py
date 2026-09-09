@@ -68,7 +68,9 @@ class TelethonTelegramFragmentGateway:
                 TelegramRpcSource.MESSAGE_READ_FALLBACK,
                 acquisition_kind=AcquisitionKind.MESSAGE_LOOKUP,
             ):
-                fetched = await self._client.get_messages(entity, ids=list(range(first_message_id, last_message_id + 1)))
+                fetched = await self._client.get_messages(
+                    entity, ids=list(range(first_message_id, last_message_id + 1))
+                )
             return FragmentFetchResult(
                 messages=tuple(
                     extract_message_row(dialog_id, message)

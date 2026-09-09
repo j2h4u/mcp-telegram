@@ -205,7 +205,9 @@ class _BootstrapProgress:
 
 
 def _dm_enrollment_state(conn: sqlite3.Connection, key: str) -> str | None:
-    row = cast(tuple[str | None] | None, conn.execute("SELECT value FROM daemon_state WHERE key = ?", (key,)).fetchone())
+    row = cast(
+        tuple[str | None] | None, conn.execute("SELECT value FROM daemon_state WHERE key = ?", (key,)).fetchone()
+    )
     return None if row is None else row[0]
 
 

@@ -780,8 +780,7 @@ async def test_run_reconciliation_loop_preserves_daily_schedule_across_restart(
     from mcp_telegram import dialog_sync
 
     sync_db.execute(
-        "INSERT OR REPLACE INTO daemon_state(key, value) VALUES "
-        "('dialog_reconciliation_last_full_at', ?)",
+        "INSERT OR REPLACE INTO daemon_state(key, value) VALUES ('dialog_reconciliation_last_full_at', ?)",
         (str(int(time.time())),),
     )
     sync_db.commit()
@@ -811,8 +810,7 @@ async def test_run_reconciliation_loop_retries_when_persisted_schedule_is_invali
     from mcp_telegram import dialog_sync
 
     sync_db.execute(
-        "INSERT OR REPLACE INTO daemon_state(key, value) VALUES "
-        "('dialog_reconciliation_last_full_at', ?)",
+        "INSERT OR REPLACE INTO daemon_state(key, value) VALUES ('dialog_reconciliation_last_full_at', ?)",
         (value,),
     )
     sync_db.commit()

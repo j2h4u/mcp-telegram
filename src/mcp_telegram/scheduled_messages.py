@@ -768,13 +768,9 @@ class ScheduledMessageReconciler:
             if self._shutdown_event.is_set():
                 break
             if demand_kind is None:
-                row_demand_kind = (
-                    DemandKind.SCHEDULED_DISCOVERY if discovery else DemandKind.SCHEDULED_REPAIR
-                )
+                row_demand_kind = DemandKind.SCHEDULED_DISCOVERY if discovery else DemandKind.SCHEDULED_REPAIR
                 with demand_context(row_demand_kind):
-                    changed, flood_waited = await self._process_due_dialog(
-                        dialog_id, generation, discovery, now
-                    )
+                    changed, flood_waited = await self._process_due_dialog(dialog_id, generation, discovery, now)
             else:
                 changed, flood_waited = await self._process_due_dialog(dialog_id, generation, discovery, now)
             total += changed
