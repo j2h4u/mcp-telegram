@@ -118,6 +118,7 @@ from .sync_db import (
     _open_sync_db,
     ensure_sync_schema,
     migrate_legacy_databases,
+    open_sync_db_reader,
 )
 from .sync_worker import FullSyncWorker
 from .telegram import create_client
@@ -140,6 +141,40 @@ from .transcription_hydration import TranscriptionHydrationHandler
 logger = logging.getLogger(__name__)
 
 _OWN_ONLY_ADMISSION_MAX_WAIT_SECONDS = 30.0
+
+
+def _operator_summary_row_factory(cursor: sqlite3.Cursor, row: tuple[object, ...]) -> dict[str, object]:
+    description = cursor.description or ()
+    return {str(column[0]): row[index] for index, column in enumerate(description)}
+
+
+def read_operator_summary_snapshot(
+    db_path: Path, since_ms: int
+) -> tuple[list[dict[str, object]], dict[str, object] | None, list[dict[str, object]]]:
+    """Read the durable rows needed by the standalone operator summary."""
+    conn = open_sync_db_reader(db_path)
+    conn.row_factory = _operator_summary_row_factory
+    try:
+        observations = cast(
+            list[dict[str, object]],
+            conn.execute(
+                "SELECT * FROM runtime_observations WHERE observed_at_ms>=? ORDER BY observed_at_ms,id",
+                (since_ms,),
+            ).fetchall(),
+        )
+        history_row = cast(
+            dict[str, object] | None,
+            conn.execute(
+                "SELECT value FROM daemon_state WHERE key='runtime_observations_history_started_at_ms'"
+            ).fetchone(),
+        )
+        dialog_rows = cast(
+            list[dict[str, object]],
+            conn.execute("SELECT status,COUNT(*) count FROM synced_dialogs GROUP BY status").fetchall(),
+        )
+    finally:
+        conn.close()
+    return observations, history_row, dialog_rows
 
 
 class _DaemonClient(Protocol):
