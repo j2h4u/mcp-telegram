@@ -6,6 +6,7 @@ from types import MappingProxyType
 
 import pytest
 
+from mcp_telegram.media_hydration import MediaFactHydrationHandler
 from mcp_telegram.telegram_rpc_consumers import (
     TELEGRAM_DEMAND_CONTRACTS,
     TELEGRAM_RPC_CONSUMERS,
@@ -23,6 +24,7 @@ from mcp_telegram.telegram_rpc_consumers import (
     validate_demand_contracts,
 )
 from mcp_telegram.telegram_rpc_scheduler import RPC_SOURCE_SERVICE_CLASS
+from mcp_telegram.transcription_hydration import TranscriptionHydrationHandler
 
 
 def test_consumer_registry_is_exhaustive_and_semantically_complete() -> None:
@@ -56,7 +58,7 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
         TelegramRpcSource.DELTA_SYNC: {DemandKind.DELTA_GAP_FILL, DemandKind.DELTA_ACCESS_PROBE},
         TelegramRpcSource.ACTIVITY_HOT_SWEEP: {DemandKind.HOT_ACTIVITY_PAGE},
         TelegramRpcSource.FACT_HYDRATION_LIVE: {DemandKind.LIVE_HYDRATION_BATCH},
-        TelegramRpcSource.FULL_SYNC: {DemandKind.FULL_SYNC_PAGE},
+        TelegramRpcSource.FULL_SYNC: {DemandKind.FULL_SYNC_DM_ENROLLMENT, DemandKind.FULL_SYNC_PAGE},
         TelegramRpcSource.DIALOG_SYNC: {
             DemandKind.DIALOG_BOOTSTRAP,
             DemandKind.DIALOG_LIGHT_RECONCILIATION,
@@ -119,6 +121,22 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
 
     assert demand_contract(DemandKind.SCHEDULED_REPAIR).freshness_target == timedelta(minutes=15)
     assert demand_contract(DemandKind.SCHEDULED_DISCOVERY).freshness_target == timedelta(hours=24)
+    assert demand_contract(DemandKind.FULL_SYNC_DM_ENROLLMENT).max_rpc_attempts_per_slice == 32
+    assert demand_contract(DemandKind.LIVE_HYDRATION_BATCH).max_rpc_attempts_per_slice == 2
+    assert demand_contract(DemandKind.BACKFILL_HYDRATION_BATCH).max_rpc_attempts_per_slice == 2
+    assert demand_contract(DemandKind.REACTION_REFRESH_BATCH).execution_mode is ExecutionMode.INLINE
+
+
+def test_hydration_slice_bounds_cover_every_registered_handler_cost() -> None:
+    max_handler_cost = max(
+        MediaFactHydrationHandler.request_cost,
+        TranscriptionHydrationHandler.request_cost,
+    )
+    assert max_handler_cost == 2
+    live_bound = demand_contract(DemandKind.LIVE_HYDRATION_BATCH).max_rpc_attempts_per_slice
+    backfill_bound = demand_contract(DemandKind.BACKFILL_HYDRATION_BATCH).max_rpc_attempts_per_slice
+    assert live_bound is not None and live_bound >= max_handler_cost
+    assert backfill_bound is not None and backfill_bound >= max_handler_cost
 
 
 def test_demand_registry_validation_rejects_missing_kind_and_contract_key_mismatch() -> None:

@@ -88,7 +88,7 @@ def test_startup_validation_requires_exact_durable_adapter_coverage() -> None:
         validate_durable_adapters(adapters)
 
     complete = _adapters()
-    complete[DemandKind.MCP_REMOTE_ACQUISITION] = _Adapter()
+    complete[DemandKind.REACTION_REFRESH_BATCH] = _Adapter()
     with pytest.raises(RuntimeError, match="unexpected"):
         validate_durable_adapters(complete)
 

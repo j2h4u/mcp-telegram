@@ -66,6 +66,7 @@ class DemandKind(StrEnum):
     DELTA_ACCESS_PROBE = "delta_access_probe"
     HOT_ACTIVITY_PAGE = "hot_activity_page"
     LIVE_HYDRATION_BATCH = "live_hydration_batch"
+    FULL_SYNC_DM_ENROLLMENT = "full_sync_dm_enrollment"
     FULL_SYNC_PAGE = "full_sync_page"
     DIALOG_BOOTSTRAP = "dialog_bootstrap"
     DIALOG_LIGHT_RECONCILIATION = "dialog_light_reconciliation"
@@ -633,7 +634,13 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.LIVE_HYDRATION_BATCH,
         TelegramRpcSource.FACT_HYDRATION_LIVE,
         _DURABLE,
-        max_rpc_attempts_per_slice=1,
+        max_rpc_attempts_per_slice=2,
+    ),
+    DemandKind.FULL_SYNC_DM_ENROLLMENT: _contract(
+        DemandKind.FULL_SYNC_DM_ENROLLMENT,
+        TelegramRpcSource.FULL_SYNC,
+        _DURABLE,
+        max_rpc_attempts_per_slice=32,
     ),
     DemandKind.FULL_SYNC_PAGE: _contract(
         DemandKind.FULL_SYNC_PAGE,
@@ -681,7 +688,7 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.BACKFILL_HYDRATION_BATCH,
         TelegramRpcSource.FACT_HYDRATION_BACKFILL,
         _DURABLE,
-        max_rpc_attempts_per_slice=1,
+        max_rpc_attempts_per_slice=2,
     ),
     DemandKind.FOLDER_SNAPSHOT: _contract(
         DemandKind.FOLDER_SNAPSHOT,
@@ -704,8 +711,7 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
     DemandKind.REACTION_REFRESH_BATCH: _contract(
         DemandKind.REACTION_REFRESH_BATCH,
         TelegramRpcSource.REACTION_REFRESH,
-        _DURABLE,
-        max_rpc_attempts_per_slice=16,
+        _INLINE,
     ),
     DemandKind.READ_RECEIPT_BATCH: _contract(
         DemandKind.READ_RECEIPT_BATCH,
