@@ -42,16 +42,33 @@ class RpcAdmissionObservationPolicy(Protocol):
 
 
 class DemandEvidenceOutcome(StrEnum):
-    """Bounded lifecycle labels for process-local demand evidence."""
+    """Final lifecycle outcomes emitted by the durable coordinator."""
 
-    OFFERED = "offered"
-    LOCALLY_SATISFIED = "locally_satisfied"
-    READY = "ready"
-    COALESCED_WAKEUP = "coalesced_wakeup"
-    PREDICTED_SELECTION = "predicted_selection"
+    SELECTED = "selected"
     COMPLETED = "completed"
     DEFERRED = "deferred"
     FAILED = "failed"
+
+
+class DemandObservationHook(Protocol):
+    """Narrow observer seam the durable coordinator may call after a slice."""
+
+    def observe_demand(  # noqa: PLR0913 - this is the stable telemetry boundary
+        self,
+        *,
+        outcome: DemandEvidenceOutcome | str,
+        demand_kind: DemandKind,
+        acquisition_kind: AcquisitionKind | None = None,
+        demand_units: int = 1,
+        actual_attempts: int = 0,
+        queue_age_seconds: float | None = None,
+        freshness_debt_seconds: float | None = None,
+        reason: str | None = None,
+    ) -> None: ...
+
+
+# Compatibility name for composition code that still refers to demand evidence.
+DemandEvidenceObserver = DemandObservationHook
 
 
 _DEMAND_EVIDENCE_OUTCOMES = frozenset(DemandEvidenceOutcome)
@@ -120,7 +137,7 @@ class RpcAdmissionObservationAggregator:
             _AdmissionAggregate,
         ] = {}
         self._demand_aggregates: dict[
-            tuple[DemandKind, AcquisitionKind | None, DemandEvidenceOutcome, DemandKind | None, bool | None],
+            tuple[DemandKind, AcquisitionKind | None, DemandEvidenceOutcome, str | None],
             _DemandAggregate,
         ] = {}
         self._state_lock = threading.Lock()
@@ -146,13 +163,11 @@ class RpcAdmissionObservationAggregator:
         acquisition_kind: AcquisitionKind | None = None,
         demand_units: int = 1,
         actual_attempts: int = 0,
-        oldest_overdue_seconds: float | None = None,
         queue_age_seconds: float | None = None,
-        predicted_kind: DemandKind | None = None,
-        selection_match: bool | None = None,
+        freshness_debt_seconds: float | None = None,
         reason: str | None = None,
     ) -> None:
-        """Aggregate bounded shadow demand evidence without storing work identity.
+        """Aggregate final coordinator outcomes without storing work identity.
 
         ``demand_units`` counts product demand and ``actual_attempts`` counts
         Telegram attempts.  They intentionally remain separate fields.
@@ -163,24 +178,19 @@ class RpcAdmissionObservationAggregator:
                 raise TypeError("demand_kind must be a DemandKind")
             if acquisition_kind is not None and not isinstance(acquisition_kind, AcquisitionKind):
                 raise TypeError("acquisition_kind must be an AcquisitionKind")
-            _validate_nonnegative_int(demand_units, "demand_units")
+            _validate_positive_int(demand_units, "demand_units")
             _validate_nonnegative_int(actual_attempts, "actual_attempts")
-            _validate_optional_nonnegative_number(oldest_overdue_seconds, "oldest_overdue_seconds")
             _validate_optional_nonnegative_number(queue_age_seconds, "queue_age_seconds")
-            if predicted_kind is not None and not isinstance(predicted_kind, DemandKind):
-                raise TypeError("predicted_kind must be a DemandKind")
-            if selection_match is not None and not isinstance(selection_match, bool):
-                raise TypeError("selection_match must be a boolean")
+            _validate_optional_nonnegative_number(freshness_debt_seconds, "freshness_debt_seconds")
             normalized_reason = _normalize_reason(reason)
-            key = (demand_kind, acquisition_kind, normalized_outcome, predicted_kind, selection_match)
+            key = (demand_kind, acquisition_kind, normalized_outcome, normalized_reason)
             with self._state_lock:
                 aggregate = self._demand_aggregates.setdefault(key, _DemandAggregate())
                 aggregate.add(
                     demand_units=demand_units,
                     actual_attempts=actual_attempts,
-                    oldest_overdue_seconds=oldest_overdue_seconds,
                     queue_age_seconds=queue_age_seconds,
-                    reason=normalized_reason,
+                    freshness_debt_seconds=freshness_debt_seconds,
                 )
             self.flush_if_due()
         except Exception:  # noqa: BLE001 - telemetry cannot break demand producers
@@ -267,29 +277,26 @@ class RpcAdmissionObservationAggregator:
             demand_kind,
             acquisition_kind,
             outcome,
-            predicted_kind,
-            selection_match,
+            reason,
         ), demand_aggregate in demand_aggregates.items():
             try:
                 payload = _demand_payload(
                     demand_kind=demand_kind,
                     acquisition_kind=acquisition_kind,
                     aggregate=demand_aggregate,
-                    predicted_kind=predicted_kind,
-                    selection_match=selection_match,
                     window_seconds=self._summary_interval_seconds,
                 )
                 self._recorder.record(
                     kind="telegram.demand",
                     outcome=outcome.value,
-                    reason_code=demand_aggregate.reason,
+                    reason_code=reason,
                     result_count=None,
                     payload=payload,
                 )
             except Exception:
                 with self._state_lock:
                     self._demand_aggregates.setdefault(
-                        (demand_kind, acquisition_kind, outcome, predicted_kind, selection_match),
+                        (demand_kind, acquisition_kind, outcome, reason),
                         _DemandAggregate(),
                     ).merge(demand_aggregate)
                 logger.exception(
@@ -330,45 +337,38 @@ class RpcAdmissionObservationAggregator:
 class _DemandAggregate:
     demand_units: int = 0
     actual_attempts: int = 0
-    oldest_overdue_seconds: float | None = None
     queue_age_seconds: float | None = None
-    reason: str | None = None
+    freshness_debt_seconds: float | None = None
 
     def add(
         self,
         *,
         demand_units: int,
         actual_attempts: int,
-        oldest_overdue_seconds: float | None,
         queue_age_seconds: float | None,
-        reason: str | None,
+        freshness_debt_seconds: float | None,
     ) -> None:
         self.demand_units += demand_units
         self.actual_attempts += actual_attempts
-        if oldest_overdue_seconds is not None:
-            self.oldest_overdue_seconds = max(self.oldest_overdue_seconds or 0.0, oldest_overdue_seconds)
         if queue_age_seconds is not None:
             self.queue_age_seconds = max(self.queue_age_seconds or 0.0, queue_age_seconds)
-        if self.reason is None:
-            self.reason = reason
+        if freshness_debt_seconds is not None:
+            self.freshness_debt_seconds = max(self.freshness_debt_seconds or 0.0, freshness_debt_seconds)
 
     def merge(self, other: _DemandAggregate) -> None:
         self.add(
             demand_units=other.demand_units,
             actual_attempts=other.actual_attempts,
-            oldest_overdue_seconds=other.oldest_overdue_seconds,
             queue_age_seconds=other.queue_age_seconds,
-            reason=other.reason,
+            freshness_debt_seconds=other.freshness_debt_seconds,
         )
 
 
-def _demand_payload(  # noqa: PLR0913 - serialization keeps every bounded dimension explicit
+def _demand_payload(
     *,
     demand_kind: DemandKind,
     acquisition_kind: AcquisitionKind | None,
     aggregate: _DemandAggregate,
-    predicted_kind: DemandKind | None,
-    selection_match: bool | None,
     window_seconds: float,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
@@ -379,14 +379,10 @@ def _demand_payload(  # noqa: PLR0913 - serialization keeps every bounded dimens
     }
     if acquisition_kind is not None:
         payload["acquisition_kind"] = acquisition_kind.value
-    if aggregate.oldest_overdue_seconds is not None:
-        payload["oldest_overdue_seconds"] = aggregate.oldest_overdue_seconds
     if aggregate.queue_age_seconds is not None:
         payload["queue_age_seconds"] = aggregate.queue_age_seconds
-    if predicted_kind is not None or selection_match is not None:
-        payload["predicted_kind"] = None if predicted_kind is None else predicted_kind.value
-    if selection_match is not None:
-        payload["selection_match"] = selection_match
+    if aggregate.freshness_debt_seconds is not None:
+        payload["freshness_debt_seconds"] = aggregate.freshness_debt_seconds
     return payload
 
 
@@ -397,6 +393,11 @@ def _is_finite(value: int | float) -> bool:
 def _validate_nonnegative_int(value: int, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
+
+
+def _validate_positive_int(value: int, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
 
 
 def _validate_optional_nonnegative_number(value: float | None, name: str) -> None:
@@ -426,7 +427,9 @@ def _normalize_reason(reason: str | None) -> str | None:
 
 
 __all__ = [
+    "DemandEvidenceObserver",
     "DemandEvidenceOutcome",
+    "DemandObservationHook",
     "ObservationRecorder",
     "RpcAdmissionObservationAggregator",
     "RpcAdmissionObservationPolicy",
