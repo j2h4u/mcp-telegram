@@ -86,10 +86,7 @@ class EntityProfileRepository:
         columns = getattr(self, attribute)
         if columns is None:
             try:
-                columns = {
-                    str(row[1])
-                    for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
-                }
+                columns = {str(row[1]) for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
             except sqlite3.OperationalError:
                 columns = set()
             setattr(self, attribute, columns)
@@ -307,7 +304,9 @@ class EntityProfileRepository:
             row = cast(
                 tuple[object, ...] | None,
                 self._conn.execute(
-                    "SELECT detail_json, fetched_at" + owner_column + scope_column
+                    "SELECT detail_json, fetched_at"
+                    + owner_column
+                    + scope_column
                     + " FROM entity_details WHERE entity_id = ?",
                     (entity_id,),
                 ).fetchone(),
@@ -321,7 +320,7 @@ class EntityProfileRepository:
             return {}, None, None, None
         try:
             parsed = cast(object, json.loads(raw_json))
-        except (TypeError, json.JSONDecodeError):
+        except TypeError, json.JSONDecodeError:
             return {}, None, None, None
         if not isinstance(parsed, dict) or parsed.get("schema") != _DETAIL_SCHEMA:
             return {}, None, None, None
@@ -489,8 +488,13 @@ class EntityProfileRepository:
             existing_columns = [
                 column
                 for column in (
-                    "status", "generation", "started_at", "pair_eligible",
-                    "follow_up_required", "profile_revision", "pair_mode",
+                    "status",
+                    "generation",
+                    "started_at",
+                    "pair_eligible",
+                    "follow_up_required",
+                    "profile_revision",
+                    "pair_mode",
                 )
                 if self._refresh_has(column)
             ]
@@ -499,7 +503,11 @@ class EntityProfileRepository:
                 (entity_id,),
             ).fetchone()
             existing = dict(zip(existing_columns, existing_row, strict=False)) if existing_row is not None else None
-            if existing is not None and str(existing.get("status")) == "pending" and int(existing.get("generation") or 0) > 0:
+            if (
+                existing is not None
+                and str(existing.get("status")) == "pending"
+                and int(existing.get("generation") or 0) > 0
+            ):
                 generation = int(existing["generation"])
                 started_at = existing.get("started_at")
                 # Eligibility is a generation fact.  A repeated enqueue or
@@ -529,8 +537,13 @@ class EntityProfileRepository:
                 "profile_revision": profile_revision,
             }
             columns = [
-                "entity_id", "status", "retry_at", "reason", "updated_at",
-                "next_section", "acquisition_cursor",
+                "entity_id",
+                "status",
+                "retry_at",
+                "reason",
+                "updated_at",
+                "next_section",
+                "acquisition_cursor",
             ]
             values: list[object] = [entity_id, "pending", None, reason, now, PROFILE_SECTIONS[0], 0]
             for column, value in optional_values.items():
@@ -604,9 +617,7 @@ class EntityProfileRepository:
             return False
         stored = self._read_stored_sections(entity_id)
         return all(
-            self._section_requires_acquisition(
-                section, stored.get(section), detail, observed_at=observed_at, now=now
-            )
+            self._section_requires_acquisition(section, stored.get(section), detail, observed_at=observed_at, now=now)
             for section in ("full_profile", "personal_channel")
         )
 
@@ -652,8 +663,12 @@ class EntityProfileRepository:
             selected.extend(
                 column
                 for column in (
-                    "generation", "started_at", "pair_eligible", "follow_up_required",
-                    "profile_revision", "pair_mode",
+                    "generation",
+                    "started_at",
+                    "pair_eligible",
+                    "follow_up_required",
+                    "profile_revision",
+                    "pair_mode",
                 )
                 if column in columns
             )
@@ -678,18 +693,17 @@ class EntityProfileRepository:
             pair_eligible=bool(values.get("pair_eligible", 0)),
             follow_up_required=bool(values.get("follow_up_required", 0)),
             profile_revision=int(values.get("profile_revision") or 0),
-            pair_mode=(
-                str(values["pair_mode"])
-                if values.get("pair_mode") in {"enabled", "disabled"}
-                else None
-            ),
+            pair_mode=(str(values["pair_mode"]) if values.get("pair_mode") in {"enabled", "disabled"} else None),
         )
 
     def _recover_pair_measurements(self, *, now: int) -> None:
         """Complete measurement rows left behind by a committed pair receipt."""
         required = {
-            "pair_full_profile_outcome", "pair_personal_channel_outcome",
-            "pair_measurement_complete", "pair_ready_at", "pair_summary_watermark",
+            "pair_full_profile_outcome",
+            "pair_personal_channel_outcome",
+            "pair_measurement_complete",
+            "pair_ready_at",
+            "pair_summary_watermark",
         }
         if not required <= self._columns("entity_profile_refresh_state", "_refresh_columns"):
             return
@@ -929,7 +943,9 @@ class EntityProfileRepository:
             raise ValueError("next_acquisition_cursor must advance")
         with self._conn:
             predicate, parameters = self._cursor_predicate(cursor)
-            assignments = "status='pending', retry_at=NULL, reason='refresh_in_progress', updated_at=?, acquisition_cursor=?"
+            assignments = (
+                "status='pending', retry_at=NULL, reason='refresh_in_progress', updated_at=?, acquisition_cursor=?"
+            )
             if self._refresh_has("profile_revision"):
                 assignments += ", profile_revision=?"
                 values: tuple[object, ...] = (now, next_acquisition_cursor, cursor.profile_revision)
@@ -1087,14 +1103,11 @@ class EntityProfileRepository:
             if metadata_update:
                 update_columns += ", " + metadata_update
             changed = self._conn.execute(
-                "UPDATE entity_details SET " + update_columns + " "
-                "WHERE entity_id=? AND profile_revision=?",
+                "UPDATE entity_details SET " + update_columns + " WHERE entity_id=? AND profile_revision=?",
                 (encoded_detail, now, *metadata_values, entity_id, expected_revision),
             ).rowcount
             if changed == 0:
-                exists = self._conn.execute(
-                    "SELECT 1 FROM entity_details WHERE entity_id=?", (entity_id,)
-                ).fetchone()
+                exists = self._conn.execute("SELECT 1 FROM entity_details WHERE entity_id=?", (entity_id,)).fetchone()
                 if exists is not None:
                     return False
                 columns = ("entity_id", "detail_json", "fetched_at", "profile_revision", *metadata_columns)
@@ -1130,7 +1143,9 @@ class EntityProfileRepository:
         observed_at = (
             evidence.observation_at
             if evidence is not None and status in {"fresh", "not_applicable"}
-            else now if evidence is None and status in {"fresh", "not_applicable"} else None
+            else now
+            if evidence is None and status in {"fresh", "not_applicable"}
+            else None
         )
         if (
             evidence is not None
@@ -1188,7 +1203,9 @@ class EntityProfileRepository:
             )
             values.extend([None] * 7)
         placeholders = ", ".join("?" for _ in columns)
-        updates = ", ".join(f"{column}=excluded.{column}" for column in columns if column not in {"entity_id", "section"})
+        updates = ", ".join(
+            f"{column}=excluded.{column}" for column in columns if column not in {"entity_id", "section"}
+        )
         self._conn.execute(
             f"INSERT INTO entity_detail_sections({', '.join(columns)}) VALUES ({placeholders}) "
             f"ON CONFLICT(entity_id, section) DO UPDATE SET {updates}",
@@ -1225,9 +1242,7 @@ class EntityProfileRepository:
             detail = _strip_schema(detail)
             detail.update(full_profile.detail_patch)
             detail.update(personal_channel.detail_patch)
-            owner_account_id, observation_scope, ownership_observed = _commit_metadata(
-                full_profile, personal_channel
-            )
+            owner_account_id, observation_scope, ownership_observed = _commit_metadata(full_profile, personal_channel)
             if not self._write_detail(
                 cursor.entity_id,
                 detail,
@@ -1259,9 +1274,13 @@ class EntityProfileRepository:
                 evidence=personal_channel.evidence,
             )
             measurement_columns = {
-                "pair_mode", "pair_eligible", "pair_full_profile_outcome",
-                "pair_personal_channel_outcome", "pair_ready_at",
-                "pair_readiness_latency_ms", "pair_measurement_complete",
+                "pair_mode",
+                "pair_eligible",
+                "pair_full_profile_outcome",
+                "pair_personal_channel_outcome",
+                "pair_ready_at",
+                "pair_readiness_latency_ms",
+                "pair_measurement_complete",
                 "pair_summary_watermark",
             }
             if cursor.pair_eligible and measurement_columns <= self._refresh_columns_or_empty():
@@ -1365,17 +1384,24 @@ class EntityProfileRepository:
         assignments.extend(
             f"{column}=NULL"
             for column in (
-            "pair_full_profile_outcome", "pair_personal_channel_outcome",
-            "pair_ready_at", "pair_readiness_latency_ms", "pair_summary_watermark",
+                "pair_full_profile_outcome",
+                "pair_personal_channel_outcome",
+                "pair_ready_at",
+                "pair_readiness_latency_ms",
+                "pair_summary_watermark",
             )
             if column in columns
         )
         assignments.extend(
             f"{column}=0"
             for column in (
-            "pair_full_profile_attempts", "pair_personal_channel_attempts",
-            "pair_full_profile_retries", "pair_personal_channel_retries",
-            "pair_attempts", "pair_retries", "pair_measurement_complete",
+                "pair_full_profile_attempts",
+                "pair_personal_channel_attempts",
+                "pair_full_profile_retries",
+                "pair_personal_channel_retries",
+                "pair_attempts",
+                "pair_retries",
+                "pair_measurement_complete",
             )
             if column in columns
         )
@@ -1398,16 +1424,17 @@ class EntityProfileRepository:
             # No canonical write happened while reusing same-generation
             # evidence, so the revision fence remains unchanged.
             pass
-        return self._conn.execute(
-            "UPDATE entity_profile_refresh_state SET " + assignments + " WHERE " + predicate,
-            (*values, *parameters),
-        ).rowcount == 1
+        return (
+            self._conn.execute(
+                "UPDATE entity_profile_refresh_state SET " + assignments + " WHERE " + predicate,
+                (*values, *parameters),
+            ).rowcount
+            == 1
+        )
 
     def _cursor_matches(self, cursor: EntityRefreshCursor) -> bool:
         predicate, parameters = self._cursor_predicate(cursor)
-        row = self._conn.execute(
-            f"SELECT 1 FROM entity_profile_refresh_state WHERE {predicate}", parameters
-        ).fetchone()
+        row = self._conn.execute(f"SELECT 1 FROM entity_profile_refresh_state WHERE {predicate}", parameters).fetchone()
         return row is not None
 
     def _cursor_predicate(self, cursor: EntityRefreshCursor) -> tuple[str, tuple[object, ...]]:
@@ -1587,7 +1614,7 @@ class EntityProfileRepository:
             return None
         try:
             generation = int(row[0])
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
         return {
             "generation": generation,
@@ -1629,8 +1656,7 @@ class EntityProfileRepository:
         started_at = evidence.get("observation_started_at")
         completed_at = evidence.get("observation_completed_at")
         if any(
-            isinstance(value, bool) or not isinstance(value, int) or value < 0
-            for value in (started_at, completed_at)
+            isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (started_at, completed_at)
         ):
             return False
         started_at = cast(int, started_at)
@@ -1736,7 +1762,7 @@ class EntityProfileRepository:
             return {}
         try:
             value = cast(object, json.loads(str(row[0])))
-        except (TypeError, json.JSONDecodeError):
+        except TypeError, json.JSONDecodeError:
             return {}
         return value if isinstance(value, dict) else {}
 
@@ -1842,11 +1868,7 @@ def _pair_readiness_latency_ms(
     full_profile: EntitySectionCommit,
     personal_channel: EntitySectionCommit,
 ) -> float | None:
-    evidences = [
-        commit.evidence
-        for commit in (full_profile, personal_channel)
-        if commit.evidence is not None
-    ]
+    evidences = [commit.evidence for commit in (full_profile, personal_channel) if commit.evidence is not None]
     starts = [evidence.observation_started_at for evidence in evidences]
     completes = [evidence.observation_completed_at for evidence in evidences]
     if not starts or any(value is None for value in starts + completes):

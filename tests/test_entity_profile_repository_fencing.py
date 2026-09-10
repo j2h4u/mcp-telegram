@@ -217,9 +217,9 @@ def test_restart_keeps_original_observation_time_and_same_generation_channel_com
         status = "not_applicable" if cursor.next_section == "contact_overlap" else "fresh"
         assert reopened_repo.commit_section(cursor, EntitySectionCommit({}, status=status), now=109)
         cursor = reopened_repo.next_due_refresh(now=109)
-    assert reopened.execute(
-        "SELECT status FROM entity_profile_refresh_state WHERE entity_id=42"
-    ).fetchone() == ("complete",)
+    assert reopened.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+        "complete",
+    )
     assert reopened_repo.read(42, now=110).sections["full_profile"]["status"] == "stale"  # type: ignore[union-attr]
     reopened.close()
 
@@ -269,9 +269,9 @@ def test_same_generation_channel_completion_ignores_ttl(tmp_path: Path) -> None:
     channel_cursor = repo.next_due_refresh(now=10_000)
     assert channel_cursor is not None
     assert repo.complete_same_generation_section(channel_cursor, identity, now=10_000)
-    assert conn.execute(
-        "SELECT status FROM entity_profile_refresh_state WHERE entity_id=42"
-    ).fetchone() == ("complete",)
+    assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+        "complete",
+    )
     conn.close()
 
 

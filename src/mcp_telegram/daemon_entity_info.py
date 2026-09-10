@@ -61,6 +61,7 @@ _PAIR_SECTION_COUNT = 2
 class _AuthScopeUnavailableError(RuntimeError):
     """The live primary session identity cannot authorize a pair receipt."""
 
+
 _ADMIN_RIGHT_FIELDS = (
     "change_info",
     "post_messages",
@@ -371,9 +372,7 @@ class DaemonEntityInfoService:
                     entity_id,
                     now=now,
                     reason="auth_scope_changed",
-                    pair_eligible_override=(
-                        True if self._deps.enable_full_user_pair else None
-                    ),
+                    pair_eligible_override=(True if self._deps.enable_full_user_pair else None),
                     pair_mode_override=self._current_pair_mode(),
                 )
                 cached = self._profiles.read(entity_id, now=now)
@@ -549,9 +548,7 @@ class DaemonEntityInfoService:
                     cursor.entity_id,
                     self._success_if_refresh_finished(cursor, committed=True),
                 )
-            reuse_rejection_reason = self._profiles.full_user_pair_reuse_rejection_reason(
-                cursor, identity, now=now
-            )
+            reuse_rejection_reason = self._profiles.full_user_pair_reuse_rejection_reason(cursor, identity, now=now)
             terminal = await self._acquire_and_commit_full_user_pair(
                 cursor,
                 now=now,
@@ -598,9 +595,7 @@ class DaemonEntityInfoService:
             }
         )
 
-    def _pair_personal_channel_is_ready(
-        self, cursor: EntityRefreshCursor, *, pair_mode: str | None = None
-    ) -> bool:
+    def _pair_personal_channel_is_ready(self, cursor: EntityRefreshCursor, *, pair_mode: str | None = None) -> bool:
         if (pair_mode or cursor.pair_mode) != "enabled" or cursor.next_section != "personal_channel":
             return False
         evidence = self._profiles.read_section_evidence(cursor.entity_id, "personal_channel")
@@ -609,8 +604,7 @@ class DaemonEntityInfoService:
         identity = self._full_user_pair_identity(target_kind)
         return (
             (identity is not None or self._deps.full_user_auth_scope is None)
-            and
-            evidence is not None
+            and evidence is not None
             and evidence.get("generation") == cursor.generation
             and evidence.get("normalization_version") == NORMALIZATION_VERSION
             and (self._deps.full_user_auth_scope is None or evidence.get("identity") == identity)
@@ -761,11 +755,7 @@ class DaemonEntityInfoService:
             return DurableRefreshTerminal.FAILURE if failed else None
         if self._deps.full_user_auth_scope is not None:
             current_scope = self._capture_pair_scope()
-            expected_identity = (
-                full_profile.evidence.identity
-                if full_profile.evidence is not None
-                else None
-            )
+            expected_identity = full_profile.evidence.identity if full_profile.evidence is not None else None
             expected_scope = self._full_user_pair_identity(
                 TargetKind.BOT
                 if self._stored_entity_type(cursor.entity_id, now=now) is DialogType.BOT
@@ -1082,11 +1072,7 @@ class DaemonEntityInfoService:
         full_profile: EntitySectionCommit,
         personal_channel: EntitySectionCommit,
     ) -> float | None:
-        boundaries = [
-            commit.evidence
-            for commit in (full_profile, personal_channel)
-            if commit.evidence is not None
-        ]
+        boundaries = [commit.evidence for commit in (full_profile, personal_channel) if commit.evidence is not None]
         starts = [evidence.observation_started_at for evidence in boundaries]
         completes = [evidence.observation_completed_at for evidence in boundaries]
         if not starts or any(value is None for value in starts + completes):
@@ -1188,9 +1174,7 @@ class DaemonEntityInfoService:
             )
         channel_id = payload.get("personal_channel_id")
         if not isinstance(channel_id, int) or channel_id <= 0:
-            evidence = self._finalize_channel_evidence(
-                evidence, outcome="partial", authoritative=False
-            )
+            evidence = self._finalize_channel_evidence(evidence, outcome="partial", authoritative=False)
             return EntitySectionCommit(
                 {},
                 status="unavailable",
@@ -1204,9 +1188,7 @@ class DaemonEntityInfoService:
         dialog_id = self._normalize_channel_dialog_id(channel_id)
         metadata = self._personal_channel_metadata(None, dialog_id=dialog_id)
         if metadata is None:
-            evidence = self._finalize_channel_evidence(
-                evidence, outcome="unavailable", authoritative=False
-            )
+            evidence = self._finalize_channel_evidence(evidence, outcome="unavailable", authoritative=False)
             return EntitySectionCommit(
                 {
                     "personal_channel_id": channel_id,

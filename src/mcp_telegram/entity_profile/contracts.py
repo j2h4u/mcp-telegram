@@ -17,9 +17,7 @@ PROFILE_SECTIONS: tuple[str, ...] = (
     "personal_channel",
 )
 
-PROFILE_ACQUISITION_OUTCOMES: frozenset[str] = frozenset(
-    {"usable", "partial", "absent", "unavailable"}
-)
+PROFILE_ACQUISITION_OUTCOMES: frozenset[str] = frozenset({"usable", "partial", "absent", "unavailable"})
 PROFILE_ENDPOINT = "users.GetFullUser"
 PROFILE_NORMALIZATION_VERSION = "entity-profile-v1"
 

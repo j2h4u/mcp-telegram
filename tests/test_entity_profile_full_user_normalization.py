@@ -67,7 +67,10 @@ def test_user_and_bot_targets_normalize_independently() -> None:
 @pytest.mark.parametrize(
     ("response", "reason"),
     [
-        (SimpleNamespace(full_user=SimpleNamespace(), users=[SimpleNamespace(id=99, bot=False)], chats=[]), "target_identity_mismatch"),
+        (
+            SimpleNamespace(full_user=SimpleNamespace(), users=[SimpleNamespace(id=99, bot=False)], chats=[]),
+            "target_identity_mismatch",
+        ),
         (SimpleNamespace(full_user=SimpleNamespace(), users=[], chats=[]), "target_identity_mismatch"),
         (SimpleNamespace(full_user=SimpleNamespace(), chats=[]), "missing_users"),
         (SimpleNamespace(users=[SimpleNamespace(id=42, bot=False)], chats=[]), "missing_full_user"),

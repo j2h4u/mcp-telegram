@@ -442,8 +442,7 @@ def _normalize_full_profile(  # noqa: PLR0912, PLR0915, PLR0914
             facts["extra_usernames"] = [
                 username
                 for entry in usernames
-                if (username := _string(_attr(entry, "username"))) is not None
-                and username != facts.get("username")
+                if (username := _string(_attr(entry, "username"))) is not None and username != facts.get("username")
             ]
     emoji_status = _attr(user, "emoji_status")
     if emoji_status is _MISSING:
@@ -479,11 +478,7 @@ def _normalize_full_profile(  # noqa: PLR0912, PLR0915, PLR0914
         else:
             facts["restriction_reason"] = restrictions
 
-    relationship = {
-        name: facts[name]
-        for name in ("contact", "mutual_contact", "close_friend")
-        if name in facts
-    }
+    relationship = {name: facts[name] for name in ("contact", "mutual_contact", "close_friend") if name in facts}
     if "blocked" in facts:
         relationship["blocked"] = facts["blocked"]
     if relationship:
@@ -500,7 +495,9 @@ def _entity_id(value: object) -> int | None:
     return _positive_integer(_attr(value, "id"))
 
 
-def _find_matching_user(users: tuple[object, ...], target_id: int, target_kind: TargetKind) -> tuple[object | None, str | None]:
+def _find_matching_user(
+    users: tuple[object, ...], target_id: int, target_kind: TargetKind
+) -> tuple[object | None, str | None]:
     matches = [user for user in users if _entity_id(user) == target_id]
     if not matches:
         return None, "target_identity_mismatch"
@@ -514,7 +511,11 @@ def _find_matching_user(users: tuple[object, ...], target_id: int, target_kind: 
 
 
 def _projection_provenance(
-    declared_fields: tuple[str, ...], payload: Mapping[str, object], observation: ObservationBoundary, *, authoritative: bool
+    declared_fields: tuple[str, ...],
+    payload: Mapping[str, object],
+    observation: ObservationBoundary,
+    *,
+    authoritative: bool,
 ) -> ProjectionProvenance:
     return ProjectionProvenance(
         endpoint=FULL_USER_ENDPOINT,
@@ -530,7 +531,9 @@ def _unavailable(reason: str) -> ProjectionOutcome:
     return ProjectionOutcome(status=ProjectionStatus.UNAVAILABLE, payload=None, reason=reason, provenance=None)
 
 
-def _normalize_personal_channel(full_user: object, chats: object, observation: ObservationBoundary) -> ProjectionOutcome:
+def _normalize_personal_channel(
+    full_user: object, chats: object, observation: ObservationBoundary
+) -> ProjectionOutcome:
     raw_id = _attr(full_user, "personal_channel_id")
     if raw_id is _MISSING:
         return ProjectionOutcome(
@@ -636,9 +639,7 @@ def normalize_full_user_response(
         )
 
     profile, complete = _normalize_full_profile(full_user, user)
-    profile_provenance = _projection_provenance(
-        FULL_PROFILE_OWNED_FIELDS, profile, boundary, authoritative=complete
-    )
+    profile_provenance = _projection_provenance(FULL_PROFILE_OWNED_FIELDS, profile, boundary, authoritative=complete)
     return FullUserNormalization(
         target_id=target_id,
         target_kind=normalized_kind,

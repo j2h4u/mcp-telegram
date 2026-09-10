@@ -751,8 +751,7 @@ def test_genuine_v61_fixture_upgrades_to_v62_and_reopens_idempotently(
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
         assert _fetchone_row(
             conn,
-            "SELECT detail_json, fetched_at, profile_owner_account_id "
-            "FROM entity_details WHERE entity_id=42",
+            "SELECT detail_json, fetched_at, profile_owner_account_id FROM entity_details WHERE entity_id=42",
         ) == ('{"schema":1,"id":42,"type":"user","name":"kept"}', 100, None)
         assert _fetchone_row(
             conn,
