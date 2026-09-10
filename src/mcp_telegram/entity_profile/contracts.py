@@ -18,7 +18,6 @@ PROFILE_SECTIONS: tuple[str, ...] = (
 )
 
 PROFILE_ACQUISITION_OUTCOMES: frozenset[str] = frozenset({"usable", "partial", "absent", "unavailable"})
-PROFILE_ENDPOINT = "users.GetFullUser"
 PROFILE_NORMALIZATION_VERSION = "entity-profile-v1"
 FULL_USER_ENDPOINT = "users.GetFullUser"
 NORMALIZATION_VERSION = "entity-profile-full-user-v1"

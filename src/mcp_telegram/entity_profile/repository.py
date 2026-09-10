@@ -55,7 +55,6 @@ class EntityRefreshCursor:
     generation: int = 0
     started_at: int | None = None
     pair_eligible: bool = False
-    follow_up_required: bool = False
     profile_revision: int = 0
     pair_mode: str | None = None
 
@@ -113,32 +112,30 @@ class EntityProfileRepository:
     def __init__(self, conn: sqlite3.Connection, *, section_ttl_seconds: int) -> None:
         self._conn = conn
         self._section_ttl_seconds = max(1, int(section_ttl_seconds))
-        self._refresh_columns: set[str] | None = None
-        self._section_columns: set[str] | None = None
-        self._detail_columns: set[str] | None = None
+        self._column_cache: dict[str, set[str]] = {}
         self._emitted_pair_summaries: set[tuple[int, int]] = set()
 
-    def _columns(self, table: str, attribute: str) -> set[str]:
-        columns = getattr(self, attribute)
+    def _columns(self, table: str) -> set[str]:
+        columns = self._column_cache.get(table)
         if columns is None:
             try:
                 columns = {str(row[1]) for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
             except sqlite3.OperationalError:
                 columns = set()
-            setattr(self, attribute, columns)
+            self._column_cache[table] = columns
         return columns
 
     def _refresh_has(self, column: str) -> bool:
-        return column in self._columns("entity_profile_refresh_state", "_refresh_columns")
+        return column in self._columns("entity_profile_refresh_state")
 
     def _refresh_columns_or_empty(self) -> set[str]:
-        return self._columns("entity_profile_refresh_state", "_refresh_columns")
+        return self._columns("entity_profile_refresh_state")
 
     def _section_has(self, column: str) -> bool:
-        return column in self._columns("entity_detail_sections", "_section_columns")
+        return column in self._columns("entity_detail_sections")
 
     def _detail_has(self, column: str) -> bool:
-        return column in self._columns("entity_details", "_detail_columns")
+        return column in self._columns("entity_details")
 
     def read(self, entity_id: int, *, now: int) -> StoredProfile | None:
         detail, observed_at, owner_account_id, observation_scope = self._read_primary_detail(entity_id)
@@ -423,7 +420,7 @@ class EntityProfileRepository:
     def refresh_state(self, entity_id: int, *, now: int) -> dict[str, object] | None:
         """Return a durable unresolved-refresh state while it is relevant."""
         try:
-            columns = self._columns("entity_profile_refresh_state", "_refresh_columns")
+            columns = self._columns("entity_profile_refresh_state")
             selected = ["status", "retry_at", "reason"]
             selected.extend(
                 column
@@ -692,7 +689,7 @@ class EntityProfileRepository:
         """Read the oldest due entity cursor without claiming or changing it."""
         try:
             self._recover_pair_measurements(now=now)
-            columns = self._columns("entity_profile_refresh_state", "_refresh_columns")
+            columns = self._columns("entity_profile_refresh_state")
             selected = ["entity_id", "next_section", "acquisition_cursor", "retry_at"]
             selected.extend(
                 column
@@ -725,7 +722,6 @@ class EntityProfileRepository:
             generation=int(values.get("generation") or 0),
             started_at=cast(int | None, values.get("started_at")),
             pair_eligible=bool(values.get("pair_eligible", 0)),
-            follow_up_required=bool(values.get("follow_up_required", 0)),
             profile_revision=int(values.get("profile_revision") or 0),
             pair_mode=(str(values["pair_mode"]) if values.get("pair_mode") in {"enabled", "disabled"} else None),
         )
@@ -739,7 +735,7 @@ class EntityProfileRepository:
             "pair_ready_at",
             "pair_summary_watermark",
         }
-        if not required <= self._columns("entity_profile_refresh_state", "_refresh_columns"):
+        if not required <= self._columns("entity_profile_refresh_state"):
             return
         with self._conn:
             self._conn.execute(
@@ -812,7 +808,7 @@ class EntityProfileRepository:
             f"pair_{section}_retries",
             "pair_attempts",
             "pair_retries",
-        } <= self._columns("entity_profile_refresh_state", "_refresh_columns"):
+        } <= self._columns("entity_profile_refresh_state"):
             return
         attempt_column = f"pair_{section}_attempts"
         retry_column = f"pair_{section}_retries"
@@ -872,7 +868,7 @@ class EntityProfileRepository:
             "pair_readiness_latency_ms",
             "pair_measurement_complete",
         }
-        if not required <= self._columns("entity_profile_refresh_state", "_refresh_columns"):
+        if not required <= self._columns("entity_profile_refresh_state"):
             return None
         with self._conn:
             return self._record_pair_section_outcome_in_transaction(
@@ -1012,7 +1008,7 @@ class EntityProfileRepository:
             "pair_readiness_latency_ms",
             "pair_measurement_complete",
         }
-        if not required <= self._columns("entity_profile_refresh_state", "_refresh_columns"):
+        if not required <= self._columns("entity_profile_refresh_state"):
             return self.commit_section(cursor, commit, now=now), None
         with self._conn:
             committed = self._commit_section_in_transaction(cursor, commit, now=now)
@@ -1446,7 +1442,7 @@ class EntityProfileRepository:
         return changed
 
     def _reset_pair_measurement(self, entity_id: int) -> None:
-        columns = self._columns("entity_profile_refresh_state", "_refresh_columns")
+        columns = self._columns("entity_profile_refresh_state")
         assignments: list[str] = []
         assignments.extend(
             f"{column}=NULL"

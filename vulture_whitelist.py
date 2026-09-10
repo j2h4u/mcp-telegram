@@ -119,3 +119,9 @@ personal_channel_message
 # callers/tests, though their reads are outside vulture's source graph.
 reusable
 authoritative_absence
+
+# Entity profile repository methods are part of the repository contract. The
+# section accessor is exercised by fencing tests; follow-up is an integration
+# entry point whose caller may live outside this source tree.
+section_is_reusable
+request_follow_up
