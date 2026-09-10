@@ -10,20 +10,41 @@ import logging
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from dataclasses import replace as dataclass_replace
 from datetime import datetime
 from typing import Protocol, cast, runtime_checkable
 
 from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[import-untyped]
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
+from .auth_scope import TelegramAuthScope
 from .demand_wiring import DemandOfferSink, offer_durable_demand
-from .entity_profile.contracts import PROFILE_SECTIONS, completeness
+from .entity_profile.contracts import (
+    FULL_PROFILE_OWNED_FIELDS,
+    FULL_USER_ENDPOINT,
+    NORMALIZATION_VERSION,
+    PERSONAL_CHANNEL_OWNED_FIELDS,
+    PROFILE_SECTIONS,
+    ProfileAcquisitionEvidence,
+    completeness,
+)
+from .entity_profile.full_user_normalization import (
+    ObservationBoundary,
+    ProjectionOutcome,
+    ProjectionStatus,
+    TargetKind,
+    normalize_full_user_response,
+)
+from .entity_profile.ports import ProfilePairObservationHook
 from .entity_profile.refresh import (
     DurableRefreshSliceResult,
     DurableRefreshTerminal,
     EntityRefreshCoordinator,
     RefreshEnqueueResult,
     RefreshLimits,
+    failure_retry_at,
+    scope_changed_retry_at,
+    throttled_retry_at,
 )
 from .entity_profile.repository import EntityProfileRepository, EntityRefreshCursor, EntitySectionCommit
 from .entity_store import EntitySnapshot, ensure_entity_stub
@@ -34,13 +55,19 @@ from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
 from .telegram_rpc import raise_if_flood_wait_error
 from .telegram_rpc_consumers import DemandKind
-from .telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
+from .telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_scope
 from .telethon_dialog import classify_dialog_type
 
 _ENTITY_DETAIL_SCHEMA_VERSION = 1
 _MEMBERSHIP_THRESHOLD_LARGE = 1000
 _CHANNEL_DIALOG_ID_OFFSET = 1_000_000_000_000
 _PERSONAL_CHANNEL_PREVIEW_CHARS = 100
+_PAIR_SECTION_COUNT = 2
+
+
+class _AuthScopeUnavailableError(RuntimeError):
+    """The live primary session identity cannot authorize a pair receipt."""
+
 
 _ADMIN_RIGHT_FIELDS = (
     "change_info",
@@ -221,6 +248,80 @@ class EntityInfoDeps:
     chat_type: type[object]
     get_dialog_placement: Callable[[int], dict[str, object]] | None = None
     refresh_limits: RefreshLimits = field(default_factory=RefreshLimits)
+    enable_full_user_pair: bool = False
+    full_user_auth_scope: Callable[[], TelegramAuthScope | None] | None = None
+    profile_observer: ProfilePairObservationHook | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfileSectionContext:
+    captured_scope: TelegramAuthScope | None
+    attempt_start: int
+    pair_section: bool
+    pair_mode: str
+    eligible_pair: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ProjectionCommitContext:
+    payload: dict[str, object]
+    evidence: ProfileAcquisitionEvidence | None
+    observation_owner_account_id: int | None
+    observation_auth_scope: Mapping[str, object] | None
+    ownership_observed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfileSectionFailure:
+    cursor: EntityRefreshCursor
+    entity_type: DialogType
+    context: _ProfileSectionContext
+    now: int
+    reason: str
+    retry_at: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PairFailure:
+    cursor: EntityRefreshCursor
+    now: int
+    pair_mode: str
+    attempt_start: int
+    reason: str
+    retry_at: int
+    reuse_rejection_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PairCommitRequest:
+    cursor: EntityRefreshCursor
+    full_profile: EntitySectionCommit
+    personal_channel: EntitySectionCommit
+    now: int
+    pair_mode: str
+    attempt_start: int
+    reuse_rejection_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PairMeasurement:
+    cursor: EntityRefreshCursor
+    full_profile: EntitySectionCommit
+    personal_channel: EntitySectionCommit
+    now: int
+    pair_mode: str
+    actual_attempts: int
+    committed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PersonalChannelCard:
+    outcome: ProjectionOutcome
+    channel_id: int
+    dialog_id: int
+    metadata: Mapping[str, object]
+    local_preview: Mapping[str, object] | None
+    local_reason: str
 
 
 class DaemonEntityInfoService:
@@ -239,6 +340,13 @@ class DaemonEntityInfoService:
         """Attach post-commit wakeups to the process-wide coordinator."""
         self._demand_sink = sink
 
+    def bind_profile_observer(self, observer: ProfilePairObservationHook) -> None:
+        """Attach the best-effort profile telemetry hook after composition."""
+        self._deps = dataclass_replace(self._deps, profile_observer=observer)
+
+    def _current_pair_mode(self) -> str:
+        return "enabled" if self._deps.enable_full_user_pair else "disabled"
+
     def _require_demand_sink(self) -> DemandOfferSink:
         sink = self._demand_sink
         if sink is None:
@@ -249,6 +357,30 @@ class DaemonEntityInfoService:
     def refresh_coordinator(self) -> EntityRefreshCoordinator | None:
         """Return the service-owned coordinator used by demand composition."""
         return self._refresh
+
+    def auth_scope_changed(self) -> None:
+        """Queue completed User/Bot pairs under a new authorization generation."""
+        if not self._deps.enable_full_user_pair:
+            return
+        rows = cast(
+            list[tuple[int]],
+            self._deps.conn.execute(
+                "SELECT DISTINCT entity_id FROM entity_detail_sections "
+                "WHERE section IN ('full_profile', 'personal_channel') AND status='fresh' "
+                "GROUP BY entity_id HAVING COUNT(*)=2"
+            ).fetchall(),
+        )
+        now = int(self._deps.now_provider())
+        for row in rows:
+            self._profiles.mark_pending(
+                int(row[0]),
+                now=now,
+                reason="auth_scope_changed",
+                pair_eligible_override=True,
+                pair_mode_override=self._current_pair_mode(),
+            )
+        if rows and self._demand_sink is not None:
+            offer_durable_demand(self._demand_sink, DemandKind.ENTITY_PROFILE_REFRESH)
 
     async def get_entity_info(self, req: Mapping[str, object]) -> dict[str, object]:
         """Run one foreground entity-info use case under its RPC source."""
@@ -303,12 +435,59 @@ class DaemonEntityInfoService:
     def _progressive_cached_result(self, entity_id: int, *, now: int) -> dict[str, object] | None:
         cached = self._profiles.read(entity_id, now=now)
         if cached is not None:
+            if self._profile_ownership_unavailable(cached):
+                self._profiles.mark_pending(
+                    entity_id,
+                    now=now,
+                    reason="profile_ownership_changed",
+                    pair_eligible_override=(True if self._deps.enable_full_user_pair else None),
+                    pair_mode_override=self._current_pair_mode(),
+                )
+                return self._pending_error(entity_id, "entity profile ownership is unavailable")
+            if self._profile_scope_changed(cached, entity_id, now=now):
+                self._profiles.mark_pending(
+                    entity_id,
+                    now=now,
+                    reason="auth_scope_changed",
+                    pair_eligible_override=(True if self._deps.enable_full_user_pair else None),
+                    pair_mode_override=self._current_pair_mode(),
+                )
+                cached = self._profiles.read(entity_id, now=now)
+                assert cached is not None
             return self._progressive_result(entity_id, cached.detail, cached.sections, now=now)
         refresh_state = self._profiles.refresh_state(entity_id, now=now)
         if refresh_state is None:
             return None
         reason = str(refresh_state.get("reason", "entity refresh is temporarily unavailable"))
         return self._pending_error(entity_id, reason)
+
+    def _profile_ownership_unavailable(self, cached: object) -> bool:
+        provider = self._deps.full_user_auth_scope
+        if provider is None:
+            return False
+        scope = self._capture_pair_scope()
+        owner = getattr(cached, "profile_owner_account_id", None)
+        return scope is None or not isinstance(owner, int) or owner != scope.account_id
+
+    def _profile_scope_changed(self, cached: object, entity_id: int, *, now: int) -> bool:
+        if self._deps.full_user_auth_scope is None:
+            return False
+        current_scope = self._capture_pair_scope()
+        if current_scope is None:
+            return True
+        stored_scope = getattr(cached, "profile_observation_scope", None)
+        if not isinstance(stored_scope, dict) or stored_scope != current_scope.as_private_mapping():
+            return True
+        detail = getattr(cached, "detail", {})
+        if not isinstance(detail, Mapping):
+            return False
+        raw_type = detail.get("type")
+        entity_type = DialogType.parse(raw_type if isinstance(raw_type, str) else None)
+        if entity_type not in {DialogType.USER, DialogType.BOT}:
+            return False
+        target_kind = TargetKind.BOT if entity_type is DialogType.BOT else TargetKind.USER
+        identity = self._full_user_pair_identity(target_kind)
+        return self._profiles.pair_receipts_require_new_scope(entity_id, identity, now=now)
 
     def _self_snapshot_result(self, entity_id: int, *, now: int, started_at: float) -> dict[str, object]:
         self_detail = self._build_self_detail()
@@ -419,18 +598,153 @@ class DaemonEntityInfoService:
         cursor = self._profiles.next_due_refresh(now=now)
         if cursor is None:
             return None
+        pair_mode = self._capture_refresh_pair_mode(cursor)
         entity_type = self._stored_entity_type(cursor.entity_id, now=now)
         if entity_type is DialogType.UNKNOWN:
-            terminal = await self._acquire_durable_refresh_core(cursor, now=now)
-            return DurableRefreshSliceResult(cursor.entity_id, terminal)
+            return await self._run_unknown_entity_refresh(cursor, now=now)
+        return await self._run_known_entity_refresh(cursor, entity_type, pair_mode=pair_mode, now=now)
+
+    def _capture_refresh_pair_mode(self, cursor: EntityRefreshCursor) -> str:
+        return self._profiles.capture_pair_mode(
+            cursor,
+            "enabled" if self._deps.enable_full_user_pair else "disabled",
+        )
+
+    async def _run_unknown_entity_refresh(
+        self,
+        cursor: EntityRefreshCursor,
+        *,
+        now: int,
+    ) -> DurableRefreshSliceResult:
+        terminal = await self._acquire_durable_refresh_core(cursor, now=now)
+        return DurableRefreshSliceResult(cursor.entity_id, terminal)
+
+    async def _run_known_entity_refresh(
+        self,
+        cursor: EntityRefreshCursor,
+        entity_type: DialogType,
+        *,
+        pair_mode: str,
+        now: int,
+    ) -> DurableRefreshSliceResult:
+        if self._pair_enabled(cursor, entity_type, pair_mode=pair_mode):
+            return await self._run_full_user_pair_refresh(cursor, entity_type, now=now)
+        if self._pair_personal_channel_is_ready(cursor, pair_mode=pair_mode):
+            return self._complete_paired_personal_channel(cursor, entity_type, now=now)
         if not self._section_applies(entity_type, cursor.next_section):
-            committed = self._commit_not_applicable_section(cursor, now=now)
-            return DurableRefreshSliceResult(
-                cursor.entity_id,
-                self._success_if_refresh_finished(cursor, committed=committed),
-            )
+            return self._complete_not_applicable_section(cursor, now=now)
         terminal = await self._acquire_and_commit_profile_section(cursor, entity_type, now=now)
         return DurableRefreshSliceResult(cursor.entity_id, terminal)
+
+    async def _run_full_user_pair_refresh(
+        self,
+        cursor: EntityRefreshCursor,
+        entity_type: DialogType,
+        *,
+        now: int,
+    ) -> DurableRefreshSliceResult:
+        identity = self._full_user_pair_identity(self._target_kind(entity_type))
+        if identity is not None and self._profiles.reuse_full_user_pair(cursor, identity, now=now):
+            self._observe_profile_pair(
+                mode="enabled",
+                eligible_pair=True,
+                outcome="reused",
+                pair_ready=True,
+                local_satisfaction=True,
+                prevented_request=True,
+                reused_age_ms=self._pair_reused_age_ms(cursor, now=now),
+            )
+            terminal = self._success_if_refresh_finished(cursor, committed=True)
+        else:
+            reuse_rejection_reason = self._profiles.full_user_pair_reuse_rejection_reason(cursor, identity, now=now)
+            terminal = await self._acquire_and_commit_full_user_pair(
+                cursor,
+                now=now,
+                reuse_rejection_reason=reuse_rejection_reason,
+            )
+        return DurableRefreshSliceResult(cursor.entity_id, terminal)
+
+    def _target_kind(self, entity_type: DialogType) -> TargetKind:
+        return TargetKind.BOT if entity_type is DialogType.BOT else TargetKind.USER
+
+    def _complete_paired_personal_channel(
+        self,
+        cursor: EntityRefreshCursor,
+        entity_type: DialogType,
+        *,
+        now: int,
+    ) -> DurableRefreshSliceResult:
+        # The pair already captured the remote channel identity. Advancing this
+        # ordered cursor is local work and must not repeat GetFullUser.
+        identity = self._full_user_pair_identity(self._target_kind(entity_type))
+        committed = self._profiles.complete_same_generation_section(cursor, identity, now=now)
+        if not committed:
+            return DurableRefreshSliceResult(cursor.entity_id, DurableRefreshTerminal.FAILURE)
+        return DurableRefreshSliceResult(
+            cursor.entity_id,
+            self._success_if_refresh_finished(cursor, committed=committed),
+        )
+
+    def _complete_not_applicable_section(
+        self,
+        cursor: EntityRefreshCursor,
+        *,
+        now: int,
+    ) -> DurableRefreshSliceResult:
+        committed = self._commit_not_applicable_section(cursor, now=now)
+        return DurableRefreshSliceResult(
+            cursor.entity_id,
+            self._success_if_refresh_finished(cursor, committed=committed),
+        )
+
+    def _pair_enabled(
+        self, cursor: EntityRefreshCursor, entity_type: DialogType, *, pair_mode: str | None = None
+    ) -> bool:
+        return (
+            (pair_mode or cursor.pair_mode) == "enabled"
+            and cursor.next_section == "full_profile"
+            and cursor.pair_eligible
+            and entity_type
+            in {
+                DialogType.USER,
+                DialogType.BOT,
+            }
+        )
+
+    def _pair_personal_channel_is_ready(self, cursor: EntityRefreshCursor, *, pair_mode: str | None = None) -> bool:
+        if not self._is_paired_personal_channel_cursor(cursor, pair_mode=pair_mode):
+            return False
+        evidence = self._profiles.read_section_evidence(cursor.entity_id, "personal_channel")
+        identity = self._stored_pair_identity(cursor.entity_id)
+        return self._pair_channel_evidence_is_ready(cursor, evidence, identity=identity)
+
+    def _is_paired_personal_channel_cursor(
+        self,
+        cursor: EntityRefreshCursor,
+        *,
+        pair_mode: str | None,
+    ) -> bool:
+        return (pair_mode or cursor.pair_mode) == "enabled" and cursor.next_section == "personal_channel"
+
+    def _stored_pair_identity(self, entity_id: int) -> dict[str, object] | None:
+        entity_type = self._stored_entity_type(entity_id, now=int(self._deps.now_provider()))
+        return self._full_user_pair_identity(self._target_kind(entity_type))
+
+    def _pair_channel_evidence_is_ready(
+        self,
+        cursor: EntityRefreshCursor,
+        evidence: Mapping[str, object] | None,
+        *,
+        identity: Mapping[str, object] | None,
+    ) -> bool:
+        return (
+            identity is not None
+            and evidence is not None
+            and evidence.get("generation") == cursor.generation
+            and evidence.get("normalization_version") == NORMALIZATION_VERSION
+            and evidence.get("identity") == identity
+            and evidence.get("outcome") in {"usable", "absent", "partial", "unavailable"}
+        )
 
     def _stored_entity_type(self, entity_id: int, *, now: int) -> DialogType:
         stored = self._profiles.read(entity_id, now=now)
@@ -454,30 +768,757 @@ class DaemonEntityInfoService:
         *,
         now: int,
     ) -> DurableRefreshTerminal | None:
+        context = self._profile_section_context(cursor, entity_type)
         try:
             result = await self._acquire_profile_section(cursor, entity_type)
         except RpcAttemptBudgetExhaustedError:
+            self._observe_profile_section_failure(cursor, entity_type, actual_attempts=0)
             raise
         except TelegramRpcThrottled as exc:
-            retry_seconds = max(1, int(exc.retry_after_seconds or 1))
-            failed = self._profiles.mark_section_failure(
-                cursor,
-                now=now,
-                reason="flood_wait",
-                retry_at=now + retry_seconds,
+            retry_at = throttled_retry_at(now, exc.retry_after_seconds)
+            return self._handle_profile_section_failure(
+                _ProfileSectionFailure(
+                    cursor=cursor,
+                    entity_type=entity_type,
+                    context=context,
+                    now=now,
+                    reason="flood_wait",
+                    retry_at=retry_at,
+                )
             )
-            return DurableRefreshTerminal.FAILURE if failed else None
         except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
             raise_if_flood_wait_error(exc)
-            failed = self._profiles.mark_section_failure(
+            return self._handle_profile_section_failure(
+                _ProfileSectionFailure(
+                    cursor=cursor,
+                    entity_type=entity_type,
+                    context=context,
+                    now=now,
+                    reason=type(exc).__name__.lower(),
+                    retry_at=failure_retry_at(now),
+                )
+            )
+        if self._profile_scope_changed_during_acquisition(context.captured_scope):
+            self._profiles.mark_section_failure(
                 cursor,
                 now=now,
-                reason=type(exc).__name__.lower(),
-                retry_at=now + 60,
+                reason="auth_scope_changed",
+                retry_at=scope_changed_retry_at(now),
             )
-            return DurableRefreshTerminal.FAILURE if failed else None
-        committed = self._profiles.commit_section(cursor, result, now=now)
+            return DurableRefreshTerminal.FAILURE
+        result = self._with_observation_metadata(result, context.captured_scope)
+        committed = self._commit_profile_section_result(cursor, entity_type, result, context, now=now)
         return self._success_if_refresh_finished(cursor, committed=committed)
+
+    def _profile_section_context(
+        self,
+        cursor: EntityRefreshCursor,
+        entity_type: DialogType,
+    ) -> _ProfileSectionContext:
+        return _ProfileSectionContext(
+            captured_scope=self._capture_pair_scope(),
+            attempt_start=self._rpc_attempt_count(),
+            pair_section=cursor.next_section in {"full_profile", "personal_channel"},
+            pair_mode=cursor.pair_mode or ("enabled" if self._deps.enable_full_user_pair else "disabled"),
+            eligible_pair=cursor.pair_eligible and entity_type in {DialogType.USER, DialogType.BOT},
+        )
+
+    def _handle_profile_section_failure(self, failure: _ProfileSectionFailure) -> DurableRefreshTerminal | None:
+        failed = self._profiles.mark_section_failure(
+            failure.cursor,
+            now=failure.now,
+            reason=failure.reason,
+            retry_at=failure.retry_at,
+        )
+        actual_attempts = self._rpc_attempt_count() - failure.context.attempt_start
+        if failure.context.pair_section and failure.context.eligible_pair and failure.context.pair_mode == "disabled":
+            self._profiles.record_pair_attempt(
+                failure.cursor,
+                failure.cursor.next_section,
+                actual_attempts=actual_attempts,
+            )
+        self._observe_profile_section_failure(failure.cursor, failure.entity_type, actual_attempts=actual_attempts)
+        return DurableRefreshTerminal.FAILURE if failed else None
+
+    def _profile_scope_changed_during_acquisition(self, captured_scope: TelegramAuthScope | None) -> bool:
+        return self._deps.full_user_auth_scope is not None and captured_scope != self._capture_pair_scope()
+
+    def _commit_profile_section_result(
+        self,
+        cursor: EntityRefreshCursor,
+        entity_type: DialogType,
+        result: EntitySectionCommit,
+        context: _ProfileSectionContext,
+        *,
+        now: int,
+    ) -> bool:
+        actual_attempts = self._rpc_attempt_count() - context.attempt_start
+        if context.pair_section and context.eligible_pair and context.pair_mode == "disabled":
+            committed, summary = self._profiles.commit_section_with_pair_measurement(
+                cursor,
+                result,
+                now=now,
+                outcome=self._section_commit_outcome(cursor.next_section, result),
+                actual_attempts=actual_attempts,
+            )
+            if summary is not None:
+                self._emit_pair_summary(summary)
+            return committed
+        committed = self._profiles.commit_section(cursor, result, now=now)
+        self._observe_profile_section_commit(cursor, entity_type, result, committed=committed)
+        return committed
+
+    async def _acquire_and_commit_full_user_pair(
+        self,
+        cursor: EntityRefreshCursor,
+        *,
+        now: int,
+        reuse_rejection_reason: str | None = None,
+    ) -> DurableRefreshTerminal | None:
+        """Acquire and atomically commit both User profile projections."""
+        attempt_start = self._rpc_attempt_count()
+        pair_mode = cursor.pair_mode or "enabled"
+        try:
+            full_profile, personal_channel = await self._acquire_full_user_pair(cursor)
+        except RpcAttemptBudgetExhaustedError:
+            self._record_full_user_pair_failure(cursor, pair_mode, attempt_start, reuse_rejection_reason)
+            raise
+        except TelegramRpcThrottled as exc:
+            return self._handle_full_user_pair_failure(
+                _PairFailure(
+                    cursor=cursor,
+                    now=now,
+                    pair_mode=pair_mode,
+                    attempt_start=attempt_start,
+                    reason="flood_wait",
+                    retry_at=throttled_retry_at(now, exc.retry_after_seconds),
+                    reuse_rejection_reason=reuse_rejection_reason,
+                )
+            )
+        except (TimeoutError, OSError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+            raise_if_flood_wait_error(exc)
+            return self._handle_full_user_pair_failure(
+                _PairFailure(
+                    cursor=cursor,
+                    now=now,
+                    pair_mode=pair_mode,
+                    attempt_start=attempt_start,
+                    reason=type(exc).__name__.lower(),
+                    retry_at=failure_retry_at(now),
+                    reuse_rejection_reason=reuse_rejection_reason,
+                )
+            )
+        if self._pair_scope_mismatch(cursor, full_profile, now=now):
+            return self._handle_full_user_pair_failure(
+                _PairFailure(
+                    cursor=cursor,
+                    now=now,
+                    pair_mode=pair_mode,
+                    attempt_start=attempt_start,
+                    reason="auth_scope_changed",
+                    retry_at=scope_changed_retry_at(now),
+                    reuse_rejection_reason="auth_scope_changed",
+                )
+            )
+        committed = self._commit_full_user_pair_or_raise(
+            _PairCommitRequest(
+                cursor=cursor,
+                full_profile=full_profile,
+                personal_channel=personal_channel,
+                now=now,
+                pair_mode=pair_mode,
+                attempt_start=attempt_start,
+                reuse_rejection_reason=reuse_rejection_reason,
+            )
+        )
+        actual_attempts = self._rpc_attempt_count() - attempt_start
+        summary = self._record_full_user_pair_commit(
+            _PairMeasurement(
+                cursor=cursor,
+                full_profile=full_profile,
+                personal_channel=personal_channel,
+                now=now,
+                pair_mode=pair_mode,
+                actual_attempts=actual_attempts,
+                committed=committed,
+            )
+        )
+        if summary is not None:
+            summary["reuse_rejection_reason"] = reuse_rejection_reason
+            self._emit_pair_summary(summary)
+        elif not committed:
+            self._observe_profile_pair(
+                mode=pair_mode,
+                eligible_pair=cursor.pair_eligible,
+                outcome="stale_writer_rejected",
+                actual_attempts=actual_attempts,
+                reuse_rejection_reason=reuse_rejection_reason,
+                stale_writer_rejected=True,
+            )
+        return self._success_if_refresh_finished(cursor, committed=committed)
+
+    def _record_full_user_pair_failure(
+        self,
+        cursor: EntityRefreshCursor,
+        pair_mode: str,
+        attempt_start: int,
+        reuse_rejection_reason: str | None,
+    ) -> None:
+        actual_attempts = self._rpc_attempt_count() - attempt_start
+        self._profiles.record_pair_attempt(cursor, "full_profile", actual_attempts=actual_attempts)
+        self._observe_profile_pair(
+            mode=pair_mode,
+            eligible_pair=cursor.pair_eligible,
+            outcome="failed",
+            actual_attempts=actual_attempts,
+            reuse_rejection_reason=reuse_rejection_reason,
+        )
+
+    def _handle_full_user_pair_failure(self, failure: _PairFailure) -> DurableRefreshTerminal | None:
+        failed = self._profiles.mark_section_failure(
+            failure.cursor,
+            now=failure.now,
+            reason=failure.reason,
+            retry_at=failure.retry_at,
+        )
+        self._record_full_user_pair_failure(
+            failure.cursor,
+            failure.pair_mode,
+            failure.attempt_start,
+            failure.reuse_rejection_reason,
+        )
+        return DurableRefreshTerminal.FAILURE if failed else None
+
+    def _pair_scope_mismatch(
+        self,
+        cursor: EntityRefreshCursor,
+        full_profile: EntitySectionCommit,
+        *,
+        now: int,
+    ) -> bool:
+        if self._deps.full_user_auth_scope is None:
+            return False
+        current_scope = self._capture_pair_scope()
+        expected_identity = full_profile.evidence.identity if full_profile.evidence is not None else None
+        expected_identity_for_scope = self._full_user_pair_identity(
+            self._target_kind(self._stored_entity_type(cursor.entity_id, now=now)),
+            scope=current_scope,
+        )
+        return current_scope is None or expected_identity != expected_identity_for_scope
+
+    def _commit_full_user_pair_or_raise(self, request: _PairCommitRequest) -> bool:
+        try:
+            return self._profiles.commit_full_user_pair(
+                request.cursor,
+                request.full_profile,
+                request.personal_channel,
+                now=request.now,
+            )
+        except Exception:
+            self._record_full_user_pair_failure(
+                request.cursor,
+                request.pair_mode,
+                request.attempt_start,
+                request.reuse_rejection_reason,
+            )
+            raise
+
+    def _record_full_user_pair_commit(self, measurement: _PairMeasurement) -> dict[str, object] | None:
+        if not measurement.committed:
+            return None
+        latency = self._pair_readiness_latency_ms(measurement.full_profile, measurement.personal_channel)
+        self._profiles.record_pair_section_outcome(
+            measurement.cursor,
+            "full_profile",
+            outcome=self._evidence_outcome(measurement.full_profile) or "unavailable",
+            actual_attempts=measurement.actual_attempts,
+            ready_at=measurement.now,
+            readiness_latency_ms=latency,
+        )
+        summary = self._profiles.record_pair_section_outcome(
+            measurement.cursor,
+            "personal_channel",
+            outcome=self._evidence_outcome(measurement.personal_channel) or "unavailable",
+            actual_attempts=0,
+            ready_at=measurement.now,
+            readiness_latency_ms=latency,
+        )
+        if summary is None and not self._profiles._refresh_has("pair_mode"):
+            return self._historical_pair_summary(
+                measurement,
+                latency=latency,
+            )
+        return summary
+
+    def _historical_pair_summary(self, measurement: _PairMeasurement, *, latency: float | None) -> dict[str, object]:
+        return {
+            "mode": measurement.pair_mode,
+            "eligible_pair": measurement.cursor.pair_eligible,
+            "outcome": "committed",
+            "actual_attempts": measurement.actual_attempts,
+            "retries": max(0, measurement.actual_attempts - 1),
+            "full_profile_outcome": self._evidence_outcome(measurement.full_profile) or "unavailable",
+            "personal_channel_outcome": self._evidence_outcome(measurement.personal_channel) or "unavailable",
+            "pair_ready": True,
+            "pair_readiness_latency_ms": latency,
+        }
+
+    async def _acquire_full_user_pair(
+        self,
+        cursor: EntityRefreshCursor,
+    ) -> tuple[EntitySectionCommit, EntitySectionCommit]:
+        captured_scope = self._capture_pair_scope()
+        started_at = self._deps.now_provider()
+        target_kind = (
+            TargetKind.BOT
+            if self._stored_entity_type(cursor.entity_id, now=int(started_at)) is DialogType.BOT
+            else TargetKind.USER
+        )
+        result = await self._deps.client(self._deps.get_full_user_request(id=cursor.entity_id))
+        completed_at = self._deps.now_provider()
+        normalized = normalize_full_user_response(
+            result,
+            target_id=cursor.entity_id,
+            target_kind=target_kind,
+            observation=ObservationBoundary(started_at=started_at, completed_at=completed_at),
+        )
+        if normalized.full_profile.status is ProjectionStatus.UNAVAILABLE:
+            raise ValueError(normalized.full_profile.reason or "full user payload is unavailable")
+        if self._deps.full_user_auth_scope is not None:
+            verified_scope = self._capture_pair_scope()
+            if captured_scope is None or verified_scope != captured_scope:
+                raise _AuthScopeUnavailableError("authenticated session scope changed during acquisition")
+        identity = self._full_user_pair_identity(target_kind, scope=captured_scope)
+        full_profile = self._normalized_full_profile_commit(normalized.full_profile, cursor, identity)
+        personal_channel = self._normalized_personal_channel_commit(
+            normalized.personal_channel,
+            cursor,
+            identity,
+        )
+        return full_profile, personal_channel
+
+    def _capture_pair_scope(self) -> TelegramAuthScope | None:
+        provider = self._deps.full_user_auth_scope
+        if provider is None:
+            return None
+        scope = provider()
+        return scope if isinstance(scope, TelegramAuthScope) else None
+
+    def _with_observation_metadata(
+        self, commit: EntitySectionCommit, scope: TelegramAuthScope | None
+    ) -> EntitySectionCommit:
+        """Attach ownership to every account-derived profile observation."""
+        return dataclass_replace(
+            commit,
+            observation_owner_account_id=scope.account_id if scope is not None else None,
+            observation_auth_scope=scope.as_private_mapping() if scope is not None else None,
+            ownership_observed=self._deps.full_user_auth_scope is not None,
+        )
+
+    @staticmethod
+    def _scope_account_id(identity: Mapping[str, object] | None) -> int | None:
+        if not isinstance(identity, Mapping):
+            return None
+        raw_scope = identity.get("auth_scope")
+        if not isinstance(raw_scope, Mapping):
+            return None
+        account_id = raw_scope.get("account_id")
+        return account_id if isinstance(account_id, int) and not isinstance(account_id, bool) else None
+
+    @staticmethod
+    def _scope_mapping(identity: Mapping[str, object] | None) -> Mapping[str, object] | None:
+        if not isinstance(identity, Mapping):
+            return None
+        raw_scope = identity.get("auth_scope")
+        return dict(raw_scope) if isinstance(raw_scope, Mapping) else None
+
+    def _full_user_pair_identity(
+        self,
+        target_kind: TargetKind,
+        *,
+        scope: TelegramAuthScope | None = None,
+    ) -> dict[str, object] | None:
+        """Return the private receipt identity for one paired projection."""
+        if self._deps.full_user_auth_scope is not None:
+            scope = self._capture_pair_scope() if scope is None else scope
+        if scope is None:
+            return None
+        return {
+            "auth_scope": scope.as_private_mapping(),
+            "entity_type": target_kind.value,
+            "endpoint": FULL_USER_ENDPOINT,
+            "normalization_version": NORMALIZATION_VERSION,
+            "declared_fields": {
+                "full_profile": list(FULL_PROFILE_OWNED_FIELDS),
+                "personal_channel": list(PERSONAL_CHANNEL_OWNED_FIELDS),
+            },
+        }
+
+    @staticmethod
+    def _projection_evidence(
+        outcome: ProjectionOutcome,
+        *,
+        cursor: EntityRefreshCursor,
+        identity: Mapping[str, object] | None,
+    ) -> ProfileAcquisitionEvidence | None:
+        provenance = outcome.provenance
+        if provenance is None:
+            return None
+        observation = provenance.observation
+        started = observation.started_at
+        completed = observation.completed_at
+        if started is None or completed is None:
+            return None
+        return ProfileAcquisitionEvidence(
+            generation=cursor.generation,
+            outcome=outcome.status.value,
+            provenance={
+                "endpoint": provenance.endpoint,
+                "declared_fields": list(provenance.declared_fields),
+                "materialized_fields": list(provenance.materialized_fields),
+                "authoritative": provenance.authoritative,
+            },
+            normalization_version=provenance.normalization_version,
+            observation_started_at=int(started),
+            observation_completed_at=int(completed),
+            identity=identity,
+        )
+
+    @staticmethod
+    def _finalize_channel_evidence(
+        evidence: ProfileAcquisitionEvidence | None,
+        *,
+        outcome: str,
+        authoritative: bool,
+    ) -> ProfileAcquisitionEvidence | None:
+        if evidence is None:
+            return None
+        provenance = evidence.provenance
+        if provenance is None:
+            return dataclass_replace(evidence, outcome=outcome)
+        final_provenance = dict(provenance)
+        final_provenance["authoritative"] = authoritative
+        return dataclass_replace(evidence, outcome=outcome, provenance=final_provenance)
+
+    def _observe_profile_pair(  # noqa: PLR0913 - mirrors the bounded hook contract
+        self,
+        *,
+        mode: str,
+        eligible_pair: bool,
+        outcome: str,
+        actual_attempts: int = 0,
+        retries: int = 0,
+        full_profile_outcome: str | None = None,
+        personal_channel_outcome: str | None = None,
+        pair_ready: bool = False,
+        pair_readiness_latency_ms: float | None = None,
+        local_satisfaction: bool = False,
+        prevented_request: bool = False,
+        reuse_rejection_reason: str | None = None,
+        reused_age_ms: float | None = None,
+        stale_writer_rejected: bool = False,
+    ) -> None:
+        observer = self._deps.profile_observer
+        if observer is None or outcome == "failed":
+            return
+        try:
+            observer.observe_profile_pair(
+                mode=mode,
+                eligible_pair=eligible_pair,
+                outcome=outcome,
+                actual_attempts=actual_attempts,
+                retries=retries,
+                full_profile_outcome=full_profile_outcome,
+                personal_channel_outcome=personal_channel_outcome,
+                pair_ready=pair_ready,
+                pair_readiness_latency_ms=pair_readiness_latency_ms,
+                local_satisfaction=local_satisfaction,
+                prevented_request=prevented_request,
+                reuse_rejection_reason=reuse_rejection_reason,
+                reused_age_ms=reused_age_ms,
+                stale_writer_rejected=stale_writer_rejected,
+            )
+        except Exception:  # noqa: BLE001 - telemetry cannot affect profile correctness
+            self._deps.logger.debug("entity_profile_pair_observation_failed")
+
+    def _emit_pair_summary(self, summary: Mapping[str, object]) -> None:
+        """Send a repository snapshot through the typed observation boundary."""
+        self._observe_profile_pair(
+            mode=cast(str, summary.get("mode")),
+            eligible_pair=cast(bool, summary.get("eligible_pair")),
+            outcome=cast(str, summary.get("outcome")),
+            actual_attempts=cast(int, summary.get("actual_attempts", 0)),
+            retries=cast(int, summary.get("retries", 0)),
+            full_profile_outcome=cast(str | None, summary.get("full_profile_outcome")),
+            personal_channel_outcome=cast(str | None, summary.get("personal_channel_outcome")),
+            pair_ready=cast(bool, summary.get("pair_ready", False)),
+            pair_readiness_latency_ms=cast(float | None, summary.get("pair_readiness_latency_ms")),
+            local_satisfaction=cast(bool, summary.get("local_satisfaction", False)),
+            prevented_request=cast(bool, summary.get("prevented_request", False)),
+            reuse_rejection_reason=cast(str | None, summary.get("reuse_rejection_reason")),
+            reused_age_ms=cast(float | None, summary.get("reused_age_ms")),
+            stale_writer_rejected=cast(bool, summary.get("stale_writer_rejected", False)),
+        )
+
+    @staticmethod
+    def _rpc_attempt_count() -> int:
+        """Read dispatch accounting owned by the current RPC scope."""
+        scope = current_rpc_scope()
+        budget = scope.attempt_budget
+        return 0 if budget is None else budget.attempts
+
+    @staticmethod
+    def _section_commit_outcome(section: str, result: EntitySectionCommit) -> str:
+        """Classify the committed projection, after normalization is final."""
+        if result.status != "fresh":
+            return "unavailable"
+        if section == "personal_channel":
+            channel_id = result.detail_patch.get("personal_channel_id")
+            return "absent" if channel_id is None else "usable"
+        return "usable"
+
+    @staticmethod
+    def _evidence_outcome(commit: EntitySectionCommit) -> str | None:
+        evidence = commit.evidence
+        if evidence is None or evidence.outcome not in {"usable", "partial", "absent", "unavailable"}:
+            return None
+        return evidence.outcome
+
+    @staticmethod
+    def _pair_readiness_latency_ms(
+        full_profile: EntitySectionCommit,
+        personal_channel: EntitySectionCommit,
+    ) -> float | None:
+        boundaries = [commit.evidence for commit in (full_profile, personal_channel) if commit.evidence is not None]
+        starts = [evidence.observation_started_at for evidence in boundaries]
+        completes = [evidence.observation_completed_at for evidence in boundaries]
+        if not starts or any(value is None for value in starts + completes):
+            return None
+        return max(cast(list[int], completes)) * 1000 - min(cast(list[int], starts)) * 1000
+
+    def _pair_reused_age_ms(self, cursor: EntityRefreshCursor, *, now: int) -> float | None:
+        starts: list[int] = []
+        for section in ("full_profile", "personal_channel"):
+            evidence = self._profiles.read_section_evidence(cursor.entity_id, section)
+            started_at = evidence.get("observation_started_at") if evidence is not None else None
+            if isinstance(started_at, int) and not isinstance(started_at, bool) and started_at >= 0:
+                starts.append(started_at)
+        if len(starts) != _PAIR_SECTION_COUNT:
+            return None
+        return max(0, now - min(starts)) * 1000.0
+
+    def _observe_profile_section_failure(
+        self,
+        cursor: EntityRefreshCursor,
+        entity_type: DialogType,
+        *,
+        actual_attempts: int,
+    ) -> None:
+        if cursor.next_section not in {"full_profile", "personal_channel"}:
+            return
+        if cursor.pair_eligible and entity_type in {DialogType.USER, DialogType.BOT}:
+            # Pair measurement is a completed-generation denominator.  A
+            # retryable section failure remains durable state and is folded
+            # into the eventual summary once the projection commits.
+            return
+        self._observe_profile_pair(
+            mode="enabled" if self._deps.enable_full_user_pair else "disabled",
+            eligible_pair=cursor.pair_eligible and entity_type in {DialogType.USER, DialogType.BOT},
+            outcome="failed",
+            actual_attempts=actual_attempts,
+        )
+
+    def _observe_profile_section_commit(
+        self,
+        cursor: EntityRefreshCursor,
+        entity_type: DialogType,
+        result: EntitySectionCommit,
+        *,
+        committed: bool,
+    ) -> None:
+        if cursor.next_section not in {"full_profile", "personal_channel"}:
+            return
+        section_outcome = "usable" if result.status == "fresh" else "unavailable"
+        self._observe_profile_pair(
+            mode="enabled" if self._deps.enable_full_user_pair else "disabled",
+            eligible_pair=cursor.pair_eligible and entity_type in {DialogType.USER, DialogType.BOT},
+            outcome="section_committed" if committed else "stale_writer_rejected",
+            actual_attempts=1,
+            full_profile_outcome=section_outcome if cursor.next_section == "full_profile" else None,
+            personal_channel_outcome=section_outcome if cursor.next_section == "personal_channel" else None,
+            stale_writer_rejected=not committed,
+        )
+
+    def _normalized_full_profile_commit(
+        self,
+        outcome: ProjectionOutcome,
+        cursor: EntityRefreshCursor,
+        identity: Mapping[str, object] | None,
+    ) -> EntitySectionCommit:
+        payload = dict(outcome.payload or {})
+        return EntitySectionCommit(
+            payload,
+            status="fresh",
+            payload=payload,
+            evidence=self._projection_evidence(outcome, cursor=cursor, identity=identity),
+            observation_owner_account_id=self._scope_account_id(identity),
+            observation_auth_scope=self._scope_mapping(identity),
+            ownership_observed=self._deps.full_user_auth_scope is not None,
+        )
+
+    def _normalized_personal_channel_commit(
+        self,
+        outcome: ProjectionOutcome,
+        cursor: EntityRefreshCursor,
+        identity: Mapping[str, object] | None,
+    ) -> EntitySectionCommit:
+        context = self._projection_commit_context(outcome, cursor=cursor, identity=identity)
+        if outcome.status is ProjectionStatus.ABSENT:
+            return self._absent_personal_channel_commit(context)
+        channel_id = context.payload.get("personal_channel_id")
+        if not isinstance(channel_id, int) or channel_id <= 0:
+            return self._unavailable_personal_channel_commit(
+                context,
+                reason=outcome.reason or "personal_channel_unavailable",
+                evidence_outcome="partial",
+            )
+        dialog_id = self._normalize_channel_dialog_id(channel_id)
+        metadata = self._personal_channel_metadata(None, dialog_id=dialog_id)
+        if metadata is None:
+            return self._missing_channel_metadata_commit(
+                context,
+                channel_id=channel_id,
+                reason=outcome.reason or "channel_metadata_unavailable",
+            )
+        local_preview, local_reason = self._latest_local_personal_channel_post(dialog_id)
+        return self._usable_personal_channel_commit(
+            context,
+            _PersonalChannelCard(
+                outcome=outcome,
+                channel_id=channel_id,
+                dialog_id=dialog_id,
+                metadata=metadata,
+                local_preview=local_preview,
+                local_reason=local_reason,
+            ),
+        )
+
+    def _projection_commit_context(
+        self,
+        outcome: ProjectionOutcome,
+        *,
+        cursor: EntityRefreshCursor,
+        identity: Mapping[str, object] | None,
+    ) -> _ProjectionCommitContext:
+        return _ProjectionCommitContext(
+            payload=dict(outcome.payload or {}),
+            evidence=self._projection_evidence(outcome, cursor=cursor, identity=identity),
+            observation_owner_account_id=self._scope_account_id(identity),
+            observation_auth_scope=self._scope_mapping(identity),
+            ownership_observed=self._deps.full_user_auth_scope is not None,
+        )
+
+    @staticmethod
+    def _absent_personal_channel_commit(context: _ProjectionCommitContext) -> EntitySectionCommit:
+        return EntitySectionCommit(
+            {
+                "personal_channel_id": None,
+                "personal_channel_message": None,
+                "personal_channel": None,
+                "personal_channel_unavailable_reason": None,
+            },
+            status="fresh",
+            payload=None,
+            evidence=context.evidence,
+            observation_owner_account_id=context.observation_owner_account_id,
+            observation_auth_scope=context.observation_auth_scope,
+            ownership_observed=context.ownership_observed,
+        )
+
+    def _unavailable_personal_channel_commit(
+        self,
+        context: _ProjectionCommitContext,
+        *,
+        reason: str,
+        evidence_outcome: str,
+    ) -> EntitySectionCommit:
+        return EntitySectionCommit(
+            {},
+            status="unavailable",
+            reason=reason,
+            payload=context.payload,
+            evidence=self._finalize_channel_evidence(
+                context.evidence,
+                outcome=evidence_outcome,
+                authoritative=False,
+            ),
+            observation_owner_account_id=context.observation_owner_account_id,
+            observation_auth_scope=context.observation_auth_scope,
+            ownership_observed=context.ownership_observed,
+        )
+
+    def _missing_channel_metadata_commit(
+        self,
+        context: _ProjectionCommitContext,
+        *,
+        channel_id: int,
+        reason: str,
+    ) -> EntitySectionCommit:
+        return EntitySectionCommit(
+            {
+                "personal_channel_id": channel_id,
+                "personal_channel_message": context.payload.get("personal_channel_message"),
+                "personal_channel": None,
+            },
+            status="unavailable",
+            reason=reason,
+            payload=context.payload,
+            evidence=self._finalize_channel_evidence(context.evidence, outcome="unavailable", authoritative=False),
+            observation_owner_account_id=context.observation_owner_account_id,
+            observation_auth_scope=context.observation_auth_scope,
+            ownership_observed=context.ownership_observed,
+        )
+
+    def _usable_personal_channel_commit(
+        self,
+        context: _ProjectionCommitContext,
+        card_context: _PersonalChannelCard,
+    ) -> EntitySectionCommit:
+        card = _compact_dict(
+            {
+                "channel_id": card_context.channel_id,
+                "dialog_id": card_context.dialog_id,
+                "title": card_context.metadata.get("title"),
+                "username": card_context.metadata.get("username"),
+                "url": self._tme_url(cast(str | None, card_context.metadata.get("username"))),
+                "metadata_source": "local_entities",
+                "attached_message_id": context.payload.get("personal_channel_message"),
+                "latest_or_attached_post": card_context.local_preview,
+                "post_preview_unavailable_reason": (
+                    card_context.local_reason if card_context.local_preview is None else None
+                ),
+            }
+        )
+        usable = card_context.outcome.status is ProjectionStatus.USABLE
+        return EntitySectionCommit(
+            {
+                "personal_channel_id": card_context.channel_id,
+                "personal_channel_message": context.payload.get("personal_channel_message"),
+                "personal_channel": card,
+                "personal_channel_unavailable_reason": None,
+            },
+            status="fresh" if usable else "unavailable",
+            reason=None if usable else card_context.outcome.reason,
+            payload=card,
+            evidence=self._finalize_channel_evidence(
+                context.evidence,
+                outcome="usable" if usable else "partial",
+                authoritative=usable,
+            ),
+            observation_owner_account_id=context.observation_owner_account_id,
+            observation_auth_scope=context.observation_auth_scope,
+            ownership_observed=context.ownership_observed,
+        )
 
     async def _acquire_durable_refresh_core(
         self,
@@ -491,12 +1532,11 @@ class DaemonEntityInfoService:
         except RpcAttemptBudgetExhaustedError:
             raise
         except TelegramRpcThrottled as exc:
-            retry_seconds = max(1, int(exc.retry_after_seconds or 1))
             self._profiles.mark_refresh_failure(
                 cursor.entity_id,
                 now=now,
                 reason="flood_wait",
-                retry_at=now + retry_seconds,
+                retry_at=throttled_retry_at(now, exc.retry_after_seconds),
             )
             return self._persisted_failure(cursor.entity_id, now=now)
         if entity is None or error is not None:
@@ -520,8 +1560,8 @@ class DaemonEntityInfoService:
     def _refresh_failure_details(error: Mapping[str, object] | None, *, now: int) -> tuple[str, int]:
         retry_after = error.get("_retry_after_seconds") if error is not None else None
         if isinstance(retry_after, int) and retry_after > 0:
-            return "flood_wait", now + retry_after
-        return "entity_unavailable", now + 60
+            return "flood_wait", throttled_retry_at(now, retry_after)
+        return "entity_unavailable", failure_retry_at(now)
 
     @staticmethod
     def _success_if_refresh_finished(
@@ -972,7 +2012,12 @@ class DaemonEntityInfoService:
             self._profiles.mark_refresh_rejected(entity_id, now=int(self._deps.now_provider()))
             self._set_section_rejected(sections)
             return
-        self._profiles.mark_refresh_queued(entity_id)
+        # A coalesced foreground request already has durable pending state
+        # owned by the admitted request.  Rewriting it would renew its
+        # timestamp (and can mutate durable state while shutdown is winning
+        # the local waiter race).
+        if result is RefreshEnqueueResult.QUEUED:
+            self._profiles.mark_refresh_queued(entity_id, pair_mode_override=self._current_pair_mode())
         self._set_section_queued(sections)
         offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
 
@@ -996,7 +2041,7 @@ class DaemonEntityInfoService:
         if result is RefreshEnqueueResult.REJECTED:
             self._profiles.mark_refresh_rejected(entity_id, now=now)
         else:
-            self._profiles.mark_pending(entity_id, now=now)
+            self._profiles.mark_pending(entity_id, now=now, pair_mode_override=self._current_pair_mode())
             offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
 
     @staticmethod

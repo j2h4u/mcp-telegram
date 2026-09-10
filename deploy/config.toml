@@ -22,6 +22,9 @@ resolver_enrichment_ttl_seconds = 300
 
 [entity_profile]
 # Wait briefly for a full profile, then fall back to the available progressive projection.
+# Paired users.GetFullUser acquisition is migration-aware and remains disabled by default.
+# Toggle this only after the v62 schema migration has completed.
+full_user_pair_enabled = false
 foreground_resolve_seconds = 3.0
 foreground_refresh_wait_seconds = 15.0
 rpc_timeout_seconds = 8.0

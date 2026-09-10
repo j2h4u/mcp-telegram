@@ -122,7 +122,7 @@ async def test_refresh_coordinator_waits_for_single_flight_completion() -> None:
     assert not waiter.done()
 
     await coordinator.shutdown()
-    assert await waiter is True
+    assert await waiter is False
     assert coordinator.queue_depth == 0
     assert coordinator.enqueue(43) is RefreshEnqueueResult.REJECTED
 
@@ -641,7 +641,7 @@ async def test_durable_profile_budget_exhaustion_leaves_core_cursor_ready() -> N
     ).fetchone() == ("pending", None, "full_profile", 0)
     assert conn.execute("SELECT COUNT(*) FROM entities").fetchone() == (0,)
     await service.shutdown()
-    assert await waiter is True
+    assert await waiter is False
     conn.close()
 
 
@@ -924,7 +924,7 @@ def test_progressive_projection_schema_upgrades_from_v56(tmp_path: Path) -> None
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_profile_refresh_state'"
     ).fetchone() == (1,)
-    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (60,)
+    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (62,)
     conn.close()
 
 

@@ -73,6 +73,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 
 from . import daemon_activity_stats as _activity_stats
+from .auth_scope import TelegramAuthScope
 from .conversation_changes import ConversationChangesTokenCodec, query_conversation_changes
 from .daemon_account_trace import (
     DaemonAccountTraceDeps,
@@ -86,6 +87,7 @@ from .daemon_dialog_queries import (
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
+from .entity_profile.ports import ProfilePairObservationHook
 from .entity_profile.refresh import RefreshLimits
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
@@ -260,6 +262,7 @@ class DaemonApiPolicy:
     telemetry: TelemetryPolicy
     slow_request_seconds: float
     entity_profile: RefreshLimits
+    full_user_pair_enabled: bool = False
 
 
 def _attr(obj: object, name: str, default: object | None = None) -> object | None:
@@ -549,6 +552,7 @@ class DaemonAPIServer:
         # calling Telethon on every read.
         self.self_id: int | None = None
         self.self_profile: dict[str, object] | None = None
+        self._auth_scope: TelegramAuthScope | None = None
         # Set to True once Telegram is connected and all startup steps complete.
         # While False, handle_client returns daemon_not_ready with startup_detail.
         self._ready: bool = False
@@ -561,6 +565,7 @@ class DaemonAPIServer:
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
         self._entity_info_service: DaemonEntityInfoService | None = None
         self._demand_sink: DemandOfferSink | None = None
+        self._profile_observer: ProfilePairObservationHook | None = None
         self._conversation_changes_token_codec = ConversationChangesTokenCodec()
 
     def bind_demand_sink(self, sink: DemandOfferSink) -> None:
@@ -568,6 +573,19 @@ class DaemonAPIServer:
         self._demand_sink = sink
         if self._entity_info_service is not None:
             self._entity_info_service.bind_demand_sink(sink)
+
+    def bind_profile_observer(self, observer: ProfilePairObservationHook) -> None:
+        """Attach the process-wide profile telemetry observer after startup composition."""
+        self._profile_observer = observer
+        if self._entity_info_service is not None:
+            self._entity_info_service.bind_profile_observer(observer)
+
+    def _publish_auth_scope(self, scope: TelegramAuthScope | None) -> None:
+        """Publish private session identity to already-composed domain services."""
+        changed = self._auth_scope != scope
+        self._auth_scope = scope
+        if changed and self._entity_info_service is not None:
+            self._entity_info_service.auth_scope_changed()
 
     def _require_demand_sink(self) -> DemandOfferSink:
         sink = self._demand_sink
@@ -1562,6 +1580,9 @@ class DaemonAPIServer:
                     chat_type=Chat,
                     get_dialog_placement=lambda entity_id: dialog_placement(self._conn, entity_id),
                     refresh_limits=self._policy.entity_profile,
+                    enable_full_user_pair=self._policy.full_user_pair_enabled,
+                    full_user_auth_scope=lambda: self._auth_scope,
+                    profile_observer=self._profile_observer,
                 )
             )
             if self._demand_sink is not None:

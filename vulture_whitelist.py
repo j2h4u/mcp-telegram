@@ -96,3 +96,32 @@ source_outstanding_depths
 expire_due
 offered_kinds
 protocol_scope
+
+# Entity Profile TypedDict fields are public serialized contract members. They
+# are consumed through Mapping payloads and therefore cannot be tied to a
+# reader by vulture's static analysis.
+ttl_period
+private_forward_name
+birthday
+business_work_hours
+note
+lang_code
+send_paid_messages_stars
+verified
+premium
+scam
+fake
+restricted
+restriction_reason
+personal_channel_message
+
+# Projection convenience properties are public contract accessors used by
+# callers/tests, though their reads are outside vulture's source graph.
+reusable
+authoritative_absence
+
+# Entity profile repository methods are part of the repository contract. The
+# section accessor is exercised by fencing tests; follow-up is an integration
+# entry point whose caller may live outside this source tree.
+section_is_reusable
+request_follow_up

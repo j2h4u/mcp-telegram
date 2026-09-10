@@ -13,7 +13,7 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 60
+_CURRENT_SCHEMA_VERSION = 62
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -25,6 +25,8 @@ _ENTITY_PROFILE_SECTIONS_MIGRATION_57 = 57
 _ACCOUNT_TRACE_INDEXES_MIGRATION_58 = 58
 _SCHEDULED_RECONCILIATION_MIGRATION_59 = 59
 _DOMAIN_RESUME_STATE_MIGRATION_60 = 60
+_ENTITY_PROFILE_ACQUISITION_MIGRATION_61 = 61
+_ENTITY_PROFILE_METADATA_MIGRATION_62 = 62
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
@@ -763,6 +765,25 @@ CREATE TABLE entity_profile_refresh_state (
         'full_profile', 'common_chats', 'contact_overlap', 'avatar_history', 'personal_channel'
     )),
     acquisition_cursor INTEGER NOT NULL DEFAULT 0 CHECK(acquisition_cursor >= 0)
+) WITHOUT ROWID
+"""
+
+_ENTITY_PROFILE_REFRESH_STATE_V61_DDL = """
+CREATE TABLE entity_profile_refresh_state (
+    entity_id          INTEGER PRIMARY KEY,
+    status             TEXT NOT NULL CHECK(status IN ('failed', 'pending', 'rejected', 'complete')),
+    retry_at           INTEGER,
+    reason             TEXT,
+    updated_at         INTEGER NOT NULL,
+    next_section       TEXT NOT NULL DEFAULT 'full_profile' CHECK(next_section IN (
+        'full_profile', 'common_chats', 'contact_overlap', 'avatar_history', 'personal_channel'
+    )),
+    acquisition_cursor INTEGER NOT NULL DEFAULT 0 CHECK(acquisition_cursor >= 0),
+    generation         INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+    started_at         INTEGER,
+    pair_eligible      INTEGER NOT NULL DEFAULT 0 CHECK(pair_eligible IN (0, 1)),
+    follow_up_required INTEGER NOT NULL DEFAULT 0 CHECK(follow_up_required IN (0, 1)),
+    profile_revision   INTEGER NOT NULL DEFAULT 0 CHECK(profile_revision >= 0)
 ) WITHOUT ROWID
 """
 
@@ -3174,6 +3195,187 @@ def _apply_migration_60(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
+def _entity_profile_refresh_state_v61_columns_and_schema(
+    conn: sqlite3.Connection,
+) -> tuple[set[str], str]:
+    columns = _table_column_names(conn, "entity_profile_refresh_state")
+    schema_row = cast(
+        tuple[str] | None,
+        conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='entity_profile_refresh_state'"
+        ).fetchone(),
+    )
+    return columns, schema_row[0] if schema_row is not None else ""
+
+
+def _entity_profile_refresh_state_v61_expressions(columns: set[str]) -> dict[str, str]:
+    defaults = {
+        "next_section": "'full_profile'",
+        "acquisition_cursor": "0",
+        "generation": "0",
+        "started_at": "NULL",
+        "pair_eligible": "0",
+        "follow_up_required": "0",
+        "profile_revision": "0",
+    }
+    return {name: name if name in columns else default for name, default in defaults.items()}
+
+
+def _copy_entity_profile_refresh_state_v61(conn: sqlite3.Connection, columns: set[str]) -> None:
+    expressions = _entity_profile_refresh_state_v61_expressions(columns)
+    # Copy through TEMP instead of renaming the old table.  ALTER TABLE
+    # RENAME makes SQLite reparse every trigger in sqlite_schema.  Some
+    # supported historical databases contain trigger definitions whose
+    # referenced tables are introduced later in the migration chain;
+    # reparsing those otherwise inert definitions aborts this upgrade.
+    conn.execute(
+        "CREATE TEMP TABLE entity_profile_refresh_state_v60_copy AS SELECT "
+        "entity_id, status, retry_at, reason, updated_at, "
+        f"{expressions['next_section']} AS next_section, "
+        f"{expressions['acquisition_cursor']} AS acquisition_cursor, "
+        f"{expressions['generation']} AS generation, "
+        f"{expressions['started_at']} AS started_at, "
+        f"{expressions['pair_eligible']} AS pair_eligible, "
+        f"{expressions['follow_up_required']} AS follow_up_required, "
+        f"{expressions['profile_revision']} AS profile_revision "
+        "FROM entity_profile_refresh_state"
+    )
+    conn.execute("DROP TABLE entity_profile_refresh_state")
+    conn.execute(_ENTITY_PROFILE_REFRESH_STATE_V61_DDL)
+    conn.execute(
+        """INSERT INTO entity_profile_refresh_state(
+            entity_id, status, retry_at, reason, updated_at, next_section,
+            acquisition_cursor, generation, started_at, pair_eligible,
+            follow_up_required, profile_revision
+        ) SELECT entity_id, status, retry_at, reason, updated_at, next_section,
+            acquisition_cursor, generation, started_at, pair_eligible,
+            follow_up_required, profile_revision
+        FROM entity_profile_refresh_state_v60_copy"""
+    )
+    conn.execute("DROP TABLE entity_profile_refresh_state_v60_copy")
+
+
+def _rebuild_entity_profile_refresh_state_v61(conn: sqlite3.Connection) -> None:
+    columns, schema = _entity_profile_refresh_state_v61_columns_and_schema(conn)
+    required = {"generation", "started_at", "pair_eligible", "follow_up_required", "profile_revision"}
+    if required <= columns and "'complete'" in schema:
+        return
+    if not columns:
+        conn.execute(_ENTITY_PROFILE_REFRESH_STATE_V61_DDL)
+        return
+    _copy_entity_profile_refresh_state_v61(conn, columns)
+
+
+def _apply_migration_61(conn: sqlite3.Connection, current: int) -> int:
+    """Add fenced Entity Profile progress and bounded acquisition evidence."""
+    if current >= _ENTITY_PROFILE_ACQUISITION_MIGRATION_61:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS entity_details (
+                entity_id INTEGER PRIMARY KEY,
+                detail_json TEXT NOT NULL,
+                fetched_at INTEGER NOT NULL,
+                profile_revision INTEGER NOT NULL DEFAULT 0 CHECK(profile_revision >= 0),
+                FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE
+            ) WITHOUT ROWID"""
+        )
+        detail_columns = _table_column_names(conn, "entity_details")
+        if "profile_revision" not in detail_columns:
+            conn.execute(
+                "ALTER TABLE entity_details ADD COLUMN profile_revision INTEGER NOT NULL DEFAULT 0 "
+                "CHECK(profile_revision >= 0)"
+            )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS entity_detail_sections (
+                entity_id INTEGER NOT NULL,
+                section TEXT NOT NULL,
+                status TEXT NOT NULL,
+                observed_at INTEGER,
+                reason TEXT,
+                payload_json TEXT,
+                retry_at INTEGER,
+                PRIMARY KEY(entity_id, section),
+                FOREIGN KEY(entity_id) REFERENCES entities(id) ON DELETE CASCADE
+            ) WITHOUT ROWID"""
+        )
+        section_columns = _table_column_names(conn, "entity_detail_sections")
+        section_alters = {
+            "acquisition_generation": "ALTER TABLE entity_detail_sections ADD COLUMN acquisition_generation INTEGER",
+            "acquisition_outcome": "ALTER TABLE entity_detail_sections ADD COLUMN acquisition_outcome TEXT",
+            "provenance_json": "ALTER TABLE entity_detail_sections ADD COLUMN provenance_json TEXT",
+            "normalization_version": "ALTER TABLE entity_detail_sections ADD COLUMN normalization_version TEXT",
+            "observation_started_at": "ALTER TABLE entity_detail_sections ADD COLUMN observation_started_at INTEGER",
+            "observation_completed_at": "ALTER TABLE entity_detail_sections ADD COLUMN observation_completed_at INTEGER",
+            "acquisition_identity_json": "ALTER TABLE entity_detail_sections ADD COLUMN acquisition_identity_json TEXT",
+        }
+        for column, statement in section_alters.items():
+            if column not in section_columns:
+                conn.execute(statement)
+        _rebuild_entity_profile_refresh_state_v61(conn)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entity_profile_refresh_generation "
+            "ON entity_profile_refresh_state(entity_id, generation, status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entity_profile_refresh_due "
+            "ON entity_profile_refresh_state(status, retry_at, updated_at, entity_id)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
+            (_ENTITY_PROFILE_ACQUISITION_MIGRATION_61,),
+        )
+        conn.commit()
+        return _ENTITY_PROFILE_ACQUISITION_MIGRATION_61
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _apply_migration_62(conn: sqlite3.Connection, current: int) -> int:
+    """Add ownership and paired-acquisition measurements after released v61."""
+    if current >= _ENTITY_PROFILE_METADATA_MIGRATION_62:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        detail_columns = _table_column_names(conn, "entity_details")
+        if detail_columns:
+            if "profile_owner_account_id" not in detail_columns:
+                conn.execute("ALTER TABLE entity_details ADD COLUMN profile_owner_account_id INTEGER")
+            if "profile_observation_scope_json" not in detail_columns:
+                conn.execute("ALTER TABLE entity_details ADD COLUMN profile_observation_scope_json TEXT")
+
+        refresh_columns = _table_column_names(conn, "entity_profile_refresh_state")
+        measurement_alters = {
+            "pair_mode": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_mode TEXT CHECK(pair_mode IN ('enabled', 'disabled') OR pair_mode IS NULL)",
+            "pair_full_profile_outcome": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_full_profile_outcome TEXT",
+            "pair_personal_channel_outcome": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_personal_channel_outcome TEXT",
+            "pair_full_profile_attempts": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_full_profile_attempts INTEGER NOT NULL DEFAULT 0 CHECK(pair_full_profile_attempts >= 0)",
+            "pair_personal_channel_attempts": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_personal_channel_attempts INTEGER NOT NULL DEFAULT 0 CHECK(pair_personal_channel_attempts >= 0)",
+            "pair_full_profile_retries": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_full_profile_retries INTEGER NOT NULL DEFAULT 0 CHECK(pair_full_profile_retries >= 0)",
+            "pair_personal_channel_retries": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_personal_channel_retries INTEGER NOT NULL DEFAULT 0 CHECK(pair_personal_channel_retries >= 0)",
+            "pair_attempts": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_attempts INTEGER NOT NULL DEFAULT 0 CHECK(pair_attempts >= 0)",
+            "pair_retries": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_retries INTEGER NOT NULL DEFAULT 0 CHECK(pair_retries >= 0)",
+            "pair_ready_at": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_ready_at INTEGER",
+            "pair_readiness_latency_ms": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_readiness_latency_ms REAL",
+            "pair_measurement_complete": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_measurement_complete INTEGER NOT NULL DEFAULT 0 CHECK(pair_measurement_complete IN (0, 1))",
+            "pair_summary_watermark": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_summary_watermark INTEGER",
+        }
+        for column, statement in measurement_alters.items():
+            if column not in refresh_columns:
+                conn.execute(statement)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
+            (_ENTITY_PROFILE_METADATA_MIGRATION_62,),
+        )
+        conn.commit()
+        return _ENTITY_PROFILE_METADATA_MIGRATION_62
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -3248,6 +3450,10 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_migration_58(conn, current)
     current = _apply_migration_59(conn, current)
     current = _apply_migration_60(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _ENTITY_PROFILE_ACQUISITION_MIGRATION_61:
+        current = _apply_migration_61(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _ENTITY_PROFILE_METADATA_MIGRATION_62:
+        current = _apply_migration_62(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

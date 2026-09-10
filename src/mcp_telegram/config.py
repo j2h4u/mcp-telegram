@@ -68,6 +68,10 @@ class EntitiesConfig:
 class EntityProfileConfig:
     """Budgets for the progressive entity-profile projection."""
 
+    # Keep the paired FullUser acquisition opt-in until observe-only evidence
+    # proves the additive migration safe for this deployment.
+    full_user_pair_enabled: bool = False
+
     foreground_resolve_seconds: float = 3.0
     foreground_refresh_wait_seconds: float = 15.0
     rpc_timeout_seconds: float = 8.0
@@ -921,6 +925,7 @@ def _parse_entity_profile(data: dict[str, object], path: Path) -> EntityProfileC
     _reject_unknown_keys(
         section,
         {
+            "full_user_pair_enabled",
             "foreground_resolve_seconds",
             "foreground_refresh_wait_seconds",
             "rpc_timeout_seconds",
@@ -934,6 +939,9 @@ def _parse_entity_profile(data: dict[str, object], path: Path) -> EntityProfileC
     defaults = EntityProfileConfig()
     try:
         return EntityProfileConfig(
+            full_user_pair_enabled=_bool(
+                section, "full_user_pair_enabled", "entity_profile", path, defaults.full_user_pair_enabled
+            ),
             foreground_resolve_seconds=_positive_float(
                 section, "foreground_resolve_seconds", "entity_profile", path, defaults.foreground_resolve_seconds
             ),

@@ -86,7 +86,7 @@ path = "mcp_telegram.daemon"
 layer = "composition"
 depends_on = [
     "mcp_telegram.activity_cold_backfill", "mcp_telegram.activity_contracts", "mcp_telegram.activity_peer_resolve", "mcp_telegram.activity_substrate",
-    "mcp_telegram.config", "mcp_telegram.daemon_api", "mcp_telegram.delta_sync", "mcp_telegram.demand_composition", "mcp_telegram.dialog_sync",
+    "mcp_telegram.auth_scope", "mcp_telegram.config", "mcp_telegram.daemon_api", "mcp_telegram.delta_sync", "mcp_telegram.demand_composition", "mcp_telegram.dialog_sync",
     "mcp_telegram.entity_profile.refresh",
     "mcp_telegram.event_handlers", "mcp_telegram.feedback_db", "mcp_telegram.feedback_service", "mcp_telegram.flood",
     "mcp_telegram.fact_hydration", "mcp_telegram.hydration_queue",
@@ -118,6 +118,7 @@ depends_on = [
     "mcp_telegram.daemon_account_trace", "mcp_telegram.daemon_activity_stats",
     "mcp_telegram.daemon_dialog_queries", "mcp_telegram.daemon_entity_info", "mcp_telegram.dialog_selector",
     "mcp_telegram.demand_wiring", "mcp_telegram.entity_profile.refresh",
+    "mcp_telegram.auth_scope", "mcp_telegram.entity_profile.ports",
     "mcp_telegram.entity_store",
     "mcp_telegram.feedback_service",
     "mcp_telegram.reading",
@@ -173,6 +174,7 @@ path = "mcp_telegram.daemon_entity_info"
 layer = "application"
 depends_on = [
     "mcp_telegram.demand_wiring", "mcp_telegram.entity_profile.contracts", "mcp_telegram.entity_profile.refresh",
+    "mcp_telegram.auth_scope", "mcp_telegram.entity_profile.full_user_normalization", "mcp_telegram.entity_profile.ports",
     "mcp_telegram.entity_profile.repository",
     "mcp_telegram.entity_store", "mcp_telegram.flood", "mcp_telegram.folders.read_model",
     "mcp_telegram.models", "mcp_telegram.telegram_access", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc", "mcp_telegram.telegram_rpc_consumers",
@@ -385,6 +387,12 @@ depends_on = ["mcp_telegram.flood", "mcp_telegram.folders.contracts", "mcp_teleg
 path = "mcp_telegram.entity_profile.refresh"
 layer = "capability"
 depends_on = ["mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
+
+[[modules]]
+path = "mcp_telegram.entity_profile.full_user_normalization"
+layer = "capability"
+depends_on = ["mcp_telegram.entity_profile.contracts"]
+
 [[modules]]
 path = "mcp_telegram.reactions"
 layer = "capability"
@@ -616,6 +624,16 @@ depends_on = ["mcp_telegram.own_only_contracts", "mcp_telegram.telegram_rpc_cons
 
 [[modules]]
 path = "mcp_telegram.entity_profile.contracts"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.entity_profile.ports"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.auth_scope"
 layer = "foundation"
 depends_on = []
 

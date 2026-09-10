@@ -595,7 +595,7 @@ def test_schema_v16_creates_entity_details(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sqlite_connection(db_path) as conn:
         cols = {(row[1], row[2]) for row in _table_info(conn, "entity_details")}
-    assert cols == {
+    assert cols >= {
         ("entity_id", "INTEGER"),
         ("detail_json", "TEXT"),
         ("fetched_at", "INTEGER"),
@@ -713,7 +713,57 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 60
+        assert _CURRENT_SCHEMA_VERSION == 62
+
+
+def test_genuine_v61_fixture_upgrades_to_v62_and_reopens_idempotently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ownership and pair measurements are a real additive post-v61 migration."""
+    db_path = tmp_path / "v61.sqlite"
+    with monkeypatch.context() as v61:
+        v61.setattr(sync_db_module, "_CURRENT_SCHEMA_VERSION", 61)
+        ensure_sync_schema(db_path)
+
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 61
+        refresh_columns = {row[1] for row in _table_info(conn, "entity_profile_refresh_state")}
+        detail_columns = {row[1] for row in _table_info(conn, "entity_details")}
+        assert "pair_mode" not in refresh_columns
+        assert "pair_summary_watermark" not in refresh_columns
+        assert "profile_owner_account_id" not in detail_columns
+        conn.execute("INSERT INTO entities(id, type, name, updated_at) VALUES (42, 'user', 'kept', 100)")
+        conn.execute(
+            "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 100)",
+            ('{"schema":1,"id":42,"type":"user","name":"kept"}',),
+        )
+        conn.execute(
+            "INSERT INTO entity_profile_refresh_state("
+            "entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor,"
+            "generation,started_at,pair_eligible,follow_up_required,profile_revision) "
+            "VALUES (42,'failed',123,'old',100,'common_chats',3,7,90,1,0,2)"
+        )
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
+        assert _fetchone_row(
+            conn,
+            "SELECT detail_json, fetched_at, profile_owner_account_id FROM entity_details WHERE entity_id=42",
+        ) == ('{"schema":1,"id":42,"type":"user","name":"kept"}', 100, None)
+        assert _fetchone_row(
+            conn,
+            "SELECT status, retry_at, reason, next_section, acquisition_cursor, generation, profile_revision "
+            "FROM entity_profile_refresh_state WHERE entity_id=42",
+        ) == ("failed", 123, "old", "common_chats", 3, 7, 2)
+        columns_before = _table_info(conn, "entity_profile_refresh_state")
+
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
+        assert _table_info(conn, "entity_profile_refresh_state") == columns_before
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1444,7 +1494,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 60
+        assert _CURRENT_SCHEMA_VERSION == 62
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:

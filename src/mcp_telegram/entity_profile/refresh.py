@@ -23,6 +23,21 @@ from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_attempt_budget, rpc_
 DurableRefreshStatusCallback = Callable[[float], DemandStatus | None]
 
 
+def throttled_retry_at(now: int, retry_after: int | None) -> int:
+    """Return the next attempt boundary for a throttled acquisition."""
+    return now + max(1, int(retry_after or 1))
+
+
+def failure_retry_at(now: int) -> int:
+    """Return the bounded retry boundary for an ordinary acquisition failure."""
+    return now + 60
+
+
+def scope_changed_retry_at(now: int) -> int:
+    """Return the immediate retry boundary after an auth-scope change."""
+    return now + 1
+
+
 def _validate_positive_duration(value: object, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value <= 0:
         raise ValueError(f"entity profile {name} must be positive")
@@ -107,6 +122,11 @@ class EntityRefreshCoordinator:
         """Return process-local refresh admissions with foreground waiters."""
         return len(self._completion_events)
 
+    @property
+    def is_closed(self) -> bool:
+        """Return whether this coordinator has stopped admitting refresh work."""
+        return self._closed
+
     def enqueue(self, entity_id: int) -> RefreshEnqueueResult:
         """Register foreground interest in durable work and coalesce duplicates."""
         if self._closed:
@@ -136,12 +156,19 @@ class EntityRefreshCoordinator:
 
     async def run_durable_slice(self, budget: RpcAttemptBudget) -> DurableRefreshSliceResult | None:
         """Run the bound restart-safe entity acquisition slice, when available."""
+        if self._closed:
+            return None
         if self._durable_slice_callback is None:
             return None
         return await self._durable_slice_callback(budget)
 
     async def wait_for_completion(self, entity_id: int, timeout_seconds: float) -> bool:
-        """Wait for an admitted single-flight refresh without cancelling it on timeout."""
+        """Wait for an admitted refresh; true only when the wait ended normally."""
+        # Shutdown is terminal for this process-local coordinator.  Check it
+        # before the missing-event shortcut so a waiter created after close
+        # cannot report a successful refresh that never ran.
+        if self._closed:
+            return False
         event = self._completion_events.get(entity_id)
         if event is None:
             return True
@@ -150,7 +177,9 @@ class EntityRefreshCoordinator:
                 await event.wait()
         except TimeoutError:
             return False
-        return True
+        # An event may have been released by shutdown.  Re-check admission so
+        # shutdown wins a terminal-signal/waiter-resumption race.
+        return not self._closed
 
     def signal_terminal(self, result: DurableRefreshSliceResult) -> None:
         """Release coalesced waiters after durable success or persisted failure."""
@@ -183,6 +212,8 @@ class EntityProfileDemandAdapter(DurableDemandAdapter):
         """Run at most the supplied actual-attempt budget and retain its cursor."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
+        if self._coordinator.is_closed:
+            return
         now = time.time()
         status = self.status(now)
         if status is None or not status.is_ready(now):

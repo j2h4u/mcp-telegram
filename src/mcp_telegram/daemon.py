@@ -65,6 +65,7 @@ from .activity_cold_backfill import ColdBackfillPacing
 from .activity_contracts import InputPeerResolver
 from .activity_peer_resolve import resolve_input_peer
 from .activity_substrate import ActivityClient
+from .auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from .config import McpTelegramConfig, SchedulingConfig, load_config, resolve_scheduling_config
 from .daemon_api import DaemonApiPolicy, DaemonAPIServer, DaemonClientLike, DaemonHealthStatus
 from .delta_sync import AccessProbePolicy, DeltaSyncWorker, DmGapScanPage, _DeltaSyncClient
@@ -1096,6 +1097,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
                 max_concurrent_refreshes=config.entity_profile.max_concurrent_refreshes,
                 max_queued_refreshes=config.entity_profile.max_queued_refreshes,
             ),
+            full_user_pair_enabled=config.entity_profile.full_user_pair_enabled,
         ),
         health_status=health_status,
     )
@@ -1121,6 +1123,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         rpc_observation_sink,
         policy=config.telemetry.runtime_observations,
     )
+    api_server.bind_profile_observer(rpc_admission_observer)
     ctx = _SyncMainContext(
         db_path=db_path,
         conn=conn,
@@ -1307,6 +1310,32 @@ def _offer_startup_demands(ctx: _SyncMainContext) -> None:
         ctx.coordinator.offer(kind)
 
 
+def capture_auth_scope(profile: object, client: object) -> TelegramAuthScope | None:
+    """Read account and primary permanent-session identity without an RPC."""
+    account_id = getattr(profile, "id", None)
+    session = getattr(client, "session", None)
+    dc_id = getattr(session, "dc_id", None)
+    auth_key = getattr(session, "auth_key", None)
+    auth_key_id = getattr(auth_key, "key_id", None)
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in (account_id, dc_id, auth_key_id)
+    ):
+        return None
+    account_id = cast(int, account_id)
+    dc_id = cast(int, dc_id)
+    auth_key_id = cast(int, auth_key_id)
+    try:
+        return TelegramAuthScope(
+            version=AUTH_SCOPE_VERSION,
+            account_id=account_id,
+            dc_id=dc_id,
+            auth_key_id=auth_key_id,
+        )
+    except ValueError:
+        return None
+
+
 def _update_self_profile(api_server: DaemonAPIServer, me: _MeLike) -> None:
     """Atomically replace the account identity exposed to local readers."""
     self_id = int(me.id)
@@ -1317,6 +1346,7 @@ def _update_self_profile(api_server: DaemonAPIServer, me: _MeLike) -> None:
         "last_name": getattr(me, "last_name", None),
         "username": getattr(me, "username", None),
     }
+    api_server._publish_auth_scope(capture_auth_scope(me, api_server._client))
 
 
 def _publish_startup_identity(ctx: _SyncMainContext, profile: object, own_only_context: OwnOnlyContext) -> None:
@@ -1519,6 +1549,21 @@ def _persist_runtime_observation_loss(ctx: _SyncMainContext) -> None:
         return
     queue_full_drops, _shutdown_drops, _startup_drops, _rejected_submissions, writer_failures = counts
     with ctx.conn:
+        try:
+            record_runtime_observation(
+                ctx.conn,
+                kind="runtime.telemetry_loss",
+                outcome="loss",
+                payload={
+                    "queue_full_drops": queue_full_drops,
+                    "shutdown_grace_drops": counts[1],
+                    "startup_drops": counts[2],
+                    "rejected_submissions": counts[3],
+                    "writer_failures": writer_failures,
+                },
+            )
+        except sqlite3.Error:
+            logger.debug("runtime_observation_loss_event_failed")
         ctx.conn.executemany(
             "INSERT OR REPLACE INTO daemon_state(key,value) VALUES (?,?)",
             (
