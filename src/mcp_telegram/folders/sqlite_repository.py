@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from collections.abc import Iterable
 from typing import cast
@@ -13,13 +14,13 @@ from .contracts import (
     FolderDialogCursor,
     FolderRule,
     FolderSourceSnapshot,
-    FolderStagingCorruptError,
     FolderStagingSnapshot,
     FolderStagingStaleError,
 )
 from .ports import FolderSnapshotRepository
 
 _STAGING_KEY = "folder_snapshot_staging_v1"
+logger = logging.getLogger(__name__)
 
 
 def _state_int(value: str | None) -> int | None:
@@ -47,6 +48,16 @@ def replace_folder_snapshot(
 class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
+        self._staging_recovery_pending = False
+
+    @property
+    def staging_recovery_pending(self) -> bool:
+        """Whether a malformed staging row was discarded since the last read."""
+        return self._staging_recovery_pending
+
+    def acknowledge_staging_recovery(self) -> None:
+        """Allow the worker to consume the immediate retry requested by recovery."""
+        self._staging_recovery_pending = False
 
     def replace_snapshot(
         self,
@@ -92,6 +103,7 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
                 },
             )
             self._conn.execute("DELETE FROM daemon_state WHERE key = ?", (_STAGING_KEY,))
+        self._staging_recovery_pending = False
         return generation
 
     def record_attempt(
@@ -148,7 +160,10 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
             raw_generation = payload.get("base_generation")
             base_generation = None if raw_generation is None else int(cast(int | str, raw_generation))
         except (json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError) as exc:
-            raise FolderStagingCorruptError("folder snapshot staging state is corrupt") from exc
+            self._discard_staging_after_corruption(raw)
+            self._staging_recovery_pending = True
+            logger.warning("folder_snapshot staging corrupt; discarded and restarting acquisition: %s", exc)
+            return None
         return FolderStagingSnapshot(folders, dialogs, cursor, started_at, base_generation)
 
     def save_staging(self, snapshot: FolderStagingSnapshot) -> None:
@@ -166,6 +181,14 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
     def clear_staging(self) -> None:
         with self._conn:
             self._conn.execute("DELETE FROM daemon_state WHERE key = ?", (_STAGING_KEY,))
+
+    def _discard_staging_after_corruption(self, raw: str) -> None:
+        """Delete only malformed staging state, preserving the published snapshot."""
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM daemon_state WHERE key = ? AND value = ?",
+                (_STAGING_KEY, raw),
+            )
 
     def _read_state_value(self, key: str) -> str | None:
         row = cast(

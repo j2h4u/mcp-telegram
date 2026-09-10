@@ -23,7 +23,7 @@ from ..telegram_demand import (
 )
 from ..telegram_rpc_consumers import DemandKind
 from ..telegram_rpc_scheduler import rpc_attempt_budget
-from .contracts import FolderSourceUnavailableError, FolderStagingStaleError
+from .contracts import FolderSourceUnavailableError, FolderStagingCorruptError, FolderStagingStaleError
 from .ports import FolderSnapshotRepository
 from .refresh import FolderProjection, FolderRefresher, FolderRefreshResult
 
@@ -99,9 +99,11 @@ class FolderProjectionWorker:
         self._last_outcome = repository.read_last_outcome()
         retry_at = repository.read_next_retry_at()
         last_success_at = repository.read_last_success_at()
+        staging = repository.read_staging()
+        self._staging_recovery_pending = self._repository_staging_recovery_pending()
         self._next_due_at = (
             0
-            if repository.read_staging() is not None
+            if staging is not None or self._staging_recovery_pending
             else (
                 retry_at
                 if retry_at is not None
@@ -119,6 +121,9 @@ class FolderProjectionWorker:
         if self._primed:
             return
         self._primed = True
+        if self._repository_staging_recovery_pending():
+            self._staging_recovery_pending = True
+            self._next_due_at = 0
         self._warn_if_needed(self._last_outcome)
         if self._next_due_at is not None and self._next_due_at > self._clock():
             return
@@ -147,6 +152,7 @@ class FolderProjectionWorker:
 
         async def perform() -> None:
             async with self._attempt_lock:
+                self._acknowledge_staging_recovery()
                 if budget is None:
                     await self._attempt_once(reason, None)
                 else:
@@ -154,6 +160,18 @@ class FolderProjectionWorker:
                         await self._attempt_once(reason, budget)
 
         await perform()
+
+    def _repository_staging_recovery_pending(self) -> bool:
+        pending = getattr(self._repository, "staging_recovery_pending", False)
+        if not isinstance(pending, bool):
+            return False
+        return pending
+
+    def _acknowledge_staging_recovery(self) -> None:
+        self._staging_recovery_pending = False
+        acknowledge = getattr(self._repository, "acknowledge_staging_recovery", None)
+        if callable(acknowledge):
+            acknowledge()
 
     async def _attempt_once(self, reason: str, budget: RpcAttemptBudget | None) -> None:
         started = self._clock()
@@ -192,7 +210,7 @@ class FolderProjectionWorker:
             if projection is None:
                 return self._continuation_result()
             return self._publish_projection(projection)
-        except FolderStagingStaleError:
+        except FolderStagingCorruptError, FolderStagingStaleError:
             self._repository.clear_staging()
             return self._continuation_result()
         except RpcAttemptBudgetExhaustedError:
@@ -313,7 +331,10 @@ class FolderProjectionDemandAdapter(DurableDemandAdapter):
         retry_at = repository.read_next_retry_at()
         last_success_at = repository.read_last_success_at()
         outcome = repository.read_last_outcome()
-        if repository.read_staging() is not None:
+        staging = repository.read_staging()
+        if self._worker._repository_staging_recovery_pending():
+            self._worker._staging_recovery_pending = True
+        if staging is not None or self._worker._staging_recovery_pending:
             release_at = now
         elif retry_at is not None:
             release_at = float(retry_at)

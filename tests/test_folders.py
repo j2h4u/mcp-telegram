@@ -81,6 +81,34 @@ def test_failed_snapshot_replacement_rolls_back_to_previous_snapshot(tmp_path: P
         conn.close()
 
 
+def test_corrupt_staging_is_discarded_without_touching_published_snapshot(tmp_path: Path) -> None:
+    conn = _connection(tmp_path / "sync.db")
+    try:
+        repository = SQLiteFolderSnapshotRepository(conn)
+        repository.replace_snapshot(
+            FolderSourceSnapshot((FolderRule(9, "Saved"),), (DialogFacts(999, DialogCategory.CONTACT),)),
+            ((9, 999),),
+            completed_at=90,
+        )
+        with conn:
+            conn.execute(
+                "INSERT INTO daemon_state(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                ("folder_snapshot_staging_v1", "{not-json"),
+            )
+
+        assert repository.read_staging() is None
+        assert folders_by_dialog(conn) == {999: [{"id": 9, "title": "Saved"}]}
+        assert repository.read_generation() == 1
+        assert repository.read_last_success_at() == 90
+        assert repository.read_last_outcome() == "success"
+        assert (
+            conn.execute("SELECT value FROM daemon_state WHERE key = 'folder_snapshot_staging_v1'").fetchone() is None
+        )
+    finally:
+        conn.close()
+
+
 def test_folder_snapshot_requires_generation_and_success_timestamp(tmp_path: Path) -> None:
     conn = _connection(tmp_path / "sync.db")
     try:
@@ -385,5 +413,39 @@ async def test_bounded_folder_acquisition_discards_stale_staging_generation(tmp_
         assert result.projection is not None
         assert result.projection.source.folders[0].title == "Contacts"
         assert gateway.fetch_calls == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_bounded_folder_acquisition_restarts_after_corrupt_staging(tmp_path: Path) -> None:
+    conn = _connection(tmp_path / "sync.db")
+    try:
+        repository = SQLiteFolderSnapshotRepository(conn)
+        repository.replace_snapshot(
+            FolderSourceSnapshot((FolderRule(9, "Saved"),), (DialogFacts(999, DialogCategory.CONTACT),)),
+            ((9, 999),),
+            completed_at=90,
+        )
+        with conn:
+            conn.execute(
+                "INSERT INTO daemon_state(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                ("folder_snapshot_staging_v1", "{not-json"),
+            )
+
+        gateway = _PagedGateway(())
+        refresher = FolderRefresher(gateway, repository)
+        budget = RpcAttemptBudget(limit=2)
+        with rpc_attempt_budget(budget):
+            result = await refresher.acquire_slice(budget)
+
+        assert result.complete is True
+        assert result.projection is not None
+        assert gateway.fetch_calls == 1
+        assert folders_by_dialog(conn) == {999: [{"id": 9, "title": "Saved"}]}
+        refresher.persist(result.projection, completed_at=123)
+        assert folders_by_dialog(conn) == {}
+        assert repository.read_generation() == 2
     finally:
         conn.close()
