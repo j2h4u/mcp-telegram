@@ -11,7 +11,7 @@ boundary.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
@@ -232,18 +232,60 @@ def _isoformat(value: object) -> str | None:
     return None
 
 
-def _field(target: dict[str, object], name: str, value: object, *, kind: str) -> None:
-    normalized: object | None
+ScalarField = tuple[str, str]
+
+_FULL_USER_SCALAR_FIELDS: tuple[ScalarField, ...] = (
+    ("about", "string"),
+    ("blocked", "bool"),
+    ("ttl_period", "int"),
+    ("private_forward_name", "string"),
+    ("folder_id", "int"),
+)
+
+_USER_SCALAR_FIELDS: tuple[ScalarField, ...] = (
+    ("username", "string"),
+    ("phone", "string"),
+    ("lang_code", "string"),
+    ("contact", "bool"),
+    ("mutual_contact", "bool"),
+    ("close_friend", "bool"),
+    ("send_paid_messages_stars", "int"),
+    ("verified", "bool"),
+    ("premium", "bool"),
+    ("bot", "bool"),
+    ("scam", "bool"),
+    ("fake", "bool"),
+    ("restricted", "bool"),
+)
+
+
+def _normalize_scalar(value: object, kind: str) -> object | None:
     if kind == "string":
-        normalized = _string(value)
-    elif kind == "int":
-        normalized = _integer(value)
-    elif kind == "bool":
-        normalized = _boolean(value)
-    else:  # pragma: no cover - the constants below are intentionally finite.
-        raise ValueError(f"unsupported FullUser field kind: {kind}")
-    if normalized is not None:
-        target[name] = normalized
+        return _string(value)
+    if kind == "int":
+        return _integer(value)
+    if kind == "bool":
+        return _boolean(value)
+    raise ValueError(f"unsupported FullUser field kind: {kind}")
+
+
+def _normalize_scalar_fields(source: object, fields: tuple[ScalarField, ...]) -> tuple[dict[str, object], bool]:
+    facts: dict[str, object] = {}
+    complete = True
+    for name, kind in fields:
+        raw = _attr(source, name)
+        if raw is _MISSING:
+            complete = False
+            continue
+        if raw is None:
+            facts[name] = None
+            continue
+        normalized = _normalize_scalar(raw, kind)
+        if normalized is None:
+            complete = False
+            continue
+        facts[name] = normalized
+    return facts, complete
 
 
 def _normalize_birthday(value: object) -> dict[str, int | None] | None:
@@ -335,45 +377,8 @@ def _normalize_restrictions(value: object) -> list[dict[str, str | None]] | None
     ]
 
 
-def _normalize_full_profile(  # noqa: PLR0912, PLR0915, PLR0914
-    full_user: object, user: object
-) -> tuple[dict[str, object], bool]:
-    facts: dict[str, object] = {}
-    complete = True
-
-    def scalar(source: object, name: str, kind: str) -> None:
-        nonlocal complete
-        value = _attr(source, name)
-        if value is _MISSING:
-            complete = False
-            return
-        if value is None:
-            facts[name] = None
-            return
-        normalized: object | None
-        if kind == "string":
-            normalized = _string(value)
-        elif kind == "int":
-            normalized = _integer(value)
-        elif kind == "bool":
-            normalized = _boolean(value)
-        else:  # pragma: no cover - this list is intentionally finite.
-            raise ValueError(f"unsupported FullUser field kind: {kind}")
-        if normalized is None:
-            complete = False
-            return
-        facts[name] = normalized
-
-    for name, kind in (
-        ("about", "string"),
-        ("blocked", "bool"),
-        ("ttl_period", "int"),
-        ("private_forward_name", "string"),
-        ("folder_id", "int"),
-    ):
-        scalar(full_user, name, kind)
-
-    nested_normalizers = (
+def _normalize_nested_fields(full_user: object) -> tuple[dict[str, object], bool]:
+    normalizers = (
         ("birthday", _normalize_birthday),
         ("bot_info", _normalize_bot_info),
         ("business_location", _normalize_business_location),
@@ -381,7 +386,9 @@ def _normalize_full_profile(  # noqa: PLR0912, PLR0915, PLR0914
         ("business_work_hours", _normalize_business_hours),
         ("note", _normalize_note),
     )
-    for name, normalizer in nested_normalizers:
+    facts: dict[str, object] = {}
+    complete = True
+    for name, normalizer in normalizers:
         raw = _attr(full_user, name)
         if raw is _MISSING:
             complete = False
@@ -394,90 +401,88 @@ def _normalize_full_profile(  # noqa: PLR0912, PLR0915, PLR0914
             complete = False
             continue
         facts[name] = value
+    return facts, complete
 
+
+def _normalize_names(user: object) -> tuple[dict[str, object], bool]:
     first_raw = _attr(user, "first_name")
     last_raw = _attr(user, "last_name")
-    if first_raw is _MISSING or last_raw is _MISSING:
-        complete = False
-    first_name = None if first_raw is _MISSING else _string(first_raw)
-    last_name = None if last_raw is _MISSING else _string(last_raw)
-    if first_raw is not _MISSING and first_raw is not None and first_name is None:
-        complete = False
-    if last_raw is not _MISSING and last_raw is not None and last_name is None:
-        complete = False
+    first_name, first_complete = _normalize_name_value(first_raw)
+    last_name, last_complete = _normalize_name_value(last_raw)
+    complete = first_complete and last_complete
+    facts: dict[str, object] = {}
     if first_raw is not _MISSING:
         facts["first_name"] = first_name
     if last_raw is not _MISSING:
         facts["last_name"] = last_name
     if first_raw is not _MISSING or last_raw is not _MISSING:
         facts["name"] = " ".join(part for part in (first_name, last_name) if part)
+    return facts, complete
 
-    for name, kind in (
-        ("username", "string"),
-        ("phone", "string"),
-        ("lang_code", "string"),
-        ("contact", "bool"),
-        ("mutual_contact", "bool"),
-        ("close_friend", "bool"),
-        ("send_paid_messages_stars", "int"),
-        ("verified", "bool"),
-        ("premium", "bool"),
-        ("bot", "bool"),
-        ("scam", "bool"),
-        ("fake", "bool"),
-        ("restricted", "bool"),
-    ):
-        scalar(user, name, kind)
 
+def _normalize_name_value(raw: object) -> tuple[str | None, bool]:
+    if raw is _MISSING:
+        return None, False
+    if raw is None:
+        return None, True
+    value = _string(raw)
+    return value, value is not None
+
+
+def _normalize_extra_usernames(user: object, username: object) -> tuple[object, bool]:
     raw_usernames = _attr(user, "usernames")
     if raw_usernames is _MISSING:
-        complete = False
-    elif raw_usernames is None:
-        facts["extra_usernames"] = None
-    else:
-        usernames = _sequence(raw_usernames)
-        if usernames is None:
-            complete = False
-        else:
-            facts["extra_usernames"] = [
-                username
-                for entry in usernames
-                if (username := _string(_attr(entry, "username"))) is not None and username != facts.get("username")
-            ]
-    emoji_status = _attr(user, "emoji_status")
-    if emoji_status is _MISSING:
-        complete = False
-    elif emoji_status is None:
-        facts["emoji_status_id"] = None
-    else:
-        emoji_status_id = _positive_integer(_attr(emoji_status, "document_id"))
-        if emoji_status_id is None:
-            complete = False
-        else:
-            facts["emoji_status_id"] = emoji_status_id
-    raw_status = _attr(user, "status")
-    if raw_status is _MISSING:
-        complete = False
-    elif raw_status is None:
-        facts["status"] = None
-    else:
-        status = _normalize_status(raw_status)
-        if status is None:
-            complete = False
-        else:
-            facts["status"] = status
-    raw_restrictions = _attr(user, "restriction_reason")
-    if raw_restrictions is _MISSING:
-        complete = False
-    elif raw_restrictions is None:
-        facts["restriction_reason"] = None
-    else:
-        restrictions = _normalize_restrictions(raw_restrictions)
-        if restrictions is None:
-            complete = False
-        else:
-            facts["restriction_reason"] = restrictions
+        return None, False
+    if raw_usernames is None:
+        return None, True
+    usernames = _sequence(raw_usernames)
+    if usernames is None:
+        return None, False
+    return [
+        value for entry in usernames if (value := _string(_attr(entry, "username"))) is not None and value != username
+    ], True
 
+
+def _normalize_emoji_status(value: object) -> int | None:
+    return _positive_integer(_attr(value, "document_id"))
+
+
+def _store_optional_fact(
+    facts: dict[str, object], name: str, raw: object, normalizer: Callable[[object], object | None]
+) -> bool:
+    if raw is _MISSING:
+        return False
+    if raw is None:
+        facts[name] = None
+        return True
+    value = normalizer(raw)
+    if value is None:
+        return False
+    facts[name] = value
+    return True
+
+
+def _normalize_user_optional(user: object) -> tuple[dict[str, object], bool]:
+    facts: dict[str, object] = {}
+    complete = True
+    extra_usernames, usernames_complete = _normalize_extra_usernames(user, _string(_attr(user, "username")))
+    if not usernames_complete:
+        complete = False
+    else:
+        facts["extra_usernames"] = extra_usernames
+
+    optional_fields = (
+        ("emoji_status_id", _attr(user, "emoji_status"), _normalize_emoji_status),
+        ("status", _attr(user, "status"), _normalize_status),
+        ("restriction_reason", _attr(user, "restriction_reason"), _normalize_restrictions),
+    )
+    for name, raw, normalizer in optional_fields:
+        if not _store_optional_fact(facts, name, raw, normalizer):
+            complete = False
+    return facts, complete
+
+
+def _add_membership(facts: dict[str, object]) -> None:
     relationship = {name: facts[name] for name in ("contact", "mutual_contact", "close_friend") if name in facts}
     if "blocked" in facts:
         relationship["blocked"] = facts["blocked"]
@@ -488,6 +493,17 @@ def _normalize_full_profile(  # noqa: PLR0912, PLR0915, PLR0914
             "admin_rights": None,
             "relationship": relationship,
         }
+
+
+def _normalize_full_profile(full_user: object, user: object) -> tuple[dict[str, object], bool]:
+    full_scalars, full_scalars_complete = _normalize_scalar_fields(full_user, _FULL_USER_SCALAR_FIELDS)
+    nested, nested_complete = _normalize_nested_fields(full_user)
+    names, names_complete = _normalize_names(user)
+    user_scalars, user_scalars_complete = _normalize_scalar_fields(user, _USER_SCALAR_FIELDS)
+    optional, optional_complete = _normalize_user_optional(user)
+    facts = full_scalars | nested | names | user_scalars | optional
+    _add_membership(facts)
+    complete = all((full_scalars_complete, nested_complete, names_complete, user_scalars_complete, optional_complete))
     return facts, complete
 
 
@@ -531,67 +547,96 @@ def _unavailable(reason: str) -> ProjectionOutcome:
     return ProjectionOutcome(status=ProjectionStatus.UNAVAILABLE, payload=None, reason=reason, provenance=None)
 
 
-def _normalize_personal_channel(
-    full_user: object, chats: object, observation: ObservationBoundary
+def _channel_outcome(
+    status: ProjectionStatus,
+    payload: Mapping[str, object] | None,
+    reason: str | None,
+    observation: ObservationBoundary,
+    *,
+    authoritative: bool,
 ) -> ProjectionOutcome:
-    raw_id = _attr(full_user, "personal_channel_id")
-    if raw_id is _MISSING:
-        return ProjectionOutcome(
-            status=ProjectionStatus.PARTIAL,
-            payload=None,
-            reason="personal_channel_id_missing",
-            provenance=_projection_provenance(PERSONAL_CHANNEL_OWNED_FIELDS, {}, observation, authoritative=False),
-        )
-    if raw_id is None:
-        payload: PersonalChannelFacts = {"personal_channel_id": None}
-        return ProjectionOutcome(
-            status=ProjectionStatus.ABSENT,
-            payload=payload,
-            reason=None,
-            provenance=_projection_provenance(PERSONAL_CHANNEL_OWNED_FIELDS, payload, observation, authoritative=True),
-        )
-    channel_id = _positive_integer(raw_id)
-    if channel_id is None:
-        return ProjectionOutcome(
-            status=ProjectionStatus.PARTIAL,
-            payload=None,
-            reason="personal_channel_id_invalid",
-            provenance=_projection_provenance(PERSONAL_CHANNEL_OWNED_FIELDS, {}, observation, authoritative=False),
-        )
+    return ProjectionOutcome(
+        status=status,
+        payload=payload,
+        reason=reason,
+        provenance=_projection_provenance(
+            PERSONAL_CHANNEL_OWNED_FIELDS, payload or {}, observation, authoritative=authoritative
+        ),
+    )
 
-    payload = {"personal_channel_id": channel_id}
-    attached_message_id = _positive_integer(_attr(full_user, "personal_channel_message"))
-    if attached_message_id is not None:
-        payload["personal_channel_message"] = attached_message_id
 
+def _channel_metadata_outcome(
+    payload: dict[str, object], channel_id: int, chats: object, observation: ObservationBoundary
+) -> ProjectionOutcome:
     chat_values = _sequence(chats)
     if chat_values is None:
-        return ProjectionOutcome(
-            status=ProjectionStatus.PARTIAL,
-            payload=payload,
-            reason="channel_metadata_missing",
-            provenance=_projection_provenance(PERSONAL_CHANNEL_OWNED_FIELDS, payload, observation, authoritative=False),
+        return _channel_outcome(
+            ProjectionStatus.PARTIAL, payload, "channel_metadata_missing", observation, authoritative=False
         )
     matching_chat = next((chat for chat in chat_values if _entity_id(chat) == channel_id), None)
     title = _string(_attr(matching_chat, "title")) if matching_chat is not None else None
     username = _string(_attr(matching_chat, "username")) if matching_chat is not None else None
     if title is None and username is None:
-        return ProjectionOutcome(
-            status=ProjectionStatus.PARTIAL,
-            payload=payload,
-            reason="channel_metadata_invalid",
-            provenance=_projection_provenance(PERSONAL_CHANNEL_OWNED_FIELDS, payload, observation, authoritative=False),
+        return _channel_outcome(
+            ProjectionStatus.PARTIAL, payload, "channel_metadata_invalid", observation, authoritative=False
         )
     if title is not None:
         payload["title"] = title
     if username is not None:
         payload["username"] = username
-    return ProjectionOutcome(
-        status=ProjectionStatus.USABLE,
-        payload=payload,
-        reason=None,
-        provenance=_projection_provenance(PERSONAL_CHANNEL_OWNED_FIELDS, payload, observation, authoritative=True),
-    )
+    return _channel_outcome(ProjectionStatus.USABLE, payload, None, observation, authoritative=True)
+
+
+def _normalize_personal_channel(
+    full_user: object, chats: object, observation: ObservationBoundary
+) -> ProjectionOutcome:
+    raw_id = _attr(full_user, "personal_channel_id")
+    if raw_id is _MISSING:
+        return _channel_outcome(
+            ProjectionStatus.PARTIAL, None, "personal_channel_id_missing", observation, authoritative=False
+        )
+    if raw_id is None:
+        return _channel_outcome(
+            ProjectionStatus.ABSENT,
+            {"personal_channel_id": None},
+            None,
+            observation,
+            authoritative=True,
+        )
+    channel_id = _positive_integer(raw_id)
+    if channel_id is None:
+        return _channel_outcome(
+            ProjectionStatus.PARTIAL, None, "personal_channel_id_invalid", observation, authoritative=False
+        )
+    payload: dict[str, object] = {"personal_channel_id": channel_id}
+    attached_message_id = _positive_integer(_attr(full_user, "personal_channel_message"))
+    if attached_message_id is not None:
+        payload["personal_channel_message"] = attached_message_id
+    return _channel_metadata_outcome(payload, channel_id, chats, observation)
+
+
+def _normalize_request_kind(target_id: int, target_kind: TargetKind | str) -> TargetKind:
+    if isinstance(target_id, bool) or not isinstance(target_id, int) or target_id <= 0:
+        raise ValueError("target_id must be a positive integer")
+    try:
+        return TargetKind(target_kind)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("target_kind must be 'user' or 'bot'") from exc
+
+
+def _resolve_response_target(
+    response: object, target_id: int, target_kind: TargetKind
+) -> tuple[object, object | None, str | None]:
+    full_user = _attr(response, "full_user")
+    users = _sequence(_attr(response, "users"))
+    if response is None:
+        return full_user, None, "invalid_response"
+    if full_user is _MISSING or full_user is None:
+        return full_user, None, "missing_full_user"
+    if users is None:
+        return full_user, None, "missing_users"
+    user, reason = _find_matching_user(users, target_id, target_kind)
+    return full_user, user, reason
 
 
 def normalize_full_user_response(
@@ -610,25 +655,9 @@ def normalize_full_user_response(
     so a caller cannot accidentally create a reusable receipt.
     """
 
-    if isinstance(target_id, bool) or not isinstance(target_id, int) or target_id <= 0:
-        raise ValueError("target_id must be a positive integer")
-    try:
-        normalized_kind = TargetKind(target_kind)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("target_kind must be 'user' or 'bot'") from exc
+    normalized_kind = _normalize_request_kind(target_id, target_kind)
     boundary = observation or ObservationBoundary()
-    full_user = _attr(response, "full_user")
-    users = _sequence(_attr(response, "users"))
-    reason: str | None = None
-    user: object | None = None
-    if response is None:
-        reason = "invalid_response"
-    elif full_user is _MISSING or full_user is None:
-        reason = "missing_full_user"
-    elif users is None:
-        reason = "missing_users"
-    else:
-        user, reason = _find_matching_user(users, target_id, normalized_kind)
+    full_user, user, reason = _resolve_response_target(response, target_id, normalized_kind)
     if reason is not None or user is None:
         failure_reason = reason or "target_identity_missing"
         return FullUserNormalization(

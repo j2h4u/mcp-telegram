@@ -6,6 +6,7 @@ import pytest
 
 from mcp_telegram.entity_profile.full_user_normalization import (
     NORMALIZATION_VERSION,
+    FullUserNormalization,
     ObservationBoundary,
     ProjectionStatus,
     TargetKind,
@@ -153,8 +154,8 @@ def test_invalid_channel_id_is_partial_and_attached_message_is_bounded() -> None
     }
 
 
-def test_optional_full_profile_facts_are_normalized_and_partial_channel_does_not_leak() -> None:
-    result = normalize_full_user_response(
+def _optional_facts_result() -> FullUserNormalization:
+    return normalize_full_user_response(
         _response(
             personal_channel_id=777,
             about="  hello ",
@@ -171,6 +172,10 @@ def test_optional_full_profile_facts_are_normalized_and_partial_channel_does_not
         target_id=42,
         target_kind=TargetKind.USER,
     )
+
+
+def test_optional_full_profile_facts_are_normalized() -> None:
+    result = _optional_facts_result()
     profile = result.full_profile.payload
     assert profile is not None
     assert profile["about"] == "hello"
@@ -179,6 +184,12 @@ def test_optional_full_profile_facts_are_normalized_and_partial_channel_does_not
     assert profile["business_intro"] == {"title": "work", "description": "service"}
     assert profile["business_work_hours"] == {"timezone": "UTC"}
     assert profile["note"] == "private note"
+
+
+def test_optional_full_profile_does_not_leak_unowned_facts() -> None:
+    result = _optional_facts_result()
+    profile = result.full_profile.payload
+    assert profile is not None
     assert "folder_name" not in profile
     assert "personal_channel_id" not in profile
     assert "latest_or_attached_post" not in profile
