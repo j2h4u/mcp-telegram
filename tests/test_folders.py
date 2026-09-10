@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from telethon.tl.types import (
+    Channel,
+    Chat,
+    ChatPhotoEmpty,
+    InputPeerChannel,
+    InputPeerChat,
+    InputPeerEmpty,
+    InputPeerUser,
+    User,
+)
 
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.folders.contracts import (
     DialogCategory,
     DialogFacts,
@@ -28,7 +41,12 @@ from mcp_telegram.folders.refresh import FolderRefresher
 from mcp_telegram.folders.sqlite_repository import (
     SQLiteFolderSnapshotRepository,
 )
-from mcp_telegram.folders.telegram_adapter import TelethonTelegramFolderGateway, _dialog_facts
+from mcp_telegram.folders.telegram_adapter import (
+    TelethonTelegramFolderGateway,
+    _dialog_facts,
+    _offset_peer,
+    _peer_cursor,
+)
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind
@@ -226,6 +244,191 @@ def test_telegram_adapter_counts_manual_unread_mark() -> None:
     )()
 
     assert _dialog_facts(dialog).unread is True
+
+
+@pytest.mark.parametrize(
+    ("entity", "expected"),
+    [
+        (None, (None, 0, 0)),
+        (User(10, access_hash=11), ("user", 10, 11)),
+        (Chat(20, "chat", ChatPhotoEmpty(), 0, None, 1), ("chat", 20, 0)),
+        (Channel(30, "channel", ChatPhotoEmpty(), None, False, None, broadcast=True, access_hash=31), ("channel", 30, 31)),
+        (type("User", (), {"id": 40, "access_hash": 41})(), ("user", 40, 41)),
+        (type("Peer", (), {"id": 50, "access_hash": 51})(), (None, 50, 51)),
+    ],
+)
+def test_telegram_adapter_builds_cursor_peer_identity(entity: object, expected: tuple[str | None, int, int]) -> None:
+    assert _peer_cursor(entity) == expected
+
+
+@pytest.mark.parametrize(
+    ("peer_type", "expected_type"),
+    [
+        ("user", InputPeerUser),
+        ("chat", InputPeerChat),
+        ("channel", InputPeerChannel),
+        (None, InputPeerEmpty),
+    ],
+)
+def test_telegram_adapter_reconstructs_cursor_peer(peer_type: str | None, expected_type: type[object]) -> None:
+    cursor = FolderDialogCursor(None, 7, peer_type, 8, 9)
+    peer = _offset_peer(cursor)
+
+    assert isinstance(peer, expected_type)
+    if isinstance(peer, InputPeerUser):
+        assert (peer.user_id, peer.access_hash) == (8, 9)
+    elif isinstance(peer, InputPeerChat):
+        assert peer.chat_id == 8
+    elif isinstance(peer, InputPeerChannel):
+        assert (peer.channel_id, peer.access_hash) == (8, 9)
+
+
+def _telegram_dialog(dialog_id: int, *, entity: object | None = None, message_id: int | None = None) -> object:
+    if entity is None:
+        entity = type("User", (), {"id": dialog_id, "access_hash": dialog_id + 100})()
+    message = SimpleNamespace(
+        id=dialog_id if message_id is None else message_id,
+        date=dt.datetime(2026, 9, 10, 12, 0, tzinfo=dt.UTC),
+    )
+    return SimpleNamespace(
+        id=dialog_id,
+        entity=entity,
+        message=message,
+        archived=False,
+        unread_count=0,
+        unread_mentions_count=0,
+        dialog=SimpleNamespace(notify_settings=None, unread_mark=False),
+    )
+
+
+class _AdapterClient:
+    def __init__(self, pages: list[list[object]], filters: tuple[object, ...] = ()) -> None:
+        self.pages = pages
+        self.filters = filters
+        self.dialog_calls: list[dict[str, object]] = []
+
+    async def __call__(self, request: object) -> object:
+        del request
+        return SimpleNamespace(filters=self.filters)
+
+    def iter_dialogs(self, **kwargs: object):
+        self.dialog_calls.append(kwargs)
+        page = self.pages.pop(0)
+
+        async def _page():
+            for dialog in page:
+                yield dialog
+
+        return _page()
+
+
+async def test_telegram_adapter_iter_dialogs_maps_page_and_cursor_offsets() -> None:
+    client = _AdapterClient([[_telegram_dialog(10)]])
+    gateway = TelethonTelegramFolderGateway(client)
+
+    items = [item async for item in gateway.iter_dialogs(None)]
+
+    assert items[0].facts.dialog_id == 10
+    assert items[0].cursor == FolderDialogCursor(
+        "2026-09-10T12:00:00+00:00", 10, "user", 10, 110
+    )
+    assert client.dialog_calls == [{"limit": 100, "ignore_pinned": True}]
+
+    cursor = FolderDialogCursor("2026-09-09T11:00:00+00:00", 9, "user", 9, 109)
+    client.pages.append([])
+    assert [item async for item in gateway.iter_dialogs(cursor)] == []
+    assert client.dialog_calls[-1] == {
+        "limit": 100,
+        "ignore_pinned": True,
+        "offset_date": dt.datetime(2026, 9, 9, 11, 0, tzinfo=dt.UTC),
+        "offset_id": 9,
+        "offset_peer": InputPeerUser(9, 109),
+    }
+
+
+class _IterFailureClient:
+    async def __call__(self, request: object) -> object:
+        del request
+        return SimpleNamespace(filters=())
+
+    def __init__(self, failure: BaseException) -> None:
+        self.failure = failure
+
+    def iter_dialogs(self, **kwargs: object):
+        del kwargs
+
+        async def _page():
+            raise self.failure
+            yield None
+
+        return _page()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (TimeoutError("network unavailable"), FolderSourceUnavailableError),
+        (TelegramRpcThrottled(retry_after_seconds=4), TelegramRpcThrottled),
+    ],
+)
+async def test_telegram_adapter_iter_dialogs_translates_expected_failures(
+    failure: BaseException, expected: type[BaseException]
+) -> None:
+    gateway = TelethonTelegramFolderGateway(_IterFailureClient(failure))
+
+    with pytest.raises(expected) as exc_info:
+        _ = [item async for item in gateway.iter_dialogs(None)]
+
+    if expected is FolderSourceUnavailableError:
+        assert exc_info.value.__cause__ is failure
+
+
+async def test_telegram_adapter_fetch_folders_preserves_throttling() -> None:
+    failure = TelegramRpcThrottled(retry_after_seconds=4)
+
+    with pytest.raises(TelegramRpcThrottled) as exc_info:
+        await TelethonTelegramFolderGateway(_SourceFailureClient(failure)).fetch_folders()
+
+    assert exc_info.value is failure
+
+
+def _folder_filter(folder_id: int = 1) -> object:
+    return type("DialogFilter", (), {"id": folder_id, "title": "Work"})()
+
+
+async def test_telegram_adapter_fetch_snapshot_paginates_full_page_then_eof() -> None:
+    client = _AdapterClient(
+        [
+            [_telegram_dialog(index) for index in range(100)],
+            [],
+        ],
+        filters=(_folder_filter(), type("Ignored", (), {})()),
+    )
+    gateway = TelethonTelegramFolderGateway(client)
+
+    snapshot = await gateway.fetch_snapshot()
+
+    assert snapshot.folders[0].title == "Work"
+    assert [dialog.dialog_id for dialog in snapshot.dialogs] == list(range(100))
+    assert len(client.dialog_calls) == 2
+    assert client.dialog_calls[1]["offset_id"] == 99
+
+
+async def test_telegram_adapter_fetch_snapshot_stops_after_partial_page() -> None:
+    client = _AdapterClient([[_telegram_dialog(7)]])
+
+    snapshot = await TelethonTelegramFolderGateway(client).fetch_snapshot()
+
+    assert [dialog.dialog_id for dialog in snapshot.dialogs] == [7]
+    assert len(client.dialog_calls) == 1
+
+
+async def test_telegram_adapter_fetch_snapshot_rejects_stalled_cursor() -> None:
+    repeated = _telegram_dialog(7)
+    client = _AdapterClient([[repeated] * 100, [repeated] * 100])
+
+    with pytest.raises(FolderSourceUnavailableError, match="cursor did not advance"):
+        await TelethonTelegramFolderGateway(client).fetch_snapshot()
 
 
 class _SourceFailureClient:
