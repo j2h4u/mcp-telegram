@@ -669,13 +669,7 @@ def _load_working_set_enrollment_state(conn: sqlite3.Connection) -> dict[str, st
     return dict(rows)
 
 
-def working_set_enrollment_release_at(
-    conn: sqlite3.Connection,
-    *,
-    now: float,
-    cadence_s: float,
-) -> float | None:
-    """Return the restart-safe release for the next enrollment unit."""
+def _validate_working_set_enrollment_timing(now: float, cadence_s: float) -> None:
     if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now) or now < 0:
         raise ValueError("now must be a finite non-negative timestamp")
     if (
@@ -685,17 +679,30 @@ def working_set_enrollment_release_at(
         or cadence_s <= 0
     ):
         raise ValueError("cadence_s must be finite and positive")
+
+
+def _has_working_set_enrollment_candidate(conn: sqlite3.Connection) -> bool:
+    candidate = cast(
+        tuple[int] | None,
+        conn.execute("SELECT 1 FROM dialogs WHERE type IN ('supergroup', 'channel') AND hidden = 0 LIMIT 1").fetchone(),
+    )
+    return candidate is not None
+
+
+def working_set_enrollment_release_at(
+    conn: sqlite3.Connection,
+    *,
+    now: float,
+    cadence_s: float,
+) -> float | None:
+    """Return the restart-safe release for the next enrollment unit."""
+    _validate_working_set_enrollment_timing(now, cadence_s)
     state = _load_working_set_enrollment_state(conn)
     if state.get(_ENROLLMENT_PHASE_KEY) is not None:
         return float(int(state.get(_ENROLLMENT_RETRY_AT_KEY) or 0))
     completed_at = int(state.get(_ENROLLMENT_COMPLETED_AT_KEY) or 0)
-    if completed_at == 0:
-        candidate = conn.execute(
-            "SELECT 1 FROM dialogs "
-            "WHERE type IN ('supergroup', 'channel') AND hidden = 0 LIMIT 1"
-        ).fetchone()
-        if candidate is None:
-            return None
+    if completed_at == 0 and not _has_working_set_enrollment_candidate(conn):
+        return None
     return 0.0 if completed_at == 0 else float(completed_at) + float(cadence_s)
 
 
@@ -769,6 +776,94 @@ def _next_enrollment_dialog(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkingSetEnrollmentPosition:
+    phase: str
+    cursor: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ChannelEnrollmentRequest:
+    client: ActivityClient
+    conn: sqlite3.Connection
+    source: TelegramRpcSource
+    timeout_s: float
+    now: int
+    cursor: int | None
+
+
+def _load_or_start_working_set_enrollment(conn: sqlite3.Connection) -> _WorkingSetEnrollmentPosition:
+    state = _load_working_set_enrollment_state(conn)
+    phase = state.get(_ENROLLMENT_PHASE_KEY)
+    if phase is None:
+        return _WorkingSetEnrollmentPosition(_start_working_set_enrollment(conn), None)
+    cursor_value = state.get(_ENROLLMENT_CURSOR_KEY)
+    cursor = int(cursor_value) if cursor_value is not None else None
+    return _WorkingSetEnrollmentPosition(phase, cursor)
+
+
+def _enroll_supergroup_slice(
+    conn: sqlite3.Connection,
+    position: _WorkingSetEnrollmentPosition,
+) -> WorkingSetEnrollmentSliceResult | None:
+    row = _next_enrollment_dialog(conn, dialog_type="supergroup", cursor=position.cursor)
+    if row is None:
+        _set_working_set_enrollment_position(conn, phase=_ENROLLMENT_CHANNELS, cursor=None)
+        return None
+    dialog_id, last_activity_at = row
+    enroll_activity_dialog(conn, dialog_id, "supergroup", last_activity_at=last_activity_at)
+    _set_working_set_enrollment_position(
+        conn,
+        phase=_ENROLLMENT_SUPERGROUPS,
+        cursor=dialog_id,
+    )
+    return WorkingSetEnrollmentSliceResult(enrolled_count=1, consumed=True)
+
+
+async def _enroll_channel_slice(
+    request: _ChannelEnrollmentRequest,
+) -> WorkingSetEnrollmentSliceResult:
+    row = _next_enrollment_dialog(request.conn, dialog_type="channel", cursor=request.cursor)
+    if row is None:
+        _finish_working_set_enrollment(request.conn, completed_at=request.now)
+        return WorkingSetEnrollmentSliceResult(completed=True, consumed=True)
+
+    channel_id, last_activity_at = row
+    try:
+        with acquisition_context(AcquisitionKind.DIALOG_TRAVERSAL):
+            with rpc_scope(request.source, timeout_seconds=request.timeout_s):
+                resolution = await resolve_linked_chat_id(
+                    request.client,
+                    request.conn,
+                    channel_id,
+                    timeout_s=request.timeout_s,
+                )
+    except RpcAttemptBudgetExhaustedError:
+        return WorkingSetEnrollmentSliceResult(budget_exhausted=True, consumed=True)
+
+    if resolution.flood_wait_seconds is not None:
+        _set_working_set_enrollment_position(
+            request.conn,
+            phase=_ENROLLMENT_CHANNELS,
+            cursor=request.cursor,
+            retry_at=request.now + resolution.flood_wait_seconds,
+        )
+        return WorkingSetEnrollmentSliceResult(flood_wait_seconds=resolution.flood_wait_seconds, consumed=True)
+    if resolution.linked_chat_id is not None:
+        enroll_activity_dialog(
+            request.conn,
+            resolution.linked_chat_id,
+            "linked_chat",
+            last_activity_at=last_activity_at,
+        )
+    _set_working_set_enrollment_position(
+        request.conn,
+        phase=_ENROLLMENT_CHANNELS,
+        cursor=channel_id,
+    )
+    return WorkingSetEnrollmentSliceResult(enrolled_count=int(resolution.linked_chat_id is not None), consumed=True)
+
+
 async def run_working_set_enrollment_slice(  # noqa: PLR0913 - explicit bounded slice dependencies
     client: ActivityClient,
     conn: sqlite3.Connection,
@@ -784,66 +879,24 @@ async def run_working_set_enrollment_slice(  # noqa: PLR0913 - explicit bounded 
     if release_at is None or release_at > at:
         return WorkingSetEnrollmentSliceResult()
 
-    state = _load_working_set_enrollment_state(conn)
-    phase = state.get(_ENROLLMENT_PHASE_KEY)
-    if phase is None:
-        phase = _start_working_set_enrollment(conn)
-        cursor = None
-    else:
-        cursor_value = state.get(_ENROLLMENT_CURSOR_KEY)
-        cursor = int(cursor_value) if cursor_value is not None else None
-
-    if phase == _ENROLLMENT_SUPERGROUPS:
-        row = _next_enrollment_dialog(conn, dialog_type="supergroup", cursor=cursor)
-        if row is not None:
-            dialog_id, last_activity_at = row
-            enroll_activity_dialog(conn, dialog_id, "supergroup", last_activity_at=last_activity_at)
-            _set_working_set_enrollment_position(
-                conn,
-                phase=_ENROLLMENT_SUPERGROUPS,
-                cursor=dialog_id,
-            )
-            return WorkingSetEnrollmentSliceResult(enrolled_count=1, consumed=True)
-        phase = _ENROLLMENT_CHANNELS
-        cursor = None
-        _set_working_set_enrollment_position(conn, phase=phase, cursor=None)
-
-    if phase != _ENROLLMENT_CHANNELS:
-        raise RuntimeError(f"unknown working-set enrollment phase {phase!r}")
-    row = _next_enrollment_dialog(conn, dialog_type="channel", cursor=cursor)
-    if row is None:
-        _finish_working_set_enrollment(conn, completed_at=at)
-        return WorkingSetEnrollmentSliceResult(completed=True, consumed=True)
-
-    channel_id, last_activity_at = row
-    try:
-        with acquisition_context(AcquisitionKind.DIALOG_TRAVERSAL):
-            with rpc_scope(source, timeout_seconds=timeout_s):
-                resolution = await resolve_linked_chat_id(client, conn, channel_id, timeout_s=timeout_s)
-    except RpcAttemptBudgetExhaustedError:
-        return WorkingSetEnrollmentSliceResult(budget_exhausted=True, consumed=True)
-
-    if resolution.flood_wait_seconds is not None:
-        _set_working_set_enrollment_position(
-            conn,
-            phase=_ENROLLMENT_CHANNELS,
-            cursor=cursor,
-            retry_at=at + resolution.flood_wait_seconds,
+    position = _load_or_start_working_set_enrollment(conn)
+    if position.phase == _ENROLLMENT_SUPERGROUPS:
+        result = _enroll_supergroup_slice(conn, position)
+        if result is not None:
+            return result
+        position = _WorkingSetEnrollmentPosition(_ENROLLMENT_CHANNELS, None)
+    if position.phase != _ENROLLMENT_CHANNELS:
+        raise RuntimeError(f"unknown working-set enrollment phase {position.phase!r}")
+    return await _enroll_channel_slice(
+        _ChannelEnrollmentRequest(
+            client=client,
+            conn=conn,
+            source=source,
+            timeout_s=timeout_s,
+            now=at,
+            cursor=position.cursor,
         )
-        return WorkingSetEnrollmentSliceResult(flood_wait_seconds=resolution.flood_wait_seconds, consumed=True)
-    if resolution.linked_chat_id is not None:
-        enroll_activity_dialog(
-            conn,
-            resolution.linked_chat_id,
-            "linked_chat",
-            last_activity_at=last_activity_at,
-        )
-    _set_working_set_enrollment_position(
-        conn,
-        phase=_ENROLLMENT_CHANNELS,
-        cursor=channel_id,
     )
-    return WorkingSetEnrollmentSliceResult(enrolled_count=int(resolution.linked_chat_id is not None), consumed=True)
 
 
 async def build_working_set(
