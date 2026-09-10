@@ -15,11 +15,21 @@ from mcp_telegram.daemon import capture_auth_scope
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.telegram_demand import RpcAttemptBudget
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from tests.test_entity_profile_full_user_pair import _PairClient, _prepare
 
 
 def _scope(*, account_id: int = 42, dc_id: int = 2, auth_key_id: int = 99) -> TelegramAuthScope:
     return TelegramAuthScope(AUTH_SCOPE_VERSION, account_id, dc_id, auth_key_id)
+
+
+class _DemandSink:
+    def __init__(self) -> None:
+        self.kinds: list[DemandKind] = []
+
+    def offer(self, kind: DemandKind) -> bool:
+        self.kinds.append(kind)
+        return True
 
 
 def test_capture_scope_requires_positive_account_and_primary_key() -> None:
@@ -122,6 +132,78 @@ async def test_scope_is_private_evidence_and_reuse_stops_at_ttl(tmp_path: Path) 
     service._deps = replace(service._deps, now_provider=lambda: 400.0)
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
     assert client.full_user_calls == 2
+    await service.shutdown()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_ownership_invalid_cached_profile_admits_refresh_and_offers_demand(tmp_path: Path) -> None:
+    conn, raw_service = _prepare(tmp_path / "ownership-admission.sqlite", migrated=True)
+    service = cast(DaemonEntityInfoService, raw_service)
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    sink = _DemandSink()
+    service.bind_demand_sink(sink)
+
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    conn.execute(
+        "UPDATE entity_details SET profile_owner_account_id=NULL, profile_observation_scope_json=NULL "
+        "WHERE entity_id=42"
+    )
+    conn.execute("DELETE FROM entity_profile_refresh_state WHERE entity_id=42")
+    conn.commit()
+
+    result = service._progressive_cached_result(42, now=100)  # type: ignore[attr-defined]
+
+    assert result is not None and result["error"] == "entity_info_pending"
+    assert coordinator.queue_depth == 1
+    assert sink.kinds == [DemandKind.ENTITY_PROFILE_REFRESH]
+    assert conn.execute(
+        "SELECT status, generation, next_section, acquisition_cursor FROM entity_profile_refresh_state "
+        "WHERE entity_id=42"
+    ).fetchone() == ("pending", 1, "full_profile", 0)
+
+    await service.shutdown()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_ownership_invalid_cached_profile_preserves_failed_retry_state(tmp_path: Path) -> None:
+    conn, raw_service = _prepare(tmp_path / "ownership-failed.sqlite", migrated=True)
+    service = cast(DaemonEntityInfoService, raw_service)
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    sink = _DemandSink()
+    service.bind_demand_sink(sink)
+
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    conn.execute(
+        "UPDATE entity_details SET profile_owner_account_id=NULL, profile_observation_scope_json=NULL "
+        "WHERE entity_id=42"
+    )
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET status='failed', retry_at=777, reason='flood_wait' "
+        "WHERE entity_id=42"
+    )
+    conn.commit()
+    before = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT status, retry_at, reason, generation, started_at, next_section, acquisition_cursor "
+            "FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone(),
+    )
+
+    result = service._progressive_cached_result(42, now=100)  # type: ignore[attr-defined]
+
+    assert result is not None and result["error"] == "entity_info_pending"
+    assert coordinator.queue_depth == 1
+    assert sink.kinds == [DemandKind.ENTITY_PROFILE_REFRESH]
+    assert conn.execute(
+        "SELECT status, retry_at, reason, generation, started_at, next_section, acquisition_cursor "
+        "FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == before
+
     await service.shutdown()
     conn.close()
 
