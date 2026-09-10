@@ -1689,7 +1689,7 @@ class EntityProfileRepository:
             "identity": _decode_payload(row[6]),
         }
 
-    def _parse_validated_receipt(  # noqa: PLR0911
+    def _parse_validated_receipt(
         self,
         entity_id: int,
         section: str,
@@ -1704,28 +1704,19 @@ class EntityProfileRepository:
         evidence = self.read_section_evidence(entity_id, section)
         if evidence is None:
             return None
-        generation = evidence.get("generation")
-        if not _is_nonnegative_int(generation):
+        fields = _validated_receipt_fields(
+            evidence,
+            identity=identity,
+            expected_generation=expected_generation,
+            now=now,
+        )
+        if fields is None:
             return None
-        if expected_generation is not None and generation != expected_generation:
-            return None
-        stored_identity = evidence.get("identity")
-        if not isinstance(stored_identity, dict) or dict(identity) != stored_identity:
-            return None
-        started_at, completed_at = _observation_bounds(evidence)
-        if started_at is None or completed_at is None or completed_at < started_at or completed_at > now:
-            return None
+        generation, observation, outcome = fields
         if not self._receipt_materialization_is_exact(entity_id, section, evidence):
             return None
-        outcome = evidence.get("outcome")
-        if not isinstance(outcome, str) or outcome not in {
-            "usable",
-            "partial",
-            "absent",
-            "unavailable",
-        }:
-            return None
-        return _ValidatedReceipt(outcome, cast(int, generation), started_at, completed_at)
+        started_at, completed_at = observation
+        return _ValidatedReceipt(outcome, generation, started_at, completed_at)
 
     def _reusable_receipt_is_valid(
         self,
@@ -1868,6 +1859,54 @@ def _observation_bounds(evidence: Mapping[str, object]) -> tuple[int | None, int
     if not _is_nonnegative_int(started_at) or not _is_nonnegative_int(completed_at):
         return None, None
     return cast(int, started_at), cast(int, completed_at)
+
+
+def _receipt_generation(evidence: Mapping[str, object], *, expected_generation: int | None) -> int | None:
+    generation = evidence.get("generation")
+    if not _is_nonnegative_int(generation):
+        return None
+    if expected_generation is not None and generation != expected_generation:
+        return None
+    return cast(int, generation)
+
+
+def _validated_receipt_fields(
+    evidence: Mapping[str, object],
+    *,
+    identity: Mapping[str, object],
+    expected_generation: int | None,
+    now: int,
+) -> tuple[int, tuple[int, int], str] | None:
+    if not _receipt_identity_matches(evidence, identity):
+        return None
+    generation = _receipt_generation(evidence, expected_generation=expected_generation)
+    if generation is None:
+        return None
+    observation = _receipt_observation(evidence, now=now)
+    if observation is None:
+        return None
+    outcome = _receipt_outcome(evidence)
+    if outcome is None:
+        return None
+    return generation, observation, outcome
+
+
+def _receipt_identity_matches(evidence: Mapping[str, object], identity: Mapping[str, object]) -> bool:
+    stored_identity = evidence.get("identity")
+    return isinstance(stored_identity, dict) and dict(identity) == stored_identity
+
+
+def _receipt_observation(evidence: Mapping[str, object], *, now: int) -> tuple[int, int] | None:
+    started_at, completed_at = _observation_bounds(evidence)
+    if started_at is None or completed_at is None or completed_at < started_at or completed_at > now:
+        return None
+    return started_at, completed_at
+
+
+def _receipt_outcome(evidence: Mapping[str, object]) -> str | None:
+    outcome = evidence.get("outcome")
+    valid_outcomes = {"usable", "partial", "absent", "unavailable"}
+    return outcome if isinstance(outcome, str) and outcome in valid_outcomes else None
 
 
 def _decode_profile_blob_row(
