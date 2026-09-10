@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
@@ -28,6 +29,7 @@ from mcp_telegram.message_fact_refresh import (
 )
 from mcp_telegram.reactions.contracts import ReactionFetchResult, ReactionFreshness, ReactionSnapshot
 from mcp_telegram.reactions.refresh import ReactionFreshener
+from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget
 from mcp_telegram.telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from mcp_telegram.telegram_reading import TelegramReadReceiptGateway
@@ -155,6 +157,23 @@ def _hydration_worker(
     )
 
 
+def _repair_hydration_worker(conn: sqlite3.Connection, handler: _HydrationHandler) -> MessageFactHydrationWorker:
+    return MessageFactHydrationWorker(
+        object(),
+        conn,
+        asyncio.Event(),
+        handlers=(handler,),
+        interval_seconds=60,
+        max_requests_per_cycle=2,
+        max_jobs_per_cycle=1,
+        retry_delay_seconds=30,
+        circuit_retry_seconds=30,
+        max_attempts=3,
+        pause_between_requests_seconds=0.01,
+        backfill_debt_limit=1,
+    )
+
+
 @pytest.mark.asyncio
 async def test_live_hydration_batch_gets_fresh_root_inside_backfill_launcher() -> None:
     conn = _hydration_db()
@@ -173,13 +192,61 @@ async def test_live_hydration_batch_gets_fresh_root_inside_backfill_launcher() -
     conn.close()
 
 
+def test_backfill_status_reports_repair_candidates_without_mutation(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
+    conn.execute(
+        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
+    )
+    conn.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
+        "VALUES (1, 1, 1, 'other', '{}')"
+    )
+    conn.commit()
+    handler = _HydrationHandler()
+    handler.kind = "media_metadata"
+    worker = _repair_hydration_worker(conn, handler)
+    adapter = FactHydrationDemandAdapter(worker, HydrationPriority.BACKFILL)
+    before = conn.total_changes
+
+    status = adapter.status(100.0)
+
+    assert status == DemandStatus(release_at=100.0)
+    assert conn.total_changes == before
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_slice_seeds_and_processes_repair_candidates(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
+    conn.execute(
+        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
+    )
+    conn.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
+        "VALUES (1, 1, 1, 'other', '{}')"
+    )
+    conn.commit()
+    handler = _HydrationHandler()
+    handler.kind = "media_metadata"
+    worker = _hydration_worker(conn, handler, clock=lambda: 100.0)
+    adapter = FactHydrationDemandAdapter(worker, HydrationPriority.BACKFILL)
+
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+    conn.close()
+
+
 @pytest.mark.asyncio
 async def test_entity_profile_adapter_observes_queue_and_entity_lookup_context() -> None:
     observed: list[tuple[DemandKind | None, AcquisitionKind | None]] = []
     pending = True
-
-    async def refresh(_entity_id: int) -> None:
-        raise AssertionError("process-local refresh worker must not execute")
 
     def status(_now: float) -> DemandStatus | None:
         return DemandStatus(release_at=0.0) if pending else None
@@ -190,7 +257,7 @@ async def test_entity_profile_adapter_observes_queue_and_entity_lookup_context()
         observed.append((scope.demand_kind, scope.acquisition_kind))
         pending = False
 
-    coordinator = EntityRefreshCoordinator(refresh)
+    coordinator = EntityRefreshCoordinator()
     coordinator.bind_durable_executor(status, run_slice)
     adapter = EntityProfileDemandAdapter(coordinator)
     budget = RpcAttemptBudget(limit=1)

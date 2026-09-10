@@ -260,6 +260,21 @@ class HydrationQueueRepository:
         )
         return [_job_from_row(row) for row in rows]
 
+    def next_release_at(self, priority: HydrationPriority) -> int | None:
+        """Return the earliest active release in one durable priority tier."""
+        if not isinstance(priority, HydrationPriority):
+            raise TypeError("priority must be a HydrationPriority")
+        row = cast(
+            tuple[object] | None,
+            self._conn.execute(
+                f"SELECT MIN(due_at) FROM {HYDRATION_QUEUE_TABLE} WHERE terminal = 0 AND priority = ?",
+                (int(priority),),
+            ).fetchone(),
+        )
+        if row is None or row[0] is None:
+            return None
+        return int(cast(int | str, row[0]))
+
     def snapshot(self, now: int) -> tuple[HydrationQueueKindSnapshot, ...]:
         """Return one compact operational snapshot without changing queue state."""
         rows = cast(list[tuple[object, ...]], self._conn.execute(_QUEUE_SNAPSHOT_SQL, (now,)).fetchall())
