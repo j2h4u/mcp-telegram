@@ -8,7 +8,7 @@ from typing import cast
 
 from ..telegram_demand import AcquisitionKind, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
 from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_attempt_budget, rpc_scope
-from .contracts import FOLDER_DIALOG_PAGE_SIZE, FolderSourceSnapshot, FolderStagingSnapshot
+from .contracts import FOLDER_DIALOG_PAGE_SIZE, DialogFacts, FolderSourceSnapshot, FolderStagingSnapshot
 from .membership import matches
 from .ports import FolderSnapshotRepository, LegacyTelegramFolderGateway, TelegramFolderGateway
 
@@ -61,6 +61,21 @@ class FolderRefresher:
             if matches(folder, dialog)
         )
 
+    @staticmethod
+    def _normalize_dialogs(dialogs: tuple[DialogFacts, ...] | list[DialogFacts]) -> tuple[DialogFacts, ...]:
+        """Keep first positions while letting later observations replace facts."""
+        positions: dict[int, int] = {}
+        normalized: list[DialogFacts] = []
+        for dialog in dialogs:
+            dialog_id = dialog.dialog_id
+            position = positions.get(dialog_id)
+            if position is None:
+                positions[dialog_id] = len(normalized)
+                normalized.append(dialog)
+            else:
+                normalized[position] = dialog
+        return tuple(normalized)
+
     def _read_current_staging(self) -> tuple[FolderStagingSnapshot | None, int]:
         staging = self._repository.read_staging()
         generation = self._repository.read_generation()
@@ -68,6 +83,17 @@ class FolderRefresher:
         if staging is not None and staging.base_generation not in {None, comparable_generation}:
             self._repository.clear_staging()
             return None, comparable_generation
+        if staging is not None:
+            normalized_dialogs = self._normalize_dialogs(staging.dialogs)
+            if normalized_dialogs != staging.dialogs:
+                staging = FolderStagingSnapshot(
+                    folders=staging.folders,
+                    dialogs=normalized_dialogs,
+                    cursor=staging.cursor,
+                    started_at=staging.started_at,
+                    base_generation=staging.base_generation,
+                )
+                self._repository.save_staging(staging)
         return staging, comparable_generation
 
     async def _start_staging(self, budget: RpcAttemptBudget, base_generation: int) -> FolderStagingSnapshot | None:
@@ -98,6 +124,7 @@ class FolderRefresher:
         budget: RpcAttemptBudget,
     ) -> tuple[FolderStagingSnapshot, int] | None:
         dialogs = list(staging.dialogs)
+        positions = {dialog.dialog_id: index for index, dialog in enumerate(dialogs)}
         cursor = staging.cursor
         page_count = 0
         try:
@@ -107,7 +134,12 @@ class FolderRefresher:
                 acquisition_kind=AcquisitionKind.FOLDER_SNAPSHOT,
             ):
                 async for item in gateway.iter_dialogs(cursor):
-                    dialogs.append(item.facts)
+                    position = positions.get(item.facts.dialog_id)
+                    if position is None:
+                        positions[item.facts.dialog_id] = len(dialogs)
+                        dialogs.append(item.facts)
+                    else:
+                        dialogs[position] = item.facts
                     cursor = item.cursor
                     page_count += 1
                     staging = FolderStagingSnapshot(
@@ -167,6 +199,10 @@ class FolderRefresher:
                 acquisition_kind=AcquisitionKind.FOLDER_SNAPSHOT,
             ):
                 source = await gateway.fetch_snapshot()
+            source = FolderSourceSnapshot(
+                folders=source.folders,
+                dialogs=self._normalize_dialogs(source.dialogs),
+            )
             return FolderProjection(source=source, memberships=self._memberships(source))
 
         # Direct callers without the demand coordinator still get a complete

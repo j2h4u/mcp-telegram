@@ -6,6 +6,7 @@ import datetime as dt
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from telethon.tl.types import (
@@ -31,6 +32,7 @@ from mcp_telegram.folders.contracts import (
     FolderStagingSnapshot,
 )
 from mcp_telegram.folders.membership import matches
+from mcp_telegram.folders.ports import FolderSnapshotRepository
 from mcp_telegram.folders.read_repository import (
     dialog_placement,
     folder_snapshot,
@@ -544,6 +546,38 @@ class _PagedGateway:
         return self._page(cursor)
 
 
+class _SequencePagedGateway:
+    def __init__(self, pages: list[tuple[FolderDialogItem, ...]]) -> None:
+        self.pages = list(pages)
+        self.fetch_calls = 0
+        self.page_calls: list[int | None] = []
+
+    async def fetch_folders(self) -> tuple[FolderRule, ...]:
+        self.fetch_calls += 1
+        current_rpc_scope().attempt_budget.debit()  # type: ignore[union-attr]
+        return (FolderRule(2, "Contacts", categories=frozenset({DialogCategory.CONTACT})),)
+
+    def iter_dialogs(self, cursor: FolderDialogCursor | None):
+        self.page_calls.append(None if cursor is None else cursor.offset_id)
+        page = self.pages.pop(0)
+
+        async def _page():
+            budget = current_rpc_scope().attempt_budget
+            assert budget is not None
+            budget.debit()
+            for item in page:
+                yield item
+
+        return _page()
+
+
+def _folder_dialog_item(dialog_id: int, category: DialogCategory, cursor_id: int) -> FolderDialogItem:
+    return FolderDialogItem(
+        DialogFacts(dialog_id, category),
+        FolderDialogCursor(None, cursor_id, "user", dialog_id, 1),
+    )
+
+
 @pytest.mark.asyncio
 async def test_bounded_folder_acquisition_stages_and_promotes_only_at_eof(tmp_path: Path) -> None:
     conn = _connection(tmp_path / "sync.db")
@@ -653,3 +687,191 @@ async def test_bounded_folder_acquisition_restarts_after_corrupt_staging(tmp_pat
         assert repository.read_generation() == 2
     finally:
         conn.close()
+
+
+@pytest.mark.asyncio
+async def test_bounded_acquisition_replaces_duplicate_fact_without_merging_fields(tmp_path: Path) -> None:
+    conn = _connection(tmp_path / "sync.db")
+    try:
+        gateway = _SequencePagedGateway(
+            [
+                (
+                    _folder_dialog_item(10, DialogCategory.CONTACT, 1),
+                    _folder_dialog_item(10, DialogCategory.NON_CONTACT, 2),
+                ),
+            ]
+        )
+        repository = SQLiteFolderSnapshotRepository(conn)
+        refresher = FolderRefresher(gateway, repository)
+        budget = RpcAttemptBudget(limit=3)
+        with rpc_attempt_budget(budget):
+            result = await refresher.acquire_slice(budget)
+
+        assert result.complete is True
+        assert result.projection is not None
+        assert result.projection.source.dialogs == (DialogFacts(10, DialogCategory.NON_CONTACT),)
+        assert result.projection.memberships == ()
+        assert gateway.page_calls == [None]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_two_page_overlap_survives_restart_and_keeps_last_cursor(tmp_path: Path) -> None:
+    conn = _connection(tmp_path / "sync.db")
+    try:
+        first_page = tuple(_folder_dialog_item(index, DialogCategory.CONTACT, index + 1) for index in range(100))
+        second_page = (
+            _folder_dialog_item(97, DialogCategory.NON_CONTACT, 201),
+            _folder_dialog_item(98, DialogCategory.NON_CONTACT, 202),
+            _folder_dialog_item(99, DialogCategory.NON_CONTACT, 203),
+            _folder_dialog_item(100, DialogCategory.CONTACT, 204),
+        )
+        gateway = _SequencePagedGateway([first_page, second_page])
+        repository = SQLiteFolderSnapshotRepository(conn)
+        refresher = FolderRefresher(gateway, repository)
+
+        first_budget = RpcAttemptBudget(limit=3)
+        with rpc_attempt_budget(first_budget):
+            first = await refresher.acquire_slice(first_budget)
+        assert first.complete is False
+        assert first.projection is None
+        assert len(repository.read_staging().dialogs) == 100  # type: ignore[union-attr]
+
+        restarted = FolderRefresher(gateway, repository)
+        second_budget = RpcAttemptBudget(limit=2)
+        with rpc_attempt_budget(second_budget):
+            second = await restarted.acquire_slice(second_budget)
+        assert second.complete is True
+        assert second.projection is not None
+        assert [dialog.dialog_id for dialog in second.projection.source.dialogs] == list(range(101))
+        assert second.projection.source.dialogs[97] == DialogFacts(97, DialogCategory.NON_CONTACT)
+        assert repository.read_staging().cursor.offset_id == 204  # type: ignore[union-attr]
+        assert gateway.page_calls == [None, 100]
+
+        restarted.persist(second.projection, completed_at=321)
+        assert repository.read_staging() is None
+        assert repository.read_generation() == 1
+        assert conn.execute("SELECT COUNT(*) FROM telegram_folder_members").fetchone()[0] == 98
+        assert folders_by_dialog(conn).get(97) is None
+        assert folders_by_dialog(conn)[100] == [{"id": 2, "title": "Contacts"}]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_one_hundred_observations_with_overlap_continue_and_retain_cursor(tmp_path: Path) -> None:
+    conn = _connection(tmp_path / "sync.db")
+    try:
+        page = tuple(
+            _folder_dialog_item(index if index < 99 else 98, DialogCategory.CONTACT, index + 1) for index in range(100)
+        )
+        gateway = _SequencePagedGateway([page, ()])
+        repository = SQLiteFolderSnapshotRepository(conn)
+        refresher = FolderRefresher(gateway, repository)
+
+        first_budget = RpcAttemptBudget(limit=3)
+        with rpc_attempt_budget(first_budget):
+            first = await refresher.acquire_slice(first_budget)
+        assert first.complete is False
+        assert first.projection is None
+        staging = repository.read_staging()
+        assert staging is not None
+        assert len(staging.dialogs) == 99
+        assert staging.cursor is not None and staging.cursor.offset_id == 100
+
+        second_budget = RpcAttemptBudget(limit=1)
+        with rpc_attempt_budget(second_budget):
+            second = await refresher.acquire_slice(second_budget)
+        assert second.complete is True
+        assert second.projection is not None
+        assert len(second.projection.source.dialogs) == 99
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_staging_is_normalized_before_empty_page_completion(tmp_path: Path) -> None:
+    conn = _connection(tmp_path / "sync.db")
+    try:
+        repository = SQLiteFolderSnapshotRepository(conn)
+        cursor = FolderDialogCursor(None, 7, "user", 10, 1)
+        repository.save_staging(
+            FolderStagingSnapshot(
+                folders=(FolderRule(2, "Contacts", categories=frozenset({DialogCategory.CONTACT})),),
+                dialogs=(
+                    DialogFacts(10, DialogCategory.CONTACT),
+                    DialogFacts(10, DialogCategory.NON_CONTACT),
+                ),
+                cursor=cursor,
+                started_at=123,
+                base_generation=0,
+            )
+        )
+        gateway = _SequencePagedGateway([()])
+        refresher = FolderRefresher(gateway, repository)
+        budget = RpcAttemptBudget(limit=1)
+        with rpc_attempt_budget(budget):
+            result = await refresher.acquire_slice(budget)
+
+        assert result.complete is True
+        assert result.projection is not None
+        assert result.projection.source.dialogs == (DialogFacts(10, DialogCategory.NON_CONTACT),)
+        normalized = repository.read_staging()
+        assert normalized is not None
+        assert normalized.dialogs == (DialogFacts(10, DialogCategory.NON_CONTACT),)
+        assert normalized.folders[0].title == "Contacts"
+        assert normalized.cursor == cursor
+        assert normalized.started_at == 123
+        assert normalized.base_generation == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_staging_is_normalized_even_when_budget_is_exhausted(tmp_path: Path) -> None:
+    conn = _connection(tmp_path / "sync.db")
+    try:
+        repository = SQLiteFolderSnapshotRepository(conn)
+        repository.save_staging(
+            FolderStagingSnapshot(
+                folders=(),
+                dialogs=(
+                    DialogFacts(10, DialogCategory.CONTACT),
+                    DialogFacts(10, DialogCategory.NON_CONTACT),
+                ),
+                cursor=None,
+                started_at=123,
+                base_generation=0,
+            )
+        )
+        gateway = _SequencePagedGateway([()])
+        refresher = FolderRefresher(gateway, repository)
+        budget = RpcAttemptBudget(limit=1, attempts=1)
+        with rpc_attempt_budget(budget):
+            result = await refresher.acquire_slice(budget)
+
+        assert result.complete is False
+        assert result.projection is None
+        assert repository.read_staging().dialogs == (DialogFacts(10, DialogCategory.NON_CONTACT),)  # type: ignore[union-attr]
+        assert gateway.page_calls == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_acquisition_normalizes_before_membership_projection() -> None:
+    class _LegacyGateway:
+        async def fetch_snapshot(self) -> FolderSourceSnapshot:
+            return FolderSourceSnapshot(
+                folders=(FolderRule(2, "Contacts", categories=frozenset({DialogCategory.CONTACT})),),
+                dialogs=(
+                    DialogFacts(10, DialogCategory.CONTACT),
+                    DialogFacts(10, DialogCategory.NON_CONTACT),
+                ),
+            )
+
+    projection = await FolderRefresher(_LegacyGateway(), cast(FolderSnapshotRepository, object())).acquire()
+
+    assert projection.source.dialogs == (DialogFacts(10, DialogCategory.NON_CONTACT),)
+    assert projection.memberships == ()

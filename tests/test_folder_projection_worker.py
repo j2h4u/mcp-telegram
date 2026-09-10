@@ -9,7 +9,15 @@ from pathlib import Path
 import pytest
 
 from mcp_telegram.flood import TelegramRpcThrottled
-from mcp_telegram.folders.contracts import DialogCategory, DialogFacts, FolderRule, FolderSourceSnapshot
+from mcp_telegram.folders.contracts import (
+    DialogCategory,
+    DialogFacts,
+    FolderDialogCursor,
+    FolderDialogItem,
+    FolderRule,
+    FolderSourceSnapshot,
+)
+from mcp_telegram.folders.ports import TelegramFolderGateway
 from mcp_telegram.folders.refresh import FolderRefresher
 from mcp_telegram.folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker
@@ -66,7 +74,7 @@ def _db(tmp_path: Path) -> tuple[sqlite3.Connection, SQLiteFolderSnapshotReposit
 
 
 def _worker(
-    gateway: _Gateway,
+    gateway: _Gateway | TelegramFolderGateway,
     repository: SQLiteFolderSnapshotRepository,
     *,
     now: list[float] | None = None,
@@ -84,7 +92,7 @@ def _worker(
 
 def _demand_adapter(
     repository: SQLiteFolderSnapshotRepository,
-    gateway: _Gateway | None = None,
+    gateway: _Gateway | TelegramFolderGateway | None = None,
 ) -> FolderProjectionDemandAdapter:
     return FolderProjectionDemandAdapter(_worker(gateway or _Gateway(), repository))
 
@@ -388,6 +396,54 @@ async def test_unexpected_failure_is_persisted_and_not_retried(tmp_path: Path) -
         assert repository.read_last_outcome() == "unexpected"
         assert repository.read_next_retry_at() is None
         assert gateway.calls == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_bounded_demand_recovers_staged_acquisition_after_unexpected_failure(tmp_path: Path) -> None:
+    conn, repository = _db(tmp_path)
+
+    class _RecoveringGateway:
+        def __init__(self) -> None:
+            self.fail = True
+
+        async def fetch_folders(self) -> tuple[FolderRule, ...]:
+            current_rpc_scope().attempt_budget.debit()  # type: ignore[union-attr]
+            return (FolderRule(1, "Work", categories=frozenset({DialogCategory.CONTACT})),)
+
+        def iter_dialogs(self, cursor: FolderDialogCursor | None):
+            del cursor
+
+            async def _page():
+                current_rpc_scope().attempt_budget.debit()  # type: ignore[union-attr]
+                if self.fail:
+                    raise RuntimeError("broken page")
+                yield FolderDialogItem(
+                    DialogFacts(10, DialogCategory.CONTACT),
+                    FolderDialogCursor(None, 1, "user", 10, 1),
+                )
+
+            return _page()
+
+    gateway = _RecoveringGateway()
+    worker = _worker(gateway, repository)
+    adapter = FolderProjectionDemandAdapter(worker)
+    try:
+        with pytest.raises(RuntimeError, match="broken page"):
+            await worker._attempt("scheduled")  # type: ignore[attr-defined]
+
+        assert repository.read_last_outcome() == "unexpected"
+        assert repository.read_staging() is not None
+        status = adapter.status(100.0)
+        assert status is not None and status.release_at == 100.0
+
+        gateway.fail = False
+        await adapter.run_slice(RpcAttemptBudget(limit=2))
+
+        assert repository.read_last_outcome() == "success"
+        assert repository.read_staging() is None
+        assert repository.read_generation() == 1
     finally:
         conn.close()
 
