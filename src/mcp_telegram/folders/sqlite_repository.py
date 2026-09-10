@@ -134,7 +134,7 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
         if raw is None:
             return None
         try:
-            decoded = json.loads(raw)
+            decoded = cast(object, json.loads(raw))
             if not isinstance(decoded, dict):
                 raise ValueError("staging payload must be an object")
             payload = cast(dict[str, object], decoded)

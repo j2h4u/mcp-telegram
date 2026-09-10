@@ -9,7 +9,7 @@ from ..telegram_demand import AcquisitionKind, RpcAttemptBudget, RpcAttemptBudge
 from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_attempt_budget, rpc_scope
 from .contracts import FolderDialogCursor, FolderSourceSnapshot, FolderStagingSnapshot
 from .membership import matches
-from .ports import FolderSnapshotRepository, TelegramFolderGateway
+from .ports import FolderSnapshotRepository, LegacyTelegramFolderGateway, TelegramFolderGateway
 from .telegram_adapter import FOLDER_DIALOG_PAGE_SIZE
 
 
@@ -40,7 +40,11 @@ class FolderAcquisitionSlice:
 
 
 class FolderRefresher:
-    def __init__(self, gateway: TelegramFolderGateway, repository: FolderSnapshotRepository) -> None:
+    def __init__(
+        self,
+        gateway: TelegramFolderGateway | LegacyTelegramFolderGateway,
+        repository: FolderSnapshotRepository,
+    ) -> None:
         self._gateway = gateway
         self._repository = repository
 
@@ -144,7 +148,7 @@ class FolderRefresher:
                 TelegramRpcSource.FOLDER_RECONCILIATION,
                 acquisition_kind=AcquisitionKind.FOLDER_SNAPSHOT,
             ):
-                source = await self._gateway.fetch_snapshot()  # type: ignore[attr-defined]
+                source = await self._gateway.fetch_snapshot()
             return FolderProjection(source=source, memberships=self._memberships(source))
 
         # Direct callers without the demand coordinator still get a complete

@@ -20,6 +20,10 @@ class TelegramFolderGateway(Protocol):
     def iter_dialogs(self, cursor: FolderDialogCursor | None) -> AsyncIterator[FolderDialogItem]: ...
 
 
+class LegacyTelegramFolderGateway(Protocol):
+    async def fetch_snapshot(self) -> FolderSourceSnapshot: ...
+
+
 class FolderSnapshotRepository(Protocol):
     def read_generation(self) -> int | None: ...
 
