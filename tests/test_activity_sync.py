@@ -10,15 +10,18 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, TypedDict, Unpack, cast
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from telethon.tl.types import PeerUser
 
 from mcp_telegram import activity_sync
 from mcp_telegram.activity_sync import ArchiveBackfillDemandAdapter, ArchiveIncrementalDemandAdapter
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_demand import RpcAttemptBudget
-from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_demand import DemandStatus, DurableDemandAdapter, RpcAttemptBudget
+from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator
+from mcp_telegram.telegram_rpc_consumers import DURABLE_DEMAND_ORDER, DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcScope, current_rpc_scope
 
 _TEST_TIMEOUT_S = 0.05
@@ -75,6 +78,53 @@ class _FakeClient:
     async def get_input_entity(self, dialog_id: int) -> object:
         del dialog_id
         return object()
+
+
+class _IdleDemandAdapter:
+    def status(self, now: float) -> DemandStatus | None:
+        del now
+        return None
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        del budget
+
+
+@dataclass
+class _DemandObserver:
+    events: list[dict[str, object]] = field(default_factory=list)
+
+    def observe_demand(self, **event: object) -> None:
+        self.events.append(event)
+
+
+class _ThrottledClient:
+    def __init__(self, error: TelegramRpcThrottled, *, dispatch: bool) -> None:
+        self._error = error
+        self._dispatch = dispatch
+
+    async def __call__(self, request: object) -> object:
+        del request
+        scope = current_rpc_scope()
+        if self._dispatch:
+            assert scope.attempt_budget is not None
+            scope.attempt_budget.debit()
+        raise self._error
+
+    async def get_input_entity(self, dialog_id: int) -> object:
+        del dialog_id
+        return object()
+
+
+def _coordinator(
+    kind: DemandKind,
+    adapter: DurableDemandAdapter,
+    *,
+    observer: _DemandObserver,
+    shutdown_event: asyncio.Event | None = None,
+) -> TelegramDemandCoordinator:
+    adapters: dict[DemandKind, DurableDemandAdapter] = {kind: _IdleDemandAdapter() for kind in DURABLE_DEMAND_ORDER}
+    adapters[kind] = adapter
+    return TelegramDemandCoordinator(adapters, shutdown_event, clock=lambda: 100.0, observer=observer)
 
 
 def _make_db(tmp_path: Path) -> sqlite3.Connection:
@@ -188,3 +238,69 @@ async def test_archive_incremental_adapter_resumes_from_key_value_state(conn: sq
     assert "incremental_min_date" not in final_state
     assert "incremental_offset_id" not in final_state
     assert int(final_state["last_sync_at"] or 0) > last_sync_at
+
+
+@pytest.mark.asyncio
+async def test_archive_backfill_finite_throttle_is_owned_by_coordinator(conn: sqlite3.Connection) -> None:
+    error = TelegramRpcThrottled(retry_after_seconds=17)
+    adapter = ArchiveBackfillDemandAdapter(
+        _ThrottledClient(error, dispatch=True),
+        conn,
+        asyncio.Event(),
+        _TEST_TIMEOUT_S,
+    )
+    observer = _DemandObserver()
+    coordinator = _coordinator(DemandKind.ARCHIVE_BACKFILL, adapter, observer=observer)
+
+    with patch("mcp_telegram.activity_sync.sleep_through_flood", new=AsyncMock()) as sleep:
+        await coordinator._execute_slice(DemandKind.ARCHIVE_BACKFILL)
+
+    sleep.assert_not_awaited()
+    coordinator.scan(now=100.0)
+    assert coordinator.next_release_at == 117.0
+    assert observer.events[-1] == {
+        "outcome": "deferred",
+        "demand_kind": DemandKind.ARCHIVE_BACKFILL,
+        "actual_attempts": 1,
+        "queue_age_seconds": None,
+        "freshness_debt_seconds": None,
+        "reason": "flood_wait",
+    }
+    assert conn.execute("SELECT value FROM activity_sync_state WHERE key='backfill_offset_id'").fetchone() == ("0",)
+
+
+@pytest.mark.asyncio
+async def test_archive_incremental_latched_throttle_stops_coordinator_without_local_completion(
+    conn: sqlite3.Connection,
+) -> None:
+    with conn:
+        conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        conn.execute("INSERT OR REPLACE INTO activity_sync_state(key, value) VALUES ('last_sync_at', '1')")
+    error = TelegramRpcThrottled(latched=True, detail="test circuit open")
+    adapter = ArchiveIncrementalDemandAdapter(
+        _ThrottledClient(error, dispatch=False),
+        conn,
+        asyncio.Event(),
+        10.0,
+        _TEST_TIMEOUT_S,
+    )
+    observer = _DemandObserver()
+    shutdown_event = asyncio.Event()
+    coordinator = _coordinator(
+        DemandKind.ARCHIVE_INCREMENTAL,
+        adapter,
+        observer=observer,
+        shutdown_event=shutdown_event,
+    )
+
+    with (
+        patch("mcp_telegram.activity_sync.sleep_through_flood", new=AsyncMock()) as sleep,
+        pytest.raises(TelegramRpcThrottled, match="test circuit open"),
+    ):
+        await coordinator._execute_slice(DemandKind.ARCHIVE_INCREMENTAL)
+
+    sleep.assert_not_awaited()
+    assert shutdown_event.is_set()
+    assert conn.execute("SELECT value FROM activity_sync_state WHERE key='last_sync_at'").fetchone() == ("1",)
+    assert conn.execute("SELECT value FROM activity_sync_state WHERE key='incremental_min_date'").fetchone() == ("0",)
+    assert [event["outcome"] for event in observer.events] == ["selected"]

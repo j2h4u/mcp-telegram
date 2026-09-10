@@ -20,6 +20,7 @@ from mcp_telegram.fact_hydration import (
     FactHydrationDemandAdapter,
     MessageFactHydrationWorker,
 )
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.hydration_queue import HydrationJob, HydrationPriority, HydrationQueueRepository
 from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshDemandAdapter,
@@ -30,10 +31,16 @@ from mcp_telegram.message_fact_refresh import (
 from mcp_telegram.reactions.contracts import ReactionFetchResult, ReactionFreshness, ReactionSnapshot
 from mcp_telegram.reactions.refresh import ReactionFreshener
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-from mcp_telegram.telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget
+from mcp_telegram.telegram_demand import (
+    AcquisitionKind,
+    DemandStatus,
+    DurableDemandAdapter,
+    RpcAttemptBudget,
+)
+from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator
 from mcp_telegram.telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from mcp_telegram.telegram_reading import TelegramReadReceiptGateway
-from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_consumers import DURABLE_DEMAND_ORDER, DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcScope,
     TelegramRpcSource,
@@ -134,6 +141,49 @@ class _HydrationHandler:
         return False
 
 
+class _ThrottledHydrationHandler(_HydrationHandler):
+    def __init__(self, error: TelegramRpcThrottled, *, dispatch: bool) -> None:
+        super().__init__()
+        self._error = error
+        self._dispatch = dispatch
+
+    async def request(self, client: object, jobs: Sequence[HydrationJob]) -> object:
+        del client, jobs
+        self.scope = current_rpc_scope()
+        if self._dispatch:
+            assert self.scope.attempt_budget is not None
+            self.scope.attempt_budget.debit()
+        raise self._error
+
+
+class _IdleDemandAdapter:
+    def status(self, now: float) -> DemandStatus | None:
+        del now
+        return None
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        del budget
+
+
+class _DemandObserver:
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    def observe_demand(self, **event: object) -> None:
+        self.events.append(event)
+
+
+def _hydration_coordinator(
+    adapter: DurableDemandAdapter,
+    *,
+    observer: _DemandObserver,
+    shutdown_event: asyncio.Event | None = None,
+) -> TelegramDemandCoordinator:
+    adapters: dict[DemandKind, DurableDemandAdapter] = {kind: _IdleDemandAdapter() for kind in DURABLE_DEMAND_ORDER}
+    adapters[DemandKind.LIVE_HYDRATION_BATCH] = adapter
+    return TelegramDemandCoordinator(adapters, shutdown_event, clock=lambda: 100.0, observer=observer)
+
+
 def _hydration_worker(
     conn: sqlite3.Connection,
     handler: _HydrationHandler,
@@ -155,6 +205,63 @@ def _hydration_worker(
         backfill_debt_limit=1,
         clock=clock,
     )
+
+
+@pytest.mark.asyncio
+async def test_hydration_finite_throttle_reschedules_and_defers_through_coordinator() -> None:
+    conn = _hydration_db()
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, priority) "
+        "VALUES ('test', 1, 1, 1, 0, 1)"
+    )
+    handler = _ThrottledHydrationHandler(TelegramRpcThrottled(retry_after_seconds=17), dispatch=True)
+    adapter = FactHydrationDemandAdapter(
+        _hydration_worker(conn, handler, clock=lambda: 100.0), HydrationPriority.FOREGROUND
+    )
+    observer = _DemandObserver()
+    coordinator = _hydration_coordinator(adapter, observer=observer)
+
+    await coordinator._execute_slice(DemandKind.LIVE_HYDRATION_BATCH)
+
+    assert conn.execute(
+        "SELECT due_at, attempts, terminal, last_outcome FROM hydration_jobs WHERE message_id=1"
+    ).fetchone() == (117, 1, 0, "rpc_paused")
+    assert observer.events[-1] == {
+        "outcome": "deferred",
+        "demand_kind": DemandKind.LIVE_HYDRATION_BATCH,
+        "actual_attempts": 1,
+        "queue_age_seconds": None,
+        "freshness_debt_seconds": None,
+        "reason": "flood_wait",
+    }
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_hydration_latched_throttle_restores_undispatched_job_and_stops_coordinator() -> None:
+    conn = _hydration_db()
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, priority) "
+        "VALUES ('test', 1, 1, 1, 2, 1)"
+    )
+    error = TelegramRpcThrottled(latched=True, detail="test circuit open")
+    handler = _ThrottledHydrationHandler(error, dispatch=False)
+    adapter = FactHydrationDemandAdapter(
+        _hydration_worker(conn, handler, clock=lambda: 100.0), HydrationPriority.FOREGROUND
+    )
+    observer = _DemandObserver()
+    shutdown_event = asyncio.Event()
+    coordinator = _hydration_coordinator(adapter, observer=observer, shutdown_event=shutdown_event)
+
+    with pytest.raises(TelegramRpcThrottled, match="test circuit open"):
+        await coordinator._execute_slice(DemandKind.LIVE_HYDRATION_BATCH)
+
+    assert shutdown_event.is_set()
+    assert conn.execute(
+        "SELECT due_at, attempts, terminal, last_outcome, last_error_code FROM hydration_jobs WHERE message_id=1"
+    ).fetchone() == (1, 2, 0, "rpc_paused", "TelegramRpcThrottled")
+    assert [event["outcome"] for event in observer.events] == ["selected"]
+    conn.close()
 
 
 def _repair_hydration_worker(conn: sqlite3.Connection, handler: _HydrationHandler) -> MessageFactHydrationWorker:

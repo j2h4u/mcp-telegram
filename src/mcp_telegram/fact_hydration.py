@@ -386,11 +386,24 @@ class MessageFactHydrationWorker:
         if not started:
             self._log_drops(batch, preflight_observations)
             return _BatchOutcome(dropped=len(preflight_observations))
+        attempts_before_request = None if attempt_budget is None else attempt_budget.attempts
         try:
             result = await self._request_batch(handler, started, attempt_budget=attempt_budget)
         except TelegramRpcAdmissionDeferred as exc:
             return self._handle_admission_rejection(handler, batch, started, preflight_observations, exc, effective_now)
         except TelegramRpcThrottled as exc:
+            if attempt_budget is not None:
+                assert attempts_before_request is not None
+                self._handle_coordinator_throttle(
+                    handler,
+                    batch,
+                    started,
+                    preflight_observations,
+                    exc,
+                    effective_now,
+                    request_dispatched=attempt_budget.attempts > attempts_before_request,
+                )
+                raise
             if exc.retry_after_seconds is None:
                 return self._handle_circuit_open(handler, batch, started, preflight_observations, effective_now)
             return self._handle_flood_wait(handler, batch, started, preflight_observations, exc, effective_now)
@@ -528,6 +541,50 @@ class MessageFactHydrationWorker:
             retried=retried,
             dropped=len(preflight_observations) + dropped,
             stopped=True,
+        )
+
+    def _handle_coordinator_throttle(  # noqa: PLR0913, PLR0917
+        self,
+        handler: HydrationHandler,
+        batch: Sequence[HydrationJob],
+        started: Sequence[HydrationJob],
+        preflight_observations: Sequence[HydrationDropObservation],
+        exc: TelegramRpcThrottled,
+        effective_now: int,
+        *,
+        request_dispatched: bool,
+    ) -> None:
+        """Restore durable admission state before the coordinator owns throttling."""
+        if request_dispatched and exc.retry_after_seconds is not None:
+            self._handle_flood_wait(handler, batch, started, preflight_observations, exc, effective_now)
+            return
+
+        error_code = type(exc).__name__
+        if request_dispatched:
+            for job in started:
+                self._queue.reschedule(
+                    job,
+                    job.due_at,
+                    outcome=HydrationOutcome.RPC_PAUSED,
+                    error_code=error_code,
+                )
+        else:
+            for job in started:
+                self._queue.requeue_undispatched(
+                    job,
+                    job.due_at,
+                    outcome=HydrationOutcome.RPC_PAUSED,
+                    error_code=error_code,
+                )
+        self._conn.commit()
+        self._log_drops(batch, preflight_observations)
+        logger.info(
+            "message_fact_hydration coordinator_throttled kind=%s dialog_id=%d jobs=%d dispatched=%s latched=%s",
+            handler.kind,
+            started[0].dialog_id,
+            len(started),
+            request_dispatched,
+            exc.latched,
         )
 
     def _handle_circuit_open(

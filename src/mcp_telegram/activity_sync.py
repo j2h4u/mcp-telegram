@@ -38,7 +38,13 @@ from .telegram_demand import (
     demand_context,
 )
 from .telegram_rpc_consumers import DemandKind
-from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_attempt_budget, rpc_scope
+from .telegram_rpc_scheduler import (
+    RpcAdmissionClosedError,
+    TelegramRpcSource,
+    current_rpc_scope,
+    rpc_attempt_budget,
+    rpc_scope,
+)
 from .telethon_dialog import classify_dialog_type
 
 logger = logging.getLogger(__name__)
@@ -214,6 +220,14 @@ def _archive_demand_scope(kind: DemandKind) -> Iterator[None]:
     if token.kind is not kind:
         raise RuntimeError(f"active demand kind {token.kind.value} cannot execute {kind.value}")
     yield
+
+
+def _coordinator_owns_throttle() -> bool:
+    """Return whether the active archive call belongs to a bounded slice."""
+    try:
+        return current_rpc_scope().attempt_budget is not None
+    except UnclassifiedTelegramDemandError:
+        return False
 
 
 def _set_state(conn: sqlite3.Connection, key: str, value: str | None) -> None:
@@ -393,6 +407,8 @@ async def _search_backfill_batch(
             exc.retry_after_seconds,
             total_fetched,
         )
+        if _coordinator_owns_throttle():
+            raise
         if exc.retry_after_seconds is None:
             return _SEARCH_BATCH_STOP
         if await sleep_through_flood(shutdown_event, exc.retry_after_seconds):
@@ -446,6 +462,8 @@ async def _search_incremental_batch(  # noqa: PLR0913 - explicit worker state an
                 )
     except TelegramRpcThrottled as exc:
         logger.warning("activity_sync_incremental_floodwait seconds=%s", exc.retry_after_seconds)
+        if _coordinator_owns_throttle():
+            raise
         if exc.retry_after_seconds is None:
             return _SEARCH_BATCH_STOP
         if await sleep_through_flood(shutdown_event, exc.retry_after_seconds):
