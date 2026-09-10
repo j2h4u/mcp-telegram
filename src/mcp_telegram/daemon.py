@@ -862,29 +862,35 @@ def _create_tracked_task(
         if not started:
             concrete_coro.close()
         ctx.background_tasks.discard(t)
-        exc = t.exception() if not t.cancelled() else None
-        if exc is not None:
-            try:
-                with ctx.conn:
-                    record_runtime_observation(
-                        ctx.conn,
-                        kind="runtime.task_failed",
-                        outcome="failed",
-                        reason_code=type(exc).__name__,
-                        payload={"task_name": t.get_name()},
-                    )
-            except Exception:
-                logger.exception("runtime_event_record_failed kind=runtime.task_failed")
-            if critical:
-                ctx.api_server._ready = False
-                ctx.api_server.startup_detail = f"critical background task failed: {t.get_name()}"
-                ctx.shutdown_event.set()
-                logger.critical("critical_background_task_failed name=%s error=%s", t.get_name(), exc, exc_info=exc)
-            else:
-                logger.error("background_task_failed name=%s error=%s", t.get_name(), exc, exc_info=exc)
+        _handle_tracked_task_completion(ctx, t, critical=critical)
 
     task.add_done_callback(_on_done)
     return task
+
+
+def _handle_tracked_task_completion(ctx: _SyncMainContext, task: asyncio.Task[object], *, critical: bool) -> None:
+    """Record and route an exception from a tracked background task."""
+    exc = task.exception() if not task.cancelled() else None
+    if exc is None:
+        return
+    try:
+        with ctx.conn:
+            record_runtime_observation(
+                ctx.conn,
+                kind="runtime.task_failed",
+                outcome="failed",
+                reason_code=type(exc).__name__,
+                payload={"task_name": task.get_name()},
+            )
+    except Exception:
+        logger.exception("runtime_event_record_failed kind=runtime.task_failed")
+    if critical:
+        ctx.api_server._ready = False
+        ctx.api_server.startup_detail = f"critical background task failed: {task.get_name()}"
+        ctx.shutdown_event.set()
+        logger.critical("critical_background_task_failed name=%s error=%s", task.get_name(), exc, exc_info=exc)
+    else:
+        logger.error("background_task_failed name=%s error=%s", task.get_name(), exc, exc_info=exc)
 
 
 def _observe_runtime(ctx: _SyncMainContext, kind: str, outcome: str, reason_code: str | None) -> None:
@@ -1508,13 +1514,10 @@ def _persist_runtime_observation_loss(ctx: _SyncMainContext) -> None:
     sink = ctx.rpc_observation_sink
     if sink is None:
         return
-    queue_full_drops = int(getattr(sink, "queue_full_drops", 0) or 0)
-    shutdown_drops = int(getattr(sink, "shutdown_grace_drops", 0) or 0)
-    startup_drops = int(getattr(sink, "startup_drops", 0) or 0)
-    rejected_submissions = int(getattr(sink, "rejected_submissions", 0) or 0)
-    writer_failures = int(getattr(sink, "permanent_failures", 0) or 0)
-    if not any((queue_full_drops, shutdown_drops, startup_drops, rejected_submissions, writer_failures)):
+    counts = _runtime_observation_loss_counts(sink)
+    if not any(counts):
         return
+    queue_full_drops, _shutdown_drops, _startup_drops, _rejected_submissions, writer_failures = counts
     with ctx.conn:
         ctx.conn.executemany(
             "INSERT OR REPLACE INTO daemon_state(key,value) VALUES (?,?)",
@@ -1524,6 +1527,17 @@ def _persist_runtime_observation_loss(ctx: _SyncMainContext) -> None:
                 ("runtime_observations_last_writer_failures", str(writer_failures)),
             ),
         )
+
+
+def _runtime_observation_loss_counts(sink: object) -> tuple[int, int, int, int, int]:
+    """Read sink loss counters once, tolerating sinks from older runtimes."""
+    return (
+        int(getattr(sink, "queue_full_drops", 0) or 0),
+        int(getattr(sink, "shutdown_grace_drops", 0) or 0),
+        int(getattr(sink, "startup_drops", 0) or 0),
+        int(getattr(sink, "rejected_submissions", 0) or 0),
+        int(getattr(sink, "permanent_failures", 0) or 0),
+    )
 
 
 async def _run_shutdown_stage(

@@ -274,58 +274,64 @@ def _optional_entity_attr(obj: object, attr: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _upsert_entities_from_search(conn: sqlite3.Connection, result: _SearchResultLike) -> None:
-    """Upsert users/chats from SearchRequest response into entities table.
+def _user_entity_snapshot(user: object, *, updated_at: int) -> EntitySnapshot | None:
+    etype = _classify_entity(user)
+    if etype is None:
+        return None
+    entity = cast(_SearchEntityLike, user)
+    first_name = _optional_entity_attr(entity, "first_name")
+    last_name = _optional_entity_attr(entity, "last_name")
+    username = _optional_entity_attr(entity, "username")
+    name = " ".join(p for p in (first_name, last_name) if p) or username
+    return EntitySnapshot(
+        entity_id=int(entity.id),
+        entity_type=etype,
+        name=name,
+        username=username,
+        name_normalized=_normalize(name),
+        updated_at=updated_at,
+    )
 
-    Uses the FULL column set (id, type, name, username, name_normalized, updated_at).
-    `type` and `updated_at` are NOT NULL with no DEFAULT — both MUST be supplied
-    on every row or the INSERT will fail.
-    """
+
+def _chat_entity_snapshot(chat: object, *, updated_at: int) -> EntitySnapshot | None:
     from telethon.utils import get_peer_id
 
-    now = int(time.time())
-    snapshots: list[EntitySnapshot] = []
+    etype = _classify_entity(chat)
+    if etype is None:
+        return None
+    try:
+        pid = int(cast(int | str, get_peer_id(chat)))  # yields -100XXXXX for Channel
+    except TypeError:
+        return None
+    name = _optional_entity_attr(chat, "title")
+    username = _optional_entity_attr(chat, "username")
+    return EntitySnapshot(
+        entity_id=pid,
+        entity_type=etype,
+        name=name,
+        username=username,
+        name_normalized=_normalize(name),
+        updated_at=updated_at,
+    )
 
-    for u in result.users or ():
-        etype = _classify_entity(u)
-        if etype is None:
-            continue
-        first_name = _optional_entity_attr(u, "first_name")
-        last_name = _optional_entity_attr(u, "last_name")
-        username = _optional_entity_attr(u, "username")
-        name = " ".join(p for p in (first_name, last_name) if p) or username
-        snapshots.append(
-            EntitySnapshot(
-                entity_id=int(u.id),
-                entity_type=etype,
-                name=name,
-                username=username,
-                name_normalized=_normalize(name),
-                updated_at=now,
-            )
-        )
 
-    for c in result.chats or ():
-        etype = _classify_entity(c)
-        if etype is None:
-            continue
-        try:
-            pid = int(cast(int | str, get_peer_id(c)))  # yields -100XXXXX for Channel
-        except TypeError:
-            continue
-        name = _optional_entity_attr(c, "title")
-        username = _optional_entity_attr(c, "username")
-        snapshots.append(
-            EntitySnapshot(
-                entity_id=pid,
-                entity_type=etype,
-                name=name,
-                username=username,
-                name_normalized=_normalize(name),
-                updated_at=now,
-            )
-        )
+def _search_entity_snapshots(result: _SearchResultLike, *, updated_at: int) -> list[EntitySnapshot]:
+    snapshots = [
+        snapshot
+        for entity in result.users or ()
+        if (snapshot := _user_entity_snapshot(entity, updated_at=updated_at)) is not None
+    ]
+    snapshots.extend(
+        snapshot
+        for entity in result.chats or ()
+        if (snapshot := _chat_entity_snapshot(entity, updated_at=updated_at)) is not None
+    )
+    return snapshots
 
+
+def _upsert_entities_from_search(conn: sqlite3.Connection, result: _SearchResultLike) -> None:
+    """Upsert complete user/chat identity snapshots from a search response."""
+    snapshots = _search_entity_snapshots(result, updated_at=int(time.time()))
     if not snapshots:
         return
     with conn:
