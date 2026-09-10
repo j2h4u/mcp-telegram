@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
+from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, RefreshLimits
 from mcp_telegram.sync_db import ensure_sync_schema
@@ -130,6 +131,7 @@ def _pair_service(conn: sqlite3.Connection, client: _PairClient, *, enabled: boo
             chat_type=object,
             refresh_limits=RefreshLimits(),
             enable_full_user_pair=enabled,
+            full_user_auth_scope=lambda: TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99),
         )
     )
     service.bind_demand_sink(MagicMock())

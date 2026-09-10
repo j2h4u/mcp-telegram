@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 
 import mcp_telegram.sync_db as sync_db_module
-from mcp_telegram.entity_profile.contracts import ProfileAcquisitionEvidence
+from mcp_telegram.entity_profile.contracts import FULL_PROFILE_OWNED_FIELDS, ProfileAcquisitionEvidence
+from mcp_telegram.entity_profile.refresh import failure_retry_at, scope_changed_retry_at, throttled_retry_at
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.sync_db import ensure_sync_schema
 
@@ -268,11 +269,153 @@ def test_same_generation_channel_completion_ignores_ttl(tmp_path: Path) -> None:
     conn.commit()
     channel_cursor = repo.next_due_refresh(now=10_000)
     assert channel_cursor is not None
+    assert not repo.complete_same_generation_section(channel_cursor, None, now=10_000)
     assert repo.complete_same_generation_section(channel_cursor, identity, now=10_000)
     assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
         "complete",
     )
     conn.close()
+
+
+@pytest.mark.parametrize(
+    ("generation_delta", "identity"),
+    ((1, {"account_generation": 7, "entity_type": "user"}), (0, {"account_generation": 8, "entity_type": "user"})),
+)
+def test_same_generation_channel_completion_rejects_changed_generation_or_scope(
+    tmp_path: Path,
+    generation_delta: int,
+    identity: dict[str, object],
+) -> None:
+    path = tmp_path / "same-generation-fence.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    stored_identity = {"account_generation": 7, "entity_type": "user"}
+    evidence = ProfileAcquisitionEvidence(
+        generation=cursor.generation,
+        outcome="absent",
+        provenance={
+            "endpoint": "users.GetFullUser",
+            "declared_fields": ["personal_channel_id", "personal_channel_message", "title", "username"],
+            "materialized_fields": ["personal_channel_id"],
+            "authoritative": True,
+        },
+        normalization_version="entity-profile-full-user-v1",
+        observation_started_at=100,
+        observation_completed_at=101,
+        identity=stored_identity,
+    )
+    assert repo.commit_full_user_pair(
+        cursor,
+        EntitySectionCommit({"about": "old"}, evidence=_evidence(cursor.generation)),
+        EntitySectionCommit({"personal_channel": None}, evidence=evidence),
+        now=101,
+    )
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0, generation=generation+? "
+        "WHERE entity_id=42",
+        (generation_delta,),
+    )
+    conn.commit()
+    fenced_cursor = repo.next_due_refresh(now=10_000)
+    assert fenced_cursor is not None
+    assert not repo.complete_same_generation_section(fenced_cursor, identity, now=10_000)
+    assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() != (
+        "complete",
+    )
+    conn.close()
+
+
+def test_same_generation_completion_rejects_corrupt_provenance_or_payload(tmp_path: Path) -> None:
+    path = tmp_path / "same-generation-corrupt.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    identity = {"account_generation": 7, "entity_type": "user"}
+    evidence = ProfileAcquisitionEvidence(
+        generation=cursor.generation,
+        outcome="usable",
+        provenance={
+            "endpoint": "users.GetFullUser",
+            "declared_fields": ["personal_channel_id", "personal_channel_message", "title", "username"],
+            "materialized_fields": ["personal_channel_id"],
+            "authoritative": True,
+        },
+        normalization_version="entity-profile-full-user-v1",
+        observation_started_at=100,
+        observation_completed_at=101,
+        identity=identity,
+    )
+    assert repo.commit_full_user_pair(
+        cursor,
+        EntitySectionCommit({"about": "old"}, evidence=_evidence(cursor.generation)),
+        EntitySectionCommit({"personal_channel": {"channel_id": 1}}, payload={"channel_id": 1}, evidence=evidence),
+        now=101,
+    )
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0 WHERE entity_id=42"
+    )
+    conn.execute(
+        "UPDATE entity_detail_sections SET provenance_json='{}', payload_json='not-json' "
+        "WHERE entity_id=42 AND section='personal_channel'"
+    )
+    conn.commit()
+    fenced_cursor = repo.next_due_refresh(now=10_000)
+    assert fenced_cursor is not None
+    assert not repo.complete_same_generation_section(fenced_cursor, identity, now=10_000)
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("started_at", "completed_at"),
+    ((101, 100), (100, 10_001)),
+)
+def test_receipts_with_invalid_observation_bounds_are_rejected(
+    tmp_path: Path, started_at: int, completed_at: int
+) -> None:
+    path = tmp_path / "invalid-bounds.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    identity = {"account_generation": 7, "entity_type": "user"}
+    evidence = ProfileAcquisitionEvidence(
+        generation=cursor.generation,
+        outcome="usable",
+        provenance={
+            "endpoint": "users.GetFullUser",
+            "declared_fields": list(FULL_PROFILE_OWNED_FIELDS),
+            "materialized_fields": ["about"],
+            "authoritative": True,
+        },
+        normalization_version="entity-profile-full-user-v1",
+        observation_started_at=100,
+        observation_completed_at=101,
+        identity=identity,
+    )
+    assert repo.commit_section(cursor, EntitySectionCommit({"about": "old"}, evidence=evidence), now=101)
+    conn.execute(
+        "UPDATE entity_detail_sections SET observation_started_at=?, observation_completed_at=? "
+        "WHERE entity_id=42 AND section='full_profile'",
+        (started_at, completed_at),
+    )
+    conn.commit()
+    assert not repo.section_is_reusable(42, "full_profile", identity=identity, now=100)
+    conn.close()
+
+
+def test_profile_retry_boundaries_are_pure_and_bounded() -> None:
+    assert throttled_retry_at(100, None) == 101
+    assert throttled_retry_at(100, 0) == 101
+    assert throttled_retry_at(100, -5) == 101
+    assert throttled_retry_at(100, 7) == 107
+    assert failure_retry_at(100) == 160
+    assert scope_changed_retry_at(100) == 101
 
 
 def test_observation_owner_and_auth_scope_are_persisted_separately(tmp_path: Path) -> None:

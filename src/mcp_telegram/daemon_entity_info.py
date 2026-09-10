@@ -42,6 +42,9 @@ from .entity_profile.refresh import (
     EntityRefreshCoordinator,
     RefreshEnqueueResult,
     RefreshLimits,
+    failure_retry_at,
+    scope_changed_retry_at,
+    throttled_retry_at,
 )
 from .entity_profile.repository import EntityProfileRepository, EntityRefreshCursor, EntitySectionCommit
 from .entity_store import EntitySnapshot, ensure_entity_stub
@@ -736,11 +739,11 @@ class DaemonEntityInfoService:
         identity: Mapping[str, object] | None,
     ) -> bool:
         return (
-            (identity is not None or self._deps.full_user_auth_scope is None)
+            identity is not None
             and evidence is not None
             and evidence.get("generation") == cursor.generation
             and evidence.get("normalization_version") == NORMALIZATION_VERSION
-            and (self._deps.full_user_auth_scope is None or evidence.get("identity") == identity)
+            and evidence.get("identity") == identity
             and evidence.get("outcome") in {"usable", "absent", "partial", "unavailable"}
         )
 
@@ -773,7 +776,7 @@ class DaemonEntityInfoService:
             self._observe_profile_section_failure(cursor, entity_type, actual_attempts=0)
             raise
         except TelegramRpcThrottled as exc:
-            retry_at = now + max(1, int(exc.retry_after_seconds or 1))
+            retry_at = throttled_retry_at(now, exc.retry_after_seconds)
             return self._handle_profile_section_failure(
                 _ProfileSectionFailure(
                     cursor=cursor,
@@ -793,11 +796,16 @@ class DaemonEntityInfoService:
                     context=context,
                     now=now,
                     reason=type(exc).__name__.lower(),
-                    retry_at=now + 60,
+                    retry_at=failure_retry_at(now),
                 )
             )
         if self._profile_scope_changed_during_acquisition(context.captured_scope):
-            self._profiles.mark_section_failure(cursor, now=now, reason="auth_scope_changed", retry_at=now + 1)
+            self._profiles.mark_section_failure(
+                cursor,
+                now=now,
+                reason="auth_scope_changed",
+                retry_at=scope_changed_retry_at(now),
+            )
             return DurableRefreshTerminal.FAILURE
         result = self._with_observation_metadata(result, context.captured_scope)
         committed = self._commit_profile_section_result(cursor, entity_type, result, context, now=now)
@@ -884,7 +892,7 @@ class DaemonEntityInfoService:
                     pair_mode=pair_mode,
                     attempt_start=attempt_start,
                     reason="flood_wait",
-                    retry_at=now + max(1, int(exc.retry_after_seconds or 1)),
+                    retry_at=throttled_retry_at(now, exc.retry_after_seconds),
                     reuse_rejection_reason=reuse_rejection_reason,
                 )
             )
@@ -897,7 +905,7 @@ class DaemonEntityInfoService:
                     pair_mode=pair_mode,
                     attempt_start=attempt_start,
                     reason=type(exc).__name__.lower(),
-                    retry_at=now + 60,
+                    retry_at=failure_retry_at(now),
                     reuse_rejection_reason=reuse_rejection_reason,
                 )
             )
@@ -909,7 +917,7 @@ class DaemonEntityInfoService:
                     pair_mode=pair_mode,
                     attempt_start=attempt_start,
                     reason="auth_scope_changed",
-                    retry_at=now + 1,
+                    retry_at=scope_changed_retry_at(now),
                     reuse_rejection_reason="auth_scope_changed",
                 )
             )
@@ -1525,12 +1533,11 @@ class DaemonEntityInfoService:
         except RpcAttemptBudgetExhaustedError:
             raise
         except TelegramRpcThrottled as exc:
-            retry_seconds = max(1, int(exc.retry_after_seconds or 1))
             self._profiles.mark_refresh_failure(
                 cursor.entity_id,
                 now=now,
                 reason="flood_wait",
-                retry_at=now + retry_seconds,
+                retry_at=throttled_retry_at(now, exc.retry_after_seconds),
             )
             return self._persisted_failure(cursor.entity_id, now=now)
         if entity is None or error is not None:
@@ -1554,8 +1561,8 @@ class DaemonEntityInfoService:
     def _refresh_failure_details(error: Mapping[str, object] | None, *, now: int) -> tuple[str, int]:
         retry_after = error.get("_retry_after_seconds") if error is not None else None
         if isinstance(retry_after, int) and retry_after > 0:
-            return "flood_wait", now + retry_after
-        return "entity_unavailable", now + 60
+            return "flood_wait", throttled_retry_at(now, retry_after)
+        return "entity_unavailable", failure_retry_at(now)
 
     @staticmethod
     def _success_if_refresh_finished(

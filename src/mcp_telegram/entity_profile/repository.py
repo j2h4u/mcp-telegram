@@ -98,12 +98,13 @@ class _EncodedDetail:
 
 
 @dataclass(frozen=True, slots=True)
-class _ReceiptContext:
-    entity_id: int
-    section: str
-    identity: Mapping[str, object]
-    expected_generation: int | None
-    positive_only: bool
+class _ValidatedReceipt:
+    """Receipt integrity shared by reuse and same-generation completion."""
+
+    outcome: str
+    generation: int
+    observation_started_at: int
+    observation_completed_at: int
 
 
 class EntityProfileRepository:
@@ -166,14 +167,7 @@ class EntityProfileRepository:
         ttl_seconds: int | None = None,
     ) -> bool:
         """Check a positive receipt without renewing its observation boundary."""
-        return self._receipt_is_valid(
-            entity_id,
-            section,
-            identity=identity,
-            now=now,
-            ttl_seconds=ttl_seconds,
-            positive_only=True,
-        )
+        return self._reusable_receipt_is_valid(entity_id, section, identity=identity, now=now, ttl_seconds=ttl_seconds)
 
     def reuse_full_user_pair(
         self,
@@ -189,12 +183,11 @@ class EntityProfileRepository:
             if not self._cursor_matches(cursor):
                 return False
             if not all(
-                self._receipt_is_valid(
+                self._reusable_receipt_is_valid(
                     cursor.entity_id,
                     section,
                     identity=identity,
                     now=now,
-                    positive_only=True,
                 )
                 for section in ("full_profile", "personal_channel")
             ):
@@ -320,12 +313,11 @@ class EntityProfileRepository:
         if identity is None:
             return True
         return any(
-            not self._receipt_is_valid(
+            not self._reusable_receipt_is_valid(
                 entity_id,
                 section,
                 identity=identity,
                 now=now,
-                positive_only=True,
             )
             for section in ("full_profile", "personal_channel")
         )
@@ -341,29 +333,17 @@ class EntityProfileRepository:
         if cursor.next_section != "personal_channel":
             return False
         if identity is None:
-            return self._complete_same_generation_without_scope(cursor, now=now)
+            return False
         with self._conn:
             if not self._cursor_matches(cursor):
                 return False
-            if not self._receipt_is_valid(
+            if not self._same_generation_completion_receipt_is_valid(
                 cursor.entity_id,
                 "personal_channel",
                 identity=identity,
                 now=now,
-                positive_only=False,
                 expected_generation=cursor.generation,
-                check_ttl=False,
             ):
-                return False
-            return self._advance_completed_section(cursor, now=now)
-
-    def _complete_same_generation_without_scope(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
-        """Compatibility path for pre-scope fixtures; production always supplies scope."""
-        with self._conn:
-            if not self._cursor_matches(cursor):
-                return False
-            evidence = self.read_section_evidence(cursor.entity_id, "personal_channel")
-            if evidence is None or evidence.get("generation") != cursor.generation:
                 return False
             return self._advance_completed_section(cursor, now=now)
 
@@ -1697,14 +1677,10 @@ class EntityProfileRepository:
             "FROM entity_detail_sections WHERE entity_id=? AND section=?",
             (entity_id, section),
         ).fetchone()
-        if row is None or row[0] is None or isinstance(row[0], bool):
-            return None
-        try:
-            generation = int(row[0])
-        except TypeError, ValueError:
+        if row is None or not _is_nonnegative_int(row[0]):
             return None
         return {
-            "generation": generation,
+            "generation": row[0],
             "outcome": row[1],
             "provenance": _decode_payload(row[2]),
             "normalization_version": row[3],
@@ -1713,7 +1689,45 @@ class EntityProfileRepository:
             "identity": _decode_payload(row[6]),
         }
 
-    def _receipt_is_valid(  # noqa: PLR0913
+    def _parse_validated_receipt(  # noqa: PLR0911
+        self,
+        entity_id: int,
+        section: str,
+        *,
+        identity: Mapping[str, object],
+        now: int,
+        expected_generation: int | None = None,
+    ) -> _ValidatedReceipt | None:
+        """Parse one receipt and validate its immutable evidence and payload."""
+        if not isinstance(identity, Mapping) or not identity:
+            return None
+        evidence = self.read_section_evidence(entity_id, section)
+        if evidence is None:
+            return None
+        generation = evidence.get("generation")
+        if not _is_nonnegative_int(generation):
+            return None
+        if expected_generation is not None and generation != expected_generation:
+            return None
+        stored_identity = evidence.get("identity")
+        if not isinstance(stored_identity, dict) or dict(identity) != stored_identity:
+            return None
+        started_at, completed_at = _observation_bounds(evidence)
+        if started_at is None or completed_at is None or completed_at < started_at or completed_at > now:
+            return None
+        if not self._receipt_materialization_is_exact(entity_id, section, evidence):
+            return None
+        outcome = evidence.get("outcome")
+        if not isinstance(outcome, str) or outcome not in {
+            "usable",
+            "partial",
+            "absent",
+            "unavailable",
+        }:
+            return None
+        return _ValidatedReceipt(outcome, cast(int, generation), started_at, completed_at)
+
+    def _reusable_receipt_is_valid(
         self,
         entity_id: int,
         section: str,
@@ -1721,71 +1735,44 @@ class EntityProfileRepository:
         identity: Mapping[str, object],
         now: int,
         ttl_seconds: int | None = None,
-        positive_only: bool,
-        expected_generation: int | None = None,
-        check_ttl: bool = True,
     ) -> bool:
-        evidence = self.read_section_evidence(entity_id, section)
-        context = _ReceiptContext(entity_id, section, identity, expected_generation, positive_only)
-        if evidence is None or not self._receipt_context_is_valid(evidence, context):
-            return False
-        started_at, completed_at = _observation_bounds(evidence)
-        if started_at is None or completed_at is None or completed_at < started_at or completed_at > now:
+        """Accept only a usable/absent fresh receipt within its original TTL."""
+        receipt = self._parse_validated_receipt(entity_id, section, identity=identity, now=now)
+        if receipt is None or receipt.outcome not in {"usable", "absent"}:
             return False
         row = self._receipt_section_state(entity_id, section)
-        if not self._receipt_state_is_valid(row, started_at, positive_only=positive_only):
+        if row is None or row[0] != "fresh" or row[1] != receipt.observation_started_at:
             return False
-        if not check_ttl:
-            return True
         ttl = self._section_ttl_seconds if ttl_seconds is None else max(1, int(ttl_seconds))
-        return now < started_at + ttl
+        return now < receipt.observation_started_at + ttl
 
-    def _receipt_context_is_valid(self, evidence: Mapping[str, object], context: _ReceiptContext) -> bool:
-        if not self._receipt_evidence_is_valid(
-            evidence,
-            identity=context.identity,
-            expected_generation=context.expected_generation,
-            positive_only=context.positive_only,
-        ):
-            return False
-        return self._receipt_materialization_is_exact(context.entity_id, context.section, evidence)
-
-    def _receipt_evidence_is_valid(
+    def _same_generation_completion_receipt_is_valid(
         self,
-        evidence: Mapping[str, object],
+        entity_id: int,
+        section: str,
         *,
         identity: Mapping[str, object],
-        expected_generation: int | None,
-        positive_only: bool,
+        now: int,
+        expected_generation: int,
     ) -> bool:
-        outcome = evidence.get("outcome")
-        allowed = {"usable", "absent"} if positive_only else {"usable", "absent", "partial", "unavailable"}
-        if outcome not in allowed:
+        """Accept any terminal outcome from the cursor's generation without TTL."""
+        receipt = self._parse_validated_receipt(
+            entity_id,
+            section,
+            identity=identity,
+            now=now,
+            expected_generation=expected_generation,
+        )
+        if receipt is None:
             return False
-        generation = evidence.get("generation")
-        if expected_generation is not None and generation != expected_generation:
-            return False
-        stored_identity = evidence.get("identity")
-        return identity is None or (isinstance(stored_identity, dict) and dict(identity) == stored_identity)
+        row = self._receipt_section_state(entity_id, section)
+        return row is not None and row[0] in {"fresh", "stale", "unavailable"}
 
     def _receipt_section_state(self, entity_id: int, section: str) -> tuple[object, ...] | None:
         return self._conn.execute(
             "SELECT status, observed_at FROM entity_detail_sections WHERE entity_id=? AND section=?",
             (entity_id, section),
         ).fetchone()
-
-    def _receipt_state_is_valid(
-        self,
-        row: tuple[object, ...] | None,
-        started_at: int,
-        *,
-        positive_only: bool,
-    ) -> bool:
-        if row is None or row[0] not in {"fresh", "unavailable", "stale"}:
-            return False
-        if positive_only and row[1] != started_at:
-            return False
-        return not (positive_only and row[0] != "fresh")
 
     def _receipt_materialization_is_exact(
         self,
@@ -1811,7 +1798,7 @@ class EntityProfileRepository:
         if payload_row is None:
             return False
         if section == "personal_channel" and evidence.get("outcome") == "absent":
-            return provenance.get("authoritative") is True
+            return provenance.get("authoritative") is True and payload_row[0] is None
         return isinstance(_decode_payload(payload_row[0]), dict)
 
     def _receipt_provenance_is_exact(

@@ -23,6 +23,21 @@ from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_attempt_budget, rpc_
 DurableRefreshStatusCallback = Callable[[float], DemandStatus | None]
 
 
+def throttled_retry_at(now: int, retry_after: int | None) -> int:
+    """Return the next attempt boundary for a throttled acquisition."""
+    return now + max(1, int(retry_after or 1))
+
+
+def failure_retry_at(now: int) -> int:
+    """Return the bounded retry boundary for an ordinary acquisition failure."""
+    return now + 60
+
+
+def scope_changed_retry_at(now: int) -> int:
+    """Return the immediate retry boundary after an auth-scope change."""
+    return now + 1
+
+
 def _validate_positive_duration(value: object, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value <= 0:
         raise ValueError(f"entity profile {name} must be positive")
