@@ -25,7 +25,9 @@ from .activity_peer_sweep import (
     WorkingSetResult,
     _save_dialog_state,
     build_working_set,
+    run_working_set_enrollment_slice,
     sweep_peer_once,
+    working_set_enrollment_release_at,
 )
 from .activity_substrate import ActivityClient
 from .demand_shadow_wiring import DemandCycleRunner
@@ -242,8 +244,19 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
     demand_kind = DemandKind.HOT_ACTIVITY_PAGE
 
     def status(self, now: float) -> DemandStatus | None:
-        """Return the earliest release among eligible hot peers."""
-        release_at = _next_hot_release_at(self.conn, now=now)
+        """Return the earliest release among enrollment and hot-page work."""
+        page_release_at = _next_hot_release_at(self.conn, now=now)
+        enrollment_release_at = working_set_enrollment_release_at(
+            self.conn,
+            now=now,
+            cadence_s=self.policy.loop_interval_seconds,
+        )
+        if enrollment_release_at is None:
+            release_at = page_release_at
+        elif page_release_at is None:
+            release_at = enrollment_release_at
+        else:
+            release_at = min(page_release_at, enrollment_release_at)
         if release_at is None:
             return None
         return DemandStatus(release_at=release_at)
@@ -254,7 +267,7 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
         budget: RpcAttemptBudget,
     ) -> SweepResult | None:
         """Fetch one page under the exact hot demand and admission scopes."""
-        with demand_context(DemandKind.HOT_ACTIVITY_PAGE):
+        with _hot_demand_scope():
             with rpc_attempt_budget(budget):
                 with acquisition_context(AcquisitionKind.MESSAGE_SEARCH_PAGE):
                     with rpc_scope(TelegramRpcSource.ACTIVITY_HOT_SWEEP, timeout_seconds=self.timeout_s):
@@ -312,16 +325,40 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
         )
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
-        """Fetch at most the supplied actual-attempt budget and persist progress."""
+        """Run one enrollment unit or one bounded hot page."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
-        state = _select_due_hot_window(self.conn, now=int(time.time()))
-        if state is None or self.shutdown_event.is_set():
+        if self.shutdown_event.is_set():
             return
-        result = await self._fetch_hot_page(state, budget)
-        if result is None:
-            return
-        self._persist_hot_page_result(state, result)
+        with _hot_demand_scope():
+            with rpc_attempt_budget(budget):
+                enrollment_release_at = working_set_enrollment_release_at(
+                    self.conn,
+                    now=float(int(time.time())),
+                    cadence_s=self.policy.loop_interval_seconds,
+                )
+                if enrollment_release_at is not None and enrollment_release_at <= time.time():
+                    enrollment = await run_working_set_enrollment_slice(
+                        self.client,
+                        self.conn,
+                        source=TelegramRpcSource.ACTIVITY_HOT_SWEEP,
+                        cadence_s=self.policy.loop_interval_seconds,
+                        timeout_s=self.timeout_s,
+                    )
+                    if enrollment.consumed:
+                        # A due candidate, including a channel with no linked
+                        # discussion group, consumed this bounded unit. Budget
+                        # exhaustion leaves its durable cursor unchanged. The
+                        # terminal scan marker also occupies this slice.
+                        return
+
+                state = _select_due_hot_window(self.conn, now=int(time.time()))
+                if state is None or self.shutdown_event.is_set():
+                    return
+                result = await self._fetch_hot_page(state, budget)
+                if result is None:
+                    return
+                self._persist_hot_page_result(state, result)
 
 
 @dataclass

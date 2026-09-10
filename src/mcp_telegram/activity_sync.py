@@ -111,12 +111,15 @@ class ArchiveIncrementalDemandAdapter(DurableDemandAdapter):
         state = _load_state(self.conn)
         if state.get("backfill_complete") != "1":
             return None
-        if state.get(_INCREMENTAL_MIN_DATE_KEY) is not None:
-            return DemandStatus(release_at=0.0)
         last_sync_at = int(state.get("last_sync_at") or 0)
         if last_sync_at == 0:
             return None
-        return DemandStatus(release_at=float(last_sync_at) + self.interval_s)
+        freshness_deadline = float(last_sync_at) + self.interval_s
+        release_at = 0.0 if state.get(_INCREMENTAL_MIN_DATE_KEY) is not None else freshness_deadline
+        return DemandStatus(
+            release_at=release_at,
+            freshness_deadline=freshness_deadline,
+        )
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
         """Fetch and commit at most one incremental search page."""

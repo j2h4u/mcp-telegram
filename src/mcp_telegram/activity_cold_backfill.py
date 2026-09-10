@@ -36,7 +36,9 @@ from .activity_peer_sweep import (
     SkipReason,
     SweepResult,
     build_working_set,
+    run_working_set_enrollment_slice,
     sweep_peer_once,
+    working_set_enrollment_release_at,
 )
 from .activity_substrate import ActivityClient
 from .demand_shadow_wiring import DemandCycleRunner
@@ -48,6 +50,7 @@ from .telegram_demand import (
     DemandStatus,
     DurableDemandAdapter,
     RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
     UnclassifiedTelegramDemandError,
     current_demand_token,
     demand_context,
@@ -129,22 +132,56 @@ class ColdPeerPageDemandAdapter(DurableDemandAdapter):
     demand_kind = DemandKind.COLD_PEER_PAGE
 
     def status(self, now: float) -> DemandStatus | None:
-        """Return the earliest release among incomplete accessible peers."""
-        release_at = _next_cold_release_at(self.conn, now=now)
+        """Return the earliest release among enrollment and peer pages."""
+        page_release_at = _next_cold_release_at(self.conn, now=now)
+        enrollment_release_at = working_set_enrollment_release_at(
+            self.conn,
+            now=now,
+            cadence_s=self.pacing.history.enroll_s,
+        )
+        if enrollment_release_at is None:
+            release_at = page_release_at
+        elif page_release_at is None:
+            release_at = enrollment_release_at
+        else:
+            release_at = min(page_release_at, enrollment_release_at)
         if release_at is None:
             return None
         return DemandStatus(release_at=release_at)
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
-        """Run at most one claimed peer page under the transport budget."""
-        with rpc_attempt_budget(budget):
-            await run_cold_backfill_pass(
-                self.client,
-                self.conn,
-                self.shutdown_event,
-                pacing=self.pacing,
-                timeout_s=self.timeout_s,
-            )
+        """Run one enrollment unit or one claimed peer page."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        if self.shutdown_event.is_set():
+            return
+        with _cold_demand_scope():
+            with rpc_attempt_budget(budget):
+                enrollment_release_at = working_set_enrollment_release_at(
+                    self.conn,
+                    now=float(int(time.time())),
+                    cadence_s=self.pacing.history.enroll_s,
+                )
+                if enrollment_release_at is not None and enrollment_release_at <= time.time():
+                    enrollment = await run_working_set_enrollment_slice(
+                        self.client,
+                        self.conn,
+                        source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
+                        cadence_s=self.pacing.history.enroll_s,
+                        timeout_s=self.timeout_s,
+                    )
+                    if enrollment.consumed:
+                        # Keep the enrollment cursor at the candidate when the
+                        # local attempt budget is exhausted; the next slice gets
+                        # a fresh budget and resumes the same bounded unit.
+                        return
+                await run_cold_backfill_pass(
+                    self.client,
+                    self.conn,
+                    self.shutdown_event,
+                    pacing=self.pacing,
+                    timeout_s=self.timeout_s,
+                )
 
 
 _BACKFILL_BATCH_LIMIT = 100
@@ -343,6 +380,18 @@ def _save_claimed_cold_state(ctx: _ColdPeerFinishContext, **fields: object) -> b
     return cursor.rowcount == 1
 
 
+def _release_cold_claim(conn: sqlite3.Connection, *, dialog_id: int, claim_until: int) -> bool:
+    """Return an unfinished peer to the queue after a slice boundary."""
+    with conn:
+        cursor = conn.execute(
+            "UPDATE activity_dialog_state "
+            "SET cold_status = 'pending', cold_next_retry_at = NULL, updated_at = ? "
+            "WHERE dialog_id = ? AND cold_status = 'running' AND cold_next_retry_at = ?",
+            (int(time.time()), dialog_id, claim_until),
+        )
+    return cursor.rowcount == 1
+
+
 def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfillPacing) -> ColdPassResult:
     """Apply one peer result and emit the matching telemetry."""
     result = ctx.result
@@ -485,21 +534,27 @@ async def _run_cold_backfill_pass(
         offset_id,
     )
 
-    with rpc_scope(
-        TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
-        timeout_seconds=timeout_s,
-        acquisition_kind=AcquisitionKind.MESSAGE_SEARCH_PAGE,
-    ):
-        result = await sweep_peer_once(
-            client,
-            conn,
-            dialog_id,
-            offset_id=offset_id,
-            min_id=0,  # no time/id ceiling — full history walk
-            limit=_BACKFILL_BATCH_LIMIT,
-            timeout_s=timeout_s,
-            hydration_priority=HydrationPriority.BACKFILL,
-        )
+    try:
+        with rpc_scope(
+            TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
+            timeout_seconds=timeout_s,
+            acquisition_kind=AcquisitionKind.MESSAGE_SEARCH_PAGE,
+        ):
+            result = await sweep_peer_once(
+                client,
+                conn,
+                dialog_id,
+                offset_id=offset_id,
+                min_id=0,  # no time/id ceiling — full history walk
+                limit=_BACKFILL_BATCH_LIMIT,
+                timeout_s=timeout_s,
+                hydration_priority=HydrationPriority.BACKFILL,
+            )
+    except RpcAttemptBudgetExhaustedError:
+        # A slice bound is not an access failure. Release the short claim so
+        # status() exposes immediate durable continuation on the next slice.
+        _release_cold_claim(conn, dialog_id=dialog_id, claim_until=claim_until)
+        return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
 
     return _finish_cold_backfill_peer(
         _ColdPeerFinishContext(
