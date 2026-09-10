@@ -3195,7 +3195,9 @@ def _apply_migration_60(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
-def _rebuild_entity_profile_refresh_state_v61(conn: sqlite3.Connection) -> None:
+def _entity_profile_refresh_state_v61_columns_and_schema(
+    conn: sqlite3.Connection,
+) -> tuple[set[str], str]:
     columns = _table_column_names(conn, "entity_profile_refresh_state")
     schema_row = cast(
         tuple[str] | None,
@@ -3203,22 +3205,29 @@ def _rebuild_entity_profile_refresh_state_v61(conn: sqlite3.Connection) -> None:
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='entity_profile_refresh_state'"
         ).fetchone(),
     )
-    schema = schema_row[0] if schema_row is not None else ""
-    required = {"generation", "started_at", "pair_eligible", "follow_up_required", "profile_revision"}
-    if required <= columns and "'complete'" in schema:
-        return
-    if not columns:
-        conn.execute(_ENTITY_PROFILE_REFRESH_STATE_V61_DDL)
-        return
-    expressions = {
-        "next_section": "next_section" if "next_section" in columns else "'full_profile'",
-        "acquisition_cursor": "acquisition_cursor" if "acquisition_cursor" in columns else "0",
-        "generation": "generation" if "generation" in columns else "0",
-        "started_at": "started_at" if "started_at" in columns else "NULL",
-        "pair_eligible": "pair_eligible" if "pair_eligible" in columns else "0",
-        "follow_up_required": "follow_up_required" if "follow_up_required" in columns else "0",
-        "profile_revision": "profile_revision" if "profile_revision" in columns else "0",
+    return columns, schema_row[0] if schema_row is not None else ""
+
+
+def _entity_profile_refresh_state_v61_expressions(columns: set[str]) -> dict[str, str]:
+    defaults = {
+        "next_section": "'full_profile'",
+        "acquisition_cursor": "0",
+        "generation": "0",
+        "started_at": "NULL",
+        "pair_eligible": "0",
+        "follow_up_required": "0",
+        "profile_revision": "0",
     }
+    return {name: name if name in columns else default for name, default in defaults.items()}
+
+
+def _copy_entity_profile_refresh_state_v61(conn: sqlite3.Connection, columns: set[str]) -> None:
+    expressions = _entity_profile_refresh_state_v61_expressions(columns)
+    # Copy through TEMP instead of renaming the old table.  ALTER TABLE
+    # RENAME makes SQLite reparse every trigger in sqlite_schema.  Some
+    # supported historical databases contain trigger definitions whose
+    # referenced tables are introduced later in the migration chain;
+    # reparsing those otherwise inert definitions aborts this upgrade.
     conn.execute(
         "CREATE TEMP TABLE entity_profile_refresh_state_v60_copy AS SELECT "
         "entity_id, status, retry_at, reason, updated_at, "
@@ -3244,6 +3253,17 @@ def _rebuild_entity_profile_refresh_state_v61(conn: sqlite3.Connection) -> None:
         FROM entity_profile_refresh_state_v60_copy"""
     )
     conn.execute("DROP TABLE entity_profile_refresh_state_v60_copy")
+
+
+def _rebuild_entity_profile_refresh_state_v61(conn: sqlite3.Connection) -> None:
+    columns, schema = _entity_profile_refresh_state_v61_columns_and_schema(conn)
+    required = {"generation", "started_at", "pair_eligible", "follow_up_required", "profile_revision"}
+    if required <= columns and "'complete'" in schema:
+        return
+    if not columns:
+        conn.execute(_ENTITY_PROFILE_REFRESH_STATE_V61_DDL)
+        return
+    _copy_entity_profile_refresh_state_v61(conn, columns)
 
 
 def _apply_migration_61(conn: sqlite3.Connection, current: int) -> int:
