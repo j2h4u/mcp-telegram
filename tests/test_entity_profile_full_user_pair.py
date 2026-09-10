@@ -16,6 +16,7 @@ from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, RefreshLimits
+from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 
@@ -139,9 +140,18 @@ def _pair_service(conn: sqlite3.Connection, client: _PairClient, *, enabled: boo
     return service
 
 
-def _prepare(path: Path, *, entity_type: str = "user", bot: bool = False) -> tuple[sqlite3.Connection, object]:
+def _prepare(
+    path: Path,
+    *,
+    entity_type: str = "user",
+    bot: bool = False,
+    migrated: bool = False,
+) -> tuple[sqlite3.Connection, object]:
+    if migrated:
+        ensure_sync_schema(path)
     conn = sqlite3.connect(path)
-    _fenced_schema(conn)
+    if not migrated:
+        _fenced_schema(conn)
     conn.execute("INSERT INTO entities VALUES (?, ?, 'Target', 'target', NULL, 100)", (42, entity_type))
     conn.execute(
         "INSERT INTO entities VALUES (?, 'channel', 'Local Channel', 'local_channel', NULL, 100)", (-1000000000123,)
@@ -248,6 +258,55 @@ async def test_disabled_switch_keeps_legacy_two_full_user_acquisitions(tmp_path:
     assert client.full_user_calls == 2
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()
+
+
+@pytest.mark.asyncio
+async def test_disabled_pair_measurement_survives_restart_at_section_boundary(tmp_path: Path) -> None:
+    path = tmp_path / "pair-disabled-restart.sqlite"
+    conn, raw_service = _prepare(path, migrated=True)
+    service = cast(DaemonEntityInfoService, raw_service)
+    service._deps = replace(service._deps, enable_full_user_pair=False)
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    assert conn.execute(
+        "SELECT pair_full_profile_outcome, pair_personal_channel_outcome, pair_attempts "
+        "FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == ("usable", None, 1)
+
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0 "
+        "WHERE entity_id=42"
+    )
+    conn.commit()
+    await service.shutdown()
+    conn.close()
+
+    reopened = sqlite3.connect(path)
+    observer_rows: list[dict[str, object]] = []
+
+    class _Observer:
+        def observe_profile_pair(self, **values: object) -> None:
+            observer_rows.append(values)
+            raise RuntimeError("telemetry failed")
+
+    restarted = cast(DaemonEntityInfoService, _pair_service(reopened, _PairClient(), enabled=False))
+    restarted.bind_profile_observer(_Observer())
+    coordinator = restarted.refresh_coordinator
+    assert coordinator is not None
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+
+    assert reopened.execute(
+        "SELECT pair_full_profile_outcome, pair_personal_channel_outcome, pair_attempts, "
+        "pair_measurement_complete, pair_summary_watermark FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == ("usable", "usable", 2, 1, 100)
+    assert len(observer_rows) == 1
+    assert observer_rows[0]["actual_attempts"] == 2
+    assert observer_rows[0]["full_profile_outcome"] == "usable"
+    assert observer_rows[0]["personal_channel_outcome"] == "usable"
+    await restarted.shutdown()
+    reopened.close()
 
 
 @pytest.mark.asyncio

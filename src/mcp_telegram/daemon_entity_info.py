@@ -684,23 +684,19 @@ class DaemonEntityInfoService:
             )
             return DurableRefreshTerminal.FAILURE
         result = self._with_observation_metadata(result, captured_scope)
-        committed = self._profiles.commit_section(cursor, result, now=now)
         actual_attempts = self._rpc_attempt_count() - attempt_start
         if pair_section and eligible_pair and pair_mode == "disabled":
-            summary = (
-                self._profiles.record_pair_section_outcome(
-                    cursor,
-                    cursor.next_section,
-                    outcome=self._section_commit_outcome(cursor.next_section, result),
-                    actual_attempts=actual_attempts,
-                    ready_at=now,
-                )
-                if committed
-                else None
+            committed, summary = self._profiles.commit_section_with_pair_measurement(
+                cursor,
+                result,
+                now=now,
+                outcome=self._section_commit_outcome(cursor.next_section, result),
+                actual_attempts=actual_attempts,
             )
             if summary is not None:
                 self._emit_pair_summary(summary)
         else:
+            committed = self._profiles.commit_section(cursor, result, now=now)
             self._observe_profile_section_commit(cursor, entity_type, result, committed=committed)
         return self._success_if_refresh_finished(cursor, committed=committed)
 

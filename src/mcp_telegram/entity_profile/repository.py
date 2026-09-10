@@ -740,6 +740,21 @@ class EntityProfileRepository:
         actual_attempts: int,
     ) -> None:
         """Durably attribute dispatched pair requests, including retries."""
+        with self._conn:
+            self._record_pair_attempt_in_transaction(
+                cursor,
+                section,
+                actual_attempts=actual_attempts,
+            )
+
+    def _record_pair_attempt_in_transaction(
+        self,
+        cursor: EntityRefreshCursor,
+        section: str,
+        *,
+        actual_attempts: int,
+    ) -> None:
+        """Attribute a pair request while an outer transaction is active."""
         if section not in {"full_profile", "personal_channel"} or actual_attempts <= 0:
             return
         if not isinstance(actual_attempts, int) or isinstance(actual_attempts, bool):
@@ -753,31 +768,29 @@ class EntityProfileRepository:
             return
         attempt_column = f"pair_{section}_attempts"
         retry_column = f"pair_{section}_retries"
-        with self._conn:
-            row = self._conn.execute(
-                f"SELECT {attempt_column} FROM entity_profile_refresh_state "
-                "WHERE entity_id=? AND generation=?",
-                (cursor.entity_id, cursor.generation),
-            ).fetchone()
-            if row is None:
-                return
-            previous = int(row[0] or 0)
-            retries = max(0, previous + actual_attempts - 1) - max(0, previous - 1)
-            self._conn.execute(
-                f"UPDATE entity_profile_refresh_state SET {attempt_column}={attempt_column}+?, "
-                f"{retry_column}={retry_column}+?, pair_attempts=pair_attempts+?, "
-                "pair_retries=pair_retries+? WHERE entity_id=? AND generation=?",
-                (
-                    actual_attempts,
-                    retries,
-                    actual_attempts,
-                    retries,
-                    cursor.entity_id,
-                    cursor.generation,
-                ),
-            )
+        row = self._conn.execute(
+            f"SELECT {attempt_column} FROM entity_profile_refresh_state WHERE entity_id=? AND generation=?",
+            (cursor.entity_id, cursor.generation),
+        ).fetchone()
+        if row is None:
+            return
+        previous = int(row[0] or 0)
+        retries = max(0, previous + actual_attempts - 1) - max(0, previous - 1)
+        self._conn.execute(
+            f"UPDATE entity_profile_refresh_state SET {attempt_column}={attempt_column}+?, "
+            f"{retry_column}={retry_column}+?, pair_attempts=pair_attempts+?, "
+            "pair_retries=pair_retries+? WHERE entity_id=? AND generation=?",
+            (
+                actual_attempts,
+                retries,
+                actual_attempts,
+                retries,
+                cursor.entity_id,
+                cursor.generation,
+            ),
+        )
 
-    def record_pair_section_outcome(  # noqa: PLR0911, PLR0913
+    def record_pair_section_outcome(  # noqa: PLR0913
         self,
         cursor: EntityRefreshCursor,
         section: str,
@@ -814,77 +827,95 @@ class EntityProfileRepository:
         if not required <= self._columns("entity_profile_refresh_state", "_refresh_columns"):
             return None
         with self._conn:
-            state = self._conn.execute(
-                "SELECT pair_mode, pair_eligible, pair_full_profile_outcome, "
-                "pair_personal_channel_outcome, pair_summary_watermark, pair_ready_at, "
-                "pair_attempts, pair_retries, pair_readiness_latency_ms "
-                "FROM entity_profile_refresh_state WHERE entity_id=? AND generation=?",
-                (cursor.entity_id, cursor.generation),
-            ).fetchone()
-            if state is None:
-                return None
-            mode = state[0] if state[0] in {"enabled", "disabled"} else None
-            if mode is None or not bool(state[1]):
-                return None
-            self.record_pair_attempt(cursor, section, actual_attempts=attempts)
-            outcome_column = (
-                "pair_full_profile_outcome" if section == "full_profile" else "pair_personal_channel_outcome"
+            return self._record_pair_section_outcome_in_transaction(
+                cursor,
+                section,
+                outcome=outcome,
+                actual_attempts=attempts,
+                ready_at=ready_at,
+                readiness_latency_ms=readiness_latency_ms,
             )
-            self._conn.execute(
-                f"UPDATE entity_profile_refresh_state SET {outcome_column}=? WHERE entity_id=? AND generation=?",
-                (outcome, cursor.entity_id, cursor.generation),
-            )
-            current = self._conn.execute(
-                "SELECT pair_full_profile_outcome, pair_personal_channel_outcome, pair_summary_watermark, "
-                "pair_attempts, pair_retries, pair_ready_at, pair_readiness_latency_ms "
-                "FROM entity_profile_refresh_state WHERE entity_id=? AND generation=?",
-                (cursor.entity_id, cursor.generation),
-            ).fetchone()
-            if current is None or current[0] is None or current[1] is None:
+
+    def _record_pair_section_outcome_in_transaction(  # noqa: PLR0911, PLR0913
+        self,
+        cursor: EntityRefreshCursor,
+        section: str,
+        *,
+        outcome: str,
+        actual_attempts: int,
+        ready_at: int,
+        readiness_latency_ms: float | None = None,
+    ) -> dict[str, object] | None:
+        """Record one pair outcome while an outer transaction is active."""
+        state = self._conn.execute(
+            "SELECT pair_mode, pair_eligible, pair_full_profile_outcome, "
+            "pair_personal_channel_outcome, pair_summary_watermark, pair_ready_at, "
+            "pair_attempts, pair_retries, pair_readiness_latency_ms "
+            "FROM entity_profile_refresh_state WHERE entity_id=? AND generation=?",
+            (cursor.entity_id, cursor.generation),
+        ).fetchone()
+        if state is None:
+            return None
+        mode = state[0] if state[0] in {"enabled", "disabled"} else None
+        if mode is None or not bool(state[1]):
+            return None
+        self._record_pair_attempt_in_transaction(cursor, section, actual_attempts=actual_attempts)
+        outcome_column = "pair_full_profile_outcome" if section == "full_profile" else "pair_personal_channel_outcome"
+        self._conn.execute(
+            f"UPDATE entity_profile_refresh_state SET {outcome_column}=? WHERE entity_id=? AND generation=?",
+            (outcome, cursor.entity_id, cursor.generation),
+        )
+        current = self._conn.execute(
+            "SELECT pair_full_profile_outcome, pair_personal_channel_outcome, pair_summary_watermark, "
+            "pair_attempts, pair_retries, pair_ready_at, pair_readiness_latency_ms "
+            "FROM entity_profile_refresh_state WHERE entity_id=? AND generation=?",
+            (cursor.entity_id, cursor.generation),
+        ).fetchone()
+        if current is None or current[0] is None or current[1] is None:
+            return None
+        summary_key = (cursor.entity_id, cursor.generation)
+        if current[2] is not None:
+            if section != "full_profile" or summary_key in self._emitted_pair_summaries:
                 return None
-            summary_key = (cursor.entity_id, cursor.generation)
-            if current[2] is not None:
-                if section != "full_profile" or summary_key in self._emitted_pair_summaries:
-                    return None
-                self._emitted_pair_summaries.add(summary_key)
-                return {
-                    "mode": str(mode),
-                    "eligible_pair": True,
-                    "outcome": "committed",
-                    "actual_attempts": int(current[3] or 0),
-                    "retries": int(current[4] or 0),
-                    "full_profile_outcome": str(current[0]),
-                    "personal_channel_outcome": str(current[1]),
-                    "pair_ready": True,
-                    "pair_readiness_latency_ms": current[6],
-                }
-            self._conn.execute(
-                "UPDATE entity_profile_refresh_state SET pair_measurement_complete=1, pair_ready_at=?, "
-                "pair_readiness_latency_ms=?, pair_summary_watermark=? WHERE entity_id=? AND generation=? "
-                "AND pair_summary_watermark IS NULL",
-                (
-                    ready_at,
-                    readiness_latency_ms,
-                    ready_at,
-                    cursor.entity_id,
-                    cursor.generation,
-                ),
-            )
-            if self._conn.execute("SELECT changes()").fetchone()[0] != 1:
-                return None
-            attempts_total = int(current[3] or 0)
-            retries_total = int(current[4] or 0)
+            self._emitted_pair_summaries.add(summary_key)
             return {
                 "mode": str(mode),
                 "eligible_pair": True,
                 "outcome": "committed",
-                "actual_attempts": attempts_total,
-                "retries": retries_total,
+                "actual_attempts": int(current[3] or 0),
+                "retries": int(current[4] or 0),
                 "full_profile_outcome": str(current[0]),
                 "personal_channel_outcome": str(current[1]),
                 "pair_ready": True,
-                "pair_readiness_latency_ms": readiness_latency_ms,
+                "pair_readiness_latency_ms": current[6],
             }
+        self._conn.execute(
+            "UPDATE entity_profile_refresh_state SET pair_measurement_complete=1, pair_ready_at=?, "
+            "pair_readiness_latency_ms=?, pair_summary_watermark=? WHERE entity_id=? AND generation=? "
+            "AND pair_summary_watermark IS NULL",
+            (
+                ready_at,
+                readiness_latency_ms,
+                ready_at,
+                cursor.entity_id,
+                cursor.generation,
+            ),
+        )
+        if self._conn.execute("SELECT changes()").fetchone()[0] != 1:
+            return None
+        attempts_total = int(current[3] or 0)
+        retries_total = int(current[4] or 0)
+        return {
+            "mode": str(mode),
+            "eligible_pair": True,
+            "outcome": "committed",
+            "actual_attempts": attempts_total,
+            "retries": retries_total,
+            "full_profile_outcome": str(current[0]),
+            "personal_channel_outcome": str(current[1]),
+            "pair_ready": True,
+            "pair_readiness_latency_ms": readiness_latency_ms,
+        }
 
     def advance_acquisition_cursor(
         self,
@@ -921,66 +952,113 @@ class EntityProfileRepository:
         if commit.status not in {"fresh", "unavailable", "not_applicable"}:
             raise ValueError("invalid terminal section status")
         with self._conn:
-            if not self._cursor_matches(cursor):
-                return False
-            detail = self._read_detail_blob(cursor.entity_id)
-            if not detail:
-                detail = self._read_entity_stub(cursor.entity_id)
-            detail = _strip_schema(detail)
-            detail.update(commit.detail_patch)
-            if not self._write_detail(
-                cursor.entity_id,
-                detail,
-                now=now,
-                expected_revision=cursor.profile_revision,
-                owner_account_id=commit.observation_owner_account_id,
-                observation_scope=commit.observation_auth_scope,
-                ownership_observed=commit.ownership_observed,
-            ):
-                return False
-            section_payload = (
-                _section_payload(detail, cursor.next_section) if commit.payload is None else commit.payload
-            )
-            self._write_section(
-                cursor.entity_id,
+            return self._commit_section_in_transaction(cursor, commit, now=now)
+
+    def commit_section_with_pair_measurement(
+        self,
+        cursor: EntityRefreshCursor,
+        commit: EntitySectionCommit,
+        *,
+        now: int,
+        outcome: str,
+        actual_attempts: int,
+    ) -> tuple[bool, dict[str, object] | None]:
+        """Commit a section and its disabled pair measurement atomically."""
+        if commit.status not in {"fresh", "unavailable", "not_applicable"}:
+            raise ValueError("invalid terminal section status")
+        required = {
+            "pair_mode",
+            "pair_eligible",
+            "pair_full_profile_outcome",
+            "pair_personal_channel_outcome",
+            "pair_summary_watermark",
+            "pair_ready_at",
+            "pair_attempts",
+            "pair_retries",
+            "pair_readiness_latency_ms",
+            "pair_measurement_complete",
+        }
+        if not required <= self._columns("entity_profile_refresh_state", "_refresh_columns"):
+            return self.commit_section(cursor, commit, now=now), None
+        with self._conn:
+            committed = self._commit_section_in_transaction(cursor, commit, now=now)
+            if not committed:
+                return False, None
+            summary = self._record_pair_section_outcome_in_transaction(
+                cursor,
                 cursor.next_section,
-                commit.status,
-                commit.reason,
-                section_payload,
-                now=now,
-                evidence=commit.evidence,
+                outcome=outcome,
+                actual_attempts=actual_attempts,
+                ready_at=now,
             )
-            next_section = _next_profile_section(cursor.next_section)
-            if next_section is None:
-                if self._refresh_has("generation"):
-                    follow_up = self._refresh_follow_up_required(cursor)
-                    if follow_up:
-                        changed = self._start_follow_up_generation(cursor, now=now)
-                    else:
-                        predicate, parameters = self._cursor_predicate(cursor)
-                        changed = self._conn.execute(
-                            "UPDATE entity_profile_refresh_state SET status='complete', retry_at=NULL, "
-                            "reason='refresh_complete', updated_at=? WHERE " + predicate,
-                            (now, *parameters),
-                        ).rowcount
+            return True, summary
+
+    def _commit_section_in_transaction(
+        self,
+        cursor: EntityRefreshCursor,
+        commit: EntitySectionCommit,
+        *,
+        now: int,
+    ) -> bool:
+        """Commit a section while an outer transaction is active."""
+        if not self._cursor_matches(cursor):
+            return False
+        detail = self._read_detail_blob(cursor.entity_id)
+        if not detail:
+            detail = self._read_entity_stub(cursor.entity_id)
+        detail = _strip_schema(detail)
+        detail.update(commit.detail_patch)
+        if not self._write_detail(
+            cursor.entity_id,
+            detail,
+            now=now,
+            expected_revision=cursor.profile_revision,
+            owner_account_id=commit.observation_owner_account_id,
+            observation_scope=commit.observation_auth_scope,
+            ownership_observed=commit.ownership_observed,
+        ):
+            return False
+        section_payload = _section_payload(detail, cursor.next_section) if commit.payload is None else commit.payload
+        self._write_section(
+            cursor.entity_id,
+            cursor.next_section,
+            commit.status,
+            commit.reason,
+            section_payload,
+            now=now,
+            evidence=commit.evidence,
+        )
+        next_section = _next_profile_section(cursor.next_section)
+        if next_section is None:
+            if self._refresh_has("generation"):
+                follow_up = self._refresh_follow_up_required(cursor)
+                if follow_up:
+                    changed = self._start_follow_up_generation(cursor, now=now)
                 else:
+                    predicate, parameters = self._cursor_predicate(cursor)
                     changed = self._conn.execute(
-                        "DELETE FROM entity_profile_refresh_state "
-                        "WHERE entity_id=? AND next_section=? AND acquisition_cursor=?",
-                        (cursor.entity_id, cursor.next_section, cursor.acquisition_cursor),
+                        "UPDATE entity_profile_refresh_state SET status='complete', retry_at=NULL, "
+                        "reason='refresh_complete', updated_at=? WHERE " + predicate,
+                        (now, *parameters),
                     ).rowcount
             else:
-                predicate, parameters = self._cursor_predicate(cursor)
-                revision_assignment = ""
-                revision_value: tuple[object, ...] = ()
-                if self._refresh_has("profile_revision") and self._detail_has("profile_revision"):
-                    revision_assignment = ", profile_revision=?"
-                    revision_value = (cursor.profile_revision + 1,)
                 changed = self._conn.execute(
-                    "UPDATE entity_profile_refresh_state SET status='pending', retry_at=NULL, reason='refresh_queued', "
-                    "updated_at=?, next_section=?, acquisition_cursor=0" + revision_assignment + " WHERE " + predicate,
-                    (now, next_section, *revision_value, *parameters),
+                    "DELETE FROM entity_profile_refresh_state "
+                    "WHERE entity_id=? AND next_section=? AND acquisition_cursor=?",
+                    (cursor.entity_id, cursor.next_section, cursor.acquisition_cursor),
                 ).rowcount
+        else:
+            predicate, parameters = self._cursor_predicate(cursor)
+            revision_assignment = ""
+            revision_value: tuple[object, ...] = ()
+            if self._refresh_has("profile_revision") and self._detail_has("profile_revision"):
+                revision_assignment = ", profile_revision=?"
+                revision_value = (cursor.profile_revision + 1,)
+            changed = self._conn.execute(
+                "UPDATE entity_profile_refresh_state SET status='pending', retry_at=NULL, reason='refresh_queued', "
+                "updated_at=?, next_section=?, acquisition_cursor=0" + revision_assignment + " WHERE " + predicate,
+                (now, next_section, *revision_value, *parameters),
+            ).rowcount
         return changed == 1
 
     def _write_detail(  # noqa: PLR0913
