@@ -392,21 +392,16 @@ class MessageFactHydrationWorker:
         except TelegramRpcAdmissionDeferred as exc:
             return self._handle_admission_rejection(handler, batch, started, preflight_observations, exc, effective_now)
         except TelegramRpcThrottled as exc:
-            if attempt_budget is not None:
-                assert attempts_before_request is not None
-                self._handle_coordinator_throttle(
-                    handler,
-                    batch,
-                    started,
-                    preflight_observations,
-                    exc,
-                    effective_now,
-                    request_dispatched=attempt_budget.attempts > attempts_before_request,
-                )
-                raise
-            if exc.retry_after_seconds is None:
-                return self._handle_circuit_open(handler, batch, started, preflight_observations, effective_now)
-            return self._handle_flood_wait(handler, batch, started, preflight_observations, exc, effective_now)
+            return self._handle_throttle(
+                handler,
+                batch,
+                started,
+                preflight_observations,
+                exc,
+                effective_now,
+                attempt_budget=attempt_budget,
+                attempts_before_request=attempts_before_request,
+            )
         except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
             return self._handle_admission_rejection(handler, batch, started, preflight_observations, exc, effective_now)
         except RpcAdmissionClosedError as exc:
@@ -542,6 +537,35 @@ class MessageFactHydrationWorker:
             dropped=len(preflight_observations) + dropped,
             stopped=True,
         )
+
+    def _handle_throttle(  # noqa: PLR0913, PLR0917
+        self,
+        handler: HydrationHandler,
+        batch: Sequence[HydrationJob],
+        started: Sequence[HydrationJob],
+        preflight_observations: Sequence[HydrationDropObservation],
+        exc: TelegramRpcThrottled,
+        effective_now: int,
+        *,
+        attempt_budget: RpcAttemptBudget | None,
+        attempts_before_request: int | None,
+    ) -> _BatchOutcome:
+        """Preserve domain state, then select coordinator or standalone recovery."""
+        if attempt_budget is not None:
+            assert attempts_before_request is not None
+            self._handle_coordinator_throttle(
+                handler,
+                batch,
+                started,
+                preflight_observations,
+                exc,
+                effective_now,
+                request_dispatched=attempt_budget.attempts > attempts_before_request,
+            )
+            raise exc
+        if exc.retry_after_seconds is None:
+            return self._handle_circuit_open(handler, batch, started, preflight_observations, effective_now)
+        return self._handle_flood_wait(handler, batch, started, preflight_observations, exc, effective_now)
 
     def _handle_coordinator_throttle(  # noqa: PLR0913, PLR0917
         self,
