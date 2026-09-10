@@ -159,7 +159,7 @@ def _prepare(
         "INSERT INTO entities VALUES (?, 'channel', 'Local Channel', 'local_channel', NULL, 100)", (-1000000000123,)
     )
     conn.commit()
-    service = _pair_service(conn, _PairClient(), enabled=True)
+    service = _pair_service(conn, _PairClient(bot=bot), enabled=True)
     service._profiles.save_core({"id": 42, "type": entity_type, "name": "Target"}, now=100)  # type: ignore[attr-defined]
     service._profiles.mark_pending(42, now=100)  # type: ignore[attr-defined]
     return conn, service

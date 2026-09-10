@@ -2012,7 +2012,12 @@ class DaemonEntityInfoService:
             self._profiles.mark_refresh_rejected(entity_id, now=int(self._deps.now_provider()))
             self._set_section_rejected(sections)
             return
-        self._profiles.mark_refresh_queued(entity_id, pair_mode_override=self._current_pair_mode())
+        # A coalesced foreground request already has durable pending state
+        # owned by the admitted request.  Rewriting it would renew its
+        # timestamp (and can mutate durable state while shutdown is winning
+        # the local waiter race).
+        if result is RefreshEnqueueResult.QUEUED:
+            self._profiles.mark_refresh_queued(entity_id, pair_mode_override=self._current_pair_mode())
         self._set_section_queued(sections)
         offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
 

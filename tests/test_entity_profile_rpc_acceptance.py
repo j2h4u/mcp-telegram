@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import patch
 
 import pytest
 from jsonschema import validate  # type: ignore[import-untyped]
@@ -22,9 +25,15 @@ from mcp_telegram.entity_profile.repository import EntityProfileRepository
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.models import DialogType
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_demand import RpcAttemptBudget
+from mcp_telegram.telegram_demand import RpcAttemptBudget, demand_context
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
-from mcp_telegram.tools.entity_info import GET_ENTITY_INFO_OUTPUT_SCHEMA, GetEntityInfo, _entity_structured_content
+from mcp_telegram.tools.entity_info import (
+    GET_ENTITY_INFO_OUTPUT_SCHEMA,
+    GetEntityInfo,
+    _entity_structured_content,
+    get_entity_info,
+)
 from tests.test_entity_profile_full_user_pair import _PairClient, _prepare
 
 
@@ -304,3 +313,89 @@ def test_progressive_user_and_bot_projection_matches_legacy_public_golden(entity
     encoded = str(current)
     for internal in ("evidence", "auth_scope", "normalization_version", "acquisition_generation"):
         assert internal not in encoded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("entity_type", "bot"), (("user", False), ("bot", True)))
+async def test_actual_entity_info_tool_renders_persisted_user_and_bot_profile(
+    tmp_path: Path,
+    entity_type: str,
+    bot: bool,
+) -> None:
+    conn, raw_service = _prepare(
+        tmp_path / f"tool-{entity_type}.sqlite", migrated=True, entity_type=entity_type, bot=bot
+    )
+    service = cast(DaemonEntityInfoService, raw_service)
+    service._deps = replace(  # type: ignore[attr-defined]
+        service._deps,
+        client=_PairClient(bot=bot),
+        refresh_limits=replace(service._deps.refresh_limits, foreground_refresh_wait_seconds=0.01),
+    )
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+
+    class ServiceConnection:
+        async def get_entity_info(self, *, entity_id: int) -> dict[str, object]:
+            with demand_context(DemandKind.FOREGROUND_ENTITY_FACTS):
+                return await service.get_entity_info({"entity_id": entity_id})
+
+    @asynccontextmanager
+    async def connection(*, timeout_seconds: float | None = None):
+        del timeout_seconds
+        yield ServiceConnection()
+
+    with patch("mcp_telegram.tools.entity_info.daemon_connection", connection):
+        result = await get_entity_info(GetEntityInfo(exact_entity_id=42))
+
+    assert result.content == ()
+    payload = cast(dict[str, object], result.structured_content)
+    assert payload["type"] == entity_type
+    assert payload["completeness"] == "partial"
+    encoded = json.dumps(payload, sort_keys=True)
+    for internal in ("evidence", "auth_scope", "normalization_version", "acquisition_generation"):
+        assert internal not in encoded
+    await service.shutdown()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_actual_entity_info_tool_renders_persisted_partial_on_target_kind_mismatch(tmp_path: Path) -> None:
+    conn, raw_service = _prepare(tmp_path / "tool-mismatch.sqlite", migrated=True, entity_type="bot", bot=True)
+    service = cast(DaemonEntityInfoService, raw_service)
+    service._deps = replace(  # type: ignore[attr-defined]
+        service._deps,
+        client=_PairClient(bot=True),
+        refresh_limits=replace(service._deps.refresh_limits, foreground_refresh_wait_seconds=0.01),
+    )
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    _requeue_new_generation(conn)
+    mismatch_client = _PairClient(bot=False)
+    service._deps = replace(service._deps, client=mismatch_client)  # type: ignore[attr-defined]
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    assert mismatch_client.full_user_calls == 1
+
+    class ServiceConnection:
+        async def get_entity_info(self, *, entity_id: int) -> dict[str, object]:
+            with demand_context(DemandKind.FOREGROUND_ENTITY_FACTS):
+                return await service.get_entity_info({"entity_id": entity_id})
+
+    @asynccontextmanager
+    async def connection(*, timeout_seconds: float | None = None):
+        del timeout_seconds
+        yield ServiceConnection()
+
+    with patch("mcp_telegram.tools.entity_info.daemon_connection", connection):
+        result = await get_entity_info(GetEntityInfo(exact_entity_id=42))
+
+    assert result.content == ()
+    payload = cast(dict[str, object], result.structured_content)
+    assert payload["type"] == "bot"
+    assert payload["completeness"] == "partial"
+    encoded = json.dumps(payload, sort_keys=True)
+    for internal in ("evidence", "auth_scope", "normalization_version", "acquisition_generation"):
+        assert internal not in encoded
+    await service.shutdown()
+    conn.close()
