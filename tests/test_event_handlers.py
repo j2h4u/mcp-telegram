@@ -99,7 +99,9 @@ def make_manager(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> EventHandlerManager:
-    return EventHandlerManager(mock_client, sync_db, shutdown_event, mock_client.get_input_entity)
+    manager = EventHandlerManager(mock_client, sync_db, shutdown_event, mock_client.get_input_entity)
+    manager.bind_demand_sink(MagicMock())
+    return manager
 
 
 def insert_synced_dialog(conn: _SQLiteConnection, dialog_id: int) -> None:
@@ -119,15 +121,15 @@ def test_auto_enrollment_offers_full_sync_only_after_commit(
 ) -> None:
     manager = make_manager(mock_client, sync_db, shutdown_event)
     offered: list[DemandKind] = []
-    shadow = MagicMock()
+    sink = MagicMock()
 
     def offer(kind: DemandKind) -> bool:
         assert not sync_db.in_transaction
         offered.append(kind)
         return True
 
-    shadow.offer.side_effect = offer
-    manager.bind_demand_shadow(shadow)
+    sink.offer.side_effect = offer
+    manager.bind_demand_sink(sink)
 
     assert manager._auto_enroll_dm(42)
     assert offered == [DemandKind.FULL_SYNC_PAGE]
@@ -191,15 +193,15 @@ async def test_on_new_message_inserts_row(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
     offered: list[DemandKind] = []
-    shadow = MagicMock()
+    sink = MagicMock()
 
     def offer(kind: DemandKind) -> bool:
         assert not sync_db.in_transaction
         offered.append(kind)
         return True
 
-    shadow.offer.side_effect = offer
-    manager.bind_demand_shadow(shadow)
+    sink.offer.side_effect = offer
+    manager.bind_demand_sink(sink)
 
     msg = build_mock_message(id=500, text="hello")
     event = make_new_message_event(chat_id=dialog_id, message=msg)
@@ -1577,6 +1579,7 @@ async def test_linked_chat_refresh_skips_input_peer_cache_miss(
         shutdown_event,
         resolver,
     )
+    manager.bind_demand_sink(MagicMock())
     manager.register()
 
     await manager.on_raw_channel_chat_update(UpdateChannel(channel_id=channel_id))

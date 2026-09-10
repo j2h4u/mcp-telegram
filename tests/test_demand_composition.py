@@ -9,56 +9,34 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from mcp_telegram.activity_cold_backfill import ColdPeerPageDemandAdapter
+from mcp_telegram.activity_hot_sweep import HotActivityDemandAdapter
+from mcp_telegram.activity_sync import ArchiveBackfillDemandAdapter, ArchiveIncrementalDemandAdapter
 from mcp_telegram.daemon import SQLiteSelfProfileCadence
+from mcp_telegram.delta_sync import DeltaAccessProbeDemandAdapter, DeltaGapFillDemandAdapter
 from mcp_telegram.demand_composition import (
     DemandCompositionClient,
     DemandCompositionDependencies,
-    TelegramDemandShadow,
     build_durable_adapter_map,
+    build_durable_coordinator,
 )
-from mcp_telegram.rpc_admission_observations import DemandEvidenceOutcome
-from mcp_telegram.self_profile_maintenance import SelfProfileCadenceState
+from mcp_telegram.dialog_sync import (
+    DialogBootstrapDemandAdapter,
+    DialogFullReconciliationDemandAdapter,
+    DialogLightReconciliationDemandAdapter,
+)
+from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
+from mcp_telegram.fact_hydration import FactHydrationDemandAdapter
+from mcp_telegram.folders.worker import FolderProjectionDemandAdapter
+from mcp_telegram.message_fact_refresh import MessageFactRefreshDemandAdapter, ReadReceiptDemandAdapter
+from mcp_telegram.scheduled_messages import ScheduledDiscoveryDemandAdapter, ScheduledRepairDemandAdapter
+from mcp_telegram.self_profile_maintenance import SelfProfileCadenceState, SelfProfileMaintenanceDemandAdapter
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_demand import DemandStatus, RpcAttemptBudget
+from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter
 from mcp_telegram.telegram_rpc_consumers import (
-    TELEGRAM_DEMAND_CONTRACTS,
     DemandKind,
-    ExecutionMode,
     demand_freshness_seconds,
 )
-
-
-class _Adapter:
-    def __init__(self, status: DemandStatus | None = None, *, fail_status: bool = False) -> None:
-        self.current_status = status
-        self.fail_status = fail_status
-        self.status_calls: list[float] = []
-        self.run_calls: list[RpcAttemptBudget] = []
-
-    def status(self, now: float) -> DemandStatus | None:
-        self.status_calls.append(now)
-        if self.fail_status:
-            raise RuntimeError("sensitive domain failure")
-        return self.current_status
-
-    async def run_slice(self, budget: RpcAttemptBudget) -> None:
-        self.run_calls.append(budget)
-
-
-class _Observer:
-    def __init__(self) -> None:
-        self.events: list[dict[str, object]] = []
-
-    def observe_demand(self, **event: object) -> None:
-        self.events.append(event)
-
-
-def _shadow_adapters() -> dict[DemandKind, _Adapter]:
-    return {
-        kind: _Adapter()
-        for kind, contract in TELEGRAM_DEMAND_CONTRACTS.items()
-        if contract.execution_mode is ExecutionMode.DURABLE
-    }
 
 
 def _dependencies() -> tuple[DemandCompositionDependencies, dict[str, object]]:
@@ -68,6 +46,7 @@ def _dependencies() -> tuple[DemandCompositionDependencies, dict[str, object]]:
         "shutdown": asyncio.Event(),
         "full": MagicMock(),
         "delta": MagicMock(),
+        "dm_gap_scanner": MagicMock(),
         "dialog": MagicMock(),
         "entity": MagicMock(),
         "hydration": MagicMock(),
@@ -92,6 +71,7 @@ def _dependencies() -> tuple[DemandCompositionDependencies, dict[str, object]]:
         shutdown_event=cast(asyncio.Event, objects["shutdown"]),
         full_sync_worker=cast(object, objects["full"]),  # type: ignore[arg-type]
         delta_sync_worker=cast(object, objects["delta"]),  # type: ignore[arg-type]
+        dm_gap_scanner=cast(object, objects["dm_gap_scanner"]),  # type: ignore[arg-type]
         dialog_reconciliation_worker=cast(object, objects["dialog"]),  # type: ignore[arg-type]
         entity_refresh_coordinator=cast(object, objects["entity"]),  # type: ignore[arg-type]
         fact_hydration_worker=cast(object, objects["hydration"]),  # type: ignore[arg-type]
@@ -112,19 +92,41 @@ def _dependencies() -> tuple[DemandCompositionDependencies, dict[str, object]]:
     return dependencies, objects
 
 
-def test_adapter_map_is_exact_and_reuses_legacy_owned_objects() -> None:
+def test_adapter_map_is_exact_against_literal_20_kind_class_map() -> None:
     dependencies, objects = _dependencies()
 
     adapters = build_durable_adapter_map(dependencies)
 
     expected = {
-        kind for kind, contract in TELEGRAM_DEMAND_CONTRACTS.items() if contract.execution_mode is ExecutionMode.DURABLE
+        DemandKind.ENTITY_PROFILE_REFRESH: EntityProfileDemandAdapter,
+        DemandKind.DELTA_GAP_FILL: DeltaGapFillDemandAdapter,
+        DemandKind.DELTA_ACCESS_PROBE: DeltaAccessProbeDemandAdapter,
+        DemandKind.HOT_ACTIVITY_PAGE: HotActivityDemandAdapter,
+        DemandKind.LIVE_HYDRATION_BATCH: FactHydrationDemandAdapter,
+        DemandKind.FULL_SYNC_DM_ENROLLMENT: FullSyncDmEnrollmentDemandAdapter,
+        DemandKind.FULL_SYNC_PAGE: FullSyncDemandAdapter,
+        DemandKind.DIALOG_BOOTSTRAP: DialogBootstrapDemandAdapter,
+        DemandKind.DIALOG_LIGHT_RECONCILIATION: DialogLightReconciliationDemandAdapter,
+        DemandKind.DIALOG_FULL_RECONCILIATION: DialogFullReconciliationDemandAdapter,
+        DemandKind.ARCHIVE_BACKFILL: ArchiveBackfillDemandAdapter,
+        DemandKind.ARCHIVE_INCREMENTAL: ArchiveIncrementalDemandAdapter,
+        DemandKind.COLD_PEER_PAGE: ColdPeerPageDemandAdapter,
+        DemandKind.BACKFILL_HYDRATION_BATCH: FactHydrationDemandAdapter,
+        DemandKind.FOLDER_SNAPSHOT: FolderProjectionDemandAdapter,
+        DemandKind.MESSAGE_FACT_REFRESH: MessageFactRefreshDemandAdapter,
+        DemandKind.READ_RECEIPT_BATCH: ReadReceiptDemandAdapter,
+        DemandKind.SCHEDULED_REPAIR: ScheduledRepairDemandAdapter,
+        DemandKind.SCHEDULED_DISCOVERY: ScheduledDiscoveryDemandAdapter,
+        DemandKind.SELF_PROFILE_MAINTENANCE: SelfProfileMaintenanceDemandAdapter,
     }
-    assert set(adapters) == expected
+    assert len(expected) == 20
+    assert set(adapters) == set(expected)
+    assert {kind: type(adapter) for kind, adapter in adapters.items()} == expected
     assert all(getattr(adapter, "demand_kind", None) is kind for kind, adapter in adapters.items())
     assert adapters[DemandKind.FULL_SYNC_PAGE]._worker is objects["full"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.FULL_SYNC_DM_ENROLLMENT]._worker is objects["full"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DELTA_GAP_FILL]._worker is objects["delta"]  # type: ignore[attr-defined]
+    assert adapters[DemandKind.DELTA_GAP_FILL]._dm_gap_scanner is objects["dm_gap_scanner"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DELTA_ACCESS_PROBE]._worker is objects["delta"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DIALOG_LIGHT_RECONCILIATION]._worker is objects["dialog"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DIALOG_FULL_RECONCILIATION]._worker is objects["dialog"]  # type: ignore[attr-defined]
@@ -145,181 +147,13 @@ def test_adapter_map_is_exact_and_reuses_legacy_owned_objects() -> None:
         adapters[DemandKind.SCHEDULED_REPAIR] = adapters[DemandKind.SCHEDULED_DISCOVERY]  # type: ignore[index]
 
 
-def test_shadow_records_transitions_and_never_executes_adapters() -> None:
-    adapters = _shadow_adapters()
-    adapters[DemandKind.SCHEDULED_REPAIR].current_status = DemandStatus(
-        release_at=50.0,
-        freshness_deadline=75.0,
-    )
-    adapters[DemandKind.SCHEDULED_DISCOVERY].current_status = DemandStatus(release_at=150.0)
-    observer = _Observer()
-    shadow = TelegramDemandShadow(
-        adapters,
-        asyncio.Event(),
-        observer=observer,
-        clock=lambda: 100.0,
-    )
-
-    assert shadow.coordinator.ready_kinds == (DemandKind.SCHEDULED_REPAIR,)
-    assert shadow.coordinator.next_release_at == 150.0
-    assert shadow._next_scan_delay(100.0) == 50.0
-    assert shadow.offer(DemandKind.SCHEDULED_DISCOVERY) is True
-    assert shadow.offer(DemandKind.SCHEDULED_DISCOVERY) is False
-
-    adapters[DemandKind.SCHEDULED_REPAIR].current_status = None
-    adapters[DemandKind.SCHEDULED_DISCOVERY].current_status = DemandStatus(release_at=100.0)
-    shadow.after_cycle_scan()
-
-    outcomes = [event["outcome"] for event in observer.events]
-    assert DemandEvidenceOutcome.READY in outcomes
-    assert DemandEvidenceOutcome.OFFERED in outcomes
-    assert DemandEvidenceOutcome.COALESCED_WAKEUP in outcomes
-    assert DemandEvidenceOutcome.LOCALLY_SATISFIED in outcomes
-    assert all(not adapter.run_calls for adapter in adapters.values())
-
-
-def test_shadow_compares_predictions_and_records_cycle_attempts_and_outcomes() -> None:
-    adapters = _shadow_adapters()
-    adapters[DemandKind.SCHEDULED_REPAIR].current_status = DemandStatus(
-        release_at=50.0,
-        freshness_deadline=75.0,
-    )
-    adapters[DemandKind.SCHEDULED_DISCOVERY].current_status = DemandStatus(release_at=50.0)
-    observer = _Observer()
-    shadow = TelegramDemandShadow(adapters, asyncio.Event(), observer=observer, clock=lambda: 100.0)
-
-    completed = shadow.begin_cycle(DemandKind.SCHEDULED_REPAIR)
-    completed.attempt_evidence.record_dispatch()
-    completed.attempt_evidence.record_dispatch()
-    adapters[DemandKind.SCHEDULED_REPAIR].current_status = None
-    shadow.after_cycle_scan(
-        completed,
-        actual_kind=DemandKind.SCHEDULED_REPAIR,
-        outcome=DemandEvidenceOutcome.COMPLETED,
-    )
-
-    deferred = shadow.begin_cycle(DemandKind.SCHEDULED_REPAIR)
-    shadow.after_cycle_scan(
-        deferred,
-        actual_kind=DemandKind.SCHEDULED_REPAIR,
-        outcome=DemandEvidenceOutcome.DEFERRED,
-        reason="capacity",
-    )
-
-    failed = shadow.begin_cycle(DemandKind.SCHEDULED_DISCOVERY)
-    failed.attempt_evidence.record_dispatch()
-    shadow.after_cycle_scan(
-        failed,
-        actual_kind=DemandKind.SCHEDULED_DISCOVERY,
-        outcome=DemandEvidenceOutcome.FAILED,
-        reason="transport",
-    )
-
-    cycles = [
-        event
-        for event in observer.events
-        if event["outcome"]
-        in {
-            DemandEvidenceOutcome.PREDICTED_SELECTION,
-            DemandEvidenceOutcome.COMPLETED,
-            DemandEvidenceOutcome.DEFERRED,
-            DemandEvidenceOutcome.FAILED,
-        }
-    ]
-    predicted, terminal, mismatch, deferred_terminal, matched_again, failed_terminal = cycles
-    assert predicted["predicted_kind"] is DemandKind.SCHEDULED_REPAIR
-    assert predicted["selection_match"] is True
-    assert terminal["actual_attempts"] == 2
-    assert terminal["oldest_overdue_seconds"] == 25.0
-    assert mismatch["predicted_kind"] is DemandKind.SCHEDULED_DISCOVERY
-    assert mismatch["selection_match"] is False
-    assert deferred_terminal["actual_attempts"] == 0
-    assert deferred_terminal["reason"] == "capacity"
-    assert matched_again["selection_match"] is True
-    assert failed_terminal["actual_attempts"] == 1
-    assert failed_terminal["reason"] == "transport"
-    assert all(not adapter.run_calls for adapter in adapters.values())
-
-
-def test_shadow_status_failures_are_bounded_and_do_not_block_scans() -> None:
-    adapters = _shadow_adapters()
-    adapters[DemandKind.SCHEDULED_REPAIR].fail_status = True
-    adapters[DemandKind.SCHEDULED_DISCOVERY].current_status = DemandStatus(release_at=0.0)
-    observer = _Observer()
-
-    shadow = TelegramDemandShadow(adapters, asyncio.Event(), observer=observer, clock=lambda: 100.0)
-
-    assert shadow.coordinator.ready_kinds == (DemandKind.SCHEDULED_DISCOVERY,)
-    assert any(
-        event["outcome"] is DemandEvidenceOutcome.FAILED
-        and event["demand_kind"] is DemandKind.SCHEDULED_REPAIR
-        and event["reason"] == "status_error"
-        for event in observer.events
-    )
-    assert all("sensitive domain failure" not in str(value) for event in observer.events for value in event.values())
-
-
-def test_shadow_does_not_report_overdue_debt_for_never_completed_demand() -> None:
-    adapters = _shadow_adapters()
-    kind = DemandKind.DIALOG_FULL_RECONCILIATION
-    adapters[kind].current_status = DemandStatus(release_at=0.0)
-    observer = _Observer()
-
-    TelegramDemandShadow(adapters, asyncio.Event(), observer=observer, clock=lambda: 1_700_000_000.0)
-
-    ready_events = [
-        event
-        for event in observer.events
-        if event["outcome"] is DemandEvidenceOutcome.READY and event["demand_kind"] is kind
-    ]
-    assert ready_events
-    assert all(event["oldest_overdue_seconds"] is None for event in ready_events)
-
-
-def test_ready_status_error_retains_honest_debt_without_false_satisfaction() -> None:
-    adapters = _shadow_adapters()
-    adapter = adapters[DemandKind.SCHEDULED_REPAIR]
-    adapter.current_status = DemandStatus(release_at=50.0, freshness_deadline=75.0)
-    observer = _Observer()
-    shadow = TelegramDemandShadow(adapters, asyncio.Event(), observer=observer, clock=lambda: 100.0)
-    assert shadow.coordinator.ready_kinds == (DemandKind.SCHEDULED_REPAIR,)
-    observer.events.clear()
-
-    adapter.fail_status = True
-    shadow.after_cycle_scan()
-
-    assert shadow.coordinator.ready_kinds == (DemandKind.SCHEDULED_REPAIR,)
-    assert shadow.coordinator.statuses[DemandKind.SCHEDULED_REPAIR] == DemandStatus(
-        release_at=50.0,
-        freshness_deadline=75.0,
-    )
-    assert observer.events == [
-        {
-            "outcome": DemandEvidenceOutcome.FAILED,
-            "demand_kind": DemandKind.SCHEDULED_REPAIR,
-            "actual_attempts": 0,
-            "oldest_overdue_seconds": None,
-            "queue_age_seconds": None,
-            "predicted_kind": None,
-            "selection_match": None,
-            "reason": "status_error",
-        }
-    ]
-    assert all(not item.run_calls for item in adapters.values())
-
-
 @pytest.mark.asyncio
-async def test_shadow_timer_exits_cleanly_without_executing() -> None:
-    adapters = _shadow_adapters()
-    shutdown = asyncio.Event()
-    shadow = TelegramDemandShadow(adapters, shutdown, safety_scan_seconds=0.01)
+async def test_composition_builds_executable_coordinator() -> None:
+    dependencies, _objects = _dependencies()
+    coordinator = build_durable_coordinator(dependencies)
 
-    task = asyncio.create_task(shadow.run())
-    await asyncio.sleep(0)
-    shutdown.set()
-    await asyncio.wait_for(task, timeout=1.0)
-
-    assert all(not adapter.run_calls for adapter in adapters.values())
+    assert coordinator.queued_kinds == ()
+    await coordinator.run_one_slice()
 
 
 def test_self_profile_cadence_survives_database_restart(tmp_path: Path) -> None:

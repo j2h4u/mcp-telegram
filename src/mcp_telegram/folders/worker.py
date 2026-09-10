@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, cast
 
-from ..demand_shadow_wiring import DemandShadow, run_legacy_demand_cycle
 from ..flood import TelegramRpcThrottled
 from ..maintenance_logging import log_maintenance_cycle
 from ..telegram_demand import (
@@ -110,12 +109,6 @@ class FolderProjectionWorker:
         self._warning_bucket: int | None = None
         self._primed = False
         self._attempt_lock = asyncio.Lock()
-        self._demand_shadow: DemandShadow | None = None
-
-    def bind_demand_shadow(self, shadow: DemandShadow) -> None:
-        """Attach the observation-only coordinator after daemon composition."""
-        self._demand_shadow = shadow
-
     async def prime(self) -> None:
         """Perform the one startup attempt; the run loop must not duplicate it."""
         if self._primed:
@@ -155,7 +148,7 @@ class FolderProjectionWorker:
                     with rpc_attempt_budget(budget):
                         await self._attempt_once(reason, budget)
 
-        await run_legacy_demand_cycle(self._demand_shadow, DemandKind.FOLDER_SNAPSHOT, perform)
+        await perform()
 
     async def _attempt_once(self, reason: str, budget: RpcAttemptBudget | None) -> None:
         started = self._clock()

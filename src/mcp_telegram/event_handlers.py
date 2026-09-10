@@ -63,7 +63,7 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .access_lifecycle import AccessLossEvidence, set_access_lost
 from .activity_contracts import InputPeerResolver
-from .demand_shadow_wiring import DemandShadow, offer_durable_demand
+from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
 from .history_enrollment import ensure_automatic_dm_enrollment
@@ -534,14 +534,20 @@ class EventHandlerManager:
         self._realtime_history_status: _RealtimeHistoryStatusReader = _SQLiteRealtimeHistoryStatusReader(conn)
         self._topic_metadata = SQLiteTopicMetadataRepository(conn)
         self._self_id: int | None = None
-        self._demand_shadow: DemandShadow | None = None
+        self._demand_sink: DemandOfferSink | None = None
 
-    def bind_demand_shadow(self, shadow: DemandShadow) -> None:
+    def bind_demand_sink(self, sink: DemandOfferSink) -> None:
         """Attach post-commit durable wakeups after daemon composition."""
-        self._demand_shadow = shadow
+        self._demand_sink = sink
+
+    def _require_demand_sink(self) -> DemandOfferSink:
+        sink = self._demand_sink
+        if sink is None:
+            raise RuntimeError("durable demand sink is not bound")
+        return sink
 
     def _offer(self, *kinds: DemandKind) -> None:
-        offer_durable_demand(self._demand_shadow, *kinds)
+        offer_durable_demand(self._require_demand_sink(), *kinds)
 
     def _offer_message_ingestion(self) -> None:
         self._offer(
