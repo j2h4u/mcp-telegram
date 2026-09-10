@@ -226,9 +226,7 @@ def _load_dm_gap_scan_state(conn: sqlite3.Connection) -> _DmGapScanState | None:
             generation=int(cast(int | str, value["generation"])),
             scan_started_at=int(cast(int | str, value["scan_started_at"])),
             dialog_id_cursor=(
-                int(cast(int | str, value["dialog_id_cursor"]))
-                if value["dialog_id_cursor"] is not None
-                else None
+                int(cast(int | str, value["dialog_id_cursor"])) if value["dialog_id_cursor"] is not None else None
             ),
             message_cursor=int(cast(int | str, value.get("message_cursor", value.get("message_offset", 0)))),
             next_run_at=int(cast(int | str, value["next_run_at"])),

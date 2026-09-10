@@ -178,9 +178,9 @@ async def test_dm_enrollment_adapter_propagates_rpc_failure_without_completing_c
 
     with pytest.raises(RPCError, match="enrollment failed"):
         await adapter.run_slice(RpcAttemptBudget(limit=1))
-    assert conn.execute(
-        "SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_status'"
-    ).fetchone() == ("in_progress",)
+    assert conn.execute("SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_status'").fetchone() == (
+        "in_progress",
+    )
 
 
 @pytest.mark.asyncio
@@ -363,7 +363,9 @@ async def test_delta_gap_adapter_propagates_coordinator_outcomes_without_checkpo
 ) -> None:
     dialog_id = 206
     _seed_history_dialog(conn, dialog_id, status="synced", refresh_requested_at=1)
-    conn.execute("INSERT INTO messages (dialog_id, message_id, sent_at, text) VALUES (?, 10, 1, 'baseline')", (dialog_id,))
+    conn.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, text) VALUES (?, 10, 1, 'baseline')", (dialog_id,)
+    )
     conn.commit()
 
     async def iter_messages(**_kwargs: object) -> AsyncIterator[object]:
@@ -438,7 +440,9 @@ async def test_full_sync_page_adapter_propagates_rpc_failure_and_preserves_progr
     adapter = FullSyncDemandAdapter(FullSyncWorker(SimpleNamespace(get_messages=get_messages), conn, asyncio.Event()))
     with pytest.raises(RPCError, match="history failed"):
         await adapter.run_slice(RpcAttemptBudget(limit=1))
-    assert conn.execute("SELECT status, sync_progress FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+    assert conn.execute(
+        "SELECT status, sync_progress FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (
         "syncing",
         77,
     )

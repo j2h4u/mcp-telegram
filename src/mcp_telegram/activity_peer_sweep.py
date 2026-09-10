@@ -744,7 +744,7 @@ def _set_working_set_enrollment_position(
         else:
             conn.execute(
                 "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
-            (_ENROLLMENT_NEXT_ATTEMPT_AT_KEY, str(retry_at)),
+                (_ENROLLMENT_NEXT_ATTEMPT_AT_KEY, str(retry_at)),
             )
 
 

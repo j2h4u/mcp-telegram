@@ -113,9 +113,7 @@ class ArchiveIncrementalDemandAdapter(DurableDemandAdapter):
         if last_sync_at == 0:
             return None
         return DemandStatus(
-            0.0
-            if state.get(_INCREMENTAL_MIN_DATE_KEY) is not None
-            else float(last_sync_at) + self.interval_s,
+            0.0 if state.get(_INCREMENTAL_MIN_DATE_KEY) is not None else float(last_sync_at) + self.interval_s,
             float(last_sync_at) + self.interval_s,
         )
 
