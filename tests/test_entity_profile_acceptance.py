@@ -245,10 +245,7 @@ async def test_file_backed_pending_pair_shutdown_preserves_state_then_reopens_fo
     assert all(result["ok"] is True for result in results)
     assert all(result["data"]["completeness"] == "partial" for result in results)
     assert client.full_user_calls == 0
-    after = {
-        table: conn.execute(f"SELECT * FROM {table} ORDER BY 1, 2").fetchall()
-        for table in before
-    }
+    after = {table: conn.execute(f"SELECT * FROM {table} ORDER BY 1, 2").fetchall() for table in before}
     assert after == before
     conn.close()
 
