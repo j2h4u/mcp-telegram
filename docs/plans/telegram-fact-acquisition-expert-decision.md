@@ -103,6 +103,76 @@ same exact acquisition. A follower timeout must not cancel shared work.
 8. Telemetry contains aggregate outcomes only, without Telegram identifiers,
    selectors, content, or stable behavioral fingerprints.
 
+## Implementation adjudication addendum
+
+Source-level discovery exposed a gap between the architectural decision and the
+current progressive profile transaction. A section cursor alone cannot prove
+that two section outcomes belong to the same logical refresh, cannot survive an
+ABA return to the same cursor, and cannot prevent an older response from
+overwriting a newer canonical observation. The implementation therefore uses an
+additive, Entity Profile-specific generation and revision fence.
+
+Extend the existing profile state rather than creating an acquisition store:
+
+- each logical refresh has a non-reused generation, start time, captured pair
+  eligibility, and a persisted follow-up-demand marker;
+- each section may carry bounded Entity Profile acquisition evidence containing
+  its generation, outcome, provenance, normalization version, and original
+  observation interval;
+- canonical entity/profile writes advance a revision used for compare-and-swap
+  protection of response-bearing commits;
+- migration preserves old facts, cursors, retry state, and pending work but
+  invents no receipt, provenance, completeness, or observation time.
+
+The combined operation validates one `GetFullUser` envelope and normalizes two
+independent outcomes. It commits both projections, their evidence, and durable
+progress in one short transaction after checking generation, cursor, and
+revision. It advances from `full_profile` to `common_chats`; the intervening
+sections retain their established order. When the cursor later reaches
+`personal_channel`, a terminal outcome for the same generation advances locally
+without changing its observation time or making an unavailable result reusable
+in a later generation.
+
+Same-generation completion and cross-generation freshness reuse are different
+claims. An unavailable or partial personal-channel result may complete that
+operation in the current generation, while only an applicable positive or
+authoritative-absence receipt satisfying identity, coverage, and TTL may avoid
+work in a later generation. If a new freshness demand arrives after a completed
+section expires while the current generation is still running, the persisted
+follow-up marker starts a new generation when the current one terminates.
+
+Reuse identity includes the authenticated account and session generation, typed
+entity, `users.GetFullUser` semantics, normalization version, and declared
+fields. Missing or invalid identity disables reuse. No auth key, Telegram ID,
+generation value, selector, or stable fingerprint is exposed through MCP or
+operational telemetry.
+
+Observation starts immediately before the admitted operation and completes
+after response validation. Freshness uses the conservative original start and
+expires at equality with the TTL. Commit, restart, recomposition, and later
+section advancement never renew it. Invalid time boundaries cannot authorize
+reuse.
+
+Fields acquired from `FullUser` have an explicit ownership list. Local channel
+metadata, folder information, and message previews retain their own provenance
+and are recomposed from current canonical projections. A cached preview is never
+replayed through a message writer, so edits and tombstones remain authoritative.
+
+A valid envelope with optional channel deficiencies may commit a usable profile
+and an honest partial or unavailable channel outcome. Invalid envelope identity,
+transport failure, timeout, or FloodWait creates no positive evidence or
+successful cursor advancement. Retry bookkeeping may still be persisted.
+
+The feature has a migration-aware configuration switch. Disabled mode preserves
+the two existing acquisitions while retaining new fencing and observe-only
+eligibility metrics. Enabled mode combines the pair. The supported rollback is
+disabling the switch on a release that understands the additive schema; an
+arbitrary older binary is not promised to support that schema.
+
+This addendum remains domain-local. It introduces no generic fact cache, raw
+Telegram response persistence, second scheduler, new database, durable lease,
+or generalized range-coverage logic.
+
 ## Overlap that remains intentional
 
 Realtime processing, Telegram difference recovery, reconnect recovery, delta
