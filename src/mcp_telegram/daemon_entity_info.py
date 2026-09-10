@@ -895,7 +895,7 @@ class DaemonEntityInfoService:
                     reuse_rejection_reason=reuse_rejection_reason,
                 )
             )
-        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+        except (TimeoutError, OSError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
             raise_if_flood_wait_error(exc)
             return self._handle_full_user_pair_failure(
                 _PairFailure(
