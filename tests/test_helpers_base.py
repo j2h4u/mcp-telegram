@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 from typing import Protocol, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -17,11 +16,6 @@ from mcp_telegram.tools._base import (
     _send_telemetry_event,
     _track_tool_telemetry,
 )
-
-
-class _HeartbeatHandlerManager(Protocol):
-    refresh_synced_dialogs: AsyncMock
-    run_dm_gap_scan: AsyncMock
 
 
 class _TelemetryConnection(Protocol):
@@ -78,95 +72,6 @@ def test_check_daemon_response_passes_extra_kwargs():
     assert result is not None
     assert result.has_filter is True
     assert result.has_cursor is True
-
-
-# ---------------------------------------------------------------------------
-# _maybe_heartbeat_and_gap_scan (M-11)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_maybe_heartbeat_fires_when_interval_elapsed():
-    """Heartbeat fires when enough time has passed."""
-    from mcp_telegram.daemon import HEARTBEAT_INTERVAL_S, _maybe_heartbeat_and_gap_scan, _SyncLoopState
-    from mcp_telegram.event_handlers import EventHandlerManager
-
-    conn_mock = MagicMock(spec=sqlite3.Connection)
-    # Make the stats query return something
-    cursor_fetchall = MagicMock(return_value=[("synced", 1)])
-    mock_cursor = MagicMock()
-    mock_cursor.fetchall = cursor_fetchall
-    execute = MagicMock()
-    execute.return_value = mock_cursor
-    conn_mock.execute = execute
-    conn = cast(sqlite3.Connection, conn_mock)
-
-    client = MagicMock()
-    client.is_connected = MagicMock(return_value=True)
-
-    handler_manager = cast(EventHandlerManager, MagicMock())
-    refresh_synced_dialogs = MagicMock(return_value=None)
-    handler_manager.refresh_synced_dialogs = refresh_synced_dialogs
-
-    import time
-
-    sync_start = time.monotonic()
-    # Set last_heartbeat far in the past to trigger
-    old_heartbeat = sync_start - HEARTBEAT_INTERVAL_S - 1
-    old_gap_scan = sync_start  # gap scan should NOT fire
-
-    state = _SyncLoopState(
-        sync_start=sync_start,
-        last_heartbeat=old_heartbeat,
-        last_gap_scan=old_gap_scan,
-    )
-
-    new_state = await _maybe_heartbeat_and_gap_scan(
-        conn,
-        client,
-        handler_manager,
-        state,
-    )
-
-    assert new_state is state
-    assert state.last_heartbeat > old_heartbeat, "heartbeat timestamp should be updated"
-    assert state.last_gap_scan == old_gap_scan
-    refresh_synced_dialogs.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_maybe_heartbeat_skips_when_recent():
-    """Heartbeat does NOT fire when interval hasn't elapsed."""
-    from mcp_telegram.daemon import _maybe_heartbeat_and_gap_scan, _SyncLoopState
-    from mcp_telegram.event_handlers import EventHandlerManager
-
-    conn = MagicMock(spec=sqlite3.Connection)
-    client = MagicMock()
-    handler_manager = cast(EventHandlerManager, MagicMock())
-    refresh_synced_dialogs = MagicMock(return_value=None)
-    handler_manager.refresh_synced_dialogs = refresh_synced_dialogs
-
-    import time
-
-    now = time.monotonic()
-
-    state = _SyncLoopState(
-        sync_start=now,
-        last_heartbeat=now,
-        last_gap_scan=now,
-    )
-
-    new_state = await _maybe_heartbeat_and_gap_scan(
-        conn,
-        client,
-        handler_manager,
-        state,
-    )
-
-    assert new_state is state
-    assert state.last_heartbeat == now, "heartbeat timestamp should not change"
-    assert state.last_gap_scan == now
-    refresh_synced_dialogs.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

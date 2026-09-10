@@ -2,7 +2,7 @@
 
 Populates own-message rows (out=1) in the unified messages table
 via messages.Search(InputPeerEmpty, from_id=InputPeerSelf).
-Runs as a named daemon background task alongside run_access_probe_loop.
+Durable archive pages are exposed through demand adapters.
 """
 
 import asyncio
@@ -20,7 +20,6 @@ from telethon.tl.functions.messages import SearchRequest
 from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, InputPeerSelf
 
 from .activity_substrate import ActivityClient, call_with_timeout
-from .demand_shadow_wiring import DemandCycleRunner
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled, sleep_through_flood
 from .hydration_queue import HydrationPriority
@@ -39,12 +38,17 @@ from .telegram_demand import (
     demand_context,
 )
 from .telegram_rpc_consumers import DemandKind
-from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_attempt_budget, rpc_scope
+from .telegram_rpc_scheduler import (
+    RpcAdmissionClosedError,
+    TelegramRpcSource,
+    current_rpc_scope,
+    rpc_attempt_budget,
+    rpc_scope,
+)
 from .telethon_dialog import classify_dialog_type
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_INTERVAL_S = 3600.0
 _BACKFILL_BATCH_LIMIT = 100
 _SECONDS_PER_MINUTE = 60
 _SECONDS_PER_HOUR = 60 * _SECONDS_PER_MINUTE
@@ -111,12 +115,13 @@ class ArchiveIncrementalDemandAdapter(DurableDemandAdapter):
         state = _load_state(self.conn)
         if state.get("backfill_complete") != "1":
             return None
-        if state.get(_INCREMENTAL_MIN_DATE_KEY) is not None:
-            return DemandStatus(release_at=0.0)
         last_sync_at = int(state.get("last_sync_at") or 0)
         if last_sync_at == 0:
             return None
-        return DemandStatus(release_at=float(last_sync_at) + self.interval_s)
+        return DemandStatus(
+            0.0 if state.get(_INCREMENTAL_MIN_DATE_KEY) is not None else float(last_sync_at) + self.interval_s,
+            float(last_sync_at) + self.interval_s,
+        )
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
         """Fetch and commit at most one incremental search page."""
@@ -169,16 +174,12 @@ class _IncrementalBatchLog:
 
 _SEARCH_BATCH_RETRY = object()
 _SEARCH_BATCH_STOP = object()
-_INCREMENTAL_BATCH_CONTINUE = object()
-_INCREMENTAL_BATCH_BREAK = object()
-_INCREMENTAL_BATCH_RETURN = object()
 
 
 class _SearchEntityLike(Protocol):
     id: int
     first_name: str | None
     last_name: str | None
-    title: str | None
     username: str | None
 
 
@@ -191,7 +192,6 @@ class _SearchResultLike(Protocol):
     users: Sequence[_SearchEntityLike] | None
     chats: Sequence[_SearchEntityLike] | None
     messages: Sequence[_SearchMessageLike] | None
-    count: int | None
 
 
 _SyncStateRow = tuple[str, str | None]
@@ -210,7 +210,7 @@ def _validate_status_now(now: float) -> None:
 
 @contextmanager
 def _archive_demand_scope(kind: DemandKind) -> Iterator[None]:
-    """Install an exact archive operation kind for legacy direct execution."""
+    """Install the exact archive operation kind for an adapter slice."""
     try:
         token = current_demand_token()
     except UnclassifiedTelegramDemandError:
@@ -222,17 +222,20 @@ def _archive_demand_scope(kind: DemandKind) -> Iterator[None]:
     yield
 
 
+def _coordinator_owns_throttle() -> bool:
+    """Return whether the active archive call belongs to a bounded slice."""
+    try:
+        return current_rpc_scope().attempt_budget is not None
+    except UnclassifiedTelegramDemandError:
+        return False
+
+
 def _set_state(conn: sqlite3.Connection, key: str, value: str | None) -> None:
     with conn:
         conn.execute(
             "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
             (key, value),
         )
-
-
-def _stamp_last_sync_at(conn: sqlite3.Connection) -> None:
-    """Record the sync completion timestamp in activity_sync_state."""
-    _set_state(conn, "last_sync_at", str(int(time.time())))
 
 
 def _finish_incremental_slice(conn: sqlite3.Connection) -> None:
@@ -271,58 +274,64 @@ def _optional_entity_attr(obj: object, attr: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _upsert_entities_from_search(conn: sqlite3.Connection, result: _SearchResultLike) -> None:
-    """Upsert users/chats from SearchRequest response into entities table.
+def _user_entity_snapshot(user: object, *, updated_at: int) -> EntitySnapshot | None:
+    etype = _classify_entity(user)
+    if etype is None:
+        return None
+    entity = cast(_SearchEntityLike, user)
+    first_name = _optional_entity_attr(entity, "first_name")
+    last_name = _optional_entity_attr(entity, "last_name")
+    username = _optional_entity_attr(entity, "username")
+    name = " ".join(p for p in (first_name, last_name) if p) or username
+    return EntitySnapshot(
+        entity_id=int(entity.id),
+        entity_type=etype,
+        name=name,
+        username=username,
+        name_normalized=_normalize(name),
+        updated_at=updated_at,
+    )
 
-    Uses the FULL column set (id, type, name, username, name_normalized, updated_at).
-    `type` and `updated_at` are NOT NULL with no DEFAULT — both MUST be supplied
-    on every row or the INSERT will fail.
-    """
+
+def _chat_entity_snapshot(chat: object, *, updated_at: int) -> EntitySnapshot | None:
     from telethon.utils import get_peer_id
 
-    now = int(time.time())
-    snapshots: list[EntitySnapshot] = []
+    etype = _classify_entity(chat)
+    if etype is None:
+        return None
+    try:
+        pid = int(cast(int | str, get_peer_id(chat)))  # yields -100XXXXX for Channel
+    except TypeError:
+        return None
+    name = _optional_entity_attr(chat, "title")
+    username = _optional_entity_attr(chat, "username")
+    return EntitySnapshot(
+        entity_id=pid,
+        entity_type=etype,
+        name=name,
+        username=username,
+        name_normalized=_normalize(name),
+        updated_at=updated_at,
+    )
 
-    for u in result.users or ():
-        etype = _classify_entity(u)
-        if etype is None:
-            continue
-        first_name = _optional_entity_attr(u, "first_name")
-        last_name = _optional_entity_attr(u, "last_name")
-        username = _optional_entity_attr(u, "username")
-        name = " ".join(p for p in (first_name, last_name) if p) or username
-        snapshots.append(
-            EntitySnapshot(
-                entity_id=int(u.id),
-                entity_type=etype,
-                name=name,
-                username=username,
-                name_normalized=_normalize(name),
-                updated_at=now,
-            )
-        )
 
-    for c in result.chats or ():
-        etype = _classify_entity(c)
-        if etype is None:
-            continue
-        try:
-            pid = int(cast(int | str, get_peer_id(c)))  # yields -100XXXXX for Channel
-        except TypeError:
-            continue
-        name = _optional_entity_attr(c, "title")
-        username = _optional_entity_attr(c, "username")
-        snapshots.append(
-            EntitySnapshot(
-                entity_id=pid,
-                entity_type=etype,
-                name=name,
-                username=username,
-                name_normalized=_normalize(name),
-                updated_at=now,
-            )
-        )
+def _search_entity_snapshots(result: _SearchResultLike, *, updated_at: int) -> list[EntitySnapshot]:
+    snapshots = [
+        snapshot
+        for entity in result.users or ()
+        if (snapshot := _user_entity_snapshot(entity, updated_at=updated_at)) is not None
+    ]
+    snapshots.extend(
+        snapshot
+        for entity in result.chats or ()
+        if (snapshot := _chat_entity_snapshot(entity, updated_at=updated_at)) is not None
+    )
+    return snapshots
 
+
+def _upsert_entities_from_search(conn: sqlite3.Connection, result: _SearchResultLike) -> None:
+    """Upsert complete user/chat identity snapshots from a search response."""
+    snapshots = _search_entity_snapshots(result, updated_at=int(time.time()))
     if not snapshots:
         return
     with conn:
@@ -335,15 +344,6 @@ def _fmt_duration(seconds: int) -> str:
     if seconds < _SECONDS_PER_HOUR:
         return f"{seconds // _SECONDS_PER_MINUTE}m{seconds % _SECONDS_PER_MINUTE:02d}s"
     return f"{seconds // _SECONDS_PER_HOUR}h{(seconds % _SECONDS_PER_HOUR) // _SECONDS_PER_MINUTE:02d}m"
-
-
-async def _wait_for_shutdown(shutdown_event: asyncio.Event, timeout: float) -> bool:
-    """Sleep until shutdown or timeout; return True when shutdown fired."""
-    try:
-        await asyncio.wait_for(shutdown_event.wait(), timeout=timeout)
-        return True
-    except TimeoutError:
-        return False
 
 
 def _extract_own_message_rows(batch: Sequence[_SearchMessageLike]) -> list[ExtractedMessage]:
@@ -413,6 +413,8 @@ async def _search_backfill_batch(
             exc.retry_after_seconds,
             total_fetched,
         )
+        if _coordinator_owns_throttle():
+            raise
         if exc.retry_after_seconds is None:
             return _SEARCH_BATCH_STOP
         if await sleep_through_flood(shutdown_event, exc.retry_after_seconds):
@@ -466,6 +468,8 @@ async def _search_incremental_batch(  # noqa: PLR0913 - explicit worker state an
                 )
     except TelegramRpcThrottled as exc:
         logger.warning("activity_sync_incremental_floodwait seconds=%s", exc.retry_after_seconds)
+        if _coordinator_owns_throttle():
+            raise
         if exc.retry_after_seconds is None:
             return _SEARCH_BATCH_STOP
         if await sleep_through_flood(shutdown_event, exc.retry_after_seconds):
@@ -704,274 +708,3 @@ async def _run_incremental_slice(
         _finish_incremental_slice(conn)
         return
     _commit_incremental_slice_result(conn, cast(_SearchResultLike, result), min_date, batch_started_at)
-
-
-async def _run_backfill(
-    client: ActivityClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    *,
-    timeout_s: float,
-) -> None:
-    """Run the legacy archive backfill under its exact operation root."""
-    with _archive_demand_scope(DemandKind.ARCHIVE_BACKFILL):
-        await _run_backfill_in_scope(client, conn, shutdown_event, timeout_s=timeout_s)
-
-
-async def _run_backfill_in_scope(
-    client: ActivityClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    *,
-    timeout_s: float,
-) -> None:
-    state = _load_state(conn)
-    if state.get("backfill_complete") == "1":
-        logger.debug("activity_sync_backfill_skip reason=already_complete")
-        return
-
-    progress = _BackfillState(
-        checkpoint=int(state.get("backfill_offset_id") or 0),
-        loop_start=time.monotonic(),
-    )
-
-    # Mark that backfill has started so scan_status can distinguish
-    # "never touched" from "running but not yet done".
-    with conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO activity_sync_state (key, value) VALUES ('backfill_started_at', ?)",
-            (str(int(time.time())),),
-        )
-
-    logger.info("activity_sync_backfill_start offset_id=%d", progress.checkpoint)
-
-    while not shutdown_event.is_set():
-        if not await _run_backfill_batch(client, conn, shutdown_event, progress, timeout_s=timeout_s):
-            return
-
-
-async def _run_backfill_batch(
-    client: ActivityClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    progress: _BackfillState,
-    *,
-    timeout_s: float,
-) -> bool:
-    """Fetch, commit, and pace one legacy backfill iteration."""
-    batch_started_at = time.monotonic()
-    result = await _search_backfill_batch(
-        client,
-        progress.checkpoint,
-        shutdown_event,
-        total_fetched=progress.total_fetched,
-        timeout_s=timeout_s,
-    )
-    if result is _SEARCH_BATCH_STOP:
-        return False
-    if result is _SEARCH_BATCH_RETRY:
-        return True
-    if not _commit_backfill_result(conn, progress, cast(_SearchResultLike, result), batch_started_at):
-        return False
-    return not await _wait_for_shutdown(shutdown_event, timeout=_PACING.search.batch_s)
-
-
-def _commit_backfill_result(
-    conn: sqlite3.Connection,
-    progress: _BackfillState,
-    search_result: _SearchResultLike,
-    batch_started_at: float,
-) -> bool:
-    """Persist one backfill page, returning whether the pass should continue."""
-    batch = list(search_result.messages or [])
-    if progress.total_known is None:
-        progress.total_known = cast(int | None, getattr(search_result, "count", None))
-        if progress.total_known is not None:
-            logger.info("activity_sync_backfill_total total=%d", progress.total_known)
-
-    if not batch:
-        _set_state(conn, "backfill_complete", "1")
-        _stamp_last_sync_at(conn)
-        logger.info(
-            "activity_sync_backfill_complete total_fetched=%d batches=%d duration_s=%.3f",
-            progress.total_fetched,
-            progress.batch_num,
-            time.monotonic() - progress.loop_start,
-        )
-        return False
-
-    progress.batch_num += 1
-    extracted = _extract_own_message_rows(batch)
-    _persist_own_message_rows(conn, extracted, priority=HydrationPriority.BACKFILL)
-    _upsert_entities_from_search(conn, search_result)
-    progress.total_fetched += len(batch)
-    progress.checkpoint = min(m.id for m in batch)
-    _set_state(conn, "backfill_offset_id", str(progress.checkpoint))
-    _log_backfill_batch(progress, len(batch), time.monotonic() - batch_started_at)
-    return True
-
-
-async def _run_incremental(
-    client: ActivityClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    *,
-    timeout_s: float,
-) -> None:
-    """Run the legacy incremental archive under its exact operation root."""
-    with _archive_demand_scope(DemandKind.ARCHIVE_INCREMENTAL):
-        await _run_incremental_in_scope(client, conn, shutdown_event, timeout_s=timeout_s)
-
-
-async def _run_incremental_in_scope(
-    client: ActivityClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    *,
-    timeout_s: float,
-) -> None:
-    state = _load_state(conn)
-    if state.get("backfill_complete") != "1":
-        return
-
-    # Anchor by timestamp, not per-chat message_id. Global SearchRequest with
-    # InputPeerEmpty returns messages from many dialogs — each with its own
-    # message_id sequence. Using min_id=MAX(message_id) across chats causes
-    # newer messages in dialogs with lower per-chat IDs to be silently skipped.
-    # min_date is a wall-clock filter applied uniformly across all dialogs.
-    last_sync_at = int(state.get("last_sync_at") or 0)
-    if last_sync_at == 0:
-        return
-
-    # 60-second buffer guards against messages at the exact boundary being
-    # missed when the previous sync finished mid-second.
-    progress = _IncrementalState(min_date=max(0, last_sync_at - 60), loop_start=time.monotonic())
-    logger.debug(
-        "activity_sync_incremental_start min_date=%d window_s=%d",
-        progress.min_date,
-        int(time.time()) - progress.min_date,
-    )
-
-    while not shutdown_event.is_set():
-        outcome = await _run_incremental_batch(client, conn, shutdown_event, progress, timeout_s=timeout_s)
-        if outcome is _INCREMENTAL_BATCH_CONTINUE:
-            continue
-        if outcome is _INCREMENTAL_BATCH_RETURN:
-            return
-        break
-
-    _stamp_last_sync_at(conn)
-    logger.debug(
-        "activity_sync_incremental_done batches=%d inserted=%d duration_s=%.3f",
-        progress.batch_num,
-        progress.inserted,
-        time.monotonic() - progress.loop_start,
-    )
-
-
-async def _run_incremental_batch(
-    client: ActivityClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    progress: _IncrementalState,
-    *,
-    timeout_s: float,
-) -> object:
-    """Fetch, commit, and pace one legacy incremental iteration."""
-    batch_started_at = time.monotonic()
-    result = await _search_incremental_batch(
-        client,
-        progress.min_date,
-        progress.offset_id,
-        shutdown_event,
-        inserted=progress.inserted,
-        timeout_s=timeout_s,
-    )
-    if result is _SEARCH_BATCH_STOP:
-        _stamp_last_sync_at(conn)
-        return _INCREMENTAL_BATCH_BREAK
-    if result is _SEARCH_BATCH_RETRY:
-        return _INCREMENTAL_BATCH_CONTINUE
-
-    search_result = cast(_SearchResultLike, result)
-    batch = list(search_result.messages or [])
-    if not batch:
-        return _INCREMENTAL_BATCH_BREAK
-
-    # messages.search(InputPeerEmpty) silently ignores min_date — canonical
-    # Telegram-API behavior, see Telethon #218. Apply the date bound
-    # client-side. Batch is ordered newest-first by offset_id, so dates
-    # are monotonically decreasing: once we hit one older than min_date,
-    # every later batch will be older too — break the outer loop.
-    in_window, past_window = _trim_incremental_batch(batch, progress.min_date)
-    extracted = _extract_own_message_rows(in_window)
-    _persist_own_message_rows(conn, extracted, priority=HydrationPriority.FOREGROUND)
-    _upsert_entities_from_search(conn, search_result)
-    progress.inserted += len(in_window)
-    progress.batch_num += 1
-    # Always advance offset_id by the full batch — even messages outside
-    # the window must be skipped past so we don't re-fetch them.
-    progress.offset_id = min(m.id for m in batch)
-
-    # last_sync_at is stamped once at end-of-loop, not per batch:
-    # with the client-side min_date filter the loop terminates within
-    # a few iterations anyway, and a mid-loop shutdown just means the
-    # next incremental re-fetches the in-progress window (UPSERT no-op).
-    _log_incremental_batch(
-        progress,
-        _IncrementalBatchLog(
-            fetched=len(batch),
-            in_window=len(in_window),
-            extracted=len(extracted),
-            inserted=progress.inserted,
-            next_offset_id=progress.offset_id,
-            past_window=past_window,
-        ),
-        time.monotonic() - batch_started_at,
-    )
-    if past_window:
-        return _INCREMENTAL_BATCH_BREAK
-    if await _wait_for_shutdown(shutdown_event, timeout=_PACING.search.batch_s):
-        return _INCREMENTAL_BATCH_RETURN
-    return _INCREMENTAL_BATCH_CONTINUE
-
-
-async def run_activity_sync_loop(  # noqa: PLR0913 - explicit loop dependencies and observation hook
-    client: ActivityClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    *,
-    interval: float = _DEFAULT_INTERVAL_S,
-    timeout_s: float,
-    demand_cycle_runner: DemandCycleRunner | None = None,
-) -> None:
-    """Background task: keep own-message rows (out=1) in messages up-to-date.
-
-    One pass = (backfill if incomplete) + (incremental if backfill complete).
-    Sleeps `interval` between passes, interruptible via shutdown_event.
-    """
-    while not shutdown_event.is_set():
-        logger.debug("activity_sync_loop_start")
-        try:
-            if demand_cycle_runner is None:
-                await _run_backfill(client, conn, shutdown_event, timeout_s=timeout_s)
-                await _run_incremental(client, conn, shutdown_event, timeout_s=timeout_s)
-            else:
-                await demand_cycle_runner(
-                    DemandKind.ARCHIVE_BACKFILL,
-                    lambda: _run_backfill_in_scope(client, conn, shutdown_event, timeout_s=timeout_s),
-                )
-                await demand_cycle_runner(
-                    DemandKind.ARCHIVE_INCREMENTAL,
-                    lambda: _run_incremental_in_scope(client, conn, shutdown_event, timeout_s=timeout_s),
-                )
-        except RpcAdmissionClosedError:
-            raise
-        except Exception:
-            logger.warning("activity_sync_error", exc_info=True)
-        logger.debug("activity_sync_loop_sleeping interval=%.0fs", interval)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
-            return
-        except TimeoutError:
-            pass

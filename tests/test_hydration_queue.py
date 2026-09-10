@@ -129,7 +129,7 @@ def test_priority_specific_limit_keeps_backfill_visible(db: sqlite3.Connection) 
     assert repository.due_jobs(1, 1, priority=HydrationPriority.BACKFILL) == [backfill]
 
 
-def test_snapshot_distinguishes_active_ready_deferred_priority_and_terminal_jobs(db: sqlite3.Connection) -> None:
+def test_snapshot_distinguishes_active_ready_priority_and_terminal_jobs(db: sqlite3.Connection) -> None:
     repository = HydrationQueueRepository(db)
     repository.enqueue(_job("media", 1, 1, 90, attempts=2, message_sent_at=40, priority=HydrationPriority.BACKFILL))
     repository.enqueue(_job("media", 1, 2, 110, attempts=1, message_sent_at=80))
@@ -150,7 +150,6 @@ def test_snapshot_distinguishes_active_ready_deferred_priority_and_terminal_jobs
             max_attempts=2,
         ),
     )
-    assert repository.snapshot(100)[0].deferred == 1
 
 
 def test_enqueue_promotes_existing_backfill_without_resetting_attempts(db: sqlite3.Connection) -> None:

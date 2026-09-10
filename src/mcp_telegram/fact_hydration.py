@@ -9,10 +9,9 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import Protocol, cast
+from typing import Protocol
 
 from .access_lifecycle import set_access_lost
-from .demand_shadow_wiring import DemandShadow, offer_durable_demand, run_legacy_demand_cycle
 from .flood import TelegramRpcThrottled
 from .hydration_queue import (
     MEDIA_METADATA_KIND,
@@ -20,14 +19,12 @@ from .hydration_queue import (
     HydrationJob,
     HydrationOutcome,
     HydrationPriority,
-    HydrationQueueKindSnapshot,
     HydrationQueueRepository,
     HydrationQueueSummary,
 )
-from .maintenance_logging import log_maintenance_cycle
 from .messages.sqlite_hydration_jobs import (
-    MediaMetadataHydrationRepair,
-    TranscriptionHydrationRepair,
+    has_media_metadata_hydration_repair_candidates,
+    has_transcription_hydration_repair_candidates,
     repair_media_metadata_hydration_jobs,
     repair_transcription_hydration_jobs,
 )
@@ -37,6 +34,7 @@ from .telegram_demand import (
     DemandStatus,
     DurableDemandAdapter,
     RpcAttemptBudget,
+    UnclassifiedTelegramDemandError,
     current_demand_token,
 )
 from .telegram_rpc_consumers import DemandKind
@@ -68,23 +66,6 @@ _DROP_LEVELS = {
 def _has_terminal_rpc_symbol(exc: BaseException, symbols: frozenset[str]) -> bool:
     """Match a bounded set of safe Telegram RPC symbols for a handler."""
     return describe_telegram_rpc_error(exc).symbol in symbols
-
-
-@dataclass(frozen=True, slots=True)
-class FactHydrationCycleResult:
-    """Sanitized counters for one bounded worker cycle."""
-
-    requests: int = 0
-    hydrated: int = 0
-    completed: int = 0
-    pending: int = 0
-    retried: int = 0
-    dropped: int = 0
-    stopped: bool = False
-    repaired_transcription_jobs: int = 0
-    repair_has_more: bool = False
-    repaired_media_metadata_jobs: int = 0
-    media_repair_has_more: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,14 +129,12 @@ class HydrationHandler(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class _BatchOutcome:
-    requests: int = 0
     hydrated: int = 0
     completed: int = 0
     pending: int = 0
     retried: int = 0
     dropped: int = 0
     stopped: bool = False
-    admission_rejected: bool = False
     dropped_by_kind: tuple[tuple[str, int], ...] = ()
 
 
@@ -240,21 +219,6 @@ def batch_jobs(
     return _order_hydration_batches(_group_hydration_batches(jobs, handlers), backfill_first=backfill_first)
 
 
-def _load_due_jobs_by_kind(
-    queue: HydrationQueueRepository,
-    effective_now: int,
-    limit: int,
-    handlers: dict[str, HydrationHandler],
-) -> dict[str, list[HydrationJob]]:
-    return {
-        kind: [
-            *queue.due_jobs(effective_now, limit, kind=kind, priority=HydrationPriority.FOREGROUND),
-            *queue.due_jobs(effective_now, limit, kind=kind, priority=HydrationPriority.BACKFILL),
-        ]
-        for kind in handlers
-    }
-
-
 def _append_due_priority_tier(
     selected: list[HydrationJob],
     remaining: dict[str, list[HydrationJob]],
@@ -273,16 +237,13 @@ def _append_due_priority_tier(
             selected.append(tiered[kind].pop(0))
 
 
-def _has_due_priority(jobs: Sequence[HydrationJob], priority: HydrationPriority) -> bool:
-    return any(job.priority == priority for job in jobs)
-
-
 class FactHydrationDemandAdapter(DurableDemandAdapter):
-    """Read one durable hydration tier while the legacy worker executes it.
+    """Expose one durable hydration tier to the sole demand coordinator.
 
     Live and backfill rows share ``hydration_jobs`` but have distinct demand
-    contracts. The priority column is therefore the authoritative partition;
-    this adapter neither selects nor claims rows in PR1 shadow mode.
+    contracts. The priority column is the authoritative partition. Missing
+    historical jobs are observed without mutation and seeded only by a
+    backfill slice.
     """
 
     def __init__(self, worker: MessageFactHydrationWorker, priority: HydrationPriority) -> None:
@@ -293,22 +254,16 @@ class FactHydrationDemandAdapter(DurableDemandAdapter):
         self.demand_kind = _hydration_demand_kind(priority)
 
     def status(self, now: float) -> DemandStatus | None:
-        """Return the earliest active row in this durable priority tier."""
-        del now
-        row = cast(
-            tuple[object] | None,
-            self._worker._conn.execute(
-                "SELECT MIN(due_at) FROM hydration_jobs WHERE terminal = 0 AND priority = ?",
-                (int(self._priority),),
-            ).fetchone(),
-        )
-        release_at = None if row is None else row[0]
-        if release_at is None:
-            return None
-        return DemandStatus(release_at=float(cast(int | float, release_at)))
+        """Return queued work or a read-only backfill-repair demand."""
+        release_at = self._worker._queue.next_release_at(self._priority)
+        if self._priority is HydrationPriority.BACKFILL and self._worker.has_repair_candidates():
+            return DemandStatus(release_at=now)
+        if release_at is not None:
+            return DemandStatus(release_at=float(release_at))
+        return None
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
-        """Run one compatible queue batch under the actual-attempt budget."""
+        """Seed and run one compatible queue batch within the attempt budget."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
         await self._worker.run_priority_slice(self._priority, budget)
@@ -334,6 +289,7 @@ class MessageFactHydrationWorker:
         backfill_debt_limit: int,
         clock: Callable[[], float] = time.time,
     ) -> None:
+        del circuit_retry_seconds
         self._client = client
         self._conn = conn
         self._shutdown_event = shutdown_event
@@ -342,90 +298,18 @@ class MessageFactHydrationWorker:
             if handler.kind in self._handlers:
                 raise ValueError(f"fact hydration handler kind must be unique: {handler.kind}")
             self._handlers[handler.kind] = handler
-        self._max_requests_per_cycle = max_requests_per_cycle
         self._max_jobs_per_cycle = max_jobs_per_cycle
         if self._max_jobs_per_cycle < len(self._handlers):
             raise ValueError("fact hydration max_jobs_per_cycle must cover registered handler kinds")
         request_capacity = sum(handler.request_cost for handler in self._handlers.values())
-        if self._max_requests_per_cycle < request_capacity:
+        if max_requests_per_cycle < request_capacity:
             raise ValueError("fact hydration max_requests_per_cycle must cover registered handler costs")
-        self._interval_seconds = interval_seconds
         self._retry_delay_seconds = retry_delay_seconds
         self._max_attempts = max_attempts
-        self._pause_between_requests_seconds = pause_between_requests_seconds
         self._clock = clock
         if backfill_debt_limit <= 0:
             raise ValueError("fact hydration backfill_debt_limit must be positive")
-        self._backfill_debt_limit = backfill_debt_limit
-        self._backfill_debt = 0
-        self._backfill_waiting = False
         self._queue = HydrationQueueRepository(conn)
-        self._demand_shadow: DemandShadow | None = None
-
-    def bind_demand_shadow(self, shadow: DemandShadow) -> None:
-        """Attach the observation-only coordinator after daemon composition."""
-        self._demand_shadow = shadow
-
-    async def run_cycle(self, *, now: int | None = None) -> FactHydrationCycleResult:
-        effective_now = int(self._clock()) if now is None else now
-        transcription_repair, media_repair = self._run_repair_producers(effective_now)
-        # The repair is a producer transaction. Commit before any awaited RPC.
-        self._conn.commit()
-        if transcription_repair is not None and transcription_repair.enqueued:
-            offer_durable_demand(
-                self._demand_shadow,
-                DemandKind.LIVE_HYDRATION_BATCH,
-                DemandKind.BACKFILL_HYDRATION_BATCH,
-            )
-        if media_repair is not None and media_repair.enqueued:
-            offer_durable_demand(
-                self._demand_shadow,
-                DemandKind.LIVE_HYDRATION_BATCH,
-                DemandKind.BACKFILL_HYDRATION_BATCH,
-            )
-        due = self._fair_due_jobs(effective_now)
-        repair_fields = self._repair_result_fields(transcription_repair, media_repair)
-        if not due:
-            result = FactHydrationCycleResult(
-                repaired_transcription_jobs=repair_fields[0],
-                repair_has_more=repair_fields[1],
-                repaired_media_metadata_jobs=repair_fields[2],
-                media_repair_has_more=repair_fields[3],
-            )
-            self._log_cycle(result, {}, self._queue.snapshot(effective_now), now=effective_now)
-            return result
-        selected_by_kind: dict[str, int] = defaultdict(int)
-        for job in due:
-            selected_by_kind[job.kind] += 1
-        request_batches = batch_jobs(
-            due,
-            self._handlers,
-            backfill_first=self._backfill_debt >= self._backfill_debt_limit,
-        )
-        outcome, per_kind, backfill_admitted = await self._run_batches(request_batches, int(effective_now))
-        if self._backfill_waiting:
-            if backfill_admitted:
-                self._backfill_debt = 0
-            else:
-                self._backfill_debt = min(self._backfill_debt + 1, self._backfill_debt_limit)
-        else:
-            self._backfill_debt = 0
-        result = replace(
-            outcome,
-            repaired_transcription_jobs=repair_fields[0],
-            repair_has_more=repair_fields[1],
-            repaired_media_metadata_jobs=repair_fields[2],
-            media_repair_has_more=repair_fields[3],
-        )
-        self._log_cycle(
-            result,
-            per_kind,
-            self._queue.snapshot(effective_now),
-            now=effective_now,
-            selected=len(due),
-            selected_by_kind=selected_by_kind,
-        )
-        return result
 
     async def run_priority_slice(self, priority: HydrationPriority, budget: RpcAttemptBudget) -> None:
         """Run at most one due batch from a single durable priority tier."""
@@ -433,9 +317,16 @@ class MessageFactHydrationWorker:
             raise TypeError("priority must be a HydrationPriority")
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
-        if budget.exhausted or self._shutdown_event.is_set():
+        if self._shutdown_event.is_set():
             return
         effective_now = int(self._clock())
+        if priority is HydrationPriority.BACKFILL:
+            self._run_repair_producers(effective_now)
+            # Repair is a producer transaction. Durable continuation must exist
+            # before the slice can await Telegram or yield on its attempt budget.
+            self._conn.commit()
+        if budget.exhausted:
+            return
         per_kind = {
             kind: self._queue.due_jobs(
                 effective_now,
@@ -466,213 +357,22 @@ class MessageFactHydrationWorker:
             attempt_budget=budget,
         )
 
-    def _run_repair_producers(
-        self, effective_now: int
-    ) -> tuple[TranscriptionHydrationRepair | None, MediaMetadataHydrationRepair | None]:
-        transcription_repair: TranscriptionHydrationRepair | None = None
+    def has_repair_candidates(self) -> bool:
+        """Return whether a bounded backfill repair can create durable work."""
+        if TRANSCRIPTION_HYDRATION_KIND in self._handlers and has_transcription_hydration_repair_candidates(self._conn):
+            return True
+        return MEDIA_METADATA_KIND in self._handlers and has_media_metadata_hydration_repair_candidates(self._conn)
+
+    def _run_repair_producers(self, effective_now: int) -> None:
         if TRANSCRIPTION_HYDRATION_KIND in self._handlers:
-            transcription_repair = repair_transcription_hydration_jobs(
-                self._conn, due_at=effective_now, max_jobs=self._max_jobs_per_cycle
-            )
-        media_repair: MediaMetadataHydrationRepair | None = None
+            repair_transcription_hydration_jobs(self._conn, due_at=effective_now, max_jobs=self._max_jobs_per_cycle)
         media_handler = self._handlers.get(MEDIA_METADATA_KIND)
         if media_handler is not None:
-            media_repair = repair_media_metadata_hydration_jobs(
+            repair_media_metadata_hydration_jobs(
                 self._conn,
                 due_at=effective_now,
                 max_jobs=min(media_handler.batch_size, self._max_jobs_per_cycle),
             )
-        return transcription_repair, media_repair
-
-    @staticmethod
-    def _repair_result_fields(
-        transcription_repair: TranscriptionHydrationRepair | None,
-        media_repair: MediaMetadataHydrationRepair | None,
-    ) -> tuple[int, bool, int, bool]:
-        return (
-            0 if transcription_repair is None else transcription_repair.enqueued,
-            False if transcription_repair is None else transcription_repair.has_more,
-            0 if media_repair is None else media_repair.enqueued,
-            False if media_repair is None else media_repair.has_more,
-        )
-
-    def _fair_due_jobs(self, effective_now: int) -> list[HydrationJob]:
-        per_kind = _load_due_jobs_by_kind(self._queue, effective_now, self._max_jobs_per_cycle, self._handlers)
-        self._backfill_waiting = any(_has_due_priority(jobs, HydrationPriority.BACKFILL) for jobs in per_kind.values())
-        selected: list[HydrationJob] = []
-        remaining = {kind: list(jobs) for kind, jobs in per_kind.items()}
-        priority_order = (
-            (HydrationPriority.BACKFILL, HydrationPriority.FOREGROUND)
-            if self._backfill_debt >= self._backfill_debt_limit
-            else (HydrationPriority.FOREGROUND, HydrationPriority.BACKFILL)
-        )
-        for priority in priority_order:
-            _append_due_priority_tier(selected, remaining, priority, self._max_jobs_per_cycle)
-        return selected
-
-    def _log_cycle(  # noqa: PLR0913 - one log record combines cycle outcome with current queue state
-        self,
-        result: FactHydrationCycleResult,
-        per_kind: dict[str, tuple[int, int, int, int, int, int]],
-        queue_snapshot: Sequence[HydrationQueueKindSnapshot],
-        *,
-        now: int,
-        selected: int = 0,
-        selected_by_kind: dict[str, int] | None = None,
-    ) -> None:
-        snapshot_by_kind = {snapshot.kind: snapshot for snapshot in queue_snapshot}
-        did_work = any(
-            (
-                selected,
-                result.repaired_transcription_jobs,
-                result.repaired_media_metadata_jobs,
-                result.stopped,
-            )
-        )
-        log_maintenance_cycle(
-            logger,
-            did_work,
-            "message_fact_hydration cycle selected=%d requests=%d hydrated=%d completed=%d "
-            "pending=%d retried=%d dropped=%d stopped=%s repaired_transcription_jobs=%d repair_has_more=%s "
-            "repaired_media_metadata_jobs=%d media_repair_has_more=%s "
-            "queue_active=%d queue_ready=%d queue_deferred=%d queue_terminal=%d queue_outcomes=%s",
-            selected,
-            result.requests,
-            result.hydrated,
-            result.completed,
-            result.pending,
-            result.retried,
-            result.dropped,
-            result.stopped,
-            result.repaired_transcription_jobs,
-            result.repair_has_more,
-            result.repaired_media_metadata_jobs,
-            result.media_repair_has_more,
-            sum(snapshot.active for snapshot in queue_snapshot),
-            sum(snapshot.ready for snapshot in queue_snapshot),
-            sum(snapshot.deferred for snapshot in queue_snapshot),
-            sum(snapshot.terminal for snapshot in queue_snapshot),
-            ",".join(f"{outcome}:{count}" for outcome, count in self._queue.outcome_counts()) or "none",
-        )
-        selected_by_kind = selected_by_kind or {}
-        for kind in self._handlers:
-            requests, hydrated, completed, pending, retried, dropped = per_kind.get(kind, (0, 0, 0, 0, 0, 0))
-            snapshot = snapshot_by_kind.get(
-                kind,
-                HydrationQueueKindSnapshot(
-                    kind=kind,
-                    active=0,
-                    ready=0,
-                    foreground=0,
-                    backfill=0,
-                    terminal=0,
-                    oldest_message_sent_at=None,
-                    newest_message_sent_at=None,
-                    max_attempts=0,
-                ),
-            )
-            logger.debug(
-                "message_fact_hydration kind=%s selected=%d requests=%d hydrated=%d completed=%d pending=%d "
-                "retried=%d dropped=%d queue_active=%d queue_ready=%d queue_deferred=%d "
-                "queue_foreground=%d queue_backfill=%d "
-                "queue_terminal=%d oldest_message_age_s=%s newest_message_age_s=%s max_attempts=%d",
-                kind,
-                selected_by_kind.get(kind, 0),
-                requests,
-                hydrated,
-                completed,
-                pending,
-                retried,
-                dropped,
-                snapshot.active,
-                snapshot.ready,
-                snapshot.deferred,
-                snapshot.foreground,
-                snapshot.backfill,
-                snapshot.terminal,
-                self._message_age(now, snapshot.oldest_message_sent_at),
-                self._message_age(now, snapshot.newest_message_sent_at),
-                snapshot.max_attempts,
-            )
-
-    @staticmethod
-    def _message_age(now: int, sent_at: int | None) -> int | None:
-        return None if sent_at is None else max(0, now - sent_at)
-
-    async def _run_batches(
-        self, request_batches: Sequence[Sequence[HydrationJob]], effective_now: int
-    ) -> tuple[FactHydrationCycleResult, dict[str, tuple[int, int, int, int, int, int]], bool]:
-        requests = hydrated = completed = pending = retried = dropped = 0
-        stopped = False
-        used_requests = 0
-        backfill_admitted = False
-        per_kind: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0, 0, 0])
-        for batch_index, batch in enumerate(request_batches):
-            handler = self._handlers[batch[0].kind]
-            if not self._batch_can_run(handler, used_requests):
-                break
-            used_requests += handler.request_cost
-            outcome = await self._process_batch(handler, batch, effective_now)
-            backfill_admitted = backfill_admitted or (
-                batch[0].priority == HydrationPriority.BACKFILL and not outcome.admission_rejected
-            )
-            batch_counts = self._merge_batch_outcome(handler, outcome, per_kind)
-            requests += batch_counts[0]
-            hydrated += batch_counts[1]
-            completed += batch_counts[2]
-            pending += batch_counts[3]
-            retried += batch_counts[4]
-            dropped += batch_counts[5]
-            if await self._batch_should_stop(outcome, batch_index + 1 < len(request_batches)):
-                stopped = True
-                break
-        return (
-            FactHydrationCycleResult(
-                requests=requests,
-                hydrated=hydrated,
-                completed=completed,
-                pending=pending,
-                retried=retried,
-                dropped=dropped,
-                stopped=stopped,
-            ),
-            {
-                kind: (counters[0], counters[1], counters[2], counters[3], counters[4], counters[5])
-                for kind, counters in per_kind.items()
-            },
-            backfill_admitted,
-        )
-
-    def _batch_can_run(self, handler: HydrationHandler, used_requests: int) -> bool:
-        return (
-            not self._shutdown_event.is_set() and used_requests + handler.request_cost <= self._max_requests_per_cycle
-        )
-
-    @staticmethod
-    def _merge_batch_outcome(
-        handler: HydrationHandler,
-        outcome: _BatchOutcome,
-        per_kind: dict[str, list[int]],
-    ) -> tuple[int, int, int, int, int, int]:
-        values = (
-            outcome.requests,
-            outcome.hydrated,
-            outcome.completed,
-            outcome.pending,
-            outcome.retried,
-            outcome.dropped,
-        )
-        counters = per_kind[handler.kind]
-        for index, value in enumerate(values):
-            counters[index] += value
-        for kind, dropped_for_kind in outcome.dropped_by_kind:
-            per_kind[kind][5] += dropped_for_kind - (outcome.dropped if kind == handler.kind else 0)
-        return values
-
-    async def _batch_should_stop(self, outcome: _BatchOutcome, has_later_batch: bool) -> bool:
-        if outcome.stopped:
-            return True
-        return has_later_batch and await self._pause_between_requests()
 
     async def _process_batch(  # noqa: PLR0911 - each transport outcome owns one durable recovery path
         self,
@@ -686,14 +386,22 @@ class MessageFactHydrationWorker:
         if not started:
             self._log_drops(batch, preflight_observations)
             return _BatchOutcome(dropped=len(preflight_observations))
+        attempts_before_request = None if attempt_budget is None else attempt_budget.attempts
         try:
             result = await self._request_batch(handler, started, attempt_budget=attempt_budget)
         except TelegramRpcAdmissionDeferred as exc:
             return self._handle_admission_rejection(handler, batch, started, preflight_observations, exc, effective_now)
         except TelegramRpcThrottled as exc:
-            if exc.retry_after_seconds is None:
-                return self._handle_circuit_open(handler, batch, started, preflight_observations, effective_now)
-            return self._handle_flood_wait(handler, batch, started, preflight_observations, exc, effective_now)
+            return self._handle_throttle(
+                handler,
+                batch,
+                started,
+                preflight_observations,
+                exc,
+                effective_now,
+                attempt_budget=attempt_budget,
+                attempts_before_request=attempts_before_request,
+            )
         except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
             return self._handle_admission_rejection(handler, batch, started, preflight_observations, exc, effective_now)
         except RpcAdmissionClosedError as exc:
@@ -719,12 +427,7 @@ class MessageFactHydrationWorker:
         *,
         attempt_budget: RpcAttemptBudget | None = None,
     ) -> object:
-        """Run one tier-specific request under a fresh root demand context.
-
-        The legacy worker loop is launched under the backfill source, but a
-        cycle may select live rows. A short child task clears that loop context
-        so the selected priority, rather than the launcher, owns attribution.
-        """
+        """Run one tier-specific request under its selected root demand."""
         source = _hydration_rpc_source(jobs[0].priority)
 
         async def request() -> object:
@@ -742,16 +445,16 @@ class MessageFactHydrationWorker:
                 demand_token=current_demand_token(),
             )
 
-        if self._demand_shadow is None:
-            return await create_scoped_rpc_task(
-                request(),
-                source=source,
-                name=f"fact-hydration-{jobs[0].priority.name.lower()}-batch",
-            )
-        return await run_legacy_demand_cycle(
-            self._demand_shadow,
-            _hydration_demand_kind(jobs[0].priority),
-            dispatch,
+        try:
+            active_token = current_demand_token()
+        except UnclassifiedTelegramDemandError:
+            active_token = None
+        if active_token is not None and active_token.kind is _hydration_demand_kind(jobs[0].priority):
+            return await dispatch()
+        return await create_scoped_rpc_task(
+            request(),
+            source=source,
+            name=f"fact-hydration-{jobs[0].priority.name.lower()}-batch",
         )
 
     def _handle_admission_rejection(  # noqa: PLR0913, PLR0917
@@ -781,7 +484,6 @@ class MessageFactHydrationWorker:
             dropped=len(preflight_observations),
             retried=retried,
             stopped=True,
-            admission_rejected=True,
         )
 
     def _release_undispatched(
@@ -831,10 +533,82 @@ class MessageFactHydrationWorker:
             retry_delay,
         )
         return _BatchOutcome(
-            requests=handler.request_cost,
             retried=retried,
             dropped=len(preflight_observations) + dropped,
             stopped=True,
+        )
+
+    def _handle_throttle(  # noqa: PLR0913, PLR0917
+        self,
+        handler: HydrationHandler,
+        batch: Sequence[HydrationJob],
+        started: Sequence[HydrationJob],
+        preflight_observations: Sequence[HydrationDropObservation],
+        exc: TelegramRpcThrottled,
+        effective_now: int,
+        *,
+        attempt_budget: RpcAttemptBudget | None,
+        attempts_before_request: int | None,
+    ) -> _BatchOutcome:
+        """Preserve domain state, then select coordinator or standalone recovery."""
+        if attempt_budget is not None:
+            assert attempts_before_request is not None
+            self._handle_coordinator_throttle(
+                handler,
+                batch,
+                started,
+                preflight_observations,
+                exc,
+                effective_now,
+                request_dispatched=attempt_budget.attempts > attempts_before_request,
+            )
+            raise exc
+        if exc.retry_after_seconds is None:
+            return self._handle_circuit_open(handler, batch, started, preflight_observations, effective_now)
+        return self._handle_flood_wait(handler, batch, started, preflight_observations, exc, effective_now)
+
+    def _handle_coordinator_throttle(  # noqa: PLR0913, PLR0917
+        self,
+        handler: HydrationHandler,
+        batch: Sequence[HydrationJob],
+        started: Sequence[HydrationJob],
+        preflight_observations: Sequence[HydrationDropObservation],
+        exc: TelegramRpcThrottled,
+        effective_now: int,
+        *,
+        request_dispatched: bool,
+    ) -> None:
+        """Restore durable admission state before the coordinator owns throttling."""
+        if request_dispatched and exc.retry_after_seconds is not None:
+            self._handle_flood_wait(handler, batch, started, preflight_observations, exc, effective_now)
+            return
+
+        error_code = type(exc).__name__
+        if request_dispatched:
+            for job in started:
+                self._queue.reschedule(
+                    job,
+                    job.due_at,
+                    outcome=HydrationOutcome.RPC_PAUSED,
+                    error_code=error_code,
+                )
+        else:
+            for job in started:
+                self._queue.requeue_undispatched(
+                    job,
+                    job.due_at,
+                    outcome=HydrationOutcome.RPC_PAUSED,
+                    error_code=error_code,
+                )
+        self._conn.commit()
+        self._log_drops(batch, preflight_observations)
+        logger.info(
+            "message_fact_hydration coordinator_throttled kind=%s dialog_id=%d jobs=%d dispatched=%s latched=%s",
+            handler.kind,
+            started[0].dialog_id,
+            len(started),
+            request_dispatched,
+            exc.latched,
         )
 
     def _handle_circuit_open(
@@ -854,7 +628,6 @@ class MessageFactHydrationWorker:
             len(started),
         )
         return _BatchOutcome(
-            requests=handler.request_cost,
             dropped=len(preflight_observations),
             stopped=True,
         )
@@ -886,7 +659,6 @@ class MessageFactHydrationWorker:
                 drop_counts[observation.kind] += 1
         dropped_by_kind = tuple(drop_counts.items())
         return _BatchOutcome(
-            requests=handler.request_cost,
             dropped=len(preflight_observations) + sum(summary.job_count for summary in summaries),
             dropped_by_kind=dropped_by_kind,
         )
@@ -907,7 +679,7 @@ class MessageFactHydrationWorker:
             self._conn.commit()
             self._log_drops(batch, preflight_observations)
             self._log_drops(started, self._observations("terminal_rpc", started), descriptor=descriptor)
-            return _BatchOutcome(requests=handler.request_cost, dropped=len(preflight_observations) + len(started))
+            return _BatchOutcome(dropped=len(preflight_observations) + len(started))
         retried, dropped, drop_observations = self._reschedule_or_drop(
             handler,
             started,
@@ -926,7 +698,6 @@ class MessageFactHydrationWorker:
             descriptor.error_type,
         )
         return _BatchOutcome(
-            requests=handler.request_cost,
             retried=retried,
             dropped=len(preflight_observations) + dropped,
         )
@@ -958,7 +729,6 @@ class MessageFactHydrationWorker:
         self._log_drops(started, applied.drop_observations)
         self._conn.commit()
         return _BatchOutcome(
-            requests=handler.request_cost,
             hydrated=applied.hydrated,
             completed=applied.completed,
             pending=pending,
@@ -1118,25 +888,9 @@ class MessageFactHydrationWorker:
             for (reason, kind, dialog_id, error_type, rpc_code, rpc_symbol), grouped_jobs in grouped.items()
         )
 
-    async def _pause_between_requests(self) -> bool:
-        try:
-            await asyncio.wait_for(self._shutdown_event.wait(), timeout=self._pause_between_requests_seconds)
-            return True
-        except TimeoutError:
-            return False
-
-    async def run(self) -> None:
-        while not self._shutdown_event.is_set():
-            await self.run_cycle()
-            try:
-                await asyncio.wait_for(self._shutdown_event.wait(), timeout=self._interval_seconds)
-            except TimeoutError:
-                continue
-
 
 __all__ = [
     "AppliedFacts",
-    "FactHydrationCycleResult",
     "FactHydrationDemandAdapter",
     "HydrationDrop",
     "HydrationDropObservation",

@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
@@ -19,6 +20,7 @@ from mcp_telegram.fact_hydration import (
     FactHydrationDemandAdapter,
     MessageFactHydrationWorker,
 )
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.hydration_queue import HydrationJob, HydrationPriority, HydrationQueueRepository
 from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshDemandAdapter,
@@ -28,10 +30,17 @@ from mcp_telegram.message_fact_refresh import (
 )
 from mcp_telegram.reactions.contracts import ReactionFetchResult, ReactionFreshness, ReactionSnapshot
 from mcp_telegram.reactions.refresh import ReactionFreshener
-from mcp_telegram.telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget
+from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.telegram_demand import (
+    AcquisitionKind,
+    DemandStatus,
+    DurableDemandAdapter,
+    RpcAttemptBudget,
+)
+from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator
 from mcp_telegram.telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from mcp_telegram.telegram_reading import TelegramReadReceiptGateway
-from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_consumers import DURABLE_DEMAND_ORDER, DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcScope,
     TelegramRpcSource,
@@ -132,6 +141,49 @@ class _HydrationHandler:
         return False
 
 
+class _ThrottledHydrationHandler(_HydrationHandler):
+    def __init__(self, error: TelegramRpcThrottled, *, dispatch: bool) -> None:
+        super().__init__()
+        self._error = error
+        self._dispatch = dispatch
+
+    async def request(self, client: object, jobs: Sequence[HydrationJob]) -> object:
+        del client, jobs
+        self.scope = current_rpc_scope()
+        if self._dispatch:
+            assert self.scope.attempt_budget is not None
+            self.scope.attempt_budget.debit()
+        raise self._error
+
+
+class _IdleDemandAdapter:
+    def status(self, now: float) -> DemandStatus | None:
+        del now
+        return None
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        del budget
+
+
+class _DemandObserver:
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    def observe_demand(self, **event: object) -> None:
+        self.events.append(event)
+
+
+def _hydration_coordinator(
+    adapter: DurableDemandAdapter,
+    *,
+    observer: _DemandObserver,
+    shutdown_event: asyncio.Event | None = None,
+) -> TelegramDemandCoordinator:
+    adapters: dict[DemandKind, DurableDemandAdapter] = {kind: _IdleDemandAdapter() for kind in DURABLE_DEMAND_ORDER}
+    adapters[DemandKind.LIVE_HYDRATION_BATCH] = adapter
+    return TelegramDemandCoordinator(adapters, shutdown_event, clock=lambda: 100.0, observer=observer)
+
+
 def _hydration_worker(
     conn: sqlite3.Connection,
     handler: _HydrationHandler,
@@ -156,20 +208,127 @@ def _hydration_worker(
 
 
 @pytest.mark.asyncio
-async def test_live_hydration_batch_gets_fresh_root_inside_backfill_launcher() -> None:
+async def test_hydration_finite_throttle_reschedules_and_defers_through_coordinator() -> None:
     conn = _hydration_db()
     conn.execute(
-        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, priority) VALUES ('test', 1, 1, 1, 1)"
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, priority) "
+        "VALUES ('test', 1, 1, 1, 0, 1)"
     )
+    handler = _ThrottledHydrationHandler(TelegramRpcThrottled(retry_after_seconds=17), dispatch=True)
+    adapter = FactHydrationDemandAdapter(
+        _hydration_worker(conn, handler, clock=lambda: 100.0), HydrationPriority.FOREGROUND
+    )
+    observer = _DemandObserver()
+    coordinator = _hydration_coordinator(adapter, observer=observer)
+
+    await coordinator._execute_slice(DemandKind.LIVE_HYDRATION_BATCH)
+
+    assert conn.execute(
+        "SELECT due_at, attempts, terminal, last_outcome FROM hydration_jobs WHERE message_id=1"
+    ).fetchone() == (117, 1, 0, "rpc_paused")
+    assert observer.events[-1] == {
+        "outcome": "deferred",
+        "demand_kind": DemandKind.LIVE_HYDRATION_BATCH,
+        "actual_attempts": 1,
+        "queue_age_seconds": None,
+        "freshness_debt_seconds": None,
+        "reason": "flood_wait",
+    }
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_hydration_latched_throttle_restores_undispatched_job_and_stops_coordinator() -> None:
+    conn = _hydration_db()
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, priority) "
+        "VALUES ('test', 1, 1, 1, 2, 1)"
+    )
+    error = TelegramRpcThrottled(latched=True, detail="test circuit open")
+    handler = _ThrottledHydrationHandler(error, dispatch=False)
+    adapter = FactHydrationDemandAdapter(
+        _hydration_worker(conn, handler, clock=lambda: 100.0), HydrationPriority.FOREGROUND
+    )
+    observer = _DemandObserver()
+    shutdown_event = asyncio.Event()
+    coordinator = _hydration_coordinator(adapter, observer=observer, shutdown_event=shutdown_event)
+
+    with pytest.raises(TelegramRpcThrottled, match="test circuit open"):
+        await coordinator._execute_slice(DemandKind.LIVE_HYDRATION_BATCH)
+
+    assert shutdown_event.is_set()
+    assert conn.execute(
+        "SELECT due_at, attempts, terminal, last_outcome, last_error_code FROM hydration_jobs WHERE message_id=1"
+    ).fetchone() == (1, 2, 0, "rpc_paused", "TelegramRpcThrottled")
+    assert [event["outcome"] for event in observer.events] == ["selected"]
+    conn.close()
+
+
+def _repair_hydration_worker(conn: sqlite3.Connection, handler: _HydrationHandler) -> MessageFactHydrationWorker:
+    return MessageFactHydrationWorker(
+        object(),
+        conn,
+        asyncio.Event(),
+        handlers=(handler,),
+        interval_seconds=60,
+        max_requests_per_cycle=2,
+        max_jobs_per_cycle=1,
+        retry_delay_seconds=30,
+        circuit_retry_seconds=30,
+        max_attempts=3,
+        pause_between_requests_seconds=0.01,
+        backfill_debt_limit=1,
+    )
+
+
+def test_backfill_status_reports_repair_candidates_without_mutation(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
+    conn.execute(
+        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
+    )
+    conn.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
+        "VALUES (1, 1, 1, 'other', '{}')"
+    )
+    conn.commit()
     handler = _HydrationHandler()
-    worker = _hydration_worker(conn, handler)
+    handler.kind = "media_metadata"
+    worker = _repair_hydration_worker(conn, handler)
+    adapter = FactHydrationDemandAdapter(worker, HydrationPriority.BACKFILL)
+    before = conn.total_changes
 
-    with rpc_scope(TelegramRpcSource.FACT_HYDRATION_BACKFILL):
-        await worker.run_cycle(now=1)
+    status = adapter.status(100.0)
 
-    assert handler.scope is not None
-    assert handler.scope.demand_kind is DemandKind.LIVE_HYDRATION_BATCH
-    assert handler.scope.acquisition_kind is AcquisitionKind.MESSAGE_LOOKUP
+    assert status == DemandStatus(release_at=100.0)
+    assert conn.total_changes == before
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_slice_seeds_and_processes_repair_candidates(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
+    conn.execute(
+        "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (1, 1, 'explicit', 1)"
+    )
+    conn.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, media_kind, media_payload) "
+        "VALUES (1, 1, 1, 'other', '{}')"
+    )
+    conn.commit()
+    handler = _HydrationHandler()
+    handler.kind = "media_metadata"
+    worker = _hydration_worker(conn, handler, clock=lambda: 100.0)
+    adapter = FactHydrationDemandAdapter(worker, HydrationPriority.BACKFILL)
+
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
     conn.close()
 
 
@@ -177,9 +336,6 @@ async def test_live_hydration_batch_gets_fresh_root_inside_backfill_launcher() -
 async def test_entity_profile_adapter_observes_queue_and_entity_lookup_context() -> None:
     observed: list[tuple[DemandKind | None, AcquisitionKind | None]] = []
     pending = True
-
-    async def refresh(_entity_id: int) -> None:
-        raise AssertionError("process-local refresh worker must not execute")
 
     def status(_now: float) -> DemandStatus | None:
         return DemandStatus(release_at=0.0) if pending else None
@@ -190,7 +346,7 @@ async def test_entity_profile_adapter_observes_queue_and_entity_lookup_context()
         observed.append((scope.demand_kind, scope.acquisition_kind))
         pending = False
 
-    coordinator = EntityRefreshCoordinator(refresh)
+    coordinator = EntityRefreshCoordinator()
     coordinator.bind_durable_executor(status, run_slice)
     adapter = EntityProfileDemandAdapter(coordinator)
     budget = RpcAttemptBudget(limit=1)

@@ -63,7 +63,7 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .access_lifecycle import AccessLossEvidence, set_access_lost
 from .activity_contracts import InputPeerResolver
-from .demand_shadow_wiring import DemandShadow, offer_durable_demand
+from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
 from .history_enrollment import ensure_automatic_dm_enrollment
@@ -534,14 +534,20 @@ class EventHandlerManager:
         self._realtime_history_status: _RealtimeHistoryStatusReader = _SQLiteRealtimeHistoryStatusReader(conn)
         self._topic_metadata = SQLiteTopicMetadataRepository(conn)
         self._self_id: int | None = None
-        self._demand_shadow: DemandShadow | None = None
+        self._demand_sink: DemandOfferSink | None = None
 
-    def bind_demand_shadow(self, shadow: DemandShadow) -> None:
+    def bind_demand_sink(self, sink: DemandOfferSink) -> None:
         """Attach post-commit durable wakeups after daemon composition."""
-        self._demand_shadow = shadow
+        self._demand_sink = sink
+
+    def _require_demand_sink(self) -> DemandOfferSink:
+        sink = self._demand_sink
+        if sink is None:
+            raise RuntimeError("durable demand sink is not bound")
+        return sink
 
     def _offer(self, *kinds: DemandKind) -> None:
-        offer_durable_demand(self._demand_shadow, *kinds)
+        offer_durable_demand(self._require_demand_sink(), *kinds)
 
     def _offer_message_ingestion(self) -> None:
         self._offer(
@@ -2047,6 +2053,11 @@ class EventHandlerManager:
         return total_marked
 
     @_rpc_scope(TelegramRpcSource.DELTA_SYNC)
+    async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        """Verify one bounded deletion page for the durable delta subqueue."""
+        return await self._scan_dm_gap_message_page(dialog_id, message_ids)
+
+    @_rpc_scope(TelegramRpcSource.DELTA_SYNC)
     async def _scan_dm_gap_dialog(self, dialog_id: int, scan_started_at: int) -> int:
         message_ids = list(list_undeleted_message_ids(self._conn, dialog_id, scan_started_at))
         if not message_ids:
@@ -2056,16 +2067,20 @@ class EventHandlerManager:
         # Batch in groups of 100 (Telegram API limit)
         for batch_start in range(0, len(message_ids), 100):
             batch = message_ids[batch_start : batch_start + 100]
-            results = cast(
-                "Sequence[_MessageLike | None]",
-                await self._client.get_messages(dialog_id, ids=batch),
-            )
+            marked += await self._scan_dm_gap_message_page(dialog_id, batch)
+        return marked
 
-            now = int(time.time())
-            with self._conn:  # atomic per-dialog batch
-                for queried_id, returned_msg in zip(batch, results, strict=False):
-                    if returned_msg is None and mark_message_deleted(self._conn, dialog_id, queried_id, now):
-                        marked += 1
+    async def _scan_dm_gap_message_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        results = cast(
+            "Sequence[_MessageLike | None]",
+            await self._client.get_messages(dialog_id, ids=list(message_ids)),
+        )
+        marked = 0
+        now = int(time.time())
+        with self._conn:  # atomic per-dialog batch
+            for queried_id, returned_msg in zip(message_ids, results, strict=False):
+                if returned_msg is None and mark_message_deleted(self._conn, dialog_id, queried_id, now):
+                    marked += 1
         return marked
 
 
@@ -2075,4 +2090,5 @@ _EXPORTED_SYMBOLS = (
     EventHandlerManager.unregister,
     EventHandlerManager.refresh_synced_dialogs,
     EventHandlerManager.run_dm_gap_scan,
+    EventHandlerManager.run_dm_gap_scan_page,
 )

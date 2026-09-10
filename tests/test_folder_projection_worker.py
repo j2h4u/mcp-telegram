@@ -269,6 +269,33 @@ async def test_restart_honors_fresh_success_without_rpc(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_restart_recovers_corrupt_staging_and_runs_fresh_attempt(tmp_path: Path) -> None:
+    conn, repository = _db(tmp_path)
+    repository.replace_snapshot(_snapshot(), ((1, 10),), completed_at=90)
+    with conn:
+        conn.execute(
+            "INSERT INTO daemon_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("folder_snapshot_staging_v1", "{not-json"),
+        )
+    gateway = _Gateway()
+    try:
+        worker = _worker(gateway, repository, now=[100.0])
+        adapter = FolderProjectionDemandAdapter(worker)
+        status = adapter.status(100.0)
+        assert status is not None
+        assert status.release_at == 100.0
+
+        await worker.prime()
+
+        assert gateway.calls == 1
+        assert repository.read_staging() is None
+        assert repository.read_last_outcome() == "success"
+        assert repository.read_last_success_at() == 100
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
 async def test_success_completion_is_after_acquisition_and_drives_due_time(tmp_path: Path) -> None:
     conn, repository = _db(tmp_path)
     now = [100.0]

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import threading
 from dataclasses import dataclass, field, replace
 
@@ -219,80 +218,66 @@ def test_failed_flush_restores_only_its_unpersisted_summary_during_concurrent_ca
     assert summaries_by_source.count((TelegramRpcSource.REALTIME_EVENT.value, 1)) == 2
 
 
-async def test_periodic_flush_persists_a_quiet_window() -> None:
-    recorder = _Recorder()
-    aggregator = RpcAdmissionObservationAggregator(
-        recorder,
-        policy=replace(RuntimeObservationConfig(), rpc_summary_interval_seconds=0.01),
-    )
-    shutdown_event = asyncio.Event()
-    aggregator.observe(_event(RpcAdmissionEventKind.QUEUED))
-
-    flush_task = asyncio.create_task(aggregator.run_periodic_flush(shutdown_event))
-    try:
-        async with asyncio.timeout(0.5):
-            while not recorder.rows:
-                await asyncio.sleep(0)
-    finally:
-        shutdown_event.set()
-        await flush_task
-
-    assert recorder.rows[0]["outcome"] == "summary"
-
-
-def test_demand_evidence_keeps_demand_and_attempt_units_separate() -> None:
+def test_demand_evidence_records_final_coordinator_outcomes_and_bounded_dimensions() -> None:
     recorder = _Recorder()
     aggregator = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), clock=lambda: 0.0)
 
     aggregator.observe_demand(
-        outcome=DemandEvidenceOutcome.OFFERED,
+        outcome=DemandEvidenceOutcome.SELECTED,
         demand_kind=DemandKind.SCHEDULED_REPAIR,
         acquisition_kind=AcquisitionKind.SCHEDULED_MESSAGES_SNAPSHOT,
-        demand_units=4,
+        queue_age_seconds=8.0,
+        freshness_debt_seconds=3.5,
+    )
+    aggregator.observe_demand(
+        outcome=DemandEvidenceOutcome.COMPLETED,
+        demand_kind=DemandKind.SCHEDULED_REPAIR,
+        actual_attempts=2,
     )
     aggregator.observe_demand(
         outcome="deferred",
-        demand_kind=DemandKind.SCHEDULED_REPAIR,
-        acquisition_kind=AcquisitionKind.SCHEDULED_MESSAGES_SNAPSHOT,
-        demand_units=2,
+        demand_kind=DemandKind.SCHEDULED_DISCOVERY,
         actual_attempts=1,
-        oldest_overdue_seconds=3.5,
         reason="capacity",
     )
     aggregator.observe_demand(
-        outcome=DemandEvidenceOutcome.PREDICTED_SELECTION,
-        demand_kind=DemandKind.SCHEDULED_DISCOVERY,
-        predicted_kind=DemandKind.SCHEDULED_REPAIR,
-        selection_match=False,
-        queue_age_seconds=8.0,
+        outcome=DemandEvidenceOutcome.FAILED,
+        demand_kind=DemandKind.ENTITY_PROFILE_REFRESH,
+        actual_attempts=1,
+        reason="x" * 80,
     )
     aggregator.flush(now=300.0)
 
-    assert [row["kind"] for row in recorder.rows] == ["telegram.demand"] * 3
-    offered, deferred, predicted = recorder.rows
-    assert offered["payload"] == {
+    assert [row["kind"] for row in recorder.rows] == ["telegram.demand"] * 4
+    assert [row["outcome"] for row in recorder.rows] == ["selected", "completed", "deferred", "failed"]
+    selected, completed, deferred, failed = recorder.rows
+    assert selected["payload"] == {
         "demand_kind": "scheduled_repair",
         "acquisition_kind": "scheduled_messages_snapshot",
-        "demand_units": 4,
+        "demand_units": 1,
         "actual_attempts": 0,
+        "queue_age_seconds": 8.0,
+        "freshness_debt_seconds": 3.5,
+        "window_seconds": 300,
+    }
+    assert completed["payload"] == {
+        "demand_kind": "scheduled_repair",
+        "demand_units": 1,
+        "actual_attempts": 2,
         "window_seconds": 300,
     }
     assert deferred["reason_code"] == "capacity"
     assert deferred["payload"] == {
-        "demand_kind": "scheduled_repair",
-        "acquisition_kind": "scheduled_messages_snapshot",
-        "demand_units": 2,
-        "actual_attempts": 1,
-        "oldest_overdue_seconds": 3.5,
-        "window_seconds": 300,
-    }
-    assert predicted["payload"] == {
         "demand_kind": "scheduled_discovery",
         "demand_units": 1,
-        "actual_attempts": 0,
-        "queue_age_seconds": 8.0,
-        "predicted_kind": "scheduled_repair",
-        "selection_match": False,
+        "actual_attempts": 1,
+        "window_seconds": 300,
+    }
+    assert failed["reason_code"] == "x" * 64
+    assert failed["payload"] == {
+        "demand_kind": "entity_profile_refresh",
+        "demand_units": 1,
+        "actual_attempts": 1,
         "window_seconds": 300,
     }
 

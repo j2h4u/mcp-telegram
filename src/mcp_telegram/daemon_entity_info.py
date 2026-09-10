@@ -9,18 +9,23 @@ import json
 import logging
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol, cast, runtime_checkable
 
 from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[import-untyped]
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
-from .demand_shadow_wiring import DemandShadow, offer_durable_demand, run_legacy_demand_cycle
+from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .entity_profile.contracts import PROFILE_SECTIONS, completeness
-from .entity_profile.refresh import EntityRefreshCoordinator, RefreshEnqueueResult, RefreshLimits
+from .entity_profile.refresh import (
+    DurableRefreshSliceResult,
+    DurableRefreshTerminal,
+    EntityRefreshCoordinator,
+    RefreshEnqueueResult,
+    RefreshLimits,
+)
 from .entity_profile.repository import EntityProfileRepository, EntityRefreshCursor, EntitySectionCommit
-from .entity_profile.telegram_gateway import BoundedTelegramGateway
 from .entity_store import EntitySnapshot, ensure_entity_stub
 from .flood import TelegramRpcThrottled
 from .folders.read_model import dialog_placement
@@ -225,22 +230,20 @@ class DaemonEntityInfoService:
         self._deps = deps
         self._profiles = EntityProfileRepository(deps.conn, section_ttl_seconds=deps.detail_ttl_seconds)
         self._section_failures: dict[str, str] = {}
-        self._demand_shadow: DemandShadow | None = None
-        self._refresh = (
-            EntityRefreshCoordinator(
-                self._refresh_entity,
-                limits=deps.refresh_limits,
-                on_failure=self._refresh_failed,
-            )
-            if enable_refresh_coordinator
-            else None
-        )
+        self._demand_sink: DemandOfferSink | None = None
+        self._refresh = EntityRefreshCoordinator(limits=deps.refresh_limits) if enable_refresh_coordinator else None
         if self._refresh is not None:
             self._refresh.bind_durable_executor(self._durable_refresh_status, self._run_durable_refresh_slice)
 
-    def bind_demand_shadow(self, shadow: DemandShadow) -> None:
-        """Attach post-commit wakeups and legacy-cycle evidence."""
-        self._demand_shadow = shadow
+    def bind_demand_sink(self, sink: DemandOfferSink) -> None:
+        """Attach post-commit wakeups to the process-wide coordinator."""
+        self._demand_sink = sink
+
+    def _require_demand_sink(self) -> DemandOfferSink:
+        sink = self._demand_sink
+        if sink is None:
+            raise RuntimeError("durable demand sink is not bound")
+        return sink
 
     @property
     def refresh_coordinator(self) -> EntityRefreshCoordinator | None:
@@ -379,6 +382,7 @@ class DaemonEntityInfoService:
             if enqueue_result is RefreshEnqueueResult.REJECTED:
                 self._profiles.mark_refresh_rejected(entity_id, now=now)
                 return self._pending_error(entity_id, "entity profile refresh queue is full")
+            self._persist_refresh_admission(entity_id, enqueue_result, now=now)
             budget = self._deps.refresh_limits.foreground_resolve_seconds
             return self._pending_error(entity_id, f"entity resolution exceeded the {budget:g} second foreground budget")
         if resolve_error is not None or entity is None:
@@ -402,70 +406,39 @@ class DaemonEntityInfoService:
         self._log_stage(entity_id, "core_complete", started_at, detail_type=core.get("type"))
         return result
 
-    async def _refresh_entity(self, entity_id: int) -> None:
-        """Run one refresh under the coordinator-owned scope and deadline."""
-        await run_legacy_demand_cycle(
-            self._demand_shadow,
-            DemandKind.ENTITY_PROFILE_REFRESH,
-            lambda: self._refresh_entity_impl(entity_id),
-        )
-
-    async def _refresh_entity_impl(self, entity_id: int) -> None:
-        started_at = self._deps.now_provider()
-        bounded_client = BoundedTelegramGateway(
-            self._deps.client,
-            timeout_seconds=self._deps.refresh_limits.per_rpc_seconds,
-        )
-        worker = DaemonEntityInfoService(
-            replace(self._deps, client=cast(_EntityInfoClient, bounded_client)),
-            enable_refresh_coordinator=False,
-        )
-        assert self._refresh is not None
-        entity = await self._refresh_resolved_entity(worker, entity_id)
-        core = self._core_from_entity(entity)
-        self._profiles.save_core(core, now=int(self._deps.now_provider()))
-        detail = await self._refresh_detail(worker, entity)
-        now = int(self._deps.now_provider())
-        self._profiles.save_detail(entity_id, detail, now=now, section_outcomes=worker._section_failures)
-        self._deps.logger.info(
-            "entity_profile.refresh outcome=success entity_id=%r duration_s=%.3f refreshed=%d timed_out=%d queue_depth=%d%s",
-            entity_id,
-            self._deps.now_provider() - started_at,
-            len(PROFILE_SECTIONS),
-            0,
-            self._refresh.queue_depth,
-            self._deps.rid(),
-        )
-
     def _durable_refresh_status(self, now: float) -> DemandStatus | None:
         del now
         release_at = self._profiles.next_refresh_release_at()
         return DemandStatus(release_at=release_at) if release_at is not None else None
 
-    async def _run_durable_refresh_slice(self, budget: RpcAttemptBudget) -> None:
+    async def _run_durable_refresh_slice(self, budget: RpcAttemptBudget) -> DurableRefreshSliceResult | None:
         """Execute and commit at most one profile acquisition for one entity."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
         now = int(self._deps.now_provider())
         cursor = self._profiles.next_due_refresh(now=now)
         if cursor is None:
-            return
+            return None
         entity_type = self._stored_entity_type(cursor.entity_id, now=now)
         if entity_type is DialogType.UNKNOWN:
-            await self._acquire_durable_refresh_core(cursor, now=now)
-            return
+            terminal = await self._acquire_durable_refresh_core(cursor, now=now)
+            return DurableRefreshSliceResult(cursor.entity_id, terminal)
         if not self._section_applies(entity_type, cursor.next_section):
-            self._commit_not_applicable_section(cursor, now=now)
-            return
-        await self._acquire_and_commit_profile_section(cursor, entity_type, now=now)
+            committed = self._commit_not_applicable_section(cursor, now=now)
+            return DurableRefreshSliceResult(
+                cursor.entity_id,
+                self._success_if_refresh_finished(cursor, committed=committed),
+            )
+        terminal = await self._acquire_and_commit_profile_section(cursor, entity_type, now=now)
+        return DurableRefreshSliceResult(cursor.entity_id, terminal)
 
     def _stored_entity_type(self, entity_id: int, *, now: int) -> DialogType:
         stored = self._profiles.read(entity_id, now=now)
         raw_type = stored.detail.get("type") if stored is not None else None
         return DialogType.parse(raw_type if isinstance(raw_type, str) else None)
 
-    def _commit_not_applicable_section(self, cursor: EntityRefreshCursor, *, now: int) -> None:
-        self._profiles.commit_section(
+    def _commit_not_applicable_section(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
+        return self._profiles.commit_section(
             cursor,
             EntitySectionCommit(
                 self._not_applicable_section_patch(cursor.next_section),
@@ -480,32 +453,38 @@ class DaemonEntityInfoService:
         entity_type: DialogType,
         *,
         now: int,
-    ) -> None:
+    ) -> DurableRefreshTerminal | None:
         try:
             result = await self._acquire_profile_section(cursor, entity_type)
         except RpcAttemptBudgetExhaustedError:
             raise
         except TelegramRpcThrottled as exc:
             retry_seconds = max(1, int(exc.retry_after_seconds or 1))
-            self._profiles.mark_section_failure(
+            failed = self._profiles.mark_section_failure(
                 cursor,
                 now=now,
                 reason="flood_wait",
                 retry_at=now + retry_seconds,
             )
-            return
+            return DurableRefreshTerminal.FAILURE if failed else None
         except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
             raise_if_flood_wait_error(exc)
-            self._profiles.mark_section_failure(
+            failed = self._profiles.mark_section_failure(
                 cursor,
                 now=now,
                 reason=type(exc).__name__.lower(),
                 retry_at=now + 60,
             )
-            return
-        self._profiles.commit_section(cursor, result, now=now)
+            return DurableRefreshTerminal.FAILURE if failed else None
+        committed = self._profiles.commit_section(cursor, result, now=now)
+        return self._success_if_refresh_finished(cursor, committed=committed)
 
-    async def _acquire_durable_refresh_core(self, cursor: EntityRefreshCursor, *, now: int) -> None:
+    async def _acquire_durable_refresh_core(
+        self,
+        cursor: EntityRefreshCursor,
+        *,
+        now: int,
+    ) -> DurableRefreshTerminal | None:
         """Persist one resolved core so later raw section requests can resume by id."""
         try:
             entity, error = await self._resolve_entity(cursor.entity_id)
@@ -519,22 +498,44 @@ class DaemonEntityInfoService:
                 reason="flood_wait",
                 retry_at=now + retry_seconds,
             )
-            return
+            return self._persisted_failure(cursor.entity_id, now=now)
         if entity is None or error is not None:
-            retry_after = (error or {}).get("_retry_after_seconds") if error is not None else None
+            reason, retry_at = self._refresh_failure_details(error, now=now)
             self._profiles.mark_refresh_failure(
                 cursor.entity_id,
                 now=now,
-                reason="entity_unavailable",
-                retry_at=now + retry_after if isinstance(retry_after, int) and retry_after > 0 else now + 60,
+                reason=reason,
+                retry_at=retry_at,
             )
-            return
+            return self._persisted_failure(cursor.entity_id, now=now)
         self._profiles.save_core(self._core_from_entity(entity), now=now)
         self._profiles.advance_acquisition_cursor(
             cursor,
             next_acquisition_cursor=cursor.acquisition_cursor + 1,
             now=now,
         )
+        return None
+
+    @staticmethod
+    def _refresh_failure_details(error: Mapping[str, object] | None, *, now: int) -> tuple[str, int]:
+        retry_after = error.get("_retry_after_seconds") if error is not None else None
+        if isinstance(retry_after, int) and retry_after > 0:
+            return "flood_wait", now + retry_after
+        return "entity_unavailable", now + 60
+
+    @staticmethod
+    def _success_if_refresh_finished(
+        cursor: EntityRefreshCursor,
+        *,
+        committed: bool,
+    ) -> DurableRefreshTerminal | None:
+        if committed and cursor.next_section == PROFILE_SECTIONS[-1]:
+            return DurableRefreshTerminal.SUCCESS
+        return None
+
+    def _persisted_failure(self, entity_id: int, *, now: int) -> DurableRefreshTerminal | None:
+        state = self._profiles.refresh_state(entity_id, now=now)
+        return DurableRefreshTerminal.FAILURE if state is not None and state.get("status") == "failed" else None
 
     async def _acquire_profile_section(
         self,
@@ -899,41 +900,6 @@ class DaemonEntityInfoService:
     def _legacy_chat_raw_id(entity_id: int) -> int:
         return -entity_id if entity_id < 0 else entity_id
 
-    async def _refresh_resolved_entity(self, worker: DaemonEntityInfoService, entity_id: int) -> object:
-        assert self._refresh is not None
-        entity, error = await self._refresh.run_rpc(lambda: worker._resolve_entity(entity_id))
-        if error is None and entity is not None:
-            return entity
-        retry_after = (error or {}).get("_retry_after_seconds") if error else None
-        if isinstance(retry_after, int) and retry_after > 0:
-            raise TelegramRpcThrottled(retry_after_seconds=retry_after)
-        raise RuntimeError(str(error or "entity unavailable"))
-
-    async def _refresh_detail(self, worker: DaemonEntityInfoService, entity: object) -> dict[str, object]:
-        detail, detail_error = await worker._build_detail_by_type(entity)
-        if detail_error is not None or detail is None:
-            raise RuntimeError(str(detail_error or "detail unavailable"))
-        return detail
-
-    def _refresh_failed(self, entity_id: int, error: BaseException) -> None:
-        refresh = self._refresh
-        assert refresh is not None
-        retry_at = getattr(error, "retry_after_seconds", None)
-        if not isinstance(retry_at, int):
-            retry_at = getattr(error, "seconds", None)
-        now = int(self._deps.now_provider())
-        reason = "flood_wait" if retry_at is not None else type(error).__name__.lower()
-        self._profiles.mark_refresh_failure(
-            entity_id, now=now, reason=reason, retry_at=(now + retry_at if isinstance(retry_at, int) else None)
-        )
-        self._deps.logger.warning(
-            "entity_info.refresh outcome=failed entity_id=%r reason=%s queue_depth=%d%s",
-            entity_id,
-            reason,
-            refresh.queue_depth,
-            self._deps.rid(),
-        )
-
     def _core_from_entity(self, entity: object) -> dict[str, object]:
         entity_id = int(self._deps.get_peer_id(entity))
         dispatch_kind = classify_dialog_type(entity)
@@ -1008,7 +974,7 @@ class DaemonEntityInfoService:
             return
         self._profiles.mark_refresh_queued(entity_id)
         self._set_section_queued(sections)
-        offer_durable_demand(self._demand_shadow, DemandKind.ENTITY_PROFILE_REFRESH)
+        offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
 
     @staticmethod
     def _set_section_rejected(sections: dict[str, dict[str, object]]) -> None:
@@ -1031,7 +997,7 @@ class DaemonEntityInfoService:
             self._profiles.mark_refresh_rejected(entity_id, now=now)
         else:
             self._profiles.mark_pending(entity_id, now=now)
-            offer_durable_demand(self._demand_shadow, DemandKind.ENTITY_PROFILE_REFRESH)
+            offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
 
     @staticmethod
     def _refresh_reason(result: RefreshEnqueueResult) -> str:

@@ -84,7 +84,7 @@ from .daemon_dialog_queries import (
     _LIST_TOPICS_SQL,
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
-from .demand_shadow_wiring import DemandShadow, offer_durable_demand
+from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
 from .entity_profile.refresh import RefreshLimits
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
@@ -560,14 +560,20 @@ class DaemonAPIServer:
         self._health_status = health_status
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
         self._entity_info_service: DaemonEntityInfoService | None = None
-        self._demand_shadow: DemandShadow | None = None
+        self._demand_sink: DemandOfferSink | None = None
         self._conversation_changes_token_codec = ConversationChangesTokenCodec()
 
-    def bind_demand_shadow(self, shadow: DemandShadow) -> None:
-        """Attach post-commit durable wakeups after daemon composition."""
-        self._demand_shadow = shadow
+    def bind_demand_sink(self, sink: DemandOfferSink) -> None:
+        """Attach the process-wide coordinator after daemon composition."""
+        self._demand_sink = sink
         if self._entity_info_service is not None:
-            self._entity_info_service.bind_demand_shadow(shadow)
+            self._entity_info_service.bind_demand_sink(sink)
+
+    def _require_demand_sink(self) -> DemandOfferSink:
+        sink = self._demand_sink
+        if sink is None:
+            raise RuntimeError("durable demand sink is not bound")
+        return sink
 
     def _get_reading_service(self) -> ReadingService:
         """Get memoized reading-service instance with explicit daemon dependencies."""
@@ -1421,11 +1427,11 @@ class DaemonAPIServer:
                 "already_syncing",
                 "preserved_explicit_enable",
             }:
-                offer_durable_demand(self._demand_shadow, DemandKind.FULL_SYNC_PAGE)
+                offer_durable_demand(self._require_demand_sink(), DemandKind.FULL_SYNC_PAGE)
             elif outcome.action == "request_delta_refresh":
-                offer_durable_demand(self._demand_shadow, DemandKind.DELTA_GAP_FILL)
+                offer_durable_demand(self._require_demand_sink(), DemandKind.DELTA_GAP_FILL)
             offer_durable_demand(
-                self._demand_shadow,
+                self._require_demand_sink(),
                 DemandKind.BACKFILL_HYDRATION_BATCH,
                 DemandKind.READ_RECEIPT_BATCH,
             )
@@ -1558,8 +1564,8 @@ class DaemonAPIServer:
                     refresh_limits=self._policy.entity_profile,
                 )
             )
-            if self._demand_shadow is not None:
-                self._entity_info_service.bind_demand_shadow(self._demand_shadow)
+            if self._demand_sink is not None:
+                self._entity_info_service.bind_demand_sink(self._demand_sink)
         return self._entity_info_service
 
     async def _get_entity_info(self, req: dict[str, object]) -> dict:

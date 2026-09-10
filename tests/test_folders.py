@@ -2,17 +2,33 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from telethon.tl.types import (
+    Channel,
+    Chat,
+    ChatPhotoEmpty,
+    InputPeerChannel,
+    InputPeerChat,
+    InputPeerEmpty,
+    InputPeerUser,
+    User,
+)
 
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.folders.contracts import (
     DialogCategory,
     DialogFacts,
+    FolderDialogCursor,
+    FolderDialogItem,
     FolderRule,
     FolderSourceSnapshot,
     FolderSourceUnavailableError,
+    FolderStagingSnapshot,
 )
 from mcp_telegram.folders.membership import matches
 from mcp_telegram.folders.read_repository import (
@@ -25,11 +41,16 @@ from mcp_telegram.folders.refresh import FolderRefresher
 from mcp_telegram.folders.sqlite_repository import (
     SQLiteFolderSnapshotRepository,
 )
-from mcp_telegram.folders.telegram_adapter import TelethonTelegramFolderGateway, _dialog_facts
+from mcp_telegram.folders.telegram_adapter import (
+    TelethonTelegramFolderGateway,
+    _dialog_facts,
+    _offset_peer,
+    _peer_cursor,
+)
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_demand import AcquisitionKind
+from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind
-from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_attempt_budget
 
 
 def _connection(path: Path) -> sqlite3.Connection:
@@ -74,6 +95,34 @@ def test_failed_snapshot_replacement_rolls_back_to_previous_snapshot(tmp_path: P
             _replace_folder_snapshot(conn, [(2, "Duplicate"), (2, "Duplicate")], [])
 
         assert folders_by_dialog(conn) == {10: [{"id": 1, "title": "Existing"}]}
+    finally:
+        conn.close()
+
+
+def test_corrupt_staging_is_discarded_without_touching_published_snapshot(tmp_path: Path) -> None:
+    conn = _connection(tmp_path / "sync.db")
+    try:
+        repository = SQLiteFolderSnapshotRepository(conn)
+        repository.replace_snapshot(
+            FolderSourceSnapshot((FolderRule(9, "Saved"),), (DialogFacts(999, DialogCategory.CONTACT),)),
+            ((9, 999),),
+            completed_at=90,
+        )
+        with conn:
+            conn.execute(
+                "INSERT INTO daemon_state(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                ("folder_snapshot_staging_v1", "{not-json"),
+            )
+
+        assert repository.read_staging() is None
+        assert folders_by_dialog(conn) == {999: [{"id": 9, "title": "Saved"}]}
+        assert repository.read_generation() == 1
+        assert repository.read_last_success_at() == 90
+        assert repository.read_last_outcome() == "success"
+        assert (
+            conn.execute("SELECT value FROM daemon_state WHERE key = 'folder_snapshot_staging_v1'").fetchone() is None
+        )
     finally:
         conn.close()
 
@@ -197,6 +246,192 @@ def test_telegram_adapter_counts_manual_unread_mark() -> None:
     assert _dialog_facts(dialog).unread is True
 
 
+@pytest.mark.parametrize(
+    ("entity", "expected"),
+    [
+        (None, (None, 0, 0)),
+        (User(10, access_hash=11), ("user", 10, 11)),
+        (Chat(20, "chat", ChatPhotoEmpty(), 0, None, 1), ("chat", 20, 0)),
+        (
+            Channel(30, "channel", ChatPhotoEmpty(), None, False, None, broadcast=True, access_hash=31),
+            ("channel", 30, 31),
+        ),
+        (type("User", (), {"id": 40, "access_hash": 41})(), ("user", 40, 41)),
+        (type("Peer", (), {"id": 50, "access_hash": 51})(), (None, 50, 51)),
+    ],
+)
+def test_telegram_adapter_builds_cursor_peer_identity(entity: object, expected: tuple[str | None, int, int]) -> None:
+    assert _peer_cursor(entity) == expected
+
+
+@pytest.mark.parametrize(
+    ("peer_type", "expected_type"),
+    [
+        ("user", InputPeerUser),
+        ("chat", InputPeerChat),
+        ("channel", InputPeerChannel),
+        (None, InputPeerEmpty),
+    ],
+)
+def test_telegram_adapter_reconstructs_cursor_peer(peer_type: str | None, expected_type: type[object]) -> None:
+    cursor = FolderDialogCursor(None, 7, peer_type, 8, 9)
+    peer = _offset_peer(cursor)
+
+    assert isinstance(peer, expected_type)
+    if isinstance(peer, InputPeerUser):
+        assert (peer.user_id, peer.access_hash) == (8, 9)
+    elif isinstance(peer, InputPeerChat):
+        assert peer.chat_id == 8
+    elif isinstance(peer, InputPeerChannel):
+        assert (peer.channel_id, peer.access_hash) == (8, 9)
+
+
+def _telegram_dialog(dialog_id: int, *, entity: object | None = None, message_id: int | None = None) -> object:
+    if entity is None:
+        entity = type("User", (), {"id": dialog_id, "access_hash": dialog_id + 100})()
+    message = SimpleNamespace(
+        id=dialog_id if message_id is None else message_id,
+        date=dt.datetime(2026, 9, 10, 12, 0, tzinfo=dt.UTC),
+    )
+    return SimpleNamespace(
+        id=dialog_id,
+        entity=entity,
+        message=message,
+        archived=False,
+        unread_count=0,
+        unread_mentions_count=0,
+        dialog=SimpleNamespace(notify_settings=None, unread_mark=False),
+    )
+
+
+class _AdapterClient:
+    def __init__(self, pages: list[list[object]], filters: tuple[object, ...] = ()) -> None:
+        self.pages = pages
+        self.filters = filters
+        self.dialog_calls: list[dict[str, object]] = []
+
+    async def __call__(self, request: object) -> object:
+        del request
+        return SimpleNamespace(filters=self.filters)
+
+    def iter_dialogs(self, **kwargs: object):
+        self.dialog_calls.append(kwargs)
+        page = self.pages.pop(0)
+
+        async def _page():
+            for dialog in page:
+                yield dialog
+
+        return _page()
+
+
+async def test_telegram_adapter_iter_dialogs_maps_page_and_cursor_offsets() -> None:
+    client = _AdapterClient([[_telegram_dialog(10)]])
+    gateway = TelethonTelegramFolderGateway(client)
+
+    items = [item async for item in gateway.iter_dialogs(None)]
+
+    assert items[0].facts.dialog_id == 10
+    assert items[0].cursor == FolderDialogCursor("2026-09-10T12:00:00+00:00", 10, "user", 10, 110)
+    assert client.dialog_calls == [{"limit": 100, "ignore_pinned": True}]
+
+    cursor = FolderDialogCursor("2026-09-09T11:00:00+00:00", 9, "user", 9, 109)
+    client.pages.append([])
+    assert [item async for item in gateway.iter_dialogs(cursor)] == []
+    assert client.dialog_calls[-1] == {
+        "limit": 100,
+        "ignore_pinned": True,
+        "offset_date": dt.datetime(2026, 9, 9, 11, 0, tzinfo=dt.UTC),
+        "offset_id": 9,
+        "offset_peer": InputPeerUser(9, 109),
+    }
+
+
+class _IterFailureClient:
+    async def __call__(self, request: object) -> object:
+        del request
+        return SimpleNamespace(filters=())
+
+    def __init__(self, failure: BaseException) -> None:
+        self.failure = failure
+
+    def iter_dialogs(self, **kwargs: object):
+        del kwargs
+
+        async def _page():
+            raise self.failure
+            yield None
+
+        return _page()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (TimeoutError("network unavailable"), FolderSourceUnavailableError),
+        (TelegramRpcThrottled(retry_after_seconds=4), TelegramRpcThrottled),
+    ],
+)
+async def test_telegram_adapter_iter_dialogs_translates_expected_failures(
+    failure: BaseException, expected: type[BaseException]
+) -> None:
+    gateway = TelethonTelegramFolderGateway(_IterFailureClient(failure))
+
+    with pytest.raises(expected) as exc_info:
+        _ = [item async for item in gateway.iter_dialogs(None)]
+
+    if expected is FolderSourceUnavailableError:
+        assert exc_info.value.__cause__ is failure
+
+
+async def test_telegram_adapter_fetch_folders_preserves_throttling() -> None:
+    failure = TelegramRpcThrottled(retry_after_seconds=4)
+
+    with pytest.raises(TelegramRpcThrottled) as exc_info:
+        await TelethonTelegramFolderGateway(_SourceFailureClient(failure)).fetch_folders()
+
+    assert exc_info.value is failure
+
+
+def _folder_filter(folder_id: int = 1) -> object:
+    return type("DialogFilter", (), {"id": folder_id, "title": "Work"})()
+
+
+async def test_telegram_adapter_fetch_snapshot_paginates_full_page_then_eof() -> None:
+    client = _AdapterClient(
+        [
+            [_telegram_dialog(index) for index in range(100)],
+            [],
+        ],
+        filters=(_folder_filter(), type("Ignored", (), {})()),
+    )
+    gateway = TelethonTelegramFolderGateway(client)
+
+    snapshot = await gateway.fetch_snapshot()
+
+    assert snapshot.folders[0].title == "Work"
+    assert [dialog.dialog_id for dialog in snapshot.dialogs] == list(range(100))
+    assert len(client.dialog_calls) == 2
+    assert client.dialog_calls[1]["offset_id"] == 99
+
+
+async def test_telegram_adapter_fetch_snapshot_stops_after_partial_page() -> None:
+    client = _AdapterClient([[_telegram_dialog(7)]])
+
+    snapshot = await TelethonTelegramFolderGateway(client).fetch_snapshot()
+
+    assert [dialog.dialog_id for dialog in snapshot.dialogs] == [7]
+    assert len(client.dialog_calls) == 1
+
+
+async def test_telegram_adapter_fetch_snapshot_rejects_stalled_cursor() -> None:
+    repeated = _telegram_dialog(7)
+    client = _AdapterClient([[repeated] * 100, [repeated] * 100])
+
+    with pytest.raises(FolderSourceUnavailableError, match="cursor did not advance"):
+        await TelethonTelegramFolderGateway(client).fetch_snapshot()
+
+
 class _SourceFailureClient:
     def __init__(self, failure: Exception) -> None:
         self._failure = failure
@@ -277,5 +512,144 @@ async def test_refresh_failure_propagates_and_preserves_saved_snapshot(tmp_path:
             await FolderRefresher(_FailingGateway(), SQLiteFolderSnapshotRepository(conn)).refresh()
 
         assert folders_by_dialog(conn) == {999: [{"id": 9, "title": "Saved"}]}
+    finally:
+        conn.close()
+
+
+class _PagedGateway:
+    def __init__(self, dialogs: tuple[DialogFacts, ...]) -> None:
+        self._dialogs = dialogs
+        self.fetch_calls = 0
+        self.page_calls: list[int | None] = []
+
+    async def fetch_folders(self) -> tuple[FolderRule, ...]:
+        self.fetch_calls += 1
+        current_rpc_scope().attempt_budget.debit()  # type: ignore[union-attr]
+        return (FolderRule(2, "Contacts", categories=frozenset({DialogCategory.CONTACT})),)
+
+    async def _page(self, cursor: FolderDialogCursor | None):
+        self.page_calls.append(None if cursor is None else cursor.offset_id)
+        budget = current_rpc_scope().attempt_budget
+        assert budget is not None
+        budget.debit()
+        start = 0 if cursor is None else cursor.offset_id
+        page = self._dialogs[start : start + 100]
+        for index, facts in enumerate(page, start=start):
+            yield FolderDialogItem(
+                facts,
+                FolderDialogCursor(None, index + 1, "user", facts.dialog_id, 1),
+            )
+
+    def iter_dialogs(self, cursor: FolderDialogCursor | None):
+        return self._page(cursor)
+
+
+@pytest.mark.asyncio
+async def test_bounded_folder_acquisition_stages_and_promotes_only_at_eof(tmp_path: Path) -> None:
+    conn = _connection(tmp_path / "sync.db")
+    try:
+        _replace_folder_snapshot(conn, [(9, "Saved")], [(9, 999)])
+        dialogs = tuple(DialogFacts(index, DialogCategory.CONTACT) for index in range(101))
+        gateway = _PagedGateway(dialogs)
+        repository = SQLiteFolderSnapshotRepository(conn)
+        refresher = FolderRefresher(gateway, repository)
+
+        first = RpcAttemptBudget(limit=1)
+        with rpc_attempt_budget(first):
+            result = await refresher.acquire_slice(first)
+        assert result.complete is False
+        assert result.projection is None
+        assert repository.read_staging() == FolderStagingSnapshot(
+            folders=(FolderRule(2, "Contacts", categories=frozenset({DialogCategory.CONTACT})),),
+            dialogs=(),
+            cursor=None,
+            started_at=repository.read_staging().started_at,  # type: ignore[union-attr]
+            base_generation=0,
+        )
+        assert folders_by_dialog(conn) == {999: [{"id": 9, "title": "Saved"}]}
+
+        second = RpcAttemptBudget(limit=2)
+        with rpc_attempt_budget(second):
+            result = await refresher.acquire_slice(second)
+        assert result.complete is False
+        assert len(repository.read_staging().dialogs) == 100  # type: ignore[union-attr]
+        assert folders_by_dialog(conn) == {999: [{"id": 9, "title": "Saved"}]}
+
+        restarted = FolderRefresher(gateway, repository)
+        third = RpcAttemptBudget(limit=2)
+        with rpc_attempt_budget(third):
+            result = await restarted.acquire_slice(third)
+        assert result.complete is True
+        assert result.projection is not None
+        restarted.persist(result.projection, completed_at=123)
+        assert repository.read_staging() is None
+        assert folders_by_dialog(conn)[100] == [{"id": 2, "title": "Contacts"}]
+        assert repository.read_generation() == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_bounded_folder_acquisition_discards_stale_staging_generation(tmp_path: Path) -> None:
+    conn = _connection(tmp_path / "sync.db")
+    try:
+        repository = SQLiteFolderSnapshotRepository(conn)
+        repository.replace_snapshot(
+            FolderSourceSnapshot((FolderRule(1, "Current"),), ()),
+            (),
+            completed_at=10,
+        )
+        repository.save_staging(
+            FolderStagingSnapshot(
+                folders=(FolderRule(8, "Stale"),),
+                dialogs=(),
+                cursor=None,
+                started_at=1,
+                base_generation=0,
+            )
+        )
+        gateway = _PagedGateway(())
+        refresher = FolderRefresher(gateway, repository)
+        budget = RpcAttemptBudget(limit=2)
+        with rpc_attempt_budget(budget):
+            result = await refresher.acquire_slice(budget)
+        assert result.complete is True
+        assert result.projection is not None
+        assert result.projection.source.folders[0].title == "Contacts"
+        assert gateway.fetch_calls == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_bounded_folder_acquisition_restarts_after_corrupt_staging(tmp_path: Path) -> None:
+    conn = _connection(tmp_path / "sync.db")
+    try:
+        repository = SQLiteFolderSnapshotRepository(conn)
+        repository.replace_snapshot(
+            FolderSourceSnapshot((FolderRule(9, "Saved"),), (DialogFacts(999, DialogCategory.CONTACT),)),
+            ((9, 999),),
+            completed_at=90,
+        )
+        with conn:
+            conn.execute(
+                "INSERT INTO daemon_state(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                ("folder_snapshot_staging_v1", "{not-json"),
+            )
+
+        gateway = _PagedGateway(())
+        refresher = FolderRefresher(gateway, repository)
+        budget = RpcAttemptBudget(limit=2)
+        with rpc_attempt_budget(budget):
+            result = await refresher.acquire_slice(budget)
+
+        assert result.complete is True
+        assert result.projection is not None
+        assert gateway.fetch_calls == 1
+        assert folders_by_dialog(conn) == {999: [{"id": 9, "title": "Saved"}]}
+        refresher.persist(result.projection, completed_at=123)
+        assert folders_by_dialog(conn) == {}
+        assert repository.read_generation() == 2
     finally:
         conn.close()

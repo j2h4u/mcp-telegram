@@ -6,14 +6,12 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from mcp_telegram.telegram_rpc_consumers import DemandKind
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -55,48 +53,6 @@ def _seed_stale_unread(conn: sqlite3.Connection, dialog_id: int, *, cursor: int 
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_loop_picks_up_late_enrollment() -> None:
-    from mcp_telegram.daemon import _run_read_position_reconciliation_loop
-
-    conn = _connection()
-    try:
-        shutdown = asyncio.Event()
-        client = AsyncMock()
-        client.get_input_entity.return_value = SimpleNamespace()
-        client.return_value = SimpleNamespace(
-            dialogs=[SimpleNamespace(peer=SimpleNamespace(), read_inbox_max_id=42, read_outbox_max_id=7)]
-        )
-
-        async def no_batch_pause(_event: asyncio.Event, _pause_seconds: float | None = None) -> bool:
-            return True
-
-        with (
-            patch("mcp_telegram.daemon._sleep_read_pos_batch", new=no_batch_pause),
-            patch("mcp_telegram.daemon.telethon_utils.get_peer_id", return_value=1001),
-        ):
-            task = asyncio.create_task(
-                _run_read_position_reconciliation_loop(
-                    client,
-                    conn,
-                    shutdown,
-                    interval_seconds=0.01,
-                    max_dialogs_per_pass=10,
-                )
-            )
-            await asyncio.sleep(0)
-            _seed_pending(conn, 1001)
-            await asyncio.sleep(0.03)
-            shutdown.set()
-            await asyncio.wait_for(task, timeout=1)
-
-        row = conn.execute("SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = 1001").fetchone()
-        assert row == (42,)
-        assert client.await_count >= 1
-    finally:
-        conn.close()
-
-
-@pytest.mark.asyncio
 async def test_reconciliation_pass_caps_selected_dialogs() -> None:
     from mcp_telegram.daemon import _initialize_read_positions
 
@@ -114,54 +70,6 @@ async def test_reconciliation_pass_caps_selected_dialogs() -> None:
             await _initialize_read_positions(client, conn, asyncio.Event(), max_dialogs=2)
         assert client.get_input_entity.await_count == 2
         assert client.await_count == 1
-    finally:
-        conn.close()
-
-
-@pytest.mark.asyncio
-async def test_reconciliation_stops_cleanly_on_shutdown() -> None:
-    from mcp_telegram.daemon import _run_read_position_reconciliation_loop
-
-    conn = _connection()
-    try:
-        shutdown = asyncio.Event()
-        shutdown.set()
-        client = AsyncMock()
-        await _run_read_position_reconciliation_loop(
-            client, conn, shutdown, interval_seconds=60, max_dialogs_per_pass=2
-        )
-        client.assert_not_awaited()
-    finally:
-        conn.close()
-
-
-@pytest.mark.asyncio
-async def test_reconciliation_loop_reports_read_receipt_demand_kind() -> None:
-    from mcp_telegram.daemon import _run_read_position_reconciliation_loop
-
-    conn = _connection()
-    try:
-        shutdown = asyncio.Event()
-        observed: list[DemandKind] = []
-
-        async def run_batch() -> None:
-            shutdown.set()
-
-        async def run_cycle(kind: DemandKind, operation: Callable[[], Awaitable[object]]) -> object:
-            observed.append(kind)
-            return await operation()
-
-        await _run_read_position_reconciliation_loop(
-            AsyncMock(),
-            conn,
-            shutdown,
-            interval_seconds=60,
-            max_dialogs_per_pass=2,
-            demand_cycle_runner=run_cycle,
-            run_batch=run_batch,
-        )
-
-        assert observed == [DemandKind.READ_RECEIPT_BATCH]
     finally:
         conn.close()
 

@@ -13,25 +13,24 @@ Architecture:
 """
 
 import asyncio
+import json
 import logging
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
-from typing import Protocol, TypedDict, Unpack, cast
+from typing import Protocol, cast
 
 from telethon.errors import RPCError  # type: ignore[import-untyped]
 
 from .access_lifecycle import (
     complete_access_revalidation,
-    due_access_revalidations,
     restore_access_after_revalidation,
     set_access_lost,
     stamp_access_revalidation,
 )
-from .demand_shadow_wiring import DemandCycleRunner, run_legacy_demand_cycle
 from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
 from .history_enrollment import full_history_enabled
 from .hydration_queue import HydrationPriority
@@ -137,6 +136,9 @@ class AccessProbePolicy:
 # the user's account hasn't received meaningful new traffic worth probing.
 RECENT_SYNC_SKIP_THRESHOLD_S: int = 3600
 _DELTA_SLICE_MESSAGE_LIMIT = 100
+_DM_GAP_SCAN_RPC_CHUNK = 100
+_DM_GAP_SCAN_PERIOD_S = 7 * 24 * 60 * 60
+_DM_GAP_SCAN_STATE_KEY = "delta_dm_gap_scan_state"
 
 _SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL = """
 SELECT sd.dialog_id, sd.last_synced_at, sd.last_delta_checked_at, sd.delta_refresh_requested_at
@@ -179,10 +181,126 @@ _REQUEST_DELTA_CONTINUATION_SQL = (
     "AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
 )
 
+_SELECT_DM_GAP_DIALOGS_SQL = """
+SELECT sd.dialog_id
+  FROM synced_dialogs AS sd
+  JOIN full_history_enrollment AS fhe
+    ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
+  JOIN entities AS entity ON entity.id = sd.dialog_id
+ WHERE sd.status = 'synced'
+   AND entity.type IN ('user', 'bot')
+ ORDER BY sd.dialog_id
+"""
 
-class AccessProbeLoopOptions(TypedDict, total=False):
-    initial_delay: float
-    demand_cycle_runner: DemandCycleRunner
+
+@dataclass(frozen=True, slots=True)
+class _DmGapScanState:
+    """Restart-safe cursor for the weekly DM deletion verification pass."""
+
+    status: str
+    generation: int
+    scan_started_at: int
+    dialog_id_cursor: int | None
+    message_cursor: int
+    next_run_at: int
+
+
+class DmGapScanPage(Protocol):
+    """Event-handler seam for one bounded Telegram deletion lookup page."""
+
+    async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int: ...
+
+
+def _load_dm_gap_scan_state(conn: sqlite3.Connection) -> _DmGapScanState | None:
+    row = cast(
+        tuple[str | None] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key = ?", (_DM_GAP_SCAN_STATE_KEY,)).fetchone(),
+    )
+    if row is None or not row[0]:
+        return None
+    try:
+        value = cast(dict[str, object], json.loads(row[0]))
+        state = _DmGapScanState(
+            status=str(value["status"]),
+            generation=int(cast(int | str, value["generation"])),
+            scan_started_at=int(cast(int | str, value["scan_started_at"])),
+            dialog_id_cursor=(
+                int(cast(int | str, value["dialog_id_cursor"])) if value["dialog_id_cursor"] is not None else None
+            ),
+            message_cursor=int(cast(int | str, value.get("message_cursor", value.get("message_offset", 0)))),
+            next_run_at=int(cast(int | str, value["next_run_at"])),
+        )
+    except KeyError, TypeError, ValueError, json.JSONDecodeError:
+        logger.warning("dm_gap_scan_state_corrupt — restarting deletion verification")
+        return None
+    if not _valid_dm_gap_scan_state(state):
+        logger.warning("dm_gap_scan_state_invalid — restarting deletion verification")
+        return None
+    return state
+
+
+def _valid_dm_gap_scan_state(state: _DmGapScanState) -> bool:
+    if state.status not in {"running", "idle"}:
+        return False
+    return all(
+        value >= 0
+        for value in (
+            state.generation,
+            state.scan_started_at,
+            state.message_cursor,
+            state.next_run_at,
+        )
+    )
+
+
+def _store_dm_gap_scan_state(conn: sqlite3.Connection, state: _DmGapScanState) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO daemon_state(key, value) VALUES (?, ?)",
+        (
+            _DM_GAP_SCAN_STATE_KEY,
+            json.dumps(
+                {
+                    "status": state.status,
+                    "generation": state.generation,
+                    "scan_started_at": state.scan_started_at,
+                    "dialog_id_cursor": state.dialog_id_cursor,
+                    "message_cursor": state.message_cursor,
+                    "next_run_at": state.next_run_at,
+                },
+                sort_keys=True,
+            ),
+        ),
+    )
+
+
+def _dm_gap_scan_dialog_ids(conn: sqlite3.Connection) -> tuple[int, ...]:
+    rows = cast(Sequence[tuple[object]], conn.execute(_SELECT_DM_GAP_DIALOGS_SQL).fetchall())
+    return tuple(int(cast(int, dialog_id)) for (dialog_id,) in rows)
+
+
+def _dm_gap_scan_page_ids(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    scan_started_at: int,
+    message_cursor: int,
+) -> tuple[int, ...]:
+    rows = cast(
+        Sequence[tuple[object]],
+        conn.execute(
+            "SELECT message_id FROM messages "
+            "WHERE dialog_id = ? AND is_deleted = 0 AND sent_at < ? AND message_id > ? "
+            "ORDER BY message_id LIMIT ?",
+            (dialog_id, scan_started_at, message_cursor, _DM_GAP_SCAN_RPC_CHUNK),
+        ).fetchall(),
+    )
+    return tuple(int(cast(int, message_id)) for (message_id,) in rows)
+
+
+def _dm_gap_scan_release_at(conn: sqlite3.Connection, now: float) -> float | None:
+    state = _load_dm_gap_scan_state(conn)
+    if state is None or state.status == "running":
+        return 0.0
+    return float(state.next_run_at) if state.next_run_at > now else 0.0
 
 
 class _DeltaSyncClient(Protocol):
@@ -196,38 +314,6 @@ class _DeltaFetchOutcome:
     rows: list[ExtractedMessage]
     result: int | None = None
     completed: bool = True
-
-
-@dataclass(frozen=True, slots=True)
-class _AccessProbeOutcome:
-    restored: int = 0
-    still_lost: int = 0
-    errors: int = 0
-    flood_wait_hit: bool = False
-    admission_deferred: bool = False
-    counts_as_checked: bool = True
-
-
-@dataclass(frozen=True, slots=True)
-class _AccessProbeRequest:
-    client: _DeltaSyncClient
-    conn: sqlite3.Connection
-    shutdown_event: asyncio.Event
-    delta_worker: DeltaSyncWorker
-    policy: AccessProbePolicy
-    dialog_id: int
-
-
-def _access_probe_rows(conn: sqlite3.Connection, policy: AccessProbePolicy, now: int) -> list[tuple[int]]:
-    return [
-        (dialog_id,)
-        for dialog_id in due_access_revalidations(
-            conn,
-            now=now,
-            cooldown_seconds=policy.cooldown_seconds,
-            limit=policy.max_dialogs_per_cycle,
-        )
-    ]
 
 
 def _row_first_int(row: tuple[object | None, ...] | None) -> int:
@@ -353,6 +439,7 @@ class DeltaSyncWorker:
         self._last_fetch_admission_deferred = False
         self._last_delta_slice_completed = False
         self._last_delta_slice_succeeded = False
+        self._last_delta_slice_error: BaseException | None = None
 
     def _stamp_delta_checkpoint(self, dialog_id: int, checked_at: int) -> None:
         self._conn.execute(_UPDATE_DELTA_CHECKPOINT_SQL, (checked_at, checked_at, dialog_id, dialog_id))
@@ -592,6 +679,7 @@ class DeltaSyncWorker:
         self._last_fetch_admission_deferred = False
         self._last_delta_slice_completed = False
         self._last_delta_slice_succeeded = False
+        self._last_delta_slice_error = None
 
     def _max_known_message_id(self, dialog_id: int) -> int:
         row = cast(
@@ -620,14 +708,17 @@ class DeltaSyncWorker:
                     completed = False
                     break
                 rows.append(extract_message_row(dialog_id, message))
-        except TelegramRpcAdmissionDeferred:
+        except TelegramRpcAdmissionDeferred as exc:
             self._last_fetch_admission_deferred = True
+            self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
-        except RpcAdmissionSaturatedError, RpcAdmissionExpiredError:
+        except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
             self._last_fetch_admission_deferred = True
+            self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
+            self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
         except ACCESS_LOST_ERRORS as exc:
             set_access_lost(self._conn, dialog_id, int(time.time()), reason=type(exc).__name__)
@@ -635,6 +726,7 @@ class DeltaSyncWorker:
             return _DeltaFetchOutcome([], 0)
         except RPCError as exc:
             logger.warning("delta_slice_rpc_error dialog_id=%d error=%s", dialog_id, exc)
+            self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
         return _DeltaFetchOutcome(rows, completed=completed)
 
@@ -656,210 +748,152 @@ class DeltaSyncWorker:
 
 
 class DeltaGapFillDemandAdapter:
-    """One-page durable adapter over delta timestamps and refresh requests."""
+    """One-page durable adapter over delta and DM tombstone subqueues."""
 
     demand_kind = DemandKind.DELTA_GAP_FILL
 
-    def __init__(self, worker: DeltaSyncWorker) -> None:
+    def __init__(self, worker: DeltaSyncWorker, dm_gap_scanner: DmGapScanPage | None = None) -> None:
         self._worker = worker
+        self._dm_gap_scanner = dm_gap_scanner
 
-    def status(self, now: float) -> DemandStatus | None:
-        """Report the oldest local delta release boundary without writes."""
-        del now
+    def _ordinary_candidate(self, now: float) -> tuple[float, int] | None:
         rows = cast(
             list[tuple[int, int | None, int | None, int | None]],
             self._worker._conn.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL).fetchall(),
         )
-        if not rows:
-            return None
-        release_at = min(
-            _delta_release_at(last_synced, last_checked, requested) for _, last_synced, last_checked, requested in rows
+        candidates = [
+            (_delta_release_at(last_synced, last_checked, requested), int(dialog_id))
+            for dialog_id, last_synced, last_checked, requested in rows
+        ]
+        return min(candidates, key=lambda candidate: (candidate[0], candidate[1])) if candidates else None
+
+    def _candidate(self, now: float) -> tuple[float, int, int | None] | None:
+        candidates: list[tuple[float, int, int | None]] = []
+        ordinary = self._ordinary_candidate(now)
+        if ordinary is not None:
+            release_at, dialog_id = ordinary
+            candidates.append((release_at, 0, dialog_id))
+        if self._dm_gap_scanner is not None:
+            dm_release_at: float | None = _dm_gap_scan_release_at(self._worker._conn, now)
+            if dm_release_at is not None:
+                candidates.append((dm_release_at, 1, None))
+        return (
+            min(candidates, key=lambda candidate: (candidate[0], candidate[1], candidate[2] or -1))
+            if candidates
+            else None
         )
-        return DemandStatus(release_at=release_at)
+
+    def status(self, now: float) -> DemandStatus | None:
+        """Report the oldest local delta release boundary without writes."""
+        candidate = self._candidate(now)
+        if candidate is None:
+            return None
+        return DemandStatus(release_at=candidate[0])
+
+    def _start_dm_gap_scan(self, now: float) -> _DmGapScanState | None:
+        state = _load_dm_gap_scan_state(self._worker._conn)
+        if state is None or (state.status == "idle" and state.next_run_at <= now):
+            previous_generation = 0 if state is None else state.generation
+            state = _DmGapScanState("running", previous_generation + 1, int(now), None, 0, 0)
+            with self._worker._conn:
+                _store_dm_gap_scan_state(self._worker._conn, state)
+        return None if state.status == "idle" else state
+
+    def _next_dm_gap_dialog(self, state: _DmGapScanState, dialog_ids: Sequence[int]) -> int | None:
+        if state.message_cursor > 0 and state.dialog_id_cursor in dialog_ids:
+            return state.dialog_id_cursor
+        return next(
+            (
+                candidate
+                for candidate in dialog_ids
+                if state.dialog_id_cursor is None or candidate > state.dialog_id_cursor
+            ),
+            None,
+        )
+
+    def _complete_dm_gap_scan(self, state: _DmGapScanState, now: float) -> None:
+        completed = _DmGapScanState(
+            "idle",
+            state.generation,
+            state.scan_started_at,
+            None,
+            0,
+            int(now) + _DM_GAP_SCAN_PERIOD_S,
+        )
+        with self._worker._conn:
+            _store_dm_gap_scan_state(self._worker._conn, completed)
+
+    def _advance_empty_dm_dialog(self, state: _DmGapScanState, dialog_id: int) -> None:
+        advanced = _DmGapScanState(
+            "running",
+            state.generation,
+            state.scan_started_at,
+            dialog_id,
+            0,
+            0,
+        )
+        with self._worker._conn:
+            _store_dm_gap_scan_state(self._worker._conn, advanced)
+
+    def _advance_dm_gap_page(self, state: _DmGapScanState, dialog_id: int, next_cursor: int) -> None:
+        advanced = _DmGapScanState(
+            "running",
+            state.generation,
+            state.scan_started_at,
+            dialog_id,
+            next_cursor,
+            0,
+        )
+        with self._worker._conn:
+            _store_dm_gap_scan_state(self._worker._conn, advanced)
+
+    async def _run_dm_gap_slice(self, now: float) -> None:
+        """Verify one persisted DM page, or advance one empty dialog locally."""
+        state = self._start_dm_gap_scan(now)
+        if state is None:
+            return
+
+        dialog_ids = _dm_gap_scan_dialog_ids(self._worker._conn)
+        dialog_id = self._next_dm_gap_dialog(state, dialog_ids)
+        if dialog_id is None:
+            self._complete_dm_gap_scan(state, now)
+            return
+
+        page = _dm_gap_scan_page_ids(
+            self._worker._conn,
+            dialog_id,
+            state.scan_started_at,
+            state.message_cursor,
+        )
+        if not page:
+            self._advance_empty_dm_dialog(state, dialog_id)
+            return
+
+        # Leave the cursor at the page start until the collaborator commits. A
+        # process crash during the RPC repeats an idempotent tombstone page.
+        await self._dm_gap_scanner.run_dm_gap_scan_page(dialog_id, page)  # type: ignore[union-attr]
+        self._advance_dm_gap_page(state, dialog_id, page[-1])
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
         """Fetch one due dialog page and leave continuation in domain state."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
         now = time.time()
-        rows = cast(
-            list[tuple[int, int | None, int | None, int | None]],
-            self._worker._conn.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL).fetchall(),
-        )
-        dialog_id = next(
-            (row[0] for row in rows if _delta_release_at(row[1], row[2], row[3]) <= now),
-            None,
-        )
-        if dialog_id is None:
+        candidate = self._candidate(now)
+        if candidate is None or candidate[0] > now:
             return
         with demand_context(DemandKind.DELTA_GAP_FILL):
             with rpc_attempt_budget(budget):
                 try:
-                    await self._worker.fetch_delta_slice_for_dialog(dialog_id)
+                    if candidate[1] == 1:
+                        await self._run_dm_gap_slice(now)
+                    else:
+                        assert candidate[2] is not None
+                        await self._worker.fetch_delta_slice_for_dialog(candidate[2])
+                        if self._worker._last_delta_slice_error is not None:
+                            raise self._worker._last_delta_slice_error
                 except RpcAttemptBudgetExhaustedError:
                     return
-
-
-async def run_delta_catch_up_loop(
-    worker: DeltaSyncWorker,
-    shutdown_event: asyncio.Event,
-    policy: DeltaCatchUpPolicy,
-    *,
-    demand_cycle_runner: DemandCycleRunner | None = None,
-) -> None:
-    """Run forward gap-fill as a bounded maintenance loop, not startup burst."""
-    if not policy.enabled:
-        logger.info("delta_catch_up_loop disabled — max_probes_per_cycle=%d", policy.max_probes_per_cycle)
-        return
-
-    while not shutdown_event.is_set():
-
-        async def catch_up() -> object:
-            return await worker.run_delta_catch_up(policy=policy)
-
-        if demand_cycle_runner is None:
-            total_new = cast(int, await run_legacy_demand_cycle(None, DemandKind.DELTA_GAP_FILL, catch_up))
-        else:
-            total_new = cast(int, await demand_cycle_runner(DemandKind.DELTA_GAP_FILL, catch_up))
-        logger.debug("delta_catch_up_cycle complete — new_messages=%d", total_new)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=policy.interval_seconds)
-            break
-        except TimeoutError:
-            continue
-
-
-# ---------------------------------------------------------------------------
-# Probe-worker — access recovery for access_lost dialogs
-# ---------------------------------------------------------------------------
-
-
-async def _handle_probe_throttling(
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    policy: AccessProbePolicy,
-    dialog_id: int,
-    exc: TelegramRpcThrottled,
-) -> None:
-    _raise_if_latched(exc)
-    logger.warning("probe_flood_wait dialog_id=%d seconds=%s", dialog_id, exc.retry_after_seconds)
-    stamp_access_revalidation(
-        conn,
-        dialog_id,
-        int(time.time()),
-        max(policy.cooldown_seconds, exc.retry_after_seconds or policy.cooldown_seconds),
-    )
-    await sleep_through_flood(shutdown_event, exc.retry_after_seconds or 1)
-
-
-async def _probe_access_lost_dialog(request: _AccessProbeRequest) -> _AccessProbeOutcome:
-    client = request.client
-    conn = request.conn
-    dialog_id = request.dialog_id
-    try:
-        result = await client.get_messages(entity=dialog_id, limit=1)
-        total = cast(int | None, getattr(result, "total", None))
-        return await _finish_access_probe(conn, request.delta_worker, dialog_id, total)
-    except (TelegramRpcAdmissionDeferred, RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
-        deferred = isinstance(exc, TelegramRpcAdmissionDeferred)
-        logger.info(
-            "access_probe admission_deferred dialog_id=%d error_type=%s — preserving revalidation budget",
-            dialog_id,
-            type(exc).__name__,
-        )
-        retry_after = cast(float | None, getattr(exc, "retry_after_seconds", None))
-        if deferred and retry_after is not None:
-            await sleep_through_flood(request.shutdown_event, retry_after)
-        return _AccessProbeOutcome(admission_deferred=True, counts_as_checked=not deferred)
-    except RpcAdmissionClosedError:
-        raise
-    except ACCESS_LOST_ERRORS:
-        logger.debug("access_still_lost dialog_id=%d", dialog_id)
-        stamp_access_revalidation(conn, dialog_id, int(time.time()), request.policy.cooldown_seconds)
-        return _AccessProbeOutcome(still_lost=1)
-    except TelegramRpcThrottled as exc:
-        await _handle_probe_throttling(request.conn, request.shutdown_event, request.policy, dialog_id, exc)
-        return _AccessProbeOutcome(flood_wait_hit=True)
-    except (RPCError, TimeoutError, OSError) as exc:
-        error_kind = "probe_rpc_error" if isinstance(exc, RPCError) else "probe_network_error"
-        logger.warning("%s dialog_id=%d error=%s", error_kind, dialog_id, exc)
-        stamp_access_revalidation(request.conn, dialog_id, int(time.time()), request.policy.cooldown_seconds)
-        return _AccessProbeOutcome(errors=1)
-
-
-async def _finish_access_probe(
-    conn: sqlite3.Connection,
-    delta_worker: DeltaSyncWorker,
-    dialog_id: int,
-    total_messages: int | None,
-) -> _AccessProbeOutcome:
-    if not full_history_enabled(conn, dialog_id):
-        return _AccessProbeOutcome(restored=_restore_revalidated_access(conn, dialog_id, total_messages=total_messages))
-    new_msgs = await delta_worker.fetch_delta_for_dialog(dialog_id)
-    logger.debug("access_restore_gap_fill dialog_id=%d new=%d", dialog_id, new_msgs)
-    if delta_worker._last_fetch_admission_deferred:
-        return _AccessProbeOutcome(admission_deferred=True)
-    return _AccessProbeOutcome(restored=_restore_revalidated_access(conn, dialog_id, total_messages=total_messages))
-
-
-@_delta_rpc_scope(DemandKind.DELTA_ACCESS_PROBE, AcquisitionKind.MESSAGE_LOOKUP)
-async def _probe_access_lost_dialogs(
-    client: _DeltaSyncClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    delta_worker: DeltaSyncWorker,
-    policy: AccessProbePolicy,
-) -> int:
-    """Probe due access_lost dialogs under a tiny cold budget.
-
-    Recovery sequence: probe -> gap-fill -> THEN reset status.
-    If gap-fill fails, status stays access_lost (safe rollback).
-    """
-    now = int(time.time())
-    rows = _access_probe_rows(conn, policy, now)
-
-    restored = 0
-    checked = 0
-    still_lost = 0
-    errors = 0
-    flood_wait_hit = False
-    for (dialog_id,) in rows:
-        if shutdown_event.is_set():
-            break
-        checked += 1
-        outcome = await _probe_access_lost_dialog(
-            _AccessProbeRequest(client, conn, shutdown_event, delta_worker, policy, dialog_id)
-        )
-        restored += outcome.restored
-        still_lost += outcome.still_lost
-        errors += outcome.errors
-        flood_wait_hit = outcome.flood_wait_hit
-        if outcome.admission_deferred:
-            if not outcome.counts_as_checked:
-                checked -= 1
-            break
-        if outcome.flood_wait_hit:
-            break
-
-        if policy.probe_pause_seconds > 0 and not shutdown_event.is_set():
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=policy.probe_pause_seconds)
-                break
-            except TimeoutError:
-                pass
-
-    log_maintenance_cycle(
-        logger,
-        any((rows, restored, errors, flood_wait_hit)),
-        "access_probe complete — selected=%d checked=%d restored=%d still_lost=%d errors=%d flood_wait_hit=%s",
-        len(rows),
-        checked,
-        restored,
-        still_lost,
-        errors,
-        flood_wait_hit,
-    )
-    return restored
 
 
 def _restore_revalidated_access(
@@ -1121,53 +1155,6 @@ class DeltaAccessProbeDemandAdapter:
             )
 
 
-async def run_access_probe_loop(
-    client: _DeltaSyncClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    delta_worker: DeltaSyncWorker,
-    policy: AccessProbePolicy,
-    **options: Unpack[AccessProbeLoopOptions],
-) -> None:
-    """Cold probe of due access_lost dialogs. Restores access and triggers gap-fill.
-
-    The loop may run daily, but each dialog is paced by a durable cooldown and
-    each cycle has a small global budget.
-    """
-    if not policy.enabled:
-        logger.info("access_probe_loop disabled — max_dialogs_per_cycle=%d", policy.max_dialogs_per_cycle)
-        return
-
-    initial_delay = options.get("initial_delay", 0.0)
-    if initial_delay > 0:
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=initial_delay)
-            return  # shutdown during initial delay
-        except TimeoutError:
-            pass  # initial delay elapsed normally; proceed with first probe
-
-    while not shutdown_event.is_set():
-        try:
-
-            async def probe() -> object:
-                return await _probe_access_lost_dialogs(client, conn, shutdown_event, delta_worker, policy)
-
-            demand_cycle_runner = options.get("demand_cycle_runner")
-            if demand_cycle_runner is None:
-                await run_legacy_demand_cycle(None, DemandKind.DELTA_ACCESS_PROBE, probe)
-            else:
-                await demand_cycle_runner(DemandKind.DELTA_ACCESS_PROBE, probe)
-        except RpcAdmissionClosedError:
-            raise
-        except Exception:
-            logger.warning("access_probe_error", exc_info=True)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=policy.interval_seconds)
-            return  # shutdown during sleep
-        except TimeoutError:
-            pass  # interval elapsed, run again
-
-
 _EXPORTED_SYMBOLS = (
     AccessProbePolicy,
     DeltaAccessProbeDemandAdapter,
@@ -1175,6 +1162,4 @@ _EXPORTED_SYMBOLS = (
     DeltaGapFillDemandAdapter,
     DeltaSyncWorker,
     DeltaSyncWorker.run_delta_catch_up,
-    run_access_probe_loop,
-    run_delta_catch_up_loop,
 )

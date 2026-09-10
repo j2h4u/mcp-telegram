@@ -145,9 +145,7 @@ class MessageFactRefreshPolicy:
 class MessageFactRefreshResult:
     """One background refresh cycle summary."""
 
-    reaction_candidates: int
     reaction_refreshed: int
-    read_at_candidates: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,7 +324,7 @@ async def refresh_message_facts_once(
 ) -> MessageFactRefreshResult:
     """Refresh a bounded batch of optional message facts into SQLite."""
     if policy.reaction_max_messages_per_cycle <= 0 and policy.read_at_max_messages_per_cycle <= 0:
-        return MessageFactRefreshResult(0, 0, 0)
+        return MessageFactRefreshResult(reaction_refreshed=0)
 
     checked_at = int(time.time() if now is None else now)
     reaction_rows = _reaction_candidates(
@@ -362,7 +360,5 @@ async def refresh_message_facts_once(
             await _interruptible_pause(shutdown_event, policy.pause_seconds)
 
     return MessageFactRefreshResult(
-        reaction_candidates=len(reaction_rows),
         reaction_refreshed=reaction_refreshed,
-        read_at_candidates=len(read_at_messages),
     )

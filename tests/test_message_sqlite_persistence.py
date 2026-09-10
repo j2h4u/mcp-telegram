@@ -13,12 +13,10 @@ from mcp_telegram.fts import stem_text
 from mcp_telegram.hydration_queue import HydrationPriority
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.messages.sqlite_bundle import (
-    MessageLogContext,
     find_unique_incoming_human_dm_dialogs,
     insert_messages_with_fts,
     list_undeleted_message_ids,
     mark_message_deleted,
-    message_log_context,
     persist_edited_message,
     persist_transcribed_text,
     read_message_text,
@@ -35,6 +33,8 @@ from mcp_telegram.messages.sqlite_hydration_jobs import (
     _TRANSCRIBABLE_MEDIA_SQL,
     TranscriptionHydrationRepair,
     _is_transcribable_media_pair,
+    has_media_metadata_hydration_repair_candidates,
+    has_transcription_hydration_repair_candidates,
     reconcile_fact_hydration_jobs_for_dialog,
     repair_media_metadata_hydration_jobs,
     repair_transcription_hydration_jobs,
@@ -101,18 +101,6 @@ def test_read_message_text_distinguishes_missing_from_null(conn: sqlite3.Connect
     null_text = read_message_text(conn, 42, 1)
     assert null_text.found is True
     assert null_text.text is None
-
-
-def test_message_log_context_projects_only_safe_coordinates(conn: sqlite3.Connection) -> None:
-    with conn:
-        insert_messages_with_fts(conn, [_message(11, text="must not be projected", sent_at=1_700_000_000)])
-
-    assert message_log_context(conn, 42, 11) == MessageLogContext(
-        dialog_id=42,
-        message_id=11,
-        telegram_sent_at=1_700_000_000,
-    )
-    assert message_log_context(conn, 42, 12) == MessageLogContext(dialog_id=42, message_id=12)
 
 
 def test_persist_edited_message_versions_sequentially_and_refreshes_fts(conn: sqlite3.Connection) -> None:
@@ -284,7 +272,7 @@ def test_media_metadata_repair_is_bounded_newest_first_and_terminal_safe(conn: s
     conn.commit()
 
     first = repair_media_metadata_hydration_jobs(conn, due_at=900, max_jobs=2)
-    assert first == type(first)(enqueued=2, has_more=True)
+    assert first == type(first)(has_more=True)
     assert conn.execute(
         "SELECT message_id, priority, message_sent_at, terminal FROM hydration_jobs "
         "WHERE kind = 'media_metadata' ORDER BY message_id"
@@ -295,14 +283,14 @@ def test_media_metadata_repair_is_bounded_newest_first_and_terminal_safe(conn: s
     ).fetchall() == [(105,), (102,)]
 
     second = repair_media_metadata_hydration_jobs(conn, due_at=901, max_jobs=2)
-    assert second == type(second)(enqueued=2, has_more=False)
+    assert second == type(second)(has_more=False)
     assert conn.execute(
         "SELECT message_id FROM hydration_jobs WHERE kind = 'media_metadata' AND terminal = 0 "
         "ORDER BY message_sent_at DESC"
     ).fetchall() == [(105,), (102,), (106,), (101,)]
 
     third = repair_media_metadata_hydration_jobs(conn, due_at=902, max_jobs=2)
-    assert third == type(third)(enqueued=0, has_more=False)
+    assert third == type(third)(has_more=False)
 
     for index_name in (
         "idx_messages_media_unresolved_contact_other",
@@ -330,6 +318,30 @@ def test_media_metadata_repair_plan_uses_both_partial_indexes_without_sort(conn:
     assert "USE TEMP B-TREE" not in details
 
 
+def test_repair_candidate_queries_are_read_only_and_kind_specific(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    conn.executemany(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+        "VALUES (42, ?, ?, NULL, ?, ?)",
+        [(108, 108, "voice", "{}"), (109, 109, "other", "{}")],
+    )
+    conn.commit()
+    before = conn.total_changes
+
+    assert has_transcription_hydration_repair_candidates(conn)
+    assert has_media_metadata_hydration_repair_candidates(conn)
+    assert conn.total_changes == before
+
+    conn.execute("INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at) VALUES ('transcription', 42, 108, 1)")
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at) VALUES ('media_metadata', 42, 109, 1)"
+    )
+    conn.commit()
+
+    assert not has_transcription_hydration_repair_candidates(conn)
+    assert not has_media_metadata_hydration_repair_candidates(conn)
+
+
 def test_historical_transcription_repair_and_dialog_reconciliation_admit_voice_and_round_video(
     conn: sqlite3.Connection,
 ) -> None:
@@ -346,7 +358,6 @@ def test_historical_transcription_repair_and_dialog_reconciliation_admit_voice_a
     conn.commit()
 
     repair = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=300)
-    assert repair.enqueued == 2
     assert conn.execute("SELECT message_id FROM hydration_jobs ORDER BY message_id").fetchall() == [(96,), (97,)]
     assert conn.execute("SELECT DISTINCT priority FROM hydration_jobs").fetchall() == [
         (int(HydrationPriority.BACKFILL),)
@@ -413,10 +424,11 @@ def test_transcription_repair_accepts_noncanonical_json_and_preflight_stays_elig
     conn.commit()
 
     first = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=1)
-    assert (first.enqueued, first.has_more) == (1, False)
+    assert first.has_more is False
     assert transcription_hydration_eligible(conn, 42, 101)
     second = repair_transcription_hydration_jobs(conn, due_at=901, max_jobs=1)
-    assert (second.enqueued, second.has_more) == (0, False)
+    assert second.has_more is False
+    assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (1,)
 
 
 @pytest.mark.parametrize(
@@ -493,7 +505,7 @@ def test_transcription_repair_is_bounded_idempotent_and_newest_first(conn: sqlit
     conn.commit()
 
     first = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=300)
-    assert (first.enqueued, first.has_more) == (300, True)
+    assert first.has_more is True
     conn.commit()
     assert conn.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (300,)
     assert conn.execute("SELECT MIN(message_id), MAX(message_id) FROM hydration_jobs").fetchone() == (206, 505)
@@ -502,10 +514,10 @@ def test_transcription_repair_is_bounded_idempotent_and_newest_first(conn: sqlit
     ).fetchone() == (900, 0, 0, 505, 0)
 
     second = repair_transcription_hydration_jobs(conn, due_at=901, max_jobs=300)
-    assert (second.enqueued, second.has_more) == (205, False)
+    assert second.has_more is False
     conn.commit()
     third = repair_transcription_hydration_jobs(conn, due_at=902, max_jobs=300)
-    assert (third.enqueued, third.has_more) == (0, False)
+    assert third.has_more is False
     assert conn.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind = 'transcription'").fetchone() == (505,)
 
 
@@ -533,17 +545,17 @@ def test_transcription_repair_only_probes_has_more_at_batch_boundary(conn: sqlit
         return result, executable
 
     first, first_statements = traced_repair(max_jobs=1)
-    assert (first.enqueued, first.has_more) == (1, True)
+    assert first.has_more is True
     assert len(first_statements) == 2
     conn.commit()
 
     second, second_statements = traced_repair(max_jobs=1)
-    assert (second.enqueued, second.has_more) == (1, False)
+    assert second.has_more is False
     assert len(second_statements) == 2
     conn.commit()
 
     third, third_statements = traced_repair(max_jobs=10)
-    assert (third.enqueued, third.has_more) == (0, False)
+    assert third.has_more is False
     assert len(third_statements) == 1
 
 
@@ -591,7 +603,7 @@ def test_transcription_repair_excludes_ineligible_and_queued_messages(conn: sqli
 
     repair = repair_transcription_hydration_jobs(conn, due_at=100, max_jobs=300)
 
-    assert (repair.enqueued, repair.has_more) == (3, False)
+    assert repair.has_more is False
     assert conn.execute(
         "SELECT dialog_id, message_id, terminal FROM hydration_jobs ORDER BY message_id"
     ).fetchall() == [
@@ -627,12 +639,11 @@ def test_transcription_repair_rolls_back_without_leaving_queue_rows(conn: sqlite
     conn.commit()
 
     repair = repair_transcription_hydration_jobs(conn, due_at=900, max_jobs=1)
-    assert repair.enqueued == 1
     conn.rollback()
     assert conn.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
 
     repair = repair_transcription_hydration_jobs(conn, due_at=901, max_jobs=1)
-    assert (repair.enqueued, repair.has_more) == (1, False)
+    assert repair.has_more is False
 
 
 @pytest.mark.parametrize(

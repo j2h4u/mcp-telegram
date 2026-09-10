@@ -6,8 +6,7 @@ from contextlib import closing
 
 import pytest
 
-from mcp_telegram import activity_cold_backfill, activity_peer_resolve, activity_sync
-from mcp_telegram.activity_cold_backfill import ColdBackfillHistoryPacing, ColdBackfillPacing
+from mcp_telegram import activity_peer_resolve, activity_sync
 from mcp_telegram.activity_peer_sweep import PeerSweepRequest, _resolve_peer_for_sweep
 from mcp_telegram.scheduled_messages import _load_candidate_entity
 from mcp_telegram.telegram_rpc_scheduler import (
@@ -64,29 +63,6 @@ async def test_activity_sync_search_propagates_scheduler_close(monkeypatch: pyte
         await activity_sync._search_backfill_batch(
             _ClosedActivityClient(closed), 0, asyncio.Event(), total_fetched=0, timeout_s=1
         )
-
-
-@pytest.mark.asyncio
-async def test_cold_backfill_safe_wrapper_propagates_scheduler_close(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    closed = _closed_error(TelegramRpcSource.ACTIVITY_COLD_BACKFILL)
-
-    async def fail(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise closed
-
-    monkeypatch.setattr(activity_cold_backfill, "run_cold_backfill_pass", fail)
-    pacing = ColdBackfillPacing(
-        idle_s=10,
-        history=ColdBackfillHistoryPacing(batch_s=1, enroll_s=1, access_retry_s=1),
-    )
-
-    with closing(sqlite3.connect(":memory:")) as conn:
-        with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
-            await activity_cold_backfill._run_cold_backfill_pass_safe(
-                _ClosedActivityClient(closed), conn, asyncio.Event(), pacing=pacing, timeout_s=1
-            )
 
 
 @pytest.mark.asyncio

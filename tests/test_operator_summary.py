@@ -102,7 +102,7 @@ def test_summary_is_one_coherent_content_free_report(tmp_path: Path) -> None:
     assert "get_entity_info: tool_error" in report.text
 
 
-def test_summary_reports_demand_units_capacity_and_overdue_reason(tmp_path: Path) -> None:
+def test_summary_reports_final_demand_outcomes_and_freshness_reason(tmp_path: Path) -> None:
     now = 2_000_000_000.0
     db_path = tmp_path / "sync.db"
     _database(db_path, now_ms=int(now * 1000))
@@ -115,9 +115,17 @@ def test_summary_reports_demand_units_capacity_and_overdue_reason(tmp_path: Path
                 int(now * 1000) - 4_000,
                 "telegram.demand",
                 "current",
-                "offered",
+                "selected",
                 None,
-                json.dumps({"demand_kind": "scheduled_repair", "demand_units": 4, "actual_attempts": 0}),
+                json.dumps(
+                    {
+                        "demand_kind": "scheduled_repair",
+                        "demand_units": 1,
+                        "actual_attempts": 0,
+                        "queue_age_seconds": 8.0,
+                        "freshness_debt_seconds": 3.5,
+                    }
+                ),
             ),
         )
         conn.execute(
@@ -133,9 +141,8 @@ def test_summary_reports_demand_units_capacity_and_overdue_reason(tmp_path: Path
                 json.dumps(
                     {
                         "demand_kind": "scheduled_repair",
-                        "demand_units": 2,
+                        "demand_units": 1,
                         "actual_attempts": 1,
-                        "oldest_overdue_seconds": 3.5,
                     }
                 ),
             ),
@@ -148,16 +155,13 @@ def test_summary_reports_demand_units_capacity_and_overdue_reason(tmp_path: Path
                 int(now * 1000) - 2_000,
                 "telegram.demand",
                 "current",
-                "predicted_selection",
+                "completed",
                 None,
                 json.dumps(
                     {
                         "demand_kind": "scheduled_discovery",
                         "demand_units": 1,
-                        "actual_attempts": 0,
-                        "queue_age_seconds": 8.0,
-                        "predicted_kind": "scheduled_repair",
-                        "selection_match": False,
+                        "actual_attempts": 2,
                     }
                 ),
             ),
@@ -167,10 +171,10 @@ def test_summary_reports_demand_units_capacity_and_overdue_reason(tmp_path: Path
     report = build_operator_summary(db_path, since_seconds=15 * 3600, now=now)
 
     assert (
-        "Demand: offered=4, predicted selection=1, deferred=2, actual attempts=1, selection matches=0, "
-        "mismatches=1, oldest queue age=8.0s, oldest overdue=3.5s, reasons=capacity=2" in report.text
+        "Demand: selected=1, completed=1, deferred=1, actual attempts=3, oldest queue age=8.0s, "
+        "max freshness debt=3.5s, reasons=capacity=1" in report.text
     )
-    assert "scheduled_repair: offered=4, deferred=2" in report.text
+    assert "scheduled_repair: selected=1, deferred=1" in report.text
 
 
 def test_summary_omits_overdue_debt_when_demand_has_no_freshness_deadline(tmp_path: Path) -> None:
@@ -186,7 +190,7 @@ def test_summary_omits_overdue_debt_when_demand_has_no_freshness_deadline(tmp_pa
                 int(now * 1000) - 1_000,
                 "telegram.demand",
                 "current",
-                "ready",
+                "completed",
                 json.dumps({"demand_kind": "dialog_full_reconciliation", "demand_units": 1}),
             ),
         )
@@ -194,8 +198,8 @@ def test_summary_omits_overdue_debt_when_demand_has_no_freshness_deadline(tmp_pa
 
     report = build_operator_summary(db_path, since_seconds=15 * 3600, now=now)
 
-    assert "dialog_full_reconciliation: ready=1" in report.text
-    assert "oldest overdue" not in report.text
+    assert "dialog_full_reconciliation: completed=1" in report.text
+    assert "max freshness debt" not in report.text
 
 
 def test_summary_marks_window_unreliable_when_snapshot_reports_loss(

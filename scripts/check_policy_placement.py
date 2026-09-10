@@ -51,6 +51,10 @@ REQUIRED_POLICY_SINKS = {
 # these keys here makes the detector reject the same spelling everywhere else.
 NON_OPERATOR_POLICY_FINDINGS: frozenset[tuple[str, str]] = frozenset(
     {
+        (
+            "policy_assignments",
+            "src/mcp_telegram/folders/contracts.py:<module>:FOLDER_DIALOG_PAGE_SIZE",
+        ),
         ("policy_assignments", "src/mcp_telegram/delta_sync.py:<module>:_DELTA_SLICE_MESSAGE_LIMIT"),
         (
             "policy_call_keywords",

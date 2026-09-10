@@ -96,11 +96,6 @@ class HydrationQueueKindSnapshot:
     newest_message_sent_at: int | None
     max_attempts: int
 
-    @property
-    def deferred(self) -> int:
-        """Return active jobs intentionally scheduled for a later cycle."""
-        return self.active - self.ready
-
 
 _JOB_COLUMNS = "kind, dialog_id, message_id, due_at, attempts, message_sent_at, priority, terminal"
 _SELECT_JOB_COLUMNS = ", ".join(f"hj.{column}" for column in _JOB_COLUMNS.split(", "))
@@ -260,21 +255,25 @@ class HydrationQueueRepository:
         )
         return [_job_from_row(row) for row in rows]
 
+    def next_release_at(self, priority: HydrationPriority) -> int | None:
+        """Return the earliest active release in one durable priority tier."""
+        if not isinstance(priority, HydrationPriority):
+            raise TypeError("priority must be a HydrationPriority")
+        row = cast(
+            tuple[object] | None,
+            self._conn.execute(
+                f"SELECT MIN(due_at) FROM {HYDRATION_QUEUE_TABLE} WHERE terminal = 0 AND priority = ?",
+                (int(priority),),
+            ).fetchone(),
+        )
+        if row is None or row[0] is None:
+            return None
+        return int(cast(int | str, row[0]))
+
     def snapshot(self, now: int) -> tuple[HydrationQueueKindSnapshot, ...]:
         """Return one compact operational snapshot without changing queue state."""
         rows = cast(list[tuple[object, ...]], self._conn.execute(_QUEUE_SNAPSHOT_SQL, (now,)).fetchall())
         return tuple(_snapshot_from_row(row) for row in rows)
-
-    def outcome_counts(self) -> tuple[tuple[str, int], ...]:
-        """Return compact counts by durable last outcome."""
-        rows = cast(
-            list[tuple[str, int]],
-            self._conn.execute(
-                f"SELECT last_outcome, COUNT(*) FROM {HYDRATION_QUEUE_TABLE} "
-                "GROUP BY last_outcome ORDER BY last_outcome"
-            ).fetchall(),
-        )
-        return tuple((str(outcome), int(count)) for outcome, count in rows)
 
     def start(self, job: HydrationJob) -> HydrationJob | None:
         """Atomically increment and return a queued job, or return ``None``.

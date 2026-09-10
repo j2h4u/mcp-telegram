@@ -50,7 +50,6 @@ from .telegram_demand import (
 from .telegram_gateway import ScheduledHistoryClient, fetch_scheduled_history_snapshot
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
-    RpcAdmissionClosedError,
     TelegramRpcSource,
     rpc_attempt_budget,
     rpc_scope,
@@ -644,24 +643,6 @@ class ScheduledMessageReconciler:
         )
         return [(_as_int(row[0]), _as_int(row[1]), bool(row[2])) for row in rows]
 
-    def _wait_timeout(self, now: int | None = None) -> float:
-        """Return a non-spinning wait until due work or account retry."""
-        current = int(time.time()) if now is None else int(now)
-        scan_seconds = max(1.0, float(self._policy.state_scan_seconds))
-        retry_at = _retry_at(self._conn)
-        if retry_at is not None and retry_at > current:
-            return min(scan_seconds, float(retry_at - current))
-        due = cast(
-            tuple[object] | None,
-            self._conn.execute(
-                "SELECT 1 FROM scheduled_reconciliation_state "
-                "WHERE (repair_due_at <= ? OR discovery_due_at <= ?) "
-                "AND (? IS NULL OR ? <= ?) LIMIT 1",
-                (current, current, retry_at, retry_at, current),
-            ).fetchone(),
-        )
-        return 0.0 if due else scan_seconds
-
     def _record_dialog_failure(self, dialog_id: int, kind: str, _code: str, now: int) -> None:
         due_column = "discovery_due_at" if kind == "discovery" else "repair_due_at"
         self._conn.execute(
@@ -791,10 +772,6 @@ class ScheduledMessageReconciler:
         changed = self._apply_snapshot(dialog_id, generation, snapshot, discovery=discovery, now=now)
         return (0 if changed is None else changed), False
 
-    async def run_once(self) -> int:
-        """Process one bounded slice of due per-dialog work."""
-        return await self._run_slice()
-
     async def run_demand_slice(self, demand_kind: DemandKind) -> int:
         """Process one bounded slice for one scheduled demand contract."""
         if demand_kind not in (DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY):
@@ -906,37 +883,6 @@ class ScheduledDiscoveryDemandAdapter(_ScheduledDemandAdapter):
     demand_kind = DemandKind.SCHEDULED_DISCOVERY
 
 
-async def run_scheduled_reconciliation_loop(
-    client: _ScheduledClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    *,
-    policy: ScheduledReconciliationPolicy,
-    own_only_context: OwnOnlyContext | None = None,
-) -> None:
-    """Run bounded due-work slices until shutdown."""
-    reconciler = ScheduledMessageReconciler(
-        client,
-        conn,
-        shutdown_event,
-        own_only_context,
-        policy=policy,
-    )
-    while not shutdown_event.is_set():
-        try:
-            await reconciler.run_once()
-        except RpcAdmissionClosedError:
-            raise
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.warning("scheduled_reconcile_failed", exc_info=True)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=reconciler._wait_timeout())
-        except TimeoutError:
-            continue
-
-
 __all__ = [
     "ScheduledDiscoveryDemandAdapter",
     "ScheduledMessageReconciler",
@@ -944,7 +890,6 @@ __all__ = [
     "ScheduledRepairDemandAdapter",
     "mark_missing_from_snapshot",
     "mark_scheduled_messages_removed",
-    "run_scheduled_reconciliation_loop",
     "scheduled_dialog_id",
     "scheduled_message_dialog_id",
     "upsert_scheduled_message",

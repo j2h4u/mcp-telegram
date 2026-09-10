@@ -40,25 +40,6 @@ class AcquisitionKind(StrEnum):
     UPDATE_DIFFERENCE = "update_difference"
 
 
-@dataclass(frozen=True, slots=True)
-class DemandPrediction:
-    """Content-free shadow selection evidence attached to one legacy cycle."""
-
-    predicted_kind: DemandKind | None
-    selected_at: float
-    queue_age_seconds: float | None
-    overdue_seconds: float | None
-
-    def __post_init__(self) -> None:
-        _validate_timestamp(self.selected_at, "selected_at")
-        for value, name in (
-            (self.queue_age_seconds, "queue_age_seconds"),
-            (self.overdue_seconds, "overdue_seconds"),
-        ):
-            if value is not None:
-                _validate_timestamp(value, name)
-
-
 @dataclass(slots=True, eq=False)
 class RpcAttemptEvidence:
     """Mutable, non-enforcing count of real sends attributed to one root."""
@@ -81,7 +62,6 @@ class DemandToken:
     acquisition_kind: AcquisitionKind | None
     owner_task: asyncio.Task[object] | None
     attempt_evidence: RpcAttemptEvidence
-    prediction: DemandPrediction | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,13 +185,10 @@ def create_demand_token(
     kind: DemandKind,
     *,
     deadline: float | None = None,
-    prediction: DemandPrediction | None = None,
 ) -> DemandToken:
     """Create an uninstalled root token for explicit cycle transfer."""
     if not isinstance(kind, DemandKind):
         raise TypeError("kind must be a DemandKind")
-    if prediction is not None and not isinstance(prediction, DemandPrediction):
-        raise TypeError("prediction must be DemandPrediction")
     contract = demand_contract(kind)
     return DemandToken(
         kind=kind,
@@ -221,7 +198,6 @@ def create_demand_token(
         acquisition_kind=None,
         owner_task=_current_task(),
         attempt_evidence=RpcAttemptEvidence(),
-        prediction=prediction,
     )
 
 

@@ -32,7 +32,6 @@ _DELETE_FORWARD_SQL = "DELETE FROM message_forwards WHERE dialog_id = ? AND mess
 _SELECT_MESSAGE_TEXT_SQL = "SELECT text FROM messages WHERE dialog_id = ? AND message_id = ?"
 _SELECT_MESSAGE_EXISTS_SQL = "SELECT 1 FROM messages WHERE dialog_id = ? AND message_id = ?"
 _SELECT_MESSAGE_OUT_SQL = "SELECT out FROM messages WHERE dialog_id = ? AND message_id = ?"
-_SELECT_MESSAGE_LOG_CONTEXT_SQL = "SELECT sent_at FROM messages WHERE dialog_id = ? AND message_id = ?"
 _NEXT_VERSION_SQL = "SELECT COALESCE(MAX(version), 0) + 1 FROM message_versions WHERE dialog_id = ? AND message_id = ?"
 _INSERT_VERSION_SQL = "INSERT INTO message_versions (dialog_id, message_id, version, old_text, edit_date, origin) VALUES (?, ?, ?, ?, ?, ?)"
 _UPDATE_MESSAGE_TEXT_SQL = "UPDATE messages SET text = ? WHERE dialog_id = ? AND message_id = ?"
@@ -72,15 +71,6 @@ class MessageOutLookup:
     outgoing: bool
 
 
-@dataclass(frozen=True, slots=True)
-class MessageLogContext:
-    """Content-free message coordinates safe for operator logs."""
-
-    dialog_id: int
-    message_id: int
-    telegram_sent_at: int | None = None
-
-
 def message_exists(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
     """Return whether the canonical message key is already persisted."""
     return conn.execute(_SELECT_MESSAGE_EXISTS_SQL, (dialog_id, message_id)).fetchone() is not None
@@ -96,19 +86,6 @@ def read_message_out(conn: sqlite3.Connection, dialog_id: int, message_id: int) 
     """Read the canonical outgoing marker without opening a transaction."""
     row = cast(tuple[int] | None, conn.execute(_SELECT_MESSAGE_OUT_SQL, (dialog_id, message_id)).fetchone())
     return MessageOutLookup(found=row is not None, outgoing=bool(row[0]) if row is not None else False)
-
-
-def message_log_context(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> MessageLogContext:
-    """Return content-free message coordinates from the canonical local row."""
-    row = cast(
-        tuple[int] | None,
-        conn.execute(_SELECT_MESSAGE_LOG_CONTEXT_SQL, (dialog_id, message_id)).fetchone(),
-    )
-    return MessageLogContext(
-        dialog_id=dialog_id,
-        message_id=message_id,
-        telegram_sent_at=row[0] if row is not None else None,
-    )
 
 
 def persist_edited_message(

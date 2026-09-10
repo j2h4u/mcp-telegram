@@ -8,6 +8,7 @@ import pytest
 
 from mcp_telegram.media_hydration import MediaFactHydrationHandler
 from mcp_telegram.telegram_rpc_consumers import (
+    DURABLE_DEMAND_ORDER,
     TELEGRAM_DEMAND_CONTRACTS,
     TELEGRAM_RPC_CONSUMERS,
     AcquisitionRole,
@@ -26,6 +27,29 @@ from mcp_telegram.telegram_rpc_consumers import (
 )
 from mcp_telegram.telegram_rpc_scheduler import RPC_SOURCE_SERVICE_CLASS
 from mcp_telegram.transcription_hydration import TranscriptionHydrationHandler
+
+EXPECTED_DURABLE_DEMAND_ORDER = (
+    DemandKind.SELF_PROFILE_MAINTENANCE,
+    DemandKind.ENTITY_PROFILE_REFRESH,
+    DemandKind.DELTA_GAP_FILL,
+    DemandKind.DELTA_ACCESS_PROBE,
+    DemandKind.HOT_ACTIVITY_PAGE,
+    DemandKind.LIVE_HYDRATION_BATCH,
+    DemandKind.FULL_SYNC_DM_ENROLLMENT,
+    DemandKind.FULL_SYNC_PAGE,
+    DemandKind.DIALOG_BOOTSTRAP,
+    DemandKind.DIALOG_LIGHT_RECONCILIATION,
+    DemandKind.DIALOG_FULL_RECONCILIATION,
+    DemandKind.ARCHIVE_BACKFILL,
+    DemandKind.ARCHIVE_INCREMENTAL,
+    DemandKind.COLD_PEER_PAGE,
+    DemandKind.BACKFILL_HYDRATION_BATCH,
+    DemandKind.FOLDER_SNAPSHOT,
+    DemandKind.MESSAGE_FACT_REFRESH,
+    DemandKind.READ_RECEIPT_BATCH,
+    DemandKind.SCHEDULED_REPAIR,
+    DemandKind.SCHEDULED_DISCOVERY,
+)
 
 
 def test_consumer_registry_is_exhaustive_and_semantically_complete() -> None:
@@ -93,6 +117,12 @@ def test_scheduler_classification_is_derived_from_consumer_registry() -> None:
     } == RPC_SOURCE_SERVICE_CLASS
 
 
+def test_startup_identity_contract_covers_both_possible_network_sends() -> None:
+    contract = demand_contract(DemandKind.SELF_PROFILE_MAINTENANCE)
+
+    assert contract.max_rpc_attempts_per_slice == 2
+
+
 def test_consumer_registry_and_records_are_immutable() -> None:
     source = TelegramRpcSource.SCHEDULED_MESSAGES
     with pytest.raises(TypeError):
@@ -127,11 +157,22 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
     assert demand_freshness_seconds(DemandKind.ARCHIVE_INCREMENTAL) == 3_600
     assert demand_freshness_seconds(DemandKind.DIALOG_FULL_RECONCILIATION) == 86_400
     assert demand_contract(DemandKind.FULL_SYNC_DM_ENROLLMENT).max_rpc_attempts_per_slice == 32
+    assert demand_contract(DemandKind.HOT_ACTIVITY_PAGE).max_rpc_attempts_per_slice == 2
+    assert demand_contract(DemandKind.COLD_PEER_PAGE).max_rpc_attempts_per_slice == 2
+    assert demand_contract(DemandKind.FOLDER_SNAPSHOT).max_rpc_attempts_per_slice == 2
     assert demand_contract(DemandKind.LIVE_HYDRATION_BATCH).max_rpc_attempts_per_slice == 2
     assert demand_contract(DemandKind.BACKFILL_HYDRATION_BATCH).max_rpc_attempts_per_slice == 2
     assert demand_contract(DemandKind.REACTION_REFRESH_BATCH).execution_mode is ExecutionMode.INLINE
     assert demand_contract(DemandKind.TOPIC_SNAPSHOT).execution_mode is ExecutionMode.INLINE
     assert demand_contract(DemandKind.RECONNECT_DIFFERENCE).execution_mode is ExecutionMode.INLINE
+
+
+def test_durable_demand_order_is_a_literal_complete_contract() -> None:
+    assert DURABLE_DEMAND_ORDER == EXPECTED_DURABLE_DEMAND_ORDER
+    assert len(DURABLE_DEMAND_ORDER) == 20
+    assert {
+        kind for kind, contract in TELEGRAM_DEMAND_CONTRACTS.items() if contract.execution_mode is ExecutionMode.DURABLE
+    } == set(EXPECTED_DURABLE_DEMAND_ORDER)
 
 
 def test_hydration_slice_bounds_cover_every_registered_handler_cost() -> None:
@@ -159,6 +200,16 @@ def test_demand_registry_validation_rejects_missing_kind_and_contract_key_mismat
     with pytest.raises(RuntimeError, match="key does not match"):
         validate_demand_contracts(MappingProxyType(mismatched))
 
+    durable_mode_drift = dict(TELEGRAM_DEMAND_CONTRACTS)
+    durable_mode_drift[DemandKind.SCHEDULED_REPAIR] = replace(
+        durable_mode_drift[DemandKind.SCHEDULED_REPAIR],
+        execution_mode=ExecutionMode.INLINE,
+        freshness_target=None,
+        max_rpc_attempts_per_slice=None,
+    )
+    with pytest.raises(RuntimeError, match="explicit durable demand order"):
+        validate_demand_contracts(MappingProxyType(durable_mode_drift))
+
 
 def test_scheduled_consumer_declares_realtime_and_difference_overlap() -> None:
     acquisition = TELEGRAM_RPC_CONSUMERS[TelegramRpcSource.SCHEDULED_MESSAGES].acquisition
@@ -171,11 +222,14 @@ def test_scheduled_consumer_declares_realtime_and_difference_overlap() -> None:
     assert TELEGRAM_RPC_CONSUMERS[TelegramRpcSource.SCHEDULED_MESSAGES].demand.bound is DemandBound.PRODUCER_BOUNDED
 
 
-def test_unbounded_producer_demand_is_explicit_and_reviewable() -> None:
-    unbounded = {
-        source for source, spec in TELEGRAM_RPC_CONSUMERS.items() if spec.demand.bound is DemandBound.PRODUCER_UNBOUNDED
-    }
-    assert unbounded == {TelegramRpcSource.DIALOG_SYNC}
+def test_every_durable_producer_is_bounded_or_resumable() -> None:
+    for kind in EXPECTED_DURABLE_DEMAND_ORDER:
+        source = demand_contract(kind).source
+        demand = TELEGRAM_RPC_CONSUMERS[source].demand
+        assert demand.owner is DemandPolicyOwner.PRODUCER
+        assert demand.bound in {DemandBound.PRODUCER_BOUNDED, DemandBound.PRODUCER_RESUMABLE}
+
+    assert TELEGRAM_RPC_CONSUMERS[TelegramRpcSource.DIALOG_SYNC].demand.bound is DemandBound.PRODUCER_RESUMABLE
 
 
 def test_lookup_rejects_non_enum_source() -> None:

@@ -8,8 +8,8 @@ This module provides:
   - sweep_peer_once: FloodWait-neutral per-peer self-search primitive.
   - enroll_activity_dialog: shared enrollment helper (reused by schedulers
     and plan 05 daemon-api wiring).
-  - build_working_set: working-set builder enrolling from dialogs.type=
-    'supergroup'/'channel' with durable resolver-path FloodWait retry.
+  - run_working_set_enrollment_slice: restart-safe bounded replacement for
+    coordinator-owned execution.
   - _load_dialog_state / _save_dialog_state: per-tier cursor helpers.
 
 Phase 54: linked_chat_id resolution is dialogs-cache-trust; no per-channel
@@ -20,6 +20,7 @@ No scheduling loops live here — those are plans 03 and 04.
 
 import asyncio
 import logging
+import math
 import sqlite3
 import time
 from collections.abc import Sequence
@@ -30,7 +31,7 @@ from typing import Protocol, cast
 from telethon.tl.types import TypeInputPeer
 
 from .access_lifecycle import set_access_lost
-from .activity_peer_resolve import LinkedChatResolution, resolve_input_peer, resolve_linked_chat_id
+from .activity_peer_resolve import resolve_input_peer, resolve_linked_chat_id
 from .activity_substrate import ActivityClient, call_with_timeout
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
@@ -39,7 +40,8 @@ from .messages.sqlite_bundle import insert_messages_with_fts, message_exists
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
 from .own_only import enroll_own_only_sync_dialog
 from .telegram_access import ACCESS_LOST_ERRORS
-from .telegram_rpc_scheduler import RpcAdmissionClosedError
+from .telegram_demand import AcquisitionKind, RpcAttemptBudgetExhaustedError, acquisition_context
+from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +60,12 @@ _PACING = PeerSweepPacing()
 
 
 @dataclass(frozen=True, slots=True)
-class WorkingSetResult:
-    """Result of refreshing the peer working set."""
+class WorkingSetEnrollmentSliceResult:
+    """Durable outcome from one bounded working-set enrollment unit."""
 
-    enrolled_count: int
+    completed: bool = False
     flood_wait_seconds: int | None = None
+    consumed: bool = False
 
 
 # Thin dialogs row written alongside the own_only synced_dialogs insert so the
@@ -173,6 +176,11 @@ async def _resolve_peer_for_sweep(request: PeerSweepRequest) -> TypeInputPeer | 
     """Resolve one peer while preserving the governed-RPC error boundary."""
     try:
         return await resolve_input_peer(request.client, request.dialog_id)
+    except RpcAttemptBudgetExhaustedError:
+        # A slice boundary is a continuation point, not an access failure.
+        # Leave the owning tier's cursor/lease untouched so the next slice can
+        # retry the same peer with a fresh budget.
+        raise
     except RpcAdmissionClosedError:
         raise
     except TelegramRpcThrottled as exc:
@@ -320,6 +328,10 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer, 
             timeout_s=request.timeout_s,
         )
     except RpcAdmissionClosedError:
+        raise
+    except RpcAttemptBudgetExhaustedError:
+        # Do not turn a local slice bound into ACCESS_SKIP.  The caller owns
+        # durable continuation and will retry this page in the next slice.
         raise
     except TelegramRpcThrottled as exc:
         _raise_if_latched(exc)
@@ -473,7 +485,7 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
 
 
 # ---------------------------------------------------------------------------
-# Shared enrollment helper — reused by build_working_set AND plan 05
+# Shared enrollment helper used by the bounded enrollment slice and API wiring.
 # ---------------------------------------------------------------------------
 
 
@@ -619,72 +631,259 @@ def _save_dialog_state(
 # ---------------------------------------------------------------------------
 
 
-async def build_working_set(
+_ENROLLMENT_PHASE_KEY = "activity_working_set_phase"
+_ENROLLMENT_CURSOR_KEY = "activity_working_set_cursor"
+_ENROLLMENT_COMPLETED_AT_KEY = "activity_working_set_completed_at"
+# Stable storage key for the next continuation attempt.  The persisted spelling
+# is retained for databases created before the demand coordinator cutover.
+_ENROLLMENT_NEXT_ATTEMPT_AT_KEY = "activity_working_set_retry_at"
+_ENROLLMENT_SUPERGROUPS = "supergroups"
+_ENROLLMENT_CHANNELS = "channels"
+
+
+def _load_working_set_enrollment_state(conn: sqlite3.Connection) -> dict[str, str | None]:
+    keys = (
+        _ENROLLMENT_PHASE_KEY,
+        _ENROLLMENT_CURSOR_KEY,
+        _ENROLLMENT_COMPLETED_AT_KEY,
+        _ENROLLMENT_NEXT_ATTEMPT_AT_KEY,
+    )
+    placeholders = ", ".join("?" for _ in keys)
+    rows = cast(
+        list[tuple[str, str | None]],
+        conn.execute(
+            f"SELECT key, value FROM activity_sync_state WHERE key IN ({placeholders})",
+            keys,
+        ).fetchall(),
+    )
+    return dict(rows)
+
+
+def _validate_working_set_enrollment_timing(now: float, cadence_s: float) -> None:
+    if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now) or now < 0:
+        raise ValueError("now must be a finite non-negative timestamp")
+    if (
+        isinstance(cadence_s, bool)
+        or not isinstance(cadence_s, (int, float))
+        or not math.isfinite(cadence_s)
+        or cadence_s <= 0
+    ):
+        raise ValueError("cadence_s must be finite and positive")
+
+
+def _has_working_set_enrollment_candidate(conn: sqlite3.Connection) -> bool:
+    candidate = cast(
+        tuple[int] | None,
+        conn.execute("SELECT 1 FROM dialogs WHERE type IN ('supergroup', 'channel') AND hidden = 0 LIMIT 1").fetchone(),
+    )
+    return candidate is not None
+
+
+def working_set_enrollment_release_at(
+    conn: sqlite3.Connection,
+    *,
+    now: float,
+    cadence_s: float,
+) -> float | None:
+    """Return the restart-safe release for the next enrollment unit."""
+    _validate_working_set_enrollment_timing(now, cadence_s)
+    state = _load_working_set_enrollment_state(conn)
+    if state.get(_ENROLLMENT_PHASE_KEY) is not None:
+        return float(int(state.get(_ENROLLMENT_NEXT_ATTEMPT_AT_KEY) or 0))
+    completed_at = int(state.get(_ENROLLMENT_COMPLETED_AT_KEY) or 0)
+    if completed_at == 0 and not _has_working_set_enrollment_candidate(conn):
+        return None
+    return 0.0 if completed_at == 0 else float(completed_at) + float(cadence_s)
+
+
+def _start_working_set_enrollment(conn: sqlite3.Connection) -> str:
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
+            (_ENROLLMENT_PHASE_KEY, _ENROLLMENT_SUPERGROUPS),
+        )
+        conn.execute(
+            "DELETE FROM activity_sync_state WHERE key IN (?, ?)",
+            (_ENROLLMENT_CURSOR_KEY, _ENROLLMENT_NEXT_ATTEMPT_AT_KEY),
+        )
+    return _ENROLLMENT_SUPERGROUPS
+
+
+def _set_working_set_enrollment_position(
+    conn: sqlite3.Connection,
+    *,
+    phase: str,
+    cursor: int | None,
+    retry_at: int | None = None,
+) -> None:
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
+            (_ENROLLMENT_PHASE_KEY, phase),
+        )
+        if cursor is None:
+            conn.execute("DELETE FROM activity_sync_state WHERE key = ?", (_ENROLLMENT_CURSOR_KEY,))
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
+                (_ENROLLMENT_CURSOR_KEY, str(cursor)),
+            )
+        if retry_at is None:
+            conn.execute("DELETE FROM activity_sync_state WHERE key = ?", (_ENROLLMENT_NEXT_ATTEMPT_AT_KEY,))
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
+                (_ENROLLMENT_NEXT_ATTEMPT_AT_KEY, str(retry_at)),
+            )
+
+
+def _finish_working_set_enrollment(conn: sqlite3.Connection, *, completed_at: int) -> None:
+    with conn:
+        conn.execute(
+            "DELETE FROM activity_sync_state WHERE key IN (?, ?, ?)",
+            (_ENROLLMENT_PHASE_KEY, _ENROLLMENT_CURSOR_KEY, _ENROLLMENT_NEXT_ATTEMPT_AT_KEY),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
+            (_ENROLLMENT_COMPLETED_AT_KEY, str(completed_at)),
+        )
+
+
+def _next_enrollment_dialog(
+    conn: sqlite3.Connection,
+    *,
+    dialog_type: str,
+    cursor: int | None,
+) -> tuple[int, int | None] | None:
+    return cast(
+        tuple[int, int | None] | None,
+        conn.execute(
+            "SELECT dialog_id, last_message_at FROM dialogs "
+            "WHERE type = ? AND hidden = 0 AND (? IS NULL OR dialog_id > ?) "
+            "ORDER BY dialog_id LIMIT 1",
+            (dialog_type, cursor, cursor),
+        ).fetchone(),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkingSetEnrollmentPosition:
+    phase: str
+    cursor: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ChannelEnrollmentRequest:
+    client: ActivityClient
+    conn: sqlite3.Connection
+    source: TelegramRpcSource
+    timeout_s: float
+    now: int
+    cursor: int | None
+
+
+def _load_or_start_working_set_enrollment(conn: sqlite3.Connection) -> _WorkingSetEnrollmentPosition:
+    state = _load_working_set_enrollment_state(conn)
+    phase = state.get(_ENROLLMENT_PHASE_KEY)
+    if phase is None:
+        return _WorkingSetEnrollmentPosition(_start_working_set_enrollment(conn), None)
+    cursor_value = state.get(_ENROLLMENT_CURSOR_KEY)
+    cursor = int(cursor_value) if cursor_value is not None else None
+    return _WorkingSetEnrollmentPosition(phase, cursor)
+
+
+def _enroll_supergroup_slice(
+    conn: sqlite3.Connection,
+    position: _WorkingSetEnrollmentPosition,
+) -> WorkingSetEnrollmentSliceResult | None:
+    row = _next_enrollment_dialog(conn, dialog_type="supergroup", cursor=position.cursor)
+    if row is None:
+        _set_working_set_enrollment_position(conn, phase=_ENROLLMENT_CHANNELS, cursor=None)
+        return None
+    dialog_id, last_activity_at = row
+    enroll_activity_dialog(conn, dialog_id, "supergroup", last_activity_at=last_activity_at)
+    _set_working_set_enrollment_position(
+        conn,
+        phase=_ENROLLMENT_SUPERGROUPS,
+        cursor=dialog_id,
+    )
+    return WorkingSetEnrollmentSliceResult(consumed=True)
+
+
+async def _enroll_channel_slice(
+    request: _ChannelEnrollmentRequest,
+) -> WorkingSetEnrollmentSliceResult:
+    row = _next_enrollment_dialog(request.conn, dialog_type="channel", cursor=request.cursor)
+    if row is None:
+        _finish_working_set_enrollment(request.conn, completed_at=request.now)
+        return WorkingSetEnrollmentSliceResult(completed=True, consumed=True)
+
+    channel_id, last_activity_at = row
+    try:
+        with acquisition_context(AcquisitionKind.DIALOG_TRAVERSAL):
+            with rpc_scope(request.source, timeout_seconds=request.timeout_s):
+                resolution = await resolve_linked_chat_id(
+                    request.client,
+                    request.conn,
+                    channel_id,
+                    timeout_s=request.timeout_s,
+                )
+    except RpcAttemptBudgetExhaustedError:
+        return WorkingSetEnrollmentSliceResult(consumed=True)
+
+    if resolution.flood_wait_seconds is not None:
+        _set_working_set_enrollment_position(
+            request.conn,
+            phase=_ENROLLMENT_CHANNELS,
+            cursor=request.cursor,
+            retry_at=request.now + resolution.flood_wait_seconds,
+        )
+        return WorkingSetEnrollmentSliceResult(flood_wait_seconds=resolution.flood_wait_seconds, consumed=True)
+    if resolution.linked_chat_id is not None:
+        enroll_activity_dialog(
+            request.conn,
+            resolution.linked_chat_id,
+            "linked_chat",
+            last_activity_at=last_activity_at,
+        )
+    _set_working_set_enrollment_position(
+        request.conn,
+        phase=_ENROLLMENT_CHANNELS,
+        cursor=channel_id,
+    )
+    return WorkingSetEnrollmentSliceResult(consumed=True)
+
+
+async def run_working_set_enrollment_slice(  # noqa: PLR0913 - explicit bounded slice dependencies
     client: ActivityClient,
     conn: sqlite3.Connection,
     *,
+    source: TelegramRpcSource,
+    cadence_s: float,
     timeout_s: float,
-) -> WorkingSetResult:
-    """Build the per-peer self-search working set and enroll peers.
+    now: int | None = None,
+) -> WorkingSetEnrollmentSliceResult:
+    """Enroll one dialog candidate while durably retaining scan continuation."""
+    at = int(time.time() if now is None else now)
+    release_at = working_set_enrollment_release_at(conn, now=float(at), cadence_s=cadence_s)
+    if release_at is None or release_at > at:
+        return WorkingSetEnrollmentSliceResult()
 
-    Source: dialogs.type='supergroup' (megagroups) and dialogs.type='channel'
-    (broadcast channels whose linked discussion group is resolved via
-    resolve_linked_chat_id (post-Phase-54: dialogs-cache hot read; falls through
-    to GetFullChannelRequest only when linked_chat_resolved_at IS NULL)).
-    NOT entities.type='group' — that taxonomy differs (concern 4 fix).
-
-    Returns the enrolled count and whether linked-chat resolution flooded.
-    """
-    # Step 1: standalone supergroups (directly self-searchable)
-    supergroup_rows = cast(
-        list[tuple[int, int | None]],
-        conn.execute(
-            "SELECT dialog_id, last_message_at FROM dialogs WHERE type = 'supergroup' AND hidden = 0"
-        ).fetchall(),
-    )
-
-    # Step 2: broadcast channels (need linked_chat resolution)
-    channel_rows = cast(
-        list[tuple[int, int | None]],
-        conn.execute("SELECT dialog_id, last_message_at FROM dialogs WHERE type = 'channel' AND hidden = 0").fetchall(),
-    )
-
-    working_set: dict[int, int | None] = {}  # peer_id → last_activity_at
-
-    # Enroll supergroups directly
-    working_set = dict(supergroup_rows)
-    supergroup_ids = {dialog_id for dialog_id, _ in supergroup_rows}
-
-    # Step 3: resolve broadcast channels to their discussion groups
-    flood_wait_seconds: int | None = None
-    for channel_id, channel_last_message_at in channel_rows:
-        res: LinkedChatResolution = await resolve_linked_chat_id(client, conn, channel_id, timeout_s=timeout_s)
-
-        if res.flood_wait_seconds is not None:
-            logger.warning(
-                "build_working_set_channel_flood channel_id=%r flood_wait_seconds=%d"
-                " — halting resolution pass (Telegram throttling from GetFullChannelRequest is"
-                " account-global; remaining channels stay due for next sweep cycle)",
-                channel_id,
-                res.flood_wait_seconds,
-            )
-            flood_wait_seconds = res.flood_wait_seconds
-            break
-
-        if res.linked_chat_id is not None:
-            existing = working_set.get(res.linked_chat_id)
-            if existing is None:
-                working_set[res.linked_chat_id] = channel_last_message_at
-        # else: no discussion group → drop channel (D-03)
-
-    # Step 4-5: enroll all peers via shared helper
-    for peer_id, last_activity_at in working_set.items():
-        source = "supergroup" if peer_id in supergroup_ids else "linked_chat"
-        enroll_activity_dialog(
-            conn,
-            peer_id,
-            source,
-            last_activity_at=last_activity_at,
+    position = _load_or_start_working_set_enrollment(conn)
+    if position.phase == _ENROLLMENT_SUPERGROUPS:
+        result = _enroll_supergroup_slice(conn, position)
+        if result is not None:
+            return result
+        position = _WorkingSetEnrollmentPosition(_ENROLLMENT_CHANNELS, None)
+    if position.phase != _ENROLLMENT_CHANNELS:
+        raise RuntimeError(f"unknown working-set enrollment phase {position.phase!r}")
+    return await _enroll_channel_slice(
+        _ChannelEnrollmentRequest(
+            client=client,
+            conn=conn,
+            source=source,
+            timeout_s=timeout_s,
+            now=at,
+            cursor=position.cursor,
         )
-
-    return WorkingSetResult(enrolled_count=len(working_set), flood_wait_seconds=flood_wait_seconds)
+    )

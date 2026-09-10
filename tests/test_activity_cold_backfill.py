@@ -16,10 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Iterator
 from typing import cast
 
 import pytest
@@ -30,16 +29,11 @@ from mcp_telegram.activity_cold_backfill import (
     ColdPassOutcome,
     ColdPassResult,
     ColdPeerPageDemandAdapter,
-    _cold_backfill_sleep_seconds,
-    _maybe_enroll_activity_peers,
-    _run_cold_backfill_pass_safe,
-    run_cold_backfill_loop,
     run_cold_backfill_pass,
 )
 from mcp_telegram.activity_peer_sweep import (
     SkipReason,
     SweepResult,
-    WorkingSetResult,
     _load_dialog_state,
     _save_dialog_state,
     enroll_activity_dialog,
@@ -58,7 +52,6 @@ _TEST_TIMEOUT_S = 120.0
 
 _DialogState = dict[str, int | str | None]
 _PACING = ColdBackfillPacing(
-    idle_s=300.0,
     history=ColdBackfillHistoryPacing(batch_s=5.0, enroll_s=1_800.0, access_retry_s=3_600.0),
 )
 
@@ -194,112 +187,6 @@ def _patch_sweep(
         _fake,
     )
     return call_log
-
-
-def _patch_build_working_set(monkeypatch: pytest.MonkeyPatch, timeout_calls: list[float] | None = None) -> None:
-    async def _noop(
-        client: object,
-        conn: sqlite3.Connection,
-        *,
-        timeout_s: float,
-    ) -> WorkingSetResult:
-        del client, conn
-        if timeout_calls is not None:
-            timeout_calls.append(timeout_s)
-        return WorkingSetResult(enrolled_count=0)
-
-    monkeypatch.setattr(
-        "mcp_telegram.activity_cold_backfill.build_working_set",
-        _noop,
-    )
-
-
-@pytest.mark.asyncio
-async def test_cold_enrollment_forwards_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    timeout_calls: list[float] = []
-    _patch_build_working_set(monkeypatch, timeout_calls)
-
-    class _DueClock:
-        def time(self) -> float:
-            return _PACING.history.enroll_s + 1.0
-
-    monkeypatch.setattr(
-        "mcp_telegram.activity_cold_backfill.asyncio.get_running_loop",
-        lambda: _DueClock(),
-    )
-    with _make_db() as conn:
-        await _maybe_enroll_activity_peers(_FakeClient(), conn, 0.0, _PACING, _TEST_TIMEOUT_S)
-    assert timeout_calls == [_TEST_TIMEOUT_S]
-
-
-@pytest.mark.asyncio
-async def test_cold_enrollment_skips_before_interval(monkeypatch: pytest.MonkeyPatch) -> None:
-    timeout_calls: list[float] = []
-    _patch_build_working_set(monkeypatch, timeout_calls)
-
-    class _FreshClock:
-        def time(self) -> float:
-            return 0.5
-
-    monkeypatch.setattr(
-        "mcp_telegram.activity_cold_backfill.asyncio.get_running_loop",
-        lambda: _FreshClock(),
-    )
-    with _make_db() as conn:
-        await _maybe_enroll_activity_peers(_FakeClient(), conn, 0.0, _PACING, _TEST_TIMEOUT_S)
-    assert timeout_calls == []
-
-
-@pytest.mark.asyncio
-async def test_cold_loop_skips_peer_search_after_working_set_flood(monkeypatch: pytest.MonkeyPatch) -> None:
-    shutdown = asyncio.Event()
-
-    async def enroll(*_args: object, **_kwargs: object) -> tuple[float, int | None]:
-        return 1.0, 45
-
-    async def unexpected_pass(*_args: object, **_kwargs: object) -> ColdPassResult:
-        raise AssertionError("cold peer pass must not start after working-set FloodWait")
-
-    def sleep_seconds(*_args: object, **_kwargs: object) -> float:
-        shutdown.set()
-        return 0.0
-
-    monkeypatch.setattr("mcp_telegram.activity_cold_backfill._maybe_enroll_activity_peers", enroll)
-    monkeypatch.setattr("mcp_telegram.activity_cold_backfill._run_cold_backfill_pass_safe", unexpected_pass)
-    monkeypatch.setattr("mcp_telegram.activity_cold_backfill._cold_backfill_sleep_seconds", sleep_seconds)
-    with _make_db() as conn:
-        await run_cold_backfill_loop(_FakeClient(), conn, shutdown, pacing=_PACING, timeout_s=1)
-
-
-@pytest.mark.asyncio
-async def test_cold_loop_reports_cold_peer_demand_kind(monkeypatch: pytest.MonkeyPatch) -> None:
-    shutdown = asyncio.Event()
-    observed: list[DemandKind] = []
-
-    async def enroll(*_args: object, **_kwargs: object) -> tuple[float, None]:
-        return 1.0, None
-
-    async def pass_once(*_args: object, **_kwargs: object) -> ColdPassResult:
-        shutdown.set()
-        return ColdPassResult(ColdPassOutcome.NO_DUE_PEER, 0)
-
-    async def run_cycle(kind: DemandKind, operation: Callable[[], Awaitable[object]]) -> object:
-        observed.append(kind)
-        return await operation()
-
-    monkeypatch.setattr("mcp_telegram.activity_cold_backfill._maybe_enroll_activity_peers", enroll)
-    monkeypatch.setattr("mcp_telegram.activity_cold_backfill._run_cold_backfill_pass_safe", pass_once)
-    with _make_db() as conn:
-        await run_cold_backfill_loop(
-            _FakeClient(),
-            conn,
-            shutdown,
-            pacing=_PACING,
-            timeout_s=1,
-            demand_cycle_runner=run_cycle,
-        )
-
-    assert observed == [DemandKind.COLD_PEER_PAGE]
 
 
 # ---------------------------------------------------------------------------
@@ -747,58 +634,3 @@ async def test_no_due_peer_outcome_when_all_gated(monkeypatch: pytest.MonkeyPatc
         result = await run_cold_backfill_pass(_FakeClient(), conn, shutdown, pacing=_PACING, timeout_s=_TEST_TIMEOUT_S)
         assert result.outcome == ColdPassOutcome.NO_DUE_PEER
         assert result.persisted == 0
-
-
-@pytest.mark.asyncio
-async def test_safe_pass_wrapper_falls_back_to_no_due_peer(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Loop-level exception handling falls back to NO_DUE_PEER."""
-    with _make_db() as conn:
-        shutdown = asyncio.Event()
-
-        async def _boom(*args: object, **kwargs: object) -> ColdPassResult:
-            del args, kwargs
-            raise RuntimeError("boom")
-
-        monkeypatch.setattr("mcp_telegram.activity_cold_backfill.run_cold_backfill_pass", _boom)
-
-        result = await _run_cold_backfill_pass_safe(
-            _FakeClient(), conn, shutdown, pacing=_PACING, timeout_s=_TEST_TIMEOUT_S
-        )
-        assert result.outcome == ColdPassOutcome.NO_DUE_PEER
-        assert result.persisted == 0
-
-
-def test_sleep_seconds_for_outcomes(caplog: pytest.LogCaptureFixture) -> None:
-    """Sleep policy distinguishes idle from processed work."""
-    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.activity_cold_backfill"):
-        assert (
-            _cold_backfill_sleep_seconds(
-                ColdPassResult(outcome=ColdPassOutcome.NO_DUE_PEER, persisted=0),
-                idle_interval=123.0,
-                pacing=_PACING,
-            )
-            == 123.0
-        )
-        assert (
-            _cold_backfill_sleep_seconds(
-                ColdPassResult(outcome=ColdPassOutcome.WROTE, persisted=5),
-                idle_interval=123.0,
-                pacing=_PACING,
-            )
-            == _PACING.history.batch_s
-        )
-        assert (
-            _cold_backfill_sleep_seconds(
-                ColdPassResult(outcome=ColdPassOutcome.FLOOD_WAIT, persisted=0, flood_wait_seconds=999),
-                idle_interval=123.0,
-                pacing=_PACING,
-            )
-            == 999.0
-        )
-
-    assert any("activity_cold_backfill_idle next_sleep_s=123.000" in record.message for record in caplog.records)
-    assert any(
-        "activity_cold_backfill_loop" in record.message
-        and f"next_sleep_s={_PACING.history.batch_s:.3f}" in record.message
-        for record in caplog.records
-    )

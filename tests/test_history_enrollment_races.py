@@ -6,14 +6,13 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
 from helpers import build_mock_message
 from mcp_telegram.daemon import (
     _apply_read_positions_from_dialogs,
-    _backfill_total_message_dialog,
 )
 from mcp_telegram.history_enrollment import disable_history
 from mcp_telegram.message_fact_refresh import MessageFactRefreshDeps, refresh_message_facts_once
@@ -102,35 +101,6 @@ async def test_own_only_outgoing_remains_allowed_without_full_enrollment(tmp_pat
 
     assert allows_new_message(RealtimeHistoryCoverage.OWN_OUTGOING, outgoing=True)
     assert not allows_new_message(RealtimeHistoryCoverage.OWN_OUTGOING, outgoing=False)
-
-
-@pytest.mark.asyncio
-async def test_total_messages_disable_during_fetch_discards_update(tmp_path) -> None:
-    path = tmp_path / "race.db"
-    first = sqlite3.connect(path)
-    second = sqlite3.connect(path)
-    _apply_migrations(first)
-    first.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (2,'synced')")
-    first.execute("INSERT INTO full_history_enrollment VALUES (2,1,'explicit',1)")
-    first.commit()
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    async def fetch(**_: object) -> object:
-        entered.set()
-        await release.wait()
-        return SimpleNamespace(total=99)
-
-    client = MagicMock(get_messages=AsyncMock(side_effect=fetch))
-    task = asyncio.create_task(_backfill_total_message_dialog(client, first, asyncio.Event(), 2))
-    await entered.wait()
-    disable_history(second, 2, now=2)
-    second.commit()
-    release.set()
-    await task
-    assert first.execute("SELECT total_messages FROM synced_dialogs WHERE dialog_id=2").fetchone() == (None,)
-    first.close()
-    second.close()
 
 
 @pytest.mark.asyncio

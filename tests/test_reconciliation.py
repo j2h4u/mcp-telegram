@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-import time
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -23,7 +22,6 @@ from telethon.errors import (
 
 from mcp_telegram.dialog_sync import (
     DialogReconciliationWorker,
-    run_reconciliation_loop,
 )
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
@@ -405,7 +403,7 @@ async def test_recon_full_pass_upserts_returned(
     )
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    count, completed = await worker.run_full_pass()
+    count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert count == 2
     assert completed is True
@@ -444,7 +442,7 @@ async def test_recon_full_pass_refreshes_read_cursors_from_dialog(
     )
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    count, completed = await worker.run_full_pass()
+    count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert count == 1
     assert completed is True
@@ -472,7 +470,7 @@ async def test_recon_full_pass_refreshes_read_cursors_from_wrapped_telethon_dial
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter([dialog]))
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    count, completed = await worker.run_full_pass()
+    count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert count == 1
     assert completed is True
@@ -499,7 +497,7 @@ async def test_recon_full_pass_projects_exact_unread_facts_without_sync_row(
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter([dialog]))
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    count, completed = await worker.run_full_pass()
+    count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert (count, completed) == (1, True)
     row = sync_db.execute(
@@ -525,7 +523,7 @@ async def test_recon_full_pass_does_not_regress_or_fabricate_read_cursors(
     )
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    count, completed = await worker.run_full_pass()
+    count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert count == 1
     assert completed is True
@@ -551,7 +549,7 @@ async def test_recon_full_pass_works_without_entity_forum(
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
     with patch.object(worker, "_refresh_forum_topics", wraps=worker._refresh_forum_topics) as spy:
-        count, completed = await worker.run_full_pass()
+        count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert count == 1
     assert completed is True
@@ -574,7 +572,7 @@ async def test_recon_full_pass_hides_missing(
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter([_make_dialog(100), _make_dialog(200)]))
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    await worker.run_full_pass()
+    await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     hidden = {
         row[0]: row[1]
@@ -614,7 +612,7 @@ async def test_recon_full_pass_flood_wait_skips_soft_delete(
     asyncio.get_event_loop().call_later(0.02, shutdown_event.set)
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    count, completed = await worker.run_full_pass()
+    count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     # 1 row UPSERTed before flood; soft-delete branch did NOT run.
     assert count == 1
@@ -649,7 +647,7 @@ async def test_recon_full_pass_source_unavailable_without_source_does_not_hide(
     mock_client.iter_dialogs = MagicMock(return_value=_gen())
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
 
-    count, completed = await worker.run_full_pass()
+    count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert (count, completed) == (0, False)
     assert sync_db.execute("SELECT hidden FROM dialogs WHERE dialog_id=200").fetchone() == (0,)
@@ -677,7 +675,7 @@ async def test_recon_full_pass_access_error_after_items_is_partial_and_does_not_
     mock_client.iter_dialogs = MagicMock(return_value=_gen())
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
 
-    count, completed = await worker.run_full_pass()
+    count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert (count, completed) == (1, False)
     assert sync_db.execute("SELECT hidden FROM dialogs WHERE dialog_id=200").fetchone() == (0,)
@@ -706,7 +704,7 @@ async def test_recon_full_pass_unexpected_error_is_partial_and_propagates(
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
 
     with pytest.raises(ValueError, match="broken dialog source"):
-        await worker.run_full_pass()
+        await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert sync_db.execute("SELECT hidden FROM dialogs WHERE dialog_id=200").fetchone() == (0,)
     state = dict(
@@ -714,171 +712,6 @@ async def test_recon_full_pass_unexpected_error_is_partial_and_propagates(
     )
     assert state["dialog_unread_sweep_status"] == "partial"
     assert state["dialog_unread_sweep_observed_count"] == "1"
-
-
-# --- loop tests -------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_run_reconciliation_loop_respects_pre_set_shutdown(
-    sync_db: sqlite3.Connection,
-    mock_client: MagicMock,
-) -> None:
-    event = asyncio.Event()
-    event.set()  # shut down before loop starts
-
-    await run_reconciliation_loop(mock_client, sync_db, event)
-
-    mock_client.get_entity.assert_not_called()
-    # iter_dialogs should also not be called (the while-condition gates it)
-    if hasattr(mock_client, "iter_dialogs") and isinstance(mock_client.iter_dialogs, MagicMock):
-        mock_client.iter_dialogs.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_run_reconciliation_loop_runs_full_pass_first(
-    sync_db: sqlite3.Connection,
-    mock_client: MagicMock,
-) -> None:
-    # Empty dialogs table; iter_dialogs yields nothing but signals when the full
-    # pass actually invokes it — so the test waits on that event instead of racing
-    # a fixed sleep (which flaked on slow CI runners).
-    iter_called = asyncio.Event()
-
-    def _iter_dialogs(*args: object, **kwargs: object):
-        iter_called.set()
-        return _async_iter([])
-
-    mock_client.iter_dialogs = MagicMock(side_effect=_iter_dialogs)
-
-    event = asyncio.Event()
-
-    # Run the loop; short hourly interval so the first full pass fires promptly.
-    task = asyncio.create_task(
-        run_reconciliation_loop(
-            mock_client,
-            sync_db,
-            event,
-            hourly_interval=0.01,
-            daily_interval=86400.0,
-        )
-    )
-    await asyncio.wait_for(iter_called.wait(), timeout=2.0)
-    event.set()
-    await asyncio.wait_for(task, timeout=1.0)
-
-    # First iteration always runs full pass (last_full_pass=0.0).
-    assert mock_client.iter_dialogs.called
-
-
-@pytest.mark.asyncio
-async def test_run_reconciliation_loop_preserves_daily_schedule_across_restart(
-    sync_db: sqlite3.Connection,
-    mock_client: MagicMock,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from mcp_telegram import dialog_sync
-
-    sync_db.execute(
-        "INSERT OR REPLACE INTO daemon_state(key, value) VALUES ('dialog_reconciliation_last_full_at', ?)",
-        (str(int(time.time())),),
-    )
-    sync_db.commit()
-    shutdown = asyncio.Event()
-
-    async def _light(_self: object) -> int:
-        shutdown.set()
-        return 0
-
-    full = AsyncMock(return_value=(0, True))
-    monkeypatch.setattr(dialog_sync.DialogReconciliationWorker, "run_light_pass", _light)
-    monkeypatch.setattr(dialog_sync.DialogReconciliationWorker, "run_full_pass", full)
-
-    await run_reconciliation_loop(mock_client, sync_db, shutdown)
-
-    full.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("value", ["not-a-timestamp", "nan", "inf", "-1"])
-async def test_run_reconciliation_loop_retries_when_persisted_schedule_is_invalid(
-    sync_db: sqlite3.Connection,
-    mock_client: MagicMock,
-    monkeypatch: pytest.MonkeyPatch,
-    value: str,
-) -> None:
-    from mcp_telegram import dialog_sync
-
-    sync_db.execute(
-        "INSERT OR REPLACE INTO daemon_state(key, value) VALUES ('dialog_reconciliation_last_full_at', ?)",
-        (value,),
-    )
-    sync_db.commit()
-    shutdown = asyncio.Event()
-
-    async def _light(_self: object) -> int:
-        shutdown.set()
-        return 0
-
-    full = AsyncMock(return_value=(0, True))
-    monkeypatch.setattr(dialog_sync.DialogReconciliationWorker, "run_light_pass", _light)
-    monkeypatch.setattr(dialog_sync.DialogReconciliationWorker, "run_full_pass", full)
-
-    await run_reconciliation_loop(mock_client, sync_db, shutdown)
-
-    full.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_recon_loop_full_pass_failure_does_not_advance_last_full_pass(
-    sync_db: sqlite3.Connection,
-    mock_client: MagicMock,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """43-REVIEWS.md Codex MEDIUM: if run_full_pass raises, the next hourly
-    tick must retry the full pass instead of waiting a full day."""
-    from mcp_telegram import dialog_sync
-
-    full_call_count = 0
-    light_call_count = 0
-
-    async def _fake_full(self: object) -> tuple[int, bool]:
-        nonlocal full_call_count
-        full_call_count += 1
-        raise RuntimeError("simulated full pass failure")
-
-    async def _fake_light(self: object) -> int:
-        nonlocal light_call_count
-        light_call_count += 1
-        return 0
-
-    monkeypatch.setattr(dialog_sync.DialogReconciliationWorker, "run_full_pass", _fake_full)
-    monkeypatch.setattr(dialog_sync.DialogReconciliationWorker, "run_light_pass", _fake_light)
-
-    event = asyncio.Event()
-    # Use small interval so we get multiple iterations quickly, but daily
-    # interval is also small so the second iteration's "now - last_full_pass"
-    # check will still trigger run_full_pass.
-    task = asyncio.create_task(
-        run_reconciliation_loop(
-            mock_client,
-            sync_db,
-            event,
-            hourly_interval=0.01,
-            daily_interval=0.01,
-        )
-    )
-    await asyncio.sleep(0.1)  # enough for several iterations
-    event.set()
-    await asyncio.wait_for(task, timeout=1.0)
-
-    # Full pass should have been attempted MORE THAN ONCE — proves
-    # last_full_pass did not advance after the first (failed) attempt.
-    assert full_call_count >= 2, (
-        f"run_full_pass attempted only {full_call_count} time(s) — last_full_pass advanced despite the failure"
-    )
-    # Light pass also runs every iteration.
-    assert light_call_count >= 2
 
 
 # --- _refresh_forum_topics tests --------------------------------------------

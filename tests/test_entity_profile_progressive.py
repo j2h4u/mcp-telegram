@@ -7,11 +7,11 @@ import json
 import logging
 import sqlite3
 from collections.abc import AsyncIterator
-from contextvars import ContextVar
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import MagicMock
 
 import pytest
 from jsonschema import validate
@@ -20,18 +20,24 @@ from telethon.tl.types import User  # type: ignore[import-untyped]
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from mcp_telegram.entity_profile.contracts import PROFILE_SECTIONS
 from mcp_telegram.entity_profile.refresh import (
+    DurableRefreshSliceResult,
+    DurableRefreshTerminal,
     EntityProfileDemandAdapter,
     EntityRefreshCoordinator,
     RefreshEnqueueResult,
     RefreshLimits,
 )
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
-from mcp_telegram.entity_profile.telegram_gateway import BoundedTelegramGateway
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import _apply_migration_57, _apply_migrations, ensure_sync_schema
-from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
+from mcp_telegram.telegram_demand import (
+    AcquisitionKind,
+    DemandStatus,
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+)
 from mcp_telegram.telegram_rpc_consumers import DemandKind
-from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_scope
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
 from mcp_telegram.tools.entity_info import GET_ENTITY_INFO_OUTPUT_SCHEMA, GetEntityInfo, _entity_structured_content
 
 
@@ -50,6 +56,11 @@ class _UnusedClient:
 
     def iter_dialogs(self) -> AsyncIterator[object]:
         raise AssertionError("client should not be called in this test")
+
+
+class _FloodClient(_UnusedClient):
+    async def __call__(self, _request: object) -> object:
+        raise TelegramRpcThrottled(retry_after_seconds=7)
 
 
 def _sections_schema(conn: sqlite3.Connection) -> None:
@@ -86,48 +97,34 @@ def test_local_core_has_pending_sections_without_rpc() -> None:
 
 
 @pytest.mark.asyncio
-async def test_refresh_coordinator_single_flight_and_shutdown() -> None:
-    calls = 0
-    release = asyncio.Event()
+async def test_refresh_coordinator_coalesces_waiters_until_durable_terminal_signal() -> None:
+    coordinator = EntityRefreshCoordinator(limits=RefreshLimits(max_queued_refreshes=2))
+    assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
+    assert coordinator.enqueue(42) is RefreshEnqueueResult.COALESCED
+    assert coordinator.queue_depth == 1
 
-    async def refresh(_entity_id: int) -> None:
-        nonlocal calls
-        calls += 1
-        await release.wait()
-
-    coordinator = EntityRefreshCoordinator(refresh)
-    assert coordinator.enqueue(42)
-    assert coordinator.enqueue(43)
-    assert all(not coordinator.enqueue(42) for _ in range(9))
+    waiter = asyncio.create_task(coordinator.wait_for_completion(42, 1.0))
     await asyncio.sleep(0)
-    assert calls == 1
-    release.set()
-    for _ in range(5):
-        await asyncio.sleep(0)
-        if calls == 2:
-            break
-    assert calls == 2
-    await coordinator.shutdown()
+    assert not waiter.done()
+
+    coordinator.signal_terminal(DurableRefreshSliceResult(42, DurableRefreshTerminal.SUCCESS))
+    assert await waiter is True
     assert coordinator.queue_depth == 0
+    await coordinator.shutdown()
 
 
 @pytest.mark.asyncio
 async def test_refresh_coordinator_waits_for_single_flight_completion() -> None:
-    release = asyncio.Event()
-
-    async def refresh(_entity_id: int) -> None:
-        await release.wait()
-
-    coordinator = EntityRefreshCoordinator(refresh)
+    coordinator = EntityRefreshCoordinator()
     assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
     waiter = asyncio.create_task(coordinator.wait_for_completion(42, 1.0))
     await asyncio.sleep(0)
     assert not waiter.done()
 
-    release.set()
-
-    assert await waiter is True
     await coordinator.shutdown()
+    assert await waiter is True
+    assert coordinator.queue_depth == 0
+    assert coordinator.enqueue(43) is RefreshEnqueueResult.REJECTED
 
 
 @pytest.mark.asyncio
@@ -146,16 +143,30 @@ async def test_get_entity_info_waits_for_fresh_profile_after_cache_miss() -> Non
     service = _test_service(conn, limits=limits)
     service._deps = replace(service._deps, get_dialog_placement=lambda _entity_id: {})
 
-    async def refresh(entity_id: int) -> None:
-        service._profiles.save_detail(
-            entity_id,
-            {"id": entity_id, "type": "user", "name": "Fresh User", "common_chats": []},
-            now=100,
-        )
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    adapter = EntityProfileDemandAdapter(coordinator)
 
-    service._refresh = EntityRefreshCoordinator(refresh, limits=limits)
+    def status(_now: float) -> DemandStatus:
+        return DemandStatus(release_at=0.0)
 
-    result = await service.get_entity_info({"entity_id": 42})
+    async def run_slice(_budget: RpcAttemptBudget) -> DurableRefreshSliceResult:
+        service._profiles.save_core({"id": 42, "type": "user", "name": "Fresh User"}, now=100)
+        service._profiles.mark_pending(42, now=100)
+        while (cursor := service._profiles.next_due_refresh(now=100)) is not None:
+            status = "not_applicable" if cursor.next_section == "contact_overlap" else "fresh"
+            assert service._profiles.commit_section(
+                cursor,
+                EntitySectionCommit({"name": "Fresh User"}, status=status),
+                now=100,
+            )
+        return DurableRefreshSliceResult(42, DurableRefreshTerminal.SUCCESS)
+
+    coordinator.bind_durable_executor(status, run_slice)
+    request = asyncio.create_task(service.get_entity_info({"entity_id": 42}))
+    await asyncio.sleep(0)
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    result = await request
 
     data = cast(dict[str, object], result["data"])
     sections = cast(dict[str, dict[str, object]], data["sections"])
@@ -168,69 +179,16 @@ async def test_get_entity_info_waits_for_fresh_profile_after_cache_miss() -> Non
 
 @pytest.mark.asyncio
 async def test_refresh_coordinator_reports_coalescing_and_queue_saturation() -> None:
-    release = asyncio.Event()
-    started = asyncio.Event()
-
-    async def refresh(_entity_id: int) -> None:
-        started.set()
-        await release.wait()
-
     coordinator = EntityRefreshCoordinator(
-        refresh,
         limits=RefreshLimits(max_concurrent_refreshes=1, max_queued_refreshes=1),
     )
     assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
     assert coordinator.enqueue(42) is RefreshEnqueueResult.COALESCED
-    await started.wait()
+    assert coordinator.enqueue(43) is RefreshEnqueueResult.REJECTED
+    assert coordinator.queue_depth == 1
+    coordinator.signal_terminal(DurableRefreshSliceResult(42, DurableRefreshTerminal.SUCCESS))
     assert coordinator.enqueue(43) is RefreshEnqueueResult.QUEUED
-    assert coordinator.enqueue(44) is RefreshEnqueueResult.REJECTED
-    assert coordinator.worker_count == 1
-    assert coordinator.queue_depth == 2
-    release.set()
     await coordinator.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_refresh_deadline_includes_time_waiting_for_worker() -> None:
-    first_started = asyncio.Event()
-    release_first = asyncio.Event()
-    second_started = asyncio.Event()
-    failures: list[tuple[int, BaseException]] = []
-
-    async def refresh(entity_id: int) -> None:
-        if entity_id == 42:
-            first_started.set()
-            await release_first.wait()
-        else:
-            second_started.set()
-            await asyncio.sleep(1)
-
-    coordinator = EntityRefreshCoordinator(
-        refresh,
-        limits=RefreshLimits(
-            foreground_resolve_seconds=0.01,
-            per_rpc_seconds=0.02,
-            whole_refresh_seconds=0.08,
-            max_concurrent_refreshes=1,
-            max_queued_refreshes=2,
-        ),
-        on_failure=lambda entity_id, error: failures.append((entity_id, error)),
-    )
-    assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
-    await first_started.wait()
-    assert coordinator.enqueue(43) is RefreshEnqueueResult.QUEUED
-    await asyncio.sleep(0.04)
-    release_first.set()
-    await second_started.wait()
-    for _ in range(20):
-        if failures:
-            break
-        await asyncio.sleep(0.01)
-    await coordinator.shutdown()
-
-    assert len(failures) == 1
-    assert failures[0][0] == 43
-    assert isinstance(failures[0][1], TimeoutError)
 
 
 @pytest.mark.asyncio
@@ -370,7 +328,13 @@ def test_last_good_survives_refresh_failure() -> None:
         (json.dumps({"schema": 1, "id": 42, "type": "user", "name": "Good", "common_chats": [{"id": 7}]}),),
     )
     repo = EntityProfileRepository(conn, section_ttl_seconds=300)
-    repo.save_detail(42, {"id": 42, "type": "user", "name": "Good", "common_chats": [{"id": 7}]}, now=100)
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None and cursor.next_section == "full_profile"
+    assert repo.commit_section(cursor, EntitySectionCommit({}, status="fresh"), now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None and cursor.next_section == "common_chats"
+    assert repo.commit_section(cursor, EntitySectionCommit({}, status="fresh"), now=100)
     repo.mark_refresh_failure(42, now=101, reason="timeout")
     stored = repo.read(42, now=101)
     assert stored is not None
@@ -412,7 +376,8 @@ def test_durable_section_failure_preserves_completed_sections_and_cursor() -> No
     conn.close()
 
 
-def test_independent_section_failure_preserves_last_good_payload() -> None:
+@pytest.mark.asyncio
+async def test_flood_wait_refresh_failure_signals_terminal_waiter_and_persists_retry() -> None:
     conn = sqlite3.connect(":memory:")
     conn.execute(
         "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
@@ -422,213 +387,37 @@ def test_independent_section_failure_preserves_last_good_payload() -> None:
         "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
     )
     _sections_schema(conn)
-    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
-    first = {
-        "id": 42,
-        "type": "user",
-        "name": "Good",
-        "common_chats": [{"id": 7}],
-        "avatar_history": [{"photo_id": 8}],
-        "avatar_count": 1,
-        "personal_channel": {"id": 9},
-    }
-    repo.save_detail(42, first, now=100)
-    repo.save_detail(
-        42,
-        {**first, "common_chats": [], "avatar_history": [], "avatar_count": 0, "personal_channel": {"id": 10}},
-        now=101,
-        section_outcomes={"common_chats": "timeout", "avatar_history": "rpc_error"},
-    )
-    stored = repo.read(42, now=101)
-    assert stored is not None
-    assert stored.detail["common_chats"] == [{"id": 7}]
-    assert stored.detail["avatar_history"] == [{"photo_id": 8}]
-    assert stored.detail["personal_channel"] == {"id": 10}
-    assert stored.sections["common_chats"]["status"] == "stale"
-    assert stored.sections["avatar_history"]["status"] == "stale"
-    assert stored.sections["personal_channel"]["status"] == "fresh"
-    assert stored.sections["common_chats"]["observed_at"] == 100
-    conn.close()
-
-
-def test_section_write_failure_rolls_back_complete_profile_update() -> None:
-    conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
-    _sections_schema(conn)
-    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
-    repo.save_detail(42, {"id": 42, "type": "user", "name": "Before", "common_chats": []}, now=100)
-    before = cast(
-        tuple[str, int] | None,
-        conn.execute("SELECT detail_json, fetched_at FROM entity_details WHERE entity_id = 42").fetchone(),
-    )
-    conn.execute(
-        "CREATE TRIGGER reject_profile_sections BEFORE UPDATE ON entity_detail_sections "
-        "BEGIN SELECT RAISE(ABORT, 'section write failed'); END"
-    )
-
-    with pytest.raises(sqlite3.IntegrityError, match="section write failed"):
-        repo.save_detail(42, {"id": 42, "type": "user", "name": "After", "common_chats": []}, now=101)
-
-    assert conn.execute("SELECT detail_json, fetched_at FROM entity_details WHERE entity_id = 42").fetchone() == before
-    conn.close()
-
-
-def test_legacy_blob_partial_failure_keeps_original_observed_at() -> None:
-    conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
-    _sections_schema(conn)
-    legacy = {"schema": 1, "id": 42, "type": "user", "name": "Good", "common_chats": [{"id": 7}]}
     conn.execute("INSERT INTO entities VALUES (42, 'user', 'Good', 'good', NULL, 100)")
-    conn.execute("INSERT INTO entity_details VALUES (42, ?, 100)", (json.dumps(legacy),))
     repo = EntityProfileRepository(conn, section_ttl_seconds=300)
-    repo.save_detail(
-        42,
-        {"id": 42, "type": "user", "name": "Good", "common_chats": []},
-        now=101,
-        section_outcomes={"common_chats": "timeout"},
-    )
-    stored = repo.read(42, now=101)
-    assert stored is not None
-    assert stored.detail["common_chats"] == [{"id": 7}]
-    assert stored.sections["common_chats"]["status"] == "stale"
-    assert stored.sections["common_chats"]["observed_at"] == 100
-    conn.close()
-
-
-def test_full_profile_failure_does_not_discard_successful_sibling_sections() -> None:
-    conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
-    _sections_schema(conn)
-    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
-    repo.save_detail(
-        42,
-        {"id": 42, "type": "user", "name": "Good", "about": "old", "common_chats": [{"id": 7}]},
-        now=100,
-    )
-    repo.save_detail(
-        42,
-        {"id": 42, "type": "user", "name": "Good", "about": None, "common_chats": [{"id": 8}]},
-        now=101,
-        section_outcomes={"full_profile": "timeout"},
-    )
-    stored = repo.read(42, now=101)
-    assert stored is not None
-    assert stored.detail["about"] == "old"
-    assert stored.detail["common_chats"] == [{"id": 8}]
-    assert stored.sections["full_profile"]["status"] == "stale"
-    assert stored.sections["common_chats"]["status"] == "fresh"
-    conn.close()
-
-
-@pytest.mark.asyncio
-async def test_bounded_gateway_applies_deadline_to_each_rpc_shape() -> None:
-    class SlowClient:
-        async def __call__(self, _request: object) -> object:
-            await asyncio.sleep(1)
-            return None
-
-        async def get_entity(self, _entity_id: int) -> object:
-            await asyncio.sleep(1)
-            return None
-
-        async def get_messages(self, _entity: object, *, ids: list[int]) -> object:
-            del ids
-            await asyncio.sleep(1)
-            return None
-
-        async def _participants(self) -> object:
-            await asyncio.sleep(1)
-            return
-            yield  # pragma: no cover
-
-        def iter_participants(self, _peer: object, *, limit: int) -> object:
-            del limit
-            return self._participants()
-
-        def iter_dialogs(self) -> object:
-            return self._participants()
-
-    gateway = BoundedTelegramGateway(SlowClient(), timeout_seconds=0.01)
-    with pytest.raises(TimeoutError):
-        await gateway(object())
-    with pytest.raises(TimeoutError):
-        await gateway.get_entity(42)
-    with pytest.raises(TimeoutError):
-        await gateway.get_messages(object(), ids=[1])
-    with pytest.raises(TimeoutError):
-        async for _item in gateway.iter_participants(object(), limit=1):
-            pass
-    with pytest.raises(TimeoutError):
-        async for _item in gateway.iter_dialogs():
-            pass
-
-
-@pytest.mark.asyncio
-async def test_refresh_coordinator_records_flood_wait_without_sleeping() -> None:
-    failures: list[BaseException] = []
-
-    async def refresh(_entity_id: int) -> None:
-        raise TelegramRpcThrottled(retry_after_seconds=7)
-
-    coordinator = EntityRefreshCoordinator(refresh, on_failure=lambda _id, exc: failures.append(exc))
-    assert coordinator.enqueue(42)
-    for _ in range(5):
-        await asyncio.sleep(0)
-        if failures:
-            break
-    await coordinator.shutdown()
-    assert len(failures) == 1
-    assert isinstance(failures[0], TelegramRpcThrottled)
-    assert failures[0].retry_after_seconds == 7
-
-
-def test_flood_wait_refresh_failure_persists_retry_and_keeps_last_good() -> None:
-    conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
-    _sections_schema(conn)
-    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
-    repo.save_detail(42, {"id": 42, "type": "user", "name": "Good", "common_chats": [{"id": 7}]}, now=100)
+    repo.mark_pending(42, now=100)
     service = _test_service(conn, limits=RefreshLimits())
-    service._refresh_failed(42, TelegramRpcThrottled(retry_after_seconds=7))
-    stored = repo.read(42, now=100)
-    assert stored is not None
-    assert stored.detail["common_chats"] == [{"id": 7}]
+    service._deps = replace(
+        service._deps,
+        client=cast(object, _FloodClient()),
+        get_full_user_request=lambda **_kwargs: object(),
+    )
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
+    waiter = asyncio.create_task(coordinator.wait_for_completion(42, 1.0))
+
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+
+    assert await waiter is True
     retry_at = cast(
         tuple[int | None] | None,
-        conn.execute(
-            "SELECT retry_at FROM entity_detail_sections WHERE entity_id = 42 AND section = 'common_chats'"
-        ).fetchone(),
+        conn.execute("SELECT retry_at FROM entity_profile_refresh_state WHERE entity_id = 42").fetchone(),
     )
     assert retry_at == (107,)
+    stored = repo.read(42, now=100)
+    assert stored is not None
+    assert stored.detail["name"] == "Good"
+    await service.shutdown()
     conn.close()
 
 
 def _test_service(conn: sqlite3.Connection, *, limits: RefreshLimits) -> DaemonEntityInfoService:
-    return DaemonEntityInfoService(
+    service = DaemonEntityInfoService(
         EntityInfoDeps(
             conn=conn,
             client=_UnusedClient(),
@@ -659,6 +448,8 @@ def _test_service(conn: sqlite3.Connection, *, limits: RefreshLimits) -> DaemonE
             refresh_limits=limits,
         )
     )
+    service.bind_demand_sink(MagicMock())
+    return service
 
 
 @pytest.mark.asyncio
@@ -839,14 +630,18 @@ async def test_durable_profile_budget_exhaustion_leaves_core_cursor_ready() -> N
     service._deps = replace(service._deps, client=ExhaustedClient())
     coordinator = service.refresh_coordinator
     assert coordinator is not None
+    assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
+    waiter = asyncio.create_task(coordinator.wait_for_completion(42, 1.0))
 
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
 
+    assert not waiter.done()
     assert conn.execute(
         "SELECT status, retry_at, next_section, acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
     ).fetchone() == ("pending", None, "full_profile", 0)
     assert conn.execute("SELECT COUNT(*) FROM entities").fetchone() == (0,)
     await service.shutdown()
+    assert await waiter is True
     conn.close()
 
 
@@ -876,36 +671,51 @@ async def test_entity_info_foreground_entrypoint_sets_rpc_source() -> None:
 
 
 @pytest.mark.asyncio
-async def test_entity_refresh_entrypoint_replaces_inherited_scope_with_bounded_scope() -> None:
+async def test_entity_profile_adapter_sets_bounded_rpc_scope() -> None:
     conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+    )
+    _sections_schema(conn)
+    conn.execute("INSERT INTO entities VALUES (42, 'user', 'Known', 'known', NULL, 1)")
+    EntityProfileRepository(conn, section_ttl_seconds=300).mark_pending(42, now=100)
     limits = RefreshLimits(foreground_resolve_seconds=0.01, per_rpc_seconds=0.02, whole_refresh_seconds=0.05)
     service = _test_service(conn, limits=limits)
-    observed_event = asyncio.Event()
-    observed: list[tuple[TelegramRpcSource, float | None, asyncio.Task[object] | None]] = []
-    request_marker: ContextVar[str | None] = ContextVar("entity_refresh_request_marker", default=None)
-    observed_marker: list[str | None] = []
+    observed: list[
+        tuple[TelegramRpcSource, float | None, asyncio.Task[object] | None, DemandKind, AcquisitionKind]
+    ] = []
 
-    async def implementation(_entity_id: int) -> None:
-        scope = current_rpc_scope()
-        observed.append((scope.source, scope.deadline, scope.owner_task))
-        observed_marker.append(request_marker.get())
-        observed_event.set()
+    class ScopedClient(_UnusedClient):
+        async def __call__(self, _request: object) -> object:
+            scope = current_rpc_scope()
+            assert scope.attempt_budget is not None
+            scope.attempt_budget.debit()
+            assert scope.demand_kind is not None
+            assert scope.acquisition_kind is not None
+            observed.append((scope.source, scope.deadline, scope.owner_task, scope.demand_kind, scope.acquisition_kind))
+            return SimpleNamespace(
+                full_user=SimpleNamespace(about="fresh", blocked=False, folder_id=None), users=[], chats=[]
+            )
 
-    service._refresh_entity_impl = implementation  # type: ignore[method-assign]
-    with rpc_scope(TelegramRpcSource.MCP_INTERACTIVE):
-        marker_token = request_marker.set("foreground-request")
-        assert service._refresh is not None
-        assert service._refresh.enqueue(42) is RefreshEnqueueResult.QUEUED
-        await observed_event.wait()
-        request_marker.reset(marker_token)
+    service._deps = replace(
+        service._deps,
+        client=ScopedClient(),
+        get_full_user_request=lambda **_kwargs: object(),
+    )
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
 
-    assert len(observed) == 1
-    source, deadline, owner_task = observed[0]
+    source, deadline, owner_task, demand_kind, acquisition_kind = observed[0]
     assert source is TelegramRpcSource.ENTITY_INFO_REFRESH
     assert deadline is not None
-    assert owner_task is not asyncio.current_task()
-    assert owner_task is not None
-    assert observed_marker == [None]
+    assert owner_task is asyncio.current_task()
+    assert demand_kind is DemandKind.ENTITY_PROFILE_REFRESH
+    assert acquisition_kind is AcquisitionKind.ENTITY_LOOKUP
     await service.shutdown()
     conn.close()
 
@@ -913,32 +723,42 @@ async def test_entity_refresh_entrypoint_replaces_inherited_scope_with_bounded_s
 @pytest.mark.asyncio
 async def test_refresh_resolution_preserves_success_and_failure_semantics() -> None:
     conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+    )
+    _sections_schema(conn)
+    conn.execute(
+        "INSERT INTO entity_profile_refresh_state(entity_id,status,retry_at,reason,updated_at) "
+        "VALUES (42,'pending',NULL,'refresh_queued',100)"
+    )
     service = _test_service(conn, limits=RefreshLimits())
-    worker = _test_service(conn, limits=RefreshLimits())
     entity = SimpleNamespace(id=42)
 
     async def resolved(_entity_id: int) -> tuple[object, None]:
         return entity, None
 
-    worker._resolve_entity = resolved  # type: ignore[method-assign]
-    assert await service._refresh_resolved_entity(worker, 42) is entity
+    service._resolve_entity = resolved  # type: ignore[method-assign]
+    cursor = service._profiles.next_due_refresh(now=100)
+    assert cursor is not None
+    assert await service._acquire_durable_refresh_core(cursor, now=100) is None
+    assert conn.execute(
+        "SELECT acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == (1,)
 
     async def throttled(_entity_id: int) -> tuple[None, dict[str, object]]:
         return None, {"_retry_after_seconds": 7}
 
-    worker._resolve_entity = throttled  # type: ignore[method-assign]
-    with pytest.raises(TelegramRpcThrottled) as throttled_error:
-        await service._refresh_resolved_entity(worker, 42)
-    assert throttled_error.value.retry_after_seconds == 7
-
-    async def unavailable(_entity_id: int) -> tuple[None, dict[str, object]]:
-        return None, {"message": "unavailable"}
-
-    worker._resolve_entity = unavailable  # type: ignore[method-assign]
-    with pytest.raises(RuntimeError, match="unavailable"):
-        await service._refresh_resolved_entity(worker, 42)
+    service._resolve_entity = throttled  # type: ignore[method-assign]
+    cursor = service._profiles.next_due_refresh(now=100)
+    assert cursor is not None
+    assert await service._acquire_durable_refresh_core(cursor, now=100) is DurableRefreshTerminal.FAILURE
+    assert service._profiles.refresh_state(42, now=100) == {
+        "status": "failed",
+        "retry_at": 107,
+        "reason": "flood_wait",
+    }
     await service.shutdown()
-    await worker.shutdown()
     conn.close()
 
 
@@ -1009,7 +829,6 @@ async def test_unknown_core_timeout_enqueues_background_resolution() -> None:
     )
     _sections_schema(conn)
     calls = 0
-    resolved: list[object] = []
     entity = SimpleNamespace(id=42, first_name="Known", username="known")
 
     async def resolve(_entity_id: int) -> tuple[object, None]:
@@ -1019,23 +838,16 @@ async def test_unknown_core_timeout_enqueues_background_resolution() -> None:
             await asyncio.sleep(1)
         return entity, None
 
-    async def background(entity_id: int) -> None:
-        result, error = await service._resolve_entity(entity_id)
-        assert error is None
-        resolved.append(result)
-
     service = _test_service(conn, limits=RefreshLimits(0.01, 0.02, 0.05, 1))
+    service._deps = replace(service._deps, get_peer_id=lambda value: int(value.id))
     service._resolve_entity = resolve  # type: ignore[method-assign]
-    service._refresh = EntityRefreshCoordinator(
-        background,
-        limits=service._deps.refresh_limits,
-        on_failure=service._refresh_failed,
-    )
     pending = await service._progressive_miss(42, now=100, started_at=100)
     assert pending["error"] == "entity_info_pending"
-    await asyncio.sleep(0.01)
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
     await service.shutdown()
-    assert resolved == [entity]
+    assert conn.execute("SELECT type, name FROM entities WHERE id=42").fetchone() == ("user", "Known")
     conn.close()
 
 
@@ -1057,18 +869,12 @@ async def test_unknown_core_flood_wait_is_durable_without_fake_entity_row() -> N
             await asyncio.sleep(1)
         raise TelegramRpcThrottled(retry_after_seconds=7)
 
-    async def background(entity_id: int) -> None:
-        await service._resolve_entity(entity_id)
-
     service._resolve_entity = resolve  # type: ignore[method-assign]
-    service._refresh = EntityRefreshCoordinator(
-        background,
-        limits=service._deps.refresh_limits,
-        on_failure=service._refresh_failed,
-    )
     pending = await service._progressive_miss(42, now=100, started_at=100)
     assert pending["error"] == "entity_info_pending"
-    await asyncio.sleep(0.01)
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
     await service.shutdown()
     assert conn.execute("SELECT COUNT(*) FROM entities").fetchone() == (0,)
     state = service._profiles.refresh_state(42, now=100)

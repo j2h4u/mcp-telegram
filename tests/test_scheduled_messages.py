@@ -10,13 +10,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 from telethon.errors import ChannelPrivateError
 from telethon.tl.types import PeerUser
 
-from mcp_telegram import scheduled_messages as scheduled_messages_module
 from mcp_telegram.activity_peer_resolve import LinkedChatResolution
 from mcp_telegram.event_handlers import EventHandlerManager, _NewMessageEvent
 from mcp_telegram.flood import TelegramRpcThrottled
@@ -28,7 +27,6 @@ from mcp_telegram.scheduled_messages import (
     ScheduledRepairDemandAdapter,
     _unix_timestamp,
     mark_scheduled_messages_removed,
-    run_scheduled_reconciliation_loop,
     scheduled_dialog_id,
     upsert_scheduled_message,
     verify_scheduled_publication,
@@ -42,10 +40,6 @@ from mcp_telegram.sync_db import (
 from mcp_telegram.telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind, demand_contract
 from mcp_telegram.telegram_rpc_scheduler import (
-    RPC_SOURCE_SERVICE_CLASS,
-    RpcAdmissionClosedError,
-    TelegramRpcScope,
-    TelegramRpcSource,
     current_rpc_scope,
 )
 
@@ -114,6 +108,11 @@ def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     connection.close()
 
 
+async def _run_all_demand_slices(worker: ScheduledMessageReconciler) -> int:
+    total = await worker.run_demand_slice(DemandKind.SCHEDULED_REPAIR)
+    return total + await worker.run_demand_slice(DemandKind.SCHEDULED_DISCOVERY)
+
+
 def test_scheduled_schema_is_separate_and_explicit(conn: sqlite3.Connection) -> None:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(scheduled_messages)")}
     assert columns >= {
@@ -177,7 +176,7 @@ async def test_reconciliation_snapshot_marks_disappearance_nonvisible(conn: sqli
         client, conn, asyncio.Event(), policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0)
     )
 
-    assert await worker.run_once() == 1
+    assert await _run_all_demand_slices(worker) == 1
     assert conn.execute(
         "SELECT message_state, unpublished, unseen FROM scheduled_messages WHERE message_id=11"
     ).fetchone() == ("unknown_missing", 1, 1)
@@ -198,7 +197,7 @@ async def test_reconciliation_floodwait_records_retry_and_stops_account_pass(con
         client, conn, asyncio.Event(), policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0)
     )
 
-    assert await worker.run_once() == 0
+    assert await _run_all_demand_slices(worker) == 0
     retry_at, error = conn.execute(
         "SELECT next_retry_at, last_error FROM scheduled_sync_state WHERE key='account'"
     ).fetchone()
@@ -222,7 +221,7 @@ async def test_reconciliation_without_own_only_context_does_not_sweep_all_synced
         client, conn, asyncio.Event(), policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0)
     )
 
-    assert await worker.run_once() == 0
+    assert await _run_all_demand_slices(worker) == 0
     assert client.requests == []
     assert client.input_entity_calls == []
 
@@ -283,7 +282,7 @@ async def test_reconciliation_classifies_and_enrolls_own_only_candidates(
     )
     conn.commit()
 
-    assert await worker.run_once() == 0
+    assert await _run_all_demand_slices(worker) == 0
     assert conn.execute("SELECT message_id FROM scheduled_messages WHERE dialog_id=?", (personal_id,)).fetchone() == (
         99,
     )
@@ -334,7 +333,7 @@ async def test_reconciliation_access_lost_candidate_log_has_dialog_context(
     conn.commit()
 
     with caplog.at_level("WARNING", logger="mcp_telegram.access_lifecycle"):
-        assert await worker.run_once() == 0
+        assert await _run_all_demand_slices(worker) == 0
 
     records = [record for record in caplog.records if record.message.startswith("access_lost ")]
     assert len(records) == 1
@@ -362,15 +361,15 @@ async def test_raw_scheduled_updates_ingest_without_messages_row(conn: sqlite3.C
     client = MagicMock()
     manager = EventHandlerManager(client, conn, asyncio.Event(), client.get_input_entity)
     offered: list[DemandKind] = []
-    shadow = MagicMock()
+    sink = MagicMock()
 
     def offer(kind: DemandKind) -> bool:
         assert not conn.in_transaction
         offered.append(kind)
         return True
 
-    shadow.offer.side_effect = offer
-    manager.bind_demand_shadow(shadow)
+    sink.offer.side_effect = offer
+    manager.bind_demand_sink(sink)
     scheduled = _message(21, "created", scheduled_at=1_900_000_021)
     await manager.on_raw_new_scheduled_message(SimpleNamespace(message=scheduled))
     await manager.on_raw_delete_scheduled_messages(
@@ -395,6 +394,7 @@ async def test_publication_reconciliation_runs_before_sync_enrollment(conn: sqli
     mark_scheduled_messages_removed(conn, 42, [21], [901], now=200)
     client = MagicMock()
     manager = EventHandlerManager(client, conn, asyncio.Event(), client.get_input_entity)
+    manager.bind_demand_sink(MagicMock())
     message = _message(901, "published")
     message.from_scheduled = True
 
@@ -489,7 +489,7 @@ async def test_reconciliation_processes_only_one_bounded_slice(conn: sqlite3.Con
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10, max_dialogs_per_slice=2),
     )
 
-    await worker.run_once()
+    await _run_all_demand_slices(worker)
 
     assert len(client.requests) == 2
     assert conn.execute("SELECT COUNT(*) FROM scheduled_reconciliation_state WHERE discovery_due_at=0").fetchone() == (
@@ -515,7 +515,7 @@ async def test_concurrent_event_prevents_stale_snapshot_apply(conn: sqlite3.Conn
         asyncio.Event(),
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
     )
-    assert await worker.run_once() == 0
+    assert await worker.run_demand_slice(DemandKind.SCHEDULED_REPAIR) == 0
     assert conn.execute(
         "SELECT message_id FROM scheduled_messages WHERE dialog_id=42 AND message_state='scheduled' ORDER BY message_id"
     ).fetchall() == [(11,), (12,)]
@@ -715,142 +715,6 @@ async def test_scheduled_discovery_adapter_runs_only_discovery_rows_with_precise
 
 
 @pytest.mark.asyncio
-async def test_legacy_run_once_attributes_each_selected_row_to_its_demand_kind(
-    conn: sqlite3.Connection,
-) -> None:
-    upsert_scheduled_message(conn, 42, _message(11), now=100)
-    conn.execute(
-        "UPDATE scheduled_reconciliation_state SET repair_due_at=0, discovery_due_at=9999999999 WHERE dialog_id=42"
-    )
-    conn.execute("INSERT INTO dialogs(dialog_id, type, hidden) VALUES (43, 'user', 0)")
-    conn.execute(
-        "INSERT INTO scheduled_reconciliation_state(dialog_id, repair_due_at, discovery_due_at, updated_at) "
-        "VALUES (43, NULL, 0, 0)"
-    )
-    conn.commit()
-    client = _ScheduledSnapshotClient({42: [], 43: []})
-    worker = ScheduledMessageReconciler(
-        client,
-        conn,
-        asyncio.Event(),
-        OwnOnlyContext(account_id=999),
-        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10, max_dialogs_per_slice=2),
-    )
-
-    await worker.run_once()
-
-    assert [scope.demand_kind for scope in client.scopes] == [
-        DemandKind.SCHEDULED_REPAIR,
-        DemandKind.SCHEDULED_DISCOVERY,
-    ]
-
-
-@pytest.mark.asyncio
-async def test_scheduled_reconciliation_loop_stops_before_work_when_shutdown_is_set(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    shutdown_event = asyncio.Event()
-    shutdown_event.set()
-    reconciler = MagicMock()
-    reconciler.run_once = AsyncMock()
-    monkeypatch.setattr(scheduled_messages_module, "ScheduledMessageReconciler", lambda *args, **kwargs: reconciler)
-
-    await run_scheduled_reconciliation_loop(
-        MagicMock(),
-        MagicMock(),
-        shutdown_event,
-        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
-    )
-
-    reconciler.run_once.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_scheduled_reconciliation_loop_retries_after_failure_and_wait_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    shutdown_event = asyncio.Event()
-    reconciler = MagicMock()
-    reconciler.run_once = AsyncMock(side_effect=[RuntimeError("temporary failure"), None])
-    reconciler._wait_timeout.return_value = 7.0
-    monkeypatch.setattr(scheduled_messages_module, "ScheduledMessageReconciler", lambda *args, **kwargs: reconciler)
-    wait_calls = 0
-    wait_timeouts: list[float] = []
-
-    async def controlled_wait_for(awaitable: object, *, timeout: float) -> None:
-        nonlocal wait_calls
-        close = getattr(awaitable, "close", None)
-        if callable(close):
-            close()
-        wait_calls += 1
-        wait_timeouts.append(timeout)
-        if wait_calls == 1:
-            raise TimeoutError
-        shutdown_event.set()
-
-    monkeypatch.setattr(scheduled_messages_module.asyncio, "wait_for", controlled_wait_for)
-    with caplog.at_level("WARNING", logger="mcp_telegram.scheduled_messages"):
-        await run_scheduled_reconciliation_loop(
-            MagicMock(),
-            MagicMock(),
-            shutdown_event,
-            policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
-        )
-
-    assert reconciler.run_once.await_count == 2
-    assert wait_timeouts == [7.0, 7.0]
-    assert [record.message for record in caplog.records] == ["scheduled_reconcile_failed"]
-
-
-@pytest.mark.asyncio
-async def test_scheduled_reconciliation_loop_propagates_admission_close(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    scope = TelegramRpcScope(
-        TelegramRpcSource.SCHEDULED_MESSAGES,
-        RPC_SOURCE_SERVICE_CLASS[TelegramRpcSource.SCHEDULED_MESSAGES],
-        None,
-        None,
-    )
-    closed = RpcAdmissionClosedError(scope, "scheduler closed")
-    shutdown_event = asyncio.Event()
-    reconciler = MagicMock()
-    reconciler.run_once = AsyncMock(side_effect=closed)
-    monkeypatch.setattr(scheduled_messages_module, "ScheduledMessageReconciler", lambda *args, **kwargs: reconciler)
-
-    with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
-        await run_scheduled_reconciliation_loop(
-            MagicMock(),
-            MagicMock(),
-            shutdown_event,
-            policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
-        )
-
-    reconciler.run_once.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_scheduled_reconciliation_loop_propagates_cancellation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    shutdown_event = asyncio.Event()
-    reconciler = MagicMock()
-    reconciler.run_once = AsyncMock(side_effect=asyncio.CancelledError)
-    monkeypatch.setattr(scheduled_messages_module, "ScheduledMessageReconciler", lambda *args, **kwargs: reconciler)
-
-    with pytest.raises(asyncio.CancelledError):
-        await run_scheduled_reconciliation_loop(
-            MagicMock(),
-            MagicMock(),
-            shutdown_event,
-            policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
-        )
-
-    reconciler.run_once.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_future_account_retry_does_not_appear_runnable(conn: sqlite3.Connection) -> None:
     now = int(time.time())
     conn.execute(
@@ -867,9 +731,8 @@ async def test_future_account_retry_does_not_appear_runnable(conn: sqlite3.Conne
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10, state_scan_seconds=60),
     )
 
-    assert await worker.run_once() == 0
+    assert await _run_all_demand_slices(worker) == 0
     assert client.requests == []
-    assert worker._wait_timeout(now=now) == 30
 
 
 def test_candidate_seed_is_not_repeated_for_an_immediate_slice(
@@ -938,7 +801,7 @@ async def test_excluded_discovery_removes_only_scheduled_ownership_basis(conn: s
         policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=120.0),
     )
 
-    assert await worker.run_once() == 0
+    assert await _run_all_demand_slices(worker) == 0
     assert conn.execute("SELECT inclusion_basis FROM own_only_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
         '["owned_channel"]',
     )

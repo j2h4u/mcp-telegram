@@ -85,6 +85,34 @@ class DemandKind(StrEnum):
     SELF_PROFILE_MAINTENANCE = "self_profile_maintenance"
 
 
+# Scheduler order is an independent product contract.  Keep this literal: deriving
+# it from ``DemandKind`` or ``_DEMAND_CONTRACTS`` would let coordinated omissions
+# pass startup validation.
+DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
+    DemandKind.SELF_PROFILE_MAINTENANCE,
+    DemandKind.ENTITY_PROFILE_REFRESH,
+    DemandKind.DELTA_GAP_FILL,
+    DemandKind.DELTA_ACCESS_PROBE,
+    DemandKind.HOT_ACTIVITY_PAGE,
+    DemandKind.LIVE_HYDRATION_BATCH,
+    DemandKind.FULL_SYNC_DM_ENROLLMENT,
+    DemandKind.FULL_SYNC_PAGE,
+    DemandKind.DIALOG_BOOTSTRAP,
+    DemandKind.DIALOG_LIGHT_RECONCILIATION,
+    DemandKind.DIALOG_FULL_RECONCILIATION,
+    DemandKind.ARCHIVE_BACKFILL,
+    DemandKind.ARCHIVE_INCREMENTAL,
+    DemandKind.COLD_PEER_PAGE,
+    DemandKind.BACKFILL_HYDRATION_BATCH,
+    DemandKind.FOLDER_SNAPSHOT,
+    DemandKind.MESSAGE_FACT_REFRESH,
+    DemandKind.READ_RECEIPT_BATCH,
+    DemandKind.SCHEDULED_REPAIR,
+    DemandKind.SCHEDULED_DISCOVERY,
+)
+_EXPECTED_DURABLE_DEMAND_COUNT = 20
+
+
 class ExecutionMode(StrEnum):
     """Layer that owns the lifecycle of a root demand operation."""
 
@@ -158,7 +186,6 @@ class DemandBound(StrEnum):
     TELETHON = "telethon"
     PRODUCER_BOUNDED = "producer_bounded"
     PRODUCER_RESUMABLE = "producer_resumable"
-    PRODUCER_UNBOUNDED = "producer_unbounded"
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,7 +448,7 @@ _REGISTRY: dict[TelegramRpcSource, TelegramRpcConsumerSpec] = {
         _P,
         FanoutScope.ACCOUNT,
         _PRODUCER,
-        demand_bound=DemandBound.PRODUCER_UNBOUNDED,
+        demand_bound=DemandBound.PRODUCER_RESUMABLE,
     ),
     TelegramRpcSource.ACTIVITY_ARCHIVE: _consumer(
         "Activity archive",
@@ -627,7 +654,7 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.HOT_ACTIVITY_PAGE,
         TelegramRpcSource.ACTIVITY_HOT_SWEEP,
         _DURABLE,
-        max_rpc_attempts_per_slice=1,
+        max_rpc_attempts_per_slice=2,
     ),
     DemandKind.LIVE_HYDRATION_BATCH: _contract(
         DemandKind.LIVE_HYDRATION_BATCH,
@@ -683,7 +710,7 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.COLD_PEER_PAGE,
         TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
         _DURABLE,
-        max_rpc_attempts_per_slice=1,
+        max_rpc_attempts_per_slice=2,
     ),
     DemandKind.BACKFILL_HYDRATION_BATCH: _contract(
         DemandKind.BACKFILL_HYDRATION_BATCH,
@@ -695,7 +722,7 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.FOLDER_SNAPSHOT,
         TelegramRpcSource.FOLDER_RECONCILIATION,
         _DURABLE,
-        max_rpc_attempts_per_slice=1,
+        max_rpc_attempts_per_slice=2,
     ),
     DemandKind.TOPIC_SNAPSHOT: _contract(
         DemandKind.TOPIC_SNAPSHOT,
@@ -737,7 +764,9 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.SELF_PROFILE_MAINTENANCE,
         TelegramRpcSource.MAINTENANCE,
         _DURABLE,
-        max_rpc_attempts_per_slice=1,
+        # get_me populates Telethon's self cache, so get_input_entity(self_id)
+        # is local; GetFullUser is the second and final possible network send.
+        max_rpc_attempts_per_slice=2,
     ),
 }
 
@@ -748,8 +777,6 @@ def _validate_registry(registry: Mapping[TelegramRpcSource, TelegramRpcConsumerS
     for source, spec in registry.items():
         if not spec.label.strip() or not spec.purpose.strip() or not spec.acquisition.domains:
             raise RuntimeError(f"Telegram RPC consumer {source.value} has incomplete semantics")
-        if spec.demand.bound is DemandBound.PRODUCER_UNBOUNDED and spec.demand.owner is not DemandPolicyOwner.PRODUCER:
-            raise RuntimeError(f"Telegram RPC consumer {source.value} has an invalid unbounded demand owner")
 
 
 def _validate_contract_identity(kind: DemandKind, contract: DemandContract) -> None:
@@ -787,30 +814,68 @@ def _validate_contract_limits(
         raise RuntimeError(f"Telegram demand source {contract.source.value} has inconsistent outstanding limits")
 
 
-def _validate_contract_durable_policy(kind: DemandKind, contract: DemandContract) -> None:
-    if contract.freshness_target is not None and (
-        not isinstance(contract.freshness_target, timedelta) or contract.freshness_target <= timedelta(0)
-    ):
+def _validate_contract_freshness(kind: DemandKind, contract: DemandContract) -> None:
+    target = contract.freshness_target
+    if target is not None and (not isinstance(target, timedelta) or target <= timedelta(0)):
         raise RuntimeError(f"Telegram demand contract {kind.value} has an invalid freshness target")
+
+
+def _validate_durable_slice_bound(kind: DemandKind, contract: DemandContract) -> None:
+    bound = contract.max_rpc_attempts_per_slice
+    if isinstance(bound, bool) or not isinstance(bound, int) or bound < 1:
+        raise RuntimeError(f"Durable demand contract {kind.value} must have a positive slice bound")
+
+
+def _validate_durable_producer(kind: DemandKind, contract: DemandContract) -> None:
+    producer = _REGISTRY[contract.source].demand
+    if producer.owner is not DemandPolicyOwner.PRODUCER or producer.bound not in {
+        DemandBound.PRODUCER_BOUNDED,
+        DemandBound.PRODUCER_RESUMABLE,
+    }:
+        raise RuntimeError(f"Durable demand contract {kind.value} must be producer-bounded or resumable")
+
+
+def _validate_contract_durable_policy(kind: DemandKind, contract: DemandContract) -> None:
+    _validate_contract_freshness(kind, contract)
     if contract.execution_mode is ExecutionMode.DURABLE:
-        if (
-            isinstance(contract.max_rpc_attempts_per_slice, bool)
-            or not isinstance(contract.max_rpc_attempts_per_slice, int)
-            or contract.max_rpc_attempts_per_slice < 1
-        ):
-            raise RuntimeError(f"Durable demand contract {kind.value} must have a positive slice bound")
-    elif contract.max_rpc_attempts_per_slice is not None or contract.freshness_target is not None:
+        _validate_durable_slice_bound(kind, contract)
+        _validate_durable_producer(kind, contract)
+        return
+    if contract.max_rpc_attempts_per_slice is not None or contract.freshness_target is not None:
         raise RuntimeError(f"Non-durable demand contract {kind.value} has durable-only policy")
 
 
-def validate_demand_contracts(contracts: Mapping[DemandKind, DemandContract]) -> None:
-    """Fail startup when demand policy is incomplete or internally inconsistent."""
+def _validate_contract_coverage(contracts: Mapping[DemandKind, DemandContract]) -> None:
     if set(contracts) != set(DemandKind):
         raise RuntimeError("Telegram demand contracts must cover every demand kind exactly once")
     if any(not isinstance(contract, DemandContract) for contract in contracts.values()):
         raise RuntimeError("Telegram demand contracts contain an invalid record")
     if {contract.source for contract in contracts.values()} != set(TelegramRpcSource):
         raise RuntimeError("Telegram demand contracts must cover every RPC source")
+
+
+def _validate_durable_order() -> None:
+    if not isinstance(DURABLE_DEMAND_ORDER, tuple):
+        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+    if len(DURABLE_DEMAND_ORDER) != _EXPECTED_DURABLE_DEMAND_COUNT:
+        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+    if any(not isinstance(kind, DemandKind) for kind in DURABLE_DEMAND_ORDER):
+        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+    if len(set(DURABLE_DEMAND_ORDER)) != _EXPECTED_DURABLE_DEMAND_COUNT:
+        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+
+
+def _validate_durable_modes(contracts: Mapping[DemandKind, DemandContract]) -> None:
+    durable_kinds = {kind for kind, contract in contracts.items() if contract.execution_mode is ExecutionMode.DURABLE}
+    if durable_kinds != set(DURABLE_DEMAND_ORDER):
+        raise RuntimeError("Durable demand contracts must match the explicit durable demand order")
+
+
+def validate_demand_contracts(contracts: Mapping[DemandKind, DemandContract]) -> None:
+    """Fail startup when demand policy is incomplete or internally inconsistent."""
+    _validate_contract_coverage(contracts)
+    _validate_durable_order()
+    _validate_durable_modes(contracts)
     source_limits: dict[TelegramRpcSource, int] = {}
     for kind, contract in contracts.items():
         _validate_contract_identity(kind, contract)
@@ -851,6 +916,7 @@ def demand_freshness_seconds(kind: DemandKind) -> int:
 
 
 __all__ = [
+    "DURABLE_DEMAND_ORDER",
     "TELEGRAM_DEMAND_CONTRACTS",
     "TELEGRAM_RPC_CONSUMERS",
     "AcquisitionRole",
