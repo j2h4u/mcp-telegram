@@ -199,8 +199,6 @@ async def test_startup_identity_wait_has_terminal_deadline() -> None:
     with pytest.raises(StartupIdentityUnavailableError, match="deadline expired"):
         await _wait_for_startup_identity(startup_identity, asyncio.Event())
 
-    assert startup_identity.failure_reason == "startup identity deadline expired"
-
 
 @pytest.mark.asyncio
 async def test_daemon_lifetime_refreshes_local_dialog_set_and_stops() -> None:

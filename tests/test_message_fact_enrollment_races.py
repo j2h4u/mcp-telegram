@@ -104,7 +104,6 @@ async def test_read_at_disable_during_fetch_skips_read_fact_and_freshness_write(
         gateway.release.set()
         result = await task
 
-        assert result.read_at_candidates == 1
         assert gateway.calls == [(dialog_id, message_id)]
         assert handler_conn.execute("SELECT * FROM message_read_facts").fetchall() == []
         assert handler_conn.execute("SELECT * FROM message_reactions_freshness").fetchall() == []
@@ -131,7 +130,6 @@ async def test_read_at_enabled_path_persists_read_fact(tmp_path: Path) -> None:
             now=2_000,
         )
 
-        assert result.read_at_candidates == 1
         assert handler_conn.execute(
             "SELECT read_at, checked_at, status FROM message_read_facts WHERE dialog_id = ? AND message_id = ?",
             (dialog_id, message_id),

@@ -93,8 +93,10 @@ def test_offer_coalesces_and_performs_one_full_scan() -> None:
     assert all(len(adapter.status_calls) == 2 for adapter in adapters.values())
 
 
-def test_scan_preserves_fifo_positions_and_tail_rotates_after_slice() -> None:
+@pytest.mark.asyncio
+async def test_scan_preserves_fifo_positions_and_tail_rotates_after_slice() -> None:
     clock = _Clock()
+    shutdown = asyncio.Event()
     first = DemandKind.ENTITY_PROFILE_REFRESH
     second = DemandKind.DELTA_GAP_FILL
     adapters = _adapters({first: DemandStatus(0), second: DemandStatus(0)})
@@ -102,10 +104,12 @@ def test_scan_preserves_fifo_positions_and_tail_rotates_after_slice() -> None:
 
     async def run_first() -> None:
         adapters[first].current_status = DemandStatus(0)
+        shutdown.set()
 
     adapters[first].on_run = run_first
+    coordinator = TelegramDemandCoordinator(adapters, shutdown, clock=clock)
     assert coordinator.ready_kinds == (first, second)
-    assert asyncio.run(coordinator.run_one_slice()) is first
+    await coordinator.run()
     assert coordinator.ready_kinds == (second, first)
 
 
@@ -126,7 +130,6 @@ async def test_run_executes_one_slice_with_contract_budget_and_stops_cleanly() -
     assert coordinator.state is CoordinatorState.STOPPED
     assert len(adapters[target].run_calls) == 1
     assert adapters[target].run_calls[0].limit == TELEGRAM_DEMAND_CONTRACTS[target].max_rpc_attempts_per_slice
-    assert coordinator.active_kind is None
 
 
 @pytest.mark.asyncio
@@ -148,7 +151,6 @@ async def test_single_flight_holds_during_active_slice_and_offer_wakes_waiter() 
     coordinator = TelegramDemandCoordinator(adapters, shutdown, clock=_Clock())
     task = asyncio.create_task(coordinator.run())
     await started.wait()
-    assert coordinator.active_kind is first
     assert coordinator.offer(second) is False
     release.set()
     shutdown.set()
@@ -248,15 +250,30 @@ def test_validation_requires_exact_twenty_adapters() -> None:
         validate_durable_adapters(adapters)
 
 
-def test_recoverable_transport_outcomes_do_not_kill_siblings() -> None:
+@pytest.mark.asyncio
+async def test_recoverable_transport_outcomes_do_not_kill_siblings() -> None:
     first, second = DURABLE_DEMAND_ORDER[:2]
+    shutdown = asyncio.Event()
     adapters = _adapters({first: DemandStatus(0), second: DemandStatus(0)})
     adapters[first].run_error = TelegramRpcAdmissionDeferred(2)
-    coordinator = TelegramDemandCoordinator(adapters, asyncio.Event(), clock=_Clock())
 
-    asyncio.run(coordinator.run_one_slice())
+    async def stop_after_first() -> None:
+        shutdown.set()
+
+    adapters[first].on_run = stop_after_first
+    coordinator = TelegramDemandCoordinator(adapters, shutdown, clock=_Clock())
+
+    await coordinator.run()
     assert coordinator.ready_kinds == (second,)
 
-    adapters[second].run_error = TelegramRpcThrottled(2)
-    asyncio.run(coordinator.run_one_slice())
+    second_shutdown = asyncio.Event()
+    second_adapters = _adapters({second: DemandStatus(0)})
+    second_adapters[second].run_error = TelegramRpcThrottled(2)
+
+    async def stop_after_second() -> None:
+        second_shutdown.set()
+
+    second_adapters[second].on_run = stop_after_second
+    coordinator = TelegramDemandCoordinator(second_adapters, second_shutdown, clock=_Clock())
+    await coordinator.run()
     assert coordinator.next_release_at == 102.0

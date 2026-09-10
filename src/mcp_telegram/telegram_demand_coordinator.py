@@ -127,7 +127,6 @@ class TelegramDemandCoordinator:
         self._status_failed_until: dict[DemandKind, float] = {}
         self._suppressed_until: dict[DemandKind, float] = {}
         self._global_release_at: float | None = None
-        self._run_task: asyncio.Task[None] | None = None
         self.scan()
 
     @property
@@ -139,24 +138,12 @@ class TelegramDemandCoordinator:
         return tuple(self._queue)
 
     @property
-    def queued_kinds(self) -> tuple[DemandKind, ...]:
-        return self.ready_kinds
-
-    @property
-    def active_kind(self) -> DemandKind | None:
-        return self._active_kind
-
-    @property
     def offered_kinds(self) -> frozenset[DemandKind]:
         return frozenset(self._offered)
 
     @property
     def statuses(self) -> Mapping[DemandKind, DemandStatus]:
         return MappingProxyType(dict(self._statuses))
-
-    @property
-    def authoritative_ready_kinds(self) -> tuple[DemandKind, ...]:
-        return tuple(kind for kind in DURABLE_DEMAND_ORDER if kind in self._authoritative_ready)
 
     @property
     def next_release_at(self) -> float | None:
@@ -241,31 +228,11 @@ class TelegramDemandCoordinator:
             self._queued.add(kind)
             self._queued_since[kind] = observed_at
 
-    def timer_scan(self, *, now: float | None = None) -> tuple[DemandKind, ...]:
-        """Run the same complete scan used by the timer wakeup."""
-        return self.scan(now=now)
-
-    async def run_one_slice(self, *, now: float | None = None) -> DemandKind | None:
-        """Execute one selected slice; primarily useful for deterministic tests."""
-        if self._state is not CoordinatorState.NEW:
-            raise RuntimeError("run_one_slice requires a new coordinator")
-        self.scan(now=now)
-        kind = self._pop_ready(now=self._now() if now is None else now)
-        if kind is None:
-            return None
-        try:
-            await self._execute_slice(kind)
-        finally:
-            self._active_kind = None
-            self.scan(now=self._now())
-        return kind
-
     async def run(self) -> None:
         """Run the critical process-wide durable pump until shutdown."""
         if self._state is not CoordinatorState.NEW:
             raise RuntimeError("Telegram demand coordinator can run only once")
         self._state = CoordinatorState.RUNNING
-        self._run_task = asyncio.current_task()
         try:
             while not self._shutdown_event.is_set():
                 self._wake.clear()
@@ -287,7 +254,6 @@ class TelegramDemandCoordinator:
         finally:
             self._state = CoordinatorState.STOPPING
             self._active_kind = None
-            self._run_task = None
             self._state = CoordinatorState.STOPPED
 
     async def _execute_slice(self, kind: DemandKind) -> None:

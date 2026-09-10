@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import threading
 from dataclasses import dataclass, field, replace
 
@@ -217,27 +216,6 @@ def test_failed_flush_restores_only_its_unpersisted_summary_during_concurrent_ca
         summaries_by_source.append((source, dispatched_count))
     assert summaries_by_source.count((TelegramRpcSource.MCP_INTERACTIVE.value, 1)) == 1
     assert summaries_by_source.count((TelegramRpcSource.REALTIME_EVENT.value, 1)) == 2
-
-
-async def test_periodic_flush_persists_a_quiet_window() -> None:
-    recorder = _Recorder()
-    aggregator = RpcAdmissionObservationAggregator(
-        recorder,
-        policy=replace(RuntimeObservationConfig(), rpc_summary_interval_seconds=0.01),
-    )
-    shutdown_event = asyncio.Event()
-    aggregator.observe(_event(RpcAdmissionEventKind.QUEUED))
-
-    flush_task = asyncio.create_task(aggregator.run_periodic_flush(shutdown_event))
-    try:
-        async with asyncio.timeout(0.5):
-            while not recorder.rows:
-                await asyncio.sleep(0)
-    finally:
-        shutdown_event.set()
-        await flush_task
-
-    assert recorder.rows[0]["outcome"] == "summary"
 
 
 def test_demand_evidence_records_final_coordinator_outcomes_and_bounded_dimensions() -> None:

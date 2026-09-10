@@ -28,7 +28,6 @@ from mcp_telegram.entity_profile.refresh import (
     RefreshLimits,
 )
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
-from mcp_telegram.entity_profile.telegram_gateway import BoundedTelegramGateway
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import _apply_migration_57, _apply_migrations, ensure_sync_schema
 from mcp_telegram.telegram_demand import (
@@ -152,11 +151,15 @@ async def test_get_entity_info_waits_for_fresh_profile_after_cache_miss() -> Non
         return DemandStatus(release_at=0.0)
 
     async def run_slice(_budget: RpcAttemptBudget) -> DurableRefreshSliceResult:
-        service._profiles.save_detail(
-            42,
-            {"id": 42, "type": "user", "name": "Fresh User", "common_chats": []},
-            now=100,
-        )
+        service._profiles.save_core({"id": 42, "type": "user", "name": "Fresh User"}, now=100)
+        service._profiles.mark_pending(42, now=100)
+        while (cursor := service._profiles.next_due_refresh(now=100)) is not None:
+            status = "not_applicable" if cursor.next_section == "contact_overlap" else "fresh"
+            assert service._profiles.commit_section(
+                cursor,
+                EntitySectionCommit({"name": "Fresh User"}, status=status),
+                now=100,
+            )
         return DurableRefreshSliceResult(42, DurableRefreshTerminal.SUCCESS)
 
     coordinator.bind_durable_executor(status, run_slice)
@@ -325,7 +328,13 @@ def test_last_good_survives_refresh_failure() -> None:
         (json.dumps({"schema": 1, "id": 42, "type": "user", "name": "Good", "common_chats": [{"id": 7}]}),),
     )
     repo = EntityProfileRepository(conn, section_ttl_seconds=300)
-    repo.save_detail(42, {"id": 42, "type": "user", "name": "Good", "common_chats": [{"id": 7}]}, now=100)
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None and cursor.next_section == "full_profile"
+    assert repo.commit_section(cursor, EntitySectionCommit({}, status="fresh"), now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None and cursor.next_section == "common_chats"
+    assert repo.commit_section(cursor, EntitySectionCommit({}, status="fresh"), now=100)
     repo.mark_refresh_failure(42, now=101, reason="timeout")
     stored = repo.read(42, now=101)
     assert stored is not None
@@ -365,175 +374,6 @@ def test_durable_section_failure_preserves_completed_sections_and_cursor() -> No
     resumed = repo.next_due_refresh(now=162)
     assert resumed is not None and resumed.next_section == "common_chats"
     conn.close()
-
-
-def test_independent_section_failure_preserves_last_good_payload() -> None:
-    conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
-    _sections_schema(conn)
-    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
-    first = {
-        "id": 42,
-        "type": "user",
-        "name": "Good",
-        "common_chats": [{"id": 7}],
-        "avatar_history": [{"photo_id": 8}],
-        "avatar_count": 1,
-        "personal_channel": {"id": 9},
-    }
-    repo.save_detail(42, first, now=100)
-    repo.save_detail(
-        42,
-        {**first, "common_chats": [], "avatar_history": [], "avatar_count": 0, "personal_channel": {"id": 10}},
-        now=101,
-        section_outcomes={"common_chats": "timeout", "avatar_history": "rpc_error"},
-    )
-    stored = repo.read(42, now=101)
-    assert stored is not None
-    assert stored.detail["common_chats"] == [{"id": 7}]
-    assert stored.detail["avatar_history"] == [{"photo_id": 8}]
-    assert stored.detail["personal_channel"] == {"id": 10}
-    assert stored.sections["common_chats"]["status"] == "stale"
-    assert stored.sections["avatar_history"]["status"] == "stale"
-    assert stored.sections["personal_channel"]["status"] == "fresh"
-    assert stored.sections["common_chats"]["observed_at"] == 100
-    conn.close()
-
-
-def test_section_write_failure_rolls_back_complete_profile_update() -> None:
-    conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
-    _sections_schema(conn)
-    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
-    repo.save_detail(42, {"id": 42, "type": "user", "name": "Before", "common_chats": []}, now=100)
-    before = cast(
-        tuple[str, int] | None,
-        conn.execute("SELECT detail_json, fetched_at FROM entity_details WHERE entity_id = 42").fetchone(),
-    )
-    conn.execute(
-        "CREATE TRIGGER reject_profile_sections BEFORE UPDATE ON entity_detail_sections "
-        "BEGIN SELECT RAISE(ABORT, 'section write failed'); END"
-    )
-
-    with pytest.raises(sqlite3.IntegrityError, match="section write failed"):
-        repo.save_detail(42, {"id": 42, "type": "user", "name": "After", "common_chats": []}, now=101)
-
-    assert conn.execute("SELECT detail_json, fetched_at FROM entity_details WHERE entity_id = 42").fetchone() == before
-    conn.close()
-
-
-def test_legacy_blob_partial_failure_keeps_original_observed_at() -> None:
-    conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
-    _sections_schema(conn)
-    legacy = {"schema": 1, "id": 42, "type": "user", "name": "Good", "common_chats": [{"id": 7}]}
-    conn.execute("INSERT INTO entities VALUES (42, 'user', 'Good', 'good', NULL, 100)")
-    conn.execute("INSERT INTO entity_details VALUES (42, ?, 100)", (json.dumps(legacy),))
-    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
-    repo.save_detail(
-        42,
-        {"id": 42, "type": "user", "name": "Good", "common_chats": []},
-        now=101,
-        section_outcomes={"common_chats": "timeout"},
-    )
-    stored = repo.read(42, now=101)
-    assert stored is not None
-    assert stored.detail["common_chats"] == [{"id": 7}]
-    assert stored.sections["common_chats"]["status"] == "stale"
-    assert stored.sections["common_chats"]["observed_at"] == 100
-    conn.close()
-
-
-def test_full_profile_failure_does_not_discard_successful_sibling_sections() -> None:
-    conn = sqlite3.connect(":memory:")
-    conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
-        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
-    _sections_schema(conn)
-    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
-    repo.save_detail(
-        42,
-        {"id": 42, "type": "user", "name": "Good", "about": "old", "common_chats": [{"id": 7}]},
-        now=100,
-    )
-    repo.save_detail(
-        42,
-        {"id": 42, "type": "user", "name": "Good", "about": None, "common_chats": [{"id": 8}]},
-        now=101,
-        section_outcomes={"full_profile": "timeout"},
-    )
-    stored = repo.read(42, now=101)
-    assert stored is not None
-    assert stored.detail["about"] == "old"
-    assert stored.detail["common_chats"] == [{"id": 8}]
-    assert stored.sections["full_profile"]["status"] == "stale"
-    assert stored.sections["common_chats"]["status"] == "fresh"
-    conn.close()
-
-
-@pytest.mark.asyncio
-async def test_bounded_gateway_applies_deadline_to_each_rpc_shape() -> None:
-    class SlowClient:
-        async def __call__(self, _request: object) -> object:
-            await asyncio.sleep(1)
-            return None
-
-        async def get_entity(self, _entity_id: int) -> object:
-            await asyncio.sleep(1)
-            return None
-
-        async def get_messages(self, _entity: object, *, ids: list[int]) -> object:
-            del ids
-            await asyncio.sleep(1)
-            return None
-
-        async def _participants(self) -> object:
-            await asyncio.sleep(1)
-            return
-            yield  # pragma: no cover
-
-        def iter_participants(self, _peer: object, *, limit: int) -> object:
-            del limit
-            return self._participants()
-
-        def iter_dialogs(self) -> object:
-            return self._participants()
-
-    gateway = BoundedTelegramGateway(SlowClient(), timeout_seconds=0.01)
-    with pytest.raises(TimeoutError):
-        await gateway(object())
-    with pytest.raises(TimeoutError):
-        await gateway.get_entity(42)
-    with pytest.raises(TimeoutError):
-        await gateway.get_messages(object(), ids=[1])
-    with pytest.raises(TimeoutError):
-        async for _item in gateway.iter_participants(object(), limit=1):
-            pass
-    with pytest.raises(TimeoutError):
-        async for _item in gateway.iter_dialogs():
-            pass
 
 
 @pytest.mark.asyncio

@@ -38,9 +38,6 @@ SHADOW_SYMBOLS = frozenset(
         "run_legacy_demand_cycle",
     }
 )
-SHADOW_FIELD_FRAGMENT = "demand_shadow"
-SHADOW_TASK_FRAGMENT = "demand_shadow"
-
 # Durable polling launchers that must disappear from daemon composition.  The
 # source functions may remain in a transition commit, but the final daemon may
 # not call them or schedule them.

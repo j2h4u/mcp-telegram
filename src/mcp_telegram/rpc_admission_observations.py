@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import threading
 import time
@@ -71,7 +70,14 @@ class DemandObservationHook(Protocol):
 DemandEvidenceObserver = DemandObservationHook
 
 
-_DEMAND_EVIDENCE_OUTCOMES = frozenset(DemandEvidenceOutcome)
+_DEMAND_EVIDENCE_OUTCOMES = frozenset(
+    {
+        DemandEvidenceOutcome.SELECTED,
+        DemandEvidenceOutcome.COMPLETED,
+        DemandEvidenceOutcome.DEFERRED,
+        DemandEvidenceOutcome.FAILED,
+    }
+)
 
 
 @dataclass(slots=True)
@@ -202,15 +208,6 @@ class RpcAdmissionObservationAggregator:
             due = now - self._last_flush_at >= self._summary_interval_seconds
         if due:
             self._try_flush(now=now)
-
-    async def run_periodic_flush(self, shutdown_event: asyncio.Event) -> None:
-        """Flush quiet windows on the configured cadence until shutdown."""
-        while not shutdown_event.is_set():
-            try:
-                async with asyncio.timeout(self._summary_interval_seconds):
-                    await shutdown_event.wait()
-            except TimeoutError:
-                self.flush()
 
     def flush(self, *, now: float | None = None) -> None:
         """Persist every pending summary, waiting for an in-progress flush if needed."""

@@ -284,8 +284,7 @@ async def test_composition_builds_executable_coordinator(
     dependencies, _objects = composition_dependencies
     coordinator = build_durable_coordinator(dependencies)
 
-    assert coordinator.queued_kinds == coordinator.authoritative_ready_kinds
-    await coordinator.run_one_slice()
+    assert coordinator.state.value == "new"
 
 
 def test_self_profile_cadence_survives_database_restart(tmp_path: Path) -> None:

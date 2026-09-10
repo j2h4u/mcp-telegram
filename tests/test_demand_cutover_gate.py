@@ -137,8 +137,6 @@ async def sync_main(ctx):
     _create_tracked_task(ctx, ctx.coordinator.run(), name="telegram_demand_coordinator")
     _create_tracked_task(ctx, run_reconnect_catch_up_loop(ctx), name="reconnect_catch_up_loop")
     _create_tracked_task(ctx, _monitor_flood_wait_kill_switch(ctx), name="flood_wait_kill_switch_monitor")
-    _create_tracked_task(ctx, ctx.rpc_admission_observer.run_periodic_flush(ctx.shutdown_event),
-                         name="rpc_admission_observation_flush_loop")
     await asyncio.sleep(0)
 """
 

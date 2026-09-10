@@ -72,10 +72,6 @@ class StartupIdentityState:
     def done_event(self) -> asyncio.Event:
         return self._done_event
 
-    @property
-    def failure_reason(self) -> str | None:
-        return self._failure_reason
-
     def remaining(self, now: float) -> float:
         """Return the remaining startup window."""
         return max(0.0, self.deadline_at - now)

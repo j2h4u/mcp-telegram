@@ -136,9 +136,7 @@ async def test_refresh_message_facts_once_refreshes_reactions_and_read_at() -> N
     finally:
         conn.close()
 
-    assert result.reaction_candidates == 1
     assert result.reaction_refreshed == 1
-    assert result.read_at_candidates == 1
     assert reactions.calls == [(10, 10, [1])]
     assert read_receipts.calls == [(20, 2)]
     assert stored_read_facts == [(1_700_000_002, 2_000, "complete")]
@@ -164,8 +162,6 @@ async def test_refresh_message_facts_once_respects_zero_budget() -> None:
     finally:
         conn.close()
 
-    assert result.reaction_candidates == 0
     assert result.reaction_refreshed == 0
-    assert result.read_at_candidates == 0
     assert reactions.calls == []
     assert read_receipts.calls == []

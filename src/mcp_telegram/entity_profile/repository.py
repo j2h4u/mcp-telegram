@@ -29,12 +29,6 @@ class StoredProfile:
 
 
 @dataclass(frozen=True, slots=True)
-class PriorBlob:
-    detail: dict[str, object]
-    observed_at: int | None
-
-
-@dataclass(frozen=True, slots=True)
 class EntityRefreshCursor:
     entity_id: int
     next_section: str
@@ -131,55 +125,6 @@ class EntityProfileRepository:
         except sqlite3.OperationalError:
             # Compatibility fixtures can expose only entity_details.
             return
-
-    def save_detail(
-        self,
-        entity_id: int,
-        detail: Mapping[str, object],
-        *,
-        now: int,
-        section_outcomes: Mapping[str, str] | None = None,
-    ) -> None:
-        """Store last-good detail and section observations atomically."""
-        outcomes = dict(section_outcomes or {})
-        if detail.get("_full_fetch_ok") is False:
-            outcomes.setdefault("full_profile", "refresh_failed")
-        previous = PriorBlob(
-            detail=self._read_detail_blob(entity_id),
-            observed_at=self._read_detail_fetched_at(entity_id),
-        )
-        merged = _merge_failed_sections(dict(detail), previous.detail, outcomes)
-        payload = {"schema": _DETAIL_SCHEMA, **merged}
-        payload.pop("_full_fetch_ok", None)
-        entity_type = str(payload.get("type", "unknown"))
-        has_section_storage = self._has_section_storage()
-        with self._conn:
-            upsert_entity_snapshots(
-                self._conn,
-                [
-                    EntitySnapshot(
-                        entity_id=entity_id,
-                        entity_type=entity_type,
-                        name=_optional_text(payload.get("name")),
-                        username=_optional_text(payload.get("username")),
-                        name_normalized=None,
-                        updated_at=now,
-                    )
-                ],
-            )
-            self._conn.execute(
-                "INSERT OR REPLACE INTO entity_details(entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
-                (entity_id, json.dumps(payload, separators=(",", ":")), now),
-            )
-            if has_section_storage:
-                self._write_sections(
-                    entity_id,
-                    payload,
-                    now=now,
-                    outcomes=outcomes,
-                    previous=previous,
-                )
-                self._conn.execute("DELETE FROM entity_profile_refresh_state WHERE entity_id = ?", (entity_id,))
 
     def refresh_state(self, entity_id: int, *, now: int) -> dict[str, object] | None:
         """Return a durable unresolved-refresh state while it is relevant."""
@@ -569,72 +514,6 @@ class EntityProfileRepository:
             return "stale"
         return status
 
-    def _write_sections(
-        self,
-        entity_id: int,
-        detail: Mapping[str, object],
-        *,
-        now: int,
-        outcomes: Mapping[str, str],
-        previous: PriorBlob,
-    ) -> None:
-        existing = self._read_section_rows(entity_id)
-        legacy_detail = _strip_schema(previous.detail)
-        legacy_observed_at = previous.observed_at
-        values: list[tuple[int, str, str, int | None, str | None, str | None, int | None]] = []
-        for section in PROFILE_SECTIONS:
-            failure = outcomes.get(section)
-            old_row = existing.get(section)
-            if failure:
-                old_observed_at = cast(int | None, old_row[2]) if old_row is not None else legacy_observed_at
-                old_payload = (
-                    cast(str | None, old_row[4])
-                    if old_row is not None
-                    else _encode_payload(_section_payload(legacy_detail, section))
-                )
-                values.append(
-                    (
-                        entity_id,
-                        section,
-                        "stale" if old_observed_at is not None else "unavailable",
-                        old_observed_at,
-                        failure,
-                        old_payload,
-                        None,
-                    )
-                )
-                continue
-            payload = _section_payload(detail, section)
-            if not _section_applicable(detail, section):
-                status = "not_applicable"
-                observed_at = now
-                reason = None
-            elif payload is None:
-                status = "unavailable"
-                observed_at = None
-                reason = "section_unavailable"
-            else:
-                status = "fresh"
-                observed_at = now
-                reason = None
-            values.append((entity_id, section, status, observed_at, reason, _encode_payload(payload), None))
-        self._conn.executemany(
-            "INSERT INTO entity_detail_sections(entity_id, section, status, observed_at, reason, payload_json, retry_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(entity_id, section) DO UPDATE SET status=excluded.status, observed_at=excluded.observed_at, "
-            "reason=excluded.reason, payload_json=excluded.payload_json, retry_at=NULL",
-            values,
-        )
-
-    def _has_section_storage(self) -> bool:
-        row = cast(
-            tuple[int] | None,
-            self._conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_detail_sections'"
-            ).fetchone(),
-        )
-        return row is not None
-
     def _read_detail_blob(self, entity_id: int) -> dict[str, object]:
         try:
             row = cast(
@@ -653,34 +532,6 @@ class EntityProfileRepository:
         except TypeError, json.JSONDecodeError:
             return {}
         return value if isinstance(value, dict) else {}
-
-    def _read_detail_fetched_at(self, entity_id: int) -> int | None:
-        try:
-            row = cast(
-                tuple[object, ...] | None,
-                self._conn.execute(
-                    "SELECT fetched_at FROM entity_details WHERE entity_id = ?",
-                    (entity_id,),
-                ).fetchone(),
-            )
-        except sqlite3.OperationalError:
-            return None
-        value = row[0] if row else None
-        return int(value) if isinstance(value, int) else None
-
-    def _read_section_rows(self, entity_id: int) -> dict[str, tuple[object, ...]]:
-        try:
-            rows = cast(
-                list[tuple[object, ...]],
-                self._conn.execute(
-                    "SELECT section, status, observed_at, reason, payload_json, retry_at "
-                    "FROM entity_detail_sections WHERE entity_id = ?",
-                    (entity_id,),
-                ).fetchall(),
-            )
-        except sqlite3.OperationalError:
-            return {}
-        return {str(row[0]): row for row in rows}
 
 
 def _normalise_entity_type(value: str) -> str:
@@ -714,35 +565,6 @@ def _section_payload(detail: Mapping[str, object], section: str) -> object | Non
 
 def _strip_schema(detail: Mapping[str, object]) -> dict[str, object]:
     return {str(key): value for key, value in detail.items() if key != "schema"}
-
-
-def _merge_failed_sections(
-    detail: dict[str, object],
-    previous: Mapping[str, object],
-    outcomes: Mapping[str, str],
-) -> dict[str, object]:
-    """Merge last-good values for failed sections into the compatibility blob."""
-    keys = {
-        "common_chats": ("common_chats",),
-        "contact_overlap": ("contacts_subscribed", "contacts_subscribed_partial", "contacts_reason"),
-        "avatar_history": ("avatar_history", "avatar_count"),
-        "personal_channel": ("personal_channel", "personal_channel_unavailable_reason"),
-    }
-    if outcomes.get("full_profile"):
-        all_section_keys = {key for keys_for_section in keys.values() for key in keys_for_section}
-        detail.update(
-            {
-                key: value
-                for key, value in previous.items()
-                if key not in {"schema", "id", "type", "name", "username"} | all_section_keys
-            }
-        )
-    for section, section_keys in keys.items():
-        if outcomes.get(section):
-            for key in section_keys:
-                if key in previous:
-                    detail[key] = previous[key]
-    return detail
 
 
 def _section_applicable(detail: Mapping[str, object], section: str) -> bool:
