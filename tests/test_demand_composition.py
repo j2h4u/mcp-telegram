@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Generator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
 
-from mcp_telegram.activity_cold_backfill import ColdPeerPageDemandAdapter
+from mcp_telegram.activity_cold_backfill import (
+    ColdBackfillHistoryPacing,
+    ColdBackfillPacing,
+    ColdPeerPageDemandAdapter,
+)
 from mcp_telegram.activity_hot_sweep import HotActivityDemandAdapter
 from mcp_telegram.activity_sync import ArchiveBackfillDemandAdapter, ArchiveIncrementalDemandAdapter
 from mcp_telegram.daemon import SQLiteSelfProfileCadence
@@ -25,10 +30,15 @@ from mcp_telegram.dialog_sync import (
     DialogFullReconciliationDemandAdapter,
     DialogLightReconciliationDemandAdapter,
 )
-from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
+from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, EntityRefreshCoordinator
 from mcp_telegram.fact_hydration import FactHydrationDemandAdapter
-from mcp_telegram.folders.worker import FolderProjectionDemandAdapter
-from mcp_telegram.message_fact_refresh import MessageFactRefreshDemandAdapter, ReadReceiptDemandAdapter
+from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker
+from mcp_telegram.message_fact_refresh import (
+    MessageFactRefreshDemandAdapter,
+    MessageFactRefreshDeps,
+    MessageFactRefreshPolicy,
+    ReadReceiptDemandAdapter,
+)
 from mcp_telegram.scheduled_messages import ScheduledDiscoveryDemandAdapter, ScheduledRepairDemandAdapter
 from mcp_telegram.self_profile_maintenance import SelfProfileCadenceState, SelfProfileMaintenanceDemandAdapter
 from mcp_telegram.sync_db import ensure_sync_schema
@@ -39,25 +49,54 @@ from mcp_telegram.telegram_rpc_consumers import (
 )
 
 
-def _dependencies() -> tuple[DemandCompositionDependencies, dict[str, object]]:
+def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[str, object]]:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    folder_repository = MagicMock()
+    folder_repository.read_consecutive_failures.return_value = 0
+    folder_repository.read_last_outcome.return_value = None
+    folder_repository.read_next_retry_at.return_value = None
+    folder_repository.read_last_success_at.return_value = None
+    folder_repository.read_staging.return_value = None
+    folder_policy = SimpleNamespace(
+        refresh_interval_seconds=60.0,
+        jitter_ratio=0.0,
+        retry_delays_seconds=(1,),
+        retry_cap_seconds=60,
+        warning_failure_threshold=3,
+        stale_threshold_seconds=300,
+    )
+    folder_worker = FolderProjectionWorker(MagicMock(), folder_repository, asyncio.Event(), folder_policy)
+    message_fact_policy = MessageFactRefreshPolicy(
+        interval_seconds=60.0,
+        reaction_ttl_seconds=60,
+        read_at_ttl_seconds=60,
+        reaction_max_messages_per_cycle=1,
+        read_at_max_messages_per_cycle=1,
+        pause_seconds=0.0,
+    )
     objects: dict[str, object] = {
         "client": MagicMock(),
-        "conn": MagicMock(spec=sqlite3.Connection),
+        "conn": conn,
         "shutdown": asyncio.Event(),
         "full": MagicMock(),
         "delta": MagicMock(),
         "dm_gap_scanner": MagicMock(),
         "dialog": MagicMock(),
-        "entity": MagicMock(),
+        "entity": EntityRefreshCoordinator(),
         "hydration": MagicMock(),
-        "folder": MagicMock(),
-        "facts": MagicMock(),
-        "fact_policy": MagicMock(),
+        "folder": folder_worker,
+        "facts": MessageFactRefreshDeps(conn, MagicMock(), MagicMock()),
+        "fact_policy": message_fact_policy,
         "scheduled": MagicMock(),
         "access_policy": MagicMock(),
-        "hot_policy": MagicMock(),
-        "cold_pacing": MagicMock(),
-        "cadence": MagicMock(),
+        "hot_policy": SimpleNamespace(loop_interval_seconds=60.0),
+        "cold_pacing": ColdBackfillPacing(
+            idle_s=300.0,
+            history=ColdBackfillHistoryPacing(batch_s=1.0, enroll_s=60.0, access_retry_s=60.0),
+        ),
+        "cadence": SQLiteSelfProfileCadence(conn, 60.0),
     }
 
     async def read_receipt_batch() -> object:
@@ -67,17 +106,17 @@ def _dependencies() -> tuple[DemandCompositionDependencies, dict[str, object]]:
     dependencies = DemandCompositionDependencies(
         client=cast(DemandCompositionClient, objects["client"]),
         conn=cast(sqlite3.Connection, objects["conn"]),
-        db_path=Path("/state/sync.db"),
+        db_path=db_path,
         shutdown_event=cast(asyncio.Event, objects["shutdown"]),
         full_sync_worker=cast(object, objects["full"]),  # type: ignore[arg-type]
         delta_sync_worker=cast(object, objects["delta"]),  # type: ignore[arg-type]
         dm_gap_scanner=cast(object, objects["dm_gap_scanner"]),  # type: ignore[arg-type]
         dialog_reconciliation_worker=cast(object, objects["dialog"]),  # type: ignore[arg-type]
-        entity_refresh_coordinator=cast(object, objects["entity"]),  # type: ignore[arg-type]
+        entity_refresh_coordinator=cast(EntityRefreshCoordinator, objects["entity"]),
         fact_hydration_worker=cast(object, objects["hydration"]),  # type: ignore[arg-type]
-        folder_projection_worker=cast(object, objects["folder"]),  # type: ignore[arg-type]
-        message_fact_refresh_deps=cast(object, objects["facts"]),  # type: ignore[arg-type]
-        message_fact_refresh_policy=cast(object, objects["fact_policy"]),  # type: ignore[arg-type]
+        folder_projection_worker=cast(FolderProjectionWorker, objects["folder"]),
+        message_fact_refresh_deps=cast(MessageFactRefreshDeps, objects["facts"]),
+        message_fact_refresh_policy=cast(MessageFactRefreshPolicy, objects["fact_policy"]),
         scheduled_reconciler=cast(object, objects["scheduled"]),  # type: ignore[arg-type]
         access_probe_policy=cast(object, objects["access_policy"]),  # type: ignore[arg-type]
         hot_sweep_policy=cast(object, objects["hot_policy"]),  # type: ignore[arg-type]
@@ -92,8 +131,21 @@ def _dependencies() -> tuple[DemandCompositionDependencies, dict[str, object]]:
     return dependencies, objects
 
 
-def test_adapter_map_is_exact_against_literal_20_kind_class_map() -> None:
-    dependencies, objects = _dependencies()
+@pytest.fixture()
+def composition_dependencies(
+    tmp_path: Path,
+) -> Generator[tuple[DemandCompositionDependencies, dict[str, object]]]:
+    dependencies, objects = _dependencies(tmp_path)
+    try:
+        yield dependencies, objects
+    finally:
+        cast(sqlite3.Connection, objects["conn"]).close()
+
+
+def test_adapter_map_is_exact_against_literal_20_kind_class_map(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+) -> None:
+    dependencies, objects = composition_dependencies
 
     adapters = build_durable_adapter_map(dependencies)
 
@@ -148,11 +200,13 @@ def test_adapter_map_is_exact_against_literal_20_kind_class_map() -> None:
 
 
 @pytest.mark.asyncio
-async def test_composition_builds_executable_coordinator() -> None:
-    dependencies, _objects = _dependencies()
+async def test_composition_builds_executable_coordinator(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+) -> None:
+    dependencies, _objects = composition_dependencies
     coordinator = build_durable_coordinator(dependencies)
 
-    assert coordinator.queued_kinds == ()
+    assert coordinator.queued_kinds == coordinator.authoritative_ready_kinds
     await coordinator.run_one_slice()
 
 

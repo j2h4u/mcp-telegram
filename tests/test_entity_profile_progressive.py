@@ -11,6 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import MagicMock
 
 import pytest
 from jsonschema import validate
@@ -578,7 +579,7 @@ async def test_flood_wait_refresh_failure_signals_terminal_waiter_and_persists_r
 
 
 def _test_service(conn: sqlite3.Connection, *, limits: RefreshLimits) -> DaemonEntityInfoService:
-    return DaemonEntityInfoService(
+    service = DaemonEntityInfoService(
         EntityInfoDeps(
             conn=conn,
             client=_UnusedClient(),
@@ -609,6 +610,8 @@ def _test_service(conn: sqlite3.Connection, *, limits: RefreshLimits) -> DaemonE
             refresh_limits=limits,
         )
     )
+    service.bind_demand_sink(MagicMock())
+    return service
 
 
 @pytest.mark.asyncio
