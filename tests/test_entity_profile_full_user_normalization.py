@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -13,23 +14,31 @@ from mcp_telegram.entity_profile.full_user_normalization import (
     normalize_full_user_response,
 )
 
+_UNSET = object()
+
 
 def _response(
     *,
     entity_id: int = 42,
     bot: bool = False,
+    status: object = _UNSET,
     personal_channel_id: object = None,
     chats: object = (),
     **full_user_fields: object,
 ) -> SimpleNamespace:
     full_user = SimpleNamespace(personal_channel_id=personal_channel_id, **full_user_fields)
+    user_fields: dict[str, object] = {
+        "id": entity_id,
+        "bot": bot,
+        "first_name": "Ada",
+        "last_name": "Lovelace",
+        "username": "ada",
+        "contact": True,
+    }
+    if status is not _UNSET:
+        user_fields["status"] = status
     user = SimpleNamespace(
-        id=entity_id,
-        bot=bot,
-        first_name="Ada",
-        last_name="Lovelace",
-        username="ada",
-        contact=True,
+        **user_fields,
     )
     return SimpleNamespace(full_user=full_user, users=[user], chats=chats)
 
@@ -184,6 +193,87 @@ def test_optional_full_profile_facts_are_normalized() -> None:
     assert profile["business_intro"] == {"title": "work", "description": "service"}
     assert profile["business_work_hours"] == {"timezone": "UTC"}
     assert profile["note"] == "private note"
+
+
+class UserStatusRecently:
+    pass
+
+
+class UserStatusLastWeek:
+    pass
+
+
+class UserStatusLastMonth:
+    pass
+
+
+class UserStatusOnline:
+    def __init__(self, expires: object) -> None:
+        self.expires = expires
+
+
+class UserStatusOffline:
+    def __init__(self, was_online: object) -> None:
+        self.was_online = was_online
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (UserStatusRecently(), {"type": "recently"}),
+        (UserStatusLastWeek(), {"type": "last_week"}),
+        (UserStatusLastMonth(), {"type": "last_month"}),
+        (
+            UserStatusOnline(datetime(2026, 9, 11, 12, 30, tzinfo=UTC)),
+            {"type": "online", "expires": "2026-09-11T12:30:00+00:00"},
+        ),
+        (UserStatusOnline(object()), {"type": "online"}),
+        (
+            UserStatusOffline(date(2026, 9, 10)),
+            {"type": "offline", "was_online": "2026-09-10"},
+        ),
+        (UserStatusOffline(object()), {"type": "offline"}),
+        (SimpleNamespace(), None),
+    ],
+)
+def test_status_variants_are_normalized_without_telethon_objects(status: object, expected: object) -> None:
+    result = normalize_full_user_response(_response(status=status), target_id=42, target_kind=TargetKind.USER)
+
+    assert result.full_profile.payload is not None
+    if expected is None:
+        assert "status" not in result.full_profile.payload
+    else:
+        assert result.full_profile.payload["status"] == expected
+
+
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        (
+            SimpleNamespace(address="  Almaty ", geo_point=SimpleNamespace(lat=43.2, long=76.9)),
+            {"address": "Almaty", "lat": 43.2, "long": 76.9},
+        ),
+        (
+            SimpleNamespace(address=None, geo_point=SimpleNamespace(lat=True, long="76.9")),
+            {"address": None, "lat": None, "long": None},
+        ),
+        (SimpleNamespace(address="office"), {"address": "office", "lat": None, "long": None}),
+    ],
+)
+def test_business_location_coordinates_are_bounded(location: object, expected: object) -> None:
+    result = normalize_full_user_response(
+        _response(business_location=location), target_id=42, target_kind=TargetKind.USER
+    )
+
+    assert result.full_profile.payload is not None
+    assert result.full_profile.payload["business_location"] == expected
+
+
+def test_explicitly_absent_business_location_is_materialized() -> None:
+    result = normalize_full_user_response(_response(business_location=None), target_id=42, target_kind=TargetKind.USER)
+
+    assert result.full_profile.payload is not None
+    assert result.full_profile.payload["business_location"] is None
 
 
 def test_optional_full_profile_does_not_leak_unowned_facts() -> None:
