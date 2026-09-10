@@ -403,7 +403,7 @@ async def test_recon_full_pass_upserts_returned(
     )
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    count, completed = await worker.run_full_pass()
+    count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert count == 2
     assert completed is True
@@ -442,7 +442,7 @@ async def test_recon_full_pass_refreshes_read_cursors_from_dialog(
     )
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    count, completed = await worker.run_full_pass()
+    count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert count == 1
     assert completed is True
@@ -470,7 +470,7 @@ async def test_recon_full_pass_refreshes_read_cursors_from_wrapped_telethon_dial
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter([dialog]))
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    count, completed = await worker.run_full_pass()
+    count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert count == 1
     assert completed is True
@@ -497,7 +497,7 @@ async def test_recon_full_pass_projects_exact_unread_facts_without_sync_row(
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter([dialog]))
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    count, completed = await worker.run_full_pass()
+    count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert (count, completed) == (1, True)
     row = sync_db.execute(
@@ -523,7 +523,7 @@ async def test_recon_full_pass_does_not_regress_or_fabricate_read_cursors(
     )
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    count, completed = await worker.run_full_pass()
+    count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert count == 1
     assert completed is True
@@ -549,7 +549,7 @@ async def test_recon_full_pass_works_without_entity_forum(
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
     with patch.object(worker, "_refresh_forum_topics", wraps=worker._refresh_forum_topics) as spy:
-        count, completed = await worker.run_full_pass()
+        count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert count == 1
     assert completed is True
@@ -572,7 +572,7 @@ async def test_recon_full_pass_hides_missing(
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter([_make_dialog(100), _make_dialog(200)]))
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    await worker.run_full_pass()
+    await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     hidden = {
         row[0]: row[1]
@@ -612,7 +612,7 @@ async def test_recon_full_pass_flood_wait_skips_soft_delete(
     asyncio.get_event_loop().call_later(0.02, shutdown_event.set)
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    count, completed = await worker.run_full_pass()
+    count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     # 1 row UPSERTed before flood; soft-delete branch did NOT run.
     assert count == 1
@@ -647,7 +647,7 @@ async def test_recon_full_pass_source_unavailable_without_source_does_not_hide(
     mock_client.iter_dialogs = MagicMock(return_value=_gen())
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
 
-    count, completed = await worker.run_full_pass()
+    count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert (count, completed) == (0, False)
     assert sync_db.execute("SELECT hidden FROM dialogs WHERE dialog_id=200").fetchone() == (0,)
@@ -675,7 +675,7 @@ async def test_recon_full_pass_access_error_after_items_is_partial_and_does_not_
     mock_client.iter_dialogs = MagicMock(return_value=_gen())
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
 
-    count, completed = await worker.run_full_pass()
+    count, completed = await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert (count, completed) == (1, False)
     assert sync_db.execute("SELECT hidden FROM dialogs WHERE dialog_id=200").fetchone() == (0,)
@@ -704,7 +704,7 @@ async def test_recon_full_pass_unexpected_error_is_partial_and_propagates(
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
 
     with pytest.raises(ValueError, match="broken dialog source"):
-        await worker.run_full_pass()
+        await worker._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     assert sync_db.execute("SELECT hidden FROM dialogs WHERE dialog_id=200").fetchone() == (0,)
     state = dict(

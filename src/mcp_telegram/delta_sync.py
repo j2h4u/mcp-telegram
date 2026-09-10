@@ -27,7 +27,6 @@ from telethon.errors import RPCError  # type: ignore[import-untyped]
 
 from .access_lifecycle import (
     complete_access_revalidation,
-    due_access_revalidations,
     restore_access_after_revalidation,
     set_access_lost,
     stamp_access_revalidation,
@@ -315,38 +314,6 @@ class _DeltaFetchOutcome:
     rows: list[ExtractedMessage]
     result: int | None = None
     completed: bool = True
-
-
-@dataclass(frozen=True, slots=True)
-class _AccessProbeOutcome:
-    restored: int = 0
-    still_lost: int = 0
-    errors: int = 0
-    flood_wait_hit: bool = False
-    admission_deferred: bool = False
-    counts_as_checked: bool = True
-
-
-@dataclass(frozen=True, slots=True)
-class _AccessProbeRequest:
-    client: _DeltaSyncClient
-    conn: sqlite3.Connection
-    shutdown_event: asyncio.Event
-    delta_worker: DeltaSyncWorker
-    policy: AccessProbePolicy
-    dialog_id: int
-
-
-def _access_probe_rows(conn: sqlite3.Connection, policy: AccessProbePolicy, now: int) -> list[tuple[int]]:
-    return [
-        (dialog_id,)
-        for dialog_id in due_access_revalidations(
-            conn,
-            now=now,
-            cooldown_seconds=policy.cooldown_seconds,
-            limit=policy.max_dialogs_per_cycle,
-        )
-    ]
 
 
 def _row_first_int(row: tuple[object | None, ...] | None) -> int:
@@ -927,139 +894,6 @@ class DeltaGapFillDemandAdapter:
                             raise self._worker._last_delta_slice_error
                 except RpcAttemptBudgetExhaustedError:
                     return
-
-
-# ---------------------------------------------------------------------------
-# Probe-worker — access recovery for access_lost dialogs
-# ---------------------------------------------------------------------------
-
-
-async def _handle_probe_throttling(
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    policy: AccessProbePolicy,
-    dialog_id: int,
-    exc: TelegramRpcThrottled,
-) -> None:
-    _raise_if_latched(exc)
-    logger.warning("probe_flood_wait dialog_id=%d seconds=%s", dialog_id, exc.retry_after_seconds)
-    stamp_access_revalidation(
-        conn,
-        dialog_id,
-        int(time.time()),
-        max(policy.cooldown_seconds, exc.retry_after_seconds or policy.cooldown_seconds),
-    )
-    await sleep_through_flood(shutdown_event, exc.retry_after_seconds or 1)
-
-
-async def _probe_access_lost_dialog(request: _AccessProbeRequest) -> _AccessProbeOutcome:
-    client = request.client
-    conn = request.conn
-    dialog_id = request.dialog_id
-    try:
-        result = await client.get_messages(entity=dialog_id, limit=1)
-        total = cast(int | None, getattr(result, "total", None))
-        return await _finish_access_probe(conn, request.delta_worker, dialog_id, total)
-    except (TelegramRpcAdmissionDeferred, RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
-        deferred = isinstance(exc, TelegramRpcAdmissionDeferred)
-        logger.info(
-            "access_probe admission_deferred dialog_id=%d error_type=%s — preserving revalidation budget",
-            dialog_id,
-            type(exc).__name__,
-        )
-        retry_after = cast(float | None, getattr(exc, "retry_after_seconds", None))
-        if deferred and retry_after is not None:
-            await sleep_through_flood(request.shutdown_event, retry_after)
-        return _AccessProbeOutcome(admission_deferred=True, counts_as_checked=not deferred)
-    except RpcAdmissionClosedError:
-        raise
-    except ACCESS_LOST_ERRORS:
-        logger.debug("access_still_lost dialog_id=%d", dialog_id)
-        stamp_access_revalidation(conn, dialog_id, int(time.time()), request.policy.cooldown_seconds)
-        return _AccessProbeOutcome(still_lost=1)
-    except TelegramRpcThrottled as exc:
-        await _handle_probe_throttling(request.conn, request.shutdown_event, request.policy, dialog_id, exc)
-        return _AccessProbeOutcome(flood_wait_hit=True)
-    except (RPCError, TimeoutError, OSError) as exc:
-        error_kind = "probe_rpc_error" if isinstance(exc, RPCError) else "probe_network_error"
-        logger.warning("%s dialog_id=%d error=%s", error_kind, dialog_id, exc)
-        stamp_access_revalidation(request.conn, dialog_id, int(time.time()), request.policy.cooldown_seconds)
-        return _AccessProbeOutcome(errors=1)
-
-
-async def _finish_access_probe(
-    conn: sqlite3.Connection,
-    delta_worker: DeltaSyncWorker,
-    dialog_id: int,
-    total_messages: int | None,
-) -> _AccessProbeOutcome:
-    if not full_history_enabled(conn, dialog_id):
-        return _AccessProbeOutcome(restored=_restore_revalidated_access(conn, dialog_id, total_messages=total_messages))
-    new_msgs = await delta_worker.fetch_delta_for_dialog(dialog_id)
-    logger.debug("access_restore_gap_fill dialog_id=%d new=%d", dialog_id, new_msgs)
-    if delta_worker._last_fetch_admission_deferred:
-        return _AccessProbeOutcome(admission_deferred=True)
-    return _AccessProbeOutcome(restored=_restore_revalidated_access(conn, dialog_id, total_messages=total_messages))
-
-
-@_delta_rpc_scope(DemandKind.DELTA_ACCESS_PROBE, AcquisitionKind.MESSAGE_LOOKUP)
-async def _probe_access_lost_dialogs(
-    client: _DeltaSyncClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    delta_worker: DeltaSyncWorker,
-    policy: AccessProbePolicy,
-) -> int:
-    """Probe due access_lost dialogs under a tiny cold budget.
-
-    Recovery sequence: probe -> gap-fill -> THEN reset status.
-    If gap-fill fails, status stays access_lost (safe rollback).
-    """
-    now = int(time.time())
-    rows = _access_probe_rows(conn, policy, now)
-
-    restored = 0
-    checked = 0
-    still_lost = 0
-    errors = 0
-    flood_wait_hit = False
-    for (dialog_id,) in rows:
-        if shutdown_event.is_set():
-            break
-        checked += 1
-        outcome = await _probe_access_lost_dialog(
-            _AccessProbeRequest(client, conn, shutdown_event, delta_worker, policy, dialog_id)
-        )
-        restored += outcome.restored
-        still_lost += outcome.still_lost
-        errors += outcome.errors
-        flood_wait_hit = outcome.flood_wait_hit
-        if outcome.admission_deferred:
-            if not outcome.counts_as_checked:
-                checked -= 1
-            break
-        if outcome.flood_wait_hit:
-            break
-
-        if policy.probe_pause_seconds > 0 and not shutdown_event.is_set():
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=policy.probe_pause_seconds)
-                break
-            except TimeoutError:
-                pass
-
-    log_maintenance_cycle(
-        logger,
-        any((rows, restored, errors, flood_wait_hit)),
-        "access_probe complete — selected=%d checked=%d restored=%d still_lost=%d errors=%d flood_wait_hit=%s",
-        len(rows),
-        checked,
-        restored,
-        still_lost,
-        errors,
-        flood_wait_hit,
-    )
-    return restored
 
 
 def _restore_revalidated_access(

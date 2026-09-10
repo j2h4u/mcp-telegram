@@ -174,24 +174,6 @@ def _repair_hydration_worker(conn: sqlite3.Connection, handler: _HydrationHandle
     )
 
 
-@pytest.mark.asyncio
-async def test_live_hydration_batch_gets_fresh_root_inside_backfill_launcher() -> None:
-    conn = _hydration_db()
-    conn.execute(
-        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, priority) VALUES ('test', 1, 1, 1, 1)"
-    )
-    handler = _HydrationHandler()
-    worker = _hydration_worker(conn, handler)
-
-    with rpc_scope(TelegramRpcSource.FACT_HYDRATION_BACKFILL):
-        await worker.run_cycle(now=1)
-
-    assert handler.scope is not None
-    assert handler.scope.demand_kind is DemandKind.LIVE_HYDRATION_BATCH
-    assert handler.scope.acquisition_kind is AcquisitionKind.MESSAGE_LOOKUP
-    conn.close()
-
-
 def test_backfill_status_reports_repair_candidates_without_mutation(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)

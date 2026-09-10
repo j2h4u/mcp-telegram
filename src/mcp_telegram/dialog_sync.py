@@ -912,7 +912,7 @@ class DialogReconciliationWorker:
       db_path arg) because the bootstrap sweep holds the connection across
       a long-lived async generator. DialogReconciliationWorker takes the
       daemon's MAIN `conn` directly because:
-        (1) Each UPSERT in run_full_pass uses its own `with self._conn:`
+        (1) Each UPSERT in the full traversal uses its own `with self._conn:`
             block — no transaction spans an await.
         (2) The access_lifecycle operation already operates on the same main
         `conn` from sync_worker.py and delta_sync.py — keeping
@@ -1354,11 +1354,6 @@ class DialogReconciliationWorker:
             state.generation,
         )
         return count, True
-
-    @_dialog_sync_rpc_scope(DemandKind.DIALOG_FULL_RECONCILIATION, AcquisitionKind.DIALOG_TRAVERSAL)
-    async def run_full_pass(self) -> tuple[int, bool]:
-        """Resume a full sweep and atomically soft-hide its unchanged baseline."""
-        return await self._run_full_pass_slice(refresh_topics=True, wait_on_throttle=True)
 
     @_dialog_sync_rpc_scope(DemandKind.DIALOG_LIGHT_RECONCILIATION, AcquisitionKind.TOPIC_SNAPSHOT)
     async def _refresh_forum_topics(

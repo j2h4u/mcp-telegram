@@ -643,24 +643,6 @@ class ScheduledMessageReconciler:
         )
         return [(_as_int(row[0]), _as_int(row[1]), bool(row[2])) for row in rows]
 
-    def _wait_timeout(self, now: int | None = None) -> float:
-        """Return a non-spinning wait until due work or account retry."""
-        current = int(time.time()) if now is None else int(now)
-        scan_seconds = max(1.0, float(self._policy.state_scan_seconds))
-        retry_at = _retry_at(self._conn)
-        if retry_at is not None and retry_at > current:
-            return min(scan_seconds, float(retry_at - current))
-        due = cast(
-            tuple[object] | None,
-            self._conn.execute(
-                "SELECT 1 FROM scheduled_reconciliation_state "
-                "WHERE (repair_due_at <= ? OR discovery_due_at <= ?) "
-                "AND (? IS NULL OR ? <= ?) LIMIT 1",
-                (current, current, retry_at, retry_at, current),
-            ).fetchone(),
-        )
-        return 0.0 if due else scan_seconds
-
     def _record_dialog_failure(self, dialog_id: int, kind: str, _code: str, now: int) -> None:
         due_column = "discovery_due_at" if kind == "discovery" else "repair_due_at"
         self._conn.execute(
@@ -789,10 +771,6 @@ class ScheduledMessageReconciler:
             return 0, stopped
         changed = self._apply_snapshot(dialog_id, generation, snapshot, discovery=discovery, now=now)
         return (0 if changed is None else changed), False
-
-    async def run_once(self) -> int:
-        """Process one bounded slice of due per-dialog work."""
-        return await self._run_slice()
 
     async def run_demand_slice(self, demand_kind: DemandKind) -> int:
         """Process one bounded slice for one scheduled demand contract."""
