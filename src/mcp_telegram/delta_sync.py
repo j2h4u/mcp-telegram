@@ -13,10 +13,11 @@ Architecture:
 """
 
 import asyncio
+import json
 import logging
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
@@ -137,6 +138,9 @@ class AccessProbePolicy:
 # the user's account hasn't received meaningful new traffic worth probing.
 RECENT_SYNC_SKIP_THRESHOLD_S: int = 3600
 _DELTA_SLICE_MESSAGE_LIMIT = 100
+_DM_GAP_SCAN_PAGE_SIZE = 100
+_DM_GAP_SCAN_INTERVAL_SECONDS = 7 * 24 * 60 * 60
+_DM_GAP_SCAN_STATE_KEY = "delta_dm_gap_scan_state"
 
 _SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL = """
 SELECT sd.dialog_id, sd.last_synced_at, sd.last_delta_checked_at, sd.delta_refresh_requested_at
@@ -178,6 +182,126 @@ _REQUEST_DELTA_CONTINUATION_SQL = (
     "WHERE dialog_id = ? "
     "AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
 )
+
+_SELECT_DM_GAP_DIALOGS_SQL = """
+SELECT sd.dialog_id
+  FROM synced_dialogs AS sd
+  JOIN full_history_enrollment AS fhe
+    ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
+  JOIN entities AS entity ON entity.id = sd.dialog_id
+ WHERE sd.status = 'synced'
+   AND entity.type IN ('user', 'bot')
+ ORDER BY sd.dialog_id
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class _DmGapScanState:
+    """Restart-safe cursor for the weekly DM deletion verification pass."""
+
+    status: str
+    generation: int
+    scan_started_at: int
+    dialog_index: int
+    message_cursor: int
+    next_run_at: int
+
+
+class DmGapScanPage(Protocol):
+    """Event-handler seam for one bounded Telegram deletion lookup page."""
+
+    async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int: ...
+
+
+def _load_dm_gap_scan_state(conn: sqlite3.Connection) -> _DmGapScanState | None:
+    row = cast(
+        tuple[str | None] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key = ?", (_DM_GAP_SCAN_STATE_KEY,)).fetchone(),
+    )
+    if row is None or not row[0]:
+        return None
+    try:
+        value = cast(dict[str, object], json.loads(row[0]))
+        state = _DmGapScanState(
+            status=str(value["status"]),
+            generation=int(cast(int | str, value["generation"])),
+            scan_started_at=int(cast(int | str, value["scan_started_at"])),
+            dialog_index=int(cast(int | str, value["dialog_index"])),
+            message_cursor=int(cast(int | str, value.get("message_cursor", value.get("message_offset", 0)))),
+            next_run_at=int(cast(int | str, value["next_run_at"])),
+        )
+    except KeyError, TypeError, ValueError, json.JSONDecodeError:
+        logger.warning("dm_gap_scan_state_corrupt — restarting deletion verification")
+        return None
+    if not _valid_dm_gap_scan_state(state):
+        logger.warning("dm_gap_scan_state_invalid — restarting deletion verification")
+        return None
+    return state
+
+
+def _valid_dm_gap_scan_state(state: _DmGapScanState) -> bool:
+    if state.status not in {"running", "idle"}:
+        return False
+    return all(
+        value >= 0
+        for value in (
+            state.generation,
+            state.scan_started_at,
+            state.dialog_index,
+            state.message_cursor,
+            state.next_run_at,
+        )
+    )
+
+
+def _store_dm_gap_scan_state(conn: sqlite3.Connection, state: _DmGapScanState) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO daemon_state(key, value) VALUES (?, ?)",
+        (
+            _DM_GAP_SCAN_STATE_KEY,
+            json.dumps(
+                {
+                    "status": state.status,
+                    "generation": state.generation,
+                    "scan_started_at": state.scan_started_at,
+                    "dialog_index": state.dialog_index,
+                    "message_cursor": state.message_cursor,
+                    "next_run_at": state.next_run_at,
+                },
+                sort_keys=True,
+            ),
+        ),
+    )
+
+
+def _dm_gap_scan_dialog_ids(conn: sqlite3.Connection) -> list[int]:
+    rows = cast(Sequence[tuple[object]], conn.execute(_SELECT_DM_GAP_DIALOGS_SQL).fetchall())
+    return [int(cast(int, dialog_id)) for (dialog_id,) in rows]
+
+
+def _dm_gap_scan_page_ids(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    scan_started_at: int,
+    message_cursor: int,
+) -> tuple[int, ...]:
+    rows = cast(
+        Sequence[tuple[object]],
+        conn.execute(
+            "SELECT message_id FROM messages "
+            "WHERE dialog_id = ? AND is_deleted = 0 AND sent_at < ? AND message_id > ? "
+            "ORDER BY message_id LIMIT ?",
+            (dialog_id, scan_started_at, message_cursor, _DM_GAP_SCAN_PAGE_SIZE),
+        ).fetchall(),
+    )
+    return tuple(int(cast(int, message_id)) for (message_id,) in rows)
+
+
+def _dm_gap_scan_release_at(conn: sqlite3.Connection, now: float) -> float | None:
+    state = _load_dm_gap_scan_state(conn)
+    if state is None or state.status == "running":
+        return 0.0
+    return float(state.next_run_at) if state.next_run_at > now else 0.0
 
 
 class AccessProbeLoopOptions(TypedDict, total=False):
@@ -656,46 +780,124 @@ class DeltaSyncWorker:
 
 
 class DeltaGapFillDemandAdapter:
-    """One-page durable adapter over delta timestamps and refresh requests."""
+    """One-page durable adapter over delta and DM tombstone subqueues."""
 
     demand_kind = DemandKind.DELTA_GAP_FILL
 
-    def __init__(self, worker: DeltaSyncWorker) -> None:
+    def __init__(self, worker: DeltaSyncWorker, dm_gap_scanner: DmGapScanPage | None = None) -> None:
         self._worker = worker
+        self._dm_gap_scanner = dm_gap_scanner
 
-    def status(self, now: float) -> DemandStatus | None:
-        """Report the oldest local delta release boundary without writes."""
-        del now
+    def _ordinary_candidate(self, now: float) -> tuple[float, int] | None:
         rows = cast(
             list[tuple[int, int | None, int | None, int | None]],
             self._worker._conn.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL).fetchall(),
         )
-        if not rows:
-            return None
-        release_at = min(
-            _delta_release_at(last_synced, last_checked, requested) for _, last_synced, last_checked, requested in rows
+        candidates = [
+            (_delta_release_at(last_synced, last_checked, requested), int(dialog_id))
+            for dialog_id, last_synced, last_checked, requested in rows
+        ]
+        return min(candidates, key=lambda candidate: (candidate[0], candidate[1])) if candidates else None
+
+    def _candidate(self, now: float) -> tuple[float, int, int | None] | None:
+        candidates: list[tuple[float, int, int | None]] = []
+        ordinary = self._ordinary_candidate(now)
+        if ordinary is not None:
+            release_at, dialog_id = ordinary
+            candidates.append((release_at, 0, dialog_id))
+        if self._dm_gap_scanner is not None:
+            dm_release_at: float | None = _dm_gap_scan_release_at(self._worker._conn, now)
+            if dm_release_at is not None:
+                candidates.append((dm_release_at, 1, None))
+        return (
+            min(candidates, key=lambda candidate: (candidate[0], candidate[1], candidate[2] or -1))
+            if candidates
+            else None
         )
-        return DemandStatus(release_at=release_at)
+
+    def status(self, now: float) -> DemandStatus | None:
+        """Report the oldest local delta release boundary without writes."""
+        candidate = self._candidate(now)
+        if candidate is None:
+            return None
+        return DemandStatus(release_at=candidate[0])
+
+    async def _run_dm_gap_slice(self, now: float) -> None:
+        """Verify one persisted DM page, or advance one empty dialog locally."""
+        state = _load_dm_gap_scan_state(self._worker._conn)
+        if state is None or (state.status == "idle" and state.next_run_at <= now):
+            previous_generation = 0 if state is None else state.generation
+            state = _DmGapScanState("running", previous_generation + 1, int(now), 0, 0, 0)
+            with self._worker._conn:
+                _store_dm_gap_scan_state(self._worker._conn, state)
+        if state.status == "idle":
+            return
+
+        dialog_ids = _dm_gap_scan_dialog_ids(self._worker._conn)
+        if state.dialog_index >= len(dialog_ids):
+            completed = _DmGapScanState(
+                "idle",
+                state.generation,
+                state.scan_started_at,
+                0,
+                0,
+                int(now) + _DM_GAP_SCAN_INTERVAL_SECONDS,
+            )
+            with self._worker._conn:
+                _store_dm_gap_scan_state(self._worker._conn, completed)
+            return
+
+        dialog_id = dialog_ids[state.dialog_index]
+        page = _dm_gap_scan_page_ids(
+            self._worker._conn,
+            dialog_id,
+            state.scan_started_at,
+            state.message_cursor,
+        )
+        if not page:
+            advanced = _DmGapScanState(
+                "running",
+                state.generation,
+                state.scan_started_at,
+                state.dialog_index + 1,
+                0,
+                0,
+            )
+            with self._worker._conn:
+                _store_dm_gap_scan_state(self._worker._conn, advanced)
+            return
+
+        # Leave the cursor at the page start until the collaborator commits. A
+        # process crash during the RPC repeats an idempotent tombstone page.
+        await self._dm_gap_scanner.run_dm_gap_scan_page(dialog_id, page)  # type: ignore[union-attr]
+        next_cursor = page[-1]
+        advanced = _DmGapScanState(
+            "running",
+            state.generation,
+            state.scan_started_at,
+            state.dialog_index,
+            next_cursor,
+            0,
+        )
+        with self._worker._conn:
+            _store_dm_gap_scan_state(self._worker._conn, advanced)
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
         """Fetch one due dialog page and leave continuation in domain state."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
         now = time.time()
-        rows = cast(
-            list[tuple[int, int | None, int | None, int | None]],
-            self._worker._conn.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL).fetchall(),
-        )
-        dialog_id = next(
-            (row[0] for row in rows if _delta_release_at(row[1], row[2], row[3]) <= now),
-            None,
-        )
-        if dialog_id is None:
+        candidate = self._candidate(now)
+        if candidate is None or candidate[0] > now:
             return
         with demand_context(DemandKind.DELTA_GAP_FILL):
             with rpc_attempt_budget(budget):
                 try:
-                    await self._worker.fetch_delta_slice_for_dialog(dialog_id)
+                    if candidate[1] == 1:
+                        await self._run_dm_gap_slice(now)
+                    else:
+                        assert candidate[2] is not None
+                        await self._worker.fetch_delta_slice_for_dialog(candidate[2])
                 except RpcAttemptBudgetExhaustedError:
                     return
 

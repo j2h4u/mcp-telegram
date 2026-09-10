@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -228,6 +228,81 @@ async def test_delta_gap_slice_commits_one_page_and_keeps_durable_continuation(
         ).fetchone()[0]
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_delta_gap_adapter_resumes_dm_tombstone_cursor_after_restart(conn: sqlite3.Connection) -> None:
+    dialog_id = 203
+    _seed_history_dialog(conn, dialog_id, status="synced", last_delta_checked_at=100)
+    conn.execute("INSERT INTO entities (id, type, updated_at) VALUES (?, 'user', 1)", (dialog_id,))
+    conn.executemany(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, text) VALUES (?, ?, 1, 'message')",
+        ((dialog_id, message_id) for message_id in range(1, 102)),
+    )
+    conn.commit()
+
+    class Scanner:
+        def __init__(self) -> None:
+            self.pages: list[tuple[int, ...]] = []
+
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+            del dialog_id
+            self.pages.append(tuple(message_ids))
+            return 0
+
+    scanner = Scanner()
+    worker = DeltaSyncWorker(cast(_DeltaSyncClient, SimpleNamespace()), conn, asyncio.Event())
+    adapter = DeltaGapFillDemandAdapter(worker, scanner)
+
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert len(scanner.pages) == 1
+    assert scanner.pages[0] == tuple(range(1, 101))
+    state = cast(
+        tuple[str], conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone()
+    )[0]
+    assert '"message_cursor": 100' in state
+
+    restarted = DeltaGapFillDemandAdapter(worker, scanner)
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
+        await restarted.run_slice(RpcAttemptBudget(limit=1))
+    assert scanner.pages[1] == (101,)
+
+
+@pytest.mark.asyncio
+async def test_full_sync_total_repair_uses_durable_retry_boundary(conn: sqlite3.Connection) -> None:
+    dialog_id = 204
+    _seed_history_dialog(conn, dialog_id, status="synced")
+    conn.execute("UPDATE synced_dialogs SET total_messages=NULL WHERE dialog_id=?", (dialog_id,))
+    conn.commit()
+
+    calls = 0
+
+    async def get_messages(**_kwargs: object) -> MockTotalList:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("temporary Telegram failure")
+        return MockTotalList([], total=17)
+
+    worker = FullSyncWorker(SimpleNamespace(get_messages=get_messages), conn, asyncio.Event())
+    adapter = FullSyncDemandAdapter(worker)
+    with patch("mcp_telegram.sync_worker.time.time", return_value=1000):
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert calls == 1
+    assert conn.execute(
+        "SELECT value FROM daemon_state WHERE key='full_sync_total_messages_repair_retry_at'"
+    ).fetchone() == ("1060",)
+
+    with patch("mcp_telegram.sync_worker.time.time", return_value=1001):
+        assert adapter.status(1001.0).release_at == 1060.0  # type: ignore[union-attr]
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert calls == 1
+
+    with patch("mcp_telegram.sync_worker.time.time", return_value=1060):
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert calls == 2
+    assert conn.execute("SELECT total_messages FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (17,)
 
 
 @pytest.mark.asyncio
