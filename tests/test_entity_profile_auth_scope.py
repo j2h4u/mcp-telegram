@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,7 +19,7 @@ from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind
-from tests.test_entity_profile_full_user_pair import _PairClient, _prepare
+from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient, _prepare
 
 
 def _scope(*, account_id: int = 42, dc_id: int = 2, auth_key_id: int = 99) -> TelegramAuthScope:
@@ -136,6 +137,76 @@ async def test_scope_is_private_evidence_and_reuse_stops_at_ttl(tmp_path: Path) 
     assert client.full_user_calls == 2
     await service.shutdown()
     conn.close()
+
+
+@pytest.mark.asyncio
+async def test_disabled_baseline_scope_reuse_survives_restart_without_pair_receipts(tmp_path: Path) -> None:
+    path = tmp_path / "disabled-scope.sqlite"
+    conn, raw_service = _prepare(path, migrated=True)
+    service = cast(DaemonEntityInfoService, raw_service)
+    service._deps = replace(service._deps, enable_full_user_pair=False)
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+
+    service._profiles.mark_pending(42, now=100, pair_mode_override="disabled")
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0 "
+        "WHERE entity_id=42"
+    )
+    conn.commit()
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    conn.execute("UPDATE entity_detail_sections SET status='fresh', observed_at=100, reason=NULL WHERE entity_id=42")
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET status='complete', retry_at=NULL, reason=NULL WHERE entity_id=42"
+    )
+    conn.commit()
+    before = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT status, retry_at, generation, pair_attempts, pair_measurement_complete "
+            "FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone(),
+    )
+    client = cast(_PairClient, service._deps.client)
+    assert service._profiles.read_section_evidence(42, "full_profile") is None
+    assert service._profiles.read_section_evidence(42, "personal_channel") is None
+
+    first = await service.get_entity_info({"entity_id": 42})
+
+    assert first["ok"] is True
+    assert coordinator.queue_depth == 0
+    assert client.full_user_calls == 2
+    assert (
+        conn.execute(
+            "SELECT status, retry_at, generation, pair_attempts, pair_measurement_complete "
+            "FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone()
+        == before
+    )
+    await service.shutdown()
+    conn.close()
+
+    reopened = sqlite3.connect(path)
+    restarted = cast(DaemonEntityInfoService, _pair_service(reopened, _PairClient(), enabled=False))
+    restarted_coordinator = restarted.refresh_coordinator
+    assert restarted_coordinator is not None
+    restarted_client = cast(_PairClient, restarted._deps.client)
+
+    second = await restarted.get_entity_info({"entity_id": 42})
+
+    assert second["ok"] is True
+    assert restarted_coordinator.queue_depth == 0
+    assert restarted_client.full_user_calls == 0
+    assert (
+        reopened.execute(
+            "SELECT status, retry_at, generation, pair_attempts, pair_measurement_complete "
+            "FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone()
+        == before
+    )
+    await restarted.shutdown()
+    reopened.close()
 
 
 @pytest.mark.asyncio

@@ -529,7 +529,7 @@ class DaemonEntityInfoService:
             return False
         raw_type = detail.get("type")
         entity_type = DialogType.parse(raw_type if isinstance(raw_type, str) else None)
-        if entity_type not in {DialogType.USER, DialogType.BOT}:
+        if not self._deps.enable_full_user_pair or entity_type not in {DialogType.USER, DialogType.BOT}:
             return False
         target_kind = TargetKind.BOT if entity_type is DialogType.BOT else TargetKind.USER
         identity = self._full_user_pair_identity(target_kind)
