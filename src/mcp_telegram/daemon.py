@@ -65,6 +65,7 @@ from .activity_cold_backfill import ColdBackfillPacing
 from .activity_contracts import InputPeerResolver
 from .activity_peer_resolve import resolve_input_peer
 from .activity_substrate import ActivityClient
+from .auth_scope import capture_auth_scope
 from .config import McpTelegramConfig, SchedulingConfig, load_config, resolve_scheduling_config
 from .daemon_api import DaemonApiPolicy, DaemonAPIServer, DaemonClientLike, DaemonHealthStatus
 from .delta_sync import AccessProbePolicy, DeltaSyncWorker, DmGapScanPage, _DeltaSyncClient
@@ -1318,6 +1319,7 @@ def _update_self_profile(api_server: DaemonAPIServer, me: _MeLike) -> None:
         "last_name": getattr(me, "last_name", None),
         "username": getattr(me, "username", None),
     }
+    api_server._publish_auth_scope(capture_auth_scope(me, api_server._client))
 
 
 def _publish_startup_identity(ctx: _SyncMainContext, profile: object, own_only_context: OwnOnlyContext) -> None:

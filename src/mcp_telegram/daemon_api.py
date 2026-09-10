@@ -73,6 +73,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 
 from . import daemon_activity_stats as _activity_stats
+from .auth_scope import TelegramAuthScope
 from .conversation_changes import ConversationChangesTokenCodec, query_conversation_changes
 from .daemon_account_trace import (
     DaemonAccountTraceDeps,
@@ -550,6 +551,7 @@ class DaemonAPIServer:
         # calling Telethon on every read.
         self.self_id: int | None = None
         self.self_profile: dict[str, object] | None = None
+        self._auth_scope: TelegramAuthScope | None = None
         # Set to True once Telegram is connected and all startup steps complete.
         # While False, handle_client returns daemon_not_ready with startup_detail.
         self._ready: bool = False
@@ -569,6 +571,13 @@ class DaemonAPIServer:
         self._demand_sink = sink
         if self._entity_info_service is not None:
             self._entity_info_service.bind_demand_sink(sink)
+
+    def _publish_auth_scope(self, scope: TelegramAuthScope | None) -> None:
+        """Publish private session identity to already-composed domain services."""
+        changed = self._auth_scope != scope
+        self._auth_scope = scope
+        if changed and self._entity_info_service is not None:
+            self._entity_info_service.auth_scope_changed()
 
     def _require_demand_sink(self) -> DemandOfferSink:
         sink = self._demand_sink
@@ -1564,6 +1573,7 @@ class DaemonAPIServer:
                     get_dialog_placement=lambda entity_id: dialog_placement(self._conn, entity_id),
                     refresh_limits=self._policy.entity_profile,
                     enable_full_user_pair=self._policy.full_user_pair_enabled,
+                    full_user_auth_scope=lambda: self._auth_scope,
                 )
             )
             if self._demand_sink is not None:

@@ -16,6 +16,7 @@ from typing import Protocol, cast, runtime_checkable
 from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[import-untyped]
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
+from .auth_scope import TelegramAuthScope
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .entity_profile.contracts import PROFILE_SECTIONS, ProfileAcquisitionEvidence, completeness
 from .entity_profile.full_user_normalization import (
@@ -52,6 +53,10 @@ _ENTITY_DETAIL_SCHEMA_VERSION = 1
 _MEMBERSHIP_THRESHOLD_LARGE = 1000
 _CHANNEL_DIALOG_ID_OFFSET = 1_000_000_000_000
 _PERSONAL_CHANNEL_PREVIEW_CHARS = 100
+
+
+class _AuthScopeUnavailableError(RuntimeError):
+    """The live primary session identity cannot authorize a pair receipt."""
 
 _ADMIN_RIGHT_FIELDS = (
     "change_info",
@@ -234,6 +239,7 @@ class EntityInfoDeps:
     refresh_limits: RefreshLimits = field(default_factory=RefreshLimits)
     enable_full_user_pair: bool = False
     full_user_identity: Mapping[str, object] | None = None
+    full_user_auth_scope: Callable[[], TelegramAuthScope | None] | None = None
 
 
 class DaemonEntityInfoService:
@@ -262,6 +268,29 @@ class DaemonEntityInfoService:
     def refresh_coordinator(self) -> EntityRefreshCoordinator | None:
         """Return the service-owned coordinator used by demand composition."""
         return self._refresh
+
+    def auth_scope_changed(self) -> None:
+        """Queue completed User/Bot pairs under a new authorization generation."""
+        if not self._deps.enable_full_user_pair:
+            return
+        rows = cast(
+            list[tuple[int]],
+            self._deps.conn.execute(
+                "SELECT DISTINCT entity_id FROM entity_detail_sections "
+                "WHERE section IN ('full_profile', 'personal_channel') AND status='fresh' "
+                "GROUP BY entity_id HAVING COUNT(*)=2"
+            ).fetchall(),
+        )
+        now = int(self._deps.now_provider())
+        for row in rows:
+            self._profiles.mark_pending(
+                int(row[0]),
+                now=now,
+                reason="auth_scope_changed",
+                pair_eligible_override=True,
+            )
+        if rows and self._demand_sink is not None:
+            offer_durable_demand(self._demand_sink, DemandKind.ENTITY_PROFILE_REFRESH)
 
     async def get_entity_info(self, req: Mapping[str, object]) -> dict[str, object]:
         """Run one foreground entity-info use case under its RPC source."""
@@ -316,12 +345,32 @@ class DaemonEntityInfoService:
     def _progressive_cached_result(self, entity_id: int, *, now: int) -> dict[str, object] | None:
         cached = self._profiles.read(entity_id, now=now)
         if cached is not None:
+            if self._deps.enable_full_user_pair and self._pair_scope_changed(cached.detail, entity_id, now=now):
+                self._profiles.mark_pending(
+                    entity_id,
+                    now=now,
+                    reason="auth_scope_changed",
+                    pair_eligible_override=True,
+                )
+                cached = self._profiles.read(entity_id, now=now)
+                assert cached is not None
             return self._progressive_result(entity_id, cached.detail, cached.sections, now=now)
         refresh_state = self._profiles.refresh_state(entity_id, now=now)
         if refresh_state is None:
             return None
         reason = str(refresh_state.get("reason", "entity refresh is temporarily unavailable"))
         return self._pending_error(entity_id, reason)
+
+    def _pair_scope_changed(self, detail: Mapping[str, object], entity_id: int, *, now: int) -> bool:
+        if self._deps.full_user_auth_scope is None:
+            return False
+        raw_type = detail.get("type")
+        entity_type = DialogType.parse(raw_type if isinstance(raw_type, str) else None)
+        if entity_type not in {DialogType.USER, DialogType.BOT}:
+            return False
+        target_kind = TargetKind.BOT if entity_type is DialogType.BOT else TargetKind.USER
+        identity = self._full_user_pair_identity(target_kind)
+        return self._profiles.pair_receipts_require_new_scope(entity_id, identity, now=now)
 
     def _self_snapshot_result(self, entity_id: int, *, now: int, started_at: float) -> dict[str, object]:
         self_detail = self._build_self_detail()
@@ -424,7 +473,9 @@ class DaemonEntityInfoService:
         release_at = self._profiles.next_refresh_release_at()
         return DemandStatus(release_at=release_at) if release_at is not None else None
 
-    async def _run_durable_refresh_slice(self, budget: RpcAttemptBudget) -> DurableRefreshSliceResult | None:
+    async def _run_durable_refresh_slice(  # noqa: PLR0911
+        self, budget: RpcAttemptBudget
+    ) -> DurableRefreshSliceResult | None:
         """Execute and commit at most one profile acquisition for one entity."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
@@ -437,17 +488,23 @@ class DaemonEntityInfoService:
             terminal = await self._acquire_durable_refresh_core(cursor, now=now)
             return DurableRefreshSliceResult(cursor.entity_id, terminal)
         if self._pair_enabled(cursor, entity_type):
+            target_kind = TargetKind.BOT if entity_type is DialogType.BOT else TargetKind.USER
+            identity = self._full_user_pair_identity(target_kind)
+            if identity is not None and self._profiles.reuse_full_user_pair(cursor, identity, now=now):
+                return DurableRefreshSliceResult(
+                    cursor.entity_id,
+                    self._success_if_refresh_finished(cursor, committed=True),
+                )
             terminal = await self._acquire_and_commit_full_user_pair(cursor, now=now)
             return DurableRefreshSliceResult(cursor.entity_id, terminal)
         if self._pair_personal_channel_is_ready(cursor):
             # The pair already captured the remote channel identity. Advancing
             # this ordered cursor is local work and must never repeat
             # GetFullUser merely to finish the same generation.
-            committed = self._profiles.commit_section(
-                cursor,
-                EntitySectionCommit({}, status="fresh"),
-                now=now,
-            )
+            entity_type = self._stored_entity_type(cursor.entity_id, now=now)
+            target_kind = TargetKind.BOT if entity_type is DialogType.BOT else TargetKind.USER
+            identity = self._full_user_pair_identity(target_kind)
+            committed = self._profiles.complete_same_generation_section(cursor, identity, now=now)
             return DurableRefreshSliceResult(
                 cursor.entity_id,
                 self._success_if_refresh_finished(cursor, committed=committed),
@@ -477,10 +534,17 @@ class DaemonEntityInfoService:
         if not self._deps.enable_full_user_pair or cursor.next_section != "personal_channel":
             return False
         evidence = self._profiles.read_section_evidence(cursor.entity_id, "personal_channel")
+        entity_type = self._stored_entity_type(cursor.entity_id, now=int(self._deps.now_provider()))
+        target_kind = TargetKind.BOT if entity_type is DialogType.BOT else TargetKind.USER
+        identity = self._full_user_pair_identity(target_kind)
         return (
+            (identity is not None or self._deps.full_user_auth_scope is None)
+            and
             evidence is not None
             and evidence.get("generation") == cursor.generation
             and evidence.get("normalization_version") == NORMALIZATION_VERSION
+            and (self._deps.full_user_auth_scope is None or evidence.get("identity") == identity)
+            and evidence.get("outcome") in {"usable", "absent", "partial", "unavailable"}
         )
 
     def _stored_entity_type(self, entity_id: int, *, now: int) -> DialogType:
@@ -559,6 +623,27 @@ class DaemonEntityInfoService:
                 retry_at=now + 60,
             )
             return DurableRefreshTerminal.FAILURE if failed else None
+        if self._deps.full_user_auth_scope is not None:
+            current_scope = self._capture_pair_scope()
+            expected_identity = (
+                full_profile.evidence.identity
+                if full_profile.evidence is not None
+                else None
+            )
+            expected_scope = self._full_user_pair_identity(
+                TargetKind.BOT
+                if self._stored_entity_type(cursor.entity_id, now=now) is DialogType.BOT
+                else TargetKind.USER,
+                scope=current_scope,
+            )
+            if current_scope is None or expected_identity != expected_scope:
+                failed = self._profiles.mark_section_failure(
+                    cursor,
+                    now=now,
+                    reason="auth_scope_changed",
+                    retry_at=now + 1,
+                )
+                return DurableRefreshTerminal.FAILURE if failed else None
         committed = self._profiles.commit_full_user_pair(
             cursor,
             full_profile,
@@ -571,6 +656,7 @@ class DaemonEntityInfoService:
         self,
         cursor: EntityRefreshCursor,
     ) -> tuple[EntitySectionCommit, EntitySectionCommit]:
+        captured_scope = self._capture_pair_scope()
         started_at = self._deps.now_provider()
         target_kind = (
             TargetKind.BOT
@@ -587,7 +673,11 @@ class DaemonEntityInfoService:
         )
         if normalized.full_profile.status is ProjectionStatus.UNAVAILABLE:
             raise ValueError(normalized.full_profile.reason or "full user payload is unavailable")
-        identity = self._full_user_pair_identity(target_kind)
+        if self._deps.full_user_auth_scope is not None:
+            verified_scope = self._capture_pair_scope()
+            if captured_scope is None or verified_scope != captured_scope:
+                raise _AuthScopeUnavailableError("authenticated session scope changed during acquisition")
+        identity = self._full_user_pair_identity(target_kind, scope=captured_scope)
         full_profile = self._normalized_full_profile_commit(normalized.full_profile, cursor, identity)
         personal_channel = self._normalized_personal_channel_commit(
             normalized.personal_channel,
@@ -596,22 +686,26 @@ class DaemonEntityInfoService:
         )
         return full_profile, personal_channel
 
-    def _full_user_pair_identity(self, target_kind: TargetKind) -> dict[str, object] | None:
-        """Return a reuse identity only when account and session identity exist."""
-        supplied = self._deps.full_user_identity
-        if not isinstance(supplied, Mapping):
+    def _capture_pair_scope(self) -> TelegramAuthScope | None:
+        provider = self._deps.full_user_auth_scope
+        if provider is None:
             return None
-        account_id = supplied.get("account_id")
-        session_generation = supplied.get("session_generation")
-        if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
-            return None
-        if session_generation is None or isinstance(session_generation, (Mapping, list, tuple, set)):
-            return None
-        if not str(session_generation).strip():
+        scope = provider()
+        return scope if isinstance(scope, TelegramAuthScope) else None
+
+    def _full_user_pair_identity(
+        self,
+        target_kind: TargetKind,
+        *,
+        scope: TelegramAuthScope | None = None,
+    ) -> dict[str, object] | None:
+        """Return the private receipt identity for one paired projection."""
+        if self._deps.full_user_auth_scope is not None:
+            scope = self._capture_pair_scope() if scope is None else scope
+        if scope is None:
             return None
         return {
-            "account_id": account_id,
-            "session_generation": str(session_generation),
+            "auth_scope": scope.as_private_mapping(),
             "entity_type": target_kind.value,
             "endpoint": FULL_USER_ENDPOINT,
             "normalization_version": NORMALIZATION_VERSION,
