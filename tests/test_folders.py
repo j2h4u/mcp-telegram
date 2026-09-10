@@ -252,7 +252,10 @@ def test_telegram_adapter_counts_manual_unread_mark() -> None:
         (None, (None, 0, 0)),
         (User(10, access_hash=11), ("user", 10, 11)),
         (Chat(20, "chat", ChatPhotoEmpty(), 0, None, 1), ("chat", 20, 0)),
-        (Channel(30, "channel", ChatPhotoEmpty(), None, False, None, broadcast=True, access_hash=31), ("channel", 30, 31)),
+        (
+            Channel(30, "channel", ChatPhotoEmpty(), None, False, None, broadcast=True, access_hash=31),
+            ("channel", 30, 31),
+        ),
         (type("User", (), {"id": 40, "access_hash": 41})(), ("user", 40, 41)),
         (type("Peer", (), {"id": 50, "access_hash": 51})(), (None, 50, 51)),
     ],
@@ -329,9 +332,7 @@ async def test_telegram_adapter_iter_dialogs_maps_page_and_cursor_offsets() -> N
     items = [item async for item in gateway.iter_dialogs(None)]
 
     assert items[0].facts.dialog_id == 10
-    assert items[0].cursor == FolderDialogCursor(
-        "2026-09-10T12:00:00+00:00", 10, "user", 10, 110
-    )
+    assert items[0].cursor == FolderDialogCursor("2026-09-10T12:00:00+00:00", 10, "user", 10, 110)
     assert client.dialog_calls == [{"limit": 100, "ignore_pinned": True}]
 
     cursor = FolderDialogCursor("2026-09-09T11:00:00+00:00", 9, "user", 9, 109)

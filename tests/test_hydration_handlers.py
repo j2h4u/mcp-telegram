@@ -95,9 +95,10 @@ def test_media_apply_maps_single_result_and_persists_empty_and_unknown_facts(
     assert applied.completed == 1
     assert applied.dropped == 1
     assert applied.drop_observations[0].reason == "missing_response"
-    assert db.execute(
-        "SELECT media_kind, media_payload FROM messages WHERE message_id = 1"
-    ).fetchone() == ("other", '{"type":"SimpleNamespace"}')
+    assert db.execute("SELECT media_kind, media_payload FROM messages WHERE message_id = 1").fetchone() == (
+        "other",
+        '{"type":"SimpleNamespace"}',
+    )
     assert db.execute("SELECT media_kind, media_payload FROM messages WHERE message_id = 2").fetchone() == (
         "other",
         "{}",
@@ -152,9 +153,9 @@ def test_media_apply_rejects_non_collection_results(
         now=20,
     )
 
-    assert applied == applied.__class__(dropped=1, drop_observations=(
-        HydrationDropObservation("invalid_result", 1, MEDIA_METADATA_KIND, 1, 0),
-    ))
+    assert applied == applied.__class__(
+        dropped=1, drop_observations=(HydrationDropObservation("invalid_result", 1, MEDIA_METADATA_KIND, 1, 0),)
+    )
 
 
 def test_media_apply_reports_not_applied_when_access_is_lost(db: sqlite3.Connection) -> None:
@@ -209,9 +210,7 @@ def test_transcription_apply_handles_pending_and_existing_fact(db: sqlite3.Conne
     handler = TranscriptionHydrationHandler(recheck_delay_seconds=30)
     queue = HydrationQueueRepository(db)
 
-    pending = handler.apply(
-        db, queue, [pending_job], SimpleNamespace(pending=True), now=20
-    )
+    pending = handler.apply(db, queue, [pending_job], SimpleNamespace(pending=True), now=20)
     db.execute(
         "INSERT INTO message_transcriptions(dialog_id, message_id, text, transcription_id, received_at) "
         "VALUES (1, 1, 'event fact', 8, 19)"
