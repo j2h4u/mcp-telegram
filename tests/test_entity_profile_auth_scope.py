@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -27,6 +28,50 @@ def test_capture_scope_requires_positive_account_and_primary_key() -> None:
     assert capture_auth_scope(SimpleNamespace(id=0), client) is None
     assert capture_auth_scope(SimpleNamespace(id=42), SimpleNamespace(session=SimpleNamespace(dc_id=2))) is None
     assert capture_auth_scope(SimpleNamespace(id=42), SimpleNamespace(session=SimpleNamespace(dc_id=0))) is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        (None, None, {"type": "user"}, False, False),
+        (lambda: _scope(), _scope().as_private_mapping(), {"type": "user"}, False, False),
+        (lambda: _scope(dc_id=3), _scope().as_private_mapping(), {"type": "user"}, False, True),
+        (lambda: _scope(account_id=7), _scope().as_private_mapping(), {"type": "user"}, False, True),
+        (lambda: None, _scope().as_private_mapping(), {"type": "user"}, False, True),
+        (lambda: _scope(), None, {"type": "user"}, False, True),
+        (lambda: _scope(), _scope().as_private_mapping(), [], False, False),
+        (lambda: _scope(), _scope().as_private_mapping(), {"type": "channel"}, False, False),
+        (lambda: _scope(), _scope().as_private_mapping(), {"type": "user"}, True, True),
+    ],
+)
+def test_profile_scope_changed_fences_only_stale_or_unavailable_pairs(
+    tmp_path: Path,
+    case: tuple[object, dict[str, object] | None, object, bool, bool],
+) -> None:
+    provider, stored_scope, detail, receipts_changed, expected = case
+    conn, raw_service = _prepare(tmp_path / f"scope-{expected}-{hash(str(detail))}.sqlite")
+    service = cast(DaemonEntityInfoService, raw_service)
+    service._deps = replace(service._deps, full_user_auth_scope=provider)  # type: ignore[arg-type]
+    service._profiles.pair_receipts_require_new_scope = MagicMock(return_value=receipts_changed)  # type: ignore[method-assign]
+    cached = SimpleNamespace(detail=detail, profile_observation_scope=stored_scope)
+
+    assert service._profile_scope_changed(cached, 42, now=100) is expected  # type: ignore[attr-defined]
+    conn.close()
+
+
+def test_scope_change_preserves_cached_detail_and_hides_private_scope(tmp_path: Path) -> None:
+    conn, raw_service = _prepare(tmp_path / "scope-preserve.sqlite")
+    service = cast(DaemonEntityInfoService, raw_service)
+    service._deps = replace(service._deps, full_user_auth_scope=lambda: _scope())
+    cached = SimpleNamespace(detail={"id": 42, "type": "user", "name": "Target"}, profile_observation_scope=None)
+
+    assert service._profile_scope_changed(cached, 42, now=100) is True  # type: ignore[attr-defined]
+    result = cast(dict[str, object], service._progressive_result(42, cached.detail, {}, now=100))  # type: ignore[attr-defined]
+    data = cast(dict[str, object], result["data"])
+
+    assert data["name"] == "Target"
+    assert "auth_scope" not in data
+    conn.close()
 
 
 @pytest.mark.asyncio
