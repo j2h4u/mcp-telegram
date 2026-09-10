@@ -55,23 +55,43 @@ def validate_durable_adapters(
     contracts: Mapping[DemandKind, DemandContract] = TELEGRAM_DEMAND_CONTRACTS,
 ) -> None:
     """Fail startup unless the complete explicit durable order has adapters."""
+    expected = set(DURABLE_DEMAND_ORDER)
+    _validate_adapter_keys(adapters)
+    _validate_durable_contracts(contracts, expected)
+    _validate_adapter_coverage(adapters, expected)
+    for kind in DURABLE_DEMAND_ORDER:
+        _validate_adapter_contract(kind, adapters[kind], contracts)
+
+
+def _validate_adapter_keys(adapters: Mapping[DemandKind, DurableDemandAdapter]) -> None:
     if any(not isinstance(kind, DemandKind) for kind in adapters):
         raise TypeError("durable adapter keys must be DemandKind values")
-    expected = set(DURABLE_DEMAND_ORDER)
+
+
+def _validate_durable_contracts(contracts: Mapping[DemandKind, DemandContract], expected: set[DemandKind]) -> None:
     if _durable_kinds(contracts) != expected:
         raise RuntimeError("durable demand contracts do not match the explicit durable demand order")
+
+
+def _validate_adapter_coverage(adapters: Mapping[DemandKind, DurableDemandAdapter], expected: set[DemandKind]) -> None:
     actual = set(adapters)
-    if actual != expected:
-        missing = sorted(kind.value for kind in expected - actual)
-        unexpected = sorted(kind.value for kind in actual - expected)
-        raise RuntimeError(f"durable adapter coverage mismatch: missing={missing}, unexpected={unexpected}")
-    for kind in DURABLE_DEMAND_ORDER:
-        adapter = adapters[kind]
-        if not callable(getattr(adapter, "status", None)) or not callable(getattr(adapter, "run_slice", None)):
-            raise TypeError(f"durable adapter {kind.value} must implement status() and run_slice()")
-        limit = contracts[kind].max_rpc_attempts_per_slice
-        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-            raise RuntimeError(f"durable demand {kind.value} has no positive slice budget")
+    if actual == expected:
+        return
+    missing = sorted(kind.value for kind in expected - actual)
+    unexpected = sorted(kind.value for kind in actual - expected)
+    raise RuntimeError(f"durable adapter coverage mismatch: missing={missing}, unexpected={unexpected}")
+
+
+def _validate_adapter_contract(
+    kind: DemandKind,
+    adapter: DurableDemandAdapter,
+    contracts: Mapping[DemandKind, DemandContract],
+) -> None:
+    if not callable(getattr(adapter, "status", None)) or not callable(getattr(adapter, "run_slice", None)):
+        raise TypeError(f"durable adapter {kind.value} must implement status() and run_slice()")
+    limit = contracts[kind].max_rpc_attempts_per_slice
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise RuntimeError(f"durable demand {kind.value} has no positive slice budget")
 
 
 class TelegramDemandCoordinator:
@@ -176,42 +196,51 @@ class TelegramDemandCoordinator:
         if clear_offers:
             self._offered.clear()
         for kind in DURABLE_DEMAND_ORDER:
-            if observed_at < self._status_failed_until.get(kind, -math.inf):
-                continue
-            try:
-                status = self._adapters[kind].status(observed_at)
-                if status is not None and not isinstance(status, DemandStatus):
-                    raise TypeError("adapter returned an invalid status")
-            except Exception as exc:  # noqa: BLE001 - one bad domain cannot stop the pump
-                self._status_failed_until[kind] = observed_at + self._safety_scan_seconds
-                self._statuses.pop(kind, None)
-                self._authoritative_ready.discard(kind)
-                self._remove_queued(kind)
-                logger.warning(
-                    "telegram_demand_status_failed kind=%s error_type=%s",
-                    kind.value,
-                    type(exc).__name__,
-                )
-                continue
-            self._status_failed_until.pop(kind, None)
-            if status is None:
-                self._statuses.pop(kind, None)
-                self._authoritative_ready.discard(kind)
-                self._remove_queued(kind)
-                continue
-            self._statuses[kind] = status
-            is_ready = status.is_ready(observed_at) and not self._is_suppressed(kind, observed_at)
-            if is_ready:
-                self._authoritative_ready.add(kind)
-                if kind not in self._queued and kind is not self._active_kind:
-                    self._queue.append(kind)
-                    self._queued.add(kind)
-                    self._queued_since[kind] = observed_at
-            else:
-                self._authoritative_ready.discard(kind)
-                self._remove_queued(kind)
+            self._scan_kind(kind, observed_at)
         self._recompute_next_release(observed_at)
         return self.ready_kinds
+
+    def _scan_kind(self, kind: DemandKind, observed_at: float) -> None:
+        if observed_at < self._status_failed_until.get(kind, -math.inf):
+            return
+        try:
+            status = self._adapters[kind].status(observed_at)
+            if status is not None and not isinstance(status, DemandStatus):
+                raise TypeError("adapter returned an invalid status")
+        except Exception as exc:  # noqa: BLE001 - one bad domain cannot stop the pump
+            self._record_status_failure(kind, observed_at, exc)
+            return
+        self._status_failed_until.pop(kind, None)
+        self._apply_status(kind, status, observed_at)
+
+    def _record_status_failure(self, kind: DemandKind, observed_at: float, exc: Exception) -> None:
+        self._status_failed_until[kind] = observed_at + self._safety_scan_seconds
+        self._statuses.pop(kind, None)
+        self._authoritative_ready.discard(kind)
+        self._remove_queued(kind)
+        logger.warning(
+            "telegram_demand_status_failed kind=%s error_type=%s",
+            kind.value,
+            type(exc).__name__,
+        )
+
+    def _apply_status(self, kind: DemandKind, status: DemandStatus | None, observed_at: float) -> None:
+        if status is None:
+            self._statuses.pop(kind, None)
+            self._authoritative_ready.discard(kind)
+            self._remove_queued(kind)
+            return
+        self._statuses[kind] = status
+        is_ready = status.is_ready(observed_at) and not self._is_suppressed(kind, observed_at)
+        if not is_ready:
+            self._authoritative_ready.discard(kind)
+            self._remove_queued(kind)
+            return
+        self._authoritative_ready.add(kind)
+        if kind not in self._queued and kind is not self._active_kind:
+            self._queue.append(kind)
+            self._queued.add(kind)
+            self._queued_since[kind] = observed_at
 
     def timer_scan(self, *, now: float | None = None) -> tuple[DemandKind, ...]:
         """Run the same complete scan used by the timer wakeup."""
@@ -278,33 +307,51 @@ class TelegramDemandCoordinator:
         except asyncio.CancelledError:
             raise
         except RpcAdmissionClosedError:
-            if self._shutdown_event.is_set():
-                self._observe("deferred", kind, actual_attempts=budget.attempts, reason="shutdown")
+            if self._handle_closed_admission(kind, budget):
                 return
-            self._shutdown_event.set()
-            self._wake.set()
             raise
         except TelegramRpcAdmissionDeferred as exc:
-            self._suppress(kind, exc.retry_after_seconds)
-            self._observe("deferred", kind, actual_attempts=budget.attempts, reason="admission_deferred")
+            self._handle_admission_deferred(kind, budget, exc)
         except TelegramRpcThrottled as exc:
-            if exc.latched:
-                self._latched_throttle = True
-                self._shutdown_event.set()
-                self._wake.set()
+            if self._handle_throttle(kind, budget, exc):
                 raise
-            self._global_release_at = max(self._global_release_at or 0.0, self._now() + (exc.retry_after_seconds or 0))
-            self._observe("deferred", kind, actual_attempts=budget.attempts, reason="flood_wait")
         except Exception as exc:  # noqa: BLE001 - adapter failure must not kill sibling demand
-            self._suppress(kind, self._safety_scan_seconds)
-            logger.warning(
-                "telegram_demand_slice_failed kind=%s error_type=%s",
-                kind.value,
-                type(exc).__name__,
-            )
-            self._observe("failed", kind, actual_attempts=budget.attempts, reason=type(exc).__name__)
+            self._handle_slice_failure(kind, budget, exc)
         else:
             self._observe("completed", kind, actual_attempts=budget.attempts)
+
+    def _handle_closed_admission(self, kind: DemandKind, budget: RpcAttemptBudget) -> bool:
+        if self._shutdown_event.is_set():
+            self._observe("deferred", kind, actual_attempts=budget.attempts, reason="shutdown")
+            return True
+        self._shutdown_event.set()
+        self._wake.set()
+        return False
+
+    def _handle_admission_deferred(
+        self, kind: DemandKind, budget: RpcAttemptBudget, exc: TelegramRpcAdmissionDeferred
+    ) -> None:
+        self._suppress(kind, exc.retry_after_seconds)
+        self._observe("deferred", kind, actual_attempts=budget.attempts, reason="admission_deferred")
+
+    def _handle_throttle(self, kind: DemandKind, budget: RpcAttemptBudget, exc: TelegramRpcThrottled) -> bool:
+        if exc.latched:
+            self._latched_throttle = True
+            self._shutdown_event.set()
+            self._wake.set()
+            return True
+        self._global_release_at = max(self._global_release_at or 0.0, self._now() + (exc.retry_after_seconds or 0))
+        self._observe("deferred", kind, actual_attempts=budget.attempts, reason="flood_wait")
+        return False
+
+    def _handle_slice_failure(self, kind: DemandKind, budget: RpcAttemptBudget, exc: Exception) -> None:
+        self._suppress(kind, self._safety_scan_seconds)
+        logger.warning(
+            "telegram_demand_slice_failed kind=%s error_type=%s",
+            kind.value,
+            type(exc).__name__,
+        )
+        self._observe("failed", kind, actual_attempts=budget.attempts, reason=type(exc).__name__)
 
     def _pop_ready(self, *, now: float) -> DemandKind | None:
         if self._global_release_at is not None and now < self._global_release_at:
