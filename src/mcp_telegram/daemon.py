@@ -1096,6 +1096,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
                 max_concurrent_refreshes=config.entity_profile.max_concurrent_refreshes,
                 max_queued_refreshes=config.entity_profile.max_queued_refreshes,
             ),
+            full_user_pair_enabled=config.entity_profile.full_user_pair_enabled,
         ),
         health_status=health_status,
     )

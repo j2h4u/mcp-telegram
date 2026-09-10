@@ -17,7 +17,18 @@ from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[imp
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
 from .demand_wiring import DemandOfferSink, offer_durable_demand
-from .entity_profile.contracts import PROFILE_SECTIONS, completeness
+from .entity_profile.contracts import PROFILE_SECTIONS, ProfileAcquisitionEvidence, completeness
+from .entity_profile.full_user_normalization import (
+    FULL_PROFILE_OWNED_FIELDS,
+    FULL_USER_ENDPOINT,
+    NORMALIZATION_VERSION,
+    PERSONAL_CHANNEL_OWNED_FIELDS,
+    ObservationBoundary,
+    ProjectionOutcome,
+    ProjectionStatus,
+    TargetKind,
+    normalize_full_user_response,
+)
 from .entity_profile.refresh import (
     DurableRefreshSliceResult,
     DurableRefreshTerminal,
@@ -221,6 +232,8 @@ class EntityInfoDeps:
     chat_type: type[object]
     get_dialog_placement: Callable[[int], dict[str, object]] | None = None
     refresh_limits: RefreshLimits = field(default_factory=RefreshLimits)
+    enable_full_user_pair: bool = False
+    full_user_identity: Mapping[str, object] | None = None
 
 
 class DaemonEntityInfoService:
@@ -423,6 +436,22 @@ class DaemonEntityInfoService:
         if entity_type is DialogType.UNKNOWN:
             terminal = await self._acquire_durable_refresh_core(cursor, now=now)
             return DurableRefreshSliceResult(cursor.entity_id, terminal)
+        if self._pair_enabled(cursor, entity_type):
+            terminal = await self._acquire_and_commit_full_user_pair(cursor, now=now)
+            return DurableRefreshSliceResult(cursor.entity_id, terminal)
+        if self._pair_personal_channel_is_ready(cursor):
+            # The pair already captured the remote channel identity. Advancing
+            # this ordered cursor is local work and must never repeat
+            # GetFullUser merely to finish the same generation.
+            committed = self._profiles.commit_section(
+                cursor,
+                EntitySectionCommit({}, status="fresh"),
+                now=now,
+            )
+            return DurableRefreshSliceResult(
+                cursor.entity_id,
+                self._success_if_refresh_finished(cursor, committed=committed),
+            )
         if not self._section_applies(entity_type, cursor.next_section):
             committed = self._commit_not_applicable_section(cursor, now=now)
             return DurableRefreshSliceResult(
@@ -431,6 +460,28 @@ class DaemonEntityInfoService:
             )
         terminal = await self._acquire_and_commit_profile_section(cursor, entity_type, now=now)
         return DurableRefreshSliceResult(cursor.entity_id, terminal)
+
+    def _pair_enabled(self, cursor: EntityRefreshCursor, entity_type: DialogType) -> bool:
+        return (
+            self._deps.enable_full_user_pair
+            and cursor.next_section == "full_profile"
+            and cursor.pair_eligible
+            and entity_type
+            in {
+                DialogType.USER,
+                DialogType.BOT,
+            }
+        )
+
+    def _pair_personal_channel_is_ready(self, cursor: EntityRefreshCursor) -> bool:
+        if not self._deps.enable_full_user_pair or cursor.next_section != "personal_channel":
+            return False
+        evidence = self._profiles.read_section_evidence(cursor.entity_id, "personal_channel")
+        return (
+            evidence is not None
+            and evidence.get("generation") == cursor.generation
+            and evidence.get("normalization_version") == NORMALIZATION_VERSION
+        )
 
     def _stored_entity_type(self, entity_id: int, *, now: int) -> DialogType:
         stored = self._profiles.read(entity_id, now=now)
@@ -478,6 +529,205 @@ class DaemonEntityInfoService:
             return DurableRefreshTerminal.FAILURE if failed else None
         committed = self._profiles.commit_section(cursor, result, now=now)
         return self._success_if_refresh_finished(cursor, committed=committed)
+
+    async def _acquire_and_commit_full_user_pair(
+        self,
+        cursor: EntityRefreshCursor,
+        *,
+        now: int,
+    ) -> DurableRefreshTerminal | None:
+        """Acquire and atomically commit both User profile projections."""
+        try:
+            full_profile, personal_channel = await self._acquire_full_user_pair(cursor)
+        except RpcAttemptBudgetExhaustedError:
+            raise
+        except TelegramRpcThrottled as exc:
+            retry_seconds = max(1, int(exc.retry_after_seconds or 1))
+            failed = self._profiles.mark_section_failure(
+                cursor,
+                now=now,
+                reason="flood_wait",
+                retry_at=now + retry_seconds,
+            )
+            return DurableRefreshTerminal.FAILURE if failed else None
+        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+            raise_if_flood_wait_error(exc)
+            failed = self._profiles.mark_section_failure(
+                cursor,
+                now=now,
+                reason=type(exc).__name__.lower(),
+                retry_at=now + 60,
+            )
+            return DurableRefreshTerminal.FAILURE if failed else None
+        committed = self._profiles.commit_full_user_pair(
+            cursor,
+            full_profile,
+            personal_channel,
+            now=now,
+        )
+        return self._success_if_refresh_finished(cursor, committed=committed)
+
+    async def _acquire_full_user_pair(
+        self,
+        cursor: EntityRefreshCursor,
+    ) -> tuple[EntitySectionCommit, EntitySectionCommit]:
+        started_at = self._deps.now_provider()
+        target_kind = (
+            TargetKind.BOT
+            if self._stored_entity_type(cursor.entity_id, now=int(started_at)) is DialogType.BOT
+            else TargetKind.USER
+        )
+        result = await self._deps.client(self._deps.get_full_user_request(id=cursor.entity_id))
+        completed_at = self._deps.now_provider()
+        normalized = normalize_full_user_response(
+            result,
+            target_id=cursor.entity_id,
+            target_kind=target_kind,
+            observation=ObservationBoundary(started_at=started_at, completed_at=completed_at),
+        )
+        if normalized.full_profile.status is ProjectionStatus.UNAVAILABLE:
+            raise ValueError(normalized.full_profile.reason or "full user payload is unavailable")
+        identity = self._full_user_pair_identity(target_kind)
+        full_profile = self._normalized_full_profile_commit(normalized.full_profile, cursor, identity)
+        personal_channel = self._normalized_personal_channel_commit(
+            normalized.personal_channel,
+            cursor,
+            identity,
+        )
+        return full_profile, personal_channel
+
+    def _full_user_pair_identity(self, target_kind: TargetKind) -> dict[str, object] | None:
+        """Return a reuse identity only when account and session identity exist."""
+        supplied = self._deps.full_user_identity
+        if not isinstance(supplied, Mapping):
+            return None
+        account_id = supplied.get("account_id")
+        session_generation = supplied.get("session_generation")
+        if isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0:
+            return None
+        if session_generation is None or isinstance(session_generation, (Mapping, list, tuple, set)):
+            return None
+        if not str(session_generation).strip():
+            return None
+        return {
+            "account_id": account_id,
+            "session_generation": str(session_generation),
+            "entity_type": target_kind.value,
+            "endpoint": FULL_USER_ENDPOINT,
+            "normalization_version": NORMALIZATION_VERSION,
+            "declared_fields": {
+                "full_profile": list(FULL_PROFILE_OWNED_FIELDS),
+                "personal_channel": list(PERSONAL_CHANNEL_OWNED_FIELDS),
+            },
+        }
+
+    @staticmethod
+    def _projection_evidence(
+        outcome: ProjectionOutcome,
+        *,
+        cursor: EntityRefreshCursor,
+        identity: Mapping[str, object] | None,
+    ) -> ProfileAcquisitionEvidence | None:
+        provenance = outcome.provenance
+        if provenance is None:
+            return None
+        observation = provenance.observation
+        started = observation.started_at
+        completed = observation.completed_at
+        if started is None or completed is None:
+            return None
+        return ProfileAcquisitionEvidence(
+            generation=cursor.generation,
+            outcome=outcome.status.value,
+            provenance={
+                "endpoint": provenance.endpoint,
+                "declared_fields": list(provenance.declared_fields),
+                "materialized_fields": list(provenance.materialized_fields),
+                "authoritative": provenance.authoritative,
+            },
+            normalization_version=provenance.normalization_version,
+            observation_started_at=int(started),
+            observation_completed_at=int(completed),
+            identity=identity,
+        )
+
+    def _normalized_full_profile_commit(
+        self,
+        outcome: ProjectionOutcome,
+        cursor: EntityRefreshCursor,
+        identity: Mapping[str, object] | None,
+    ) -> EntitySectionCommit:
+        payload = dict(outcome.payload or {})
+        return EntitySectionCommit(
+            payload,
+            status="fresh",
+            payload=payload,
+            evidence=self._projection_evidence(outcome, cursor=cursor, identity=identity),
+        )
+
+    def _normalized_personal_channel_commit(
+        self,
+        outcome: ProjectionOutcome,
+        cursor: EntityRefreshCursor,
+        identity: Mapping[str, object] | None,
+    ) -> EntitySectionCommit:
+        payload = dict(outcome.payload or {})
+        evidence = self._projection_evidence(outcome, cursor=cursor, identity=identity)
+        if outcome.status is ProjectionStatus.ABSENT:
+            return EntitySectionCommit(
+                {
+                    "personal_channel_id": None,
+                    "personal_channel": None,
+                    "personal_channel_unavailable_reason": None,
+                },
+                status="fresh",
+                payload=None,
+                evidence=evidence,
+            )
+        channel_id = payload.get("personal_channel_id")
+        if not isinstance(channel_id, int) or channel_id <= 0:
+            return EntitySectionCommit(
+                {},
+                status="unavailable",
+                reason=outcome.reason or "personal_channel_unavailable",
+                payload=payload,
+                evidence=evidence,
+            )
+        dialog_id = self._normalize_channel_dialog_id(channel_id)
+        metadata = self._personal_channel_metadata(None, dialog_id=dialog_id)
+        if metadata is None:
+            return EntitySectionCommit(
+                {"personal_channel_id": channel_id},
+                status="unavailable",
+                reason=outcome.reason or "channel_metadata_unavailable",
+                payload=payload,
+                evidence=evidence,
+            )
+        local_preview, local_reason = self._latest_local_personal_channel_post(dialog_id)
+        card = _compact_dict(
+            {
+                "channel_id": channel_id,
+                "dialog_id": dialog_id,
+                "title": metadata.get("title"),
+                "username": metadata.get("username"),
+                "url": self._tme_url(cast(str | None, metadata.get("username"))),
+                "metadata_source": "local_entities",
+                "attached_message_id": payload.get("personal_channel_message"),
+                "latest_or_attached_post": local_preview,
+                "post_preview_unavailable_reason": local_reason if local_preview is None else None,
+            }
+        )
+        return EntitySectionCommit(
+            {
+                "personal_channel_id": channel_id,
+                "personal_channel": card,
+                "personal_channel_unavailable_reason": None,
+            },
+            status="fresh" if outcome.status is ProjectionStatus.USABLE else "unavailable",
+            reason=None if outcome.status is ProjectionStatus.USABLE else outcome.reason,
+            payload=card,
+            evidence=evidence,
+        )
 
     async def _acquire_durable_refresh_core(
         self,

@@ -83,6 +83,7 @@ def test_load_config_reads_entity_profile_budgets_and_ipc_validation(tmp_path: P
 dir = "/state"
 
 [entity_profile]
+full_user_pair_enabled = true
 foreground_resolve_seconds = 2
 foreground_refresh_wait_seconds = 12
 rpc_timeout_seconds = 6
@@ -92,6 +93,7 @@ max_queued_refreshes = 7
 """,
     )
     assert load_config(path).entity_profile == EntityProfileConfig(
+        full_user_pair_enabled=True,
         foreground_resolve_seconds=2.0,
         foreground_refresh_wait_seconds=12.0,
         rpc_timeout_seconds=6.0,

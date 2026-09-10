@@ -260,6 +260,7 @@ class DaemonApiPolicy:
     telemetry: TelemetryPolicy
     slow_request_seconds: float
     entity_profile: RefreshLimits
+    full_user_pair_enabled: bool = False
 
 
 def _attr(obj: object, name: str, default: object | None = None) -> object | None:
@@ -1562,6 +1563,7 @@ class DaemonAPIServer:
                     chat_type=Chat,
                     get_dialog_placement=lambda entity_id: dialog_placement(self._conn, entity_id),
                     refresh_limits=self._policy.entity_profile,
+                    enable_full_user_pair=self._policy.full_user_pair_enabled,
                 )
             )
             if self._demand_sink is not None:
