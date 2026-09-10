@@ -639,41 +639,57 @@ class FullSyncWorker:
             return 0.0
         return float(retry_at)
 
-    async def _fetch_batch_page(self, dialog_id: int, sync_progress: int) -> _FetchedBatchPage:
-        self._last_page_error = None
-        try:
-            result = await self._client.get_messages(entity=dialog_id, limit=_BATCH_SIZE, offset_id=sync_progress)
-            total_messages = result.total if sync_progress == 0 else None
-            return _FetchedBatchPage(total_messages, list(result))
-        except TelegramRpcAdmissionDeferred as exc:
+    async def _sleep_for_batch_retry(self, retry_after_seconds: int | None) -> None:
+        if retry_after_seconds is not None and current_rpc_scope().attempt_budget is None:
+            await sleep_through_flood(self._shutdown_event, retry_after_seconds)
+
+    def _deferred_batch_page(self, dialog_id: int, sync_progress: int, exc: Exception) -> _FetchedBatchPage:
+        if isinstance(exc, TelegramRpcAdmissionDeferred):
             logger.info(
                 "sync_batch admission_deferred dialog_id=%d retry_after=%s — preserving checkpoint",
                 dialog_id,
                 exc.retry_after_seconds,
             )
-            if exc.retry_after_seconds is not None and current_rpc_scope().attempt_budget is None:
-                await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
-            self._last_page_error = exc
-            return _FetchedBatchPage(None, [], (sync_progress, False))
-        except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
+        else:
             logger.info(
                 "sync_batch admission_deferred dialog_id=%d error_type=%s — preserving checkpoint",
                 dialog_id,
                 type(exc).__name__,
             )
-            self._last_page_error = exc
-            return _FetchedBatchPage(None, [], (sync_progress, False))
-        except TelegramRpcThrottled as exc:
+        self._last_page_error = exc
+        return _FetchedBatchPage(None, [], (sync_progress, False))
+
+    async def _handle_batch_page_error(
+        self,
+        dialog_id: int,
+        sync_progress: int,
+        exc: Exception,
+    ) -> _FetchedBatchPage:
+        if isinstance(exc, TelegramRpcAdmissionDeferred):
+            await self._sleep_for_batch_retry(exc.retry_after_seconds)
+            return self._deferred_batch_page(dialog_id, sync_progress, exc)
+        if isinstance(exc, (RpcAdmissionSaturatedError, RpcAdmissionExpiredError)):
+            return self._deferred_batch_page(dialog_id, sync_progress, exc)
+        if isinstance(exc, TelegramRpcThrottled):
             logger.warning("Telegram RPC throttled dialog_id=%d — retry_after=%s", dialog_id, exc.retry_after_seconds)
-            if exc.retry_after_seconds is not None and current_rpc_scope().attempt_budget is None:
-                await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
+            await self._sleep_for_batch_retry(exc.retry_after_seconds)
             self._last_page_error = exc
             return _FetchedBatchPage(None, [], (sync_progress, False))
-        except ACCESS_LOST_ERRORS as exc:
+        if isinstance(exc, ACCESS_LOST_ERRORS):
             now = int(time.time())
             set_access_lost(self._conn, dialog_id, now, reason=type(exc).__name__)
             self._conn.commit()
             return _FetchedBatchPage(None, [], (sync_progress, True))
+        raise exc
+
+    async def _fetch_batch_page(self, dialog_id: int, sync_progress: int) -> _FetchedBatchPage:
+        self._last_page_error = None
+        try:
+            result = await self._client.get_messages(entity=dialog_id, limit=_BATCH_SIZE, offset_id=sync_progress)
+        except ACCESS_LOST_ERRORS as exc:
+            return await self._handle_batch_page_error(dialog_id, sync_progress, exc)
+        except (TelegramRpcThrottled, RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
+            return await self._handle_batch_page_error(dialog_id, sync_progress, exc)
         except RPCError as exc:
             logger.exception(
                 "sync_batch_rpc_error dialog_id=%d error=%s — dialog NOT marked synced, will retry",
@@ -682,6 +698,8 @@ class FullSyncWorker:
             )
             self._last_page_error = exc
             return _FetchedBatchPage(None, [], (sync_progress, False))
+        total_messages = result.total if sync_progress == 0 else None
+        return _FetchedBatchPage(total_messages, list(result))
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def _fetch_batch(self, dialog_id: int, sync_progress: int) -> tuple[int, bool]:

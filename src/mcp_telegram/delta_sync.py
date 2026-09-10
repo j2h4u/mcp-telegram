@@ -823,66 +823,52 @@ class DeltaGapFillDemandAdapter:
             return None
         return DemandStatus(release_at=candidate[0])
 
-    async def _run_dm_gap_slice(self, now: float) -> None:
-        """Verify one persisted DM page, or advance one empty dialog locally."""
+    def _start_dm_gap_scan(self, now: float) -> _DmGapScanState | None:
         state = _load_dm_gap_scan_state(self._worker._conn)
         if state is None or (state.status == "idle" and state.next_run_at <= now):
             previous_generation = 0 if state is None else state.generation
             state = _DmGapScanState("running", previous_generation + 1, int(now), None, 0, 0)
             with self._worker._conn:
                 _store_dm_gap_scan_state(self._worker._conn, state)
-        if state.status == "idle":
-            return
+        return None if state.status == "idle" else state
 
-        dialog_ids = _dm_gap_scan_dialog_ids(self._worker._conn)
-        dialog_id: int | None
+    def _next_dm_gap_dialog(self, state: _DmGapScanState, dialog_ids: Sequence[int]) -> int | None:
         if state.message_cursor > 0 and state.dialog_id_cursor in dialog_ids:
-            dialog_id = state.dialog_id_cursor
-        else:
-            dialog_id = next(
-                (
-                    candidate
-                    for candidate in dialog_ids
-                    if state.dialog_id_cursor is None or candidate > state.dialog_id_cursor
-                ),
-                None,
-            )
-        if dialog_id is None:
-            completed = _DmGapScanState(
-                "idle",
-                state.generation,
-                state.scan_started_at,
-                None,
-                0,
-                int(now) + _DM_GAP_SCAN_PERIOD_S,
-            )
-            with self._worker._conn:
-                _store_dm_gap_scan_state(self._worker._conn, completed)
-            return
-
-        page = _dm_gap_scan_page_ids(
-            self._worker._conn,
-            dialog_id,
-            state.scan_started_at,
-            state.message_cursor,
+            return state.dialog_id_cursor
+        return next(
+            (
+                candidate
+                for candidate in dialog_ids
+                if state.dialog_id_cursor is None or candidate > state.dialog_id_cursor
+            ),
+            None,
         )
-        if not page:
-            advanced = _DmGapScanState(
-                "running",
-                state.generation,
-                state.scan_started_at,
-                dialog_id,
-                0,
-                0,
-            )
-            with self._worker._conn:
-                _store_dm_gap_scan_state(self._worker._conn, advanced)
-            return
 
-        # Leave the cursor at the page start until the collaborator commits. A
-        # process crash during the RPC repeats an idempotent tombstone page.
-        await self._dm_gap_scanner.run_dm_gap_scan_page(dialog_id, page)  # type: ignore[union-attr]
-        next_cursor = page[-1]
+    def _complete_dm_gap_scan(self, state: _DmGapScanState, now: float) -> None:
+        completed = _DmGapScanState(
+            "idle",
+            state.generation,
+            state.scan_started_at,
+            None,
+            0,
+            int(now) + _DM_GAP_SCAN_PERIOD_S,
+        )
+        with self._worker._conn:
+            _store_dm_gap_scan_state(self._worker._conn, completed)
+
+    def _advance_empty_dm_dialog(self, state: _DmGapScanState, dialog_id: int) -> None:
+        advanced = _DmGapScanState(
+            "running",
+            state.generation,
+            state.scan_started_at,
+            dialog_id,
+            0,
+            0,
+        )
+        with self._worker._conn:
+            _store_dm_gap_scan_state(self._worker._conn, advanced)
+
+    def _advance_dm_gap_page(self, state: _DmGapScanState, dialog_id: int, next_cursor: int) -> None:
         advanced = _DmGapScanState(
             "running",
             state.generation,
@@ -893,6 +879,33 @@ class DeltaGapFillDemandAdapter:
         )
         with self._worker._conn:
             _store_dm_gap_scan_state(self._worker._conn, advanced)
+
+    async def _run_dm_gap_slice(self, now: float) -> None:
+        """Verify one persisted DM page, or advance one empty dialog locally."""
+        state = self._start_dm_gap_scan(now)
+        if state is None:
+            return
+
+        dialog_ids = _dm_gap_scan_dialog_ids(self._worker._conn)
+        dialog_id = self._next_dm_gap_dialog(state, dialog_ids)
+        if dialog_id is None:
+            self._complete_dm_gap_scan(state, now)
+            return
+
+        page = _dm_gap_scan_page_ids(
+            self._worker._conn,
+            dialog_id,
+            state.scan_started_at,
+            state.message_cursor,
+        )
+        if not page:
+            self._advance_empty_dm_dialog(state, dialog_id)
+            return
+
+        # Leave the cursor at the page start until the collaborator commits. A
+        # process crash during the RPC repeats an idempotent tombstone page.
+        await self._dm_gap_scanner.run_dm_gap_scan_page(dialog_id, page)  # type: ignore[union-attr]
+        self._advance_dm_gap_page(state, dialog_id, page[-1])
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
         """Fetch one due dialog page and leave continuation in domain state."""
