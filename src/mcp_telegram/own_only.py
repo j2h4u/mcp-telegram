@@ -15,6 +15,7 @@ from enum import StrEnum
 from typing import cast
 
 from .models import DialogType
+from .own_only_contracts import OwnOnlyContext, normalize_channel_peer_id
 from .sync_db import ensure_own_only_schema
 
 
@@ -39,33 +40,6 @@ class OwnOnlyClassification:
     def inclusion_basis(self) -> tuple[str, ...]:
         """Stable string values suitable for structured payloads and SQL adapters."""
         return tuple(item.value for item in self.basis)
-
-
-@dataclass(frozen=True, slots=True)
-class OwnOnlyContext:
-    """Account facts needed by the classifier.
-
-    ``personal_channel_id`` and ``linked_chat_id`` use Telegram's canonical
-    peer-id form (``-100...``).  The classifier also accepts a positive raw
-    channel id and normalizes it for callers that obtained it from UserFull.
-    """
-
-    account_id: int
-    personal_channel_id: int | None = None
-    personal_channel_linked_chat_id: int | None = None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "account_id", int(self.account_id))
-        object.__setattr__(self, "personal_channel_id", _peer_id(self.personal_channel_id))
-        object.__setattr__(self, "personal_channel_linked_chat_id", _peer_id(self.personal_channel_linked_chat_id))
-
-
-def _peer_id(value: int | None) -> int | None:
-    """Normalize a raw channel id without requiring a Telethon entity."""
-    if value is None:
-        return None
-    value = int(value)
-    return value if value <= 0 else -1000000000000 - value
 
 
 def _has_admin_rights(entity: object) -> bool:
@@ -281,7 +255,7 @@ def query_own_only_candidates(
     intentionally not guessed by SQL.  The caller must pass each candidate's
     Telegram entity to :func:`classify_own_only_dialog`.
     """
-    personal_id = _peer_id(personal_channel_id)
+    personal_id = normalize_channel_peer_id(personal_channel_id)
     rows = cast(
         list[tuple[object, object, object, object, object]],
         conn.execute(_OWN_ONLY_CANDIDATE_SQL, (personal_id,)).fetchall(),
@@ -301,7 +275,6 @@ def query_own_only_candidates(
 __all__ = [
     "OwnOnlyBasis",
     "OwnOnlyClassification",
-    "OwnOnlyContext",
     "add_own_only_basis",
     "classify_own_only_dialog",
     "enroll_own_only_dialog",

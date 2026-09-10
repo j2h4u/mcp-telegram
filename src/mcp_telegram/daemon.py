@@ -99,7 +99,8 @@ from .message_fact_refresh import (
     MessageFactRefreshPolicy,
 )
 from .messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
-from .own_only import OwnOnlyContext, ensure_own_only_schema
+from .own_only import ensure_own_only_schema
+from .own_only_contracts import OwnOnlyContext
 from .reactions.refresh import ReactionFreshener
 from .reactions.sqlite_repository import SQLiteReactionSnapshotRepository
 from .reactions.telegram_adapter import TelethonTelegramReactionGateway
@@ -108,7 +109,7 @@ from .reconnect import run_reconnect_catch_up_loop
 from .rpc_admission_observations import RpcAdmissionObservationAggregator
 from .runtime_observations import RuntimeObservationSink, prune_runtime_observations, record_runtime_observation
 from .scheduled_messages import ScheduledMessageReconciler, ScheduledReconciliationPolicy
-from .self_profile_maintenance import (
+from .startup_identity import (
     StartupIdentityResult,
     StartupIdentityState,
 )

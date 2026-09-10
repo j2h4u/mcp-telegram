@@ -41,13 +41,13 @@ from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshPolicy,
     ReadReceiptDemandAdapter,
 )
-from mcp_telegram.own_only import OwnOnlyContext
+from mcp_telegram.own_only_contracts import OwnOnlyContext
 from mcp_telegram.scheduled_messages import ScheduledDiscoveryDemandAdapter, ScheduledRepairDemandAdapter
 from mcp_telegram.self_profile_maintenance import (
     SelfProfileCadenceState,
     SelfProfileMaintenanceDemandAdapter,
-    StartupIdentityState,
 )
+from mcp_telegram.startup_identity import StartupIdentityState
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter
 from mcp_telegram.telegram_rpc_consumers import (

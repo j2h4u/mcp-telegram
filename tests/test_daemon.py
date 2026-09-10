@@ -19,8 +19,8 @@ from mcp_telegram.daemon import (
     _SyncMainContext,
     _wait_for_startup_identity,
 )
-from mcp_telegram.own_only import OwnOnlyContext
-from mcp_telegram.self_profile_maintenance import (
+from mcp_telegram.own_only_contracts import OwnOnlyContext
+from mcp_telegram.startup_identity import (
     StartupIdentityResult,
     StartupIdentityState,
     StartupIdentityUnavailableError,

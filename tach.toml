@@ -77,7 +77,7 @@ depends_on = [
     "mcp_telegram.activity_cold_backfill", "mcp_telegram.activity_hot_sweep", "mcp_telegram.activity_substrate", "mcp_telegram.activity_sync",
     "mcp_telegram.delta_sync", "mcp_telegram.dialog_sync", "mcp_telegram.entity_profile.refresh", "mcp_telegram.fact_hydration",
     "mcp_telegram.folders.worker", "mcp_telegram.hydration_queue", "mcp_telegram.message_fact_refresh",
-    "mcp_telegram.scheduled_messages", "mcp_telegram.self_profile_maintenance", "mcp_telegram.sync_db", "mcp_telegram.sync_worker",
+    "mcp_telegram.own_only_contracts", "mcp_telegram.scheduled_messages", "mcp_telegram.self_profile_maintenance", "mcp_telegram.startup_identity", "mcp_telegram.sync_db", "mcp_telegram.sync_worker",
     "mcp_telegram.telegram_demand", "mcp_telegram.telegram_demand_coordinator", "mcp_telegram.telegram_rpc_consumers",
 ]
 
@@ -92,9 +92,9 @@ depends_on = [
     "mcp_telegram.fact_hydration", "mcp_telegram.hydration_queue",
     "mcp_telegram.folders.refresh", "mcp_telegram.folders.sqlite_repository", "mcp_telegram.folders.telegram_adapter", "mcp_telegram.folders.worker",
     "mcp_telegram.fts", "mcp_telegram.media_hydration", "mcp_telegram.message_fact_refresh", "mcp_telegram.messages.sqlite_hydration_jobs",
-    "mcp_telegram.own_only", "mcp_telegram.read_state", "mcp_telegram.reconnect", "mcp_telegram.reactions.refresh",
+    "mcp_telegram.own_only", "mcp_telegram.own_only_contracts", "mcp_telegram.read_state", "mcp_telegram.reconnect", "mcp_telegram.reactions.refresh",
     "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.reactions.telegram_adapter", "mcp_telegram.rpc_admission_observations", "mcp_telegram.scheduled_messages",
-    "mcp_telegram.runtime_observations", "mcp_telegram.state", "mcp_telegram.sync_db", "mcp_telegram.sync_worker", "mcp_telegram.telegram", "mcp_telegram.daemon_shutdown",
+    "mcp_telegram.runtime_observations", "mcp_telegram.startup_identity", "mcp_telegram.state", "mcp_telegram.sync_db", "mcp_telegram.sync_worker", "mcp_telegram.telegram", "mcp_telegram.daemon_shutdown",
     "mcp_telegram.telegram_read_receipts", "mcp_telegram.topics.refresh", "mcp_telegram.transcription_hydration",
     "mcp_telegram.topics.sqlite_repository", "mcp_telegram.topics.telegram_adapter",
     "mcp_telegram.telegram_demand", "mcp_telegram.telegram_demand_coordinator", "mcp_telegram.telegram_rpc", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler",
@@ -267,7 +267,7 @@ depends_on = [
 [[modules]]
 path = "mcp_telegram.own_only"
 layer = "application"
-depends_on = ["mcp_telegram.models", "mcp_telegram.sync_db"]
+depends_on = ["mcp_telegram.models", "mcp_telegram.own_only_contracts", "mcp_telegram.sync_db"]
 
 [[modules]]
 path = "mcp_telegram.activity_substrate"
@@ -335,7 +335,7 @@ depends_on = ["mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consume
 [[modules]]
 path = "mcp_telegram.self_profile_maintenance"
 layer = "application"
-depends_on = ["mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.flood", "mcp_telegram.own_only_contracts", "mcp_telegram.startup_identity", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
 
 # capability — only established product ownership is vertical.
 [[modules]]
@@ -604,6 +604,16 @@ depends_on = []
 path = "mcp_telegram.models"
 layer = "foundation"
 depends_on = []
+
+[[modules]]
+path = "mcp_telegram.own_only_contracts"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.startup_identity"
+layer = "foundation"
+depends_on = ["mcp_telegram.own_only_contracts", "mcp_telegram.telegram_rpc_consumers"]
 
 [[modules]]
 path = "mcp_telegram.entity_profile.contracts"

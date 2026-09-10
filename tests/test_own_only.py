@@ -6,11 +6,11 @@ from types import SimpleNamespace
 from mcp_telegram.models import DialogType
 from mcp_telegram.own_only import (
     OwnOnlyBasis,
-    OwnOnlyContext,
     classify_own_only_dialog,
     enroll_own_only_sync_dialog,
     query_own_only_candidates,
 )
+from mcp_telegram.own_only_contracts import OwnOnlyContext
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -23,7 +23,7 @@ def _context() -> OwnOnlyContext:
 
 
 def test_peer_id_zero_returns_zero() -> None:
-    """_peer_id(0) returns 0 — the <= 0 branch preserves the value without overflow."""
+    """A zero channel id stays zero instead of being converted to channel form."""
     ctx = OwnOnlyContext(account_id=1, personal_channel_id=0)
     assert ctx.personal_channel_id == 0
 

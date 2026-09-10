@@ -5,10 +5,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from mcp_telegram.own_only import OwnOnlyContext
+from mcp_telegram.own_only_contracts import OwnOnlyContext
 from mcp_telegram.self_profile_maintenance import (
     SelfProfileMaintenanceDemandAdapter,
     SelfProfileMaintenanceDependencies,
+)
+from mcp_telegram.startup_identity import (
     StartupIdentityPhase,
     StartupIdentityState,
     StartupIdentityUnavailableError,
