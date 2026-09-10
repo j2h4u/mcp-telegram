@@ -16,6 +16,7 @@ import ast
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = ROOT / "src" / "mcp_telegram"
@@ -266,14 +267,18 @@ class _DaemonVisitor(ast.NodeVisitor):
         return tuple(name for target in targets for name in cls._target_names(target))
 
     @staticmethod
-    def _callable_name(node: ast.expr) -> str | None:
+    def _callable_name(node: ast.expr | None) -> str | None:
+        if node is None:
+            return None
         if isinstance(node, ast.Name):
             return node.id
         if isinstance(node, ast.Attribute):
             return node.attr
         return None
 
-    def _assigned_strings(self, node: ast.expr) -> set[str]:
+    def _assigned_strings(self, node: ast.expr | None) -> set[str]:
+        if node is None:
+            return set()
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return {node.value}
         if isinstance(node, ast.Name):
@@ -476,7 +481,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT, help="repository root (default: checkout root)")
     args = parser.parse_args(argv)
-    findings = find_violations(args.root.resolve())
+    root = cast(Path, args.root)
+    findings = find_violations(root.resolve())
     if findings:
         print("Demand cutover gate failed:", file=sys.stderr)
         print("\n".join(f"- {finding.render()}" for finding in findings), file=sys.stderr)
