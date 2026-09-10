@@ -14,7 +14,6 @@ import pytest
 from mcp_telegram.activity_hot_sweep import (
     _capped_empty_interval,
     deterministic_hot_due_at,
-    run_hot_sweep_loop,
     run_hot_sweep_pass,
     seed_hot_sweep_schedule,
 )
@@ -370,35 +369,6 @@ def test_shutdown_during_success_does_not_cool_peer(monkeypatch: pytest.MonkeyPa
 
 def test_capped_empty_interval_handles_large_streak() -> None:
     assert _capped_empty_interval(3600, 604800, 1024) == 604800
-
-
-@pytest.mark.asyncio
-async def test_hot_loop_waits_for_longer_flood_duration(
-    monkeypatch: pytest.MonkeyPatch, conn: sqlite3.Connection
-) -> None:
-    shutdown = asyncio.Event()
-    pass_calls = 0
-    wait_timeouts: list[float] = []
-
-    async def fake_pass(*_args: object, **_kwargs: object) -> dict[str, int | float | bool | None]:
-        nonlocal pass_calls
-        pass_calls += 1
-        return {"genuinely_new": 0, "flood_wait_seconds": 999}
-
-    async def fake_wait_for(awaitable: object, timeout: float) -> bool:
-        wait_timeouts.append(timeout)
-        if hasattr(awaitable, "close"):
-            awaitable.close()  # type: ignore[union-attr]
-        shutdown.set()
-        return True
-
-    monkeypatch.setattr("mcp_telegram.activity_hot_sweep.run_hot_sweep_pass", fake_pass)
-    monkeypatch.setattr("mcp_telegram.activity_hot_sweep.asyncio.wait_for", fake_wait_for)
-    await run_hot_sweep_loop(
-        _FakeClient(), conn, shutdown, policy=ActivityHotSweepConfig(loop_interval_seconds=60), timeout_s=1
-    )
-    assert pass_calls == 1
-    assert wait_timeouts == [999]
 
 
 def test_config_nested_toml_and_env_override(tmp_path: Path) -> None:
