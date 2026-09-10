@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import cast
 
@@ -33,7 +33,6 @@ from mcp_telegram.activity_hot_sweep import (
     HotActivityDemandAdapter,
     _HotSweepPeerOutcome,
     _log_recovered_messages,
-    run_hot_sweep_loop,
     run_hot_sweep_pass,
 )
 from mcp_telegram.activity_peer_sweep import (
@@ -52,33 +51,6 @@ from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred, cu
 
 _TEST_TIMEOUT_S = 120.0
 _POLICY = ActivityHotSweepConfig(jitter_max_seconds=0)
-
-
-@pytest.mark.asyncio
-async def test_loop_reports_hot_activity_demand_kind(monkeypatch: pytest.MonkeyPatch) -> None:
-    shutdown = asyncio.Event()
-    observed: list[DemandKind] = []
-
-    async def pass_once(*_args: object, **_kwargs: object) -> dict[str, int | float | bool | None]:
-        shutdown.set()
-        return {"genuinely_new": 0, "flood_wait_seconds": None}
-
-    async def run_cycle(kind: DemandKind, operation: Callable[[], Awaitable[object]]) -> object:
-        observed.append(kind)
-        return await operation()
-
-    monkeypatch.setattr("mcp_telegram.activity_hot_sweep.run_hot_sweep_pass", pass_once)
-    with _make_db() as conn:
-        await run_hot_sweep_loop(
-            _FakeClient(),
-            conn,
-            shutdown,
-            policy=_POLICY,
-            timeout_s=_TEST_TIMEOUT_S,
-            demand_cycle_runner=run_cycle,
-        )
-
-    assert observed == [DemandKind.HOT_ACTIVITY_PAGE]
 
 
 # ---------------------------------------------------------------------------
@@ -856,52 +828,6 @@ async def test_flood_halts_whole_pass_account_safety(monkeypatch: pytest.MonkeyP
         assert _get_state(conn, flood_first).get("hot_next_retry_at") is not None
         assert _get_state(conn, later_a).get("hot_next_retry_at") is None
         assert _get_state(conn, later_b).get("hot_next_retry_at") is None
-
-
-@pytest.mark.asyncio
-async def test_hot_loop_retries_admission_deferred_without_advancing_cursor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    with _make_db() as conn:
-        dialog_id = -100100000099
-        now = int(time.time())
-        _enroll(conn, dialog_id, last_activity_at=now, hot_cursor=123)
-        pass_calls = 0
-        wait_timeouts: list[float] = []
-        shutdown = asyncio.Event()
-
-        async def deferred_then_success(*_args: object, **_kwargs: object) -> dict[str, int | float | bool | None]:
-            nonlocal pass_calls
-            pass_calls += 1
-            if pass_calls == 1:
-                raise TelegramRpcAdmissionDeferred(retry_after_seconds=7)
-            return {"genuinely_new": 0, "flood_wait_seconds": None}
-
-        async def fake_wait_for(awaitable: object, timeout: float) -> bool:
-            wait_timeouts.append(timeout)
-            if hasattr(awaitable, "close"):
-                awaitable.close()  # type: ignore[union-attr]
-            if len(wait_timeouts) == 1:
-                raise TimeoutError
-            if len(wait_timeouts) == 2:
-                shutdown.set()
-                return True
-            raise AssertionError("unexpected wait")
-
-        monkeypatch.setattr("mcp_telegram.activity_hot_sweep._run_hot_sweep_pass", deferred_then_success)
-        monkeypatch.setattr("mcp_telegram.activity_hot_sweep.asyncio.wait_for", fake_wait_for)
-
-        await run_hot_sweep_loop(
-            _FakeClient(),
-            conn,
-            shutdown,
-            policy=ActivityHotSweepConfig(loop_interval_seconds=1, jitter_max_seconds=0),
-            timeout_s=_TEST_TIMEOUT_S,
-        )
-
-        assert pass_calls == 2
-        assert wait_timeouts == [7, 1]
-        assert _get_state(conn, dialog_id)["hot_cursor"] == 123
 
 
 @pytest.mark.asyncio

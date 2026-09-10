@@ -19,7 +19,7 @@ import contextlib
 import logging
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Iterator
 from typing import cast
 
 import pytest
@@ -33,7 +33,6 @@ from mcp_telegram.activity_cold_backfill import (
     _cold_backfill_sleep_seconds,
     _maybe_enroll_activity_peers,
     _run_cold_backfill_pass_safe,
-    run_cold_backfill_loop,
     run_cold_backfill_pass,
 )
 from mcp_telegram.activity_peer_sweep import (
@@ -248,58 +247,6 @@ async def test_cold_enrollment_skips_before_interval(monkeypatch: pytest.MonkeyP
     with _make_db() as conn:
         await _maybe_enroll_activity_peers(_FakeClient(), conn, 0.0, _PACING, _TEST_TIMEOUT_S)
     assert timeout_calls == []
-
-
-@pytest.mark.asyncio
-async def test_cold_loop_skips_peer_search_after_working_set_flood(monkeypatch: pytest.MonkeyPatch) -> None:
-    shutdown = asyncio.Event()
-
-    async def enroll(*_args: object, **_kwargs: object) -> tuple[float, int | None]:
-        return 1.0, 45
-
-    async def unexpected_pass(*_args: object, **_kwargs: object) -> ColdPassResult:
-        raise AssertionError("cold peer pass must not start after working-set FloodWait")
-
-    def sleep_seconds(*_args: object, **_kwargs: object) -> float:
-        shutdown.set()
-        return 0.0
-
-    monkeypatch.setattr("mcp_telegram.activity_cold_backfill._maybe_enroll_activity_peers", enroll)
-    monkeypatch.setattr("mcp_telegram.activity_cold_backfill._run_cold_backfill_pass_safe", unexpected_pass)
-    monkeypatch.setattr("mcp_telegram.activity_cold_backfill._cold_backfill_sleep_seconds", sleep_seconds)
-    with _make_db() as conn:
-        await run_cold_backfill_loop(_FakeClient(), conn, shutdown, pacing=_PACING, timeout_s=1)
-
-
-@pytest.mark.asyncio
-async def test_cold_loop_reports_cold_peer_demand_kind(monkeypatch: pytest.MonkeyPatch) -> None:
-    shutdown = asyncio.Event()
-    observed: list[DemandKind] = []
-
-    async def enroll(*_args: object, **_kwargs: object) -> tuple[float, None]:
-        return 1.0, None
-
-    async def pass_once(*_args: object, **_kwargs: object) -> ColdPassResult:
-        shutdown.set()
-        return ColdPassResult(ColdPassOutcome.NO_DUE_PEER, 0)
-
-    async def run_cycle(kind: DemandKind, operation: Callable[[], Awaitable[object]]) -> object:
-        observed.append(kind)
-        return await operation()
-
-    monkeypatch.setattr("mcp_telegram.activity_cold_backfill._maybe_enroll_activity_peers", enroll)
-    monkeypatch.setattr("mcp_telegram.activity_cold_backfill._run_cold_backfill_pass_safe", pass_once)
-    with _make_db() as conn:
-        await run_cold_backfill_loop(
-            _FakeClient(),
-            conn,
-            shutdown,
-            pacing=_PACING,
-            timeout_s=1,
-            demand_cycle_runner=run_cycle,
-        )
-
-    assert observed == [DemandKind.COLD_PEER_PAGE]
 
 
 # ---------------------------------------------------------------------------

@@ -41,7 +41,6 @@ from .activity_peer_sweep import (
     working_set_enrollment_release_at,
 )
 from .activity_substrate import ActivityClient
-from .demand_shadow_wiring import DemandCycleRunner
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
 from .sync_read_model import SyncStatus
@@ -568,73 +567,3 @@ async def _run_cold_backfill_pass(
         ),
         pacing,
     )
-
-
-# ---------------------------------------------------------------------------
-# Low-priority loop wrapper
-# ---------------------------------------------------------------------------
-
-
-async def run_cold_backfill_loop(  # noqa: PLR0913 - explicit worker state and injected transport policy
-    client: ActivityClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    *,
-    idle_interval: float | None = None,
-    pacing: ColdBackfillPacing,
-    timeout_s: float,
-    demand_cycle_runner: DemandCycleRunner | None = None,
-) -> None:
-    """Background task: run Tier-B ColdBackfill, low-priority, self-enrolling.
-
-    Loop sleep policy (cycle-4 MEDIUM — must NOT idle 300s after zero-write work):
-    - outcome == NO_DUE_PEER → sleep idle_interval (long: no work exists)
-    - outcome in {WROTE, ZERO_PERSISTED, FLOOD_WAIT} → sleep `pacing.history.batch_s`
-      (short: a peer was processed, more may be due)
-
-    Enrollment: build_working_set is called on entry and then no more often than
-    every `pacing.history.enroll_s` so Tier B is self-sufficient for enrollment and
-    does not depend on Tier A having run (review MEDIUM).
-
-    Logs use the activity_cold_backfill_* prefix.
-    """
-    resolved_idle_interval = idle_interval if idle_interval is not None else pacing.idle_s
-    last_enroll_at: float = 0.0  # sentinel: force enroll on first iteration
-
-    while not shutdown_event.is_set():
-
-        async def run_cycle() -> object:
-            nonlocal last_enroll_at
-            # Throttled enrollment keeps the peer set current without
-            # creating a second legacy demand cycle.
-            last_enroll_at, enrollment_flood_wait_seconds = await _maybe_enroll_activity_peers(
-                client, conn, last_enroll_at, pacing, timeout_s
-            )
-            if shutdown_event.is_set():
-                return None
-            if enrollment_flood_wait_seconds is not None:
-                return ColdPassResult(
-                    outcome=ColdPassOutcome.FLOOD_WAIT,
-                    persisted=0,
-                    flood_wait_seconds=enrollment_flood_wait_seconds,
-                )
-            return await _run_cold_backfill_pass_safe(client, conn, shutdown_event, pacing=pacing, timeout_s=timeout_s)
-
-        if demand_cycle_runner is None:
-            cycle_result = await run_cycle()
-        else:
-            cycle_result = await demand_cycle_runner(
-                DemandKind.COLD_PEER_PAGE,
-                run_cycle,
-            )
-        if cycle_result is None:
-            return
-        pass_result = cast(ColdPassResult, cycle_result)
-
-        sleep_s = _cold_backfill_sleep_seconds(pass_result, resolved_idle_interval, pacing)
-
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=sleep_s)
-            return  # shutdown signalled
-        except TimeoutError:
-            pass  # normal — continue loop

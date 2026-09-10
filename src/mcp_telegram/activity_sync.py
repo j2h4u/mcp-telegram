@@ -2,7 +2,7 @@
 
 Populates own-message rows (out=1) in the unified messages table
 via messages.Search(InputPeerEmpty, from_id=InputPeerSelf).
-Runs as a named daemon background task alongside run_access_probe_loop.
+Durable archive pages are exposed through demand adapters.
 """
 
 import asyncio
@@ -20,7 +20,6 @@ from telethon.tl.functions.messages import SearchRequest
 from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, InputPeerSelf
 
 from .activity_substrate import ActivityClient, call_with_timeout
-from .demand_shadow_wiring import DemandCycleRunner
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled, sleep_through_flood
 from .hydration_queue import HydrationPriority
@@ -44,7 +43,6 @@ from .telethon_dialog import classify_dialog_type
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_INTERVAL_S = 3600.0
 _BACKFILL_BATCH_LIMIT = 100
 _SECONDS_PER_MINUTE = 60
 _SECONDS_PER_HOUR = 60 * _SECONDS_PER_MINUTE
@@ -213,7 +211,7 @@ def _validate_status_now(now: float) -> None:
 
 @contextmanager
 def _archive_demand_scope(kind: DemandKind) -> Iterator[None]:
-    """Install an exact archive operation kind for legacy direct execution."""
+    """Install the exact archive operation kind for an adapter slice."""
     try:
         token = current_demand_token()
     except UnclassifiedTelegramDemandError:
@@ -937,44 +935,3 @@ async def _run_incremental_batch(
     if await _wait_for_shutdown(shutdown_event, timeout=_PACING.search.batch_s):
         return _INCREMENTAL_BATCH_RETURN
     return _INCREMENTAL_BATCH_CONTINUE
-
-
-async def run_activity_sync_loop(  # noqa: PLR0913 - explicit loop dependencies and observation hook
-    client: ActivityClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    *,
-    interval: float = _DEFAULT_INTERVAL_S,
-    timeout_s: float,
-    demand_cycle_runner: DemandCycleRunner | None = None,
-) -> None:
-    """Background task: keep own-message rows (out=1) in messages up-to-date.
-
-    One pass = (backfill if incomplete) + (incremental if backfill complete).
-    Sleeps `interval` between passes, interruptible via shutdown_event.
-    """
-    while not shutdown_event.is_set():
-        logger.debug("activity_sync_loop_start")
-        try:
-            if demand_cycle_runner is None:
-                await _run_backfill(client, conn, shutdown_event, timeout_s=timeout_s)
-                await _run_incremental(client, conn, shutdown_event, timeout_s=timeout_s)
-            else:
-                await demand_cycle_runner(
-                    DemandKind.ARCHIVE_BACKFILL,
-                    lambda: _run_backfill_in_scope(client, conn, shutdown_event, timeout_s=timeout_s),
-                )
-                await demand_cycle_runner(
-                    DemandKind.ARCHIVE_INCREMENTAL,
-                    lambda: _run_incremental_in_scope(client, conn, shutdown_event, timeout_s=timeout_s),
-                )
-        except RpcAdmissionClosedError:
-            raise
-        except Exception:
-            logger.warning("activity_sync_error", exc_info=True)
-        logger.debug("activity_sync_loop_sleeping interval=%.0fs", interval)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
-            return
-        except TimeoutError:
-            pass

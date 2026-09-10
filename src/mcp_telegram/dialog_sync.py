@@ -70,7 +70,6 @@ from .telegram_demand import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 from .telegram_rpc_scheduler import (
-    RpcAdmissionClosedError,
     RpcAdmissionExpiredError,
     RpcAdmissionSaturatedError,
     TelegramRpcAdmissionDeferred,
@@ -1466,66 +1465,6 @@ class DialogFullReconciliationDemandAdapter:
                     await self._worker._run_full_pass_slice(refresh_topics=False, wait_on_throttle=False)
 
 
-async def run_reconciliation_loop(  # noqa: PLR0913
-    client: object,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    *,
-    hourly_interval: float = 3600.0,
-    daily_interval: float = 86400.0,
-    topic_refresher: TopicRefresher | None = None,
-) -> None:
-    """Background loop: light pass every hourly_interval, full pass every daily_interval.
-
-    The first iteration runs a full pass when no valid completion timestamp is persisted.
-    Shutdown-responsive: returns from inside asyncio.wait_for as soon as
-    shutdown_event fires.
-
-    last_full_pass is updated ONLY when run_full_pass() returns without
-    raising. If the per-pass try/except catches an exception, last_full_pass
-    stays at its prior value — the next hourly tick will retry the full
-    pass instead of waiting a full day. This addresses 43-REVIEWS.md
-    "Update last_full_pass only on success" (Codex MEDIUM).
-
-    UAT support: Plan 03's daemon caller may pass a smaller hourly_interval
-    supplied by the daemon scheduling configuration so an operator can observe a
-    needs_refresh=1 -> 0 transition without waiting an hour.
-    """
-    last_full_pass = _read_last_full_reconciliation_at(conn)
-    while not shutdown_event.is_set():
-        now = time.time()
-        worker = DialogReconciliationWorker(client, conn, shutdown_event, topic_refresher)
-        try:
-            await worker.run_light_pass()
-        except RpcAdmissionClosedError:
-            raise
-        except Exception:
-            logger.warning("recon_light_pass_error", exc_info=True)
-        if last_full_pass is None or now - last_full_pass >= daily_interval:
-            try:
-                _count, completed = await worker.run_full_pass()
-                # Advance last_full_pass only when the sweep completed
-                # normally (soft-delete phase ran). Throttling or shutdown
-                # mid-stream returns completed=False, leaving last_full_pass
-                # unchanged so the next hourly tick retries the full pass.
-                if completed:
-                    last_full_pass = time.time()
-                    with conn:
-                        conn.execute(
-                            "INSERT OR REPLACE INTO daemon_state(key, value) VALUES (?, ?)",
-                            (_LAST_FULL_RECONCILIATION_KEY, str(last_full_pass)),
-                        )
-            except RpcAdmissionClosedError:
-                raise
-            except Exception:
-                logger.warning("recon_full_pass_error", exc_info=True)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=hourly_interval)
-            return  # shutdown
-        except TimeoutError:
-            pass
-
-
 _EXPORTED_SYMBOLS = (
     DialogBootstrapDemandAdapter,
     DialogFullReconciliationDemandAdapter,
@@ -1533,5 +1472,4 @@ _EXPORTED_SYMBOLS = (
     DialogReconciliationWorker,
     DialogsBootstrapWorker,
     DialogsBootstrapWorker.run,
-    run_reconciliation_loop,
 )

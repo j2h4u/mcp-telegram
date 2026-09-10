@@ -30,7 +30,6 @@ from .activity_peer_sweep import (
     working_set_enrollment_release_at,
 )
 from .activity_substrate import ActivityClient
-from .demand_shadow_wiring import DemandCycleRunner
 from .flood import TelegramRpcThrottled
 from .hydration_queue import HydrationPriority
 from .maintenance_logging import log_maintenance_cycle
@@ -1101,65 +1100,3 @@ async def run_hot_sweep_pass(
             exc.retry_after_seconds,
         )
         return _admission_deferred_telemetry(conn, exc.retry_after_seconds)
-
-
-async def run_hot_sweep_loop(  # noqa: PLR0913 - explicit loop dependencies and observation hook
-    client: ActivityClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    *,
-    policy: HotSweepPolicy,
-    timeout_s: float,
-    demand_cycle_runner: DemandCycleRunner | None = None,
-) -> None:
-    """Background task: run Tier-A HotSweep hourly, interruptible via shutdown_event.
-
-    Mirrors the structure of run_activity_sync_loop.
-    """
-    while not shutdown_event.is_set():
-        logger.debug("activity_hot_sweep_loop_start")
-        telemetry: dict[str, int | float | bool | None] = {"flood_wait_seconds": None}
-        try:
-            if demand_cycle_runner is None:
-                telemetry = await run_hot_sweep_pass(
-                    client,
-                    conn,
-                    shutdown_event,
-                    policy=policy,
-                    timeout_s=timeout_s,
-                )
-            else:
-                telemetry = cast(
-                    dict[str, int | float | bool | None],
-                    await demand_cycle_runner(
-                        DemandKind.HOT_ACTIVITY_PAGE,
-                        lambda: run_hot_sweep_pass(
-                            client,
-                            conn,
-                            shutdown_event,
-                            policy=policy,
-                            timeout_s=timeout_s,
-                        ),
-                    ),
-                )
-            logger.debug(
-                "activity_hot_sweep_loop_done genuinely_new=%d flood_wait_seconds=%r",
-                telemetry["genuinely_new"],
-                telemetry["flood_wait_seconds"],
-            )
-        except RpcAdmissionClosedError:
-            raise
-        except TelegramRpcThrottled:
-            raise
-        except Exception:
-            logger.warning("activity_hot_sweep_error", exc_info=True)
-        wait_seconds = max(
-            policy.loop_interval_seconds,
-            float(telemetry.get("retry_after_seconds") or telemetry.get("flood_wait_seconds") or 0),
-        )
-        logger.debug("activity_hot_sweep_loop_sleeping interval=%.0fs", wait_seconds)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=wait_seconds)
-            return
-        except TimeoutError:
-            pass

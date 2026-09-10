@@ -21,7 +21,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequen
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
-from typing import Protocol, TypedDict, Unpack, cast
+from typing import Protocol, cast
 
 from telethon.errors import RPCError  # type: ignore[import-untyped]
 
@@ -32,7 +32,6 @@ from .access_lifecycle import (
     set_access_lost,
     stamp_access_revalidation,
 )
-from .demand_shadow_wiring import DemandCycleRunner, run_legacy_demand_cycle
 from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
 from .history_enrollment import full_history_enabled
 from .hydration_queue import HydrationPriority
@@ -302,11 +301,6 @@ def _dm_gap_scan_release_at(conn: sqlite3.Connection, now: float) -> float | Non
     if state is None or state.status == "running":
         return 0.0
     return float(state.next_run_at) if state.next_run_at > now else 0.0
-
-
-class AccessProbeLoopOptions(TypedDict, total=False):
-    initial_delay: float
-    demand_cycle_runner: DemandCycleRunner
 
 
 class _DeltaSyncClient(Protocol):
@@ -902,35 +896,6 @@ class DeltaGapFillDemandAdapter:
                     return
 
 
-async def run_delta_catch_up_loop(
-    worker: DeltaSyncWorker,
-    shutdown_event: asyncio.Event,
-    policy: DeltaCatchUpPolicy,
-    *,
-    demand_cycle_runner: DemandCycleRunner | None = None,
-) -> None:
-    """Run forward gap-fill as a bounded maintenance loop, not startup burst."""
-    if not policy.enabled:
-        logger.info("delta_catch_up_loop disabled — max_probes_per_cycle=%d", policy.max_probes_per_cycle)
-        return
-
-    while not shutdown_event.is_set():
-
-        async def catch_up() -> object:
-            return await worker.run_delta_catch_up(policy=policy)
-
-        if demand_cycle_runner is None:
-            total_new = cast(int, await run_legacy_demand_cycle(None, DemandKind.DELTA_GAP_FILL, catch_up))
-        else:
-            total_new = cast(int, await demand_cycle_runner(DemandKind.DELTA_GAP_FILL, catch_up))
-        logger.debug("delta_catch_up_cycle complete — new_messages=%d", total_new)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=policy.interval_seconds)
-            break
-        except TimeoutError:
-            continue
-
-
 # ---------------------------------------------------------------------------
 # Probe-worker — access recovery for access_lost dialogs
 # ---------------------------------------------------------------------------
@@ -1323,53 +1288,6 @@ class DeltaAccessProbeDemandAdapter:
             )
 
 
-async def run_access_probe_loop(
-    client: _DeltaSyncClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    delta_worker: DeltaSyncWorker,
-    policy: AccessProbePolicy,
-    **options: Unpack[AccessProbeLoopOptions],
-) -> None:
-    """Cold probe of due access_lost dialogs. Restores access and triggers gap-fill.
-
-    The loop may run daily, but each dialog is paced by a durable cooldown and
-    each cycle has a small global budget.
-    """
-    if not policy.enabled:
-        logger.info("access_probe_loop disabled — max_dialogs_per_cycle=%d", policy.max_dialogs_per_cycle)
-        return
-
-    initial_delay = options.get("initial_delay", 0.0)
-    if initial_delay > 0:
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=initial_delay)
-            return  # shutdown during initial delay
-        except TimeoutError:
-            pass  # initial delay elapsed normally; proceed with first probe
-
-    while not shutdown_event.is_set():
-        try:
-
-            async def probe() -> object:
-                return await _probe_access_lost_dialogs(client, conn, shutdown_event, delta_worker, policy)
-
-            demand_cycle_runner = options.get("demand_cycle_runner")
-            if demand_cycle_runner is None:
-                await run_legacy_demand_cycle(None, DemandKind.DELTA_ACCESS_PROBE, probe)
-            else:
-                await demand_cycle_runner(DemandKind.DELTA_ACCESS_PROBE, probe)
-        except RpcAdmissionClosedError:
-            raise
-        except Exception:
-            logger.warning("access_probe_error", exc_info=True)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=policy.interval_seconds)
-            return  # shutdown during sleep
-        except TimeoutError:
-            pass  # interval elapsed, run again
-
-
 _EXPORTED_SYMBOLS = (
     AccessProbePolicy,
     DeltaAccessProbeDemandAdapter,
@@ -1377,6 +1295,4 @@ _EXPORTED_SYMBOLS = (
     DeltaGapFillDemandAdapter,
     DeltaSyncWorker,
     DeltaSyncWorker.run_delta_catch_up,
-    run_access_probe_loop,
-    run_delta_catch_up_loop,
 )

@@ -10,13 +10,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 from telethon.errors import ChannelPrivateError
 from telethon.tl.types import PeerUser
 
-from mcp_telegram import scheduled_messages as scheduled_messages_module
 from mcp_telegram.activity_peer_resolve import LinkedChatResolution
 from mcp_telegram.event_handlers import EventHandlerManager, _NewMessageEvent
 from mcp_telegram.flood import TelegramRpcThrottled
@@ -28,7 +27,6 @@ from mcp_telegram.scheduled_messages import (
     ScheduledRepairDemandAdapter,
     _unix_timestamp,
     mark_scheduled_messages_removed,
-    run_scheduled_reconciliation_loop,
     scheduled_dialog_id,
     upsert_scheduled_message,
     verify_scheduled_publication,
@@ -42,10 +40,6 @@ from mcp_telegram.sync_db import (
 from mcp_telegram.telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind, demand_contract
 from mcp_telegram.telegram_rpc_scheduler import (
-    RPC_SOURCE_SERVICE_CLASS,
-    RpcAdmissionClosedError,
-    TelegramRpcScope,
-    TelegramRpcSource,
     current_rpc_scope,
 )
 
@@ -743,111 +737,6 @@ async def test_legacy_run_once_attributes_each_selected_row_to_its_demand_kind(
         DemandKind.SCHEDULED_REPAIR,
         DemandKind.SCHEDULED_DISCOVERY,
     ]
-
-
-@pytest.mark.asyncio
-async def test_scheduled_reconciliation_loop_stops_before_work_when_shutdown_is_set(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    shutdown_event = asyncio.Event()
-    shutdown_event.set()
-    reconciler = MagicMock()
-    reconciler.run_once = AsyncMock()
-    monkeypatch.setattr(scheduled_messages_module, "ScheduledMessageReconciler", lambda *args, **kwargs: reconciler)
-
-    await run_scheduled_reconciliation_loop(
-        MagicMock(),
-        MagicMock(),
-        shutdown_event,
-        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
-    )
-
-    reconciler.run_once.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_scheduled_reconciliation_loop_retries_after_failure_and_wait_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    shutdown_event = asyncio.Event()
-    reconciler = MagicMock()
-    reconciler.run_once = AsyncMock(side_effect=[RuntimeError("temporary failure"), None])
-    reconciler._wait_timeout.return_value = 7.0
-    monkeypatch.setattr(scheduled_messages_module, "ScheduledMessageReconciler", lambda *args, **kwargs: reconciler)
-    wait_calls = 0
-    wait_timeouts: list[float] = []
-
-    async def controlled_wait_for(awaitable: object, *, timeout: float) -> None:
-        nonlocal wait_calls
-        close = getattr(awaitable, "close", None)
-        if callable(close):
-            close()
-        wait_calls += 1
-        wait_timeouts.append(timeout)
-        if wait_calls == 1:
-            raise TimeoutError
-        shutdown_event.set()
-
-    monkeypatch.setattr(scheduled_messages_module.asyncio, "wait_for", controlled_wait_for)
-    with caplog.at_level("WARNING", logger="mcp_telegram.scheduled_messages"):
-        await run_scheduled_reconciliation_loop(
-            MagicMock(),
-            MagicMock(),
-            shutdown_event,
-            policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
-        )
-
-    assert reconciler.run_once.await_count == 2
-    assert wait_timeouts == [7.0, 7.0]
-    assert [record.message for record in caplog.records] == ["scheduled_reconcile_failed"]
-
-
-@pytest.mark.asyncio
-async def test_scheduled_reconciliation_loop_propagates_admission_close(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    scope = TelegramRpcScope(
-        TelegramRpcSource.SCHEDULED_MESSAGES,
-        RPC_SOURCE_SERVICE_CLASS[TelegramRpcSource.SCHEDULED_MESSAGES],
-        None,
-        None,
-    )
-    closed = RpcAdmissionClosedError(scope, "scheduler closed")
-    shutdown_event = asyncio.Event()
-    reconciler = MagicMock()
-    reconciler.run_once = AsyncMock(side_effect=closed)
-    monkeypatch.setattr(scheduled_messages_module, "ScheduledMessageReconciler", lambda *args, **kwargs: reconciler)
-
-    with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
-        await run_scheduled_reconciliation_loop(
-            MagicMock(),
-            MagicMock(),
-            shutdown_event,
-            policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
-        )
-
-    reconciler.run_once.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_scheduled_reconciliation_loop_propagates_cancellation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    shutdown_event = asyncio.Event()
-    reconciler = MagicMock()
-    reconciler.run_once = AsyncMock(side_effect=asyncio.CancelledError)
-    monkeypatch.setattr(scheduled_messages_module, "ScheduledMessageReconciler", lambda *args, **kwargs: reconciler)
-
-    with pytest.raises(asyncio.CancelledError):
-        await run_scheduled_reconciliation_loop(
-            MagicMock(),
-            MagicMock(),
-            shutdown_event,
-            policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
-        )
-
-    reconciler.run_once.assert_awaited_once()
 
 
 @pytest.mark.asyncio
