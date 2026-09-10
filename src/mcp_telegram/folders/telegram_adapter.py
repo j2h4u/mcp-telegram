@@ -23,6 +23,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 
 from ..flood import TelegramRpcThrottled
 from .contracts import (
+    FOLDER_DIALOG_PAGE_SIZE,
     DialogCategory,
     DialogFacts,
     FolderDialogCursor,
@@ -32,8 +33,6 @@ from .contracts import (
     FolderSourceUnavailableError,
 )
 from .ports import TelegramFolderGateway
-
-FOLDER_DIALOG_PAGE_SIZE = 100
 
 
 class FolderClient(Protocol):

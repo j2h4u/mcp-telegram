@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+FOLDER_DIALOG_PAGE_SIZE = 100
+
 
 class DialogCategory(StrEnum):
     CONTACT = "contact"

@@ -8,10 +8,9 @@ from typing import cast
 
 from ..telegram_demand import AcquisitionKind, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
 from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_attempt_budget, rpc_scope
-from .contracts import FolderSourceSnapshot, FolderStagingSnapshot
+from .contracts import FOLDER_DIALOG_PAGE_SIZE, FolderSourceSnapshot, FolderStagingSnapshot
 from .membership import matches
 from .ports import FolderSnapshotRepository, LegacyTelegramFolderGateway, TelegramFolderGateway
-from .telegram_adapter import FOLDER_DIALOG_PAGE_SIZE
 
 
 @dataclass(frozen=True, slots=True)
