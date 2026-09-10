@@ -65,7 +65,7 @@ from .activity_cold_backfill import ColdBackfillPacing
 from .activity_contracts import InputPeerResolver
 from .activity_peer_resolve import resolve_input_peer
 from .activity_substrate import ActivityClient
-from .auth_scope import capture_auth_scope
+from .auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from .config import McpTelegramConfig, SchedulingConfig, load_config, resolve_scheduling_config
 from .daemon_api import DaemonApiPolicy, DaemonAPIServer, DaemonClientLike, DaemonHealthStatus
 from .delta_sync import AccessProbePolicy, DeltaSyncWorker, DmGapScanPage, _DeltaSyncClient
@@ -1308,6 +1308,32 @@ def _offer_startup_demands(ctx: _SyncMainContext) -> None:
         DemandKind.READ_RECEIPT_BATCH,
     ):
         ctx.coordinator.offer(kind)
+
+
+def capture_auth_scope(profile: object, client: object) -> TelegramAuthScope | None:
+    """Read account and primary permanent-session identity without an RPC."""
+    account_id = getattr(profile, "id", None)
+    session = getattr(client, "session", None)
+    dc_id = getattr(session, "dc_id", None)
+    auth_key = getattr(session, "auth_key", None)
+    auth_key_id = getattr(auth_key, "key_id", None)
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in (account_id, dc_id, auth_key_id)
+    ):
+        return None
+    account_id = cast(int, account_id)
+    dc_id = cast(int, dc_id)
+    auth_key_id = cast(int, auth_key_id)
+    try:
+        return TelegramAuthScope(
+            version=AUTH_SCOPE_VERSION,
+            account_id=account_id,
+            dc_id=dc_id,
+            auth_key_id=auth_key_id,
+        )
+    except ValueError:
+        return None
 
 
 def _update_self_profile(api_server: DaemonAPIServer, me: _MeLike) -> None:

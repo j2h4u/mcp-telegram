@@ -9,7 +9,8 @@ from typing import cast
 
 import pytest
 
-from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope, capture_auth_scope
+from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
+from mcp_telegram.daemon import capture_auth_scope
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.telegram_demand import RpcAttemptBudget

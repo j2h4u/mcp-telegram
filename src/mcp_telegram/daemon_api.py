@@ -87,6 +87,7 @@ from .daemon_dialog_queries import (
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
+from .entity_profile.ports import ProfilePairObservationHook
 from .entity_profile.refresh import RefreshLimits
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
@@ -94,7 +95,6 @@ from .folders.read_model import dialog_placement, folder_snapshot, folder_summar
 from .history_enrollment import disable_history, enable_history, read_intent
 from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
-from .rpc_admission_observations import ProfilePairObservationHook
 from .runtime_observations import (
     RuntimeObservationPolicy,
     prune_runtime_observations,

@@ -20,6 +20,50 @@ PROFILE_SECTIONS: tuple[str, ...] = (
 PROFILE_ACQUISITION_OUTCOMES: frozenset[str] = frozenset({"usable", "partial", "absent", "unavailable"})
 PROFILE_ENDPOINT = "users.GetFullUser"
 PROFILE_NORMALIZATION_VERSION = "entity-profile-v1"
+FULL_USER_ENDPOINT = "users.GetFullUser"
+NORMALIZATION_VERSION = "entity-profile-full-user-v1"
+
+FULL_PROFILE_OWNED_FIELDS: tuple[str, ...] = (
+    "about",
+    "blocked",
+    "ttl_period",
+    "private_forward_name",
+    "folder_id",
+    "birthday",
+    "bot_info",
+    "business_location",
+    "business_intro",
+    "business_work_hours",
+    "note",
+    "name",
+    "username",
+    "first_name",
+    "last_name",
+    "extra_usernames",
+    "emoji_status_id",
+    "status",
+    "phone",
+    "lang_code",
+    "contact",
+    "mutual_contact",
+    "close_friend",
+    "send_paid_messages_stars",
+    "verified",
+    "premium",
+    "bot",
+    "scam",
+    "fake",
+    "restricted",
+    "restriction_reason",
+    "my_membership",
+)
+
+PERSONAL_CHANNEL_OWNED_FIELDS: tuple[str, ...] = (
+    "personal_channel_id",
+    "personal_channel_message",
+    "title",
+    "username",
+)
 
 
 @dataclass(frozen=True, slots=True)

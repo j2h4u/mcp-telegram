@@ -19,12 +19,13 @@ from typing import cast
 
 from ..entity_store import EntitySnapshot, upsert_entity_snapshots
 from ..models import DialogType
-from .contracts import PROFILE_SECTIONS, ProfileAcquisitionEvidence
-from .full_user_normalization import (
+from .contracts import (
     FULL_PROFILE_OWNED_FIELDS,
     FULL_USER_ENDPOINT,
     NORMALIZATION_VERSION,
     PERSONAL_CHANNEL_OWNED_FIELDS,
+    PROFILE_SECTIONS,
+    ProfileAcquisitionEvidence,
 )
 
 _DETAIL_SCHEMA = 1

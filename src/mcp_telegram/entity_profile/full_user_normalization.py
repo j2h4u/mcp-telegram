@@ -17,49 +17,11 @@ from datetime import date, datetime
 from enum import StrEnum
 from typing import TypedDict, cast
 
-FULL_USER_ENDPOINT = "users.GetFullUser"
-NORMALIZATION_VERSION = "entity-profile-full-user-v1"
-
-FULL_PROFILE_OWNED_FIELDS: tuple[str, ...] = (
-    "about",
-    "blocked",
-    "ttl_period",
-    "private_forward_name",
-    "folder_id",
-    "birthday",
-    "bot_info",
-    "business_location",
-    "business_intro",
-    "business_work_hours",
-    "note",
-    "name",
-    "username",
-    "first_name",
-    "last_name",
-    "extra_usernames",
-    "emoji_status_id",
-    "status",
-    "phone",
-    "lang_code",
-    "contact",
-    "mutual_contact",
-    "close_friend",
-    "send_paid_messages_stars",
-    "verified",
-    "premium",
-    "bot",
-    "scam",
-    "fake",
-    "restricted",
-    "restriction_reason",
-    "my_membership",
-)
-
-PERSONAL_CHANNEL_OWNED_FIELDS: tuple[str, ...] = (
-    "personal_channel_id",
-    "personal_channel_message",
-    "title",
-    "username",
+from .contracts import (
+    FULL_PROFILE_OWNED_FIELDS,
+    FULL_USER_ENDPOINT,
+    NORMALIZATION_VERSION,
+    PERSONAL_CHANNEL_OWNED_FIELDS,
 )
 
 
@@ -685,10 +647,6 @@ def normalize_full_user_response(
 
 
 __all__ = [
-    "FULL_PROFILE_OWNED_FIELDS",
-    "FULL_USER_ENDPOINT",
-    "NORMALIZATION_VERSION",
-    "PERSONAL_CHANNEL_OWNED_FIELDS",
     "FullProfileFacts",
     "FullUserNormalization",
     "ObservationBoundary",

@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from mcp_telegram.entity_profile.contracts import NORMALIZATION_VERSION
 from mcp_telegram.entity_profile.full_user_normalization import (
-    NORMALIZATION_VERSION,
     FullUserNormalization,
     ObservationBoundary,
     ProjectionStatus,

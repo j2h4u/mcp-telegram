@@ -19,18 +19,23 @@ from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
 from .auth_scope import TelegramAuthScope
 from .demand_wiring import DemandOfferSink, offer_durable_demand
-from .entity_profile.contracts import PROFILE_SECTIONS, ProfileAcquisitionEvidence, completeness
-from .entity_profile.full_user_normalization import (
+from .entity_profile.contracts import (
     FULL_PROFILE_OWNED_FIELDS,
     FULL_USER_ENDPOINT,
     NORMALIZATION_VERSION,
     PERSONAL_CHANNEL_OWNED_FIELDS,
+    PROFILE_SECTIONS,
+    ProfileAcquisitionEvidence,
+    completeness,
+)
+from .entity_profile.full_user_normalization import (
     ObservationBoundary,
     ProjectionOutcome,
     ProjectionStatus,
     TargetKind,
     normalize_full_user_response,
 )
+from .entity_profile.ports import ProfilePairObservationHook
 from .entity_profile.refresh import (
     DurableRefreshSliceResult,
     DurableRefreshTerminal,
@@ -43,7 +48,6 @@ from .entity_store import EntitySnapshot, ensure_entity_stub
 from .flood import TelegramRpcThrottled
 from .folders.read_model import dialog_placement
 from .models import DialogType
-from .rpc_admission_observations import ProfilePairObservationHook
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
 from .telegram_rpc import raise_if_flood_wait_error
