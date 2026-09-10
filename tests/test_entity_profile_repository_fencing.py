@@ -105,6 +105,60 @@ def test_pair_commit_rolls_back_all_projections_on_failure(tmp_path: Path) -> No
     conn.close()
 
 
+def test_pair_measurement_survives_reopen_after_projection_commit(tmp_path: Path) -> None:
+    path = tmp_path / "pair-measurement.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    repo.mark_pending(42, now=100, pair_mode_override="enabled")
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    assert repo.commit_full_user_pair(
+        cursor,
+        EntitySectionCommit({"about": "new"}, evidence=_evidence(cursor.generation)),
+        EntitySectionCommit(
+            {"personal_channel": None},
+            status="unavailable",
+            reason="absent",
+            evidence=_evidence(cursor.generation, outcome="absent"),
+        ),
+        now=101,
+    )
+    conn.close()
+
+    reopened = sqlite3.connect(path)
+    assert reopened.execute(
+        "SELECT pair_mode, pair_full_profile_outcome, pair_personal_channel_outcome, "
+        "pair_measurement_complete, pair_ready_at, pair_summary_watermark "
+        "FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == ("enabled", "usable", "absent", 1, 101, 101)
+    reopened.close()
+
+
+def test_pair_mode_is_generation_durable_across_restart_and_flip(tmp_path: Path) -> None:
+    path = tmp_path / "pair-mode.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    repo.mark_pending(42, now=100, pair_mode_override="disabled")
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None and cursor.pair_mode == "disabled"
+    conn.close()
+
+    reopened = sqlite3.connect(path)
+    repo = EntityProfileRepository(reopened, section_ttl_seconds=10)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None and cursor.pair_mode == "disabled"
+    repo.mark_pending(42, now=101, pair_mode_override="enabled")
+    cursor = repo.next_due_refresh(now=101)
+    assert cursor is not None and cursor.pair_mode == "disabled"
+    while cursor is not None:
+        assert repo.commit_section(cursor, EntitySectionCommit({}, status="not_applicable"), now=101)
+        cursor = repo.next_due_refresh(now=101)
+    repo.mark_pending(42, now=102, pair_mode_override="enabled")
+    cursor = repo.next_due_refresh(now=102)
+    assert cursor is not None and cursor.pair_mode == "enabled"
+    reopened.close()
+
+
 def test_generation_and_revision_fences_reject_stale_writers(tmp_path: Path) -> None:
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)

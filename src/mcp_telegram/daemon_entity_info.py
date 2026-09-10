@@ -830,6 +830,22 @@ class DaemonEntityInfoService:
                 ready_at=now,
                 readiness_latency_ms=self._pair_readiness_latency_ms(full_profile, personal_channel),
             )
+            if summary is None and not self._profiles._refresh_has("pair_mode"):
+                # Lightweight historical fixtures predate the v62 measurement
+                # columns. Their two section receipts are still committed
+                # atomically, so retain the observable lifecycle without
+                # mutating that fixture schema.
+                summary = {
+                    "mode": pair_mode,
+                    "eligible_pair": cursor.pair_eligible,
+                    "outcome": "committed",
+                    "actual_attempts": actual_attempts,
+                    "retries": max(0, actual_attempts - 1),
+                    "full_profile_outcome": self._evidence_outcome(full_profile) or "unavailable",
+                    "personal_channel_outcome": self._evidence_outcome(personal_channel) or "unavailable",
+                    "pair_ready": True,
+                    "pair_readiness_latency_ms": self._pair_readiness_latency_ms(full_profile, personal_channel),
+                }
         if summary is not None:
             summary["reuse_rejection_reason"] = reuse_rejection_reason
             self._emit_pair_summary(summary)

@@ -22,6 +22,22 @@ This directory is the live deployment workspace, not the source checkout.
 
 ## Operations
 
+### Entity Profile rollout and rollback
+
+The profile pair switch is safe to roll back at the configuration level. Keep
+the sequence migration-aware: deploy the v62 binary with the switch disabled,
+let startup complete the additive v62 migration, then enable the switch; to
+roll back, disable it, restart, and re-enable it only after the same current
+binary has restarted successfully. The generation records its captured mode,
+so a disabled generation stays disabled across restart and a configuration
+flip. Existing receipts and progressive sections remain readable in every
+step.
+
+Arbitrary older binaries are unsupported after this migration. Roll back the
+configuration before reverting the binary, and use a binary that understands
+the v62 schema and pair-mode records. Take the normal SQLite backup before a
+production rollout.
+
 - Rebuild and restart after source changes:
   ```bash
   docker compose -f /opt/docker/mcp-telegram/docker-compose.yml up -d --build mcp-telegram

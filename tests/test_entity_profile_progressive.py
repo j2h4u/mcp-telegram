@@ -924,7 +924,7 @@ def test_progressive_projection_schema_upgrades_from_v56(tmp_path: Path) -> None
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_profile_refresh_state'"
     ).fetchone() == (1,)
-    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (61,)
+    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (62,)
     conn.close()
 
 
