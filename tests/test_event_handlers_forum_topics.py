@@ -182,6 +182,7 @@ def _topic_count(conn: _SQLiteConnection) -> int:
 
 def _make_manager(client: MagicMock, conn: _SQLiteConnection, ev: asyncio.Event) -> EventHandlerManager:
     m = EventHandlerManager(client, conn, ev, client.get_input_entity)
+    m.bind_demand_sink(MagicMock())
     m.register()
     return m
 

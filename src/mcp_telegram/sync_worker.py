@@ -129,7 +129,7 @@ _NEXT_TOTAL_MESSAGES_REPAIR_SQL = (
 )
 _UPDATE_TOTAL_MESSAGES_SQL = (
     "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ? AND total_messages IS NULL "
-    "AND status NOT IN ('not_synced', 'access_lost') "
+    "AND status NOT IN ('not_synced', ?) "
     "AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
 )
 _UPDATE_PROGRESS_SQL = (
@@ -592,7 +592,7 @@ class FullSyncWorker:
         with self._conn:
             self._conn.execute(
                 _UPDATE_TOTAL_MESSAGES_SQL,
-                (total_messages, dialog_id, dialog_id),
+                (total_messages, dialog_id, "access_lost", dialog_id),
             )
             _set_total_messages_repair_retry(self._conn, None)
         logger.info("sync_total_repair_complete dialog_id=%d total_messages=%d", dialog_id, total_messages)
