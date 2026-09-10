@@ -112,11 +112,11 @@ class ArchiveIncrementalDemandAdapter(DurableDemandAdapter):
         last_sync_at = int(state.get("last_sync_at") or 0)
         if last_sync_at == 0:
             return None
-        freshness_deadline = float(last_sync_at) + self.interval_s
-        release_at = 0.0 if state.get(_INCREMENTAL_MIN_DATE_KEY) is not None else freshness_deadline
         return DemandStatus(
-            release_at=release_at,
-            freshness_deadline=freshness_deadline,
+            0.0
+            if state.get(_INCREMENTAL_MIN_DATE_KEY) is not None
+            else float(last_sync_at) + self.interval_s,
+            float(last_sync_at) + self.interval_s,
         )
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:

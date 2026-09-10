@@ -127,7 +127,6 @@ class TelegramDemandCoordinator:
         self._status_failed_until: dict[DemandKind, float] = {}
         self._suppressed_until: dict[DemandKind, float] = {}
         self._global_release_at: float | None = None
-        self._latched_throttle = False
         self._run_task: asyncio.Task[None] | None = None
         self.scan()
 
@@ -336,7 +335,6 @@ class TelegramDemandCoordinator:
 
     def _handle_throttle(self, kind: DemandKind, budget: RpcAttemptBudget, exc: TelegramRpcThrottled) -> bool:
         if exc.latched:
-            self._latched_throttle = True
             self._shutdown_event.set()
             self._wake.set()
             return True

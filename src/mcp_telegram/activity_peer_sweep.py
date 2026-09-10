@@ -76,7 +76,6 @@ class WorkingSetEnrollmentSliceResult:
     enrolled_count: int = 0
     completed: bool = False
     flood_wait_seconds: int | None = None
-    budget_exhausted: bool = False
     consumed: bool = False
 
 
@@ -646,7 +645,9 @@ def _save_dialog_state(
 _ENROLLMENT_PHASE_KEY = "activity_working_set_phase"
 _ENROLLMENT_CURSOR_KEY = "activity_working_set_cursor"
 _ENROLLMENT_COMPLETED_AT_KEY = "activity_working_set_completed_at"
-_ENROLLMENT_RETRY_AT_KEY = "activity_working_set_retry_at"
+# Stable storage key for the next continuation attempt.  The persisted spelling
+# is retained for databases created before the demand coordinator cutover.
+_ENROLLMENT_NEXT_ATTEMPT_AT_KEY = "activity_working_set_retry_at"
 _ENROLLMENT_SUPERGROUPS = "supergroups"
 _ENROLLMENT_CHANNELS = "channels"
 
@@ -656,7 +657,7 @@ def _load_working_set_enrollment_state(conn: sqlite3.Connection) -> dict[str, st
         _ENROLLMENT_PHASE_KEY,
         _ENROLLMENT_CURSOR_KEY,
         _ENROLLMENT_COMPLETED_AT_KEY,
-        _ENROLLMENT_RETRY_AT_KEY,
+        _ENROLLMENT_NEXT_ATTEMPT_AT_KEY,
     )
     placeholders = ", ".join("?" for _ in keys)
     rows = cast(
@@ -699,7 +700,7 @@ def working_set_enrollment_release_at(
     _validate_working_set_enrollment_timing(now, cadence_s)
     state = _load_working_set_enrollment_state(conn)
     if state.get(_ENROLLMENT_PHASE_KEY) is not None:
-        return float(int(state.get(_ENROLLMENT_RETRY_AT_KEY) or 0))
+        return float(int(state.get(_ENROLLMENT_NEXT_ATTEMPT_AT_KEY) or 0))
     completed_at = int(state.get(_ENROLLMENT_COMPLETED_AT_KEY) or 0)
     if completed_at == 0 and not _has_working_set_enrollment_candidate(conn):
         return None
@@ -714,7 +715,7 @@ def _start_working_set_enrollment(conn: sqlite3.Connection) -> str:
         )
         conn.execute(
             "DELETE FROM activity_sync_state WHERE key IN (?, ?)",
-            (_ENROLLMENT_CURSOR_KEY, _ENROLLMENT_RETRY_AT_KEY),
+            (_ENROLLMENT_CURSOR_KEY, _ENROLLMENT_NEXT_ATTEMPT_AT_KEY),
         )
     return _ENROLLMENT_SUPERGROUPS
 
@@ -739,11 +740,11 @@ def _set_working_set_enrollment_position(
                 (_ENROLLMENT_CURSOR_KEY, str(cursor)),
             )
         if retry_at is None:
-            conn.execute("DELETE FROM activity_sync_state WHERE key = ?", (_ENROLLMENT_RETRY_AT_KEY,))
+            conn.execute("DELETE FROM activity_sync_state WHERE key = ?", (_ENROLLMENT_NEXT_ATTEMPT_AT_KEY,))
         else:
             conn.execute(
                 "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
-                (_ENROLLMENT_RETRY_AT_KEY, str(retry_at)),
+            (_ENROLLMENT_NEXT_ATTEMPT_AT_KEY, str(retry_at)),
             )
 
 
@@ -751,7 +752,7 @@ def _finish_working_set_enrollment(conn: sqlite3.Connection, *, completed_at: in
     with conn:
         conn.execute(
             "DELETE FROM activity_sync_state WHERE key IN (?, ?, ?)",
-            (_ENROLLMENT_PHASE_KEY, _ENROLLMENT_CURSOR_KEY, _ENROLLMENT_RETRY_AT_KEY),
+            (_ENROLLMENT_PHASE_KEY, _ENROLLMENT_CURSOR_KEY, _ENROLLMENT_NEXT_ATTEMPT_AT_KEY),
         )
         conn.execute(
             "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
@@ -839,7 +840,7 @@ async def _enroll_channel_slice(
                     timeout_s=request.timeout_s,
                 )
     except RpcAttemptBudgetExhaustedError:
-        return WorkingSetEnrollmentSliceResult(budget_exhausted=True, consumed=True)
+        return WorkingSetEnrollmentSliceResult(consumed=True)
 
     if resolution.flood_wait_seconds is not None:
         _set_working_set_enrollment_position(
