@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import cast
 
 from ..telegram_demand import AcquisitionKind, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
 from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_attempt_budget, rpc_scope
@@ -86,11 +87,12 @@ class FolderRefresher:
             if budget.exhausted:
                 return FolderAcquisitionSlice(None, False)
             try:
+                gateway = cast(TelegramFolderGateway, self._gateway)
                 with rpc_scope(
                     TelegramRpcSource.FOLDER_RECONCILIATION,
                     acquisition_kind=AcquisitionKind.FOLDER_SNAPSHOT,
                 ):
-                    folders = await self._gateway.fetch_folders()
+                    folders = await gateway.fetch_folders()
             except RpcAttemptBudgetExhaustedError:
                 return FolderAcquisitionSlice(None, False)
             staging = FolderStagingSnapshot(
@@ -109,11 +111,12 @@ class FolderRefresher:
         cursor: FolderDialogCursor | None = staging.cursor
         page_count = 0
         try:
+            gateway = cast(TelegramFolderGateway, self._gateway)
             with rpc_scope(
                 TelegramRpcSource.FOLDER_RECONCILIATION,
                 acquisition_kind=AcquisitionKind.FOLDER_SNAPSHOT,
             ):
-                async for item in self._gateway.iter_dialogs(cursor):
+                async for item in gateway.iter_dialogs(cursor):
                     dialogs.append(item.facts)
                     cursor = item.cursor
                     page_count += 1
@@ -144,11 +147,12 @@ class FolderRefresher:
         # Keep the small direct-test/maintenance gateway contract working. The
         # daemon gateway implements the bounded fetch_folders/iter_dialogs API.
         if not hasattr(self._gateway, "fetch_folders"):
+            gateway = cast(LegacyTelegramFolderGateway, self._gateway)
             with rpc_scope(
                 TelegramRpcSource.FOLDER_RECONCILIATION,
                 acquisition_kind=AcquisitionKind.FOLDER_SNAPSHOT,
             ):
-                source = await self._gateway.fetch_snapshot()
+                source = await gateway.fetch_snapshot()
             return FolderProjection(source=source, memberships=self._memberships(source))
 
         # Direct callers without the demand coordinator still get a complete

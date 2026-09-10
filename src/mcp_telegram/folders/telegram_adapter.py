@@ -124,7 +124,7 @@ def _dialog_cursor(dialog: object) -> FolderDialogCursor:
     entity_id = int(getattr(entity, "id", 0) or 0)
     access_hash = int(getattr(entity, "access_hash", 0) or 0)
     peer_type: str | None = None
-    entity_type = type(entity).__name__ if entity is not None else None
+    entity_type = type(cast(object, entity)).__name__ if entity is not None else None
     if isinstance(entity, User) or entity_type == User.__name__:
         peer_type = "user"
     elif isinstance(entity, Chat) or entity_type == Chat.__name__:
