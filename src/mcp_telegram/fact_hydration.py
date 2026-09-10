@@ -117,7 +117,7 @@ class HydrationHandler(Protocol):
     def apply(
         self,
         conn: sqlite3.Connection,
-        _queue: HydrationQueueRepository,
+        queue: HydrationQueueRepository,
         jobs: Sequence[HydrationJob],
         result: object,
         *,
