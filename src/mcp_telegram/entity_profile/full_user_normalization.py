@@ -483,7 +483,9 @@ def _normalize_user_optional(user: object) -> tuple[dict[str, object], bool]:
 
 
 def _add_membership(facts: dict[str, object]) -> None:
-    relationship = {name: facts[name] for name in ("contact", "mutual_contact", "close_friend") if name in facts}
+    relationship: dict[str, object] = {
+        name: facts[name] for name in ("contact", "mutual_contact", "close_friend") if name in facts
+    }
     if "blocked" in facts:
         relationship["blocked"] = facts["blocked"]
     if relationship:
