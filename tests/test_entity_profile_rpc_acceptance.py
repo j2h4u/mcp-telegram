@@ -82,11 +82,17 @@ class _CompletePairClient(_FailureClient):
             personal_channel_id=123,
             personal_channel_message=9,
         )
-        super().__init__(response=SimpleNamespace(full_user=full_user, users=[user], chats=[SimpleNamespace(id=123, title="Channel", username="channel")]))
+        super().__init__(
+            response=SimpleNamespace(
+                full_user=full_user, users=[user], chats=[SimpleNamespace(id=123, title="Channel", username="channel")]
+            )
+        )
 
 
 def _requeue_new_generation(conn: sqlite3.Connection) -> None:
-    revision = cast(tuple[int], conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone())[0]
+    revision = cast(
+        tuple[int], conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone()
+    )[0]
     conn.execute(
         """
         UPDATE entity_profile_refresh_state
@@ -169,7 +175,9 @@ async def test_enabled_pair_failures_preserve_prior_data_and_account_attempts(
     ),
 )
 async def test_invalid_full_user_envelopes_do_not_create_positive_receipts(tmp_path: Path, response: object) -> None:
-    conn, service = await _baseline_then_fail(tmp_path / f"{type(response).__name__}.sqlite", _FailureClient(response=response))
+    conn, service = await _baseline_then_fail(
+        tmp_path / f"{type(response).__name__}.sqlite", _FailureClient(response=response)
+    )
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))

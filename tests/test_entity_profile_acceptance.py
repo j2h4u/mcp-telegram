@@ -155,9 +155,10 @@ async def test_actual_sink_loss_is_durable_and_does_not_change_pair_state(
         "SELECT status FROM entity_detail_sections WHERE entity_id=42 "
         "AND section IN ('full_profile', 'personal_channel') ORDER BY section"
     ).fetchall() == [("fresh",), ("fresh",)]
-    assert conn.execute(
-        "SELECT value FROM daemon_state WHERE key='runtime_observations_last_loss_ms'"
-    ).fetchone() is not None
+    assert (
+        conn.execute("SELECT value FROM daemon_state WHERE key='runtime_observations_last_loss_ms'").fetchone()
+        is not None
+    )
 
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()
