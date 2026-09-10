@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,6 +16,7 @@ from mcp_telegram.daemon import (
     _prime_runtime,
     _run_daemon_lifetime,
     _shutdown_sync_main_context,
+    _SyncMainContext,
 )
 from mcp_telegram.own_only import OwnOnlyContext
 from mcp_telegram.telegram_rpc_consumers import DemandKind
@@ -25,12 +28,12 @@ def _ctx(**overrides: object) -> SimpleNamespace:
         "shutdown_event": asyncio.Event(),
         "coordinator": None,
         "demand_runtime": None,
-        "handler_manager": MagicMock(),
-        "api_server": MagicMock(self_id=1, _ready=False, startup_detail="", self_profile=None),
+        "handler_manager": _HandlerStub(),
+        "api_server": _ApiStub(),
         "conn": MagicMock(),
-        "client": MagicMock(),
-        "folder_projection_worker": MagicMock(),
-        "fact_hydration_worker": MagicMock(),
+        "client": _ClientStub(),
+        "folder_projection_worker": SimpleNamespace(),
+        "fact_hydration_worker": SimpleNamespace(),
         "socket_path": Path("/tmp/mcp-telegram-test.sock"),
         "unix_server": None,
         "feedback_conn": MagicMock(),
@@ -41,8 +44,82 @@ def _ctx(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+def _typed_ctx(**overrides: object) -> _SyncMainContext:
+    return cast(_SyncMainContext, _ctx(**overrides))
+
+
+class _CoordinatorStub:
+    def __init__(self) -> None:
+        self.offered: list[DemandKind] = []
+        self.shutdown_calls = 0
+
+    def offer(self, kind: DemandKind) -> bool:
+        self.offered.append(kind)
+        return True
+
+    def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
+class _HandlerStub:
+    def __init__(self) -> None:
+        self.self_ids: list[int] = []
+        self.refresh_calls = 0
+
+    def set_self_id(self, value: int) -> None:
+        self.self_ids.append(value)
+
+    def refresh_synced_dialogs(self) -> None:
+        self.refresh_calls += 1
+
+    def unregister(self) -> None:
+        return
+
+
+class _ApiStub:
+    def __init__(self) -> None:
+        self.self_id = 1
+        self.self_profile: dict[str, object] | None = None
+        self.startup_detail = ""
+        self._ready = False
+
+    async def shutdown(self) -> None:
+        return
+
+
+class _ClientStub:
+    def __init__(self) -> None:
+        self.disconnect_calls = 0
+        self.close_scheduler_calls = 0
+        self.observer_detached = False
+
+    def is_connected(self) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        self.disconnect_calls += 1
+
+    async def close_rpc_scheduler(self) -> None:
+        self.close_scheduler_calls += 1
+
+    def set_rpc_admission_observer(self, observer: object | None) -> None:
+        self.observer_detached = observer is None
+
+
+class _ConnectionStub:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def execute(self, _sql: str, _parameters: tuple[object, ...] = ()) -> object:
+        raise sqlite3.DatabaseError("test connection")
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
 def test_sync_main_has_one_coordinator_task_and_no_retired_launcher() -> None:
-    daemon = __import__("mcp_telegram.daemon", fromlist=["sync_main"])
+    from mcp_telegram import daemon
+
     source = inspect.getsource(daemon.sync_main)
     composition = inspect.getsource(_ensure_demand_runtime)
     assert composition.count('name="telegram_demand_coordinator"') == 1
@@ -60,12 +137,12 @@ def test_sync_main_has_one_coordinator_task_and_no_retired_launcher() -> None:
 
 
 def test_startup_demands_are_offered_to_coordinator() -> None:
-    coordinator = MagicMock()
-    ctx = _ctx(coordinator=coordinator)
+    coordinator = _CoordinatorStub()
+    ctx = _typed_ctx(coordinator=coordinator)
 
     _offer_startup_demands(ctx)
 
-    assert [call.args[0] for call in coordinator.offer.call_args_list] == [
+    assert coordinator.offered == [
         DemandKind.FULL_SYNC_DM_ENROLLMENT,
         DemandKind.DIALOG_BOOTSTRAP,
         DemandKind.FULL_SYNC_PAGE,
@@ -75,40 +152,43 @@ def test_startup_demands_are_offered_to_coordinator() -> None:
 
 @pytest.mark.asyncio
 async def test_prime_runtime_waits_for_coordinator_profile_and_offers_folder() -> None:
-    coordinator = MagicMock()
-    handler = MagicMock()
-    api = SimpleNamespace(self_id=42, self_profile={"id": 42}, startup_detail="", _ready=False)
-    ctx = _ctx(
+    coordinator = _CoordinatorStub()
+    handler = _HandlerStub()
+    api = _ApiStub()
+    api.self_id = 42
+    api.self_profile = {"id": 42}
+    conn = sqlite3.connect(":memory:")
+    ctx = _typed_ctx(
         coordinator=coordinator,
         handler_manager=handler,
         api_server=api,
-        conn=MagicMock(),
-        client=MagicMock(),
+        conn=conn,
+        client=_ClientStub(),
         socket_path=Path("/tmp/mcp-telegram-test.sock"),
         own_only_context=None,
         self_profile_cadence=None,
     )
 
-    with patch(
-        "mcp_telegram.daemon._load_own_only_context",
-        new=AsyncMock(return_value=OwnOnlyContext(account_id=42)),
-    ):
-        await _prime_runtime(ctx)
+    try:
+        with patch(
+            "mcp_telegram.daemon._load_own_only_context",
+            new=AsyncMock(return_value=OwnOnlyContext(account_id=42)),
+        ):
+            await _prime_runtime(ctx)
+    finally:
+        conn.close()
 
-    handler.set_self_id.assert_called_once_with(42)
+    assert handler.self_ids == [42]
     assert ctx.own_only_context == OwnOnlyContext(account_id=42)
-    assert coordinator.offer.call_args_list == [
-        ((DemandKind.SELF_PROFILE_MAINTENANCE,),),
-        ((DemandKind.FOLDER_SNAPSHOT,),),
-    ]
+    assert coordinator.offered == [DemandKind.SELF_PROFILE_MAINTENANCE, DemandKind.FOLDER_SNAPSHOT]
     assert api._ready is True
 
 
 @pytest.mark.asyncio
 async def test_daemon_lifetime_refreshes_local_dialog_set_and_stops() -> None:
     event = asyncio.Event()
-    handler = MagicMock()
-    ctx = _ctx(shutdown_event=event, handler_manager=handler, conn=MagicMock(), client=MagicMock())
+    handler = _HandlerStub()
+    ctx = _typed_ctx(shutdown_event=event, handler_manager=handler, conn=_ConnectionStub(), client=_ClientStub())
 
     async def stop_after_refresh(_awaitable: object, *, timeout: float) -> bool:
         del timeout
@@ -121,21 +201,21 @@ async def test_daemon_lifetime_refreshes_local_dialog_set_and_stops() -> None:
     with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=stop_after_refresh):
         await _run_daemon_lifetime(ctx)
 
-    handler.refresh_synced_dialogs.assert_called_once_with()
+    assert handler.refresh_calls == 1
 
 
 @pytest.mark.asyncio
 async def test_shutdown_requests_coordinator_stop_before_connections_close() -> None:
     event = asyncio.Event()
-    coordinator = MagicMock()
-    client = MagicMock()
-    client.disconnect = AsyncMock()
-    client.close_rpc_scheduler = AsyncMock()
-    ctx = _ctx(shutdown_event=event, coordinator=coordinator, client=client)
-    ctx.api_server.shutdown = AsyncMock()
+    coordinator = _CoordinatorStub()
+    client = _ClientStub()
+    ctx = _typed_ctx(shutdown_event=event, coordinator=coordinator, client=client)
+    ctx.conn = cast(sqlite3.Connection, _ConnectionStub())
 
     await _shutdown_sync_main_context(ctx)
 
-    coordinator.shutdown.assert_called_once_with()
-    client.disconnect.assert_awaited_once_with()
-    ctx.conn.close.assert_called_once_with()
+    assert coordinator.shutdown_calls == 1
+    assert client.disconnect_calls == 1
+    assert client.close_scheduler_calls == 1
+    assert client.observer_detached
+    assert cast(_ConnectionStub, ctx.conn).close_calls == 1
