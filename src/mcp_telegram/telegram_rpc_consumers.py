@@ -812,46 +812,68 @@ def _validate_contract_limits(
         raise RuntimeError(f"Telegram demand source {contract.source.value} has inconsistent outstanding limits")
 
 
-def _validate_contract_durable_policy(kind: DemandKind, contract: DemandContract) -> None:
-    if contract.freshness_target is not None and (
-        not isinstance(contract.freshness_target, timedelta) or contract.freshness_target <= timedelta(0)
-    ):
+def _validate_contract_freshness(kind: DemandKind, contract: DemandContract) -> None:
+    target = contract.freshness_target
+    if target is not None and (not isinstance(target, timedelta) or target <= timedelta(0)):
         raise RuntimeError(f"Telegram demand contract {kind.value} has an invalid freshness target")
+
+
+def _validate_durable_slice_bound(kind: DemandKind, contract: DemandContract) -> None:
+    bound = contract.max_rpc_attempts_per_slice
+    if isinstance(bound, bool) or not isinstance(bound, int) or bound < 1:
+        raise RuntimeError(f"Durable demand contract {kind.value} must have a positive slice bound")
+
+
+def _validate_durable_producer(kind: DemandKind, contract: DemandContract) -> None:
+    producer = _REGISTRY[contract.source].demand
+    if producer.owner is not DemandPolicyOwner.PRODUCER or producer.bound not in {
+        DemandBound.PRODUCER_BOUNDED,
+        DemandBound.PRODUCER_RESUMABLE,
+    }:
+        raise RuntimeError(f"Durable demand contract {kind.value} must be producer-bounded or resumable")
+
+
+def _validate_contract_durable_policy(kind: DemandKind, contract: DemandContract) -> None:
+    _validate_contract_freshness(kind, contract)
     if contract.execution_mode is ExecutionMode.DURABLE:
-        if (
-            isinstance(contract.max_rpc_attempts_per_slice, bool)
-            or not isinstance(contract.max_rpc_attempts_per_slice, int)
-            or contract.max_rpc_attempts_per_slice < 1
-        ):
-            raise RuntimeError(f"Durable demand contract {kind.value} must have a positive slice bound")
-        producer = _REGISTRY[contract.source].demand
-        if producer.owner is not DemandPolicyOwner.PRODUCER or producer.bound not in {
-            DemandBound.PRODUCER_BOUNDED,
-            DemandBound.PRODUCER_RESUMABLE,
-        }:
-            raise RuntimeError(f"Durable demand contract {kind.value} must be producer-bounded or resumable")
-    elif contract.max_rpc_attempts_per_slice is not None or contract.freshness_target is not None:
+        _validate_durable_slice_bound(kind, contract)
+        _validate_durable_producer(kind, contract)
+        return
+    if contract.max_rpc_attempts_per_slice is not None or contract.freshness_target is not None:
         raise RuntimeError(f"Non-durable demand contract {kind.value} has durable-only policy")
 
 
-def validate_demand_contracts(contracts: Mapping[DemandKind, DemandContract]) -> None:
-    """Fail startup when demand policy is incomplete or internally inconsistent."""
+def _validate_contract_coverage(contracts: Mapping[DemandKind, DemandContract]) -> None:
     if set(contracts) != set(DemandKind):
         raise RuntimeError("Telegram demand contracts must cover every demand kind exactly once")
     if any(not isinstance(contract, DemandContract) for contract in contracts.values()):
         raise RuntimeError("Telegram demand contracts contain an invalid record")
     if {contract.source for contract in contracts.values()} != set(TelegramRpcSource):
         raise RuntimeError("Telegram demand contracts must cover every RPC source")
-    if (
-        not isinstance(DURABLE_DEMAND_ORDER, tuple)
-        or len(DURABLE_DEMAND_ORDER) != _EXPECTED_DURABLE_DEMAND_COUNT
-        or any(not isinstance(kind, DemandKind) for kind in DURABLE_DEMAND_ORDER)
-        or len(set(DURABLE_DEMAND_ORDER)) != _EXPECTED_DURABLE_DEMAND_COUNT
-    ):
+
+
+def _validate_durable_order() -> None:
+    if not isinstance(DURABLE_DEMAND_ORDER, tuple):
         raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+    if len(DURABLE_DEMAND_ORDER) != _EXPECTED_DURABLE_DEMAND_COUNT:
+        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+    if any(not isinstance(kind, DemandKind) for kind in DURABLE_DEMAND_ORDER):
+        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+    if len(set(DURABLE_DEMAND_ORDER)) != _EXPECTED_DURABLE_DEMAND_COUNT:
+        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+
+
+def _validate_durable_modes(contracts: Mapping[DemandKind, DemandContract]) -> None:
     durable_kinds = {kind for kind, contract in contracts.items() if contract.execution_mode is ExecutionMode.DURABLE}
     if durable_kinds != set(DURABLE_DEMAND_ORDER):
         raise RuntimeError("Durable demand contracts must match the explicit durable demand order")
+
+
+def validate_demand_contracts(contracts: Mapping[DemandKind, DemandContract]) -> None:
+    """Fail startup when demand policy is incomplete or internally inconsistent."""
+    _validate_contract_coverage(contracts)
+    _validate_durable_order()
+    _validate_durable_modes(contracts)
     source_limits: dict[TelegramRpcSource, int] = {}
     for kind, contract in contracts.items():
         _validate_contract_identity(kind, contract)
