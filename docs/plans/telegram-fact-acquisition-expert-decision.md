@@ -205,6 +205,9 @@ Extend bounded operational telemetry with:
 - queue age and freshness debt;
 - prevented requests only when a real acquisition need was satisfied locally.
 
+Exact event fields and denominator definitions are maintained in
+[Telegram fact acquisition telemetry](../telegram-fact-acquisition-telemetry.md).
+
 Returned rows and newly materialized rows measure projection overlap, not by
 themselves unnecessary RPCs.
 

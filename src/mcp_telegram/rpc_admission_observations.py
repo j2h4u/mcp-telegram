@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, TypedDict, cast
 
 from .telegram_demand import AcquisitionKind
 from .telegram_rpc_consumers import DemandKind
@@ -68,6 +68,46 @@ class DemandObservationHook(Protocol):
 
 # Compatibility name for composition code that still refers to demand evidence.
 DemandEvidenceObserver = DemandObservationHook
+
+
+class ProfilePairObservationHook(Protocol):
+    """Best-effort aggregate observer for Entity Profile pair lifecycles."""
+
+    def observe_profile_pair(  # noqa: PLR0913 - this is the privacy-safe boundary
+        self,
+        *,
+        mode: str,
+        eligible_pair: bool,
+        outcome: str,
+        actual_attempts: int = 0,
+        retries: int = 0,
+        full_profile_outcome: str | None = None,
+        personal_channel_outcome: str | None = None,
+        pair_ready: bool = False,
+        pair_readiness_latency_ms: float | None = None,
+        local_satisfaction: bool = False,
+        prevented_request: bool = False,
+        reuse_rejection_reason: str | None = None,
+        reused_age_ms: float | None = None,
+        stale_writer_rejected: bool = False,
+    ) -> None: ...
+
+
+class _ProfileObservationValues(TypedDict):
+    mode: str
+    eligible_pair: bool
+    outcome: str
+    actual_attempts: int
+    retries: int
+    full_profile_outcome: str | None
+    personal_channel_outcome: str | None
+    pair_ready: bool
+    pair_readiness_latency_ms: float | None
+    local_satisfaction: bool
+    prevented_request: bool
+    reuse_rejection_reason: str | None
+    reused_age_ms: float | None
+    stale_writer_rejected: bool
 
 
 _DEMAND_EVIDENCE_OUTCOMES = frozenset(
@@ -146,6 +186,7 @@ class RpcAdmissionObservationAggregator:
             tuple[DemandKind, AcquisitionKind | None, DemandEvidenceOutcome, str | None],
             _DemandAggregate,
         ] = {}
+        self._profile_aggregates: dict[tuple[object, ...], _ProfilePairAggregate] = {}
         self._state_lock = threading.Lock()
         self._flush_lock = threading.Lock()
 
@@ -202,6 +243,71 @@ class RpcAdmissionObservationAggregator:
         except Exception:  # noqa: BLE001 - telemetry cannot break demand producers
             return
 
+    def observe_profile_pair(  # noqa: PLR0913 - explicit bounded evidence dimensions
+        self,
+        *,
+        mode: str,
+        eligible_pair: bool,
+        outcome: str,
+        actual_attempts: int = 0,
+        retries: int = 0,
+        full_profile_outcome: str | None = None,
+        personal_channel_outcome: str | None = None,
+        pair_ready: bool = False,
+        pair_readiness_latency_ms: float | None = None,
+        local_satisfaction: bool = False,
+        prevented_request: bool = False,
+        reuse_rejection_reason: str | None = None,
+        reused_age_ms: float | None = None,
+        stale_writer_rejected: bool = False,
+    ) -> None:
+        """Aggregate one profile lifecycle without retaining work identity.
+
+        ``actual_attempts`` is deliberately separate from the transport
+        admission aggregate.  It describes the profile operation's own
+        GetFullUser dispatches and is never added to admission counters.
+        """
+        try:
+            values = _validate_profile_observation(
+                mode=mode,
+                eligible_pair=eligible_pair,
+                outcome=outcome,
+                actual_attempts=actual_attempts,
+                retries=retries,
+                full_profile_outcome=full_profile_outcome,
+                personal_channel_outcome=personal_channel_outcome,
+                pair_ready=pair_ready,
+                pair_readiness_latency_ms=pair_readiness_latency_ms,
+                local_satisfaction=local_satisfaction,
+                prevented_request=prevented_request,
+                reuse_rejection_reason=reuse_rejection_reason,
+                reused_age_ms=reused_age_ms,
+                stale_writer_rejected=stale_writer_rejected,
+            )
+            key = (
+                values["mode"],
+                values["eligible_pair"],
+                values["outcome"],
+                values["full_profile_outcome"],
+                values["personal_channel_outcome"],
+                values["local_satisfaction"],
+                values["prevented_request"],
+                values["reuse_rejection_reason"],
+                values["stale_writer_rejected"],
+            )
+            with self._state_lock:
+                aggregate = self._profile_aggregates.setdefault(key, _ProfilePairAggregate())
+                aggregate.add(
+                    actual_attempts=values["actual_attempts"],
+                    retries=values["retries"],
+                    pair_ready=values["pair_ready"],
+                    pair_readiness_latency_ms=values["pair_readiness_latency_ms"],
+                    reused_age_ms=values["reused_age_ms"],
+                )
+            self.flush_if_due()
+        except Exception:  # noqa: BLE001 - telemetry cannot affect profile correctness
+            return
+
     def flush_if_due(self) -> None:
         now = self._clock()
         with self._state_lock:
@@ -223,7 +329,7 @@ class RpcAdmissionObservationAggregator:
         finally:
             self._flush_lock.release()
 
-    def _flush_locked(self, *, now: float | None) -> None:
+    def _flush_locked(self, *, now: float | None) -> None:  # noqa: PLR0912, PLR0914, PLR0915
         """Persist one snapshot while serialising source/class summaries."""
         flush_at = self._clock() if now is None else now
         with self._state_lock:
@@ -236,7 +342,7 @@ class RpcAdmissionObservationAggregator:
                 aggregate.wait_total_seconds * _MILLISECONDS_PER_SECOND / dispatched if dispatched else None
             )
             try:
-                payload: dict[str, object] = {
+                admission_payload: dict[str, object] = {
                     "source": source.value,
                     "service_class": service_class.value,
                     "queued_count": aggregate.queued_count,
@@ -249,16 +355,16 @@ class RpcAdmissionObservationAggregator:
                     "window_seconds": self._summary_interval_seconds,
                 }
                 if demand_kind is not None:
-                    payload["demand_kind"] = demand_kind.value
-                    payload["actual_attempts"] = dispatched
+                    admission_payload["demand_kind"] = demand_kind.value
+                    admission_payload["actual_attempts"] = dispatched
                 if acquisition_kind is not None:
-                    payload["acquisition_kind"] = acquisition_kind.value
+                    admission_payload["acquisition_kind"] = acquisition_kind.value
                 self._recorder.record(
                     kind="telegram.rpc_admission",
                     outcome="summary",
                     duration_ms=average_wait_ms,
                     result_count=dispatched,
-                    payload=payload,
+                    payload=admission_payload,
                 )
             except Exception:
                 with self._state_lock:
@@ -302,6 +408,60 @@ class RpcAdmissionObservationAggregator:
                     None if acquisition_kind is None else acquisition_kind.value,
                     outcome.value,
                 )
+        with self._state_lock:
+            profile_aggregates, self._profile_aggregates = self._profile_aggregates, {}
+        for key, aggregate in profile_aggregates.items():
+            (
+                mode,
+                eligible_pair,
+                outcome,
+                full_profile_outcome,
+                personal_channel_outcome,
+                local_satisfaction,
+                prevented_request,
+                reuse_rejection_reason,
+                stale_writer_rejected,
+            ) = key
+            try:
+                payload: dict[str, object] = {
+                    "mode": mode,
+                    "eligible_pair": eligible_pair,
+                    "event_count": aggregate.event_count,
+                    "actual_attempts": aggregate.actual_attempts,
+                    "retries": aggregate.retries,
+                    "pair_ready_count": aggregate.pair_ready_count,
+                    "local_satisfaction": local_satisfaction,
+                    "prevented_request": prevented_request,
+                    "stale_writer_rejected": stale_writer_rejected,
+                    "window_seconds": self._summary_interval_seconds,
+                }
+                if full_profile_outcome is not None:
+                    payload["full_profile_outcome"] = full_profile_outcome
+                if personal_channel_outcome is not None:
+                    payload["personal_channel_outcome"] = personal_channel_outcome
+                if reuse_rejection_reason is not None:
+                    payload["reuse_rejection_reason"] = reuse_rejection_reason
+                if aggregate.readiness_latency_count:
+                    payload["pair_readiness_latency_ms"] = (
+                        aggregate.readiness_latency_total_ms / aggregate.readiness_latency_count
+                    )
+                if aggregate.reused_age_count:
+                    payload["reused_age_ms"] = aggregate.reused_age_max_ms
+                self._recorder.record(
+                    kind="entity_profile.pair",
+                    outcome=cast(str, outcome),
+                    result_count=aggregate.event_count,
+                    duration_ms=(
+                        aggregate.readiness_latency_total_ms / aggregate.readiness_latency_count
+                        if aggregate.readiness_latency_count
+                        else None
+                    ),
+                    payload=payload,
+                )
+            except Exception:  # noqa: BLE001 - telemetry cannot affect profile correctness
+                with self._state_lock:
+                    self._profile_aggregates.setdefault(key, _ProfilePairAggregate()).merge(aggregate)
+                logger.debug("entity_profile_pair_summary_flush_failed")
 
     def _aggregate(self, event: RpcAdmissionEvent) -> None:
         if event.source is None or event.service_class is None:
@@ -361,6 +521,48 @@ class _DemandAggregate:
         )
 
 
+@dataclass(slots=True)
+class _ProfilePairAggregate:
+    event_count: int = 0
+    actual_attempts: int = 0
+    retries: int = 0
+    pair_ready_count: int = 0
+    readiness_latency_total_ms: float = 0.0
+    readiness_latency_count: int = 0
+    reused_age_max_ms: float = 0.0
+    reused_age_count: int = 0
+
+    def add(
+        self,
+        *,
+        actual_attempts: int,
+        retries: int,
+        pair_ready: bool,
+        pair_readiness_latency_ms: float | None,
+        reused_age_ms: float | None,
+    ) -> None:
+        self.event_count += 1
+        self.actual_attempts += actual_attempts
+        self.retries += retries
+        self.pair_ready_count += int(pair_ready)
+        if pair_readiness_latency_ms is not None:
+            self.readiness_latency_total_ms += pair_readiness_latency_ms
+            self.readiness_latency_count += 1
+        if reused_age_ms is not None:
+            self.reused_age_max_ms = max(self.reused_age_max_ms, reused_age_ms)
+            self.reused_age_count += 1
+
+    def merge(self, other: _ProfilePairAggregate) -> None:
+        self.event_count += other.event_count
+        self.actual_attempts += other.actual_attempts
+        self.retries += other.retries
+        self.pair_ready_count += other.pair_ready_count
+        self.readiness_latency_total_ms += other.readiness_latency_total_ms
+        self.readiness_latency_count += other.readiness_latency_count
+        self.reused_age_max_ms = max(self.reused_age_max_ms, other.reused_age_max_ms)
+        self.reused_age_count += other.reused_age_count
+
+
 def _demand_payload(
     *,
     demand_kind: DemandKind,
@@ -381,6 +583,89 @@ def _demand_payload(
     if aggregate.freshness_debt_seconds is not None:
         payload["freshness_debt_seconds"] = aggregate.freshness_debt_seconds
     return payload
+
+
+_PROFILE_MODES = frozenset({"enabled", "disabled", "observe_only"})
+_PROFILE_OUTCOMES = frozenset({"committed", "reused", "failed", "stale_writer_rejected", "section_committed"})
+_PROFILE_SECTION_OUTCOMES = frozenset({"usable", "partial", "absent", "unavailable"})
+_PROFILE_REUSE_REASONS = frozenset(
+    {
+        "missing_identity",
+        "missing_receipt",
+        "outcome_not_reusable",
+        "identity_mismatch",
+        "materialization_mismatch",
+        "invalid_observation",
+        "stale",
+        "section_not_fresh",
+        "cursor_mismatch",
+        "ineligible_pair",
+        "auth_scope_changed",
+    }
+)
+
+
+def _validate_profile_observation(  # noqa: PLR0913 - explicit bounded telemetry contract
+    *,
+    mode: str,
+    eligible_pair: bool,
+    outcome: str,
+    actual_attempts: int,
+    retries: int,
+    full_profile_outcome: str | None,
+    personal_channel_outcome: str | None,
+    pair_ready: bool,
+    pair_readiness_latency_ms: float | None,
+    local_satisfaction: bool,
+    prevented_request: bool,
+    reuse_rejection_reason: str | None,
+    reused_age_ms: float | None,
+    stale_writer_rejected: bool,
+) -> _ProfileObservationValues:
+    if mode not in _PROFILE_MODES or outcome not in _PROFILE_OUTCOMES:
+        raise ValueError("profile telemetry mode or outcome is invalid")
+    for value, name in (
+        (eligible_pair, "eligible_pair"),
+        (pair_ready, "pair_ready"),
+        (local_satisfaction, "local_satisfaction"),
+        (prevented_request, "prevented_request"),
+        (stale_writer_rejected, "stale_writer_rejected"),
+    ):
+        if not isinstance(value, bool):
+            raise TypeError(f"{name} must be a boolean")
+    _validate_nonnegative_int(actual_attempts, "actual_attempts")
+    _validate_nonnegative_int(retries, "retries")
+    for value, name in (
+        (pair_readiness_latency_ms, "pair_readiness_latency_ms"),
+        (reused_age_ms, "reused_age_ms"),
+    ):
+        _validate_optional_nonnegative_number(value, name)
+    for value, name in (
+        (full_profile_outcome, "full_profile_outcome"),
+        (personal_channel_outcome, "personal_channel_outcome"),
+    ):
+        if value is not None and value not in _PROFILE_SECTION_OUTCOMES:
+            raise ValueError(f"{name} is invalid")
+    if reuse_rejection_reason is not None and reuse_rejection_reason not in _PROFILE_REUSE_REASONS:
+        raise ValueError("reuse_rejection_reason is invalid")
+    if retries > actual_attempts:
+        raise ValueError("retries cannot exceed actual_attempts")
+    return {
+        "mode": mode,
+        "eligible_pair": eligible_pair,
+        "outcome": outcome,
+        "actual_attempts": actual_attempts,
+        "retries": retries,
+        "full_profile_outcome": full_profile_outcome,
+        "personal_channel_outcome": personal_channel_outcome,
+        "pair_ready": pair_ready,
+        "pair_readiness_latency_ms": pair_readiness_latency_ms,
+        "local_satisfaction": local_satisfaction,
+        "prevented_request": prevented_request,
+        "reuse_rejection_reason": reuse_rejection_reason,
+        "reused_age_ms": reused_age_ms,
+        "stale_writer_rejected": stale_writer_rejected,
+    }
 
 
 def _is_finite(value: int | float) -> bool:
@@ -428,6 +713,7 @@ __all__ = [
     "DemandEvidenceOutcome",
     "DemandObservationHook",
     "ObservationRecorder",
+    "ProfilePairObservationHook",
     "RpcAdmissionObservationAggregator",
     "RpcAdmissionObservationPolicy",
 ]

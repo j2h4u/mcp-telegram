@@ -94,6 +94,7 @@ from .folders.read_model import dialog_placement, folder_snapshot, folder_summar
 from .history_enrollment import disable_history, enable_history, read_intent
 from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
+from .rpc_admission_observations import ProfilePairObservationHook
 from .runtime_observations import (
     RuntimeObservationPolicy,
     prune_runtime_observations,
@@ -564,6 +565,7 @@ class DaemonAPIServer:
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
         self._entity_info_service: DaemonEntityInfoService | None = None
         self._demand_sink: DemandOfferSink | None = None
+        self._profile_observer: ProfilePairObservationHook | None = None
         self._conversation_changes_token_codec = ConversationChangesTokenCodec()
 
     def bind_demand_sink(self, sink: DemandOfferSink) -> None:
@@ -571,6 +573,12 @@ class DaemonAPIServer:
         self._demand_sink = sink
         if self._entity_info_service is not None:
             self._entity_info_service.bind_demand_sink(sink)
+
+    def bind_profile_observer(self, observer: ProfilePairObservationHook) -> None:
+        """Attach the process-wide profile telemetry observer after startup composition."""
+        self._profile_observer = observer
+        if self._entity_info_service is not None:
+            self._entity_info_service.bind_profile_observer(observer)
 
     def _publish_auth_scope(self, scope: TelegramAuthScope | None) -> None:
         """Publish private session identity to already-composed domain services."""
@@ -1574,6 +1582,7 @@ class DaemonAPIServer:
                     refresh_limits=self._policy.entity_profile,
                     enable_full_user_pair=self._policy.full_user_pair_enabled,
                     full_user_auth_scope=lambda: self._auth_scope,
+                    profile_observer=self._profile_observer,
                 )
             )
             if self._demand_sink is not None:

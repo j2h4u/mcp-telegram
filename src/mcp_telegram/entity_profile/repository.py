@@ -33,6 +33,10 @@ _EVIDENCE_MAX_JSON_BYTES = 4096
 _SECTION_STATUSES = {"fresh", "stale", "pending", "unavailable", "not_applicable"}
 
 
+def _is_nonnegative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 @dataclass(frozen=True, slots=True)
 class StoredProfile:
     detail: dict[str, object]
@@ -160,6 +164,49 @@ class EntityProfileRepository:
                 (now, PROFILE_SECTIONS[1], *parameters),
             ).rowcount
             return changed == 1
+
+    def full_user_pair_reuse_rejection_reason(  # noqa: PLR0911, PLR0912
+        self,
+        cursor: EntityRefreshCursor,
+        identity: Mapping[str, object] | None,
+        *,
+        now: int,
+    ) -> str | None:
+        """Return a bounded reason why a pair receipt cannot suppress work."""
+        if cursor.next_section != "full_profile":
+            return "cursor_mismatch"
+        if not cursor.pair_eligible:
+            return "ineligible_pair"
+        if identity is None:
+            return "missing_identity"
+        for section in ("full_profile", "personal_channel"):
+            evidence = self.read_section_evidence(cursor.entity_id, section)
+            if evidence is None:
+                return "missing_receipt"
+            if evidence.get("outcome") not in {"usable", "absent"}:
+                return "outcome_not_reusable"
+            stored_identity = evidence.get("identity")
+            if not isinstance(stored_identity, dict) or dict(identity) != stored_identity:
+                return "identity_mismatch"
+            if not self._receipt_materialization_is_exact(cursor.entity_id, section, evidence):
+                return "materialization_mismatch"
+            started_at = evidence.get("observation_started_at")
+            completed_at = evidence.get("observation_completed_at")
+            if not _is_nonnegative_int(started_at) or not _is_nonnegative_int(completed_at):
+                return "invalid_observation"
+            started_at_int = cast(int, started_at)
+            completed_at_int = cast(int, completed_at)
+            if completed_at_int < started_at_int or completed_at_int > now:
+                return "invalid_observation"
+            row = self._conn.execute(
+                "SELECT status, observed_at FROM entity_detail_sections WHERE entity_id=? AND section=?",
+                (cursor.entity_id, section),
+            ).fetchone()
+            if row is None or row[0] != "fresh":
+                return "section_not_fresh"
+            if row[1] != started_at_int or now >= started_at_int + self._section_ttl_seconds:
+                return "stale"
+        return None
 
     def pair_receipts_require_new_scope(
         self,

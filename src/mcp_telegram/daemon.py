@@ -1123,6 +1123,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         rpc_observation_sink,
         policy=config.telemetry.runtime_observations,
     )
+    api_server.bind_profile_observer(rpc_admission_observer)
     ctx = _SyncMainContext(
         db_path=db_path,
         conn=conn,
@@ -1522,6 +1523,21 @@ def _persist_runtime_observation_loss(ctx: _SyncMainContext) -> None:
         return
     queue_full_drops, _shutdown_drops, _startup_drops, _rejected_submissions, writer_failures = counts
     with ctx.conn:
+        try:
+            record_runtime_observation(
+                ctx.conn,
+                kind="runtime.telemetry_loss",
+                outcome="loss",
+                payload={
+                    "queue_full_drops": queue_full_drops,
+                    "shutdown_grace_drops": counts[1],
+                    "startup_drops": counts[2],
+                    "rejected_submissions": counts[3],
+                    "writer_failures": writer_failures,
+                },
+            )
+        except sqlite3.Error:
+            logger.debug("runtime_observation_loss_event_failed")
         ctx.conn.executemany(
             "INSERT OR REPLACE INTO daemon_state(key,value) VALUES (?,?)",
             (
