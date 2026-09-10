@@ -6,7 +6,12 @@ aggregated over the configured runtime observation window and contain no
 account, entity, session, generation, selector, content, exception text, or
 stable fingerprint.
 
-Each summary has an explicit `event_count` denominator and these dimensions:
+Each completed generation produces at most one summary. The refresh state keeps
+the mode, eligibility, section outcomes, actual dispatch and retry counts,
+readiness timestamp, completeness bit, and a summary watermark. A generation
+without both durable section outcomes, with a mode mismatch, or with lost
+measurement is excluded from the completed-pair denominator. Each emitted
+summary has an explicit `event_count` denominator and these dimensions:
 
 - `mode`: `enabled` or `disabled` (the feature switch state);
 - `eligible_pair`: both `full_profile` and `personal_channel` required work at
@@ -23,6 +28,8 @@ Each summary has an explicit `event_count` denominator and these dimensions:
 - `reused_age_ms`: maximum age of reused observations in the summary;
 - `pair_readiness_latency_ms`: average original observation-to-commit latency;
 - `stale_writer_rejected`: a response lost the repository fence.
+- `measurement_complete`: the generation had complete pair attribution when
+  the summary was taken.
 
 `telegram.rpc_admission` remains the authoritative transport admission stream.
 Profile `actual_attempts` is intentionally independent and is not added to

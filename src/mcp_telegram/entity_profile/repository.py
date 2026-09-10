@@ -15,7 +15,7 @@ import json
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import cast
+from typing import ClassVar, cast
 
 from ..entity_store import EntitySnapshot, upsert_entity_snapshots
 from ..models import DialogType
@@ -57,6 +57,7 @@ class EntityRefreshCursor:
     pair_eligible: bool = False
     follow_up_required: bool = False
     profile_revision: int = 0
+    pair_mode: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +81,46 @@ class EntityProfileRepository:
         self._refresh_columns: set[str] | None = None
         self._section_columns: set[str] | None = None
         self._detail_columns: set[str] | None = None
+        self._ensure_pair_measurement_columns()
+
+    _PAIR_MEASUREMENT_COLUMNS: ClassVar[dict[str, str]] = {
+        "pair_mode": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_mode TEXT",
+        "pair_full_profile_outcome": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_full_profile_outcome TEXT",
+        "pair_personal_channel_outcome": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_personal_channel_outcome TEXT",
+        "pair_full_profile_attempts": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_full_profile_attempts INTEGER NOT NULL DEFAULT 0",
+        "pair_personal_channel_attempts": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_personal_channel_attempts INTEGER NOT NULL DEFAULT 0",
+        "pair_full_profile_retries": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_full_profile_retries INTEGER NOT NULL DEFAULT 0",
+        "pair_personal_channel_retries": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_personal_channel_retries INTEGER NOT NULL DEFAULT 0",
+        "pair_attempts": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_attempts INTEGER NOT NULL DEFAULT 0",
+        "pair_retries": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_retries INTEGER NOT NULL DEFAULT 0",
+        "pair_ready_at": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_ready_at INTEGER",
+        "pair_readiness_latency_ms": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_readiness_latency_ms REAL",
+        "pair_measurement_complete": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_measurement_complete INTEGER NOT NULL DEFAULT 0",
+        "pair_summary_watermark": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_summary_watermark INTEGER",
+    }
+
+    def _ensure_pair_measurement_columns(self) -> None:
+        """Repair the additive measurement columns for lightweight test schemas.
+
+        The production migration creates these columns.  A few repository
+        fixtures intentionally construct only the fenced profile tables, so
+        keeping this idempotent compatibility repair here lets those fixtures
+        exercise the same durable contract.
+        """
+        try:
+            columns = {
+                str(row[1])
+                for row in self._conn.execute("PRAGMA table_info(entity_profile_refresh_state)").fetchall()
+            }
+            changed = False
+            for column, statement in self._PAIR_MEASUREMENT_COLUMNS.items():
+                if column not in columns:
+                    self._conn.execute(statement)
+                    changed = True
+            if changed:
+                self._conn.commit()
+        except sqlite3.OperationalError:
+            return
 
     def _columns(self, table: str, attribute: str) -> set[str]:
         columns = getattr(self, attribute)
@@ -385,7 +426,14 @@ class EntityProfileRepository:
             selected = ["status", "retry_at", "reason"]
             selected.extend(
                 column
-                for column in ("generation", "started_at", "pair_eligible", "follow_up_required", "profile_revision")
+                for column in (
+                    "generation",
+                    "started_at",
+                    "pair_eligible",
+                    "follow_up_required",
+                    "profile_revision",
+                    "pair_mode",
+                )
                 if column in columns
             )
             row = self._conn.execute(
@@ -414,6 +462,7 @@ class EntityProfileRepository:
         now: int,
         reason: str = "refresh_queued",
         pair_eligible_override: bool | None = None,
+        pair_mode_override: str | None = None,
     ) -> None:
         """Make pending explicit where the additive section table is present."""
         try:
@@ -423,6 +472,7 @@ class EntityProfileRepository:
                     now=now,
                     reason=reason,
                     pair_eligible_override=pair_eligible_override,
+                    pair_mode_override=pair_mode_override,
                 )
                 self._conn.executemany(
                     "INSERT INTO entity_detail_sections(entity_id, section, status, observed_at, reason, payload_json, retry_at) "
@@ -437,11 +487,22 @@ class EntityProfileRepository:
         except sqlite3.OperationalError:
             return
 
-    def mark_refresh_queued(self, entity_id: int, *, reason: str = "refresh_queued") -> None:
+    def mark_refresh_queued(
+        self,
+        entity_id: int,
+        *,
+        reason: str = "refresh_queued",
+        pair_mode_override: str | None = None,
+    ) -> None:
         """Clear rejection state and restore an honest queued reason."""
         try:
             with self._conn:
-                self._upsert_pending_refresh(entity_id, now=self._database_now(), reason=reason)
+                self._upsert_pending_refresh(
+                    entity_id,
+                    now=self._database_now(),
+                    reason=reason,
+                    pair_mode_override=pair_mode_override,
+                )
                 self._conn.execute(
                     "UPDATE entity_detail_sections SET status='pending', reason=?, retry_at=NULL "
                     "WHERE entity_id=? AND status IN ('pending', 'stale', 'unavailable')",
@@ -457,20 +518,26 @@ class EntityProfileRepository:
         now: int,
         reason: str,
         pair_eligible_override: bool | None = None,
+        pair_mode_override: str | None = None,
     ) -> None:
         if self._refresh_has("generation"):
+            new_generation = False
             existing = self._conn.execute(
-                "SELECT status, generation, started_at, pair_eligible, follow_up_required, profile_revision "
+                "SELECT status, generation, started_at, pair_eligible, follow_up_required, profile_revision, pair_mode "
                 "FROM entity_profile_refresh_state WHERE entity_id=?",
                 (entity_id,),
             ).fetchone()
             if existing is not None and str(existing[0]) == "pending" and int(existing[1] or 0) > 0:
                 generation = int(existing[1])
                 started_at = existing[2]
-                pair_eligible = int(existing[3] or 0) if pair_eligible_override is None else int(pair_eligible_override)
+                # Eligibility is a generation fact.  A repeated enqueue or
+                # auth-scope wakeup must not rewrite it while work is active.
+                pair_eligible = int(existing[3] or 0)
                 follow_up_required = int(existing[4] or 0)
                 profile_revision = int(existing[5] or 0)
+                pair_mode = existing[6] if pair_mode_override is None else pair_mode_override
             else:
+                new_generation = True
                 previous_generation = int(existing[1] or 0) if existing is not None else 0
                 generation = max(1, previous_generation + 1)
                 started_at = now
@@ -481,13 +548,14 @@ class EntityProfileRepository:
                 )
                 follow_up_required = 0
                 profile_revision = self._profile_revision(entity_id)
+                pair_mode = pair_mode_override
             self._conn.execute(
                 """
                 INSERT INTO entity_profile_refresh_state(
                     entity_id, status, retry_at, reason, updated_at, next_section,
                     acquisition_cursor, generation, started_at, pair_eligible,
-                    follow_up_required, profile_revision
-                ) VALUES (?, 'pending', NULL, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+                    follow_up_required, profile_revision, pair_mode
+                ) VALUES (?, 'pending', NULL, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(entity_id) DO UPDATE SET
                     status='pending', retry_at=NULL, reason=excluded.reason,
                     updated_at=excluded.updated_at, next_section=CASE
@@ -504,7 +572,8 @@ class EntityProfileRepository:
                     started_at=excluded.started_at,
                     pair_eligible=excluded.pair_eligible,
                     follow_up_required=excluded.follow_up_required,
-                    profile_revision=excluded.profile_revision
+                    profile_revision=excluded.profile_revision,
+                    pair_mode=COALESCE(entity_profile_refresh_state.pair_mode, excluded.pair_mode)
                 """,
                 (
                     entity_id,
@@ -516,8 +585,19 @@ class EntityProfileRepository:
                     pair_eligible,
                     follow_up_required,
                     profile_revision,
+                    pair_mode,
                 ),
             )
+            if new_generation:
+                self._conn.execute(
+                    "UPDATE entity_profile_refresh_state SET pair_full_profile_outcome=NULL, "
+                    "pair_personal_channel_outcome=NULL, pair_full_profile_attempts=0, "
+                    "pair_personal_channel_attempts=0, pair_full_profile_retries=0, "
+                    "pair_personal_channel_retries=0, pair_attempts=0, pair_retries=0, "
+                    "pair_ready_at=NULL, pair_readiness_latency_ms=NULL, "
+                    "pair_measurement_complete=0, pair_summary_watermark=NULL WHERE entity_id=?",
+                    (entity_id,),
+                )
             return
         self._conn.execute(
             """
@@ -621,6 +701,151 @@ class EntityProfileRepository:
         if len(values) > _BASE_CURSOR_FIELD_COUNT + 3:
             values[7] = bool(values[7])
         return EntityRefreshCursor(*values)
+
+    def capture_pair_mode(self, cursor: EntityRefreshCursor, mode: str) -> str:
+        """Capture the feature mode once for a refresh generation.
+
+        A switch change while a generation is in flight must not turn a
+        disabled baseline into an enabled pair (or vice versa).  Legacy
+        fixtures can start with a NULL mode; the first durable slice fills it
+        using the current switch value.
+        """
+        if mode not in {"enabled", "disabled"}:
+            raise ValueError("pair mode must be enabled or disabled")
+        if not self._refresh_has("pair_mode"):
+            return mode
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT pair_mode FROM entity_profile_refresh_state WHERE entity_id=? AND generation=?",
+                (cursor.entity_id, cursor.generation),
+            ).fetchone()
+            if row is None:
+                return mode
+            stored = row[0] if row[0] in {"enabled", "disabled"} else None
+            if stored is not None:
+                return str(stored)
+            self._conn.execute(
+                "UPDATE entity_profile_refresh_state SET pair_mode=? WHERE entity_id=? AND generation=?",
+                (mode, cursor.entity_id, cursor.generation),
+            )
+            return mode
+
+    def record_pair_attempt(
+        self,
+        cursor: EntityRefreshCursor,
+        section: str,
+        *,
+        actual_attempts: int,
+    ) -> None:
+        """Durably attribute dispatched pair requests, including retries."""
+        if section not in {"full_profile", "personal_channel"} or actual_attempts <= 0:
+            return
+        if not isinstance(actual_attempts, int) or isinstance(actual_attempts, bool):
+            raise ValueError("actual_attempts must be a non-negative integer")
+        attempt_column = f"pair_{section}_attempts"
+        retry_column = f"pair_{section}_retries"
+        with self._conn:
+            row = self._conn.execute(
+                f"SELECT {attempt_column} FROM entity_profile_refresh_state "
+                "WHERE entity_id=? AND generation=?",
+                (cursor.entity_id, cursor.generation),
+            ).fetchone()
+            if row is None:
+                return
+            previous = int(row[0] or 0)
+            retries = max(0, previous + actual_attempts - 1) - max(0, previous - 1)
+            self._conn.execute(
+                f"UPDATE entity_profile_refresh_state SET {attempt_column}={attempt_column}+?, "
+                f"{retry_column}={retry_column}+?, pair_attempts=pair_attempts+?, "
+                "pair_retries=pair_retries+? WHERE entity_id=? AND generation=?",
+                (
+                    actual_attempts,
+                    retries,
+                    actual_attempts,
+                    retries,
+                    cursor.entity_id,
+                    cursor.generation,
+                ),
+            )
+
+    def record_pair_section_outcome(  # noqa: PLR0913
+        self,
+        cursor: EntityRefreshCursor,
+        section: str,
+        *,
+        outcome: str,
+        actual_attempts: int,
+        ready_at: int,
+        readiness_latency_ms: float | None = None,
+    ) -> dict[str, object] | None:
+        """Commit one final projection outcome and atomically take its summary.
+
+        The returned mapping is intentionally identifier-free and is emitted
+        only once, when both pair outcomes belong to this generation.
+        """
+        if section not in {"full_profile", "personal_channel"}:
+            return None
+        if outcome not in {"usable", "partial", "absent", "unavailable"}:
+            raise ValueError("invalid pair section outcome")
+        attempts = max(0, actual_attempts)
+        if not isinstance(attempts, int) or isinstance(attempts, bool):
+            raise ValueError("actual_attempts must be a non-negative integer")
+        with self._conn:
+            state = self._conn.execute(
+                "SELECT pair_mode, pair_eligible, pair_full_profile_outcome, "
+                "pair_personal_channel_outcome, pair_summary_watermark, pair_ready_at, "
+                "pair_attempts, pair_retries, pair_readiness_latency_ms "
+                "FROM entity_profile_refresh_state WHERE entity_id=? AND generation=?",
+                (cursor.entity_id, cursor.generation),
+            ).fetchone()
+            if state is None:
+                return None
+            mode = state[0] if state[0] in {"enabled", "disabled"} else None
+            if mode is None or not bool(state[1]):
+                return None
+            self.record_pair_attempt(cursor, section, actual_attempts=attempts)
+            outcome_column = (
+                "pair_full_profile_outcome" if section == "full_profile" else "pair_personal_channel_outcome"
+            )
+            self._conn.execute(
+                f"UPDATE entity_profile_refresh_state SET {outcome_column}=? WHERE entity_id=? AND generation=?",
+                (outcome, cursor.entity_id, cursor.generation),
+            )
+            current = self._conn.execute(
+                "SELECT pair_full_profile_outcome, pair_personal_channel_outcome, pair_summary_watermark, "
+                "pair_attempts, pair_retries, pair_ready_at, pair_readiness_latency_ms "
+                "FROM entity_profile_refresh_state WHERE entity_id=? AND generation=?",
+                (cursor.entity_id, cursor.generation),
+            ).fetchone()
+            if current is None or current[0] is None or current[1] is None or current[2] is not None:
+                return None
+            self._conn.execute(
+                "UPDATE entity_profile_refresh_state SET pair_measurement_complete=1, pair_ready_at=?, "
+                "pair_readiness_latency_ms=?, pair_summary_watermark=? WHERE entity_id=? AND generation=? "
+                "AND pair_summary_watermark IS NULL",
+                (
+                    ready_at,
+                    readiness_latency_ms,
+                    ready_at,
+                    cursor.entity_id,
+                    cursor.generation,
+                ),
+            )
+            if self._conn.execute("SELECT changes()").fetchone()[0] != 1:
+                return None
+            attempts_total = int(current[3] or 0)
+            retries_total = int(current[4] or 0)
+            return {
+                "mode": str(mode),
+                "eligible_pair": True,
+                "outcome": "committed",
+                "actual_attempts": attempts_total,
+                "retries": retries_total,
+                "full_profile_outcome": str(current[0]),
+                "personal_channel_outcome": str(current[1]),
+                "pair_ready": True,
+                "pair_readiness_latency_ms": readiness_latency_ms,
+            }
 
     def advance_acquisition_cursor(
         self,
@@ -952,6 +1177,8 @@ class EntityProfileRepository:
                 "WHERE entity_id=? AND status='complete'",
                 (now, now, int(self._pair_is_eligible(entity_id, now=now)), PROFILE_SECTIONS[0], entity_id),
             ).rowcount
+            if changed == 1:
+                self._reset_pair_measurement(entity_id)
             return changed == 1
 
     def _refresh_follow_up_required(self, cursor: EntityRefreshCursor) -> bool:
@@ -963,7 +1190,7 @@ class EntityProfileRepository:
 
     def _start_follow_up_generation(self, cursor: EntityRefreshCursor, *, now: int) -> int:
         predicate, parameters = self._cursor_predicate(cursor)
-        return self._conn.execute(
+        changed = self._conn.execute(
             "UPDATE entity_profile_refresh_state SET status='pending', retry_at=NULL, "
             "reason='refresh_follow_up', updated_at=?, generation=generation+1, started_at=?, "
             "pair_eligible=?, follow_up_required=0, next_section=?, acquisition_cursor=0 "
@@ -976,6 +1203,20 @@ class EntityProfileRepository:
                 *parameters,
             ),
         ).rowcount
+        if changed == 1:
+            self._reset_pair_measurement(cursor.entity_id)
+        return changed
+
+    def _reset_pair_measurement(self, entity_id: int) -> None:
+        self._conn.execute(
+            "UPDATE entity_profile_refresh_state SET pair_full_profile_outcome=NULL, "
+            "pair_personal_channel_outcome=NULL, pair_full_profile_attempts=0, "
+            "pair_personal_channel_attempts=0, pair_full_profile_retries=0, "
+            "pair_personal_channel_retries=0, pair_attempts=0, pair_retries=0, "
+            "pair_ready_at=NULL, pair_readiness_latency_ms=NULL, "
+            "pair_measurement_complete=0, pair_summary_watermark=NULL WHERE entity_id=?",
+            (entity_id,),
+        )
 
     def _advance_completed_section(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
         next_section = _next_profile_section(cursor.next_section)

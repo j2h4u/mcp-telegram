@@ -90,6 +90,7 @@ class ProfilePairObservationHook(Protocol):
         reuse_rejection_reason: str | None = None,
         reused_age_ms: float | None = None,
         stale_writer_rejected: bool = False,
+        measurement_complete: bool = True,
     ) -> None: ...
 
 
@@ -108,6 +109,7 @@ class _ProfileObservationValues(TypedDict):
     reuse_rejection_reason: str | None
     reused_age_ms: float | None
     stale_writer_rejected: bool
+    measurement_complete: bool
 
 
 _DEMAND_EVIDENCE_OUTCOMES = frozenset(
@@ -260,6 +262,7 @@ class RpcAdmissionObservationAggregator:
         reuse_rejection_reason: str | None = None,
         reused_age_ms: float | None = None,
         stale_writer_rejected: bool = False,
+        measurement_complete: bool = True,
     ) -> None:
         """Aggregate one profile lifecycle without retaining work identity.
 
@@ -283,6 +286,7 @@ class RpcAdmissionObservationAggregator:
                 reuse_rejection_reason=reuse_rejection_reason,
                 reused_age_ms=reused_age_ms,
                 stale_writer_rejected=stale_writer_rejected,
+                measurement_complete=measurement_complete,
             )
             key = (
                 values["mode"],
@@ -294,6 +298,7 @@ class RpcAdmissionObservationAggregator:
                 values["prevented_request"],
                 values["reuse_rejection_reason"],
                 values["stale_writer_rejected"],
+                values["measurement_complete"],
             )
             with self._state_lock:
                 aggregate = self._profile_aggregates.setdefault(key, _ProfilePairAggregate())
@@ -421,6 +426,7 @@ class RpcAdmissionObservationAggregator:
                 prevented_request,
                 reuse_rejection_reason,
                 stale_writer_rejected,
+                measurement_complete,
             ) = key
             try:
                 payload: dict[str, object] = {
@@ -433,6 +439,7 @@ class RpcAdmissionObservationAggregator:
                     "local_satisfaction": local_satisfaction,
                     "prevented_request": prevented_request,
                     "stale_writer_rejected": stale_writer_rejected,
+                    "measurement_complete": measurement_complete,
                     "window_seconds": self._summary_interval_seconds,
                 }
                 if full_profile_outcome is not None:
@@ -621,6 +628,7 @@ def _validate_profile_observation(  # noqa: PLR0913 - explicit bounded telemetry
     reuse_rejection_reason: str | None,
     reused_age_ms: float | None,
     stale_writer_rejected: bool,
+    measurement_complete: bool,
 ) -> _ProfileObservationValues:
     if mode not in _PROFILE_MODES or outcome not in _PROFILE_OUTCOMES:
         raise ValueError("profile telemetry mode or outcome is invalid")
@@ -630,6 +638,7 @@ def _validate_profile_observation(  # noqa: PLR0913 - explicit bounded telemetry
         (local_satisfaction, "local_satisfaction"),
         (prevented_request, "prevented_request"),
         (stale_writer_rejected, "stale_writer_rejected"),
+        (measurement_complete, "measurement_complete"),
     ):
         if not isinstance(value, bool):
             raise TypeError(f"{name} must be a boolean")
@@ -665,6 +674,7 @@ def _validate_profile_observation(  # noqa: PLR0913 - explicit bounded telemetry
         "reuse_rejection_reason": reuse_rejection_reason,
         "reused_age_ms": reused_age_ms,
         "stale_writer_rejected": stale_writer_rejected,
+        "measurement_complete": measurement_complete,
     }
 
 

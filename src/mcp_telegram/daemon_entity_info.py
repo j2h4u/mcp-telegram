@@ -48,7 +48,7 @@ from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
 from .telegram_rpc import raise_if_flood_wait_error
 from .telegram_rpc_consumers import DemandKind
-from .telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
+from .telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_scope
 from .telethon_dialog import classify_dialog_type
 
 _ENTITY_DETAIL_SCHEMA_VERSION = 1
@@ -266,6 +266,9 @@ class DaemonEntityInfoService:
         """Attach the best-effort profile telemetry hook after composition."""
         self._deps = dataclass_replace(self._deps, profile_observer=observer)
 
+    def _current_pair_mode(self) -> str:
+        return "enabled" if self._deps.enable_full_user_pair else "disabled"
+
     def _require_demand_sink(self) -> DemandOfferSink:
         sink = self._demand_sink
         if sink is None:
@@ -296,6 +299,7 @@ class DaemonEntityInfoService:
                 now=now,
                 reason="auth_scope_changed",
                 pair_eligible_override=True,
+                pair_mode_override=self._current_pair_mode(),
             )
         if rows and self._demand_sink is not None:
             offer_durable_demand(self._demand_sink, DemandKind.ENTITY_PROFILE_REFRESH)
@@ -359,6 +363,7 @@ class DaemonEntityInfoService:
                     now=now,
                     reason="profile_ownership_changed",
                     pair_eligible_override=(True if self._deps.enable_full_user_pair else None),
+                    pair_mode_override=self._current_pair_mode(),
                 )
                 return self._pending_error(entity_id, "entity profile ownership is unavailable")
             if self._profile_scope_changed(cached, entity_id, now=now):
@@ -369,6 +374,7 @@ class DaemonEntityInfoService:
                     pair_eligible_override=(
                         True if self._deps.enable_full_user_pair else None
                     ),
+                    pair_mode_override=self._current_pair_mode(),
                 )
                 cached = self._profiles.read(entity_id, now=now)
                 assert cached is not None
@@ -518,11 +524,15 @@ class DaemonEntityInfoService:
         cursor = self._profiles.next_due_refresh(now=now)
         if cursor is None:
             return None
+        pair_mode = self._profiles.capture_pair_mode(
+            cursor,
+            "enabled" if self._deps.enable_full_user_pair else "disabled",
+        )
         entity_type = self._stored_entity_type(cursor.entity_id, now=now)
         if entity_type is DialogType.UNKNOWN:
             terminal = await self._acquire_durable_refresh_core(cursor, now=now)
             return DurableRefreshSliceResult(cursor.entity_id, terminal)
-        if self._pair_enabled(cursor, entity_type):
+        if self._pair_enabled(cursor, entity_type, pair_mode=pair_mode):
             target_kind = TargetKind.BOT if entity_type is DialogType.BOT else TargetKind.USER
             identity = self._full_user_pair_identity(target_kind)
             if identity is not None and self._profiles.reuse_full_user_pair(cursor, identity, now=now):
@@ -548,7 +558,7 @@ class DaemonEntityInfoService:
                 reuse_rejection_reason=reuse_rejection_reason,
             )
             return DurableRefreshSliceResult(cursor.entity_id, terminal)
-        if self._pair_personal_channel_is_ready(cursor):
+        if self._pair_personal_channel_is_ready(cursor, pair_mode=pair_mode):
             # The pair already captured the remote channel identity. Advancing
             # this ordered cursor is local work and must never repeat
             # GetFullUser merely to finish the same generation.
@@ -574,9 +584,11 @@ class DaemonEntityInfoService:
         terminal = await self._acquire_and_commit_profile_section(cursor, entity_type, now=now)
         return DurableRefreshSliceResult(cursor.entity_id, terminal)
 
-    def _pair_enabled(self, cursor: EntityRefreshCursor, entity_type: DialogType) -> bool:
+    def _pair_enabled(
+        self, cursor: EntityRefreshCursor, entity_type: DialogType, *, pair_mode: str | None = None
+    ) -> bool:
         return (
-            self._deps.enable_full_user_pair
+            (pair_mode or cursor.pair_mode) == "enabled"
             and cursor.next_section == "full_profile"
             and cursor.pair_eligible
             and entity_type
@@ -586,8 +598,10 @@ class DaemonEntityInfoService:
             }
         )
 
-    def _pair_personal_channel_is_ready(self, cursor: EntityRefreshCursor) -> bool:
-        if not self._deps.enable_full_user_pair or cursor.next_section != "personal_channel":
+    def _pair_personal_channel_is_ready(
+        self, cursor: EntityRefreshCursor, *, pair_mode: str | None = None
+    ) -> bool:
+        if (pair_mode or cursor.pair_mode) != "enabled" or cursor.next_section != "personal_channel":
             return False
         evidence = self._profiles.read_section_evidence(cursor.entity_id, "personal_channel")
         entity_type = self._stored_entity_type(cursor.entity_id, now=int(self._deps.now_provider()))
@@ -626,6 +640,10 @@ class DaemonEntityInfoService:
         now: int,
     ) -> DurableRefreshTerminal | None:
         captured_scope = self._capture_pair_scope()
+        attempt_start = self._rpc_attempt_count()
+        pair_section = cursor.next_section in {"full_profile", "personal_channel"}
+        pair_mode = cursor.pair_mode or ("enabled" if self._deps.enable_full_user_pair else "disabled")
+        eligible_pair = cursor.pair_eligible and entity_type in {DialogType.USER, DialogType.BOT}
         try:
             result = await self._acquire_profile_section(cursor, entity_type)
         except RpcAttemptBudgetExhaustedError:
@@ -639,7 +657,10 @@ class DaemonEntityInfoService:
                 reason="flood_wait",
                 retry_at=now + retry_seconds,
             )
-            self._observe_profile_section_failure(cursor, entity_type, actual_attempts=1)
+            actual_attempts = self._rpc_attempt_count() - attempt_start
+            if pair_section and eligible_pair and pair_mode == "disabled":
+                self._profiles.record_pair_attempt(cursor, cursor.next_section, actual_attempts=actual_attempts)
+            self._observe_profile_section_failure(cursor, entity_type, actual_attempts=actual_attempts)
             return DurableRefreshTerminal.FAILURE if failed else None
         except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
             raise_if_flood_wait_error(exc)
@@ -649,7 +670,10 @@ class DaemonEntityInfoService:
                 reason=type(exc).__name__.lower(),
                 retry_at=now + 60,
             )
-            self._observe_profile_section_failure(cursor, entity_type, actual_attempts=1)
+            actual_attempts = self._rpc_attempt_count() - attempt_start
+            if pair_section and eligible_pair and pair_mode == "disabled":
+                self._profiles.record_pair_attempt(cursor, cursor.next_section, actual_attempts=actual_attempts)
+            self._observe_profile_section_failure(cursor, entity_type, actual_attempts=actual_attempts)
             return DurableRefreshTerminal.FAILURE if failed else None
         if self._deps.full_user_auth_scope is not None and captured_scope != self._capture_pair_scope():
             self._profiles.mark_section_failure(
@@ -661,10 +685,26 @@ class DaemonEntityInfoService:
             return DurableRefreshTerminal.FAILURE
         result = self._with_observation_metadata(result, captured_scope)
         committed = self._profiles.commit_section(cursor, result, now=now)
-        self._observe_profile_section_commit(cursor, entity_type, result, committed=committed)
+        actual_attempts = self._rpc_attempt_count() - attempt_start
+        if pair_section and eligible_pair and pair_mode == "disabled":
+            summary = (
+                self._profiles.record_pair_section_outcome(
+                    cursor,
+                    cursor.next_section,
+                    outcome=self._section_commit_outcome(cursor.next_section, result),
+                    actual_attempts=actual_attempts,
+                    ready_at=now,
+                )
+                if committed
+                else None
+            )
+            if summary is not None:
+                self._emit_pair_summary(summary)
+        else:
+            self._observe_profile_section_commit(cursor, entity_type, result, committed=committed)
         return self._success_if_refresh_finished(cursor, committed=committed)
 
-    async def _acquire_and_commit_full_user_pair(
+    async def _acquire_and_commit_full_user_pair(  # noqa: PLR0915
         self,
         cursor: EntityRefreshCursor,
         *,
@@ -672,14 +712,18 @@ class DaemonEntityInfoService:
         reuse_rejection_reason: str | None = None,
     ) -> DurableRefreshTerminal | None:
         """Acquire and atomically commit both User profile projections."""
+        attempt_start = self._rpc_attempt_count()
+        pair_mode = cursor.pair_mode or "enabled"
         try:
             full_profile, personal_channel = await self._acquire_full_user_pair(cursor)
         except RpcAttemptBudgetExhaustedError:
+            actual_attempts = self._rpc_attempt_count() - attempt_start
+            self._profiles.record_pair_attempt(cursor, "full_profile", actual_attempts=actual_attempts)
             self._observe_profile_pair(
-                mode="enabled",
+                mode=pair_mode,
                 eligible_pair=cursor.pair_eligible,
                 outcome="failed",
-                actual_attempts=0,
+                actual_attempts=actual_attempts,
                 reuse_rejection_reason=reuse_rejection_reason,
             )
             raise
@@ -691,11 +735,13 @@ class DaemonEntityInfoService:
                 reason="flood_wait",
                 retry_at=now + retry_seconds,
             )
+            actual_attempts = self._rpc_attempt_count() - attempt_start
+            self._profiles.record_pair_attempt(cursor, "full_profile", actual_attempts=actual_attempts)
             self._observe_profile_pair(
-                mode="enabled",
+                mode=pair_mode,
                 eligible_pair=cursor.pair_eligible,
                 outcome="failed",
-                actual_attempts=1,
+                actual_attempts=actual_attempts,
                 reuse_rejection_reason=reuse_rejection_reason,
             )
             return DurableRefreshTerminal.FAILURE if failed else None
@@ -707,11 +753,13 @@ class DaemonEntityInfoService:
                 reason=type(exc).__name__.lower(),
                 retry_at=now + 60,
             )
+            actual_attempts = self._rpc_attempt_count() - attempt_start
+            self._profiles.record_pair_attempt(cursor, "full_profile", actual_attempts=actual_attempts)
             self._observe_profile_pair(
-                mode="enabled",
+                mode=pair_mode,
                 eligible_pair=cursor.pair_eligible,
                 outcome="failed",
-                actual_attempts=1,
+                actual_attempts=actual_attempts,
                 reuse_rejection_reason=reuse_rejection_reason,
             )
             return DurableRefreshTerminal.FAILURE if failed else None
@@ -735,11 +783,13 @@ class DaemonEntityInfoService:
                     reason="auth_scope_changed",
                     retry_at=now + 1,
                 )
+                actual_attempts = self._rpc_attempt_count() - attempt_start
+                self._profiles.record_pair_attempt(cursor, "full_profile", actual_attempts=actual_attempts)
                 self._observe_profile_pair(
-                    mode="enabled",
+                    mode=pair_mode,
                     eligible_pair=cursor.pair_eligible,
                     outcome="failed",
-                    actual_attempts=1,
+                    actual_attempts=actual_attempts,
                     reuse_rejection_reason="auth_scope_changed",
                 )
                 return DurableRefreshTerminal.FAILURE if failed else None
@@ -751,26 +801,47 @@ class DaemonEntityInfoService:
                 now=now,
             )
         except Exception:
+            actual_attempts = self._rpc_attempt_count() - attempt_start
+            self._profiles.record_pair_attempt(cursor, "full_profile", actual_attempts=actual_attempts)
             self._observe_profile_pair(
-                mode="enabled",
+                mode=pair_mode,
                 eligible_pair=cursor.pair_eligible,
                 outcome="failed",
-                actual_attempts=1,
+                actual_attempts=actual_attempts,
                 reuse_rejection_reason=reuse_rejection_reason,
             )
             raise
-        self._observe_profile_pair(
-            mode="enabled",
-            eligible_pair=cursor.pair_eligible,
-            outcome="committed" if committed else "stale_writer_rejected",
-            actual_attempts=1,
-            full_profile_outcome=self._evidence_outcome(full_profile),
-            personal_channel_outcome=self._evidence_outcome(personal_channel),
-            pair_ready=committed,
-            pair_readiness_latency_ms=self._pair_readiness_latency_ms(full_profile, personal_channel),
-            reuse_rejection_reason=reuse_rejection_reason,
-            stale_writer_rejected=not committed,
-        )
+        actual_attempts = self._rpc_attempt_count() - attempt_start
+        summary = None
+        if committed:
+            self._profiles.record_pair_section_outcome(
+                cursor,
+                "full_profile",
+                outcome=self._evidence_outcome(full_profile) or "unavailable",
+                actual_attempts=actual_attempts,
+                ready_at=now,
+                readiness_latency_ms=self._pair_readiness_latency_ms(full_profile, personal_channel),
+            )
+            summary = self._profiles.record_pair_section_outcome(
+                cursor,
+                "personal_channel",
+                outcome=self._evidence_outcome(personal_channel) or "unavailable",
+                actual_attempts=0,
+                ready_at=now,
+                readiness_latency_ms=self._pair_readiness_latency_ms(full_profile, personal_channel),
+            )
+        if summary is not None:
+            summary["reuse_rejection_reason"] = reuse_rejection_reason
+            self._emit_pair_summary(summary)
+        elif not committed:
+            self._observe_profile_pair(
+                mode=pair_mode,
+                eligible_pair=cursor.pair_eligible,
+                outcome="stale_writer_rejected",
+                actual_attempts=actual_attempts,
+                reuse_rejection_reason=reuse_rejection_reason,
+                stale_writer_rejected=True,
+            )
         return self._success_if_refresh_finished(cursor, committed=committed)
 
     async def _acquire_full_user_pair(
@@ -929,7 +1000,7 @@ class DaemonEntityInfoService:
         stale_writer_rejected: bool = False,
     ) -> None:
         observer = self._deps.profile_observer
-        if observer is None:
+        if observer is None or outcome == "failed":
             return
         try:
             observer.observe_profile_pair(
@@ -950,6 +1021,42 @@ class DaemonEntityInfoService:
             )
         except Exception:  # noqa: BLE001 - telemetry cannot affect profile correctness
             self._deps.logger.debug("entity_profile_pair_observation_failed")
+
+    def _emit_pair_summary(self, summary: Mapping[str, object]) -> None:
+        """Send a repository snapshot through the typed observation boundary."""
+        self._observe_profile_pair(
+            mode=cast(str, summary.get("mode")),
+            eligible_pair=cast(bool, summary.get("eligible_pair")),
+            outcome=cast(str, summary.get("outcome")),
+            actual_attempts=cast(int, summary.get("actual_attempts", 0)),
+            retries=cast(int, summary.get("retries", 0)),
+            full_profile_outcome=cast(str | None, summary.get("full_profile_outcome")),
+            personal_channel_outcome=cast(str | None, summary.get("personal_channel_outcome")),
+            pair_ready=cast(bool, summary.get("pair_ready", False)),
+            pair_readiness_latency_ms=cast(float | None, summary.get("pair_readiness_latency_ms")),
+            local_satisfaction=cast(bool, summary.get("local_satisfaction", False)),
+            prevented_request=cast(bool, summary.get("prevented_request", False)),
+            reuse_rejection_reason=cast(str | None, summary.get("reuse_rejection_reason")),
+            reused_age_ms=cast(float | None, summary.get("reused_age_ms")),
+            stale_writer_rejected=cast(bool, summary.get("stale_writer_rejected", False)),
+        )
+
+    @staticmethod
+    def _rpc_attempt_count() -> int:
+        """Read dispatch accounting owned by the current RPC scope."""
+        scope = current_rpc_scope()
+        budget = scope.attempt_budget
+        return 0 if budget is None else budget.attempts
+
+    @staticmethod
+    def _section_commit_outcome(section: str, result: EntitySectionCommit) -> str:
+        """Classify the committed projection, after normalization is final."""
+        if result.status != "fresh":
+            return "unavailable"
+        if section == "personal_channel":
+            channel_id = result.detail_patch.get("personal_channel_id")
+            return "absent" if channel_id is None else "usable"
+        return "usable"
 
     @staticmethod
     def _evidence_outcome(commit: EntitySectionCommit) -> str | None:
@@ -993,6 +1100,11 @@ class DaemonEntityInfoService:
         actual_attempts: int,
     ) -> None:
         if cursor.next_section not in {"full_profile", "personal_channel"}:
+            return
+        if cursor.pair_eligible and entity_type in {DialogType.USER, DialogType.BOT}:
+            # Pair measurement is a completed-generation denominator.  A
+            # retryable section failure remains durable state and is folded
+            # into the eventual summary once the projection commits.
             return
         self._observe_profile_pair(
             mode="enabled" if self._deps.enable_full_user_pair else "disabled",
@@ -1624,7 +1736,7 @@ class DaemonEntityInfoService:
             self._profiles.mark_refresh_rejected(entity_id, now=int(self._deps.now_provider()))
             self._set_section_rejected(sections)
             return
-        self._profiles.mark_refresh_queued(entity_id)
+        self._profiles.mark_refresh_queued(entity_id, pair_mode_override=self._current_pair_mode())
         self._set_section_queued(sections)
         offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
 
@@ -1648,7 +1760,7 @@ class DaemonEntityInfoService:
         if result is RefreshEnqueueResult.REJECTED:
             self._profiles.mark_refresh_rejected(entity_id, now=now)
         else:
-            self._profiles.mark_pending(entity_id, now=now)
+            self._profiles.mark_pending(entity_id, now=now, pair_mode_override=self._current_pair_mode())
             offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
 
     @staticmethod

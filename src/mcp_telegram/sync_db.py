@@ -782,7 +782,20 @@ CREATE TABLE entity_profile_refresh_state (
     started_at         INTEGER,
     pair_eligible      INTEGER NOT NULL DEFAULT 0 CHECK(pair_eligible IN (0, 1)),
     follow_up_required INTEGER NOT NULL DEFAULT 0 CHECK(follow_up_required IN (0, 1)),
-    profile_revision   INTEGER NOT NULL DEFAULT 0 CHECK(profile_revision >= 0)
+    profile_revision   INTEGER NOT NULL DEFAULT 0 CHECK(profile_revision >= 0),
+    pair_mode TEXT CHECK(pair_mode IN ('enabled', 'disabled') OR pair_mode IS NULL),
+    pair_full_profile_outcome TEXT,
+    pair_personal_channel_outcome TEXT,
+    pair_full_profile_attempts INTEGER NOT NULL DEFAULT 0 CHECK(pair_full_profile_attempts >= 0),
+    pair_personal_channel_attempts INTEGER NOT NULL DEFAULT 0 CHECK(pair_personal_channel_attempts >= 0),
+    pair_full_profile_retries INTEGER NOT NULL DEFAULT 0 CHECK(pair_full_profile_retries >= 0),
+    pair_personal_channel_retries INTEGER NOT NULL DEFAULT 0 CHECK(pair_personal_channel_retries >= 0),
+    pair_attempts INTEGER NOT NULL DEFAULT 0 CHECK(pair_attempts >= 0),
+    pair_retries INTEGER NOT NULL DEFAULT 0 CHECK(pair_retries >= 0),
+    pair_ready_at INTEGER,
+    pair_readiness_latency_ms REAL,
+    pair_measurement_complete INTEGER NOT NULL DEFAULT 0 CHECK(pair_measurement_complete IN (0, 1)),
+    pair_summary_watermark INTEGER
 ) WITHOUT ROWID
 """
 
@@ -3251,12 +3264,31 @@ def _apply_migration_61(conn: sqlite3.Connection, current: int) -> int:
         # v61 was already released before observation ownership was added.
         # Repair that additive part in place without inventing ownership for
         # historical rows or advancing the public schema version.
+        refresh_columns = _table_column_names(conn, "entity_profile_refresh_state")
+        measurement_alters = {
+            "pair_mode": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_mode TEXT",
+            "pair_full_profile_outcome": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_full_profile_outcome TEXT",
+            "pair_personal_channel_outcome": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_personal_channel_outcome TEXT",
+            "pair_full_profile_attempts": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_full_profile_attempts INTEGER NOT NULL DEFAULT 0",
+            "pair_personal_channel_attempts": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_personal_channel_attempts INTEGER NOT NULL DEFAULT 0",
+            "pair_full_profile_retries": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_full_profile_retries INTEGER NOT NULL DEFAULT 0",
+            "pair_personal_channel_retries": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_personal_channel_retries INTEGER NOT NULL DEFAULT 0",
+            "pair_attempts": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_attempts INTEGER NOT NULL DEFAULT 0",
+            "pair_retries": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_retries INTEGER NOT NULL DEFAULT 0",
+            "pair_ready_at": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_ready_at INTEGER",
+            "pair_readiness_latency_ms": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_readiness_latency_ms REAL",
+            "pair_measurement_complete": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_measurement_complete INTEGER NOT NULL DEFAULT 0",
+            "pair_summary_watermark": "ALTER TABLE entity_profile_refresh_state ADD COLUMN pair_summary_watermark INTEGER",
+        }
+        refresh_statements = [
+            statement for column, statement in measurement_alters.items() if column not in refresh_columns
+        ]
         detail_columns = _table_column_names(conn, "entity_details")
         missing = {
             "profile_owner_account_id": "ALTER TABLE entity_details ADD COLUMN profile_owner_account_id INTEGER",
             "profile_observation_scope_json": "ALTER TABLE entity_details ADD COLUMN profile_observation_scope_json TEXT",
         }
-        statements = [statement for column, statement in missing.items() if column not in detail_columns]
+        statements = refresh_statements + [statement for column, statement in missing.items() if column not in detail_columns]
         if statements:
             conn.execute("BEGIN IMMEDIATE")
             try:
