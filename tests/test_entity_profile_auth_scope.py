@@ -182,8 +182,7 @@ async def test_ownership_invalid_cached_profile_preserves_failed_retry_state(tmp
         "WHERE entity_id=42"
     )
     conn.execute(
-        "UPDATE entity_profile_refresh_state SET status='failed', retry_at=777, reason='flood_wait' "
-        "WHERE entity_id=42"
+        "UPDATE entity_profile_refresh_state SET status='failed', retry_at=777, reason='flood_wait' WHERE entity_id=42"
     )
     conn.commit()
     before = cast(
@@ -199,10 +198,13 @@ async def test_ownership_invalid_cached_profile_preserves_failed_retry_state(tmp
     assert result is not None and result["error"] == "entity_info_pending"
     assert coordinator.queue_depth == 1
     assert sink.kinds == [DemandKind.ENTITY_PROFILE_REFRESH]
-    assert conn.execute(
-        "SELECT status, retry_at, reason, generation, started_at, next_section, acquisition_cursor "
-        "FROM entity_profile_refresh_state WHERE entity_id=42"
-    ).fetchone() == before
+    assert (
+        conn.execute(
+            "SELECT status, retry_at, reason, generation, started_at, next_section, acquisition_cursor "
+            "FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone()
+        == before
+    )
 
     await service.shutdown()
     conn.close()
