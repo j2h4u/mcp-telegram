@@ -82,7 +82,6 @@ from .feedback_service import FeedbackApplicationService
 from .flood import (
     FloodWaitKillSwitchPolicy,
     TelegramRpcThrottled,
-    _raise_if_latched,
     configure_flood_wait_kill_switch,
     flood_wait_kill_switch_status,
     maybe_log_flood_wait_rollup,
@@ -109,6 +108,10 @@ from .reconnect import run_reconnect_catch_up_loop
 from .rpc_admission_observations import RpcAdmissionObservationAggregator
 from .runtime_observations import RuntimeObservationSink, prune_runtime_observations, record_runtime_observation
 from .scheduled_messages import ScheduledMessageReconciler, ScheduledReconciliationPolicy
+from .self_profile_maintenance import (
+    StartupIdentityResult,
+    StartupIdentityState,
+)
 from .state import StatePaths, ensure_private_state_dir
 from .sync_db import (
     _open_sync_db,
@@ -129,10 +132,8 @@ from .telegram_rpc import TelegramRpcCooldownPersistence
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
     AdmissionObserver,
-    RpcAdmissionClosedError,
     RpcAdmissionEvent,
     RpcAdmissionEventKind,
-    TelegramRpcAdmissionDeferred,
 )
 from .topics.refresh import TopicRefresher
 from .topics.sqlite_repository import SQLiteTopicSnapshotRepository
@@ -140,8 +141,6 @@ from .topics.telegram_adapter import TelethonTelegramTopicGateway, TopicClient
 from .transcription_hydration import TranscriptionHydrationHandler
 
 logger = logging.getLogger(__name__)
-
-_OWN_ONLY_ADMISSION_MAX_WAIT_SECONDS = 30.0
 
 
 def _operator_summary_row_factory(cursor: sqlite3.Cursor, row: tuple[object, ...]) -> dict[str, object]:
@@ -329,6 +328,7 @@ class _DemandRuntime:
     dialog_reconciliation_worker: DialogReconciliationWorker
     message_fact_refresh_deps: MessageFactRefreshDeps
     read_receipt_batch: Callable[[], Awaitable[object]]
+    startup_identity: StartupIdentityState
 
 
 @dataclass(frozen=True, slots=True)
@@ -824,10 +824,14 @@ async def _run_daemon_lifetime(ctx: _SyncMainContext) -> None:
         _log_heartbeat(ctx.conn, ctx.client, sync_start)
         if ctx.handler_manager is not None:
             ctx.handler_manager.refresh_synced_dialogs()
+        shutdown_wait = asyncio.create_task(ctx.shutdown_event.wait())
+        heartbeat_wait = asyncio.create_task(asyncio.sleep(HEARTBEAT_INTERVAL_S))
         try:
-            await asyncio.wait_for(ctx.shutdown_event.wait(), timeout=HEARTBEAT_INTERVAL_S)
-        except TimeoutError:
-            continue
+            await asyncio.wait((shutdown_wait, heartbeat_wait), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (shutdown_wait, heartbeat_wait):
+                if not task.done():
+                    task.cancel()
 
 
 def _create_tracked_task(
@@ -1215,92 +1219,45 @@ async def _connect_telegram(ctx: _SyncMainContext) -> bool:
     return True
 
 
-async def _fetch_own_only_personal_channel_id(client: _DaemonClient, account_id: int) -> int | None:
-    input_user = cast(TypeInputUser, await client.get_input_entity(account_id))
-    full_result = await client(GetFullUserRequest(id=input_user))
-    user_full = getattr(full_result, "full_user", None)
-    personal_channel_id = getattr(user_full, "personal_channel_id", None)
-    return personal_channel_id if isinstance(personal_channel_id, int) and personal_channel_id > 0 else None
-
-
-async def _wait_for_own_only_admission_retry(
-    shutdown: asyncio.Event,
-    exc: TelegramRpcAdmissionDeferred,
-    attempt: int,
-) -> None:
-    delay = min(
-        max(exc.retry_after_seconds or 1, 1),
-        _OWN_ONLY_ADMISSION_MAX_WAIT_SECONDS,
-    )
-    logger.info("own_only_account_facts_admission_deferred retry_after=%s attempt=%d", delay, attempt)
+async def _wait_for_startup_identity(
+    startup: StartupIdentityState,
+    shutdown_event: asyncio.Event,
+) -> StartupIdentityResult:
+    """Wait for coordinator publication, shutdown, or the contract-derived bound."""
+    settled_wait = asyncio.create_task(startup.done_event.wait())
+    shutdown_wait = asyncio.create_task(shutdown_event.wait())
+    expiry_wait = asyncio.create_task(asyncio.sleep(startup.remaining(time.time())))
     try:
-        await asyncio.wait_for(shutdown.wait(), timeout=delay)
-    except TimeoutError:
-        return
-    logger.info("own_only_account_facts_deferred_until_shutdown")
-    raise asyncio.CancelledError from None
+        await asyncio.wait(
+            (settled_wait, shutdown_wait, expiry_wait),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for task in (settled_wait, shutdown_wait, expiry_wait):
+            if not task.done():
+                task.cancel()
 
-
-async def _load_own_only_context(
-    client: _DaemonClient,
-    account_id: int,
-    shutdown_event: asyncio.Event | None = None,
-) -> OwnOnlyContext:
-    context = OwnOnlyContext(account_id=account_id)
-    shutdown = asyncio.Event() if shutdown_event is None else shutdown_event
-    attempt = 0
-    while True:
-        try:
-            personal_channel_id = await _fetch_own_only_personal_channel_id(client, account_id)
-        except RpcAdmissionClosedError:
-            raise
-        except TelegramRpcAdmissionDeferred as exc:
-            attempt += 1
-            await _wait_for_own_only_admission_retry(shutdown, exc, attempt)
-            continue
-        except TelegramRpcThrottled as exc:
-            _raise_if_latched(exc)
-            logger.warning("own_only_account_facts_unavailable error=%s", exc)
-            break
-        except (RPCError, TypeError, AttributeError, ValueError) as exc:
-            logger.warning("own_only_account_facts_unavailable error=%s", exc)
-            break
-        if personal_channel_id is not None:
-            return OwnOnlyContext(account_id=account_id, personal_channel_id=personal_channel_id)
-        break
-    return context
-
-
-async def _wait_for_self_profile(ctx: _SyncMainContext) -> None:
-    """Wait until the coordinator has published the authenticated profile."""
-    while ctx.api_server.self_id is None:
-        if ctx.shutdown_event.is_set():
-            raise asyncio.CancelledError
-        try:
-            await asyncio.wait_for(ctx.shutdown_event.wait(), timeout=0.1)
-        except TimeoutError:
-            continue
+    if startup.done_event.is_set():
+        return startup.result()
+    if shutdown_event.is_set():
+        raise asyncio.CancelledError
+    startup.fail("startup identity deadline expired")
+    return startup.result()
 
 
 async def _prime_runtime(ctx: _SyncMainContext) -> None:
-    """Publish startup demand, then perform only local identity setup."""
-    if ctx.coordinator is None:
-        raise RuntimeError("demand coordinator is unavailable")
+    """Wait for coordinator-owned startup identity before enabling readers."""
+    if ctx.coordinator is None or ctx.demand_runtime is None:
+        raise RuntimeError("demand runtime is unavailable")
     ctx.api_server.startup_detail = "fetching account info"
     _ = ctx.api_server.startup_detail
 
     ctx.coordinator.offer(DemandKind.SELF_PROFILE_MAINTENANCE)
-    await _wait_for_self_profile(ctx)
+    identity = await _wait_for_startup_identity(ctx.demand_runtime.startup_identity, ctx.shutdown_event)
     assert ctx.api_server.self_id is not None
+    assert ctx.own_only_context == identity.own_only_context
     assert ctx.handler_manager is not None
     ctx.handler_manager.set_self_id(ctx.api_server.self_id)
-    # Own-only facts are local context derived after profile readiness. The
-    # profile itself is always fetched through the coordinator adapter.
-    ctx.own_only_context = await _load_own_only_context(
-        ctx.client,
-        ctx.api_server.self_id,
-        ctx.shutdown_event,
-    )
     ensure_own_only_schema(ctx.conn)
     logger.info("daemon self_id cached: %s", ctx.api_server.self_id)
 
@@ -1355,6 +1312,12 @@ def _update_self_profile(api_server: DaemonAPIServer, me: _MeLike) -> None:
     }
 
 
+def _publish_startup_identity(ctx: _SyncMainContext, profile: object, own_only_context: OwnOnlyContext) -> None:
+    """Publish all startup identity facts before waking the readiness waiter."""
+    _update_self_profile(ctx.api_server, cast(_MeLike, profile))
+    ctx.own_only_context = own_only_context
+
+
 def _build_message_fact_refresh_dependencies(ctx: _SyncMainContext) -> MessageFactRefreshDeps:
     conn = _open_sync_db(ctx.db_path)
     return MessageFactRefreshDeps(
@@ -1383,6 +1346,7 @@ def _build_demand_runtime(
         raise RuntimeError("entity profile refresh coordinator is unavailable")
 
     message_fact_refresh_deps = _build_message_fact_refresh_dependencies(ctx)
+    startup_identity = StartupIdentityState.begin()
     scheduled_reconciler = ScheduledMessageReconciler(
         ctx.client,
         ctx.conn,
@@ -1412,6 +1376,17 @@ def _build_demand_runtime(
             success_recheck_seconds=ctx.scheduling.read_position_reconciliation_seconds,
         )
 
+    async def get_self_input_entity(account_id: int) -> object:
+        return await ctx.client.get_input_entity(account_id)
+
+    async def get_full_self_user(input_user: object) -> object:
+        return await ctx.client(GetFullUserRequest(id=cast(TypeInputUser, input_user)))
+
+    def publish_startup_identity(profile: object, own_only_context: OwnOnlyContext) -> None:
+        _publish_startup_identity(ctx, profile, own_only_context)
+        scheduled_reconciler._own_only_context = own_only_context
+        scheduled_reconciler._resolved_context = own_only_context
+
     try:
         dependencies = DemandCompositionDependencies(
             client=cast(DemandCompositionClient, ctx.client),
@@ -1435,6 +1410,10 @@ def _build_demand_runtime(
             read_receipt_batch=read_receipt_batch,
             self_profile_cadence=ctx.self_profile_cadence,
             update_self_profile=lambda me: _update_self_profile(ctx.api_server, cast(_MeLike, me)),
+            startup_identity=startup_identity,
+            get_self_input_entity=get_self_input_entity,
+            get_full_self_user=get_full_self_user,
+            publish_startup_identity=publish_startup_identity,
             startup_detail_setter=lambda detail: setattr(ctx.api_server, "startup_detail", detail),
         )
         coordinator = build_durable_coordinator(dependencies, observer=ctx.rpc_admission_observer)
@@ -1447,6 +1426,7 @@ def _build_demand_runtime(
         dialog_reconciliation_worker=dialog_reconciliation_worker,
         message_fact_refresh_deps=message_fact_refresh_deps,
         read_receipt_batch=read_receipt_batch,
+        startup_identity=startup_identity,
     )
 
 
@@ -1641,12 +1621,8 @@ async def sync_main() -> None:
 
         delta_worker = DeltaSyncWorker(cast(_DeltaSyncClient, ctx.client), ctx.conn, ctx.shutdown_event)
         worker = FullSyncWorker(ctx.client, ctx.conn, ctx.shutdown_event)
-        demand_runtime = _ensure_demand_runtime(ctx, worker, delta_worker)
+        _ensure_demand_runtime(ctx, worker, delta_worker)
         await _prime_runtime(ctx)
-        # Scheduled demand needs the local own-only context after coordinator
-        # self-profile readiness; all Telegram work remains coordinator-owned.
-        demand_runtime.scheduled_reconciler._own_only_context = ctx.own_only_context
-        demand_runtime.scheduled_reconciler._resolved_context = ctx.own_only_context
         _offer_startup_demands(ctx)
         await _run_daemon_lifetime(ctx)
     finally:

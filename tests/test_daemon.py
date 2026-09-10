@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -17,8 +17,14 @@ from mcp_telegram.daemon import (
     _run_daemon_lifetime,
     _shutdown_sync_main_context,
     _SyncMainContext,
+    _wait_for_startup_identity,
 )
 from mcp_telegram.own_only import OwnOnlyContext
+from mcp_telegram.self_profile_maintenance import (
+    StartupIdentityResult,
+    StartupIdentityState,
+    StartupIdentityUnavailableError,
+)
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 
 
@@ -158,23 +164,25 @@ async def test_prime_runtime_waits_for_coordinator_profile_and_offers_folder() -
     api.self_id = 42
     api.self_profile = {"id": 42}
     conn = sqlite3.connect(":memory:")
+    own_only_context = OwnOnlyContext(account_id=42)
+    startup_identity = StartupIdentityState(100.0, 200.0)
+    startup_identity.advance_profile(SimpleNamespace(id=42))
+    startup_identity.advance_input_user(object())
+    startup_identity.complete(StartupIdentityResult(SimpleNamespace(id=42), own_only_context))
     ctx = _typed_ctx(
         coordinator=coordinator,
+        demand_runtime=SimpleNamespace(startup_identity=startup_identity),
         handler_manager=handler,
         api_server=api,
         conn=conn,
         client=_ClientStub(),
         socket_path=Path("/tmp/mcp-telegram-test.sock"),
-        own_only_context=None,
+        own_only_context=own_only_context,
         self_profile_cadence=None,
     )
 
     try:
-        with patch(
-            "mcp_telegram.daemon._load_own_only_context",
-            new=AsyncMock(return_value=OwnOnlyContext(account_id=42)),
-        ):
-            await _prime_runtime(ctx)
+        await _prime_runtime(ctx)
     finally:
         conn.close()
 
@@ -185,21 +193,27 @@ async def test_prime_runtime_waits_for_coordinator_profile_and_offers_folder() -
 
 
 @pytest.mark.asyncio
+async def test_startup_identity_wait_has_terminal_deadline() -> None:
+    startup_identity = StartupIdentityState(0.0, 1.0)
+
+    with pytest.raises(StartupIdentityUnavailableError, match="deadline expired"):
+        await _wait_for_startup_identity(startup_identity, asyncio.Event())
+
+    assert startup_identity.failure_reason == "startup identity deadline expired"
+
+
+@pytest.mark.asyncio
 async def test_daemon_lifetime_refreshes_local_dialog_set_and_stops() -> None:
     event = asyncio.Event()
     handler = _HandlerStub()
     ctx = _typed_ctx(shutdown_event=event, handler_manager=handler, conn=_ConnectionStub(), client=_ClientStub())
 
-    async def stop_after_refresh(_awaitable: object, *, timeout: float) -> bool:
-        del timeout
-        close = getattr(_awaitable, "close", None)
-        if callable(close):
-            close()
+    def refresh_and_stop() -> None:
+        handler.refresh_calls += 1
         event.set()
-        return True
 
-    with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=stop_after_refresh):
-        await _run_daemon_lifetime(ctx)
+    handler.refresh_synced_dialogs = refresh_and_stop
+    await _run_daemon_lifetime(ctx)
 
     assert handler.refresh_calls == 1
 

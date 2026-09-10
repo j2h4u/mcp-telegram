@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable, Generator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
 
@@ -40,8 +41,13 @@ from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshPolicy,
     ReadReceiptDemandAdapter,
 )
+from mcp_telegram.own_only import OwnOnlyContext
 from mcp_telegram.scheduled_messages import ScheduledDiscoveryDemandAdapter, ScheduledRepairDemandAdapter
-from mcp_telegram.self_profile_maintenance import SelfProfileCadenceState, SelfProfileMaintenanceDemandAdapter
+from mcp_telegram.self_profile_maintenance import (
+    SelfProfileCadenceState,
+    SelfProfileMaintenanceDemandAdapter,
+    StartupIdentityState,
+)
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter
 from mcp_telegram.telegram_rpc_consumers import (
@@ -163,7 +169,14 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
     async def read_receipt_batch() -> object:
         return None
 
+    async def get_self_input_entity(_account_id: int) -> object:
+        return object()
+
+    async def get_full_self_user(_input_user: object) -> object:
+        return SimpleNamespace(full_user=SimpleNamespace(personal_channel_id=None))
+
     update_profile: Callable[[object], None] = MagicMock()
+    publish_startup_identity: Callable[[object, OwnOnlyContext], None] = MagicMock()
     dependencies = DemandCompositionDependencies(
         client=cast(DemandCompositionClient, objects["client"]),
         conn=cast(sqlite3.Connection, objects["conn"]),
@@ -186,6 +199,10 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         read_receipt_batch=cast(Callable[[], Awaitable[object]], read_receipt_batch),
         self_profile_cadence=cast(SelfProfileCadenceState, objects["cadence"]),
         update_self_profile=update_profile,
+        startup_identity=StartupIdentityState.begin(now=100.0),
+        get_self_input_entity=get_self_input_entity,
+        get_full_self_user=get_full_self_user,
+        publish_startup_identity=publish_startup_identity,
     )
     objects["read_receipt_batch"] = read_receipt_batch
     objects["update_profile"] = update_profile

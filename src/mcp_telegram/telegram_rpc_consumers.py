@@ -89,6 +89,7 @@ class DemandKind(StrEnum):
 # it from ``DemandKind`` or ``_DEMAND_CONTRACTS`` would let coordinated omissions
 # pass startup validation.
 DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
+    DemandKind.SELF_PROFILE_MAINTENANCE,
     DemandKind.ENTITY_PROFILE_REFRESH,
     DemandKind.DELTA_GAP_FILL,
     DemandKind.DELTA_ACCESS_PROBE,
@@ -108,7 +109,6 @@ DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
     DemandKind.READ_RECEIPT_BATCH,
     DemandKind.SCHEDULED_REPAIR,
     DemandKind.SCHEDULED_DISCOVERY,
-    DemandKind.SELF_PROFILE_MAINTENANCE,
 )
 _EXPECTED_DURABLE_DEMAND_COUNT = 20
 
@@ -764,7 +764,9 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.SELF_PROFILE_MAINTENANCE,
         TelegramRpcSource.MAINTENANCE,
         _DURABLE,
-        max_rpc_attempts_per_slice=1,
+        # get_me populates Telethon's self cache, so get_input_entity(self_id)
+        # is local; GetFullUser is the second and final possible network send.
+        max_rpc_attempts_per_slice=2,
     ),
 }
 

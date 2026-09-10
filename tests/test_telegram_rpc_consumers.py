@@ -29,6 +29,7 @@ from mcp_telegram.telegram_rpc_scheduler import RPC_SOURCE_SERVICE_CLASS
 from mcp_telegram.transcription_hydration import TranscriptionHydrationHandler
 
 EXPECTED_DURABLE_DEMAND_ORDER = (
+    DemandKind.SELF_PROFILE_MAINTENANCE,
     DemandKind.ENTITY_PROFILE_REFRESH,
     DemandKind.DELTA_GAP_FILL,
     DemandKind.DELTA_ACCESS_PROBE,
@@ -48,7 +49,6 @@ EXPECTED_DURABLE_DEMAND_ORDER = (
     DemandKind.READ_RECEIPT_BATCH,
     DemandKind.SCHEDULED_REPAIR,
     DemandKind.SCHEDULED_DISCOVERY,
-    DemandKind.SELF_PROFILE_MAINTENANCE,
 )
 
 
@@ -115,6 +115,12 @@ def test_scheduler_classification_is_derived_from_consumer_registry() -> None:
     assert {
         source: spec.admission.service_class for source, spec in TELEGRAM_RPC_CONSUMERS.items()
     } == RPC_SOURCE_SERVICE_CLASS
+
+
+def test_startup_identity_contract_covers_both_possible_network_sends() -> None:
+    contract = demand_contract(DemandKind.SELF_PROFILE_MAINTENANCE)
+
+    assert contract.max_rpc_attempts_per_slice == 2
 
 
 def test_consumer_registry_and_records_are_immutable() -> None:

@@ -36,6 +36,7 @@ from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshPolicy,
     ReadReceiptDemandAdapter,
 )
+from mcp_telegram.own_only import OwnOnlyContext
 from mcp_telegram.scheduled_messages import (
     ScheduledDiscoveryDemandAdapter,
     ScheduledMessageReconciler,
@@ -45,6 +46,7 @@ from mcp_telegram.self_profile_maintenance import (
     SelfProfileCadenceState,
     SelfProfileMaintenanceDemandAdapter,
     SelfProfileMaintenanceDependencies,
+    StartupIdentityState,
 )
 from mcp_telegram.sync_db import SyncDatabaseConnection
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter, FullSyncWorker
@@ -88,6 +90,10 @@ class DemandCompositionDependencies:
     read_receipt_batch: Callable[[], Awaitable[object]]
     self_profile_cadence: SelfProfileCadenceState
     update_self_profile: Callable[[object], None]
+    startup_identity: StartupIdentityState
+    get_self_input_entity: Callable[[int], Awaitable[object]]
+    get_full_self_user: Callable[[object], Awaitable[object]]
+    publish_startup_identity: Callable[[object, OwnOnlyContext], None]
     startup_detail_setter: Callable[[str], None] | None = None
 
 
@@ -169,6 +175,10 @@ def build_durable_adapter_map(dependencies: DemandCompositionDependencies) -> Ma
                 cadence=dependencies.self_profile_cadence,
                 get_me=dependencies.client.get_me,
                 update_profile=dependencies.update_self_profile,
+                startup=dependencies.startup_identity,
+                get_input_entity=dependencies.get_self_input_entity,
+                get_full_user=dependencies.get_full_self_user,
+                publish_startup_identity=dependencies.publish_startup_identity,
             )
         ),
     }

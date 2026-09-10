@@ -5,9 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from mcp_telegram.own_only import OwnOnlyContext
 from mcp_telegram.self_profile_maintenance import (
     SelfProfileMaintenanceDemandAdapter,
     SelfProfileMaintenanceDependencies,
+    StartupIdentityPhase,
+    StartupIdentityState,
+    StartupIdentityUnavailableError,
 )
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
@@ -140,3 +144,100 @@ async def test_run_slice_does_not_apply_profile_when_attempt_budget_is_exhausted
 
     assert applied == []
     assert cadence.refreshed_at == []
+
+
+@pytest.mark.asyncio
+async def test_startup_bypasses_persisted_cadence_and_resumes_after_budget_split() -> None:
+    cadence = _Cadence(DemandStatus(release_at=10_000.0))
+    startup = StartupIdentityState(100.0, 200.0)
+    profile = SimpleNamespace(id=42, username="account")
+    input_user = object()
+    applied_profiles: list[object] = []
+    applied_contexts: list[OwnOnlyContext] = []
+    observed: list[tuple[DemandKind, AcquisitionKind]] = []
+
+    def observe_scope() -> None:
+        token = current_demand_token()
+        scope = current_rpc_scope()
+        assert token.acquisition_kind is not None
+        assert scope.attempt_budget is not None
+        observed.append((token.kind, token.acquisition_kind))
+
+    async def get_me() -> object:
+        observe_scope()
+        current_rpc_scope().attempt_budget.debit()  # type: ignore[union-attr]
+        return profile
+
+    async def get_input_entity(account_id: int) -> object:
+        observe_scope()
+        assert account_id == 42
+        return input_user
+
+    async def get_full_user(received: object) -> object:
+        observe_scope()
+        assert received is input_user
+        current_rpc_scope().attempt_budget.debit()  # type: ignore[union-attr]
+        return SimpleNamespace(full_user=SimpleNamespace(personal_channel_id=9001))
+
+    def publish_startup_identity(applied_profile: object, context: OwnOnlyContext) -> None:
+        applied_profiles.append(applied_profile)
+        applied_contexts.append(context)
+
+    adapter = SelfProfileMaintenanceDemandAdapter(
+        SelfProfileMaintenanceDependencies(
+            cadence=cadence,
+            get_me=get_me,
+            update_profile=applied_profiles.append,
+            startup=startup,
+            get_input_entity=get_input_entity,
+            get_full_user=get_full_user,
+            publish_startup_identity=publish_startup_identity,
+        ),
+        clock=lambda: 100.0,
+    )
+
+    assert adapter.status(100.0) == DemandStatus(release_at=0.0, freshness_deadline=200.0)
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert startup.phase is StartupIdentityPhase.FULL_USER
+    assert applied_profiles == []
+
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert startup.phase is StartupIdentityPhase.READY
+    assert startup.done_event.is_set()
+    assert startup.result().profile is profile
+    assert startup.result().own_only_context.account_id == 42
+    assert startup.result().own_only_context.personal_channel_id == -1000000009001
+    assert applied_profiles == [profile]
+    assert applied_contexts == [startup.result().own_only_context]
+    assert cadence.refreshed_at == [100.0]
+    assert adapter.status(100.0) == DemandStatus(release_at=10_000.0)
+    assert observed == [(DemandKind.SELF_PROFILE_MAINTENANCE, AcquisitionKind.ACCOUNT_SELF_PROFILE)] * 4
+
+
+@pytest.mark.asyncio
+async def test_permanent_startup_profile_failure_signals_terminal_state() -> None:
+    startup = StartupIdentityState(100.0, 200.0)
+
+    async def get_me() -> object:
+        raise RuntimeError("permanent")
+
+    adapter = SelfProfileMaintenanceDemandAdapter(
+        SelfProfileMaintenanceDependencies(
+            cadence=_Cadence(DemandStatus(release_at=10_000.0)),
+            get_me=get_me,
+            update_profile=_unused_update_profile,
+            startup=startup,
+            get_input_entity=lambda _account_id: _unused_get_me(),
+            get_full_user=lambda _input_user: _unused_get_me(),
+            publish_startup_identity=lambda _profile, _context: None,
+        ),
+        clock=lambda: 100.0,
+    )
+
+    with pytest.raises(StartupIdentityUnavailableError, match="profile failed"):
+        await adapter.run_slice(RpcAttemptBudget(limit=2))
+
+    assert startup.phase is StartupIdentityPhase.FAILED
+    assert startup.done_event.is_set()
+    assert adapter.status(100.0) is None
