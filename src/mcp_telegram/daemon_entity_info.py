@@ -249,7 +249,6 @@ class EntityInfoDeps:
     get_dialog_placement: Callable[[int], dict[str, object]] | None = None
     refresh_limits: RefreshLimits = field(default_factory=RefreshLimits)
     enable_full_user_pair: bool = False
-    full_user_identity: Mapping[str, object] | None = None
     full_user_auth_scope: Callable[[], TelegramAuthScope | None] | None = None
     profile_observer: ProfilePairObservationHook | None = None
 
