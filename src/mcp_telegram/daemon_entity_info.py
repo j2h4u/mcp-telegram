@@ -429,22 +429,27 @@ class DaemonEntityInfoService:
         )
         if not completed:
             return fallback
-        refreshed = self._progressive_cached_result(entity_id, now=int(self._deps.now_provider()))
+        refreshed = self._progressive_cached_result(
+            entity_id,
+            now=int(self._deps.now_provider()),
+            admit_refresh=False,
+        )
         return fallback if refreshed is None else refreshed
 
-    def _progressive_cached_result(self, entity_id: int, *, now: int) -> dict[str, object] | None:
+    def _progressive_cached_result(
+        self,
+        entity_id: int,
+        *,
+        now: int,
+        admit_refresh: bool = True,
+    ) -> dict[str, object] | None:
         cached = self._profiles.read(entity_id, now=now)
         if cached is not None:
             if self._profile_ownership_unavailable(cached):
-                self._profiles.mark_pending(
-                    entity_id,
-                    now=now,
-                    reason="profile_ownership_changed",
-                    pair_eligible_override=(True if self._deps.enable_full_user_pair else None),
-                    pair_mode_override=self._current_pair_mode(),
-                )
+                if admit_refresh:
+                    self._admit_cached_ownership_refresh(entity_id, now=now)
                 return self._pending_error(entity_id, "entity profile ownership is unavailable")
-            if self._profile_scope_changed(cached, entity_id, now=now):
+            if self._profile_scope_changed(cached, entity_id, now=now) and admit_refresh:
                 self._profiles.mark_pending(
                     entity_id,
                     now=now,
@@ -454,12 +459,53 @@ class DaemonEntityInfoService:
                 )
                 cached = self._profiles.read(entity_id, now=now)
                 assert cached is not None
-            return self._progressive_result(entity_id, cached.detail, cached.sections, now=now)
+            return self._progressive_result(
+                entity_id,
+                cached.detail,
+                cached.sections,
+                now=now,
+                admit_refresh=admit_refresh,
+            )
         refresh_state = self._profiles.refresh_state(entity_id, now=now)
         if refresh_state is None:
             return None
         reason = str(refresh_state.get("reason", "entity refresh is temporarily unavailable"))
         return self._pending_error(entity_id, reason)
+
+    def _admit_cached_ownership_refresh(self, entity_id: int, *, now: int) -> RefreshEnqueueResult:
+        """Admit ownership repair while retaining already durable refresh work."""
+        assert self._refresh is not None
+        enqueue_result = self._refresh.enqueue(entity_id)
+        existing_status = self._refresh_state_status(entity_id)
+        preserves_work = existing_status in {"pending", "failed"}
+        if enqueue_result is RefreshEnqueueResult.REJECTED:
+            if not preserves_work:
+                self._profiles.mark_refresh_rejected(entity_id, now=now)
+            return enqueue_result
+        if not preserves_work:
+            self._profiles.mark_pending(
+                entity_id,
+                now=now,
+                reason="profile_ownership_changed",
+                pair_eligible_override=(True if self._deps.enable_full_user_pair else None),
+                pair_mode_override=self._current_pair_mode(),
+            )
+        offer_durable_demand(self._require_demand_sink(), DemandKind.ENTITY_PROFILE_REFRESH)
+        return enqueue_result
+
+    def _refresh_state_status(self, entity_id: int) -> str | None:
+        """Read the exact durable state needed to avoid rewriting active work."""
+        try:
+            row = cast(
+                tuple[object] | None,
+                self._deps.conn.execute(
+                    "SELECT status FROM entity_profile_refresh_state WHERE entity_id=?",
+                    (entity_id,),
+                ).fetchone(),
+            )
+        except sqlite3.OperationalError:
+            return None
+        return str(row[0]) if row is not None else None
 
     def _profile_ownership_unavailable(self, cached: object) -> bool:
         provider = self._deps.full_user_auth_scope
@@ -1966,8 +2012,10 @@ class DaemonEntityInfoService:
         sections: dict[str, dict[str, object]],
         *,
         now: int,
+        admit_refresh: bool = True,
     ) -> dict[str, object]:
-        self._enqueue_section_refresh(entity_id, sections)
+        if admit_refresh:
+            self._enqueue_section_refresh(entity_id, sections)
         result = dict(detail)
         result["id"] = entity_id
         result["dialog_placement"] = result.get(
