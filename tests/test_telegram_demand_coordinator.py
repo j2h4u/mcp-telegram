@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 
 import pytest
 
@@ -34,13 +34,17 @@ class _Clock:
         return self.value
 
 
+async def _noop() -> None:
+    return None
+
+
 class _Adapter:
     def __init__(self, status: DemandStatus | None = None) -> None:
         self.current_status = status
         self.status_calls: list[float] = []
         self.run_calls: list[RpcAttemptBudget] = []
         self.run_error: BaseException | None = None
-        self.on_run = None
+        self.on_run: Callable[[], Awaitable[None]] = _noop
 
     def status(self, now: float) -> DemandStatus | None:
         self.status_calls.append(now)
@@ -48,8 +52,7 @@ class _Adapter:
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
         self.run_calls.append(budget)
-        if self.on_run is not None:
-            await self.on_run()
+        await self.on_run()
         if self.run_error is not None:
             raise self.run_error
 
