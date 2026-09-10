@@ -72,6 +72,7 @@ class HotSweepPolicy(Protocol):
     @property
     def jitter_max_seconds(self) -> float: ...
 
+
 @contextmanager
 def _hot_demand_scope() -> Iterator[None]:
     """Install the exact hot-page root for a legacy pass."""

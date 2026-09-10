@@ -189,6 +189,7 @@ def _patch_sweep(
 # (f/idle) NO_DUE_PEER when no peer enrolled
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_no_due_peer_when_none_enrolled(monkeypatch: pytest.MonkeyPatch) -> None:
     """With no enrolled peers, run_cold_backfill_pass returns NO_DUE_PEER."""

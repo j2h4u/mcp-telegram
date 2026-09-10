@@ -368,9 +368,7 @@ class MessageFactHydrationWorker:
 
     def _run_repair_producers(self, effective_now: int) -> None:
         if TRANSCRIPTION_HYDRATION_KIND in self._handlers:
-            repair_transcription_hydration_jobs(
-                self._conn, due_at=effective_now, max_jobs=self._max_jobs_per_cycle
-            )
+            repair_transcription_hydration_jobs(self._conn, due_at=effective_now, max_jobs=self._max_jobs_per_cycle)
         media_handler = self._handlers.get(MEDIA_METADATA_KIND)
         if media_handler is not None:
             repair_media_metadata_hydration_jobs(
@@ -378,6 +376,7 @@ class MessageFactHydrationWorker:
                 due_at=effective_now,
                 max_jobs=min(media_handler.batch_size, self._max_jobs_per_cycle),
             )
+
     async def _process_batch(  # noqa: PLR0911 - each transport outcome owns one durable recovery path
         self,
         handler: HydrationHandler,

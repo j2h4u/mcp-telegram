@@ -140,7 +140,9 @@ async def test_archive_backfill_adapter_commits_one_page_with_precise_scope(conn
 
     assert adapter.status(1_700_000_000.0) is not None
     await adapter.run_slice(budget)
-    state = dict(cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall()))
+    state = dict(
+        cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    )
     assert state["backfill_offset_id"] == "100"
     assert state["backfill_complete"] == "0"
     assert client.scopes[0].demand_kind is DemandKind.ARCHIVE_BACKFILL
@@ -167,14 +169,18 @@ async def test_archive_incremental_adapter_resumes_from_key_value_state(conn: sq
     assert initial is not None
     assert initial.release_at == last_sync_at + 3_600
     await adapter.run_slice(first_budget)
-    state = dict(cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall()))
+    state = dict(
+        cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    )
     assert state["incremental_min_date"] == str(last_sync_at - 60)
     assert state["incremental_offset_id"] == "12"
     assert client.scopes[0].demand_kind is DemandKind.ARCHIVE_INCREMENTAL
     assert client.scopes[0].attempt_budget is first_budget
 
     await adapter.run_slice(RpcAttemptBudget(limit=1))
-    final_state = dict(cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall()))
+    final_state = dict(
+        cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    )
     assert "incremental_min_date" not in final_state
     assert "incremental_offset_id" not in final_state
     assert int(final_state["last_sync_at"] or 0) > last_sync_at

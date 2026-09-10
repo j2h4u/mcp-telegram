@@ -128,7 +128,9 @@ async def test_hot_activity_adapter_resumes_page_window_before_advancing_cursor(
         _enroll(conn, dialog_id, hot_cursor=10)
         first_page = list(range(101, 201))
         second_page = [11, 12]
-        call_log = _patch_sweep(monkeypatch, {dialog_id: [_make_sweep_result(first_page), _make_sweep_result(second_page)]})
+        call_log = _patch_sweep(
+            monkeypatch, {dialog_id: [_make_sweep_result(first_page), _make_sweep_result(second_page)]}
+        )
         adapter = HotActivityDemandAdapter(_FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S)
 
         await adapter.run_slice(RpcAttemptBudget(limit=1))
