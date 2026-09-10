@@ -5,7 +5,6 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import cast
 
 import pytest
 
@@ -138,6 +137,18 @@ async def sync_main(ctx):
     assert _messages(_fixture_root(tmp_path, daemon=daemon)) == []
 
 
+def test_demand_wiring_offer_helper_is_allowed(tmp_path: Path) -> None:
+    root = _fixture_root(tmp_path)
+    (root / "src" / "mcp_telegram" / "producer.py").write_text(
+        "from .demand_wiring import offer_durable_demand\n"
+        "def emit(sink, kind):\n"
+        "    offer_durable_demand(sink, kind)\n",
+        encoding="utf-8",
+    )
+
+    assert _messages(root) == []
+
+
 def test_inline_protocol_realtime_and_transport_tasks_are_allowed(tmp_path: Path) -> None:
     daemon = """
 async def sync_main(ctx):
@@ -163,13 +174,11 @@ async def sync_main(ctx):
     assert any("expected one coordinator task launch, found 2" in message for message in messages)
 
 
-def test_current_pr1_checkout_is_explicitly_blocked_until_cutover() -> None:
+def test_current_checkout_has_completed_the_cutover() -> None:
     gate = _gate()
-    findings = cast(tuple[object, ...], gate.find_violations(Path(__file__).parents[1]))
+    findings = gate.find_violations(Path(__file__).parents[1])
 
-    assert findings
-    assert any(getattr(finding, "rule", None) == "shadow-module" for finding in findings)
-    assert any(getattr(finding, "rule", None) == "retired-durable-launch" for finding in findings)
+    assert findings == ()
 
 
 @pytest.mark.parametrize(

@@ -34,7 +34,6 @@ SHADOW_SYMBOLS = frozenset(
         "DemandCycleRunner",
         "DemandShadow",
         "TelegramDemandShadow",
-        "offer_durable_demand",
         "run_legacy_demand_cycle",
     }
 )
