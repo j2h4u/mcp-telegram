@@ -60,6 +60,22 @@ def test_shadow_modules_symbols_and_fields_are_release_blockers(tmp_path: Path) 
     assert any("shadow-field" in message for message in findings)
 
 
+def test_shadow_declarations_and_shadow_named_modules_are_release_blockers(tmp_path: Path) -> None:
+    root = _fixture_root(tmp_path)
+    source = root / "src" / "mcp_telegram"
+    (source / "telegram_demand_shadow_runtime.py").write_text("class Runtime: pass\n", encoding="utf-8")
+    (source / "bindings.py").write_text(
+        "class DemandShadowBridge: pass\ndef bind_demand_shadow(value):\n    return value\n",
+        encoding="utf-8",
+    )
+
+    findings = _messages(root)
+
+    assert any("shadow-module" in message for message in findings)
+    assert any("DemandShadowBridge" in message for message in findings)
+    assert any("bind_demand_shadow" in message for message in findings)
+
+
 def test_daemon_rejects_legacy_loops_and_direct_worker_execution(tmp_path: Path) -> None:
     daemon = """
 import asyncio
@@ -77,6 +93,34 @@ async def sync_main(ctx):
     assert any("run_sync_loop" in message for message in messages)
 
 
+def test_daemon_rejects_aliased_legacy_loops_and_worker_methods(tmp_path: Path) -> None:
+    daemon = """
+from package import run_activity_sync_loop as legacy_loop
+
+async def sync_main(ctx):
+    launcher = legacy_loop
+    worker_operation = ctx.folder_projection_worker.run
+    _create_tracked_task(ctx, launcher(ctx), name="legacy")
+    worker_operation()
+    _create_tracked_task(ctx, ctx.coordinator.run(), name="telegram_demand_coordinator")
+"""
+    messages = _messages(_fixture_root(tmp_path, daemon=daemon))
+
+    assert any("retired-durable-launch" in message for message in messages)
+    assert any("direct-durable-operation" in message for message in messages)
+
+
+def test_coordinator_alias_and_task_label_alias_are_counted(tmp_path: Path) -> None:
+    daemon = """
+async def sync_main(ctx):
+    coordinator_run = ctx.coordinator.run
+    coordinator_name = "telegram_demand_coordinator"
+    _create_tracked_task(ctx, coordinator_run(), name=coordinator_name)
+"""
+
+    assert _messages(_fixture_root(tmp_path, daemon=daemon)) == []
+
+
 def test_producer_offers_and_non_durable_runtime_tasks_are_allowed(tmp_path: Path) -> None:
     daemon = """
 import asyncio
@@ -89,6 +133,20 @@ async def sync_main(ctx):
     _create_tracked_task(ctx, ctx.rpc_admission_observer.run_periodic_flush(ctx.shutdown_event),
                          name="rpc_admission_observation_flush_loop")
     await asyncio.sleep(0)
+"""
+
+    assert _messages(_fixture_root(tmp_path, daemon=daemon)) == []
+
+
+def test_inline_protocol_realtime_and_transport_tasks_are_allowed(tmp_path: Path) -> None:
+    daemon = """
+async def sync_main(ctx):
+    ctx.coordinator.offer(DemandKind.SCHEDULED_REPAIR)
+    _create_tracked_task(ctx, ctx.coordinator.run(), name="telegram_demand_coordinator")
+    _create_tracked_task(ctx, ctx.inline.run(), name="inline")
+    _create_tracked_task(ctx, ctx.protocol.run(), name="protocol")
+    _create_tracked_task(ctx, ctx.realtime.run(), name="realtime")
+    _create_tracked_task(ctx, ctx.transport.run(), name="transport")
 """
 
     assert _messages(_fixture_root(tmp_path, daemon=daemon)) == []

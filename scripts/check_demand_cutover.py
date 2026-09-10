@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import ast
 import sys
-from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +28,7 @@ SHADOW_MODULES = frozenset(
         "demand_shadow_wiring",
     }
 )
+SHADOW_IDENTIFIER_FRAGMENT = "demandshadow"
 SHADOW_SYMBOLS = frozenset(
     {
         "DemandCycleRunner",
@@ -141,9 +141,14 @@ def _name_parts(node: ast.expr) -> tuple[str, ...]:
     return ()
 
 
-def _contains_name(node: ast.AST, names: Iterable[str]) -> bool:
-    wanted = set(names)
-    return any(isinstance(item, ast.Name) and item.id in wanted for item in ast.walk(node))
+def _is_shadow_identifier(value: str) -> bool:
+    """Recognize snake_case and CamelCase names from the retired bridge."""
+    return SHADOW_IDENTIFIER_FRAGMENT in value.casefold().replace("_", "")
+
+
+def _is_shadow_module(value: str) -> bool:
+    module_name = value.rsplit(".", 1)[-1]
+    return module_name in SHADOW_MODULES or _is_shadow_identifier(module_name)
 
 
 def _literal_strings(node: ast.AST) -> tuple[str, ...]:
@@ -156,39 +161,61 @@ class _ShadowVisitor(ast.NodeVisitor):
     def __init__(self, relative_path: str) -> None:
         self.path = relative_path
         self.findings: list[Finding] = []
+        self.shadow_aliases: set[str] = set()
 
     def _add(self, node: ast.AST, rule: str, detail: str) -> None:
         self.findings.append(Finding(self.path, _line(node), rule, detail))
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
-            module_name = alias.name.rsplit(".", 1)[-1]
-            if module_name in SHADOW_MODULES or alias.name.endswith(tuple(f".{name}" for name in SHADOW_MODULES)):
+            if _is_shadow_module(alias.name):
                 self._add(node, "shadow-module", f"PR1 shadow module {alias.name!r} is retired")
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module or ""
-        module_name = module.rsplit(".", 1)[-1]
-        if module_name in SHADOW_MODULES:
+        if _is_shadow_module(module):
             self._add(node, "shadow-module", f"PR1 shadow module {module!r} is retired")
         for alias in node.names:
             if alias.name in SHADOW_SYMBOLS:
                 self._add(node, "shadow-symbol", f"PR1 shadow symbol {alias.name!r} is retired")
+                self.shadow_aliases.add(alias.asname or alias.name)
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
-        if node.id in SHADOW_SYMBOLS:
+        if node.id in SHADOW_SYMBOLS or node.id in self.shadow_aliases:
             self._add(node, "shadow-symbol", f"PR1 shadow symbol {node.id!r} is retired")
-        if SHADOW_FIELD_FRAGMENT in node.id.lower():
+        elif _is_shadow_identifier(node.id):
             self._add(node, "shadow-field", f"PR1 shadow field {node.id!r} is retired")
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if node.attr in SHADOW_SYMBOLS:
             self._add(node, "shadow-symbol", f"PR1 shadow attribute {node.attr!r} is retired")
-        if SHADOW_FIELD_FRAGMENT in node.attr.lower():
+        elif _is_shadow_identifier(node.attr):
             self._add(node, "shadow-field", f"PR1 shadow field {node.attr!r} is retired")
         self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._check_declared_name(node, node.name)
+        self.generic_visit(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._check_declared_name(node, node.name)
+        self.generic_visit(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._check_declared_name(node, node.name)
+        self.generic_visit(node)
+
+    def visit_arg(self, node: ast.arg) -> None:
+        self._check_declared_name(node, node.arg)
+        self.generic_visit(node)
+
+    def _check_declared_name(self, node: ast.AST, name: str) -> None:
+        if name in SHADOW_SYMBOLS:
+            self._add(node, "shadow-symbol", f"PR1 shadow symbol {name!r} is retired")
+        elif _is_shadow_identifier(name):
+            self._add(node, "shadow-field", f"PR1 shadow field {name!r} is retired")
 
 
 class _DaemonVisitor(ast.NodeVisitor):
@@ -198,6 +225,10 @@ class _DaemonVisitor(ast.NodeVisitor):
         self.path = relative_path
         self.findings: list[Finding] = []
         self.coordinator_tasks = 0
+        self.retired_loop_aliases: set[str] = set()
+        self.direct_worker_aliases: set[str] = set()
+        self.coordinator_run_aliases: set[str] = set()
+        self.string_aliases: dict[str, set[str]] = {}
 
     def _add(self, node: ast.AST, rule: str, detail: str) -> None:
         self.findings.append(Finding(self.path, _line(node), rule, detail))
@@ -211,33 +242,146 @@ class _DaemonVisitor(ast.NodeVisitor):
     def _receiver_is_coordinator(node: ast.Call) -> bool:
         if not isinstance(node.func, ast.Attribute) or node.func.attr != "run":
             return False
-        return any("coordinator" in part.lower() for part in _name_parts(node.func.value))
+        return _DaemonVisitor._looks_like_coordinator_receiver(node.func.value)
+
+    @staticmethod
+    def _looks_like_coordinator_receiver(node: ast.expr) -> bool:
+        return any("coordinator" in part.lower() for part in _name_parts(node))
 
     @staticmethod
     def _is_task_creator(node: ast.Call) -> bool:
         name = _DaemonVisitor._call_name(node)
         return name in TASK_CREATORS
 
+    @staticmethod
+    def _target_names(node: ast.AST) -> tuple[str, ...]:
+        if isinstance(node, ast.Name):
+            return (node.id,)
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return tuple(name for element in node.elts for name in _DaemonVisitor._target_names(element))
+        return ()
+
+    @classmethod
+    def _assignment_targets(cls, node: ast.Assign | ast.AnnAssign) -> tuple[str, ...]:
+        targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+        return tuple(name for target in targets for name in cls._target_names(target))
+
+    @staticmethod
+    def _callable_name(node: ast.expr) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return None
+
+    def _assigned_strings(self, node: ast.expr) -> set[str]:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return {node.value}
+        if isinstance(node, ast.Name):
+            return set(self.string_aliases.get(node.id, ()))
+        return set()
+
+    @staticmethod
+    def _remember_alias(aliases: set[str], name: str | None) -> bool:
+        if name is None or name in aliases:
+            return False
+        aliases.add(name)
+        return True
+
+    def _collect_import_aliases(self, tree: ast.AST) -> None:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name in RETIRED_DURABLE_LOOP_CALLS:
+                        self._remember_alias(self.retired_loop_aliases, alias.asname or alias.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    imported_name = alias.name.rsplit(".", 1)[-1]
+                    if imported_name in RETIRED_DURABLE_LOOP_CALLS:
+                        self._remember_alias(self.retired_loop_aliases, alias.asname)
+
+    def _collect_assignment_aliases(self, assignments: tuple[ast.Assign | ast.AnnAssign, ...]) -> bool:
+        changed = False
+        for node in assignments:
+            value = node.value
+            value_name = self._callable_name(value)
+            value_strings = self._assigned_strings(value)
+            for target in self._assignment_targets(node):
+                changed |= self._remember_alias(
+                    self.retired_loop_aliases,
+                    target
+                    if value_name in RETIRED_DURABLE_LOOP_CALLS or value_name in self.retired_loop_aliases
+                    else None,
+                )
+                changed |= self._remember_alias(
+                    self.direct_worker_aliases,
+                    target if value_name in self.direct_worker_aliases else None,
+                )
+                changed |= self._remember_alias(
+                    self.coordinator_run_aliases,
+                    target if value_name in self.coordinator_run_aliases else None,
+                )
+                if isinstance(value, ast.Attribute):
+                    changed |= self._remember_alias(
+                        self.retired_loop_aliases,
+                        target if value.attr in RETIRED_DURABLE_LOOP_CALLS else None,
+                    )
+                    changed |= self._remember_alias(
+                        self.direct_worker_aliases,
+                        target
+                        if value.attr in DIRECT_DURABLE_METHODS and self._looks_like_durable_receiver(value.value)
+                        else None,
+                    )
+                    changed |= self._remember_alias(
+                        self.coordinator_run_aliases,
+                        target if value.attr == "run" and self._looks_like_coordinator_receiver(value.value) else None,
+                    )
+                if value_strings:
+                    known_strings = self.string_aliases.setdefault(target, set())
+                    if known_strings.isdisjoint(value_strings):
+                        known_strings.update(value_strings)
+                        changed = True
+        return changed
+
+    def collect_bindings(self, tree: ast.AST) -> None:
+        """Collect simple aliases before checking calls, regardless of source order."""
+        assignments = tuple(node for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign)))
+        self._collect_import_aliases(tree)
+        while self._collect_assignment_aliases(assignments):
+            pass
+
+    def _resolved_strings(self, node: ast.AST) -> tuple[str, ...]:
+        values = set(_literal_strings(node))
+        for item in ast.walk(node):
+            if isinstance(item, ast.Name):
+                values.update(self.string_aliases.get(item.id, ()))
+        return tuple(sorted(values))
+
     def _check_coordinator_task(self, node: ast.Call) -> None:
         if not self._is_task_creator(node):
             return
-        strings = _literal_strings(node)
+        strings = self._resolved_strings(node)
         is_named = COORDINATOR_TASK_NAME in strings or any("coordinator" in value.lower() for value in strings)
-        if self._receiver_is_coordinator(node) or is_named or _contains_name(node, {"coordinator"}):
+        has_coordinator_run = any(
+            isinstance(item, ast.Call)
+            and (self._receiver_is_coordinator(item) or self._call_name(item) in self.coordinator_run_aliases)
+            for item in ast.walk(node)
+        )
+        if has_coordinator_run or is_named:
             self.coordinator_tasks += 1
 
     def _check_retired_loop(self, node: ast.Call) -> None:
         name = self._call_name(node)
-        if name in RETIRED_DURABLE_LOOP_CALLS:
+        if name in RETIRED_DURABLE_LOOP_CALLS or name in self.retired_loop_aliases:
             self._add(node, "retired-durable-launch", f"daemon launches retired durable loop {name!r}")
 
     def _check_task_label(self, node: ast.Call) -> None:
         if not self._is_task_creator(node):
             return
-        for value in _literal_strings(node):
+        for value in self._resolved_strings(node):
             if value in RETIRED_DURABLE_TASK_LABELS:
                 self._add(node, "retired-durable-task", f"daemon creates retired durable task {value!r}")
-            elif SHADOW_TASK_FRAGMENT in value.lower():
+            elif _is_shadow_identifier(value):
                 self._add(node, "shadow-task", f"PR1 shadow task label {value!r} is retired")
 
     @staticmethod
@@ -248,6 +392,14 @@ class _DaemonVisitor(ast.NodeVisitor):
         )
 
     def _check_direct_worker_operation(self, node: ast.Call) -> None:
+        name = self._call_name(node)
+        if name in self.direct_worker_aliases:
+            self._add(
+                node,
+                "direct-durable-operation",
+                f"daemon directly invokes durable worker operation {name!r}",
+            )
+            return
         if not isinstance(node.func, ast.Attribute) or node.func.attr not in DIRECT_DURABLE_METHODS:
             return
         receiver = node.func.value
@@ -279,9 +431,11 @@ def find_violations(root: Path = ROOT) -> tuple[Finding, ...]:
     findings: list[Finding] = []
     daemon_found = False
     daemon_visitor: _DaemonVisitor | None = None
+    if not source_root.is_dir():
+        return (Finding("src/mcp_telegram", 1, "source-root", "source package directory is missing"),)
     for path in _python_files(source_root):
         relative_path = _relative(path, root)
-        if path.stem in SHADOW_MODULES:
+        if _is_shadow_module(path.stem):
             findings.append(
                 Finding(relative_path, 1, "shadow-module", f"PR1 shadow module {path.stem!r} must be removed")
             )
@@ -296,6 +450,7 @@ def find_violations(root: Path = ROOT) -> tuple[Finding, ...]:
         if path.name == "daemon.py":
             daemon_found = True
             daemon_visitor = _DaemonVisitor(relative_path)
+            daemon_visitor.collect_bindings(tree)
             daemon_visitor.visit(tree)
             findings.extend(daemon_visitor.findings)
 
@@ -313,6 +468,8 @@ def find_violations(root: Path = ROOT) -> tuple[Finding, ...]:
                     f"expected one coordinator task launch, found {daemon_visitor.coordinator_tasks}",
                 )
             )
+    else:
+        findings.append(Finding("src/mcp_telegram/daemon.py", 1, "daemon", "daemon composition module is missing"))
     return tuple(sorted(findings, key=lambda finding: (finding.path, finding.line, finding.rule, finding.detail)))
 
 
