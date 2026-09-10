@@ -74,6 +74,7 @@ from .telegram_rpc_scheduler import (
     RpcAdmissionSaturatedError,
     TelegramRpcAdmissionDeferred,
     TelegramRpcSource,
+    current_rpc_scope,
     rpc_attempt_budget,
     rpc_scope,
 )
@@ -648,6 +649,7 @@ class DialogsBootstrapWorker:
         self._conn = _open_sync_db(db_path)
         self._shutdown_event = shutdown_event
         self._startup_detail_setter = startup_detail_setter
+        self._last_retry_error: BaseException | None = None
 
     def _set_detail(self, msg: str) -> None:
         """Forward to startup_detail_setter if provided (None-safe)."""
@@ -683,19 +685,6 @@ class DialogsBootstrapWorker:
                 _clear_cursor(self._conn)
             return None, 0, None
 
-    async def _handle_bootstrap_throttling(self, exc: TelegramRpcThrottled, count: int) -> int:
-        if exc.retry_after_seconds is None:
-            return count
-        wait_s = exc.retry_after_seconds
-        logger.warning(
-            "bootstrap_sweep flood_wait=%ds processed_so_far=%d — sleeping",
-            wait_s,
-            count,
-        )
-        self._set_detail(f"bootstrap sweep: flood_wait {wait_s}s (processed {count})")
-        await sleep_through_flood(self._shutdown_event, wait_s)
-        return count
-
     async def _consume_bootstrap_attempt(self, attempt: _BootstrapAttempt) -> bool:
         """Consume one iterator pass and report whether it drained normally."""
         offset_date, offset_id, offset_peer = self._reconstruct_cursor()
@@ -715,6 +704,19 @@ class DialogsBootstrapWorker:
                 self._set_detail(f"bootstrap sweep: {attempt.count} dialogs processed")
         return True
 
+    async def _handle_bootstrap_throttling(self, exc: TelegramRpcThrottled, count: int) -> int:
+        if exc.retry_after_seconds is None or current_rpc_scope().attempt_budget is not None:
+            return count
+        wait_s = exc.retry_after_seconds
+        logger.warning(
+            "bootstrap_sweep flood_wait=%ds processed_so_far=%d — sleeping",
+            wait_s,
+            count,
+        )
+        self._set_detail(f"bootstrap sweep: flood_wait {wait_s}s (processed {count})")
+        await sleep_through_flood(self._shutdown_event, wait_s)
+        return count
+
     async def _handle_bootstrap_admission_deferred(
         self, exc: TelegramRpcAdmissionDeferred, count: int
     ) -> _BootstrapAttemptResult:
@@ -725,6 +727,8 @@ class DialogsBootstrapWorker:
             count,
         )
         self._set_detail(f"bootstrap sweep: admission deferred {wait_s}s (processed {count})")
+        if current_rpc_scope().attempt_budget is not None:
+            return _BootstrapAttemptResult(count)
         return _BootstrapAttemptResult(
             count,
             continue_sweep=not await sleep_through_flood(self._shutdown_event, wait_s),
@@ -751,13 +755,14 @@ class DialogsBootstrapWorker:
         try:
             completed = await self._consume_bootstrap_attempt(attempt)
         except TelegramRpcAdmissionDeferred as exc:
+            self._last_retry_error = exc
             return await self._handle_bootstrap_admission_deferred(exc, attempt.count)
         except TelegramRpcThrottled as exc:
+            self._last_retry_error = exc
             await self._handle_bootstrap_throttling(exc, attempt.count)
-            # The async generator cannot resume after a flood wait. Keep the
-            # durable in-progress state for the next daemon start.
             return _BootstrapAttemptResult(attempt.count)
         except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
+            self._last_retry_error = exc
             logger.info(
                 "bootstrap_sweep admission_deferred error_type=%s processed_so_far=%d — preserving cursor",
                 type(exc).__name__,
@@ -765,6 +770,7 @@ class DialogsBootstrapWorker:
             )
             return _BootstrapAttemptResult(attempt.count)
         except RPCError as exc:
+            self._last_retry_error = exc
             logger.warning(
                 "bootstrap_sweep rpc_error=%s processed_so_far=%d — aborting sweep",
                 exc,
@@ -802,6 +808,7 @@ class DialogsBootstrapWorker:
                 result = await self._run_bootstrap_attempt(count)
                 count = result.count
                 if result.continue_sweep:
+                    self._last_retry_error = None
                     continue
                 if not result.completed:
                     return count
@@ -864,6 +871,8 @@ class DialogBootstrapDemandAdapter:
             with rpc_attempt_budget(budget):
                 try:
                     await worker.run()
+                    if worker._last_retry_error is not None:
+                        raise worker._last_retry_error
                 except RpcAttemptBudgetExhaustedError:
                     return
 
@@ -1226,6 +1235,8 @@ class DialogReconciliationWorker:
     ) -> _FullPassSliceResult:
         if isinstance(exc, RpcAttemptBudgetExhaustedError):
             return _FullPassSliceResult(False)
+        if not wait_on_throttle:
+            raise exc
         if isinstance(exc, TelegramRpcAdmissionDeferred):
             logger.info(
                 "recon_full admission_deferred retry_after=%s generation=%d",

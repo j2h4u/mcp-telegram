@@ -58,6 +58,7 @@ from .telegram_rpc_scheduler import (
     RpcAdmissionSaturatedError,
     TelegramRpcAdmissionDeferred,
     TelegramRpcSource,
+    current_rpc_scope,
     rpc_attempt_budget,
     rpc_scope,
 )
@@ -65,7 +66,6 @@ from .telethon_dialog import classify_dialog_type
 
 logger = logging.getLogger(__name__)
 _BATCH_SIZE = 100
-_DM_BOOTSTRAP_MAX_ADMISSION_WAIT_SECONDS = 30
 _DM_ENROLLMENT_KEY_STATUS = "full_sync_dm_enrollment_status"
 _DM_ENROLLMENT_KEY_OFFSET_DATE = "full_sync_dm_enrollment_offset_date"
 _DM_ENROLLMENT_KEY_OFFSET_ID = "full_sync_dm_enrollment_offset_id"
@@ -78,8 +78,9 @@ _DM_ENROLLMENT_CURSOR_KEYS = (
 )
 _DM_ENROLLMENT_IN_PROGRESS = "in_progress"
 _DM_ENROLLMENT_COMPLETE = "complete"
-_TOTAL_MESSAGES_REPAIR_RETRY_KEY = "full_sync_total_messages_repair_retry_at"
-_TOTAL_MESSAGES_REPAIR_RETRY_SECONDS = 60
+_DM_BOOTSTRAP_MAX_ADMISSION_WAIT_SECONDS = 30
+_TOTAL_MESSAGES_REPAIR_GATE_STATE_KEY = "full_sync_total_messages_repair_retry_at"
+_TOTAL_MESSAGES_REPAIR_FAILURE_DELAY_S = 60
 
 
 @contextmanager
@@ -233,7 +234,7 @@ def _clear_dm_enrollment_cursor(conn: sqlite3.Connection) -> None:
 
 
 def _total_messages_repair_retry_at(conn: sqlite3.Connection) -> int | None:
-    value = _dm_enrollment_state(conn, _TOTAL_MESSAGES_REPAIR_RETRY_KEY)
+    value = _dm_enrollment_state(conn, _TOTAL_MESSAGES_REPAIR_GATE_STATE_KEY)
     if value is None:
         return None
     try:
@@ -246,7 +247,7 @@ def _total_messages_repair_retry_at(conn: sqlite3.Connection) -> int | None:
 def _set_total_messages_repair_retry(conn: sqlite3.Connection, retry_at: int | None) -> None:
     _set_dm_enrollment_state(
         conn,
-        _TOTAL_MESSAGES_REPAIR_RETRY_KEY,
+        _TOTAL_MESSAGES_REPAIR_GATE_STATE_KEY,
         None if retry_at is None else str(retry_at),
     )
 
@@ -338,6 +339,9 @@ class FullSyncWorker:
         self._client = cast(_SyncWorkerClient, client)
         self._conn = conn
         self._shutdown_event = shutdown_event
+        self._last_page_error: BaseException | None = None
+        self._last_total_repair_error: BaseException | None = None
+        self._last_dm_enrollment_error: BaseException | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -406,6 +410,8 @@ class FullSyncWorker:
             exc.retry_after_seconds,
             progress.enrolled,
         )
+        if current_rpc_scope().attempt_budget is not None:
+            return True
         return await sleep_through_flood(self._shutdown_event, retry_after)
 
     def _prepare_dm_enrollment(self, *, start_new_if_complete: bool) -> bool:
@@ -422,6 +428,7 @@ class FullSyncWorker:
         return True
 
     async def _handle_dm_enrollment_error(self, exc: Exception, progress: _BootstrapProgress) -> bool | None:
+        self._last_dm_enrollment_error = exc
         if isinstance(exc, TelegramRpcAdmissionDeferred):
             return False if await self._retry_dm_bootstrap_admission(exc, progress) else None
         if isinstance(exc, (TelegramRpcThrottled, RPCError)):
@@ -467,6 +474,7 @@ class FullSyncWorker:
                 outcome = await self._handle_dm_enrollment_error(exc, progress)
                 if outcome is not None:
                     return outcome
+                self._last_dm_enrollment_error = None
         return False
 
     def _finish_dm_enrollment(self, completed: bool, progress: _BootstrapProgress) -> int:
@@ -481,6 +489,7 @@ class FullSyncWorker:
         return progress.enrolled
 
     async def _run_dm_enrollment(self, *, start_new_if_complete: bool) -> int:
+        self._last_dm_enrollment_error = None
         if not self._prepare_dm_enrollment(start_new_if_complete=start_new_if_complete):
             return 0
 
@@ -536,6 +545,7 @@ class FullSyncWorker:
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_LOOKUP)
     async def repair_one_total_messages(self) -> bool:  # noqa: PLR0911
         """Repair one missing Telegram history total under a single RPC budget."""
+        self._last_total_repair_error = None
         dialog_id = self._next_total_messages_repair_dialog()
         if dialog_id is None:
             return True
@@ -551,8 +561,8 @@ class FullSyncWorker:
                 dialog_id,
                 type(exc).__name__,
             )
-            retry_after = getattr(exc, "retry_after_seconds", None)
-            self._set_total_repair_retry(retry_after)
+            self._set_total_repair_retry(getattr(exc, "retry_after_seconds", None))
+            self._last_total_repair_error = exc
             return False
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
@@ -562,6 +572,7 @@ class FullSyncWorker:
                 exc.retry_after_seconds,
             )
             self._set_total_repair_retry(exc.retry_after_seconds)
+            self._last_total_repair_error = exc
             return False
         except ACCESS_LOST_ERRORS as exc:
             set_access_lost(self._conn, dialog_id, int(time.time()), reason=type(exc).__name__)
@@ -570,6 +581,7 @@ class FullSyncWorker:
         except (RPCError, TimeoutError, OSError) as exc:
             logger.warning("sync_total_repair_failed dialog_id=%d error=%s", dialog_id, exc)
             self._set_total_repair_retry(None)
+            self._last_total_repair_error = exc
             return False
 
         total_messages = cast(int | None, getattr(result, "total", None))
@@ -588,12 +600,12 @@ class FullSyncWorker:
 
     def _set_total_repair_retry(self, retry_after_seconds: object | None) -> None:
         try:
-            retry_after = max(1, int(cast(float, retry_after_seconds))) if retry_after_seconds is not None else 0
+            failure_delay = max(1, int(cast(float, retry_after_seconds))) if retry_after_seconds is not None else 0
         except TypeError, ValueError:
-            retry_after = 0
-        retry_at = int(time.time()) + max(_TOTAL_MESSAGES_REPAIR_RETRY_SECONDS, retry_after)
+            failure_delay = 0
+        release_at = int(time.time()) + max(_TOTAL_MESSAGES_REPAIR_FAILURE_DELAY_S, failure_delay)
         with self._conn:
-            _set_total_messages_repair_retry(self._conn, retry_at)
+            _set_total_messages_repair_retry(self._conn, release_at)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -628,6 +640,7 @@ class FullSyncWorker:
         return float(retry_at)
 
     async def _fetch_batch_page(self, dialog_id: int, sync_progress: int) -> _FetchedBatchPage:
+        self._last_page_error = None
         try:
             result = await self._client.get_messages(entity=dialog_id, limit=_BATCH_SIZE, offset_id=sync_progress)
             total_messages = result.total if sync_progress == 0 else None
@@ -638,8 +651,9 @@ class FullSyncWorker:
                 dialog_id,
                 exc.retry_after_seconds,
             )
-            if exc.retry_after_seconds is not None:
+            if exc.retry_after_seconds is not None and current_rpc_scope().attempt_budget is None:
                 await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
+            self._last_page_error = exc
             return _FetchedBatchPage(None, [], (sync_progress, False))
         except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
             logger.info(
@@ -647,11 +661,13 @@ class FullSyncWorker:
                 dialog_id,
                 type(exc).__name__,
             )
+            self._last_page_error = exc
             return _FetchedBatchPage(None, [], (sync_progress, False))
         except TelegramRpcThrottled as exc:
             logger.warning("Telegram RPC throttled dialog_id=%d — retry_after=%s", dialog_id, exc.retry_after_seconds)
-            if exc.retry_after_seconds is not None:
+            if exc.retry_after_seconds is not None and current_rpc_scope().attempt_budget is None:
                 await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
+            self._last_page_error = exc
             return _FetchedBatchPage(None, [], (sync_progress, False))
         except ACCESS_LOST_ERRORS as exc:
             now = int(time.time())
@@ -664,6 +680,7 @@ class FullSyncWorker:
                 dialog_id,
                 exc,
             )
+            self._last_page_error = exc
             return _FetchedBatchPage(None, [], (sync_progress, False))
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
@@ -785,8 +802,12 @@ class FullSyncDemandAdapter:
                 try:
                     if self._worker._next_pending_dialog() is not None:
                         await self._worker.process_one_batch()
+                        if self._worker._last_page_error is not None:
+                            raise self._worker._last_page_error
                     else:
                         await self._worker.repair_one_total_messages()
+                        if self._worker._last_total_repair_error is not None:
+                            raise self._worker._last_total_repair_error
                 except RpcAttemptBudgetExhaustedError:
                     return
 
@@ -819,6 +840,8 @@ class FullSyncDmEnrollmentDemandAdapter:
             with rpc_attempt_budget(budget):
                 try:
                     await self._worker.bootstrap_dms()
+                    if self._worker._last_dm_enrollment_error is not None:
+                        raise self._worker._last_dm_enrollment_error
                 except RpcAttemptBudgetExhaustedError:
                     return
 

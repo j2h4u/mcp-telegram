@@ -137,8 +137,8 @@ class AccessProbePolicy:
 # the user's account hasn't received meaningful new traffic worth probing.
 RECENT_SYNC_SKIP_THRESHOLD_S: int = 3600
 _DELTA_SLICE_MESSAGE_LIMIT = 100
-_DM_GAP_SCAN_PAGE_SIZE = 100
-_DM_GAP_SCAN_INTERVAL_SECONDS = 7 * 24 * 60 * 60
+_DM_GAP_SCAN_RPC_CHUNK = 100
+_DM_GAP_SCAN_PERIOD_S = 7 * 24 * 60 * 60
 _DM_GAP_SCAN_STATE_KEY = "delta_dm_gap_scan_state"
 
 _SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL = """
@@ -201,7 +201,7 @@ class _DmGapScanState:
     status: str
     generation: int
     scan_started_at: int
-    dialog_index: int
+    dialog_id_cursor: int | None
     message_cursor: int
     next_run_at: int
 
@@ -225,7 +225,11 @@ def _load_dm_gap_scan_state(conn: sqlite3.Connection) -> _DmGapScanState | None:
             status=str(value["status"]),
             generation=int(cast(int | str, value["generation"])),
             scan_started_at=int(cast(int | str, value["scan_started_at"])),
-            dialog_index=int(cast(int | str, value["dialog_index"])),
+            dialog_id_cursor=(
+                int(cast(int | str, value["dialog_id_cursor"]))
+                if value["dialog_id_cursor"] is not None
+                else None
+            ),
             message_cursor=int(cast(int | str, value.get("message_cursor", value.get("message_offset", 0)))),
             next_run_at=int(cast(int | str, value["next_run_at"])),
         )
@@ -246,7 +250,6 @@ def _valid_dm_gap_scan_state(state: _DmGapScanState) -> bool:
         for value in (
             state.generation,
             state.scan_started_at,
-            state.dialog_index,
             state.message_cursor,
             state.next_run_at,
         )
@@ -263,7 +266,7 @@ def _store_dm_gap_scan_state(conn: sqlite3.Connection, state: _DmGapScanState) -
                     "status": state.status,
                     "generation": state.generation,
                     "scan_started_at": state.scan_started_at,
-                    "dialog_index": state.dialog_index,
+                    "dialog_id_cursor": state.dialog_id_cursor,
                     "message_cursor": state.message_cursor,
                     "next_run_at": state.next_run_at,
                 },
@@ -273,9 +276,9 @@ def _store_dm_gap_scan_state(conn: sqlite3.Connection, state: _DmGapScanState) -
     )
 
 
-def _dm_gap_scan_dialog_ids(conn: sqlite3.Connection) -> list[int]:
+def _dm_gap_scan_dialog_ids(conn: sqlite3.Connection) -> tuple[int, ...]:
     rows = cast(Sequence[tuple[object]], conn.execute(_SELECT_DM_GAP_DIALOGS_SQL).fetchall())
-    return [int(cast(int, dialog_id)) for (dialog_id,) in rows]
+    return tuple(int(cast(int, dialog_id)) for (dialog_id,) in rows)
 
 
 def _dm_gap_scan_page_ids(
@@ -290,7 +293,7 @@ def _dm_gap_scan_page_ids(
             "SELECT message_id FROM messages "
             "WHERE dialog_id = ? AND is_deleted = 0 AND sent_at < ? AND message_id > ? "
             "ORDER BY message_id LIMIT ?",
-            (dialog_id, scan_started_at, message_cursor, _DM_GAP_SCAN_PAGE_SIZE),
+            (dialog_id, scan_started_at, message_cursor, _DM_GAP_SCAN_RPC_CHUNK),
         ).fetchall(),
     )
     return tuple(int(cast(int, message_id)) for (message_id,) in rows)
@@ -471,6 +474,7 @@ class DeltaSyncWorker:
         self._last_fetch_admission_deferred = False
         self._last_delta_slice_completed = False
         self._last_delta_slice_succeeded = False
+        self._last_delta_slice_error: BaseException | None = None
 
     def _stamp_delta_checkpoint(self, dialog_id: int, checked_at: int) -> None:
         self._conn.execute(_UPDATE_DELTA_CHECKPOINT_SQL, (checked_at, checked_at, dialog_id, dialog_id))
@@ -710,6 +714,7 @@ class DeltaSyncWorker:
         self._last_fetch_admission_deferred = False
         self._last_delta_slice_completed = False
         self._last_delta_slice_succeeded = False
+        self._last_delta_slice_error = None
 
     def _max_known_message_id(self, dialog_id: int) -> int:
         row = cast(
@@ -738,14 +743,17 @@ class DeltaSyncWorker:
                     completed = False
                     break
                 rows.append(extract_message_row(dialog_id, message))
-        except TelegramRpcAdmissionDeferred:
+        except TelegramRpcAdmissionDeferred as exc:
             self._last_fetch_admission_deferred = True
+            self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
-        except RpcAdmissionSaturatedError, RpcAdmissionExpiredError:
+        except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
             self._last_fetch_admission_deferred = True
+            self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
+            self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
         except ACCESS_LOST_ERRORS as exc:
             set_access_lost(self._conn, dialog_id, int(time.time()), reason=type(exc).__name__)
@@ -753,6 +761,7 @@ class DeltaSyncWorker:
             return _DeltaFetchOutcome([], 0)
         except RPCError as exc:
             logger.warning("delta_slice_rpc_error dialog_id=%d error=%s", dialog_id, exc)
+            self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
         return _DeltaFetchOutcome(rows, completed=completed)
 
@@ -821,27 +830,38 @@ class DeltaGapFillDemandAdapter:
         state = _load_dm_gap_scan_state(self._worker._conn)
         if state is None or (state.status == "idle" and state.next_run_at <= now):
             previous_generation = 0 if state is None else state.generation
-            state = _DmGapScanState("running", previous_generation + 1, int(now), 0, 0, 0)
+            state = _DmGapScanState("running", previous_generation + 1, int(now), None, 0, 0)
             with self._worker._conn:
                 _store_dm_gap_scan_state(self._worker._conn, state)
         if state.status == "idle":
             return
 
         dialog_ids = _dm_gap_scan_dialog_ids(self._worker._conn)
-        if state.dialog_index >= len(dialog_ids):
+        dialog_id: int | None
+        if state.message_cursor > 0 and state.dialog_id_cursor in dialog_ids:
+            dialog_id = state.dialog_id_cursor
+        else:
+            dialog_id = next(
+                (
+                    candidate
+                    for candidate in dialog_ids
+                    if state.dialog_id_cursor is None or candidate > state.dialog_id_cursor
+                ),
+                None,
+            )
+        if dialog_id is None:
             completed = _DmGapScanState(
                 "idle",
                 state.generation,
                 state.scan_started_at,
+                None,
                 0,
-                0,
-                int(now) + _DM_GAP_SCAN_INTERVAL_SECONDS,
+                int(now) + _DM_GAP_SCAN_PERIOD_S,
             )
             with self._worker._conn:
                 _store_dm_gap_scan_state(self._worker._conn, completed)
             return
 
-        dialog_id = dialog_ids[state.dialog_index]
         page = _dm_gap_scan_page_ids(
             self._worker._conn,
             dialog_id,
@@ -853,7 +873,7 @@ class DeltaGapFillDemandAdapter:
                 "running",
                 state.generation,
                 state.scan_started_at,
-                state.dialog_index + 1,
+                dialog_id,
                 0,
                 0,
             )
@@ -869,7 +889,7 @@ class DeltaGapFillDemandAdapter:
             "running",
             state.generation,
             state.scan_started_at,
-            state.dialog_index,
+            dialog_id,
             next_cursor,
             0,
         )
@@ -892,6 +912,8 @@ class DeltaGapFillDemandAdapter:
                     else:
                         assert candidate[2] is not None
                         await self._worker.fetch_delta_slice_for_dialog(candidate[2])
+                        if self._worker._last_delta_slice_error is not None:
+                            raise self._worker._last_delta_slice_error
                 except RpcAttemptBudgetExhaustedError:
                     return
 
