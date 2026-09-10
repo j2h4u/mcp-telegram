@@ -208,8 +208,7 @@ def _sequence(value: object) -> tuple[object, ...] | None:
 def _string(value: object) -> str | None:
     if not isinstance(value, str):
         return None
-    normalized = value.strip()
-    return normalized or None
+    return value.strip()
 
 
 def _integer(value: object) -> int | None:
@@ -336,8 +335,35 @@ def _normalize_restrictions(value: object) -> list[dict[str, str | None]] | None
     ]
 
 
-def _normalize_full_profile(full_user: object, user: object) -> dict[str, object]:
+def _normalize_full_profile(  # noqa: PLR0912, PLR0915, PLR0914
+    full_user: object, user: object
+) -> tuple[dict[str, object], bool]:
     facts: dict[str, object] = {}
+    complete = True
+
+    def scalar(source: object, name: str, kind: str) -> None:
+        nonlocal complete
+        value = _attr(source, name)
+        if value is _MISSING:
+            complete = False
+            return
+        if value is None:
+            facts[name] = None
+            return
+        normalized: object | None
+        if kind == "string":
+            normalized = _string(value)
+        elif kind == "int":
+            normalized = _integer(value)
+        elif kind == "bool":
+            normalized = _boolean(value)
+        else:  # pragma: no cover - this list is intentionally finite.
+            raise ValueError(f"unsupported FullUser field kind: {kind}")
+        if normalized is None:
+            complete = False
+            return
+        facts[name] = normalized
+
     for name, kind in (
         ("about", "string"),
         ("blocked", "bool"),
@@ -345,24 +371,45 @@ def _normalize_full_profile(full_user: object, user: object) -> dict[str, object
         ("private_forward_name", "string"),
         ("folder_id", "int"),
     ):
-        value = _attr(full_user, name)
-        if value is not _MISSING:
-            _field(facts, name, value, kind=kind)
+        scalar(full_user, name, kind)
 
-    nested = (
-        ("birthday", _normalize_birthday(_attr(full_user, "birthday"))),
-        ("bot_info", _normalize_bot_info(_attr(full_user, "bot_info"))),
-        ("business_location", _normalize_business_location(_attr(full_user, "business_location"))),
-        ("business_intro", _normalize_business_intro(_attr(full_user, "business_intro"))),
-        ("business_work_hours", _normalize_business_hours(_attr(full_user, "business_work_hours"))),
-        ("note", _normalize_note(_attr(full_user, "note"))),
+    nested_normalizers = (
+        ("birthday", _normalize_birthday),
+        ("bot_info", _normalize_bot_info),
+        ("business_location", _normalize_business_location),
+        ("business_intro", _normalize_business_intro),
+        ("business_work_hours", _normalize_business_hours),
+        ("note", _normalize_note),
     )
-    facts.update({name: value for name, value in nested if value is not None})
+    for name, normalizer in nested_normalizers:
+        raw = _attr(full_user, name)
+        if raw is _MISSING:
+            complete = False
+            continue
+        if raw is None:
+            facts[name] = None
+            continue
+        value = normalizer(raw)
+        if value is None:
+            complete = False
+            continue
+        facts[name] = value
 
-    first_name = _string(_attr(user, "first_name"))
-    last_name = _string(_attr(user, "last_name"))
-    facts.update({name: value for name, value in (("first_name", first_name), ("last_name", last_name)) if value})
-    if first_name is not None or last_name is not None:
+    first_raw = _attr(user, "first_name")
+    last_raw = _attr(user, "last_name")
+    if first_raw is _MISSING or last_raw is _MISSING:
+        complete = False
+    first_name = None if first_raw is _MISSING else _string(first_raw)
+    last_name = None if last_raw is _MISSING else _string(last_raw)
+    if first_raw is not _MISSING and first_raw is not None and first_name is None:
+        complete = False
+    if last_raw is not _MISSING and last_raw is not None and last_name is None:
+        complete = False
+    if first_raw is not _MISSING:
+        facts["first_name"] = first_name
+    if last_raw is not _MISSING:
+        facts["last_name"] = last_name
+    if first_raw is not _MISSING or last_raw is not _MISSING:
         facts["name"] = " ".join(part for part in (first_name, last_name) if part)
 
     for name, kind in (
@@ -380,28 +427,57 @@ def _normalize_full_profile(full_user: object, user: object) -> dict[str, object
         ("fake", "bool"),
         ("restricted", "bool"),
     ):
-        value = _attr(user, name)
-        if value is not _MISSING:
-            _field(facts, name, value, kind=kind)
+        scalar(user, name, kind)
 
-    usernames = _sequence(_attr(user, "usernames"))
-    if usernames is not None:
-        facts["extra_usernames"] = [
-            username
-            for entry in usernames
-            if (username := _string(_attr(entry, "username"))) is not None
-            and username != facts.get("username")
-        ]
+    raw_usernames = _attr(user, "usernames")
+    if raw_usernames is _MISSING:
+        complete = False
+    elif raw_usernames is None:
+        facts["extra_usernames"] = None
+    else:
+        usernames = _sequence(raw_usernames)
+        if usernames is None:
+            complete = False
+        else:
+            facts["extra_usernames"] = [
+                username
+                for entry in usernames
+                if (username := _string(_attr(entry, "username"))) is not None
+                and username != facts.get("username")
+            ]
     emoji_status = _attr(user, "emoji_status")
-    emoji_status_id = _positive_integer(_attr(emoji_status, "document_id"))
-    if emoji_status_id is not None:
-        facts["emoji_status_id"] = emoji_status_id
-    status = _normalize_status(_attr(user, "status"))
-    if status is not None:
-        facts["status"] = status
-    restrictions = _normalize_restrictions(_attr(user, "restriction_reason"))
-    if restrictions is not None:
-        facts["restriction_reason"] = restrictions
+    if emoji_status is _MISSING:
+        complete = False
+    elif emoji_status is None:
+        facts["emoji_status_id"] = None
+    else:
+        emoji_status_id = _positive_integer(_attr(emoji_status, "document_id"))
+        if emoji_status_id is None:
+            complete = False
+        else:
+            facts["emoji_status_id"] = emoji_status_id
+    raw_status = _attr(user, "status")
+    if raw_status is _MISSING:
+        complete = False
+    elif raw_status is None:
+        facts["status"] = None
+    else:
+        status = _normalize_status(raw_status)
+        if status is None:
+            complete = False
+        else:
+            facts["status"] = status
+    raw_restrictions = _attr(user, "restriction_reason")
+    if raw_restrictions is _MISSING:
+        complete = False
+    elif raw_restrictions is None:
+        facts["restriction_reason"] = None
+    else:
+        restrictions = _normalize_restrictions(raw_restrictions)
+        if restrictions is None:
+            complete = False
+        else:
+            facts["restriction_reason"] = restrictions
 
     relationship = {
         name: facts[name]
@@ -417,7 +493,7 @@ def _normalize_full_profile(full_user: object, user: object) -> dict[str, object
             "admin_rights": None,
             "relationship": relationship,
         }
-    return facts
+    return facts, complete
 
 
 def _entity_id(value: object) -> int | None:
@@ -559,15 +635,17 @@ def normalize_full_user_response(
             personal_channel=_unavailable(failure_reason),
         )
 
-    profile = _normalize_full_profile(full_user, user)
-    profile_provenance = _projection_provenance(FULL_PROFILE_OWNED_FIELDS, profile, boundary, authoritative=True)
+    profile, complete = _normalize_full_profile(full_user, user)
+    profile_provenance = _projection_provenance(
+        FULL_PROFILE_OWNED_FIELDS, profile, boundary, authoritative=complete
+    )
     return FullUserNormalization(
         target_id=target_id,
         target_kind=normalized_kind,
         full_profile=ProjectionOutcome(
             status=ProjectionStatus.USABLE,
             payload=profile,
-            reason=None,
+            reason=None if complete else "full_profile_fields_unknown",
             provenance=profile_provenance,
         ),
         personal_channel=_normalize_personal_channel(full_user, _attr(response, "chats"), boundary),

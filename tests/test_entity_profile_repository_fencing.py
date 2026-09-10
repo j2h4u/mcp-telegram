@@ -64,6 +64,11 @@ def test_migration_is_additive_and_invents_no_evidence(tmp_path: Path, monkeypat
     assert conn.execute(
         "SELECT COUNT(*) FROM entity_detail_sections WHERE entity_id=42 AND acquisition_generation IS NOT NULL"
     ).fetchone() == (0,)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(entity_details)")}
+    assert {"profile_owner_account_id", "profile_observation_scope_json"} <= columns
+    assert conn.execute(
+        "SELECT profile_owner_account_id, profile_observation_scope_json FROM entity_details WHERE entity_id=42"
+    ).fetchone() == (None, None)
     conn.close()
 
 
@@ -163,3 +168,80 @@ def test_restart_keeps_original_observation_time_and_same_generation_channel_com
     ).fetchone() == ("complete",)
     assert reopened_repo.read(42, now=110).sections["full_profile"]["status"] == "stale"  # type: ignore[union-attr]
     reopened.close()
+
+
+def test_same_generation_channel_completion_ignores_ttl(tmp_path: Path) -> None:
+    path = tmp_path / "same-generation-ttl.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    identity = {"account_generation": 7, "entity_type": "user"}
+    evidence = ProfileAcquisitionEvidence(
+        generation=cursor.generation,
+        outcome="absent",
+        provenance={
+            "endpoint": "users.GetFullUser",
+            "declared_fields": [
+                "personal_channel_id",
+                "personal_channel_message",
+                "title",
+                "username",
+            ],
+            "materialized_fields": ["personal_channel_id"],
+            "authoritative": True,
+        },
+        normalization_version="entity-profile-full-user-v1",
+        observation_started_at=100,
+        observation_completed_at=101,
+        identity=identity,
+    )
+    assert repo.commit_full_user_pair(
+        cursor,
+        EntitySectionCommit({"about": "old"}, evidence=_evidence(cursor.generation)),
+        EntitySectionCommit(
+            {"personal_channel": None},
+            status="unavailable",
+            evidence=evidence,
+        ),
+        now=101,
+    )
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0 "
+        "WHERE entity_id=42"
+    )
+    conn.commit()
+    channel_cursor = repo.next_due_refresh(now=10_000)
+    assert channel_cursor is not None
+    assert repo.complete_same_generation_section(channel_cursor, identity, now=10_000)
+    assert conn.execute(
+        "SELECT status FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == ("complete",)
+    conn.close()
+
+
+def test_observation_owner_and_auth_scope_are_persisted_separately(tmp_path: Path) -> None:
+    path = tmp_path / "ownership.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    scope = {"version": 1, "account_id": 7, "dc_id": 2, "auth_key_id": 9}
+    commit = EntitySectionCommit(
+        {"about": "owned"},
+        evidence=_evidence(cursor.generation),
+        observation_owner_account_id=7,
+        observation_auth_scope=scope,
+        ownership_observed=True,
+    )
+    assert repo.commit_section(cursor, commit, now=101)
+    assert conn.execute(
+        "SELECT profile_owner_account_id, profile_observation_scope_json FROM entity_details WHERE entity_id=42"
+    ).fetchone() == (7, '{"account_id":7,"auth_key_id":9,"dc_id":2,"version":1}')
+    stored = repo.read(42, now=101)
+    assert stored is not None
+    assert stored.profile_owner_account_id == 7
+    assert stored.profile_observation_scope == scope
+    conn.close()

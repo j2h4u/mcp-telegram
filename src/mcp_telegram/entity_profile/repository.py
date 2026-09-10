@@ -42,6 +42,8 @@ class StoredProfile:
     detail: dict[str, object]
     observed_at: int | None
     sections: dict[str, dict[str, object]]
+    profile_owner_account_id: int | None = None
+    profile_observation_scope: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +66,9 @@ class EntitySectionCommit:
     reason: str | None = None
     payload: object | None = None
     evidence: ProfileAcquisitionEvidence | None = None
+    observation_owner_account_id: int | None = None
+    observation_auth_scope: Mapping[str, object] | None = None
+    ownership_observed: bool = False
 
 
 class EntityProfileRepository:
@@ -99,11 +104,17 @@ class EntityProfileRepository:
         return column in self._columns("entity_details", "_detail_columns")
 
     def read(self, entity_id: int, *, now: int) -> StoredProfile | None:
-        detail, observed_at = self._read_primary_detail(entity_id)
+        detail, observed_at, owner_account_id, observation_scope = self._read_primary_detail(entity_id)
         if not detail:
             return None
         sections = self._read_sections(entity_id, detail, now=now, observed_at=observed_at)
-        return StoredProfile(detail=detail, observed_at=observed_at, sections=sections)
+        return StoredProfile(
+            detail=detail,
+            observed_at=observed_at,
+            sections=sections,
+            profile_owner_account_id=owner_account_id,
+            profile_observation_scope=observation_scope,
+        )
 
     def read_section_evidence(self, entity_id: int, section: str) -> dict[str, object] | None:
         """Return the bounded receipt projection, if a migration-created row has one."""
@@ -259,6 +270,7 @@ class EntityProfileRepository:
                 now=now,
                 positive_only=False,
                 expected_generation=cursor.generation,
+                check_ttl=False,
             ):
                 return False
             return self._advance_completed_section(cursor, now=now)
@@ -273,34 +285,52 @@ class EntityProfileRepository:
                 return False
             return self._advance_completed_section(cursor, now=now)
 
-    def _read_primary_detail(self, entity_id: int) -> tuple[dict[str, object], int | None]:
-        detail, observed_at = self._read_profile_blob(entity_id)
+    def _read_primary_detail(
+        self, entity_id: int
+    ) -> tuple[dict[str, object], int | None, int | None, dict[str, object] | None]:
+        detail, observed_at, owner_account_id, observation_scope = self._read_profile_blob(entity_id)
         if detail:
-            return detail, observed_at
+            return detail, observed_at, owner_account_id, observation_scope
         detail = self._read_entity_stub(entity_id)
-        return (detail, None) if detail else ({}, None)
+        return (detail, None, None, None) if detail else ({}, None, None, None)
 
-    def _read_profile_blob(self, entity_id: int) -> tuple[dict[str, object], int | None]:
+    def _read_profile_blob(  # noqa: PLR0911
+        self, entity_id: int
+    ) -> tuple[dict[str, object], int | None, int | None, dict[str, object] | None]:
+        owner_column = ", profile_owner_account_id" if self._detail_has("profile_owner_account_id") else ""
+        scope_column = ", profile_observation_scope_json" if self._detail_has("profile_observation_scope_json") else ""
         try:
             row = cast(
-                tuple[str, int] | None,
+                tuple[object, ...] | None,
                 self._conn.execute(
-                    "SELECT detail_json, fetched_at FROM entity_details WHERE entity_id = ?",
+                    "SELECT detail_json, fetched_at" + owner_column + scope_column
+                    + " FROM entity_details WHERE entity_id = ?",
                     (entity_id,),
                 ).fetchone(),
             )
         except sqlite3.OperationalError:
-            return {}, None
+            return {}, None, None, None
         if row is None:
-            return {}, None
-        raw_json, fetched_at = row
+            return {}, None, None, None
+        raw_json, fetched_at, *metadata = row
+        if not isinstance(raw_json, str):
+            return {}, None, None, None
         try:
             parsed = cast(object, json.loads(raw_json))
-        except TypeError, json.JSONDecodeError:
-            return {}, None
+        except (TypeError, json.JSONDecodeError):
+            return {}, None, None, None
         if not isinstance(parsed, dict) or parsed.get("schema") != _DETAIL_SCHEMA:
-            return {}, None
-        return {str(key): value for key, value in parsed.items() if key != "schema"}, int(fetched_at)
+            return {}, None, None, None
+        owner = (
+            cast(int, metadata[0])
+            if metadata and _is_nonnegative_int(metadata[0]) and cast(int, metadata[0]) > 0
+            else None
+        )
+        scope = _decode_mapping(metadata[1]) if len(metadata) > 1 else None
+        if not _is_nonnegative_int(fetched_at):
+            return {}, None, None, None
+        fetched_at_int = cast(int, fetched_at)
+        return {str(key): value for key, value in parsed.items() if key != "schema"}, fetched_at_int, owner, scope
 
     def _read_entity_stub(self, entity_id: int) -> dict[str, object]:
         entity_row = cast(
@@ -521,7 +551,7 @@ class EntityProfileRepository:
         return int(row[0]) if row is not None and row[0] is not None else 0
 
     def _pair_is_eligible(self, entity_id: int, *, now: int) -> bool:
-        detail, observed_at = self._read_primary_detail(entity_id)
+        detail, observed_at, _owner, _scope = self._read_primary_detail(entity_id)
         if _normalise_entity_type(str(detail.get("type", "unknown"))) not in {"user", "bot"}:
             return False
         stored = self._read_stored_sections(entity_id)
@@ -634,7 +664,15 @@ class EntityProfileRepository:
                 detail = self._read_entity_stub(cursor.entity_id)
             detail = _strip_schema(detail)
             detail.update(commit.detail_patch)
-            if not self._write_detail(cursor.entity_id, detail, now=now, expected_revision=cursor.profile_revision):
+            if not self._write_detail(
+                cursor.entity_id,
+                detail,
+                now=now,
+                expected_revision=cursor.profile_revision,
+                owner_account_id=commit.observation_owner_account_id,
+                observation_scope=commit.observation_auth_scope,
+                ownership_observed=commit.ownership_observed,
+            ):
                 return False
             section_payload = (
                 _section_payload(detail, cursor.next_section) if commit.payload is None else commit.payload
@@ -681,20 +719,35 @@ class EntityProfileRepository:
                 ).rowcount
         return changed == 1
 
-    def _write_detail(
+    def _write_detail(  # noqa: PLR0913
         self,
         entity_id: int,
         detail: Mapping[str, object],
         *,
         now: int,
         expected_revision: int,
+        owner_account_id: int | None = None,
+        observation_scope: Mapping[str, object] | None = None,
+        ownership_observed: bool = False,
     ) -> bool:
         encoded_detail = json.dumps({"schema": _DETAIL_SCHEMA, **detail}, separators=(",", ":"))
+        metadata_values: tuple[object, ...] = ()
+        metadata_columns: tuple[str, ...] = ()
+        if ownership_observed and self._detail_has("profile_owner_account_id"):
+            metadata_columns += ("profile_owner_account_id",)
+            metadata_values += (owner_account_id,)
+        if ownership_observed and self._detail_has("profile_observation_scope_json"):
+            metadata_columns += ("profile_observation_scope_json",)
+            metadata_values += (_encode_bounded_json(observation_scope),)
+        metadata_update = ", ".join(f"{column}=?" for column in metadata_columns)
         if self._detail_has("profile_revision"):
+            update_columns = "detail_json=?, fetched_at=?, profile_revision=profile_revision+1"
+            if metadata_update:
+                update_columns += ", " + metadata_update
             changed = self._conn.execute(
-                "UPDATE entity_details SET detail_json=?, fetched_at=?, profile_revision=profile_revision+1 "
+                "UPDATE entity_details SET " + update_columns + " "
                 "WHERE entity_id=? AND profile_revision=?",
-                (encoded_detail, now, entity_id, expected_revision),
+                (encoded_detail, now, *metadata_values, entity_id, expected_revision),
             ).rowcount
             if changed == 0:
                 exists = self._conn.execute(
@@ -702,16 +755,22 @@ class EntityProfileRepository:
                 ).fetchone()
                 if exists is not None:
                     return False
+                columns = ("entity_id", "detail_json", "fetched_at", "profile_revision", *metadata_columns)
+                values: tuple[object, ...] = (entity_id, encoded_detail, now, 1, *metadata_values)
                 self._conn.execute(
-                    "INSERT INTO entity_details(entity_id, detail_json, fetched_at, profile_revision) "
-                    "VALUES (?, ?, ?, 1)",
-                    (entity_id, encoded_detail, now),
+                    f"INSERT INTO entity_details({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+                    values,
                 )
             return True
+        columns = ("entity_id", "detail_json", "fetched_at", *metadata_columns)
+        values = (entity_id, encoded_detail, now, *metadata_values)
+        updates = "detail_json=excluded.detail_json, fetched_at=excluded.fetched_at"
+        if metadata_columns:
+            updates += ", " + ", ".join(f"{column}=excluded.{column}" for column in metadata_columns)
         self._conn.execute(
-            "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(entity_id) DO UPDATE SET detail_json=excluded.detail_json, fetched_at=excluded.fetched_at",
-            (entity_id, encoded_detail, now),
+            f"INSERT INTO entity_details({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)}) "
+            "ON CONFLICT(entity_id) DO UPDATE SET " + updates,
+            values,
         )
         return True
 
@@ -731,6 +790,21 @@ class EntityProfileRepository:
             if evidence is not None and status in {"fresh", "not_applicable"}
             else now if evidence is None and status in {"fresh", "not_applicable"} else None
         )
+        if (
+            evidence is not None
+            and section == "full_profile"
+            and isinstance(evidence.provenance, Mapping)
+            and evidence.provenance.get("authoritative") is False
+        ):
+            # The response may contain only a sparse subset.  Keep the prior
+            # section observation age for retained fields; the current
+            # observation is represented by its partial evidence instead.
+            previous = self._conn.execute(
+                "SELECT observed_at FROM entity_detail_sections WHERE entity_id=? AND section=?",
+                (entity_id, section),
+            ).fetchone()
+            if previous is not None and previous[0] is not None:
+                observed_at = previous[0]
         columns = ["entity_id", "section", "status", "observed_at", "reason", "payload_json", "retry_at"]
         values: list[object] = [entity_id, section, status, observed_at, reason, _encode_payload(payload), None]
         if evidence is not None and self._section_has("acquisition_generation"):
@@ -809,7 +883,18 @@ class EntityProfileRepository:
             detail = _strip_schema(detail)
             detail.update(full_profile.detail_patch)
             detail.update(personal_channel.detail_patch)
-            if not self._write_detail(cursor.entity_id, detail, now=now, expected_revision=cursor.profile_revision):
+            owner_account_id, observation_scope, ownership_observed = _commit_metadata(
+                full_profile, personal_channel
+            )
+            if not self._write_detail(
+                cursor.entity_id,
+                detail,
+                now=now,
+                expected_revision=cursor.profile_revision,
+                owner_account_id=owner_account_id,
+                observation_scope=observation_scope,
+                ownership_observed=ownership_observed,
+            ):
                 return False
             self._write_section(
                 cursor.entity_id,
@@ -1116,6 +1201,7 @@ class EntityProfileRepository:
         ttl_seconds: int | None = None,
         positive_only: bool,
         expected_generation: int | None = None,
+        check_ttl: bool = True,
     ) -> bool:
         evidence = self.read_section_evidence(entity_id, section)
         if evidence is None:
@@ -1153,6 +1239,8 @@ class EntityProfileRepository:
             return False
         if positive_only and row[0] != "fresh":
             return False
+        if not check_ttl:
+            return True
         ttl = self._section_ttl_seconds if ttl_seconds is None else max(1, int(ttl_seconds))
         return now < started_at + ttl
 
@@ -1184,6 +1272,15 @@ class EntityProfileRepository:
         if len(set(materialized)) != len(materialized) or not set(materialized) <= set(expected_fields):
             return False
         if not isinstance(provenance.get("authoritative"), bool):
+            return False
+        if (
+            section == "full_profile"
+            and provenance.get("authoritative") is not True
+            and self._detail_has("profile_owner_account_id")
+        ):
+            # A sparse or malformed FullUser envelope may retain old fields in
+            # the canonical blob, but its current observation cannot renew
+            # coverage or authorize reuse of those retained values.
             return False
         payload_row = self._conn.execute(
             "SELECT payload_json FROM entity_detail_sections WHERE entity_id=? AND section=?",
@@ -1231,7 +1328,7 @@ class EntityProfileRepository:
             return {}
         try:
             value = cast(object, json.loads(str(row[0])))
-        except TypeError, json.JSONDecodeError:
+        except (TypeError, json.JSONDecodeError):
             return {}
         return value if isinstance(value, dict) else {}
 
@@ -1303,6 +1400,11 @@ def _decode_payload(value: str | None) -> object | None:
         return None
 
 
+def _decode_mapping(value: object) -> dict[str, object] | None:
+    decoded = _decode_payload(value if isinstance(value, str) else None)
+    return {str(key): item for key, item in decoded.items()} if isinstance(decoded, dict) else None
+
+
 def _section_due(status: str, observed_at: int | None, *, now: int, ttl: int) -> bool:
     if status in {"pending", "stale", "unavailable"}:
         return True
@@ -1316,3 +1418,13 @@ def _encode_bounded_json(value: Mapping[str, object] | None) -> str | None:
     if len(encoded) > _EVIDENCE_MAX_JSON_BYTES:
         raise ValueError("profile acquisition evidence exceeds bounded size")
     return encoded
+
+
+def _commit_metadata(
+    *commits: EntitySectionCommit,
+) -> tuple[int | None, Mapping[str, object] | None, bool]:
+    observed = [commit for commit in commits if commit.ownership_observed]
+    if not observed:
+        return None, None, False
+    first = observed[0]
+    return first.observation_owner_account_id, first.observation_auth_scope, True

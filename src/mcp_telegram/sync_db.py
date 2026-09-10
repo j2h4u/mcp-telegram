@@ -3248,6 +3248,24 @@ def _rebuild_entity_profile_refresh_state_v61(conn: sqlite3.Connection) -> None:
 def _apply_migration_61(conn: sqlite3.Connection, current: int) -> int:
     """Add fenced Entity Profile progress and bounded acquisition evidence."""
     if current >= _ENTITY_PROFILE_ACQUISITION_MIGRATION_61:
+        # v61 was already released before observation ownership was added.
+        # Repair that additive part in place without inventing ownership for
+        # historical rows or advancing the public schema version.
+        detail_columns = _table_column_names(conn, "entity_details")
+        missing = {
+            "profile_owner_account_id": "ALTER TABLE entity_details ADD COLUMN profile_owner_account_id INTEGER",
+            "profile_observation_scope_json": "ALTER TABLE entity_details ADD COLUMN profile_observation_scope_json TEXT",
+        }
+        statements = [statement for column, statement in missing.items() if column not in detail_columns]
+        if statements:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for statement in statements:
+                    conn.execute(statement)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
         return current
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -3266,6 +3284,11 @@ def _apply_migration_61(conn: sqlite3.Connection, current: int) -> int:
                 "ALTER TABLE entity_details ADD COLUMN profile_revision INTEGER NOT NULL DEFAULT 0 "
                 "CHECK(profile_revision >= 0)"
             )
+        detail_columns = _table_column_names(conn, "entity_details")
+        if "profile_owner_account_id" not in detail_columns:
+            conn.execute("ALTER TABLE entity_details ADD COLUMN profile_owner_account_id INTEGER")
+        if "profile_observation_scope_json" not in detail_columns:
+            conn.execute("ALTER TABLE entity_details ADD COLUMN profile_observation_scope_json TEXT")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS entity_detail_sections (
                 entity_id INTEGER NOT NULL,

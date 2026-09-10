@@ -353,12 +353,22 @@ class DaemonEntityInfoService:
     def _progressive_cached_result(self, entity_id: int, *, now: int) -> dict[str, object] | None:
         cached = self._profiles.read(entity_id, now=now)
         if cached is not None:
-            if self._deps.enable_full_user_pair and self._pair_scope_changed(cached.detail, entity_id, now=now):
+            if self._profile_ownership_unavailable(cached):
+                self._profiles.mark_pending(
+                    entity_id,
+                    now=now,
+                    reason="profile_ownership_changed",
+                    pair_eligible_override=(True if self._deps.enable_full_user_pair else None),
+                )
+                return self._pending_error(entity_id, "entity profile ownership is unavailable")
+            if self._profile_scope_changed(cached, entity_id, now=now):
                 self._profiles.mark_pending(
                     entity_id,
                     now=now,
                     reason="auth_scope_changed",
-                    pair_eligible_override=True,
+                    pair_eligible_override=(
+                        True if self._deps.enable_full_user_pair else None
+                    ),
                 )
                 cached = self._profiles.read(entity_id, now=now)
                 assert cached is not None
@@ -369,8 +379,25 @@ class DaemonEntityInfoService:
         reason = str(refresh_state.get("reason", "entity refresh is temporarily unavailable"))
         return self._pending_error(entity_id, reason)
 
-    def _pair_scope_changed(self, detail: Mapping[str, object], entity_id: int, *, now: int) -> bool:
+    def _profile_ownership_unavailable(self, cached: object) -> bool:
+        provider = self._deps.full_user_auth_scope
+        if provider is None:
+            return False
+        scope = self._capture_pair_scope()
+        owner = getattr(cached, "profile_owner_account_id", None)
+        return scope is None or not isinstance(owner, int) or owner != scope.account_id
+
+    def _profile_scope_changed(self, cached: object, entity_id: int, *, now: int) -> bool:
         if self._deps.full_user_auth_scope is None:
+            return False
+        current_scope = self._capture_pair_scope()
+        if current_scope is None:
+            return True
+        stored_scope = getattr(cached, "profile_observation_scope", None)
+        if not isinstance(stored_scope, dict) or stored_scope != current_scope.as_private_mapping():
+            return True
+        detail = getattr(cached, "detail", {})
+        if not isinstance(detail, Mapping):
             return False
         raw_type = detail.get("type")
         entity_type = DialogType.parse(raw_type if isinstance(raw_type, str) else None)
@@ -529,6 +556,11 @@ class DaemonEntityInfoService:
             target_kind = TargetKind.BOT if entity_type is DialogType.BOT else TargetKind.USER
             identity = self._full_user_pair_identity(target_kind)
             committed = self._profiles.complete_same_generation_section(cursor, identity, now=now)
+            if not committed:
+                # A local CAS failure is a real refresh failure.  Returning a
+                # quiet intermediate result leaves foreground waiters blocked
+                # and can make an already-finished generation appear healthy.
+                return DurableRefreshSliceResult(cursor.entity_id, DurableRefreshTerminal.FAILURE)
             return DurableRefreshSliceResult(
                 cursor.entity_id,
                 self._success_if_refresh_finished(cursor, committed=committed),
@@ -593,6 +625,7 @@ class DaemonEntityInfoService:
         *,
         now: int,
     ) -> DurableRefreshTerminal | None:
+        captured_scope = self._capture_pair_scope()
         try:
             result = await self._acquire_profile_section(cursor, entity_type)
         except RpcAttemptBudgetExhaustedError:
@@ -618,6 +651,15 @@ class DaemonEntityInfoService:
             )
             self._observe_profile_section_failure(cursor, entity_type, actual_attempts=1)
             return DurableRefreshTerminal.FAILURE if failed else None
+        if self._deps.full_user_auth_scope is not None and captured_scope != self._capture_pair_scope():
+            self._profiles.mark_section_failure(
+                cursor,
+                now=now,
+                reason="auth_scope_changed",
+                retry_at=now + 1,
+            )
+            return DurableRefreshTerminal.FAILURE
+        result = self._with_observation_metadata(result, captured_scope)
         committed = self._profiles.commit_section(cursor, result, now=now)
         self._observe_profile_section_commit(cursor, entity_type, result, committed=committed)
         return self._success_if_refresh_finished(cursor, committed=committed)
@@ -772,6 +814,34 @@ class DaemonEntityInfoService:
         scope = provider()
         return scope if isinstance(scope, TelegramAuthScope) else None
 
+    def _with_observation_metadata(
+        self, commit: EntitySectionCommit, scope: TelegramAuthScope | None
+    ) -> EntitySectionCommit:
+        """Attach ownership to every account-derived profile observation."""
+        return dataclass_replace(
+            commit,
+            observation_owner_account_id=scope.account_id if scope is not None else None,
+            observation_auth_scope=scope.as_private_mapping() if scope is not None else None,
+            ownership_observed=self._deps.full_user_auth_scope is not None,
+        )
+
+    @staticmethod
+    def _scope_account_id(identity: Mapping[str, object] | None) -> int | None:
+        if not isinstance(identity, Mapping):
+            return None
+        raw_scope = identity.get("auth_scope")
+        if not isinstance(raw_scope, Mapping):
+            return None
+        account_id = raw_scope.get("account_id")
+        return account_id if isinstance(account_id, int) and not isinstance(account_id, bool) else None
+
+    @staticmethod
+    def _scope_mapping(identity: Mapping[str, object] | None) -> Mapping[str, object] | None:
+        if not isinstance(identity, Mapping):
+            return None
+        raw_scope = identity.get("auth_scope")
+        return dict(raw_scope) if isinstance(raw_scope, Mapping) else None
+
     def _full_user_pair_identity(
         self,
         target_kind: TargetKind,
@@ -823,6 +893,22 @@ class DaemonEntityInfoService:
             observation_completed_at=int(completed),
             identity=identity,
         )
+
+    @staticmethod
+    def _finalize_channel_evidence(
+        evidence: ProfileAcquisitionEvidence | None,
+        *,
+        outcome: str,
+        authoritative: bool,
+    ) -> ProfileAcquisitionEvidence | None:
+        if evidence is None:
+            return None
+        provenance = evidence.provenance
+        if provenance is None:
+            return dataclass_replace(evidence, outcome=outcome)
+        final_provenance = dict(provenance)
+        final_provenance["authoritative"] = authoritative
+        return dataclass_replace(evidence, outcome=outcome, provenance=final_provenance)
 
     def _observe_profile_pair(  # noqa: PLR0913 - mirrors the bounded hook contract
         self,
@@ -948,6 +1034,9 @@ class DaemonEntityInfoService:
             status="fresh",
             payload=payload,
             evidence=self._projection_evidence(outcome, cursor=cursor, identity=identity),
+            observation_owner_account_id=self._scope_account_id(identity),
+            observation_auth_scope=self._scope_mapping(identity),
+            ownership_observed=self._deps.full_user_auth_scope is not None,
         )
 
     def _normalized_personal_channel_commit(
@@ -962,31 +1051,51 @@ class DaemonEntityInfoService:
             return EntitySectionCommit(
                 {
                     "personal_channel_id": None,
+                    "personal_channel_message": None,
                     "personal_channel": None,
                     "personal_channel_unavailable_reason": None,
                 },
                 status="fresh",
                 payload=None,
                 evidence=evidence,
+                observation_owner_account_id=self._scope_account_id(identity),
+                observation_auth_scope=self._scope_mapping(identity),
+                ownership_observed=self._deps.full_user_auth_scope is not None,
             )
         channel_id = payload.get("personal_channel_id")
         if not isinstance(channel_id, int) or channel_id <= 0:
+            evidence = self._finalize_channel_evidence(
+                evidence, outcome="partial", authoritative=False
+            )
             return EntitySectionCommit(
                 {},
                 status="unavailable",
                 reason=outcome.reason or "personal_channel_unavailable",
                 payload=payload,
                 evidence=evidence,
+                observation_owner_account_id=self._scope_account_id(identity),
+                observation_auth_scope=self._scope_mapping(identity),
+                ownership_observed=self._deps.full_user_auth_scope is not None,
             )
         dialog_id = self._normalize_channel_dialog_id(channel_id)
         metadata = self._personal_channel_metadata(None, dialog_id=dialog_id)
         if metadata is None:
+            evidence = self._finalize_channel_evidence(
+                evidence, outcome="unavailable", authoritative=False
+            )
             return EntitySectionCommit(
-                {"personal_channel_id": channel_id},
+                {
+                    "personal_channel_id": channel_id,
+                    "personal_channel_message": payload.get("personal_channel_message"),
+                    "personal_channel": None,
+                },
                 status="unavailable",
                 reason=outcome.reason or "channel_metadata_unavailable",
                 payload=payload,
                 evidence=evidence,
+                observation_owner_account_id=self._scope_account_id(identity),
+                observation_auth_scope=self._scope_mapping(identity),
+                ownership_observed=self._deps.full_user_auth_scope is not None,
             )
         local_preview, local_reason = self._latest_local_personal_channel_post(dialog_id)
         card = _compact_dict(
@@ -1005,13 +1114,21 @@ class DaemonEntityInfoService:
         return EntitySectionCommit(
             {
                 "personal_channel_id": channel_id,
+                "personal_channel_message": payload.get("personal_channel_message"),
                 "personal_channel": card,
                 "personal_channel_unavailable_reason": None,
             },
             status="fresh" if outcome.status is ProjectionStatus.USABLE else "unavailable",
             reason=None if outcome.status is ProjectionStatus.USABLE else outcome.reason,
             payload=card,
-            evidence=evidence,
+            evidence=self._finalize_channel_evidence(
+                evidence,
+                outcome="usable" if outcome.status is ProjectionStatus.USABLE else "partial",
+                authoritative=outcome.status is ProjectionStatus.USABLE,
+            ),
+            observation_owner_account_id=self._scope_account_id(identity),
+            observation_auth_scope=self._scope_mapping(identity),
+            ownership_observed=self._deps.full_user_auth_scope is not None,
         )
 
     async def _acquire_durable_refresh_core(

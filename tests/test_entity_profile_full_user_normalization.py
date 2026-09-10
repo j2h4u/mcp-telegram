@@ -218,3 +218,38 @@ def test_invalid_observation_boundaries_cannot_authorize_reuse() -> None:
     assert result.full_profile.provenance.reusable is False
     assert result.personal_channel.provenance is not None
     assert result.personal_channel.provenance.reusable is False
+
+
+def test_false_zero_and_empty_full_user_values_are_materialized() -> None:
+    result = normalize_full_user_response(
+        _response(
+            about="",
+            blocked=False,
+            ttl_period=0,
+            private_forward_name="",
+            folder_id=0,
+            chats=[],
+        ),
+        target_id=42,
+        target_kind=TargetKind.USER,
+    )
+    profile = result.full_profile.payload
+    assert profile is not None
+    assert profile["about"] == ""
+    assert profile["blocked"] is False
+    assert profile["ttl_period"] == 0
+    assert profile["private_forward_name"] == ""
+    assert profile["folder_id"] == 0
+    assert profile["username"] == "ada"
+
+
+def test_malformed_owned_value_is_omitted_and_marks_partial_coverage() -> None:
+    result = normalize_full_user_response(
+        _response(about=object(), blocked=False), target_id=42, target_kind=TargetKind.USER
+    )
+    profile = result.full_profile.payload
+    assert profile is not None
+    assert "about" not in profile
+    assert result.full_profile.reason == "full_profile_fields_unknown"
+    assert result.full_profile.provenance is not None
+    assert result.full_profile.provenance.authoritative is False
