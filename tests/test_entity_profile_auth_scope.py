@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.daemon import capture_auth_scope
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from tests.test_entity_profile_full_user_pair import _PairClient, _prepare
@@ -206,6 +208,68 @@ async def test_ownership_invalid_cached_profile_preserves_failed_retry_state(tmp
         == before
     )
 
+    await service.shutdown()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_public_wait_reread_does_not_requeue_flooded_refresh(tmp_path: Path) -> None:
+    conn, raw_service = _prepare(tmp_path / "ownership-reread.sqlite", migrated=True)
+    service = cast(DaemonEntityInfoService, raw_service)
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET status='complete', next_section='personal_channel' WHERE entity_id=42"
+    )
+    conn.execute(
+        "UPDATE entity_detail_sections SET acquisition_generation=NULL, acquisition_outcome=NULL, "
+        "provenance_json=NULL, normalization_version=NULL, observation_started_at=NULL, "
+        "observation_completed_at=NULL, acquisition_identity_json=NULL, observed_at=0 "
+        "WHERE entity_id=42 AND section IN ('full_profile', 'personal_channel')"
+    )
+    service._profiles.mark_pending(42, now=100)  # type: ignore[attr-defined]
+    conn.execute(
+        "UPDATE entity_details SET profile_owner_account_id=NULL, profile_observation_scope_json=NULL "
+        "WHERE entity_id=42"
+    )
+    conn.commit()
+
+    class RecoveryClient(_PairClient):
+        async def __call__(self, request: object) -> object:
+            request_name = cast(tuple[str, object], request)[0]
+            if request_name == "common_chats":
+                raise TelegramRpcThrottled(retry_after_seconds=777)
+            return await super().__call__(request)
+
+    service._deps = replace(service._deps, client=RecoveryClient())
+    request = asyncio.create_task(service.get_entity_info({"entity_id": 42}))
+    await asyncio.sleep(0)
+    assert coordinator.queue_depth == 1
+
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    assert coordinator.queue_depth == 1
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    failed_state = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT status, retry_at, generation, next_section, acquisition_cursor "
+            "FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone(),
+    )
+    assert failed_state == ("failed", 877, 2, "common_chats", 0)
+
+    result = await request
+
+    assert result["ok"] is True
+    assert (
+        conn.execute(
+            "SELECT status, retry_at, generation, next_section, acquisition_cursor "
+            "FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone()
+        == failed_state
+    )
     await service.shutdown()
     conn.close()
 
