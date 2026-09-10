@@ -566,9 +566,7 @@ async def test_flood_wait_refresh_failure_signals_terminal_waiter_and_persists_r
     assert await waiter is True
     retry_at = cast(
         tuple[int | None] | None,
-        conn.execute(
-            "SELECT retry_at FROM entity_profile_refresh_state WHERE entity_id = 42"
-        ).fetchone(),
+        conn.execute("SELECT retry_at FROM entity_profile_refresh_state WHERE entity_id = 42").fetchone(),
     )
     assert retry_at == (107,)
     stored = repo.read(42, now=100)
@@ -847,7 +845,9 @@ async def test_entity_profile_adapter_sets_bounded_rpc_scope() -> None:
     EntityProfileRepository(conn, section_ttl_seconds=300).mark_pending(42, now=100)
     limits = RefreshLimits(foreground_resolve_seconds=0.01, per_rpc_seconds=0.02, whole_refresh_seconds=0.05)
     service = _test_service(conn, limits=limits)
-    observed: list[tuple[TelegramRpcSource, float | None, asyncio.Task[object] | None, DemandKind, AcquisitionKind]] = []
+    observed: list[
+        tuple[TelegramRpcSource, float | None, asyncio.Task[object] | None, DemandKind, AcquisitionKind]
+    ] = []
 
     class ScopedClient(_UnusedClient):
         async def __call__(self, _request: object) -> object:
@@ -857,7 +857,9 @@ async def test_entity_profile_adapter_sets_bounded_rpc_scope() -> None:
             assert scope.demand_kind is not None
             assert scope.acquisition_kind is not None
             observed.append((scope.source, scope.deadline, scope.owner_task, scope.demand_kind, scope.acquisition_kind))
-            return SimpleNamespace(full_user=SimpleNamespace(about="fresh", blocked=False, folder_id=None), users=[], chats=[])
+            return SimpleNamespace(
+                full_user=SimpleNamespace(about="fresh", blocked=False, folder_id=None), users=[], chats=[]
+            )
 
     service._deps = replace(
         service._deps,
@@ -900,7 +902,9 @@ async def test_refresh_resolution_preserves_success_and_failure_semantics() -> N
     cursor = service._profiles.next_due_refresh(now=100)
     assert cursor is not None
     assert await service._acquire_durable_refresh_core(cursor, now=100) is None
-    assert conn.execute("SELECT acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (1,)
+    assert conn.execute(
+        "SELECT acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == (1,)
 
     async def throttled(_entity_id: int) -> tuple[None, dict[str, object]]:
         return None, {"_retry_after_seconds": 7}

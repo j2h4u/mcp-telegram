@@ -231,11 +231,7 @@ class DaemonEntityInfoService:
         self._profiles = EntityProfileRepository(deps.conn, section_ttl_seconds=deps.detail_ttl_seconds)
         self._section_failures: dict[str, str] = {}
         self._demand_sink: DemandOfferSink | None = None
-        self._refresh = (
-            EntityRefreshCoordinator(limits=deps.refresh_limits)
-            if enable_refresh_coordinator
-            else None
-        )
+        self._refresh = EntityRefreshCoordinator(limits=deps.refresh_limits) if enable_refresh_coordinator else None
         if self._refresh is not None:
             self._refresh.bind_durable_executor(self._durable_refresh_status, self._run_durable_refresh_slice)
 
