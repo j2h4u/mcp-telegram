@@ -71,6 +71,40 @@ class EntitySectionCommit:
     ownership_observed: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _PairMeasurement:
+    outcome: str
+    actual_attempts: int
+    ready_at: int
+    readiness_latency_ms: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PairSummaryContext:
+    cursor: EntityRefreshCursor
+    section: str
+    mode: str
+    current: tuple[object, ...]
+    measurement: _PairMeasurement
+
+
+@dataclass(frozen=True, slots=True)
+class _EncodedDetail:
+    entity_id: int
+    encoded: str
+    metadata_columns: tuple[str, ...]
+    metadata_values: tuple[object, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ReceiptContext:
+    entity_id: int
+    section: str
+    identity: Mapping[str, object]
+    expected_generation: int | None
+    positive_only: bool
+
+
 class EntityProfileRepository:
     """Read and write entity profiles without making Telegram calls."""
 
@@ -177,7 +211,7 @@ class EntityProfileRepository:
             ).rowcount
             return changed == 1
 
-    def full_user_pair_reuse_rejection_reason(  # noqa: PLR0911, PLR0912
+    def full_user_pair_reuse_rejection_reason(
         self,
         cursor: EntityRefreshCursor,
         identity: Mapping[str, object] | None,
@@ -192,32 +226,78 @@ class EntityProfileRepository:
         if identity is None:
             return "missing_identity"
         for section in ("full_profile", "personal_channel"):
-            evidence = self.read_section_evidence(cursor.entity_id, section)
-            if evidence is None:
-                return "missing_receipt"
-            if evidence.get("outcome") not in {"usable", "absent"}:
-                return "outcome_not_reusable"
-            stored_identity = evidence.get("identity")
-            if not isinstance(stored_identity, dict) or dict(identity) != stored_identity:
-                return "identity_mismatch"
-            if not self._receipt_materialization_is_exact(cursor.entity_id, section, evidence):
-                return "materialization_mismatch"
-            started_at = evidence.get("observation_started_at")
-            completed_at = evidence.get("observation_completed_at")
-            if not _is_nonnegative_int(started_at) or not _is_nonnegative_int(completed_at):
-                return "invalid_observation"
-            started_at_int = cast(int, started_at)
-            completed_at_int = cast(int, completed_at)
-            if completed_at_int < started_at_int or completed_at_int > now:
-                return "invalid_observation"
-            row = self._conn.execute(
-                "SELECT status, observed_at FROM entity_detail_sections WHERE entity_id=? AND section=?",
-                (cursor.entity_id, section),
-            ).fetchone()
-            if row is None or row[0] != "fresh":
-                return "section_not_fresh"
-            if row[1] != started_at_int or now >= started_at_int + self._section_ttl_seconds:
-                return "stale"
+            reason = self._pair_section_reuse_rejection_reason(
+                cursor.entity_id,
+                section,
+                identity=identity,
+                now=now,
+            )
+            if reason is not None:
+                return reason
+        return None
+
+    def _pair_section_reuse_rejection_reason(
+        self,
+        entity_id: int,
+        section: str,
+        *,
+        identity: Mapping[str, object],
+        now: int,
+    ) -> str | None:
+        evidence = self.read_section_evidence(entity_id, section)
+        if evidence is None:
+            return "missing_receipt"
+        reason = self._pair_evidence_rejection_reason(
+            entity_id,
+            section,
+            evidence,
+            identity=identity,
+        )
+        if reason is not None:
+            return reason
+        started_at, completed_at = _observation_bounds(evidence)
+        if started_at is None or completed_at is None:
+            return "invalid_observation"
+        if completed_at < started_at or completed_at > now:
+            return "invalid_observation"
+        return self._pair_section_freshness_rejection(
+            entity_id,
+            section,
+            started_at=started_at,
+            now=now,
+        )
+
+    def _pair_section_freshness_rejection(
+        self,
+        entity_id: int,
+        section: str,
+        *,
+        started_at: int,
+        now: int,
+    ) -> str | None:
+        row = self._conn.execute(
+            "SELECT status, observed_at FROM entity_detail_sections WHERE entity_id=? AND section=?",
+            (entity_id, section),
+        ).fetchone()
+        if row is None or row[0] != "fresh":
+            return "section_not_fresh"
+        return "stale" if row[1] != started_at or now >= started_at + self._section_ttl_seconds else None
+
+    def _pair_evidence_rejection_reason(
+        self,
+        entity_id: int,
+        section: str,
+        evidence: Mapping[str, object],
+        *,
+        identity: Mapping[str, object],
+    ) -> str | None:
+        if evidence.get("outcome") not in {"usable", "absent"}:
+            return "outcome_not_reusable"
+        stored_identity = evidence.get("identity")
+        if not isinstance(stored_identity, dict) or dict(identity) != stored_identity:
+            return "identity_mismatch"
+        if not self._receipt_materialization_is_exact(entity_id, section, evidence):
+            return "materialization_mismatch"
         return None
 
     def pair_receipts_require_new_scope(
@@ -295,45 +375,23 @@ class EntityProfileRepository:
         detail = self._read_entity_stub(entity_id)
         return (detail, None, None, None) if detail else ({}, None, None, None)
 
-    def _read_profile_blob(  # noqa: PLR0911
+    def _read_profile_blob(
         self, entity_id: int
     ) -> tuple[dict[str, object], int | None, int | None, dict[str, object] | None]:
-        owner_column = ", profile_owner_account_id" if self._detail_has("profile_owner_account_id") else ""
-        scope_column = ", profile_observation_scope_json" if self._detail_has("profile_observation_scope_json") else ""
         try:
-            row = cast(
-                tuple[object, ...] | None,
-                self._conn.execute(
-                    "SELECT detail_json, fetched_at"
-                    + owner_column
-                    + scope_column
-                    + " FROM entity_details WHERE entity_id = ?",
-                    (entity_id,),
-                ).fetchone(),
-            )
+            row = self._conn.execute(self._profile_blob_query(), (entity_id,)).fetchone()
         except sqlite3.OperationalError:
             return {}, None, None, None
-        if row is None:
-            return {}, None, None, None
-        raw_json, fetched_at, *metadata = row
-        if not isinstance(raw_json, str):
-            return {}, None, None, None
-        try:
-            parsed = cast(object, json.loads(raw_json))
-        except TypeError, json.JSONDecodeError:
-            return {}, None, None, None
-        if not isinstance(parsed, dict) or parsed.get("schema") != _DETAIL_SCHEMA:
-            return {}, None, None, None
-        owner = (
-            cast(int, metadata[0])
-            if metadata and _is_nonnegative_int(metadata[0]) and cast(int, metadata[0]) > 0
-            else None
+        return _decode_profile_blob_row(row)
+
+    def _profile_blob_query(self) -> str:
+        columns = ["detail_json", "fetched_at"]
+        columns.extend(
+            column
+            for column in ("profile_owner_account_id", "profile_observation_scope_json")
+            if self._detail_has(column)
         )
-        scope = _decode_mapping(metadata[1]) if len(metadata) > 1 else None
-        if not _is_nonnegative_int(fetched_at):
-            return {}, None, None, None
-        fetched_at_int = cast(int, fetched_at)
-        return {str(key): value for key, value in parsed.items() if key != "schema"}, fetched_at_int, owner, scope
+        return f"SELECT {', '.join(columns)} FROM entity_details WHERE entity_id = ?"
 
     def _read_entity_stub(self, entity_id: int) -> dict[str, object]:
         entity_row = cast(
@@ -474,7 +532,7 @@ class EntityProfileRepository:
         except sqlite3.OperationalError:
             return
 
-    def _upsert_pending_refresh(  # noqa: PLR0914
+    def _upsert_pending_refresh(
         self,
         entity_id: int,
         *,
@@ -483,103 +541,98 @@ class EntityProfileRepository:
         pair_eligible_override: bool | None = None,
         pair_mode_override: str | None = None,
     ) -> None:
-        if self._refresh_has("generation"):
-            new_generation = False
-            existing_columns = [
-                column
-                for column in (
-                    "status",
-                    "generation",
-                    "started_at",
-                    "pair_eligible",
-                    "follow_up_required",
-                    "profile_revision",
-                    "pair_mode",
-                )
-                if self._refresh_has(column)
-            ]
-            existing_row = self._conn.execute(
-                f"SELECT {', '.join(existing_columns)} FROM entity_profile_refresh_state WHERE entity_id=?",
-                (entity_id,),
-            ).fetchone()
-            existing = dict(zip(existing_columns, existing_row, strict=False)) if existing_row is not None else None
-            if (
-                existing is not None
-                and str(existing.get("status")) == "pending"
-                and int(existing.get("generation") or 0) > 0
-            ):
-                generation = int(existing["generation"])
-                started_at = existing.get("started_at")
-                # Eligibility is a generation fact.  A repeated enqueue or
-                # auth-scope wakeup must not rewrite it while work is active.
-                pair_eligible = int(existing.get("pair_eligible") or 0)
-                follow_up_required = int(existing.get("follow_up_required") or 0)
-                profile_revision = int(existing.get("profile_revision") or 0)
-                pair_mode = existing.get("pair_mode") if pair_mode_override is None else pair_mode_override
-            else:
-                new_generation = True
-                previous_generation = int(existing.get("generation") or 0) if existing is not None else 0
-                generation = max(1, previous_generation + 1)
-                started_at = now
-                pair_eligible = int(
-                    self._pair_is_eligible(entity_id, now=now)
-                    if pair_eligible_override is None
-                    else pair_eligible_override
-                )
-                follow_up_required = 0
-                profile_revision = self._profile_revision(entity_id)
-                pair_mode = pair_mode_override
-            optional_values: dict[str, object] = {
-                "generation": generation,
-                "started_at": started_at,
-                "pair_eligible": pair_eligible,
-                "follow_up_required": follow_up_required,
-                "profile_revision": profile_revision,
-            }
-            columns = [
-                "entity_id",
-                "status",
-                "retry_at",
-                "reason",
-                "updated_at",
-                "next_section",
-                "acquisition_cursor",
-            ]
-            values: list[object] = [entity_id, "pending", None, reason, now, PROFILE_SECTIONS[0], 0]
-            for column, value in optional_values.items():
-                if self._refresh_has(column):
-                    columns.append(column)
-                    values.append(value)
-            if self._refresh_has("pair_mode"):
-                columns.append("pair_mode")
-                values.append(pair_mode)
-            placeholders = ", ".join("?" for _ in columns)
-            updates = [
-                "status='pending'",
-                "retry_at=NULL",
-                "reason=excluded.reason",
-                "updated_at=excluded.updated_at",
-                "next_section=CASE WHEN entity_profile_refresh_state.status='pending' AND entity_profile_refresh_state.next_section IS NOT NULL THEN entity_profile_refresh_state.next_section ELSE excluded.next_section END",
-                "acquisition_cursor=CASE WHEN entity_profile_refresh_state.status='pending' AND entity_profile_refresh_state.next_section IS NOT NULL THEN entity_profile_refresh_state.acquisition_cursor ELSE 0 END",
-            ]
-            for column in columns[7:]:
-                if column == "pair_mode":
-                    updates.append(
-                        "pair_mode=CASE WHEN entity_profile_refresh_state.status='pending' "
-                        "AND entity_profile_refresh_state.generation=excluded.generation "
-                        "THEN COALESCE(entity_profile_refresh_state.pair_mode, excluded.pair_mode) "
-                        "ELSE excluded.pair_mode END"
-                    )
-                else:
-                    updates.append(f"{column}=excluded.{column}")
-            self._conn.execute(
-                f"INSERT INTO entity_profile_refresh_state({', '.join(columns)}) VALUES ({placeholders}) "
-                f"ON CONFLICT(entity_id) DO UPDATE SET {', '.join(updates)}",
-                values,
-            )
-            if new_generation:
-                self._reset_pair_measurement(entity_id)
+        if not self._refresh_has("generation"):
+            self._upsert_legacy_pending_refresh(entity_id, now=now, reason=reason)
             return
+
+        new_generation, optional_values = self._pending_refresh_state(
+            entity_id,
+            now=now,
+            pair_eligible_override=pair_eligible_override,
+            pair_mode_override=pair_mode_override,
+        )
+        columns = [
+            "entity_id",
+            "status",
+            "retry_at",
+            "reason",
+            "updated_at",
+            "next_section",
+            "acquisition_cursor",
+        ]
+        values: list[object] = [entity_id, "pending", None, reason, now, PROFILE_SECTIONS[0], 0]
+        for column, value in optional_values.items():
+            if self._refresh_has(column):
+                columns.append(column)
+                values.append(value)
+        query = _pending_refresh_upsert_query(columns)
+        self._conn.execute(query, values)
+        if new_generation:
+            self._reset_pair_measurement(entity_id)
+
+    def _pending_refresh_state(
+        self,
+        entity_id: int,
+        *,
+        now: int,
+        pair_eligible_override: bool | None,
+        pair_mode_override: str | None,
+    ) -> tuple[bool, dict[str, object]]:
+        existing = self._read_pending_refresh_state(entity_id)
+        if _pending_refresh_is_active(existing):
+            assert existing is not None
+            return False, _active_pending_values(existing, pair_mode_override=pair_mode_override)
+        return True, self._new_pending_values(
+            entity_id,
+            existing,
+            now=now,
+            pair_eligible_override=pair_eligible_override,
+            pair_mode_override=pair_mode_override,
+        )
+
+    def _read_pending_refresh_state(self, entity_id: int) -> dict[str, object] | None:
+        columns = [
+            column
+            for column in (
+                "status",
+                "generation",
+                "started_at",
+                "pair_eligible",
+                "follow_up_required",
+                "profile_revision",
+                "pair_mode",
+            )
+            if self._refresh_has(column)
+        ]
+        row = self._conn.execute(
+            f"SELECT {', '.join(columns)} FROM entity_profile_refresh_state WHERE entity_id=?",
+            (entity_id,),
+        ).fetchone()
+        return dict(zip(columns, row, strict=False)) if row is not None else None
+
+    def _new_pending_values(
+        self,
+        entity_id: int,
+        existing: Mapping[str, object] | None,
+        *,
+        now: int,
+        pair_eligible_override: bool | None,
+        pair_mode_override: str | None,
+    ) -> dict[str, object]:
+        previous_generation = _as_int(existing.get("generation")) if existing is not None else 0
+        pair_eligible = (
+            self._pair_is_eligible(entity_id, now=now) if pair_eligible_override is None else pair_eligible_override
+        )
+        return {
+            "generation": max(1, previous_generation + 1),
+            "started_at": now,
+            "pair_eligible": int(pair_eligible),
+            "follow_up_required": 0,
+            "profile_revision": self._profile_revision(entity_id),
+            "pair_mode": pair_mode_override,
+        }
+
+    def _upsert_legacy_pending_refresh(self, entity_id: int, *, now: int, reason: str) -> None:
         self._conn.execute(
             """
             INSERT INTO entity_profile_refresh_state(
@@ -844,40 +897,27 @@ class EntityProfileRepository:
             return self._record_pair_section_outcome_in_transaction(
                 cursor,
                 section,
-                outcome=outcome,
-                actual_attempts=attempts,
-                ready_at=ready_at,
-                readiness_latency_ms=readiness_latency_ms,
+                _PairMeasurement(outcome, attempts, ready_at, readiness_latency_ms),
             )
 
-    def _record_pair_section_outcome_in_transaction(  # noqa: PLR0911, PLR0913
+    def _record_pair_section_outcome_in_transaction(
         self,
         cursor: EntityRefreshCursor,
         section: str,
-        *,
-        outcome: str,
-        actual_attempts: int,
-        ready_at: int,
-        readiness_latency_ms: float | None = None,
+        measurement: _PairMeasurement,
     ) -> dict[str, object] | None:
         """Record one pair outcome while an outer transaction is active."""
-        state = self._conn.execute(
-            "SELECT pair_mode, pair_eligible, pair_full_profile_outcome, "
-            "pair_personal_channel_outcome, pair_summary_watermark, pair_ready_at, "
-            "pair_attempts, pair_retries, pair_readiness_latency_ms "
-            "FROM entity_profile_refresh_state WHERE entity_id=? AND generation=?",
-            (cursor.entity_id, cursor.generation),
-        ).fetchone()
+        state = self._pair_outcome_state(cursor)
         if state is None:
             return None
-        mode = state[0] if state[0] in {"enabled", "disabled"} else None
-        if mode is None or not bool(state[1]):
+        mode, eligible = state[0], state[1]
+        if mode is None or not bool(eligible):
             return None
-        self._record_pair_attempt_in_transaction(cursor, section, actual_attempts=actual_attempts)
+        self._record_pair_attempt_in_transaction(cursor, section, actual_attempts=measurement.actual_attempts)
         outcome_column = "pair_full_profile_outcome" if section == "full_profile" else "pair_personal_channel_outcome"
         self._conn.execute(
             f"UPDATE entity_profile_refresh_state SET {outcome_column}=? WHERE entity_id=? AND generation=?",
-            (outcome, cursor.entity_id, cursor.generation),
+            (measurement.outcome, cursor.entity_id, cursor.generation),
         )
         current = self._conn.execute(
             "SELECT pair_full_profile_outcome, pair_personal_channel_outcome, pair_summary_watermark, "
@@ -887,49 +927,46 @@ class EntityProfileRepository:
         ).fetchone()
         if current is None or current[0] is None or current[1] is None:
             return None
+        return self._pair_outcome_summary(_PairSummaryContext(cursor, section, str(mode), current, measurement))
+
+    def _pair_outcome_state(self, cursor: EntityRefreshCursor) -> tuple[str | None, object] | None:
+        state = self._conn.execute(
+            "SELECT pair_mode, pair_eligible FROM entity_profile_refresh_state WHERE entity_id=? AND generation=?",
+            (cursor.entity_id, cursor.generation),
+        ).fetchone()
+        if state is None:
+            return None
+        mode = state[0] if state[0] in {"enabled", "disabled"} else None
+        return mode, state[1]
+
+    def _pair_outcome_summary(self, context: _PairSummaryContext) -> dict[str, object] | None:
+        cursor = context.cursor
+        section = context.section
+        mode = context.mode
+        current = context.current
+        measurement = context.measurement
+        readiness_latency_ms = measurement.readiness_latency_ms
         summary_key = (cursor.entity_id, cursor.generation)
         if current[2] is not None:
             if section != "full_profile" or summary_key in self._emitted_pair_summaries:
                 return None
             self._emitted_pair_summaries.add(summary_key)
-            return {
-                "mode": str(mode),
-                "eligible_pair": True,
-                "outcome": "committed",
-                "actual_attempts": int(current[3] or 0),
-                "retries": int(current[4] or 0),
-                "full_profile_outcome": str(current[0]),
-                "personal_channel_outcome": str(current[1]),
-                "pair_ready": True,
-                "pair_readiness_latency_ms": current[6],
-            }
+            return _pair_summary_payload(mode, current, readiness_latency_ms=current[6], ready=True)
         self._conn.execute(
             "UPDATE entity_profile_refresh_state SET pair_measurement_complete=1, pair_ready_at=?, "
             "pair_readiness_latency_ms=?, pair_summary_watermark=? WHERE entity_id=? AND generation=? "
             "AND pair_summary_watermark IS NULL",
             (
-                ready_at,
+                measurement.ready_at,
                 readiness_latency_ms,
-                ready_at,
+                measurement.ready_at,
                 cursor.entity_id,
                 cursor.generation,
             ),
         )
         if self._conn.execute("SELECT changes()").fetchone()[0] != 1:
             return None
-        attempts_total = int(current[3] or 0)
-        retries_total = int(current[4] or 0)
-        return {
-            "mode": str(mode),
-            "eligible_pair": True,
-            "outcome": "committed",
-            "actual_attempts": attempts_total,
-            "retries": retries_total,
-            "full_profile_outcome": str(current[0]),
-            "personal_channel_outcome": str(current[1]),
-            "pair_ready": True,
-            "pair_readiness_latency_ms": readiness_latency_ms,
-        }
+        return _pair_summary_payload(mode, current, readiness_latency_ms=readiness_latency_ms, ready=True)
 
     def advance_acquisition_cursor(
         self,
@@ -1003,9 +1040,7 @@ class EntityProfileRepository:
             summary = self._record_pair_section_outcome_in_transaction(
                 cursor,
                 cursor.next_section,
-                outcome=outcome,
-                actual_attempts=actual_attempts,
-                ready_at=now,
+                _PairMeasurement(outcome, actual_attempts, now, None),
             )
             return True, summary
 
@@ -1089,34 +1124,74 @@ class EntityProfileRepository:
         ownership_observed: bool = False,
     ) -> bool:
         encoded_detail = json.dumps({"schema": _DETAIL_SCHEMA, **detail}, separators=(",", ":"))
-        metadata_values: tuple[object, ...] = ()
-        metadata_columns: tuple[str, ...] = ()
-        if ownership_observed and self._detail_has("profile_owner_account_id"):
-            metadata_columns += ("profile_owner_account_id",)
-            metadata_values += (owner_account_id,)
-        if ownership_observed and self._detail_has("profile_observation_scope_json"):
-            metadata_columns += ("profile_observation_scope_json",)
-            metadata_values += (_encode_bounded_json(observation_scope),)
-        metadata_update = ", ".join(f"{column}=?" for column in metadata_columns)
+        metadata_columns, metadata_values = self._detail_metadata(
+            owner_account_id=owner_account_id,
+            observation_scope=observation_scope,
+            ownership_observed=ownership_observed,
+        )
+        encoded = _EncodedDetail(entity_id, encoded_detail, metadata_columns, metadata_values)
         if self._detail_has("profile_revision"):
-            update_columns = "detail_json=?, fetched_at=?, profile_revision=profile_revision+1"
-            if metadata_update:
-                update_columns += ", " + metadata_update
-            changed = self._conn.execute(
-                "UPDATE entity_details SET " + update_columns + " WHERE entity_id=? AND profile_revision=?",
-                (encoded_detail, now, *metadata_values, entity_id, expected_revision),
-            ).rowcount
-            if changed == 0:
-                exists = self._conn.execute("SELECT 1 FROM entity_details WHERE entity_id=?", (entity_id,)).fetchone()
-                if exists is not None:
-                    return False
-                columns = ("entity_id", "detail_json", "fetched_at", "profile_revision", *metadata_columns)
-                values: tuple[object, ...] = (entity_id, encoded_detail, now, 1, *metadata_values)
-                self._conn.execute(
-                    f"INSERT INTO entity_details({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
-                    values,
-                )
+            return self._write_fenced_detail(
+                encoded,
+                now=now,
+                expected_revision=expected_revision,
+            )
+        return self._write_legacy_detail(entity_id, encoded_detail, metadata_columns, metadata_values, now=now)
+
+    def _detail_metadata(
+        self,
+        *,
+        owner_account_id: int | None,
+        observation_scope: Mapping[str, object] | None,
+        ownership_observed: bool,
+    ) -> tuple[tuple[str, ...], tuple[object, ...]]:
+        metadata: list[tuple[str, object]] = []
+        if ownership_observed and self._detail_has("profile_owner_account_id"):
+            metadata.append(("profile_owner_account_id", owner_account_id))
+        if ownership_observed and self._detail_has("profile_observation_scope_json"):
+            metadata.append(("profile_observation_scope_json", _encode_bounded_json(observation_scope)))
+        return tuple(column for column, _value in metadata), tuple(value for _column, value in metadata)
+
+    def _write_fenced_detail(
+        self,
+        detail: _EncodedDetail,
+        *,
+        now: int,
+        expected_revision: int,
+    ) -> bool:
+        entity_id = detail.entity_id
+        encoded_detail = detail.encoded
+        metadata_columns = detail.metadata_columns
+        metadata_values = detail.metadata_values
+        assignments = "detail_json=?, fetched_at=?, profile_revision=profile_revision+1"
+        if metadata_columns:
+            assignments += ", " + ", ".join(f"{column}=?" for column in metadata_columns)
+        changed = self._conn.execute(
+            "UPDATE entity_details SET " + assignments + " WHERE entity_id=? AND profile_revision=?",
+            (encoded_detail, now, *metadata_values, entity_id, expected_revision),
+        ).rowcount
+        if changed != 0:
             return True
+        exists = self._conn.execute("SELECT 1 FROM entity_details WHERE entity_id=?", (entity_id,)).fetchone()
+        if exists is not None:
+            return False
+        columns = ("entity_id", "detail_json", "fetched_at", "profile_revision", *metadata_columns)
+        values: tuple[object, ...] = (entity_id, encoded_detail, now, 1, *metadata_values)
+        self._conn.execute(
+            f"INSERT INTO entity_details({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+            values,
+        )
+        return True
+
+    def _write_legacy_detail(
+        self,
+        entity_id: int,
+        encoded_detail: str,
+        metadata_columns: tuple[str, ...],
+        metadata_values: tuple[object, ...],
+        *,
+        now: int,
+    ) -> bool:
         columns = ("entity_id", "detail_json", "fetched_at", *metadata_columns)
         values = (entity_id, encoded_detail, now, *metadata_values)
         updates = "detail_json=excluded.detail_json, fetched_at=excluded.fetched_at"
@@ -1140,68 +1215,12 @@ class EntityProfileRepository:
         now: int,
         evidence: ProfileAcquisitionEvidence | None,
     ) -> None:
-        observed_at = (
-            evidence.observation_at
-            if evidence is not None and status in {"fresh", "not_applicable"}
-            else now
-            if evidence is None and status in {"fresh", "not_applicable"}
-            else None
-        )
-        if (
-            evidence is not None
-            and section == "full_profile"
-            and isinstance(evidence.provenance, Mapping)
-            and evidence.provenance.get("authoritative") is False
-        ):
-            # The response may contain only a sparse subset.  Keep the prior
-            # section observation age for retained fields; the current
-            # observation is represented by its partial evidence instead.
-            previous = self._conn.execute(
-                "SELECT observed_at FROM entity_detail_sections WHERE entity_id=? AND section=?",
-                (entity_id, section),
-            ).fetchone()
-            if previous is not None and previous[0] is not None:
-                observed_at = previous[0]
+        observed_at = self._section_observed_at(entity_id, section, status, evidence, now=now)
         columns = ["entity_id", "section", "status", "observed_at", "reason", "payload_json", "retry_at"]
         values: list[object] = [entity_id, section, status, observed_at, reason, _encode_payload(payload), None]
-        if evidence is not None and self._section_has("acquisition_generation"):
-            encoded_provenance = _encode_bounded_json(evidence.provenance)
-            encoded_identity = _encode_bounded_json(evidence.identity)
-            columns.extend(
-                [
-                    "acquisition_generation",
-                    "acquisition_outcome",
-                    "provenance_json",
-                    "normalization_version",
-                    "observation_started_at",
-                    "observation_completed_at",
-                    "acquisition_identity_json",
-                ]
-            )
-            values.extend(
-                [
-                    evidence.generation,
-                    evidence.outcome,
-                    encoded_provenance,
-                    evidence.normalization_version,
-                    evidence.observation_started_at,
-                    evidence.observation_completed_at,
-                    encoded_identity,
-                ]
-            )
-        elif evidence is None and self._section_has("acquisition_generation"):
-            columns.extend(
-                [
-                    "acquisition_generation",
-                    "acquisition_outcome",
-                    "provenance_json",
-                    "normalization_version",
-                    "observation_started_at",
-                    "observation_completed_at",
-                    "acquisition_identity_json",
-                ]
-            )
-            values.extend([None] * 7)
+        evidence_columns, evidence_values = self._section_evidence_values(evidence)
+        columns.extend(evidence_columns)
+        values.extend(evidence_values)
         placeholders = ", ".join("?" for _ in columns)
         updates = ", ".join(
             f"{column}=excluded.{column}" for column in columns if column not in {"entity_id", "section"}
@@ -1210,6 +1229,55 @@ class EntityProfileRepository:
             f"INSERT INTO entity_detail_sections({', '.join(columns)}) VALUES ({placeholders}) "
             f"ON CONFLICT(entity_id, section) DO UPDATE SET {updates}",
             values,
+        )
+
+    def _section_observed_at(
+        self,
+        entity_id: int,
+        section: str,
+        status: str,
+        evidence: ProfileAcquisitionEvidence | None,
+        *,
+        now: int,
+    ) -> object | None:
+        if evidence is not None and status in {"fresh", "not_applicable"}:
+            observed_at: object | None = evidence.observation_at
+        elif evidence is None and status in {"fresh", "not_applicable"}:
+            observed_at = now
+        else:
+            observed_at = None
+        if not _is_sparse_full_profile_evidence(section, evidence):
+            return observed_at
+        previous = self._conn.execute(
+            "SELECT observed_at FROM entity_detail_sections WHERE entity_id=? AND section=?",
+            (entity_id, section),
+        ).fetchone()
+        return previous[0] if previous is not None and previous[0] is not None else observed_at
+
+    def _section_evidence_values(
+        self, evidence: ProfileAcquisitionEvidence | None
+    ) -> tuple[tuple[str, ...], tuple[object, ...]]:
+        if not self._section_has("acquisition_generation"):
+            return (), ()
+        columns = (
+            "acquisition_generation",
+            "acquisition_outcome",
+            "provenance_json",
+            "normalization_version",
+            "observation_started_at",
+            "observation_completed_at",
+            "acquisition_identity_json",
+        )
+        if evidence is None:
+            return columns, (None,) * len(columns)
+        return columns, (
+            evidence.generation,
+            evidence.outcome,
+            _encode_bounded_json(evidence.provenance),
+            evidence.normalization_version,
+            evidence.observation_started_at,
+            evidence.observation_completed_at,
+            _encode_bounded_json(evidence.identity),
         )
 
     def commit_full_user_pair(
@@ -1228,104 +1296,122 @@ class EntityProfileRepository:
         """
         if cursor.next_section != "full_profile":
             return False
+        self._validate_pair_commits(cursor, full_profile, personal_channel)
+        with self._conn:
+            if not self._cursor_matches(cursor):
+                return False
+            detail = self._pair_detail(cursor, full_profile, personal_channel, now=now)
+            if detail is None:
+                return False
+            self._record_full_pair_measurement(cursor, full_profile, personal_channel, now=now)
+            return self._advance_full_pair_cursor(cursor, now=now)
+
+    def _validate_pair_commits(
+        self,
+        cursor: EntityRefreshCursor,
+        full_profile: EntitySectionCommit,
+        personal_channel: EntitySectionCommit,
+    ) -> None:
         for commit in (full_profile, personal_channel):
             if commit.status not in {"fresh", "unavailable", "not_applicable"}:
                 raise ValueError("invalid terminal section status")
             if commit.evidence is not None and commit.evidence.generation != cursor.generation:
                 raise ValueError("pair evidence generation does not match refresh cursor")
-        with self._conn:
-            if not self._cursor_matches(cursor):
-                return False
-            detail = self._read_detail_blob(cursor.entity_id)
-            if not detail:
-                detail = self._read_entity_stub(cursor.entity_id)
-            detail = _strip_schema(detail)
-            detail.update(full_profile.detail_patch)
-            detail.update(personal_channel.detail_patch)
-            owner_account_id, observation_scope, ownership_observed = _commit_metadata(full_profile, personal_channel)
-            if not self._write_detail(
+
+    def _pair_detail(
+        self,
+        cursor: EntityRefreshCursor,
+        full_profile: EntitySectionCommit,
+        personal_channel: EntitySectionCommit,
+        *,
+        now: int,
+    ) -> dict[str, object] | None:
+        detail = self._read_detail_blob(cursor.entity_id) or self._read_entity_stub(cursor.entity_id)
+        detail = _strip_schema(detail)
+        detail.update(full_profile.detail_patch)
+        detail.update(personal_channel.detail_patch)
+        owner_account_id, observation_scope, ownership_observed = _commit_metadata(full_profile, personal_channel)
+        if not self._write_detail(
+            cursor.entity_id,
+            detail,
+            now=now,
+            expected_revision=cursor.profile_revision,
+            owner_account_id=owner_account_id,
+            observation_scope=observation_scope,
+            ownership_observed=ownership_observed,
+        ):
+            return None
+        self._write_pair_section(cursor.entity_id, "full_profile", full_profile, detail, now=now)
+        self._write_pair_section(cursor.entity_id, "personal_channel", personal_channel, detail, now=now)
+        return detail
+
+    def _write_pair_section(
+        self,
+        entity_id: int,
+        section: str,
+        commit: EntitySectionCommit,
+        detail: Mapping[str, object],
+        *,
+        now: int,
+    ) -> None:
+        payload = _section_payload(detail, section) if commit.payload is None else commit.payload
+        self._write_section(
+            entity_id, section, commit.status, commit.reason, payload, now=now, evidence=commit.evidence
+        )
+
+    def _record_full_pair_measurement(
+        self,
+        cursor: EntityRefreshCursor,
+        full_profile: EntitySectionCommit,
+        personal_channel: EntitySectionCommit,
+        *,
+        now: int,
+    ) -> None:
+        required = {
+            "pair_mode",
+            "pair_eligible",
+            "pair_full_profile_outcome",
+            "pair_personal_channel_outcome",
+            "pair_ready_at",
+            "pair_readiness_latency_ms",
+            "pair_measurement_complete",
+            "pair_summary_watermark",
+        }
+        if not cursor.pair_eligible or not required <= self._refresh_columns_or_empty():
+            return
+        full_outcome = _pair_commit_outcome(full_profile)
+        personal_outcome = _pair_commit_outcome(personal_channel)
+        self._conn.execute(
+            "UPDATE entity_profile_refresh_state SET pair_mode=COALESCE(pair_mode, 'enabled'), "
+            "pair_full_profile_outcome=?, pair_personal_channel_outcome=?, pair_ready_at=?, "
+            "pair_readiness_latency_ms=?, pair_measurement_complete=1, pair_summary_watermark=? "
+            "WHERE entity_id=? AND generation=? AND pair_summary_watermark IS NULL",
+            (
+                full_outcome,
+                personal_outcome,
+                now,
+                _pair_readiness_latency_ms(full_profile, personal_channel),
+                now,
                 cursor.entity_id,
-                detail,
-                now=now,
-                expected_revision=cursor.profile_revision,
-                owner_account_id=owner_account_id,
-                observation_scope=observation_scope,
-                ownership_observed=ownership_observed,
-            ):
-                return False
-            self._write_section(
-                cursor.entity_id,
-                "full_profile",
-                full_profile.status,
-                full_profile.reason,
-                _section_payload(detail, "full_profile") if full_profile.payload is None else full_profile.payload,
-                now=now,
-                evidence=full_profile.evidence,
-            )
-            self._write_section(
-                cursor.entity_id,
-                "personal_channel",
-                personal_channel.status,
-                personal_channel.reason,
-                _section_payload(detail, "personal_channel")
-                if personal_channel.payload is None
-                else personal_channel.payload,
-                now=now,
-                evidence=personal_channel.evidence,
-            )
-            measurement_columns = {
-                "pair_mode",
-                "pair_eligible",
-                "pair_full_profile_outcome",
-                "pair_personal_channel_outcome",
-                "pair_ready_at",
-                "pair_readiness_latency_ms",
-                "pair_measurement_complete",
-                "pair_summary_watermark",
-            }
-            if cursor.pair_eligible and measurement_columns <= self._refresh_columns_or_empty():
-                full_outcome = (
-                    full_profile.evidence.outcome
-                    if full_profile.evidence is not None
-                    and full_profile.evidence.outcome in {"usable", "partial", "absent", "unavailable"}
-                    else "unavailable"
-                )
-                personal_outcome = (
-                    personal_channel.evidence.outcome
-                    if personal_channel.evidence is not None
-                    and personal_channel.evidence.outcome in {"usable", "partial", "absent", "unavailable"}
-                    else "unavailable"
-                )
-                readiness_latency_ms = _pair_readiness_latency_ms(full_profile, personal_channel)
-                self._conn.execute(
-                    "UPDATE entity_profile_refresh_state SET pair_mode=COALESCE(pair_mode, 'enabled'), "
-                    "pair_full_profile_outcome=?, pair_personal_channel_outcome=?, pair_ready_at=?, "
-                    "pair_readiness_latency_ms=?, pair_measurement_complete=1, pair_summary_watermark=? "
-                    "WHERE entity_id=? AND generation=? AND pair_summary_watermark IS NULL",
-                    (
-                        full_outcome,
-                        personal_outcome,
-                        now,
-                        readiness_latency_ms,
-                        now,
-                        cursor.entity_id,
-                        cursor.generation,
-                    ),
-                )
-            predicate, parameters = self._cursor_predicate(cursor)
-            assignments = (
-                "status='pending', retry_at=NULL, reason='refresh_queued', updated_at=?, "
-                "next_section=?, acquisition_cursor=0"
-            )
-            values: tuple[object, ...] = (now, PROFILE_SECTIONS[1])
-            if self._refresh_has("profile_revision") and self._detail_has("profile_revision"):
-                assignments += ", profile_revision=?"
-                values += (cursor.profile_revision + 1,)
-            changed = self._conn.execute(
-                "UPDATE entity_profile_refresh_state SET " + assignments + " WHERE " + predicate,
-                (*values, *parameters),
-            ).rowcount
-            return changed == 1
+                cursor.generation,
+            ),
+        )
+
+    def _advance_full_pair_cursor(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
+        predicate, parameters = self._cursor_predicate(cursor)
+        assignments = (
+            "status='pending', retry_at=NULL, reason='refresh_queued', updated_at=?, "
+            "next_section=?, acquisition_cursor=0"
+        )
+        values: tuple[object, ...] = (now, PROFILE_SECTIONS[1])
+        if self._refresh_has("profile_revision") and self._detail_has("profile_revision"):
+            assignments += ", profile_revision=?"
+            values += (cursor.profile_revision + 1,)
+        changed = self._conn.execute(
+            "UPDATE entity_profile_refresh_state SET " + assignments + " WHERE " + predicate,
+            (*values, *parameters),
+        ).rowcount
+        return changed == 1
 
     def request_follow_up(self, entity_id: int, *, now: int) -> bool:
         """Record a new freshness demand without losing the active generation."""
@@ -1626,7 +1712,7 @@ class EntityProfileRepository:
             "identity": _decode_payload(row[6]),
         }
 
-    def _receipt_is_valid(  # noqa: PLR0911, PLR0913
+    def _receipt_is_valid(  # noqa: PLR0913
         self,
         entity_id: int,
         section: str,
@@ -1639,8 +1725,38 @@ class EntityProfileRepository:
         check_ttl: bool = True,
     ) -> bool:
         evidence = self.read_section_evidence(entity_id, section)
-        if evidence is None:
+        context = _ReceiptContext(entity_id, section, identity, expected_generation, positive_only)
+        if evidence is None or not self._receipt_context_is_valid(evidence, context):
             return False
+        started_at, completed_at = _observation_bounds(evidence)
+        if started_at is None or completed_at is None or completed_at < started_at or completed_at > now:
+            return False
+        row = self._receipt_section_state(entity_id, section)
+        if not self._receipt_state_is_valid(row, started_at, positive_only=positive_only):
+            return False
+        if not check_ttl:
+            return True
+        ttl = self._section_ttl_seconds if ttl_seconds is None else max(1, int(ttl_seconds))
+        return now < started_at + ttl
+
+    def _receipt_context_is_valid(self, evidence: Mapping[str, object], context: _ReceiptContext) -> bool:
+        if not self._receipt_evidence_is_valid(
+            evidence,
+            identity=context.identity,
+            expected_generation=context.expected_generation,
+            positive_only=context.positive_only,
+        ):
+            return False
+        return self._receipt_materialization_is_exact(context.entity_id, context.section, evidence)
+
+    def _receipt_evidence_is_valid(
+        self,
+        evidence: Mapping[str, object],
+        *,
+        identity: Mapping[str, object],
+        expected_generation: int | None,
+        positive_only: bool,
+    ) -> bool:
         outcome = evidence.get("outcome")
         allowed = {"usable", "absent"} if positive_only else {"usable", "absent", "partial", "unavailable"}
         if outcome not in allowed:
@@ -1649,36 +1765,28 @@ class EntityProfileRepository:
         if expected_generation is not None and generation != expected_generation:
             return False
         stored_identity = evidence.get("identity")
-        if identity is not None and (not isinstance(stored_identity, dict) or dict(identity) != stored_identity):
-            return False
-        if not self._receipt_materialization_is_exact(entity_id, section, evidence):
-            return False
-        started_at = evidence.get("observation_started_at")
-        completed_at = evidence.get("observation_completed_at")
-        if any(
-            isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (started_at, completed_at)
-        ):
-            return False
-        started_at = cast(int, started_at)
-        completed_at = cast(int, completed_at)
-        if completed_at < started_at or completed_at > now:
-            return False
-        row = self._conn.execute(
+        return identity is None or (isinstance(stored_identity, dict) and dict(identity) == stored_identity)
+
+    def _receipt_section_state(self, entity_id: int, section: str) -> tuple[object, ...] | None:
+        return self._conn.execute(
             "SELECT status, observed_at FROM entity_detail_sections WHERE entity_id=? AND section=?",
             (entity_id, section),
         ).fetchone()
+
+    def _receipt_state_is_valid(
+        self,
+        row: tuple[object, ...] | None,
+        started_at: int,
+        *,
+        positive_only: bool,
+    ) -> bool:
         if row is None or row[0] not in {"fresh", "unavailable", "stale"}:
             return False
         if positive_only and row[1] != started_at:
             return False
-        if positive_only and row[0] != "fresh":
-            return False
-        if not check_ttl:
-            return True
-        ttl = self._section_ttl_seconds if ttl_seconds is None else max(1, int(ttl_seconds))
-        return now < started_at + ttl
+        return not (positive_only and row[0] != "fresh")
 
-    def _receipt_materialization_is_exact(  # noqa: PLR0911
+    def _receipt_materialization_is_exact(
         self,
         entity_id: int,
         section: str,
@@ -1690,31 +1798,10 @@ class EntityProfileRepository:
         }.get(section)
         if expected_fields is None:
             return False
-        if evidence.get("normalization_version") != NORMALIZATION_VERSION:
-            return False
         provenance = evidence.get("provenance")
+        if not self._receipt_provenance_is_exact(section, expected_fields, evidence, provenance):
+            return False
         if not isinstance(provenance, dict):
-            return False
-        if provenance.get("endpoint") != FULL_USER_ENDPOINT:
-            return False
-        declared = provenance.get("declared_fields")
-        materialized = provenance.get("materialized_fields")
-        if declared != list(expected_fields) or not isinstance(materialized, list):
-            return False
-        if any(not isinstance(value, str) for value in materialized):
-            return False
-        if len(set(materialized)) != len(materialized) or not set(materialized) <= set(expected_fields):
-            return False
-        if not isinstance(provenance.get("authoritative"), bool):
-            return False
-        if (
-            section == "full_profile"
-            and provenance.get("authoritative") is not True
-            and self._detail_has("profile_owner_account_id")
-        ):
-            # A sparse or malformed FullUser envelope may retain old fields in
-            # the canonical blob, but its current observation cannot renew
-            # coverage or authorize reuse of those retained values.
             return False
         payload_row = self._conn.execute(
             "SELECT payload_json FROM entity_detail_sections WHERE entity_id=? AND section=?",
@@ -1725,6 +1812,26 @@ class EntityProfileRepository:
         if section == "personal_channel" and evidence.get("outcome") == "absent":
             return provenance.get("authoritative") is True
         return isinstance(_decode_payload(payload_row[0]), dict)
+
+    def _receipt_provenance_is_exact(
+        self,
+        section: str,
+        expected_fields: tuple[str, ...] | list[str],
+        evidence: Mapping[str, object],
+        provenance: object,
+    ) -> bool:
+        if evidence.get("normalization_version") != NORMALIZATION_VERSION:
+            return False
+        if not isinstance(provenance, dict) or provenance.get("endpoint") != FULL_USER_ENDPOINT:
+            return False
+        if not _provenance_fields_are_exact(provenance, expected_fields):
+            return False
+        authoritative = provenance.get("authoritative")
+        if not isinstance(authoritative, bool):
+            return False
+        return not (
+            section == "full_profile" and authoritative is not True and self._detail_has("profile_owner_account_id")
+        )
 
     def _legacy_section_status(
         self,
@@ -1765,6 +1872,147 @@ class EntityProfileRepository:
         except TypeError, json.JSONDecodeError:
             return {}
         return value if isinstance(value, dict) else {}
+
+
+def _observation_bounds(evidence: Mapping[str, object]) -> tuple[int | None, int | None]:
+    started_at = evidence.get("observation_started_at")
+    completed_at = evidence.get("observation_completed_at")
+    if not _is_nonnegative_int(started_at) or not _is_nonnegative_int(completed_at):
+        return None, None
+    return cast(int, started_at), cast(int, completed_at)
+
+
+def _decode_profile_blob_row(
+    row: tuple[object, ...] | None,
+) -> tuple[dict[str, object], int | None, int | None, dict[str, object] | None]:
+    if row is None:
+        return {}, None, None, None
+    raw_json, fetched_at, *metadata = row
+    if not isinstance(raw_json, str):
+        return {}, None, None, None
+    try:
+        parsed = cast(object, json.loads(raw_json))
+    except TypeError, json.JSONDecodeError:
+        return {}, None, None, None
+    if not isinstance(parsed, dict) or parsed.get("schema") != _DETAIL_SCHEMA:
+        return {}, None, None, None
+    if not _is_nonnegative_int(fetched_at):
+        return {}, None, None, None
+    owner = _profile_owner(metadata)
+    scope = _decode_mapping(metadata[1]) if len(metadata) > 1 else None
+    return {str(key): value for key, value in parsed.items() if key != "schema"}, cast(int, fetched_at), owner, scope
+
+
+def _profile_owner(metadata: list[object]) -> int | None:
+    if not metadata or not _is_nonnegative_int(metadata[0]) or cast(int, metadata[0]) <= 0:
+        return None
+    return cast(int, metadata[0])
+
+
+def _as_int(value: object | None) -> int:
+    return int(cast(int | str, value or 0))
+
+
+def _pending_refresh_is_active(existing: Mapping[str, object] | None) -> bool:
+    return existing is not None and str(existing.get("status")) == "pending" and _as_int(existing.get("generation")) > 0
+
+
+def _active_pending_values(
+    existing: Mapping[str, object],
+    *,
+    pair_mode_override: str | None,
+) -> dict[str, object]:
+    return {
+        "generation": _as_int(existing["generation"]),
+        "started_at": existing.get("started_at"),
+        "pair_eligible": _as_int(existing.get("pair_eligible")),
+        "follow_up_required": _as_int(existing.get("follow_up_required")),
+        "profile_revision": _as_int(existing.get("profile_revision")),
+        "pair_mode": existing.get("pair_mode") if pair_mode_override is None else pair_mode_override,
+    }
+
+
+def _provenance_fields_are_exact(
+    provenance: Mapping[str, object], expected_fields: tuple[str, ...] | list[str]
+) -> bool:
+    declared = provenance.get("declared_fields")
+    materialized = provenance.get("materialized_fields")
+    if declared != list(expected_fields) or not isinstance(materialized, list):
+        return False
+    if any(not isinstance(value, str) for value in materialized):
+        return False
+    return len(set(materialized)) == len(materialized) and set(materialized) <= set(expected_fields)
+
+
+def _pending_refresh_upsert_query(columns: list[str]) -> str:
+    placeholders = ", ".join("?" for _ in columns)
+    updates = [
+        "status='pending'",
+        "retry_at=NULL",
+        "reason=excluded.reason",
+        "updated_at=excluded.updated_at",
+        "next_section=CASE WHEN entity_profile_refresh_state.status='pending' AND entity_profile_refresh_state.next_section IS NOT NULL THEN entity_profile_refresh_state.next_section ELSE excluded.next_section END",
+        "acquisition_cursor=CASE WHEN entity_profile_refresh_state.status='pending' AND entity_profile_refresh_state.next_section IS NOT NULL THEN entity_profile_refresh_state.acquisition_cursor ELSE 0 END",
+    ]
+    updates.extend(
+        [
+            (
+                "pair_mode=CASE WHEN entity_profile_refresh_state.status='pending' "
+                "AND entity_profile_refresh_state.generation=excluded.generation "
+                "THEN COALESCE(entity_profile_refresh_state.pair_mode, excluded.pair_mode) "
+                "ELSE excluded.pair_mode END"
+                if column == "pair_mode"
+                else f"{column}=excluded.{column}"
+            )
+            for column in columns[7:]
+        ]
+    )
+    return (
+        f"INSERT INTO entity_profile_refresh_state({', '.join(columns)}) VALUES ({placeholders}) "
+        f"ON CONFLICT(entity_id) DO UPDATE SET {', '.join(updates)}"
+    )
+
+
+def _pair_summary_payload(
+    mode: str,
+    current: tuple[object, ...],
+    *,
+    readiness_latency_ms: object,
+    ready: bool,
+) -> dict[str, object]:
+    attempts = int(cast(int | str, current[3] or 0))
+    retries = int(cast(int | str, current[4] or 0))
+    return {
+        "mode": mode,
+        "eligible_pair": True,
+        "outcome": "committed",
+        "actual_attempts": attempts,
+        "retries": retries,
+        "full_profile_outcome": str(current[0]),
+        "personal_channel_outcome": str(current[1]),
+        "pair_ready": ready,
+        "pair_readiness_latency_ms": readiness_latency_ms,
+    }
+
+
+def _pair_commit_outcome(commit: EntitySectionCommit) -> str:
+    return (
+        commit.evidence.outcome
+        if commit.evidence is not None and commit.evidence.outcome in {"usable", "partial", "absent", "unavailable"}
+        else "unavailable"
+    )
+
+
+def _is_sparse_full_profile_evidence(
+    section: str,
+    evidence: ProfileAcquisitionEvidence | None,
+) -> bool:
+    return (
+        evidence is not None
+        and section == "full_profile"
+        and isinstance(evidence.provenance, Mapping)
+        and evidence.provenance.get("authoritative") is False
+    )
 
 
 def _normalise_entity_type(value: str) -> str:
