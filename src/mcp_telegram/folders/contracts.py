@@ -19,6 +19,14 @@ class FolderSourceUnavailableError(Exception):
     """An expected transient failure while reading folder state from Telegram."""
 
 
+class FolderStagingCorruptError(ValueError):
+    """The durable, unpublished folder acquisition state cannot be decoded."""
+
+
+class FolderStagingStaleError(RuntimeError):
+    """The unpublished acquisition was based on a no-longer-current generation."""
+
+
 @dataclass(frozen=True, slots=True)
 class FolderRule:
     folder_id: int
@@ -46,3 +54,33 @@ class DialogFacts:
 class FolderSourceSnapshot:
     folders: tuple[FolderRule, ...]
     dialogs: tuple[DialogFacts, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FolderDialogCursor:
+    """Serializable Telegram dialog-enumeration cursor."""
+
+    offset_date: str | None
+    offset_id: int
+    offset_peer_type: str | None
+    offset_peer_id: int
+    offset_peer_access_hash: int
+
+
+@dataclass(frozen=True, slots=True)
+class FolderDialogItem:
+    """One dialog fact together with the cursor after that observation."""
+
+    facts: DialogFacts
+    cursor: FolderDialogCursor
+
+
+@dataclass(frozen=True, slots=True)
+class FolderStagingSnapshot:
+    """Durable source facts that are never exposed before publication."""
+
+    folders: tuple[FolderRule, ...]
+    dialogs: tuple[DialogFacts, ...]
+    cursor: FolderDialogCursor | None
+    started_at: int
+    base_generation: int | None = None

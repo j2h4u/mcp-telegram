@@ -10,9 +10,12 @@ import pytest
 from mcp_telegram.folders.contracts import (
     DialogCategory,
     DialogFacts,
+    FolderDialogCursor,
+    FolderDialogItem,
     FolderRule,
     FolderSourceSnapshot,
     FolderSourceUnavailableError,
+    FolderStagingSnapshot,
 )
 from mcp_telegram.folders.membership import matches
 from mcp_telegram.folders.read_repository import (
@@ -27,9 +30,9 @@ from mcp_telegram.folders.sqlite_repository import (
 )
 from mcp_telegram.folders.telegram_adapter import TelethonTelegramFolderGateway, _dialog_facts
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_demand import AcquisitionKind
+from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind
-from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_attempt_budget
 
 
 def _connection(path: Path) -> sqlite3.Connection:
@@ -277,5 +280,110 @@ async def test_refresh_failure_propagates_and_preserves_saved_snapshot(tmp_path:
             await FolderRefresher(_FailingGateway(), SQLiteFolderSnapshotRepository(conn)).refresh()
 
         assert folders_by_dialog(conn) == {999: [{"id": 9, "title": "Saved"}]}
+    finally:
+        conn.close()
+
+
+class _PagedGateway:
+    def __init__(self, dialogs: tuple[DialogFacts, ...]) -> None:
+        self._dialogs = dialogs
+        self.fetch_calls = 0
+        self.page_calls: list[int | None] = []
+
+    async def fetch_folders(self) -> tuple[FolderRule, ...]:
+        self.fetch_calls += 1
+        current_rpc_scope().attempt_budget.debit()  # type: ignore[union-attr]
+        return (FolderRule(2, "Contacts", categories=frozenset({DialogCategory.CONTACT})),)
+
+    async def _page(self, cursor: FolderDialogCursor | None):
+        self.page_calls.append(None if cursor is None else cursor.offset_id)
+        budget = current_rpc_scope().attempt_budget
+        assert budget is not None
+        budget.debit()
+        start = 0 if cursor is None else cursor.offset_id
+        page = self._dialogs[start : start + 100]
+        for index, facts in enumerate(page, start=start):
+            yield FolderDialogItem(
+                facts,
+                FolderDialogCursor(None, index + 1, "user", facts.dialog_id, 1),
+            )
+
+    def iter_dialogs(self, cursor: FolderDialogCursor | None):
+        return self._page(cursor)
+
+
+@pytest.mark.asyncio
+async def test_bounded_folder_acquisition_stages_and_promotes_only_at_eof(tmp_path: Path) -> None:
+    conn = _connection(tmp_path / "sync.db")
+    try:
+        _replace_folder_snapshot(conn, [(9, "Saved")], [(9, 999)])
+        dialogs = tuple(DialogFacts(index, DialogCategory.CONTACT) for index in range(101))
+        gateway = _PagedGateway(dialogs)
+        repository = SQLiteFolderSnapshotRepository(conn)
+        refresher = FolderRefresher(gateway, repository)
+
+        first = RpcAttemptBudget(limit=1)
+        with rpc_attempt_budget(first):
+            result = await refresher.acquire_slice(first)
+        assert result.complete is False
+        assert result.projection is None
+        assert repository.read_staging() == FolderStagingSnapshot(
+            folders=(FolderRule(2, "Contacts", categories=frozenset({DialogCategory.CONTACT})),),
+            dialogs=(),
+            cursor=None,
+            started_at=repository.read_staging().started_at,  # type: ignore[union-attr]
+            base_generation=0,
+        )
+        assert folders_by_dialog(conn) == {999: [{"id": 9, "title": "Saved"}]}
+
+        second = RpcAttemptBudget(limit=2)
+        with rpc_attempt_budget(second):
+            result = await refresher.acquire_slice(second)
+        assert result.complete is False
+        assert len(repository.read_staging().dialogs) == 100  # type: ignore[union-attr]
+        assert folders_by_dialog(conn) == {999: [{"id": 9, "title": "Saved"}]}
+
+        restarted = FolderRefresher(gateway, repository)
+        third = RpcAttemptBudget(limit=2)
+        with rpc_attempt_budget(third):
+            result = await restarted.acquire_slice(third)
+        assert result.complete is True
+        assert result.projection is not None
+        restarted.persist(result.projection, completed_at=123)
+        assert repository.read_staging() is None
+        assert folders_by_dialog(conn)[100] == [{"id": 2, "title": "Contacts"}]
+        assert repository.read_generation() == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_bounded_folder_acquisition_discards_stale_staging_generation(tmp_path: Path) -> None:
+    conn = _connection(tmp_path / "sync.db")
+    try:
+        repository = SQLiteFolderSnapshotRepository(conn)
+        repository.replace_snapshot(
+            FolderSourceSnapshot((FolderRule(1, "Current"),), ()),
+            (),
+            completed_at=10,
+        )
+        repository.save_staging(
+            FolderStagingSnapshot(
+                folders=(FolderRule(8, "Stale"),),
+                dialogs=(),
+                cursor=None,
+                started_at=1,
+                base_generation=0,
+            )
+        )
+        gateway = _PagedGateway(())
+        refresher = FolderRefresher(gateway, repository)
+        budget = RpcAttemptBudget(limit=2)
+        with rpc_attempt_budget(budget):
+            result = await refresher.acquire_slice(budget)
+        assert result.complete is True
+        assert result.projection is not None
+        assert result.projection.source.folders[0].title == "Contacts"
+        assert gateway.fetch_calls == 1
     finally:
         conn.close()

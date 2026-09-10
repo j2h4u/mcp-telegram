@@ -9,11 +9,31 @@ from typing import Protocol, cast
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetDialogFiltersRequest  # type: ignore[import-untyped]
-from telethon.tl.types import Channel, Chat, DialogFilter, DialogFilterChatlist, User  # type: ignore[import-untyped]
+from telethon.tl.types import (  # type: ignore[import-untyped]
+    Channel,
+    Chat,
+    DialogFilter,
+    DialogFilterChatlist,
+    InputPeerChannel,
+    InputPeerChat,
+    InputPeerEmpty,
+    InputPeerUser,
+    User,
+)
 
 from ..flood import TelegramRpcThrottled
-from .contracts import DialogCategory, DialogFacts, FolderRule, FolderSourceSnapshot, FolderSourceUnavailableError
+from .contracts import (
+    DialogCategory,
+    DialogFacts,
+    FolderDialogCursor,
+    FolderDialogItem,
+    FolderRule,
+    FolderSourceSnapshot,
+    FolderSourceUnavailableError,
+)
 from .ports import TelegramFolderGateway
+
+FOLDER_DIALOG_PAGE_SIZE = 100
 
 
 class FolderClient(Protocol):
@@ -91,12 +111,45 @@ def _dialog_facts(dialog: object) -> DialogFacts:
         or bool(getattr(raw_dialog, "unread_mark", False))
     )
     return DialogFacts(
-        dialog_id=int(dialog.id),  # type: ignore[attr-defined]
+        dialog_id=int(getattr(dialog, "id", 0) or 0),
         category=_category(getattr(dialog, "entity", None)),
         archived=bool(getattr(dialog, "archived", False)),
         unread=unread,
         muted=_is_muted(dialog),
     )
+
+
+def _dialog_cursor(dialog: object) -> FolderDialogCursor:
+    entity = getattr(dialog, "entity", None)
+    entity_id = int(getattr(entity, "id", 0) or 0)
+    access_hash = int(getattr(entity, "access_hash", 0) or 0)
+    peer_type: str | None = None
+    entity_type = entity.__class__.__name__ if entity is not None else None
+    if isinstance(entity, User) or entity_type == User.__name__:
+        peer_type = "user"
+    elif isinstance(entity, Chat) or entity_type == Chat.__name__:
+        peer_type = "chat"
+    elif isinstance(entity, Channel) or entity_type == Channel.__name__:
+        peer_type = "channel"
+    message = getattr(dialog, "message", None)
+    date = getattr(message, "date", None) or getattr(dialog, "date", None)
+    return FolderDialogCursor(
+        offset_date=date.isoformat() if isinstance(date, dt.datetime) else None,
+        offset_id=int(getattr(message, "id", 0) or 0),
+        offset_peer_type=peer_type,
+        offset_peer_id=entity_id,
+        offset_peer_access_hash=access_hash,
+    )
+
+
+def _offset_peer(cursor: FolderDialogCursor) -> object:
+    if cursor.offset_peer_type == "user":
+        return InputPeerUser(cursor.offset_peer_id, cursor.offset_peer_access_hash)
+    if cursor.offset_peer_type == "chat":
+        return InputPeerChat(cursor.offset_peer_id)
+    if cursor.offset_peer_type == "channel":
+        return InputPeerChannel(cursor.offset_peer_id, cursor.offset_peer_access_hash)
+    return InputPeerEmpty()
 
 
 class TelethonTelegramFolderGateway(TelegramFolderGateway):
@@ -105,10 +158,9 @@ class TelethonTelegramFolderGateway(TelegramFolderGateway):
     def __init__(self, client: FolderClient) -> None:
         self._client = client
 
-    async def fetch_snapshot(self) -> FolderSourceSnapshot:
+    async def fetch_folders(self) -> tuple[FolderRule, ...]:
         try:
             response = await self._client(GetDialogFiltersRequest())
-            raw_dialogs = [dialog async for dialog in self._client.iter_dialogs()]
         except TelegramRpcThrottled:
             raise
         except (RPCError, TimeoutError, OSError) as exc:
@@ -116,10 +168,44 @@ class TelethonTelegramFolderGateway(TelegramFolderGateway):
 
         raw_filters = cast(Sequence[object], getattr(response, "filters", ()))
         names = {DialogFilter.__name__, DialogFilterChatlist.__name__}
-        folders = tuple(
+        return tuple(
             _folder_rule(item)
             for item in raw_filters
             if isinstance(item, (DialogFilter, DialogFilterChatlist)) or item.__class__.__name__ in names
         )
-        dialogs = [_dialog_facts(dialog) for dialog in raw_dialogs]
+
+    async def iter_dialogs(self, cursor: FolderDialogCursor | None) -> AsyncIterator[FolderDialogItem]:
+        options: dict[str, object] = {"limit": FOLDER_DIALOG_PAGE_SIZE, "ignore_pinned": True}
+        if cursor is not None:
+            options.update(
+                {
+                    "offset_date": dt.datetime.fromisoformat(cursor.offset_date) if cursor.offset_date else None,
+                    "offset_id": cursor.offset_id,
+                    "offset_peer": _offset_peer(cursor),
+                }
+            )
+        try:
+            async for dialog in self._client.iter_dialogs(**options):
+                yield FolderDialogItem(_dialog_facts(dialog), _dialog_cursor(dialog))
+        except TelegramRpcThrottled:
+            raise
+        except (RPCError, TimeoutError, OSError) as exc:
+            raise FolderSourceUnavailableError("Telegram folder source is unavailable") from exc
+
+    async def fetch_snapshot(self) -> FolderSourceSnapshot:
+        """Acquire a complete snapshot for explicit maintenance callers and tests."""
+        folders = await self.fetch_folders()
+        dialogs: list[DialogFacts] = []
+        cursor: FolderDialogCursor | None = None
+        while True:
+            page = [item async for item in self.iter_dialogs(cursor)]
+            if not page:
+                break
+            dialogs.extend(item.facts for item in page)
+            if len(page) < FOLDER_DIALOG_PAGE_SIZE:
+                break
+            next_cursor = page[-1].cursor
+            if next_cursor == cursor:
+                raise FolderSourceUnavailableError("Telegram folder dialog cursor did not advance")
+            cursor = next_cursor
         return FolderSourceSnapshot(folders=folders, dialogs=tuple(dialogs))

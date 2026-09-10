@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterable
 from typing import cast
 
-from .contracts import FolderSourceSnapshot
+from .contracts import (
+    DialogCategory,
+    DialogFacts,
+    FolderDialogCursor,
+    FolderRule,
+    FolderSourceSnapshot,
+    FolderStagingCorruptError,
+    FolderStagingSnapshot,
+    FolderStagingStaleError,
+)
 from .ports import FolderSnapshotRepository
+
+_STAGING_KEY = "folder_snapshot_staging_v1"
 
 
 def _state_int(value: str | None) -> int | None:
@@ -42,6 +54,7 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
         memberships: tuple[tuple[int, int], ...],
         *,
         completed_at: int,
+        expected_generation: int | None = None,
     ) -> int:
         """Replace tables and success metadata in one SQLite transaction."""
         with self._conn:
@@ -52,9 +65,12 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
                 ).fetchone(),
             )
             try:
-                generation = int(cast(int | str, previous[0])) + 1 if previous is not None else 1
+                current_generation = int(cast(int | str, previous[0])) if previous is not None else 0
             except TypeError, ValueError:
-                generation = 1
+                current_generation = 0
+            if expected_generation is not None and current_generation != expected_generation:
+                raise FolderStagingStaleError("folder staging generation is stale")
+            generation = current_generation + 1
             self._conn.execute("DELETE FROM telegram_folder_members")
             self._conn.execute("DELETE FROM telegram_folders")
             self._conn.executemany(
@@ -75,6 +91,7 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
                     "folder_snapshot_consecutive_failures": 0,
                 },
             )
+            self._conn.execute("DELETE FROM daemon_state WHERE key = ?", (_STAGING_KEY,))
         return generation
 
     def record_attempt(
@@ -100,6 +117,9 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
     def read_consecutive_failures(self) -> int:
         return _state_int(self._read_state_value("folder_snapshot_consecutive_failures")) or 0
 
+    def read_generation(self) -> int | None:
+        return _state_int(self._read_state_value("folder_snapshot_generation"))
+
     def read_last_outcome(self) -> str | None:
         return self._read_state_value("folder_snapshot_last_outcome")
 
@@ -108,6 +128,44 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
 
     def read_next_retry_at(self) -> int | None:
         return _state_int(self._read_state_value("folder_snapshot_next_retry_at"))
+
+    def read_staging(self) -> FolderStagingSnapshot | None:
+        raw = self._read_state_value(_STAGING_KEY)
+        if raw is None:
+            return None
+        try:
+            decoded = json.loads(raw)
+            if not isinstance(decoded, dict):
+                raise ValueError("staging payload must be an object")
+            payload = cast(dict[str, object], decoded)
+            if payload.get("version") != 1:
+                raise ValueError("unsupported folder staging version")
+            folders = tuple(_decode_folder(item) for item in cast(list[object], payload["folders"]))
+            dialogs = tuple(_decode_dialog(item) for item in cast(list[object], payload["dialogs"]))
+            raw_cursor = payload.get("cursor")
+            cursor = None if raw_cursor is None else _decode_cursor(raw_cursor)
+            started_at = int(cast(int | str, payload["started_at"]))
+            raw_generation = payload.get("base_generation")
+            base_generation = None if raw_generation is None else int(cast(int | str, raw_generation))
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise FolderStagingCorruptError("folder snapshot staging state is corrupt") from exc
+        return FolderStagingSnapshot(folders, dialogs, cursor, started_at, base_generation)
+
+    def save_staging(self, snapshot: FolderStagingSnapshot) -> None:
+        payload = {
+            "version": 1,
+            "started_at": snapshot.started_at,
+            "folders": [_encode_folder(folder) for folder in snapshot.folders],
+            "dialogs": [_encode_dialog(dialog) for dialog in snapshot.dialogs],
+            "cursor": None if snapshot.cursor is None else _encode_cursor(snapshot.cursor),
+            "base_generation": snapshot.base_generation,
+        }
+        with self._conn:
+            _set_state_values(self._conn, {_STAGING_KEY: json.dumps(payload, separators=(",", ":"))})
+
+    def clear_staging(self) -> None:
+        with self._conn:
+            self._conn.execute("DELETE FROM daemon_state WHERE key = ?", (_STAGING_KEY,))
 
     def _read_state_value(self, key: str) -> str | None:
         row = cast(
@@ -121,4 +179,79 @@ def _set_state_values(conn: sqlite3.Connection, values: dict[str, object | None]
     conn.executemany(
         "INSERT INTO daemon_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         ((key, None if value is None else str(value)) for key, value in values.items()),
+    )
+
+
+def _encode_folder(folder: FolderRule) -> dict[str, object]:
+    return {
+        "folder_id": folder.folder_id,
+        "title": folder.title,
+        "included_ids": sorted(folder.included_ids),
+        "pinned_ids": sorted(folder.pinned_ids),
+        "excluded_ids": sorted(folder.excluded_ids),
+        "categories": sorted(category.value for category in folder.categories),
+        "exclude_archived": folder.exclude_archived,
+        "exclude_read": folder.exclude_read,
+        "exclude_muted": folder.exclude_muted,
+        "explicit_only": folder.explicit_only,
+    }
+
+
+def _decode_folder(raw: object) -> FolderRule:
+    value = cast(dict[str, object], raw)
+    return FolderRule(
+        folder_id=int(cast(int | str, value["folder_id"])),
+        title=str(value["title"]),
+        included_ids=frozenset(int(item) for item in cast(list[int | str], value["included_ids"])),
+        pinned_ids=frozenset(int(item) for item in cast(list[int | str], value["pinned_ids"])),
+        excluded_ids=frozenset(int(item) for item in cast(list[int | str], value["excluded_ids"])),
+        categories=frozenset(DialogCategory(str(item)) for item in cast(list[object], value["categories"])),
+        exclude_archived=bool(value["exclude_archived"]),
+        exclude_read=bool(value["exclude_read"]),
+        exclude_muted=bool(value["exclude_muted"]),
+        explicit_only=bool(value["explicit_only"]),
+    )
+
+
+def _encode_dialog(dialog: DialogFacts) -> dict[str, object]:
+    return {
+        "dialog_id": dialog.dialog_id,
+        "category": dialog.category.value,
+        "archived": dialog.archived,
+        "unread": dialog.unread,
+        "muted": dialog.muted,
+    }
+
+
+def _decode_dialog(raw: object) -> DialogFacts:
+    value = cast(dict[str, object], raw)
+    return DialogFacts(
+        dialog_id=int(cast(int | str, value["dialog_id"])),
+        category=DialogCategory(str(value["category"])),
+        archived=bool(value["archived"]),
+        unread=bool(value["unread"]),
+        muted=bool(value["muted"]),
+    )
+
+
+def _encode_cursor(cursor: FolderDialogCursor) -> dict[str, object]:
+    return {
+        "offset_date": cursor.offset_date,
+        "offset_id": cursor.offset_id,
+        "offset_peer_type": cursor.offset_peer_type,
+        "offset_peer_id": cursor.offset_peer_id,
+        "offset_peer_access_hash": cursor.offset_peer_access_hash,
+    }
+
+
+def _decode_cursor(raw: object) -> FolderDialogCursor:
+    value = cast(dict[str, object], raw)
+    offset_date = value["offset_date"]
+    offset_peer_type = value["offset_peer_type"]
+    return FolderDialogCursor(
+        offset_date=None if offset_date is None else str(offset_date),
+        offset_id=int(cast(int | str, value["offset_id"])),
+        offset_peer_type=None if offset_peer_type is None else str(offset_peer_type),
+        offset_peer_id=int(cast(int | str, value["offset_peer_id"])),
+        offset_peer_access_hash=int(cast(int | str, value["offset_peer_access_hash"])),
     )

@@ -15,10 +15,16 @@ from typing import Protocol, cast
 from ..demand_shadow_wiring import DemandShadow, run_legacy_demand_cycle
 from ..flood import TelegramRpcThrottled
 from ..maintenance_logging import log_maintenance_cycle
-from ..telegram_demand import DemandStatus, DurableDemandAdapter, RpcAttemptBudget, demand_context
+from ..telegram_demand import (
+    DemandStatus,
+    DurableDemandAdapter,
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+    demand_context,
+)
 from ..telegram_rpc_consumers import DemandKind
 from ..telegram_rpc_scheduler import rpc_attempt_budget
-from .contracts import FolderSourceUnavailableError
+from .contracts import FolderSourceUnavailableError, FolderStagingStaleError
 from .ports import FolderSnapshotRepository
 from .refresh import FolderRefresher, FolderRefreshResult
 
@@ -47,6 +53,7 @@ class FolderProjectionScheduling(Protocol):
 
 class FolderAttemptResult(StrEnum):
     SUCCESS = "success"
+    CONTINUATION = "continuation"
     SOURCE_UNAVAILABLE = "source_unavailable"
     FLOOD_WAIT = "flood_wait"
     CIRCUIT_OPEN = "circuit_open"
@@ -93,7 +100,7 @@ class FolderProjectionWorker:
         self._last_outcome = repository.read_last_outcome()
         retry_at = repository.read_next_retry_at()
         last_success_at = repository.read_last_success_at()
-        self._next_due_at = (
+        self._next_due_at = 0 if repository.read_staging() is not None else (
             retry_at
             if retry_at is not None
             else None
@@ -136,18 +143,28 @@ class FolderProjectionWorker:
                 return
             await self._attempt("scheduled")
 
-    async def _attempt(self, reason: str) -> None:
+    async def _attempt(self, reason: str, budget: RpcAttemptBudget | None = None) -> None:
+        if budget is None and self._refresher.supports_bounded_acquisition:
+            budget = RpcAttemptBudget(limit=2)
+
         async def perform() -> None:
             async with self._attempt_lock:
-                await self._attempt_once(reason)
+                if budget is None:
+                    await self._attempt_once(reason, None)
+                else:
+                    with rpc_attempt_budget(budget):
+                        await self._attempt_once(reason, budget)
 
         await run_legacy_demand_cycle(self._demand_shadow, DemandKind.FOLDER_SNAPSHOT, perform)
 
-    async def _attempt_once(self, reason: str) -> None:
+    async def _attempt_once(self, reason: str, budget: RpcAttemptBudget | None) -> None:
         started = self._clock()
-        result, refresh_result, requested_flood_wait, unexpected, next_due_at = await self._perform_attempt()
-        if result != FolderAttemptResult.SUCCESS:
+        result, refresh_result, requested_flood_wait, unexpected, next_due_at = await self._perform_attempt(budget)
+        if result not in {FolderAttemptResult.SUCCESS, FolderAttemptResult.CONTINUATION}:
             next_due_at = self._record_failure(result, requested_flood_wait)
+        elif result is FolderAttemptResult.CONTINUATION:
+            next_due_at = math.ceil(self._clock())
+            self._next_due_at = next_due_at
 
         completion = self._clock()
         snapshot_at = self._repository.read_last_success_at()
@@ -163,18 +180,25 @@ class FolderProjectionWorker:
             next_due_at=next_due_at,
         )
         self._log_attempt(attempt)
-        if result != FolderAttemptResult.SUCCESS:
+        if result not in {FolderAttemptResult.SUCCESS, FolderAttemptResult.CONTINUATION}:
             self._warn_if_needed(result)
         if unexpected is not None:
             raise unexpected
 
-    async def _perform_attempt(
+    async def _perform_attempt(  # noqa: PLR0911 - classify expected transport outcomes explicitly
         self,
+        budget: RpcAttemptBudget | None,
     ) -> tuple[FolderAttemptResult, FolderRefreshResult | None, int | None, Exception | None, int | None]:
         refresh_result: FolderRefreshResult | None = None
         next_due_at: int | None = None
         try:
-            projection = await self._refresher.acquire()
+            if budget is not None and self._refresher.supports_bounded_acquisition:
+                bounded = await self._refresher.acquire_slice(budget)
+                if not bounded.complete or bounded.projection is None:
+                    return FolderAttemptResult.CONTINUATION, None, None, None, self._next_due_at
+                projection = bounded.projection
+            else:
+                projection = await self._refresher.acquire()
             completion = self._clock()
             refresh_result = self._refresher.persist(projection, completed_at=int(completion))
             self._failure_count = 0
@@ -183,6 +207,11 @@ class FolderProjectionWorker:
             next_due_at = self._schedule_from_completion(completion)
             self._next_due_at = next_due_at
             return FolderAttemptResult.SUCCESS, refresh_result, None, None, next_due_at
+        except FolderStagingStaleError:
+            self._repository.clear_staging()
+            return FolderAttemptResult.CONTINUATION, None, None, None, self._next_due_at
+        except RpcAttemptBudgetExhaustedError:
+            return FolderAttemptResult.CONTINUATION, None, None, None, self._next_due_at
         except FolderSourceUnavailableError, TimeoutError, OSError:
             return FolderAttemptResult.SOURCE_UNAVAILABLE, None, None, None, None
         except TelegramRpcThrottled as exc:
@@ -275,7 +304,9 @@ class FolderProjectionDemandAdapter(DurableDemandAdapter):
         retry_at = repository.read_next_retry_at()
         last_success_at = repository.read_last_success_at()
         outcome = repository.read_last_outcome()
-        if retry_at is not None:
+        if repository.read_staging() is not None:
+            release_at = now
+        elif retry_at is not None:
             release_at = float(retry_at)
         elif last_success_at is not None and outcome in {None, FolderAttemptResult.SUCCESS}:
             release_at = math.ceil(last_success_at + policy.refresh_interval_seconds)
@@ -293,4 +324,4 @@ class FolderProjectionDemandAdapter(DurableDemandAdapter):
         if budget.exhausted:
             return
         with demand_context(self.demand_kind), rpc_attempt_budget(budget):
-            await self._worker._attempt("demand")
+            await self._worker._attempt("demand", budget)

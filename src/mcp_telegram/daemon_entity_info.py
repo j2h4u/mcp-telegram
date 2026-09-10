@@ -498,12 +498,12 @@ class DaemonEntityInfoService:
             )
             return self._persisted_failure(cursor.entity_id, now=now)
         if entity is None or error is not None:
-            retry_after = (error or {}).get("_retry_after_seconds") if error is not None else None
+            reason, retry_at = self._refresh_failure_details(error, now=now)
             self._profiles.mark_refresh_failure(
                 cursor.entity_id,
                 now=now,
-                reason="flood_wait" if isinstance(retry_after, int) and retry_after > 0 else "entity_unavailable",
-                retry_at=now + retry_after if isinstance(retry_after, int) and retry_after > 0 else now + 60,
+                reason=reason,
+                retry_at=retry_at,
             )
             return self._persisted_failure(cursor.entity_id, now=now)
         self._profiles.save_core(self._core_from_entity(entity), now=now)
@@ -513,6 +513,13 @@ class DaemonEntityInfoService:
             now=now,
         )
         return None
+
+    @staticmethod
+    def _refresh_failure_details(error: Mapping[str, object] | None, *, now: int) -> tuple[str, int]:
+        retry_after = error.get("_retry_after_seconds") if error is not None else None
+        if isinstance(retry_after, int) and retry_after > 0:
+            return "flood_wait", now + retry_after
+        return "entity_unavailable", now + 60
 
     @staticmethod
     def _success_if_refresh_finished(
