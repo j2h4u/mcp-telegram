@@ -43,7 +43,6 @@ _TRANSCRIPTION_HYDRATION_MESSAGE_SQL = (
 class TranscriptionHydrationRepair:
     """Bounded result of repairing missing transcription jobs."""
 
-    enqueued: int
     has_more: bool
 
 
@@ -51,7 +50,6 @@ class TranscriptionHydrationRepair:
 class MediaMetadataHydrationRepair:
     """Bounded result of repairing missing media metadata jobs."""
 
-    enqueued: int
     has_more: bool
 
 
@@ -191,7 +189,7 @@ def repair_transcription_hydration_jobs(
 ) -> TranscriptionHydrationRepair:
     """Bound the recurring repair of missing transcribable-media jobs."""
     if max_jobs <= 0:
-        return TranscriptionHydrationRepair(0, False)
+        return TranscriptionHydrationRepair(False)
     candidates_sql = (
         "SELECT 'transcription', m.dialog_id, m.message_id, ?, 0, ?, m.sent_at, 0 "
         f"{_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL} "
@@ -213,7 +211,7 @@ def repair_transcription_hydration_jobs(
             ).fetchone()
             is not None
         )
-    return TranscriptionHydrationRepair(cursor.rowcount, has_more)
+    return TranscriptionHydrationRepair(has_more)
 
 
 def repair_media_metadata_hydration_jobs(
@@ -221,7 +219,7 @@ def repair_media_metadata_hydration_jobs(
 ) -> MediaMetadataHydrationRepair:
     """Bound recurring repair of unresolved contact/other and video metadata."""
     if max_jobs <= 0:
-        return MediaMetadataHydrationRepair(0, False)
+        return MediaMetadataHydrationRepair(False)
     candidates_sql = (
         "SELECT 'media_metadata', m.dialog_id, m.message_id, ?, 0, ?, m.sent_at, 0 "
         f"{_REPAIR_MEDIA_METADATA_CONTACT_OTHER_SQL} "
@@ -247,7 +245,7 @@ def repair_media_metadata_hydration_jobs(
             ).fetchone()
             is not None
         )
-    return MediaMetadataHydrationRepair(cursor.rowcount, has_more)
+    return MediaMetadataHydrationRepair(has_more)
 
 
 def reconcile_fact_hydration_job(

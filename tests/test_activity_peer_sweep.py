@@ -1,15 +1,6 @@
 """Tests for activity_peer_sweep.py.
 
-Covers:
-  (a) dedup: a peer that is BOTH a direct supergroup and a channel's
-      linked_chat appears exactly once.
-  (b) channel with no discussion group contributes no row.
-  (c) after build_working_set, activity_dialog_state.last_activity_at equals
-      the peer's dialogs.last_message_at.
-  (d) dialogs.type='group' is NOT selected as a supergroup; type='supergroup'
-      IS selected (proves the source/casing fix — concern 4).
-  (e) FloodWait on the second of three channels halts the pass (break, not
-      continue) — account-global wait invariant regression guard (Phase 54).
+It covers the per-peer self-search and durable enrollment substrate.
 
 Note: Phase-53 durable backoff tests and helpers were removed in Phase 54
 (plan 04). The new event-driven resolver model is tested in the
@@ -23,11 +14,10 @@ import logging
 import sqlite3
 import time
 from contextlib import closing
-from typing import TypedDict, cast
+from typing import cast
 
 import pytest
 
-from mcp_telegram.activity_peer_resolve import LinkedChatResolution
 from mcp_telegram.activity_peer_sweep import (
     _DIALOG_STATE_COLUMNS,
     _PACING,
@@ -36,7 +26,6 @@ from mcp_telegram.activity_peer_sweep import (
     SweepResult,
     _load_dialog_state,
     _save_dialog_state,
-    build_working_set,
     enroll_activity_dialog,
     sweep_peer_once,
 )
@@ -49,59 +38,14 @@ _TEST_TIMEOUT_S = 120.0
 # ---------------------------------------------------------------------------
 
 
-class _ActivityRow(TypedDict):
-    dialog_id: int
-    source: str
-    last_activity_at: int | None
-    cold_status: str
-
-
 def _make_db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
     return conn
 
 
-def _insert_dialog(conn: sqlite3.Connection, dialog_id: int, dtype: str, last_message_at: int = 1000) -> None:
-    conn.execute(
-        "INSERT OR REPLACE INTO dialogs (dialog_id, name, type, hidden, last_message_at, snapshot_at)"
-        " VALUES (?, ?, ?, 0, ?, ?)",
-        (dialog_id, f"dialog_{dialog_id}", dtype, last_message_at, int(time.time())),
-    )
-    conn.commit()
-
-
-def _get_activity_row(conn: sqlite3.Connection, dialog_id: int) -> _ActivityRow | None:
-    row = cast(
-        tuple[int, str, int | None, str] | None,
-        conn.execute(
-            "SELECT dialog_id, source, last_activity_at, cold_status FROM activity_dialog_state WHERE dialog_id = ?",
-            (dialog_id,),
-        ).fetchone(),
-    )
-    if row is None:
-        return None
-    return {
-        "dialog_id": row[0],
-        "source": row[1],
-        "last_activity_at": row[2],
-        "cold_status": row[3],
-    }
-
-
-def _count_activity_rows(conn: sqlite3.Connection) -> int:
-    row = cast(tuple[int] | None, conn.execute("SELECT COUNT(*) FROM activity_dialog_state").fetchone())
-    assert row is not None
-    return int(row[0])
-
-
-# ---------------------------------------------------------------------------
-# Fake client and resolver
-# ---------------------------------------------------------------------------
-
-
 class _FakeClient:
-    """Minimal fake client; sweep_peer_once won't be called in builder tests."""
+    """Minimal fake client for sweep_peer_once tests."""
 
     async def get_input_entity(self, dialog_id: int) -> object:
         del dialog_id
@@ -109,26 +53,7 @@ class _FakeClient:
 
     async def __call__(self, request: object) -> object:
         del request
-        raise AssertionError("_FakeClient.__call__ should not be invoked in builder tests")
-
-
-class _FakeResolver:
-    """Controllable linked-chat resolver for patching build_working_set."""
-
-    def __init__(self, mapping: dict[int, LinkedChatResolution]):
-        self._mapping = mapping
-        self.call_count = 0
-        self.called_with: list[int] = []
-        self.timeouts: list[float] = []
-
-    async def __call__(
-        self, client: object, conn: sqlite3.Connection, channel_id: int, *, timeout_s: float
-    ) -> LinkedChatResolution:
-        del client, conn
-        self.call_count += 1
-        self.called_with.append(channel_id)
-        self.timeouts.append(timeout_s)
-        return self._mapping.get(channel_id, LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None))
+        raise AssertionError("_FakeClient.__call__ should not be invoked by the sweep test")
 
 
 class _FakeSweepMessage:
@@ -140,201 +65,6 @@ class _FakeSweepMessage:
 class _FakeSweepResult:
     def __init__(self, messages: object) -> None:
         self.messages = messages
-
-
-# ---------------------------------------------------------------------------
-# (d) Source casing: type='supergroup' selected, type='group' not selected
-# ---------------------------------------------------------------------------
-
-
-def test_supergroup_type_selected_not_group(monkeypatch: pytest.MonkeyPatch) -> None:
-    """dialogs.type='supergroup' IS enrolled; type='group' is NOT."""
-    with closing(_make_db()) as conn:
-        supergroup_id = -100100000001
-        legacy_group_id = -200000001
-        _insert_dialog(conn, supergroup_id, "supergroup", last_message_at=5000)
-        _insert_dialog(conn, legacy_group_id, "group", last_message_at=6000)
-
-        # Patch resolve_linked_chat_id to return no results for any channel
-        resolver = _FakeResolver({})
-        monkeypatch.setattr(
-            "mcp_telegram.activity_peer_sweep.resolve_linked_chat_id",
-            resolver,
-        )
-
-        count = asyncio.run(build_working_set(_FakeClient(), conn, timeout_s=120.0))
-
-        assert count.enrolled_count == 1, f"Expected 1 peer (only supergroup), got {count.enrolled_count}"
-        row = _get_activity_row(conn, supergroup_id)
-        assert row is not None, "Supergroup should be enrolled"
-        assert _get_activity_row(conn, legacy_group_id) is None, "Legacy group must NOT be enrolled via supergroup path"
-
-
-# ---------------------------------------------------------------------------
-# (c) last_activity_at populated from dialogs.last_message_at
-# ---------------------------------------------------------------------------
-
-
-def test_last_activity_at_from_dialogs(monkeypatch: pytest.MonkeyPatch) -> None:
-    """build_working_set populates last_activity_at from dialogs.last_message_at."""
-    with closing(_make_db()) as conn:
-        peer_id = -100111111111
-        last_ts = 99999
-        _insert_dialog(conn, peer_id, "supergroup", last_message_at=last_ts)
-
-        resolver = _FakeResolver({})
-        monkeypatch.setattr(
-            "mcp_telegram.activity_peer_sweep.resolve_linked_chat_id",
-            resolver,
-        )
-
-        asyncio.run(build_working_set(_FakeClient(), conn, timeout_s=120.0))
-
-        row = _get_activity_row(conn, peer_id)
-        assert row is not None
-        assert row["last_activity_at"] == last_ts, f"Expected last_activity_at={last_ts}, got {row['last_activity_at']}"
-
-
-# Note: tests (b) channel_no_discussion_group_not_enrolled and (a)
-# test_dedup_supergroup_and_linked_chat are restored below (Phase 54, plan 04)
-# now that the dead-code backoff gate has been removed from build_working_set.
-
-
-# ---------------------------------------------------------------------------
-# (b) channel with no discussion group contributes no row
-# ---------------------------------------------------------------------------
-
-
-def test_channel_no_discussion_group_not_enrolled(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A broadcast channel with no linked_chat_id must not appear in activity_dialog_state."""
-    with closing(_make_db()) as conn:
-        channel_id = -100200000001
-        _insert_dialog(conn, channel_id, "channel", last_message_at=1000)
-
-        # Resolver returns no linked chat
-        resolver = _FakeResolver(
-            {
-                channel_id: LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None),
-            }
-        )
-        monkeypatch.setattr(
-            "mcp_telegram.activity_peer_sweep.resolve_linked_chat_id",
-            resolver,
-        )
-
-        count = asyncio.run(build_working_set(_FakeClient(), conn, timeout_s=120.0))
-
-        assert count.enrolled_count == 0, f"Expected 0 peers enrolled, got {count.enrolled_count}"
-        assert resolver.timeouts == [120.0]
-        assert _get_activity_row(conn, channel_id) is None, "Channel with no discussion group must NOT be enrolled"
-
-
-# ---------------------------------------------------------------------------
-# (a) dedup: peer that is both a direct supergroup and a channel's linked_chat
-# ---------------------------------------------------------------------------
-
-
-def test_dedup_supergroup_and_linked_chat(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A peer that is both a supergroup and a channel's linked_chat appears exactly once."""
-    with closing(_make_db()) as conn:
-        supergroup_id = -100300000001
-        channel_id = -100300000002
-        _insert_dialog(conn, supergroup_id, "supergroup", last_message_at=2000)
-        _insert_dialog(conn, channel_id, "channel", last_message_at=3000)
-
-        # Channel resolves to the same peer as the supergroup
-        resolver = _FakeResolver(
-            {
-                channel_id: LinkedChatResolution(linked_chat_id=supergroup_id, flood_wait_seconds=None),
-            }
-        )
-        monkeypatch.setattr(
-            "mcp_telegram.activity_peer_sweep.resolve_linked_chat_id",
-            resolver,
-        )
-
-        count = asyncio.run(build_working_set(_FakeClient(), conn, timeout_s=120.0))
-
-        assert count.enrolled_count == 1, f"Expected 1 peer (dedup), got {count.enrolled_count}"
-        row = _get_activity_row(conn, supergroup_id)
-        assert row is not None
-        # Source must be 'supergroup' (direct enrollment wins over linked_chat)
-        assert row["source"] == "supergroup", f"Deduped peer source must be 'supergroup', got {row['source']!r}"
-
-
-# ---------------------------------------------------------------------------
-# (e) FloodWait on second channel halts the pass — account-global invariant
-# ---------------------------------------------------------------------------
-
-
-def test_build_working_set_floodwait_halts_pass(monkeypatch: pytest.MonkeyPatch) -> None:
-    """FloodWait on the 2nd of 3 channels must halt the pass (break, not continue).
-
-    Verifies the account-global FloodWait invariant: once Telegram issues a
-    wait, every further request in the same pass is sent during the wait window.
-    The resolver must be called exactly TWICE (the first and second channels
-    visited in iteration order); the third channel must never be reached.
-
-    Uses position-based flood assignment so the test is order-agnostic with
-    respect to SQLite's internal rowid iteration.
-    """
-    with closing(_make_db()) as conn:
-        channel_a = -100400000001
-        channel_b = -100400000002
-        channel_c = -100400000003
-        linked_first = -100400000010
-
-        _insert_dialog(conn, channel_a, "channel", last_message_at=1000)
-        _insert_dialog(conn, channel_b, "channel", last_message_at=2000)
-        _insert_dialog(conn, channel_c, "channel", last_message_at=3000)
-
-        all_channel_ids = {channel_a, channel_b, channel_c}
-        call_log: list[int] = []
-
-        async def mock_resolver(
-            client: object, conn: sqlite3.Connection, channel_id: int, *, timeout_s: float
-        ) -> LinkedChatResolution:
-            del client, conn
-            assert timeout_s == 120.0
-            call_log.append(channel_id)
-            if len(call_log) == 1:
-                # First channel visited → clean resolution with a linked chat
-                return LinkedChatResolution(linked_chat_id=linked_first, flood_wait_seconds=None)
-            if len(call_log) == 2:
-                # Second channel visited → FloodWait; pass must halt here
-                return LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=30)
-            # Third channel must never be reached
-            raise AssertionError(f"resolve_linked_chat_id called a 3rd time for channel_id={channel_id!r}")
-
-        monkeypatch.setattr(
-            "mcp_telegram.activity_peer_sweep.resolve_linked_chat_id",
-            mock_resolver,
-        )
-
-        result = asyncio.run(build_working_set(_FakeClient(), conn, timeout_s=120.0))
-
-        # Resolver called exactly twice: first (ok) + second (flood) → break
-        assert len(call_log) == 2, f"Expected exactly 2 resolver calls, got {len(call_log)}: {call_log}"
-        assert result.flood_wait_seconds == 30
-        flood_channel = call_log[1]  # second channel visited triggered FloodWait
-        skipped_channel = (all_channel_ids - set(call_log)).pop()  # third, never reached
-
-        # Working set contains linked_first (from the first channel) only
-        assert _get_activity_row(conn, linked_first) is not None, "linked_first (from first channel) must be enrolled"
-        assert _get_activity_row(conn, flood_channel) is None, "FloodWait channel must NOT be enrolled"
-        assert _get_activity_row(conn, skipped_channel) is None, "Skipped (never-reached) channel must NOT be enrolled"
-
-        # flood_channel's dialogs.linked_chat_resolved_at stays NULL (resolver's FloodWait
-        # branch did not write to it — plan 02 task 3 guarantee)
-        row = cast(
-            tuple[int | None] | None,
-            conn.execute(
-                "SELECT linked_chat_resolved_at FROM dialogs WHERE dialog_id = ?",
-                (flood_channel,),
-            ).fetchone(),
-        )
-        assert row is not None
-        assert row[0] is None, f"flood_channel linked_chat_resolved_at must stay NULL after FloodWait, got {row[0]!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -982,7 +712,7 @@ def test_enroll_does_not_overwrite_cursors():
         )
         conn.commit()
 
-        # Re-enroll (as happens on every build_working_set pass)
+        # Re-enroll while preserving the active peer's durable cursors.
         enroll_activity_dialog(conn, peer_id, "supergroup", last_activity_at=2000)
 
         row = cast(

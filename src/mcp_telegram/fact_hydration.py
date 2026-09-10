@@ -129,14 +129,12 @@ class HydrationHandler(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class _BatchOutcome:
-    requests: int = 0
     hydrated: int = 0
     completed: int = 0
     pending: int = 0
     retried: int = 0
     dropped: int = 0
     stopped: bool = False
-    admission_rejected: bool = False
     dropped_by_kind: tuple[tuple[str, int], ...] = ()
 
 
@@ -308,7 +306,6 @@ class MessageFactHydrationWorker:
             raise ValueError("fact hydration max_requests_per_cycle must cover registered handler costs")
         self._retry_delay_seconds = retry_delay_seconds
         self._max_attempts = max_attempts
-        self._pause_between_requests_seconds = pause_between_requests_seconds
         self._clock = clock
         if backfill_debt_limit <= 0:
             raise ValueError("fact hydration backfill_debt_limit must be positive")
@@ -479,7 +476,6 @@ class MessageFactHydrationWorker:
             dropped=len(preflight_observations),
             retried=retried,
             stopped=True,
-            admission_rejected=True,
         )
 
     def _release_undispatched(
@@ -529,7 +525,6 @@ class MessageFactHydrationWorker:
             retry_delay,
         )
         return _BatchOutcome(
-            requests=handler.request_cost,
             retried=retried,
             dropped=len(preflight_observations) + dropped,
             stopped=True,
@@ -552,7 +547,6 @@ class MessageFactHydrationWorker:
             len(started),
         )
         return _BatchOutcome(
-            requests=handler.request_cost,
             dropped=len(preflight_observations),
             stopped=True,
         )
@@ -584,7 +578,6 @@ class MessageFactHydrationWorker:
                 drop_counts[observation.kind] += 1
         dropped_by_kind = tuple(drop_counts.items())
         return _BatchOutcome(
-            requests=handler.request_cost,
             dropped=len(preflight_observations) + sum(summary.job_count for summary in summaries),
             dropped_by_kind=dropped_by_kind,
         )
@@ -605,7 +598,7 @@ class MessageFactHydrationWorker:
             self._conn.commit()
             self._log_drops(batch, preflight_observations)
             self._log_drops(started, self._observations("terminal_rpc", started), descriptor=descriptor)
-            return _BatchOutcome(requests=handler.request_cost, dropped=len(preflight_observations) + len(started))
+            return _BatchOutcome(dropped=len(preflight_observations) + len(started))
         retried, dropped, drop_observations = self._reschedule_or_drop(
             handler,
             started,
@@ -624,7 +617,6 @@ class MessageFactHydrationWorker:
             descriptor.error_type,
         )
         return _BatchOutcome(
-            requests=handler.request_cost,
             retried=retried,
             dropped=len(preflight_observations) + dropped,
         )
@@ -656,7 +648,6 @@ class MessageFactHydrationWorker:
         self._log_drops(started, applied.drop_observations)
         self._conn.commit()
         return _BatchOutcome(
-            requests=handler.request_cost,
             hydrated=applied.hydrated,
             completed=applied.completed,
             pending=pending,
@@ -815,13 +806,6 @@ class MessageFactHydrationWorker:
             )
             for (reason, kind, dialog_id, error_type, rpc_code, rpc_symbol), grouped_jobs in grouped.items()
         )
-
-    async def _pause_between_requests(self) -> bool:
-        try:
-            await asyncio.wait_for(self._shutdown_event.wait(), timeout=self._pause_between_requests_seconds)
-            return True
-        except TimeoutError:
-            return False
 
 
 __all__ = [

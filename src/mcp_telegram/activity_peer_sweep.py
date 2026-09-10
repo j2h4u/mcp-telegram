@@ -8,8 +8,6 @@ This module provides:
   - sweep_peer_once: FloodWait-neutral per-peer self-search primitive.
   - enroll_activity_dialog: shared enrollment helper (reused by schedulers
     and plan 05 daemon-api wiring).
-  - build_working_set: working-set builder enrolling from dialogs.type=
-    'supergroup'/'channel' with durable resolver-path FloodWait retry.
   - run_working_set_enrollment_slice: restart-safe bounded replacement for
     coordinator-owned execution.
   - _load_dialog_state / _save_dialog_state: per-tier cursor helpers.
@@ -33,7 +31,7 @@ from typing import Protocol, cast
 from telethon.tl.types import TypeInputPeer
 
 from .access_lifecycle import set_access_lost
-from .activity_peer_resolve import LinkedChatResolution, resolve_input_peer, resolve_linked_chat_id
+from .activity_peer_resolve import resolve_input_peer, resolve_linked_chat_id
 from .activity_substrate import ActivityClient, call_with_timeout
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
@@ -62,18 +60,9 @@ _PACING = PeerSweepPacing()
 
 
 @dataclass(frozen=True, slots=True)
-class WorkingSetResult:
-    """Result of refreshing the peer working set."""
-
-    enrolled_count: int
-    flood_wait_seconds: int | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class WorkingSetEnrollmentSliceResult:
     """Durable outcome from one bounded working-set enrollment unit."""
 
-    enrolled_count: int = 0
     completed: bool = False
     flood_wait_seconds: int | None = None
     consumed: bool = False
@@ -496,7 +485,7 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
 
 
 # ---------------------------------------------------------------------------
-# Shared enrollment helper — reused by build_working_set AND plan 05
+# Shared enrollment helper used by the bounded enrollment slice and API wiring.
 # ---------------------------------------------------------------------------
 
 
@@ -818,7 +807,7 @@ def _enroll_supergroup_slice(
         phase=_ENROLLMENT_SUPERGROUPS,
         cursor=dialog_id,
     )
-    return WorkingSetEnrollmentSliceResult(enrolled_count=1, consumed=True)
+    return WorkingSetEnrollmentSliceResult(consumed=True)
 
 
 async def _enroll_channel_slice(
@@ -862,7 +851,7 @@ async def _enroll_channel_slice(
         phase=_ENROLLMENT_CHANNELS,
         cursor=channel_id,
     )
-    return WorkingSetEnrollmentSliceResult(enrolled_count=int(resolution.linked_chat_id is not None), consumed=True)
+    return WorkingSetEnrollmentSliceResult(consumed=True)
 
 
 async def run_working_set_enrollment_slice(  # noqa: PLR0913 - explicit bounded slice dependencies
@@ -898,74 +887,3 @@ async def run_working_set_enrollment_slice(  # noqa: PLR0913 - explicit bounded 
             cursor=position.cursor,
         )
     )
-
-
-async def build_working_set(
-    client: ActivityClient,
-    conn: sqlite3.Connection,
-    *,
-    timeout_s: float,
-) -> WorkingSetResult:
-    """Build the per-peer self-search working set and enroll peers.
-
-    Source: dialogs.type='supergroup' (megagroups) and dialogs.type='channel'
-    (broadcast channels whose linked discussion group is resolved via
-    resolve_linked_chat_id (post-Phase-54: dialogs-cache hot read; falls through
-    to GetFullChannelRequest only when linked_chat_resolved_at IS NULL)).
-    NOT entities.type='group' — that taxonomy differs (concern 4 fix).
-
-    Returns the enrolled count and whether linked-chat resolution flooded.
-    """
-    # Step 1: standalone supergroups (directly self-searchable)
-    supergroup_rows = cast(
-        list[tuple[int, int | None]],
-        conn.execute(
-            "SELECT dialog_id, last_message_at FROM dialogs WHERE type = 'supergroup' AND hidden = 0"
-        ).fetchall(),
-    )
-
-    # Step 2: broadcast channels (need linked_chat resolution)
-    channel_rows = cast(
-        list[tuple[int, int | None]],
-        conn.execute("SELECT dialog_id, last_message_at FROM dialogs WHERE type = 'channel' AND hidden = 0").fetchall(),
-    )
-
-    working_set: dict[int, int | None] = {}  # peer_id → last_activity_at
-
-    # Enroll supergroups directly
-    working_set = dict(supergroup_rows)
-    supergroup_ids = {dialog_id for dialog_id, _ in supergroup_rows}
-
-    # Step 3: resolve broadcast channels to their discussion groups
-    flood_wait_seconds: int | None = None
-    for channel_id, channel_last_message_at in channel_rows:
-        res: LinkedChatResolution = await resolve_linked_chat_id(client, conn, channel_id, timeout_s=timeout_s)
-
-        if res.flood_wait_seconds is not None:
-            logger.warning(
-                "build_working_set_channel_flood channel_id=%r flood_wait_seconds=%d"
-                " — halting resolution pass (Telegram throttling from GetFullChannelRequest is"
-                " account-global; remaining channels stay due for next sweep cycle)",
-                channel_id,
-                res.flood_wait_seconds,
-            )
-            flood_wait_seconds = res.flood_wait_seconds
-            break
-
-        if res.linked_chat_id is not None:
-            existing = working_set.get(res.linked_chat_id)
-            if existing is None:
-                working_set[res.linked_chat_id] = channel_last_message_at
-        # else: no discussion group → drop channel (D-03)
-
-    # Step 4-5: enroll all peers via shared helper
-    for peer_id, last_activity_at in working_set.items():
-        source = "supergroup" if peer_id in supergroup_ids else "linked_chat"
-        enroll_activity_dialog(
-            conn,
-            peer_id,
-            source,
-            last_activity_at=last_activity_at,
-        )
-
-    return WorkingSetResult(enrolled_count=len(working_set), flood_wait_seconds=flood_wait_seconds)
