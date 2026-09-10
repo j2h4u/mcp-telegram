@@ -168,6 +168,22 @@ _REPAIR_MEDIA_METADATA_VIDEO_SQL = (
     "AND json_type(m.media_payload, '$.round_message') IS NULL "
     "AND hj.message_id IS NULL"
 )
+_TRANSCRIPTION_REPAIR_CANDIDATE_SQL = f"SELECT 1 {_REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL} LIMIT 1"
+_MEDIA_METADATA_REPAIR_CANDIDATE_SQL = (
+    "SELECT 1 FROM (SELECT 1 "
+    f"{_REPAIR_MEDIA_METADATA_CONTACT_OTHER_SQL} UNION ALL SELECT 1 "
+    f"{_REPAIR_MEDIA_METADATA_VIDEO_SQL}) LIMIT 1"
+)
+
+
+def has_transcription_hydration_repair_candidates(conn: sqlite3.Connection) -> bool:
+    """Return whether one missing transcription job can be repaired."""
+    return conn.execute(_TRANSCRIPTION_REPAIR_CANDIDATE_SQL).fetchone() is not None
+
+
+def has_media_metadata_hydration_repair_candidates(conn: sqlite3.Connection) -> bool:
+    """Return whether one unresolved media metadata job can be repaired."""
+    return conn.execute(_MEDIA_METADATA_REPAIR_CANDIDATE_SQL).fetchone() is not None
 
 
 def repair_transcription_hydration_jobs(

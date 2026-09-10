@@ -27,6 +27,8 @@ from .maintenance_logging import log_maintenance_cycle
 from .messages.sqlite_hydration_jobs import (
     MediaMetadataHydrationRepair,
     TranscriptionHydrationRepair,
+    has_media_metadata_hydration_repair_candidates,
+    has_transcription_hydration_repair_candidates,
     repair_media_metadata_hydration_jobs,
     repair_transcription_hydration_jobs,
 )
@@ -63,41 +65,6 @@ _DROP_LEVELS = {
     "missing_response": logging.DEBUG,
     "not_applied": logging.DEBUG,
 }
-_TRANSCRIPTION_REPAIR_CANDIDATE_SQL = (
-    "SELECT 1 FROM messages m INDEXED BY idx_messages_transcribable_undeleted_sent "
-    "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
-    "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
-    "LEFT JOIN hydration_jobs hj ON hj.kind = 'transcription' "
-    "AND hj.dialog_id = m.dialog_id AND hj.message_id = m.message_id "
-    "WHERE m.is_deleted = 0 AND json_valid(m.media_payload) "
-    "AND json_type(CASE WHEN json_valid(m.media_payload) THEN m.media_payload ELSE '{}' END) = 'object' "
-    "AND (m.media_kind = 'voice' OR (m.media_kind = 'video' "
-    "AND json_type(CASE WHEN json_valid(m.media_payload) THEN m.media_payload ELSE '{}' END, "
-    "'$.round_message') = 'true')) "
-    "AND NOT EXISTS (SELECT 1 FROM message_transcriptions mt "
-    "WHERE mt.dialog_id = m.dialog_id AND mt.message_id = m.message_id) "
-    "AND hj.message_id IS NULL LIMIT 1"
-)
-_MEDIA_METADATA_REPAIR_CANDIDATE_SQL = (
-    "SELECT 1 FROM ("
-    "SELECT 1 FROM messages m INDEXED BY idx_messages_media_unresolved_contact_other "
-    "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
-    "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
-    "LEFT JOIN hydration_jobs hj ON hj.kind = 'media_metadata' "
-    "AND hj.dialog_id = m.dialog_id AND hj.message_id = m.message_id "
-    "WHERE m.is_deleted = 0 AND m.media_kind IN ('contact', 'other') AND m.media_payload = '{}' "
-    "AND hj.message_id IS NULL "
-    "UNION ALL "
-    "SELECT 1 FROM messages m INDEXED BY idx_messages_media_unresolved_video "
-    "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id AND sd.status IN ('syncing', 'synced') "
-    "JOIN full_history_enrollment fhe ON fhe.dialog_id = m.dialog_id AND fhe.enabled = 1 "
-    "LEFT JOIN hydration_jobs hj ON hj.kind = 'media_metadata' "
-    "AND hj.dialog_id = m.dialog_id AND hj.message_id = m.message_id "
-    "WHERE m.is_deleted = 0 AND m.media_kind = 'video' AND json_valid(m.media_payload) "
-    "AND json_type(m.media_payload) = 'object' "
-    "AND json_type(m.media_payload, '$.round_message') IS NULL "
-    "AND hj.message_id IS NULL) LIMIT 1"
-)
 
 
 def _has_terminal_rpc_symbol(exc: BaseException, symbols: frozenset[str]) -> bool:
@@ -488,15 +455,9 @@ class MessageFactHydrationWorker:
 
     def has_repair_candidates(self) -> bool:
         """Return whether a bounded backfill repair can create durable work."""
-        if (
-            TRANSCRIPTION_HYDRATION_KIND in self._handlers
-            and self._conn.execute(_TRANSCRIPTION_REPAIR_CANDIDATE_SQL).fetchone() is not None
-        ):
+        if TRANSCRIPTION_HYDRATION_KIND in self._handlers and has_transcription_hydration_repair_candidates(self._conn):
             return True
-        return (
-            MEDIA_METADATA_KIND in self._handlers
-            and self._conn.execute(_MEDIA_METADATA_REPAIR_CANDIDATE_SQL).fetchone() is not None
-        )
+        return MEDIA_METADATA_KIND in self._handlers and has_media_metadata_hydration_repair_candidates(self._conn)
 
     def _run_repair_producers(
         self, effective_now: int

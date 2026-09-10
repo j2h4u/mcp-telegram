@@ -35,6 +35,8 @@ from mcp_telegram.messages.sqlite_hydration_jobs import (
     _TRANSCRIBABLE_MEDIA_SQL,
     TranscriptionHydrationRepair,
     _is_transcribable_media_pair,
+    has_media_metadata_hydration_repair_candidates,
+    has_transcription_hydration_repair_candidates,
     reconcile_fact_hydration_jobs_for_dialog,
     repair_media_metadata_hydration_jobs,
     repair_transcription_hydration_jobs,
@@ -328,6 +330,30 @@ def test_media_metadata_repair_plan_uses_both_partial_indexes_without_sort(conn:
     assert "idx_messages_media_unresolved_video" in details
     assert "SCAN messages" not in details
     assert "USE TEMP B-TREE" not in details
+
+
+def test_repair_candidate_queries_are_read_only_and_kind_specific(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    conn.executemany(
+        "INSERT INTO messages(dialog_id, message_id, sent_at, text, media_kind, media_payload) "
+        "VALUES (42, ?, ?, NULL, ?, ?)",
+        [(108, 108, "voice", "{}"), (109, 109, "other", "{}")],
+    )
+    conn.commit()
+    before = conn.total_changes
+
+    assert has_transcription_hydration_repair_candidates(conn)
+    assert has_media_metadata_hydration_repair_candidates(conn)
+    assert conn.total_changes == before
+
+    conn.execute("INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at) VALUES ('transcription', 42, 108, 1)")
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at) VALUES ('media_metadata', 42, 109, 1)"
+    )
+    conn.commit()
+
+    assert not has_transcription_hydration_repair_candidates(conn)
+    assert not has_media_metadata_hydration_repair_candidates(conn)
 
 
 def test_historical_transcription_repair_and_dialog_reconciliation_admit_voice_and_round_video(
