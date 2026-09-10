@@ -25,7 +25,7 @@ from ..telegram_rpc_consumers import DemandKind
 from ..telegram_rpc_scheduler import rpc_attempt_budget
 from .contracts import FolderSourceUnavailableError, FolderStagingStaleError
 from .ports import FolderSnapshotRepository
-from .refresh import FolderRefresher, FolderRefreshResult
+from .refresh import FolderProjection, FolderRefresher, FolderRefreshResult
 
 logger = logging.getLogger(__name__)
 
@@ -99,16 +99,21 @@ class FolderProjectionWorker:
         self._last_outcome = repository.read_last_outcome()
         retry_at = repository.read_next_retry_at()
         last_success_at = repository.read_last_success_at()
-        self._next_due_at = 0 if repository.read_staging() is not None else (
-            retry_at
-            if retry_at is not None
-            else None
-            if last_success_at is None or self._last_outcome not in {None, FolderAttemptResult.SUCCESS}
-            else math.ceil(last_success_at + policy.refresh_interval_seconds)
+        self._next_due_at = (
+            0
+            if repository.read_staging() is not None
+            else (
+                retry_at
+                if retry_at is not None
+                else None
+                if last_success_at is None or self._last_outcome not in {None, FolderAttemptResult.SUCCESS}
+                else math.ceil(last_success_at + policy.refresh_interval_seconds)
+            )
         )
         self._warning_bucket: int | None = None
         self._primed = False
         self._attempt_lock = asyncio.Lock()
+
     async def prime(self) -> None:
         """Perform the one startup attempt; the run loop must not duplicate it."""
         if self._primed:
@@ -182,29 +187,16 @@ class FolderProjectionWorker:
         self,
         budget: RpcAttemptBudget | None,
     ) -> tuple[FolderAttemptResult, FolderRefreshResult | None, int | None, Exception | None, int | None]:
-        refresh_result: FolderRefreshResult | None = None
-        next_due_at: int | None = None
         try:
-            if budget is not None and self._refresher.supports_bounded_acquisition:
-                bounded = await self._refresher.acquire_slice(budget)
-                if not bounded.complete or bounded.projection is None:
-                    return FolderAttemptResult.CONTINUATION, None, None, None, self._next_due_at
-                projection = bounded.projection
-            else:
-                projection = await self._refresher.acquire()
-            completion = self._clock()
-            refresh_result = self._refresher.persist(projection, completed_at=int(completion))
-            self._failure_count = 0
-            self._warning_bucket = None
-            self._last_outcome = FolderAttemptResult.SUCCESS
-            next_due_at = self._schedule_from_completion(completion)
-            self._next_due_at = next_due_at
-            return FolderAttemptResult.SUCCESS, refresh_result, None, None, next_due_at
+            projection = await self._acquire_projection(budget)
+            if projection is None:
+                return self._continuation_result()
+            return self._publish_projection(projection)
         except FolderStagingStaleError:
             self._repository.clear_staging()
-            return FolderAttemptResult.CONTINUATION, None, None, None, self._next_due_at
+            return self._continuation_result()
         except RpcAttemptBudgetExhaustedError:
-            return FolderAttemptResult.CONTINUATION, None, None, None, self._next_due_at
+            return self._continuation_result()
         except FolderSourceUnavailableError, TimeoutError, OSError:
             return FolderAttemptResult.SOURCE_UNAVAILABLE, None, None, None, None
         except TelegramRpcThrottled as exc:
@@ -215,6 +207,30 @@ class FolderProjectionWorker:
             raise
         except Exception as exc:  # noqa: BLE001 - unexpected programming errors terminate the tracked worker
             return FolderAttemptResult.UNEXPECTED, None, None, exc, None
+
+    async def _acquire_projection(self, budget: RpcAttemptBudget | None) -> FolderProjection | None:
+        if budget is not None and self._refresher.supports_bounded_acquisition:
+            bounded = await self._refresher.acquire_slice(budget)
+            return bounded.projection if bounded.complete else None
+        return await self._refresher.acquire()
+
+    def _continuation_result(
+        self,
+    ) -> tuple[FolderAttemptResult, None, None, None, int | None]:
+        return FolderAttemptResult.CONTINUATION, None, None, None, self._next_due_at
+
+    def _publish_projection(
+        self,
+        projection: FolderProjection,
+    ) -> tuple[FolderAttemptResult, FolderRefreshResult, None, None, int]:
+        completion = self._clock()
+        refresh_result = self._refresher.persist(projection, completed_at=int(completion))
+        self._failure_count = 0
+        self._warning_bucket = None
+        self._last_outcome = FolderAttemptResult.SUCCESS
+        next_due_at = self._schedule_from_completion(completion)
+        self._next_due_at = next_due_at
+        return FolderAttemptResult.SUCCESS, refresh_result, None, None, next_due_at
 
     def _record_failure(self, result: FolderAttemptResult, requested_flood_wait: int | None) -> int | None:
         self._failure_count += 1

@@ -8,7 +8,7 @@ from typing import cast
 
 from ..telegram_demand import AcquisitionKind, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
 from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_attempt_budget, rpc_scope
-from .contracts import FolderDialogCursor, FolderSourceSnapshot, FolderStagingSnapshot
+from .contracts import FolderSourceSnapshot, FolderStagingSnapshot
 from .membership import matches
 from .ports import FolderSnapshotRepository, LegacyTelegramFolderGateway, TelegramFolderGateway
 from .telegram_adapter import FOLDER_DIALOG_PAGE_SIZE
@@ -62,53 +62,44 @@ class FolderRefresher:
             if matches(folder, dialog)
         )
 
-    async def acquire_slice(self, budget: RpcAttemptBudget) -> FolderAcquisitionSlice:  # noqa: PLR0911
-        """Acquire at most one bounded dialog page and publish only at EOF.
-
-        The source cursor and all facts collected so far are written to staging
-        after each yielded dialog.  A budget rejection therefore leaves a
-        restartable acquisition without changing the published tables.
-        """
-        if not isinstance(budget, RpcAttemptBudget):
-            raise TypeError("budget must be an RpcAttemptBudget")
-
+    def _read_current_staging(self) -> tuple[FolderStagingSnapshot | None, int]:
         staging = self._repository.read_staging()
-        current_generation = self._repository.read_generation()
-        comparable_generation = 0 if current_generation is None else current_generation
-        if (
-            staging is not None
-            and staging.base_generation is not None
-            and staging.base_generation != comparable_generation
-        ):
+        generation = self._repository.read_generation()
+        comparable_generation = 0 if generation is None else generation
+        if staging is not None and staging.base_generation not in {None, comparable_generation}:
             self._repository.clear_staging()
-            staging = None
+            return None, comparable_generation
+        return staging, comparable_generation
 
-        if staging is None:
-            if budget.exhausted:
-                return FolderAcquisitionSlice(None, False)
-            try:
-                gateway = cast(TelegramFolderGateway, self._gateway)
-                with rpc_scope(
-                    TelegramRpcSource.FOLDER_RECONCILIATION,
-                    acquisition_kind=AcquisitionKind.FOLDER_SNAPSHOT,
-                ):
-                    folders = await gateway.fetch_folders()
-            except RpcAttemptBudgetExhaustedError:
-                return FolderAcquisitionSlice(None, False)
-            staging = FolderStagingSnapshot(
-                folders=folders,
-                dialogs=(),
-                cursor=None,
-                started_at=int(time.time()),
-                base_generation=comparable_generation,
-            )
-            self._repository.save_staging(staging)
-
+    async def _start_staging(self, budget: RpcAttemptBudget, base_generation: int) -> FolderStagingSnapshot | None:
         if budget.exhausted:
-            return FolderAcquisitionSlice(None, False)
+            return None
+        try:
+            gateway = cast(TelegramFolderGateway, self._gateway)
+            with rpc_scope(
+                TelegramRpcSource.FOLDER_RECONCILIATION,
+                acquisition_kind=AcquisitionKind.FOLDER_SNAPSHOT,
+            ):
+                folders = await gateway.fetch_folders()
+        except RpcAttemptBudgetExhaustedError:
+            return None
+        staging = FolderStagingSnapshot(
+            folders=folders,
+            dialogs=(),
+            cursor=None,
+            started_at=int(time.time()),
+            base_generation=base_generation,
+        )
+        self._repository.save_staging(staging)
+        return staging
 
+    async def _acquire_dialog_page(
+        self,
+        staging: FolderStagingSnapshot,
+        budget: RpcAttemptBudget,
+    ) -> tuple[FolderStagingSnapshot, int] | None:
         dialogs = list(staging.dialogs)
-        cursor: FolderDialogCursor | None = staging.cursor
+        cursor = staging.cursor
         page_count = 0
         try:
             gateway = cast(TelegramFolderGateway, self._gateway)
@@ -120,24 +111,48 @@ class FolderRefresher:
                     dialogs.append(item.facts)
                     cursor = item.cursor
                     page_count += 1
-                    self._repository.save_staging(
-                        FolderStagingSnapshot(
-                            folders=staging.folders,
-                            dialogs=tuple(dialogs),
-                            cursor=cursor,
-                            started_at=staging.started_at,
-                            base_generation=staging.base_generation,
-                        )
+                    staging = FolderStagingSnapshot(
+                        folders=staging.folders,
+                        dialogs=tuple(dialogs),
+                        cursor=cursor,
+                        started_at=staging.started_at,
+                        base_generation=staging.base_generation,
                     )
+                    self._repository.save_staging(staging)
                     if budget.exhausted:
-                        return FolderAcquisitionSlice(None, False)
+                        return None
         except RpcAttemptBudgetExhaustedError:
+            return None
+        return staging, page_count
+
+    async def acquire_slice(self, budget: RpcAttemptBudget) -> FolderAcquisitionSlice:
+        """Acquire at most one bounded dialog page and publish only at EOF.
+
+        The source cursor and all facts collected so far are written to staging
+        after each yielded dialog.  A budget rejection therefore leaves a
+        restartable acquisition without changing the published tables.
+        """
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+
+        staging, generation = self._read_current_staging()
+        if staging is None:
+            staging = await self._start_staging(budget, generation)
+            if staging is None:
+                return FolderAcquisitionSlice(None, False)
+
+        if budget.exhausted:
             return FolderAcquisitionSlice(None, False)
+
+        page = await self._acquire_dialog_page(staging, budget)
+        if page is None:
+            return FolderAcquisitionSlice(None, False)
+        staging, page_count = page
 
         if page_count >= FOLDER_DIALOG_PAGE_SIZE:
             return FolderAcquisitionSlice(None, False)
 
-        source = FolderSourceSnapshot(folders=staging.folders, dialogs=tuple(dialogs))
+        source = FolderSourceSnapshot(folders=staging.folders, dialogs=staging.dialogs)
         return FolderAcquisitionSlice(
             FolderProjection(source=source, memberships=self._memberships(source)),
             True,

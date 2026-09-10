@@ -119,18 +119,21 @@ def _dialog_facts(dialog: object) -> DialogFacts:
     )
 
 
-def _dialog_cursor(dialog: object) -> FolderDialogCursor:
-    entity = getattr(dialog, "entity", None)
+def _peer_cursor(entity: object) -> tuple[str | None, int, int]:
     entity_id = int(getattr(entity, "id", 0) or 0)
     access_hash = int(getattr(entity, "access_hash", 0) or 0)
-    peer_type: str | None = None
-    entity_type = type(cast(object, entity)).__name__ if entity is not None else None
+    entity_type = type(entity).__name__ if entity is not None else None
     if isinstance(entity, User) or entity_type == User.__name__:
-        peer_type = "user"
-    elif isinstance(entity, Chat) or entity_type == Chat.__name__:
-        peer_type = "chat"
-    elif isinstance(entity, Channel) or entity_type == Channel.__name__:
-        peer_type = "channel"
+        return "user", entity_id, access_hash
+    if isinstance(entity, Chat) or entity_type == Chat.__name__:
+        return "chat", entity_id, access_hash
+    if isinstance(entity, Channel) or entity_type == Channel.__name__:
+        return "channel", entity_id, access_hash
+    return None, entity_id, access_hash
+
+
+def _dialog_cursor(dialog: object) -> FolderDialogCursor:
+    peer_type, entity_id, access_hash = _peer_cursor(getattr(dialog, "entity", None))
     message = getattr(dialog, "message", None)
     date = getattr(message, "date", None) or getattr(dialog, "date", None)
     return FolderDialogCursor(
