@@ -4,19 +4,27 @@ import ast
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
+from typing import Protocol, cast
 
 import pytest
 
 
-def _gate() -> ModuleType:
+class _Finding(Protocol):
+    def render(self) -> str: ...
+
+
+class _DemandCutoverGate(Protocol):
+    def find_violations(self, root: Path) -> tuple[_Finding, ...]: ...
+
+
+def _gate() -> _DemandCutoverGate:
     path = Path(__file__).parents[1] / "scripts" / "check_demand_cutover.py"
     spec = importlib.util.spec_from_file_location("check_demand_cutover", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    return module
+    return cast(_DemandCutoverGate, module)
 
 
 def _fixture_root(
