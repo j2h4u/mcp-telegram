@@ -356,15 +356,15 @@ async def test_raw_scheduled_updates_ingest_without_messages_row(conn: sqlite3.C
     client = MagicMock()
     manager = EventHandlerManager(client, conn, asyncio.Event(), client.get_input_entity)
     offered: list[DemandKind] = []
-    shadow = MagicMock()
+    sink = MagicMock()
 
     def offer(kind: DemandKind) -> bool:
         assert not conn.in_transaction
         offered.append(kind)
         return True
 
-    shadow.offer.side_effect = offer
-    manager.bind_demand_shadow(shadow)
+    sink.offer.side_effect = offer
+    manager.bind_demand_sink(sink)
     scheduled = _message(21, "created", scheduled_at=1_900_000_021)
     await manager.on_raw_new_scheduled_message(SimpleNamespace(message=scheduled))
     await manager.on_raw_delete_scheduled_messages(
@@ -389,6 +389,7 @@ async def test_publication_reconciliation_runs_before_sync_enrollment(conn: sqli
     mark_scheduled_messages_removed(conn, 42, [21], [901], now=200)
     client = MagicMock()
     manager = EventHandlerManager(client, conn, asyncio.Event(), client.get_input_entity)
+    manager.bind_demand_sink(MagicMock())
     message = _message(901, "published")
     message.from_scheduled = True
 

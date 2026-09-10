@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Awaitable, Callable, Generator
+from collections.abc import Awaitable, Callable, Generator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
 
@@ -18,7 +18,7 @@ from mcp_telegram.activity_cold_backfill import (
 from mcp_telegram.activity_hot_sweep import HotActivityDemandAdapter
 from mcp_telegram.activity_sync import ArchiveBackfillDemandAdapter, ArchiveIncrementalDemandAdapter
 from mcp_telegram.daemon import SQLiteSelfProfileCadence
-from mcp_telegram.delta_sync import DeltaAccessProbeDemandAdapter, DeltaGapFillDemandAdapter
+from mcp_telegram.delta_sync import DeltaAccessProbeDemandAdapter, DeltaGapFillDemandAdapter, DmGapScanPage
 from mcp_telegram.demand_composition import (
     DemandCompositionClient,
     DemandCompositionDependencies,
@@ -32,6 +32,7 @@ from mcp_telegram.dialog_sync import (
 )
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, EntityRefreshCoordinator
 from mcp_telegram.fact_hydration import FactHydrationDemandAdapter
+from mcp_telegram.folders.ports import FolderSnapshotRepository
 from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker
 from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshDemandAdapter,
@@ -49,25 +50,85 @@ from mcp_telegram.telegram_rpc_consumers import (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _FolderPolicy:
+    refresh_interval_seconds: float = 60.0
+    jitter_ratio: float = 0.0
+    retry_delays_seconds: tuple[int, ...] = (1,)
+    retry_cap_seconds: int = 60
+    warning_failure_threshold: int = 3
+    stale_threshold_seconds: int = 300
+
+
+class _IdleFolderRepository(FolderSnapshotRepository):
+    def read_generation(self) -> int | None:
+        return None
+
+    def read_consecutive_failures(self) -> int:
+        return 0
+
+    def read_last_outcome(self) -> str | None:
+        return None
+
+    def read_last_success_at(self) -> int | None:
+        return None
+
+    def read_next_retry_at(self) -> int | None:
+        return None
+
+    def read_staging(self) -> None:
+        return None
+
+    def save_staging(self, snapshot: object) -> None:
+        del snapshot
+
+    def clear_staging(self) -> None:
+        return None
+
+    def replace_snapshot(
+        self,
+        snapshot: object,
+        memberships: tuple[tuple[int, int], ...],
+        *,
+        completed_at: int,
+        expected_generation: int | None = None,
+    ) -> int:
+        del snapshot, memberships, completed_at, expected_generation
+        return 1
+
+    def record_attempt(
+        self,
+        *,
+        attempted_at: int,
+        outcome: str,
+        next_retry_at: int | None,
+        consecutive_failures: int,
+    ) -> None:
+        del attempted_at, outcome, next_retry_at, consecutive_failures
+
+
+class _DmGapScanner(DmGapScanPage):
+    async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        del dialog_id, message_ids
+        return 0
+
+
+@dataclass(frozen=True, slots=True)
+class _HotPolicy:
+    loop_interval_seconds: float = 60.0
+    max_peers_per_pass: int = 1
+    base_due_seconds: float = 60.0
+    max_due_seconds: float = 300.0
+    jitter_max_seconds: float = 0.0
+    initial_spread_seconds: float = 0.0
+
+
 def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[str, object]]:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
-    folder_repository = MagicMock()
-    folder_repository.read_consecutive_failures.return_value = 0
-    folder_repository.read_last_outcome.return_value = None
-    folder_repository.read_next_retry_at.return_value = None
-    folder_repository.read_last_success_at.return_value = None
-    folder_repository.read_staging.return_value = None
-    folder_policy = SimpleNamespace(
-        refresh_interval_seconds=60.0,
-        jitter_ratio=0.0,
-        retry_delays_seconds=(1,),
-        retry_cap_seconds=60,
-        warning_failure_threshold=3,
-        stale_threshold_seconds=300,
-    )
-    folder_worker = FolderProjectionWorker(MagicMock(), folder_repository, asyncio.Event(), folder_policy)
+    folder_repository = _IdleFolderRepository()
+    folder_worker = FolderProjectionWorker(MagicMock(), folder_repository, asyncio.Event(), _FolderPolicy())
     message_fact_policy = MessageFactRefreshPolicy(
         interval_seconds=60.0,
         reaction_ttl_seconds=60,
@@ -82,7 +143,7 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         "shutdown": asyncio.Event(),
         "full": MagicMock(),
         "delta": MagicMock(),
-        "dm_gap_scanner": MagicMock(),
+        "dm_gap_scanner": _DmGapScanner(),
         "dialog": MagicMock(),
         "entity": EntityRefreshCoordinator(),
         "hydration": MagicMock(),
@@ -91,7 +152,7 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         "fact_policy": message_fact_policy,
         "scheduled": MagicMock(),
         "access_policy": MagicMock(),
-        "hot_policy": SimpleNamespace(loop_interval_seconds=60.0),
+        "hot_policy": _HotPolicy(),
         "cold_pacing": ColdBackfillPacing(
             idle_s=300.0,
             history=ColdBackfillHistoryPacing(batch_s=1.0, enroll_s=60.0, access_retry_s=60.0),
@@ -110,7 +171,7 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         shutdown_event=cast(asyncio.Event, objects["shutdown"]),
         full_sync_worker=cast(object, objects["full"]),  # type: ignore[arg-type]
         delta_sync_worker=cast(object, objects["delta"]),  # type: ignore[arg-type]
-        dm_gap_scanner=cast(object, objects["dm_gap_scanner"]),  # type: ignore[arg-type]
+        dm_gap_scanner=cast(DmGapScanPage, objects["dm_gap_scanner"]),
         dialog_reconciliation_worker=cast(object, objects["dialog"]),  # type: ignore[arg-type]
         entity_refresh_coordinator=cast(EntityRefreshCoordinator, objects["entity"]),
         fact_hydration_worker=cast(object, objects["hydration"]),  # type: ignore[arg-type]

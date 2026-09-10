@@ -2480,15 +2480,15 @@ async def test_mark_dialog_for_sync_enable() -> None:
     conn = _make_db()
     server = make_server(conn)
     offered: list[DemandKind] = []
-    shadow = MagicMock()
+    sink = MagicMock()
 
     def offer(kind: DemandKind) -> bool:
         assert not conn.in_transaction
         offered.append(kind)
         return True
 
-    shadow.offer.side_effect = offer
-    server.bind_demand_shadow(shadow)
+    sink.offer.side_effect = offer
+    server.bind_demand_sink(sink)
     result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 42, "enable": True})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
@@ -2514,15 +2514,15 @@ async def test_mark_dialog_for_sync_ignores_existing() -> None:
     hydration_requests: list[tuple[sqlite3.Connection, int, int]] = []
     server = make_server(conn, hydration_requester=lambda *request: hydration_requests.append(request))
     offered: list[DemandKind] = []
-    shadow = MagicMock()
+    sink = MagicMock()
 
     def offer(kind: DemandKind) -> bool:
         assert not conn.in_transaction
         offered.append(kind)
         return True
 
-    shadow.offer.side_effect = offer
-    server.bind_demand_shadow(shadow)
+    sink.offer.side_effect = offer
+    server.bind_demand_sink(sink)
     result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 42, "enable": True})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
