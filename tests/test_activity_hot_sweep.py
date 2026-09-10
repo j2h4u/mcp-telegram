@@ -42,6 +42,10 @@ class _FakeClient:
         del request
         return object()
 
+    async def get_input_entity(self, dialog_id: int) -> object:
+        del dialog_id
+        return object()
+
 
 def _enroll(conn: sqlite3.Connection, dialog_id: int, *, hot_cursor: int | None = None) -> None:
     now = int(time.time())
@@ -136,10 +140,13 @@ async def test_hot_activity_adapter_resumes_page_window_before_advancing_cursor(
         await adapter.run_slice(RpcAttemptBudget(limit=1))
 
         state = _get_state(conn, dialog_id)
-        resume = conn.execute(
-            "SELECT hot_page_offset_id, hot_window_max_id FROM activity_dialog_state WHERE dialog_id=?",
-            (dialog_id,),
-        ).fetchone()
+        resume = cast(
+            tuple[int | None, int | None] | None,
+            conn.execute(
+                "SELECT hot_page_offset_id, hot_window_max_id FROM activity_dialog_state WHERE dialog_id=?",
+                (dialog_id,),
+            ).fetchone(),
+        )
         assert state["hot_cursor"] == 10
         assert resume == (min(first_page), max(first_page))
 
@@ -147,10 +154,13 @@ async def test_hot_activity_adapter_resumes_page_window_before_advancing_cursor(
         await restarted.run_slice(RpcAttemptBudget(limit=1))
 
         state = _get_state(conn, dialog_id)
-        resume = conn.execute(
-            "SELECT hot_page_offset_id, hot_window_max_id FROM activity_dialog_state WHERE dialog_id=?",
-            (dialog_id,),
-        ).fetchone()
+        resume = cast(
+            tuple[int | None, int | None] | None,
+            conn.execute(
+                "SELECT hot_page_offset_id, hot_window_max_id FROM activity_dialog_state WHERE dialog_id=?",
+                (dialog_id,),
+            ).fetchone(),
+        )
         assert call_log[dialog_id] == [(0, 11), (min(first_page), 11)]
         assert state["hot_cursor"] == max(first_page)
         assert resume == (None, None)

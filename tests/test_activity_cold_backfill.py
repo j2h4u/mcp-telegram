@@ -96,6 +96,10 @@ class _FakeClient:
         del request
         return object()
 
+    async def get_input_entity(self, dialog_id: int) -> object:
+        del dialog_id
+        return object()
+
 
 # ---------------------------------------------------------------------------
 # Fake SweepResult builders

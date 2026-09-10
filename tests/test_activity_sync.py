@@ -72,6 +72,10 @@ class _FakeClient:
         self.scopes.append(current_rpc_scope())
         return self._batches.pop(0) if self._batches else FakeSearchResult(messages=[])
 
+    async def get_input_entity(self, dialog_id: int) -> object:
+        del dialog_id
+        return object()
+
 
 def _make_db(tmp_path: Path) -> sqlite3.Connection:
     db_path = tmp_path / "sync.db"
