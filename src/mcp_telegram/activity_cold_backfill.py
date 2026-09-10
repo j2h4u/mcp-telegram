@@ -15,8 +15,8 @@ Key design constraints (from plan reviews):
 - cold_offset_id walks downward: each non-empty batch sets
   cold_offset_id = result.min_id.
 - NO hot_* column is ever written here.
-- run_cold_backfill_pass returns a structured ColdPassResult (cycle-4 MEDIUM) so the
-  loop can distinguish idle (NO_DUE_PEER) from zero-write work (ZERO_PERSISTED).
+- run_cold_backfill_pass returns a structured ColdPassResult for one bounded demand
+  slice, preserving the distinction between idle and zero-write work.
 """
 
 from __future__ import annotations
@@ -35,13 +35,11 @@ from typing import Protocol, cast
 from .activity_peer_sweep import (
     SkipReason,
     SweepResult,
-    build_working_set,
     run_working_set_enrollment_slice,
     sweep_peer_once,
     working_set_enrollment_release_at,
 )
 from .activity_substrate import ActivityClient
-from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
 from .sync_read_model import SyncStatus
 from .telegram_demand import (
@@ -55,7 +53,7 @@ from .telegram_demand import (
     demand_context,
 )
 from .telegram_rpc_consumers import DemandKind
-from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_attempt_budget, rpc_scope
+from .telegram_rpc_scheduler import TelegramRpcSource, rpc_attempt_budget, rpc_scope
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +74,6 @@ def _cold_demand_scope() -> Iterator[None]:
 
 class _ColdBackfillScheduling(Protocol):
     """Scheduling values injected by the daemon-owned configuration tree."""
-
-    @property
-    def activity_cold_backfill_seconds(self) -> float: ...
 
     @property
     def activity_cold_backfill_batch_pause_seconds(self) -> float: ...
@@ -104,13 +99,11 @@ class ColdBackfillHistoryPacing:
 
 @dataclass(frozen=True, slots=True)
 class ColdBackfillPacing:
-    idle_s: float
     history: ColdBackfillHistoryPacing
 
     @classmethod
     def from_scheduling(cls, scheduling: _ColdBackfillScheduling) -> ColdBackfillPacing:
         return cls(
-            idle_s=scheduling.activity_cold_backfill_seconds,
             history=ColdBackfillHistoryPacing(
                 batch_s=scheduling.activity_cold_backfill_batch_pause_seconds,
                 enroll_s=scheduling.activity_cold_enroll_seconds,
@@ -221,84 +214,6 @@ class _ColdPeerFinishContext:
     now: int
     claim_until: int
     result: SweepResult
-
-
-# ---------------------------------------------------------------------------
-# Single-pass implementation
-# ---------------------------------------------------------------------------
-
-
-async def _run_cold_backfill_pass_safe(
-    client: ActivityClient,
-    conn: sqlite3.Connection,
-    shutdown_event: asyncio.Event,
-    *,
-    pacing: ColdBackfillPacing,
-    timeout_s: float,
-) -> ColdPassResult:
-    try:
-        return await run_cold_backfill_pass(client, conn, shutdown_event, pacing=pacing, timeout_s=timeout_s)
-    except RpcAdmissionClosedError:
-        raise
-    except TelegramRpcThrottled as exc:
-        _raise_if_latched(exc)
-        logger.warning("activity_cold_backfill_throttled retry_after=%s", exc.retry_after_seconds)
-        return ColdPassResult(
-            outcome=ColdPassOutcome.FLOOD_WAIT, persisted=0, flood_wait_seconds=exc.retry_after_seconds
-        )
-    except Exception:
-        logger.warning("activity_cold_backfill_error", exc_info=True)
-        # Treat as NO_DUE_PEER for sleep purposes to avoid tight error loops.
-        return ColdPassResult(outcome=ColdPassOutcome.NO_DUE_PEER, persisted=0)
-
-
-def _cold_backfill_sleep_seconds(
-    pass_result: ColdPassResult, idle_interval: float, pacing: ColdBackfillPacing
-) -> float:
-    if pass_result.outcome is ColdPassOutcome.NO_DUE_PEER:
-        logger.debug("activity_cold_backfill_idle next_sleep_s=%.3f", idle_interval)
-        return idle_interval
-
-    logger.debug(
-        "activity_cold_backfill_loop outcome=%s persisted=%d flood_wait_seconds=%r next_sleep_s=%.3f",
-        pass_result.outcome,
-        pass_result.persisted,
-        pass_result.flood_wait_seconds,
-        max(pacing.history.batch_s, float(pass_result.flood_wait_seconds or 0)),
-    )
-    return max(pacing.history.batch_s, float(pass_result.flood_wait_seconds or 0))
-
-
-async def _maybe_enroll_activity_peers(
-    client: ActivityClient,
-    conn: sqlite3.Connection,
-    last_enroll_at: float,
-    pacing: ColdBackfillPacing,
-    timeout_s: float,
-) -> tuple[float, int | None]:
-    now_mono = asyncio.get_running_loop().time()
-    if now_mono - last_enroll_at < pacing.history.enroll_s:
-        return last_enroll_at, None
-
-    try:
-        with _cold_demand_scope():
-            with rpc_scope(
-                TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
-                timeout_seconds=timeout_s,
-                acquisition_kind=AcquisitionKind.DIALOG_TRAVERSAL,
-            ):
-                result = await build_working_set(client, conn, timeout_s=timeout_s)
-        logger.debug("activity_cold_backfill_enroll enrolled=%d", result.enrolled_count)
-        return asyncio.get_running_loop().time(), result.flood_wait_seconds
-    except TelegramRpcThrottled as exc:
-        _raise_if_latched(exc)
-        logger.warning("activity_cold_backfill_enroll_throttled retry_after=%s", exc.retry_after_seconds)
-        return asyncio.get_running_loop().time(), exc.retry_after_seconds
-    except RpcAdmissionClosedError:
-        raise
-    except Exception:
-        logger.warning("activity_cold_backfill_enroll_error", exc_info=True)
-    return asyncio.get_running_loop().time(), None
 
 
 def _next_cold_release_at(conn: sqlite3.Connection, *, now: float) -> float | None:

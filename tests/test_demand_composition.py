@@ -160,7 +160,6 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         "access_policy": MagicMock(),
         "hot_policy": _HotPolicy(),
         "cold_pacing": ColdBackfillPacing(
-            idle_s=300.0,
             history=ColdBackfillHistoryPacing(batch_s=1.0, enroll_s=60.0, access_retry_s=60.0),
         ),
         "cadence": SQLiteSelfProfileCadence(conn, 60.0),
