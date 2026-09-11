@@ -14,7 +14,15 @@ from dataclasses import replace as dataclass_replace
 from datetime import datetime
 from typing import Protocol, cast, runtime_checkable
 
-from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[import-untyped]
+from telethon.errors import (  # type: ignore[import-untyped]
+    ChatAdminRequiredError,
+    ChatIdInvalidError,
+    PeerIdInvalidError,
+    RPCError,
+    UserIdInvalidError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
+)
 from telethon.tl import types as tl_types  # type: ignore[import-untyped]
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
@@ -53,7 +61,13 @@ from .flood import TelegramRpcThrottled
 from .folders.read_model import dialog_placement
 from .models import DialogType
 from .telegram_access import ACCESS_LOST_ERRORS
-from .telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
+from .telegram_demand import (
+    AcquisitionKind,
+    DemandStatus,
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+    UnclassifiedTelegramDemandError,
+)
 from .telegram_rpc import raise_if_flood_wait_error
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_scope
@@ -66,6 +80,13 @@ _PERSONAL_CHANNEL_PREVIEW_CHARS = 100
 _PAIR_SECTION_COUNT = 2
 _GROUP_FULL_CHAT_ENDPOINT = "messages.GetFullChat"
 _GROUP_FULL_CHAT_NORMALIZATION_VERSION = "entity-profile-group-full-chat-v1"
+_ENTITY_NOT_FOUND_ERRORS = (
+    ChatIdInvalidError,
+    PeerIdInvalidError,
+    UserIdInvalidError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
+)
 
 
 class _AuthScopeUnavailableError(RuntimeError):
@@ -429,6 +450,8 @@ class DaemonEntityInfoService:
         fallback: dict[str, object],
     ) -> dict[str, object]:
         """Return the refreshed projection when foreground wait headroom permits it."""
+        if fallback.get("error") == "entity_not_found":
+            return fallback
         assert self._refresh is not None
         completed = await self._refresh.wait_for_completion(
             entity_id,
@@ -450,6 +473,10 @@ class DaemonEntityInfoService:
         now: int,
         admit_refresh: bool = True,
     ) -> dict[str, object] | None:
+        refresh_state = self._profiles.refresh_state(entity_id, now=now)
+        terminal_error = self._terminal_resolution_error(refresh_state)
+        if terminal_error is not None:
+            return terminal_error
         cached = self._profiles.read(entity_id, now=now)
         if cached is not None:
             if self._profile_ownership_unavailable(cached):
@@ -473,11 +500,20 @@ class DaemonEntityInfoService:
                 now=now,
                 admit_refresh=admit_refresh,
             )
-        refresh_state = self._profiles.refresh_state(entity_id, now=now)
         if refresh_state is None:
             return None
         reason = str(refresh_state.get("reason", "entity refresh is temporarily unavailable"))
         return self._pending_error(entity_id, reason)
+
+    def _terminal_resolution_error(self, refresh_state: Mapping[str, object] | None) -> dict[str, object] | None:
+        if refresh_state is None:
+            return None
+        if refresh_state.get("status") != "rejected" or refresh_state.get("reason") != "entity_not_found":
+            return None
+        return self._error(
+            "entity_not_found",
+            "Entity was not found. Action: retry with an exact entity id from ListDialogs.",
+        )
 
     def _admit_cached_ownership_refresh(self, entity_id: int, *, now: int) -> RefreshEnqueueResult:
         """Admit ownership repair while retaining already durable refresh work."""
@@ -601,6 +637,16 @@ class DaemonEntityInfoService:
     def _record_section_failure(self, section: str, reason: str) -> None:
         self._section_failures.setdefault(section, reason)
 
+    def _queue_unknown_refresh(self, entity_id: int, *, now: int, message: str) -> dict[str, object]:
+        self._profiles.ensure_unknown_refresh_parent(entity_id, now=now)
+        assert self._refresh is not None
+        enqueue_result = self._refresh.enqueue(entity_id)
+        if enqueue_result is RefreshEnqueueResult.REJECTED:
+            self._profiles.mark_refresh_rejected(entity_id, now=now)
+            return self._pending_error(entity_id, "entity profile refresh queue is full")
+        self._persist_refresh_admission(entity_id, enqueue_result, now=now)
+        return self._pending_error(entity_id, message)
+
     async def _progressive_miss(self, entity_id: int, *, now: int, started_at: float) -> dict[str, object]:
         try:
             entity, resolve_error = await asyncio.wait_for(
@@ -609,17 +655,17 @@ class DaemonEntityInfoService:
             )
         except TimeoutError:
             self._log_stage(entity_id, "resolve_timeout", started_at)
-            assert self._refresh is not None
-            enqueue_result = self._refresh.enqueue(entity_id)
-            if enqueue_result is RefreshEnqueueResult.REJECTED:
-                self._profiles.mark_refresh_rejected(entity_id, now=now)
-                return self._pending_error(entity_id, "entity profile refresh queue is full")
-            self._persist_refresh_admission(entity_id, enqueue_result, now=now)
             budget = self._deps.refresh_limits.foreground_resolve_seconds
-            return self._pending_error(entity_id, f"entity resolution exceeded the {budget:g} second foreground budget")
+            return self._queue_unknown_refresh(
+                entity_id,
+                now=now,
+                message=f"entity resolution exceeded the {budget:g} second foreground budget",
+            )
         if resolve_error is not None or entity is None:
+            if resolve_error is not None and resolve_error.get("error") == "entity_not_found":
+                return resolve_error
             message = str((resolve_error or {}).get("message", "entity resolution is temporarily unavailable"))
-            return self._pending_error(entity_id, message)
+            return self._queue_unknown_refresh(entity_id, now=now, message=message)
 
         core = self._core_from_entity(entity)
         self._profiles.save_core(core, now=now)
@@ -684,7 +730,7 @@ class DaemonEntityInfoService:
             return await self._run_group_full_chat_pair(cursor, now=now)
         if self._pair_enabled(cursor, entity_type, pair_mode=pair_mode):
             return await self._run_full_user_pair_refresh(cursor, entity_type, now=now)
-        if self._pair_personal_channel_is_ready(cursor, pair_mode=pair_mode):
+        if self._is_paired_personal_channel_cursor(cursor, entity_type=entity_type, pair_mode=pair_mode):
             return self._complete_paired_personal_channel(cursor, entity_type, now=now)
         if not self._section_applies(entity_type, cursor.next_section):
             return self._complete_not_applicable_section(cursor, now=now)
@@ -814,6 +860,14 @@ class DaemonEntityInfoService:
         identity = self._full_user_pair_identity(self._target_kind(entity_type))
         committed = self._profiles.complete_same_generation_section(cursor, identity, now=now)
         if not committed:
+            failed = self._profiles.mark_section_failure(
+                cursor,
+                now=now,
+                reason="pair_receipt_invalid",
+                retry_at=failure_retry_at(now),
+            )
+            if not failed:
+                return DurableRefreshSliceResult(cursor.entity_id, None)
             return DurableRefreshSliceResult(cursor.entity_id, DurableRefreshTerminal.FAILURE)
         return DurableRefreshSliceResult(
             cursor.entity_id,
@@ -846,39 +900,18 @@ class DaemonEntityInfoService:
             }
         )
 
-    def _pair_personal_channel_is_ready(self, cursor: EntityRefreshCursor, *, pair_mode: str | None = None) -> bool:
-        if not self._is_paired_personal_channel_cursor(cursor, pair_mode=pair_mode):
-            return False
-        evidence = self._profiles.read_section_evidence(cursor.entity_id, "personal_channel")
-        identity = self._stored_pair_identity(cursor.entity_id)
-        return self._pair_channel_evidence_is_ready(cursor, evidence, identity=identity)
-
     def _is_paired_personal_channel_cursor(
         self,
         cursor: EntityRefreshCursor,
         *,
+        entity_type: DialogType,
         pair_mode: str | None,
     ) -> bool:
-        return (pair_mode or cursor.pair_mode) == "enabled" and cursor.next_section == "personal_channel"
-
-    def _stored_pair_identity(self, entity_id: int) -> dict[str, object] | None:
-        entity_type = self._stored_entity_type(entity_id, now=int(self._deps.now_provider()))
-        return self._full_user_pair_identity(self._target_kind(entity_type))
-
-    def _pair_channel_evidence_is_ready(
-        self,
-        cursor: EntityRefreshCursor,
-        evidence: Mapping[str, object] | None,
-        *,
-        identity: Mapping[str, object] | None,
-    ) -> bool:
         return (
-            identity is not None
-            and evidence is not None
-            and evidence.get("generation") == cursor.generation
-            and evidence.get("normalization_version") == NORMALIZATION_VERSION
-            and evidence.get("identity") == identity
-            and evidence.get("outcome") in {"usable", "absent", "partial", "unavailable"}
+            (pair_mode or cursor.pair_mode) == "enabled"
+            and cursor.next_section == "personal_channel"
+            and cursor.pair_eligible
+            and entity_type in {DialogType.USER, DialogType.BOT}
         )
 
     def _stored_entity_type(self, entity_id: int, *, now: int) -> DialogType:
@@ -1675,6 +1708,9 @@ class DaemonEntityInfoService:
             )
             return self._persisted_failure(cursor.entity_id, now=now)
         if entity is None or error is not None:
+            if error is not None and error.get("error") == "entity_not_found":
+                self._profiles.mark_refresh_not_found(cursor.entity_id, now=now)
+                return DurableRefreshTerminal.FAILURE
             reason, retry_at = self._refresh_failure_details(error, now=now)
             self._profiles.mark_refresh_failure(
                 cursor.entity_id,
@@ -2503,18 +2539,18 @@ class DaemonEntityInfoService:
     async def _resolve_entity(self, entity_id: int) -> tuple[object | None, dict[str, object] | None]:
         try:
             entity = await self._deps.client.get_entity(entity_id)
-            return entity, None
-        except (ValueError, KeyError) as exc:
+        except (ValueError, KeyError, *_ENTITY_NOT_FOUND_ERRORS) as exc:
             self._deps.logger.warning(
                 "entity_info entity_not_found entity_id=%r error=%s%s",
                 entity_id,
                 exc,
                 self._deps.rid(),
             )
-            return None, self._error("entity_not_found", str(exc))
-        except TelegramRpcThrottled:
-            raise
-        except RpcAttemptBudgetExhaustedError:
+            return None, self._error(
+                "entity_not_found",
+                f"{exc}. Action: retry with an exact entity id from ListDialogs.",
+            )
+        except TelegramRpcThrottled, RpcAttemptBudgetExhaustedError, UnclassifiedTelegramDemandError:
             raise
         except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError) as exc:
             raise_if_flood_wait_error(exc)
@@ -2539,6 +2575,19 @@ class DaemonEntityInfoService:
             if isinstance(retry_after, int) and retry_after > 0:
                 error["_retry_after_seconds"] = retry_after
             return None, error
+        try:
+            canonical_id = int(self._deps.get_peer_id(entity))
+        except (TypeError, ValueError, AttributeError) as exc:
+            return None, self._error(
+                "entity_not_found",
+                f"resolved entity has no valid canonical id: {exc}. Action: retry with an exact entity id from ListDialogs.",
+            )
+        if canonical_id != entity_id:
+            return None, self._error(
+                "entity_not_found",
+                f"requested entity id {entity_id} resolved to {canonical_id}. Action: retry with the canonical id from ListDialogs.",
+            )
+        return entity, None
 
     async def _build_detail_by_type(self, entity: object) -> tuple[dict[str, object] | None, dict[str, object] | None]:
         dispatch_kind = classify_dialog_type(entity)

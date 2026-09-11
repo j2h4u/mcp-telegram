@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from jsonschema import validate
+from telethon.errors import PeerIdInvalidError  # type: ignore[import-untyped]
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
@@ -879,6 +880,136 @@ async def test_unknown_core_flood_wait_is_durable_without_fake_entity_row() -> N
     assert conn.execute("SELECT COUNT(*) FROM entities").fetchone() == (0,)
     state = service._profiles.refresh_state(42, now=100)
     assert state == {"status": "failed", "retry_at": 107, "reason": "flood_wait"}
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_entity_requires_canonical_id_match() -> None:
+    class MismatchClient(_UnusedClient):
+        async def get_entity(self, entity_id: int) -> object:
+            del entity_id
+            return SimpleNamespace(id=-42)
+
+    conn = sqlite3.connect(":memory:")
+    service = _test_service(conn, limits=RefreshLimits())
+    service._deps = replace(service._deps, client=MismatchClient(), get_peer_id=lambda value: int(value.id))
+
+    entity, error = await service._resolve_entity(42)
+
+    assert entity is None
+    assert error is not None and error["error"] == "entity_not_found"
+    assert "Action:" in str(error["message"])
+    await service.shutdown()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_entity_not_found_is_terminal_and_positive_id_is_valid() -> None:
+    class NotFoundClient(_UnusedClient):
+        async def get_entity(self, entity_id: int) -> object:
+            del entity_id
+            raise PeerIdInvalidError(request=None)
+
+    class ValidClient(_UnusedClient):
+        async def get_entity(self, entity_id: int) -> object:
+            del entity_id
+            return SimpleNamespace(id=42)
+
+    conn = sqlite3.connect(":memory:")
+    service = _test_service(conn, limits=RefreshLimits())
+    service._deps = replace(service._deps, client=NotFoundClient(), get_peer_id=lambda value: int(value.id))
+
+    entity, error = await service._resolve_entity(42)
+    assert entity is None
+    assert error is not None and error["error"] == "entity_not_found"
+    assert "Action:" in str(error["message"])
+
+    service._deps = replace(service._deps, client=ValidClient())
+    entity, error = await service._resolve_entity(42)
+    assert entity is not None and getattr(entity, "id", None) == 42
+    assert error is None
+    await service.shutdown()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_timeout_creates_fk_parent_before_refresh_rows(tmp_path: Path) -> None:
+    class TimeoutClient(_UnusedClient):
+        async def get_entity(self, entity_id: int) -> object:
+            del entity_id
+            await asyncio.sleep(1)
+            raise AssertionError("foreground timeout should cancel resolution")
+
+    path = tmp_path / "unknown-fk.sqlite"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA foreign_keys = ON")
+    service = _test_service(conn, limits=RefreshLimits(0.01, 0.02, 0.05, 1))
+    service._deps = replace(service._deps, client=TimeoutClient())
+
+    result = await service._progressive_miss(42, now=100, started_at=100)
+
+    assert result["error"] == "entity_info_pending"
+    assert conn.execute("SELECT type FROM entities WHERE id=42").fetchone() == ("unknown",)
+    assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == ("pending",)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM entity_detail_sections WHERE entity_id=42 AND status='pending'"
+    ).fetchone() == (5,)
+    await service.shutdown()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_timeout_then_terminal_not_found_stays_terminal_on_reread(tmp_path: Path) -> None:
+    class TimeoutThenNotFoundClient(_UnusedClient):
+        calls = 0
+
+        async def get_entity(self, entity_id: int) -> object:
+            del entity_id
+            self.calls += 1
+            if self.calls == 1:
+                await asyncio.sleep(1)
+            raise ValueError("entity no longer exists")
+
+    path = tmp_path / "unknown-terminal.sqlite"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA foreign_keys = ON")
+    client = TimeoutThenNotFoundClient()
+    service = _test_service(conn, limits=RefreshLimits(0.01, 0.02, 0.05, 1))
+    service._deps = replace(service._deps, client=client)
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+
+    pending = await service._progressive_miss(42, now=100, started_at=100)
+    assert pending["error"] == "entity_info_pending"
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    assert conn.execute("SELECT status, reason FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+        "rejected",
+        "entity_not_found",
+    )
+
+    reread = await service.get_entity_info({"entity_id": 42})
+
+    assert reread["error"] == "entity_not_found"
+    assert "Action:" in str(reread["message"])
+    assert coordinator.queue_depth == 0
+    assert client.calls == 2
+    await service.shutdown()
+    conn.close()
+
+
+def test_refresh_rejection_is_fk_safe_without_unknown_parent(tmp_path: Path) -> None:
+    path = tmp_path / "rejected-fk.sqlite"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA foreign_keys = ON")
+    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
+
+    repo.mark_refresh_rejected(42, now=100)
+
+    assert conn.execute("SELECT 1 FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() is None
+    assert conn.execute("SELECT 1 FROM entity_detail_sections WHERE entity_id=42").fetchone() is None
     conn.close()
 
 
