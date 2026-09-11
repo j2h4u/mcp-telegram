@@ -239,7 +239,22 @@ def test_group_pair_generation_only_stale_cursor_does_not_mutate_anything() -> N
 
 def test_group_pair_detail_revision_only_stale_cursor_does_not_mutate_anything() -> None:
     conn, service, _client = _service()
-    _assert_stale_group_cursor_is_unchanged(conn, service, "profile_revision")
+    repo = service._profiles
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    conn.execute(
+        "INSERT INTO entity_details(entity_id, detail_json, fetched_at, profile_revision) VALUES (?, ?, ?, ?)",
+        (-123, '{"schema":1}', 100, cursor.profile_revision + 1),
+    )
+    conn.commit()
+    expected = _profile_snapshot(conn)
+    assert not repo.commit_group_full_chat_pair(
+        cursor,
+        EntitySectionCommit({"about": "stale"}),
+        EntitySectionCommit({"contacts_subscribed": []}),
+        now=101,
+    )
+    assert _profile_snapshot(conn) == expected
     conn.close()
 
 
