@@ -1283,6 +1283,98 @@ class EntityProfileRepository:
             self._record_full_pair_measurement(cursor, full_profile, personal_channel, now=now)
             return self._advance_full_pair_cursor(cursor, now=now)
 
+    def commit_group_full_chat_pair(
+        self,
+        cursor: EntityRefreshCursor,
+        full_profile: EntitySectionCommit,
+        contact_overlap: EntitySectionCommit,
+        *,
+        now: int,
+    ) -> bool:
+        """Atomically commit both legacy-group projections from one observation."""
+        if cursor.next_section != "full_profile":
+            return False
+        self._validate_group_pair_commits(cursor, full_profile, contact_overlap)
+        with self._conn:
+            if not self._cursor_matches(cursor):
+                return False
+            detail = self._read_detail_blob(cursor.entity_id) or self._read_entity_stub(cursor.entity_id)
+            detail = _strip_schema(detail)
+            detail.update(full_profile.detail_patch)
+            detail.update({"common_chats": []})
+            detail.update(contact_overlap.detail_patch)
+            owner_account_id, observation_scope, ownership_observed = _commit_metadata(full_profile, contact_overlap)
+            if not self._write_detail(
+                cursor.entity_id,
+                detail,
+                now=now,
+                expected_revision=cursor.profile_revision,
+                owner_account_id=owner_account_id,
+                observation_scope=observation_scope,
+                ownership_observed=ownership_observed,
+            ):
+                return False
+            self._write_section(
+                cursor.entity_id,
+                "full_profile",
+                full_profile.status,
+                full_profile.reason,
+                _section_payload(detail, "full_profile") if full_profile.payload is None else full_profile.payload,
+                now=now,
+                evidence=full_profile.evidence,
+            )
+            self._write_section(
+                cursor.entity_id,
+                "common_chats",
+                "not_applicable",
+                "not_applicable",
+                [],
+                now=now,
+                evidence=None,
+            )
+            self._write_section(
+                cursor.entity_id,
+                "contact_overlap",
+                contact_overlap.status,
+                contact_overlap.reason,
+                _section_payload(detail, "contact_overlap")
+                if contact_overlap.payload is None
+                else contact_overlap.payload,
+                now=now,
+                evidence=contact_overlap.evidence,
+            )
+            return self._advance_group_full_chat_cursor(cursor, now=now)
+
+    @staticmethod
+    def _validate_group_pair_commits(
+        cursor: EntityRefreshCursor,
+        full_profile: EntitySectionCommit,
+        contact_overlap: EntitySectionCommit,
+    ) -> None:
+        for commit in (full_profile, contact_overlap):
+            if commit.status not in {"fresh", "unavailable"}:
+                raise ValueError("invalid legacy group section status")
+            if commit.evidence is not None and commit.evidence.generation != cursor.generation:
+                raise ValueError("legacy group evidence generation does not match refresh cursor")
+
+    def _advance_group_full_chat_cursor(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
+        predicate, parameters = self._cursor_predicate(cursor)
+        assignments = (
+            "status='pending', retry_at=NULL, reason='refresh_queued', updated_at=?, "
+            "next_section=?, acquisition_cursor=0"
+        )
+        values: tuple[object, ...] = (now, PROFILE_SECTIONS[3])
+        if self._refresh_has("profile_revision") and self._detail_has("profile_revision"):
+            assignments += ", profile_revision=?"
+            values += (cursor.profile_revision + 1,)
+        return (
+            self._conn.execute(
+                "UPDATE entity_profile_refresh_state SET " + assignments + " WHERE " + predicate,
+                (*values, *parameters),
+            ).rowcount
+            == 1
+        )
+
     def _validate_pair_commits(
         self,
         cursor: EntityRefreshCursor,
