@@ -127,6 +127,23 @@ async def test_group_pair_uses_one_rpc_and_commits_independent_projections() -> 
 
 
 @pytest.mark.asyncio
+async def test_group_pair_real_empty_participants_are_complete_empty_overlap() -> None:
+    conn, service, client = _service()
+    client.response = _full_chat(participants=types.ChatParticipants(chat_id=123, participants=[], version=1))
+    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+
+    detail = service._profiles.read(-123, now=100)  # type: ignore[attr-defined]
+    assert detail is not None
+    assert detail.detail["members_count"] == 0
+    assert detail.detail["contacts_subscribed"] == []
+    assert conn.execute(
+        "SELECT status FROM entity_detail_sections WHERE entity_id=-123 AND section='contact_overlap'"
+    ).fetchone() == ("fresh",)
+    await service.shutdown()  # type: ignore[attr-defined]
+    conn.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("bad_chat_id", (True, 123.0, "123", 0, -123, None))
 async def test_group_pair_requires_positive_non_bool_participant_chat_id(bad_chat_id: object) -> None:
     conn, service, client = _service()
@@ -184,27 +201,45 @@ async def test_old_contact_cursor_keeps_independent_fallback() -> None:
     conn.close()
 
 
-def test_group_pair_rejects_stale_generation_or_revision_without_mutation() -> None:
-    conn, service, _client = _service()
-    repo = service._profiles
+def _profile_snapshot(conn: sqlite3.Connection) -> tuple[object, object, object]:
+    return (
+        conn.execute("SELECT detail_json, profile_revision FROM entity_details WHERE entity_id=-123").fetchone(),
+        conn.execute(
+            "SELECT section, status, reason, payload_json FROM entity_detail_sections "
+            "WHERE entity_id=-123 ORDER BY section"
+        ).fetchall(),
+        conn.execute(
+            "SELECT status, retry_at, reason, next_section, acquisition_cursor, generation, profile_revision, "
+            "follow_up_required FROM entity_profile_refresh_state WHERE entity_id=-123"
+        ).fetchone(),
+    )
+
+
+def _assert_stale_group_cursor_is_unchanged(conn: sqlite3.Connection, service: object, column: str) -> None:
+    repo = service._profiles  # type: ignore[attr-defined]
     cursor = repo.next_due_refresh(now=100)
     assert cursor is not None
-    before = conn.execute("SELECT detail_json, profile_revision FROM entity_details WHERE entity_id=-123").fetchone()
-    conn.execute(
-        "UPDATE entity_profile_refresh_state SET generation=generation+1, profile_revision=profile_revision+1 "
-        "WHERE entity_id=-123"
-    )
+    conn.execute(f"UPDATE entity_profile_refresh_state SET {column}={column}+1 WHERE entity_id=-123")
     conn.commit()
+    expected = _profile_snapshot(conn)
     assert not repo.commit_group_full_chat_pair(
         cursor,
         EntitySectionCommit({"about": "stale"}),
         EntitySectionCommit({"contacts_subscribed": []}),
         now=101,
     )
-    assert (
-        conn.execute("SELECT detail_json, profile_revision FROM entity_details WHERE entity_id=-123").fetchone()
-        == before
-    )
+    assert _profile_snapshot(conn) == expected
+
+
+def test_group_pair_generation_only_stale_cursor_does_not_mutate_anything() -> None:
+    conn, service, _client = _service()
+    _assert_stale_group_cursor_is_unchanged(conn, service, "generation")
+    conn.close()
+
+
+def test_group_pair_detail_revision_only_stale_cursor_does_not_mutate_anything() -> None:
+    conn, service, _client = _service()
+    _assert_stale_group_cursor_is_unchanged(conn, service, "profile_revision")
     conn.close()
 
 
