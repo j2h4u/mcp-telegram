@@ -68,9 +68,9 @@ class EntitiesConfig:
 class EntityProfileConfig:
     """Budgets for the progressive entity-profile projection."""
 
-    # Keep the paired FullUser acquisition opt-in until observe-only evidence
-    # proves the additive migration safe for this deployment.
-    full_user_pair_enabled: bool = False
+    # Pair the eligible FullUser projections by default. Set false to roll back
+    # on a release that understands the additive v62 schema.
+    full_user_pair_enabled: bool = True
 
     foreground_resolve_seconds: float = 3.0
     foreground_refresh_wait_seconds: float = 15.0

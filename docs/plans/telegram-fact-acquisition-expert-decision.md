@@ -211,10 +211,13 @@ Exact event fields and denominator definitions are maintained in
 Returned rows and newly materialized rows measure projection overlap, not by
 themselves unnecessary RPCs.
 
-Use an observe-only baseline before enabling reuse. The suggested evaluation
-window is seven days before and seven days after enablement, with at least 100
-eligible successful profile pairs when production volume permits. This is a
-proposed threshold, not a result already measured.
+The deterministic correctness outcome is established by the acceptance
+criteria and live validation; it does not require an observe-only baseline
+before enablement. An observe-only baseline is optional and supports later
+aggregate impact claims. If collected, the suggested evaluation window is
+seven days before and seven days after enablement, with at least 100 eligible
+successful profile pairs when production volume permits. This is a proposed
+threshold, not a result already measured.
 
 ## Acceptance criteria
 
@@ -321,16 +324,17 @@ The final verifier emits one of these states:
 
 ### Post-deploy product validation
 
-Before enablement, capture an observe-only baseline with fixed metric definitions,
-code and configuration versions, window boundaries, eligible pairs, clean
+An observe-only baseline may be captured with fixed metric definitions, code
+and configuration versions, window boundaries, eligible pairs, clean
 successes, actual attempts, section outcomes, readiness latency, foreground
-timeouts, queue freshness debt, FloodWaits, and telemetry loss.
+timeouts, queue freshness debt, FloodWaits, and telemetry loss. It is optional
+for enablement and is used only to support aggregate impact claims.
 
-The target evaluation uses comparable seven-day baseline and post-change
-windows and at least 100 naturally occurring eligible pairs. Do not generate
-artificial Telegram traffic to reach the sample. When volume is lower, the
-slice may remain `SHIPPED_VERIFIED`, while the product effect remains
-`UNPROVEN`.
+An aggregate impact evaluation uses comparable seven-day baseline and
+post-change windows and at least 100 naturally occurring eligible pairs. Do
+not generate artificial Telegram traffic to reach the sample. When volume is
+lower or no baseline was collected, the slice may remain
+`SHIPPED_VERIFIED`, while the aggregate product effect remains `UNPROVEN`.
 
 `PRODUCT_VALIDATED` requires:
 
