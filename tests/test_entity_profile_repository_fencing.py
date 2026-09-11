@@ -160,6 +160,32 @@ def test_pair_mode_is_generation_durable_across_restart_and_flip(tmp_path: Path)
     reopened.close()
 
 
+def test_active_readmission_preserves_failed_retry_and_section_receipts(tmp_path: Path) -> None:
+    path = tmp_path / "active-readmission.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    repo.mark_pending(42, now=100, pair_mode_override="enabled")
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET status='failed', retry_at=777, reason='flood_wait', "
+        "next_section='personal_channel', acquisition_cursor=3 WHERE entity_id=42"
+    )
+    conn.execute(
+        "UPDATE entity_detail_sections SET status='fresh', observed_at=90, reason=NULL, payload_json='{}' "
+        "WHERE entity_id=42 AND section='full_profile'"
+    )
+    conn.commit()
+    repo.mark_pending(42, now=200, reason="auth_scope_changed", pair_mode_override="disabled")
+    assert conn.execute(
+        "SELECT status, retry_at, next_section, acquisition_cursor, generation, pair_mode, follow_up_required "
+        "FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == ("failed", 777, "personal_channel", 3, 1, "enabled", 1)
+    assert conn.execute(
+        "SELECT status, observed_at, reason, payload_json FROM entity_detail_sections "
+        "WHERE entity_id=42 AND section='full_profile'"
+    ).fetchone() == ("fresh", 90, None, "{}")
+    conn.close()
+
+
 def test_generation_and_revision_fences_reject_stale_writers(tmp_path: Path) -> None:
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
@@ -277,6 +303,68 @@ def test_same_generation_channel_completion_ignores_ttl(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_pending_pair_receipt_is_restored_before_local_completion(tmp_path: Path) -> None:
+    path = tmp_path / "pending-pair-repair.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    repo.mark_pending(42, now=100, pair_mode_override="enabled")
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    identity = {"account_generation": 7, "entity_type": "user"}
+    full_evidence = ProfileAcquisitionEvidence(
+        generation=cursor.generation,
+        outcome="usable",
+        provenance={
+            "endpoint": "users.GetFullUser",
+            "declared_fields": list(FULL_PROFILE_OWNED_FIELDS),
+            "materialized_fields": ["about"],
+            "authoritative": True,
+        },
+        normalization_version="entity-profile-full-user-v1",
+        observation_started_at=100,
+        observation_completed_at=101,
+        identity=identity,
+    )
+    channel_evidence = ProfileAcquisitionEvidence(
+        generation=cursor.generation,
+        outcome="absent",
+        provenance={
+            "endpoint": "users.GetFullUser",
+            "declared_fields": ["personal_channel_id", "personal_channel_message", "title", "username"],
+            "materialized_fields": ["personal_channel_id"],
+            "authoritative": True,
+        },
+        normalization_version="entity-profile-full-user-v1",
+        observation_started_at=100,
+        observation_completed_at=101,
+        identity=identity,
+    )
+    assert repo.commit_full_user_pair(
+        cursor,
+        EntitySectionCommit({"about": "old"}, evidence=full_evidence),
+        EntitySectionCommit({"personal_channel": None}, evidence=channel_evidence),
+        now=101,
+    )
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET status='pending', reason='auth_scope_changed', "
+        "next_section='personal_channel', acquisition_cursor=0 WHERE entity_id=42"
+    )
+    conn.execute(
+        "UPDATE entity_detail_sections SET status='pending', observed_at=NULL, reason='auth_scope_changed' "
+        "WHERE entity_id=42 AND section IN ('full_profile', 'personal_channel')"
+    )
+    conn.commit()
+    damaged_cursor = repo.next_due_refresh(now=10_000)
+    assert damaged_cursor is not None
+    assert repo.complete_same_generation_section(damaged_cursor, identity, now=10_000)
+    assert conn.execute(
+        "SELECT status, observed_at FROM entity_detail_sections WHERE entity_id=42 "
+        "AND section IN ('full_profile', 'personal_channel') ORDER BY section"
+    ).fetchall() == [("fresh", 100), ("fresh", 100)]
+    assert conn.execute("SELECT generation FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (2,)
+    conn.close()
+
+
 @pytest.mark.parametrize(
     ("generation_delta", "identity"),
     ((1, {"account_generation": 7, "entity_type": "user"}), (0, {"account_generation": 8, "entity_type": "user"})),
@@ -325,6 +413,9 @@ def test_same_generation_channel_completion_rejects_changed_generation_or_scope(
     assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() != (
         "complete",
     )
+    refreshed_cursor = repo.next_due_refresh(now=10_000)
+    assert refreshed_cursor is not None and refreshed_cursor.next_section == "full_profile"
+    assert refreshed_cursor.generation > fenced_cursor.generation
     conn.close()
 
 

@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import cast
 
-from ..entity_store import EntitySnapshot, upsert_entity_snapshots
+from ..entity_store import EntitySnapshot, ensure_entity_stub, upsert_entity_snapshots
 from ..models import DialogType
 from .contracts import (
     FULL_PROFILE_OWNED_FIELDS,
@@ -334,15 +334,100 @@ class EntityProfileRepository:
         with self._conn:
             if not self._cursor_matches(cursor):
                 return False
-            if not self._same_generation_completion_receipt_is_valid(
+            personal_receipt = self._parse_validated_receipt(
                 cursor.entity_id,
                 "personal_channel",
                 identity=identity,
                 now=now,
                 expected_generation=cursor.generation,
+            )
+            if personal_receipt is None:
+                # A stale, corrupt, or scope-fenced receipt cannot be retried
+                # at this cursor: the next local slice would otherwise repeat
+                # forever without reacquiring the pair.
+                self._start_follow_up_generation(cursor, now=now)
+                return False
+            if not self._restore_pending_pair_section(
+                cursor.entity_id,
+                "personal_channel",
+                personal_receipt,
             ):
                 return False
+
+            follow_up_required = self._restore_pair_predecessors(
+                cursor.entity_id,
+                identity=identity,
+                generation=cursor.generation,
+                now=now,
+            )
+            if follow_up_required and self._refresh_has("follow_up_required"):
+                self._conn.execute(
+                    "UPDATE entity_profile_refresh_state SET follow_up_required=1 WHERE entity_id=? AND generation=?",
+                    (cursor.entity_id, cursor.generation),
+                )
             return self._advance_completed_section(cursor, now=now)
+
+    def _restore_pair_predecessors(
+        self,
+        entity_id: int,
+        *,
+        identity: Mapping[str, object],
+        generation: int,
+        now: int,
+    ) -> bool:
+        """Restore proven pair predecessors and flag unproven scope repairs."""
+        refresh_reason = self._conn.execute(
+            "SELECT reason FROM entity_profile_refresh_state WHERE entity_id=? AND generation=?",
+            (entity_id, generation),
+        ).fetchone()
+        scope_repair = refresh_reason is not None and refresh_reason[0] == "auth_scope_changed"
+        follow_up_required = False
+        full_row = self._receipt_section_state(entity_id, "full_profile")
+        if full_row is None:
+            follow_up_required = True
+        elif full_row[0] == "pending":
+            full_receipt = self._parse_validated_receipt(
+                entity_id,
+                "full_profile",
+                identity=identity,
+                now=now,
+                expected_generation=generation,
+            )
+            if full_receipt is None or not self._restore_pending_pair_section(
+                entity_id,
+                "full_profile",
+                full_receipt,
+            ):
+                follow_up_required = True
+        if scope_repair:
+            follow_up_required = follow_up_required or any(
+                (row := self._receipt_section_state(entity_id, section)) is None or row[0] == "pending"
+                for section in PROFILE_SECTIONS[:4]
+            )
+        return follow_up_required
+
+    def _restore_pending_pair_section(
+        self,
+        entity_id: int,
+        section: str,
+        receipt: _ValidatedReceipt | None,
+    ) -> bool:
+        """Restore terminal metadata for a pending section from its receipt."""
+        if receipt is None:
+            return False
+        row = self._receipt_section_state(entity_id, section)
+        if row is None:
+            return False
+        if row[0] != "pending":
+            return row[0] in {"fresh", "stale", "unavailable"}
+        status = "fresh" if receipt.outcome in {"usable", "absent"} else "unavailable"
+        reason = None if status == "fresh" else f"receipt_{receipt.outcome}"
+        changed = self._conn.execute(
+            "UPDATE entity_detail_sections SET status=?, observed_at=?, reason=?, retry_at=NULL "
+            "WHERE entity_id=? AND section=? AND status='pending'",
+            (status, receipt.observation_started_at, reason, entity_id, section),
+        ).rowcount
+        return changed == 1
 
     def _read_primary_detail(
         self, entity_id: int
@@ -417,6 +502,21 @@ class EntityProfileRepository:
             # Compatibility fixtures can expose only entity_details.
             return
 
+    def ensure_unknown_refresh_parent(self, entity_id: int, *, now: int) -> bool:
+        """Create an unknown entity parent before FK-protected refresh rows."""
+        try:
+            foreign_keys = self._conn.execute("PRAGMA foreign_keys").fetchone()
+            if foreign_keys is None or int(foreign_keys[0]) != 1:
+                return True
+            with self._conn:
+                ensure_entity_stub(
+                    self._conn,
+                    EntitySnapshot(entity_id, "unknown", None, None, None, now),
+                )
+            return True
+        except sqlite3.OperationalError, ValueError:
+            return False
+
     def refresh_state(self, entity_id: int, *, now: int) -> dict[str, object] | None:
         """Return a durable unresolved-refresh state while it is relevant."""
         try:
@@ -466,24 +566,33 @@ class EntityProfileRepository:
         """Make pending explicit where the additive section table is present."""
         try:
             with self._conn:
-                self._upsert_pending_refresh(
+                new_generation = self._upsert_pending_refresh(
                     entity_id,
                     now=now,
                     reason=reason,
                     pair_eligible_override=pair_eligible_override,
                     pair_mode_override=pair_mode_override,
                 )
-                self._conn.executemany(
-                    "INSERT INTO entity_detail_sections(entity_id, section, status, observed_at, reason, payload_json, retry_at) "
-                    "VALUES (?, ?, 'pending', NULL, ?, NULL, NULL) "
-                    "ON CONFLICT(entity_id, section) DO UPDATE SET "
-                    "status=CASE WHEN entity_detail_sections.status='not_applicable' "
-                    "THEN entity_detail_sections.status ELSE 'pending' END, "
-                    "reason=CASE WHEN entity_detail_sections.status='not_applicable' "
-                    "THEN entity_detail_sections.reason ELSE excluded.reason END, retry_at=NULL",
-                    ((entity_id, section, reason) for section in PROFILE_SECTIONS),
-                )
-        except sqlite3.OperationalError:
+                if new_generation:
+                    self._conn.executemany(
+                        "INSERT INTO entity_detail_sections(entity_id, section, status, observed_at, reason, payload_json, retry_at) "
+                        "VALUES (?, ?, 'pending', NULL, ?, NULL, NULL) "
+                        "ON CONFLICT(entity_id, section) DO UPDATE SET "
+                        "status=CASE WHEN entity_detail_sections.status='not_applicable' "
+                        "THEN entity_detail_sections.status ELSE 'pending' END, "
+                        "reason=CASE WHEN entity_detail_sections.status='not_applicable' "
+                        "THEN entity_detail_sections.reason ELSE excluded.reason END, retry_at=NULL",
+                        ((entity_id, section, reason) for section in PROFILE_SECTIONS),
+                    )
+                else:
+                    # Active-generation re-admission must not rewrite evidence,
+                    # timestamps, retry boundaries, or captured pair mode.
+                    self._conn.executemany(
+                        "INSERT OR IGNORE INTO entity_detail_sections(entity_id, section, status, observed_at, reason, payload_json, retry_at) "
+                        "VALUES (?, ?, 'pending', NULL, ?, NULL, NULL)",
+                        ((entity_id, section, reason) for section in PROFILE_SECTIONS),
+                    )
+        except sqlite3.OperationalError, sqlite3.IntegrityError:
             return
 
     def mark_refresh_queued(
@@ -496,18 +605,19 @@ class EntityProfileRepository:
         """Clear rejection state and restore an honest queued reason."""
         try:
             with self._conn:
-                self._upsert_pending_refresh(
+                new_generation = self._upsert_pending_refresh(
                     entity_id,
                     now=self._database_now(),
                     reason=reason,
                     pair_mode_override=pair_mode_override,
                 )
-                self._conn.execute(
-                    "UPDATE entity_detail_sections SET status='pending', reason=?, retry_at=NULL "
-                    "WHERE entity_id=? AND status IN ('pending', 'stale', 'unavailable')",
-                    (reason, entity_id),
-                )
-        except sqlite3.OperationalError:
+                if new_generation:
+                    self._conn.execute(
+                        "UPDATE entity_detail_sections SET status='pending', reason=?, retry_at=NULL "
+                        "WHERE entity_id=? AND status IN ('pending', 'stale', 'unavailable')",
+                        (reason, entity_id),
+                    )
+        except sqlite3.OperationalError, sqlite3.IntegrityError:
             return
 
     def _upsert_pending_refresh(
@@ -518,10 +628,10 @@ class EntityProfileRepository:
         reason: str,
         pair_eligible_override: bool | None = None,
         pair_mode_override: str | None = None,
-    ) -> None:
+    ) -> bool:
         if not self._refresh_has("generation"):
             self._upsert_legacy_pending_refresh(entity_id, now=now, reason=reason)
-            return
+            return True
 
         new_generation, optional_values = self._pending_refresh_state(
             entity_id,
@@ -538,7 +648,15 @@ class EntityProfileRepository:
             "next_section",
             "acquisition_cursor",
         ]
-        values: list[object] = [entity_id, "pending", None, reason, now, PROFILE_SECTIONS[0], 0]
+        values: list[object] = [
+            entity_id,
+            "pending",
+            optional_values.pop("retry_at", None),
+            reason,
+            now,
+            PROFILE_SECTIONS[0],
+            0,
+        ]
         for column, value in optional_values.items():
             if self._refresh_has(column):
                 columns.append(column)
@@ -547,6 +665,7 @@ class EntityProfileRepository:
         self._conn.execute(query, values)
         if new_generation:
             self._reset_pair_measurement(entity_id)
+        return new_generation
 
     def _pending_refresh_state(
         self,
@@ -573,6 +692,7 @@ class EntityProfileRepository:
             column
             for column in (
                 "status",
+                "retry_at",
                 "generation",
                 "started_at",
                 "pair_eligible",
@@ -1653,6 +1773,8 @@ class EntityProfileRepository:
 
     def _advance_completed_section(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
         next_section = _next_profile_section(cursor.next_section)
+        if next_section is None and self._refresh_has("generation") and self._refresh_follow_up_required(cursor):
+            return self._start_follow_up_generation(cursor, now=now) == 1
         predicate, parameters = self._cursor_predicate(cursor)
         if next_section is None:
             assignments = "status='complete', retry_at=NULL, reason='refresh_complete', updated_at=?"
@@ -1713,8 +1835,12 @@ class EntityProfileRepository:
                     "WHERE entity_id=? AND status <> 'not_applicable'",
                     (reason, entity_id),
                 )
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError, sqlite3.IntegrityError:
             return
+
+    def mark_refresh_not_found(self, entity_id: int, *, now: int) -> None:
+        """Persist terminal resolution failure without leaving pending work."""
+        self.mark_refresh_rejected(entity_id, now=now, reason="entity_not_found")
 
     def mark_section_failure(
         self,
@@ -1910,28 +2036,6 @@ class EntityProfileRepository:
         ttl = self._section_ttl_seconds if ttl_seconds is None else max(1, int(ttl_seconds))
         return now < receipt.observation_started_at + ttl
 
-    def _same_generation_completion_receipt_is_valid(
-        self,
-        entity_id: int,
-        section: str,
-        *,
-        identity: Mapping[str, object],
-        now: int,
-        expected_generation: int,
-    ) -> bool:
-        """Accept any terminal outcome from the cursor's generation without TTL."""
-        receipt = self._parse_validated_receipt(
-            entity_id,
-            section,
-            identity=identity,
-            now=now,
-            expected_generation=expected_generation,
-        )
-        if receipt is None:
-            return False
-        row = self._receipt_section_state(entity_id, section)
-        return row is not None and row[0] in {"fresh", "stale", "unavailable"}
-
     def _receipt_section_state(self, entity_id: int, section: str) -> tuple[object, ...] | None:
         return self._conn.execute(
             "SELECT status, observed_at FROM entity_detail_sections WHERE entity_id=? AND section=?",
@@ -2114,7 +2218,11 @@ def _as_int(value: object | None) -> int:
 
 
 def _pending_refresh_is_active(existing: Mapping[str, object] | None) -> bool:
-    return existing is not None and str(existing.get("status")) == "pending" and _as_int(existing.get("generation")) > 0
+    return (
+        existing is not None
+        and str(existing.get("status")) in {"pending", "failed"}
+        and _as_int(existing.get("generation")) > 0
+    )
 
 
 def _active_pending_values(
@@ -2124,11 +2232,12 @@ def _active_pending_values(
 ) -> dict[str, object]:
     return {
         "generation": _as_int(existing["generation"]),
+        "retry_at": existing.get("retry_at"),
         "started_at": existing.get("started_at"),
         "pair_eligible": _as_int(existing.get("pair_eligible")),
-        "follow_up_required": _as_int(existing.get("follow_up_required")),
+        "follow_up_required": 1,
         "profile_revision": _as_int(existing.get("profile_revision")),
-        "pair_mode": existing.get("pair_mode") if pair_mode_override is None else pair_mode_override,
+        "pair_mode": existing.get("pair_mode") or pair_mode_override,
     }
 
 
@@ -2147,17 +2256,29 @@ def _provenance_fields_are_exact(
 def _pending_refresh_upsert_query(columns: list[str]) -> str:
     placeholders = ", ".join("?" for _ in columns)
     updates = [
-        "status='pending'",
-        "retry_at=NULL",
-        "reason=excluded.reason",
-        "updated_at=excluded.updated_at",
-        "next_section=CASE WHEN entity_profile_refresh_state.status='pending' AND entity_profile_refresh_state.next_section IS NOT NULL THEN entity_profile_refresh_state.next_section ELSE excluded.next_section END",
-        "acquisition_cursor=CASE WHEN entity_profile_refresh_state.status='pending' AND entity_profile_refresh_state.next_section IS NOT NULL THEN entity_profile_refresh_state.acquisition_cursor ELSE 0 END",
+        (
+            "status=CASE WHEN excluded.generation=entity_profile_refresh_state.generation "
+            "AND entity_profile_refresh_state.status IN ('pending', 'failed') THEN entity_profile_refresh_state.status ELSE 'pending' END"
+        ),
+        (
+            "retry_at=CASE WHEN excluded.generation=entity_profile_refresh_state.generation "
+            "AND entity_profile_refresh_state.status IN ('pending', 'failed') THEN entity_profile_refresh_state.retry_at ELSE excluded.retry_at END"
+        ),
+        (
+            "reason=CASE WHEN excluded.generation=entity_profile_refresh_state.generation "
+            "AND entity_profile_refresh_state.status IN ('pending', 'failed') THEN entity_profile_refresh_state.reason ELSE excluded.reason END"
+        ),
+        (
+            "updated_at=CASE WHEN excluded.generation=entity_profile_refresh_state.generation "
+            "AND entity_profile_refresh_state.status IN ('pending', 'failed') THEN entity_profile_refresh_state.updated_at ELSE excluded.updated_at END"
+        ),
+        "next_section=CASE WHEN entity_profile_refresh_state.status IN ('pending', 'failed') AND entity_profile_refresh_state.next_section IS NOT NULL THEN entity_profile_refresh_state.next_section ELSE excluded.next_section END",
+        "acquisition_cursor=CASE WHEN entity_profile_refresh_state.status IN ('pending', 'failed') AND entity_profile_refresh_state.next_section IS NOT NULL THEN entity_profile_refresh_state.acquisition_cursor ELSE 0 END",
     ]
     updates.extend(
         [
             (
-                "pair_mode=CASE WHEN entity_profile_refresh_state.status='pending' "
+                "pair_mode=CASE WHEN entity_profile_refresh_state.status IN ('pending', 'failed') "
                 "AND entity_profile_refresh_state.generation=excluded.generation "
                 "THEN COALESCE(entity_profile_refresh_state.pair_mode, excluded.pair_mode) "
                 "ELSE excluded.pair_mode END"

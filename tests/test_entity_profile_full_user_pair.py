@@ -244,6 +244,29 @@ async def test_pair_personal_channel_completion_is_local_and_does_not_repeat_ful
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("entity_type", "bot"), (("user", False), ("bot", True)))
+async def test_personal_channel_pair_guard_requires_pair_eligibility(
+    tmp_path: Path, entity_type: str, bot: bool
+) -> None:
+    conn, service = _prepare(tmp_path / f"pair-ineligible-{entity_type}.sqlite", entity_type=entity_type, bot=bot)
+    client = cast(_PairClient, service._deps.client)  # type: ignore[attr-defined]
+    coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
+    assert coordinator is not None
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET next_section='personal_channel', acquisition_cursor=0, "
+        "pair_eligible=0 WHERE entity_id=42"
+    )
+    conn.commit()
+
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+
+    assert client.full_user_calls == 2
+    await service.shutdown()  # type: ignore[attr-defined]
+    conn.close()
+
+
+@pytest.mark.asyncio
 async def test_disabled_switch_keeps_legacy_two_full_user_acquisitions(tmp_path: Path) -> None:
     conn, service = _prepare(tmp_path / "pair-disabled.sqlite")
     service._deps = replace(service._deps, enable_full_user_pair=False)  # type: ignore[attr-defined]
