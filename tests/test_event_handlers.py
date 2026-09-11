@@ -29,6 +29,7 @@ from mcp_telegram.event_handlers import (
     _EditedMessageEvent,
     _NewMessageEvent,
 )
+from mcp_telegram.history_enrollment import disable_history
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
@@ -417,6 +418,165 @@ async def test_on_new_message_auto_enroll_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_first_seen_private_message_projects_visible_dialog_and_entity(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 7016
+    sender = SimpleNamespace(first_name="Алиса", last_name="Иванова", username="alice")
+    msg = build_mock_message(id=17, text="hello")
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(
+            chat_id=dialog_id,
+            message=msg,
+            is_private=True,
+            get_sender=AsyncMock(return_value=sender),
+        ),
+    )
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    await manager.on_new_message(event)
+
+    expected_sent_at = int(msg.date.timestamp())
+    dialog_row = sync_db.execute(
+        "SELECT name, type, last_message_at, snapshot_at, hidden, needs_refresh FROM dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone()
+    assert dialog_row is not None
+    assert dialog_row[:3] == ("Алиса Иванова", "user", expected_sent_at)
+    assert dialog_row[3] is not None and dialog_row[3] > 0
+    assert dialog_row[4:] == (0, 1)
+    assert sync_db.execute(
+        "SELECT type, name, username, name_normalized FROM entities WHERE id=?", (dialog_id,)
+    ).fetchone() == ("user", "Алиса Иванова", "alice", "alisa ivanova")
+    assert sync_db.execute("SELECT message_id FROM messages WHERE dialog_id=?", (dialog_id,)).fetchone() == (17,)
+
+
+@pytest.mark.asyncio
+async def test_first_seen_outgoing_private_message_uses_chat_peer(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 7017
+    peer = SimpleNamespace(first_name="Target", last_name="Bot", username="target_bot", bot=True)
+    msg = build_mock_message(id=18, text="outgoing")
+    msg.out = True
+    get_sender = AsyncMock(side_effect=AssertionError("operator sender must not be used"))
+    get_chat = AsyncMock(return_value=peer)
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(
+            chat_id=dialog_id,
+            message=msg,
+            is_private=True,
+            get_sender=get_sender,
+            get_chat=get_chat,
+        ),
+    )
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    await manager.on_new_message(event)
+
+    assert sync_db.execute("SELECT name, type FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        "Target Bot",
+        "bot",
+    )
+    get_chat.assert_awaited_once_with()
+    get_sender.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_first_seen_outgoing_private_lookup_failure_keeps_message_discoverable(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 7018
+    msg = build_mock_message(id=19, text="lookup failed")
+    msg.out = True
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(
+            chat_id=dialog_id,
+            message=msg,
+            is_private=True,
+            get_chat=AsyncMock(side_effect=RuntimeError("unavailable")),
+        ),
+    )
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    await manager.on_new_message(event)
+
+    assert sync_db.execute(
+        "SELECT name, type, hidden, needs_refresh FROM dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (None, None, 0, 1)
+    assert sync_db.execute("SELECT message_id, out FROM messages WHERE dialog_id=?", (dialog_id,)).fetchone() == (19, 1)
+
+
+@pytest.mark.asyncio
+async def test_first_seen_private_event_respects_explicit_disable_tombstone(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 7020
+    disable_history(sync_db, dialog_id, now=100)
+    sender = SimpleNamespace(first_name="Disabled", last_name="Peer", username="disabled")
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(
+            chat_id=dialog_id,
+            message=build_mock_message(id=21, text="ignored"),
+            is_private=True,
+            get_sender=AsyncMock(return_value=sender),
+        ),
+    )
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    await manager.on_new_message(event)
+
+    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is None
+    assert sync_db.execute("SELECT dialog_id FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is None
+    assert sync_db.execute("SELECT message_id FROM messages WHERE dialog_id=?", (dialog_id,)).fetchone() is None
+
+
+@pytest.mark.asyncio
+async def test_first_seen_private_event_preserves_existing_dialog_facts(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 7019
+    sync_db.execute(
+        "INSERT INTO dialogs(dialog_id, name, type, archived, pinned, members, hidden, unread_count, draft_text) "
+        "VALUES (?, 'Saved', 'user', 1, 1, 9, 1, 4, 'draft')",
+        (dialog_id,),
+    )
+    sync_db.commit()
+    sender = SimpleNamespace(first_name="New", last_name="Name", username="new_name")
+    msg = build_mock_message(id=20, text="new")
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(
+            chat_id=dialog_id,
+            message=msg,
+            is_private=True,
+            get_sender=AsyncMock(return_value=sender),
+        ),
+    )
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    assert manager._auto_enroll_dm(dialog_id, sender=sender, message_date=msg.date, observed_at=100)
+
+    assert sync_db.execute(
+        "SELECT name, archived, pinned, members, hidden, unread_count, draft_text FROM dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone() == ("Saved", 1, 1, 9, 1, 4, "draft")
+
+
+@pytest.mark.asyncio
 async def test_on_new_message_ignores_unsynced_non_private(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
@@ -514,6 +674,67 @@ async def test_auto_enroll_entity_write_fails_gracefully(
     assert row is not None, "dialog must be enrolled even when entity write fails"
     assert row[1] == "syncing"
     assert dialog_id in manager._synced_dialog_ids
+
+
+def test_auto_enroll_rolls_back_enrollment_when_dialog_projection_fails(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 7021
+    sync_db.execute(
+        "CREATE TRIGGER fail_realtime_dialog BEFORE INSERT ON dialogs "
+        "BEGIN SELECT RAISE(ABORT, 'dialog projection failed'); END"
+    )
+    sync_db.commit()
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    sink = MagicMock()
+    manager.bind_demand_sink(sink)
+
+    assert not manager._auto_enroll_dm(
+        dialog_id,
+        sender=SimpleNamespace(first_name="Atomic", last_name="Peer", username="atomic"),
+        message_date=build_mock_message(id=22).date,
+        observed_at=100,
+    )
+    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is None
+    assert (
+        sync_db.execute("SELECT dialog_id FROM full_history_enrollment WHERE dialog_id=?", (dialog_id,)).fetchone()
+        is None
+    )
+    assert sync_db.execute("SELECT dialog_id FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is None
+    sink.offer.assert_not_called()
+
+
+def test_auto_enroll_entity_failure_does_not_rollback_committed_dialog_projection(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 7022
+    sync_db.execute(
+        "CREATE TRIGGER fail_realtime_entity BEFORE INSERT ON entities "
+        "BEGIN SELECT RAISE(ROLLBACK, 'entity projection failed'); END"
+    )
+    sync_db.commit()
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    sink = MagicMock()
+    manager.bind_demand_sink(sink)
+
+    assert manager._auto_enroll_dm(
+        dialog_id,
+        sender=SimpleNamespace(first_name="Committed", last_name="Peer", username="committed"),
+        message_date=build_mock_message(id=23).date,
+        observed_at=100,
+    )
+    assert sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        "syncing",
+    )
+    assert sync_db.execute(
+        "SELECT name, type, needs_refresh FROM dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == ("Committed Peer", "user", 1)
+    assert sync_db.execute("SELECT id FROM entities WHERE id=?", (dialog_id,)).fetchone() is None
+    sink.offer.assert_called_once()
 
 
 @pytest.mark.asyncio

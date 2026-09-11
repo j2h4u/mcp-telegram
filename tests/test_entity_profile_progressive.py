@@ -30,7 +30,7 @@ from mcp_telegram.entity_profile.refresh import (
 )
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.flood import TelegramRpcThrottled
-from mcp_telegram.sync_db import _apply_migration_57, _apply_migrations, ensure_sync_schema
+from mcp_telegram.sync_db import _CURRENT_SCHEMA_VERSION, _apply_migration_57, _apply_migrations, ensure_sync_schema
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
     DemandStatus,
@@ -1055,7 +1055,7 @@ def test_progressive_projection_schema_upgrades_from_v56(tmp_path: Path) -> None
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_profile_refresh_state'"
     ).fetchone() == (1,)
-    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (62,)
+    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (_CURRENT_SCHEMA_VERSION,)
     conn.close()
 
 

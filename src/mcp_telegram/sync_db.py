@@ -13,7 +13,7 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 62
+_CURRENT_SCHEMA_VERSION = 63
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -27,6 +27,7 @@ _SCHEDULED_RECONCILIATION_MIGRATION_59 = 59
 _DOMAIN_RESUME_STATE_MIGRATION_60 = 60
 _ENTITY_PROFILE_ACQUISITION_MIGRATION_61 = 61
 _ENTITY_PROFILE_METADATA_MIGRATION_62 = 62
+_REALTIME_DM_DIALOG_BACKFILL_MIGRATION_63 = 63
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
@@ -3376,6 +3377,66 @@ def _apply_migration_62(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
+def _apply_migration_63(conn: sqlite3.Connection, current: int) -> int:
+    """Materialise visible dialog rows for previously enrolled local peers."""
+    if current >= _REALTIME_DM_DIALOG_BACKFILL_MIGRATION_63:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        has_entities = (
+            conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'entities'").fetchone()
+            is not None
+        )
+        entity_name = "e.name" if has_entities else "NULL"
+        entity_type = "e.type" if has_entities else "NULL"
+        entity_join = "LEFT JOIN entities e ON e.id = sd.dialog_id" if has_entities else ""
+        conn.execute(
+            f"""INSERT OR IGNORE INTO dialogs (
+                    dialog_id, name, type, last_message_at, snapshot_at,
+                    hidden, needs_refresh, archived, pinned,
+                    unread_mentions_count, unread_reactions_count
+                )
+                SELECT sd.dialog_id,
+                       {entity_name},
+                       {entity_type},
+                       COALESCE(
+                           (SELECT MAX(m.sent_at) FROM messages m
+                            WHERE m.dialog_id = sd.dialog_id),
+                           sd.last_event_at,
+                           sd.last_synced_at
+                       ),
+                       COALESCE(sd.last_event_at, sd.last_synced_at, unixepoch()),
+                       0,
+                       1,
+                       0,
+                       0,
+                       0,
+                       0
+                  FROM synced_dialogs sd
+                  LEFT JOIN dialogs d ON d.dialog_id = sd.dialog_id
+                  {entity_join}
+                 WHERE d.dialog_id IS NULL
+                   AND sd.dialog_id > 0
+                   AND sd.status != 'access_lost'
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM full_history_enrollment fhe
+                        WHERE fhe.dialog_id = sd.dialog_id
+                          AND fhe.enabled = 0
+                          AND fhe.source = 'explicit'
+                   )"""
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
+            (_REALTIME_DM_DIALOG_BACKFILL_MIGRATION_63,),
+        )
+        conn.commit()
+        return _REALTIME_DM_DIALOG_BACKFILL_MIGRATION_63
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -3454,6 +3515,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_61(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _ENTITY_PROFILE_METADATA_MIGRATION_62:
         current = _apply_migration_62(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _REALTIME_DM_DIALOG_BACKFILL_MIGRATION_63:
+        current = _apply_migration_63(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

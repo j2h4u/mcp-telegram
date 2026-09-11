@@ -20,7 +20,7 @@ from mcp_telegram.entity_profile.contracts import (
     ProfileAcquisitionEvidence,
 )
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
-from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.sync_db import _CURRENT_SCHEMA_VERSION, ensure_sync_schema
 
 
 def _seed_pending_pair(path: Path, *, mode: str = "enabled") -> None:
@@ -230,7 +230,7 @@ raise AssertionError('migration failpoint did not fire')
     conn.close()
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
-    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (62,)
+    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (_CURRENT_SCHEMA_VERSION,)
     assert conn.execute("SELECT COUNT(*) FROM schema_version WHERE version=?", (version,)).fetchone() == (1,)
     conn.close()
 
