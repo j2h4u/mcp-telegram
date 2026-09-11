@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Protocol, cast, runtime_checkable
 
 from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[import-untyped]
+from telethon.tl import types as tl_types  # type: ignore[import-untyped]
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
 from .auth_scope import TelegramAuthScope
@@ -63,6 +64,8 @@ _MEMBERSHIP_THRESHOLD_LARGE = 1000
 _CHANNEL_DIALOG_ID_OFFSET = 1_000_000_000_000
 _PERSONAL_CHANNEL_PREVIEW_CHARS = 100
 _PAIR_SECTION_COUNT = 2
+_GROUP_FULL_CHAT_ENDPOINT = "messages.GetFullChat"
+_GROUP_FULL_CHAT_NORMALIZATION_VERSION = "entity-profile-group-full-chat-v1"
 
 
 class _AuthScopeUnavailableError(RuntimeError):
@@ -142,6 +145,10 @@ def _attr(obj: object, name: str, default: object | None = None) -> object | Non
 def _opt_int_attr(obj: object, name: str) -> int | None:
     value = _attr(obj, name)
     return value if isinstance(value, int) else None
+
+
+def _positive_non_bool_id(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
 def _opt_str_attr(obj: object, name: str) -> str | None:
@@ -673,6 +680,8 @@ class DaemonEntityInfoService:
         pair_mode: str,
         now: int,
     ) -> DurableRefreshSliceResult:
+        if entity_type is DialogType.GROUP and cursor.next_section == "full_profile":
+            return await self._run_group_full_chat_pair(cursor, now=now)
         if self._pair_enabled(cursor, entity_type, pair_mode=pair_mode):
             return await self._run_full_user_pair_refresh(cursor, entity_type, now=now)
         if self._pair_personal_channel_is_ready(cursor, pair_mode=pair_mode):
@@ -681,6 +690,86 @@ class DaemonEntityInfoService:
             return self._complete_not_applicable_section(cursor, now=now)
         terminal = await self._acquire_and_commit_profile_section(cursor, entity_type, now=now)
         return DurableRefreshSliceResult(cursor.entity_id, terminal)
+
+    async def _run_group_full_chat_pair(
+        self,
+        cursor: EntityRefreshCursor,
+        *,
+        now: int,
+    ) -> DurableRefreshSliceResult:
+        """Acquire one legacy group envelope for independent profile projections."""
+        context = self._profile_section_context(cursor, DialogType.GROUP)
+        try:
+            full_profile, contact_overlap = await self._acquire_group_full_chat_pair(cursor)
+        except RpcAttemptBudgetExhaustedError:
+            self._observe_profile_section_failure(cursor, DialogType.GROUP, actual_attempts=0)
+            raise
+        except TelegramRpcThrottled as exc:
+            terminal = self._handle_profile_section_failure(
+                _ProfileSectionFailure(
+                    cursor=cursor,
+                    entity_type=DialogType.GROUP,
+                    context=context,
+                    now=now,
+                    reason="flood_wait",
+                    retry_at=throttled_retry_at(now, exc.retry_after_seconds),
+                )
+            )
+            return DurableRefreshSliceResult(cursor.entity_id, terminal)
+        except (
+            TimeoutError,
+            OSError,
+            RPCError,
+            RuntimeError,
+            TypeError,
+            AttributeError,
+            ValueError,
+            sqlite3.Error,
+        ) as exc:
+            raise_if_flood_wait_error(exc)
+            terminal = self._handle_profile_section_failure(
+                _ProfileSectionFailure(
+                    cursor=cursor,
+                    entity_type=DialogType.GROUP,
+                    context=context,
+                    now=now,
+                    reason=(
+                        "auth_scope_unavailable"
+                        if isinstance(exc, _AuthScopeUnavailableError)
+                        else type(exc).__name__.lower()
+                    ),
+                    retry_at=failure_retry_at(now),
+                )
+            )
+            return DurableRefreshSliceResult(cursor.entity_id, terminal)
+
+        if self._profile_scope_changed_during_acquisition(context.captured_scope):
+            self._profiles.mark_section_failure(
+                cursor,
+                now=now,
+                reason="auth_scope_changed",
+                retry_at=scope_changed_retry_at(now),
+            )
+            return DurableRefreshSliceResult(cursor.entity_id, DurableRefreshTerminal.FAILURE)
+
+        full_profile = self._with_observation_metadata(full_profile, context.captured_scope)
+        contact_overlap = self._with_observation_metadata(contact_overlap, context.captured_scope)
+        committed = self._profiles.commit_group_full_chat_pair(
+            cursor,
+            full_profile,
+            contact_overlap,
+            now=now,
+        )
+        self._observe_profile_section_commit(
+            cursor,
+            DialogType.GROUP,
+            full_profile,
+            committed=committed,
+        )
+        return DurableRefreshSliceResult(
+            cursor.entity_id,
+            self._success_if_refresh_finished(cursor, committed=committed),
+        )
 
     async def _run_full_user_pair_refresh(
         self,
@@ -1766,17 +1855,188 @@ class DaemonEntityInfoService:
 
     async def _acquire_group_full_profile(self, entity_id: int) -> EntitySectionCommit:
         result = await self._deps.client(self._deps.get_full_chat_request(chat_id=self._legacy_chat_raw_id(entity_id)))
-        full_chat = _attr(result, "full_chat", None)
-        if full_chat is None:
-            raise ValueError("full chat payload is missing")
-        participants = _sequence_attr(_attr(full_chat, "participants", None), "participants")
+        full_chat, participants, _reason = self._validate_group_full_chat_result(result, entity_id)
+        return self._group_full_profile_commit(full_chat, participants)
+
+    async def _acquire_group_full_chat_pair(
+        self,
+        cursor: EntityRefreshCursor,
+    ) -> tuple[EntitySectionCommit, EntitySectionCommit]:
+        """Build full profile and contact overlap from one validated RPC result."""
+        captured_scope = self._capture_pair_scope()
+        if self._deps.full_user_auth_scope is not None and captured_scope is None:
+            raise _AuthScopeUnavailableError("authenticated session scope is unavailable")
+        started_at = int(self._deps.now_provider())
+        result = await self._deps.client(
+            self._deps.get_full_chat_request(chat_id=self._legacy_chat_raw_id(cursor.entity_id))
+        )
+        completed_at = int(self._deps.now_provider())
+        full_chat, participants, participants_reason = self._validate_group_full_chat_result(
+            result,
+            cursor.entity_id,
+        )
+        identity = self._group_full_chat_identity(captured_scope)
+        full_profile = self._group_full_profile_commit(
+            full_chat,
+            participants,
+            evidence=self._group_full_chat_evidence(
+                cursor,
+                outcome="usable",
+                started_at=started_at,
+                completed_at=completed_at,
+                identity=identity,
+                authoritative=True,
+                declared_fields=("about", "invite_link", "members_count"),
+            ),
+        )
+        if participants is None:
+            contact_overlap = EntitySectionCommit(
+                {
+                    "contacts_subscribed": None,
+                    "contacts_subscribed_partial": False,
+                    "contacts_reason": participants_reason,
+                },
+                status="unavailable",
+                reason=participants_reason,
+                evidence=self._group_full_chat_evidence(
+                    cursor,
+                    outcome="unavailable",
+                    started_at=started_at,
+                    completed_at=completed_at,
+                    identity=identity,
+                    authoritative=False,
+                    declared_fields=("contacts_subscribed", "contacts_subscribed_partial", "contacts_reason"),
+                ),
+            )
+        else:
+            participant_ids = self._extract_group_participants(participants)
+            contacts = self._enrich_contact_ids_with_names(participant_ids & self._deps.dm_peer_ids())
+            contact_overlap = EntitySectionCommit(
+                {
+                    "contacts_subscribed": contacts,
+                    "contacts_subscribed_partial": False,
+                    "contacts_reason": None,
+                },
+                payload=contacts,
+                evidence=self._group_full_chat_evidence(
+                    cursor,
+                    outcome="usable",
+                    started_at=started_at,
+                    completed_at=completed_at,
+                    identity=identity,
+                    authoritative=True,
+                    declared_fields=("contacts_subscribed", "contacts_subscribed_partial", "contacts_reason"),
+                ),
+            )
+        return full_profile, contact_overlap
+
+    def _group_full_profile_commit(
+        self,
+        full_chat: object,
+        participants: Sequence[object] | None,
+        *,
+        evidence: ProfileAcquisitionEvidence | None = None,
+    ) -> EntitySectionCommit:
         exported_invite = _attr(full_chat, "exported_invite", None)
         return EntitySectionCommit(
             {
                 "about": _opt_str_attr(full_chat, "about"),
                 "invite_link": _opt_str_attr(exported_invite, "link") if exported_invite is not None else None,
-                "members_count": len(participants) if participants else None,
-            }
+                "members_count": len(participants) if participants is not None else None,
+            },
+            evidence=evidence,
+        )
+
+    def _validate_group_full_chat_result(
+        self,
+        result: object,
+        entity_id: int,
+    ) -> tuple[object, Sequence[object] | None, str | None]:
+        """Validate the exact legacy GetFullChat envelope and participant shape."""
+        if not isinstance(result, tl_types.messages.ChatFull):
+            raise ValueError("full chat envelope is invalid")
+        full_chat = _attr(result, "full_chat", None)
+        if not isinstance(full_chat, tl_types.ChatFull):
+            raise ValueError("legacy chat full payload is invalid")
+        if not isinstance(entity_id, int) or isinstance(entity_id, bool):
+            raise ValueError("legacy chat target id is invalid")
+        raw_chat_id = self._legacy_chat_raw_id(entity_id)
+        if _positive_non_bool_id(_attr(full_chat, "id")) != raw_chat_id:
+            raise ValueError("legacy chat full target does not match")
+        participants, reason = self._validate_group_participants(
+            _attr(full_chat, "participants", None),
+            raw_chat_id,
+        )
+        return full_chat, participants, reason
+
+    @staticmethod
+    def _validate_group_participants(  # noqa: PLR0911
+        raw_participants: object | None,
+        raw_chat_id: int,
+    ) -> tuple[Sequence[object] | None, str | None]:
+        if isinstance(raw_participants, tl_types.ChatParticipants):
+            if _positive_non_bool_id(_attr(raw_participants, "chat_id")) != raw_chat_id:
+                return None, "participants_target_mismatch"
+            candidate = _attr(raw_participants, "participants", None)
+            if not isinstance(candidate, Sequence) or isinstance(candidate, str | bytes | bytearray):
+                return None, "participants_not_sequence"
+            if not DaemonEntityInfoService._group_participants_are_valid(candidate):
+                return None, "participants_malformed"
+            return candidate, None
+        if isinstance(raw_participants, tl_types.ChatParticipantsForbidden):
+            return None, "participants_forbidden"
+        if raw_participants is None:
+            return None, "participants_missing"
+        return None, "participants_malformed"
+
+    @staticmethod
+    def _group_participants_are_valid(participants: Sequence[object]) -> bool:
+        participant_types = (
+            tl_types.ChatParticipant,
+            tl_types.ChatParticipantAdmin,
+            tl_types.ChatParticipantCreator,
+        )
+        return all(
+            isinstance(participant, participant_types)
+            and _positive_non_bool_id(_attr(participant, "user_id")) is not None
+            for participant in participants
+        )
+
+    @staticmethod
+    def _group_full_chat_identity(scope: TelegramAuthScope | None) -> Mapping[str, object] | None:
+        if scope is None:
+            return None
+        return {
+            "auth_scope": scope.as_private_mapping(),
+            "entity_type": DialogType.GROUP.value,
+            "endpoint": _GROUP_FULL_CHAT_ENDPOINT,
+            "normalization_version": _GROUP_FULL_CHAT_NORMALIZATION_VERSION,
+        }
+
+    @staticmethod
+    def _group_full_chat_evidence(  # noqa: PLR0913
+        cursor: EntityRefreshCursor,
+        *,
+        outcome: str,
+        started_at: int,
+        completed_at: int,
+        identity: Mapping[str, object] | None,
+        authoritative: bool,
+        declared_fields: Sequence[str],
+    ) -> ProfileAcquisitionEvidence:
+        return ProfileAcquisitionEvidence(
+            generation=cursor.generation,
+            outcome=outcome,
+            provenance={
+                "endpoint": _GROUP_FULL_CHAT_ENDPOINT,
+                "declared_fields": list(declared_fields),
+                "materialized_fields": list(declared_fields),
+                "authoritative": authoritative,
+            },
+            normalization_version=_GROUP_FULL_CHAT_NORMALIZATION_VERSION,
+            observation_started_at=started_at,
+            observation_completed_at=completed_at,
+            identity=identity,
         )
 
     async def _acquire_common_chats(self, entity_id: int) -> EntitySectionCommit:
@@ -1803,13 +2063,18 @@ class DaemonEntityInfoService:
 
     async def _acquire_group_contact_overlap(self, entity_id: int) -> EntitySectionCommit:
         result = await self._deps.client(self._deps.get_full_chat_request(chat_id=self._legacy_chat_raw_id(entity_id)))
-        full_chat = _attr(result, "full_chat", None)
-        if full_chat is None:
-            raise ValueError("full chat payload is missing")
-        raw_participants = _attr(full_chat, "participants", None)
-        participant_ids = self._extract_group_participants(
-            _sequence_attr(raw_participants, "participants") if raw_participants is not None else ()
-        )
+        _full_chat, participants, reason = self._validate_group_full_chat_result(result, entity_id)
+        if participants is None:
+            return EntitySectionCommit(
+                {
+                    "contacts_subscribed": None,
+                    "contacts_subscribed_partial": False,
+                    "contacts_reason": reason,
+                },
+                status="unavailable",
+                reason=reason,
+            )
+        participant_ids = self._extract_group_participants(participants)
         contacts = self._enrich_contact_ids_with_names(participant_ids & self._deps.dm_peer_ids())
         return EntitySectionCommit(
             {
@@ -3359,7 +3624,5 @@ class DaemonEntityInfoService:
 
     def _extract_group_participants(self, participants: Sequence[object]) -> set[int]:
         return {
-            int(p_user_id)
-            for p in participants
-            if (p_user_id := _opt_int_attr(p, "user_id")) is not None and int(p_user_id) != 0
+            p_user_id for p in participants if (p_user_id := _positive_non_bool_id(_attr(p, "user_id"))) is not None
         }

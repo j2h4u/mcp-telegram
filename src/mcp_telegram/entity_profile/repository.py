@@ -1056,38 +1056,67 @@ class EntityProfileRepository:
             now=now,
             evidence=commit.evidence,
         )
+        detail_revision = (
+            cursor.profile_revision + 1
+            if self._refresh_has("profile_revision") and self._detail_has("profile_revision")
+            else None
+        )
+        changed = self._advance_after_section_write(cursor, now=now, detail_revision=detail_revision)
+        if changed != 1:
+            raise sqlite3.OperationalError("entity profile cursor advance was rejected")
+        return True
+
+    def _advance_after_section_write(
+        self,
+        cursor: EntityRefreshCursor,
+        *,
+        now: int,
+        detail_revision: int | None,
+    ) -> int:
         next_section = _next_profile_section(cursor.next_section)
         if next_section is None:
-            if self._refresh_has("generation"):
-                follow_up = self._refresh_follow_up_required(cursor)
-                if follow_up:
-                    changed = self._start_follow_up_generation(cursor, now=now)
-                else:
-                    predicate, parameters = self._cursor_predicate(cursor)
-                    changed = self._conn.execute(
-                        "UPDATE entity_profile_refresh_state SET status='complete', retry_at=NULL, "
-                        "reason='refresh_complete', updated_at=? WHERE " + predicate,
-                        (now, *parameters),
-                    ).rowcount
-            else:
-                changed = self._conn.execute(
-                    "DELETE FROM entity_profile_refresh_state "
-                    "WHERE entity_id=? AND next_section=? AND acquisition_cursor=?",
-                    (cursor.entity_id, cursor.next_section, cursor.acquisition_cursor),
-                ).rowcount
-        else:
+            return self._finish_section_generation(cursor, now=now, detail_revision=detail_revision)
+        return self._queue_next_section(cursor, next_section=next_section, now=now, detail_revision=detail_revision)
+
+    def _finish_section_generation(
+        self,
+        cursor: EntityRefreshCursor,
+        *,
+        now: int,
+        detail_revision: int | None,
+    ) -> int:
+        if self._refresh_has("generation"):
+            if self._refresh_follow_up_required(cursor):
+                return self._start_follow_up_generation(cursor, now=now, profile_revision=detail_revision)
             predicate, parameters = self._cursor_predicate(cursor)
-            revision_assignment = ""
-            revision_value: tuple[object, ...] = ()
-            if self._refresh_has("profile_revision") and self._detail_has("profile_revision"):
-                revision_assignment = ", profile_revision=?"
-                revision_value = (cursor.profile_revision + 1,)
-            changed = self._conn.execute(
-                "UPDATE entity_profile_refresh_state SET status='pending', retry_at=NULL, reason='refresh_queued', "
-                "updated_at=?, next_section=?, acquisition_cursor=0" + revision_assignment + " WHERE " + predicate,
-                (now, next_section, *revision_value, *parameters),
+            revision_assignment = ", profile_revision=?" if detail_revision is not None else ""
+            revision_value = (detail_revision,) if detail_revision is not None else ()
+            return self._conn.execute(
+                "UPDATE entity_profile_refresh_state SET status='complete', retry_at=NULL, "
+                "reason='refresh_complete', updated_at=?" + revision_assignment + " WHERE " + predicate,
+                (now, *revision_value, *parameters),
             ).rowcount
-        return changed == 1
+        return self._conn.execute(
+            "DELETE FROM entity_profile_refresh_state WHERE entity_id=? AND next_section=? AND acquisition_cursor=?",
+            (cursor.entity_id, cursor.next_section, cursor.acquisition_cursor),
+        ).rowcount
+
+    def _queue_next_section(
+        self,
+        cursor: EntityRefreshCursor,
+        *,
+        next_section: str,
+        now: int,
+        detail_revision: int | None,
+    ) -> int:
+        predicate, parameters = self._cursor_predicate(cursor)
+        revision_assignment = ", profile_revision=?" if detail_revision is not None else ""
+        revision_value = (detail_revision,) if detail_revision is not None else ()
+        return self._conn.execute(
+            "UPDATE entity_profile_refresh_state SET status='pending', retry_at=NULL, reason='refresh_queued', "
+            "updated_at=?, next_section=?, acquisition_cursor=0" + revision_assignment + " WHERE " + predicate,
+            (now, next_section, *revision_value, *parameters),
+        ).rowcount
 
     def _write_detail(  # noqa: PLR0913
         self,
@@ -1191,7 +1220,7 @@ class EntityProfileRepository:
         *,
         now: int,
         evidence: ProfileAcquisitionEvidence | None,
-    ) -> None:
+    ) -> bool:
         observed_at = self._section_observed_at(entity_id, section, status, evidence, now=now)
         columns = ["entity_id", "section", "status", "observed_at", "reason", "payload_json", "retry_at"]
         values: list[object] = [entity_id, section, status, observed_at, reason, _encode_payload(payload), None]
@@ -1202,10 +1231,13 @@ class EntityProfileRepository:
         updates = ", ".join(
             f"{column}=excluded.{column}" for column in columns if column not in {"entity_id", "section"}
         )
-        self._conn.execute(
-            f"INSERT INTO entity_detail_sections({', '.join(columns)}) VALUES ({placeholders}) "
-            f"ON CONFLICT(entity_id, section) DO UPDATE SET {updates}",
-            values,
+        return (
+            self._conn.execute(
+                f"INSERT INTO entity_detail_sections({', '.join(columns)}) VALUES ({placeholders}) "
+                f"ON CONFLICT(entity_id, section) DO UPDATE SET {updates}",
+                values,
+            ).rowcount
+            == 1
         )
 
     def _section_observed_at(
@@ -1282,6 +1314,135 @@ class EntityProfileRepository:
                 return False
             self._record_full_pair_measurement(cursor, full_profile, personal_channel, now=now)
             return self._advance_full_pair_cursor(cursor, now=now)
+
+    def commit_group_full_chat_pair(
+        self,
+        cursor: EntityRefreshCursor,
+        full_profile: EntitySectionCommit,
+        contact_overlap: EntitySectionCommit,
+        *,
+        now: int,
+    ) -> bool:
+        """Atomically commit both legacy-group projections from one observation."""
+        if cursor.next_section != "full_profile":
+            return False
+        self._validate_group_pair_commits(cursor, full_profile, contact_overlap)
+        with self._conn:
+            if not self._cursor_matches(cursor):
+                return False
+            detail = self._group_pair_detail(cursor, full_profile, contact_overlap, now=now)
+            if detail is None:
+                return False
+            self._write_group_pair_sections(cursor, detail, full_profile, contact_overlap, now=now)
+            advanced = self._advance_group_full_chat_cursor(cursor, now=now)
+            if not advanced:
+                raise sqlite3.OperationalError("legacy group cursor advance was rejected")
+            return True
+
+    def _group_pair_detail(
+        self,
+        cursor: EntityRefreshCursor,
+        full_profile: EntitySectionCommit,
+        contact_overlap: EntitySectionCommit,
+        *,
+        now: int,
+    ) -> dict[str, object] | None:
+        detail = self._read_detail_blob(cursor.entity_id) or self._read_entity_stub(cursor.entity_id)
+        detail = _strip_schema(detail)
+        detail.update(full_profile.detail_patch)
+        detail.update({"common_chats": []})
+        detail.update(contact_overlap.detail_patch)
+        owner_account_id, observation_scope, ownership_observed = _commit_metadata(full_profile, contact_overlap)
+        if not self._write_detail(
+            cursor.entity_id,
+            detail,
+            now=now,
+            expected_revision=cursor.profile_revision,
+            owner_account_id=owner_account_id,
+            observation_scope=observation_scope,
+            ownership_observed=ownership_observed,
+        ):
+            return None
+        return detail
+
+    def _write_group_pair_sections(
+        self,
+        cursor: EntityRefreshCursor,
+        detail: Mapping[str, object],
+        full_profile: EntitySectionCommit,
+        contact_overlap: EntitySectionCommit,
+        *,
+        now: int,
+    ) -> None:
+        writes: tuple[tuple[str, str, str | None, object | None, ProfileAcquisitionEvidence | None, str], ...] = (
+            (
+                "full_profile",
+                full_profile.status,
+                full_profile.reason,
+                _section_payload(detail, "full_profile") if full_profile.payload is None else full_profile.payload,
+                full_profile.evidence,
+                "legacy group full profile write was rejected",
+            ),
+            (
+                "common_chats",
+                "not_applicable",
+                "not_applicable",
+                [],
+                None,
+                "legacy group common chats write was rejected",
+            ),
+            (
+                "contact_overlap",
+                contact_overlap.status,
+                contact_overlap.reason,
+                _section_payload(detail, "contact_overlap")
+                if contact_overlap.payload is None
+                else contact_overlap.payload,
+                contact_overlap.evidence,
+                "legacy group contact overlap write was rejected",
+            ),
+        )
+        for section, status, reason, payload, evidence, error in writes:
+            if not self._write_section(
+                cursor.entity_id,
+                section,
+                status,
+                reason,
+                payload,
+                now=now,
+                evidence=evidence,
+            ):
+                raise sqlite3.OperationalError(error)
+
+    @staticmethod
+    def _validate_group_pair_commits(
+        cursor: EntityRefreshCursor,
+        full_profile: EntitySectionCommit,
+        contact_overlap: EntitySectionCommit,
+    ) -> None:
+        for commit in (full_profile, contact_overlap):
+            if commit.status not in {"fresh", "unavailable"}:
+                raise ValueError("invalid legacy group section status")
+            if commit.evidence is not None and commit.evidence.generation != cursor.generation:
+                raise ValueError("legacy group evidence generation does not match refresh cursor")
+
+    def _advance_group_full_chat_cursor(self, cursor: EntityRefreshCursor, *, now: int) -> bool:
+        predicate, parameters = self._cursor_predicate(cursor)
+        assignments = (
+            "status='pending', retry_at=NULL, reason='refresh_queued', updated_at=?, "
+            "next_section=?, acquisition_cursor=0"
+        )
+        values: tuple[object, ...] = (now, PROFILE_SECTIONS[3])
+        if self._refresh_has("profile_revision") and self._detail_has("profile_revision"):
+            assignments += ", profile_revision=?"
+            values += (cursor.profile_revision + 1,)
+        return (
+            self._conn.execute(
+                "UPDATE entity_profile_refresh_state SET " + assignments + " WHERE " + predicate,
+                (*values, *parameters),
+            ).rowcount
+            == 1
+        )
 
     def _validate_pair_commits(
         self,
@@ -1422,18 +1583,34 @@ class EntityProfileRepository:
         ).fetchone()
         return bool(row and row[0])
 
-    def _start_follow_up_generation(self, cursor: EntityRefreshCursor, *, now: int) -> int:
+    def _start_follow_up_generation(
+        self,
+        cursor: EntityRefreshCursor,
+        *,
+        now: int,
+        profile_revision: int | None = None,
+    ) -> int:
         predicate, parameters = self._cursor_predicate(cursor)
+        revision_assignment = ""
+        revision_value: tuple[object, ...] = ()
+        if (
+            profile_revision is not None
+            and self._refresh_has("profile_revision")
+            and self._detail_has("profile_revision")
+        ):
+            revision_assignment = ", profile_revision=?"
+            revision_value = (profile_revision,)
         changed = self._conn.execute(
             "UPDATE entity_profile_refresh_state SET status='pending', retry_at=NULL, "
             "reason='refresh_follow_up', updated_at=?, generation=generation+1, started_at=?, "
-            "pair_eligible=?, follow_up_required=0, next_section=?, acquisition_cursor=0 "
+            "pair_eligible=?, follow_up_required=0, next_section=?, acquisition_cursor=0" + revision_assignment + " "
             "WHERE " + predicate,
             (
                 now,
                 now,
                 int(self._pair_is_eligible(cursor.entity_id, now=now)),
                 PROFILE_SECTIONS[0],
+                *revision_value,
                 *parameters,
             ),
         ).rowcount
