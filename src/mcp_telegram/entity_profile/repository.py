@@ -341,24 +341,21 @@ class EntityProfileRepository:
                 now=now,
                 expected_generation=cursor.generation,
             )
-            if personal_receipt is None:
+            personal_row = self._receipt_section_state(cursor.entity_id, "personal_channel")
+            if (
+                personal_receipt is None
+                or personal_row is None
+                or personal_row[0] not in {"fresh", "stale", "unavailable"}
+            ):
                 # A stale, corrupt, or scope-fenced receipt cannot be retried
                 # at this cursor: the next local slice would otherwise repeat
                 # forever without reacquiring the pair.
                 self._start_follow_up_generation(cursor, now=now)
                 return False
-            if not self._restore_pending_pair_section(
-                cursor.entity_id,
-                "personal_channel",
-                personal_receipt,
-            ):
-                return False
 
-            follow_up_required = self._restore_pair_predecessors(
+            follow_up_required = self._pair_predecessors_require_follow_up(
                 cursor.entity_id,
-                identity=identity,
                 generation=cursor.generation,
-                now=now,
             )
             if follow_up_required and self._refresh_has("follow_up_required"):
                 self._conn.execute(
@@ -367,15 +364,13 @@ class EntityProfileRepository:
                 )
             return self._advance_completed_section(cursor, now=now)
 
-    def _restore_pair_predecessors(
+    def _pair_predecessors_require_follow_up(
         self,
         entity_id: int,
         *,
-        identity: Mapping[str, object],
         generation: int,
-        now: int,
     ) -> bool:
-        """Restore proven pair predecessors and flag unproven scope repairs."""
+        """Flag missing or pending pair predecessors and scope repairs."""
         refresh_reason = self._conn.execute(
             "SELECT reason FROM entity_profile_refresh_state WHERE entity_id=? AND generation=?",
             (entity_id, generation),
@@ -383,51 +378,14 @@ class EntityProfileRepository:
         scope_repair = refresh_reason is not None and refresh_reason[0] == "auth_scope_changed"
         follow_up_required = False
         full_row = self._receipt_section_state(entity_id, "full_profile")
-        if full_row is None:
+        if full_row is None or full_row[0] == "pending":
             follow_up_required = True
-        elif full_row[0] == "pending":
-            full_receipt = self._parse_validated_receipt(
-                entity_id,
-                "full_profile",
-                identity=identity,
-                now=now,
-                expected_generation=generation,
-            )
-            if full_receipt is None or not self._restore_pending_pair_section(
-                entity_id,
-                "full_profile",
-                full_receipt,
-            ):
-                follow_up_required = True
         if scope_repair:
             follow_up_required = follow_up_required or any(
                 (row := self._receipt_section_state(entity_id, section)) is None or row[0] == "pending"
                 for section in PROFILE_SECTIONS[:4]
             )
         return follow_up_required
-
-    def _restore_pending_pair_section(
-        self,
-        entity_id: int,
-        section: str,
-        receipt: _ValidatedReceipt | None,
-    ) -> bool:
-        """Restore terminal metadata for a pending section from its receipt."""
-        if receipt is None:
-            return False
-        row = self._receipt_section_state(entity_id, section)
-        if row is None:
-            return False
-        if row[0] != "pending":
-            return row[0] in {"fresh", "stale", "unavailable"}
-        status = "fresh" if receipt.outcome in {"usable", "absent"} else "unavailable"
-        reason = None if status == "fresh" else f"receipt_{receipt.outcome}"
-        changed = self._conn.execute(
-            "UPDATE entity_detail_sections SET status=?, observed_at=?, reason=?, retry_at=NULL "
-            "WHERE entity_id=? AND section=? AND status='pending'",
-            (status, receipt.observation_started_at, reason, entity_id, section),
-        ).rowcount
-        return changed == 1
 
     def _read_primary_detail(
         self, entity_id: int
