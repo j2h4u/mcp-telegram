@@ -66,7 +66,7 @@ from .activity_contracts import InputPeerResolver
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
-from .history_enrollment import ensure_automatic_dm_enrollment
+from .history_enrollment import EnrollmentOutcome, ensure_automatic_dm_enrollment
 from .hydration_queue import HydrationPriority
 from .messages.sqlite_bundle import (
     find_unique_incoming_human_dm_dialogs,
@@ -191,6 +191,13 @@ class _SenderLike(Protocol):
     username: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _DmIdentity:
+    name: str | None
+    username: str | None
+    entity_type: str
+
+
 class _MessageLike(Protocol):
     id: int
     message: str | None
@@ -207,6 +214,8 @@ class _NewMessageEvent(Protocol):
     message: _MessageLike
 
     async def get_sender(self) -> _SenderLike | None: ...
+
+    async def get_chat(self) -> _SenderLike | None: ...
 
 
 class _EditedMessageEvent(Protocol):
@@ -496,6 +505,26 @@ _UPDATE_DIALOG_LAST_MESSAGE_AT_SQL = (
     "UPDATE dialogs SET last_message_at = MAX(COALESCE(last_message_at, 0), ?),     snapshot_at = ? WHERE dialog_id = ?"
 )
 
+_UPSERT_REALTIME_DM_DIALOG_SQL = """
+INSERT INTO dialogs (
+    dialog_id, name, type, last_message_at, snapshot_at, hidden, needs_refresh,
+    archived, pinned, unread_mentions_count, unread_reactions_count
+) VALUES (?, ?, ?, ?, ?, 0, 1, 0, 0, 0, 0)
+ON CONFLICT(dialog_id) DO UPDATE SET
+    name = COALESCE(dialogs.name, excluded.name),
+    type = COALESCE(dialogs.type, excluded.type),
+    last_message_at = CASE
+        WHEN excluded.last_message_at IS NULL THEN dialogs.last_message_at
+        WHEN dialogs.last_message_at IS NULL THEN excluded.last_message_at
+        ELSE MAX(dialogs.last_message_at, excluded.last_message_at)
+    END,
+    snapshot_at = CASE
+        WHEN dialogs.snapshot_at IS NULL THEN excluded.snapshot_at
+        ELSE MAX(dialogs.snapshot_at, excluded.snapshot_at)
+    END,
+    needs_refresh = 1
+"""
+
 # IN-list rewrite — placeholder count substituted at call site:
 _CLEAR_PINS_NOT_IN_SQL_TEMPLATE = (
     "UPDATE dialogs SET pinned=0, snapshot_at=? WHERE pinned=1 AND dialog_id NOT IN ({placeholders})"
@@ -685,7 +714,77 @@ class EventHandlerManager:
         """Metadata follows an admitted realtime coverage, not raw status text."""
         return coverage is not RealtimeHistoryCoverage.NO_REALTIME_HISTORY
 
-    def _auto_enroll_dm(self, dialog_id: int, sender: _SenderLike | None = None) -> bool:
+    @staticmethod
+    def _dm_identity(sender: _SenderLike | None) -> _DmIdentity | None:
+        if sender is None:
+            return None
+        first = _first_non_empty_str(getattr(sender, "first_name", None)) or ""
+        last = _first_non_empty_str(getattr(sender, "last_name", None)) or ""
+        return _DmIdentity(
+            name=f"{first} {last}".strip() or None,
+            username=_first_non_empty_str(getattr(sender, "username", None)),
+            entity_type=classify_dialog_type(sender).value,
+        )
+
+    def _persist_dm_enrollment(
+        self,
+        dialog_id: int,
+        identity: _DmIdentity | None,
+        *,
+        message_timestamp: int | None,
+        observed_at: int,
+    ) -> EnrollmentOutcome:
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            outcome = ensure_automatic_dm_enrollment(self._conn, dialog_id, now=observed_at)
+            if not outcome.enabled:
+                self._conn.commit()
+                return outcome
+            self._conn.execute(
+                _UPSERT_REALTIME_DM_DIALOG_SQL,
+                (
+                    dialog_id,
+                    identity.name if identity is not None else None,
+                    identity.entity_type if identity is not None else None,
+                    message_timestamp,
+                    observed_at,
+                ),
+            )
+            self._conn.commit()
+            return outcome
+        except BaseException:
+            self._conn.rollback()
+            raise
+
+    def _persist_dm_entity(self, dialog_id: int, identity: _DmIdentity, observed_at: int) -> None:
+        try:
+            with self._conn:
+                upsert_entity_snapshots(
+                    self._conn,
+                    (
+                        EntitySnapshot(
+                            entity_id=dialog_id,
+                            entity_type=identity.entity_type,
+                            name=identity.name,
+                            username=identity.username,
+                            name_normalized=latinize(identity.name) if identity.name else None,
+                            updated_at=observed_at,
+                        ),
+                    ),
+                )
+        except Exception:
+            # Entity enrichment is optional after the mandatory dialog snapshot
+            # has committed; the next refresh can fill a failed cache write.
+            logger.exception("dm_auto_enroll_entity_failed dialog_id=%d", dialog_id)
+
+    def _auto_enroll_dm(
+        self,
+        dialog_id: int,
+        sender: _SenderLike | None = None,
+        *,
+        message_date: datetime | None = None,
+        observed_at: int | None = None,
+    ) -> bool:
         """Enroll a new DM dialog into synced_dialogs on first incoming message.
 
         Called from on_new_message when a private message arrives from a dialog
@@ -694,13 +793,23 @@ class EventHandlerManager:
         added to the in-memory set so subsequent messages are written real-time;
         FullSyncWorker picks up full history in its next batch cycle.
 
-        If sender is provided (types.User), writes an entity row so the resolver
-        can find this contact by name immediately.  Entity write is best-effort —
-        failure does not prevent enrollment.
+        If sender is provided (types.User), writes an entity and dialog snapshot
+        so the resolver can find this contact immediately.  Identity lookup is
+        best-effort: a missing peer still receives a visible thin dialog row.
         """
+        now = int(time.time()) if observed_at is None else observed_at
+        message_timestamp = int(message_date.timestamp()) if message_date is not None else None
+        identity = self._dm_identity(sender)
+
         try:
-            outcome = ensure_automatic_dm_enrollment(self._conn, dialog_id)
-            self._conn.commit()
+            outcome = self._persist_dm_enrollment(
+                dialog_id,
+                identity,
+                message_timestamp=message_timestamp,
+                observed_at=now,
+            )
+            if outcome.enabled and identity is not None:
+                self._persist_dm_entity(dialog_id, identity, now)
             if outcome.enabled and outcome.action in {"queue_full_history", "preserved_enabled_intent"}:
                 self._offer(DemandKind.FULL_SYNC_PAGE)
                 # status='syncing' is stable once inserted — FullSyncWorker only
@@ -714,32 +823,8 @@ class EventHandlerManager:
         except Exception:
             logger.exception("dm_auto_enroll_failed dialog_id=%d", dialog_id)
             return False
-
-        if sender is None:
-            return True
-        try:
-            first = _first_non_empty_str(getattr(sender, "first_name", None)) or ""
-            last = _first_non_empty_str(getattr(sender, "last_name", None)) or ""
-            username = _first_non_empty_str(getattr(sender, "username", None))
-            name: str | None = f"{first} {last}".strip() or None
-            entity_type_str = classify_dialog_type(sender).value
-            with self._conn:
-                upsert_entity_snapshots(
-                    self._conn,
-                    (
-                        EntitySnapshot(
-                            entity_id=dialog_id,
-                            entity_type=entity_type_str,
-                            name=name,
-                            username=username,
-                            name_normalized=latinize(name) if name else None,
-                            updated_at=int(time.time()),
-                        ),
-                    ),
-                )
-            logger.info("dm_auto_enroll_entity dialog_id=%d name=%r", dialog_id, name)
-        except Exception:
-            logger.exception("dm_auto_enroll_entity_failed dialog_id=%d", dialog_id)
+        if identity is not None:
+            logger.info("dm_auto_enroll_entity dialog_id=%d name=%r", dialog_id, identity.name)
         return True
 
     # ------------------------------------------------------------------
@@ -833,12 +918,23 @@ class EventHandlerManager:
             self._offer(DemandKind.SCHEDULED_REPAIR, DemandKind.SCHEDULED_DISCOVERY)
         status, _ = self._realtime_history_status.read_status(dialog_id)
         if event.is_private and status is None:
-            sender = None
+            peer = None
             try:
-                sender = await event.get_sender()
+                lookup = (
+                    getattr(event, "get_chat", None)
+                    if bool(getattr(event.message, "out", False))
+                    else getattr(event, "get_sender", None)
+                )
+                if callable(lookup):
+                    peer = await cast(Callable[[], Awaitable[_SenderLike | None]], lookup)()
             except _DM_AUTO_ENROLL_SENDER_EXCEPTIONS:
-                logger.debug("dm_auto_enroll_sender_fetch_failed dialog_id=%d", dialog_id)
-            self._auto_enroll_dm(dialog_id, sender=sender)
+                logger.debug("dm_auto_enroll_peer_fetch_failed dialog_id=%d", dialog_id)
+            self._auto_enroll_dm(
+                dialog_id,
+                sender=peer,
+                message_date=event.message.date,
+                observed_at=int(time.time()),
+            )
             coverage = self._realtime_coverage(dialog_id)
         return coverage
 

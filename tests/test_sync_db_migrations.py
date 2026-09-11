@@ -713,7 +713,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 62
+        assert _CURRENT_SCHEMA_VERSION == 63
 
 
 def test_genuine_v61_fixture_upgrades_to_v62_and_reopens_idempotently(
@@ -1494,7 +1494,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 62
+        assert _CURRENT_SCHEMA_VERSION == 63
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:
@@ -1661,6 +1661,57 @@ def test_migration_v25_ignores_non_own_only(tmp_path: Path) -> None:
 
         row_pending = _fetchone_row(conn, "SELECT dialog_id FROM dialogs WHERE dialog_id = ?", (pending_id,))
         assert row_pending is None, "non-own_only 'pending' peer must NOT get a thin dialogs row"
+
+
+def test_migration_v63_repairs_positive_synced_dialog_orphans(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute(
+            "INSERT INTO synced_dialogs(dialog_id, status, last_event_at, last_synced_at) VALUES (?, 'synced', ?, ?)",
+            (12345, 1700000002, 1700000001),
+        )
+        conn.execute(
+            "INSERT INTO entities(id, type, name, name_normalized, updated_at) VALUES (?, 'bot', ?, ?, ?)",
+            (12345, "Exact Bot", "exact bot", 1700000000),
+        )
+        conn.execute(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, text) VALUES (?, ?, ?, ?)",
+            (12345, 1, 1700000005, "hello"),
+        )
+        conn.execute(
+            "INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, 'access_lost')",
+            (12346,),
+        )
+        conn.execute(
+            "INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, 'synced')",
+            (12348,),
+        )
+        conn.execute(
+            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) "
+            "VALUES (?, 0, 'explicit', 1700000000)",
+            (12348,),
+        )
+        conn.execute(
+            "INSERT INTO dialogs(dialog_id, name, type, hidden, archived, pinned, needs_refresh, draft_text) "
+            "VALUES (?, 'Keep', 'user', 1, 1, 1, 0, 'draft')",
+            (12347,),
+        )
+        conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, 'synced')", (12347,))
+        conn.execute("DELETE FROM schema_version WHERE version = 63")
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        assert conn.execute(
+            "SELECT name, type, last_message_at, hidden, needs_refresh FROM dialogs WHERE dialog_id=?", (12345,)
+        ).fetchone() == ("Exact Bot", "bot", 1700000005, 0, 1)
+        assert conn.execute("SELECT dialog_id FROM dialogs WHERE dialog_id=?", (12346,)).fetchone() is None
+        assert conn.execute("SELECT dialog_id FROM dialogs WHERE dialog_id=?", (12348,)).fetchone() is None
+        assert conn.execute(
+            "SELECT name, type, hidden, archived, pinned, needs_refresh, draft_text FROM dialogs WHERE dialog_id=?",
+            (12347,),
+        ).fetchone() == ("Keep", "user", 1, 1, 1, 0, "draft")
 
 
 def test_startup_repair_reclassifies_persisted_replies_rows(tmp_path: Path) -> None:
