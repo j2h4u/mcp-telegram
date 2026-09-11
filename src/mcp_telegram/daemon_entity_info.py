@@ -147,6 +147,10 @@ def _opt_int_attr(obj: object, name: str) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def _positive_non_bool_id(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
 def _opt_str_attr(obj: object, name: str) -> str | None:
     value = _attr(obj, name)
     return value if isinstance(value, str) else None
@@ -1954,8 +1958,10 @@ class DaemonEntityInfoService:
         full_chat = _attr(result, "full_chat", None)
         if not isinstance(full_chat, tl_types.ChatFull):
             raise ValueError("legacy chat full payload is invalid")
+        if not isinstance(entity_id, int) or isinstance(entity_id, bool):
+            raise ValueError("legacy chat target id is invalid")
         raw_chat_id = self._legacy_chat_raw_id(entity_id)
-        if _opt_int_attr(full_chat, "id") != raw_chat_id:
+        if _positive_non_bool_id(_attr(full_chat, "id")) != raw_chat_id:
             raise ValueError("legacy chat full target does not match")
         raw_participants = _attr(full_chat, "participants", None)
         participants: Sequence[object] | None = None
@@ -1976,7 +1982,9 @@ class DaemonEntityInfoService:
                     if any(not isinstance(participant, participant_types) for participant in candidate):
                         reason = "participants_malformed"
                     else:
-                        if any(_opt_int_attr(participant, "user_id") in {None, 0} for participant in candidate):
+                        if any(
+                            _positive_non_bool_id(_attr(participant, "user_id")) is None for participant in candidate
+                        ):
                             reason = "participants_malformed"
                         else:
                             participants = candidate
@@ -3610,7 +3618,5 @@ class DaemonEntityInfoService:
 
     def _extract_group_participants(self, participants: Sequence[object]) -> set[int]:
         return {
-            int(p_user_id)
-            for p in participants
-            if (p_user_id := _opt_int_attr(p, "user_id")) is not None and int(p_user_id) != 0
+            p_user_id for p in participants if (p_user_id := _positive_non_bool_id(_attr(p, "user_id"))) is not None
         }
