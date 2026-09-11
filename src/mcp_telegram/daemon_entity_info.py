@@ -1947,7 +1947,7 @@ class DaemonEntityInfoService:
             evidence=evidence,
         )
 
-    def _validate_group_full_chat_result(  # noqa: PLR0912
+    def _validate_group_full_chat_result(
         self,
         result: object,
         entity_id: int,
@@ -1963,38 +1963,44 @@ class DaemonEntityInfoService:
         raw_chat_id = self._legacy_chat_raw_id(entity_id)
         if _positive_non_bool_id(_attr(full_chat, "id")) != raw_chat_id:
             raise ValueError("legacy chat full target does not match")
-        raw_participants = _attr(full_chat, "participants", None)
-        participants: Sequence[object] | None = None
-        reason: str | None = None
-        if isinstance(raw_participants, tl_types.ChatParticipants):
-            if raw_participants.chat_id != raw_chat_id:
-                reason = "participants_target_mismatch"
-            else:
-                candidate = _attr(raw_participants, "participants", None)
-                if not isinstance(candidate, Sequence) or isinstance(candidate, str | bytes | bytearray):
-                    reason = "participants_not_sequence"
-                else:
-                    participant_types = (
-                        tl_types.ChatParticipant,
-                        tl_types.ChatParticipantAdmin,
-                        tl_types.ChatParticipantCreator,
-                    )
-                    if any(not isinstance(participant, participant_types) for participant in candidate):
-                        reason = "participants_malformed"
-                    else:
-                        if any(
-                            _positive_non_bool_id(_attr(participant, "user_id")) is None for participant in candidate
-                        ):
-                            reason = "participants_malformed"
-                        else:
-                            participants = candidate
-        elif isinstance(raw_participants, tl_types.ChatParticipantsForbidden):
-            reason = "participants_forbidden"
-        elif raw_participants is None:
-            reason = "participants_missing"
-        else:
-            reason = "participants_malformed"
+        participants, reason = self._validate_group_participants(
+            _attr(full_chat, "participants", None),
+            raw_chat_id,
+        )
         return full_chat, participants, reason
+
+    @staticmethod
+    def _validate_group_participants(  # noqa: PLR0911
+        raw_participants: object | None,
+        raw_chat_id: int,
+    ) -> tuple[Sequence[object] | None, str | None]:
+        if isinstance(raw_participants, tl_types.ChatParticipants):
+            if _positive_non_bool_id(_attr(raw_participants, "chat_id")) != raw_chat_id:
+                return None, "participants_target_mismatch"
+            candidate = _attr(raw_participants, "participants", None)
+            if not isinstance(candidate, Sequence) or isinstance(candidate, str | bytes | bytearray):
+                return None, "participants_not_sequence"
+            if not DaemonEntityInfoService._group_participants_are_valid(candidate):
+                return None, "participants_malformed"
+            return candidate, None
+        if isinstance(raw_participants, tl_types.ChatParticipantsForbidden):
+            return None, "participants_forbidden"
+        if raw_participants is None:
+            return None, "participants_missing"
+        return None, "participants_malformed"
+
+    @staticmethod
+    def _group_participants_are_valid(participants: Sequence[object]) -> bool:
+        participant_types = (
+            tl_types.ChatParticipant,
+            tl_types.ChatParticipantAdmin,
+            tl_types.ChatParticipantCreator,
+        )
+        return all(
+            isinstance(participant, participant_types)
+            and _positive_non_bool_id(_attr(participant, "user_id")) is not None
+            for participant in participants
+        )
 
     @staticmethod
     def _group_full_chat_identity(scope: TelegramAuthScope | None) -> Mapping[str, object] | None:

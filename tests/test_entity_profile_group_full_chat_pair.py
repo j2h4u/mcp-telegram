@@ -127,6 +127,110 @@ async def test_group_pair_uses_one_rpc_and_commits_independent_projections() -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bad_chat_id", (True, 123.0, "123", 0, -123, None))
+async def test_group_pair_requires_positive_non_bool_participant_chat_id(bad_chat_id: object) -> None:
+    conn, service, client = _service()
+    participants = types.ChatParticipants(chat_id=123, participants=[], version=1)
+    participants.chat_id = cast(int, bad_chat_id)
+    client.response = _full_chat(participants=participants)
+    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    assert conn.execute(
+        "SELECT status, reason FROM entity_detail_sections WHERE entity_id=-123 AND section='contact_overlap'"
+    ).fetchone() == ("unavailable", "participants_target_mismatch")
+    await service.shutdown()  # type: ignore[attr-defined]
+    conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_target", (True, 123.0, "123", 0, -123, None))
+async def test_group_pair_rejects_non_positive_or_non_int_target(bad_target: object) -> None:
+    conn, service, client = _service()
+    response = _full_chat()
+    response.full_chat.id = cast(int, bad_target)
+    client.response = response
+    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    assert conn.execute(
+        "SELECT status, reason, next_section FROM entity_profile_refresh_state WHERE entity_id=-123"
+    ).fetchone() == ("failed", "valueerror", "full_profile")
+    await service.shutdown()  # type: ignore[attr-defined]
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_group_pair_sections_share_the_observation_boundary() -> None:
+    conn, service, _client = _service()
+    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    assert conn.execute(
+        "SELECT observation_started_at, observation_completed_at FROM entity_detail_sections "
+        "WHERE entity_id=-123 AND section IN ('full_profile','contact_overlap') ORDER BY section"
+    ).fetchall() == [(100, 100), (100, 100)]
+    await service.shutdown()  # type: ignore[attr-defined]
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_old_contact_cursor_keeps_independent_fallback() -> None:
+    conn, service, client = _service()
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET next_section='contact_overlap', acquisition_cursor=0 WHERE entity_id=-123"
+    )
+    conn.commit()
+    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    assert client.calls == ["full_chat"]
+    assert conn.execute("SELECT next_section FROM entity_profile_refresh_state WHERE entity_id=-123").fetchone() == (
+        "avatar_history",
+    )
+    await service.shutdown()  # type: ignore[attr-defined]
+    conn.close()
+
+
+def test_group_pair_rejects_stale_generation_or_revision_without_mutation() -> None:
+    conn, service, _client = _service()
+    repo = service._profiles
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    before = conn.execute("SELECT detail_json, profile_revision FROM entity_details WHERE entity_id=-123").fetchone()
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET generation=generation+1, profile_revision=profile_revision+1 "
+        "WHERE entity_id=-123"
+    )
+    conn.commit()
+    assert not repo.commit_group_full_chat_pair(
+        cursor,
+        EntitySectionCommit({"about": "stale"}),
+        EntitySectionCommit({"contacts_subscribed": []}),
+        now=101,
+    )
+    assert (
+        conn.execute("SELECT detail_json, profile_revision FROM entity_details WHERE entity_id=-123").fetchone()
+        == before
+    )
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_completion_follow_up_starts_one_fenced_generation() -> None:
+    conn, service, client = _service()
+    adapter = EntityProfileDemandAdapter(service.refresh_coordinator)  # type: ignore[attr-defined]
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=-123").fetchone() == (
+        "complete",
+    )
+    assert service._profiles.request_follow_up(-123, now=100)  # type: ignore[attr-defined]
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    detail_revision = conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=-123").fetchone()[0]
+    assert conn.execute(
+        "SELECT generation, profile_revision, next_section, acquisition_cursor, follow_up_required "
+        "FROM entity_profile_refresh_state WHERE entity_id=-123"
+    ).fetchone() == (2, detail_revision, "avatar_history", 0, 0)
+    assert client.calls == ["full_chat", "search", "full_chat"]
+    await service.shutdown()  # type: ignore[attr-defined]
+    conn.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ("forbidden", "missing", "nonsequence", "malformed"))
 async def test_group_pair_keeps_full_profile_when_participants_are_unavailable(kind: str) -> None:
     conn, service, client = _service()
