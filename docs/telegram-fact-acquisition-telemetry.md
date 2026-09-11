@@ -34,10 +34,12 @@ summary has an explicit `event_count` denominator and these dimensions:
 The pair-mode value is captured per generation. A generation started with the
 switch disabled remains a disabled generation after restart or a configuration
 flip; a later generation can capture the newly enabled value. The additive
-ownership and measurement columns are introduced by schema migration v62.
-Rollouts should start with the switch disabled, confirm migration completion,
-then enable it. The supported rollback is enabled to disabled to enabled on a
-v62-aware binary; arbitrary older binaries are unsupported.
+ownership and measurement columns are introduced by schema migration v62. The
+default is enabled on v62-aware releases. Optional observe-only measurement
+supports aggregate impact claims and is not a prerequisite for deterministic
+one-RPC correctness or enablement. The supported rollback is enabled to
+disabled to enabled on a v62-aware binary; arbitrary older binaries are
+unsupported.
 
 `telegram.rpc_admission` remains the authoritative transport admission stream.
 Profile `actual_attempts` is intentionally independent and is not added to
@@ -52,4 +54,5 @@ failure counts. Loss never changes profile persistence, reuse decisions, or
 RPC admission.
 
 See the [fact acquisition decision](plans/telegram-fact-acquisition-expert-decision.md)
-for acceptance criteria and the proposed observe-only evaluation windows.
+for deterministic acceptance criteria and the optional observe-only evaluation
+windows for aggregate impact claims.

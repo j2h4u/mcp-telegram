@@ -50,6 +50,7 @@ def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
     assert config.flood_wait == FloodWaitConfig()
     assert config.telegram_rpc == TelegramRpcConfig()
     assert config.entity_profile == EntityProfileConfig()
+    assert config.entity_profile.full_user_pair_enabled is True
     assert config.scheduling == SchedulingConfig()
     assert config.scheduling.activity_rpc_timeout_seconds == 120.0
     assert config.scheduling.fact_hydration == FactHydrationConfig()
@@ -115,6 +116,17 @@ dir = "/state"
         load_config(invalid)
     with pytest.raises(ValueError, match="below daemon IPC timeout"):
         EntityProfileConfig(refresh_timeout_seconds=30)
+
+    rollback = _write_config(
+        tmp_path,
+        """[state]
+dir = "/state"
+
+[entity_profile]
+full_user_pair_enabled = false
+""",
+    )
+    assert load_config(rollback).entity_profile.full_user_pair_enabled is False
 
 
 def test_fact_hydration_config_rejects_non_positive_values() -> None:
