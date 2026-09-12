@@ -13,7 +13,7 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 66
+_CURRENT_SCHEMA_VERSION = 67
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -31,6 +31,7 @@ _REALTIME_DM_DIALOG_BACKFILL_MIGRATION_63 = 63
 _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64 = 64
 _PUBLISHED_DIALOG_READ_CURSORS_MIGRATION_65 = 65
 _CANONICAL_DIALOG_FACTS_MIGRATION_66 = 66
+_LOCAL_FOLDER_PROJECTION_MIGRATION_67 = 67
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
@@ -851,6 +852,56 @@ CREATE TABLE IF NOT EXISTS dialog_directory_published_pins (
     position INTEGER NOT NULL CHECK(position >= 0),
     PRIMARY KEY(folder_id, dialog_id)
 ) WITHOUT ROWID
+"""
+
+_TELEGRAM_FOLDER_RULES_DDL = """
+CREATE TABLE IF NOT EXISTS telegram_folder_rules (
+    namespace       TEXT NOT NULL,
+    folder_id       INTEGER NOT NULL,
+    title           TEXT NOT NULL,
+    rule_kind       TEXT NOT NULL CHECK(rule_kind IN ('filter', 'chatlist', 'default')),
+    source_position INTEGER NOT NULL CHECK(source_position >= 0),
+    rule_json       TEXT NOT NULL,
+    PRIMARY KEY(namespace, folder_id)
+) WITHOUT ROWID
+"""
+
+_TELEGRAM_FOLDER_MEMBERS_DDL = """
+CREATE TABLE IF NOT EXISTS telegram_folder_local_members (
+    namespace    TEXT NOT NULL,
+    folder_id    INTEGER NOT NULL,
+    dialog_id    INTEGER NOT NULL,
+    state        TEXT NOT NULL CHECK(state IN ('present', 'unknown')),
+    pin_position INTEGER CHECK(pin_position >= 0),
+    PRIMARY KEY(namespace, folder_id, dialog_id)
+) WITHOUT ROWID
+"""
+
+_TELEGRAM_FOLDER_PROJECTION_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS telegram_folder_projection_state (
+    singleton                    INTEGER PRIMARY KEY CHECK(singleton = 1),
+    account_id                   INTEGER,
+    canonical_generation         INTEGER,
+    accepted_rule_token          TEXT,
+    rule_observation_started_at  INTEGER,
+    completed_at                 INTEGER,
+    canonical_observed_at        INTEGER,
+    next_mute_expiry             INTEGER,
+    coverage_status              TEXT NOT NULL DEFAULT 'unavailable' CHECK(coverage_status IN ('complete', 'unavailable')),
+    last_attempt_at              INTEGER,
+    last_outcome                 TEXT,
+    next_retry_at                INTEGER,
+    consecutive_failures         INTEGER NOT NULL DEFAULT 0 CHECK(consecutive_failures >= 0)
+)
+"""
+
+_TELEGRAM_FOLDER_PENDING_OBSERVATION_DDL = """
+CREATE TABLE IF NOT EXISTS telegram_folder_pending_observation (
+    singleton   INTEGER PRIMARY KEY CHECK(singleton = 1),
+    token       TEXT NOT NULL,
+    started_at  INTEGER NOT NULL,
+    rules_json  TEXT NOT NULL
+)
 """
 
 _DELTA_ACCESS_RECOVERY_STATE_DDL = """
@@ -3696,6 +3747,34 @@ def _apply_migration_66(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
+def _apply_migration_67(conn: sqlite3.Connection, current: int) -> int:
+    """Cut folder projection over to local canonical directory facts.
+
+    The old folder tables are retained under explicit legacy names.  They are
+    historical projections without canonical provenance and must never be
+    promoted into the new receipt.
+    """
+    if current >= _LOCAL_FOLDER_PROJECTION_MIGRATION_67:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(_TELEGRAM_FOLDER_RULES_DDL)
+        conn.execute(_TELEGRAM_FOLDER_MEMBERS_DDL)
+        conn.execute(_TELEGRAM_FOLDER_PROJECTION_STATE_DDL)
+        conn.execute(_TELEGRAM_FOLDER_PENDING_OBSERVATION_DDL)
+        conn.execute("INSERT OR IGNORE INTO telegram_folder_projection_state(singleton) VALUES (1)")
+        conn.execute("DELETE FROM daemon_state WHERE key LIKE 'folder_snapshot_staging_%'")
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
+            (_LOCAL_FOLDER_PROJECTION_MIGRATION_67,),
+        )
+        conn.commit()
+        return _LOCAL_FOLDER_PROJECTION_MIGRATION_67
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -3782,6 +3861,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_65(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_FACTS_MIGRATION_66:
         current = _apply_migration_66(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _LOCAL_FOLDER_PROJECTION_MIGRATION_67:
+        current = _apply_migration_67(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

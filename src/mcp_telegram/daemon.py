@@ -1084,6 +1084,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
             priority=HydrationPriority.BACKFILL,
         ),
         topic_refresher=topic_refresher,
+        folder_projection_reproject=lambda: folder_repository.ensure_mute_projection(now=int(time.time())),
         policy=DaemonApiPolicy(
             read_at_ttl_seconds=config.freshness.read_receipts.read_at_ttl_seconds,
             deleted_message_visibility_seconds=config.freshness.inbox.deleted_message_visibility_seconds,

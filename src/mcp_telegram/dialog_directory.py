@@ -30,6 +30,7 @@ from .dialog_directory_tl import (
     normalize_pinned_dialogs_response,
 )
 from .flood import TelegramRpcThrottled
+from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .read_state import apply_read_cursor
 from .sync_db import _open_sync_db
 from .telegram_demand import (
@@ -708,6 +709,10 @@ class CanonicalDialogDirectory:
             "UPDATE dialog_directory_publication SET account_id=?,generation=?,observation_started_at=?,observation_completed_at=? WHERE singleton=1",
             (account_id, generation, state.observation_started_at, completed_at),
         )
+        # Folder rules are already accepted local state.  Reproject them in
+        # this transaction so readers cannot observe a new catalog with an
+        # old membership generation, and do not trigger another Telegram RPC.
+        SQLiteFolderSnapshotRepository(conn).reproject_current_rules_in_transaction(now=completed_at)
         conn.execute("DELETE FROM dialog_directory_staging WHERE generation=?", (generation,))
         conn.execute("DELETE FROM dialog_directory_baseline WHERE generation=?", (generation,))
         conn.execute("DELETE FROM dialog_directory_pins WHERE generation=?", (generation,))

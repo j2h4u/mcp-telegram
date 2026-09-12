@@ -1,60 +1,23 @@
-"""Variable I/O boundaries used by folder refresh."""
+"""I/O boundaries for folder-rule acquisition and local projection."""
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from typing import Protocol
 
-from .contracts import (
-    FolderDialogCursor,
-    FolderDialogItem,
-    FolderRule,
-    FolderSourceSnapshot,
-    FolderStagingSnapshot,
-)
+from .contracts import FolderRuleObservation
 
 
 class TelegramFolderGateway(Protocol):
-    async def fetch_folders(self) -> tuple[FolderRule, ...]: ...
-
-    def iter_dialogs(self, cursor: FolderDialogCursor | None) -> AsyncIterator[FolderDialogItem]: ...
-
-
-class LegacyTelegramFolderGateway(Protocol):
-    async def fetch_snapshot(self) -> FolderSourceSnapshot: ...
+    async def fetch_rules(self, *, started_at: int) -> FolderRuleObservation: ...
 
 
 class FolderSnapshotRepository(Protocol):
-    def read_generation(self) -> int | None: ...
-
     def read_consecutive_failures(self) -> int: ...
-
     def read_last_outcome(self) -> str | None: ...
-
     def read_last_success_at(self) -> int | None: ...
-
     def read_next_retry_at(self) -> int | None: ...
-
-    def read_staging(self) -> FolderStagingSnapshot | None: ...
-
-    def save_staging(self, snapshot: FolderStagingSnapshot) -> None: ...
-
-    def clear_staging(self) -> None: ...
-
-    def replace_snapshot(
-        self,
-        snapshot: FolderSourceSnapshot,
-        memberships: tuple[tuple[int, int], ...],
-        *,
-        completed_at: int,
-        expected_generation: int | None = None,
-    ) -> int: ...
-
-    def record_attempt(
-        self,
-        *,
-        attempted_at: int,
-        outcome: str,
-        next_retry_at: int | None,
-        consecutive_failures: int,
-    ) -> None: ...
+    def rules_are_fresh(self, *, now: int) -> bool: ...
+    def project_observation(self, observation: FolderRuleObservation, *, completed_at: int) -> int | None: ...
+    def reproject_current_rules(self, *, now: int) -> int | None: ...
+    def next_mute_expiry(self) -> int | None: ...
+    def record_attempt(self, *, attempted_at: int, outcome: str, next_retry_at: int | None, consecutive_failures: int) -> None: ...

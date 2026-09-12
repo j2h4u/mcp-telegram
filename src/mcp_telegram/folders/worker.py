@@ -1,19 +1,16 @@
-"""Daemon-owned single-flight folder projection scheduler."""
+"""Daemon-owned single-flight scheduler for local folder projection."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import math
-import random
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol, cast
+from typing import Protocol
 
 from ..flood import TelegramRpcThrottled
-from ..maintenance_logging import log_maintenance_cycle
 from ..telegram_demand import (
     DemandStatus,
     DurableDemandAdapter,
@@ -23,9 +20,9 @@ from ..telegram_demand import (
 )
 from ..telegram_rpc_consumers import DemandKind
 from ..telegram_rpc_scheduler import rpc_attempt_budget
-from .contracts import FolderSourceUnavailableError, FolderStagingCorruptError, FolderStagingStaleError
+from .contracts import RULE_TTL_SECONDS, FolderSourceUnavailableError
 from .ports import FolderSnapshotRepository
-from .refresh import FolderProjection, FolderRefresher, FolderRefreshResult
+from .refresh import FolderRefresher
 
 logger = logging.getLogger(__name__)
 
@@ -33,53 +30,24 @@ logger = logging.getLogger(__name__)
 class FolderProjectionScheduling(Protocol):
     @property
     def refresh_interval_seconds(self) -> float: ...
-
-    @property
-    def jitter_ratio(self) -> float: ...
-
     @property
     def retry_delays_seconds(self) -> tuple[int, ...]: ...
-
     @property
     def retry_cap_seconds(self) -> int: ...
-
     @property
     def warning_failure_threshold(self) -> int: ...
-
-    @property
-    def stale_threshold_seconds(self) -> int: ...
 
 
 class FolderAttemptResult(StrEnum):
     SUCCESS = "success"
-    CONTINUATION = "continuation"
     SOURCE_UNAVAILABLE = "source_unavailable"
     FLOOD_WAIT = "flood_wait"
     CIRCUIT_OPEN = "circuit_open"
     UNEXPECTED = "unexpected"
 
 
-@dataclass(frozen=True, slots=True)
-class _Attempt:
-    reason: str
-    result: str
-    duration_seconds: float
-    folder_count: int
-    dialog_count: int
-    membership_count: int
-    failure_count: int
-    snapshot_age_seconds: int | None
-    next_due_at: int | None
-
-
-def _default_jitter(interval: float, ratio: float) -> float:
-    return interval * (1.0 + random.uniform(-ratio, ratio))
-
-
 class FolderProjectionWorker:
-    """Run one folder source attempt at a time and schedule from completion."""
-
-    def __init__(  # noqa: PLR0913 - explicit composition dependencies and deterministic test seams
+    def __init__(
         self,
         refresher: FolderRefresher,
         repository: FolderSnapshotRepository,
@@ -87,239 +55,94 @@ class FolderProjectionWorker:
         policy: FolderProjectionScheduling,
         *,
         clock: Callable[[], float] = time.time,
-        jitter: Callable[[float, float], float] = _default_jitter,
     ) -> None:
         self._refresher = refresher
         self._repository = repository
         self._shutdown_event = shutdown_event
         self._policy = policy
         self._clock = clock
-        self._jitter = jitter
         self._failure_count = repository.read_consecutive_failures()
-        self._last_outcome = repository.read_last_outcome()
-        retry_at = repository.read_next_retry_at()
-        last_success_at = repository.read_last_success_at()
-        staging = repository.read_staging()
-        self._staging_recovery_pending = self._repository_staging_recovery_pending()
-        self._next_due_at = (
-            0
-            if staging is not None or self._staging_recovery_pending
-            else (
-                retry_at
-                if retry_at is not None
-                else None
-                if last_success_at is None or self._last_outcome not in {None, FolderAttemptResult.SUCCESS}
-                else math.ceil(last_success_at + policy.refresh_interval_seconds)
-            )
-        )
-        self._warning_bucket: int | None = None
+        self._next_due_at = self._due_at()
         self._primed = False
         self._attempt_lock = asyncio.Lock()
 
+    def _due_at(self) -> int | None:
+        retry = self._repository.read_next_retry_at()
+        if retry is not None:
+            return retry
+        success = self._repository.read_last_success_at()
+        outcome = self._repository.read_last_outcome()
+        if success is None or outcome not in {None, FolderAttemptResult.SUCCESS}:
+            return 0
+        return success + RULE_TTL_SECONDS
+
     async def prime(self) -> None:
-        """Perform the one startup attempt; the run loop must not duplicate it."""
         if self._primed:
             return
         self._primed = True
-        if self._repository_staging_recovery_pending():
-            self._staging_recovery_pending = True
-            self._next_due_at = 0
-        self._warn_if_needed(self._last_outcome)
-        if self._next_due_at is not None and self._next_due_at > self._clock():
-            return
-        await self._attempt("startup")
+        if self._next_due_at is not None and self._next_due_at <= self._clock():
+            await self._attempt("startup")
 
     async def run(self) -> None:
-        """Run until daemon shutdown, with no detached or overlapping attempts."""
         if not self._primed:
             await self.prime()
-        while not self._shutdown_event.is_set():
-            due_at = self._next_due_at
-            if due_at is None:
-                return
-            delay = max(0.0, float(due_at) - self._clock())
+        while not self._shutdown_event.is_set() and self._next_due_at is not None:
             try:
-                await asyncio.wait_for(self._shutdown_event.wait(), timeout=delay)
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=max(0.0, self._next_due_at - self._clock()))
             except TimeoutError:
-                pass
-            if self._shutdown_event.is_set():
-                return
-            await self._attempt("scheduled")
+                await self._attempt("scheduled")
 
     async def _attempt(self, reason: str, budget: RpcAttemptBudget | None = None) -> None:
-        if budget is None and self._refresher.supports_bounded_acquisition:
-            budget = RpcAttemptBudget(limit=2)
-
-        async def perform() -> None:
-            async with self._attempt_lock:
-                self._acknowledge_staging_recovery()
+        del reason
+        async with self._attempt_lock:
+            now = int(self._clock())
+            expiry = self._repository.next_mute_expiry()
+            if expiry is not None and now >= expiry:
+                self._repository.reproject_current_rules(now=now)
+            if self._repository.rules_are_fresh(now=now):
+                self._next_due_at = self._due_at()
+                return
+            if budget is not None and budget.exhausted:
+                return
+            try:
                 if budget is None:
-                    await self._attempt_once(reason, None)
+                    await self._refresher.refresh(completed_at=now)
                 else:
                     with rpc_attempt_budget(budget):
-                        await self._attempt_once(reason, budget)
+                        await self._refresher.refresh(completed_at=now)
+            except asyncio.CancelledError:
+                raise
+            except FolderSourceUnavailableError, TimeoutError, OSError:
+                self._record_failure(FolderAttemptResult.SOURCE_UNAVAILABLE, None)
+            except TelegramRpcThrottled as exc:
+                self._record_failure(
+                    FolderAttemptResult.CIRCUIT_OPEN if exc.retry_after_seconds is None else FolderAttemptResult.FLOOD_WAIT,
+                    exc.retry_after_seconds,
+                )
+            except RpcAttemptBudgetExhaustedError:
+                return
+            except Exception:
+                self._record_failure(FolderAttemptResult.UNEXPECTED, None)
+                raise
+            else:
+                self._failure_count = 0
+                self._next_due_at = self._due_at()
 
-        await perform()
-
-    def _repository_staging_recovery_pending(self) -> bool:
-        pending = getattr(self._repository, "staging_recovery_pending", False)
-        if not isinstance(pending, bool):
-            return False
-        return pending
-
-    def _acknowledge_staging_recovery(self) -> None:
-        self._staging_recovery_pending = False
-        acknowledge = getattr(self._repository, "acknowledge_staging_recovery", None)
-        if callable(acknowledge):
-            acknowledge()
-
-    async def _attempt_once(self, reason: str, budget: RpcAttemptBudget | None) -> None:
-        started = self._clock()
-        result, refresh_result, requested_flood_wait, unexpected, next_due_at = await self._perform_attempt(budget)
-        if result not in {FolderAttemptResult.SUCCESS, FolderAttemptResult.CONTINUATION}:
-            next_due_at = self._record_failure(result, requested_flood_wait)
-        elif result is FolderAttemptResult.CONTINUATION:
-            next_due_at = math.ceil(self._clock())
-            self._next_due_at = next_due_at
-
-        completion = self._clock()
-        snapshot_at = self._repository.read_last_success_at()
-        attempt = _Attempt(
-            reason=reason,
-            result=result,
-            duration_seconds=max(0.0, completion - started),
-            folder_count=0 if refresh_result is None else refresh_result.folder_count,
-            dialog_count=0 if refresh_result is None else refresh_result.dialog_count,
-            membership_count=0 if refresh_result is None else refresh_result.membership_count,
-            failure_count=self._failure_count,
-            snapshot_age_seconds=None if snapshot_at is None else max(0, int(completion - snapshot_at)),
-            next_due_at=next_due_at,
-        )
-        self._log_attempt(attempt)
-        if result not in {FolderAttemptResult.SUCCESS, FolderAttemptResult.CONTINUATION}:
-            self._warn_if_needed(result)
-        if unexpected is not None:
-            raise unexpected
-
-    async def _perform_attempt(  # noqa: PLR0911 - classify expected transport outcomes explicitly
-        self,
-        budget: RpcAttemptBudget | None,
-    ) -> tuple[FolderAttemptResult, FolderRefreshResult | None, int | None, Exception | None, int | None]:
-        try:
-            projection = await self._acquire_projection(budget)
-            if projection is None:
-                return self._continuation_result()
-            return self._publish_projection(projection)
-        except FolderStagingCorruptError, FolderStagingStaleError:
-            self._repository.clear_staging()
-            return self._continuation_result()
-        except RpcAttemptBudgetExhaustedError:
-            return self._continuation_result()
-        except FolderSourceUnavailableError, TimeoutError, OSError:
-            return FolderAttemptResult.SOURCE_UNAVAILABLE, None, None, None, None
-        except TelegramRpcThrottled as exc:
-            if exc.retry_after_seconds is None:
-                return FolderAttemptResult.CIRCUIT_OPEN, None, None, None, None
-            return FolderAttemptResult.FLOOD_WAIT, None, exc.retry_after_seconds, None, None
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - unexpected programming errors terminate the tracked worker
-            return FolderAttemptResult.UNEXPECTED, None, None, exc, None
-
-    async def _acquire_projection(self, budget: RpcAttemptBudget | None) -> FolderProjection | None:
-        if budget is not None and self._refresher.supports_bounded_acquisition:
-            bounded = await self._refresher.acquire_slice(budget)
-            return bounded.projection if bounded.complete else None
-        return await self._refresher.acquire()
-
-    def _continuation_result(
-        self,
-    ) -> tuple[FolderAttemptResult, None, None, None, int | None]:
-        return FolderAttemptResult.CONTINUATION, None, None, None, self._next_due_at
-
-    def _publish_projection(
-        self,
-        projection: FolderProjection,
-    ) -> tuple[FolderAttemptResult, FolderRefreshResult, None, None, int]:
-        completion = self._clock()
-        refresh_result = self._refresher.persist(projection, completed_at=int(completion))
-        self._failure_count = 0
-        self._warning_bucket = None
-        self._last_outcome = FolderAttemptResult.SUCCESS
-        next_due_at = self._schedule_from_completion(completion)
-        self._next_due_at = next_due_at
-        return FolderAttemptResult.SUCCESS, refresh_result, None, None, next_due_at
-
-    def _record_failure(self, result: FolderAttemptResult, requested_flood_wait: int | None) -> int | None:
+    def _record_failure(self, outcome: FolderAttemptResult, retry_after: int | None) -> None:
         self._failure_count += 1
-        if result in {FolderAttemptResult.CIRCUIT_OPEN, FolderAttemptResult.UNEXPECTED}:
-            next_due_at = None
+        if outcome in {FolderAttemptResult.CIRCUIT_OPEN, FolderAttemptResult.UNEXPECTED}:
+            retry_at = None
         else:
-            retry_delay = self._retry_delay(self._failure_count)
-            if requested_flood_wait is not None:
-                retry_delay = max(retry_delay, requested_flood_wait)
-            next_due_at = math.ceil(self._clock() + retry_delay)
-        self._next_due_at = next_due_at
+            schedule = self._policy.retry_delays_seconds
+            delay = schedule[min(self._failure_count - 1, len(schedule) - 1)]
+            retry_at = math.ceil(self._clock() + max(delay, retry_after or 0))
         self._repository.record_attempt(
-            attempted_at=int(self._clock()),
-            outcome=result,
-            next_retry_at=next_due_at,
-            consecutive_failures=self._failure_count,
+            attempted_at=int(self._clock()), outcome=outcome, next_retry_at=retry_at, consecutive_failures=self._failure_count
         )
-        self._last_outcome = result
-        return next_due_at
-
-    def _log_attempt(self, attempt: _Attempt) -> None:
-        log_maintenance_cycle(
-            logger,
-            attempt.result != FolderAttemptResult.SUCCESS or attempt.reason != "scheduled",
-            "folder_projection_complete reason=%s result=%s duration_s=%.3f folder_count=%d dialog_count=%d "
-            "membership_count=%d failure_count=%d snapshot_age_seconds=%s next_due_at=%s",
-            attempt.reason,
-            attempt.result,
-            attempt.duration_seconds,
-            attempt.folder_count,
-            attempt.dialog_count,
-            attempt.membership_count,
-            attempt.failure_count,
-            attempt.snapshot_age_seconds,
-            attempt.next_due_at,
-        )
-
-    def _retry_delay(self, failure_count: int) -> int:
-        schedule = cast(tuple[int, ...], self._policy.retry_delays_seconds)
-        normalized = max(1, failure_count)
-        if normalized <= len(schedule):
-            return min(self._policy.retry_cap_seconds, schedule[normalized - 1])
-        multiplier = 1
-        for _ in range(normalized - len(schedule)):
-            multiplier *= 2
-        final_delay = schedule[-1] * multiplier
-        return min(self._policy.retry_cap_seconds, final_delay)
-
-    def _schedule_from_completion(self, completion: float) -> int:
-        delay = max(1.0, self._jitter(self._policy.refresh_interval_seconds, self._policy.jitter_ratio))
-        return math.ceil(completion + delay)
-
-    def _warn_if_needed(self, outcome: str | None) -> None:
-        threshold = self._policy.warning_failure_threshold
-        if threshold < 1 or self._failure_count < threshold:
-            return
-        bucket = self._failure_count // threshold
-        if bucket == self._warning_bucket:
-            return
-        self._warning_bucket = bucket
-        logger.warning(
-            "folder_projection_warning consecutive_failures=%d threshold=%d result=%s",
-            self._failure_count,
-            threshold,
-            outcome or "persisted",
-        )
+        self._next_due_at = retry_at
 
 
 class FolderProjectionDemandAdapter(DurableDemandAdapter):
-    """Expose folder demand and run one bounded attempt through the worker."""
-
     demand_kind = DemandKind.FOLDER_SNAPSHOT
 
     def __init__(self, worker: FolderProjectionWorker) -> None:
@@ -327,31 +150,20 @@ class FolderProjectionDemandAdapter(DurableDemandAdapter):
 
     def status(self, now: float) -> DemandStatus | None:
         repository = self._worker._repository
-        policy = self._worker._policy
-        retry_at = repository.read_next_retry_at()
-        last_success_at = repository.read_last_success_at()
+        retry = repository.read_next_retry_at()
         outcome = repository.read_last_outcome()
-        staging = repository.read_staging()
-        if self._worker._repository_staging_recovery_pending():
-            self._worker._staging_recovery_pending = True
-        if staging is not None or self._worker._staging_recovery_pending:
-            release_at = now
-        elif retry_at is not None:
-            release_at = float(retry_at)
-        elif last_success_at is not None and outcome in {None, FolderAttemptResult.SUCCESS}:
-            release_at = math.ceil(last_success_at + policy.refresh_interval_seconds)
-        elif outcome in {FolderAttemptResult.CIRCUIT_OPEN, FolderAttemptResult.UNEXPECTED}:
+        if retry is not None:
+            return DemandStatus(release_at=float(retry))
+        if outcome in {FolderAttemptResult.CIRCUIT_OPEN, FolderAttemptResult.UNEXPECTED}:
             return None
-        else:
-            release_at = now
-        freshness_deadline = None if last_success_at is None else last_success_at + policy.stale_threshold_seconds
-        return DemandStatus(release_at=release_at, freshness_deadline=freshness_deadline)
+        success = repository.read_last_success_at()
+        if success is None:
+            return DemandStatus(release_at=now)
+        deadline = success + RULE_TTL_SECONDS
+        return DemandStatus(release_at=float(deadline), freshness_deadline=float(deadline))
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
-        """Run one existing worker attempt under the precise durable demand."""
-        if not isinstance(budget, RpcAttemptBudget):
-            raise TypeError("budget must be an RpcAttemptBudget")
         if budget.exhausted:
             return
-        with demand_context(self.demand_kind), rpc_attempt_budget(budget):
+        with demand_context(self.demand_kind):
             await self._worker._attempt("demand", budget)

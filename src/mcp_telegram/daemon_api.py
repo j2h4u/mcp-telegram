@@ -555,6 +555,7 @@ class DaemonAPIServer:
         reaction_freshener: ReactionFreshener,
         hydration_requester: Callable[[sqlite3.Connection, int, int], None] | None = None,
         topic_refresher: TopicRefresher | None = None,
+        folder_projection_reproject: Callable[[], object] | None = None,
         policy: DaemonApiPolicy,
         health_status: Callable[[], DaemonHealthStatus] = _healthy_daemon_status,
     ) -> None:
@@ -578,6 +579,7 @@ class DaemonAPIServer:
         self.startup_detail: str = "connecting to Telegram"
         self._reading_service: ReadingService | None = None
         self._topic_refresher = topic_refresher
+        self._folder_projection_reproject = folder_projection_reproject
         self._hydration_requester = hydration_requester
         self._policy = policy
         self._health_status = health_status
@@ -611,6 +613,10 @@ class DaemonAPIServer:
         if sink is None:
             raise RuntimeError("durable demand sink is not bound")
         return sink
+
+    def _reproject_due_folder_memberships(self) -> None:
+        if self._folder_projection_reproject is not None:
+            self._folder_projection_reproject()
 
     def _get_reading_service(self) -> ReadingService:
         """Get memoized reading-service instance with explicit daemon dependencies."""
@@ -1345,6 +1351,7 @@ class DaemonAPIServer:
 
     async def _list_dialogs(self, req: dict[str, object]) -> dict:
         """Delegate list_dialogs reads to the reading service."""
+        self._reproject_due_folder_memberships()
         result = await self._get_reading_service().list_dialogs(cast(dict[str, object], req))
         if not result.get("ok"):
             return result
@@ -1376,6 +1383,7 @@ class DaemonAPIServer:
         return await self._get_reading_service().get_unread_summary(cast(dict[str, object], req))
 
     async def _list_folders(self, _req: dict[str, object]) -> dict:
+        self._reproject_due_folder_memberships()
         return {
             "ok": True,
             "data": {
@@ -1646,6 +1654,7 @@ class DaemonAPIServer:
 
     async def _get_entity_info(self, req: dict[str, object]) -> dict:
         """Type-tagged entity inspector covering 5 Telegram entity kinds."""
+        self._reproject_due_folder_memberships()
         result = await self._get_entity_info_service().get_entity_info(req)
         if result.get("ok"):
             data = cast(dict[str, object], result.get("data", {}))
