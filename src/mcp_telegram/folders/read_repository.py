@@ -110,7 +110,7 @@ def folder_summaries(conn: FolderReadConnection) -> list[dict[str, object]]:
                            WHERE unknown.namespace=f.namespace AND unknown.folder_id=f.folder_id AND unknown.state='unknown')
                    FROM telegram_folder_rules AS f
                    LEFT JOIN telegram_folder_local_members AS fm ON fm.namespace=f.namespace AND fm.folder_id=f.folder_id AND fm.state='present'
-                   LEFT JOIN dialogs AS d ON d.dialog_id = fm.dialog_id
+                   LEFT JOIN dialogs AS d ON d.dialog_id = fm.dialog_id AND d.hidden=0
                    GROUP BY f.namespace, f.folder_id, f.title, f.source_position
                    ORDER BY f.source_position"""
             ).fetchall(),
@@ -142,6 +142,7 @@ def folders_by_dialog(conn: FolderReadConnection) -> dict[int, list[dict[str, ob
                 """SELECT f.folder_id, f.title, m.dialog_id
                    FROM telegram_folder_rules AS f
                    JOIN telegram_folder_local_members AS m ON m.namespace=f.namespace AND m.folder_id=f.folder_id
+                   JOIN dialogs AS d ON d.dialog_id=m.dialog_id AND d.hidden=0
                    WHERE m.state='present'
                    ORDER BY f.source_position, m.pin_position IS NULL, m.pin_position, m.dialog_id"""
             ).fetchall(),

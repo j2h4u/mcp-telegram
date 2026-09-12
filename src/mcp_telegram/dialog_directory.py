@@ -71,6 +71,7 @@ class _DirectoryState:
     account_id: int | None
     retry_at: int | None
     reason: str | None
+    cursor_error: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +134,8 @@ class CanonicalDialogDirectory:
     def status(self, now: float, conn: sqlite3.Connection) -> DemandStatus | None:
         """Expose the strictest current eventual freshness target (900 seconds)."""
         state = self._load_state(conn)
+        if state.cursor_error:
+            return DemandStatus(release_at=0.0)
         if state.retry_at is not None and now < state.retry_at:
             return DemandStatus(release_at=float(state.retry_at))
         if state.status == "invalid":
@@ -151,7 +154,16 @@ class CanonicalDialogDirectory:
             return
         conn = _open_sync_db(self._db_path)
         try:
-            if self._load_state(conn).status == "invalid":
+            initial_state = self._load_state(conn)
+            if initial_state.cursor_error:
+                with conn:
+                    conn.execute(
+                        "UPDATE dialog_directory_state SET status='invalid',ordinary_status='invalid',"
+                        "reason='ordinary:invalid:corrupt_cursor',retry_at=NULL WHERE singleton=1 AND generation=?",
+                        (initial_state.generation,),
+                    )
+                return
+            if initial_state.status == "invalid":
                 return
             account_id = await self._bound_account_id(conn)
             state = self._prepare_or_resume(conn)
@@ -794,16 +806,12 @@ class CanonicalDialogDirectory:
         if row is None:
             raise RuntimeError("canonical dialog directory state is missing")
         cursor = None
+        cursor_error = False
         if row[1] != "invalid" and row[12] != "legacy_wrapper_cursor_unverified":
             try:
                 cursor = _decode_cursor(row[5], row[6], row[7])
             except (ValueError, TypeError, json.JSONDecodeError, RuntimeError):
-                with conn:
-                    conn.execute(
-                        "UPDATE dialog_directory_state SET status='invalid',ordinary_status='invalid',"
-                        "reason='ordinary:corrupt_cursor',retry_at=NULL WHERE singleton=1"
-                    )
-                row = (*row[:1], "invalid", "invalid", *row[3:12], "ordinary:corrupt_cursor")
+                cursor_error = True
         return _DirectoryState(
             _required_int(row[0], "directory generation"),
             str(row[1]),
@@ -816,6 +824,7 @@ class CanonicalDialogDirectory:
             _nullable_int(row[10]),
             _nullable_int(row[11]),
             str(row[12]) if row[12] is not None else None,
+            cursor_error,
         )
 
 
@@ -839,12 +848,6 @@ class CanonicalDialogDirectoryDemandAdapter:
                 with rpc_attempt_budget(budget):
                     with rpc_scope(TelegramRpcSource.DIALOG_SYNC):
                         await self._directory.run_slice()
-
-
-class CanonicalDirectoryFullDemandAdapter(CanonicalDialogDirectoryDemandAdapter):
-    """Compatibility demand label sharing the one canonical owner."""
-
-    demand_kind = DemandKind.DIALOG_FULL_RECONCILIATION
 
 
 def _entity_name(entity: object | None) -> str | None:

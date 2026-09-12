@@ -75,6 +75,7 @@ from .dialog_directory import (
 )
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
+from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .history_enrollment import EnrollmentOutcome, ensure_automatic_dm_enrollment
 from .hydration_queue import HydrationPriority
 from .messages.sqlite_bundle import (
@@ -1751,7 +1752,7 @@ class EventHandlerManager:
             return None
         return int(cast(int, get_peer_id(inner_peer)))
 
-    def _collect_known_pinned_dialog_ids(self, order: Sequence[object]) -> list[int]:
+    def _collect_pinned_dialog_ids(self, order: Sequence[object]) -> list[int]:
         pinned_ids: list[int] = []
         seen: set[int] = set()
         for dialog_peer in order:
@@ -1760,9 +1761,7 @@ class EventHandlerManager:
                 dialog_id = int(cast(int, get_peer_id(inner_peer)))
             except TypeError, ValueError:
                 continue
-            if dialog_id not in seen and self._conn.execute(
-                "SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)
-            ).fetchone() is not None:
+            if dialog_id not in seen:
                 pinned_ids.append(dialog_id)
                 seen.add(dialog_id)
         return pinned_ids
@@ -1819,13 +1818,11 @@ class EventHandlerManager:
         # A folder-scoped update carries only pins *within* that folder, so we
         # must not use it to clear pins in other folders.
         folder_id = update.folder_id
-        pinned_ids = self._collect_known_pinned_dialog_ids(cast(Sequence[object], order))
+        pinned_ids = self._collect_pinned_dialog_ids(cast(Sequence[object], order))
         with self._conn:
             for dialog_id in pinned_ids:
-                self._conn.execute(
-                    _UPDATE_DIALOG_PINNED_SQL,
-                    (1, now, dialog_id),
-                )
+                if self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None:
+                    self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (1, now, dialog_id))
             if folder_id is None:
                 # Main list: rewrite the full pin set — the update is
                 # authoritative for all main-list pins.
@@ -1921,13 +1918,25 @@ class EventHandlerManager:
             dialog_id = int(get_peer_id(peer))
         except TypeError, ValueError:
             return
-        mute_until = getattr(getattr(update, "notify_settings", None), "mute_until", None)
+        settings = cast(object | None, getattr(update, "notify_settings", None))
+        if settings is None:
+            return
+        mute_until = getattr(settings, "mute_until", None)
         if isinstance(mute_until, datetime):
             mute_until = int(mute_until.timestamp())
+        if mute_until is None:
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE dialog_directory_facts SET mute_until=NULL WHERE dialog_id=? AND mute_until IS NOT NULL",
+                    (dialog_id,),
+                )
+                SQLiteFolderSnapshotRepository(self._conn).reproject_current_rules_in_transaction(now=now)
+            return
         if not _is_valid_nonnegative_int(mute_until):
             return
         with self._conn:
             apply_realtime_eligibility(self._conn, dialog_id, mute_until=mute_until, observed_at=now)
+            SQLiteFolderSnapshotRepository(self._conn).reproject_current_rules_in_transaction(now=now)
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_identity_or_notify(self, update: UpdateUserName | UpdateNotifySettings) -> None:

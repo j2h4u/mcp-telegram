@@ -23,7 +23,6 @@ from mcp_telegram.delta_sync import (
 from mcp_telegram.dialog_directory import (
     CanonicalDialogDirectory,
     CanonicalDialogDirectoryDemandAdapter,
-    CanonicalDirectoryFullDemandAdapter,
 )
 from mcp_telegram.dialog_sync import (
     DialogLightReconciliationDemandAdapter,
@@ -58,10 +57,6 @@ from mcp_telegram.telegram_demand import (
 )
 from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator, validate_durable_adapters
 from mcp_telegram.telegram_rpc_consumers import DemandKind, demand_freshness_seconds
-
-# Compatibility constant retained for callers that read the contract-derived
-# reconciliation cadence during the daemon cutover.
-DIALOG_FULL_RECONCILIATION_INTERVAL_SECONDS = demand_freshness_seconds(DemandKind.DIALOG_FULL_RECONCILIATION)
 
 
 class DemandCompositionClient(ActivityClient, Protocol):
@@ -133,10 +128,6 @@ def build_durable_adapter_map(dependencies: DemandCompositionDependencies) -> Ma
         DemandKind.DIALOG_LIGHT_RECONCILIATION: DialogLightReconciliationDemandAdapter(
             dependencies.dialog_reconciliation_worker
         ),
-        DemandKind.DIALOG_FULL_RECONCILIATION: CanonicalDirectoryFullDemandAdapter(
-            dependencies.dialog_directory,
-            dependencies.conn,
-        ),
         DemandKind.ARCHIVE_BACKFILL: ArchiveBackfillDemandAdapter(
             dependencies.client,
             dependencies.conn,
@@ -205,7 +196,6 @@ def build_durable_coordinator(
 
 
 __all__ = [
-    "DIALOG_FULL_RECONCILIATION_INTERVAL_SECONDS",
     "DemandCompositionClient",
     "DemandCompositionDependencies",
     "build_durable_adapter_map",

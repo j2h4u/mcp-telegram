@@ -1371,11 +1371,12 @@ class DaemonAPIServer:
                     break
         data["dialogs"] = enriched
         if requested_folder is not None:
+            folder_namespace = "default" if int(cast(int | str, requested_folder)) == 0 else "filter"
             unknown_row = cast(
                 tuple[object] | None,
                 self._conn.execute(
-                    "SELECT COUNT(*) FROM telegram_folder_local_members WHERE folder_id=? AND state='unknown'",
-                    (int(cast(int | str, requested_folder)),),
+                    "SELECT COUNT(*) FROM telegram_folder_local_members WHERE namespace=? AND folder_id=? AND state='unknown'",
+                    (folder_namespace, int(cast(int | str, requested_folder))),
                 ).fetchone(),
             )
             data["folder_membership_unknown_count"] = _coerce_int(unknown_row[0], 0) if unknown_row is not None else 0

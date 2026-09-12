@@ -69,7 +69,6 @@ class DemandKind(StrEnum):
     FULL_SYNC_PAGE = "full_sync_page"
     DIALOG_BOOTSTRAP = "dialog_bootstrap"
     DIALOG_LIGHT_RECONCILIATION = "dialog_light_reconciliation"
-    DIALOG_FULL_RECONCILIATION = "dialog_full_reconciliation"
     ARCHIVE_BACKFILL = "archive_backfill"
     ARCHIVE_INCREMENTAL = "archive_incremental"
     COLD_PEER_PAGE = "cold_peer_page"
@@ -98,7 +97,6 @@ DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
     DemandKind.FULL_SYNC_PAGE,
     DemandKind.DIALOG_BOOTSTRAP,
     DemandKind.DIALOG_LIGHT_RECONCILIATION,
-    DemandKind.DIALOG_FULL_RECONCILIATION,
     DemandKind.ARCHIVE_BACKFILL,
     DemandKind.ARCHIVE_INCREMENTAL,
     DemandKind.COLD_PEER_PAGE,
@@ -109,7 +107,7 @@ DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
     DemandKind.SCHEDULED_REPAIR,
     DemandKind.SCHEDULED_DISCOVERY,
 )
-_EXPECTED_DURABLE_DEMAND_COUNT = 20
+_EXPECTED_DURABLE_DEMAND_COUNT = 19
 
 
 class ExecutionMode(StrEnum):
@@ -685,13 +683,6 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         _DURABLE,
         max_rpc_attempts_per_slice=8,
     ),
-    DemandKind.DIALOG_FULL_RECONCILIATION: _contract(
-        DemandKind.DIALOG_FULL_RECONCILIATION,
-        TelegramRpcSource.DIALOG_SYNC,
-        _DURABLE,
-        freshness_target=timedelta(days=1),
-        max_rpc_attempts_per_slice=32,
-    ),
     DemandKind.ARCHIVE_BACKFILL: _contract(
         DemandKind.ARCHIVE_BACKFILL,
         TelegramRpcSource.ACTIVITY_ARCHIVE,
@@ -855,13 +846,13 @@ def _validate_contract_coverage(contracts: Mapping[DemandKind, DemandContract]) 
 
 def _validate_durable_order() -> None:
     if not isinstance(DURABLE_DEMAND_ORDER, tuple):
-        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+        raise RuntimeError("Durable demand order must contain exactly 19 unique kinds")
     if len(DURABLE_DEMAND_ORDER) != _EXPECTED_DURABLE_DEMAND_COUNT:
-        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+        raise RuntimeError("Durable demand order must contain exactly 19 unique kinds")
     if any(not isinstance(kind, DemandKind) for kind in DURABLE_DEMAND_ORDER):
-        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+        raise RuntimeError("Durable demand order must contain exactly 19 unique kinds")
     if len(set(DURABLE_DEMAND_ORDER)) != _EXPECTED_DURABLE_DEMAND_COUNT:
-        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+        raise RuntimeError("Durable demand order must contain exactly 19 unique kinds")
 
 
 def _validate_durable_modes(contracts: Mapping[DemandKind, DemandContract]) -> None:

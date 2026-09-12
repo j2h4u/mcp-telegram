@@ -29,7 +29,6 @@ from mcp_telegram.demand_composition import (
 from mcp_telegram.dialog_directory import (
     CanonicalDialogDirectory,
     CanonicalDialogDirectoryDemandAdapter,
-    CanonicalDirectoryFullDemandAdapter,
 )
 from mcp_telegram.dialog_sync import (
     DialogLightReconciliationDemandAdapter,
@@ -241,7 +240,6 @@ def test_adapter_map_is_exact_against_literal_20_kind_class_map(
         DemandKind.FULL_SYNC_PAGE: FullSyncDemandAdapter,
         DemandKind.DIALOG_BOOTSTRAP: CanonicalDialogDirectoryDemandAdapter,
         DemandKind.DIALOG_LIGHT_RECONCILIATION: DialogLightReconciliationDemandAdapter,
-        DemandKind.DIALOG_FULL_RECONCILIATION: CanonicalDirectoryFullDemandAdapter,
         DemandKind.ARCHIVE_BACKFILL: ArchiveBackfillDemandAdapter,
         DemandKind.ARCHIVE_INCREMENTAL: ArchiveIncrementalDemandAdapter,
         DemandKind.COLD_PEER_PAGE: ColdPeerPageDemandAdapter,
@@ -253,7 +251,7 @@ def test_adapter_map_is_exact_against_literal_20_kind_class_map(
         DemandKind.SCHEDULED_DISCOVERY: ScheduledDiscoveryDemandAdapter,
         DemandKind.SELF_PROFILE_MAINTENANCE: SelfProfileMaintenanceDemandAdapter,
     }
-    assert len(expected) == 20
+    assert len(expected) == 19
     assert set(adapters) == set(expected)
     assert {kind: type(adapter) for kind, adapter in adapters.items()} == expected
     assert all(getattr(adapter, "demand_kind", None) is kind for kind, adapter in adapters.items())
@@ -264,7 +262,6 @@ def test_adapter_map_is_exact_against_literal_20_kind_class_map(
     assert adapters[DemandKind.DELTA_ACCESS_PROBE]._worker is objects["delta"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DIALOG_LIGHT_RECONCILIATION]._worker is objects["dialog"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DIALOG_BOOTSTRAP]._directory is objects["directory"]  # type: ignore[attr-defined]
-    assert adapters[DemandKind.DIALOG_FULL_RECONCILIATION]._directory is objects["directory"]  # type: ignore[attr-defined]
     assert (
         adapters[DemandKind.ARCHIVE_INCREMENTAL].interval_s  # type: ignore[attr-defined]
         == demand_freshness_seconds(DemandKind.ARCHIVE_INCREMENTAL)

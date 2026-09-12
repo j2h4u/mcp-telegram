@@ -14,7 +14,6 @@ from telethon.tl import functions, types  # type: ignore[import-untyped]
 from mcp_telegram.dialog_directory import (
     CanonicalDialogDirectory,
     CanonicalDialogDirectoryDemandAdapter,
-    CanonicalDirectoryFullDemandAdapter,
     _decode_cursor,
     _eligibility_category,
     _encode_input_peer,
@@ -496,7 +495,6 @@ async def test_duplicate_page_cools_down_both_aliases_then_resumes_from_its_curs
         )
         assert conn.execute("SELECT top_message FROM dialog_directory_staging WHERE dialog_id=1").fetchone() == (9,)
         assert CanonicalDialogDirectoryDemandAdapter(directory, conn).status(1001.0).release_at == 1900.0
-        assert CanonicalDirectoryFullDemandAdapter(directory, conn).status(1001.0).release_at == 1900.0
     finally:
         conn.close()
 
@@ -693,7 +691,7 @@ async def test_corrupt_persisted_cursor_latches_invalid_without_rpc(tmp_path: Pa
         assert conn.execute("SELECT status,ordinary_status,reason,retry_at FROM dialog_directory_state").fetchone() == (
             "invalid",
             "invalid",
-            "ordinary:corrupt_cursor",
+            "ordinary:invalid:corrupt_cursor",
             None,
         )
         assert client.requests == []
