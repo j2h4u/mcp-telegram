@@ -37,7 +37,10 @@ def _dialog(peer_id: int, message_id: int) -> types.Dialog:
 
 
 def _response(dialogs: Sequence[types.Dialog], *, terminal: bool = True) -> object:
-    users = [types.User(id=dialog.peer.user_id, first_name=f"User {dialog.peer.user_id}", access_hash=42) for dialog in dialogs]
+    users = [
+        types.User(id=dialog.peer.user_id, first_name=f"User {dialog.peer.user_id}", access_hash=42)
+        for dialog in dialogs
+    ]
     messages = [
         types.Message(
             id=dialog.top_message,
@@ -56,9 +59,35 @@ def _pinned_response(dialogs: Sequence[types.Dialog] = ()) -> types.messages.Pee
         dialogs=list(dialogs),
         messages=[],
         chats=[],
-        users=[types.User(id=dialog.peer.user_id, first_name=f"User {dialog.peer.user_id}", access_hash=42) for dialog in dialogs],
+        users=[
+            types.User(id=dialog.peer.user_id, first_name=f"User {dialog.peer.user_id}", access_hash=42)
+            for dialog in dialogs
+        ],
         state=types.updates.State(pts=0, qts=0, date=None, seq=0, unread_count=0),
     )
+
+
+def _unread_receipt(conn: sqlite3.Connection) -> dict[str, str]:
+    return dict(
+        conn.execute(
+            "SELECT key,value FROM daemon_state WHERE key IN "
+            "('dialog_unread_sweep_status','dialog_unread_sweep_completed_at',"
+            "'dialog_unread_sweep_observed_count','dialog_unread_sweep_last_visible_count')"
+        ).fetchall()
+    )
+
+
+def _stored_unread_receipt(db_path: Path) -> dict[str, str]:
+    conn = _open_sync_db(db_path)
+    try:
+        return _unread_receipt(conn)
+    finally:
+        conn.close()
+
+
+async def _run_slices(directory: CanonicalDialogDirectory, count: int) -> None:
+    for _ in range(count):
+        await directory.run_slice()
 
 
 def test_raw_request_has_only_the_contract_arguments() -> None:
@@ -80,7 +109,7 @@ def test_slice_continues_and_uses_peer_matched_last_message_cursor() -> None:
     assert page.cursor.offset_peer.user_id == 2
 
 
-def test_missing_message_and_repeated_cursor_are_never_eof() -> None:
+def test_terminal_missing_optional_facts_completes_but_slice_stalls() -> None:
     dialog = _dialog(1, 8)
     response = types.messages.DialogsSlice(
         count=1,
@@ -89,11 +118,19 @@ def test_missing_message_and_repeated_cursor_are_never_eof() -> None:
         chats=[],
         users=[types.User(id=1, first_name="One", access_hash=42)],
     )
-    assert normalize_dialogs_response(response, None).kind == "incomplete"
+    stalled = normalize_dialogs_response(response, None)
+    assert (stalled.kind, stalled.reason) == ("incomplete", "stalled:missing_safe_cursor")
 
     valid = normalize_dialogs_response(_response([dialog], terminal=False), None)
     assert valid.cursor is not None
-    assert normalize_dialogs_response(_response([dialog], terminal=False), valid.cursor).kind == "invalid"
+    repeated = normalize_dialogs_response(_response([dialog], terminal=False), valid.cursor)
+    assert (repeated.kind, repeated.reason) == ("incomplete", "stalled:non_advancing_cursor")
+
+    terminal = types.messages.Dialogs(dialogs=[dialog], messages=[], chats=[], users=[])
+    completed = normalize_dialogs_response(terminal, valid.cursor)
+    assert completed.kind == "terminal"
+    assert completed.cursor is None
+    assert len(completed.facts) == 1
 
 
 def test_missing_entity_markers_duplicates_and_not_modified_are_explicit_outcomes() -> None:
@@ -146,6 +183,124 @@ def test_min_entity_cannot_fabricate_a_cursor() -> None:
         users=[types.User(id=1, first_name="One", min=True, access_hash=42)],
     )
     assert normalize_dialogs_response(response, None).kind == "incomplete"
+
+
+@pytest.mark.asyncio
+async def test_imperfect_slice_advances_and_retains_every_identifiable_row(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    missing = _dialog(1, 7)
+    usable = _dialog(2, 8)
+    imperfect = types.messages.DialogsSlice(
+        count=2,
+        dialogs=[missing, usable],
+        messages=[types.Message(id=8, peer_id=usable.peer, date=datetime(2026, 1, 1, tzinfo=UTC))],
+        chats=[],
+        users=[types.User(id=2, first_name="Two", access_hash=42)],
+    )
+    directory = CanonicalDialogDirectory(
+        _FakeClient([_pinned_response(), _pinned_response(), imperfect, _response([])]), db_path, asyncio.Event()
+    )
+
+    await directory.run_slice()
+    await directory.run_slice()
+    await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT offset_id FROM dialog_directory_state").fetchone() == (8,)
+        assert conn.execute("SELECT COUNT(*) FROM dialog_directory_staging").fetchone() == (2,)
+    finally:
+        conn.close()
+
+    await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT dialog_id,type FROM dialogs ORDER BY dialog_id").fetchall() == [
+            (1, "unknown"),
+            (2, "user"),
+        ]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_wholly_unpageable_slice_stages_then_retries_from_committed_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    monkeypatch.setattr("mcp_telegram.dialog_directory.time.time", lambda: 1_000)
+    unpageable = types.messages.DialogsSlice(
+        count=1,
+        dialogs=[_dialog(1, 8)],
+        messages=[],
+        chats=[],
+        users=[types.User(id=1, first_name="One", access_hash=42)],
+    )
+    directory = CanonicalDialogDirectory(
+        _FakeClient([_pinned_response(), _pinned_response(), unpageable, _response([])]),
+        db_path,
+        asyncio.Event(),
+    )
+
+    await directory.run_slice()
+    await directory.run_slice()
+    await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT status,ordinary_status,offset_id,retry_at,reason FROM dialog_directory_state"
+        ).fetchone() == (
+            "incomplete",
+            "incomplete",
+            0,
+            1900,
+            "stalled:missing_safe_cursor",
+        )
+        assert conn.execute("SELECT COUNT(*) FROM dialog_directory_staging").fetchone() == (1,)
+        conn.execute("UPDATE dialog_directory_state SET retry_at=0")
+        conn.commit()
+    finally:
+        conn.close()
+
+    await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT status FROM dialog_directory_state").fetchone() == ("complete",)
+        assert conn.execute("SELECT dialog_id,type FROM dialogs").fetchone() == (1, "user")
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_pinned_membership_keeps_source_order_when_entities_are_unknown(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    pinned = types.messages.PeerDialogs(
+        dialogs=[_dialog(2, 8), _dialog(1, 7)],
+        messages=[],
+        chats=[],
+        users=[],
+        state=types.updates.State(pts=0, qts=0, date=None, seq=0, unread_count=0),
+    )
+    directory = CanonicalDialogDirectory(
+        _FakeClient([pinned, _pinned_response(), _response([])]), db_path, asyncio.Event()
+    )
+
+    await directory.run_slice()
+    await directory.run_slice()
+    await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=0 ORDER BY position"
+        ).fetchall() == [(2, 0), (1, 1)]
+        assert conn.execute("SELECT dialog_id,type FROM dialogs ORDER BY dialog_id").fetchall() == [
+            (1, "unknown"),
+            (2, "unknown"),
+        ]
+    finally:
+        conn.close()
 
 
 def test_cursor_round_trip_keeps_real_self_and_forbidden_peers() -> None:
@@ -340,13 +495,19 @@ async def test_account_fence_and_published_pin_receipt_survive_new_attempt(tmp_p
     try:
         assert conn.execute("SELECT account_id,generation FROM dialog_directory_publication").fetchone() == (100, 1)
         assert conn.execute("SELECT status,observed_count FROM dialog_directory_state").fetchone() == ("complete", 2)
-        assert conn.execute("SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=0 ORDER BY position").fetchall() == [
+        assert conn.execute(
+            "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=0 ORDER BY position"
+        ).fetchall() == [
             (1, 0),
             (2, 1),
         ]
         assert conn.execute("SELECT COUNT(*) FROM dialog_directory_published_pins WHERE folder_id=1").fetchone() == (0,)
-        assert conn.execute("SELECT value FROM daemon_state WHERE key='dialog_unread_sweep_observed_count'").fetchone() == ("2",)
-        assert conn.execute("SELECT value FROM daemon_state WHERE key='dialog_unread_sweep_last_visible_count'").fetchone() == ("2",)
+        assert conn.execute(
+            "SELECT value FROM daemon_state WHERE key='dialog_unread_sweep_observed_count'"
+        ).fetchone() == ("2",)
+        assert conn.execute(
+            "SELECT value FROM daemon_state WHERE key='dialog_unread_sweep_last_visible_count'"
+        ).fetchone() == ("2",)
     finally:
         conn.close()
 
@@ -355,17 +516,93 @@ async def test_account_fence_and_published_pin_receipt_survive_new_attempt(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_cross_source_type_conflict_restarts_from_pinned_main_after_retry(tmp_path: Path) -> None:
+async def test_unread_observation_metadata_preserves_then_replaces_as_one_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    now = 1_000
+    monkeypatch.setattr("mcp_telegram.dialog_directory.time.time", lambda: now)
+    client = _FakeClient(
+        [
+            _pinned_response(),
+            _pinned_response(),
+            _response([_dialog(1, 8)]),
+            _pinned_response(),
+            _pinned_response(),
+            _response([]),
+            _pinned_response(),
+            _pinned_response(),
+            _response([]),
+        ]
+    )
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+
+    await _run_slices(directory, 3)
+    first = _stored_unread_receipt(db_path)
+    assert first == {
+        "dialog_unread_sweep_status": "complete",
+        "dialog_unread_sweep_completed_at": "1000",
+        "dialog_unread_sweep_observed_count": "1",
+        "dialog_unread_sweep_last_visible_count": "1",
+    }
+
+    now = 2_000
+    await _run_slices(directory, 1)
+    conn = _open_sync_db(db_path)
+    try:
+        assert _unread_receipt(conn) == first
+        assert conn.execute(
+            "SELECT value FROM daemon_state WHERE key='dialog_unread_sweep_attempted_at'"
+        ).fetchone() == ("2000",)
+    finally:
+        conn.close()
+    await _run_slices(directory, 2)
+
+    second = _stored_unread_receipt(db_path)
+    assert second == {
+        "dialog_unread_sweep_status": "complete",
+        "dialog_unread_sweep_completed_at": "2000",
+        "dialog_unread_sweep_observed_count": "0",
+        "dialog_unread_sweep_last_visible_count": "0",
+    }
+
+    now = 3_000
+    await _run_slices(directory, 2)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute(
+            "CREATE TRIGGER fail_unread_receipt BEFORE INSERT ON daemon_state "
+            "WHEN NEW.key='dialog_unread_sweep_status' BEGIN SELECT RAISE(ABORT, 'metadata failure'); END"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(sqlite3.IntegrityError, match="metadata failure"):
+        await directory.run_slice()
+    assert _stored_unread_receipt(db_path) == second
+
+
+@pytest.mark.asyncio
+async def test_cross_source_observations_replace_mutable_facts(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     dialog = _dialog(1, 8)
-    conflict = types.messages.Dialogs(
+    pinned = types.messages.PeerDialogs(
         dialogs=[dialog],
-        messages=[types.Message(id=8, peer_id=dialog.peer, date=datetime(2026, 1, 1, tzinfo=UTC))],
+        messages=[types.Message(id=8, peer_id=dialog.peer, date=datetime(2026, 1, 2, tzinfo=UTC))],
+        chats=[],
+        users=[types.User(id=1, first_name="One", access_hash=42)],
+        state=types.updates.State(pts=0, qts=0, date=None, seq=0, unread_count=0),
+    )
+    later_dialog = _dialog(1, 7)
+    ordinary = types.messages.Dialogs(
+        dialogs=[later_dialog],
+        messages=[],
         chats=[],
         users=[types.User(id=1, first_name="One", access_hash=42, bot=True)],
     )
-    client = _FakeClient([_pinned_response([dialog]), _pinned_response(), conflict, _pinned_response()])
+    client = _FakeClient([pinned, _pinned_response(), ordinary])
     directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
     await directory.run_slice()
     await directory.run_slice()
@@ -373,24 +610,13 @@ async def test_cross_source_type_conflict_restarts_from_pinned_main_after_retry(
 
     conn = _open_sync_db(db_path)
     try:
-        generation, status, retry_at = conn.execute(
-            "SELECT generation,status,retry_at FROM dialog_directory_state"
-        ).fetchone()
-        assert (generation, status) == (1, "invalid")
-        assert isinstance(retry_at, int)
-        assert conn.execute("SELECT COUNT(*) FROM dialog_directory_staging").fetchone() == (0,)
-        assert directory.status(float(retry_at - 1), conn).release_at == float(retry_at)
-        conn.execute("UPDATE dialog_directory_state SET retry_at=0")
-        conn.commit()
-    finally:
-        conn.close()
-
-    await directory.run_slice()
-    assert isinstance(client.requests[-1], functions.messages.GetPinnedDialogsRequest)
-    assert client.requests[-1].folder_id == 0
-    conn = _open_sync_db(db_path)
-    try:
-        assert conn.execute("SELECT generation,status FROM dialog_directory_state").fetchone() == (2, "in_progress")
+        assert conn.execute("SELECT status FROM dialog_directory_state").fetchone() == ("complete",)
+        assert conn.execute("SELECT type,last_message_at,pinned FROM dialogs WHERE dialog_id=1").fetchone() == (
+            "bot",
+            None,
+            1,
+        )
+        assert conn.execute("SELECT dialog_id,position FROM dialog_directory_published_pins").fetchone() == (1, 0)
     finally:
         conn.close()
 

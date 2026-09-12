@@ -240,12 +240,13 @@ class CanonicalDialogDirectory:
             "SELECT ?, dialog_id, revision, 0 FROM dialogs",
             (generation,),
         )
-        for key, value in (
-            ("dialog_unread_sweep_attempted_at", str(started_at)),
-            ("dialog_unread_sweep_status", "partial"),
-            ("dialog_unread_sweep_observed_count", "0"),
-        ):
-            conn.execute("INSERT OR REPLACE INTO daemon_state(key,value) VALUES (?,?)", (key, value))
+        # These keys describe the last *published* directory observation.
+        # Starting (or later failing) a generation records only its attempt;
+        # callers keep seeing the coherent prior publication until replacement.
+        conn.execute(
+            "INSERT OR REPLACE INTO daemon_state(key,value) VALUES ('dialog_unread_sweep_attempted_at',?)",
+            (str(started_at),),
+        )
         conn.execute(
             "UPDATE dialog_directory_state SET generation=?, status='in_progress', ordinary_status='pending', "
             "pinned_main_status='pending', pinned_archive_status='pending', offset_date=NULL, offset_id=0, "
@@ -267,22 +268,17 @@ class CanonicalDialogDirectory:
         if page.kind not in {"terminal", "page"}:
             self._commit_pinned_failure(conn, state.generation, folder_id, page.reason or page.kind, account_id)
             return
-        try:
-            with conn:
-                self._stage_facts(conn, state.generation, page.facts, folder_id=folder_id, account_id=account_id)
-                conn.executemany(
-                    "INSERT INTO dialog_directory_pins(generation, folder_id, dialog_id, position) VALUES (?, ?, ?, ?)",
-                    [(state.generation, folder_id, fact.dialog_id, position) for position, fact in enumerate(page.facts)],
-                )
-                column = "pinned_main_status" if folder_id == 0 else "pinned_archive_status"
-                conn.execute(
-                    f"UPDATE dialog_directory_state SET {column}='complete', retry_at=NULL WHERE singleton=1 AND account_id=? AND generation=?",
-                    (account_id, state.generation),
-                )
-        except RuntimeError as exc:
-            if str(exc) != "conflicting_cross_page_dialog":
-                raise
-            self._invalidate_active_acquisition(conn, state.generation, str(exc), account_id)
+        with conn:
+            self._stage_facts(conn, state.generation, page.facts, folder_id=folder_id, account_id=account_id)
+            conn.executemany(
+                "INSERT INTO dialog_directory_pins(generation, folder_id, dialog_id, position) VALUES (?, ?, ?, ?)",
+                [(state.generation, folder_id, fact.dialog_id, position) for position, fact in enumerate(page.facts)],
+            )
+            column = "pinned_main_status" if folder_id == 0 else "pinned_archive_status"
+            conn.execute(
+                f"UPDATE dialog_directory_state SET {column}='complete', retry_at=NULL WHERE singleton=1 AND account_id=? AND generation=?",
+                (account_id, state.generation),
+            )
 
     async def _acquire_ordinary(self, conn: sqlite3.Connection, state: _DirectoryState, account_id: int) -> None:
         published = False
@@ -297,37 +293,36 @@ class CanonicalDialogDirectory:
             self._commit_ordinary_failure(conn, state.generation, page.kind, page.reason or page.kind, account_id)
             return
         if page.kind == "incomplete":
+            reason = page.reason or "incomplete_page"
+            retry_delay = 900 if reason.startswith("stalled:") else 60
             with conn:
+                # An incomplete page may still contribute catalog rows.
+                # It never advances the committed cursor or publishes.
+                self._stage_facts(conn, state.generation, page.facts, folder_id=None, account_id=account_id)
                 conn.execute(
                     "UPDATE dialog_directory_state SET status='incomplete', ordinary_status='incomplete', reason=?, retry_at=? "
                     "WHERE singleton=1 AND account_id=? AND generation=?",
-                    (page.reason or "incomplete_page", int(time.time()) + 60, account_id, state.generation),
+                    (reason, int(time.time()) + retry_delay, account_id, state.generation),
                 )
             return
-        try:
-            with conn:
-                self._stage_facts(conn, state.generation, page.facts, folder_id=None, account_id=account_id)
-                if page.kind == "page":
-                    if page.cursor is None:
-                        raise RuntimeError("ordinary page cannot commit without a cursor")
-                    self._save_cursor(conn, page.cursor, state.generation, account_id)
-                    conn.execute(
-                        "UPDATE dialog_directory_state SET observed_count=observed_count+?, reason=NULL "
-                        "WHERE singleton=1 AND account_id=? AND generation=?",
-                        (len(page.facts), account_id, state.generation),
-                    )
-                    return
+        with conn:
+            self._stage_facts(conn, state.generation, page.facts, folder_id=None, account_id=account_id)
+            if page.kind == "page":
+                if page.cursor is None:
+                    raise RuntimeError("ordinary page cannot commit without a cursor")
+                self._save_cursor(conn, page.cursor, state.generation, account_id)
                 conn.execute(
-                    "UPDATE dialog_directory_state SET ordinary_status='complete', observed_count=observed_count+?, reason=NULL "
+                    "UPDATE dialog_directory_state SET observed_count=observed_count+?, reason=NULL "
                     "WHERE singleton=1 AND account_id=? AND generation=?",
                     (len(page.facts), account_id, state.generation),
                 )
-                published = self._publish_if_complete(conn, state.generation, account_id)
-        except RuntimeError as exc:
-            if str(exc) != "conflicting_cross_page_dialog":
-                raise
-            self._invalidate_active_acquisition(conn, state.generation, str(exc), account_id)
-            return
+                return
+            conn.execute(
+                "UPDATE dialog_directory_state SET ordinary_status='complete', observed_count=observed_count+?, reason=NULL "
+                "WHERE singleton=1 AND account_id=? AND generation=?",
+                (len(page.facts), account_id, state.generation),
+            )
+            published = self._publish_if_complete(conn, state.generation, account_id)
         if published:
             self._set_detail("canonical dialog directory: complete")
 
@@ -407,29 +402,18 @@ class CanonicalDialogDirectory:
                 ).fetchone(),
             )
             baseline_revision = _required_int(baseline[0], "baseline revision") if baseline is not None else None
-            existing = cast(
-                tuple[object, object, object] | None,
-                conn.execute(
-                    "SELECT peer_kind,top_message,type FROM dialog_directory_staging WHERE generation=? AND dialog_id=?",
-                    (generation, row.dialog_id),
-                ).fetchone(),
-            )
-            if existing is not None and (existing[0], existing[1], existing[2]) != (
-                row.peer_kind,
-                row.top_message,
-                row.dialog_type,
-            ):
-                raise RuntimeError("conflicting_cross_page_dialog")
             conn.execute(
                 "INSERT INTO dialog_directory_staging("
                 "generation,dialog_id,source,peer_kind,top_message,name,type,archived,pinned,members,created,last_message_at,read_inbox_max_id,read_outbox_max_id,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,draft_text,snapshot_at,baseline_revision) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(generation,dialog_id) DO UPDATE SET "
+                "source=excluded.source,peer_kind=excluded.peer_kind,top_message=excluded.top_message,"
                 "name=excluded.name,type=excluded.type,archived=excluded.archived,pinned=excluded.pinned,members=excluded.members,"
                 "created=excluded.created,last_message_at=excluded.last_message_at,read_inbox_max_id=excluded.read_inbox_max_id,"
                 "read_outbox_max_id=excluded.read_outbox_max_id,unread_mentions_count=excluded.unread_mentions_count,"
                 "unread_reactions_count=excluded.unread_reactions_count,unread_count=excluded.unread_count,"
-                "unread_mark=excluded.unread_mark,draft_text=excluded.draft_text,snapshot_at=excluded.snapshot_at",
+                "unread_mark=excluded.unread_mark,draft_text=excluded.draft_text,snapshot_at=excluded.snapshot_at,"
+                "baseline_revision=excluded.baseline_revision",
                 (
                     generation,
                     row.dialog_id,
@@ -459,9 +443,7 @@ class CanonicalDialogDirectory:
                 (generation, row.dialog_id),
             )
 
-    def _staged_fact(
-        self, fact: RawDialogFact, observed_at: int, folder_id: int | None, source: str
-    ) -> _StagedFact:
+    def _staged_fact(self, fact: RawDialogFact, observed_at: int, folder_id: int | None, source: str) -> _StagedFact:
         entity = fact.entity
         kind = EntityKind.UNKNOWN
         if isinstance(entity, types.User):
@@ -512,7 +494,8 @@ class CanonicalDialogDirectory:
         # before acquisition still matches; realtime always wins otherwise.
         conn.execute(
             "UPDATE dialogs AS current SET name=staged.name, type=staged.type, archived=staged.archived, "
-            "pinned=staged.pinned, members=staged.members, created=staged.created, last_message_at=staged.last_message_at, "
+            "pinned=CASE WHEN EXISTS (SELECT 1 FROM dialog_directory_pins pin WHERE pin.generation=staged.generation AND pin.dialog_id=staged.dialog_id) THEN 1 ELSE 0 END, "
+            "members=staged.members, created=staged.created, last_message_at=staged.last_message_at, "
             "snapshot_at=staged.snapshot_at, unread_mentions_count=staged.unread_mentions_count, "
             "unread_reactions_count=staged.unread_reactions_count, draft_text=staged.draft_text, "
             "unread_count=CASE WHEN staged.unread_count IS NOT NULL AND (current.unread_count_observed_at IS NULL OR current.unread_count_observed_at < staged.snapshot_at) THEN staged.unread_count ELSE current.unread_count END, "
@@ -526,7 +509,9 @@ class CanonicalDialogDirectory:
         )
         conn.execute(
             "INSERT INTO dialogs(dialog_id,name,type,archived,pinned,members,created,last_message_at,snapshot_at,hidden,needs_refresh,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,unread_count_observed_at,unread_mark_observed_at,draft_text) "
-            "SELECT staged.dialog_id,staged.name,staged.type,staged.archived,staged.pinned,staged.members,staged.created,staged.last_message_at,"
+            "SELECT staged.dialog_id,staged.name,staged.type,staged.archived,"
+            "CASE WHEN EXISTS (SELECT 1 FROM dialog_directory_pins pin WHERE pin.generation=staged.generation AND pin.dialog_id=staged.dialog_id) THEN 1 ELSE 0 END,"
+            "staged.members,staged.created,staged.last_message_at,"
             "staged.snapshot_at,0,0,staged.unread_mentions_count,staged.unread_reactions_count,staged.unread_count,staged.unread_mark,"
             "CASE WHEN staged.unread_count IS NULL THEN NULL ELSE staged.snapshot_at END,"
             "CASE WHEN staged.unread_mark IS NULL THEN NULL ELSE staged.snapshot_at END,staged.draft_text FROM dialog_directory_staging AS staged "
@@ -568,20 +553,14 @@ class CanonicalDialogDirectory:
             "WHERE singleton=1 AND account_id=? AND generation=?",
             (completed_at, observed_count, account_id, generation),
         )
-        conn.execute(
-            "INSERT OR REPLACE INTO daemon_state(key,value) VALUES ('dialog_unread_sweep_status','complete')"
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO daemon_state(key,value) VALUES ('dialog_unread_sweep_completed_at',?)",
-            (str(completed_at),),
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO daemon_state(key,value) VALUES ('dialog_unread_sweep_observed_count',?)",
-            (str(observed_count),),
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO daemon_state(key,value) VALUES ('dialog_unread_sweep_last_visible_count',?)",
-            (str(visible_count),),
+        conn.executemany(
+            "INSERT OR REPLACE INTO daemon_state(key,value) VALUES (?,?)",
+            (
+                ("dialog_unread_sweep_status", "complete"),
+                ("dialog_unread_sweep_completed_at", str(completed_at)),
+                ("dialog_unread_sweep_observed_count", str(observed_count)),
+                ("dialog_unread_sweep_last_visible_count", str(visible_count)),
+            ),
         )
         conn.execute("DELETE FROM dialog_directory_published_pins")
         conn.execute(
@@ -639,7 +618,11 @@ class CanonicalDialogDirectory:
         )
         if row is None:
             raise RuntimeError("canonical dialog directory state is missing")
-        cursor = None if row[1] == "invalid" or row[12] == "legacy_wrapper_cursor_unverified" else _decode_cursor(row[5], row[6], row[7])
+        cursor = (
+            None
+            if row[1] == "invalid" or row[12] == "legacy_wrapper_cursor_unverified"
+            else _decode_cursor(row[5], row[6], row[7])
+        )
         return _DirectoryState(
             _required_int(row[0], "directory generation"),
             str(row[1]),

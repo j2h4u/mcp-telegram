@@ -95,7 +95,6 @@ def normalize_dialogs_response(  # noqa: PLR0911, PLR0912 - distinct TL failures
     facts: list[RawDialogFact] = []
     identities: dict[int, tuple[str, int]] = {}
     candidate: DialogCursor | None = None
-    incomplete_reason: str | None = None
 
     for raw_dialog in dialogs:
         if isinstance(raw_dialog, types.DialogFolder):
@@ -121,32 +120,29 @@ def normalize_dialogs_response(  # noqa: PLR0911, PLR0912 - distinct TL failures
             message_date = None
         facts.append(RawDialogFact(dialog_id, entity, raw_dialog, message_date))
 
-        if entity is None:
-            incomplete_reason = incomplete_reason or "missing_dialog_entity"
-            continue
         offset_peer = _input_peer_for(entity, identity)
-        if message_date is None:
-            incomplete_reason = incomplete_reason or "missing_top_message"
-            continue
-        if offset_peer is None:
-            incomplete_reason = incomplete_reason or "unresolvable_offset_peer"
-            continue
-        candidate = DialogCursor(message_date, int(raw_dialog.top_message), offset_peer)
+        if message_date is not None and offset_peer is not None:
+            # Source order is significant: the last row that has every
+            # continuation fact is the only safe advancing cursor.
+            candidate = DialogCursor(message_date, int(raw_dialog.top_message), offset_peer)
 
     if not facts:
-        return RawDialogPage("incomplete", (), None, "dialog_folder_only_page")
-    if incomplete_reason is not None:
-        return RawDialogPage("incomplete", tuple(facts), None, incomplete_reason)
-    if candidate is None:
-        return RawDialogPage("incomplete", tuple(facts), None, "missing_safe_cursor")
-    if prior_cursor is not None and _cursor_key(candidate) == _cursor_key(prior_cursor):
-        return RawDialogPage("invalid", tuple(facts), None, "non_advancing_cursor")
+        if isinstance(response, types.messages.Dialogs):
+            return RawDialogPage("terminal", (), None)
+        return RawDialogPage("incomplete", (), None, "stalled:missing_safe_cursor")
     if isinstance(response, types.messages.Dialogs):
-        return RawDialogPage("terminal", tuple(facts), candidate)
+        # A terminal constructor is authoritative without a continuation.
+        # Missing entities, message dates, and input peers are row facts whose
+        # availability is independent from catalog completeness.
+        return RawDialogPage("terminal", tuple(facts), None)
+    if candidate is None:
+        return RawDialogPage("incomplete", tuple(facts), None, "stalled:missing_safe_cursor")
+    if prior_cursor is not None and _cursor_key(candidate) == _cursor_key(prior_cursor):
+        return RawDialogPage("incomplete", tuple(facts), None, "stalled:non_advancing_cursor")
     return RawDialogPage("page", tuple(facts), candidate)
 
 
-def normalize_pinned_dialogs_response(response: object) -> RawDialogPage:  # noqa: PLR0911 - TL outcomes are durable states
+def normalize_pinned_dialogs_response(response: object) -> RawDialogPage:
     """Normalize a pinned response while retaining raw source order.
 
     Pinned membership needs a canonical peer identity. Missing top-message
@@ -160,7 +156,6 @@ def normalize_pinned_dialogs_response(response: object) -> RawDialogPage:  # noq
     messages = _message_map(response)
     facts: list[RawDialogFact] = []
     identities: set[int] = set()
-    incomplete_reason: str | None = None
     for raw_dialog in cast(list[object], response.dialogs):
         if isinstance(raw_dialog, types.DialogFolder):
             continue
@@ -174,8 +169,6 @@ def normalize_pinned_dialogs_response(response: object) -> RawDialogPage:  # noq
             return RawDialogPage("invalid", tuple(facts), None, "duplicate_pinned_dialog")
         identities.add(dialog_id)
         entity = entities.get(identity)
-        if entity is None:
-            incomplete_reason = incomplete_reason or "missing_dialog_entity"
         message = messages.get((identity, int(raw_dialog.top_message)))
         message_date = getattr(message, "date", None) if message is not None else None
         facts.append(
@@ -186,8 +179,6 @@ def normalize_pinned_dialogs_response(response: object) -> RawDialogPage:  # noq
                 message_date if isinstance(message_date, datetime) else None,
             )
         )
-    if incomplete_reason is not None:
-        return RawDialogPage("incomplete", tuple(facts), None, incomplete_reason)
     return RawDialogPage("terminal", tuple(facts), None)
 
 
@@ -244,7 +235,7 @@ def _canonical_dialog_id(identity: tuple[str, int]) -> int:
 
 
 def _input_peer_for(  # noqa: PLR0911 - raw peer constructors have explicit security gates
-    entity: object, identity: tuple[str, int]
+    entity: object | None, identity: tuple[str, int]
 ) -> InputPeer | None:
     kind, raw_id = identity
     if kind == "user" and isinstance(entity, types.User):
@@ -253,7 +244,7 @@ def _input_peer_for(  # noqa: PLR0911 - raw peer constructors have explicit secu
         if entity.min or not isinstance(entity.access_hash, int) or isinstance(entity.access_hash, bool):
             return None
         return InputPeerUser(raw_id, entity.access_hash)
-    if kind == "chat" and isinstance(entity, (types.Chat, types.ChatForbidden)):
+    if kind == "chat":
         return InputPeerChat(raw_id)
     if kind == "channel" and isinstance(entity, (types.Channel, types.ChannelForbidden)):
         if (

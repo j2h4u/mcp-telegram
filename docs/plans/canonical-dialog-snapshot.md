@@ -48,13 +48,13 @@ list, or a successful empty catalog. An empty list is authoritative only when
 the applicable source completed and the source contract permits an empty
 result to prove absence.
 
-Every published dialog row has, at minimum, a canonical peer identity and
-type, a display name when Telegram supplied one, placement facts such as
-archived and pinned when supplied, top-message identity and date when supplied,
-and source observation/provenance. Unavailable or omitted fields remain
-`unknown`; a row may be useful while some optional facts are unknown. Read and
-unread facts retain their own observation times and cannot be renewed by a
-later observation of unrelated fields.
+Every published dialog row has, at minimum, a canonical peer identity. Entity
+classification, display name, placement facts, top-message identity and date,
+and source-derived details are recorded when Telegram supplied them. An
+unresolved entity does not let the directory infer a user type or eligibility
+from `PeerUser`; those facts remain `unknown`. Read and unread facts retain
+their own observation times and cannot be renewed by a later observation of
+unrelated fields.
 
 Folder rules carry a folder ID and title, category selectors, explicit included
 and excluded peers, pinned peers, and applicable exclusion flags such as
@@ -141,37 +141,68 @@ uses the last committed raw cursor. Telegram documents `limit`,
 [`messages.getDialogs`](https://core.telegram.org/method/messages.getDialogs),
 and identifies `top_message` as the message ID used for pagination.
 
+### Dialog liveness amendment
+
+Catalog membership completeness, optional row-fact availability, and
+pagination ability are independent. Every raw dialog with a resolvable
+canonical identity is retained. Missing entity-derived fields or
+classification, a matched top message or date, and a reconstructible
+`InputPeer` become `unknown` facts; they never block a terminal `Dialogs`
+constructor, including an empty terminal response.
+
+For a nonterminal `DialogsSlice`, the safe cursor is the last source-order row
+with both a matched top-message date and a reconstructible input peer. Rows
+after that candidate are staged and may repeat on retry. If no safe cursor
+exists, or it equals the committed cursor, the ordinary source becomes
+`incomplete` with `stalled:missing_safe_cursor` or
+`stalled:non_advancing_cursor`, retains its staging and committed cursor, and
+retries after 900 seconds. It does not publish partial acquisition. Unknown
+constructors, unresolvable canonical identities, and contradictory identities
+within one response remain blocking.
+
+Successive observations of one canonical peer are not conflicts merely because
+mutable facts differ. Later source order replaces the staged mutable bundle,
+including source, top-message, matched date, and provenance; a lower
+top-message ID is valid and a later missing date replaces the earlier date with
+`unknown`. Pinned membership and source order remain separate from ordinary
+facts, so ordinary observation cannot erase them.
+
+The unread-sweep metadata describes the last published observation as one
+receipt: `status`, `observed_count`, `completed_at`, and
+`last_visible_count` are left intact while a generation starts or fails, while
+`attempted_at` records the new attempt. A successful publication replaces all
+four receipt fields in its publication transaction. Fresh installs have no
+such receipt and therefore report unknown coverage.
+
 ### Project cursor algorithm
 
 The following algorithm is project-owned. For each raw dialog in source order,
-first resolve its raw peer and look up a response message by the pair `(peer,
-top_message)`. From the last raw
-dialog with a matched message, take that message's `date`, the dialog's
-`top_message` ID, and the dialog's reconstructible `offset_peer` as the next
-cursor. The pair key prevents a message ID belonging to another peer from
-being used. The selected cursor is compared with the prior cursor before it
-is committed.
+first resolve its canonical peer identity and look up a response message by the
+pair `(peer, top_message)`. All identifiable rows are retained. For a
+nonterminal page, the last row with a matched message date and reconstructible
+`offset_peer` supplies the next cursor. The pair key prevents a message ID
+belonging to another peer from being used. The selected cursor is compared with
+the prior cursor before it is committed.
 
 The adapter has these explicit edge rules:
 
-- a missing entity or missing `(peer, top_message)` message may leave that row
-  with an unknown top-message fact, but it is skipped as a cursor candidate and
-  the page is incomplete; the adapter does not commit a cursor past the page;
+- missing entity, classification, matched `(peer, top_message)` message, date,
+  or reconstructible peer facts leave that row `unknown` and skip it as a
+  cursor candidate; they do not prevent terminal completion;
 - `DialogFolder` is a folder marker, not a dialog row. It is skipped for facts
   and cursor selection, does not count as EOF, and a page containing only such
-  markers is incomplete because it has no safe cursor candidate;
+  markers is stalled because it has no safe cursor candidate;
 - an exact duplicate of a canonical peer ID with the same identity and
   `top_message` is skipped after the first occurrence; conflicting identity,
   type, or top-message data is invalid and cannot advance the cursor;
 - equal dates are allowed when the message ID and peer make the cursor tuple
   distinct. An exact `(date, top_message, offset_peer)` collision with the
-  prior cursor, or an unresolvable `offset_peer`, is a non-advancing invalid
-  outcome, never an EOF signal.
+  prior cursor is a non-advancing stalled outcome, never an EOF signal.
 
-Valid facts from a partial page may be staged for retry diagnostics, but only a
-transaction containing a safe next cursor can advance the source. These rules
-make every skip explicit and prevent a missing raw object or tie from silently
-losing the remainder of the catalog.
+Valid facts from a stalled page are staged for retry, but only a transaction
+containing a safe next cursor can advance the source. These rules make every
+skip explicit and prevent a missing raw object or tie from silently losing the
+remainder of the catalog.
 
 Pinned dialogs are acquired as a separate source, once for `folder_id=0` and
 once for `folder_id=1`, through `messages.getPinnedDialogs`. They are not
@@ -184,14 +215,16 @@ documentation.
 
 For a raw `messages.DialogsSlice`, the adapter continues until it receives an
 empty raw `dialogs` page or a terminal `messages.Dialogs` result. The wrapper's
-page length is not EOF. A terminal result is authoritative only after all
-required raw records in the preceding pages passed the cursor rules above. The
-adapter must preserve the exact identity needed to reconstruct the next raw
-request; it must not invent a peer or silently drop an unresolved one.
+page length is not EOF. A terminal result needs no cursor and is authoritative
+even when optional row facts are unknown or a hypothetical cursor would repeat.
+The adapter must preserve the exact identity needed to reconstruct the next raw
+request; it must not invent a peer or silently drop an unresolved canonical
+identity.
 
 The following outcomes are never complete:
 
-- the next cursor repeats the prior cursor or otherwise does not advance;
+- a nonterminal next cursor repeats the prior cursor or otherwise does not
+  advance;
 - a raw dialog's identity cannot be resolved to the canonical peer identity;
 - a response is `messages.DialogsNotModified` and there is no cached response
   that can be used under this acquisition contract;
@@ -204,8 +237,8 @@ claiming catalog completeness.
 
 Each raw page and its next cursor are stored in one local transaction. A crash
 before commit leaves the prior cursor and prior staged facts in force; a
-successful commit makes both visible together. Publication is a separate
-short transaction after every required source has a complete receipt.
+successful commit makes both visible together. Publication is a separate short
+transaction after every required source has a complete receipt.
 
 ## Minimal staging and atomic publication
 
