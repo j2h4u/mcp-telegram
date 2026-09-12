@@ -937,68 +937,58 @@ class DaemonAPIServer:
             metadata[dialog_id] = (name, entity_type, eligible, username, identity_complete)
         return metadata
 
-    def _local_dialog_directory(  # noqa: PLR0914
+    def _local_dialog_directory(
         self,
     ) -> _DialogDirectoryResult:
         """Return exact-name cache entries and fuzzy-eligible dialog entries."""
         dialog_metadata = self._local_dialog_metadata()
-        entity_rows = cast(
-            list[tuple[object, ...]],
-            self._conn.execute("SELECT id, name, username, type FROM entities ORDER BY id").fetchall(),
-        )
-        stored_entities = {
-            _coerce_int(row[0], 0): (
-                row[1],
-                row[2] if isinstance(row[2], str) and row[2] else None,
-                row[3] if isinstance(row[3], str) and row[3] else None,
-            )
-            for row in entity_rows
-        }
+        stored_entities = self._local_dialog_stored_entities()
         directory = _LocalDialogDirectory.from_metadata(dialog_metadata)
         for entity_id in sorted(dialog_metadata):
-            dialog_name, dialog_type, eligible, _dialog_username, identity_complete = dialog_metadata[entity_id]
-            if not eligible:
+            identity = self._local_dialog_effective_identity(entity_id, dialog_metadata, stored_entities)
+            if identity is None:
                 continue
-            stored_name, _stored_username, stored_type = stored_entities.get(entity_id, (None, None, None))
-            # A complete canonical bundle is authoritative, including a known
-            # absence (for example a username removed by Telegram).
-            if identity_complete is True:
-                stored_name = None
-                stored_type = None
-            name = dialog_name if dialog_name is not None else stored_name
+            name, entity_type = identity
             directory.add(
                 entity_id,
                 stored_name=name,
-                stored_type=dialog_type or stored_type,
+                stored_type=entity_type,
                 dialog_metadata=dialog_metadata,
             )
         names, normalized, fuzzy_names, fuzzy_normalized, entity_types, ineligible_ids, _ = directory.result()
         coverage = read_dialog_directory_coverage(self._conn)
         return names, normalized, fuzzy_names, fuzzy_normalized, entity_types, ineligible_ids, coverage
 
-    @staticmethod
-    def _local_username_match(
-        row: tuple[object, ...],
-        *,
-        username: str,
-        dialog_metadata: _DialogMetadata,
-    ) -> MatchInfo | None:
-        entity_id = _coerce_int(row[0], 0)
-        dialog_name, dialog_type, eligible, dialog_username, identity_complete = dialog_metadata.get(
-            entity_id, (None, None, True, None, None)
+    def _local_dialog_stored_entities(self) -> dict[int, tuple[object, str | None, str | None]]:
+        rows = cast(
+            list[tuple[object, ...]],
+            self._conn.execute("SELECT id, name, username, type FROM entities ORDER BY id").fetchall(),
         )
-        if entity_id == 0 or not eligible:
-            return None
         return {
-            "entity_id": entity_id,
-            "display_name": str(dialog_name or row[1] or f"@{username}"),
-            "score": 100,
-            "username": dialog_username
-            or (str(row[2]) if row[2] is not None and identity_complete is not True else username),
-            "entity_type": dialog_type
-            or (str(row[3]) if row[3] is not None and identity_complete is not True else None),
-            "disambiguation_hint": None,
+            _coerce_int(row[0], 0): (
+                row[1],
+                row[2] if isinstance(row[2], str) and row[2] else None,
+                row[3] if isinstance(row[3], str) and row[3] else None,
+            )
+            for row in rows
         }
+
+    @staticmethod
+    def _local_dialog_effective_identity(
+        entity_id: int,
+        dialog_metadata: _DialogMetadata,
+        stored_entities: Mapping[int, tuple[object, str | None, str | None]],
+    ) -> tuple[object, str | None] | None:
+        dialog_name, dialog_type, eligible, _dialog_username, identity_complete = dialog_metadata[entity_id]
+        if not eligible:
+            return None
+        stored_name, _stored_username, stored_type = stored_entities.get(entity_id, (None, None, None))
+        # A complete canonical bundle is authoritative, including a known
+        # absence (for example a username removed by Telegram).
+        if identity_complete is True:
+            stored_name = None
+            stored_type = None
+        return dialog_name if dialog_name is not None else stored_name, dialog_type or stored_type
 
     @staticmethod
     def _resolve_exact_natural_name(
@@ -1032,13 +1022,13 @@ class DaemonAPIServer:
             for match in result.matches:
                 match["entity_type"] = entity_types.get(match["entity_id"])
 
-    def _resolve_local_dialog_username(self, username: str, query: str) -> Resolved | Candidates | NotFound:
+    def _local_dialog_username_rows(self, username: str) -> list[tuple[object, ...]]:
         column_rows = cast(list[tuple[object, ...]], self._conn.execute("PRAGMA table_info(dialogs)").fetchall())
         dialog_columns = {str(row[1]) for row in column_rows}
         canonical_username_sql = "d.username" if "username" in dialog_columns else "NULL"
         identity_complete_sql = "d.identity_complete" if "identity_complete" in dialog_columns else "0"
         hidden = "d.hidden" if "hidden" in dialog_columns else "0"
-        rows = cast(
+        return cast(
             list[tuple[object, ...]],
             self._conn.execute(
                 f"SELECT d.dialog_id,d.name,{canonical_username_sql},d.type,{identity_complete_sql},e.name,e.username,e.type "
@@ -1051,8 +1041,10 @@ class DaemonAPIServer:
                 (username, username),
             ).fetchall(),
         )
-        matches: list[MatchInfo] = []
-        for (
+
+    @staticmethod
+    def _project_local_dialog_username_row(row: tuple[object, ...], username: str) -> MatchInfo | None:
+        (
             dialog_id,
             name,
             canonical_username,
@@ -1061,25 +1053,26 @@ class DaemonAPIServer:
             entity_name,
             entity_username,
             entity_type,
-        ) in rows:
-            complete = bool(identity_complete)
-            effective_username = (
-                canonical_username if canonical_username is not None else (None if complete else entity_username)
-            )
-            if not isinstance(effective_username, str):
-                continue
-            display_name = name if isinstance(name, str) else (None if complete else entity_name)
-            effective_type = dialog_type if isinstance(dialog_type, str) else (None if complete else entity_type)
-            matches.append(
-                {
-                    "entity_id": _coerce_int(dialog_id, 0),
-                    "display_name": str(display_name or f"@{username}"),
-                    "score": 100,
-                    "username": effective_username,
-                    "entity_type": str(effective_type) if effective_type is not None else None,
-                    "disambiguation_hint": None,
-                }
-            )
+        ) = row
+        complete = bool(identity_complete)
+        effective_username = (
+            canonical_username if canonical_username is not None else (None if complete else entity_username)
+        )
+        if not isinstance(effective_username, str):
+            return None
+        display_name = name if isinstance(name, str) else (None if complete else entity_name)
+        effective_type = dialog_type if isinstance(dialog_type, str) else (None if complete else entity_type)
+        return {
+            "entity_id": _coerce_int(dialog_id, 0),
+            "display_name": str(display_name or f"@{username}"),
+            "score": 100,
+            "username": effective_username,
+            "entity_type": str(effective_type) if effective_type is not None else None,
+            "disambiguation_hint": None,
+        }
+
+    @staticmethod
+    def _resolve_local_username_matches(query: str, matches: list[MatchInfo]) -> Resolved | Candidates | NotFound:
         matches.sort(key=lambda item: (item["display_name"].casefold(), item["entity_id"]))
         if len(matches) == 1:
             match = matches[0]
@@ -1087,6 +1080,13 @@ class DaemonAPIServer:
         if matches:
             return Candidates(query=query, matches=matches)
         return NotFound(query=query)
+
+    def _resolve_local_dialog_username(self, username: str, query: str) -> Resolved | Candidates | NotFound:
+        rows = self._local_dialog_username_rows(username)
+        matches = [
+            match for row in rows if (match := self._project_local_dialog_username_row(row, username)) is not None
+        ]
+        return self._resolve_local_username_matches(query, matches)
 
     async def _resolve_dialog_entity(self, dialog: str) -> int | None:
         """Resolve a dialog selector through the live Telegram entity lookup."""
@@ -1181,7 +1181,64 @@ class DaemonAPIServer:
             response["retry_after"] = retry_after
         return response
 
-    async def _resolve_dialog_id(  # noqa: PLR0911 - stable resolution response branches
+    @classmethod
+    def _dialog_resolution_candidates_response(
+        cls,
+        selector: DialogSelector,
+        result: Candidates,
+        coverage: DialogDirectoryCoverage,
+    ) -> dict[str, object]:
+        candidates = cls._sorted_dialog_matches(result.matches)
+        coverage_wire = coverage.to_wire()
+        if len(candidates) == 1:
+            return {
+                "ok": False,
+                "error": "dialog_not_found",
+                "message": f"Dialog {selector.label!r} was not found; one approximate match is available.",
+                "suggestion": candidates[0],
+                "directory_coverage": coverage_wire,
+                "required_action": "Retry with the suggestion's exact dialog id, or refine the dialog name.",
+            }
+        return {
+            "ok": False,
+            "error": "ambiguous_dialog",
+            "message": f"Dialog {selector.label!r} matched multiple dialogs.",
+            "candidates": candidates,
+            "directory_coverage": coverage_wire,
+            "required_action": "Retry with an exact dialog id from candidates.",
+        }
+
+    @staticmethod
+    def _dialog_resolution_no_match_response(
+        selector: DialogSelector,
+        coverage: DialogDirectoryCoverage,
+    ) -> dict[str, object]:
+        coverage_wire = coverage.to_wire()
+        if coverage.status in {"never", "in_progress"} or not coverage.lookup_complete:
+            return {
+                "ok": False,
+                "error": "dialog_directory_incomplete",
+                "message": "No local match; coverage incomplete/unknown.",
+                "directory_coverage": coverage_wire,
+                "required_action": "Use an exact dialog id or @username when known, or retry after a future directory refresh.",
+            }
+        if coverage.status == "stale" or not coverage.lookup_fresh:
+            return {
+                "ok": False,
+                "error": "stale_local_directory",
+                "message": "No local match; the local dialog directory or identity lookup is stale.",
+                "directory_coverage": coverage_wire,
+                "required_action": "Use an exact dialog id or @username when known, or retry after a future directory refresh.",
+            }
+        return {
+            "ok": False,
+            "error": "dialog_not_found",
+            "message": f"Dialog {selector.label!r} was not found.",
+            "directory_coverage": coverage_wire,
+            "required_action": "Call list_dialogs, then retry with an exact dialog id or full dialog name.",
+        }
+
+    async def _resolve_dialog_id(
         self,
         selector: DialogSelector,
     ) -> int | dict:
@@ -1201,48 +1258,8 @@ class DaemonAPIServer:
         if isinstance(result, Resolved):
             return ResolvedDialogId(result.entity_id, directory_coverage)
         if isinstance(result, Candidates):
-            candidates = self._sorted_dialog_matches(result.matches)
-            coverage = directory_coverage.to_wire()
-            if len(candidates) == 1:
-                return {
-                    "ok": False,
-                    "error": "dialog_not_found",
-                    "message": f"Dialog {selector.label!r} was not found; one approximate match is available.",
-                    "suggestion": candidates[0],
-                    "directory_coverage": coverage,
-                    "required_action": "Retry with the suggestion's exact dialog id, or refine the dialog name.",
-                }
-            return {
-                "ok": False,
-                "error": "ambiguous_dialog",
-                "message": f"Dialog {selector.label!r} matched multiple dialogs.",
-                "candidates": candidates,
-                "directory_coverage": coverage,
-                "required_action": "Retry with an exact dialog id from candidates.",
-            }
-        if directory_coverage.status in {"never", "in_progress"} or not directory_coverage.lookup_complete:
-            return {
-                "ok": False,
-                "error": "dialog_directory_incomplete",
-                "message": "No local match; coverage incomplete/unknown.",
-                "directory_coverage": directory_coverage.to_wire(),
-                "required_action": "Use an exact dialog id or @username when known, or retry after a future directory refresh.",
-            }
-        if directory_coverage.status == "stale" or not directory_coverage.lookup_fresh:
-            return {
-                "ok": False,
-                "error": "stale_local_directory",
-                "message": "No local match; the local dialog directory or identity lookup is stale.",
-                "directory_coverage": directory_coverage.to_wire(),
-                "required_action": "Use an exact dialog id or @username when known, or retry after a future directory refresh.",
-            }
-        return {
-            "ok": False,
-            "error": "dialog_not_found",
-            "message": f"Dialog {selector.label!r} was not found.",
-            "directory_coverage": directory_coverage.to_wire(),
-            "required_action": "Call list_dialogs, then retry with an exact dialog id or full dialog name.",
-        }
+            return self._dialog_resolution_candidates_response(selector, result, directory_coverage)
+        return self._dialog_resolution_no_match_response(selector, directory_coverage)
 
     def _trace_service(self) -> DaemonAccountTraceService:
         return DaemonAccountTraceService(
@@ -1364,61 +1381,77 @@ class DaemonAPIServer:
         result = await self._get_reading_service().list_dialogs(cast(dict[str, object], req))
         if not result.get("ok"):
             return result
-        memberships = folders_by_dialog(self._conn)
         requested_folder = req.get("folder_id")
+        folder_id = None if requested_folder is None else int(cast(int | str, requested_folder))
         raw_limit = req.get("limit")
         limit = None if raw_limit is None else _clamp(_coerce_int(raw_limit, 100), 1, 500)
         data = cast(dict[str, object], result.get("data", {}))
         dialogs = cast(list[dict[str, object]], data.get("dialogs", []))
-        if _coerce_int(requested_folder, -1) == 1:
-            archive_rows = cast(
-                list[tuple[object, object]],
-                self._conn.execute(
-                    "SELECT d.dialog_id,COALESCE(f.archived,d.archived) FROM dialogs d "
-                    "LEFT JOIN dialog_directory_facts f ON f.dialog_id=d.dialog_id WHERE d.hidden=0"
-                ).fetchall(),
-            )
-            archived_ids = {_coerce_int(dialog_id, 0) for dialog_id, archived in archive_rows if archived == 1}
-            unknown_archived = sum(archived is None for _, archived in archive_rows)
-            enriched = [dialog for dialog in dialogs if int(cast(int | str, dialog["id"])) in archived_ids]
-            for dialog in enriched:
-                dialog["folder_ids"] = [1]
-                dialog["folders"] = [{"id": 1, "title": "Archived"}]
-            data["dialogs"] = enriched[:limit] if limit is not None else enriched
-            data["folder_membership_unknown_count"] = unknown_archived
-            data["folder_snapshot"] = folder_snapshot(
-                self._conn,
-                stale_after_seconds=self._policy.folder_snapshot_stale_after_seconds,
-            )
-            return result
+        if folder_id == 1:
+            self._project_archived_dialogs(data, dialogs, limit)
+        else:
+            self._project_regular_folder_dialogs(data, dialogs, folder_id, limit)
+        data["folder_snapshot"] = folder_snapshot(
+            self._conn,
+            stale_after_seconds=self._policy.folder_snapshot_stale_after_seconds,
+        )
+        return result
+
+    def _project_archived_dialogs(
+        self,
+        data: dict[str, object],
+        dialogs: list[dict[str, object]],
+        limit: int | None,
+    ) -> None:
+        archive_rows = cast(
+            list[tuple[object, object]],
+            self._conn.execute(
+                "SELECT d.dialog_id,COALESCE(f.archived,d.archived) FROM dialogs d "
+                "LEFT JOIN dialog_directory_facts f ON f.dialog_id=d.dialog_id WHERE d.hidden=0"
+            ).fetchall(),
+        )
+        archived_ids = {_coerce_int(dialog_id, 0) for dialog_id, archived in archive_rows if archived == 1}
+        unknown_archived = sum(archived is None for _, archived in archive_rows)
+        enriched = [dialog for dialog in dialogs if int(cast(int | str, dialog["id"])) in archived_ids]
+        for dialog in enriched:
+            dialog["folder_ids"] = [1]
+            dialog["folders"] = [{"id": 1, "title": "Archived"}]
+        data["dialogs"] = enriched[:limit] if limit is not None else enriched
+        data["folder_membership_unknown_count"] = unknown_archived
+
+    def _project_regular_folder_dialogs(
+        self,
+        data: dict[str, object],
+        dialogs: list[dict[str, object]],
+        folder_id: int | None,
+        limit: int | None,
+    ) -> None:
+        memberships = folders_by_dialog(self._conn)
         enriched = []
         for dialog in dialogs:
             folders = memberships.get(int(cast(int | str, dialog["id"])), [])
             ids = [int(cast(int | str, folder["id"])) for folder in folders]
             dialog["folder_ids"] = ids
             dialog["folders"] = folders
-            if requested_folder is None or int(cast(int | str, requested_folder)) in ids:
+            if folder_id is None or folder_id in ids:
                 enriched.append(dialog)
                 if limit is not None and len(enriched) >= limit:
                     break
         data["dialogs"] = enriched
-        if requested_folder is not None:
-            folder_namespace = "default" if int(cast(int | str, requested_folder)) == 0 else "filter"
-            unknown_row = cast(
-                tuple[object] | None,
-                self._conn.execute(
-                    "SELECT COUNT(*) FROM telegram_folder_local_members WHERE namespace=? AND folder_id=? AND state='unknown'",
-                    (folder_namespace, int(cast(int | str, requested_folder))),
-                ).fetchone(),
-            )
-            data["folder_membership_unknown_count"] = _coerce_int(unknown_row[0], 0) if unknown_row is not None else 0
-        else:
-            data["folder_membership_unknown_count"] = 0
-        data["folder_snapshot"] = folder_snapshot(
-            self._conn,
-            stale_after_seconds=self._policy.folder_snapshot_stale_after_seconds,
+        data["folder_membership_unknown_count"] = self._folder_membership_unknown_count(folder_id)
+
+    def _folder_membership_unknown_count(self, folder_id: int | None) -> int:
+        if folder_id is None:
+            return 0
+        folder_namespace = "default" if folder_id == 0 else "filter"
+        unknown_row = cast(
+            tuple[object] | None,
+            self._conn.execute(
+                "SELECT COUNT(*) FROM telegram_folder_local_members WHERE namespace=? AND folder_id=? AND state='unknown'",
+                (folder_namespace, folder_id),
+            ).fetchone(),
         )
-        return result
+        return _coerce_int(unknown_row[0], 0) if unknown_row is not None else 0
 
     async def _get_unread_summary(self, req: dict[str, object]) -> dict:
         """Delegate the Dialog-projection unread overview to the read service."""

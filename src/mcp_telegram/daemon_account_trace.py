@@ -1314,15 +1314,17 @@ async def _resolve_trace_account_scope(
         decode_navigation=request.req.get("navigation"),
     )
     if navigation_scope is not None:
-        nav_error: dict | None = navigation_scope.error
-        if nav_error is not None:
-            return None, nav_error
-        if navigation_scope.scope_dialog_ids is not None:
-            scope_dialog_ids = navigation_scope.scope_dialog_ids
-        if navigation_scope.navigation_payload is not None:
-            navigation_payload = navigation_scope.navigation_payload
-        if exact_dialog_id is not None and navigation_scope.linked_chat_id is not None:
-            linked_chat_map[exact_dialog_id] = navigation_scope.linked_chat_id
+        applied_navigation = _apply_trace_navigation_scope(
+            navigation_scope,
+            exact_dialog_id=exact_dialog_id,
+            scope_dialog_ids=scope_dialog_ids,
+            linked_chat_map=linked_chat_map,
+        )
+        if applied_navigation.error is not None:
+            return None, applied_navigation.error
+        scope_dialog_ids = applied_navigation.scope_dialog_ids
+        navigation_payload = applied_navigation.navigation_payload
+        linked_chat_map = applied_navigation.linked_chat_map
 
     return _TraceAccountMessagesScope(
         exact_dialog_id=exact_dialog_id,
@@ -1340,6 +1342,34 @@ class _TraceNavigationScopeResult:
     scope_dialog_ids: list[int] | None
     linked_chat_id: int | None
     error: dict[str, object] | None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _AppliedTraceNavigationScope:
+    navigation_payload: dict[str, int] | None
+    scope_dialog_ids: list[int] | None
+    linked_chat_map: dict[int, int]
+    error: dict[str, object] | None
+
+
+def _apply_trace_navigation_scope(
+    navigation_scope: _TraceNavigationScopeResult,
+    *,
+    exact_dialog_id: int | None,
+    scope_dialog_ids: list[int] | None,
+    linked_chat_map: dict[int, int],
+) -> _AppliedTraceNavigationScope:
+    if navigation_scope.error is not None:
+        return _AppliedTraceNavigationScope(None, scope_dialog_ids, linked_chat_map, navigation_scope.error)
+    if navigation_scope.scope_dialog_ids is not None:
+        scope_dialog_ids = navigation_scope.scope_dialog_ids
+    if navigation_scope.navigation_payload is not None:
+        navigation_payload = navigation_scope.navigation_payload
+    else:
+        navigation_payload = None
+    if exact_dialog_id is not None and navigation_scope.linked_chat_id is not None:
+        linked_chat_map[exact_dialog_id] = navigation_scope.linked_chat_id
+    return _AppliedTraceNavigationScope(navigation_payload, scope_dialog_ids, linked_chat_map, None)
 
 
 async def _resolve_trace_account_scope_dialog_id(
