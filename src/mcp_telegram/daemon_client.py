@@ -271,7 +271,8 @@ class DaemonConnection:
 
         Args:
             dialog_id: Numeric dialog id (preferred over dialog name).
-            dialog: Fuzzy dialog name — daemon resolves via get_entity/iter_dialogs.
+            dialog: Natural name resolved from the daemon's canonical local directory;
+                explicit usernames may use a targeted exact-peer lookup.
             limit: Max messages to return (daemon clamps to 1..500).
             navigation: Opaque cursor token from a previous next_navigation response.
             direction: Internal page-selection direction; response presentation is chronological.

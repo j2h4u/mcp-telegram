@@ -96,7 +96,7 @@ def read_dialog_directory_coverage(  # noqa: PLR0914
         identity_row = None
 
     candidate_count = _int_or_none(identity_row[0]) if identity_row is not None else 0
-    unknown_count = _int_or_none(identity_row[1]) if identity_row is not None else 0
+    unknown_count = (_int_or_none(identity_row[1]) or 0) if identity_row is not None else 0
     lookup_complete = unknown_count == 0
     min_identity_observed = _int_or_none(identity_row[3]) if identity_row is not None else None
     lookup_fresh = lookup_complete and (

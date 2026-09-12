@@ -4,7 +4,7 @@ DaemonAPIServer listens on a Unix domain socket and handles seventeen methods:
   - list_messages: read from sync.db (synced dialogs) or Telegram (on-demand)
   - search_messages: FTS5 stemmed full-text search against messages_fts
   - trace_account_messages: observable authored-message evidence for one account
-  - list_dialogs: live dialog list from Telegram enriched with sync_status
+  - list_dialogs: canonical local dialog list enriched with sync_status
   - list_topics: forum topic list via Telegram API
   - get_me: current user info via Telegram API
   - mark_dialog_for_sync: add/remove dialog from sync scope
@@ -46,7 +46,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, SupportsIndex, cast
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 from telethon.errors import RPCError  # type: ignore[import-untyped]
@@ -399,6 +399,13 @@ class ResolvedDialogId(int):
         value = cast(ResolvedDialogId, int.__new__(cls, entity_id))
         value.coverage = coverage
         return value
+
+    def __reduce_ex__(
+        self, protocol: SupportsIndex
+    ) -> tuple[type[ResolvedDialogId], tuple[int, DialogDirectoryCoverage]]:
+        """Preserve the receipt when ``copy.deepcopy`` crosses message storage."""
+        del protocol
+        return type(self), (int(self), self.coverage)
 
 
 def _selector_dialog_name(entity_id: int, dialog_name: str | None, entity_name: object) -> str | None:

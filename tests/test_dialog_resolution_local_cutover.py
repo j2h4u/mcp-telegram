@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from mcp_telegram.daemon_api import ResolvedDialogId
+from mcp_telegram.dialog_directory_coverage import DialogDirectoryCoverage
 from mcp_telegram.dialog_selector import required_dialog_selector
 from test_daemon_api import _make_db_with_dialogs, _seed_dialog_row, _TestClient, make_server
 
@@ -16,6 +19,21 @@ def _add_canonical_identity_columns(conn) -> None:
     conn.execute("ALTER TABLE dialogs ADD COLUMN identity_complete INTEGER NOT NULL DEFAULT 0")
     conn.execute("ALTER TABLE dialogs ADD COLUMN identity_source TEXT")
     conn.commit()
+
+
+def test_resolved_dialog_id_survives_dataclass_asdict() -> None:
+    coverage = DialogDirectoryCoverage("complete", 7, 1_700_000_000, 1, "complete", True, True)
+    resolved = ResolvedDialogId(9004, coverage)
+
+    @dataclasses.dataclass
+    class Fragment:
+        dialog_id: int
+
+    copied = dataclasses.asdict(Fragment(resolved))
+
+    assert copied["dialog_id"] == 9004
+    assert isinstance(copied["dialog_id"], ResolvedDialogId)
+    assert copied["dialog_id"].coverage == coverage
 
 
 @pytest.mark.asyncio
@@ -79,4 +97,3 @@ async def test_complete_canonical_absence_defeats_stale_entity_name() -> None:
     assert isinstance(result, dict)
     assert result["error"] == "dialog_directory_incomplete"
     client.get_entity.assert_not_awaited()
-
