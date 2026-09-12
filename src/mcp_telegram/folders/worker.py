@@ -136,9 +136,7 @@ class FolderProjectionWorker:
             # create a private retry loop against a blocked account.
             _raise_if_latched(exc)
             self._record_failure(
-                FolderAttemptResult.CIRCUIT_OPEN
-                if exc.retry_after_seconds is None
-                else FolderAttemptResult.FLOOD_WAIT,
+                FolderAttemptResult.CIRCUIT_OPEN if exc.retry_after_seconds is None else FolderAttemptResult.FLOOD_WAIT,
                 exc.retry_after_seconds,
             )
             return True
