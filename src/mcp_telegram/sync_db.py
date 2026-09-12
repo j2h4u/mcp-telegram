@@ -13,7 +13,7 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 64
+_CURRENT_SCHEMA_VERSION = 65
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -29,6 +29,7 @@ _ENTITY_PROFILE_ACQUISITION_MIGRATION_61 = 61
 _ENTITY_PROFILE_METADATA_MIGRATION_62 = 62
 _REALTIME_DM_DIALOG_BACKFILL_MIGRATION_63 = 63
 _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64 = 64
+_PUBLISHED_DIALOG_READ_CURSORS_MIGRATION_65 = 65
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
@@ -549,7 +550,9 @@ CREATE TABLE IF NOT EXISTS dialogs (
     unread_mark             INTEGER,
     unread_count_observed_at INTEGER,
     unread_mark_observed_at INTEGER,
-    draft_text              TEXT
+    draft_text              TEXT,
+    read_inbox_max_id       INTEGER,
+    read_outbox_max_id      INTEGER
 )
 """
 
@@ -3602,6 +3605,28 @@ def _apply_migration_64(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
+def _apply_migration_65(conn: sqlite3.Connection, current: int) -> int:
+    """Retain canonical read cursors on the published local dialog snapshot."""
+    if current >= _PUBLISHED_DIALOG_READ_CURSORS_MIGRATION_65:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        columns = _table_column_names(conn, "dialogs")
+        if "read_inbox_max_id" not in columns:
+            conn.execute("ALTER TABLE dialogs ADD COLUMN read_inbox_max_id INTEGER")
+        if "read_outbox_max_id" not in columns:
+            conn.execute("ALTER TABLE dialogs ADD COLUMN read_outbox_max_id INTEGER")
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
+            (_PUBLISHED_DIALOG_READ_CURSORS_MIGRATION_65,),
+        )
+        conn.commit()
+        return _PUBLISHED_DIALOG_READ_CURSORS_MIGRATION_65
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -3684,6 +3709,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_63(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64:
         current = _apply_migration_64(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _PUBLISHED_DIALOG_READ_CURSORS_MIGRATION_65:
+        current = _apply_migration_65(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

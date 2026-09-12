@@ -1605,6 +1605,8 @@ def test_schema_v17_dialogs_columns(tmp_sync_db_path: Path) -> None:
             "linked_chat_id",
             "linked_chat_resolved_at",
             "revision",
+            "read_inbox_max_id",
+            "read_outbox_max_id",
         }
         assert required == set(columns.keys()), (
             f"Column mismatch.\nExpected: {sorted(required)}\nGot: {sorted(columns.keys())}"
@@ -1705,7 +1707,7 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 63, f"_CURRENT_SCHEMA_VERSION must be 63, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 65, f"_CURRENT_SCHEMA_VERSION must be 65, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
 

@@ -534,6 +534,12 @@ class CanonicalDialogDirectory:
             "members=staged.members, created=staged.created, last_message_at=staged.last_message_at, "
             "snapshot_at=staged.snapshot_at, unread_mentions_count=staged.unread_mentions_count, "
             "unread_reactions_count=staged.unread_reactions_count, draft_text=staged.draft_text, "
+            "read_inbox_max_id=CASE WHEN staged.read_inbox_max_id IS NULL THEN current.read_inbox_max_id "
+            "WHEN current.read_inbox_max_id IS NULL THEN staged.read_inbox_max_id "
+            "ELSE MAX(current.read_inbox_max_id, staged.read_inbox_max_id) END, "
+            "read_outbox_max_id=CASE WHEN staged.read_outbox_max_id IS NULL THEN current.read_outbox_max_id "
+            "WHEN current.read_outbox_max_id IS NULL THEN staged.read_outbox_max_id "
+            "ELSE MAX(current.read_outbox_max_id, staged.read_outbox_max_id) END, "
             "unread_count=CASE WHEN staged.unread_count IS NOT NULL AND (current.unread_count_observed_at IS NULL OR current.unread_count_observed_at < staged.snapshot_at) THEN staged.unread_count ELSE current.unread_count END, "
             "unread_count_observed_at=CASE WHEN staged.unread_count IS NOT NULL AND (current.unread_count_observed_at IS NULL OR current.unread_count_observed_at < staged.snapshot_at) THEN staged.snapshot_at ELSE current.unread_count_observed_at END, "
             "unread_mark=CASE WHEN staged.unread_mark IS NOT NULL AND (current.unread_mark_observed_at IS NULL OR current.unread_mark_observed_at < staged.snapshot_at) THEN staged.unread_mark ELSE current.unread_mark END, "
@@ -544,16 +550,32 @@ class CanonicalDialogDirectory:
             (generation,),
         )
         conn.execute(
-            "INSERT INTO dialogs(dialog_id,name,type,archived,pinned,members,created,last_message_at,snapshot_at,hidden,needs_refresh,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,unread_count_observed_at,unread_mark_observed_at,draft_text) "
+            "INSERT INTO dialogs(dialog_id,name,type,archived,pinned,members,created,last_message_at,snapshot_at,hidden,needs_refresh,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,unread_count_observed_at,unread_mark_observed_at,draft_text,read_inbox_max_id,read_outbox_max_id) "
             "SELECT staged.dialog_id,staged.name,staged.type,staged.archived,"
             "CASE WHEN EXISTS (SELECT 1 FROM dialog_directory_pins pin WHERE pin.generation=staged.generation AND pin.dialog_id=staged.dialog_id) THEN 1 ELSE 0 END,"
             "staged.members,staged.created,staged.last_message_at,"
             "staged.snapshot_at,0,0,staged.unread_mentions_count,staged.unread_reactions_count,staged.unread_count,staged.unread_mark,"
             "CASE WHEN staged.unread_count IS NULL THEN NULL ELSE staged.snapshot_at END,"
-            "CASE WHEN staged.unread_mark IS NULL THEN NULL ELSE staged.snapshot_at END,staged.draft_text FROM dialog_directory_staging AS staged "
+            "CASE WHEN staged.unread_mark IS NULL THEN NULL ELSE staged.snapshot_at END,staged.draft_text,"
+            "staged.read_inbox_max_id,staged.read_outbox_max_id FROM dialog_directory_staging AS staged "
             "WHERE staged.generation=? AND staged.baseline_revision IS NULL "
             "AND NOT EXISTS (SELECT 1 FROM dialogs current WHERE current.dialog_id=staged.dialog_id) "
             "AND NOT EXISTS (SELECT 1 FROM synced_dialogs sd WHERE sd.dialog_id=staged.dialog_id AND sd.status='access_lost')",
+            (generation,),
+        )
+        # Read cursors are monotonic facts of the completed publication. Apply
+        # them even when a concurrent realtime dialog update advanced revision
+        # and therefore fenced the mutable snapshot fields above.
+        conn.execute(
+            "UPDATE dialogs AS current SET "
+            "read_inbox_max_id=CASE WHEN staged.read_inbox_max_id IS NULL THEN current.read_inbox_max_id "
+            "WHEN current.read_inbox_max_id IS NULL THEN staged.read_inbox_max_id "
+            "ELSE MAX(current.read_inbox_max_id, staged.read_inbox_max_id) END, "
+            "read_outbox_max_id=CASE WHEN staged.read_outbox_max_id IS NULL THEN current.read_outbox_max_id "
+            "WHEN current.read_outbox_max_id IS NULL THEN staged.read_outbox_max_id "
+            "ELSE MAX(current.read_outbox_max_id, staged.read_outbox_max_id) END "
+            "FROM dialog_directory_staging AS staged "
+            "WHERE staged.generation=? AND staged.dialog_id=current.dialog_id",
             (generation,),
         )
         read_rows = cast(

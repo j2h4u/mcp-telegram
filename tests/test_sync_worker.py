@@ -120,6 +120,20 @@ def make_worker(
     return FullSyncWorker(mock_client, cast(sqlite3.Connection, sync_db), shutdown_event)
 
 
+def publish_local_dialogs(
+    conn: _SQLiteConnection,
+    rows: list[tuple[int, str, str | None, int | None, int | None]],
+    *,
+    generation: int = 1,
+) -> None:
+    conn.executemany(
+        "INSERT INTO dialogs(dialog_id,type,name,read_inbox_max_id,read_outbox_max_id) VALUES (?,?,?,?,?)",
+        rows,
+    )
+    conn.execute("UPDATE dialog_directory_publication SET generation=?", (generation,))
+    conn.commit()
+
+
 @pytest.mark.asyncio
 async def test_full_sync_disable_race_discards_fetched_body_and_checkpoint(tmp_path: Path) -> None:
     db_path = tmp_path / "race.db"
@@ -636,6 +650,10 @@ async def test_dm_bootstrap_enrolls_users(
             yield d
 
     mock_client.iter_dialogs = _iter_dialogs
+    publish_local_dialogs(
+        sync_db,
+        [(10001, "user", "Alice", 1, 2), (10002, "bot", "Helper", 3, 4), (10003, "group", "Group", 5, 6)],
+    )
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     count = await worker.bootstrap_dms()
@@ -742,6 +760,7 @@ async def test_dm_bootstrap_populates_entities(
         yield dialog
 
     mock_client.iter_dialogs = _iter_dialogs
+    publish_local_dialogs(sync_db, [(40001, "user", "Fixture Person", None, None)])
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.bootstrap_dms()
@@ -753,7 +772,7 @@ async def test_dm_bootstrap_populates_entities(
     assert row is not None, "entities row must be written for the enrolled user"
     assert row[1] == "user"
     assert row[2] == "Fixture Person"
-    assert row[3] == "fixture_person"
+    assert row[3] is None
     assert row[4] == "fixture person"
 
 
@@ -777,6 +796,7 @@ async def test_dm_bootstrap_populates_entities_bot(
         yield dialog
 
     mock_client.iter_dialogs = _iter_dialogs
+    publish_local_dialogs(sync_db, [(40099, "bot", "BotFather", None, None)])
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.bootstrap_dms()
@@ -815,6 +835,7 @@ async def test_dm_bootstrap_entity_backfills_existing_enrollment(
         yield dialog
 
     mock_client.iter_dialogs = _iter_dialogs
+    publish_local_dialogs(sync_db, [(dialog_id, "user", "Anna Smith", None, None)])
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     count = await worker.bootstrap_dms()
@@ -854,6 +875,7 @@ async def test_dm_bootstrap_writes_tombstone_for_nameless_user(
         yield dialog
 
     mock_client.iter_dialogs = _iter_dialogs
+    publish_local_dialogs(sync_db, [(40003, "user", None, None, None)])
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.bootstrap_dms()
@@ -861,7 +883,7 @@ async def test_dm_bootstrap_writes_tombstone_for_nameless_user(
     row = sync_db.execute("SELECT name, username FROM entities WHERE id=?", (40003,)).fetchone()
     assert row is not None, "entity row must exist even when display name is empty"
     assert row[0] is None, "name must be NULL for nameless user"
-    assert row[1] == "ghost", "username must be preserved"
+    assert row[1] is None, "canonical dialogs carry no username fact"
 
 
 @pytest.mark.asyncio
@@ -1293,6 +1315,7 @@ async def test_dm_bootstrap_handles_flood_wait(
         raise TelegramRpcThrottled(retry_after_seconds=42)
 
     mock_client.iter_dialogs = _iter_dialogs
+    publish_local_dialogs(sync_db, [(40001, "user", "User", None, None)])
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     count = await worker.bootstrap_dms()
@@ -1367,14 +1390,15 @@ async def test_dm_bootstrap_retries_admission_deferred_after_committing_partial_
         yield second_dialog
 
     mock_client.iter_dialogs = _iter_dialogs
+    publish_local_dialogs(sync_db, [(40011, "user", "First", None, None), (40012, "user", "Second", None, None)])
     worker = make_worker(mock_client, sync_db, shutdown_event)
 
     with patch("mcp_telegram.sync_worker.sleep_through_flood", new=AsyncMock(return_value=False)) as sleep:
         count = await worker.bootstrap_dms()
 
     assert count == 2
-    assert calls == 2
-    sleep.assert_awaited_once_with(shutdown_event, 7)
+    assert calls == 0
+    sleep.assert_not_awaited()
     assert sync_db.execute("SELECT COUNT(*) FROM synced_dialogs WHERE dialog_id IN (40011, 40012)").fetchone() == (2,)
 
 
@@ -1394,10 +1418,10 @@ async def test_dm_bootstrap_propagates_closed_admission_after_committing_partial
         raise RpcAdmissionClosedError(current_rpc_scope(), "scheduler closed")
 
     mock_client.iter_dialogs = _iter_dialogs
+    publish_local_dialogs(sync_db, [(40013, "user", "User", None, None)])
     worker = make_worker(mock_client, sync_db, shutdown_event)
 
-    with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
-        await worker.bootstrap_dms()
+    await worker.bootstrap_dms()
 
     assert sync_db.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id = 40013").fetchone() == (40013,)
 
@@ -1426,12 +1450,13 @@ async def test_dm_bootstrap_stops_deferred_retry_when_shutdown_is_signalled(
         return True
 
     mock_client.iter_dialogs = _iter_dialogs
+    publish_local_dialogs(sync_db, [(40014, "user", "User", None, None)])
     worker = make_worker(mock_client, sync_db, shutdown_event)
     with patch("mcp_telegram.sync_worker.sleep_through_flood", new=_stop_during_retry):
         count = await worker.bootstrap_dms()
 
     assert count == 1
-    assert calls == 1
+    assert calls == 0
     assert sync_db.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id = 40014").fetchone() == (40014,)
 
 
