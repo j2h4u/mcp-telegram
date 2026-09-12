@@ -32,11 +32,10 @@ typecheck:
 
 # Run basedpyright over the package and deploy helpers.
 typecheck-pyright:
-    uv run basedpyright src/mcp_telegram deploy scripts --warnings
+    uv run basedpyright src/mcp_telegram deploy scripts tests --warnings
 
-# Type-check tests with basedpyright.
-typecheck-tests:
-    uv run basedpyright tests --warnings
+# Compatibility alias for the combined BasedPyright gate.
+typecheck-tests: typecheck-pyright
 
 # Enforce named architecture contracts that should remain stable across refactors.
 import-contracts:
