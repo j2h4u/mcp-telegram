@@ -57,14 +57,6 @@ NON_OPERATOR_POLICY_FINDINGS: frozenset[tuple[str, str]] = frozenset(
         ),
         ("policy_assignments", "src/mcp_telegram/delta_sync.py:<module>:_DELTA_SLICE_MESSAGE_LIMIT"),
         (
-            "policy_call_keywords",
-            "src/mcp_telegram/dialog_sync.py:DialogReconciliationWorker.run_full_pass:wait_on_throttle",
-        ),
-        (
-            "policy_call_keywords",
-            "src/mcp_telegram/dialog_sync.py:DialogFullReconciliationDemandAdapter.run_slice:wait_on_throttle",
-        ),
-        (
             "policy_assignments",
             "src/mcp_telegram/reactions/refresh.py:<module>:_PERSISTENCE_RETRY_DELAYS_SECONDS",
         ),

@@ -54,7 +54,6 @@ class DemandKind(StrEnum):
     MCP_REMOTE_ACQUISITION = "mcp_remote_acquisition"
     MESSAGE_READ_FALLBACK = "message_read_fallback"
     ENTITY_LOOKUP = "entity_lookup"
-    DIALOG_TRAVERSAL = "dialog_traversal"
     TOPIC_LOOKUP = "topic_lookup"
     FOREGROUND_ENTITY_FACTS = "foreground_entity_facts"
     ENTITY_PROFILE_REFRESH = "entity_profile_refresh"
@@ -613,7 +612,6 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.MESSAGE_READ_FALLBACK, TelegramRpcSource.MESSAGE_READ_FALLBACK, _INLINE
     ),
     DemandKind.ENTITY_LOOKUP: _contract(DemandKind.ENTITY_LOOKUP, TelegramRpcSource.DIALOG_RESOLUTION, _INLINE),
-    DemandKind.DIALOG_TRAVERSAL: _contract(DemandKind.DIALOG_TRAVERSAL, TelegramRpcSource.DIALOG_RESOLUTION, _INLINE),
     DemandKind.TOPIC_LOOKUP: _contract(DemandKind.TOPIC_LOOKUP, TelegramRpcSource.TOPIC_RESOLUTION, _INLINE),
     DemandKind.FOREGROUND_ENTITY_FACTS: _contract(
         DemandKind.FOREGROUND_ENTITY_FACTS, TelegramRpcSource.ENTITY_INFO_FOREGROUND, _INLINE

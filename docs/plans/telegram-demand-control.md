@@ -125,7 +125,7 @@ The initial exhaustive mapping is:
 | --- | --- | --- | --- |
 | `MCP_INTERACTIVE` | MCP remote acquisition | `INLINE` | — |
 | `MESSAGE_READ_FALLBACK` | Message read fallback | `INLINE` | — |
-| `DIALOG_RESOLUTION` | Entity lookup; dialog traversal | `INLINE` | — |
+| `DIALOG_RESOLUTION` | Entity lookup | `INLINE` | — |
 | `TOPIC_RESOLUTION` | Topic lookup | `INLINE` | — |
 | `ENTITY_INFO_FOREGROUND` | Foreground entity facts | `INLINE` | — |
 | `ENTITY_INFO_REFRESH` | Entity profile refresh | `DURABLE` | Entity refresh state |
@@ -137,7 +137,7 @@ The initial exhaustive mapping is:
 | `ACTIVITY_HOT_SWEEP` | Hot activity page | `DURABLE` | Activity dialog state |
 | `FACT_HYDRATION_LIVE` | Live hydration batch | `DURABLE` | Hydration jobs |
 | `FULL_SYNC` | DM enrollment traversal; full-sync page | `DURABLE` | Synced-dialog state |
-| `DIALOG_SYNC` | Dialog bootstrap; light/full reconciliation | `DURABLE` | Dialog state |
+| `DIALOG_SYNC` | Canonical dialog directory; light reconciliation | `DURABLE` | Dialog state |
 | `ACTIVITY_ARCHIVE` | Archive backfill; incremental archive | `DURABLE` | Activity archive state |
 | `ACTIVITY_COLD_BACKFILL` | Cold peer page | `DURABLE` | Activity dialog state |
 | `FACT_HYDRATION_BACKFILL` | Backfill hydration batch | `DURABLE` | Hydration jobs |

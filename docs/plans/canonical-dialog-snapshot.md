@@ -425,7 +425,8 @@ next consumer on its existing path, but it must not leave a partially writable
 catalog or a migration that requires clearing state.
 
 1. **State and raw adapter.** `sync_db.py` owns the generation-1 migration and
-   current staging state; `dialog_sync.py` owns the directory state machine;
+   current staging state; the canonical dialog directory owns the directory
+   state machine;
    the new raw-TL adapter module owns `GetDialogs` and `GetPinnedDialogs`
    decoding and cursor construction. Result: generation 1 resumes existing
    state, ordinary and pinned sources have explicit outcomes, and page/cursor
@@ -433,8 +434,8 @@ catalog or a migration that requires clearing state.
    reset, exact request arguments, raw `DialogsSlice`/`Dialogs`/`NotModified`
    handling, matched-message cursor selection, duplicate/tie rules, and
    missing entity/message cases.
-2. **Staging, publication, and realtime fencing.** `dialog_sync.py` and
-   `sync_db.py` implement minimal staging and atomic publication;
+2. **Staging, publication, and realtime fencing.** The canonical dialog
+   directory and `sync_db.py` implement minimal staging and atomic publication;
    `event_handlers.py` remains the realtime writer protected by
    `dialogs.revision`. Result: publication first merges facts with revision
    fencing, then computes membership from final facts and the accepted rules

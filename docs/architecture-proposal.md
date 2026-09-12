@@ -55,7 +55,7 @@ This is the minimum DDD vocabulary for the current codebase:
 
 | Domain concept | Use case | Telegram access | Local output |
 | --- | --- | --- | --- |
-| Dialog | `dialog_sync` reconciliation | Dialog metadata, folders, topics | `dialogs`, folder/topic snapshots |
+| Dialog | Canonical dialog directory and `dialog_sync` light reconciliation | Dialog metadata, folders, topics | `dialogs`, folder/topic snapshots |
 | Message history | `FullSyncWorker` | Backward history batches | `messages`, FTS, aggregate reactions present on message objects |
 | Recent gaps | `DeltaSyncWorker` | Forward messages newer than local max id | New `messages`, FTS, aggregate reactions present on message objects |
 | Live events | `EventHandlerManager` | Telethon updates while daemon is online | New/edit/delete/read cursor rows; aggregate reaction updates |

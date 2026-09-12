@@ -72,7 +72,7 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
     expected_by_source = {
         TelegramRpcSource.MCP_INTERACTIVE: {DemandKind.MCP_REMOTE_ACQUISITION},
         TelegramRpcSource.MESSAGE_READ_FALLBACK: {DemandKind.MESSAGE_READ_FALLBACK},
-        TelegramRpcSource.DIALOG_RESOLUTION: {DemandKind.ENTITY_LOOKUP, DemandKind.DIALOG_TRAVERSAL},
+        TelegramRpcSource.DIALOG_RESOLUTION: {DemandKind.ENTITY_LOOKUP},
         TelegramRpcSource.TOPIC_RESOLUTION: {DemandKind.TOPIC_LOOKUP},
         TelegramRpcSource.ENTITY_INFO_FOREGROUND: {DemandKind.FOREGROUND_ENTITY_FACTS},
         TelegramRpcSource.ENTITY_INFO_REFRESH: {DemandKind.ENTITY_PROFILE_REFRESH},
