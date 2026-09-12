@@ -3776,6 +3776,19 @@ def _apply_migration_67(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
+def _apply_migrations_64_to_67(conn: sqlite3.Connection, current: int) -> int:
+    """Apply the ordered canonical-directory and folder migrations."""
+    if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64:
+        current = _apply_migration_64(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _PUBLISHED_DIALOG_READ_CURSORS_MIGRATION_65:
+        current = _apply_migration_65(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_FACTS_MIGRATION_66:
+        current = _apply_migration_66(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _LOCAL_FOLDER_PROJECTION_MIGRATION_67:
+        current = _apply_migration_67(conn, current)
+    return current
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -3856,14 +3869,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_62(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _REALTIME_DM_DIALOG_BACKFILL_MIGRATION_63:
         current = _apply_migration_63(conn, current)
-    if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64:
-        current = _apply_migration_64(conn, current)
-    if _CURRENT_SCHEMA_VERSION >= _PUBLISHED_DIALOG_READ_CURSORS_MIGRATION_65:
-        current = _apply_migration_65(conn, current)
-    if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_FACTS_MIGRATION_66:
-        current = _apply_migration_66(conn, current)
-    if _CURRENT_SCHEMA_VERSION >= _LOCAL_FOLDER_PROJECTION_MIGRATION_67:
-        current = _apply_migration_67(conn, current)
+    current = _apply_migrations_64_to_67(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

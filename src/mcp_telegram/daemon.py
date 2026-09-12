@@ -1269,22 +1269,31 @@ async def _acquire_startup_identity_before_updates(
     while startup.pending:
         if ctx.shutdown_event.is_set():
             raise asyncio.CancelledError
-        try:
-            await adapter.run_slice(RpcAttemptBudget(limit))
-        except TelegramRpcAdmissionDeferred as exc:
-            if await sleep_through_flood(ctx.shutdown_event, exc.retry_after_seconds or 1):
-                raise asyncio.CancelledError from None
-        except TelegramRpcThrottled as exc:
-            if exc.latched:
-                raise
-            if await sleep_through_flood(ctx.shutdown_event, exc.retry_after_seconds or 1):
-                raise asyncio.CancelledError from None
-        except RpcAdmissionClosedError:
-            raise
-        else:
-            await asyncio.sleep(0)
+        await _run_startup_identity_slice(adapter, limit, ctx.shutdown_event)
     startup.result()
     return startup
+
+
+async def _run_startup_identity_slice(
+    adapter: SelfProfileMaintenanceDemandAdapter,
+    limit: int,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Run one startup identity slice and handle admission backoff."""
+    try:
+        await adapter.run_slice(RpcAttemptBudget(limit))
+    except TelegramRpcAdmissionDeferred as exc:
+        if await sleep_through_flood(shutdown_event, exc.retry_after_seconds or 1):
+            raise asyncio.CancelledError from None
+    except TelegramRpcThrottled as exc:
+        if exc.latched:
+            raise
+        if await sleep_through_flood(shutdown_event, exc.retry_after_seconds or 1):
+            raise asyncio.CancelledError from None
+    except RpcAdmissionClosedError:
+        raise
+    else:
+        await asyncio.sleep(0)
 
 
 async def _wait_for_startup_identity(
