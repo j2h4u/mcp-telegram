@@ -35,6 +35,7 @@ from mcp_telegram.dialog_sync import (
 )
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, EntityRefreshCoordinator
 from mcp_telegram.fact_hydration import FactHydrationDemandAdapter
+from mcp_telegram.folders.contracts import FolderRuleObservation
 from mcp_telegram.folders.ports import FolderSnapshotRepository
 from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker
 from mcp_telegram.message_fact_refresh import (
@@ -69,9 +70,6 @@ class _FolderPolicy:
 
 
 class _IdleFolderRepository(FolderSnapshotRepository):
-    def read_generation(self) -> int | None:
-        return None
-
     def read_consecutive_failures(self) -> int:
         return 0
 
@@ -84,25 +82,20 @@ class _IdleFolderRepository(FolderSnapshotRepository):
     def read_next_retry_at(self) -> int | None:
         return None
 
-    def read_staging(self) -> None:
+    def rules_are_fresh(self, *, now: int) -> bool:
+        del now
+        return False
+
+    def project_observation(self, observation: FolderRuleObservation, *, completed_at: int) -> int | None:
+        del observation, completed_at
         return None
 
-    def save_staging(self, snapshot: object) -> None:
-        del snapshot
-
-    def clear_staging(self) -> None:
+    def reproject_current_rules(self, *, now: int) -> int | None:
+        del now
         return None
 
-    def replace_snapshot(
-        self,
-        snapshot: object,
-        memberships: tuple[tuple[int, int], ...],
-        *,
-        completed_at: int,
-        expected_generation: int | None = None,
-    ) -> int:
-        del snapshot, memberships, completed_at, expected_generation
-        return 1
+    def next_mute_expiry(self) -> int | None:
+        return None
 
     def record_attempt(
         self,

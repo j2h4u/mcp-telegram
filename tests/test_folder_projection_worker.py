@@ -133,7 +133,9 @@ def test_legacy_failure_without_retry_is_immediately_due(tmp_path: Path, outcome
             consecutive_failures=1,
         )
         adapter = FolderProjectionDemandAdapter(
-            FolderProjectionWorker(_Gateway(), repository, asyncio.Event(), _Policy(), clock=lambda: 1000.0)
+            FolderProjectionWorker(
+                FolderRefresher(_Gateway(), repository), repository, asyncio.Event(), _Policy(), clock=lambda: 1000.0
+            )
         )
         status = adapter.status(1000.0)
         assert status is not None and status.release_at == 1000.0

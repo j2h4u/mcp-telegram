@@ -44,38 +44,48 @@ def _dialog(peer_id: int, message_id: int) -> types.Dialog:
         unread_mentions_count=0,
         unread_reactions_count=0,
         unread_poll_votes_count=0,
-        notify_settings=None,
+        notify_settings=types.PeerNotifySettings(),
     )
 
 
+def _user_id(dialog: types.Dialog) -> int:
+    assert isinstance(dialog.peer, types.PeerUser)
+    return dialog.peer.user_id
+
+
+def _message(dialog: types.Dialog, second: int) -> types.TypeMessage:
+    return types.Message(
+        id=dialog.top_message,
+        peer_id=dialog.peer,
+        date=datetime(2026, 1, 1, 0, 0, second, tzinfo=UTC),
+        message="",
+    )
+
+
+def _state() -> object:
+    return types.updates.State(pts=0, qts=0, date=None, seq=0, unread_count=0)
+
+
 def _response(dialogs: Sequence[types.Dialog], *, terminal: bool = True) -> object:
-    users = [
-        types.User(id=dialog.peer.user_id, first_name=f"User {dialog.peer.user_id}", access_hash=42)
-        for dialog in dialogs
+    users: list[types.TypeUser] = [
+        types.User(id=_user_id(dialog), first_name=f"User {_user_id(dialog)}", access_hash=42) for dialog in dialogs
     ]
-    messages = [
-        types.Message(
-            id=dialog.top_message,
-            peer_id=dialog.peer,
-            date=datetime(2026, 1, 1, 0, 0, second, tzinfo=UTC),
-        )
-        for second, dialog in enumerate(dialogs)
-    ]
+    messages = [_message(dialog, second) for second, dialog in enumerate(dialogs)]
     if terminal:
         return types.messages.Dialogs(dialogs=list(dialogs), messages=messages, chats=[], users=users)
     return types.messages.DialogsSlice(count=200, dialogs=list(dialogs), messages=messages, chats=[], users=users)
 
 
 def _pinned_response(dialogs: Sequence[types.Dialog] = ()) -> types.messages.PeerDialogs:
+    users: list[types.TypeUser] = [
+        types.User(id=_user_id(dialog), first_name=f"User {_user_id(dialog)}", access_hash=42) for dialog in dialogs
+    ]
     return types.messages.PeerDialogs(
         dialogs=list(dialogs),
         messages=[],
         chats=[],
-        users=[
-            types.User(id=dialog.peer.user_id, first_name=f"User {dialog.peer.user_id}", access_hash=42)
-            for dialog in dialogs
-        ],
-        state=types.updates.State(pts=0, qts=0, date=None, seq=0, unread_count=0),
+        users=users,
+        state=_state(),  # pyright: ignore[reportArgumentType] - Telethon's generated alias resolves to its module
     )
 
 
@@ -150,7 +160,7 @@ def test_missing_entity_markers_duplicates_and_not_modified_are_explicit_outcome
     missing_entity = types.messages.DialogsSlice(
         count=1,
         dialogs=[dialog],
-        messages=[types.Message(id=8, peer_id=types.PeerUser(1), date=datetime(2026, 1, 1, tzinfo=UTC))],
+        messages=[types.Message(id=8, peer_id=types.PeerUser(1), date=datetime(2026, 1, 1, tzinfo=UTC), message="")],
         chats=[],
         users=[],
     )
@@ -179,7 +189,7 @@ def test_pinned_requires_real_peer_dialogs_constructor() -> None:
         messages=[],
         chats=[],
         users=[types.User(id=1, first_name="One", access_hash=42)],
-        state=types.updates.State(pts=0, qts=0, date=None, seq=0, unread_count=0),
+        state=_state(),  # pyright: ignore[reportArgumentType] - Telethon's generated alias resolves to its module
     )
     assert normalize_pinned_dialogs_response(pinned).kind == "terminal"
     assert normalize_pinned_dialogs_response(_response([dialog])).kind == "invalid"
@@ -190,7 +200,7 @@ def test_min_entity_cannot_fabricate_a_cursor() -> None:
     response = types.messages.DialogsSlice(
         count=1,
         dialogs=[dialog],
-        messages=[types.Message(id=8, peer_id=types.PeerUser(1), date=datetime(2026, 1, 1, tzinfo=UTC))],
+        messages=[types.Message(id=8, peer_id=types.PeerUser(1), date=datetime(2026, 1, 1, tzinfo=UTC), message="")],
         chats=[],
         users=[types.User(id=1, first_name="One", min=True, access_hash=42)],
     )
@@ -206,7 +216,7 @@ async def test_imperfect_slice_advances_and_retains_every_identifiable_row(tmp_p
     imperfect = types.messages.DialogsSlice(
         count=2,
         dialogs=[missing, usable],
-        messages=[types.Message(id=8, peer_id=usable.peer, date=datetime(2026, 1, 1, tzinfo=UTC))],
+        messages=[types.Message(id=8, peer_id=usable.peer, date=datetime(2026, 1, 1, tzinfo=UTC), message="")],
         chats=[],
         users=[types.User(id=2, first_name="Two", access_hash=42)],
     )
@@ -293,7 +303,7 @@ async def test_pinned_membership_keeps_source_order_when_entities_are_unknown(tm
         messages=[],
         chats=[],
         users=[],
-        state=types.updates.State(pts=0, qts=0, date=None, seq=0, unread_count=0),
+        state=_state(),  # pyright: ignore[reportArgumentType] - Telethon's generated alias resolves to its module
     )
     directory = CanonicalDialogDirectory(
         _FakeClient([pinned, _pinned_response(), _response([])]), db_path, asyncio.Event()
@@ -334,12 +344,12 @@ def test_cursor_round_trip_keeps_real_self_and_forbidden_peers() -> None:
         unread_mentions_count=0,
         unread_reactions_count=0,
         unread_poll_votes_count=0,
-        notify_settings=None,
+        notify_settings=types.PeerNotifySettings(),
     )
     response = types.messages.DialogsSlice(
         count=1,
         dialogs=[dialog],
-        messages=[types.Message(id=8, peer_id=dialog.peer, date=datetime(2026, 1, 1, tzinfo=UTC))],
+        messages=[types.Message(id=8, peer_id=dialog.peer, date=datetime(2026, 1, 1, tzinfo=UTC), message="")],
         chats=[types.ChannelForbidden(id=9, access_hash=99, title="Forbidden")],
         users=[],
     )
@@ -647,7 +657,9 @@ async def test_duplicate_page_cools_down_both_aliases_then_resumes_from_its_curs
             "pagination_no_new_dialogs",
         )
         assert conn.execute("SELECT top_message FROM dialog_directory_staging WHERE dialog_id=1").fetchone() == (9,)
-        assert CanonicalDialogDirectoryDemandAdapter(directory, conn).status(1001.0).release_at == 1900.0
+        status = CanonicalDialogDirectoryDemandAdapter(directory, conn).status(1001.0)
+        assert status is not None
+        assert status.release_at == 1900.0
     finally:
         conn.close()
 
@@ -1054,10 +1066,10 @@ async def test_cross_source_observations_replace_mutable_facts(tmp_path: Path) -
     dialog = _dialog(1, 8)
     pinned = types.messages.PeerDialogs(
         dialogs=[dialog],
-        messages=[types.Message(id=8, peer_id=dialog.peer, date=datetime(2026, 1, 2, tzinfo=UTC))],
+        messages=[types.Message(id=8, peer_id=dialog.peer, date=datetime(2026, 1, 2, tzinfo=UTC), message="")],
         chats=[],
         users=[types.User(id=1, first_name="One", access_hash=42)],
-        state=types.updates.State(pts=0, qts=0, date=None, seq=0, unread_count=0),
+        state=_state(),  # pyright: ignore[reportArgumentType] - Telethon's generated alias resolves to its module
     )
     later_dialog = _dialog(1, 7)
     ordinary = types.messages.Dialogs(
@@ -1145,7 +1157,9 @@ def test_sqlite_row_composition_does_not_depend_on_tuple_factory(tmp_path: Path)
     conn.row_factory = sqlite3.Row
     try:
         directory = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event())
-        assert directory.status(0.0, conn).release_at == 0.0
+        status = directory.status(0.0, conn)
+        assert status is not None
+        assert status.release_at == 0.0
     finally:
         conn.close()
 
@@ -1207,14 +1221,24 @@ def test_identity_and_eligibility_extract_only_authoritative_facts() -> None:
     assert _eligibility_category(types.User(id=3, min=True, contact=True)) is None
     assert _eligibility_category(types.User(id=4)) is None
     assert (
-        _eligibility_category(types.Chat(id=5, title="group", photo=None, participants_count=1, date=None, version=1))
+        _eligibility_category(
+            types.Chat(id=5, title="group", photo=types.ChatPhotoEmpty(), participants_count=1, date=None, version=1)
+        )
         == "group"
     )
-    assert _eligibility_category(types.Channel(id=6, title="group", photo=None, date=None, megagroup=True)) == "group"
     assert (
-        _eligibility_category(types.Channel(id=7, title="feed", photo=None, date=None, broadcast=True)) == "broadcast"
+        _eligibility_category(
+            types.Channel(id=6, title="group", photo=types.ChatPhotoEmpty(), date=None, megagroup=True)
+        )
+        == "group"
     )
-    assert _eligibility_category(types.Channel(id=8, title="unknown", photo=None, date=None)) is None
+    assert (
+        _eligibility_category(
+            types.Channel(id=7, title="feed", photo=types.ChatPhotoEmpty(), date=None, broadcast=True)
+        )
+        == "broadcast"
+    )
+    assert _eligibility_category(types.Channel(id=8, title="unknown", photo=types.ChatPhotoEmpty(), date=None)) is None
 
     assert (
         _three_valued_unread(
@@ -1227,7 +1251,7 @@ def test_identity_and_eligibility_extract_only_authoritative_facts() -> None:
                 unread_mentions_count=0,
                 unread_reactions_count=9,
                 unread_poll_votes_count=0,
-                notify_settings=None,
+                notify_settings=types.PeerNotifySettings(),
                 unread_mark=False,
             )
         )
@@ -1244,7 +1268,7 @@ def test_identity_and_eligibility_extract_only_authoritative_facts() -> None:
                 unread_mentions_count=1,
                 unread_reactions_count=0,
                 unread_poll_votes_count=0,
-                notify_settings=None,
+                notify_settings=types.PeerNotifySettings(),
             )
         )
         == 1
@@ -1343,7 +1367,7 @@ async def test_directory_publication_merges_eligibility_for_unchanged_existing_d
     dialog.unread_mark = False
     response = types.messages.Dialogs(
         dialogs=[dialog],
-        messages=[types.Message(id=8, peer_id=dialog.peer, date=datetime(2026, 1, 1, tzinfo=UTC))],
+        messages=[types.Message(id=8, peer_id=dialog.peer, date=datetime(2026, 1, 1, tzinfo=UTC), message="")],
         chats=[],
         users=[types.User(id=1, first_name="One", access_hash=42, bot=True)],
     )
@@ -1377,7 +1401,7 @@ async def test_reseen_hidden_dialog_regains_eligibility_facts_under_revision_fen
     dialog.unread_mark = False
     response = types.messages.Dialogs(
         dialogs=[dialog],
-        messages=[types.Message(id=8, peer_id=dialog.peer, date=datetime(2026, 1, 1, tzinfo=UTC))],
+        messages=[types.Message(id=8, peer_id=dialog.peer, date=datetime(2026, 1, 1, tzinfo=UTC), message="")],
         chats=[],
         users=[types.User(id=1, first_name="One", access_hash=42, bot=True)],
     )
@@ -1444,7 +1468,7 @@ async def test_incomplete_directory_identity_keeps_known_username_and_oldest_bou
     dialog = _dialog(1, 8)
     response = types.messages.Dialogs(
         dialogs=[dialog],
-        messages=[types.Message(id=8, peer_id=types.PeerUser(1), date=datetime(2026, 1, 1, tzinfo=UTC))],
+        messages=[types.Message(id=8, peer_id=types.PeerUser(1), date=datetime(2026, 1, 1, tzinfo=UTC), message="")],
         chats=[],
         users=[types.User(id=1, first_name="Partial", username="partial", min=True)],
     )

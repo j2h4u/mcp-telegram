@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,6 +43,8 @@ class _SQLiteCursor(Protocol):
 class _SQLiteConnection(Protocol):
     def execute(self, sql: str, parameters: tuple[object, ...] = ()) -> _SQLiteCursor: ...
 
+    def executemany(self, sql: str, parameters: Sequence[Sequence[object]]) -> _SQLiteCursor: ...
+
     def commit(self) -> None: ...
 
     def close(self) -> None: ...
@@ -68,7 +70,6 @@ class _MockClient:
         self.get_messages: AsyncMock = AsyncMock()
         self.get_entity: AsyncMock = AsyncMock()
         self.iter_messages = _empty_async_iter
-        self.iter_dialogs = _empty_async_iter
         self.is_connected = MagicMock(return_value=True)
 
 
@@ -101,7 +102,7 @@ def sync_db(tmp_path: Path) -> Iterator[_SQLiteConnection]:
 
 @pytest.fixture()
 def mock_client() -> _MockClient:
-    """Return a mock TelegramClient with async iter_messages/iter_dialogs."""
+    """Return a mock TelegramClient with async iter_messages."""
     return _MockClient()
 
 
@@ -129,6 +130,7 @@ def publish_local_dialogs(
         "INSERT INTO dialogs(dialog_id,type,name,read_inbox_max_id,read_outbox_max_id) VALUES (?,?,?,?,?)",
         rows,
     )
+    conn.execute("UPDATE dialogs SET identity_complete=1")
     conn.execute("UPDATE dialog_directory_publication SET generation=?", (generation,))
     conn.commit()
 
@@ -145,7 +147,6 @@ async def test_dm_bootstrap_consumes_canonical_publication_without_dialog_traver
     worker = make_worker(client, sync_db, asyncio.Event())
 
     assert await worker.bootstrap_dms() == 2
-    client.iter_dialogs.assert_not_called()
     assert sync_db.execute("SELECT dialog_id FROM synced_dialogs ORDER BY dialog_id").fetchall() == [(101,), (102,)]
     assert sync_db.execute("SELECT id FROM entities ORDER BY id").fetchall() == [(101,), (102,)]
 
