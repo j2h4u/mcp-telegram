@@ -281,15 +281,6 @@ class CanonicalDialogDirectory:
         if self._startup_detail_setter is not None:
             self._startup_detail_setter(detail)
 
-    def recover_invalid_generation(self) -> dict[str, object]:
-        """Explicitly abandon an invalid legacy attempt without clearing products."""
-        conn = _open_sync_db(self._db_path)
-        try:
-            with conn:
-                return recover_invalid_generation_in_transaction(conn)
-        finally:
-            conn.close()
-
     def bind_account_id(self, account_id: int) -> None:
         """Fence the directory to the authenticated account before readers start."""
         conn = _open_sync_db(self._db_path)

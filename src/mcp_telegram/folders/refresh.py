@@ -13,11 +13,8 @@ from .ports import FolderSnapshotRepository, TelegramFolderGateway
 
 @dataclass(frozen=True, slots=True)
 class FolderRefreshResult:
-    folder_count: int
     dialog_count: int
-    membership_count: int
     generation: int | None
-    coverage_available: bool
 
 
 class FolderRefresher:
@@ -26,10 +23,6 @@ class FolderRefresher:
     def __init__(self, gateway: TelegramFolderGateway, repository: FolderSnapshotRepository) -> None:
         self._gateway = gateway
         self._repository = repository
-
-    @property
-    def supports_bounded_acquisition(self) -> bool:
-        return True
 
     async def acquire(self, *, started_at: int | None = None) -> FolderRuleObservation:
         observation_started_at = int(time.time()) if started_at is None else started_at
@@ -40,7 +33,7 @@ class FolderRefresher:
         completion = int(time.time()) if completed_at is None else completed_at
         observation = await self.acquire(started_at=completion)
         generation = self._repository.project_observation(observation, completed_at=completion)
-        return FolderRefreshResult(len(observation.rules), 0, 0, generation, generation is not None)
+        return FolderRefreshResult(0, generation)
 
     def reproject_current_rules(self, *, now: int) -> int | None:
         return self._repository.reproject_current_rules(now=now)

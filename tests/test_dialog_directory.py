@@ -22,6 +22,7 @@ from mcp_telegram.dialog_directory import (
     apply_realtime_eligibility,
     apply_realtime_identity,
     clear_realtime_mute,
+    recover_invalid_generation_in_transaction,
     sync_active_generation_pins_from_publication,
 )
 from mcp_telegram.dialog_directory_tl import (
@@ -899,7 +900,12 @@ async def test_semantic_invalid_latches_without_rpc_or_automatic_recovery(tmp_pa
     restarted = CanonicalDialogDirectory(client, db_path, asyncio.Event())
     await restarted.run_slice()
     assert len(client.requests) == 4
-    restarted.recover_invalid_generation()
+    conn = _open_sync_db(db_path)
+    try:
+        with conn:
+            recover_invalid_generation_in_transaction(conn)
+    finally:
+        conn.close()
     conn = _open_sync_db(db_path)
     try:
         assert conn.execute("SELECT generation,status,retry_at FROM dialog_directory_state").fetchone() == (

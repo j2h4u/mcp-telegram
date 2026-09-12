@@ -384,13 +384,3 @@ def _as_int(value: object) -> int:
     if isinstance(value, str):
         return int(value)
     raise TypeError("folder projection integer field has an invalid type")
-
-
-def reproject_due_mutes(conn: sqlite3.Connection, *, now: int) -> int | None:
-    """Read-side boundary hook: a mute expiry changes local truth without RPC."""
-    try:
-        return SQLiteFolderSnapshotRepository(conn).ensure_mute_projection(now=now)
-    except sqlite3.OperationalError as exc:
-        if "no such table" not in str(exc):
-            raise
-        return None

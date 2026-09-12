@@ -85,10 +85,6 @@ class _EntityLike(Protocol):
     date: datetime | None
 
 
-class _DraftLike(Protocol):
-    message: str | None
-
-
 class _MessageLike(Protocol):
     id: int
     date: datetime | None

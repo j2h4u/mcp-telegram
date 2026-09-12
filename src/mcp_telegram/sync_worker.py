@@ -316,14 +316,6 @@ class FullSyncWorker:
         logger.info("dm_publication_consumed generation=%d enrolled=%d", generation, enrolled)
         return enrolled
 
-    async def bootstrap_dms(self) -> int:
-        """Retained entry point that now consumes local canonical data only."""
-        return self.consume_canonical_dm_publication()
-
-    async def resume_dm_enrollment(self) -> int:
-        """Retained continuation entry point for local canonical consumption."""
-        return self.consume_canonical_dm_publication()
-
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def process_one_batch(self) -> bool:
         """Fetch one batch of messages for the next pending dialog.

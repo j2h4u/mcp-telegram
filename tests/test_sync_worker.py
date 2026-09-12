@@ -146,7 +146,7 @@ async def test_dm_bootstrap_consumes_canonical_publication_without_dialog_traver
     client = MagicMock()
     worker = make_worker(client, sync_db, asyncio.Event())
 
-    assert await worker.bootstrap_dms() == 2
+    assert worker.consume_canonical_dm_publication() == 2
     assert sync_db.execute("SELECT dialog_id FROM synced_dialogs ORDER BY dialog_id").fetchall() == [(101,), (102,)]
     assert sync_db.execute("SELECT id FROM entities ORDER BY id").fetchall() == [(101,), (102,)]
 
@@ -156,8 +156,8 @@ async def test_dm_bootstrap_is_idempotent_for_consumed_publication(sync_db: _SQL
     publish_local_dialogs(sync_db, [(101, "user", "Alice", None, None)])
     worker = make_worker(MagicMock(), sync_db, asyncio.Event())
 
-    assert await worker.bootstrap_dms() == 1
-    assert await worker.bootstrap_dms() == 0
+    assert worker.consume_canonical_dm_publication() == 1
+    assert worker.consume_canonical_dm_publication() == 0
 
 
 @pytest.mark.asyncio
@@ -168,7 +168,7 @@ async def test_dm_bootstrap_excludes_hidden_rows_and_preserves_richer_entity_typ
     sync_db.commit()
     worker = make_worker(MagicMock(), sync_db, asyncio.Event())
 
-    assert await worker.bootstrap_dms() == 1
+    assert worker.consume_canonical_dm_publication() == 1
     assert sync_db.execute("SELECT dialog_id FROM synced_dialogs ORDER BY dialog_id").fetchall() == [(101,)]
     assert sync_db.execute("SELECT type FROM entities WHERE id=101").fetchone() == ("channel",)
 
@@ -182,7 +182,7 @@ async def test_hidden_previously_synced_dm_is_neither_reenrolled_nor_scheduled(s
     sync_db.commit()
     worker = make_worker(MagicMock(), sync_db, asyncio.Event())
 
-    assert await worker.bootstrap_dms() == 0
+    assert worker.consume_canonical_dm_publication() == 0
     assert worker._next_pending_dialog() is None
     assert sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=102").fetchone() == ("syncing",)
 
