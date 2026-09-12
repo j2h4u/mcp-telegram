@@ -288,10 +288,11 @@ advance the row revision after publication.
 
 ## Migration and resume: current generation 1
 
-Migration initializes the directory's current lifecycle marker as generation 1
-and preserves the existing published catalog, pending status, valid cursor,
-folder facts, DM enrollment, and read cursors. An in-progress operation resumes
-from its committed page and cursor; it is not reset to an empty catalog.
+Migration initializes the directory's current lifecycle marker to
+`max(1, legacy generation)` and preserves the existing published catalog,
+pending status, valid cursor, folder facts, DM enrollment, and read cursors.
+An in-progress operation resumes from its committed page and cursor; it is not
+reset to an empty catalog.
 
 The migration does not manufacture a completeness receipt, observation time,
 or freshness claim for old rows. Existing rows remain usable with their actual
@@ -445,9 +446,11 @@ projection, revision fencing, raw pagination, and freshness:
 | Realtime event changes a row while a catalog RPC is in flight | Event facts and the newer revision survive publication. |
 | A previously unseen row is created while the walk is in flight | The absence candidate is rejected and the new row remains visible. |
 | Archive, read, or mute changes after baseline and before publication | Facts are merged first; membership is then computed from final facts and accepted rules version. |
-| A raw page has a missing entity or matched message | The row/cursor candidate is skipped under the explicit rule, the page stays incomplete, and no cursor advances past it. |
-| A raw page contains `DialogFolder` markers | Markers are skipped as non-dialogs; they are not EOF, and a marker-only page is incomplete. |
-| Raw IDs overlap or dates are equal | Exact identity duplicates are skipped only when equivalent; conflicting IDs/facts or a non-advancing cursor is invalid. Equal dates are accepted only when peer and message ID disambiguate the tuple. |
+| A slice has identifiable rows with missing entity or matched-message facts | Every row is staged with unknown optional facts; the slice advances from its last safe candidate when one exists. |
+| A terminal response has missing optional facts or repeats a hypothetical cursor | It completes without a cursor and publishes once the required sources are complete. |
+| A raw page contains `DialogFolder` markers | Markers are skipped as non-dialogs; they are not EOF, and a marker-only slice stalls as incomplete. |
+| Raw IDs overlap or dates are equal | Exact identity duplicates are skipped only when equivalent; conflicting in-response identities are invalid. A non-advancing slice stalls; equal dates are accepted when peer and message ID disambiguate the tuple. |
+| A nonterminal page repeats only already-staged canonical dialog IDs | Its safe cursor commits, then the owner cools down for the 900-second freshness interval without publishing partial acquisition. |
 | Fact age is just below, exactly at, or above 900 seconds | Below is fresh; at and above are stale. |
 | A projection has required inputs from different acquisition starts | Its age is the oldest required input age; publication and restart do not renew it. |
 
@@ -475,8 +478,8 @@ projection, revision fencing, raw pagination, and freshness:
   no historical generations, feature flag, or publication-bus event.
 - Realtime changes protected by `dialogs.revision` survive an older snapshot;
   incomplete enumeration cannot hide a changed or unseen dialog.
-- Migration starts current generation 1, preserves existing state, and resumes
-  a valid cursor without a reset or invented receipt.
+- Migration preserves `max(1, legacy generation)`, existing state, and a valid
+  cursor without a reset or invented receipt.
 - Completeness, dialog-fact freshness, and folder-rule freshness are separately
   represented and evaluated. Default-folder consumers use the current 900
   second target, with below/at/above boundary tests and age measured from

@@ -11,7 +11,13 @@ from pathlib import Path
 import pytest
 from telethon.tl import functions, types  # type: ignore[import-untyped]
 
-from mcp_telegram.dialog_directory import CanonicalDialogDirectory, _decode_cursor, _encode_input_peer
+from mcp_telegram.dialog_directory import (
+    CanonicalDialogDirectory,
+    CanonicalDialogDirectoryDemandAdapter,
+    CanonicalDirectoryFullDemandAdapter,
+    _decode_cursor,
+    _encode_input_peer,
+)
 from mcp_telegram.dialog_directory_tl import (
     DialogCursor,
     get_dialogs_request,
@@ -340,12 +346,14 @@ class _FakeClient:
     def __init__(self, responses: list[object]) -> None:
         self.responses = responses
         self.requests: list[object] = []
+        self.get_me_calls = 0
 
     async def __call__(self, request: object) -> object:
         self.requests.append(request)
         return self.responses.pop(0)
 
     async def get_me(self) -> object:
+        self.get_me_calls += 1
         return types.User(id=100, is_self=True)
 
 
@@ -445,6 +453,185 @@ async def test_cursor_and_page_commit_together_and_absence_waits_for_eof(tmp_pat
         assert client.requests[0].folder_id == 0
         assert isinstance(client.requests[1], functions.messages.GetPinnedDialogsRequest)
         assert client.requests[1].folder_id == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_page_cools_down_both_aliases_then_resumes_from_its_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    now = 1_000
+    monkeypatch.setattr("mcp_telegram.dialog_directory.time.time", lambda: now)
+    client = _FakeClient(
+        [
+            _pinned_response(),
+            _pinned_response(),
+            _response([_dialog(1, 8)], terminal=False),
+            _response([_dialog(1, 9)], terminal=False),
+            _response([_dialog(2, 10)], terminal=False),
+            _response([]),
+        ]
+    )
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    await _run_slices(directory, 4)
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT status,ordinary_status,offset_id,retry_at,reason FROM dialog_directory_state"
+        ).fetchone() == (
+            "incomplete",
+            "incomplete",
+            9,
+            1900,
+            "pagination_no_new_dialogs",
+        )
+        assert conn.execute("SELECT top_message FROM dialog_directory_staging WHERE dialog_id=1").fetchone() == (9,)
+        assert CanonicalDialogDirectoryDemandAdapter(directory, conn).status(1001.0).release_at == 1900.0
+        assert CanonicalDirectoryFullDemandAdapter(directory, conn).status(1001.0).release_at == 1900.0
+    finally:
+        conn.close()
+
+    now = 1900
+    restarted = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    await restarted.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT status,ordinary_status,offset_id,retry_at FROM dialog_directory_state"
+        ).fetchone() == (
+            "in_progress",
+            "incomplete",
+            10,
+            None,
+        )
+        assert isinstance(client.requests[-1], functions.messages.GetDialogsRequest)
+        assert client.requests[-1].offset_id == 9
+        assert conn.execute("SELECT COUNT(*) FROM dialog_directory_staging").fetchone() == (2,)
+    finally:
+        conn.close()
+
+    await restarted.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT status,retry_at FROM dialog_directory_state").fetchone() == ("complete", None)
+        assert client.get_me_calls == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_duplicate_completes_without_pagination_cooldown(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    client = _FakeClient(
+        [
+            _pinned_response(),
+            _pinned_response(),
+            _response([_dialog(1, 8)], terminal=False),
+            _response([_dialog(1, 9)]),
+        ]
+    )
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    await _run_slices(directory, 4)
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT status,reason,retry_at FROM dialog_directory_state").fetchone() == (
+            "complete",
+            None,
+            None,
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_pagination_cooldown_does_not_change_the_prior_publication_age(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    now = 100
+    monkeypatch.setattr("mcp_telegram.dialog_directory.time.time", lambda: now)
+    client = _FakeClient(
+        [
+            _pinned_response(),
+            _pinned_response(),
+            _response([_dialog(1, 8)]),
+            _pinned_response(),
+            _pinned_response(),
+            _response([_dialog(1, 8)], terminal=False),
+            _response([_dialog(1, 9)], terminal=False),
+        ]
+    )
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    await _run_slices(directory, 3)
+    now = 200
+    await _run_slices(directory, 4)
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT observation_started_at,observation_completed_at FROM dialog_directory_publication"
+        ).fetchone() == (100, 100)
+        assert conn.execute("SELECT status,retry_at FROM dialog_directory_state").fetchone() == ("incomplete", 1100)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_page_rollback_keeps_prior_cursor_and_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    client = _FakeClient(
+        [
+            _pinned_response(),
+            _pinned_response(),
+            _response([_dialog(1, 8)], terminal=False),
+            _response([_dialog(1, 9)], terminal=False),
+        ]
+    )
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    await _run_slices(directory, 3)
+
+    def fail_cursor(*_args: object) -> None:
+        raise RuntimeError("duplicate cursor commit failed")
+
+    monkeypatch.setattr(directory, "_save_cursor", fail_cursor)
+    with pytest.raises(RuntimeError, match="duplicate cursor"):
+        await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT status,offset_id,retry_at FROM dialog_directory_state").fetchone() == (
+            "in_progress",
+            8,
+            None,
+        )
+        assert conn.execute("SELECT top_message FROM dialog_directory_staging WHERE dialog_id=1").fetchone() == (8,)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_many_productive_pages_never_cool_down_or_repeat_account_identity(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    pages = [_response([_dialog(index, index)], terminal=False) for index in range(1, 35)]
+    client = _FakeClient([_pinned_response(), _pinned_response(), *pages, _response([])])
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    await _run_slices(directory, 37)
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT status,retry_at FROM dialog_directory_state").fetchone() == ("complete", None)
+        assert conn.execute("SELECT COUNT(*) FROM dialogs").fetchone() == (34,)
+        assert client.get_me_calls == 1
     finally:
         conn.close()
 
@@ -701,5 +888,37 @@ def test_freshness_uses_acquisition_start_not_publication_time(tmp_path: Path) -
         assert status.release_at == 1000.0
         assert not status.is_ready(999.0)
         assert status.is_ready(1000.0)
+        assert status.is_ready(1001.0)
+        assert status.overdue_seconds(1001.0) == 1.0
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_long_acquisition_and_restart_keep_the_original_freshness_age(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    now = 100
+    monkeypatch.setattr("mcp_telegram.dialog_directory.time.time", lambda: now)
+    directory = CanonicalDialogDirectory(
+        _FakeClient([_pinned_response(), _pinned_response(), _response([])]), db_path, asyncio.Event()
+    )
+
+    await directory.run_slice()
+    now = 1_001
+    await directory.run_slice()
+    await directory.run_slice()
+
+    conn = _open_sync_db(db_path)
+    try:
+        status = directory.status(float(now), conn)
+        assert status is not None
+        assert status.release_at == 1000.0
+        assert status.overdue_seconds(float(now)) == 1.0
+        restarted = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event())
+        restarted_status = restarted.status(float(now), conn)
+        assert restarted_status == status
     finally:
         conn.close()

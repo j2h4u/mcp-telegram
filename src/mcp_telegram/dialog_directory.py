@@ -134,8 +134,7 @@ class CanonicalDialogDirectory:
             return
         conn = _open_sync_db(self._db_path)
         try:
-            account_id = await self._authenticated_account_id()
-            self._bind_account(conn, account_id)
+            account_id = await self._bound_account_id(conn)
             state = self._prepare_or_resume(conn)
             if state is None or self._shutdown_event.is_set():
                 return
@@ -180,6 +179,16 @@ class CanonicalDialogDirectory:
     async def _authenticated_account_id(self) -> int:
         profile = await self._client.get_me()
         return _account_id_from_profile(profile)
+
+    async def _bound_account_id(self, conn: sqlite3.Connection) -> int:
+        """Use the durable account fence without an identity RPC on every page."""
+        state = self._load_state(conn)
+        if state.account_id is None:
+            self._bind_account(conn, await self._authenticated_account_id())
+            state = self._load_state(conn)
+        if state.account_id is None:
+            raise RuntimeError("dialog directory account identity is missing")
+        return state.account_id
 
     def _bind_account(self, conn: sqlite3.Connection, account_id: int) -> None:
         state = self._load_state(conn)
@@ -306,13 +315,26 @@ class CanonicalDialogDirectory:
                 )
             return
         with conn:
+            new_ids = self._new_dialog_ids(conn, state.generation, page.facts)
             self._stage_facts(conn, state.generation, page.facts, folder_id=None, account_id=account_id)
             if page.kind == "page":
                 if page.cursor is None:
                     raise RuntimeError("ordinary page cannot commit without a cursor")
                 self._save_cursor(conn, page.cursor, state.generation, account_id)
+                if not new_ids:
+                    conn.execute(
+                        "UPDATE dialog_directory_state SET status='incomplete', ordinary_status='incomplete', "
+                        "reason='pagination_no_new_dialogs', retry_at=? "
+                        "WHERE singleton=1 AND account_id=? AND generation=?",
+                        (
+                            int(time.time()) + demand_freshness_seconds(DemandKind.DIALOG_BOOTSTRAP),
+                            account_id,
+                            state.generation,
+                        ),
+                    )
+                    return
                 conn.execute(
-                    "UPDATE dialog_directory_state SET observed_count=observed_count+?, reason=NULL "
+                    "UPDATE dialog_directory_state SET observed_count=observed_count+?, reason=NULL, retry_at=NULL "
                     "WHERE singleton=1 AND account_id=? AND generation=?",
                     (len(page.facts), account_id, state.generation),
                 )
@@ -442,6 +464,20 @@ class CanonicalDialogDirectory:
                 "UPDATE dialog_directory_baseline SET seen=1 WHERE generation=? AND dialog_id=?",
                 (generation, row.dialog_id),
             )
+
+    @staticmethod
+    def _new_dialog_ids(conn: sqlite3.Connection, generation: int, facts: tuple[RawDialogFact, ...]) -> set[int]:
+        staged_ids = {
+            _required_int(row[0], "staged dialog id")
+            for row in cast(
+                list[tuple[object]],
+                conn.execute(
+                    "SELECT dialog_id FROM dialog_directory_staging WHERE generation=?",
+                    (generation,),
+                ).fetchall(),
+            )
+        }
+        return {fact.dialog_id for fact in facts if fact.dialog_id not in staged_ids}
 
     def _staged_fact(self, fact: RawDialogFact, observed_at: int, folder_id: int | None, source: str) -> _StagedFact:
         entity = fact.entity
