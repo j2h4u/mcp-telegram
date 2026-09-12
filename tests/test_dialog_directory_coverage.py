@@ -41,3 +41,25 @@ def test_unpublished_or_missing_start_never_claims_coverage(tmp_path: Path) -> N
         assert (coverage.status, coverage.age_seconds, coverage.observation_started_at) == ("never", None, None)
     finally:
         conn.close()
+
+
+def test_lookup_coverage_uses_only_visible_published_candidates_and_exposes_reason(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "UPDATE dialog_directory_publication SET generation=3,observation_started_at=100,observation_completed_at=200"
+        )
+        conn.execute("UPDATE dialog_directory_state SET status='incomplete',reason='ordinary:TimeoutError'")
+        conn.executemany(
+            "INSERT INTO dialogs(dialog_id,type,identity_complete,identity_observed_at,hidden) VALUES (?,?,?,?,?)",
+            [(1, "user", 1, 100, 0), (2, "user", 0, None, 1), (3, "unknown", 0, None, 1)],
+        )
+        conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (2,'access_lost')")
+        coverage = read_dialog_directory_coverage(conn, now=200)
+        assert coverage.lookup_complete is True
+        assert coverage.lookup_fresh is True
+        assert coverage.to_wire()["reason"] == "ordinary:TimeoutError"
+    finally:
+        conn.close()

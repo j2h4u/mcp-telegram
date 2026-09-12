@@ -86,6 +86,7 @@ from .daemon_dialog_queries import (
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from .demand_wiring import DemandOfferSink, offer_durable_demand
+from .dialog_directory import recover_invalid_generation_in_transaction
 from .dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
 from .entity_profile.ports import ProfilePairObservationHook
@@ -877,6 +878,7 @@ class DaemonAPIServer:
             "get_me": self._get_me,
             "mark_dialog_for_sync": self._mark_dialog_for_sync,
             "get_sync_status": self._get_sync_status,
+            "recover_dialog_directory": self._recover_dialog_directory,
             "list_conversation_changes": self._list_conversation_changes,
             "get_entity_info": self._get_entity_info,
             "get_inbox": self._list_unread_messages,
@@ -1605,6 +1607,14 @@ class DaemonAPIServer:
         if sync_read_model.sync_status is SyncStatus.ACCESS_LOST and total_messages is None:
             data["archived_message_count"] = message_count
         return {"ok": True, "data": data}
+
+    def _recover_dialog_directory(self, req: dict[str, object]) -> dict[str, object]:
+        """Start a new unpublished attempt only after a semantic-invalid latch."""
+        with self._conn:
+            result = recover_invalid_generation_in_transaction(self._conn)
+        if result["ok"]:
+            return {"ok": True, "data": result}
+        return {"ok": False, "error": result["error"], "data": {"state": result["state"]}}
 
     # ------------------------------------------------------------------
     # list_conversation_changes

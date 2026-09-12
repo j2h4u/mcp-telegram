@@ -173,11 +173,32 @@ def complete_access_revalidation(conn: sqlite3.Connection, dialog_id: int, check
         )
 
 
+def not_access_lost_sql(dialog_id_expression: str) -> str:
+    """Return the canonical visibility guard for set-based directory writes."""
+    return (
+        "NOT EXISTS (SELECT 1 FROM synced_dialogs access_state "
+        f"WHERE access_state.dialog_id={dialog_id_expression} "
+        "AND access_state.status='access_lost')"
+    )
+
+
+def unhide_after_realtime_presence(conn: sqlite3.Connection, dialog_id: int) -> bool:
+    """Expose a catalog row proved present by realtime without reviving access loss."""
+    with _lifecycle_savepoint(conn):
+        cursor = conn.execute(
+            "UPDATE dialogs SET hidden=0 WHERE dialog_id=? AND hidden=1 AND " + not_access_lost_sql("dialogs.dialog_id"),
+            (dialog_id,),
+        )
+    return cursor.rowcount > 0
+
+
 __all__ = [
     "AccessLossEvidence",
     "complete_access_revalidation",
     "due_access_revalidations",
+    "not_access_lost_sql",
     "restore_access_after_revalidation",
     "set_access_lost",
     "stamp_access_revalidation",
+    "unhide_after_realtime_presence",
 ]

@@ -277,6 +277,13 @@ It preserves the generation, committed cursor, valid staged work, and prior
 publication until the explicit maintenance recovery operation starts a fresh
 unpublished generation.
 
+The operator performs that maintenance through the running daemon, which is
+the sole writer: `mcp-telegram recover-dialog-directory`. The command only
+accepts a semantic-invalid state, reports the prior and new generation and
+reason, performs no Telegram RPC, and leaves the published catalog and receipt
+in place. The ordinary scheduler resumes the newly started attempt; it never
+calls recovery automatically.
+
 Each raw page and its next cursor are stored in one local transaction. A crash
 before commit leaves the prior cursor and prior staged facts in force; a
 successful commit makes both visible together. Publication is a separate short

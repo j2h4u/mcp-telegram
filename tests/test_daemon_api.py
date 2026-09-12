@@ -368,6 +368,71 @@ def make_server(
     return server
 
 
+@pytest.mark.asyncio
+async def test_recover_dialog_directory_uses_daemon_writer_and_preserves_publication(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE dialog_directory_state SET generation=4,status='invalid',ordinary_status='invalid',"
+            "reason='ordinary:unexpected_response',retry_at=NULL"
+        )
+        conn.execute(
+            "UPDATE dialog_directory_publication SET generation=3,observation_started_at=10,observation_completed_at=20"
+        )
+        result = await make_server(conn)._dispatch({"method": "recover_dialog_directory"})
+        assert result["ok"] is True
+        data = cast(dict[str, object], result["data"])
+        assert data["previous"] == {"generation": 4, "status": "invalid", "reason": "ordinary:unexpected_response"}
+        assert data["current"] == {"generation": 5, "status": "in_progress", "reason": None}
+        publication = conn.execute("SELECT generation FROM dialog_directory_publication WHERE singleton=1").fetchone()
+        assert publication is not None and publication[0] == 3
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_recover_dialog_directory_rejects_non_invalid_state(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("UPDATE dialog_directory_state SET generation=4,status='incomplete',reason='ordinary:TimeoutError'")
+        result = await make_server(conn)._dispatch({"method": "recover_dialog_directory"})
+        assert result == {
+            "ok": False,
+            "error": "dialog_directory_not_invalid",
+            "data": {"state": {"generation": 4, "status": "incomplete", "reason": "ordinary:TimeoutError"}},
+        }
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_entity_info_folder_title_uses_current_folder_rules(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("INSERT INTO telegram_folders(folder_id,title) VALUES (2,'Legacy title')")
+        conn.execute(
+            "INSERT INTO telegram_folder_rules(namespace,folder_id,title,rule_kind,source_position,rule_json) "
+            "VALUES ('filter',2,'Renamed folder','filter',0,'{}')"
+        )
+        service = make_server(conn)._get_entity_info_service()
+        assert await service._resolve_folder_name(2) == "Renamed folder"
+        conn.execute("UPDATE telegram_folder_rules SET title='Newest title' WHERE namespace='filter' AND folder_id=2")
+        assert await service._resolve_folder_name(2) == "Newest title"
+        conn.execute(
+            "INSERT INTO telegram_folder_rules(namespace,folder_id,title,rule_kind,source_position,rule_json) "
+            "VALUES ('default',0,'All chats','default',0,'{}')"
+        )
+        assert await service._resolve_folder_name(0) == "All chats"
+    finally:
+        conn.close()
+
+
 def test_daemon_api_server_uses_explicit_sync_db_path(tmp_path: Path) -> None:
     conn = _make_db()
     sync_db_path = tmp_path / "sync.db"

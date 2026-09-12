@@ -3100,7 +3100,11 @@ class DaemonEntityInfoService:
             row = cast(
                 tuple[object, ...] | None,
                 self._deps.conn.execute(
-                    "SELECT title FROM telegram_folders WHERE folder_id = ?", (folder_id,)
+                    "SELECT title FROM telegram_folder_rules "
+                    "WHERE (namespace='filter' AND folder_id=?) "
+                    "OR (namespace='default' AND ?=0) "
+                    "ORDER BY CASE namespace WHEN 'filter' THEN 0 ELSE 1 END LIMIT 1",
+                    (folder_id, folder_id),
                 ).fetchone(),
             )
             if row is not None:

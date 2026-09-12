@@ -1,5 +1,7 @@
 """Read-only coverage projection for the canonical dialog directory."""
 
+# ruff: noqa: PLR0914
+
 from __future__ import annotations
 
 import sqlite3
@@ -22,6 +24,7 @@ class DialogDirectoryCoverage:
     refresh_status: str | None
     lookup_complete: bool
     lookup_fresh: bool
+    reason: str | None = None
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -30,6 +33,7 @@ class DialogDirectoryCoverage:
             "observation_started_at": self.observation_started_at,
             "age_seconds": self.age_seconds,
             "refresh_status": self.refresh_status,
+            "reason": self.reason,
             "lookup_complete": self.lookup_complete,
             "lookup_fresh": self.lookup_fresh,
         }
@@ -66,16 +70,31 @@ def read_dialog_directory_coverage(
         state = cast(
             tuple[object, object] | None,
             conn.execute(
-                "SELECT status, observation_started_at FROM dialog_directory_state WHERE singleton=1"
+                "SELECT status, reason FROM dialog_directory_state WHERE singleton=1"
             ).fetchone(),
         )
     except sqlite3.OperationalError:
-        # Small legacy/test databases may predate the canonical directory.
-        return DialogDirectoryCoverage("never", None, None, None, None, False, False)
+        try:
+            state = cast(
+                tuple[object, object] | None,
+                conn.execute(
+                    "SELECT status, NULL AS reason FROM dialog_directory_state WHERE singleton=1"
+                ).fetchone(),
+            )
+            publication = cast(
+                tuple[object, object] | None,
+                conn.execute(
+                    "SELECT generation, observation_started_at FROM dialog_directory_publication WHERE singleton=1"
+                ).fetchone(),
+            )
+        except sqlite3.OperationalError:
+            # Small legacy/test databases may predate the canonical directory.
+            return DialogDirectoryCoverage("never", None, None, None, None, False, False)
 
     generation = _int_or_none(publication[0]) if publication is not None else None
     published_started = _int_or_none(publication[1]) if publication is not None else None
     refresh_status = str(state[0]) if state is not None and state[0] is not None else None
+    reason = str(state[1]) if state is not None and state[1] is not None else None
     observation_started_at = published_started
 
     try:
@@ -86,8 +105,7 @@ def read_dialog_directory_coverage(
                 "SUM(CASE WHEN COALESCE(d.identity_complete, 0) <> 1 THEN 1 ELSE 0 END), "
                 "MIN(CASE WHEN COALESCE(d.identity_complete, 0) = 1 THEN d.identity_observed_at END), "
                 "MIN(d.identity_observed_at) "
-                "FROM dialogs d LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
-                "WHERE d.hidden=0 OR sd.status='access_lost'"
+                "FROM dialogs d WHERE d.hidden=0"
             ).fetchone(),
         )
     except sqlite3.OperationalError:
@@ -123,4 +141,5 @@ def read_dialog_directory_coverage(
         refresh_status=refresh_status,
         lookup_complete=lookup_complete,
         lookup_fresh=lookup_fresh,
+        reason=reason,
     )

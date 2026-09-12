@@ -229,6 +229,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                 "observation_started_at": {"type": ["integer", "null"]},
                 "age_seconds": {"type": ["integer", "null"]},
                 "refresh_status": {"type": ["string", "null"]},
+                "reason": {"type": ["string", "null"]},
                 "lookup_complete": {"type": "boolean"},
                 "lookup_fresh": {"type": "boolean"},
             },
@@ -238,6 +239,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                 "observation_started_at",
                 "age_seconds",
                 "refresh_status",
+                "reason",
                 "lookup_complete",
                 "lookup_fresh",
             ],
@@ -496,6 +498,7 @@ def _strict_list_dialogs_data(
                 "observation_started_at": 0,
                 "age_seconds": 0,
                 "refresh_status": "never",
+                "reason": None,
                 "lookup_complete": False,
                 "lookup_fresh": False,
             }

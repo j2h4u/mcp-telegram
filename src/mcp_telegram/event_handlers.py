@@ -64,7 +64,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from .access_lifecycle import AccessLossEvidence, set_access_lost
+from .access_lifecycle import AccessLossEvidence, set_access_lost, unhide_after_realtime_presence
 from .activity_contracts import InputPeerResolver
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import IDENTITY_OMITTED, apply_realtime_eligibility, apply_realtime_identity
@@ -827,6 +827,7 @@ class EventHandlerManager:
                     observed_at,
                 ),
             )
+            unhide_after_realtime_presence(self._conn, dialog_id)
             self._conn.commit()
             return outcome
         except BaseException:
@@ -1745,26 +1746,55 @@ class EventHandlerManager:
             return None
         return int(cast(int, get_peer_id(inner_peer)))
 
-    def _collect_synced_pinned_dialog_ids(self, order: Sequence[object]) -> list[int]:
+    def _collect_known_pinned_dialog_ids(self, order: Sequence[object]) -> list[int]:
         pinned_ids: list[int] = []
+        seen: set[int] = set()
         for dialog_peer in order:
             inner_peer = dialog_peer.peer if isinstance(dialog_peer, _PeerContainer) else dialog_peer
             try:
                 dialog_id = int(cast(int, get_peer_id(inner_peer)))
             except TypeError, ValueError:
                 continue
-            if dialog_id in self._synced_dialog_ids:
+            if dialog_id not in seen and self._conn.execute(
+                "SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)
+            ).fetchone() is not None:
                 pinned_ids.append(dialog_id)
+                seen.add(dialog_id)
         return pinned_ids
+
+    @staticmethod
+    def _published_pin_folder(folder_id: object) -> int | None:
+        if folder_id is None or folder_id == 0:
+            return 0
+        if folder_id == 1:
+            return 1
+        return None
+
+    def _append_published_pin(self, folder_id: int, dialog_id: int) -> None:
+        self._conn.execute(
+            "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) "
+            "VALUES (?, ?, COALESCE((SELECT MAX(position)+1 FROM dialog_directory_published_pins WHERE folder_id=?), 0)) "
+            "ON CONFLICT(folder_id,dialog_id) DO NOTHING",
+            (folder_id, dialog_id, folder_id),
+        )
 
     def _update_dialog_pinned(self, update: UpdateDialogPinned, now: int) -> None:
         dialog_id = self._dialog_id_from_peer(update.peer)
-        if dialog_id is None or dialog_id not in self._synced_dialog_ids:
+        if dialog_id is None or self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is None:
             return
         pinned = 1 if update.pinned else 0
         with self._conn:
             self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
             folder_id = getattr(update, "folder_id", None)
+            published_folder = self._published_pin_folder(folder_id)
+            if published_folder is not None:
+                if pinned:
+                    self._append_published_pin(published_folder, dialog_id)
+                else:
+                    self._conn.execute(
+                        "DELETE FROM dialog_directory_published_pins WHERE folder_id=? AND dialog_id=?",
+                        (published_folder, dialog_id),
+                    )
             if isinstance(folder_id, int) and not isinstance(folder_id, bool) and folder_id in {0, 1}:
                 apply_realtime_eligibility(
                     self._conn,
@@ -1783,9 +1813,7 @@ class EventHandlerManager:
         # A folder-scoped update carries only pins *within* that folder, so we
         # must not use it to clear pins in other folders.
         folder_id = update.folder_id
-        # Decode peers; gate by _synced_dialog_ids so we never UPDATE
-        # rows for dialogs the daemon does not own.
-        pinned_ids = self._collect_synced_pinned_dialog_ids(cast(Sequence[object], order))
+        pinned_ids = self._collect_known_pinned_dialog_ids(cast(Sequence[object], order))
         with self._conn:
             for dialog_id in pinned_ids:
                 self._conn.execute(
@@ -1805,6 +1833,13 @@ class EventHandlerManager:
                     # Empty order list → all dialogs unpinned in main list.
                     # NOT IN () is invalid SQLite — use the dedicated SQL.
                     self._conn.execute(_CLEAR_ALL_PINS_SQL, (now,))
+            published_folder = self._published_pin_folder(folder_id)
+            if published_folder is not None:
+                self._conn.execute("DELETE FROM dialog_directory_published_pins WHERE folder_id=?", (published_folder,))
+                self._conn.executemany(
+                    "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (?,?,?)",
+                    [(published_folder, dialog_id, position) for position, dialog_id in enumerate(pinned_ids)],
+                )
             # For folder-scoped updates (folder_id != None) we only set the
             # pinned=1 rows above; we do not clear other dialogs because the
             # update does not describe pins outside that folder.

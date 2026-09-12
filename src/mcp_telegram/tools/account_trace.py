@@ -38,6 +38,7 @@ _DEFAULT_DIRECTORY_COVERAGE = {
     "observation_started_at": 0,
     "age_seconds": 0,
     "refresh_status": "never",
+    "reason": None,
     "lookup_complete": False,
     "lookup_fresh": False,
 }

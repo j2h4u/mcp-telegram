@@ -355,12 +355,12 @@ async def test_update_dialog_pinned_with_pinned_false_unsets(
 
 
 @pytest.mark.asyncio
-async def test_update_dialog_pinned_skips_unenrolled_dialog(
+async def test_update_dialog_pinned_updates_known_unenrolled_catalog_dialog(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """EVENTS-01: unenrolled dialog — no UPDATE issued (snapshot_at stays at seeded=1)."""
+    """A pin event is authoritative for a known canonical row even before enrollment."""
     channel_id = 99999
     dialog_id = get_peer_id(PeerChannel(channel_id))
     # NOT enrolled in _synced_dialog_ids
@@ -377,8 +377,8 @@ async def test_update_dialog_pinned_skips_unenrolled_dialog(
 
     row = _dialog_row(sync_db, dialog_id)
     assert row is not None
-    assert row["pinned"] == 0
-    assert row["snapshot_at"] == 1  # unchanged
+    assert row["pinned"] == 1
+    assert row["snapshot_at"] is not None and row["snapshot_at"] > 1
 
 
 @pytest.mark.asyncio
@@ -484,6 +484,56 @@ async def test_update_pinned_dialogs_with_order_none_is_noop(
     row = _dialog_row(sync_db, dialog_id)
     assert row["pinned"] == 1
     assert row["snapshot_at"] == 42  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_realtime_main_pin_order_replaces_published_pin_order(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    first = get_peer_id(PeerUser(user_id=701))
+    second = get_peer_id(PeerUser(user_id=702))
+    for dialog_id in (first, second):
+        _insert_dialog(sync_db, dialog_id, pinned=0, snapshot_at=1)
+    sync_db.execute(
+        "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (0,?,0)", (second,)
+    )
+    update = UpdatePinnedDialogs(
+        folder_id=None,
+        order=[DialogPeer(peer=PeerUser(user_id=702)), DialogPeer(peer=PeerUser(user_id=701))],
+    )
+    await _make_manager(mock_client, sync_db, shutdown_event).on_raw_dialog_pinned(update)
+    assert sync_db.execute(
+        "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=0 ORDER BY position"
+    ).fetchall() == [(second, 0), (first, 1)]
+
+
+@pytest.mark.asyncio
+async def test_realtime_single_pin_toggle_preserves_existing_published_order(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    first = get_peer_id(PeerUser(user_id=711))
+    second = get_peer_id(PeerUser(user_id=712))
+    third = get_peer_id(PeerUser(user_id=713))
+    for dialog_id in (first, second, third):
+        _insert_dialog(sync_db, dialog_id, pinned=0, snapshot_at=1)
+    sync_db.executemany(
+        "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (0,?,?)",
+        [(first, 0), (second, 1)],
+    )
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    await manager.on_raw_dialog_pinned(
+        UpdateDialogPinned(peer=DialogPeer(peer=PeerUser(user_id=713)), pinned=True, folder_id=None)
+    )
+    await manager.on_raw_dialog_pinned(
+        UpdateDialogPinned(peer=DialogPeer(peer=PeerUser(user_id=711)), pinned=False, folder_id=None)
+    )
+    assert sync_db.execute(
+        "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=0 ORDER BY position"
+    ).fetchall() == [(second, 1), (third, 2)]
 
 
 @pytest.mark.asyncio

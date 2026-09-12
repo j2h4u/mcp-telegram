@@ -1115,6 +1115,25 @@ def test_partial_realtime_identity_omission_preserves_values_and_explicit_remova
         conn.close()
 
 
+def test_realtime_identity_presence_unhides_catalog_row_without_reviving_access_loss(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.executemany(
+            "INSERT INTO dialogs(dialog_id,name,type,identity_complete,hidden) VALUES (?,?,?,?,1)",
+            [(1, "Known", "user", 0), (2, "Lost", "user", 0)],
+        )
+        conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (2,'access_lost')")
+        with conn:
+            assert apply_realtime_identity(conn, 1, name="Renamed", observed_at=20, complete=False) == 1
+            assert apply_realtime_identity(conn, 2, name="Renamed", observed_at=20, complete=False) == 1
+        assert conn.execute("SELECT hidden FROM dialogs WHERE dialog_id=1").fetchone() == (0,)
+        assert conn.execute("SELECT hidden FROM dialogs WHERE dialog_id=2").fetchone() == (1,)
+    finally:
+        conn.close()
+
+
 @pytest.mark.asyncio
 async def test_realtime_eligibility_fences_an_older_directory_publication(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"

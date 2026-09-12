@@ -20,6 +20,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     InputPeerUser,
 )
 
+from .access_lifecycle import not_access_lost_sql, unhide_after_realtime_presence
 from .dialog_classification import EntityKind, classify_dialog_type
 from .dialog_directory_tl import (
     DialogCursor,
@@ -69,6 +70,7 @@ class _DirectoryState:
     observation_completed_at: int | None
     account_id: int | None
     retry_at: int | None
+    reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,15 +175,12 @@ class CanonicalDialogDirectory:
         if self._startup_detail_setter is not None:
             self._startup_detail_setter(detail)
 
-    def recover_invalid_generation(self) -> None:
+    def recover_invalid_generation(self) -> dict[str, object]:
         """Explicitly abandon an invalid legacy attempt without clearing products."""
         conn = _open_sync_db(self._db_path)
         try:
-            state = self._load_state(conn)
-            if state.status != "invalid":
-                return
             with conn:
-                self._start_generation(conn, state.generation + 1)
+                return recover_invalid_generation_in_transaction(conn)
         finally:
             conn.close()
 
@@ -254,7 +253,8 @@ class CanonicalDialogDirectory:
             return self._load_state(conn)
         return state
 
-    def _start_generation(self, conn: sqlite3.Connection, generation: int) -> None:
+    @staticmethod
+    def _start_generation(conn: sqlite3.Connection, generation: int) -> None:
         started_at = int(time.time())
         conn.execute("DELETE FROM dialog_directory_staging")
         conn.execute("DELETE FROM dialog_directory_baseline")
@@ -306,14 +306,7 @@ class CanonicalDialogDirectory:
             )
             return
         if page.kind not in {"terminal", "page"}:
-            self._mark_source_incomplete(
-                conn,
-                state.generation,
-                f"pinned_{folder_id}:{page.reason or page.kind}",
-                account_id,
-                source_column="pinned_main_status" if folder_id == 0 else "pinned_archive_status",
-            )
-            return
+            raise RuntimeError(f"unexpected normalized pinned response: {page.kind}")
         with conn:
             self._stage_facts(conn, state.generation, page.facts, folder_id=folder_id, account_id=account_id)
             conn.executemany(
@@ -613,7 +606,9 @@ class CanonicalDialogDirectory:
             "identity_source=CASE WHEN staged.identity_complete=1 THEN staged.identity_source "
             "WHEN current.identity_complete=1 AND (staged.name IS NOT NULL OR staged.username IS NOT NULL) THEN 'mixed' "
             "WHEN current.identity_complete=1 THEN current.identity_source "
-            "WHEN current.identity_source IS NULL THEN staged.identity_source "
+            "WHEN current.identity_source IS NULL AND current.name IS NULL AND current.username IS NULL "
+            "AND (current.type IS NULL OR current.type='unknown') THEN staged.identity_source "
+            "WHEN current.identity_source IS NULL THEN 'mixed' "
             "WHEN staged.name IS NOT NULL OR staged.username IS NOT NULL THEN 'mixed' ELSE current.identity_source END, "
             "identity_observed_at=CASE WHEN staged.identity_complete=1 THEN staged.identity_observed_at "
             "WHEN staged.name IS NULL AND staged.username IS NULL THEN current.identity_observed_at "
@@ -635,7 +630,7 @@ class CanonicalDialogDirectory:
             "unread_count_observed_at=CASE WHEN staged.unread_count IS NOT NULL AND (current.unread_count_observed_at IS NULL OR current.unread_count_observed_at < staged.snapshot_at) THEN staged.snapshot_at ELSE current.unread_count_observed_at END, "
             "unread_mark=CASE WHEN staged.unread_mark IS NOT NULL AND (current.unread_mark_observed_at IS NULL OR current.unread_mark_observed_at < staged.snapshot_at) THEN staged.unread_mark ELSE current.unread_mark END, "
             "unread_mark_observed_at=CASE WHEN staged.unread_mark IS NOT NULL AND (current.unread_mark_observed_at IS NULL OR current.unread_mark_observed_at < staged.snapshot_at) THEN staged.snapshot_at ELSE current.unread_mark_observed_at END, "
-            "hidden=CASE WHEN NOT EXISTS (SELECT 1 FROM synced_dialogs sd WHERE sd.dialog_id=current.dialog_id AND sd.status='access_lost') THEN 0 ELSE current.hidden END "
+            f"hidden=CASE WHEN {not_access_lost_sql('current.dialog_id')} THEN 0 ELSE current.hidden END "
             "FROM dialog_directory_staging AS staged WHERE staged.generation=? AND staged.dialog_id=current.dialog_id "
             "AND staged.baseline_revision=current.revision",
             (generation,),
@@ -651,7 +646,7 @@ class CanonicalDialogDirectory:
             "staged.read_inbox_max_id,staged.read_outbox_max_id FROM dialog_directory_staging AS staged "
             "WHERE staged.generation=? AND staged.baseline_revision IS NULL "
             "AND NOT EXISTS (SELECT 1 FROM dialogs current WHERE current.dialog_id=staged.dialog_id) "
-            "AND NOT EXISTS (SELECT 1 FROM synced_dialogs sd WHERE sd.dialog_id=staged.dialog_id AND sd.status='access_lost')",
+            f"AND {not_access_lost_sql('staged.dialog_id')}",
             (generation,),
         )
         conn.execute(
@@ -723,7 +718,7 @@ class CanonicalDialogDirectory:
             "SELECT 1 FROM dialog_directory_baseline baseline "
             "WHERE baseline.generation=? AND baseline.dialog_id=current.dialog_id "
             "AND baseline.seen=0 AND baseline.baseline_revision=current.revision) "
-            "AND NOT EXISTS (SELECT 1 FROM synced_dialogs sd WHERE sd.dialog_id=current.dialog_id AND sd.status='access_lost')",
+            f"AND {not_access_lost_sql('current.dialog_id')}",
             (state.observation_started_at, generation),
         )
         observed_count = self._staged_count(conn, generation)
@@ -771,16 +766,6 @@ class CanonicalDialogDirectory:
         )
 
     @staticmethod
-    def _observed_count(conn: sqlite3.Connection, generation: int) -> int:
-        row = cast(
-            tuple[object] | None,
-            conn.execute(
-                "SELECT observed_count FROM dialog_directory_state WHERE singleton=1 AND generation=?", (generation,)
-            ).fetchone(),
-        )
-        return _required_int(row[0], "directory observed count") if row is not None else 0
-
-    @staticmethod
     def _staged_count(conn: sqlite3.Connection, generation: int) -> int:
         row = cast(
             tuple[object] | None,
@@ -793,7 +778,8 @@ class CanonicalDialogDirectory:
         row = cast(tuple[object] | None, conn.execute("SELECT COUNT(*) FROM dialogs WHERE hidden=0").fetchone())
         return _required_int(row[0], "directory visible count") if row is not None else 0
 
-    def _load_state(self, conn: sqlite3.Connection) -> _DirectoryState:
+    @staticmethod
+    def _load_state(conn: sqlite3.Connection) -> _DirectoryState:
         row = cast(
             tuple[object, ...] | None,
             conn.execute(
@@ -819,6 +805,7 @@ class CanonicalDialogDirectory:
             _nullable_int(row[9]),
             _nullable_int(row[10]),
             _nullable_int(row[11]),
+            str(row[12]) if row[12] is not None else None,
         )
 
 
@@ -967,6 +954,8 @@ def apply_realtime_identity(  # noqa: PLR0913
             "revision=revision+1 WHERE dialog_id=?",
             (updated_name, updated_username, updated_type, boundary, "mixed" if retained_type else "realtime", dialog_id),
         )
+        if cursor.rowcount:
+            unhide_after_realtime_presence(conn, dialog_id)
         return cursor.rowcount
     if not isinstance(dialog_type, str):
         raise ValueError("complete realtime identity requires a dialog type")
@@ -977,7 +966,28 @@ def apply_realtime_identity(  # noqa: PLR0913
         "identity_source='realtime',revision=revision+1 WHERE dialog_id=?",
         (name, username, dialog_type, observed_at, dialog_id),
     )
+    if cursor.rowcount:
+        unhide_after_realtime_presence(conn, dialog_id)
     return cursor.rowcount
+
+
+def _state_wire(state: _DirectoryState) -> dict[str, object]:
+    return {
+        "generation": state.generation,
+        "status": state.status,
+        "reason": state.reason,
+    }
+
+
+def recover_invalid_generation_in_transaction(conn: sqlite3.Connection) -> dict[str, object]:
+    """Explicitly replace only a semantic-invalid attempt on the daemon writer."""
+    state = CanonicalDialogDirectory._load_state(conn)
+    previous = _state_wire(state)
+    if state.status != "invalid":
+        return {"ok": False, "error": "dialog_directory_not_invalid", "state": previous}
+    CanonicalDialogDirectory._start_generation(conn, state.generation + 1)
+    current = CanonicalDialogDirectory._load_state(conn)
+    return {"ok": True, "previous": previous, "current": _state_wire(current)}
 
 
 def apply_realtime_eligibility(  # noqa: PLR0913
