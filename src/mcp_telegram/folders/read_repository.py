@@ -98,14 +98,16 @@ def folder_summaries(conn: FolderReadConnection) -> list[dict[str, object]]:
     """Return one compact structural summary per Telegram folder."""
     try:
         rows = cast(
-            list[tuple[int, str, int, int, int, int | None]],
+            list[tuple[int, str, int, int, int, int | None, int]],
             conn.execute(
                 """SELECT f.folder_id,
                           f.title,
-                          COUNT(fm.dialog_id),
+                          COUNT(d.dialog_id),
                           COALESCE(SUM(CASE WHEN COALESCE(d.unread_count, 0) > 0 THEN 1 ELSE 0 END), 0),
                           COALESCE(SUM(COALESCE(d.unread_count, 0)), 0),
-                          MAX(d.last_message_at)
+                          MAX(d.last_message_at),
+                          (SELECT COUNT(*) FROM telegram_folder_local_members unknown
+                           WHERE unknown.namespace=f.namespace AND unknown.folder_id=f.folder_id AND unknown.state='unknown')
                    FROM telegram_folder_rules AS f
                    LEFT JOIN telegram_folder_local_members AS fm ON fm.namespace=f.namespace AND fm.folder_id=f.folder_id AND fm.state='present'
                    LEFT JOIN dialogs AS d ON d.dialog_id = fm.dialog_id
@@ -125,8 +127,9 @@ def folder_summaries(conn: FolderReadConnection) -> list[dict[str, object]]:
             "unread_dialog_count": int(unread_dialog_count),
             "unread_count": int(unread_count),
             "last_message_at": None if last_message_at is None else int(last_message_at),
+            "unknown_membership_count": int(unknown_membership_count),
         }
-        for folder_id, title, dialog_count, unread_dialog_count, unread_count, last_message_at in rows
+        for folder_id, title, dialog_count, unread_dialog_count, unread_count, last_message_at, unknown_membership_count in rows
     ]
 
 

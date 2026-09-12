@@ -282,6 +282,7 @@ class CanonicalDialogDirectory:
     async def _acquire_pinned(
         self, conn: sqlite3.Connection, state: _DirectoryState, folder_id: int, account_id: int
     ) -> None:
+        published_before = _published_pin_rows(conn, folder_id)
         try:
             response = await self._client(get_pinned_dialogs_request(folder_id))
         except Exception as exc:  # noqa: BLE001 - transport classes vary under Telethon
@@ -309,10 +310,13 @@ class CanonicalDialogDirectory:
             raise RuntimeError(f"unexpected normalized pinned response: {page.kind}")
         with conn:
             self._stage_facts(conn, state.generation, page.facts, folder_id=folder_id, account_id=account_id)
-            conn.executemany(
-                "INSERT INTO dialog_directory_pins(generation, folder_id, dialog_id, position) VALUES (?, ?, ?, ?)",
-                [(state.generation, folder_id, fact.dialog_id, position) for position, fact in enumerate(page.facts)],
-            )
+            if _published_pin_rows(conn, folder_id) != published_before:
+                sync_active_generation_pins_from_publication(conn, folder_id)
+            else:
+                conn.executemany(
+                    "INSERT INTO dialog_directory_pins(generation, folder_id, dialog_id, position) VALUES (?, ?, ?, ?)",
+                    [(state.generation, folder_id, fact.dialog_id, position) for position, fact in enumerate(page.facts)],
+                )
             column = "pinned_main_status" if folder_id == 0 else "pinned_archive_status"
             conn.execute(
                 f"UPDATE dialog_directory_state SET {column}='complete', retry_at=NULL WHERE singleton=1 AND account_id=? AND generation=?",
@@ -789,11 +793,17 @@ class CanonicalDialogDirectory:
         )
         if row is None:
             raise RuntimeError("canonical dialog directory state is missing")
-        cursor = (
-            None
-            if row[1] == "invalid" or row[12] == "legacy_wrapper_cursor_unverified"
-            else _decode_cursor(row[5], row[6], row[7])
-        )
+        cursor = None
+        if row[1] != "invalid" and row[12] != "legacy_wrapper_cursor_unverified":
+            try:
+                cursor = _decode_cursor(row[5], row[6], row[7])
+            except (ValueError, TypeError, json.JSONDecodeError, RuntimeError):
+                with conn:
+                    conn.execute(
+                        "UPDATE dialog_directory_state SET status='invalid',ordinary_status='invalid',"
+                        "reason='ordinary:corrupt_cursor',retry_at=NULL WHERE singleton=1"
+                    )
+                row = (*row[:1], "invalid", "invalid", *row[3:12], "ordinary:corrupt_cursor")
         return _DirectoryState(
             _required_int(row[0], "directory generation"),
             str(row[1]),
@@ -988,6 +998,35 @@ def recover_invalid_generation_in_transaction(conn: sqlite3.Connection) -> dict[
     CanonicalDialogDirectory._start_generation(conn, state.generation + 1)
     current = CanonicalDialogDirectory._load_state(conn)
     return {"ok": True, "previous": previous, "current": _state_wire(current)}
+
+
+def _published_pin_rows(conn: sqlite3.Connection, folder_id: int) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        cast(
+            list[tuple[int, int]],
+            conn.execute(
+                "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=? ORDER BY position,dialog_id",
+                (folder_id,),
+            ).fetchall(),
+        )
+    )
+
+
+def sync_active_generation_pins_from_publication(conn: sqlite3.Connection, folder_id: int) -> None:
+    """Fence an active source against newer realtime pin membership and order."""
+    row = cast(
+        tuple[int, str] | None,
+        conn.execute("SELECT generation,status FROM dialog_directory_state WHERE singleton=1").fetchone(),
+    )
+    if row is None or row[1] != "in_progress":
+        return
+    generation = int(row[0])
+    conn.execute("DELETE FROM dialog_directory_pins WHERE generation=? AND folder_id=?", (generation, folder_id))
+    conn.execute(
+        "INSERT INTO dialog_directory_pins(generation,folder_id,dialog_id,position) "
+        "SELECT ?,folder_id,dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=?",
+        (generation, folder_id),
+    )
 
 
 def apply_realtime_eligibility(  # noqa: PLR0913

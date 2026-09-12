@@ -265,8 +265,7 @@ def _evaluate_rules(
     }
     result: list[FolderMembership] = []
     for rule in rules:
-        candidate_ids = set(facts)
-        candidate_ids.update(visible_dialog_ids)
+        candidate_ids = set(visible_dialog_ids)
         candidate_ids.update(rule.explicit_ids)
         for dialog_id in candidate_ids:
             state = evaluate(rule, facts.get(dialog_id, DialogFacts(dialog_id)), now=now)

@@ -499,6 +499,7 @@ async def test_realtime_main_pin_order_replaces_published_pin_order(
     sync_db.execute(
         "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (0,?,0)", (second,)
     )
+    sync_db.execute("UPDATE dialog_directory_state SET status='in_progress',generation=9")
     update = UpdatePinnedDialogs(
         folder_id=None,
         order=[DialogPeer(peer=PeerUser(user_id=702)), DialogPeer(peer=PeerUser(user_id=701))],
@@ -506,6 +507,9 @@ async def test_realtime_main_pin_order_replaces_published_pin_order(
     await _make_manager(mock_client, sync_db, shutdown_event).on_raw_dialog_pinned(update)
     assert sync_db.execute(
         "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=0 ORDER BY position"
+    ).fetchall() == [(second, 0), (first, 1)]
+    assert sync_db.execute(
+        "SELECT dialog_id,position FROM dialog_directory_pins WHERE generation=9 AND folder_id=0 ORDER BY position"
     ).fetchall() == [(second, 0), (first, 1)]
 
 

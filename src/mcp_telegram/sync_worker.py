@@ -281,13 +281,12 @@ class FullSyncWorker:
         name = cast(str | None, row[2])
         inbox = cast(int | None, row[3])
         outbox = cast(int | None, row[4])
-        with self._conn:
-            outcome = ensure_automatic_dm_enrollment(self._conn, dialog_id, now=now)
-            self._upsert_local_entity_stub(dialog_id, dialog_type, name, now)
-            if inbox is not None:
-                apply_read_cursor(self._conn, dialog_id, "inbox", inbox)
-            if outbox is not None:
-                apply_read_cursor(self._conn, dialog_id, "outbox", outbox)
+        outcome = ensure_automatic_dm_enrollment(self._conn, dialog_id, now=now)
+        self._upsert_local_entity_stub(dialog_id, dialog_type, name, now)
+        if inbox is not None:
+            apply_read_cursor(self._conn, dialog_id, "inbox", inbox)
+        if outbox is not None:
+            apply_read_cursor(self._conn, dialog_id, "outbox", outbox)
         return int(outcome.action == "queue_full_history")
 
     def consume_canonical_dm_publication(self) -> int:
@@ -299,17 +298,22 @@ class FullSyncWorker:
             list[tuple[object, ...]],
             self._conn.execute(
                 "SELECT dialog_id,type,name,read_inbox_max_id,read_outbox_max_id FROM dialogs "
-                "WHERE type IN ('user','bot') AND hidden=0 ORDER BY dialog_id"
+                "WHERE type IN ('user','bot') AND identity_complete=1 AND hidden=0 ORDER BY dialog_id"
             ).fetchall(),
         )
         now = int(time.time())
-        enrolled = sum(self._consume_one_canonical_dm(row, now) for row in rows)
-        with self._conn:
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            enrolled = sum(self._consume_one_canonical_dm(row, now) for row in rows)
             _set_dm_enrollment_state(
                 self._conn,
                 _DM_ENROLLMENT_KEY_LAST_PUBLICATION_GENERATION,
                 str(generation),
             )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
         logger.info("dm_publication_consumed generation=%d enrolled=%d", generation, enrolled)
         return enrolled
 

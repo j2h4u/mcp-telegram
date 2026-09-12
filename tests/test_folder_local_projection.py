@@ -101,6 +101,7 @@ def test_default_uses_catalog_and_main_pin_order(tmp_path: Path) -> None:
             "INSERT INTO dialog_directory_facts(dialog_id,category,archived,unread,mute_until,observed_at) VALUES (?,?,?,?,?,?)",
             [(40, "group", 0, 0, 0, 10), (10, "bot", 0, 1, 0, 10)],
         )
+        conn.executemany("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (?, 'group', 0)", [(40,), (10,)])
         conn.executemany(
             "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (0,?,?)", [(40, 1), (10, 0)]
         )
@@ -142,6 +143,7 @@ def test_mute_expiry_reprojects_without_rule_rpc(tmp_path: Path) -> None:
     conn = _conn(tmp_path / "sync.db")
     try:
         conn.execute("INSERT INTO dialog_directory_facts VALUES (1,'contact',0,1,200,10)")
+        conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (1,'user',0)")
         repo = SQLiteFolderSnapshotRepository(conn)
         rule = FolderRule(1, "Unmuted", categories=frozenset({DialogCategory.CONTACT}), exclude_muted=True)
         repo.project_observation(_observation(rule), completed_at=100)

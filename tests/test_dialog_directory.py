@@ -673,6 +673,35 @@ async def test_invalid_page_discards_only_that_page_and_retries_saved_cursor(tmp
 
 
 @pytest.mark.asyncio
+async def test_corrupt_persisted_cursor_latches_invalid_without_rpc(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute(
+            "UPDATE dialog_directory_state SET status='in_progress',ordinary_status='pending',"
+            "offset_date='not-a-date',offset_id=1,offset_peer='{}'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    client = _FakeClient([])
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+    await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT status,ordinary_status,reason,retry_at FROM dialog_directory_state").fetchone() == (
+            "invalid",
+            "invalid",
+            "ordinary:corrupt_cursor",
+            None,
+        )
+        assert client.requests == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
 async def test_semantic_invalid_latches_without_rpc_or_automatic_recovery(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)

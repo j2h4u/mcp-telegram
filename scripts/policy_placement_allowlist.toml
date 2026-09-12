@@ -419,11 +419,6 @@ rationale = "This is the canonical directory's computed publication freshness re
 
 [[entry]]
 category = "policy_assignments"
-key = "src/mcp_telegram/dialog_directory.py:CanonicalDialogDirectory._invalidate_active_acquisition:retry_at"
-rationale = "This is a bounded retry timestamp for an invalidated directory acquisition."
-
-[[entry]]
-category = "policy_assignments"
 key = "src/mcp_telegram/folders/contracts.py:<module>:RULE_TTL_SECONDS"
 rationale = "This folder-rule freshness contract is local domain behavior, not operator policy."
 

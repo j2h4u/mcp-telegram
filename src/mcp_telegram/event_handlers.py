@@ -67,7 +67,12 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 from .access_lifecycle import AccessLossEvidence, set_access_lost, unhide_after_realtime_presence
 from .activity_contracts import InputPeerResolver
 from .demand_wiring import DemandOfferSink, offer_durable_demand
-from .dialog_directory import IDENTITY_OMITTED, apply_realtime_eligibility, apply_realtime_identity
+from .dialog_directory import (
+    IDENTITY_OMITTED,
+    apply_realtime_eligibility,
+    apply_realtime_identity,
+    sync_active_generation_pins_from_publication,
+)
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
 from .history_enrollment import EnrollmentOutcome, ensure_automatic_dm_enrollment
@@ -1795,6 +1800,7 @@ class EventHandlerManager:
                         "DELETE FROM dialog_directory_published_pins WHERE folder_id=? AND dialog_id=?",
                         (published_folder, dialog_id),
                     )
+                sync_active_generation_pins_from_publication(self._conn, published_folder)
             if isinstance(folder_id, int) and not isinstance(folder_id, bool) and folder_id in {0, 1}:
                 apply_realtime_eligibility(
                     self._conn,
@@ -1840,6 +1846,7 @@ class EventHandlerManager:
                     "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (?,?,?)",
                     [(published_folder, dialog_id, position) for position, dialog_id in enumerate(pinned_ids)],
                 )
+                sync_active_generation_pins_from_publication(self._conn, published_folder)
             # For folder-scoped updates (folder_id != None) we only set the
             # pinned=1 rows above; we do not clear other dialogs because the
             # update does not describe pins outside that folder.
@@ -2256,6 +2263,7 @@ class EventHandlerManager:
                 type(update).__name__,
             )
 
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_forum_topics_pinned(self, update: object) -> None:
         """Apply UpdatePinnedForumTopics as a complete known-topic membership set."""
         try:

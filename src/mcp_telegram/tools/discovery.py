@@ -179,6 +179,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "unread_dialog_count": {"type": "integer"},
                     "unread_count": {"type": "integer"},
                     "last_message_at": {"type": ["integer", "string", "null"]},
+                    "unknown_membership_count": {"type": "integer"},
                 },
                 "required": [
                     "id",
@@ -187,6 +188,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "unread_dialog_count",
                     "unread_count",
                     "last_message_at",
+                    "unknown_membership_count",
                 ],
                 "additionalProperties": False,
             },
@@ -248,6 +250,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
         "bootstrap_pending": {"type": "boolean"},
         "scope": {"type": "string", "enum": ["all", "own_only"]},
         "folder_snapshot": FOLDER_SNAPSHOT_OUTPUT_SCHEMA,
+        "folder_membership_unknown_count": {"type": "integer"},
         "warnings": {
             "type": "array",
             "items": {
@@ -274,6 +277,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
         "bootstrap_pending",
         "scope",
         "folder_snapshot",
+        "folder_membership_unknown_count",
         "warnings",
     ],
     "additionalProperties": False,
@@ -330,6 +334,7 @@ class _FolderSummarySurface:
     unread_dialog_count: int
     unread_count: int
     last_message_at: int | None
+    unknown_membership_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +345,7 @@ class _ListDialogsSurface:
     scope: str
     folder_snapshot: _FolderSnapshotSurface
     directory_coverage: dict[str, object]
+    folder_membership_unknown_count: int
 
 
 def _list_dialogs_contract_error(detail: str) -> ToolResult:
@@ -503,6 +509,11 @@ def _strict_list_dialogs_data(
                 "lookup_fresh": False,
             }
         ),
+        folder_membership_unknown_count=(
+            _strict_int(raw_data, "folder_membership_unknown_count", context="list_dialogs")
+            if "folder_membership_unknown_count" in raw_data
+            else 0
+        ),
     )
 
 
@@ -531,6 +542,11 @@ def _strict_folder_summaries(
                 unread_dialog_count=_strict_int(value, "unread_dialog_count", context=context),
                 unread_count=_strict_int(value, "unread_count", context=context),
                 last_message_at=_strict_optional_int(value, "last_message_at", context=context),
+                unknown_membership_count=(
+                    _strict_int(value, "unknown_membership_count", context=context)
+                    if "unknown_membership_count" in value
+                    else 0
+                ),
             )
         )
     return folders, _strict_folder_snapshot(_required(raw_data, "folder_snapshot", context="list_folders"))
@@ -684,6 +700,7 @@ def _folder_view_result(args: ListDialogs, response: Mapping[str, object]) -> To
             "unread_dialog_count": folder.unread_dialog_count,
             "unread_count": folder.unread_count,
             "last_message_at": folder.last_message_at,
+            "unknown_membership_count": folder.unknown_membership_count,
         }
         for folder in folders
     ]
@@ -698,6 +715,7 @@ def _folder_view_result(args: ListDialogs, response: Mapping[str, object]) -> To
             "bootstrap_pending": not snapshot.complete,
             "scope": "all",
             "folder_snapshot": snapshot.to_wire(),
+            "folder_membership_unknown_count": sum(folder.unknown_membership_count for folder in folders),
             "warnings": warnings,
         },
         result_count=len(structured_folders),
@@ -808,6 +826,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
         "scope": surface.scope,
         "folder_snapshot": surface.folder_snapshot.to_wire(),
         "directory_coverage": surface.directory_coverage,
+        "folder_membership_unknown_count": surface.folder_membership_unknown_count,
         "warnings": warnings,
     }
 

@@ -1033,53 +1033,42 @@ class DaemonAPIServer:
                 match["entity_type"] = entity_types.get(match["entity_id"])
 
     def _resolve_local_dialog_username(self, username: str, query: str) -> Resolved | Candidates | NotFound:
-        dialog_metadata = self._local_dialog_metadata()
-        entity_rows = cast(
+        column_rows = cast(list[tuple[object, ...]], self._conn.execute("PRAGMA table_info(dialogs)").fetchall())
+        dialog_columns = {str(row[1]) for row in column_rows}
+        canonical_username_sql = "d.username" if "username" in dialog_columns else "NULL"
+        identity_complete_sql = "d.identity_complete" if "identity_complete" in dialog_columns else "0"
+        hidden = "d.hidden" if "hidden" in dialog_columns else "0"
+        rows = cast(
             list[tuple[object, ...]],
-            self._conn.execute("SELECT id, name, username, type FROM entities ORDER BY id").fetchall(),
+            self._conn.execute(
+                f"SELECT d.dialog_id,d.name,{canonical_username_sql},d.type,{identity_complete_sql},e.name,e.username,e.type "
+                "FROM dialogs d LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
+                "LEFT JOIN entities e ON e.id=d.dialog_id "
+                f"WHERE ({hidden}=0 OR sd.status='access_lost') AND "
+                f"({canonical_username_sql}=? COLLATE NOCASE OR "
+                f"(COALESCE({identity_complete_sql},0)<>1 AND e.username=? COLLATE NOCASE)) "
+                "ORDER BY d.dialog_id",
+                (username, username),
+            ).fetchall(),
         )
-        entity_cache = {_coerce_int(row[0], 0): row for row in entity_rows}
-        rows = [
-            (
-                entity_id,
-                name
-                or (
-                    entity_cache.get(entity_id, (None, None, None, None))[1] if identity_complete is not True else None
-                ),
-                canonical_username
-                or (
-                    entity_cache.get(entity_id, (None, None, None, None))[2] if identity_complete is not True else None
-                ),
-                entity_type
-                or (
-                    entity_cache.get(entity_id, (None, None, None, None))[3] if identity_complete is not True else None
-                ),
+        matches: list[MatchInfo] = []
+        for dialog_id, name, canonical_username, dialog_type, identity_complete, entity_name, entity_username, entity_type in rows:
+            complete = bool(identity_complete)
+            effective_username = canonical_username if canonical_username is not None else (None if complete else entity_username)
+            if not isinstance(effective_username, str):
+                continue
+            display_name = name if isinstance(name, str) else (None if complete else entity_name)
+            effective_type = dialog_type if isinstance(dialog_type, str) else (None if complete else entity_type)
+            matches.append(
+                {
+                    "entity_id": _coerce_int(dialog_id, 0),
+                    "display_name": str(display_name or f"@{username}"),
+                    "score": 100,
+                    "username": effective_username,
+                    "entity_type": str(effective_type) if effective_type is not None else None,
+                    "disambiguation_hint": None,
+                }
             )
-            for entity_id, (
-                name,
-                entity_type,
-                eligible,
-                canonical_username,
-                identity_complete,
-            ) in dialog_metadata.items()
-            if eligible
-            and (
-                canonical_username
-                or (entity_cache.get(entity_id, (None, None, None, None))[2] if identity_complete is not True else None)
-            )
-            is not None
-            and str(
-                canonical_username
-                or (entity_cache.get(entity_id, (None, None, None, None))[2] if identity_complete is not True else None)
-            ).casefold()
-            == username.casefold()
-        ]
-        matches = [
-            match
-            for row in rows
-            if (match := self._local_username_match(row, username=username, dialog_metadata=dialog_metadata))
-            is not None
-        ]
         matches.sort(key=lambda item: (item["display_name"].casefold(), item["entity_id"]))
         if len(matches) == 1:
             match = matches[0]
@@ -1226,7 +1215,7 @@ class DaemonAPIServer:
                 "error": "dialog_directory_incomplete",
                 "message": "No local match; coverage incomplete/unknown.",
                 "directory_coverage": directory_coverage.to_wire(),
-                "required_action": "Wait for the local dialog directory and identity lookup to complete, then retry.",
+                "required_action": "Use an exact dialog id or @username when known, or retry after a future directory refresh.",
             }
         if directory_coverage.status == "stale" or not directory_coverage.lookup_fresh:
             return {
@@ -1234,7 +1223,7 @@ class DaemonAPIServer:
                 "error": "stale_local_directory",
                 "message": "No local match; the local dialog directory or identity lookup is stale.",
                 "directory_coverage": directory_coverage.to_wire(),
-                "required_action": "Wait for a fresh local directory receipt, then retry.",
+                "required_action": "Use an exact dialog id or @username when known, or retry after a future directory refresh.",
             }
         return {
             "ok": False,
@@ -1381,6 +1370,17 @@ class DaemonAPIServer:
                 if limit is not None and len(enriched) >= limit:
                     break
         data["dialogs"] = enriched
+        if requested_folder is not None:
+            unknown_row = cast(
+                tuple[object] | None,
+                self._conn.execute(
+                    "SELECT COUNT(*) FROM telegram_folder_local_members WHERE folder_id=? AND state='unknown'",
+                    (int(cast(int | str, requested_folder)),),
+                ).fetchone(),
+            )
+            data["folder_membership_unknown_count"] = _coerce_int(unknown_row[0], 0) if unknown_row is not None else 0
+        else:
+            data["folder_membership_unknown_count"] = 0
         data["folder_snapshot"] = folder_snapshot(
             self._conn,
             stale_after_seconds=self._policy.folder_snapshot_stale_after_seconds,
