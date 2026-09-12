@@ -5,30 +5,58 @@ from __future__ import annotations
 from .contracts import DialogFacts, FolderRule, FolderRuleKind, MembershipState
 
 
-def evaluate(rule: FolderRule, facts: DialogFacts | None, *, now: int) -> MembershipState:  # noqa: PLR0911
+def evaluate(rule: FolderRule, facts: DialogFacts | None, *, now: int) -> MembershipState:
     """Evaluate one current canonical fact without inventing absence from gaps."""
-    dialog_id = facts.dialog_id if facts is not None else None
-    if dialog_id is not None and dialog_id in rule.excluded_ids:
+    state = _excluded_state(rule, facts)
+    if state is not None:
+        return state
+    state = _explicit_state(rule, facts)
+    if state is not None:
+        return state
+    state = _chatlist_state(rule)
+    if state is not None:
+        return state
+    state = _missing_facts_state(facts)
+    if state is not None:
+        return state
+    assert facts is not None
+    if rule.kind is FolderRuleKind.DEFAULT:
+        return _default_state(facts)
+    return _filter_state(rule, facts, now=now)
+
+
+def _excluded_state(rule: FolderRule, facts: DialogFacts | None) -> MembershipState | None:
+    if facts is not None and facts.dialog_id in rule.excluded_ids:
         return MembershipState.ABSENT
-    if dialog_id is not None and dialog_id in rule.explicit_ids:
+    return None
+
+
+def _explicit_state(rule: FolderRule, facts: DialogFacts | None) -> MembershipState | None:
+    if facts is not None and facts.dialog_id in rule.explicit_ids:
         return MembershipState.PRESENT
+    return None
+
+
+def _chatlist_state(rule: FolderRule) -> MembershipState | None:
     if rule.kind is FolderRuleKind.CHATLIST:
         return MembershipState.ABSENT
+    return None
+
+
+def _missing_facts_state(facts: DialogFacts | None) -> MembershipState | None:
     if facts is None:
         return MembershipState.UNKNOWN
-    if rule.kind is FolderRuleKind.DEFAULT:
-        if facts.archived is None:
-            return MembershipState.UNKNOWN
-        return MembershipState.ABSENT if facts.archived else MembershipState.PRESENT
-    category = _category_state(rule, facts)
-    if category is MembershipState.ABSENT:
-        return category
-    exclusions = _exclusions_state(rule, facts, now=now)
-    if exclusions is MembershipState.ABSENT:
-        return exclusions
-    if category is MembershipState.UNKNOWN or exclusions is MembershipState.UNKNOWN:
+    return None
+
+
+def _default_state(facts: DialogFacts) -> MembershipState:
+    if facts.archived is None:
         return MembershipState.UNKNOWN
-    return MembershipState.PRESENT
+    return MembershipState.ABSENT if facts.archived else MembershipState.PRESENT
+
+
+def _filter_state(rule: FolderRule, facts: DialogFacts, *, now: int) -> MembershipState:
+    return _compose_states(_category_state(rule, facts), _exclusions_state(rule, facts, now=now))
 
 
 def pin_position(rule: FolderRule, dialog_id: int) -> int | None:
@@ -47,23 +75,34 @@ def _category_state(rule: FolderRule, facts: DialogFacts) -> MembershipState:
 
 
 def _exclusions_state(rule: FolderRule, facts: DialogFacts, *, now: int) -> MembershipState:
-    unknown = False
-    if rule.exclude_archived:
-        if facts.archived is None:
-            unknown = True
-        elif facts.archived:
-            return MembershipState.ABSENT
-    if rule.exclude_read:
-        if facts.unread is None:
-            unknown = True
-        elif not facts.unread:
-            return MembershipState.ABSENT
-    if rule.exclude_muted:
-        if facts.mute_until is None:
-            unknown = True
-        elif facts.mute_until > now:
-            return MembershipState.ABSENT
-    return MembershipState.UNKNOWN if unknown else MembershipState.PRESENT
+    read_excluded = None if facts.unread is None else not facts.unread
+    mute_excluded = None if facts.mute_until is None else facts.mute_until > now
+    states = (
+        _optional_exclusion_state(rule.exclude_archived, facts.archived),
+        _optional_exclusion_state(rule.exclude_read, read_excluded),
+        _optional_exclusion_state(rule.exclude_muted, mute_excluded),
+    )
+    if MembershipState.ABSENT in states:
+        return MembershipState.ABSENT
+    if MembershipState.UNKNOWN in states:
+        return MembershipState.UNKNOWN
+    return MembershipState.PRESENT
+
+
+def _optional_exclusion_state(enabled: bool, excluded: bool | None) -> MembershipState | None:
+    if not enabled:
+        return None
+    if excluded is None:
+        return MembershipState.UNKNOWN
+    return MembershipState.ABSENT if excluded else MembershipState.PRESENT
+
+
+def _compose_states(category: MembershipState, exclusions: MembershipState) -> MembershipState:
+    if MembershipState.ABSENT in (category, exclusions):
+        return MembershipState.ABSENT
+    if MembershipState.UNKNOWN in (category, exclusions):
+        return MembershipState.UNKNOWN
+    return MembershipState.PRESENT
 
 
 def matches(rule: FolderRule, facts: DialogFacts, *, now: int = 0) -> bool:

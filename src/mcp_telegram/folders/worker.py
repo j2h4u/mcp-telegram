@@ -96,43 +96,60 @@ class FolderProjectionWorker:
         del reason
         async with self._attempt_lock:
             now = int(self._clock())
-            expiry = self._repository.next_mute_expiry()
-            if expiry is not None and now >= expiry:
-                self._repository.reproject_current_rules(now=now)
-            if self._repository.rules_are_fresh(now=now):
-                self._next_due_at = self._due_at()
-                return
-            if budget is not None and budget.exhausted:
+            if self._attempt_preflight(now, budget):
                 return
             try:
-                if budget is None:
-                    await self._refresher.refresh(completed_at=now)
-                else:
-                    with rpc_attempt_budget(budget):
-                        await self._refresher.refresh(completed_at=now)
+                await self._refresh_once(now, budget)
             except asyncio.CancelledError:
                 raise
-            except FolderSourceUnavailableError, TimeoutError, OSError:
-                self._record_failure(FolderAttemptResult.SOURCE_UNAVAILABLE, None)
-            except TelegramRpcThrottled as exc:
-                # An account circuit is a coordinator-owned latch.  Let the
-                # existing convention propagate it so this demand does not
-                # create a private retry loop against a blocked account.
-                _raise_if_latched(exc)
-                self._record_failure(
-                    FolderAttemptResult.CIRCUIT_OPEN
-                    if exc.retry_after_seconds is None
-                    else FolderAttemptResult.FLOOD_WAIT,
-                    exc.retry_after_seconds,
-                )
-            except RpcAttemptBudgetExhaustedError:
-                return
-            except Exception:
-                self._record_failure(FolderAttemptResult.UNEXPECTED, None)
+            except Exception as exc:
+                if self._handle_refresh_error(exc):
+                    return
                 raise
             else:
-                self._failure_count = 0
-                self._next_due_at = self._due_at()
+                self._record_success()
+
+    def _attempt_preflight(self, now: int, budget: RpcAttemptBudget | None) -> bool:
+        """Run the no-RPC checks while the attempt lock is held."""
+        expiry = self._repository.next_mute_expiry()
+        if expiry is not None and now >= expiry:
+            self._repository.reproject_current_rules(now=now)
+        if self._repository.rules_are_fresh(now=now):
+            self._next_due_at = self._due_at()
+            return True
+        return budget is not None and budget.exhausted
+
+    async def _refresh_once(self, now: int, budget: RpcAttemptBudget | None) -> None:
+        if budget is None:
+            await self._refresher.refresh(completed_at=now)
+            return
+        with rpc_attempt_budget(budget):
+            await self._refresher.refresh(completed_at=now)
+
+    def _handle_refresh_error(self, exc: Exception) -> bool:
+        if isinstance(exc, (FolderSourceUnavailableError, TimeoutError, OSError)):
+            self._record_failure(FolderAttemptResult.SOURCE_UNAVAILABLE, None)
+            return True
+        if isinstance(exc, TelegramRpcThrottled):
+            # An account circuit is a coordinator-owned latch.  Let the
+            # existing convention propagate it so this demand does not
+            # create a private retry loop against a blocked account.
+            _raise_if_latched(exc)
+            self._record_failure(
+                FolderAttemptResult.CIRCUIT_OPEN
+                if exc.retry_after_seconds is None
+                else FolderAttemptResult.FLOOD_WAIT,
+                exc.retry_after_seconds,
+            )
+            return True
+        if isinstance(exc, RpcAttemptBudgetExhaustedError):
+            return True
+        self._record_failure(FolderAttemptResult.UNEXPECTED, None)
+        return False
+
+    def _record_success(self) -> None:
+        self._failure_count = 0
+        self._next_due_at = self._due_at()
 
     def _record_failure(self, outcome: FolderAttemptResult, retry_after: int | None) -> None:
         self._failure_count += 1
