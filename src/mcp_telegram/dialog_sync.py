@@ -35,7 +35,7 @@ import logging
 import math
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -1127,12 +1127,12 @@ class DialogReconciliationWorker:
         snapshot_at = int(time.time())
         with self._conn:
             current = cast(
-                tuple[int, str] | None,
+                Sequence[object] | None,
                 self._conn.execute(
                     "SELECT generation, status FROM dialog_full_reconciliation_state WHERE singleton=1"
                 ).fetchone(),
             )
-            if current != (state.generation, "in_progress"):
+            if current is None or current[0] != state.generation or current[1] != "in_progress":
                 return False
             self._conn.execute(_UPSERT_DIALOG_SQL, _extract_dialog_row(dialog, snapshot_at))
             _apply_dialog_read_cursors(self._conn, dialog)
@@ -1446,12 +1446,12 @@ class DialogFullReconciliationDemandAdapter:
         release_at = 0.0 if completed_at is None else completed_at + self._interval_seconds
         freshness_deadline = None if completed_at is None else release_at
         state = cast(
-            tuple[str] | None,
+            Sequence[object] | None,
             self._worker._conn.execute(
                 "SELECT status FROM dialog_full_reconciliation_state WHERE singleton=1"
             ).fetchone(),
         )
-        if state == ("in_progress",):
+        if state is not None and state[0] == "in_progress":
             return DemandStatus(release_at=0.0, freshness_deadline=freshness_deadline)
         return DemandStatus(release_at=release_at, freshness_deadline=freshness_deadline)
 

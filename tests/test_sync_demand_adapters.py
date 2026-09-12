@@ -779,6 +779,20 @@ def test_dialog_full_adapter_never_completed_has_no_freshness_debt(
     assert status.overdue_seconds(1_700_000_000.0) == 0.0
 
 
+def test_dialog_full_adapter_status_sees_in_progress_with_row_factory(conn: sqlite3.Connection) -> None:
+    conn.row_factory = sqlite3.Row
+    conn.execute("INSERT INTO daemon_state (key, value) VALUES ('dialog_reconciliation_last_full_at', '100')")
+    conn.execute("UPDATE dialog_full_reconciliation_state SET status='in_progress' WHERE singleton=1")
+    conn.commit()
+    worker = DialogReconciliationWorker(SimpleNamespace(iter_dialogs=AsyncMock()), conn, asyncio.Event())
+    adapter = DialogFullReconciliationDemandAdapter(worker, interval_seconds=50.0)
+
+    status = adapter.status(200.0)
+
+    assert status.release_at == 0.0
+    assert status.freshness_deadline == 150.0
+
+
 @pytest.mark.asyncio
 async def test_dialog_full_adapter_resumes_message_cursor_and_preserves_changed_unseen_row(
     conn: sqlite3.Connection,

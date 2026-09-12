@@ -9,6 +9,7 @@ import logging
 import sqlite3
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -25,6 +26,7 @@ from mcp_telegram.dialog_sync import (
 )
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.telegram_demand import RpcAttemptBudgetExhaustedError
 from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway
@@ -421,6 +423,67 @@ async def test_recon_full_pass_upserts_returned(
     assert sweep_state["dialog_unread_sweep_last_visible_count"] == "2"
     assert sweep_state["dialog_unread_sweep_attempted_at"].isdigit()
     assert sweep_state["dialog_unread_sweep_completed_at"].isdigit()
+
+
+@pytest.mark.asyncio
+async def test_recon_full_pass_row_factory_checkpoints_and_completes_generation(
+    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """The daemon's Row factory must preserve resumable full-pass progress."""
+    sync_db.row_factory = sqlite3.Row
+    dialog = _make_dialog(100, name="A_new")
+    dialog.message = SimpleNamespace(id=777, date=datetime(2026, 1, 2, tzinfo=UTC))
+
+    async def interrupted_pass():
+        yield dialog
+        raise RpcAttemptBudgetExhaustedError("slice complete")
+
+    async def drained_pass():
+        return
+        yield  # pragma: no cover
+
+    mock_client.iter_dialogs = MagicMock(side_effect=[interrupted_pass(), drained_pass()])
+    worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
+
+    count, completed = await worker._run_full_pass_slice(refresh_topics=False, wait_on_throttle=False)
+
+    assert (count, completed) == (1, False)
+    checkpoint = sync_db.execute(
+        "SELECT status, offset_id, observed_count FROM dialog_full_reconciliation_state WHERE singleton=1"
+    ).fetchone()
+    assert checkpoint["status"] == "in_progress"
+    assert checkpoint["offset_id"] == 777
+    assert checkpoint["observed_count"] == 1
+
+    count, completed = await worker._run_full_pass_slice(refresh_topics=False, wait_on_throttle=False)
+
+    assert (count, completed) == (1, True)
+    finished = sync_db.execute(
+        "SELECT status, generation, observed_count FROM dialog_full_reconciliation_state WHERE singleton=1"
+    ).fetchone()
+    assert finished["status"] == "idle"
+    assert finished["generation"] == 1
+    assert finished["observed_count"] == 0
+
+
+def test_recon_checkpoint_row_factory_rejects_stale_generation(
+    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    shutdown_event: asyncio.Event,
+) -> None:
+    sync_db.row_factory = sqlite3.Row
+    worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
+    state = worker._load_or_begin_full_generation()
+    sync_db.execute(
+        "UPDATE dialog_full_reconciliation_state SET generation=? WHERE singleton=1",
+        (state.generation + 1,),
+    )
+    sync_db.commit()
+
+    assert worker._checkpoint_full_dialog(state, _make_dialog(100)) is False
+    assert sync_db.execute("SELECT COUNT(*) FROM dialogs").fetchone()[0] == 0
 
 
 @pytest.mark.asyncio
