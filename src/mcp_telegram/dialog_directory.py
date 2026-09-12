@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 import time
 from collections.abc import Callable
@@ -51,6 +52,8 @@ from .telegram_rpc_scheduler import (
     rpc_attempt_budget,
     rpc_scope,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class DialogDirectoryClient(Protocol):
@@ -356,6 +359,16 @@ class CanonicalDialogDirectory:
         conn.execute("DELETE FROM dialog_directory_staging")
         conn.execute("DELETE FROM dialog_directory_baseline")
         conn.execute("DELETE FROM dialog_directory_pins")
+        conn.execute("DELETE FROM daemon_state WHERE key LIKE 'dialog_directory_pin_fence:%'")
+        # Realtime pin deltas received before a source RPC completes must
+        # build on the active generation's coherent prior publication.  The
+        # acquisition transaction may replace this snapshot when no realtime
+        # writer crossed its fence.
+        conn.execute(
+            "INSERT INTO dialog_directory_pins(generation,folder_id,dialog_id,position) "
+            "SELECT ?,folder_id,dialog_id,position FROM dialog_directory_published_pins",
+            (generation,),
+        )
         conn.execute(
             "INSERT INTO dialog_directory_baseline(generation, dialog_id, baseline_revision, seen) "
             "SELECT ?, dialog_id, revision, 0 FROM dialogs",
@@ -379,7 +392,6 @@ class CanonicalDialogDirectory:
     async def _acquire_pinned(
         self, conn: sqlite3.Connection, state: _DirectoryState, folder_id: int, account_id: int
     ) -> None:
-        published_before = _published_pin_rows(conn, folder_id)
         try:
             response = await self._client(get_pinned_dialogs_request(folder_id))
         except Exception as exc:  # noqa: BLE001 - transport classes vary under Telethon
@@ -407,22 +419,12 @@ class CanonicalDialogDirectory:
             raise RuntimeError(f"unexpected normalized pinned response: {page.kind}")
         with conn:
             self._stage_facts(conn, state.generation, page.facts, folder_id=folder_id, account_id=account_id)
-            if _published_pin_rows(conn, folder_id) != published_before:
-                sync_active_generation_pins_from_publication(conn, folder_id)
-            else:
-                # No realtime writer published this source during the request,
-                # so this RPC is the authoritative, replaceable source order.
-                conn.execute(
-                    "DELETE FROM dialog_directory_pins WHERE generation=? AND folder_id=?",
-                    (state.generation, folder_id),
-                )
-                conn.executemany(
-                    "INSERT INTO dialog_directory_pins(generation, folder_id, dialog_id, position) VALUES (?, ?, ?, ?)",
-                    [
-                        (state.generation, folder_id, fact.dialog_id, position)
-                        for position, fact in enumerate(page.facts)
-                    ],
-                )
+            _commit_pinned_generation(
+                conn,
+                state.generation,
+                folder_id,
+                [fact.dialog_id for fact in page.facts],
+            )
             column = "pinned_main_status" if folder_id == 0 else "pinned_archive_status"
             conn.execute(
                 f"UPDATE dialog_directory_state SET {column}='complete', retry_at=NULL WHERE singleton=1 AND account_id=? AND generation=?",
@@ -552,10 +554,18 @@ class CanonicalDialogDirectory:
         if column is None:
             raise ValueError(f"unknown directory source: {source}")
         with conn:
-            conn.execute(
+            cursor = conn.execute(
                 f"UPDATE dialog_directory_state SET status='invalid', {column}='invalid', reason=?, retry_at=NULL "
-                "WHERE singleton=1 AND account_id=? AND generation=?",
+                "WHERE singleton=1 AND account_id=? AND generation=? AND status != 'invalid'",
                 (f"{source}:invalid:{specific}", account_id, generation),
+            )
+            first_latch = cursor.rowcount == 1
+        if first_latch:
+            logger.warning(
+                "canonical_dialog_directory_semantic_invalid generation=%d source=%s reason=%s",
+                generation,
+                source,
+                specific,
             )
         self._set_detail(f"canonical dialog directory: invalid {source} ({specific})")
 
@@ -857,6 +867,7 @@ class CanonicalDialogDirectory:
             "SELECT folder_id,dialog_id,position FROM dialog_directory_pins WHERE generation=?",
             (generation,),
         )
+        conn.execute("DELETE FROM daemon_state WHERE key LIKE 'dialog_directory_pin_fence:%'")
         conn.execute(
             "UPDATE dialog_directory_publication SET account_id=?,generation=?,observation_started_at=?,observation_completed_at=? WHERE singleton=1",
             (account_id, generation, state.observation_started_at, completed_at),
@@ -1132,18 +1143,6 @@ def recover_invalid_generation_in_transaction(conn: sqlite3.Connection) -> dict[
     return {"ok": True, "previous": previous, "current": _state_wire(current)}
 
 
-def _published_pin_rows(conn: sqlite3.Connection, folder_id: int) -> tuple[tuple[int, int], ...]:
-    return tuple(
-        cast(
-            list[tuple[int, int]],
-            conn.execute(
-                "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=? ORDER BY position,dialog_id",
-                (folder_id,),
-            ).fetchall(),
-        )
-    )
-
-
 def sync_active_generation_pins_from_publication(conn: sqlite3.Connection, folder_id: int) -> None:
     """Fence an active source against newer realtime pin membership and order."""
     row = cast(
@@ -1152,13 +1151,170 @@ def sync_active_generation_pins_from_publication(conn: sqlite3.Connection, folde
     )
     if row is None or row[1] != "in_progress":
         return
-    generation = int(row[0])
+    generation = int(cast(int, row[0]))
     conn.execute("DELETE FROM dialog_directory_pins WHERE generation=? AND folder_id=?", (generation, folder_id))
     conn.execute(
         "INSERT INTO dialog_directory_pins(generation,folder_id,dialog_id,position) "
         "SELECT ?,folder_id,dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=?",
         (generation, folder_id),
     )
+
+
+def apply_active_generation_pin_delta(conn: sqlite3.Connection, folder_id: int, dialog_id: int, pinned: bool) -> None:
+    """Apply a realtime single-peer pin delta to the active generation.
+
+    The active generation is the source of truth while acquisition is in
+    progress.  Reading the published relation here would discard pins already
+    acquired by the in-flight generation.
+    """
+    row = cast(
+        tuple[object, object] | None,
+        conn.execute("SELECT generation,status FROM dialog_directory_state WHERE singleton=1").fetchone(),
+    )
+    if row is None or row[1] != "in_progress":
+        return
+    generation = int(cast(int, row[0]))
+    current = [
+        int(cast(int, pin[0]))
+        for pin in cast(
+            list[tuple[object, object]],
+            conn.execute(
+                "SELECT dialog_id,position FROM dialog_directory_pins "
+                "WHERE generation=? AND folder_id=? ORDER BY position,dialog_id",
+                (generation, folder_id),
+            ).fetchall(),
+        )
+    ]
+    if pinned:
+        current = [dialog_id, *(existing for existing in current if existing != dialog_id)]
+    else:
+        current = [existing for existing in current if existing != dialog_id]
+    conn.execute(
+        "DELETE FROM dialog_directory_pins WHERE generation=? AND folder_id=?",
+        (generation, folder_id),
+    )
+    conn.executemany(
+        "INSERT INTO dialog_directory_pins(generation,folder_id,dialog_id,position) VALUES (?,?,?,?)",
+        [(generation, folder_id, current_id, position) for position, current_id in enumerate(current)],
+    )
+
+
+def _pin_fence_key(generation: int, folder_id: int) -> str:
+    return f"dialog_directory_pin_fence:{generation}:{folder_id}"
+
+
+def record_realtime_pin_fence(
+    conn: sqlite3.Connection,
+    folder_id: int,
+    event: dict[str, object],
+) -> None:
+    """Record an in-flight pin event for the next source commit.
+
+    Events and source RPC commits use separate connections and cannot share a
+    Python flag.  This small durable fence keeps event ordering across that
+    await boundary without changing the published schema.
+    """
+    row = cast(
+        tuple[object, object] | None,
+        conn.execute("SELECT generation,status FROM dialog_directory_state WHERE singleton=1").fetchone(),
+    )
+    if row is None or row[1] != "in_progress":
+        return
+    generation = int(cast(int, row[0]))
+    key = _pin_fence_key(generation, folder_id)
+    prior = cast(
+        tuple[object] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key=?", (key,)).fetchone(),
+    )
+    events: list[dict[str, object]] = []
+    if prior is not None and prior[0] is not None:
+        decoded = cast(object, json.loads(str(cast(object, prior[0]))))
+        if not isinstance(decoded, list) or not all(isinstance(item, dict) for item in decoded):
+            raise RuntimeError("invalid dialog directory pin fence")
+        events = cast(list[dict[str, object]], decoded)
+    events.append(event)
+    conn.execute(
+        "INSERT OR REPLACE INTO daemon_state(key,value) VALUES (?,?)",
+        (key, json.dumps(events, separators=(",", ":"))),
+    )
+
+
+def read_realtime_pin_fence(conn: sqlite3.Connection, generation: int, folder_id: int) -> list[dict[str, object]]:
+    row = cast(
+        tuple[object] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key=?", (_pin_fence_key(generation, folder_id),)).fetchone(),
+    )
+    if row is None or row[0] is None:
+        return []
+    decoded = cast(object, json.loads(str(cast(object, row[0]))))
+    if not isinstance(decoded, list) or not all(isinstance(item, dict) for item in decoded):
+        raise RuntimeError("invalid dialog directory pin fence")
+    return cast(list[dict[str, object]], decoded)
+
+
+def replace_active_generation_pins(
+    conn: sqlite3.Connection, generation: int, folder_id: int, dialog_ids: list[int]
+) -> None:
+    conn.execute(
+        "DELETE FROM dialog_directory_pins WHERE generation=? AND folder_id=?",
+        (generation, folder_id),
+    )
+    conn.executemany(
+        "INSERT INTO dialog_directory_pins(generation,folder_id,dialog_id,position) VALUES (?,?,?,?)",
+        [(generation, folder_id, dialog_id, position) for position, dialog_id in enumerate(dialog_ids)],
+    )
+
+
+def apply_realtime_pin_fence(
+    conn: sqlite3.Connection, generation: int, folder_id: int, dialog_ids: list[int]
+) -> list[int]:
+    """Replay fenced realtime pin events onto an acquired RPC order."""
+    current = list(dialog_ids)
+    for event in read_realtime_pin_fence(conn, generation, folder_id):
+        current = _apply_realtime_pin_fence_event(current, event)
+    replace_active_generation_pins(conn, generation, folder_id, current)
+    return current
+
+
+def _apply_realtime_pin_fence_event(current: list[int], event: dict[str, object]) -> list[int]:
+    kind = event.get("kind")
+    if kind == "rewrite":
+        return _pin_rewrite_from_fence(event)
+    if kind == "delta":
+        return _pin_delta_from_fence(current, event)
+    raise RuntimeError("invalid dialog directory pin event fence")
+
+
+def _pin_rewrite_from_fence(event: dict[str, object]) -> list[int]:
+    raw_ids = event.get("dialog_ids")
+    if not isinstance(raw_ids, list) or not all(isinstance(item, int) for item in raw_ids):
+        raise RuntimeError("invalid dialog directory pin rewrite fence")
+    return list(cast(list[int], raw_ids))
+
+
+def _pin_delta_from_fence(current: list[int], event: dict[str, object]) -> list[int]:
+    event_id = event.get("dialog_id")
+    event_pinned = event.get("pinned")
+    if not isinstance(event_id, int) or not isinstance(event_pinned, bool):
+        raise RuntimeError("invalid dialog directory pin delta fence")
+    if event_pinned:
+        return [event_id, *(existing for existing in current if existing != event_id)]
+    return [existing for existing in current if existing != event_id]
+
+
+def _commit_pinned_generation(
+    conn: sqlite3.Connection,
+    generation: int,
+    folder_id: int,
+    rpc_ids: list[int],
+) -> None:
+    fence_events = read_realtime_pin_fence(conn, generation, folder_id)
+    if fence_events:
+        apply_realtime_pin_fence(conn, generation, folder_id, rpc_ids)
+    else:
+        # No realtime writer published this source during the request, so this
+        # RPC is the authoritative, replaceable source order.
+        replace_active_generation_pins(conn, generation, folder_id, rpc_ids)
 
 
 def _insert_realtime_eligibility(

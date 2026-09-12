@@ -70,9 +70,11 @@ from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import (
     IDENTITY_OMITTED,
     _IdentityOmitted,
+    apply_active_generation_pin_delta,
     apply_realtime_eligibility,
     apply_realtime_identity,
     clear_realtime_mute,
+    record_realtime_pin_fence,
     sync_active_generation_pins_from_publication,
 )
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
@@ -1778,26 +1780,36 @@ class EventHandlerManager:
             return 1
         return None
 
-    def _append_published_pin(self, folder_id: int, dialog_id: int) -> None:
-        self._conn.execute(
-            "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) "
-            "VALUES (?, ?, COALESCE((SELECT MAX(position)+1 FROM dialog_directory_published_pins WHERE folder_id=?), 0)) "
-            "ON CONFLICT(folder_id,dialog_id) DO NOTHING",
-            (folder_id, dialog_id, folder_id),
-        )
-
     def _apply_published_pin_mutation(self, folder_id: int | None, dialog_id: int, pinned: int) -> None:
         """Apply one published pin change within the caller's transaction."""
         if folder_id is None:
             return
-        if pinned:
-            self._append_published_pin(folder_id, dialog_id)
-        else:
-            self._conn.execute(
-                "DELETE FROM dialog_directory_published_pins WHERE folder_id=? AND dialog_id=?",
-                (folder_id, dialog_id),
+        current = [
+            int(cast(int, pin[0]))
+            for pin in cast(
+                list[tuple[object, object]],
+                self._conn.execute(
+                    "SELECT dialog_id,position FROM dialog_directory_published_pins "
+                    "WHERE folder_id=? ORDER BY position,dialog_id",
+                    (folder_id,),
+                ).fetchall(),
             )
-        sync_active_generation_pins_from_publication(self._conn, folder_id)
+        ]
+        if pinned:
+            current = [dialog_id, *(existing for existing in current if existing != dialog_id)]
+        else:
+            current = [existing for existing in current if existing != dialog_id]
+        self._conn.execute("DELETE FROM dialog_directory_published_pins WHERE folder_id=?", (folder_id,))
+        self._conn.executemany(
+            "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (?,?,?)",
+            [(folder_id, current_id, position) for position, current_id in enumerate(current)],
+        )
+        apply_active_generation_pin_delta(self._conn, folder_id, dialog_id, bool(pinned))
+        record_realtime_pin_fence(
+            self._conn,
+            folder_id,
+            {"kind": "delta", "dialog_id": dialog_id, "pinned": bool(pinned)},
+        )
 
     def _project_pinned_eligibility(
         self,
@@ -1876,6 +1888,11 @@ class EventHandlerManager:
                     [(published_folder, dialog_id, position) for position, dialog_id in enumerate(pinned_ids)],
                 )
                 sync_active_generation_pins_from_publication(self._conn, published_folder)
+                record_realtime_pin_fence(
+                    self._conn,
+                    published_folder,
+                    {"kind": "rewrite", "dialog_ids": pinned_ids},
+                )
             # For folder-scoped updates (folder_id != None) we only set the
             # pinned=1 rows above; we do not clear other dialogs because the
             # update does not describe pins outside that folder.

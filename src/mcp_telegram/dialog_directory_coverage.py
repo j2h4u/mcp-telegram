@@ -48,56 +48,35 @@ def _int_or_none(value: object) -> int | None:
 
 def _read_coverage_sources(
     conn: sqlite3.Connection,
-) -> tuple[tuple[object, object] | None, tuple[object, object, object] | None] | None:
-    try:
-        publication = cast(
-            tuple[object, object] | None,
-            conn.execute(
-                "SELECT generation, observation_started_at FROM dialog_directory_publication WHERE singleton=1"
-            ).fetchone(),
-        )
-        state = cast(
-            tuple[object, object, object] | None,
-            conn.execute(
-                "SELECT status, reason, observation_started_at FROM dialog_directory_state WHERE singleton=1"
-            ).fetchone(),
-        )
-    except sqlite3.OperationalError:
-        try:
-            state = cast(
-                tuple[object, object, object] | None,
-                conn.execute(
-                    "SELECT status, NULL AS reason, observation_started_at FROM dialog_directory_state WHERE singleton=1"
-                ).fetchone(),
-            )
-            publication = cast(
-                tuple[object, object] | None,
-                conn.execute(
-                    "SELECT generation, observation_started_at FROM dialog_directory_publication WHERE singleton=1"
-                ).fetchone(),
-            )
-        except sqlite3.OperationalError:
-            # Small legacy/test databases may predate the canonical directory.
-            return None
+) -> tuple[tuple[object, object] | None, tuple[object, object, object] | None]:
+    publication = cast(
+        tuple[object, object] | None,
+        conn.execute(
+            "SELECT generation, observation_started_at FROM dialog_directory_publication WHERE singleton=1"
+        ).fetchone(),
+    )
+    state = cast(
+        tuple[object, object, object] | None,
+        conn.execute(
+            "SELECT status, reason, observation_started_at FROM dialog_directory_state WHERE singleton=1"
+        ).fetchone(),
+    )
     return publication, state
 
 
 def _read_identity_aggregate(
     conn: sqlite3.Connection,
 ) -> tuple[object, object, object, object] | None:
-    try:
-        return cast(
-            tuple[object, object, object, object] | None,
-            conn.execute(
-                "SELECT COUNT(*), "
-                "SUM(CASE WHEN COALESCE(d.identity_complete, 0) <> 1 THEN 1 ELSE 0 END), "
-                "MIN(CASE WHEN COALESCE(d.identity_complete, 0) = 1 THEN d.identity_observed_at END), "
-                "MIN(d.identity_observed_at) "
-                "FROM dialogs d WHERE d.hidden=0"
-            ).fetchone(),
-        )
-    except sqlite3.OperationalError:
-        return None
+    return cast(
+        tuple[object, object, object, object] | None,
+        conn.execute(
+            "SELECT COUNT(*), "
+            "SUM(CASE WHEN COALESCE(d.identity_complete, 0) <> 1 THEN 1 ELSE 0 END), "
+            "MIN(CASE WHEN COALESCE(d.identity_complete, 0) = 1 THEN d.identity_observed_at END), "
+            "MIN(d.identity_observed_at) "
+            "FROM dialogs d WHERE d.hidden=0"
+        ).fetchone(),
+    )
 
 
 def _lookup_coverage(
@@ -148,8 +127,6 @@ def read_dialog_directory_coverage(
     """
     current = int(time.time()) if now is None else now
     sources = _read_coverage_sources(conn)
-    if sources is None:
-        return DialogDirectoryCoverage("never", None, None, None, None, False, False)
     publication, state = sources
 
     generation = _int_or_none(publication[0]) if publication is not None else None

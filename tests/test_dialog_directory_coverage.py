@@ -5,8 +5,20 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from mcp_telegram.dialog_directory_coverage import read_dialog_directory_coverage
 from mcp_telegram.sync_db import ensure_sync_schema
+
+
+def test_coverage_schema_fault_propagates(tmp_path: Path) -> None:
+    path = tmp_path / "not-migrated.db"
+    conn = sqlite3.connect(path)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            read_dialog_directory_coverage(conn)
+    finally:
+        conn.close()
 
 
 def test_published_directory_age_uses_acquisition_start_at_exact_stale_boundary(tmp_path: Path) -> None:

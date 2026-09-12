@@ -517,6 +517,49 @@ async def test_realtime_main_pin_order_replaces_published_pin_order(
 
 
 @pytest.mark.asyncio
+async def test_realtime_single_pin_delta_preserves_active_generation_pins(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    acquired = [get_peer_id(PeerUser(user_id=user_id)) for user_id in range(741, 746)]
+    new_pin = get_peer_id(PeerUser(user_id=746))
+    for dialog_id in [*acquired, new_pin]:
+        _insert_dialog(sync_db, dialog_id, pinned=0, snapshot_at=1)
+    sync_db.execute(
+        "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (0,?,0)",
+        (acquired[0],),
+    )
+    sync_db.execute("UPDATE dialog_directory_state SET status='in_progress',generation=9")
+    sync_db.executemany(
+        "INSERT INTO dialog_directory_pins(generation,folder_id,dialog_id,position) VALUES (9,0,?,?)",
+        [(dialog_id, position) for position, dialog_id in enumerate(acquired)],
+    )
+    sync_db.commit()
+
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    await manager.on_raw_dialog_pinned(
+        UpdateDialogPinned(peer=DialogPeer(peer=PeerUser(user_id=746)), pinned=True, folder_id=None)
+    )
+    assert sync_db.execute(
+        "SELECT dialog_id,position FROM dialog_directory_pins WHERE generation=9 AND folder_id=0 ORDER BY position"
+    ).fetchall() == [(new_pin, 0), *[(dialog_id, position + 1) for position, dialog_id in enumerate(acquired)]]
+
+    await manager.on_raw_dialog_pinned(
+        UpdateDialogPinned(peer=DialogPeer(peer=PeerUser(user_id=743)), pinned=False, folder_id=None)
+    )
+    assert sync_db.execute(
+        "SELECT dialog_id,position FROM dialog_directory_pins WHERE generation=9 AND folder_id=0 ORDER BY position"
+    ).fetchall() == [
+        (new_pin, 0),
+        (acquired[0], 1),
+        (acquired[1], 2),
+        (acquired[3], 3),
+        (acquired[4], 4),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_realtime_single_pin_toggle_preserves_existing_published_order(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
@@ -540,7 +583,7 @@ async def test_realtime_single_pin_toggle_preserves_existing_published_order(
     )
     assert sync_db.execute(
         "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=0 ORDER BY position"
-    ).fetchall() == [(second, 1), (third, 2)]
+    ).fetchall() == [(third, 0), (second, 1)]
 
 
 @pytest.mark.asyncio

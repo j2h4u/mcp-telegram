@@ -19,9 +19,11 @@ from mcp_telegram.dialog_directory import (
     _encode_input_peer,
     _mute_until,
     _three_valued_unread,
+    apply_active_generation_pin_delta,
     apply_realtime_eligibility,
     apply_realtime_identity,
     clear_realtime_mute,
+    record_realtime_pin_fence,
     recover_invalid_generation_in_transaction,
     sync_active_generation_pins_from_publication,
 )
@@ -400,6 +402,40 @@ class _RealtimePinClient(_FakeClient):
                         (self._folder_id, self._dialog_id),
                     )
                     sync_active_generation_pins_from_publication(conn, self._folder_id)
+                    record_realtime_pin_fence(
+                        conn,
+                        self._folder_id,
+                        {"kind": "rewrite", "dialog_ids": [self._dialog_id]},
+                    )
+            finally:
+                conn.close()
+        return await super().__call__(request)
+
+
+class _RealtimeDeltaPinClient(_FakeClient):
+    def __init__(self, responses: list[object], db_path: Path, dialog_id: int) -> None:
+        super().__init__(responses)
+        self._db_path = db_path
+        self._dialog_id = dialog_id
+        self._applied = False
+
+    async def __call__(self, request: object) -> object:
+        if not self._applied and getattr(request, "folder_id", None) == 0:
+            self._applied = True
+            conn = _open_sync_db(self._db_path)
+            try:
+                with conn:
+                    conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (?,'user',0)", (self._dialog_id,))
+                    apply_active_generation_pin_delta(conn, 0, self._dialog_id, True)
+                    record_realtime_pin_fence(
+                        conn,
+                        0,
+                        {"kind": "delta", "dialog_id": self._dialog_id, "pinned": True},
+                    )
+                    conn.execute(
+                        "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (?,?,0)",
+                        (0, self._dialog_id),
+                    )
             finally:
                 conn.close()
         return await super().__call__(request)
@@ -438,6 +474,29 @@ async def test_realtime_pins_win_over_an_overlapping_pending_pinned_rpc(
             (folder_id,),
         ).fetchall() == [(realtime_id, 0)]
         assert conn.execute("SELECT COUNT(*) FROM dialog_directory_pins").fetchone() == (0,)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_pin_delta_replays_onto_fresh_pinned_rpc_result(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    acquired = [_dialog(user_id, 8) for user_id in range(1, 6)]
+    client = _RealtimeDeltaPinClient(
+        [_pinned_response(acquired), _pinned_response(), _response([])],
+        db_path,
+        dialog_id=6,
+    )
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+
+    await _run_slices(directory, 3)
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=0 ORDER BY position"
+        ).fetchall() == [(6, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]
     finally:
         conn.close()
 
@@ -919,11 +978,20 @@ async def test_semantic_invalid_latches_without_rpc_or_automatic_recovery(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_pinned_semantic_invalid_latches_its_source(tmp_path: Path) -> None:
+async def test_pinned_semantic_invalid_latches_its_source_and_logs_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     directory = CanonicalDialogDirectory(_FakeClient([_response([])]), db_path, asyncio.Event())
-    await directory.run_slice()
+    with caplog.at_level("WARNING", logger="mcp_telegram.dialog_directory"):
+        await directory.run_slice()
+        conn = _open_sync_db(db_path)
+        try:
+            with conn:
+                directory._latch_semantic_invalid(conn, 1, "pinned_0", "unexpected_pinned_response:Dialogs", 100)
+        finally:
+            conn.close()
     conn = _open_sync_db(db_path)
     try:
         assert conn.execute(
@@ -936,6 +1004,11 @@ async def test_pinned_semantic_invalid_latches_its_source(tmp_path: Path) -> Non
         )
     finally:
         conn.close()
+    records = [record for record in caplog.records if "canonical_dialog_directory_semantic_invalid" in record.message]
+    assert len(records) == 1
+    assert "generation=1" in records[0].message
+    assert "source=pinned_0" in records[0].message
+    assert "unexpected_pinned_response:Dialogs" in records[0].message
 
 
 @pytest.mark.asyncio
