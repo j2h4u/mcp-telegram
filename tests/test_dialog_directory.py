@@ -1326,13 +1326,101 @@ def test_realtime_identity_presence_unhides_catalog_row_without_reviving_access_
 
 
 @pytest.mark.asyncio
-async def test_realtime_eligibility_fences_an_older_directory_publication(tmp_path: Path) -> None:
+async def test_directory_publication_merges_eligibility_for_unchanged_existing_dialog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    monkeypatch.setattr("mcp_telegram.dialog_directory.time.time", lambda: 20)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute("INSERT INTO dialogs(dialog_id,name,type,snapshot_at,hidden) VALUES (1,'Old','user',1,0)")
+        conn.execute("INSERT INTO dialog_directory_facts VALUES (1,'contact',1,1,500,10)")
+        conn.commit()
+    finally:
+        conn.close()
+    dialog = _dialog(1, 8)
+    dialog.unread_mark = False
+    response = types.messages.Dialogs(
+        dialogs=[dialog],
+        messages=[types.Message(id=8, peer_id=dialog.peer, date=datetime(2026, 1, 1, tzinfo=UTC))],
+        chats=[],
+        users=[types.User(id=1, first_name="One", access_hash=42, bot=True)],
+    )
+    directory = CanonicalDialogDirectory(
+        _FakeClient([_pinned_response(), _pinned_response(), response]), db_path, asyncio.Event()
+    )
+
+    await _run_slices(directory, 3)
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT category,archived,unread,observed_at FROM dialog_directory_facts WHERE dialog_id=1"
+        ).fetchone() == ("bot", 0, 0, 10)
+        assert conn.execute("SELECT revision FROM dialogs WHERE dialog_id=1").fetchone()[0] > 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reseen_hidden_dialog_regains_eligibility_facts_under_revision_fence(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
     try:
         conn.execute("INSERT INTO dialogs(dialog_id,name,type,snapshot_at,hidden) VALUES (1,'Old','user',1,0)")
         conn.commit()
+    finally:
+        conn.close()
+    dialog = _dialog(1, 8)
+    dialog.unread_mark = False
+    response = types.messages.Dialogs(
+        dialogs=[dialog],
+        messages=[types.Message(id=8, peer_id=dialog.peer, date=datetime(2026, 1, 1, tzinfo=UTC))],
+        chats=[],
+        users=[types.User(id=1, first_name="One", access_hash=42, bot=True)],
+    )
+    client = _FakeClient(
+        [
+            _pinned_response(),
+            _pinned_response(),
+            response,
+            _pinned_response(),
+            _pinned_response(),
+            _response([]),
+            _pinned_response(),
+            _pinned_response(),
+            response,
+        ]
+    )
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+
+    await _run_slices(directory, 9)
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT hidden FROM dialogs WHERE dialog_id=1").fetchone() == (0,)
+        assert conn.execute(
+            "SELECT category,archived,unread FROM dialog_directory_facts WHERE dialog_id=1"
+        ).fetchone() == ("bot", 0, 0)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_archive_only_pin_does_not_set_main_dialog_pinned_flag(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    client = _FakeClient([_pinned_response(), _pinned_response([_dialog(1, 8)]), _response([])])
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+
+    await _run_slices(directory, 3)
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT pinned FROM dialogs WHERE dialog_id=1").fetchone() == (0,)
+        assert conn.execute("SELECT folder_id,dialog_id FROM dialog_directory_published_pins").fetchone() == (1, 1)
     finally:
         conn.close()
 

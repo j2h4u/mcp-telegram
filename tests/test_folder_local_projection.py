@@ -212,3 +212,15 @@ async def test_telethon_adapter_uses_exactly_one_rule_rpc() -> None:
     assert len(client.calls) == 1
     assert observation.rules == ()
     assert observation.started_at == 7
+
+
+@pytest.mark.asyncio
+async def test_telethon_adapter_rejects_custom_filter_id_reserved_for_archive() -> None:
+    class Client:
+        async def __call__(self, request: object) -> object:
+            del request
+            folder = type("DialogFilter", (), {"id": 1, "title": "Collision"})()
+            return type("Response", (), {"filters": (folder,)})()
+
+    with pytest.raises(ValueError, match="reserved for the Telegram archive"):
+        await TelethonTelegramFolderGateway(Client()).fetch_rules(started_at=7)

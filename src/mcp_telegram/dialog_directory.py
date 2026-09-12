@@ -616,8 +616,37 @@ class CanonicalDialogDirectory:
             return False
         if state.pinned_archive_status != "complete":
             return False
-        # Positive facts first. A snapshot writes only when the revision read
-        # before acquisition still matches; realtime always wins otherwise.
+        # Eligibility facts must merge before the dialogs UPDATE below. That
+        # UPDATE fires the revision trigger, so doing this afterwards would
+        # make the pre-acquisition revision fence reject every existing row.
+        # Realtime always wins when its revision already differs.
+        conn.execute(
+            "UPDATE dialog_directory_facts AS current SET "
+            "category=CASE WHEN staged.eligibility_category IS NULL THEN current.category ELSE staged.eligibility_category END, "
+            "archived=CASE WHEN staged.eligibility_archived IS NULL THEN current.archived ELSE staged.eligibility_archived END, "
+            "unread=CASE WHEN staged.eligibility_unread IS NULL THEN current.unread ELSE staged.eligibility_unread END, "
+            "mute_until=CASE WHEN staged.eligibility_mute_until IS NULL THEN current.mute_until ELSE staged.eligibility_mute_until END, "
+            "observed_at=CASE WHEN staged.eligibility_category IS NULL AND staged.eligibility_archived IS NULL "
+            "AND staged.eligibility_unread IS NULL AND staged.eligibility_mute_until IS NULL THEN current.observed_at "
+            "WHEN current.observed_at IS NULL THEN staged.eligibility_observed_at "
+            "WHEN staged.eligibility_observed_at IS NULL THEN current.observed_at "
+            "ELSE MIN(current.observed_at,staged.eligibility_observed_at) END "
+            "FROM dialog_directory_staging AS staged JOIN dialogs AS dialog ON dialog.dialog_id=staged.dialog_id "
+            "WHERE staged.generation=? AND staged.dialog_id=current.dialog_id AND staged.baseline_revision=dialog.revision",
+            (generation,),
+        )
+        # A previously hidden row can be re-seen after absence handling
+        # removed its facts row. Restore that row under the same revision fence.
+        conn.execute(
+            "INSERT INTO dialog_directory_facts(dialog_id,category,archived,unread,mute_until,observed_at) "
+            "SELECT staged.dialog_id,staged.eligibility_category,staged.eligibility_archived,staged.eligibility_unread,"
+            "staged.eligibility_mute_until,staged.eligibility_observed_at FROM dialog_directory_staging AS staged "
+            "JOIN dialogs AS dialog ON dialog.dialog_id=staged.dialog_id "
+            "WHERE staged.generation=? AND staged.baseline_revision=dialog.revision "
+            "AND NOT EXISTS (SELECT 1 FROM dialog_directory_facts current WHERE current.dialog_id=staged.dialog_id)",
+            (generation,),
+        )
+        # Positive dialog facts are fenced by the revision captured before RPC.
         conn.execute(
             "UPDATE dialogs AS current SET "
             "name=CASE WHEN staged.identity_complete=1 THEN staged.name "
@@ -640,7 +669,7 @@ class CanonicalDialogDirectory:
             "WHEN staged.identity_observed_at IS NULL THEN current.identity_observed_at "
             "ELSE MIN(current.identity_observed_at,staged.identity_observed_at) END, "
             "archived=staged.archived, "
-            "pinned=CASE WHEN EXISTS (SELECT 1 FROM dialog_directory_pins pin WHERE pin.generation=staged.generation AND pin.dialog_id=staged.dialog_id) THEN 1 ELSE 0 END, "
+            "pinned=CASE WHEN EXISTS (SELECT 1 FROM dialog_directory_pins pin WHERE pin.generation=staged.generation AND pin.folder_id=0 AND pin.dialog_id=staged.dialog_id) THEN 1 ELSE 0 END, "
             "members=staged.members, created=staged.created, last_message_at=staged.last_message_at, "
             "snapshot_at=staged.snapshot_at, unread_mentions_count=staged.unread_mentions_count, "
             "unread_reactions_count=staged.unread_reactions_count, draft_text=staged.draft_text, "
@@ -662,7 +691,7 @@ class CanonicalDialogDirectory:
         conn.execute(
             "INSERT INTO dialogs(dialog_id,name,type,username,identity_observed_at,identity_complete,identity_source,archived,pinned,members,created,last_message_at,snapshot_at,hidden,needs_refresh,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,unread_count_observed_at,unread_mark_observed_at,draft_text,read_inbox_max_id,read_outbox_max_id) "
             "SELECT staged.dialog_id,staged.name,staged.type,staged.username,staged.identity_observed_at,staged.identity_complete,staged.identity_source,staged.archived,"
-            "CASE WHEN EXISTS (SELECT 1 FROM dialog_directory_pins pin WHERE pin.generation=staged.generation AND pin.dialog_id=staged.dialog_id) THEN 1 ELSE 0 END,"
+            "CASE WHEN EXISTS (SELECT 1 FROM dialog_directory_pins pin WHERE pin.generation=staged.generation AND pin.folder_id=0 AND pin.dialog_id=staged.dialog_id) THEN 1 ELSE 0 END,"
             "staged.members,staged.created,staged.last_message_at,"
             "staged.snapshot_at,0,0,staged.unread_mentions_count,staged.unread_reactions_count,staged.unread_count,staged.unread_mark,"
             "CASE WHEN staged.unread_count IS NULL THEN NULL ELSE staged.snapshot_at END,"
@@ -673,21 +702,8 @@ class CanonicalDialogDirectory:
             f"AND {not_access_lost_sql('staged.dialog_id')}",
             (generation,),
         )
-        conn.execute(
-            "UPDATE dialog_directory_facts AS current SET "
-            "category=CASE WHEN staged.eligibility_category IS NULL THEN current.category ELSE staged.eligibility_category END, "
-            "archived=CASE WHEN staged.eligibility_archived IS NULL THEN current.archived ELSE staged.eligibility_archived END, "
-            "unread=CASE WHEN staged.eligibility_unread IS NULL THEN current.unread ELSE staged.eligibility_unread END, "
-            "mute_until=CASE WHEN staged.eligibility_mute_until IS NULL THEN current.mute_until ELSE staged.eligibility_mute_until END, "
-            "observed_at=CASE WHEN staged.eligibility_category IS NULL AND staged.eligibility_archived IS NULL "
-            "AND staged.eligibility_unread IS NULL AND staged.eligibility_mute_until IS NULL THEN current.observed_at "
-            "WHEN current.observed_at IS NULL THEN staged.eligibility_observed_at "
-            "WHEN staged.eligibility_observed_at IS NULL THEN current.observed_at "
-            "ELSE MIN(current.observed_at,staged.eligibility_observed_at) END "
-            "FROM dialog_directory_staging AS staged JOIN dialogs AS dialog ON dialog.dialog_id=staged.dialog_id "
-            "WHERE staged.generation=? AND staged.dialog_id=current.dialog_id AND staged.baseline_revision=dialog.revision",
-            (generation,),
-        )
+        # New rows did not have a revision to fence before insertion. Their
+        # eligibility facts are inserted only after the canonical row exists.
         conn.execute(
             "INSERT INTO dialog_directory_facts(dialog_id,category,archived,unread,mute_until,observed_at) "
             "SELECT staged.dialog_id,staged.eligibility_category,staged.eligibility_archived,staged.eligibility_unread,"

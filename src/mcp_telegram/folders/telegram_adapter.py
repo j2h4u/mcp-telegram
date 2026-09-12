@@ -65,9 +65,16 @@ def _folder_rule(folder: object, position: int) -> FolderRule | None:
     known = {DialogFilter.__name__, DialogFilterChatlist.__name__}
     if not (isinstance(folder, (DialogFilter, DialogFilterChatlist)) or kind_name in known):
         return None
-    kind = FolderRuleKind.CHATLIST if isinstance(folder, DialogFilterChatlist) or kind_name == DialogFilterChatlist.__name__ else FolderRuleKind.FILTER
+    kind = (
+        FolderRuleKind.CHATLIST
+        if isinstance(folder, DialogFilterChatlist) or kind_name == DialogFilterChatlist.__name__
+        else FolderRuleKind.FILTER
+    )
+    folder_id = _as_int(getattr(folder, "id", None))
+    if folder_id == 1:
+        raise ValueError("custom filter id 1 is reserved for the Telegram archive folder")
     return FolderRule(
-        _as_int(getattr(folder, "id", None)),
+        folder_id,
         title,
         FILTER_FOLDER_NAMESPACE,
         kind,
@@ -84,9 +91,20 @@ def _folder_rule(folder: object, position: int) -> FolderRule | None:
 
 def _observation_token(rules: tuple[FolderRule, ...]) -> str:
     payload = [
-        (rule.namespace, rule.folder_id, rule.title, rule.kind.value, rule.source_position, rule.included_ids, rule.pinned_ids,
-         rule.excluded_ids, sorted(category.value for category in rule.categories), rule.exclude_archived,
-         rule.exclude_read, rule.exclude_muted)
+        (
+            rule.namespace,
+            rule.folder_id,
+            rule.title,
+            rule.kind.value,
+            rule.source_position,
+            rule.included_ids,
+            rule.pinned_ids,
+            rule.excluded_ids,
+            sorted(category.value for category in rule.categories),
+            rule.exclude_archived,
+            rule.exclude_read,
+            rule.exclude_muted,
+        )
         for rule in rules
     ]
     return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
@@ -106,7 +124,9 @@ class TelethonTelegramFolderGateway(TelegramFolderGateway):
         except (RPCError, TimeoutError, OSError) as exc:
             raise FolderSourceUnavailableError("Telegram folder source is unavailable") from exc
         raw_filters = cast(Sequence[object], getattr(response, "filters", ()))
-        rules = tuple(rule for position, item in enumerate(raw_filters) if (rule := _folder_rule(item, position)) is not None)
+        rules = tuple(
+            rule for position, item in enumerate(raw_filters) if (rule := _folder_rule(item, position)) is not None
+        )
         return FolderRuleObservation(rules, _observation_token(rules), started_at)
 
 

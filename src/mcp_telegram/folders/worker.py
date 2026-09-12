@@ -116,7 +116,9 @@ class FolderProjectionWorker:
                 self._record_failure(FolderAttemptResult.SOURCE_UNAVAILABLE, None)
             except TelegramRpcThrottled as exc:
                 self._record_failure(
-                    FolderAttemptResult.CIRCUIT_OPEN if exc.retry_after_seconds is None else FolderAttemptResult.FLOOD_WAIT,
+                    FolderAttemptResult.CIRCUIT_OPEN
+                    if exc.retry_after_seconds is None
+                    else FolderAttemptResult.FLOOD_WAIT,
                     exc.retry_after_seconds,
                 )
             except RpcAttemptBudgetExhaustedError:
@@ -130,14 +132,14 @@ class FolderProjectionWorker:
 
     def _record_failure(self, outcome: FolderAttemptResult, retry_after: int | None) -> None:
         self._failure_count += 1
-        if outcome in {FolderAttemptResult.CIRCUIT_OPEN, FolderAttemptResult.UNEXPECTED}:
-            retry_at = None
-        else:
-            schedule = self._policy.retry_delays_seconds
-            delay = schedule[min(self._failure_count - 1, len(schedule) - 1)]
-            retry_at = math.ceil(self._clock() + max(delay, retry_after or 0))
+        schedule = self._policy.retry_delays_seconds
+        delay = schedule[min(self._failure_count - 1, len(schedule) - 1)]
+        retry_at = math.ceil(self._clock() + max(delay, retry_after or 0))
         self._repository.record_attempt(
-            attempted_at=int(self._clock()), outcome=outcome, next_retry_at=retry_at, consecutive_failures=self._failure_count
+            attempted_at=int(self._clock()),
+            outcome=outcome,
+            next_retry_at=retry_at,
+            consecutive_failures=self._failure_count,
         )
         self._next_due_at = retry_at
 

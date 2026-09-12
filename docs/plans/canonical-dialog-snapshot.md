@@ -133,6 +133,9 @@ custom filter IDs and their rules come from `messages.getDialogFilters`.
 Equal numeric IDs must not be treated as the same source or rule. Membership
 for each folder stores the folder's pinned order independently from the
 unordered membership set.
+Because Telegram reserves custom filter ID 1 for the archive peer-folder, the
+adapter rejects a custom filter with that ID at the source boundary rather than
+allowing the two namespaces to collide.
 
 ## One owner of the full catalog
 
@@ -339,17 +342,17 @@ advance the row revision after publication.
 
 Migration initializes the directory's current lifecycle marker to
 `max(1, legacy generation)` and preserves the existing published catalog,
-pending status, valid cursor, folder facts, DM enrollment, and read cursors.
-An in-progress operation resumes from its committed page and cursor; it is not
-reset to an empty catalog.
+pending status, folder facts, DM enrollment, and read cursors. An in-progress
+legacy operation retains its identity and prior rows, but its wrapper cursor is
+not treated as a raw directory cursor: the first owner slice safely restarts
+from an empty cursor.
 
 The migration does not manufacture a completeness receipt, observation time,
 or freshness claim for old rows. Existing rows remain usable with their actual
 provenance, while the new directory status reports the coverage that has and
-has not been proven. If a legacy cursor cannot be shown to represent the raw
-cursor contract, the attempt is incomplete or invalid and requires the
-directory's explicit recovery path; it must not be silently marked complete or
-used to hide rows. No migration step clears catalog rows, enrollment, or read
+has not been proven. A legacy cursor that cannot be shown to represent the raw
+cursor contract is discarded for that fresh restart; migration never marks it
+complete, uses it to hide rows, or clears catalog rows, enrollment, or read
 cursors merely to make the new worker start.
 
 Subsequent publications may advance the current lifecycle marker, but only the

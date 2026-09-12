@@ -1810,6 +1810,21 @@ async def test_list_dialogs_archive_folder_uses_canonical_archive_facts(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_list_dialogs_ignore_pinned_keeps_archive_only_pin(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _register_sqlite_connection(sqlite3.connect(db_path))
+    _seed_dialog_row(conn, 1, name="Archived", type_="User", pinned=0)
+    conn.execute("INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (1,1,0)")
+    server = make_server(conn)
+
+    result = await server._list_dialogs({"ignore_pinned": True})
+
+    assert result["ok"] is True
+    assert [dialog["id"] for dialog in cast(list[dict[str, object]], _response_data(result)["dialogs"])] == [1]
+
+
+@pytest.mark.asyncio
 async def test_list_dialogs_file_db_uses_threaded_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     conn, db_path = _make_file_db_with_dialogs(tmp_path)
     _seed_dialog_row(conn, 101, name="Threaded", type_="user", last_message_at=100)
