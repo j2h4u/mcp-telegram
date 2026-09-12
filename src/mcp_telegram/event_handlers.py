@@ -69,6 +69,7 @@ from .activity_contracts import InputPeerResolver
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import (
     IDENTITY_OMITTED,
+    _IdentityOmitted,
     apply_realtime_eligibility,
     apply_realtime_identity,
     clear_realtime_mute,
@@ -1785,37 +1786,54 @@ class EventHandlerManager:
             (folder_id, dialog_id, folder_id),
         )
 
+    def _apply_published_pin_mutation(self, folder_id: int | None, dialog_id: int, pinned: int) -> None:
+        """Apply one published pin change within the caller's transaction."""
+        if folder_id is None:
+            return
+        if pinned:
+            self._append_published_pin(folder_id, dialog_id)
+        else:
+            self._conn.execute(
+                "DELETE FROM dialog_directory_published_pins WHERE folder_id=? AND dialog_id=?",
+                (folder_id, dialog_id),
+            )
+        sync_active_generation_pins_from_publication(self._conn, folder_id)
+
+    def _project_pinned_eligibility(
+        self,
+        dialog_id: int,
+        folder_id: object,
+        *,
+        known_dialog: bool,
+        now: int,
+    ) -> None:
+        """Project archive membership for a known dialog within the caller's transaction."""
+        if not known_dialog or not isinstance(folder_id, int) or isinstance(folder_id, bool) or folder_id not in {0, 1}:
+            return
+        apply_realtime_eligibility(
+            self._conn,
+            dialog_id,
+            archived=int(folder_id == 1),
+            observed_at=now,
+        )
+
     def _update_dialog_pinned(self, update: UpdateDialogPinned, now: int) -> None:
         dialog_id = self._dialog_id_from_peer(update.peer)
         if dialog_id is None:
             return
         folder_id = getattr(update, "folder_id", None)
         published_folder = self._published_pin_folder(folder_id)
-        known_dialog = (
-            self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
-        )
         pinned = 1 if update.pinned else 0
         with self._conn:
+            known_dialog = (
+                self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
+            )
             # ``dialogs.pinned`` is the projection for the main list.  A pin
             # update scoped to another folder must not change that bit.
             if known_dialog and published_folder == 0:
                 self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
-            if published_folder is not None:
-                if pinned:
-                    self._append_published_pin(published_folder, dialog_id)
-                else:
-                    self._conn.execute(
-                        "DELETE FROM dialog_directory_published_pins WHERE folder_id=? AND dialog_id=?",
-                        (published_folder, dialog_id),
-                    )
-                sync_active_generation_pins_from_publication(self._conn, published_folder)
-            if known_dialog and isinstance(folder_id, int) and not isinstance(folder_id, bool) and folder_id in {0, 1}:
-                apply_realtime_eligibility(
-                    self._conn,
-                    dialog_id,
-                    archived=int(folder_id == 1),
-                    observed_at=now,
-                )
+            self._apply_published_pin_mutation(published_folder, dialog_id, pinned)
+            self._project_pinned_eligibility(dialog_id, folder_id, known_dialog=known_dialog, now=now)
         logger.info("event_dialog_pinned dialog_id=%d pinned=%d", dialog_id, pinned)
 
     def _rewrite_pinned_dialogs(self, update: UpdatePinnedDialogs, now: int) -> None:
@@ -1895,37 +1913,39 @@ class EventHandlerManager:
             rowcount,
         )
 
-    def _update_realtime_identity_or_notify(self, update: UpdateUserName | UpdateNotifySettings, now: int) -> None:
-        if isinstance(update, UpdateUserName):
-            name = (
-                " ".join(part for part in (update.first_name, update.last_name) if part) or None
-                if hasattr(update, "first_name") or hasattr(update, "last_name")
-                else IDENTITY_OMITTED
+    @staticmethod
+    def _username_update_name(update: UpdateUserName) -> str | _IdentityOmitted | None:
+        if not hasattr(update, "first_name") and not hasattr(update, "last_name"):
+            return IDENTITY_OMITTED
+        return " ".join(part for part in (update.first_name, update.last_name) if part) or None
+
+    @staticmethod
+    def _username_update_alias(update: UpdateUserName) -> str | _IdentityOmitted | None:
+        if not hasattr(update, "usernames"):
+            return IDENTITY_OMITTED
+        return next(
+            (
+                username.removeprefix("@")
+                for candidate in (update.usernames or ())
+                if getattr(candidate, "active", False)
+                and isinstance(username := getattr(candidate, "username", None), str)
+            ),
+            None,
+        )
+
+    def _update_realtime_username(self, update: UpdateUserName, now: int) -> None:
+        with self._conn:
+            apply_realtime_identity(
+                self._conn,
+                int(update.user_id),
+                name=self._username_update_name(update),
+                username=self._username_update_alias(update),
+                dialog_type=None,
+                observed_at=now,
+                complete=False,
             )
-            username = (
-                next(
-                    (
-                        username.removeprefix("@")
-                        for candidate in (update.usernames or ())
-                        if getattr(candidate, "active", False)
-                        and isinstance(username := getattr(candidate, "username", None), str)
-                    ),
-                    None,
-                )
-                if hasattr(update, "usernames")
-                else IDENTITY_OMITTED
-            )
-            with self._conn:
-                apply_realtime_identity(
-                    self._conn,
-                    int(update.user_id),
-                    name=name,
-                    username=username,
-                    dialog_type=None,
-                    observed_at=now,
-                    complete=False,
-                )
-            return
+
+    def _update_realtime_notify(self, update: UpdateNotifySettings, now: int) -> None:
         peer = getattr(getattr(update, "peer", None), "peer", None)
         if not isinstance(peer, (PeerUser, PeerChat, PeerChannel)):
             return
@@ -1949,6 +1969,12 @@ class EventHandlerManager:
         with self._conn:
             apply_realtime_eligibility(self._conn, dialog_id, mute_until=mute_until, observed_at=now)
             SQLiteFolderSnapshotRepository(self._conn).reproject_current_rules_in_transaction(now=now)
+
+    def _update_realtime_identity_or_notify(self, update: UpdateUserName | UpdateNotifySettings, now: int) -> None:
+        if isinstance(update, UpdateUserName):
+            self._update_realtime_username(update, now)
+            return
+        self._update_realtime_notify(update, now)
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_identity_or_notify(self, update: UpdateUserName | UpdateNotifySettings) -> None:
