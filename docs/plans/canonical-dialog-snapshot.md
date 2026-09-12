@@ -66,6 +66,9 @@ subtype or an absent field and cannot erase a known value. When a partial
 observation contributes alongside retained facts, the row says `mixed` and
 keeps the earliest contributing acquisition-start boundary. Legacy names and
 types are retained with incomplete identity and no invented source or time.
+Realtime `UpdateUserName` omissions retain known fields. An explicit empty
+name or active-username removal clears that field only; the retained type keeps
+the row mixed at its oldest boundary and does not renew whole-bundle freshness.
 Generic entity-cache writes are not directory identity writes.
 
 Eligibility is a separate current-state projection keyed by dialog ID. It has
@@ -265,6 +268,15 @@ Such an attempt is recorded as `incomplete` or `invalid` with the relevant
 reason. It may retain useful facts, but it cannot authorize hiding a dialog or
 claiming catalog completeness.
 
+Transport and stalled pagination remain retryable `incomplete` outcomes. A
+`DialogsNotModified` reply to the hash-zero/no-cache request is also
+`incomplete`, with a 900-second retry and an explicit source reason. A
+contradictory duplicate, unresolvable canonical identity, or unexpected raw
+response latches that source and the acquisition as `invalid` with no retry.
+It preserves the generation, committed cursor, valid staged work, and prior
+publication until the explicit maintenance recovery operation starts a fresh
+unpublished generation.
+
 Each raw page and its next cursor are stored in one local transaction. A crash
 before commit leaves the prior cursor and prior staged facts in force; a
 successful commit makes both visible together. Publication is a separate short
@@ -346,6 +358,11 @@ These three dimensions are evaluated independently:
 | Catalog completeness | The required ordinary, pinned, and rule sources reached their declared terminal conditions for one publication. | That every field in every row is fresh now. |
 | Dialog-fact freshness | A particular identity, name, placement, top-message, or read/unread fact was observed within the consumer's age limit. | That a missing dialog is absent, or that folder rules are current. |
 | Folder-rule freshness | The rules used to compute folder membership were observed within the consumer's age limit. | That the directory traversal or each dialog fact is complete and fresh. |
+
+A directory receipt ages from its published acquisition start, never the later
+completion timestamp: it is fresh through 899 seconds and stale at 900
+seconds. An unpublished attempt, or a receipt missing that start boundary,
+does not claim coverage.
 
 A consumer declares which dimensions it needs. A complete but old catalog is
 complete and stale; a fresh row does not make an incomplete catalog complete;

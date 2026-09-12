@@ -160,6 +160,33 @@ async def test_dm_bootstrap_is_idempotent_for_consumed_publication(sync_db: _SQL
 
 
 @pytest.mark.asyncio
+async def test_dm_bootstrap_excludes_hidden_rows_and_preserves_richer_entity_type(sync_db: _SQLiteConnection) -> None:
+    publish_local_dialogs(sync_db, [(101, "user", "Visible", None, None), (102, "user", "Hidden", None, None)])
+    sync_db.execute("UPDATE dialogs SET hidden=1 WHERE dialog_id=102")
+    sync_db.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (101,'channel','Rich',1)")
+    sync_db.commit()
+    worker = make_worker(MagicMock(), sync_db, asyncio.Event())
+
+    assert await worker.bootstrap_dms() == 1
+    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs ORDER BY dialog_id").fetchall() == [(101,)]
+    assert sync_db.execute("SELECT type FROM entities WHERE id=101").fetchone() == ("channel",)
+
+
+@pytest.mark.asyncio
+async def test_hidden_previously_synced_dm_is_neither_reenrolled_nor_scheduled(sync_db: _SQLiteConnection) -> None:
+    publish_local_dialogs(sync_db, [(102, "user", "Absent", None, None)])
+    sync_db.execute("UPDATE dialogs SET hidden=1 WHERE dialog_id=102")
+    sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (102,'syncing')")
+    sync_db.execute("INSERT INTO full_history_enrollment VALUES (102,1,'automatic',1)")
+    sync_db.commit()
+    worker = make_worker(MagicMock(), sync_db, asyncio.Event())
+
+    assert await worker.bootstrap_dms() == 0
+    assert worker._next_pending_dialog() is None
+    assert sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=102").fetchone() == ("syncing",)
+
+
+@pytest.mark.asyncio
 async def test_full_sync_disable_race_discards_fetched_body_and_checkpoint(tmp_path: Path) -> None:
     db_path = tmp_path / "race.db"
     ensure_sync_schema(db_path)

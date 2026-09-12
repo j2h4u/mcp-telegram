@@ -101,6 +101,13 @@ class _StagedFact:
     eligibility_mute_until: int | None
 
 
+class _IdentityOmitted:
+    """Distinguish a missing realtime field from an authoritative clear."""
+
+
+IDENTITY_OMITTED = _IdentityOmitted()
+
+
 class CanonicalDialogDirectory:
     """Acquire raw dialog sources into one generation and atomically publish it.
 
@@ -127,7 +134,7 @@ class CanonicalDialogDirectory:
         if state.retry_at is not None and now < state.retry_at:
             return DemandStatus(release_at=float(state.retry_at))
         if state.status == "invalid":
-            return DemandStatus(release_at=0.0)
+            return None
         if state.status != "complete" or state.observation_started_at is None:
             return DemandStatus(release_at=0.0)
         interval = demand_freshness_seconds(DemandKind.DIALOG_BOOTSTRAP)
@@ -142,6 +149,8 @@ class CanonicalDialogDirectory:
             return
         conn = _open_sync_db(self._db_path)
         try:
+            if self._load_state(conn).status == "invalid":
+                return
             account_id = await self._bound_account_id(conn)
             state = self._prepare_or_resume(conn)
             if state is None or self._shutdown_event.is_set():
@@ -228,9 +237,7 @@ class CanonicalDialogDirectory:
         if state.retry_at is not None and time.time() < state.retry_at:
             return None
         if state.status == "invalid":
-            with conn:
-                self._start_generation(conn, state.generation + 1)
-            return self._load_state(conn)
+            return None
         if state.status == "complete":
             # The timestamp is original observation time. Starting a new
             # generation never refreshes it until a complete publication.
@@ -279,11 +286,33 @@ class CanonicalDialogDirectory:
             response = await self._client(get_pinned_dialogs_request(folder_id))
         except Exception as exc:  # noqa: BLE001 - transport classes vary under Telethon
             self._propagate_policy_exception(exc)
-            self._mark_source_incomplete(conn, state.generation, f"pinned_{folder_id}:{type(exc).__name__}", account_id)
+            self._mark_source_incomplete(
+                conn, state.generation, f"pinned_{folder_id}:{type(exc).__name__}", account_id, source_column=None
+            )
             return
         page = normalize_pinned_dialogs_response(response)
+        if page.kind == "invalid":
+            self._latch_semantic_invalid(
+                conn, state.generation, f"pinned_{folder_id}", page.reason or "invalid", account_id
+            )
+            return
+        if page.kind == "not_modified":
+            self._mark_not_modified_without_cache(
+                conn,
+                state.generation,
+                f"pinned_{folder_id}:not_modified_without_cache",
+                account_id,
+                source_column="pinned_main_status" if folder_id == 0 else "pinned_archive_status",
+            )
+            return
         if page.kind not in {"terminal", "page"}:
-            self._commit_pinned_failure(conn, state.generation, folder_id, page.reason or page.kind, account_id)
+            self._mark_source_incomplete(
+                conn,
+                state.generation,
+                f"pinned_{folder_id}:{page.reason or page.kind}",
+                account_id,
+                source_column="pinned_main_status" if folder_id == 0 else "pinned_archive_status",
+            )
             return
         with conn:
             self._stage_facts(conn, state.generation, page.facts, folder_id=folder_id, account_id=account_id)
@@ -303,11 +332,22 @@ class CanonicalDialogDirectory:
             response = await self._client(get_dialogs_request(state.cursor))
         except Exception as exc:  # noqa: BLE001 - transport classes vary under Telethon
             self._propagate_policy_exception(exc)
-            self._mark_source_incomplete(conn, state.generation, f"ordinary:{type(exc).__name__}", account_id)
+            self._mark_source_incomplete(
+                conn, state.generation, f"ordinary:{type(exc).__name__}", account_id, source_column=None
+            )
             return
         page = normalize_dialogs_response(response, state.cursor)
-        if page.kind in {"invalid", "not_modified"}:
-            self._commit_ordinary_failure(conn, state.generation, page.kind, page.reason or page.kind, account_id)
+        if page.kind == "invalid":
+            self._latch_semantic_invalid(conn, state.generation, "ordinary", page.reason or "invalid", account_id)
+            return
+        if page.kind == "not_modified":
+            self._mark_not_modified_without_cache(
+                conn,
+                state.generation,
+                "ordinary:not_modified_without_cache",
+                account_id,
+                source_column="ordinary_status",
+            )
             return
         if page.kind == "incomplete":
             reason = page.reason or "incomplete_page"
@@ -356,55 +396,59 @@ class CanonicalDialogDirectory:
         if published:
             self._set_detail("canonical dialog directory: complete")
 
-    def _commit_pinned_failure(
-        self, conn: sqlite3.Connection, generation: int, folder_id: int, reason: str, account_id: int
+    def _mark_source_incomplete(
+        self,
+        conn: sqlite3.Connection,
+        generation: int,
+        reason: str,
+        account_id: int,
+        *,
+        source_column: str | None,
     ) -> None:
-        column = "pinned_main_status" if folder_id == 0 else "pinned_archive_status"
+        source_update = "" if source_column is None else f", {source_column}='incomplete'"
         with conn:
             conn.execute(
-                f"UPDATE dialog_directory_state SET status='incomplete', {column}='incomplete', reason=?, retry_at=? "
-                "WHERE singleton=1 AND account_id=? AND generation=?",
-                (reason, int(time.time()) + 60, account_id, generation),
-            )
-        self._set_detail(f"canonical dialog directory: retry pinned {folder_id} ({reason})")
-
-    def _commit_ordinary_failure(
-        self, conn: sqlite3.Connection, generation: int, outcome: str, reason: str, account_id: int
-    ) -> None:
-        with conn:
-            conn.execute(
-                "UPDATE dialog_directory_state SET status='incomplete', ordinary_status='incomplete', reason=?, retry_at=? "
-                "WHERE singleton=1 AND account_id=? AND generation=?",
-                (f"{outcome}:{reason}", int(time.time()) + 60, account_id, generation),
-            )
-        self._set_detail(f"canonical dialog directory: retry ordinary ({outcome})")
-
-    def _mark_source_incomplete(self, conn: sqlite3.Connection, generation: int, reason: str, account_id: int) -> None:
-        with conn:
-            conn.execute(
-                "UPDATE dialog_directory_state SET status='incomplete', reason=?, retry_at=? "
+                f"UPDATE dialog_directory_state SET status='incomplete'{source_update}, reason=?, retry_at=? "
                 "WHERE singleton=1 AND account_id=? AND generation=?",
                 (reason, int(time.time()) + 60, account_id, generation),
             )
         self._set_detail(f"canonical dialog directory: retry ({reason})")
 
-    def _invalidate_active_acquisition(
-        self, conn: sqlite3.Connection, generation: int, reason: str, account_id: int
+    def _mark_not_modified_without_cache(
+        self,
+        conn: sqlite3.Connection,
+        generation: int,
+        reason: str,
+        account_id: int,
+        *,
+        source_column: str,
     ) -> None:
-        """Discard an internally contradictory attempt, retaining the published receipt."""
-        retry_at = int(time.time()) + 60
         with conn:
-            conn.execute("DELETE FROM dialog_directory_staging WHERE generation=?", (generation,))
-            conn.execute("DELETE FROM dialog_directory_baseline WHERE generation=?", (generation,))
-            conn.execute("DELETE FROM dialog_directory_pins WHERE generation=?", (generation,))
             conn.execute(
-                "UPDATE dialog_directory_state SET status='invalid', ordinary_status='invalid', "
-                "pinned_main_status='invalid', pinned_archive_status='invalid', offset_date=NULL, offset_id=0, "
-                "offset_peer=NULL, observed_count=0, reason=?, retry_at=? "
+                f"UPDATE dialog_directory_state SET status='incomplete', {source_column}='incomplete', reason=?, retry_at=? "
                 "WHERE singleton=1 AND account_id=? AND generation=?",
-                (reason, retry_at, account_id, generation),
+                (reason, int(time.time()) + 900, account_id, generation),
             )
-        self._set_detail(f"canonical dialog directory: retry complete acquisition ({reason})")
+        self._set_detail(f"canonical dialog directory: retry ({reason})")
+
+    def _latch_semantic_invalid(
+        self, conn: sqlite3.Connection, generation: int, source: str, specific: str, account_id: int
+    ) -> None:
+        """Latch an impossible source outcome without destroying prior work."""
+        column = {
+            "ordinary": "ordinary_status",
+            "pinned_0": "pinned_main_status",
+            "pinned_1": "pinned_archive_status",
+        }.get(source)
+        if column is None:
+            raise ValueError(f"unknown directory source: {source}")
+        with conn:
+            conn.execute(
+                f"UPDATE dialog_directory_state SET status='invalid', {column}='invalid', reason=?, retry_at=NULL "
+                "WHERE singleton=1 AND account_id=? AND generation=?",
+                (f"{source}:invalid:{specific}", account_id, generation),
+            )
+        self._set_detail(f"canonical dialog directory: invalid {source} ({specific})")
 
     def _stage_facts(
         self,
@@ -894,22 +938,40 @@ def apply_realtime_identity(  # noqa: PLR0913
     conn: sqlite3.Connection,
     dialog_id: int,
     *,
-    name: str | None,
-    username: str | None,
-    dialog_type: str | None,
+    name: str | _IdentityOmitted | None = IDENTITY_OMITTED,
+    username: str | _IdentityOmitted | None = IDENTITY_OMITTED,
+    dialog_type: str | _IdentityOmitted | None = IDENTITY_OMITTED,
     observed_at: int,
     complete: bool,
 ) -> int:
     """Apply a realtime identity observation on an existing catalog row."""
     if not complete:
+        prior = cast(
+            tuple[str | None, str | None, str, int | None] | None,
+            conn.execute(
+                "SELECT name,username,type,identity_observed_at FROM dialogs WHERE dialog_id=?", (dialog_id,)
+            ).fetchone(),
+        )
+        if prior is None or (
+            name is IDENTITY_OMITTED and username is IDENTITY_OMITTED and dialog_type is IDENTITY_OMITTED
+        ):
+            return 0
+        prior_name, prior_username, prior_type, prior_observed_at = prior
+        retained_type = dialog_type is IDENTITY_OMITTED or dialog_type is None
+        updated_name = prior_name if name is IDENTITY_OMITTED else name
+        updated_username = prior_username if username is IDENTITY_OMITTED else username
+        updated_type = prior_type if retained_type else dialog_type
+        boundary = observed_at if prior_observed_at is None else min(prior_observed_at, observed_at)
         cursor = conn.execute(
-            "UPDATE dialogs SET name=?,username=?,type=COALESCE(?,type),"
-            "identity_observed_at=CASE WHEN identity_observed_at IS NULL THEN ? ELSE MIN(identity_observed_at,?) END,"
-            "identity_source=CASE WHEN identity_observed_at IS NULL THEN 'realtime' ELSE 'mixed' END,"
+            "UPDATE dialogs SET name=?,username=?,type=?,identity_observed_at=?,identity_source=?,"
             "revision=revision+1 WHERE dialog_id=?",
-            (name, username, dialog_type, observed_at, observed_at, dialog_id),
+            (updated_name, updated_username, updated_type, boundary, "mixed" if retained_type else "realtime", dialog_id),
         )
         return cursor.rowcount
+    if not isinstance(dialog_type, str):
+        raise ValueError("complete realtime identity requires a dialog type")
+    if name is IDENTITY_OMITTED or username is IDENTITY_OMITTED:
+        raise ValueError("complete realtime identity requires every identity field")
     cursor = conn.execute(
         "UPDATE dialogs SET name=?,username=?,type=?,identity_observed_at=?,identity_complete=1,"
         "identity_source='realtime',revision=revision+1 WHERE dialog_id=?",

@@ -62,7 +62,7 @@ def _user(dialog_id: int, name: str = "Alice") -> object:
 
 
 @pytest.mark.asyncio
-async def test_recon_light_pass_resets_needs_refresh(
+async def test_recon_light_pass_resets_needs_refresh_without_owning_identity(
     sync_db: sqlite3.Connection, mock_client: _MockClient, shutdown_event: asyncio.Event
 ) -> None:
     _seed_dialog(sync_db, 100, needs_refresh=1)
@@ -71,7 +71,7 @@ async def test_recon_light_pass_resets_needs_refresh(
     count = await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass()
 
     assert count == 1
-    assert sync_db.execute("SELECT name, needs_refresh FROM dialogs WHERE dialog_id=100").fetchone() == ("NewName", 0)
+    assert sync_db.execute("SELECT name, needs_refresh FROM dialogs WHERE dialog_id=100").fetchone() == ("Old", 0)
 
 
 @pytest.mark.asyncio

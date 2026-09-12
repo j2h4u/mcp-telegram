@@ -44,7 +44,7 @@ def _int_or_none(value: object) -> int | None:
         return None
 
 
-def read_dialog_directory_coverage(  # noqa: PLR0914
+def read_dialog_directory_coverage(
     conn: sqlite3.Connection,
     *,
     now: int | None = None,
@@ -57,9 +57,9 @@ def read_dialog_directory_coverage(  # noqa: PLR0914
     current = int(time.time()) if now is None else now
     try:
         publication = cast(
-            tuple[object, object, object] | None,
+            tuple[object, object] | None,
             conn.execute(
-                "SELECT generation, observation_started_at, observation_completed_at "
+                "SELECT generation, observation_started_at "
                 "FROM dialog_directory_publication WHERE singleton=1"
             ).fetchone(),
         )
@@ -75,10 +75,8 @@ def read_dialog_directory_coverage(  # noqa: PLR0914
 
     generation = _int_or_none(publication[0]) if publication is not None else None
     published_started = _int_or_none(publication[1]) if publication is not None else None
-    completed_at = _int_or_none(publication[2]) if publication is not None else None
     refresh_status = str(state[0]) if state is not None and state[0] is not None else None
-    state_started = _int_or_none(state[1]) if state is not None else None
-    observation_started_at = published_started or state_started
+    observation_started_at = published_started
 
     try:
         identity_row = cast(
@@ -108,13 +106,13 @@ def read_dialog_directory_coverage(  # noqa: PLR0914
         )
     )
 
-    if completed_at is None:
+    if published_started is None:
         status: DirectoryCoverageStatus = (
             "in_progress" if generation is None and refresh_status == "in_progress" else "never"
         )
         age_seconds = None
     else:
-        age_seconds = max(0, current - completed_at)
+        age_seconds = max(0, current - published_started)
         status = "stale" if age_seconds >= _STALE_AFTER_SECONDS else "complete"
 
     return DialogDirectoryCoverage(

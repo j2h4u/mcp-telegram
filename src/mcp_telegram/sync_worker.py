@@ -31,6 +31,7 @@ from typing import Protocol, cast
 from telethon.errors import RPCError  # type: ignore[import-untyped]
 
 from .access_lifecycle import set_access_lost
+from .entity_store import EntitySnapshot, upsert_entity_stub
 from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
 from .history_enrollment import ensure_automatic_dm_enrollment, full_history_enabled
 from .hydration_queue import HydrationPriority
@@ -104,12 +105,14 @@ _NEXT_PENDING_SQL = (
     "SELECT sd.dialog_id, sd.sync_progress FROM synced_dialogs sd "
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
     "WHERE sd.status IN ('syncing', 'not_synced') "
+    "AND NOT EXISTS (SELECT 1 FROM dialogs directory WHERE directory.dialog_id=sd.dialog_id AND directory.hidden=1) "
     "ORDER BY rowid LIMIT 1"
 )
 _NEXT_TOTAL_MESSAGES_REPAIR_SQL = (
     "SELECT sd.dialog_id FROM synced_dialogs sd "
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
     "WHERE sd.total_messages IS NULL AND sd.status NOT IN ('not_synced', 'access_lost') "
+    "AND NOT EXISTS (SELECT 1 FROM dialogs directory WHERE directory.dialog_id=sd.dialog_id AND directory.hidden=1) "
     "ORDER BY sd.rowid LIMIT 1"
 )
 _UPDATE_TOTAL_MESSAGES_SQL = (
@@ -260,16 +263,16 @@ class FullSyncWorker:
 
     def _upsert_local_entity_stub(self, dialog_id: int, dialog_type: str, name: str | None, now: int) -> None:
         """Create a local identity row while retaining richer existing fields."""
-        normalized_name = latinize(name) if name else None
-        self._conn.execute(
-            "INSERT INTO entities(id,type,name,username,name_normalized,updated_at) VALUES (?,?,?,?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET "
-            "type=excluded.type, "
-            "name=COALESCE(entities.name, excluded.name), "
-            "username=entities.username, "
-            "name_normalized=COALESCE(entities.name_normalized, excluded.name_normalized), "
-            "updated_at=MAX(entities.updated_at, excluded.updated_at)",
-            (dialog_id, dialog_type, name, None, normalized_name, now),
+        upsert_entity_stub(
+            self._conn,
+            EntitySnapshot(
+                entity_id=dialog_id,
+                entity_type=dialog_type,
+                name=name,
+                username=None,
+                name_normalized=latinize(name) if name else None,
+                updated_at=now,
+            ),
         )
 
     def _consume_one_canonical_dm(self, row: tuple[object, ...], now: int) -> int:
@@ -296,7 +299,7 @@ class FullSyncWorker:
             list[tuple[object, ...]],
             self._conn.execute(
                 "SELECT dialog_id,type,name,read_inbox_max_id,read_outbox_max_id FROM dialogs "
-                "WHERE type IN ('user','bot') ORDER BY dialog_id"
+                "WHERE type IN ('user','bot') AND hidden=0 ORDER BY dialog_id"
             ).fetchall(),
         )
         now = int(time.time())

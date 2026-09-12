@@ -913,6 +913,7 @@ def _publish_test_dialog_directory(
     conn: sqlite3.Connection,
     *,
     completed_at: int | None = None,
+    started_at: int | None = None,
     refresh_status: str = "complete",
 ) -> None:
     """Add the canonical identity columns and a test directory receipt."""
@@ -928,7 +929,7 @@ def _publish_test_dialog_directory(
         if column not in dialog_columns:
             conn.execute(f"ALTER TABLE dialogs ADD COLUMN {column} {definition}")
 
-    started_at = int(time.time()) - 1
+    started_at = int(time.time()) - 1 if started_at is None else started_at
     if completed_at is None:
         completed_at = started_at
     conn.execute(
@@ -1346,7 +1347,7 @@ async def test_local_name_miss_reports_directory_coverage(
         )
         conn.commit()
     elif coverage_state == "stale":
-        _publish_test_dialog_directory(conn, completed_at=int(time.time()) - 901)
+        _publish_test_dialog_directory(conn, started_at=int(time.time()) - 901)
     elif coverage_state == "complete":
         _publish_test_dialog_directory(conn)
 

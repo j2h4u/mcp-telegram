@@ -67,7 +67,7 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 from .access_lifecycle import AccessLossEvidence, set_access_lost
 from .activity_contracts import InputPeerResolver
 from .demand_wiring import DemandOfferSink, offer_durable_demand
-from .dialog_directory import apply_realtime_eligibility, apply_realtime_identity
+from .dialog_directory import IDENTITY_OMITTED, apply_realtime_eligibility, apply_realtime_identity
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
 from .history_enrollment import EnrollmentOutcome, ensure_automatic_dm_enrollment
@@ -1844,14 +1844,22 @@ class EventHandlerManager:
 
     def _update_realtime_identity_or_notify(self, update: UpdateUserName | UpdateNotifySettings, now: int) -> None:
         if isinstance(update, UpdateUserName):
-            name = " ".join(part for part in (update.first_name, update.last_name) if part) or None
-            username = next(
-                (
-                    candidate.username.removeprefix("@")
-                    for candidate in update.usernames
-                    if getattr(candidate, "active", False) and isinstance(getattr(candidate, "username", None), str)
-                ),
-                None,
+            name = (
+                " ".join(part for part in (update.first_name, update.last_name) if part) or None
+                if hasattr(update, "first_name") or hasattr(update, "last_name")
+                else IDENTITY_OMITTED
+            )
+            username = (
+                next(
+                    (
+                        candidate.username.removeprefix("@")
+                        for candidate in update.usernames
+                        if getattr(candidate, "active", False) and isinstance(getattr(candidate, "username", None), str)
+                    ),
+                    None,
+                )
+                if hasattr(update, "usernames")
+                else IDENTITY_OMITTED
             )
             with self._conn:
                 apply_realtime_identity(

@@ -137,7 +137,7 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
         completed_at: int,
     ) -> None:
         facts = _canonical_facts(self._conn)
-        members = _evaluate_rules(observation.rules, facts, _published_main_pins(self._conn), now=completed_at)
+        members = _evaluate_rules(self._conn, observation.rules, facts, _published_main_pins(self._conn), now=completed_at)
         self._conn.execute("DELETE FROM telegram_folder_local_members")
         self._conn.execute("DELETE FROM telegram_folder_rules")
         self._conn.executemany(
@@ -165,12 +165,17 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
 
     def _save_pending(self, observation: FolderRuleObservation) -> None:
         row = cast(
-            tuple[object] | None,
-            self._conn.execute("SELECT token FROM telegram_folder_pending_observation WHERE singleton=1").fetchone(),
+            tuple[object, object] | None,
+            self._conn.execute("SELECT token,started_at FROM telegram_folder_pending_observation WHERE singleton=1").fetchone(),
         )
         if row is None:
             self._conn.execute(
                 "INSERT INTO telegram_folder_pending_observation(singleton,token,started_at,rules_json) VALUES (1,?,?,?)",
+                (observation.token, observation.started_at, _encode_observation(observation)),
+            )
+        elif observation.started_at >= _as_int(row[1]):
+            self._conn.execute(
+                "UPDATE telegram_folder_pending_observation SET token=?,started_at=?,rules_json=? WHERE singleton=1",
                 (observation.token, observation.started_at, _encode_observation(observation)),
             )
         self._conn.execute(
@@ -242,11 +247,26 @@ def _published_main_pins(conn: sqlite3.Connection) -> dict[int, int]:
 
 
 def _evaluate_rules(
-    rules: tuple[FolderRule, ...], facts: dict[int, DialogFacts], main_pins: dict[int, int], *, now: int
+    conn: sqlite3.Connection,
+    rules: tuple[FolderRule, ...],
+    facts: dict[int, DialogFacts],
+    main_pins: dict[int, int],
+    *,
+    now: int,
 ) -> tuple[FolderMembership, ...]:
+    visible_dialog_ids = {
+        dialog_id
+        for (dialog_id,) in cast(
+            list[tuple[int]],
+            # A published dialog can lack optional eligibility facts. It must
+            # still be represented in three-valued folder membership.
+            conn.execute("SELECT dialog_id FROM dialogs WHERE hidden=0").fetchall(),
+        )
+    }
     result: list[FolderMembership] = []
     for rule in rules:
         candidate_ids = set(facts)
+        candidate_ids.update(visible_dialog_ids)
         candidate_ids.update(rule.explicit_ids)
         for dialog_id in candidate_ids:
             state = evaluate(rule, facts.get(dialog_id, DialogFacts(dialog_id)), now=now)

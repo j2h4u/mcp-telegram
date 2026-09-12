@@ -30,6 +30,15 @@ _UPSERT_ENTITY_SQL = (
 _INSERT_ENTITY_STUB_SQL = (
     "INSERT OR IGNORE INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
 )
+_UPSERT_ENTITY_STUB_SQL = (
+    "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+    "ON CONFLICT(id) DO UPDATE SET "
+    "type=COALESCE(entities.type, excluded.type), "
+    "name=COALESCE(entities.name, excluded.name), "
+    "username=entities.username, "
+    "name_normalized=COALESCE(entities.name_normalized, excluded.name_normalized), "
+    "updated_at=MAX(entities.updated_at, excluded.updated_at)"
+)
 
 
 def _snapshot_values(snapshot: EntitySnapshot) -> tuple[int, str, str | None, str | None, str | None, int]:
@@ -53,3 +62,8 @@ def upsert_entity_snapshots(conn: sqlite3.Connection, snapshots: Sequence[Entity
 def ensure_entity_stub(conn: sqlite3.Connection, snapshot: EntitySnapshot) -> None:
     """Insert a missing parent entity without changing an existing row."""
     conn.execute(_INSERT_ENTITY_STUB_SQL, _snapshot_values(snapshot))
+
+
+def upsert_entity_stub(conn: sqlite3.Connection, snapshot: EntitySnapshot) -> None:
+    """Fill a local stub without replacing richer existing entity facts."""
+    conn.execute(_UPSERT_ENTITY_STUB_SQL, _snapshot_values(snapshot))

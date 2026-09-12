@@ -75,6 +75,25 @@ def test_pending_rule_observation_is_preserved_without_catalog(tmp_path: Path) -
         conn.close()
 
 
+def test_newer_pending_rule_replaces_older_rule_before_catalog_publication(tmp_path: Path) -> None:
+    conn = _conn(tmp_path / "sync.db")
+    try:
+        conn.execute("UPDATE dialog_directory_publication SET account_id=NULL,generation=NULL,observation_started_at=NULL WHERE singleton=1")
+        repo = SQLiteFolderSnapshotRepository(conn)
+        first = FolderRuleObservation((FolderRule(1, "Old"),), "old", 55)
+        second = FolderRuleObservation((FolderRule(2, "New"),), "new", 70)
+        assert repo.project_observation(first, completed_at=56) is None
+        assert repo.project_observation(second, completed_at=71) is None
+        assert conn.execute("SELECT token,started_at FROM telegram_folder_pending_observation").fetchone() == ("new", 70)
+        conn.execute(
+            "UPDATE dialog_directory_publication SET account_id=1,generation=8,observation_started_at=80 WHERE singleton=1"
+        )
+        assert repo.reproject_current_rules(now=81) == 8
+        assert conn.execute("SELECT folder_id,title FROM telegram_folder_rules").fetchall() == [(2, "New")]
+    finally:
+        conn.close()
+
+
 def test_default_uses_catalog_and_main_pin_order(tmp_path: Path) -> None:
     conn = _conn(tmp_path / "sync.db")
     try:
@@ -89,6 +108,21 @@ def test_default_uses_catalog_and_main_pin_order(tmp_path: Path) -> None:
         rule = FolderRule(0, "All chats", DEFAULT_FOLDER_NAMESPACE, FolderRuleKind.DEFAULT)
         repo.project_observation(_observation(rule), completed_at=100)
         assert conn.execute("SELECT dialog_id,pin_position FROM telegram_folder_local_members ORDER BY pin_position").fetchall() == [(10, 0), (40, 1)]
+    finally:
+        conn.close()
+
+
+def test_visible_dialog_without_eligibility_facts_is_not_omitted(tmp_path: Path) -> None:
+    conn = _conn(tmp_path / "sync.db")
+    try:
+        conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (77,'user',0)")
+        repo = SQLiteFolderSnapshotRepository(conn)
+        default = FolderRule(0, "All chats", DEFAULT_FOLDER_NAMESPACE, FolderRuleKind.DEFAULT)
+        filtered = FolderRule(2, "Contacts", categories=frozenset({DialogCategory.CONTACT}))
+        repo.project_observation(_observation(default, filtered), completed_at=100)
+        assert conn.execute(
+            "SELECT namespace,folder_id,state FROM telegram_folder_local_members WHERE dialog_id=77 ORDER BY folder_id"
+        ).fetchall() == [("default", 0, "present"), ("filter", 2, "unknown")]
     finally:
         conn.close()
 
