@@ -13,7 +13,7 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 65
+_CURRENT_SCHEMA_VERSION = 66
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -30,6 +30,7 @@ _ENTITY_PROFILE_METADATA_MIGRATION_62 = 62
 _REALTIME_DM_DIALOG_BACKFILL_MIGRATION_63 = 63
 _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64 = 64
 _PUBLISHED_DIALOG_READ_CURSORS_MIGRATION_65 = 65
+_CANONICAL_DIALOG_FACTS_MIGRATION_66 = 66
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
@@ -552,7 +553,11 @@ CREATE TABLE IF NOT EXISTS dialogs (
     unread_mark_observed_at INTEGER,
     draft_text              TEXT,
     read_inbox_max_id       INTEGER,
-    read_outbox_max_id      INTEGER
+    read_outbox_max_id      INTEGER,
+    username                TEXT,
+    identity_observed_at    INTEGER,
+    identity_complete       INTEGER NOT NULL DEFAULT 0 CHECK(identity_complete IN (0, 1)),
+    identity_source         TEXT CHECK(identity_source IN ('directory', 'realtime', 'mixed', 'legacy') OR identity_source IS NULL)
 )
 """
 
@@ -780,7 +785,27 @@ CREATE TABLE IF NOT EXISTS dialog_directory_staging (
     draft_text          TEXT,
     snapshot_at         INTEGER NOT NULL,
     baseline_revision   INTEGER,
+    username            TEXT,
+    identity_observed_at INTEGER,
+    identity_complete   INTEGER NOT NULL DEFAULT 0 CHECK(identity_complete IN (0, 1)),
+    identity_source     TEXT CHECK(identity_source IN ('directory', 'realtime', 'mixed', 'legacy') OR identity_source IS NULL),
+    eligibility_category TEXT CHECK(eligibility_category IN ('contact', 'non_contact', 'bot', 'group', 'broadcast') OR eligibility_category IS NULL),
+    eligibility_archived INTEGER CHECK(eligibility_archived IN (0, 1) OR eligibility_archived IS NULL),
+    eligibility_unread   INTEGER CHECK(eligibility_unread IN (0, 1) OR eligibility_unread IS NULL),
+    eligibility_mute_until INTEGER,
+    eligibility_observed_at INTEGER,
     PRIMARY KEY(generation, dialog_id)
+) WITHOUT ROWID
+"""
+
+_DIALOG_DIRECTORY_FACTS_DDL = """
+CREATE TABLE IF NOT EXISTS dialog_directory_facts (
+    dialog_id   INTEGER PRIMARY KEY,
+    category    TEXT CHECK(category IN ('contact', 'non_contact', 'bot', 'group', 'broadcast') OR category IS NULL),
+    archived    INTEGER CHECK(archived IN (0, 1) OR archived IS NULL),
+    unread      INTEGER CHECK(unread IN (0, 1) OR unread IS NULL),
+    mute_until  INTEGER,
+    observed_at INTEGER
 ) WITHOUT ROWID
 """
 
@@ -3627,6 +3652,50 @@ def _apply_migration_65(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
+def _apply_migration_66(conn: sqlite3.Connection, current: int) -> int:
+    """Add canonical identity and current eligibility facts without inventing provenance."""
+    if current >= _CANONICAL_DIALOG_FACTS_MIGRATION_66:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        dialog_columns = _table_column_names(conn, "dialogs")
+        dialog_alters = {
+            "username": "ALTER TABLE dialogs ADD COLUMN username TEXT",
+            "identity_observed_at": "ALTER TABLE dialogs ADD COLUMN identity_observed_at INTEGER",
+            "identity_complete": "ALTER TABLE dialogs ADD COLUMN identity_complete INTEGER NOT NULL DEFAULT 0 CHECK(identity_complete IN (0, 1))",
+            "identity_source": "ALTER TABLE dialogs ADD COLUMN identity_source TEXT",
+        }
+        for column, statement in dialog_alters.items():
+            if column not in dialog_columns:
+                conn.execute(statement)
+
+        staging_columns = _table_column_names(conn, "dialog_directory_staging")
+        staging_alters = {
+            "username": "ALTER TABLE dialog_directory_staging ADD COLUMN username TEXT",
+            "identity_observed_at": "ALTER TABLE dialog_directory_staging ADD COLUMN identity_observed_at INTEGER",
+            "identity_complete": "ALTER TABLE dialog_directory_staging ADD COLUMN identity_complete INTEGER NOT NULL DEFAULT 0 CHECK(identity_complete IN (0, 1))",
+            "identity_source": "ALTER TABLE dialog_directory_staging ADD COLUMN identity_source TEXT",
+            "eligibility_category": "ALTER TABLE dialog_directory_staging ADD COLUMN eligibility_category TEXT",
+            "eligibility_archived": "ALTER TABLE dialog_directory_staging ADD COLUMN eligibility_archived INTEGER",
+            "eligibility_unread": "ALTER TABLE dialog_directory_staging ADD COLUMN eligibility_unread INTEGER",
+            "eligibility_mute_until": "ALTER TABLE dialog_directory_staging ADD COLUMN eligibility_mute_until INTEGER",
+            "eligibility_observed_at": "ALTER TABLE dialog_directory_staging ADD COLUMN eligibility_observed_at INTEGER",
+        }
+        for column, statement in staging_alters.items():
+            if column not in staging_columns:
+                conn.execute(statement)
+        conn.execute(_DIALOG_DIRECTORY_FACTS_DDL)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
+            (_CANONICAL_DIALOG_FACTS_MIGRATION_66,),
+        )
+        conn.commit()
+        return _CANONICAL_DIALOG_FACTS_MIGRATION_66
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -3711,6 +3780,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_64(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _PUBLISHED_DIALOG_READ_CURSORS_MIGRATION_65:
         current = _apply_migration_65(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_FACTS_MIGRATION_66:
+        current = _apply_migration_66(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

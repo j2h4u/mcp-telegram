@@ -29,8 +29,10 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     ChannelParticipantBanned,
     ChatBannedRights,
     DialogPeer,
+    NotifyPeer,
     PeerChannel,
     PeerChat,
+    PeerNotifySettings,
     PeerUser,
     UpdateChannel,
     UpdateChannelParticipant,
@@ -38,9 +40,12 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     UpdateChatParticipant,
     UpdateDialogPinned,
     UpdateDialogUnreadMark,
+    UpdateNotifySettings,
     UpdatePinnedDialogs,
     UpdateReadChannelInbox,
     UpdateReadHistoryInbox,
+    UpdateUserName,
+    Username,
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
@@ -533,6 +538,39 @@ async def test_update_dialog_unread_mark_false_is_exact_and_does_not_unhide(
     assert row[2] is not None
 
 
+@pytest.mark.asyncio
+async def test_realtime_identity_and_mute_update_only_their_canonical_bundles(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 67890
+    _insert_dialog(sync_db, dialog_id, snapshot_at=1)
+    sync_db.execute(
+        "UPDATE dialogs SET name='Old',type='user',username='old',identity_complete=1,"
+        "identity_source='directory',identity_observed_at=10 WHERE dialog_id=?",
+        (dialog_id,),
+    )
+    sync_db.commit()
+    mgr = _make_manager(mock_client, sync_db, shutdown_event)
+
+    await mgr.on_raw_identity_or_notify(UpdateUserName(dialog_id, "New", "Name", [Username("new", active=True)]))
+    await mgr.on_raw_identity_or_notify(
+        UpdateNotifySettings(
+            NotifyPeer(PeerUser(dialog_id)),
+            PeerNotifySettings(mute_until=datetime(2026, 1, 1, tzinfo=UTC)),
+        )
+    )
+
+    assert sync_db.execute(
+        "SELECT name,username,type,identity_complete,identity_source,identity_observed_at FROM dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone() == ("New Name", "new", "user", 1, "mixed", 10)
+    assert sync_db.execute(
+        "SELECT mute_until FROM dialog_directory_facts WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (1_767_225_600,)
+
+
 # ---------------------------------------------------------------------------
 # EVENTS-02: still_unread_count persisted as an exact Telegram fact
 # ---------------------------------------------------------------------------
@@ -568,7 +606,7 @@ async def test_update_read_history_inbox_logs_still_unread_count(
     row = cast(
         tuple[int, int, int | None],
         sync_db.execute(
-            "SELECT unread_count, unread_count_observed_at, read_inbox_max_id "
+            "SELECT dialogs.unread_count, dialogs.unread_count_observed_at, synced_dialogs.read_inbox_max_id "
             "FROM dialogs JOIN synced_dialogs USING(dialog_id) WHERE dialogs.dialog_id=?",
             (dialog_id,),
         ).fetchone(),
@@ -957,7 +995,7 @@ def test_register_attaches_three_new_handlers(
     """Dialog, scheduled, and topic handlers bring the registration total to 14."""
     mgr = EventHandlerManager(mock_client, sync_db, shutdown_event, mock_client.get_input_entity)
     mgr.register()
-    assert mock_client.add_event_handler.call_count == 14
+    assert mock_client.add_event_handler.call_count == 15
 
 
 def test_unregister_detaches_all_new_handlers(

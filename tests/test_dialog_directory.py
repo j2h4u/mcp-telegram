@@ -16,7 +16,12 @@ from mcp_telegram.dialog_directory import (
     CanonicalDialogDirectoryDemandAdapter,
     CanonicalDirectoryFullDemandAdapter,
     _decode_cursor,
+    _eligibility_category,
     _encode_input_peer,
+    _mute_until,
+    _three_valued_unread,
+    apply_realtime_eligibility,
+    apply_realtime_identity,
 )
 from mcp_telegram.dialog_directory_tl import (
     DialogCursor,
@@ -920,5 +925,190 @@ async def test_long_acquisition_and_restart_keep_the_original_freshness_age(
         restarted = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event())
         restarted_status = restarted.status(float(now), conn)
         assert restarted_status == status
+    finally:
+        conn.close()
+
+
+def test_identity_and_eligibility_extract_only_authoritative_facts() -> None:
+    assert _eligibility_category(types.User(id=1, bot=True, contact=True)) == "bot"
+    assert _eligibility_category(types.User(id=2, contact=False)) == "non_contact"
+    assert _eligibility_category(types.User(id=3, min=True, contact=True)) is None
+    assert _eligibility_category(types.User(id=4)) is None
+    assert (
+        _eligibility_category(types.Chat(id=5, title="group", photo=None, participants_count=1, date=None, version=1))
+        == "group"
+    )
+    assert _eligibility_category(types.Channel(id=6, title="group", photo=None, date=None, megagroup=True)) == "group"
+    assert (
+        _eligibility_category(types.Channel(id=7, title="feed", photo=None, date=None, broadcast=True)) == "broadcast"
+    )
+    assert _eligibility_category(types.Channel(id=8, title="unknown", photo=None, date=None)) is None
+
+    assert (
+        _three_valued_unread(
+            types.Dialog(
+                peer=types.PeerUser(1),
+                top_message=1,
+                read_inbox_max_id=0,
+                read_outbox_max_id=0,
+                unread_count=0,
+                unread_mentions_count=0,
+                unread_reactions_count=9,
+                unread_poll_votes_count=0,
+                notify_settings=None,
+                unread_mark=False,
+            )
+        )
+        == 0
+    )
+    assert (
+        _three_valued_unread(
+            types.Dialog(
+                peer=types.PeerUser(1),
+                top_message=1,
+                read_inbox_max_id=0,
+                read_outbox_max_id=0,
+                unread_count=0,
+                unread_mentions_count=1,
+                unread_reactions_count=0,
+                unread_poll_votes_count=0,
+                notify_settings=None,
+            )
+        )
+        == 1
+    )
+    assert _mute_until(None) is None
+    assert _mute_until(types.PeerNotifySettings(mute_until=datetime(2026, 1, 1, tzinfo=UTC))) == 1_767_225_600
+    assert _mute_until(type("Settings", (), {"mute_until": 0})()) == 0
+
+
+def test_realtime_bundles_preserve_oldest_boundary_and_complete_identity_replaces(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO dialogs(dialog_id,name,type,username,identity_observed_at,identity_complete,identity_source) "
+            "VALUES (1,'Old','user','old',10,1,'directory')"
+        )
+        with conn:
+            assert apply_realtime_eligibility(conn, 1, category="contact", archived=0, observed_at=20) == 1
+            assert apply_realtime_eligibility(conn, 1, unread=1, observed_at=30) == 1
+            assert (
+                apply_realtime_identity(
+                    conn, 1, name="Renamed", username=None, dialog_type="user", observed_at=40, complete=True
+                )
+                == 1
+            )
+        assert conn.execute(
+            "SELECT name,username,identity_observed_at,identity_complete,identity_source FROM dialogs WHERE dialog_id=1"
+        ).fetchone() == ("Renamed", None, 40, 1, "realtime")
+        assert conn.execute(
+            "SELECT category,archived,unread,observed_at FROM dialog_directory_facts WHERE dialog_id=1"
+        ).fetchone() == ("contact", 0, 1, 20)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_realtime_eligibility_fences_an_older_directory_publication(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute("INSERT INTO dialogs(dialog_id,name,type,snapshot_at,hidden) VALUES (1,'Old','user',1,0)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_incomplete_directory_identity_keeps_known_username_and_oldest_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO dialogs(dialog_id,name,type,username,identity_observed_at,identity_complete,identity_source,hidden) "
+            "VALUES (1,'Known','user','known',10,1,'directory',0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr("mcp_telegram.dialog_directory.time.time", lambda: 20)
+    dialog = _dialog(1, 8)
+    response = types.messages.Dialogs(
+        dialogs=[dialog],
+        messages=[types.Message(id=8, peer_id=types.PeerUser(1), date=datetime(2026, 1, 1, tzinfo=UTC))],
+        chats=[],
+        users=[types.User(id=1, first_name="Partial", username="partial", min=True)],
+    )
+    directory = CanonicalDialogDirectory(
+        _FakeClient([_pinned_response(), _pinned_response(), response]), db_path, asyncio.Event()
+    )
+    await _run_slices(directory, 3)
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT name,username,identity_observed_at,identity_complete,identity_source FROM dialogs WHERE dialog_id=1"
+        ).fetchone() == ("Known", "known", 10, 1, "mixed")
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_complete_directory_absence_hides_row_and_removes_current_eligibility(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    directory = CanonicalDialogDirectory(
+        _FakeClient(
+            [
+                _pinned_response(),
+                _pinned_response(),
+                _response([_dialog(1, 8)]),
+                _pinned_response(),
+                _pinned_response(),
+                _response([]),
+            ]
+        ),
+        db_path,
+        asyncio.Event(),
+    )
+    await _run_slices(directory, 3)
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM dialog_directory_facts WHERE dialog_id=1").fetchone() == (1,)
+    finally:
+        conn.close()
+    await _run_slices(directory, 3)
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT hidden FROM dialogs WHERE dialog_id=1").fetchone() == (1,)
+        assert conn.execute("SELECT COUNT(*) FROM dialog_directory_facts WHERE dialog_id=1").fetchone() == (0,)
+    finally:
+        conn.close()
+    directory = CanonicalDialogDirectory(
+        _FakeClient([_pinned_response(), _pinned_response(), _response([_dialog(1, 8)])]), db_path, asyncio.Event()
+    )
+    await directory.run_slice()
+    await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        with conn:
+            apply_realtime_eligibility(conn, 1, category="bot", unread=1, observed_at=50)
+    finally:
+        conn.close()
+    await directory.run_slice()
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT category,unread,observed_at FROM dialog_directory_facts WHERE dialog_id=1"
+        ).fetchone() == (
+            "bot",
+            1,
+            50,
+        )
     finally:
         conn.close()

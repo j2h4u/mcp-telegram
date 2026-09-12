@@ -91,6 +91,13 @@ class _StagedFact:
     unread_mark: int | None
     draft_text: str | None
     snapshot_at: int
+    username: str | None
+    identity_complete: int
+    identity_source: str
+    eligibility_category: str | None
+    eligibility_archived: int | None
+    eligibility_unread: int | None
+    eligibility_mute_until: int | None
 
 
 class CanonicalDialogDirectory:
@@ -426,8 +433,8 @@ class CanonicalDialogDirectory:
             baseline_revision = _required_int(baseline[0], "baseline revision") if baseline is not None else None
             conn.execute(
                 "INSERT INTO dialog_directory_staging("
-                "generation,dialog_id,source,peer_kind,top_message,name,type,archived,pinned,members,created,last_message_at,read_inbox_max_id,read_outbox_max_id,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,draft_text,snapshot_at,baseline_revision) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "generation,dialog_id,source,peer_kind,top_message,name,type,archived,pinned,members,created,last_message_at,read_inbox_max_id,read_outbox_max_id,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,draft_text,snapshot_at,baseline_revision,username,identity_observed_at,identity_complete,identity_source,eligibility_category,eligibility_archived,eligibility_unread,eligibility_mute_until,eligibility_observed_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(generation,dialog_id) DO UPDATE SET "
                 "source=excluded.source,peer_kind=excluded.peer_kind,top_message=excluded.top_message,"
                 "name=excluded.name,type=excluded.type,archived=excluded.archived,pinned=excluded.pinned,members=excluded.members,"
@@ -435,7 +442,11 @@ class CanonicalDialogDirectory:
                 "read_outbox_max_id=excluded.read_outbox_max_id,unread_mentions_count=excluded.unread_mentions_count,"
                 "unread_reactions_count=excluded.unread_reactions_count,unread_count=excluded.unread_count,"
                 "unread_mark=excluded.unread_mark,draft_text=excluded.draft_text,snapshot_at=excluded.snapshot_at,"
-                "baseline_revision=excluded.baseline_revision",
+                "baseline_revision=excluded.baseline_revision,username=excluded.username,"
+                "identity_observed_at=excluded.identity_observed_at,identity_complete=excluded.identity_complete,"
+                "identity_source=excluded.identity_source,eligibility_category=excluded.eligibility_category,"
+                "eligibility_archived=excluded.eligibility_archived,eligibility_unread=excluded.eligibility_unread,"
+                "eligibility_mute_until=excluded.eligibility_mute_until,eligibility_observed_at=excluded.eligibility_observed_at",
                 (
                     generation,
                     row.dialog_id,
@@ -458,6 +469,15 @@ class CanonicalDialogDirectory:
                     row.draft_text,
                     row.snapshot_at,
                     baseline_revision,
+                    row.username,
+                    row.snapshot_at,
+                    row.identity_complete,
+                    row.identity_source,
+                    row.eligibility_category,
+                    row.eligibility_archived,
+                    row.eligibility_unread,
+                    row.eligibility_mute_until,
+                    row.snapshot_at,
                 ),
             )
             conn.execute(
@@ -489,7 +509,8 @@ class CanonicalDialogDirectory:
         elif isinstance(entity, (types.Channel, types.ChannelForbidden)):
             kind = EntityKind.CHANNEL
         name = _entity_name(entity)
-        dialog_type = classify_dialog_type(entity, entity_kind=kind).value
+        identity_complete = int(_identity_is_complete(entity))
+        dialog_type = classify_dialog_type(entity, entity_kind=kind).value if identity_complete else "unknown"
         raw = cast(types.Dialog, fact.dialog)
         archived = int(folder_id == 1 or getattr(raw, "folder_id", None) == 1)
         pinned = int(folder_id is not None or bool(getattr(raw, "pinned", False)))
@@ -514,6 +535,13 @@ class CanonicalDialogDirectory:
             int(bool(getattr(raw, "unread_mark", False))) if getattr(raw, "unread_mark", None) is not None else None,
             _draft_text(getattr(raw, "draft", None)),
             observed_at,
+            _primary_username(entity),
+            identity_complete,
+            "directory",
+            _eligibility_category(entity),
+            archived,
+            _three_valued_unread(raw),
+            _mute_until(getattr(raw, "notify_settings", None)),
         )
 
     def _publish_if_complete(self, conn: sqlite3.Connection, generation: int, account_id: int) -> bool:
@@ -529,7 +557,25 @@ class CanonicalDialogDirectory:
         # Positive facts first. A snapshot writes only when the revision read
         # before acquisition still matches; realtime always wins otherwise.
         conn.execute(
-            "UPDATE dialogs AS current SET name=staged.name, type=staged.type, archived=staged.archived, "
+            "UPDATE dialogs AS current SET "
+            "name=CASE WHEN staged.identity_complete=1 THEN staged.name "
+            "WHEN current.identity_complete=1 THEN current.name ELSE COALESCE(current.name,staged.name) END, "
+            "type=CASE WHEN staged.identity_complete=1 THEN staged.type "
+            "WHEN current.identity_complete=1 THEN current.type ELSE COALESCE(NULLIF(current.type,'unknown'),NULLIF(staged.type,'unknown'),'unknown') END, "
+            "username=CASE WHEN staged.identity_complete=1 THEN staged.username "
+            "WHEN current.identity_complete=1 THEN current.username ELSE COALESCE(current.username,staged.username) END, "
+            "identity_complete=CASE WHEN staged.identity_complete=1 THEN 1 ELSE current.identity_complete END, "
+            "identity_source=CASE WHEN staged.identity_complete=1 THEN staged.identity_source "
+            "WHEN current.identity_complete=1 AND (staged.name IS NOT NULL OR staged.username IS NOT NULL) THEN 'mixed' "
+            "WHEN current.identity_complete=1 THEN current.identity_source "
+            "WHEN current.identity_source IS NULL THEN staged.identity_source "
+            "WHEN staged.name IS NOT NULL OR staged.username IS NOT NULL THEN 'mixed' ELSE current.identity_source END, "
+            "identity_observed_at=CASE WHEN staged.identity_complete=1 THEN staged.identity_observed_at "
+            "WHEN staged.name IS NULL AND staged.username IS NULL THEN current.identity_observed_at "
+            "WHEN current.identity_observed_at IS NULL THEN staged.identity_observed_at "
+            "WHEN staged.identity_observed_at IS NULL THEN current.identity_observed_at "
+            "ELSE MIN(current.identity_observed_at,staged.identity_observed_at) END, "
+            "archived=staged.archived, "
             "pinned=CASE WHEN EXISTS (SELECT 1 FROM dialog_directory_pins pin WHERE pin.generation=staged.generation AND pin.dialog_id=staged.dialog_id) THEN 1 ELSE 0 END, "
             "members=staged.members, created=staged.created, last_message_at=staged.last_message_at, "
             "snapshot_at=staged.snapshot_at, unread_mentions_count=staged.unread_mentions_count, "
@@ -550,8 +596,8 @@ class CanonicalDialogDirectory:
             (generation,),
         )
         conn.execute(
-            "INSERT INTO dialogs(dialog_id,name,type,archived,pinned,members,created,last_message_at,snapshot_at,hidden,needs_refresh,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,unread_count_observed_at,unread_mark_observed_at,draft_text,read_inbox_max_id,read_outbox_max_id) "
-            "SELECT staged.dialog_id,staged.name,staged.type,staged.archived,"
+            "INSERT INTO dialogs(dialog_id,name,type,username,identity_observed_at,identity_complete,identity_source,archived,pinned,members,created,last_message_at,snapshot_at,hidden,needs_refresh,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,unread_count_observed_at,unread_mark_observed_at,draft_text,read_inbox_max_id,read_outbox_max_id) "
+            "SELECT staged.dialog_id,staged.name,staged.type,staged.username,staged.identity_observed_at,staged.identity_complete,staged.identity_source,staged.archived,"
             "CASE WHEN EXISTS (SELECT 1 FROM dialog_directory_pins pin WHERE pin.generation=staged.generation AND pin.dialog_id=staged.dialog_id) THEN 1 ELSE 0 END,"
             "staged.members,staged.created,staged.last_message_at,"
             "staged.snapshot_at,0,0,staged.unread_mentions_count,staged.unread_reactions_count,staged.unread_count,staged.unread_mark,"
@@ -561,6 +607,30 @@ class CanonicalDialogDirectory:
             "WHERE staged.generation=? AND staged.baseline_revision IS NULL "
             "AND NOT EXISTS (SELECT 1 FROM dialogs current WHERE current.dialog_id=staged.dialog_id) "
             "AND NOT EXISTS (SELECT 1 FROM synced_dialogs sd WHERE sd.dialog_id=staged.dialog_id AND sd.status='access_lost')",
+            (generation,),
+        )
+        conn.execute(
+            "UPDATE dialog_directory_facts AS current SET "
+            "category=CASE WHEN staged.eligibility_category IS NULL THEN current.category ELSE staged.eligibility_category END, "
+            "archived=CASE WHEN staged.eligibility_archived IS NULL THEN current.archived ELSE staged.eligibility_archived END, "
+            "unread=CASE WHEN staged.eligibility_unread IS NULL THEN current.unread ELSE staged.eligibility_unread END, "
+            "mute_until=CASE WHEN staged.eligibility_mute_until IS NULL THEN current.mute_until ELSE staged.eligibility_mute_until END, "
+            "observed_at=CASE WHEN staged.eligibility_category IS NULL AND staged.eligibility_archived IS NULL "
+            "AND staged.eligibility_unread IS NULL AND staged.eligibility_mute_until IS NULL THEN current.observed_at "
+            "WHEN current.observed_at IS NULL THEN staged.eligibility_observed_at "
+            "WHEN staged.eligibility_observed_at IS NULL THEN current.observed_at "
+            "ELSE MIN(current.observed_at,staged.eligibility_observed_at) END "
+            "FROM dialog_directory_staging AS staged JOIN dialogs AS dialog ON dialog.dialog_id=staged.dialog_id "
+            "WHERE staged.generation=? AND staged.dialog_id=current.dialog_id AND staged.baseline_revision=dialog.revision",
+            (generation,),
+        )
+        conn.execute(
+            "INSERT INTO dialog_directory_facts(dialog_id,category,archived,unread,mute_until,observed_at) "
+            "SELECT staged.dialog_id,staged.eligibility_category,staged.eligibility_archived,staged.eligibility_unread,"
+            "staged.eligibility_mute_until,staged.eligibility_observed_at FROM dialog_directory_staging AS staged "
+            "JOIN dialogs AS dialog ON dialog.dialog_id=staged.dialog_id "
+            "WHERE staged.generation=? AND staged.baseline_revision IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM dialog_directory_facts current WHERE current.dialog_id=staged.dialog_id)",
             (generation,),
         )
         # Read cursors are monotonic facts of the completed publication. Apply
@@ -594,6 +664,14 @@ class CanonicalDialogDirectory:
         # therefore survive an in-flight snapshot even when unseen by it.
         if state.observation_started_at is None:
             raise RuntimeError("complete directory generation has no observation start")
+        conn.execute(
+            "DELETE FROM dialog_directory_facts WHERE EXISTS ("
+            "SELECT 1 FROM dialog_directory_baseline baseline JOIN dialogs current ON current.dialog_id=baseline.dialog_id "
+            "WHERE baseline.generation=? AND baseline.dialog_id=dialog_directory_facts.dialog_id "
+            "AND baseline.seen=0 AND baseline.baseline_revision=current.revision "
+            "AND current.hidden=0)",
+            (generation,),
+        )
         conn.execute(
             "UPDATE dialogs AS current SET hidden=1, snapshot_at=? "
             "WHERE current.hidden=0 AND EXISTS ("
@@ -745,6 +823,142 @@ def _draft_text(draft: object) -> str | None:
 
 def _nullable_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _identity_is_complete(entity: object | None) -> bool:
+    """Return whether this entity can authoritatively replace identity fields."""
+    if isinstance(entity, types.User):
+        return not bool(entity.min)
+    if isinstance(entity, types.Chat):
+        return True
+    if isinstance(entity, types.Channel):
+        return not bool(entity.min)
+    return False
+
+
+def _primary_username(entity: object | None) -> str | None:
+    username = getattr(entity, "username", None)
+    if not isinstance(username, str):
+        return None
+    username = username.removeprefix("@")
+    return username or None
+
+
+def _eligibility_category(entity: object | None) -> str | None:
+    """Classify only flags whose source object is complete and authoritative."""
+    category: str | None = None
+    if not _identity_is_complete(entity):
+        return category
+    if isinstance(entity, types.User):
+        if entity.bot is True:
+            category = "bot"
+        elif isinstance(entity.contact, bool):
+            category = "contact" if entity.contact else "non_contact"
+    elif isinstance(entity, types.Chat):
+        category = "group"
+    elif isinstance(entity, types.Channel):
+        if entity.megagroup is True:
+            category = "group"
+        elif entity.broadcast is True:
+            category = "broadcast"
+    return category
+
+
+def _three_valued_unread(raw: object) -> int | None:
+    operands: list[bool | None] = []
+    for field in ("unread_count", "unread_mentions_count"):
+        value = _nullable_int(getattr(raw, field, None))
+        operands.append(None if value is None else value > 0)
+    mark = getattr(raw, "unread_mark", None)
+    operands.append(mark if isinstance(mark, bool) else None)
+    if any(operand is True for operand in operands):
+        return 1
+    if all(operand is False for operand in operands):
+        return 0
+    return None
+
+
+def _mute_until(settings: object | None) -> int | None:
+    value = getattr(settings, "mute_until", None)
+    if isinstance(value, datetime):
+        return int(value.timestamp())
+    return _nullable_int(value)
+
+
+def apply_realtime_identity(  # noqa: PLR0913
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    name: str | None,
+    username: str | None,
+    dialog_type: str | None,
+    observed_at: int,
+    complete: bool,
+) -> int:
+    """Apply a realtime identity observation on an existing catalog row."""
+    if not complete:
+        cursor = conn.execute(
+            "UPDATE dialogs SET name=?,username=?,type=COALESCE(?,type),"
+            "identity_observed_at=CASE WHEN identity_observed_at IS NULL THEN ? ELSE MIN(identity_observed_at,?) END,"
+            "identity_source=CASE WHEN identity_observed_at IS NULL THEN 'realtime' ELSE 'mixed' END,"
+            "revision=revision+1 WHERE dialog_id=?",
+            (name, username, dialog_type, observed_at, observed_at, dialog_id),
+        )
+        return cursor.rowcount
+    cursor = conn.execute(
+        "UPDATE dialogs SET name=?,username=?,type=?,identity_observed_at=?,identity_complete=1,"
+        "identity_source='realtime',revision=revision+1 WHERE dialog_id=?",
+        (name, username, dialog_type, observed_at, dialog_id),
+    )
+    return cursor.rowcount
+
+
+def apply_realtime_eligibility(  # noqa: PLR0913
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    observed_at: int,
+    category: str | None = None,
+    archived: int | None = None,
+    unread: int | None = None,
+    mute_until: int | None = None,
+) -> int:
+    """Merge a partial realtime eligibility observation without renewing retained facts."""
+    supplied = (category, archived, unread, mute_until)
+    if all(value is None for value in supplied):
+        return 0
+    prior = cast(
+        tuple[str | None, int | None, int | None, int | None, int | None] | None,
+        conn.execute(
+            "SELECT category,archived,unread,mute_until,observed_at FROM dialog_directory_facts WHERE dialog_id=?",
+            (dialog_id,),
+        ).fetchone(),
+    )
+    if prior is None:
+        initial_values = supplied
+        boundary = observed_at
+        conn.execute(
+            "INSERT INTO dialog_directory_facts(dialog_id,category,archived,unread,mute_until,observed_at) VALUES (?,?,?,?,?,?)",
+            (dialog_id, *initial_values, boundary),
+        )
+    else:
+        values: tuple[str | None, int | None, int | None, int | None] = (
+            category if category is not None else prior[0],
+            archived if archived is not None else prior[1],
+            unread if unread is not None else prior[2],
+            mute_until if mute_until is not None else prior[3],
+        )
+        changed = values != prior[:4]
+        if not changed:
+            return 0
+        retained = any(new is None and old is not None for new, old in zip(supplied, prior[:4], strict=True))
+        boundary = min(prior[4], observed_at) if retained and prior[4] is not None else observed_at
+        conn.execute(
+            "UPDATE dialog_directory_facts SET category=?,archived=?,unread=?,mute_until=?,observed_at=? WHERE dialog_id=?",
+            (*values, boundary, dialog_id),
+        )
+    conn.execute("UPDATE dialogs SET revision=revision+1 WHERE dialog_id=?", (dialog_id,))
+    return 1
 
 
 def _account_id_from_profile(profile: object) -> int:

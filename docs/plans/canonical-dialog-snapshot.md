@@ -56,6 +56,36 @@ from `PeerUser`; those facts remain `unknown`. Read and unread facts retain
 their own observation times and cannot be renewed by a later observation of
 unrelated fields.
 
+The canonical identity bundle is the signed peer ID together with the supplied
+display name, primary username without `@` (while retaining Telegram's display
+spelling), and the authoritative domain type. Its current row stores
+`identity_complete`, `identity_source`, and `identity_observed_at`. A full
+directory or realtime observation replaces the whole bundle, including a known
+username removal. A min, missing, or otherwise partial entity never infers a
+subtype or an absent field and cannot erase a known value. When a partial
+observation contributes alongside retained facts, the row says `mixed` and
+keeps the earliest contributing acquisition-start boundary. Legacy names and
+types are retained with incomplete identity and no invented source or time.
+Generic entity-cache writes are not directory identity writes.
+
+Eligibility is a separate current-state projection keyed by dialog ID. It has
+nullable `category`, `archived`, `unread`, `mute_until`, and `observed_at`
+fields and follows the same conservative bundle boundary. A bot wins over a
+contact classification; a full non-bot user with an explicit negative contact
+flag is `non_contact`; a basic chat or megagroup is `group`; and only an
+authoritative channel broadcast flag makes `broadcast`. Missing or min entities
+remain unknown. Unread is the three-valued OR of unread messages, unread
+mentions, and unread mark: any true is true, all known false is false, and all
+other cases are unknown. Reactions are excluded. `mute_until=0` is known
+unmuted, while absent settings or deadline are unknown. Realtime identity,
+unread, archive-placement, and notification changes update only their relevant
+bundle in their transaction and advance the dialog revision; pin, message,
+read-cursor, folder, publication, and restart events do not renew unrelated
+facts.
+Directory publication and absence handling apply the same revision fence to
+these facts. Folder projection consumes this table later; it is not called by
+these writers.
+
 Folder rules carry a folder ID and title, category selectors, explicit included
 and excluded peers, pinned peers, and applicable exclusion flags such as
 muted, read, or archived. Their observation status and time are independent

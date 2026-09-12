@@ -39,6 +39,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     MessageService,
     PeerChannel,
     PeerChat,
+    PeerUser,
     TypeInputChannel,
     TypePeer,
     UpdateChannel,
@@ -52,18 +53,21 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     UpdateNewChannelMessage,
     UpdateNewMessage,
     UpdateNewScheduledMessage,
+    UpdateNotifySettings,
     UpdatePinnedDialogs,
     UpdatePinnedForumTopic,
     UpdatePinnedForumTopics,
     UpdateReadChannelInbox,
     UpdateReadHistoryInbox,
     UpdateTranscribedAudio,
+    UpdateUserName,
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .access_lifecycle import AccessLossEvidence, set_access_lost
 from .activity_contracts import InputPeerResolver
 from .demand_wiring import DemandOfferSink, offer_durable_demand
+from .dialog_directory import apply_realtime_eligibility, apply_realtime_identity
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
 from .history_enrollment import EnrollmentOutcome, ensure_automatic_dm_enrollment
@@ -442,8 +446,31 @@ def _apply_inbox_read_fact(
         observed_at=observed_at,
         create_missing=True,
     )
+    apply_realtime_eligibility(
+        conn,
+        dialog_id,
+        unread=_current_unread_eligibility(conn, dialog_id),
+        observed_at=observed_at,
+    )
     conn.execute(_UPDATE_LAST_EVENT_SQL, (observed_at, dialog_id))
     return cursor_rowcount, unread_rowcount
+
+
+def _current_unread_eligibility(conn: sqlite3.Connection, dialog_id: int) -> int | None:
+    row = cast(
+        tuple[int | None, int | None, int | None] | None,
+        conn.execute(
+            "SELECT unread_count,unread_mentions_count,unread_mark FROM dialogs WHERE dialog_id=?", (dialog_id,)
+        ).fetchone(),
+    )
+    if row is None:
+        return None
+    # Realtime inbox and mark updates do not carry an unread-mentions
+    # observation. A stored zero may merely be the row default, so they can
+    # establish a positive aggregate but cannot manufacture a false one.
+    if any(value is not None and value > 0 for value in row[:2]) or row[2] == 1:
+        return 1
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -687,6 +714,10 @@ class EventHandlerManager:
             events.Raw(types=[UpdateChannel, UpdateChat]),
         )
         self._client.add_event_handler(
+            self.on_raw_identity_or_notify,
+            events.Raw(types=[UpdateUserName, UpdateNotifySettings]),
+        )
+        self._client.add_event_handler(
             self.on_raw_participant,
             events.Raw(types=[UpdateChannelParticipant, UpdateChatParticipant]),
         )
@@ -715,6 +746,7 @@ class EventHandlerManager:
         self._client.remove_event_handler(self.on_raw_delete_scheduled_messages)
         self._client.remove_event_handler(self.on_raw_dialog_pinned)
         self._client.remove_event_handler(self.on_raw_channel_chat_update)
+        self._client.remove_event_handler(self.on_raw_identity_or_notify)
         self._client.remove_event_handler(self.on_raw_participant)
         self._client.remove_event_handler(self.on_raw_inbox_read)
         self._client.remove_event_handler(self.on_raw_forum_topic_pinned)
@@ -1732,6 +1764,14 @@ class EventHandlerManager:
         pinned = 1 if update.pinned else 0
         with self._conn:
             self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
+            folder_id = getattr(update, "folder_id", None)
+            if isinstance(folder_id, int) and not isinstance(folder_id, bool) and folder_id in {0, 1}:
+                apply_realtime_eligibility(
+                    self._conn,
+                    dialog_id,
+                    archived=int(folder_id == 1),
+                    observed_at=now,
+                )
         logger.info("event_dialog_pinned dialog_id=%d pinned=%d", dialog_id, pinned)
 
     def _rewrite_pinned_dialogs(self, update: UpdatePinnedDialogs, now: int) -> None:
@@ -1787,6 +1827,12 @@ class EventHandlerManager:
                 mark_needs_refresh=True,
                 create_missing=True,
             )
+            apply_realtime_eligibility(
+                self._conn,
+                dialog_id,
+                unread=_current_unread_eligibility(self._conn, dialog_id),
+                observed_at=now,
+            )
         if rowcount:
             self._offer(DemandKind.DIALOG_LIGHT_RECONCILIATION)
         logger.info(
@@ -1795,6 +1841,51 @@ class EventHandlerManager:
             getattr(update, "unread", None),
             rowcount,
         )
+
+    def _update_realtime_identity_or_notify(self, update: UpdateUserName | UpdateNotifySettings, now: int) -> None:
+        if isinstance(update, UpdateUserName):
+            name = " ".join(part for part in (update.first_name, update.last_name) if part) or None
+            username = next(
+                (
+                    candidate.username.removeprefix("@")
+                    for candidate in update.usernames
+                    if getattr(candidate, "active", False) and isinstance(getattr(candidate, "username", None), str)
+                ),
+                None,
+            )
+            with self._conn:
+                apply_realtime_identity(
+                    self._conn,
+                    int(update.user_id),
+                    name=name,
+                    username=username,
+                    dialog_type=None,
+                    observed_at=now,
+                    complete=False,
+                )
+            return
+        peer = getattr(getattr(update, "peer", None), "peer", None)
+        if not isinstance(peer, (PeerUser, PeerChat, PeerChannel)):
+            return
+        try:
+            dialog_id = int(get_peer_id(peer))
+        except TypeError, ValueError:
+            return
+        mute_until = getattr(getattr(update, "notify_settings", None), "mute_until", None)
+        if isinstance(mute_until, datetime):
+            mute_until = int(mute_until.timestamp())
+        if not _is_valid_nonnegative_int(mute_until):
+            return
+        with self._conn:
+            apply_realtime_eligibility(self._conn, dialog_id, mute_until=mute_until, observed_at=now)
+
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
+    async def on_raw_identity_or_notify(self, update: UpdateUserName | UpdateNotifySettings) -> None:
+        """Persist complete name updates and exact notification mute deadlines."""
+        try:
+            self._update_realtime_identity_or_notify(update, int(time.time()))
+        except Exception:
+            logger.exception("event_identity_or_notify_failed update=%r", type(update).__name__)
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_dialog_pinned(self, update: object) -> None:
