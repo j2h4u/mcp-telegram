@@ -39,7 +39,6 @@ dev = [
     "pytest-xdist>=3.8.0",
     "actionlint-py>=1.7.12.24",
     "basedpyright>=1.39.10",
-    "pytest-crap>=0.3.0",
     "radon>=6.0.1",
     "setuptools>=84.0.0",
     "deptry>=0.25.1",
