@@ -118,14 +118,6 @@ unit:
 deadcode:
     uv run vulture
 
-# Informational aggregate test coverage report; never a quality gate.
-coverage:
-    uv run pytest -W error::ResourceWarning --cov=src/mcp_telegram --cov-report=term-missing
-
-# Human CRAP report over the full suite.
-crap:
-    uv run pytest --cov=src/mcp_telegram --cov-report=term-missing --crap --crap-threshold=30 --crap-top-n=30
-
 # CI/regression CRAP gate that checks the tracked baseline.
 crap-check: crap-ratchet
 
@@ -139,8 +131,8 @@ coverage-data:
     uv run pytest "${test_files[@]:0:split}" --cov=src/mcp_telegram --cov-report=; \
     uv run pytest "${test_files[@]:split}" --cov=src/mcp_telegram --cov-append --cov-report=
 
-# Keep JSON serialization out of pytest's memory-heavy process. The standalone
-# coverage command reads the same .coverage data and preserves function regions.
+# Keep JSON serialization out of pytest's memory-heavy processes. The coverage
+# CLI reads the same .coverage data and preserves function regions.
 # Migrate/tighten the tracked CRAP baseline from the current coverage state.
 crap-baseline:
     coverage_file="$(mktemp /tmp/mcp-telegram-crap-coverage.XXXXXX.json)"; \

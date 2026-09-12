@@ -301,7 +301,6 @@ just --list
 just check
 just typecheck
 just unit
-just coverage
 just crap-ratchet
 just runtime-smoke
 just runtime-verify
@@ -309,9 +308,8 @@ just verify
 ```
 
 `just check` runs Ruff plus the non-test static gates. `just typecheck` runs
-mypy. `just unit` runs pytest. `just coverage` prints an informational aggregate
-coverage report; aggregate coverage is not a quality gate. `just crap-ratchet`
-runs pytest with per-function coverage and enforces the tracked CRAP baseline.
+mypy. `just unit` runs pytest. `just crap-ratchet` runs pytest with per-function
+coverage and enforces the tracked CRAP baseline.
 `just verify` runs the full local gate, including the CRAP ratchet and live
 runtime verification. `just runtime-verify` rebuilds the live Docker container,
 waits for it to become healthy, and runs the redacted MCP smoke test through
