@@ -1789,13 +1789,15 @@ class EventHandlerManager:
         dialog_id = self._dialog_id_from_peer(update.peer)
         if dialog_id is None:
             return
+        folder_id = getattr(update, "folder_id", None)
+        published_folder = self._published_pin_folder(folder_id)
         known_dialog = self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
         pinned = 1 if update.pinned else 0
         with self._conn:
-            if known_dialog:
+            # ``dialogs.pinned`` is the projection for the main list.  A pin
+            # update scoped to another folder must not change that bit.
+            if known_dialog and published_folder == 0:
                 self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
-            folder_id = getattr(update, "folder_id", None)
-            published_folder = self._published_pin_folder(folder_id)
             if published_folder is not None:
                 if pinned:
                     self._append_published_pin(published_folder, dialog_id)
@@ -1823,12 +1825,16 @@ class EventHandlerManager:
         # A folder-scoped update carries only pins *within* that folder, so we
         # must not use it to clear pins in other folders.
         folder_id = update.folder_id
+        published_folder = self._published_pin_folder(folder_id)
+        is_main_folder = published_folder == 0
         pinned_ids = self._collect_pinned_dialog_ids(cast(Sequence[object], order))
         with self._conn:
             for dialog_id in pinned_ids:
-                if self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None:
+                if is_main_folder and self._conn.execute(
+                    "SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)
+                ).fetchone() is not None:
                     self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (1, now, dialog_id))
-            if folder_id is None:
+            if is_main_folder:
                 # Main list: rewrite the full pin set — the update is
                 # authoritative for all main-list pins.
                 if pinned_ids:
@@ -1841,7 +1847,6 @@ class EventHandlerManager:
                     # Empty order list → all dialogs unpinned in main list.
                     # NOT IN () is invalid SQLite — use the dedicated SQL.
                     self._conn.execute(_CLEAR_ALL_PINS_SQL, (now,))
-            published_folder = self._published_pin_folder(folder_id)
             if published_folder is not None:
                 self._conn.execute("DELETE FROM dialog_directory_published_pins WHERE folder_id=?", (published_folder,))
                 self._conn.executemany(

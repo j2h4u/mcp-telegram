@@ -12,7 +12,7 @@ from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.folders.contracts import FolderRule, FolderRuleObservation
 from mcp_telegram.folders.refresh import FolderRefresher
 from mcp_telegram.folders.sqlite_repository import SQLiteFolderSnapshotRepository
-from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker
+from mcp_telegram.folders.worker import FolderAttemptResult, FolderProjectionDemandAdapter, FolderProjectionWorker
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 
@@ -95,7 +95,7 @@ async def test_unexpected_folder_failure_uses_bounded_retry_cadence(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_latched_folder_failure_uses_bounded_retry_cadence(tmp_path: Path) -> None:
+async def test_latched_folder_failure_propagates_without_private_retry(tmp_path: Path) -> None:
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
@@ -111,8 +111,31 @@ async def test_latched_folder_failure_uses_bounded_retry_cadence(tmp_path: Path)
             FolderRefresher(Gateway(), repository), repository, asyncio.Event(), _Policy(), clock=lambda: 1000.0
         )
         adapter = FolderProjectionDemandAdapter(worker)
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        with pytest.raises(TelegramRpcThrottled, match="circuit open"):
+            await adapter.run_slice(RpcAttemptBudget(limit=1))
+        assert repository.read_next_retry_at() is None
+        assert adapter.status(1000.0) is not None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("outcome", [FolderAttemptResult.CIRCUIT_OPEN, FolderAttemptResult.UNEXPECTED])
+def test_legacy_failure_without_retry_is_immediately_due(tmp_path: Path, outcome: FolderAttemptResult) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    try:
+        repository = SQLiteFolderSnapshotRepository(conn)
+        repository.record_attempt(
+            attempted_at=999,
+            outcome=outcome,
+            next_retry_at=None,
+            consecutive_failures=1,
+        )
+        adapter = FolderProjectionDemandAdapter(
+            FolderProjectionWorker(_Gateway(), repository, asyncio.Event(), _Policy(), clock=lambda: 1000.0)
+        )
         status = adapter.status(1000.0)
-        assert status is not None and status.release_at == 1001.0
+        assert status is not None and status.release_at == 1000.0
     finally:
         conn.close()

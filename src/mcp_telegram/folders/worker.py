@@ -10,7 +10,7 @@ from collections.abc import Callable
 from enum import StrEnum
 from typing import Protocol
 
-from ..flood import TelegramRpcThrottled
+from ..flood import TelegramRpcThrottled, _raise_if_latched
 from ..telegram_demand import (
     DemandStatus,
     DurableDemandAdapter,
@@ -115,6 +115,10 @@ class FolderProjectionWorker:
             except FolderSourceUnavailableError, TimeoutError, OSError:
                 self._record_failure(FolderAttemptResult.SOURCE_UNAVAILABLE, None)
             except TelegramRpcThrottled as exc:
+                # An account circuit is a coordinator-owned latch.  Let the
+                # existing convention propagate it so this demand does not
+                # create a private retry loop against a blocked account.
+                _raise_if_latched(exc)
                 self._record_failure(
                     FolderAttemptResult.CIRCUIT_OPEN
                     if exc.retry_after_seconds is None
@@ -157,7 +161,10 @@ class FolderProjectionDemandAdapter(DurableDemandAdapter):
         if retry is not None:
             return DemandStatus(release_at=float(retry))
         if outcome in {FolderAttemptResult.CIRCUIT_OPEN, FolderAttemptResult.UNEXPECTED}:
-            return None
+            # Older versions persisted these outcomes without a retry time.
+            # Treat that state as immediately due so an upgrade cannot mute
+            # folder projection permanently.
+            return DemandStatus(release_at=now)
         success = repository.read_last_success_at()
         if success is None:
             return DemandStatus(release_at=now)

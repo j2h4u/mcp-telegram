@@ -544,6 +544,73 @@ async def test_realtime_single_pin_toggle_preserves_existing_published_order(
 
 
 @pytest.mark.asyncio
+async def test_realtime_archive_single_pin_toggle_preserves_main_pin(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    main_dialog = get_peer_id(PeerUser(user_id=721))
+    archive_dialog = get_peer_id(PeerUser(user_id=722))
+    for dialog_id, pinned in ((main_dialog, 1), (archive_dialog, 0)):
+        _insert_dialog(sync_db, dialog_id, pinned=pinned, snapshot_at=1)
+    sync_db.executemany(
+        "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (?,?,?)",
+        [(0, main_dialog, 0), (1, archive_dialog, 0)],
+    )
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+
+    await manager.on_raw_dialog_pinned(
+        UpdateDialogPinned(peer=DialogPeer(peer=PeerUser(user_id=722)), pinned=True, folder_id=1)
+    )
+    await manager.on_raw_dialog_pinned(
+        UpdateDialogPinned(peer=DialogPeer(peer=PeerUser(user_id=721)), pinned=False, folder_id=1)
+    )
+
+    assert _dialog_row(sync_db, main_dialog)["pinned"] == 1
+    assert _dialog_row(sync_db, archive_dialog)["pinned"] == 0
+    assert sync_db.execute(
+        "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=0 ORDER BY position"
+    ).fetchall() == [(main_dialog, 0)]
+    assert sync_db.execute(
+        "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=1 ORDER BY position"
+    ).fetchall() == [(archive_dialog, 0)]
+
+
+@pytest.mark.asyncio
+async def test_realtime_archive_pin_rewrite_preserves_main_pin_and_scope(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    main_dialog = get_peer_id(PeerUser(user_id=731))
+    old_archive_dialog = get_peer_id(PeerUser(user_id=732))
+    new_archive_dialog = get_peer_id(PeerUser(user_id=733))
+    for dialog_id, pinned in ((main_dialog, 1), (old_archive_dialog, 0), (new_archive_dialog, 0)):
+        _insert_dialog(sync_db, dialog_id, pinned=pinned, snapshot_at=1)
+    sync_db.executemany(
+        "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (?,?,?)",
+        [(0, main_dialog, 0), (1, old_archive_dialog, 0)],
+    )
+
+    await _make_manager(mock_client, sync_db, shutdown_event).on_raw_dialog_pinned(
+        UpdatePinnedDialogs(
+            folder_id=1,
+            order=[DialogPeer(peer=PeerUser(user_id=733))],
+        )
+    )
+
+    assert _dialog_row(sync_db, main_dialog)["pinned"] == 1
+    assert _dialog_row(sync_db, old_archive_dialog)["pinned"] == 0
+    assert _dialog_row(sync_db, new_archive_dialog)["pinned"] == 0
+    assert sync_db.execute(
+        "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=0 ORDER BY position"
+    ).fetchall() == [(main_dialog, 0)]
+    assert sync_db.execute(
+        "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=1 ORDER BY position"
+    ).fetchall() == [(new_archive_dialog, 0)]
+
+
+@pytest.mark.asyncio
 async def test_update_dialog_unread_mark_sets_needs_refresh(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
