@@ -12,18 +12,15 @@ Architecture:
   WAL before the daemon disconnects.
 
 Event handlers:
-- EventHandlerManager is registered BEFORE Telegram connect() so Telethon
-  catch_up=True replays missed updates into live handlers, not an empty handler
-  set.  It also remains registered BEFORE FullSyncWorker starts so no real-time
-  events are missed during initial bulk fetch.  INSERT OR REPLACE handles any
-  overlap between real-time and bulk paths idempotently.
+- A startup barrier is attached before connect. Telethon's persisted catch-up
+  reaches the registered callbacks but they wait until account bind succeeds.
 - synced_dialogs set is refreshed every heartbeat so newly enrolled dialogs
   are picked up within one interval without re-registering handlers.
 - Durable Telegram work is selected and executed by one coordinator task.
 
 Delta catch-up:
-- connect() called with catch_up=True — Telethon replays missed updates via PTS
-  on reconnect after handlers are already registered.
+- connect() retains Telethon's catch_up=True persisted update recovery; the
+  reconnect loop invokes public catch_up() after later reconnects.
 - reconnect_catch_up_loop polls public connection state and invokes public
   catch_up() once per observed disconnected→connected transition.
 - Delta gap and access recovery are durable demand slices selected by the
@@ -74,9 +71,10 @@ from .demand_composition import (
     DemandCompositionDependencies,
     build_durable_coordinator,
 )
+from .dialog_directory import CanonicalDialogDirectory
 from .dialog_sync import DialogReconciliationWorker
 from .entity_profile.refresh import RefreshLimits
-from .event_handlers import EventHandlerManager
+from .event_handlers import EventHandlerManager, UpdateProcessingBarrier
 from .fact_hydration import MessageFactHydrationWorker
 from .feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
 from .feedback_service import FeedbackApplicationService
@@ -110,6 +108,10 @@ from .reconnect import run_reconnect_catch_up_loop
 from .rpc_admission_observations import RpcAdmissionObservationAggregator
 from .runtime_observations import RuntimeObservationSink, prune_runtime_observations, record_runtime_observation
 from .scheduled_messages import ScheduledMessageReconciler, ScheduledReconciliationPolicy
+from .self_profile_maintenance import (
+    SelfProfileMaintenanceDemandAdapter,
+    SelfProfileMaintenanceDependencies,
+)
 from .startup_identity import (
     StartupIdentityResult,
     StartupIdentityState,
@@ -127,15 +129,17 @@ from .sync_db import (
 )
 from .sync_worker import FullSyncWorker
 from .telegram import create_client
-from .telegram_demand import DemandStatus, demand_context
+from .telegram_demand import DemandStatus, RpcAttemptBudget, demand_context
 from .telegram_demand_coordinator import TelegramDemandCoordinator
 from .telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from .telegram_rpc import TelegramRpcCooldownPersistence
-from .telegram_rpc_consumers import DemandKind
+from .telegram_rpc_consumers import DemandKind, demand_contract
 from .telegram_rpc_scheduler import (
     AdmissionObserver,
+    RpcAdmissionClosedError,
     RpcAdmissionEvent,
     RpcAdmissionEventKind,
+    TelegramRpcAdmissionDeferred,
 )
 from .topics.refresh import TopicRefresher
 from .topics.sqlite_repository import SQLiteTopicSnapshotRepository
@@ -328,6 +332,7 @@ class _DemandRuntime:
     coordinator: TelegramDemandCoordinator
     scheduled_reconciler: ScheduledMessageReconciler
     dialog_reconciliation_worker: DialogReconciliationWorker
+    dialog_directory: CanonicalDialogDirectory
     message_fact_refresh_deps: MessageFactRefreshDeps
     read_receipt_batch: Callable[[], Awaitable[object]]
     startup_identity: StartupIdentityState
@@ -1229,6 +1234,58 @@ async def _connect_telegram(ctx: _SyncMainContext) -> bool:
     return True
 
 
+async def _acquire_startup_identity_before_updates(
+    ctx: _SyncMainContext,
+    directory: CanonicalDialogDirectory,
+) -> StartupIdentityState:
+    """Run the established classified startup identity path while updates wait."""
+    startup = StartupIdentityState.begin()
+
+    async def get_self_input_entity(account_id: int) -> object:
+        return await ctx.client.get_input_entity(account_id)
+
+    async def get_full_self_user(input_user: object) -> object:
+        return await ctx.client(GetFullUserRequest(id=cast(TypeInputUser, input_user)))
+
+    def publish(profile: object, own_only_context: OwnOnlyContext) -> None:
+        directory.bind_account_id(own_only_context.account_id)
+        _publish_startup_identity(ctx, profile, own_only_context)
+
+    adapter = SelfProfileMaintenanceDemandAdapter(
+        SelfProfileMaintenanceDependencies(
+            cadence=ctx.self_profile_cadence,
+            get_me=ctx.client.get_me,
+            update_profile=lambda profile: _update_self_profile(ctx.api_server, cast(_MeLike, profile)),
+            startup=startup,
+            get_input_entity=get_self_input_entity,
+            get_full_user=get_full_self_user,
+            publish_startup_identity=publish,
+        )
+    )
+    limit = demand_contract(DemandKind.SELF_PROFILE_MAINTENANCE).max_rpc_attempts_per_slice
+    if limit is None:
+        raise RuntimeError("startup identity has no RPC attempt bound")
+    while startup.pending:
+        if ctx.shutdown_event.is_set():
+            raise asyncio.CancelledError
+        try:
+            await adapter.run_slice(RpcAttemptBudget(limit))
+        except TelegramRpcAdmissionDeferred as exc:
+            if await sleep_through_flood(ctx.shutdown_event, exc.retry_after_seconds or 1):
+                raise asyncio.CancelledError from None
+        except TelegramRpcThrottled as exc:
+            if exc.latched:
+                raise
+            if await sleep_through_flood(ctx.shutdown_event, exc.retry_after_seconds or 1):
+                raise asyncio.CancelledError from None
+        except RpcAdmissionClosedError:
+            raise
+        else:
+            await asyncio.sleep(0)
+    startup.result()
+    return startup
+
+
 async def _wait_for_startup_identity(
     startup: StartupIdentityState,
     shutdown_event: asyncio.Event,
@@ -1266,6 +1323,9 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     identity = await _wait_for_startup_identity(ctx.demand_runtime.startup_identity, ctx.shutdown_event)
     assert ctx.api_server.self_id is not None
     assert ctx.own_only_context == identity.own_only_context
+    # The directory's account fence is durable and must settle before event
+    # ownership and API readiness can expose the authenticated account.
+    ctx.demand_runtime.dialog_directory.bind_account_id(ctx.api_server.self_id)
     assert ctx.handler_manager is not None
     ctx.handler_manager.set_self_id(ctx.api_server.self_id)
     ensure_own_only_schema(ctx.conn)
@@ -1373,6 +1433,8 @@ def _build_demand_runtime(
     ctx: _SyncMainContext,
     full_sync_worker: FullSyncWorker,
     delta_sync_worker: DeltaSyncWorker,
+    dialog_directory: CanonicalDialogDirectory,
+    startup_identity: StartupIdentityState,
 ) -> _DemandRuntime:
     """Build the exhaustive durable coordinator after event handlers exist."""
     if ctx.handler_manager is None:
@@ -1383,7 +1445,6 @@ def _build_demand_runtime(
         raise RuntimeError("entity profile refresh coordinator is unavailable")
 
     message_fact_refresh_deps = _build_message_fact_refresh_dependencies(ctx)
-    startup_identity = StartupIdentityState.begin()
     scheduled_reconciler = ScheduledMessageReconciler(
         ctx.client,
         ctx.conn,
@@ -1400,7 +1461,6 @@ def _build_demand_runtime(
         ctx.shutdown_event,
         ctx.topic_refresher,
     )
-
     async def read_receipt_batch() -> object:
         return await _initialize_read_positions(
             ctx.client,
@@ -1433,6 +1493,7 @@ def _build_demand_runtime(
             full_sync_worker=full_sync_worker,
             delta_sync_worker=delta_sync_worker,
             dm_gap_scanner=cast(DmGapScanPage, ctx.handler_manager),
+            dialog_directory=dialog_directory,
             dialog_reconciliation_worker=dialog_reconciliation_worker,
             entity_refresh_coordinator=entity_refresh_coordinator,
             fact_hydration_worker=ctx.fact_hydration_worker,
@@ -1461,6 +1522,7 @@ def _build_demand_runtime(
         coordinator=coordinator,
         scheduled_reconciler=scheduled_reconciler,
         dialog_reconciliation_worker=dialog_reconciliation_worker,
+        dialog_directory=dialog_directory,
         message_fact_refresh_deps=message_fact_refresh_deps,
         read_receipt_batch=read_receipt_batch,
         startup_identity=startup_identity,
@@ -1471,11 +1533,19 @@ def _ensure_demand_runtime(
     ctx: _SyncMainContext,
     full_sync_worker: FullSyncWorker,
     delta_sync_worker: DeltaSyncWorker,
+    dialog_directory: CanonicalDialogDirectory,
+    startup_identity: StartupIdentityState,
 ) -> _DemandRuntime:
     """Install and wire the single process-wide durable coordinator."""
     if ctx.demand_runtime is not None:
         return ctx.demand_runtime
-    demand_runtime = _build_demand_runtime(ctx, full_sync_worker, delta_sync_worker)
+    demand_runtime = _build_demand_runtime(
+        ctx,
+        full_sync_worker,
+        delta_sync_worker,
+        dialog_directory,
+        startup_identity,
+    )
     ctx.demand_runtime = demand_runtime
     ctx.coordinator = demand_runtime.coordinator
     ctx.api_server.bind_demand_sink(demand_runtime.coordinator)
@@ -1657,17 +1727,38 @@ async def sync_main() -> None:
         )
         await _run_fts_backfill(ctx)
 
+        update_barrier = UpdateProcessingBarrier(closed=True)
         input_peer_resolver = cast(InputPeerResolver, partial(resolve_input_peer, cast(ActivityClient, ctx.client)))
-        ctx.handler_manager = EventHandlerManager(ctx.client, ctx.conn, ctx.shutdown_event, input_peer_resolver)
+        ctx.handler_manager = EventHandlerManager(
+            ctx.client,
+            ctx.conn,
+            ctx.shutdown_event,
+            input_peer_resolver,
+            update_barrier=update_barrier,
+        )
         ctx.handler_manager.register()
-        logger.info("event handlers registered")
+        logger.info("event handlers registered behind startup account barrier")
 
         if not await _connect_telegram(ctx):
             return
 
-        # Telethon owns initial catch-up through catch_up=True. Keep the
-        # application-owned transition watcher live for the rest of startup
-        # and the daemon lifetime so transient reconnects are observed too.
+        dialog_directory = CanonicalDialogDirectory(
+            ctx.client,
+            ctx.db_path,
+            ctx.shutdown_event,
+            startup_detail_setter=lambda detail: setattr(ctx.api_server, "startup_detail", detail),
+        )
+        startup_identity = await _acquire_startup_identity_before_updates(ctx, dialog_directory)
+        assert ctx.api_server.self_id is not None
+        ctx.handler_manager.set_self_id(ctx.api_server.self_id)
+
+        delta_worker = DeltaSyncWorker(cast(_DeltaSyncClient, ctx.client), ctx.conn, ctx.shutdown_event)
+        worker = FullSyncWorker(ctx.client, ctx.conn, ctx.shutdown_event)
+        _ensure_demand_runtime(ctx, worker, delta_worker, dialog_directory, startup_identity)
+        update_barrier.open()
+
+        # Keep the transition watcher live for later reconnects. Initial
+        # catch-up is already retained by Telethon behind the startup barrier.
         _create_tracked_task(
             ctx,
             run_reconnect_catch_up_loop(
@@ -1679,9 +1770,6 @@ async def sync_main() -> None:
             name="reconnect_catch_up_loop",
         )
 
-        delta_worker = DeltaSyncWorker(cast(_DeltaSyncClient, ctx.client), ctx.conn, ctx.shutdown_event)
-        worker = FullSyncWorker(ctx.client, ctx.conn, ctx.shutdown_event)
-        _ensure_demand_runtime(ctx, worker, delta_worker)
         await _prime_runtime(ctx)
         _offer_startup_demands(ctx)
         await _run_daemon_lifetime(ctx)

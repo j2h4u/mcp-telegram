@@ -678,6 +678,7 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.DIALOG_BOOTSTRAP,
         TelegramRpcSource.DIALOG_SYNC,
         _DURABLE,
+        freshness_target=timedelta(seconds=900),
         max_rpc_attempts_per_slice=32,
     ),
     DemandKind.DIALOG_LIGHT_RECONCILIATION: _contract(

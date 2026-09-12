@@ -25,6 +25,7 @@ import pytest
 from helpers import build_mock_message
 from mcp_telegram.event_handlers import (
     EventHandlerManager,
+    UpdateProcessingBarrier,
     _DeletedMessagesEvent,
     _EditedMessageEvent,
     _NewMessageEvent,
@@ -41,6 +42,24 @@ from mcp_telegram.telegram_rpc_consumers import DemandKind, TelegramRpcSource
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 _SQLiteConnection = sqlite3.Connection
+
+
+@pytest.mark.asyncio
+async def test_startup_update_barrier_waits_then_cancels_cleanly() -> None:
+    shutdown = asyncio.Event()
+    barrier = UpdateProcessingBarrier(closed=True)
+    waiting = asyncio.create_task(barrier.wait(shutdown))
+    await asyncio.sleep(0)
+    assert not waiting.done()
+    barrier.open()
+    await waiting
+
+    cancelled = UpdateProcessingBarrier(closed=True)
+    waiting = asyncio.create_task(cancelled.wait(shutdown))
+    await asyncio.sleep(0)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
 
 
 def make_new_message_event(

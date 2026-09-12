@@ -151,6 +151,8 @@ def _demand_root[**P, R](
     def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
         @wraps(func)
         async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            manager = cast(EventHandlerManager, args[0])
+            await manager._wait_for_update_barrier()
             try:
                 current_demand_token()
             except UnclassifiedTelegramDemandError:
@@ -161,6 +163,41 @@ def _demand_root[**P, R](
         return wrapped
 
     return decorator
+
+
+class UpdateProcessingBarrier:
+    """Startup-only gate that retains Telethon-delivered updates until account bind."""
+
+    def __init__(self, *, closed: bool = False) -> None:
+        self._opened = asyncio.Event()
+        self._cancelled = False
+        if not closed:
+            self._opened.set()
+
+    def open(self) -> None:
+        if not self._cancelled:
+            self._opened.set()
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        self._opened.set()
+
+    async def wait(self, shutdown_event: asyncio.Event) -> None:
+        if self._cancelled or shutdown_event.is_set():
+            raise asyncio.CancelledError
+        if self._opened.is_set():
+            return
+        opened_wait = asyncio.create_task(self._opened.wait())
+        shutdown_wait = asyncio.create_task(shutdown_event.wait())
+        try:
+            await asyncio.wait((opened_wait, shutdown_wait), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (opened_wait, shutdown_wait):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(opened_wait, shutdown_wait, return_exceptions=True)
+        if self._cancelled or shutdown_event.is_set():
+            raise asyncio.CancelledError
 
 
 def _acquisition[**P, R](
@@ -553,10 +590,12 @@ class EventHandlerManager:
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
         input_peer_resolver: InputPeerResolver,
+        update_barrier: UpdateProcessingBarrier | None = None,
     ) -> None:
         self._client = client
         self._conn = conn
         self._shutdown_event = shutdown_event
+        self._update_barrier = update_barrier
         self._input_peer_resolver = input_peer_resolver
         self._shutdown_event.is_set()
         self._synced_dialog_ids: set[int] = set()
@@ -568,6 +607,10 @@ class EventHandlerManager:
     def bind_demand_sink(self, sink: DemandOfferSink) -> None:
         """Attach post-commit durable wakeups after daemon composition."""
         self._demand_sink = sink
+
+    async def _wait_for_update_barrier(self) -> None:
+        if self._update_barrier is not None:
+            await self._update_barrier.wait(self._shutdown_event)
 
     def _require_demand_sink(self) -> DemandOfferSink:
         sink = self._demand_sink
@@ -659,6 +702,8 @@ class EventHandlerManager:
 
     def unregister(self) -> None:
         """Remove all handlers from the client (graceful shutdown)."""
+        if self._update_barrier is not None:
+            self._update_barrier.cancel()
         self._client.remove_event_handler(self.on_new_message)
         self._client.remove_event_handler(self.on_raw_topic_message)
         self._client.remove_event_handler(self.on_message_edited)
@@ -2181,6 +2226,7 @@ class EventHandlerManager:
 
 
 _EXPORTED_SYMBOLS = (
+    UpdateProcessingBarrier,
     EventHandlerManager,
     EventHandlerManager.register,
     EventHandlerManager.unregister,

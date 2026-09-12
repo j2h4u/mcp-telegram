@@ -13,7 +13,7 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 63
+_CURRENT_SCHEMA_VERSION = 64
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -28,6 +28,7 @@ _DOMAIN_RESUME_STATE_MIGRATION_60 = 60
 _ENTITY_PROFILE_ACQUISITION_MIGRATION_61 = 61
 _ENTITY_PROFILE_METADATA_MIGRATION_62 = 62
 _REALTIME_DM_DIALOG_BACKFILL_MIGRATION_63 = 63
+_CANONICAL_DIALOG_DIRECTORY_MIGRATION_64 = 64
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
@@ -728,6 +729,100 @@ BEGIN
        SET revision = OLD.revision + 1
      WHERE dialog_id = NEW.dialog_id;
 END
+"""
+
+# The directory keeps one restartable acquisition and one small staging area.
+# Completed staging is discarded at publication; this is deliberately not a
+# snapshot history table.
+_DIALOG_DIRECTORY_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS dialog_directory_state (
+    singleton                  INTEGER PRIMARY KEY CHECK(singleton = 1),
+    account_id                 INTEGER,
+    generation                 INTEGER NOT NULL CHECK(generation >= 1),
+    status                     TEXT NOT NULL CHECK(status IN ('pending', 'in_progress', 'complete', 'incomplete', 'invalid')),
+    ordinary_status            TEXT NOT NULL CHECK(ordinary_status IN ('pending', 'complete', 'incomplete', 'invalid')),
+    pinned_main_status         TEXT NOT NULL CHECK(pinned_main_status IN ('pending', 'complete', 'incomplete', 'invalid')),
+    pinned_archive_status      TEXT NOT NULL CHECK(pinned_archive_status IN ('pending', 'complete', 'incomplete', 'invalid')),
+    offset_date                TEXT,
+    offset_id                  INTEGER NOT NULL DEFAULT 0,
+    offset_peer                TEXT,
+    observation_started_at     INTEGER,
+    observation_completed_at   INTEGER,
+    observed_count             INTEGER NOT NULL DEFAULT 0 CHECK(observed_count >= 0),
+    retry_at                   INTEGER,
+    reason                     TEXT
+)
+"""
+
+_DIALOG_DIRECTORY_STAGING_DDL = """
+CREATE TABLE IF NOT EXISTS dialog_directory_staging (
+    generation          INTEGER NOT NULL,
+    dialog_id           INTEGER NOT NULL,
+    source              TEXT NOT NULL,
+    peer_kind           TEXT NOT NULL,
+    top_message         INTEGER NOT NULL,
+    name                TEXT,
+    type                TEXT NOT NULL,
+    archived            INTEGER NOT NULL CHECK(archived IN (0, 1)),
+    pinned              INTEGER NOT NULL CHECK(pinned IN (0, 1)),
+    members             INTEGER,
+    created             INTEGER,
+    last_message_at     INTEGER,
+    read_inbox_max_id   INTEGER,
+    read_outbox_max_id  INTEGER,
+    unread_mentions_count INTEGER,
+    unread_reactions_count INTEGER,
+    unread_count        INTEGER,
+    unread_mark         INTEGER,
+    draft_text          TEXT,
+    snapshot_at         INTEGER NOT NULL,
+    baseline_revision   INTEGER,
+    PRIMARY KEY(generation, dialog_id)
+) WITHOUT ROWID
+"""
+
+_DIALOG_DIRECTORY_BASELINE_DDL = """
+CREATE TABLE IF NOT EXISTS dialog_directory_baseline (
+    generation        INTEGER NOT NULL,
+    dialog_id         INTEGER NOT NULL,
+    baseline_revision INTEGER NOT NULL CHECK(baseline_revision >= 0),
+    seen              INTEGER NOT NULL DEFAULT 0 CHECK(seen IN (0, 1)),
+    PRIMARY KEY(generation, dialog_id)
+) WITHOUT ROWID
+"""
+
+_DIALOG_DIRECTORY_PINS_DDL = """
+CREATE TABLE IF NOT EXISTS dialog_directory_pins (
+    generation INTEGER NOT NULL,
+    folder_id  INTEGER NOT NULL CHECK(folder_id IN (0, 1)),
+    dialog_id  INTEGER NOT NULL,
+    position   INTEGER NOT NULL CHECK(position >= 0),
+    PRIMARY KEY(generation, folder_id, dialog_id)
+) WITHOUT ROWID
+"""
+
+_DIALOG_DIRECTORY_UNSEEN_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_dialog_directory_unseen
+ON dialog_directory_baseline(generation, seen, dialog_id)
+"""
+
+_DIALOG_DIRECTORY_PUBLICATION_DDL = """
+CREATE TABLE IF NOT EXISTS dialog_directory_publication (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    account_id INTEGER,
+    generation INTEGER,
+    observation_started_at INTEGER,
+    observation_completed_at INTEGER
+)
+"""
+
+_DIALOG_DIRECTORY_PUBLISHED_PINS_DDL = """
+CREATE TABLE IF NOT EXISTS dialog_directory_published_pins (
+    folder_id INTEGER NOT NULL CHECK(folder_id IN (0, 1)),
+    dialog_id INTEGER NOT NULL,
+    position INTEGER NOT NULL CHECK(position >= 0),
+    PRIMARY KEY(folder_id, dialog_id)
+) WITHOUT ROWID
 """
 
 _DELTA_ACCESS_RECOVERY_STATE_DDL = """
@@ -3437,6 +3532,76 @@ def _apply_migration_63(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
+def _apply_migration_64(conn: sqlite3.Connection, current: int) -> int:
+    """Install the single-generation canonical dialog-directory lifecycle.
+
+    The old full-reconciliation state is evidence of an attempted wrapper
+    traversal, not a raw-directory receipt. Keep its generation and cursor
+    for diagnostics, but never promote it to complete or clear cached rows.
+    """
+    if current >= _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(_DIALOG_DIRECTORY_STATE_DDL)
+        conn.execute(_DIALOG_DIRECTORY_STAGING_DDL)
+        conn.execute(_DIALOG_DIRECTORY_BASELINE_DDL)
+        conn.execute(_DIALOG_DIRECTORY_PINS_DDL)
+        conn.execute(_DIALOG_DIRECTORY_UNSEEN_INDEX_DDL)
+        conn.execute(_DIALOG_DIRECTORY_PUBLICATION_DDL)
+        conn.execute(_DIALOG_DIRECTORY_PUBLISHED_PINS_DDL)
+        conn.execute("INSERT OR IGNORE INTO dialog_directory_publication(singleton) VALUES (1)")
+        legacy = cast(
+            tuple[int, str, str | None, int, str | None, int] | None,
+            conn.execute(
+                "SELECT generation, status, offset_date, offset_id, offset_peer, observed_count "
+                "FROM dialog_full_reconciliation_state WHERE singleton=1"
+            ).fetchone(),
+        )
+        generation = 1
+        status = "pending"
+        offset_date: str | None = None
+        offset_id = 0
+        offset_peer: str | None = None
+        observed_count = 0
+        reason: str | None = None
+        if legacy is not None:
+            generation = max(1, legacy[0])
+            if legacy[1] == "in_progress":
+                # The identity is preserved, but a wrapper cursor is never
+                # decoded as raw state. The owner restarts generation 1.
+                status = "pending"
+                offset_date, offset_id, offset_peer, observed_count = legacy[2:]
+                reason = "legacy_wrapper_cursor_unverified"
+        conn.execute(
+            "INSERT OR IGNORE INTO dialog_directory_state("
+            "singleton,generation,status,ordinary_status,pinned_main_status,pinned_archive_status,"
+            "offset_date,offset_id,offset_peer,observed_count,reason) "
+            "VALUES (1,?,?,?,?,?,?,?,?,?,?)",
+            (
+                generation,
+                status,
+                "pending",
+                "pending",
+                "pending",
+                offset_date,
+                offset_id,
+                offset_peer,
+                observed_count,
+                reason,
+            ),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
+            (_CANONICAL_DIALOG_DIRECTORY_MIGRATION_64,),
+        )
+        conn.commit()
+        return _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -3517,6 +3682,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_62(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _REALTIME_DM_DIALOG_BACKFILL_MIGRATION_63:
         current = _apply_migration_63(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64:
+        current = _apply_migration_64(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

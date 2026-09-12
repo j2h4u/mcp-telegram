@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from mcp_telegram.daemon import (
+    _acquire_startup_identity_before_updates,
     _ensure_demand_runtime,
     _offer_startup_demands,
     _prime_runtime,
@@ -19,12 +20,14 @@ from mcp_telegram.daemon import (
     _SyncMainContext,
     _wait_for_startup_identity,
 )
+from mcp_telegram.dialog_directory import CanonicalDialogDirectory
 from mcp_telegram.own_only_contracts import OwnOnlyContext
 from mcp_telegram.startup_identity import (
     StartupIdentityResult,
     StartupIdentityState,
     StartupIdentityUnavailableError,
 )
+from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 
 
@@ -88,8 +91,12 @@ class _ApiStub:
         self.self_profile: dict[str, object] | None = None
         self.startup_detail = ""
         self._ready = False
+        self._client = object()
 
     async def shutdown(self) -> None:
+        return
+
+    def _publish_auth_scope(self, _scope: object) -> None:
         return
 
 
@@ -111,6 +118,9 @@ class _ClientStub:
     def set_rpc_admission_observer(self, observer: object | None) -> None:
         self.observer_detached = observer is None
 
+    async def get_me(self) -> object:
+        return SimpleNamespace(id=1)
+
 
 class _ConnectionStub:
     def __init__(self) -> None:
@@ -121,6 +131,29 @@ class _ConnectionStub:
 
     def close(self) -> None:
         self.close_calls += 1
+
+
+class _StartupIdentityClient(_ClientStub):
+    def __init__(self, account_id: int) -> None:
+        super().__init__()
+        self._account_id = account_id
+
+    async def get_me(self) -> object:
+        return SimpleNamespace(id=self._account_id)
+
+    async def get_input_entity(self, _account_id: int) -> object:
+        return object()
+
+    async def __call__(self, _request: object) -> object:
+        return SimpleNamespace(full_user=SimpleNamespace(personal_channel_id=None))
+
+
+class _CadenceStub:
+    def status(self, _now: float) -> None:
+        return None
+
+    def mark_refreshed(self, _completed_at: float) -> None:
+        return
 
 
 def test_sync_main_has_one_coordinator_task_and_no_retired_launcher() -> None:
@@ -169,9 +202,13 @@ async def test_prime_runtime_waits_for_coordinator_profile_and_offers_folder() -
     startup_identity.advance_profile(SimpleNamespace(id=42))
     startup_identity.advance_input_user(object())
     startup_identity.complete(StartupIdentityResult(SimpleNamespace(id=42), own_only_context))
+    bound_account_ids: list[int] = []
     ctx = _typed_ctx(
         coordinator=coordinator,
-        demand_runtime=SimpleNamespace(startup_identity=startup_identity),
+        demand_runtime=SimpleNamespace(
+            startup_identity=startup_identity,
+            dialog_directory=SimpleNamespace(bind_account_id=bound_account_ids.append),
+        ),
         handler_manager=handler,
         api_server=api,
         conn=conn,
@@ -187,9 +224,69 @@ async def test_prime_runtime_waits_for_coordinator_profile_and_offers_folder() -
         conn.close()
 
     assert handler.self_ids == [42]
+    assert bound_account_ids == [42]
     assert ctx.own_only_context == OwnOnlyContext(account_id=42)
     assert coordinator.offered == [DemandKind.SELF_PROFILE_MAINTENANCE, DemandKind.FOLDER_SNAPSHOT]
     assert api._ready is True
+
+
+@pytest.mark.asyncio
+async def test_classified_startup_identity_mismatch_preserves_directory_rows(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute("UPDATE dialog_directory_state SET account_id=100")
+        conn.execute(
+            "INSERT INTO dialogs(dialog_id,name,type,unread_count,snapshot_at,hidden) VALUES (7,'kept','user',4,1,0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    shutdown = asyncio.Event()
+    ctx = _typed_ctx(
+        db_path=db_path,
+        shutdown_event=shutdown,
+        client=_StartupIdentityClient(101),
+        api_server=_ApiStub(),
+        self_profile_cadence=_CadenceStub(),
+    )
+    directory = CanonicalDialogDirectory(ctx.client, db_path, shutdown)
+
+    with pytest.raises(StartupIdentityUnavailableError, match="startup identity"):
+        await _acquire_startup_identity_before_updates(ctx, directory)
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT account_id FROM dialog_directory_state").fetchone() == (100,)
+        assert conn.execute("SELECT unread_count,revision FROM dialogs WHERE dialog_id=7").fetchone() == (4, 0)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_classified_startup_identity_binds_matching_account(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    shutdown = asyncio.Event()
+    ctx = _typed_ctx(
+        db_path=db_path,
+        shutdown_event=shutdown,
+        client=_StartupIdentityClient(101),
+        api_server=_ApiStub(),
+        self_profile_cadence=_CadenceStub(),
+    )
+    directory = CanonicalDialogDirectory(ctx.client, db_path, shutdown)
+
+    startup = await _acquire_startup_identity_before_updates(ctx, directory)
+
+    assert not startup.pending
+    assert ctx.api_server.self_id == 101
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT account_id FROM dialog_directory_state").fetchone() == (101,)
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio

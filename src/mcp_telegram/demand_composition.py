@@ -20,9 +20,12 @@ from mcp_telegram.delta_sync import (
     DeltaSyncWorker,
     DmGapScanPage,
 )
+from mcp_telegram.dialog_directory import (
+    CanonicalDialogDirectory,
+    CanonicalDialogDirectoryDemandAdapter,
+    CanonicalDirectoryFullDemandAdapter,
+)
 from mcp_telegram.dialog_sync import (
-    DialogBootstrapDemandAdapter,
-    DialogFullReconciliationDemandAdapter,
     DialogLightReconciliationDemandAdapter,
     DialogReconciliationWorker,
 )
@@ -76,6 +79,7 @@ class DemandCompositionDependencies:
     full_sync_worker: FullSyncWorker
     delta_sync_worker: DeltaSyncWorker
     dm_gap_scanner: DmGapScanPage
+    dialog_directory: CanonicalDialogDirectory
     dialog_reconciliation_worker: DialogReconciliationWorker
     entity_refresh_coordinator: EntityRefreshCoordinator
     fact_hydration_worker: MessageFactHydrationWorker
@@ -122,18 +126,16 @@ def build_durable_adapter_map(dependencies: DemandCompositionDependencies) -> Ma
         ),
         DemandKind.FULL_SYNC_DM_ENROLLMENT: FullSyncDmEnrollmentDemandAdapter(dependencies.full_sync_worker),
         DemandKind.FULL_SYNC_PAGE: FullSyncDemandAdapter(dependencies.full_sync_worker),
-        DemandKind.DIALOG_BOOTSTRAP: DialogBootstrapDemandAdapter(
-            dependencies.client,
+        DemandKind.DIALOG_BOOTSTRAP: CanonicalDialogDirectoryDemandAdapter(
+            dependencies.dialog_directory,
             dependencies.conn,
-            dependencies.db_path,
-            dependencies.shutdown_event,
-            startup_detail_setter=dependencies.startup_detail_setter,
         ),
         DemandKind.DIALOG_LIGHT_RECONCILIATION: DialogLightReconciliationDemandAdapter(
             dependencies.dialog_reconciliation_worker
         ),
-        DemandKind.DIALOG_FULL_RECONCILIATION: DialogFullReconciliationDemandAdapter(
-            dependencies.dialog_reconciliation_worker,
+        DemandKind.DIALOG_FULL_RECONCILIATION: CanonicalDirectoryFullDemandAdapter(
+            dependencies.dialog_directory,
+            dependencies.conn,
         ),
         DemandKind.ARCHIVE_BACKFILL: ArchiveBackfillDemandAdapter(
             dependencies.client,

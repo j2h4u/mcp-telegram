@@ -26,9 +26,12 @@ from mcp_telegram.demand_composition import (
     build_durable_adapter_map,
     build_durable_coordinator,
 )
+from mcp_telegram.dialog_directory import (
+    CanonicalDialogDirectory,
+    CanonicalDialogDirectoryDemandAdapter,
+    CanonicalDirectoryFullDemandAdapter,
+)
 from mcp_telegram.dialog_sync import (
-    DialogBootstrapDemandAdapter,
-    DialogFullReconciliationDemandAdapter,
     DialogLightReconciliationDemandAdapter,
 )
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, EntityRefreshCoordinator
@@ -151,6 +154,7 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         "delta": MagicMock(),
         "dm_gap_scanner": _DmGapScanner(),
         "dialog": MagicMock(),
+        "directory": CanonicalDialogDirectory(MagicMock(), db_path, asyncio.Event()),
         "entity": EntityRefreshCoordinator(),
         "hydration": MagicMock(),
         "folder": folder_worker,
@@ -184,6 +188,7 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         full_sync_worker=cast(object, objects["full"]),  # type: ignore[arg-type]
         delta_sync_worker=cast(object, objects["delta"]),  # type: ignore[arg-type]
         dm_gap_scanner=cast(DmGapScanPage, objects["dm_gap_scanner"]),
+        dialog_directory=cast(CanonicalDialogDirectory, objects["directory"]),
         dialog_reconciliation_worker=cast(object, objects["dialog"]),  # type: ignore[arg-type]
         entity_refresh_coordinator=cast(EntityRefreshCoordinator, objects["entity"]),
         fact_hydration_worker=cast(object, objects["hydration"]),  # type: ignore[arg-type]
@@ -234,9 +239,9 @@ def test_adapter_map_is_exact_against_literal_20_kind_class_map(
         DemandKind.LIVE_HYDRATION_BATCH: FactHydrationDemandAdapter,
         DemandKind.FULL_SYNC_DM_ENROLLMENT: FullSyncDmEnrollmentDemandAdapter,
         DemandKind.FULL_SYNC_PAGE: FullSyncDemandAdapter,
-        DemandKind.DIALOG_BOOTSTRAP: DialogBootstrapDemandAdapter,
+        DemandKind.DIALOG_BOOTSTRAP: CanonicalDialogDirectoryDemandAdapter,
         DemandKind.DIALOG_LIGHT_RECONCILIATION: DialogLightReconciliationDemandAdapter,
-        DemandKind.DIALOG_FULL_RECONCILIATION: DialogFullReconciliationDemandAdapter,
+        DemandKind.DIALOG_FULL_RECONCILIATION: CanonicalDirectoryFullDemandAdapter,
         DemandKind.ARCHIVE_BACKFILL: ArchiveBackfillDemandAdapter,
         DemandKind.ARCHIVE_INCREMENTAL: ArchiveIncrementalDemandAdapter,
         DemandKind.COLD_PEER_PAGE: ColdPeerPageDemandAdapter,
@@ -258,11 +263,8 @@ def test_adapter_map_is_exact_against_literal_20_kind_class_map(
     assert adapters[DemandKind.DELTA_GAP_FILL]._dm_gap_scanner is objects["dm_gap_scanner"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DELTA_ACCESS_PROBE]._worker is objects["delta"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DIALOG_LIGHT_RECONCILIATION]._worker is objects["dialog"]  # type: ignore[attr-defined]
-    assert adapters[DemandKind.DIALOG_FULL_RECONCILIATION]._worker is objects["dialog"]  # type: ignore[attr-defined]
-    assert (
-        adapters[DemandKind.DIALOG_FULL_RECONCILIATION]._interval_seconds  # type: ignore[attr-defined]
-        == demand_freshness_seconds(DemandKind.DIALOG_FULL_RECONCILIATION)
-    )
+    assert adapters[DemandKind.DIALOG_BOOTSTRAP]._directory is objects["directory"]  # type: ignore[attr-defined]
+    assert adapters[DemandKind.DIALOG_FULL_RECONCILIATION]._directory is objects["directory"]  # type: ignore[attr-defined]
     assert (
         adapters[DemandKind.ARCHIVE_INCREMENTAL].interval_s  # type: ignore[attr-defined]
         == demand_freshness_seconds(DemandKind.ARCHIVE_INCREMENTAL)
