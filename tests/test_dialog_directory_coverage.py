@@ -21,6 +21,41 @@ def test_coverage_schema_fault_propagates(tmp_path: Path) -> None:
         conn.close()
 
 
+def test_coverage_state_column_fault_propagates() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute(
+            "CREATE TABLE dialog_directory_publication ("
+            "singleton INTEGER PRIMARY KEY, generation INTEGER, observation_started_at INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE dialog_directory_state ("
+            "singleton INTEGER PRIMARY KEY, status TEXT, observation_started_at INTEGER)"
+        )
+        with pytest.raises(sqlite3.OperationalError, match="no such column: reason"):
+            read_dialog_directory_coverage(conn)
+    finally:
+        conn.close()
+
+
+def test_coverage_identity_column_fault_propagates() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute(
+            "CREATE TABLE dialog_directory_publication ("
+            "singleton INTEGER PRIMARY KEY, generation INTEGER, observation_started_at INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE dialog_directory_state ("
+            "singleton INTEGER PRIMARY KEY, status TEXT, reason TEXT, observation_started_at INTEGER)"
+        )
+        conn.execute("CREATE TABLE dialogs (hidden INTEGER, identity_complete INTEGER)")
+        with pytest.raises(sqlite3.OperationalError, match="no such column: d.identity_observed_at"):
+            read_dialog_directory_coverage(conn)
+    finally:
+        conn.close()
+
+
 def test_published_directory_age_uses_acquisition_start_at_exact_stale_boundary(tmp_path: Path) -> None:
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)

@@ -62,6 +62,7 @@ from mcp_telegram.topics.contracts import TopicFact
 from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from tests.daemon_api_policy import make_daemon_api_policy
+from tests.dialog_directory_coverage_fixtures import install_dialog_directory_coverage_schema
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
 
@@ -704,7 +705,12 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             dialog_id   INTEGER PRIMARY KEY,
             name        TEXT,
             type        TEXT,
-            members     INTEGER
+            members     INTEGER,
+            hidden      INTEGER NOT NULL DEFAULT 0,
+            username    TEXT,
+            identity_observed_at INTEGER,
+            identity_complete INTEGER NOT NULL DEFAULT 0,
+            identity_source TEXT
         )
         """
     )
@@ -769,6 +775,7 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
     )
     if with_fts:
         conn.execute(MESSAGES_FTS_DDL)
+    install_dialog_directory_coverage_schema(conn)
     conn.commit()
     return conn
 
@@ -797,7 +804,11 @@ def _make_db_with_dialogs(*, with_fts: bool = False, with_entities: bool = False
             unread_mark             INTEGER,
             unread_count_observed_at INTEGER,
             unread_mark_observed_at INTEGER,
-            draft_text              TEXT
+            draft_text              TEXT,
+            username                TEXT,
+            identity_observed_at    INTEGER,
+            identity_complete       INTEGER NOT NULL DEFAULT 0,
+            identity_source         TEXT
         )
         """
     )
@@ -805,6 +816,7 @@ def _make_db_with_dialogs(*, with_fts: bool = False, with_entities: bool = False
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_type ON dialogs(type)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_snapshot_at ON dialogs(snapshot_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_needs_refresh_hidden ON dialogs(needs_refresh, hidden)")
+    install_dialog_directory_coverage_schema(conn)
     conn.commit()
     return conn
 
@@ -983,17 +995,8 @@ def _publish_test_dialog_directory(
     started_at: int | None = None,
     refresh_status: str = "complete",
 ) -> None:
-    """Add the canonical identity columns and a test directory receipt."""
-    dialog_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(dialogs)").fetchall()}
-    for column, definition in (
-        ("username", "TEXT"),
-        ("identity_observed_at", "INTEGER"),
-        ("identity_complete", "INTEGER NOT NULL DEFAULT 0"),
-        ("identity_source", "TEXT"),
-    ):
-        if column not in dialog_columns:
-            conn.execute(f"ALTER TABLE dialogs ADD COLUMN {column} {definition}")
-
+    """Mark the current test directory snapshot as published."""
+    install_dialog_directory_coverage_schema(conn)
     started_at = int(time.time()) - 1 if started_at is None else started_at
     if completed_at is None:
         completed_at = started_at
@@ -1002,31 +1005,14 @@ def _publish_test_dialog_directory(
         (started_at,),
     )
     conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dialog_directory_publication (
-            singleton INTEGER PRIMARY KEY,
-            generation INTEGER,
-            observation_started_at INTEGER,
-            observation_completed_at INTEGER
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dialog_directory_state (
-            singleton INTEGER PRIMARY KEY,
-            status TEXT,
-            observation_started_at INTEGER
-        )
-        """
-    )
-    conn.execute(
-        "INSERT OR REPLACE INTO dialog_directory_publication VALUES (1, ?, ?, ?)",
+        "UPDATE dialog_directory_publication SET generation=?, observation_started_at=?, "
+        "observation_completed_at=? WHERE singleton=1",
         (1, started_at, completed_at),
     )
     conn.execute(
-        "INSERT OR REPLACE INTO dialog_directory_state VALUES (1, ?, ?)",
-        (refresh_status, started_at),
+        "UPDATE dialog_directory_state SET status=?, ordinary_status=?, pinned_main_status=?, "
+        "pinned_archive_status=?, observation_started_at=?, reason=NULL WHERE singleton=1",
+        (refresh_status, refresh_status, refresh_status, refresh_status, started_at),
     )
     conn.commit()
 
@@ -1399,15 +1385,8 @@ async def test_local_name_miss_reports_directory_coverage(
     conn = _make_db_with_dialogs()
     if coverage_state == "in_progress":
         conn.execute(
-            "CREATE TABLE dialog_directory_publication ("
-            "singleton INTEGER PRIMARY KEY, generation INTEGER, observation_started_at INTEGER, "
-            "observation_completed_at INTEGER)"
-        )
-        conn.execute(
-            "CREATE TABLE dialog_directory_state (singleton INTEGER PRIMARY KEY, status TEXT, observation_started_at INTEGER)"
-        )
-        conn.execute(
-            "INSERT INTO dialog_directory_state VALUES (1, 'in_progress', ?)",
+            "UPDATE dialog_directory_state SET status='in_progress', observation_started_at=?, reason=NULL "
+            "WHERE singleton=1",
             (int(time.time()),),
         )
         conn.commit()
