@@ -61,9 +61,7 @@ async def test_unknown_canonical_identity_can_be_enriched_by_existing_entity_cac
     conn = _make_db_with_dialogs()
     _add_canonical_identity_columns(conn)
     _seed_dialog_row(conn, 9002, name=None)
-    conn.execute(
-        "UPDATE dialogs SET identity_complete=0,identity_observed_at=NULL WHERE dialog_id=9002"
-    )
+    conn.execute("UPDATE dialogs SET identity_complete=0,identity_observed_at=NULL WHERE dialog_id=9002")
     conn.execute(
         "INSERT INTO entities (id,type,name,name_normalized,updated_at) VALUES (?,?,?,?,?)",
         (9002, "User", "Cached Name", "cached name", 1),
@@ -82,9 +80,7 @@ async def test_complete_canonical_absence_defeats_stale_entity_name() -> None:
     conn = _make_db_with_dialogs()
     _add_canonical_identity_columns(conn)
     _seed_dialog_row(conn, 9003, name=None)
-    conn.execute(
-        "UPDATE dialogs SET identity_complete=1,identity_observed_at=1700000000 WHERE dialog_id=9003"
-    )
+    conn.execute("UPDATE dialogs SET identity_complete=1,identity_observed_at=1700000000 WHERE dialog_id=9003")
     conn.execute(
         "INSERT INTO entities (id,type,name,name_normalized,updated_at) VALUES (?,?,?,?,?)",
         (9003, "User", "Removed Name", "removed name", 1),

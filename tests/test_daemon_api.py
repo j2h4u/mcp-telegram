@@ -398,7 +398,9 @@ async def test_recover_dialog_directory_rejects_non_invalid_state(tmp_path: Path
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute("UPDATE dialog_directory_state SET generation=4,status='incomplete',reason='ordinary:TimeoutError'")
+        conn.execute(
+            "UPDATE dialog_directory_state SET generation=4,status='incomplete',reason='ordinary:TimeoutError'"
+        )
         result = await make_server(conn)._dispatch({"method": "recover_dialog_directory"})
         assert result == {
             "ok": False,
@@ -982,9 +984,7 @@ def _publish_test_dialog_directory(
     refresh_status: str = "complete",
 ) -> None:
     """Add the canonical identity columns and a test directory receipt."""
-    dialog_columns = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info(dialogs)").fetchall()
-    }
+    dialog_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(dialogs)").fetchall()}
     for column, definition in (
         ("username", "TEXT"),
         ("identity_observed_at", "INTEGER"),

@@ -131,10 +131,14 @@ async def test_dm_enrollment_consumes_completed_publication_locally_and_idempote
     )
     conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (114,'access_lost')")
     seed_full_history_enrollment(conn, 114, enabled=True, source="automatic")
-    conn.execute("INSERT INTO dialogs(dialog_id,type,name,read_inbox_max_id,read_outbox_max_id,identity_complete) VALUES (114,'user','Lost',31,41,1)")
+    conn.execute(
+        "INSERT INTO dialogs(dialog_id,type,name,read_inbox_max_id,read_outbox_max_id,identity_complete) VALUES (114,'user','Lost',31,41,1)"
+    )
     seed_full_history_enrollment(conn, 112, enabled=False, source="explicit")
     conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (112,'not_synced')")
-    conn.execute("INSERT INTO entities(id,type,name,username,name_normalized,updated_at) VALUES (111,'user','Richer','richer','richer',100)")
+    conn.execute(
+        "INSERT INTO entities(id,type,name,username,name_normalized,updated_at) VALUES (111,'user','Richer','richer','richer',100)"
+    )
     _publish_generation(conn)
 
     class NoTelegramCalls:
@@ -146,21 +150,31 @@ async def test_dm_enrollment_consumes_completed_publication_locally_and_idempote
     assert adapter.status(10.0) is not None
     await adapter.run_slice(RpcAttemptBudget(limit=1))
 
-    assert conn.execute("SELECT dialog_id,status,read_inbox_max_id,read_outbox_max_id FROM synced_dialogs ORDER BY dialog_id").fetchall() == [
+    assert conn.execute(
+        "SELECT dialog_id,status,read_inbox_max_id,read_outbox_max_id FROM synced_dialogs ORDER BY dialog_id"
+    ).fetchall() == [
         (111, "syncing", 17, None),
         (112, "not_synced", None, 23),
         (114, "access_lost", 31, 41),
     ]
-    assert conn.execute("SELECT dialog_id FROM full_history_enrollment ORDER BY dialog_id").fetchall() == [(111,), (112,), (114,)]
+    assert conn.execute("SELECT dialog_id FROM full_history_enrollment ORDER BY dialog_id").fetchall() == [
+        (111,),
+        (112,),
+        (114,),
+    ]
     assert conn.execute("SELECT name,username FROM entities WHERE id=111").fetchone() == ("Richer", "richer")
     assert conn.execute("SELECT id,type,name FROM entities WHERE id IN (112,113,114) ORDER BY id").fetchall() == [
         (112, "bot", "Helper"),
         (114, "user", "Lost"),
     ]
-    assert conn.execute("SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_last_publication_generation'").fetchone() == ("1",)
+    assert conn.execute(
+        "SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_last_publication_generation'"
+    ).fetchone() == ("1",)
     assert adapter.status(10.0) is None
     await adapter.run_slice(RpcAttemptBudget(limit=1))
-    assert conn.execute("SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_last_publication_generation'").fetchone() == ("1",)
+    assert conn.execute(
+        "SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_last_publication_generation'"
+    ).fetchone() == ("1",)
 
 
 def test_dm_enrollment_waits_for_a_completed_publication(conn: sqlite3.Connection) -> None:
@@ -195,13 +209,23 @@ async def test_dm_enrollment_restarts_after_interruption_without_replaying_teleg
     worker._consume_one_canonical_dm = fail_once  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="interrupted"):
         await FullSyncDmEnrollmentDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
-    assert conn.execute("SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_last_publication_generation'").fetchone() is None
+    assert (
+        conn.execute(
+            "SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_last_publication_generation'"
+        ).fetchone()
+        is None
+    )
     assert conn.execute("SELECT dialog_id FROM full_history_enrollment").fetchall() == []
 
     worker._consume_one_canonical_dm = original  # type: ignore[method-assign]
     await FullSyncDmEnrollmentDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
-    assert conn.execute("SELECT dialog_id FROM full_history_enrollment ORDER BY dialog_id").fetchall() == [(121,), (122,)]
-    assert conn.execute("SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_last_publication_generation'").fetchone() == ("7",)
+    assert conn.execute("SELECT dialog_id FROM full_history_enrollment ORDER BY dialog_id").fetchall() == [
+        (121,),
+        (122,),
+    ]
+    assert conn.execute(
+        "SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_last_publication_generation'"
+    ).fetchone() == ("7",)
 
 
 def test_delta_gap_status_uses_refresh_or_recency_boundary_without_writes(conn: sqlite3.Connection) -> None:

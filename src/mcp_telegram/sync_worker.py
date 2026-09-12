@@ -240,8 +240,7 @@ class FullSyncWorker:
         row = cast(
             tuple[int] | None,
             self._conn.execute(
-                "SELECT generation FROM dialog_directory_publication "
-                "WHERE singleton = 1 AND generation IS NOT NULL"
+                "SELECT generation FROM dialog_directory_publication WHERE singleton = 1 AND generation IS NOT NULL"
             ).fetchone(),
         )
         return None if row is None else int(row[0])

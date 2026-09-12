@@ -63,8 +63,7 @@ def read_dialog_directory_coverage(
         publication = cast(
             tuple[object, object] | None,
             conn.execute(
-                "SELECT generation, observation_started_at "
-                "FROM dialog_directory_publication WHERE singleton=1"
+                "SELECT generation, observation_started_at FROM dialog_directory_publication WHERE singleton=1"
             ).fetchone(),
         )
         state = cast(
@@ -76,9 +75,9 @@ def read_dialog_directory_coverage(
     except sqlite3.OperationalError:
         try:
             state = cast(
-            tuple[object, object, object] | None,
-            conn.execute(
-                "SELECT status, NULL AS reason, observation_started_at FROM dialog_directory_state WHERE singleton=1"
+                tuple[object, object, object] | None,
+                conn.execute(
+                    "SELECT status, NULL AS reason, observation_started_at FROM dialog_directory_state WHERE singleton=1"
                 ).fetchone(),
             )
             publication = cast(

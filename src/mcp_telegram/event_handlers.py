@@ -1791,7 +1791,9 @@ class EventHandlerManager:
             return
         folder_id = getattr(update, "folder_id", None)
         published_folder = self._published_pin_folder(folder_id)
-        known_dialog = self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
+        known_dialog = (
+            self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
+        )
         pinned = 1 if update.pinned else 0
         with self._conn:
             # ``dialogs.pinned`` is the projection for the main list.  A pin
@@ -1830,9 +1832,11 @@ class EventHandlerManager:
         pinned_ids = self._collect_pinned_dialog_ids(cast(Sequence[object], order))
         with self._conn:
             for dialog_id in pinned_ids:
-                if is_main_folder and self._conn.execute(
-                    "SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)
-                ).fetchone() is not None:
+                if (
+                    is_main_folder
+                    and self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()
+                    is not None
+                ):
                     self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (1, now, dialog_id))
             if is_main_folder:
                 # Main list: rewrite the full pin set — the update is

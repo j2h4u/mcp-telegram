@@ -1462,6 +1462,7 @@ def _build_demand_runtime(
         ctx.shutdown_event,
         ctx.topic_refresher,
     )
+
     async def read_receipt_batch() -> object:
         return await _initialize_read_positions(
             ctx.client,

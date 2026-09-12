@@ -1052,9 +1052,20 @@ class DaemonAPIServer:
             ).fetchall(),
         )
         matches: list[MatchInfo] = []
-        for dialog_id, name, canonical_username, dialog_type, identity_complete, entity_name, entity_username, entity_type in rows:
+        for (
+            dialog_id,
+            name,
+            canonical_username,
+            dialog_type,
+            identity_complete,
+            entity_name,
+            entity_username,
+            entity_type,
+        ) in rows:
             complete = bool(identity_complete)
-            effective_username = canonical_username if canonical_username is not None else (None if complete else entity_username)
+            effective_username = (
+                canonical_username if canonical_username is not None else (None if complete else entity_username)
+            )
             if not isinstance(effective_username, str):
                 continue
             display_name = name if isinstance(name, str) else (None if complete else entity_name)

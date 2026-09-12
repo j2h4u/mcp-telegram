@@ -186,7 +186,8 @@ def unhide_after_realtime_presence(conn: sqlite3.Connection, dialog_id: int) -> 
     """Expose a catalog row proved present by realtime without reviving access loss."""
     with _lifecycle_savepoint(conn):
         cursor = conn.execute(
-            "UPDATE dialogs SET hidden=0 WHERE dialog_id=? AND hidden=1 AND " + not_access_lost_sql("dialogs.dialog_id"),
+            "UPDATE dialogs SET hidden=0 WHERE dialog_id=? AND hidden=1 AND "
+            + not_access_lost_sql("dialogs.dialog_id"),
             (dialog_id,),
         )
     return cursor.rowcount > 0

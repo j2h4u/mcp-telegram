@@ -47,8 +47,17 @@ def folder_snapshot(
     receipts = (_state_int(values.get("rule_observation_started_at")), _state_int(values.get("canonical_observed_at")))
     current = int(time.time() if now is None else now)
     freshness_receipts = tuple(receipt for receipt in receipts if receipt is not None)
-    age = None if len(freshness_receipts) != len(receipts) else max(max(0, current - receipt) for receipt in freshness_receipts)
-    complete = generation is not None and completed_at is not None and values.get("coverage_status") == "complete" and age is not None
+    age = (
+        None
+        if len(freshness_receipts) != len(receipts)
+        else max(max(0, current - receipt) for receipt in freshness_receipts)
+    )
+    complete = (
+        generation is not None
+        and completed_at is not None
+        and values.get("coverage_status") == "complete"
+        and age is not None
+    )
     return {
         "generation": generation,
         "status": _snapshot_status(complete, age, min(stale_after_seconds, 900)),

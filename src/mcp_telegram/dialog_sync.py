@@ -114,9 +114,7 @@ def _attr[T](obj: object, name: str, default: T) -> T:
 
 _SELECT_DIRTY_DIALOGS_SQL = "SELECT dialog_id FROM dialogs WHERE needs_refresh = 1 AND hidden = 0"
 _SELECT_DIRTY_DIALOG_EXISTS_SQL = "SELECT 1 FROM dialogs WHERE needs_refresh = 1 AND hidden = 0 LIMIT 1"
-_UPDATE_DIALOG_ENTITY_SQL = (
-    "UPDATE dialogs SET members=?, created=?, needs_refresh=0, snapshot_at=? WHERE dialog_id=?"
-)
+_UPDATE_DIALOG_ENTITY_SQL = "UPDATE dialogs SET members=?, created=?, needs_refresh=0, snapshot_at=? WHERE dialog_id=?"
 
 
 def _extract_entity_fields(entity: _EntityLike) -> _EntityFields:

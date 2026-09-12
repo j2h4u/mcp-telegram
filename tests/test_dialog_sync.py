@@ -38,7 +38,9 @@ def test_set_access_lost_atomic(sync_db: sqlite3.Connection) -> None:
 
     set_access_lost(sync_db, dialog_id, now)
 
-    assert sync_db.execute("SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+    assert sync_db.execute(
+        "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (
         "access_lost",
         now,
     )
