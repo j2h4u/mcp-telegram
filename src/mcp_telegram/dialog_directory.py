@@ -25,6 +25,7 @@ from .dialog_classification import EntityKind, classify_dialog_type
 from .dialog_directory_tl import (
     DialogCursor,
     RawDialogFact,
+    RawDialogPage,
     get_dialogs_request,
     get_pinned_dialogs_request,
     normalize_dialogs_response,
@@ -104,11 +105,104 @@ class _StagedFact:
     eligibility_mute_until: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class _StagedEntityProjection:
+    name: str | None
+    dialog_type: str
+    members: int | None
+    created: int | None
+    username: str | None
+    identity_complete: int
+    eligibility_category: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedDialogProjection:
+    peer_kind: str
+    top_message: int
+    archived: int
+    pinned: int
+    last_message_at: int | None
+    read_inbox_max_id: int | None
+    read_outbox_max_id: int | None
+    unread_mentions_count: int
+    unread_reactions_count: int
+    unread_count: int | None
+    unread_mark: int | None
+    draft_text: str | None
+    snapshot_at: int
+    unread: int | None
+    mute_until: int | None
+
+
 class _IdentityOmitted:
     """Distinguish a missing realtime field from an authoritative clear."""
 
 
 IDENTITY_OMITTED = _IdentityOmitted()
+
+
+@dataclass(frozen=True, slots=True)
+class _RealtimeIdentity:
+    name: str | _IdentityOmitted | None
+    username: str | _IdentityOmitted | None
+    dialog_type: str | _IdentityOmitted | None
+    observed_at: int
+
+
+def _publication_ready(state: _DirectoryState, generation: int, account_id: int) -> bool:
+    return (
+        state.generation == generation
+        and state.account_id == account_id
+        and state.status == "in_progress"
+        and state.ordinary_status == "complete"
+        and state.pinned_main_status == "complete"
+        and state.pinned_archive_status == "complete"
+    )
+
+
+def _staged_entity_projection(entity: object | None) -> _StagedEntityProjection:
+    kind = EntityKind.UNKNOWN
+    if isinstance(entity, types.User):
+        kind = EntityKind.USER
+    elif isinstance(entity, (types.Chat, types.ChatForbidden)):
+        kind = EntityKind.CHAT
+    elif isinstance(entity, (types.Channel, types.ChannelForbidden)):
+        kind = EntityKind.CHANNEL
+    identity_complete = int(_identity_is_complete(entity))
+    return _StagedEntityProjection(
+        name=_entity_name(entity),
+        dialog_type=classify_dialog_type(entity, entity_kind=kind).value if identity_complete else "unknown",
+        members=_nullable_int(getattr(entity, "participants_count", None)),
+        created=int(entity.date.timestamp()) if isinstance(entity, types.Channel) and entity.date is not None else None,
+        username=_primary_username(entity),
+        identity_complete=identity_complete,
+        eligibility_category=_eligibility_category(entity),
+    )
+
+
+def _staged_dialog_projection(fact: RawDialogFact, observed_at: int, folder_id: int | None) -> _StagedDialogProjection:
+    raw = cast(types.Dialog, fact.dialog)
+    archived = int(folder_id == 1 or getattr(raw, "folder_id", None) == 1)
+    return _StagedDialogProjection(
+        peer_kind=type(raw.peer).__name__,
+        top_message=int(raw.top_message),
+        archived=archived,
+        pinned=int(folder_id is not None or bool(getattr(raw, "pinned", False))),
+        last_message_at=int(fact.top_message_date.timestamp()) if fact.top_message_date is not None else None,
+        read_inbox_max_id=_nullable_int(getattr(raw, "read_inbox_max_id", None)),
+        read_outbox_max_id=_nullable_int(getattr(raw, "read_outbox_max_id", None)),
+        unread_mentions_count=_nullable_int(getattr(raw, "unread_mentions_count", None)) or 0,
+        unread_reactions_count=_nullable_int(getattr(raw, "unread_reactions_count", None)) or 0,
+        unread_count=_nullable_int(getattr(raw, "unread_count", None)),
+        unread_mark=(
+            int(bool(getattr(raw, "unread_mark", False))) if getattr(raw, "unread_mark", None) is not None else None
+        ),
+        draft_text=_draft_text(getattr(raw, "draft", None)),
+        snapshot_at=observed_at,
+        unread=_three_valued_unread(raw),
+        mute_until=_mute_until(getattr(raw, "notify_settings", None)),
+    )
 
 
 class CanonicalDialogDirectory:
@@ -345,7 +439,6 @@ class CanonicalDialogDirectory:
             )
 
     async def _acquire_ordinary(self, conn: sqlite3.Connection, state: _DirectoryState, account_id: int) -> None:
-        published = False
         try:
             response = await self._client(get_dialogs_request(state.cursor))
         except Exception as exc:  # noqa: BLE001 - transport classes vary under Telethon
@@ -355,30 +448,9 @@ class CanonicalDialogDirectory:
             )
             return
         page = normalize_dialogs_response(response, state.cursor)
-        if page.kind == "invalid":
-            self._latch_semantic_invalid(conn, state.generation, "ordinary", page.reason or "invalid", account_id)
+        if self._handle_ordinary_non_authoritative(conn, state, account_id, page):
             return
-        if page.kind == "not_modified":
-            self._mark_not_modified_without_cache(
-                conn,
-                state.generation,
-                "ordinary:not_modified_without_cache",
-                account_id,
-                source_column="ordinary_status",
-            )
-            return
-        if page.kind == "incomplete":
-            reason = page.reason or "incomplete_page"
-            with conn:
-                # An incomplete page may still contribute catalog rows.
-                # It never advances the committed cursor or publishes.
-                self._stage_facts(conn, state.generation, page.facts, folder_id=None, account_id=account_id)
-                conn.execute(
-                    "UPDATE dialog_directory_state SET status='incomplete', ordinary_status='incomplete', reason=?, retry_at=? "
-                    "WHERE singleton=1 AND account_id=? AND generation=?",
-                    (reason, int(time.time()) + 900, account_id, state.generation),
-                )
-            return
+        published = False
         with conn:
             new_ids = self._new_dialog_ids(conn, state.generation, page.facts)
             self._stage_facts(conn, state.generation, page.facts, folder_id=None, account_id=account_id)
@@ -412,6 +484,35 @@ class CanonicalDialogDirectory:
             published = self._publish_if_complete(conn, state.generation, account_id)
         if published:
             self._set_detail("canonical dialog directory: complete")
+
+    def _handle_ordinary_non_authoritative(
+        self, conn: sqlite3.Connection, state: _DirectoryState, account_id: int, page: RawDialogPage
+    ) -> bool:
+        if page.kind == "invalid":
+            self._latch_semantic_invalid(conn, state.generation, "ordinary", page.reason or "invalid", account_id)
+            return True
+        if page.kind == "not_modified":
+            self._mark_not_modified_without_cache(
+                conn,
+                state.generation,
+                "ordinary:not_modified_without_cache",
+                account_id,
+                source_column="ordinary_status",
+            )
+            return True
+        if page.kind != "incomplete":
+            return False
+        reason = page.reason or "incomplete_page"
+        with conn:
+            # An incomplete page may still contribute catalog rows.
+            # It never advances the committed cursor or publishes.
+            self._stage_facts(conn, state.generation, page.facts, folder_id=None, account_id=account_id)
+            conn.execute(
+                "UPDATE dialog_directory_state SET status='incomplete', ordinary_status='incomplete', reason=?, retry_at=? "
+                "WHERE singleton=1 AND account_id=? AND generation=?",
+                (reason, int(time.time()) + 900, account_id, state.generation),
+            )
+        return True
 
     def _mark_source_incomplete(
         self,
@@ -562,59 +663,40 @@ class CanonicalDialogDirectory:
         return {fact.dialog_id for fact in facts if fact.dialog_id not in staged_ids}
 
     def _staged_fact(self, fact: RawDialogFact, observed_at: int, folder_id: int | None, source: str) -> _StagedFact:
-        entity = fact.entity
-        kind = EntityKind.UNKNOWN
-        if isinstance(entity, types.User):
-            kind = EntityKind.USER
-        elif isinstance(entity, (types.Chat, types.ChatForbidden)):
-            kind = EntityKind.CHAT
-        elif isinstance(entity, (types.Channel, types.ChannelForbidden)):
-            kind = EntityKind.CHANNEL
-        name = _entity_name(entity)
-        identity_complete = int(_identity_is_complete(entity))
-        dialog_type = classify_dialog_type(entity, entity_kind=kind).value if identity_complete else "unknown"
-        raw = cast(types.Dialog, fact.dialog)
-        archived = int(folder_id == 1 or getattr(raw, "folder_id", None) == 1)
-        pinned = int(folder_id is not None or bool(getattr(raw, "pinned", False)))
-        peer_kind = type(raw.peer).__name__
+        entity = _staged_entity_projection(fact.entity)
+        dialog = _staged_dialog_projection(fact, observed_at, folder_id)
         return _StagedFact(
             fact.dialog_id,
             source,
-            peer_kind,
-            int(raw.top_message),
-            name,
-            dialog_type,
-            archived,
-            pinned,
-            _nullable_int(getattr(entity, "participants_count", None)),
-            int(entity.date.timestamp()) if isinstance(entity, types.Channel) and entity.date is not None else None,
-            int(fact.top_message_date.timestamp()) if fact.top_message_date is not None else None,
-            _nullable_int(getattr(raw, "read_inbox_max_id", None)),
-            _nullable_int(getattr(raw, "read_outbox_max_id", None)),
-            _nullable_int(getattr(raw, "unread_mentions_count", None)) or 0,
-            _nullable_int(getattr(raw, "unread_reactions_count", None)) or 0,
-            _nullable_int(getattr(raw, "unread_count", None)),
-            int(bool(getattr(raw, "unread_mark", False))) if getattr(raw, "unread_mark", None) is not None else None,
-            _draft_text(getattr(raw, "draft", None)),
-            observed_at,
-            _primary_username(entity),
-            identity_complete,
+            dialog.peer_kind,
+            dialog.top_message,
+            entity.name,
+            entity.dialog_type,
+            dialog.archived,
+            dialog.pinned,
+            entity.members,
+            entity.created,
+            dialog.last_message_at,
+            dialog.read_inbox_max_id,
+            dialog.read_outbox_max_id,
+            dialog.unread_mentions_count,
+            dialog.unread_reactions_count,
+            dialog.unread_count,
+            dialog.unread_mark,
+            dialog.draft_text,
+            dialog.snapshot_at,
+            entity.username,
+            entity.identity_complete,
             "directory",
-            _eligibility_category(entity),
-            archived,
-            _three_valued_unread(raw),
-            _mute_until(getattr(raw, "notify_settings", None)),
+            entity.eligibility_category,
+            dialog.archived,
+            dialog.unread,
+            dialog.mute_until,
         )
 
     def _publish_if_complete(self, conn: sqlite3.Connection, generation: int, account_id: int) -> bool:
         state = self._load_state(conn)
-        if state.generation != generation or state.account_id != account_id:
-            return False
-        if state.status != "in_progress":
-            return False
-        if state.ordinary_status != "complete" or state.pinned_main_status != "complete":
-            return False
-        if state.pinned_archive_status != "complete":
+        if not _publication_ready(state, generation, account_id):
             return False
         # Eligibility facts must merge before the dialogs UPDATE below. That
         # UPDATE fires the revision trigger, so doing this afterwards would
@@ -958,6 +1040,71 @@ def _mute_until(settings: object | None) -> int | None:
     return _nullable_int(value)
 
 
+def _apply_partial_realtime_identity(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    observation: _RealtimeIdentity,
+) -> int:
+    prior = cast(
+        tuple[str | None, str | None, str, int | None] | None,
+        conn.execute(
+            "SELECT name,username,type,identity_observed_at FROM dialogs WHERE dialog_id=?", (dialog_id,)
+        ).fetchone(),
+    )
+    if prior is None or _identity_observation_is_empty(observation):
+        return 0
+    return _store_partial_realtime_identity(conn, dialog_id, prior, observation)
+
+
+def _identity_observation_is_empty(observation: _RealtimeIdentity) -> bool:
+    return (
+        observation.name is IDENTITY_OMITTED
+        and observation.username is IDENTITY_OMITTED
+        and observation.dialog_type is IDENTITY_OMITTED
+    )
+
+
+def _store_partial_realtime_identity(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    prior: tuple[str | None, str | None, str, int | None],
+    observation: _RealtimeIdentity,
+) -> int:
+    prior_name, prior_username, prior_type, prior_observed_at = prior
+    retained_type = observation.dialog_type is IDENTITY_OMITTED or observation.dialog_type is None
+    updated_name = prior_name if observation.name is IDENTITY_OMITTED else observation.name
+    updated_username = prior_username if observation.username is IDENTITY_OMITTED else observation.username
+    updated_type = prior_type if retained_type else observation.dialog_type
+    boundary = observation.observed_at if prior_observed_at is None else min(prior_observed_at, observation.observed_at)
+    cursor = conn.execute(
+        "UPDATE dialogs SET name=?,username=?,type=?,identity_observed_at=?,identity_source=?,"
+        "revision=revision+1 WHERE dialog_id=?",
+        (updated_name, updated_username, updated_type, boundary, "mixed" if retained_type else "realtime", dialog_id),
+    )
+    if cursor.rowcount:
+        unhide_after_realtime_presence(conn, dialog_id)
+    return cursor.rowcount
+
+
+def _apply_complete_realtime_identity(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    observation: _RealtimeIdentity,
+) -> int:
+    if not isinstance(observation.dialog_type, str):
+        raise ValueError("complete realtime identity requires a dialog type")
+    if observation.name is IDENTITY_OMITTED or observation.username is IDENTITY_OMITTED:
+        raise ValueError("complete realtime identity requires every identity field")
+    cursor = conn.execute(
+        "UPDATE dialogs SET name=?,username=?,type=?,identity_observed_at=?,identity_complete=1,"
+        "identity_source='realtime',revision=revision+1 WHERE dialog_id=?",
+        (observation.name, observation.username, observation.dialog_type, observation.observed_at, dialog_id),
+    )
+    if cursor.rowcount:
+        unhide_after_realtime_presence(conn, dialog_id)
+    return cursor.rowcount
+
+
 def apply_realtime_identity(  # noqa: PLR0913
     conn: sqlite3.Connection,
     dialog_id: int,
@@ -969,50 +1116,10 @@ def apply_realtime_identity(  # noqa: PLR0913
     complete: bool,
 ) -> int:
     """Apply a realtime identity observation on an existing catalog row."""
-    if not complete:
-        prior = cast(
-            tuple[str | None, str | None, str, int | None] | None,
-            conn.execute(
-                "SELECT name,username,type,identity_observed_at FROM dialogs WHERE dialog_id=?", (dialog_id,)
-            ).fetchone(),
-        )
-        if prior is None or (
-            name is IDENTITY_OMITTED and username is IDENTITY_OMITTED and dialog_type is IDENTITY_OMITTED
-        ):
-            return 0
-        prior_name, prior_username, prior_type, prior_observed_at = prior
-        retained_type = dialog_type is IDENTITY_OMITTED or dialog_type is None
-        updated_name = prior_name if name is IDENTITY_OMITTED else name
-        updated_username = prior_username if username is IDENTITY_OMITTED else username
-        updated_type = prior_type if retained_type else dialog_type
-        boundary = observed_at if prior_observed_at is None else min(prior_observed_at, observed_at)
-        cursor = conn.execute(
-            "UPDATE dialogs SET name=?,username=?,type=?,identity_observed_at=?,identity_source=?,"
-            "revision=revision+1 WHERE dialog_id=?",
-            (
-                updated_name,
-                updated_username,
-                updated_type,
-                boundary,
-                "mixed" if retained_type else "realtime",
-                dialog_id,
-            ),
-        )
-        if cursor.rowcount:
-            unhide_after_realtime_presence(conn, dialog_id)
-        return cursor.rowcount
-    if not isinstance(dialog_type, str):
-        raise ValueError("complete realtime identity requires a dialog type")
-    if name is IDENTITY_OMITTED or username is IDENTITY_OMITTED:
-        raise ValueError("complete realtime identity requires every identity field")
-    cursor = conn.execute(
-        "UPDATE dialogs SET name=?,username=?,type=?,identity_observed_at=?,identity_complete=1,"
-        "identity_source='realtime',revision=revision+1 WHERE dialog_id=?",
-        (name, username, dialog_type, observed_at, dialog_id),
-    )
-    if cursor.rowcount:
-        unhide_after_realtime_presence(conn, dialog_id)
-    return cursor.rowcount
+    observation = _RealtimeIdentity(name, username, dialog_type, observed_at)
+    if complete:
+        return _apply_complete_realtime_identity(conn, dialog_id, observation)
+    return _apply_partial_realtime_identity(conn, dialog_id, observation)
 
 
 def _state_wire(state: _DirectoryState) -> dict[str, object]:
@@ -1063,6 +1170,42 @@ def sync_active_generation_pins_from_publication(conn: sqlite3.Connection, folde
     )
 
 
+def _insert_realtime_eligibility(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    supplied: tuple[str | None, int | None, int | None, int | None],
+    observed_at: int,
+) -> None:
+    conn.execute(
+        "INSERT INTO dialog_directory_facts(dialog_id,category,archived,unread,mute_until,observed_at) VALUES (?,?,?,?,?,?)",
+        (dialog_id, *supplied, observed_at),
+    )
+
+
+def _merge_realtime_eligibility(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    supplied: tuple[str | None, int | None, int | None, int | None],
+    prior: tuple[str | None, int | None, int | None, int | None, int | None],
+    observed_at: int,
+) -> bool:
+    values: tuple[str | None, int | None, int | None, int | None] = (
+        supplied[0] if supplied[0] is not None else prior[0],
+        supplied[1] if supplied[1] is not None else prior[1],
+        supplied[2] if supplied[2] is not None else prior[2],
+        supplied[3] if supplied[3] is not None else prior[3],
+    )
+    if values == prior[:4]:
+        return False
+    retained = any(new is None and old is not None for new, old in zip(supplied, prior[:4], strict=True))
+    boundary = min(prior[4], observed_at) if retained and prior[4] is not None else observed_at
+    conn.execute(
+        "UPDATE dialog_directory_facts SET category=?,archived=?,unread=?,mute_until=?,observed_at=? WHERE dialog_id=?",
+        (*values, boundary, dialog_id),
+    )
+    return True
+
+
 def apply_realtime_eligibility(  # noqa: PLR0913
     conn: sqlite3.Connection,
     dialog_id: int,
@@ -1085,28 +1228,9 @@ def apply_realtime_eligibility(  # noqa: PLR0913
         ).fetchone(),
     )
     if prior is None:
-        initial_values = supplied
-        boundary = observed_at
-        conn.execute(
-            "INSERT INTO dialog_directory_facts(dialog_id,category,archived,unread,mute_until,observed_at) VALUES (?,?,?,?,?,?)",
-            (dialog_id, *initial_values, boundary),
-        )
-    else:
-        values: tuple[str | None, int | None, int | None, int | None] = (
-            category if category is not None else prior[0],
-            archived if archived is not None else prior[1],
-            unread if unread is not None else prior[2],
-            mute_until if mute_until is not None else prior[3],
-        )
-        changed = values != prior[:4]
-        if not changed:
-            return 0
-        retained = any(new is None and old is not None for new, old in zip(supplied, prior[:4], strict=True))
-        boundary = min(prior[4], observed_at) if retained and prior[4] is not None else observed_at
-        conn.execute(
-            "UPDATE dialog_directory_facts SET category=?,archived=?,unread=?,mute_until=?,observed_at=? WHERE dialog_id=?",
-            (*values, boundary, dialog_id),
-        )
+        _insert_realtime_eligibility(conn, dialog_id, supplied, observed_at)
+    elif not _merge_realtime_eligibility(conn, dialog_id, supplied, prior, observed_at):
+        return 0
     conn.execute("UPDATE dialogs SET revision=revision+1 WHERE dialog_id=?", (dialog_id,))
     return 1
 
