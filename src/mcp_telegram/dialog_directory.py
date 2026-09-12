@@ -295,6 +295,7 @@ class CanonicalDialogDirectory:
         self, conn: sqlite3.Connection, state: _DirectoryState, folder_id: int, account_id: int
     ) -> None:
         published_before = _published_pin_rows(conn, folder_id)
+        active_rows_before = _active_generation_pin_rows(conn, state.generation, folder_id)
         try:
             response = await self._client(get_pinned_dialogs_request(folder_id))
         except Exception as exc:  # noqa: BLE001 - transport classes vary under Telethon
@@ -322,12 +323,21 @@ class CanonicalDialogDirectory:
             raise RuntimeError(f"unexpected normalized pinned response: {page.kind}")
         with conn:
             self._stage_facts(conn, state.generation, page.facts, folder_id=folder_id, account_id=account_id)
-            if _published_pin_rows(conn, folder_id) != published_before:
+            if active_rows_before or _published_pin_rows(conn, folder_id) != published_before:
                 sync_active_generation_pins_from_publication(conn, folder_id)
             else:
+                # No realtime writer published this source during the request,
+                # so this RPC is the authoritative, replaceable source order.
+                conn.execute(
+                    "DELETE FROM dialog_directory_pins WHERE generation=? AND folder_id=?",
+                    (state.generation, folder_id),
+                )
                 conn.executemany(
                     "INSERT INTO dialog_directory_pins(generation, folder_id, dialog_id, position) VALUES (?, ?, ?, ?)",
-                    [(state.generation, folder_id, fact.dialog_id, position) for position, fact in enumerate(page.facts)],
+                    [
+                        (state.generation, folder_id, fact.dialog_id, position)
+                        for position, fact in enumerate(page.facts)
+                    ],
                 )
             column = "pinned_main_status" if folder_id == 0 else "pinned_archive_status"
             conn.execute(
@@ -546,7 +556,7 @@ class CanonicalDialogDirectory:
             for row in cast(
                 list[tuple[object]],
                 conn.execute(
-                    "SELECT dialog_id FROM dialog_directory_staging WHERE generation=?",
+                    "SELECT dialog_id FROM dialog_directory_staging WHERE generation=? AND source='ordinary'",
                     (generation,),
                 ).fetchall(),
             )
@@ -810,7 +820,7 @@ class CanonicalDialogDirectory:
         if row[1] != "invalid" and row[12] != "legacy_wrapper_cursor_unverified":
             try:
                 cursor = _decode_cursor(row[5], row[6], row[7])
-            except (ValueError, TypeError, json.JSONDecodeError, RuntimeError):
+            except ValueError, TypeError, json.JSONDecodeError, RuntimeError:
                 cursor_error = True
         return _DirectoryState(
             _required_int(row[0], "directory generation"),
@@ -965,7 +975,14 @@ def apply_realtime_identity(  # noqa: PLR0913
         cursor = conn.execute(
             "UPDATE dialogs SET name=?,username=?,type=?,identity_observed_at=?,identity_source=?,"
             "revision=revision+1 WHERE dialog_id=?",
-            (updated_name, updated_username, updated_type, boundary, "mixed" if retained_type else "realtime", dialog_id),
+            (
+                updated_name,
+                updated_username,
+                updated_type,
+                boundary,
+                "mixed" if retained_type else "realtime",
+                dialog_id,
+            ),
         )
         if cursor.rowcount:
             unhide_after_realtime_presence(conn, dialog_id)
@@ -1010,6 +1027,21 @@ def _published_pin_rows(conn: sqlite3.Connection, folder_id: int) -> tuple[tuple
             conn.execute(
                 "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=? ORDER BY position,dialog_id",
                 (folder_id,),
+            ).fetchall(),
+        )
+    )
+
+
+def _active_generation_pin_rows(
+    conn: sqlite3.Connection, generation: int, folder_id: int
+) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        cast(
+            list[tuple[int, int]],
+            conn.execute(
+                "SELECT dialog_id,position FROM dialog_directory_pins "
+                "WHERE generation=? AND folder_id=? ORDER BY position,dialog_id",
+                (generation, folder_id),
             ).fetchall(),
         )
     )
@@ -1078,6 +1110,18 @@ def apply_realtime_eligibility(  # noqa: PLR0913
         )
     conn.execute("UPDATE dialogs SET revision=revision+1 WHERE dialog_id=?", (dialog_id,))
     return 1
+
+
+def clear_realtime_mute(conn: sqlite3.Connection, dialog_id: int, *, observed_at: int) -> int:
+    """Clear a realtime mute fact while fencing an in-flight directory snapshot."""
+    conn.execute(
+        "UPDATE dialog_directory_facts SET mute_until=NULL, "
+        "observed_at=CASE WHEN observed_at IS NULL THEN ? ELSE MIN(observed_at,?) END "
+        "WHERE dialog_id=?",
+        (observed_at, observed_at, dialog_id),
+    )
+    cursor = conn.execute("UPDATE dialogs SET revision=revision+1 WHERE dialog_id=?", (dialog_id,))
+    return cursor.rowcount
 
 
 def _account_id_from_profile(profile: object) -> int:

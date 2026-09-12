@@ -21,6 +21,8 @@ from mcp_telegram.dialog_directory import (
     _three_valued_unread,
     apply_realtime_eligibility,
     apply_realtime_identity,
+    clear_realtime_mute,
+    sync_active_generation_pins_from_publication,
 )
 from mcp_telegram.dialog_directory_tl import (
     DialogCursor,
@@ -367,12 +369,163 @@ class _ThrottledClient(_FakeClient):
         raise TelegramRpcThrottled(30)
 
 
+class _RealtimePinClient(_FakeClient):
+    def __init__(self, responses: list[object], db_path: Path, *, folder_id: int, dialog_id: int) -> None:
+        super().__init__(responses)
+        self._db_path = db_path
+        self._folder_id = folder_id
+        self._dialog_id = dialog_id
+        self._published = False
+
+    async def __call__(self, request: object) -> object:
+        if not self._published and getattr(request, "folder_id", None) == self._folder_id:
+            self._published = True
+            conn = _open_sync_db(self._db_path)
+            try:
+                with conn:
+                    conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (?,'user',0)", (self._dialog_id,))
+                    conn.execute(
+                        "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (?,?,0)",
+                        (self._folder_id, self._dialog_id),
+                    )
+                    sync_active_generation_pins_from_publication(conn, self._folder_id)
+            finally:
+                conn.close()
+        return await super().__call__(request)
+
+
 @pytest.mark.asyncio
 async def test_throttle_reaches_coordinator_policy(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with pytest.raises(TelegramRpcThrottled):
         await CanonicalDialogDirectory(_ThrottledClient([]), db_path, asyncio.Event()).run_slice()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("folder_id", "realtime_id"), [(0, 42), (1, 43)])
+async def test_realtime_pins_win_over_an_overlapping_pending_pinned_rpc(
+    tmp_path: Path, folder_id: int, realtime_id: int
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    client = _RealtimePinClient(
+        [_pinned_response([_dialog(1, 8)]), _pinned_response([_dialog(2, 9)]), _response([])],
+        db_path,
+        folder_id=folder_id,
+        dialog_id=realtime_id,
+    )
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+
+    await _run_slices(directory, 3)
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT status,retry_at FROM dialog_directory_state").fetchone() == ("complete", None)
+        assert conn.execute(
+            "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=?",
+            (folder_id,),
+        ).fetchall() == [(realtime_id, 0)]
+        assert conn.execute("SELECT COUNT(*) FROM dialog_directory_pins").fetchone() == (0,)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("folder_id", "realtime_id"), [(0, 52), (1, 53)])
+async def test_existing_realtime_active_pins_are_never_reinserted_by_pinned_rpc(
+    tmp_path: Path, folder_id: int, realtime_id: int
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    directory = CanonicalDialogDirectory(_FakeClient([_pinned_response([_dialog(1, 8)])]), db_path, asyncio.Event())
+    directory.bind_account_id(100)
+    conn = _open_sync_db(db_path)
+    try:
+        with conn:
+            CanonicalDialogDirectory._start_generation(conn, 1)
+            conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (?,'user',0)", (realtime_id,))
+            conn.execute(
+                "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (?,?,0)",
+                (folder_id, realtime_id),
+            )
+            if folder_id == 1:
+                conn.execute("UPDATE dialog_directory_state SET pinned_main_status='complete'")
+            sync_active_generation_pins_from_publication(conn, folder_id)
+    finally:
+        conn.close()
+
+    await directory.run_slice()
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT dialog_id,position FROM dialog_directory_pins WHERE generation=1 AND folder_id=?",
+            (folder_id,),
+        ).fetchall() == [(realtime_id, 0)]
+    finally:
+        conn.close()
+
+
+def test_realtime_mute_clear_fences_staged_directory_eligibility(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute("INSERT INTO dialogs(dialog_id,type,hidden,revision) VALUES (1,'user',0,0)")
+        conn.execute("INSERT INTO dialog_directory_facts VALUES (1,'contact',0,1,500,10)")
+        conn.execute("INSERT INTO dialog_directory_baseline VALUES (1,1,0,1)")
+        conn.execute(
+            "INSERT INTO dialog_directory_staging(generation,dialog_id,source,peer_kind,top_message,name,type,archived,pinned,"
+            "unread_mentions_count,unread_reactions_count,snapshot_at,identity_complete,identity_source,"
+            "eligibility_category,eligibility_archived,eligibility_unread,eligibility_mute_until,eligibility_observed_at) "
+            "VALUES (1,1,'ordinary','PeerUser',1,'One','user',0,0,0,0,20,1,'directory','contact',0,1,900,20)"
+        )
+        assert clear_realtime_mute(conn, 1, observed_at=30) == 1
+        assert conn.execute("SELECT revision FROM dialogs WHERE dialog_id=1").fetchone() == (1,)
+        assert conn.execute(
+            "SELECT mute_until,observed_at FROM dialog_directory_facts WHERE dialog_id=1"
+        ).fetchone() == (None, 10)
+        conn.execute(
+            "UPDATE dialog_directory_facts AS current SET mute_until=staged.eligibility_mute_until "
+            "FROM dialog_directory_staging AS staged JOIN dialogs AS dialog ON dialog.dialog_id=staged.dialog_id "
+            "WHERE staged.generation=1 AND staged.dialog_id=current.dialog_id AND staged.baseline_revision=dialog.revision"
+        )
+        assert conn.execute("SELECT mute_until FROM dialog_directory_facts WHERE dialog_id=1").fetchone() == (None,)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_first_ordinary_page_is_productive_when_every_dialog_was_pinned(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    client = _FakeClient(
+        [
+            _pinned_response([_dialog(1, 8)]),
+            _pinned_response(),
+            _response([_dialog(1, 9)], terminal=False),
+            _response([]),
+        ]
+    )
+    directory = CanonicalDialogDirectory(client, db_path, asyncio.Event())
+
+    await _run_slices(directory, 3)
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT status,ordinary_status,reason,retry_at,offset_id FROM dialog_directory_state"
+        ).fetchone() == (
+            "in_progress",
+            "pending",
+            None,
+            None,
+            9,
+        )
+    finally:
+        conn.close()
+    await directory.run_slice()
 
 
 @pytest.mark.asyncio
@@ -716,7 +869,9 @@ async def test_semantic_invalid_latches_without_rpc_or_automatic_recovery(tmp_pa
 
     conn = _open_sync_db(db_path)
     try:
-        assert conn.execute("SELECT status,ordinary_status,offset_id,retry_at,reason FROM dialog_directory_state").fetchone() == (
+        assert conn.execute(
+            "SELECT status,ordinary_status,offset_id,retry_at,reason FROM dialog_directory_state"
+        ).fetchone() == (
             "invalid",
             "invalid",
             8,
@@ -735,7 +890,11 @@ async def test_semantic_invalid_latches_without_rpc_or_automatic_recovery(tmp_pa
     restarted.recover_invalid_generation()
     conn = _open_sync_db(db_path)
     try:
-        assert conn.execute("SELECT generation,status,retry_at FROM dialog_directory_state").fetchone() == (2, "in_progress", None)
+        assert conn.execute("SELECT generation,status,retry_at FROM dialog_directory_state").fetchone() == (
+            2,
+            "in_progress",
+            None,
+        )
         assert conn.execute("SELECT COUNT(*) FROM dialog_directory_staging").fetchone() == (0,)
     finally:
         conn.close()
@@ -749,7 +908,9 @@ async def test_pinned_semantic_invalid_latches_its_source(tmp_path: Path) -> Non
     await directory.run_slice()
     conn = _open_sync_db(db_path)
     try:
-        assert conn.execute("SELECT status,pinned_main_status,retry_at,reason FROM dialog_directory_state").fetchone() == (
+        assert conn.execute(
+            "SELECT status,pinned_main_status,retry_at,reason FROM dialog_directory_state"
+        ).fetchone() == (
             "invalid",
             "invalid",
             None,
@@ -1132,9 +1293,12 @@ def test_partial_realtime_identity_omission_preserves_values_and_explicit_remova
         )
         with conn:
             assert apply_realtime_identity(conn, 1, observed_at=20, complete=False) == 0
-            assert apply_realtime_identity(
-                conn, 1, name=None, username=None, dialog_type=None, observed_at=30, complete=False
-            ) == 1
+            assert (
+                apply_realtime_identity(
+                    conn, 1, name=None, username=None, dialog_type=None, observed_at=30, complete=False
+                )
+                == 1
+            )
         assert conn.execute(
             "SELECT name,username,type,identity_observed_at,identity_source FROM dialogs WHERE dialog_id=1"
         ).fetchone() == (None, None, "user", 10, "mixed")

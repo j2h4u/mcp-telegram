@@ -71,6 +71,7 @@ from .dialog_directory import (
     IDENTITY_OMITTED,
     apply_realtime_eligibility,
     apply_realtime_identity,
+    clear_realtime_mute,
     sync_active_generation_pins_from_publication,
 )
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
@@ -1784,7 +1785,10 @@ class EventHandlerManager:
 
     def _update_dialog_pinned(self, update: UpdateDialogPinned, now: int) -> None:
         dialog_id = self._dialog_id_from_peer(update.peer)
-        if dialog_id is None or self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is None:
+        if (
+            dialog_id is None
+            or self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is None
+        ):
             return
         pinned = 1 if update.pinned else 0
         with self._conn:
@@ -1891,9 +1895,10 @@ class EventHandlerManager:
             username = (
                 next(
                     (
-                        candidate.username.removeprefix("@")
-                        for candidate in update.usernames
-                        if getattr(candidate, "active", False) and isinstance(getattr(candidate, "username", None), str)
+                        username.removeprefix("@")
+                        for candidate in (update.usernames or ())
+                        if getattr(candidate, "active", False)
+                        and isinstance(username := getattr(candidate, "username", None), str)
                     ),
                     None,
                 )
@@ -1926,10 +1931,7 @@ class EventHandlerManager:
             mute_until = int(mute_until.timestamp())
         if mute_until is None:
             with self._conn:
-                self._conn.execute(
-                    "UPDATE dialog_directory_facts SET mute_until=NULL WHERE dialog_id=? AND mute_until IS NOT NULL",
-                    (dialog_id,),
-                )
+                clear_realtime_mute(self._conn, dialog_id, observed_at=now)
                 SQLiteFolderSnapshotRepository(self._conn).reproject_current_rules_in_transaction(now=now)
             return
         if not _is_valid_nonnegative_int(mute_until):

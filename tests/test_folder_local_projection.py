@@ -37,7 +37,14 @@ def _observation(*rules: FolderRule, started_at: int = 100) -> FolderRuleObserva
 
 
 def test_three_valued_precedence_and_missing_explicit_peer() -> None:
-    rule = FolderRule(4, "Work", included_ids=(99,), excluded_ids=(7,), categories=frozenset({DialogCategory.CONTACT}), exclude_archived=True)
+    rule = FolderRule(
+        4,
+        "Work",
+        included_ids=(99,),
+        excluded_ids=(7,),
+        categories=frozenset({DialogCategory.CONTACT}),
+        exclude_archived=True,
+    )
     assert evaluate(rule, DialogFacts(7, DialogCategory.CONTACT), now=10) is MembershipState.ABSENT
     assert evaluate(rule, DialogFacts(99), now=10) is MembershipState.PRESENT
     assert evaluate(rule, DialogFacts(2), now=10) is MembershipState.UNKNOWN
@@ -65,10 +72,15 @@ def test_projection_retains_unknown_and_custom_pin_order(tmp_path: Path) -> None
 def test_pending_rule_observation_is_preserved_without_catalog(tmp_path: Path) -> None:
     conn = _conn(tmp_path / "sync.db")
     try:
-        conn.execute("UPDATE dialog_directory_publication SET account_id=NULL,generation=NULL,observation_started_at=NULL WHERE singleton=1")
+        conn.execute(
+            "UPDATE dialog_directory_publication SET account_id=NULL,generation=NULL,observation_started_at=NULL WHERE singleton=1"
+        )
         repo = SQLiteFolderSnapshotRepository(conn)
         assert repo.project_observation(_observation(FolderRule(1, "A"), started_at=55), completed_at=56) is None
-        assert conn.execute("SELECT token,started_at FROM telegram_folder_pending_observation").fetchone() == ("rule-token", 55)
+        assert conn.execute("SELECT token,started_at FROM telegram_folder_pending_observation").fetchone() == (
+            "rule-token",
+            55,
+        )
         assert repo.rules_are_fresh(now=954)
         assert not repo.rules_are_fresh(now=955)
     finally:
@@ -78,13 +90,18 @@ def test_pending_rule_observation_is_preserved_without_catalog(tmp_path: Path) -
 def test_newer_pending_rule_replaces_older_rule_before_catalog_publication(tmp_path: Path) -> None:
     conn = _conn(tmp_path / "sync.db")
     try:
-        conn.execute("UPDATE dialog_directory_publication SET account_id=NULL,generation=NULL,observation_started_at=NULL WHERE singleton=1")
+        conn.execute(
+            "UPDATE dialog_directory_publication SET account_id=NULL,generation=NULL,observation_started_at=NULL WHERE singleton=1"
+        )
         repo = SQLiteFolderSnapshotRepository(conn)
         first = FolderRuleObservation((FolderRule(1, "Old"),), "old", 55)
         second = FolderRuleObservation((FolderRule(2, "New"),), "new", 70)
         assert repo.project_observation(first, completed_at=56) is None
         assert repo.project_observation(second, completed_at=71) is None
-        assert conn.execute("SELECT token,started_at FROM telegram_folder_pending_observation").fetchone() == ("new", 70)
+        assert conn.execute("SELECT token,started_at FROM telegram_folder_pending_observation").fetchone() == (
+            "new",
+            70,
+        )
         conn.execute(
             "UPDATE dialog_directory_publication SET account_id=1,generation=8,observation_started_at=80 WHERE singleton=1"
         )
@@ -103,12 +120,15 @@ def test_default_uses_catalog_and_main_pin_order(tmp_path: Path) -> None:
         )
         conn.executemany("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (?, 'group', 0)", [(40,), (10,)])
         conn.executemany(
-            "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (0,?,?)", [(40, 1), (10, 0)]
+            "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (0,?,?)",
+            [(40, 1), (10, 0)],
         )
         repo = SQLiteFolderSnapshotRepository(conn)
         rule = FolderRule(0, "All chats", DEFAULT_FOLDER_NAMESPACE, FolderRuleKind.DEFAULT)
         repo.project_observation(_observation(rule), completed_at=100)
-        assert conn.execute("SELECT dialog_id,pin_position FROM telegram_folder_local_members ORDER BY pin_position").fetchall() == [(10, 0), (40, 1)]
+        assert conn.execute(
+            "SELECT dialog_id,pin_position FROM telegram_folder_local_members ORDER BY pin_position"
+        ).fetchall() == [(10, 0), (40, 1)]
     finally:
         conn.close()
 
@@ -124,6 +144,25 @@ def test_visible_dialog_without_eligibility_facts_is_not_omitted(tmp_path: Path)
         assert conn.execute(
             "SELECT namespace,folder_id,state FROM telegram_folder_local_members WHERE dialog_id=77 ORDER BY folder_id"
         ).fetchall() == [("default", 0, "present"), ("filter", 2, "unknown")]
+    finally:
+        conn.close()
+
+
+def test_default_excludes_archived_dialogs_and_marks_unknown_archive_unknown(tmp_path: Path) -> None:
+    conn = _conn(tmp_path / "sync.db")
+    try:
+        conn.executemany(
+            "INSERT INTO dialogs(dialog_id,type,hidden,archived) VALUES (?,'user',0,?)",
+            [(1, 0), (2, 1), (3, 0)],
+        )
+        conn.execute("INSERT INTO dialog_directory_facts VALUES (3,NULL,NULL,NULL,NULL,NULL)")
+        repo = SQLiteFolderSnapshotRepository(conn)
+        default = FolderRule(0, "All chats", DEFAULT_FOLDER_NAMESPACE, FolderRuleKind.DEFAULT)
+        repo.project_observation(_observation(default), completed_at=100)
+        assert conn.execute(
+            "SELECT dialog_id,state FROM telegram_folder_local_members ORDER BY dialog_id"
+        ).fetchall() == [(1, "present"), (3, "present")]
+        assert evaluate(default, DialogFacts(9, archived=None), now=100) is MembershipState.UNKNOWN
     finally:
         conn.close()
 

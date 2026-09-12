@@ -17,7 +17,9 @@ def evaluate(rule: FolderRule, facts: DialogFacts | None, *, now: int) -> Member
     if facts is None:
         return MembershipState.UNKNOWN
     if rule.kind is FolderRuleKind.DEFAULT:
-        return MembershipState.PRESENT
+        if facts.archived is None:
+            return MembershipState.UNKNOWN
+        return MembershipState.ABSENT if facts.archived else MembershipState.PRESENT
     category = _category_state(rule, facts)
     if category is MembershipState.ABSENT:
         return category

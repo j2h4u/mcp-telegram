@@ -625,6 +625,27 @@ async def test_realtime_identity_and_mute_update_only_their_canonical_bundles(
     ).fetchone() == (1_767_225_600,)
 
 
+@pytest.mark.asyncio
+async def test_username_update_with_null_aliases_still_applies_authoritative_fields(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 67891
+    _insert_dialog(sync_db, dialog_id, snapshot_at=1)
+    sync_db.execute("UPDATE dialogs SET name='Old',type='user',username='old' WHERE dialog_id=?", (dialog_id,))
+    sync_db.commit()
+
+    await _make_manager(mock_client, sync_db, shutdown_event).on_raw_identity_or_notify(
+        UpdateUserName(dialog_id, "New", "Name", None)
+    )
+
+    assert sync_db.execute("SELECT name,username FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        "New Name",
+        None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # EVENTS-02: still_unread_count persisted as an exact Telegram fact
 # ---------------------------------------------------------------------------

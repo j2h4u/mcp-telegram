@@ -60,7 +60,9 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
             return accepted
         row = cast(
             tuple[object] | None,
-            self._conn.execute("SELECT started_at FROM telegram_folder_pending_observation WHERE singleton=1").fetchone(),
+            self._conn.execute(
+                "SELECT started_at FROM telegram_folder_pending_observation WHERE singleton=1"
+            ).fetchone(),
         )
         return None if row is None or row[0] is None else _as_int(row[0])
 
@@ -137,7 +139,9 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
         completed_at: int,
     ) -> None:
         facts = _canonical_facts(self._conn)
-        members = _evaluate_rules(self._conn, observation.rules, facts, _published_main_pins(self._conn), now=completed_at)
+        members = _evaluate_rules(
+            self._conn, observation.rules, facts, _published_main_pins(self._conn), now=completed_at
+        )
         self._conn.execute("DELETE FROM telegram_folder_local_members")
         self._conn.execute("DELETE FROM telegram_folder_rules")
         self._conn.executemany(
@@ -149,24 +153,42 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
         )
         self._conn.executemany(
             "INSERT INTO telegram_folder_local_members(namespace,folder_id,dialog_id,state,pin_position) VALUES (?,?,?,?,?)",
-            [(member.namespace, member.folder_id, member.dialog_id, member.state.value, member.pin_position) for member in members],
+            [
+                (member.namespace, member.folder_id, member.dialog_id, member.state.value, member.pin_position)
+                for member in members
+            ],
         )
         next_mute_expiry = min(
-            (facts_item.mute_until for facts_item in facts.values() if facts_item.mute_until is not None and facts_item.mute_until > completed_at),
+            (
+                facts_item.mute_until
+                for facts_item in facts.values()
+                if facts_item.mute_until is not None and facts_item.mute_until > completed_at
+            ),
             default=None,
         )
         self._conn.execute(
             "UPDATE telegram_folder_projection_state SET account_id=?,canonical_generation=?,accepted_rule_token=?,"
             "rule_observation_started_at=?,completed_at=?,canonical_observed_at=?,next_mute_expiry=?,coverage_status='complete',"
             "last_attempt_at=?,last_outcome='success',next_retry_at=NULL,consecutive_failures=0 WHERE singleton=1",
-            (account_id, generation, observation.token, observation.started_at, completed_at, canonical_observed_at, next_mute_expiry, completed_at),
+            (
+                account_id,
+                generation,
+                observation.token,
+                observation.started_at,
+                completed_at,
+                canonical_observed_at,
+                next_mute_expiry,
+                completed_at,
+            ),
         )
         self._conn.execute("DELETE FROM telegram_folder_pending_observation")
 
     def _save_pending(self, observation: FolderRuleObservation) -> None:
         row = cast(
             tuple[object, object] | None,
-            self._conn.execute("SELECT token,started_at FROM telegram_folder_pending_observation WHERE singleton=1").fetchone(),
+            self._conn.execute(
+                "SELECT token,started_at FROM telegram_folder_pending_observation WHERE singleton=1"
+            ).fetchone(),
         )
         if row is None:
             self._conn.execute(
@@ -185,13 +207,16 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
 
     def _accepted_observation(self) -> FolderRuleObservation | None:
         rows = cast(
-            list[tuple[str]], self._conn.execute("SELECT rule_json FROM telegram_folder_rules ORDER BY source_position").fetchall()
+            list[tuple[str]],
+            self._conn.execute("SELECT rule_json FROM telegram_folder_rules ORDER BY source_position").fetchall(),
         )
         if not rows:
             return None
         state = cast(
             tuple[str | None, int | None] | None,
-            self._conn.execute("SELECT accepted_rule_token,rule_observation_started_at FROM telegram_folder_projection_state WHERE singleton=1").fetchone(),
+            self._conn.execute(
+                "SELECT accepted_rule_token,rule_observation_started_at FROM telegram_folder_projection_state WHERE singleton=1"
+            ).fetchone(),
         )
         if state is None or state[0] is None or state[1] is None:
             return None
@@ -200,7 +225,9 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
     def _pending_observation(self) -> FolderRuleObservation | None:
         row = cast(
             tuple[object, object, object] | None,
-            self._conn.execute("SELECT token,started_at,rules_json FROM telegram_folder_pending_observation WHERE singleton=1").fetchone(),
+            self._conn.execute(
+                "SELECT token,started_at,rules_json FROM telegram_folder_pending_observation WHERE singleton=1"
+            ).fetchone(),
         )
         if row is None:
             return None
@@ -209,14 +236,19 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
         return FolderRuleObservation(rules, str(row[0]), _as_int(row[1]))
 
     def _state(self, column: str) -> str | None:
-        row = cast(tuple[object] | None, self._conn.execute(f"SELECT {column} FROM telegram_folder_projection_state WHERE singleton=1").fetchone())
+        row = cast(
+            tuple[object] | None,
+            self._conn.execute(f"SELECT {column} FROM telegram_folder_projection_state WHERE singleton=1").fetchone(),
+        )
         return None if row is None or row[0] is None else str(row[0])
 
 
 def _canonical_receipt(conn: sqlite3.Connection) -> tuple[int, int, int] | None:
     row = cast(
         tuple[object, object, object] | None,
-        conn.execute("SELECT account_id,generation,observation_started_at FROM dialog_directory_publication WHERE singleton=1").fetchone(),
+        conn.execute(
+            "SELECT account_id,generation,observation_started_at FROM dialog_directory_publication WHERE singleton=1"
+        ).fetchone(),
     )
     if row is None or any(value is None for value in row):
         return None
@@ -226,7 +258,9 @@ def _canonical_receipt(conn: sqlite3.Connection) -> tuple[int, int, int] | None:
 def _canonical_facts(conn: sqlite3.Connection) -> dict[int, DialogFacts]:
     rows = cast(
         list[tuple[int, str | None, int | None, int | None, int | None, int | None]],
-        conn.execute("SELECT dialog_id,category,archived,unread,mute_until,observed_at FROM dialog_directory_facts").fetchall(),
+        conn.execute(
+            "SELECT dialog_id,category,archived,unread,mute_until,observed_at FROM dialog_directory_facts"
+        ).fetchall(),
     )
     return {
         dialog_id: DialogFacts(
@@ -242,7 +276,10 @@ def _canonical_facts(conn: sqlite3.Connection) -> dict[int, DialogFacts]:
 
 
 def _published_main_pins(conn: sqlite3.Connection) -> dict[int, int]:
-    rows = cast(list[tuple[int, int]], conn.execute("SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=0").fetchall())
+    rows = cast(
+        list[tuple[int, int]],
+        conn.execute("SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=0").fetchall(),
+    )
     return dict(rows)
 
 
@@ -254,21 +291,31 @@ def _evaluate_rules(
     *,
     now: int,
 ) -> tuple[FolderMembership, ...]:
-    visible_dialog_ids = {
-        dialog_id
-        for (dialog_id,) in cast(
-            list[tuple[int]],
+    visible_dialogs = {
+        dialog_id: bool(archived)
+        for dialog_id, archived in cast(
+            list[tuple[int, int]],
             # A published dialog can lack optional eligibility facts. It must
             # still be represented in three-valued folder membership.
-            conn.execute("SELECT dialog_id FROM dialogs WHERE hidden=0").fetchall(),
+            conn.execute("SELECT dialog_id,archived FROM dialogs WHERE hidden=0").fetchall(),
         )
     }
     result: list[FolderMembership] = []
     for rule in rules:
-        candidate_ids = set(visible_dialog_ids)
+        candidate_ids = set(visible_dialogs)
         candidate_ids.update(rule.explicit_ids)
         for dialog_id in candidate_ids:
-            state = evaluate(rule, facts.get(dialog_id, DialogFacts(dialog_id)), now=now)
+            facts_item = facts.get(dialog_id, DialogFacts(dialog_id, archived=visible_dialogs.get(dialog_id)))
+            if facts_item.archived is None and dialog_id in visible_dialogs:
+                facts_item = DialogFacts(
+                    dialog_id,
+                    facts_item.category,
+                    visible_dialogs[dialog_id],
+                    facts_item.unread,
+                    facts_item.mute_until,
+                    facts_item.observed_at,
+                )
+            state = evaluate(rule, facts_item, now=now)
             if state is MembershipState.ABSENT:
                 continue
             position = pin_position(rule, dialog_id)
@@ -281,27 +328,50 @@ def _evaluate_rules(
 def _encode_rule(rule: FolderRule) -> str:
     return json.dumps(
         {
-            "id": rule.folder_id, "title": rule.title, "namespace": rule.namespace, "kind": rule.kind.value,
-            "position": rule.source_position, "include": rule.included_ids, "pins": rule.pinned_ids,
-            "exclude": rule.excluded_ids, "categories": [item.value for item in rule.categories],
-            "exclude_archived": rule.exclude_archived, "exclude_read": rule.exclude_read, "exclude_muted": rule.exclude_muted,
-        }, separators=(",", ":"), sort_keys=True,
+            "id": rule.folder_id,
+            "title": rule.title,
+            "namespace": rule.namespace,
+            "kind": rule.kind.value,
+            "position": rule.source_position,
+            "include": rule.included_ids,
+            "pins": rule.pinned_ids,
+            "exclude": rule.excluded_ids,
+            "categories": [item.value for item in rule.categories],
+            "exclude_archived": rule.exclude_archived,
+            "exclude_read": rule.exclude_read,
+            "exclude_muted": rule.exclude_muted,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
     )
 
 
 def _decode_rule(raw: str) -> FolderRule:
     value = cast(dict[str, object], json.loads(raw))
     return FolderRule(
-        _as_int(value["id"]), str(value["title"]), str(value["namespace"]), FolderRuleKind(str(value["kind"])),
-        _as_int(value["position"]), tuple(_as_int(item) for item in cast(list[object], value["include"])),
-        tuple(_as_int(item) for item in cast(list[object], value["pins"])), tuple(_as_int(item) for item in cast(list[object], value["exclude"])),
-        frozenset(DialogCategory(str(item)) for item in cast(list[object], value["categories"])), bool(value["exclude_archived"]),
-        bool(value["exclude_read"]), bool(value["exclude_muted"]),
+        _as_int(value["id"]),
+        str(value["title"]),
+        str(value["namespace"]),
+        FolderRuleKind(str(value["kind"])),
+        _as_int(value["position"]),
+        tuple(_as_int(item) for item in cast(list[object], value["include"])),
+        tuple(_as_int(item) for item in cast(list[object], value["pins"])),
+        tuple(_as_int(item) for item in cast(list[object], value["exclude"])),
+        frozenset(DialogCategory(str(item)) for item in cast(list[object], value["categories"])),
+        bool(value["exclude_archived"]),
+        bool(value["exclude_read"]),
+        bool(value["exclude_muted"]),
     )
 
 
 def _encode_observation(observation: FolderRuleObservation) -> str:
-    return json.dumps({"token": observation.token, "started_at": observation.started_at, "rules": [_encode_rule(rule) for rule in observation.rules]})
+    return json.dumps(
+        {
+            "token": observation.token,
+            "started_at": observation.started_at,
+            "rules": [_encode_rule(rule) for rule in observation.rules],
+        }
+    )
 
 
 def _int_state(value: str | None) -> int | None:
