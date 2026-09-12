@@ -221,6 +221,28 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
             "additionalProperties": False,
         },
         "snapshot_age_h": {"type": ["integer", "null"]},
+        "directory_coverage": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["never", "in_progress", "stale", "complete"]},
+                "publication_generation": {"type": ["integer", "null"]},
+                "observation_started_at": {"type": ["integer", "null"]},
+                "age_seconds": {"type": ["integer", "null"]},
+                "refresh_status": {"type": ["string", "null"]},
+                "lookup_complete": {"type": "boolean"},
+                "lookup_fresh": {"type": "boolean"},
+            },
+            "required": [
+                "status",
+                "publication_generation",
+                "observation_started_at",
+                "age_seconds",
+                "refresh_status",
+                "lookup_complete",
+                "lookup_fresh",
+            ],
+            "additionalProperties": False,
+        },
         "bootstrap_pending": {"type": "boolean"},
         "scope": {"type": "string", "enum": ["all", "own_only"]},
         "folder_snapshot": FOLDER_SNAPSHOT_OUTPUT_SCHEMA,
@@ -246,6 +268,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
         "count",
         "filters",
         "snapshot_age_h",
+        "directory_coverage",
         "bootstrap_pending",
         "scope",
         "folder_snapshot",
@@ -314,6 +337,7 @@ class _ListDialogsSurface:
     bootstrap_pending: bool
     scope: str
     folder_snapshot: _FolderSnapshotSurface
+    directory_coverage: dict[str, object]
 
 
 def _list_dialogs_contract_error(detail: str) -> ToolResult:
@@ -463,6 +487,19 @@ def _strict_list_dialogs_data(
         bootstrap_pending=bootstrap_pending,
         scope=cast(str, scope),
         folder_snapshot=_strict_folder_snapshot(_required(raw_data, "folder_snapshot", context="list_dialogs")),
+        directory_coverage=(
+            dict(raw_data["directory_coverage"])
+            if isinstance(raw_data.get("directory_coverage"), Mapping)
+            else {
+                "status": "never",
+                "publication_generation": 0,
+                "observation_started_at": 0,
+                "age_seconds": 0,
+                "refresh_status": "never",
+                "lookup_complete": False,
+                "lookup_fresh": False,
+            }
+        ),
     )
 
 
@@ -767,6 +804,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
         "bootstrap_pending": surface.bootstrap_pending,
         "scope": surface.scope,
         "folder_snapshot": surface.folder_snapshot.to_wire(),
+        "directory_coverage": surface.directory_coverage,
         "warnings": warnings,
     }
 

@@ -7,7 +7,12 @@ from dataclasses import dataclass
 
 from .structured import telegram_content
 
-_DIALOG_RESOLUTION_ERRORS = {"ambiguous_dialog", "dialog_not_found"}
+_DIALOG_RESOLUTION_ERRORS = {
+    "ambiguous_dialog",
+    "dialog_not_found",
+    "dialog_directory_incomplete",
+    "stale_local_directory",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +81,12 @@ def project_dialog_resolution_error(
 
     raw_candidates = response.get("candidates")
     raw_suggestion = response.get("suggestion")
-    if not isinstance(raw_candidates, list) and not isinstance(raw_suggestion, Mapping):
+    coverage = response.get("directory_coverage")
+    if (
+        not isinstance(raw_candidates, list)
+        and not isinstance(raw_suggestion, Mapping)
+        and not isinstance(coverage, Mapping)
+    ):
         return None
 
     message_text, action_text = _dialog_resolution_message_and_action(response, fallback_action)
@@ -86,6 +96,8 @@ def project_dialog_resolution_error(
         "required_action": action_text,
     }
     structured_content.update(_dialog_resolution_candidate_fields(raw_candidates, raw_suggestion))
+    if isinstance(coverage, Mapping):
+        structured_content["directory_coverage"] = dict(coverage)
     return DialogResolutionErrorProjection(
         text=f"Error: {error}: {message_text}\nAction: {action_text}",
         structured_content=structured_content,

@@ -49,6 +49,15 @@ from .structured import (
 
 # Archive coverage values are expressed as percentages.
 _ARCHIVE_COVERAGE_COMPLETE_PERCENT = 100
+_DEFAULT_DIRECTORY_COVERAGE = {
+    "status": "never",
+    "publication_generation": 0,
+    "observation_started_at": 0,
+    "age_seconds": 0,
+    "refresh_status": "never",
+    "lookup_complete": False,
+    "lookup_fresh": False,
+}
 _SEARCHABLE_QUERY_TOKEN_RE = re.compile(SEARCHABLE_QUERY_TOKEN_PATTERN)
 
 # ---------------------------------------------------------------------------
@@ -223,6 +232,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
             ],
             "additionalProperties": False,
         },
+        "directory_coverage": {"type": "object"},
         "warnings": {
             "type": "array",
             "items": {
@@ -380,6 +390,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
         "dialog",
         "source",
         "coverage",
+        "directory_coverage",
         "warnings",
         "filters",
         "limits",
@@ -641,6 +652,7 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
         },
         "source": data.get("source", "unknown"),
         "coverage": _list_messages_coverage(data),
+        "directory_coverage": data.get("directory_coverage") or dict(_DEFAULT_DIRECTORY_COVERAGE),
         "warnings": warnings,
         "filters": {
             "dialog": args.dialog,
@@ -716,6 +728,7 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
         },
         "source": {"type": "string"},
         "coverage": {"type": "object"},
+        "directory_coverage": {"type": "object"},
         "warnings": {"type": "array", "items": {"type": "object"}},
         "read_state_per_dialog": {"type": "object"},
         "navigation": {
@@ -763,6 +776,7 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
         "scope",
         "source",
         "coverage",
+        "directory_coverage",
         "warnings",
         "read_state_per_dialog",
         "navigation",
@@ -945,6 +959,7 @@ def _search_structured_content(ctx: _SearchStructuredContentContext) -> dict[str
         "scope": _search_scope_payload(ctx),
         "source": source,
         "coverage": _list_messages_coverage(data_with_source),
+        "directory_coverage": data.get("directory_coverage") or dict(_DEFAULT_DIRECTORY_COVERAGE),
         "warnings": _list_messages_warnings(data),
         "read_state_per_dialog": _search_read_state_per_dialog(data),
         "navigation": {

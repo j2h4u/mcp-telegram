@@ -121,8 +121,6 @@ class _EntityInfoClient(Protocol):
 
     def iter_participants(self, peer: object, limit: int = 0) -> AsyncIterator[object]: ...
 
-    def iter_dialogs(self) -> AsyncIterator[object]: ...
-
 
 class _CommonChatsResult(Protocol):
     chats: Sequence[object]
