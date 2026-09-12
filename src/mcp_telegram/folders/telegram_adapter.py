@@ -84,7 +84,7 @@ def _folder_rule(folder: object, position: int) -> FolderRule | None:
 
 def _observation_token(rules: tuple[FolderRule, ...]) -> str:
     payload = [
-        (rule.namespace, rule.folder_id, rule.kind.value, rule.source_position, rule.included_ids, rule.pinned_ids,
+        (rule.namespace, rule.folder_id, rule.title, rule.kind.value, rule.source_position, rule.included_ids, rule.pinned_ids,
          rule.excluded_ids, sorted(category.value for category in rule.categories), rule.exclude_archived,
          rule.exclude_read, rule.exclude_muted)
         for rule in rules

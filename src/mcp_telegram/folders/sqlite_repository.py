@@ -292,9 +292,9 @@ def _evaluate_rules(
     now: int,
 ) -> tuple[FolderMembership, ...]:
     visible_dialogs = {
-        dialog_id: bool(archived)
+        dialog_id: None if archived is None else bool(archived)
         for dialog_id, archived in cast(
-            list[tuple[int, int]],
+            list[tuple[int, int | None]],
             # A published dialog can lack optional eligibility facts. It must
             # still be represented in three-valued folder membership.
             conn.execute("SELECT dialog_id,archived FROM dialogs WHERE hidden=0").fetchall(),

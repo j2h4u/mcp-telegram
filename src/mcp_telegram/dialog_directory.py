@@ -295,7 +295,6 @@ class CanonicalDialogDirectory:
         self, conn: sqlite3.Connection, state: _DirectoryState, folder_id: int, account_id: int
     ) -> None:
         published_before = _published_pin_rows(conn, folder_id)
-        active_rows_before = _active_generation_pin_rows(conn, state.generation, folder_id)
         try:
             response = await self._client(get_pinned_dialogs_request(folder_id))
         except Exception as exc:  # noqa: BLE001 - transport classes vary under Telethon
@@ -323,7 +322,7 @@ class CanonicalDialogDirectory:
             raise RuntimeError(f"unexpected normalized pinned response: {page.kind}")
         with conn:
             self._stage_facts(conn, state.generation, page.facts, folder_id=folder_id, account_id=account_id)
-            if active_rows_before or _published_pin_rows(conn, folder_id) != published_before:
+            if _published_pin_rows(conn, folder_id) != published_before:
                 sync_active_generation_pins_from_publication(conn, folder_id)
             else:
                 # No realtime writer published this source during the request,
@@ -370,7 +369,6 @@ class CanonicalDialogDirectory:
             return
         if page.kind == "incomplete":
             reason = page.reason or "incomplete_page"
-            retry_delay = 900 if reason.startswith("stalled:") else 60
             with conn:
                 # An incomplete page may still contribute catalog rows.
                 # It never advances the committed cursor or publishes.
@@ -378,7 +376,7 @@ class CanonicalDialogDirectory:
                 conn.execute(
                     "UPDATE dialog_directory_state SET status='incomplete', ordinary_status='incomplete', reason=?, retry_at=? "
                     "WHERE singleton=1 AND account_id=? AND generation=?",
-                    (reason, int(time.time()) + retry_delay, account_id, state.generation),
+                    (reason, int(time.time()) + 900, account_id, state.generation),
                 )
             return
         with conn:
@@ -1032,21 +1030,6 @@ def _published_pin_rows(conn: sqlite3.Connection, folder_id: int) -> tuple[tuple
     )
 
 
-def _active_generation_pin_rows(
-    conn: sqlite3.Connection, generation: int, folder_id: int
-) -> tuple[tuple[int, int], ...]:
-    return tuple(
-        cast(
-            list[tuple[int, int]],
-            conn.execute(
-                "SELECT dialog_id,position FROM dialog_directory_pins "
-                "WHERE generation=? AND folder_id=? ORDER BY position,dialog_id",
-                (generation, folder_id),
-            ).fetchall(),
-        )
-    )
-
-
 def sync_active_generation_pins_from_publication(conn: sqlite3.Connection, folder_id: int) -> None:
     """Fence an active source against newer realtime pin membership and order."""
     row = cast(
@@ -1114,13 +1097,14 @@ def apply_realtime_eligibility(  # noqa: PLR0913
 
 def clear_realtime_mute(conn: sqlite3.Connection, dialog_id: int, *, observed_at: int) -> int:
     """Clear a realtime mute fact while fencing an in-flight directory snapshot."""
-    conn.execute(
+    cursor = conn.execute(
         "UPDATE dialog_directory_facts SET mute_until=NULL, "
         "observed_at=CASE WHEN observed_at IS NULL THEN ? ELSE MIN(observed_at,?) END "
-        "WHERE dialog_id=?",
+        "WHERE dialog_id=? AND mute_until IS NOT NULL",
         (observed_at, observed_at, dialog_id),
     )
-    cursor = conn.execute("UPDATE dialogs SET revision=revision+1 WHERE dialog_id=?", (dialog_id,))
+    if cursor.rowcount:
+        conn.execute("UPDATE dialogs SET revision=revision+1 WHERE dialog_id=?", (dialog_id,))
     return cursor.rowcount
 
 

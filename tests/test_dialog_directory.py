@@ -433,7 +433,7 @@ async def test_realtime_pins_win_over_an_overlapping_pending_pinned_rpc(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("folder_id", "realtime_id"), [(0, 52), (1, 53)])
-async def test_existing_realtime_active_pins_are_never_reinserted_by_pinned_rpc(
+async def test_existing_realtime_active_pins_are_replaced_by_unchanged_pinned_rpc(
     tmp_path: Path, folder_id: int, realtime_id: int
 ) -> None:
     db_path = tmp_path / "sync.db"
@@ -462,7 +462,7 @@ async def test_existing_realtime_active_pins_are_never_reinserted_by_pinned_rpc(
         assert conn.execute(
             "SELECT dialog_id,position FROM dialog_directory_pins WHERE generation=1 AND folder_id=?",
             (folder_id,),
-        ).fetchall() == [(realtime_id, 0)]
+        ).fetchall() == [(1, 0)]
     finally:
         conn.close()
 

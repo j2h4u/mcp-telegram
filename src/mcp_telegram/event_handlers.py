@@ -568,6 +568,8 @@ _SELECT_SYNCED_ONLY_SQL = (
 # snapshot_at=NULL and needs_refresh=1 without unhiding an existing row.
 # ---------------------------------------------------------------------------
 
+# All dialogs.pinned writers also synchronize the published-pin relation below;
+# publication and active staging are the authoritative cross-source pin record.
 _UPDATE_DIALOG_PINNED_SQL = "UPDATE dialogs SET pinned=?, snapshot_at=? WHERE dialog_id=?"
 
 _UPDATE_DIALOG_NEEDS_REFRESH_SQL = "UPDATE dialogs SET needs_refresh=1, snapshot_at=? WHERE dialog_id=?"
@@ -1785,14 +1787,13 @@ class EventHandlerManager:
 
     def _update_dialog_pinned(self, update: UpdateDialogPinned, now: int) -> None:
         dialog_id = self._dialog_id_from_peer(update.peer)
-        if (
-            dialog_id is None
-            or self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is None
-        ):
+        if dialog_id is None:
             return
+        known_dialog = self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
         pinned = 1 if update.pinned else 0
         with self._conn:
-            self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
+            if known_dialog:
+                self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
             folder_id = getattr(update, "folder_id", None)
             published_folder = self._published_pin_folder(folder_id)
             if published_folder is not None:
@@ -1804,7 +1805,7 @@ class EventHandlerManager:
                         (published_folder, dialog_id),
                     )
                 sync_active_generation_pins_from_publication(self._conn, published_folder)
-            if isinstance(folder_id, int) and not isinstance(folder_id, bool) and folder_id in {0, 1}:
+            if known_dialog and isinstance(folder_id, int) and not isinstance(folder_id, bool) and folder_id in {0, 1}:
                 apply_realtime_eligibility(
                     self._conn,
                     dialog_id,
@@ -1931,8 +1932,8 @@ class EventHandlerManager:
             mute_until = int(mute_until.timestamp())
         if mute_until is None:
             with self._conn:
-                clear_realtime_mute(self._conn, dialog_id, observed_at=now)
-                SQLiteFolderSnapshotRepository(self._conn).reproject_current_rules_in_transaction(now=now)
+                if clear_realtime_mute(self._conn, dialog_id, observed_at=now):
+                    SQLiteFolderSnapshotRepository(self._conn).reproject_current_rules_in_transaction(now=now)
             return
         if not _is_valid_nonnegative_int(mute_until):
             return

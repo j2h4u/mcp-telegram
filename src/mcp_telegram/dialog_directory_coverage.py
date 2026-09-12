@@ -68,17 +68,17 @@ def read_dialog_directory_coverage(
             ).fetchone(),
         )
         state = cast(
-            tuple[object, object] | None,
+            tuple[object, object, object] | None,
             conn.execute(
-                "SELECT status, reason FROM dialog_directory_state WHERE singleton=1"
+                "SELECT status, reason, observation_started_at FROM dialog_directory_state WHERE singleton=1"
             ).fetchone(),
         )
     except sqlite3.OperationalError:
         try:
             state = cast(
-                tuple[object, object] | None,
-                conn.execute(
-                    "SELECT status, NULL AS reason FROM dialog_directory_state WHERE singleton=1"
+            tuple[object, object, object] | None,
+            conn.execute(
+                "SELECT status, NULL AS reason, observation_started_at FROM dialog_directory_state WHERE singleton=1"
                 ).fetchone(),
             )
             publication = cast(
@@ -95,6 +95,7 @@ def read_dialog_directory_coverage(
     published_started = _int_or_none(publication[1]) if publication is not None else None
     refresh_status = str(state[0]) if state is not None and state[0] is not None else None
     reason = str(state[1]) if state is not None and state[1] is not None else None
+    acquisition_started = _int_or_none(state[2]) if state is not None else None
     observation_started_at = published_started
 
     try:
@@ -126,7 +127,9 @@ def read_dialog_directory_coverage(
 
     if published_started is None:
         status: DirectoryCoverageStatus = (
-            "in_progress" if generation is None and refresh_status == "in_progress" else "never"
+            "in_progress"
+            if acquisition_started is not None and refresh_status in {"pending", "in_progress", "incomplete"}
+            else "never"
         )
         age_seconds = None
     else:

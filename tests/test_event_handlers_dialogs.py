@@ -382,12 +382,12 @@ async def test_update_dialog_pinned_updates_known_unenrolled_catalog_dialog(
 
 
 @pytest.mark.asyncio
-async def test_update_dialog_pinned_missing_dialogs_row_is_noop(
+async def test_update_dialog_pinned_missing_dialogs_row_updates_published_pin_without_fabricating_dialog(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """EVENTS-01: enrolled in _synced_dialog_ids but NO dialogs row — no exception, no INSERT."""
+    """A cold peer updates canonical pin order without fabricating a dialog row."""
     channel_id = 77777
     dialog_id = get_peer_id(PeerChannel(channel_id))
     _enroll_synced(sync_db, dialog_id)
@@ -402,7 +402,10 @@ async def test_update_dialog_pinned_missing_dialogs_row_is_noop(
     mgr._synced_dialog_ids.add(dialog_id)
     await mgr.on_raw_dialog_pinned(upd)  # must not raise
 
-    assert _dialogs_count(sync_db) == 0  # no row created
+    assert _dialogs_count(sync_db) == 0
+    assert sync_db.execute(
+        "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=0"
+    ).fetchall() == [(dialog_id, 0)]
 
 
 @pytest.mark.asyncio

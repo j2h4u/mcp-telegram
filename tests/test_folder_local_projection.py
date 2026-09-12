@@ -19,7 +19,7 @@ from mcp_telegram.folders.contracts import (
 from mcp_telegram.folders.membership import evaluate
 from mcp_telegram.folders.read_repository import folder_snapshot
 from mcp_telegram.folders.sqlite_repository import SQLiteFolderSnapshotRepository
-from mcp_telegram.folders.telegram_adapter import TelethonTelegramFolderGateway
+from mcp_telegram.folders.telegram_adapter import TelethonTelegramFolderGateway, _observation_token
 from mcp_telegram.sync_db import ensure_sync_schema
 
 
@@ -165,6 +165,10 @@ def test_default_excludes_archived_dialogs_and_marks_unknown_archive_unknown(tmp
         assert evaluate(default, DialogFacts(9, archived=None), now=100) is MembershipState.UNKNOWN
     finally:
         conn.close()
+
+
+def test_folder_observation_token_changes_when_only_title_changes() -> None:
+    assert _observation_token((FolderRule(1, "Old"),)) != _observation_token((FolderRule(1, "New"),))
 
 
 def test_canonical_and_rule_receipts_turn_stale_at_exactly_900_seconds(tmp_path: Path) -> None:

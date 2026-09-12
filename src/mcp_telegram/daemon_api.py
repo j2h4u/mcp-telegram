@@ -1359,6 +1359,27 @@ class DaemonAPIServer:
         limit = None if raw_limit is None else _clamp(_coerce_int(raw_limit, 100), 1, 500)
         data = cast(dict[str, object], result.get("data", {}))
         dialogs = cast(list[dict[str, object]], data.get("dialogs", []))
+        if _coerce_int(requested_folder, -1) == 1:
+            archive_rows = cast(
+                list[tuple[object, object]],
+                self._conn.execute(
+                    "SELECT d.dialog_id,COALESCE(f.archived,d.archived) FROM dialogs d "
+                    "LEFT JOIN dialog_directory_facts f ON f.dialog_id=d.dialog_id WHERE d.hidden=0"
+                ).fetchall(),
+            )
+            archived_ids = {_coerce_int(dialog_id, 0) for dialog_id, archived in archive_rows if archived == 1}
+            unknown_archived = sum(archived is None for _, archived in archive_rows)
+            enriched = [dialog for dialog in dialogs if int(cast(int | str, dialog["id"])) in archived_ids]
+            for dialog in enriched:
+                dialog["folder_ids"] = [1]
+                dialog["folders"] = [{"id": 1, "title": "Archived"}]
+            data["dialogs"] = enriched[:limit] if limit is not None else enriched
+            data["folder_membership_unknown_count"] = unknown_archived
+            data["folder_snapshot"] = folder_snapshot(
+                self._conn,
+                stale_after_seconds=self._policy.folder_snapshot_stale_after_seconds,
+            )
+            return result
         enriched = []
         for dialog in dialogs:
             folders = memberships.get(int(cast(int | str, dialog["id"])), [])

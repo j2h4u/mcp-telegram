@@ -3615,8 +3615,9 @@ def _apply_migration_64(conn: sqlite3.Connection, current: int) -> int:
     """Install the single-generation canonical dialog-directory lifecycle.
 
     The old full-reconciliation state is evidence of an attempted wrapper
-    traversal, not a raw-directory receipt. Keep its generation and cursor
-    for diagnostics, but never promote it to complete or clear cached rows.
+    traversal, not a raw-directory receipt. Its unverifiable cursor is
+    deliberately discarded and safely restarted during this one-time cutover;
+    never promote it to complete or send it to semantic-invalid recovery.
     """
     if current >= _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64:
         return current

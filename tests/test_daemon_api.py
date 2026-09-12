@@ -1792,6 +1792,24 @@ async def test_list_dialogs_with_folder_filter_uses_preserved_snapshot(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_list_dialogs_archive_folder_uses_canonical_archive_facts(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _register_sqlite_connection(sqlite3.connect(db_path))
+    _seed_dialog_row(conn, 1, name="Archived", type_="User", archived=True)
+    _seed_dialog_row(conn, 2, name="Main", type_="User", archived=False)
+    conn.execute("INSERT INTO dialog_directory_facts VALUES (1,NULL,1,NULL,NULL,NULL)")
+    conn.execute("INSERT INTO dialog_directory_facts VALUES (2,NULL,0,NULL,NULL,NULL)")
+    server = make_server(conn)
+
+    result = await server._list_dialogs({"folder_id": 1})
+
+    data = cast(dict[str, object], _response_data(result))
+    assert [dialog["id"] for dialog in cast(list[dict[str, object]], data["dialogs"])] == [1]
+    assert data["folder_membership_unknown_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_list_dialogs_file_db_uses_threaded_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     conn, db_path = _make_file_db_with_dialogs(tmp_path)
     _seed_dialog_row(conn, 101, name="Threaded", type_="user", last_message_at=100)

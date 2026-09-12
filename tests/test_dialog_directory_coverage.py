@@ -38,7 +38,9 @@ def test_unpublished_or_missing_start_never_claims_coverage(tmp_path: Path) -> N
         assert (coverage.status, coverage.age_seconds, coverage.observation_started_at) == ("in_progress", None, None)
         conn.execute("UPDATE dialog_directory_publication SET generation=1,observation_completed_at=200")
         coverage = read_dialog_directory_coverage(conn, now=10_000)
-        assert (coverage.status, coverage.age_seconds, coverage.observation_started_at) == ("never", None, None)
+        assert (coverage.status, coverage.age_seconds, coverage.observation_started_at) == ("in_progress", None, None)
+        conn.execute("UPDATE dialog_directory_state SET status='invalid'")
+        assert read_dialog_directory_coverage(conn, now=10_000).status == "never"
     finally:
         conn.close()
 
