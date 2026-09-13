@@ -447,6 +447,37 @@ def _strict_folder_snapshot(value: object) -> _FolderSnapshotSurface:
     return _FolderSnapshotSurface(generation, cast(str, status), completed_at, age_seconds, complete)
 
 
+def _strict_directory_coverage(value: object, *, context: str) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise SyncReadModelContractError(f"{context} must be an object")
+    status = _required(value, "status", context=context)
+    if not isinstance(status, str) or status not in {"never", "in_progress", "stale", "complete"}:
+        raise SyncReadModelContractError(f"{context}.status is invalid")
+    lookup_complete = _required(value, "lookup_complete", context=context)
+    if not isinstance(lookup_complete, bool):
+        raise SyncReadModelContractError(f"{context}.lookup_complete must be a boolean")
+    lookup_fresh = _required(value, "lookup_fresh", context=context)
+    if not isinstance(lookup_fresh, bool):
+        raise SyncReadModelContractError(f"{context}.lookup_fresh must be a boolean")
+
+    coverage: dict[str, object] = {
+        "status": status,
+        "lookup_complete": lookup_complete,
+        "lookup_fresh": lookup_fresh,
+    }
+    optional_fields = {
+        "publication_generation": _strict_optional_int,
+        "observation_started_at": _strict_optional_int,
+        "age_seconds": _strict_optional_int,
+        "refresh_status": _strict_optional_string,
+        "reason": _strict_optional_string,
+    }
+    for name, validator in optional_fields.items():
+        if name in value:
+            coverage[name] = validator(value, name, context=context)
+    return coverage
+
+
 def _strict_dialog(value: object, index: int) -> _DialogSurface:
     context = f"dialogs[{index}]"
     if not isinstance(value, Mapping):
@@ -519,7 +550,7 @@ def _strict_list_dialogs_data(
 
 def _strict_folder_summaries(
     response: Mapping[str, object],
-) -> tuple[list[_FolderSummarySurface], _FolderSnapshotSurface]:
+) -> tuple[list[_FolderSummarySurface], _FolderSnapshotSurface, dict[str, object]]:
     raw_data = response.get("data")
     if not isinstance(raw_data, Mapping):
         raise SyncReadModelContractError("data must be an object")
@@ -549,7 +580,14 @@ def _strict_folder_summaries(
                 ),
             )
         )
-    return folders, _strict_folder_snapshot(_required(raw_data, "folder_snapshot", context="list_folders"))
+    return (
+        folders,
+        _strict_folder_snapshot(_required(raw_data, "folder_snapshot", context="list_folders")),
+        _strict_directory_coverage(
+            _required(raw_data, "directory_coverage", context="list_folders"),
+            context="directory_coverage",
+        ),
+    )
 
 
 LIST_TOPICS_OUTPUT_SCHEMA = {
@@ -679,7 +717,7 @@ def _list_dialogs_filters(args: ListDialogs) -> dict[str, object]:
 
 def _folder_view_result(args: ListDialogs, response: Mapping[str, object]) -> ToolResult:
     try:
-        folders, snapshot = _strict_folder_summaries(response)
+        folders, snapshot, directory_coverage = _strict_folder_summaries(response)
     except SyncReadModelContractError as exc:
         return _list_dialogs_contract_error(str(exc))
     warnings: list[StructuredWarning] = []
@@ -715,6 +753,7 @@ def _folder_view_result(args: ListDialogs, response: Mapping[str, object]) -> To
             "bootstrap_pending": not snapshot.complete,
             "scope": "all",
             "folder_snapshot": snapshot.to_wire(),
+            "directory_coverage": directory_coverage,
             "folder_membership_unknown_count": sum(folder.unknown_membership_count for folder in folders),
             "warnings": warnings,
         },
