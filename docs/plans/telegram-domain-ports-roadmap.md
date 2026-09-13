@@ -97,6 +97,9 @@ Telethon method and not an MCP tool.
   suspected overlap or prove an acceptance criterion.
 - A refactor removes the superseded path. It does not retain rollback paths,
   compatibility healing, or shadow execution without a current product need.
+- Each slice reduces the legacy complexity it touches. The Radon and CRAP
+  baselines are temporary debt ceilings, not complexity budgets that new code
+  may consume.
 
 ## Current state
 
@@ -119,6 +122,15 @@ prevents an unreviewed new Telethon importer, but its allowlist still recognizes
 Telegram is hidden behind domain ports.
 
 ## Action plan
+
+The checkboxes below are decision and acceptance points, not a one-checkbox-per-PR
+plan. Implement the roadmap as a small sequence of coherent vertical slices.
+One slice should normally close several related action points: introduce the
+port and adapter, move one proven acquisition path, simplify the affected
+legacy functions, remove the superseded path, and verify the resulting product
+behavior together. Complexity cleanup is not a separate workstream or PR
+series. The expected order of magnitude is four to seven substantial PRs, but
+evidence and cohesion determine the actual boundaries.
 
 ### Lock the intended boundary
 
@@ -186,6 +198,26 @@ Telegram is hidden behind domain ports.
 - [ ] Add focused telemetry only for overlaps that cannot be resolved from
   source, tests, and existing runtime observations.
 
+### Pay down legacy complexity
+
+- [ ] Assign every existing Radon and CRAP legacy baseline entry to the
+  architectural slice that already needs to change or remove that code.
+- [ ] Identify the Radon and CRAP baseline entries owned or materially touched
+  by each vertical slice before implementation.
+- [ ] Delete superseded branches, compatibility wrappers, duplicate
+  orchestration, and obsolete recovery code as part of the same slice.
+- [ ] Split mixed application/RPC functions along the accepted domain boundary
+  so that the resulting units have coherent responsibilities and lower
+  cyclomatic complexity.
+- [ ] Tighten or remove affected Radon and CRAP baseline entries whenever the
+  measured debt falls; do not preserve an obsolete ceiling for convenience.
+- [ ] Require an explicit architectural reason when a touched legacy baseline
+  cannot be reduced, and prevent the slice from increasing either ceiling.
+- [ ] Prefer deletion and direct domain contracts over forwarding layers that
+  merely move complexity or inflate the call graph.
+- [ ] Remove the final legacy baseline entries within the last architectural
+  slice; do not schedule a separate complexity-cleanup phase afterward.
+
 ### Reach the final boundary
 
 - [ ] Reduce the Telethon importer allowlist to the accepted adapter,
@@ -203,7 +235,8 @@ Telegram is hidden behind domain ports.
 
 Use this checklist when accepting a PR or deployment that claims progress
 toward this roadmap. Leave the boxes empty in the standing document; evaluate
-them against the concrete slice under review.
+them against the concrete slice under review. These are recurring review
+questions, not additional implementation PRs and not cumulative progress boxes.
 
 - [ ] The slice names the product facts, their owner, and all consumers.
 - [ ] The application contract contains no Telethon types or Telegram request
@@ -218,6 +251,10 @@ them against the concrete slice under review.
   domain contract.
 - [ ] The old direct path and obsolete recovery machinery are removed.
 - [ ] The Telethon-import ratchet is unchanged or smaller, never broader.
+- [ ] Touched Radon and CRAP debt is lower, or the unchanged debt has a concrete
+  documented reason; neither ratchet ceiling increases.
+- [ ] Complexity was removed rather than displaced into adapters, wrappers, or
+  additional orchestration layers.
 - [ ] Targeted contract tests and a real scenario smoke prove the intended
   product behavior.
 - [ ] The release-candidate full gate passes; coverage is collected only as
@@ -237,6 +274,9 @@ them against the concrete slice under review.
   fallback traversal.
 - [ ] Structural checks enforce the final boundary without a brownfield
   application-layer allowlist.
+- [ ] The legacy Radon and CRAP baselines contain no remaining debt entries;
+  the architectural slices removed them without a separate cleanup project or
+  replacement compatibility complexity.
 - [ ] Production telemetry shows no unexplained duplicate acquisition for the
   same fact bundle and observation window.
 - [ ] The operator-facing architecture documentation matches the deployed
