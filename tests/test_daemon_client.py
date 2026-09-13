@@ -787,6 +787,22 @@ async def test_get_sync_status_convenience() -> None:
 
 
 @pytest.mark.asyncio
+async def test_recover_dialog_directory_convenience() -> None:
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True, "data": {}}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+    await conn.recover_dialog_directory()
+    assert captured == [{"method": "recover_dialog_directory"}]
+
+
+@pytest.mark.asyncio
 async def test_submit_feedback_convenience_with_optional_fields() -> None:
     """submit_feedback forwards optional context and status metadata."""
     reader = MagicMock(spec=asyncio.StreamReader)

@@ -131,6 +131,21 @@ def make_worker(
 
 
 @pytest.mark.asyncio
+async def test_delta_skips_hidden_previously_synced_dialog(
+    sync_db: _SQLiteConnection, mock_client: _MockClient, shutdown_event: asyncio.Event
+) -> None:
+    sync_db.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (77,'user',1)")
+    sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status,delta_refresh_requested_at) VALUES (77,'synced',1)")
+    sync_db.execute("INSERT INTO full_history_enrollment VALUES (77,1,'automatic',1)")
+    sync_db.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (77,1,1)")
+    sync_db.commit()
+    mock_client.iter_messages = MagicMock(side_effect=AssertionError("hidden dialog must not fetch delta"))
+
+    assert await make_worker(mock_client, sync_db, shutdown_event).run_delta_catch_up() == 0
+    mock_client.iter_messages.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_delta_disable_race_discards_fetched_body_and_checkpoint(tmp_path: Path) -> None:
     db_path = tmp_path / "race.db"
     ensure_sync_schema(db_path)

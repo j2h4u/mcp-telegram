@@ -36,6 +36,8 @@ def test_aggregate_coverage_is_informational_only() -> None:
     assert "fail_under" not in pyproject_text
     assert all("fail-under" not in text for text in (pyproject_text, justfile, workflow))
     assert "coverage-check:" not in justfile
+    assert re.search(r"(?m)^coverage:\s*$", justfile) is None
+    assert "just coverage" not in workflow
     workflow_job_ids = [
         match.group(1) for match in re.finditer(r"(?m)^  ([a-z][a-z0-9_-]*):\s*$", workflow.partition("jobs:\n")[2])
     ]
@@ -44,6 +46,7 @@ def test_aggregate_coverage_is_informational_only() -> None:
 
 
 def test_crap_remains_the_coverage_informed_gate() -> None:
+    pyproject_text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
@@ -53,6 +56,10 @@ def test_crap_remains_the_coverage_informed_gate() -> None:
     assert workflow.count("if: needs.changes.outputs.run_heavy == 'true'") == 4
     assert "needs: [changes, quality, unit, crap, docker-build]" in workflow
     assert re.search(r"(?m)^crap-ratchet:\s*$", justfile) is not None
+    assert re.search(r"(?m)^crap:\s*$", justfile) is None
+    assert "pytest-crap" not in pyproject_text
+    assert "pytest-crap" not in justfile
+    assert "--crap" not in justfile
     assert re.search(r"(?m)^coverage-data:\s*$", justfile) is not None
     assert "--cov-append --cov-report=" in justfile
     assert justfile.count("just coverage-data;") == 3

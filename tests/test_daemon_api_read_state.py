@@ -25,6 +25,7 @@ from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.reading.sqlite_projection import _dialog_type_from_db, _read_state_for_dialog
 from mcp_telegram.telethon_dialog import classify_dialog_type
 from tests.daemon_api_policy import make_daemon_api_policy
+from tests.dialog_directory_coverage_fixtures import install_dialog_directory_coverage_schema
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
 
@@ -179,7 +180,11 @@ def _make_db() -> Iterator[sqlite3.Connection]:
             dialog_id   INTEGER PRIMARY KEY,
             name        TEXT,
             type        TEXT,
-            members     INTEGER
+            members     INTEGER,
+            hidden      INTEGER NOT NULL DEFAULT 0,
+            identity_observed_at INTEGER,
+            identity_complete INTEGER NOT NULL DEFAULT 0,
+            identity_source TEXT
         )
         """
     )
@@ -199,6 +204,7 @@ def _make_db() -> Iterator[sqlite3.Connection]:
     from mcp_telegram.fts import MESSAGES_FTS_DDL
 
     conn.execute(MESSAGES_FTS_DDL)
+    install_dialog_directory_coverage_schema(conn)
     conn.commit()
     try:
         yield conn

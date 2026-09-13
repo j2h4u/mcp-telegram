@@ -32,6 +32,17 @@ from .structured import (
     structured_warning,
 )
 
+_DEFAULT_DIRECTORY_COVERAGE = {
+    "status": "never",
+    "publication_generation": 0,
+    "observation_started_at": 0,
+    "age_seconds": 0,
+    "refresh_status": "never",
+    "reason": None,
+    "lookup_complete": False,
+    "lookup_fresh": False,
+}
+
 TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -153,6 +164,7 @@ TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
             ],
             "additionalProperties": True,
         },
+        "directory_coverage": {"type": "object"},
         "gaps": {
             "type": "array",
             "items": {
@@ -218,6 +230,7 @@ TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
         "resolved_account",
         "groups",
         "coverage",
+        "directory_coverage",
         "gaps",
         "provenance",
         "next_navigation",
@@ -461,6 +474,7 @@ def _normalize_trace_group_order(data: dict) -> None:
 def _trace_structured_content(data: dict, args: TraceAccountMessages) -> dict[str, object]:
     data.setdefault("view", args.view)
     data.setdefault("dialogs", [])
+    data.setdefault("directory_coverage", dict(_DEFAULT_DIRECTORY_COVERAGE))
     _normalize_trace_group_order(data)
     _attach_trace_content_metadata(data)
     evidence_count = _trace_evidence_count(data)

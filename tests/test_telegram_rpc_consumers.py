@@ -39,7 +39,6 @@ EXPECTED_DURABLE_DEMAND_ORDER = (
     DemandKind.FULL_SYNC_PAGE,
     DemandKind.DIALOG_BOOTSTRAP,
     DemandKind.DIALOG_LIGHT_RECONCILIATION,
-    DemandKind.DIALOG_FULL_RECONCILIATION,
     DemandKind.ARCHIVE_BACKFILL,
     DemandKind.ARCHIVE_INCREMENTAL,
     DemandKind.COLD_PEER_PAGE,
@@ -72,7 +71,7 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
     expected_by_source = {
         TelegramRpcSource.MCP_INTERACTIVE: {DemandKind.MCP_REMOTE_ACQUISITION},
         TelegramRpcSource.MESSAGE_READ_FALLBACK: {DemandKind.MESSAGE_READ_FALLBACK},
-        TelegramRpcSource.DIALOG_RESOLUTION: {DemandKind.ENTITY_LOOKUP, DemandKind.DIALOG_TRAVERSAL},
+        TelegramRpcSource.DIALOG_RESOLUTION: {DemandKind.ENTITY_LOOKUP},
         TelegramRpcSource.TOPIC_RESOLUTION: {DemandKind.TOPIC_LOOKUP},
         TelegramRpcSource.ENTITY_INFO_FOREGROUND: {DemandKind.FOREGROUND_ENTITY_FACTS},
         TelegramRpcSource.ENTITY_INFO_REFRESH: {DemandKind.ENTITY_PROFILE_REFRESH},
@@ -87,7 +86,6 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
         TelegramRpcSource.DIALOG_SYNC: {
             DemandKind.DIALOG_BOOTSTRAP,
             DemandKind.DIALOG_LIGHT_RECONCILIATION,
-            DemandKind.DIALOG_FULL_RECONCILIATION,
         },
         TelegramRpcSource.ACTIVITY_ARCHIVE: {DemandKind.ARCHIVE_BACKFILL, DemandKind.ARCHIVE_INCREMENTAL},
         TelegramRpcSource.ACTIVITY_COLD_BACKFILL: {DemandKind.COLD_PEER_PAGE},
@@ -153,9 +151,7 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
     assert demand_contract(DemandKind.SCHEDULED_REPAIR).freshness_target == timedelta(minutes=15)
     assert demand_contract(DemandKind.SCHEDULED_DISCOVERY).freshness_target == timedelta(hours=24)
     assert demand_contract(DemandKind.ARCHIVE_INCREMENTAL).freshness_target == timedelta(hours=1)
-    assert demand_contract(DemandKind.DIALOG_FULL_RECONCILIATION).freshness_target == timedelta(days=1)
     assert demand_freshness_seconds(DemandKind.ARCHIVE_INCREMENTAL) == 3_600
-    assert demand_freshness_seconds(DemandKind.DIALOG_FULL_RECONCILIATION) == 86_400
     assert demand_contract(DemandKind.FULL_SYNC_DM_ENROLLMENT).max_rpc_attempts_per_slice == 32
     assert demand_contract(DemandKind.HOT_ACTIVITY_PAGE).max_rpc_attempts_per_slice == 2
     assert demand_contract(DemandKind.COLD_PEER_PAGE).max_rpc_attempts_per_slice == 2
@@ -169,7 +165,7 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
 
 def test_durable_demand_order_is_a_literal_complete_contract() -> None:
     assert DURABLE_DEMAND_ORDER == EXPECTED_DURABLE_DEMAND_ORDER
-    assert len(DURABLE_DEMAND_ORDER) == 20
+    assert len(DURABLE_DEMAND_ORDER) == 19
     assert {
         kind for kind, contract in TELEGRAM_DEMAND_CONTRACTS.items() if contract.execution_mode is ExecutionMode.DURABLE
     } == set(EXPECTED_DURABLE_DEMAND_ORDER)

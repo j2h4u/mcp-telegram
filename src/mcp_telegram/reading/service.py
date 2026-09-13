@@ -19,6 +19,7 @@ from ..daemon_message import (
     project_cached_message_facts,
     project_cached_message_facts_by_dialog,
 )
+from ..dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
 from ..dialog_selector import DialogSelector, DialogSelectorError, optional_dialog_selector, required_dialog_selector
 from ..fts import stem_query
 from ..models import DialogType, ReadMessage, ReadState
@@ -1791,7 +1792,8 @@ class ReadingService:
                 "error": "missing_dialog",
                 "message": "Either dialog_id or dialog name is required",
             }
-        return await self._list_messages_for_state(dialog_id, request, direction)
+        result = await self._list_messages_for_state(dialog_id, request, direction)
+        return self._attach_directory_coverage(result, getattr(resolved, "coverage", None))
 
     async def _search_messages_scoped_for_state(
         self,
@@ -1802,26 +1804,47 @@ class ReadingService:
         resolved = await self._deps.resolve_dialog_id(selector)
         if isinstance(resolved, dict):
             return resolved
+        directory_coverage = getattr(resolved, "coverage", None)
         request = dataclasses.replace(request, dialog_id=resolved)
         navigation_result = self._bind_search_navigation(request, resolved)
         if isinstance(navigation_result, dict):
             return navigation_result
         request = navigation_result
         if request.message_state == "scheduled":
-            return self._search_scheduled_messages(request)
+            return self._attach_directory_coverage(self._search_scheduled_messages(request), directory_coverage)
         if request.message_state == "all":
             sent_result = await self._search_messages_scoped_result(
                 dataclasses.replace(request, message_state="sent", offset=0, limit=request.offset + request.limit),
                 stemmed,
             )
-            return self._merge_search_results(
-                sent_result,
-                self._search_scheduled_messages(
-                    dataclasses.replace(request, offset=0, limit=request.offset + request.limit)
+            return self._attach_directory_coverage(
+                self._merge_search_results(
+                    sent_result,
+                    self._search_scheduled_messages(
+                        dataclasses.replace(request, offset=0, limit=request.offset + request.limit)
+                    ),
+                    request,
                 ),
-                request,
+                directory_coverage,
             )
-        return await self._search_messages_scoped_result(request, stemmed)
+        return self._attach_directory_coverage(
+            await self._search_messages_scoped_result(request, stemmed), directory_coverage
+        )
+
+    @staticmethod
+    def _attach_directory_coverage(
+        result: dict,
+        coverage: DialogDirectoryCoverage | None,
+    ) -> dict:
+        """Carry selector coverage alongside successful local read results."""
+        if coverage is None or not result.get("ok"):
+            return result
+        data = result.get("data")
+        if isinstance(data, dict):
+            data["directory_coverage"] = coverage.to_wire()
+        else:
+            result["directory_coverage"] = coverage.to_wire()
+        return result
 
     async def _search_messages_for_state(
         self,
@@ -1911,7 +1934,10 @@ class ReadingService:
                     "Action: pass a searchable query, or use list_messages."
                 ),
             }
-        return await self._search_messages_for_state(request, stemmed, selector)
+        result = await self._search_messages_for_state(request, stemmed, selector)
+        if selector is None:
+            result = self._attach_directory_coverage(result, read_dialog_directory_coverage(self._conn))
+        return result
 
     async def list_unread_messages(self, req: dict[str, object]) -> dict:
         """Return prioritized unread messages across dialogs from sync.db."""
@@ -2257,6 +2283,7 @@ class ReadingService:
 
     def _list_dialogs_sync(self, conn: sqlite3.Connection, req: dict) -> dict:  # noqa: PLR0914
         """Return dialog list from the local dialogs snapshot (pure SQL)."""
+        directory_coverage = read_dialog_directory_coverage(conn).to_wire()
         request = self._parse_list_dialogs_request(req)
         if request.message_state not in {"sent", "scheduled", "all"}:
             return {
@@ -2283,6 +2310,7 @@ class ReadingService:
                     "snapshot_age_h": None,
                     "bootstrap_pending": count_total == 0,
                     "scope": request.scope,
+                    "directory_coverage": directory_coverage,
                 },
             }
 
@@ -2317,6 +2345,7 @@ class ReadingService:
                     "snapshot_age_h": None,
                     "bootstrap_pending": False,
                     "scope": request.scope,
+                    "directory_coverage": directory_coverage,
                 },
             }
 
@@ -2348,5 +2377,6 @@ class ReadingService:
                 "snapshot_age_h": snapshot_age_h,
                 "bootstrap_pending": False,
                 "scope": request.scope,
+                "directory_coverage": directory_coverage,
             },
         }

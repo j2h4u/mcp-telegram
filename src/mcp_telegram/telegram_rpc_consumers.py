@@ -54,7 +54,6 @@ class DemandKind(StrEnum):
     MCP_REMOTE_ACQUISITION = "mcp_remote_acquisition"
     MESSAGE_READ_FALLBACK = "message_read_fallback"
     ENTITY_LOOKUP = "entity_lookup"
-    DIALOG_TRAVERSAL = "dialog_traversal"
     TOPIC_LOOKUP = "topic_lookup"
     FOREGROUND_ENTITY_FACTS = "foreground_entity_facts"
     ENTITY_PROFILE_REFRESH = "entity_profile_refresh"
@@ -70,7 +69,6 @@ class DemandKind(StrEnum):
     FULL_SYNC_PAGE = "full_sync_page"
     DIALOG_BOOTSTRAP = "dialog_bootstrap"
     DIALOG_LIGHT_RECONCILIATION = "dialog_light_reconciliation"
-    DIALOG_FULL_RECONCILIATION = "dialog_full_reconciliation"
     ARCHIVE_BACKFILL = "archive_backfill"
     ARCHIVE_INCREMENTAL = "archive_incremental"
     COLD_PEER_PAGE = "cold_peer_page"
@@ -99,7 +97,6 @@ DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
     DemandKind.FULL_SYNC_PAGE,
     DemandKind.DIALOG_BOOTSTRAP,
     DemandKind.DIALOG_LIGHT_RECONCILIATION,
-    DemandKind.DIALOG_FULL_RECONCILIATION,
     DemandKind.ARCHIVE_BACKFILL,
     DemandKind.ARCHIVE_INCREMENTAL,
     DemandKind.COLD_PEER_PAGE,
@@ -110,7 +107,7 @@ DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
     DemandKind.SCHEDULED_REPAIR,
     DemandKind.SCHEDULED_DISCOVERY,
 )
-_EXPECTED_DURABLE_DEMAND_COUNT = 20
+_EXPECTED_DURABLE_DEMAND_COUNT = 19
 
 
 class ExecutionMode(StrEnum):
@@ -613,7 +610,6 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.MESSAGE_READ_FALLBACK, TelegramRpcSource.MESSAGE_READ_FALLBACK, _INLINE
     ),
     DemandKind.ENTITY_LOOKUP: _contract(DemandKind.ENTITY_LOOKUP, TelegramRpcSource.DIALOG_RESOLUTION, _INLINE),
-    DemandKind.DIALOG_TRAVERSAL: _contract(DemandKind.DIALOG_TRAVERSAL, TelegramRpcSource.DIALOG_RESOLUTION, _INLINE),
     DemandKind.TOPIC_LOOKUP: _contract(DemandKind.TOPIC_LOOKUP, TelegramRpcSource.TOPIC_RESOLUTION, _INLINE),
     DemandKind.FOREGROUND_ENTITY_FACTS: _contract(
         DemandKind.FOREGROUND_ENTITY_FACTS, TelegramRpcSource.ENTITY_INFO_FOREGROUND, _INLINE
@@ -678,6 +674,7 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         DemandKind.DIALOG_BOOTSTRAP,
         TelegramRpcSource.DIALOG_SYNC,
         _DURABLE,
+        freshness_target=timedelta(seconds=900),
         max_rpc_attempts_per_slice=32,
     ),
     DemandKind.DIALOG_LIGHT_RECONCILIATION: _contract(
@@ -685,13 +682,6 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         TelegramRpcSource.DIALOG_SYNC,
         _DURABLE,
         max_rpc_attempts_per_slice=8,
-    ),
-    DemandKind.DIALOG_FULL_RECONCILIATION: _contract(
-        DemandKind.DIALOG_FULL_RECONCILIATION,
-        TelegramRpcSource.DIALOG_SYNC,
-        _DURABLE,
-        freshness_target=timedelta(days=1),
-        max_rpc_attempts_per_slice=32,
     ),
     DemandKind.ARCHIVE_BACKFILL: _contract(
         DemandKind.ARCHIVE_BACKFILL,
@@ -856,13 +846,13 @@ def _validate_contract_coverage(contracts: Mapping[DemandKind, DemandContract]) 
 
 def _validate_durable_order() -> None:
     if not isinstance(DURABLE_DEMAND_ORDER, tuple):
-        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+        raise RuntimeError("Durable demand order must contain exactly 19 unique kinds")
     if len(DURABLE_DEMAND_ORDER) != _EXPECTED_DURABLE_DEMAND_COUNT:
-        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+        raise RuntimeError("Durable demand order must contain exactly 19 unique kinds")
     if any(not isinstance(kind, DemandKind) for kind in DURABLE_DEMAND_ORDER):
-        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+        raise RuntimeError("Durable demand order must contain exactly 19 unique kinds")
     if len(set(DURABLE_DEMAND_ORDER)) != _EXPECTED_DURABLE_DEMAND_COUNT:
-        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+        raise RuntimeError("Durable demand order must contain exactly 19 unique kinds")
 
 
 def _validate_durable_modes(contracts: Mapping[DemandKind, DemandContract]) -> None:

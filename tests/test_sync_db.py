@@ -1574,8 +1574,8 @@ def test_schema_v17_dialogs_table_exists(tmp_sync_db_path: Path) -> None:
         conn.close()
 
 
-def test_schema_v17_dialogs_columns(tmp_sync_db_path: Path) -> None:
-    """dialogs table has snapshot and nullable Telegram unread fact columns."""
+def test_dialogs_columns_match_current_schema(tmp_sync_db_path: Path) -> None:
+    """dialogs retains snapshot, identity, and nullable Telegram fact columns."""
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_db(tmp_sync_db_path)
     try:
@@ -1605,6 +1605,13 @@ def test_schema_v17_dialogs_columns(tmp_sync_db_path: Path) -> None:
             "linked_chat_id",
             "linked_chat_resolved_at",
             "revision",
+            "read_inbox_max_id",
+            "read_outbox_max_id",
+            # v66: canonical identity provenance columns
+            "username",
+            "identity_observed_at",
+            "identity_complete",
+            "identity_source",
         }
         assert required == set(columns.keys()), (
             f"Column mismatch.\nExpected: {sorted(required)}\nGot: {sorted(columns.keys())}"
@@ -1617,6 +1624,7 @@ def test_schema_v17_dialogs_columns(tmp_sync_db_path: Path) -> None:
             "needs_refresh",
             "unread_mentions_count",
             "unread_reactions_count",
+            "identity_complete",
         ):
             col = columns[col_name]
             assert col[2] == "INTEGER", f"{col_name} must be INTEGER, got {col[2]}"
@@ -1637,6 +1645,9 @@ def test_schema_v17_dialogs_columns(tmp_sync_db_path: Path) -> None:
             "unread_mark",
             "unread_count_observed_at",
             "unread_mark_observed_at",
+            "username",
+            "identity_observed_at",
+            "identity_source",
         ):
             col = columns[col_name]
             assert col[3] == 0, f"{col_name} must be nullable (NOT NULL=0), got notnull={col[3]}"
@@ -1705,7 +1716,7 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 63, f"_CURRENT_SCHEMA_VERSION must be 63, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 67, f"_CURRENT_SCHEMA_VERSION must be 67, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
 

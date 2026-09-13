@@ -25,6 +25,8 @@ from mcp_telegram.sync_db import (
     _apply_migration_58,
     _apply_migration_59,
     _apply_migration_60,
+    _apply_migration_64,
+    _apply_migration_66,
     _open_sync_db,
     ensure_sync_schema,
 )
@@ -707,13 +709,13 @@ def test_migration_v18_idempotent(tmp_path: Path) -> None:
         assert row == ("value",)
 
 
-def test_schema_version_records_current_v18(tmp_path: Path) -> None:
+def test_schema_version_records_current(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 63
+    assert _CURRENT_SCHEMA_VERSION == 67
 
 
 def test_genuine_v61_fixture_upgrades_to_v62_and_reopens_idempotently(
@@ -1494,7 +1496,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 63
+        assert _CURRENT_SCHEMA_VERSION == 67
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:
@@ -2643,3 +2645,69 @@ def test_genuine_v59_schema_upgrades_to_v60_and_is_idempotent(
             "SELECT stage, total_messages, probe_succeeded_at, retry_at, updated_at "
             "FROM delta_access_recovery_state WHERE dialog_id=42",
         ) == ("gap_fill", 10, 300, 400, 500)
+
+
+def test_v64_preserves_legacy_generation_one_without_manufacturing_a_receipt(tmp_path: Path) -> None:
+    """The historical NULL/zero legacy cursor remains fenced, never reset or complete."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute("DROP TABLE dialog_directory_pins")
+        conn.execute("DROP TABLE dialog_directory_staging")
+        conn.execute("DROP TABLE dialog_directory_baseline")
+        conn.execute("DROP TABLE dialog_directory_state")
+        conn.execute("DELETE FROM schema_version WHERE version=64")
+        conn.execute(
+            "UPDATE dialog_full_reconciliation_state SET generation=1,status='in_progress',offset_date=NULL,"
+            "offset_id=0,offset_peer=NULL,observed_count=0 WHERE singleton=1"
+        )
+        conn.execute("INSERT INTO dialogs(dialog_id,name,type,snapshot_at,hidden) VALUES (77,'kept','user',1,0)")
+        conn.commit()
+
+        assert _apply_migration_64(conn, 63) == 64
+        assert _fetchone_row(
+            conn,
+            "SELECT generation,status,offset_date,offset_id,offset_peer,observed_count,reason "
+            "FROM dialog_directory_state WHERE singleton=1",
+        ) == (1, "pending", None, 0, None, 0, "legacy_wrapper_cursor_unverified")
+        assert _fetchone_row(conn, "SELECT name FROM dialogs WHERE dialog_id=77") == ("kept",)
+
+
+def test_v64_keeps_completed_legacy_generation_one_pending_for_raw_proof(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute("DROP TABLE dialog_directory_pins")
+        conn.execute("DROP TABLE dialog_directory_staging")
+        conn.execute("DROP TABLE dialog_directory_baseline")
+        conn.execute("DROP TABLE dialog_directory_state")
+        conn.execute("DELETE FROM schema_version WHERE version=64")
+        conn.execute(
+            "UPDATE dialog_full_reconciliation_state SET generation=1,status='idle',observed_count=0 WHERE singleton=1"
+        )
+        conn.execute("INSERT INTO dialogs(dialog_id,name,type,snapshot_at,hidden) VALUES (78,'kept','user',1,0)")
+        conn.commit()
+
+        assert _apply_migration_64(conn, 63) == 64
+        assert _fetchone_row(
+            conn,
+            "SELECT generation,status,observation_started_at,observation_completed_at FROM dialog_directory_state",
+        ) == (1, "pending", None, None)
+        assert _fetchone_row(conn, "SELECT name FROM dialogs WHERE dialog_id=78") == ("kept",)
+
+
+def test_v66_preserves_legacy_identity_without_fabricating_provenance(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute("INSERT INTO dialogs(dialog_id,name,type) VALUES (99,'legacy','user')")
+        conn.execute("DROP TABLE dialog_directory_facts")
+        conn.execute("DELETE FROM schema_version WHERE version=66")
+        conn.commit()
+
+        assert _apply_migration_66(conn, 65) == 66
+        assert _fetchone_row(
+            conn,
+            "SELECT name,type,username,identity_observed_at,identity_complete,identity_source FROM dialogs WHERE dialog_id=99",
+        ) == ("legacy", "user", None, None, 0, None)
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM dialog_directory_facts") == 0

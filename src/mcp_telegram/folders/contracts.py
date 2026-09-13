@@ -1,11 +1,13 @@
-"""Transport- and storage-neutral folder facts."""
+"""Folder-rule contracts independent from Telegram directory acquisition."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
 
-FOLDER_DIALOG_PAGE_SIZE = 100
+RULE_TTL_SECONDS = 900
+DEFAULT_FOLDER_NAMESPACE = "default"
+FILTER_FOLDER_NAMESPACE = "filter"
 
 
 class DialogCategory(StrEnum):
@@ -14,75 +16,84 @@ class DialogCategory(StrEnum):
     BOT = "bot"
     GROUP = "group"
     BROADCAST = "broadcast"
+
+
+class FolderRuleKind(StrEnum):
+    FILTER = "filter"
+    CHATLIST = "chatlist"
+    DEFAULT = "default"
+
+
+class MembershipState(StrEnum):
+    PRESENT = "present"
+    ABSENT = "absent"
     UNKNOWN = "unknown"
 
 
 class FolderSourceUnavailableError(Exception):
-    """An expected transient failure while reading folder state from Telegram."""
-
-
-class FolderStagingCorruptError(ValueError):
-    """The durable, unpublished folder acquisition state cannot be decoded."""
-
-
-class FolderStagingStaleError(RuntimeError):
-    """The unpublished acquisition was based on a no-longer-current generation."""
-
-
-@dataclass(frozen=True, slots=True)
-class FolderRule:
-    folder_id: int
-    title: str
-    included_ids: frozenset[int] = frozenset()
-    pinned_ids: frozenset[int] = frozenset()
-    excluded_ids: frozenset[int] = frozenset()
-    categories: frozenset[DialogCategory] = frozenset()
-    exclude_archived: bool = False
-    exclude_read: bool = False
-    exclude_muted: bool = False
-    explicit_only: bool = False
+    """A transient failure while observing Telegram folder rules."""
 
 
 @dataclass(frozen=True, slots=True)
 class DialogFacts:
+    """One current canonical eligibility record; ``None`` means unknown."""
+
     dialog_id: int
-    category: DialogCategory
-    archived: bool = False
-    unread: bool = False
-    muted: bool = False
+    category: DialogCategory | None = None
+    archived: bool | None = None
+    unread: bool | None = None
+    mute_until: int | None = None
+    observed_at: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class FolderSourceSnapshot:
-    folders: tuple[FolderRule, ...]
-    dialogs: tuple[DialogFacts, ...]
+class FolderRule:
+    """A ``GetDialogFilters`` constructor with the exact supplied order."""
+
+    folder_id: int
+    title: str
+    namespace: str = FILTER_FOLDER_NAMESPACE
+    kind: FolderRuleKind = FolderRuleKind.FILTER
+    source_position: int = 0
+    included_ids: tuple[int, ...] = ()
+    pinned_ids: tuple[int, ...] = ()
+    excluded_ids: tuple[int, ...] = ()
+    categories: frozenset[DialogCategory] = frozenset()
+    exclude_archived: bool = False
+    exclude_read: bool = False
+    exclude_muted: bool = False
+
+    @property
+    def key(self) -> tuple[str, int]:
+        return self.namespace, self.folder_id
+
+    @property
+    def explicit_ids(self) -> tuple[int, ...]:
+        return _dedupe_first((*self.included_ids, *self.pinned_ids))
 
 
 @dataclass(frozen=True, slots=True)
-class FolderDialogCursor:
-    """Serializable Telegram dialog-enumeration cursor."""
-
-    offset_date: str | None
-    offset_id: int
-    offset_peer_type: str | None
-    offset_peer_id: int
-    offset_peer_access_hash: int
-
-
-@dataclass(frozen=True, slots=True)
-class FolderDialogItem:
-    """One dialog fact together with the cursor after that observation."""
-
-    facts: DialogFacts
-    cursor: FolderDialogCursor
-
-
-@dataclass(frozen=True, slots=True)
-class FolderStagingSnapshot:
-    """Durable source facts that are never exposed before publication."""
-
-    folders: tuple[FolderRule, ...]
-    dialogs: tuple[DialogFacts, ...]
-    cursor: FolderDialogCursor | None
+class FolderRuleObservation:
+    rules: tuple[FolderRule, ...]
+    token: str
     started_at: int
-    base_generation: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FolderMembership:
+    namespace: str
+    folder_id: int
+    dialog_id: int
+    state: MembershipState
+    pin_position: int | None = None
+
+
+def _dedupe_first(values: tuple[int, ...]) -> tuple[int, ...]:
+    seen: set[int] = set()
+    result: list[int] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return tuple(result)

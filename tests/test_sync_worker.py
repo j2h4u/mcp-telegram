@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,7 +29,6 @@ from mcp_telegram.sync_worker import FullSyncWorker
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
     RpcAdmissionSaturatedError,
-    TelegramRpcAdmissionDeferred,
     current_rpc_scope,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
@@ -43,6 +42,8 @@ class _SQLiteCursor(Protocol):
 
 class _SQLiteConnection(Protocol):
     def execute(self, sql: str, parameters: tuple[object, ...] = ()) -> _SQLiteCursor: ...
+
+    def executemany(self, sql: str, parameters: Sequence[Sequence[object]]) -> _SQLiteCursor: ...
 
     def commit(self) -> None: ...
 
@@ -69,7 +70,6 @@ class _MockClient:
         self.get_messages: AsyncMock = AsyncMock()
         self.get_entity: AsyncMock = AsyncMock()
         self.iter_messages = _empty_async_iter
-        self.iter_dialogs = _empty_async_iter
         self.is_connected = MagicMock(return_value=True)
 
 
@@ -102,7 +102,7 @@ def sync_db(tmp_path: Path) -> Iterator[_SQLiteConnection]:
 
 @pytest.fixture()
 def mock_client() -> _MockClient:
-    """Return a mock TelegramClient with async iter_messages/iter_dialogs."""
+    """Return a mock TelegramClient with async iter_messages."""
     return _MockClient()
 
 
@@ -118,6 +118,73 @@ def make_worker(
     shutdown_event: asyncio.Event,
 ) -> FullSyncWorker:
     return FullSyncWorker(mock_client, cast(sqlite3.Connection, sync_db), shutdown_event)
+
+
+def publish_local_dialogs(
+    conn: _SQLiteConnection,
+    rows: list[tuple[int, str, str | None, int | None, int | None]],
+    *,
+    generation: int = 1,
+) -> None:
+    conn.executemany(
+        "INSERT INTO dialogs(dialog_id,type,name,read_inbox_max_id,read_outbox_max_id) VALUES (?,?,?,?,?)",
+        rows,
+    )
+    conn.execute("UPDATE dialogs SET identity_complete=1")
+    conn.execute("UPDATE dialog_directory_publication SET generation=?", (generation,))
+    conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_dm_bootstrap_consumes_canonical_publication_without_dialog_traversal(
+    sync_db: _SQLiteConnection,
+) -> None:
+    publish_local_dialogs(
+        sync_db,
+        [(101, "user", "Alice", 7, None), (102, "bot", "Helper", None, 8), (103, "group", "Group", 9, 9)],
+    )
+    client = MagicMock()
+    worker = make_worker(client, sync_db, asyncio.Event())
+
+    assert worker.consume_canonical_dm_publication() == 2
+    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs ORDER BY dialog_id").fetchall() == [(101,), (102,)]
+    assert sync_db.execute("SELECT id FROM entities ORDER BY id").fetchall() == [(101,), (102,)]
+
+
+@pytest.mark.asyncio
+async def test_dm_bootstrap_is_idempotent_for_consumed_publication(sync_db: _SQLiteConnection) -> None:
+    publish_local_dialogs(sync_db, [(101, "user", "Alice", None, None)])
+    worker = make_worker(MagicMock(), sync_db, asyncio.Event())
+
+    assert worker.consume_canonical_dm_publication() == 1
+    assert worker.consume_canonical_dm_publication() == 0
+
+
+@pytest.mark.asyncio
+async def test_dm_bootstrap_excludes_hidden_rows_and_preserves_richer_entity_type(sync_db: _SQLiteConnection) -> None:
+    publish_local_dialogs(sync_db, [(101, "user", "Visible", None, None), (102, "user", "Hidden", None, None)])
+    sync_db.execute("UPDATE dialogs SET hidden=1 WHERE dialog_id=102")
+    sync_db.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (101,'channel','Rich',1)")
+    sync_db.commit()
+    worker = make_worker(MagicMock(), sync_db, asyncio.Event())
+
+    assert worker.consume_canonical_dm_publication() == 1
+    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs ORDER BY dialog_id").fetchall() == [(101,)]
+    assert sync_db.execute("SELECT type FROM entities WHERE id=101").fetchone() == ("channel",)
+
+
+@pytest.mark.asyncio
+async def test_hidden_previously_synced_dm_is_neither_reenrolled_nor_scheduled(sync_db: _SQLiteConnection) -> None:
+    publish_local_dialogs(sync_db, [(102, "user", "Absent", None, None)])
+    sync_db.execute("UPDATE dialogs SET hidden=1 WHERE dialog_id=102")
+    sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (102,'syncing')")
+    sync_db.execute("INSERT INTO full_history_enrollment VALUES (102,1,'automatic',1)")
+    sync_db.commit()
+    worker = make_worker(MagicMock(), sync_db, asyncio.Event())
+
+    assert worker.consume_canonical_dm_publication() == 0
+    assert worker._next_pending_dialog() is None
+    assert sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=102").fetchone() == ("syncing",)
 
 
 @pytest.mark.asyncio
@@ -610,297 +677,6 @@ async def test_scheduler_closure_propagates_from_full_sync(
 
 
 # ---------------------------------------------------------------------------
-# DAEMON-06: DM bootstrap — enrolls User dialogs only
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_dm_bootstrap_enrolls_users(
-    mock_client: _MockClient,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """bootstrap_dms() enrolls exactly 2 User dialogs (not channels)."""
-    from telethon.tl import types  # type: ignore[import-untyped]
-
-    user1 = MagicMock(spec=types.User)
-    user2 = MagicMock(spec=types.User)
-    channel = MagicMock(spec=types.Channel)
-
-    dialog1 = SimpleNamespace(entity=user1, id=10001)
-    dialog2 = SimpleNamespace(entity=user2, id=10002)
-    dialog3 = SimpleNamespace(entity=channel, id=10003)
-
-    async def _iter_dialogs():
-        for d in [dialog1, dialog2, dialog3]:
-            yield d
-
-    mock_client.iter_dialogs = _iter_dialogs
-
-    worker = make_worker(mock_client, sync_db, shutdown_event)
-    count = await worker.bootstrap_dms()
-
-    assert count == 2
-
-    rows = sync_db.execute("SELECT dialog_id, status FROM synced_dialogs ORDER BY dialog_id").fetchall()
-    assert len(rows) == 2
-    assert rows[0] == (10001, "syncing")
-    assert rows[1] == (10002, "syncing")
-
-
-@pytest.mark.asyncio
-async def test_dm_bootstrap_skips_groups(
-    mock_client: _MockClient,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """bootstrap_dms() skips Chat and Channel entities — 0 rows inserted."""
-    from telethon.tl import types  # type: ignore[import-untyped]
-
-    chat = MagicMock(spec=types.Chat)
-    channel = MagicMock(spec=types.Channel)
-
-    dialog1 = SimpleNamespace(entity=chat, id=20001)
-    dialog2 = SimpleNamespace(entity=channel, id=20002)
-
-    async def _iter_dialogs():
-        for d in [dialog1, dialog2]:
-            yield d
-
-    mock_client.iter_dialogs = _iter_dialogs
-
-    worker = make_worker(mock_client, sync_db, shutdown_event)
-    count = await worker.bootstrap_dms()
-
-    assert count == 0
-    rows = sync_db.execute("SELECT COUNT(*) FROM synced_dialogs").fetchone()
-    assert rows is not None
-    assert rows[0] == 0
-
-
-@pytest.mark.asyncio
-async def test_dm_bootstrap_idempotent(
-    mock_client: _MockClient,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """bootstrap_dms() does NOT overwrite existing synced_dialogs rows."""
-    from telethon.tl import types  # type: ignore[import-untyped]
-
-    dialog_id = 30001
-    # Pre-insert with 'synced' status and real progress
-    sync_db.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'synced', 999)",
-        (dialog_id,),
-    )
-    sync_db.commit()
-
-    user = MagicMock(spec=types.User)
-    dialog = SimpleNamespace(entity=user, id=dialog_id)
-
-    async def _iter_dialogs():
-        yield dialog
-
-    mock_client.iter_dialogs = _iter_dialogs
-
-    worker = make_worker(mock_client, sync_db, shutdown_event)
-    count = await worker.bootstrap_dms()
-
-    # count should be 0 (INSERT OR IGNORE — already exists)
-    assert count == 0
-
-    row = sync_db.execute(
-        "SELECT status, sync_progress FROM synced_dialogs WHERE dialog_id = ?",
-        (dialog_id,),
-    ).fetchone()
-    assert row is not None
-    assert row[0] == "synced", "status must not be overwritten"
-    assert row[1] == 999, "sync_progress must not be overwritten"
-
-
-# ---------------------------------------------------------------------------
-# bootstrap_dms() — entity population
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_dm_bootstrap_populates_entities(
-    mock_client: _MockClient,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """bootstrap_dms() writes an entities row for each User dialog."""
-    from telethon.tl import types  # type: ignore[import-untyped]
-
-    user = MagicMock(spec=types.User)
-    user.first_name = "Fixture"
-    user.last_name = "Person"
-    user.username = "fixture_person"
-    dialog = SimpleNamespace(entity=user, id=40001)
-
-    async def _iter_dialogs():
-        yield dialog
-
-    mock_client.iter_dialogs = _iter_dialogs
-
-    worker = make_worker(mock_client, sync_db, shutdown_event)
-    await worker.bootstrap_dms()
-
-    row = sync_db.execute(
-        "SELECT id, type, name, username, name_normalized FROM entities WHERE id=?",
-        (40001,),
-    ).fetchone()
-    assert row is not None, "entities row must be written for the enrolled user"
-    assert row[1] == "user"
-    assert row[2] == "Fixture Person"
-    assert row[3] == "fixture_person"
-    assert row[4] == "fixture person"
-
-
-@pytest.mark.asyncio
-async def test_dm_bootstrap_populates_entities_bot(
-    mock_client: _MockClient,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """bootstrap_dms() writes type='bot' for a user entity with bot=True."""
-    from telethon.tl import types  # type: ignore[import-untyped]
-
-    user = MagicMock(spec=types.User)
-    user.first_name = "BotFather"
-    user.last_name = None
-    user.username = "BotFather"
-    user.bot = True
-    dialog = SimpleNamespace(entity=user, id=40099)
-
-    async def _iter_dialogs():
-        yield dialog
-
-    mock_client.iter_dialogs = _iter_dialogs
-
-    worker = make_worker(mock_client, sync_db, shutdown_event)
-    await worker.bootstrap_dms()
-
-    row = sync_db.execute(
-        "SELECT type FROM entities WHERE id=?",
-        (40099,),
-    ).fetchone()
-    assert row is not None
-    assert row[0] == "bot"
-
-
-@pytest.mark.asyncio
-async def test_dm_bootstrap_entity_backfills_existing_enrollment(
-    mock_client: _MockClient,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """bootstrap_dms() writes entity even for already-enrolled dialogs (fixes existing gap)."""
-    from telethon.tl import types  # type: ignore[import-untyped]
-
-    dialog_id = 40002
-    sync_db.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'synced', 500)",
-        (dialog_id,),
-    )
-    sync_db.commit()
-
-    user = MagicMock(spec=types.User)
-    user.first_name = "Anna"
-    user.last_name = "Smith"
-    user.username = None
-    dialog = SimpleNamespace(entity=user, id=dialog_id)
-
-    async def _iter_dialogs():
-        yield dialog
-
-    mock_client.iter_dialogs = _iter_dialogs
-
-    worker = make_worker(mock_client, sync_db, shutdown_event)
-    count = await worker.bootstrap_dms()
-
-    assert count == 0  # already enrolled — no new enrollment
-
-    row = sync_db.execute(
-        "SELECT name, name_normalized FROM entities WHERE id=?",
-        (dialog_id,),
-    ).fetchone()
-    assert row is not None, "entity must be backfilled for already-enrolled dialog"
-    assert row[0] == "Anna Smith"
-    assert row[1] == "anna smith"
-
-
-@pytest.mark.asyncio
-async def test_dm_bootstrap_writes_tombstone_for_nameless_user(
-    mock_client: _MockClient,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """bootstrap_dms() writes entity row with name=NULL when user has no display name.
-
-    Invariant: every enrolled dialog must have an entity row after bootstrap so
-    that absence of a row unambiguously means "never enrolled", not "enrolled
-    but nameless".
-    """
-    from telethon.tl import types  # type: ignore[import-untyped]
-
-    user = MagicMock(spec=types.User)
-    user.first_name = None
-    user.last_name = None
-    user.username = "ghost"
-    dialog = SimpleNamespace(entity=user, id=40003)
-
-    async def _iter_dialogs():
-        yield dialog
-
-    mock_client.iter_dialogs = _iter_dialogs
-
-    worker = make_worker(mock_client, sync_db, shutdown_event)
-    await worker.bootstrap_dms()
-
-    row = sync_db.execute("SELECT name, username FROM entities WHERE id=?", (40003,)).fetchone()
-    assert row is not None, "entity row must exist even when display name is empty"
-    assert row[0] is None, "name must be NULL for nameless user"
-    assert row[1] == "ghost", "username must be preserved"
-
-
-@pytest.mark.asyncio
-async def test_dm_bootstrap_invariant_every_enrolled_dialog_has_entity(
-    mock_client: _MockClient,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """After bootstrap_dms(), every enrolled dialog must have an entity row — named or not."""
-    from telethon.tl import types  # type: ignore[import-untyped]
-
-    def _make_user(first: str | None, last: str | None, username: str | None, dialog_id: int) -> SimpleNamespace:
-        user = MagicMock(spec=types.User)
-        user.first_name = first
-        user.last_name = last
-        user.username = username
-        return SimpleNamespace(entity=user, id=dialog_id)
-
-    dialogs = [
-        _make_user("Ivan", "Zakazov", "ivan_z", 50001),
-        _make_user(None, None, "ghost_bot", 50002),
-        _make_user(None, None, None, 50003),
-    ]
-
-    async def _iter_dialogs():
-        for d in dialogs:
-            yield d
-
-    mock_client.iter_dialogs = _iter_dialogs
-
-    worker = make_worker(mock_client, sync_db, shutdown_event)
-    await worker.bootstrap_dms()
-
-    enrolled = {row[0] for row in sync_db.execute("SELECT dialog_id FROM synced_dialogs").fetchall()}
-    entities = {row[0] for row in sync_db.execute("SELECT id FROM entities").fetchall()}
-    assert enrolled == entities, f"dialogs without entity rows: {enrolled - entities}"
-
-
-# ---------------------------------------------------------------------------
 # Completion detection
 # ---------------------------------------------------------------------------
 
@@ -1263,176 +1039,6 @@ async def test_process_one_batch_fts_matches_message_ids(
         for row in sync_db.execute("SELECT message_id FROM messages_fts WHERE dialog_id = ?", (dialog_id,)).fetchall()
     }
     assert fts_ids == {200, 201}
-
-
-# ---------------------------------------------------------------------------
-# bootstrap_dms error handling (H-2)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_dm_bootstrap_handles_flood_wait(
-    mock_client: _MockClient,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """bootstrap_dms() catches TelegramRpcThrottled and commits partial progress."""
-    from telethon.tl import types  # type: ignore[import-untyped]
-
-    from mcp_telegram.flood import TelegramRpcThrottled
-
-    user = MagicMock(spec=types.User)
-    dialog = SimpleNamespace(entity=user, id=40001)
-
-    call_count = 0
-
-    async def _iter_dialogs():
-        nonlocal call_count
-        yield dialog
-        call_count += 1
-        raise TelegramRpcThrottled(retry_after_seconds=42)
-
-    mock_client.iter_dialogs = _iter_dialogs
-
-    worker = make_worker(mock_client, sync_db, shutdown_event)
-    count = await worker.bootstrap_dms()
-
-    assert count == 1, "should have enrolled the dialog yielded before the error"
-    row = sync_db.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id = ?", (40001,)).fetchone()
-    assert row is not None, "partial progress should be committed"
-
-
-@pytest.mark.asyncio
-async def test_dm_bootstrap_handles_rpc_error(
-    mock_client: _MockClient,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """bootstrap_dms() catches RPCError and commits partial progress."""
-    from telethon.errors import RPCError  # type: ignore[import-untyped]
-
-    async def _iter_dialogs():
-        if False:
-            yield None
-        raise RPCError(request=None, message="TEST_ERROR", code=400)
-
-    mock_client.iter_dialogs = _iter_dialogs
-
-    worker = make_worker(mock_client, sync_db, shutdown_event)
-    count = await worker.bootstrap_dms()
-
-    assert count == 0, "no dialogs enrolled on immediate error"
-
-
-@pytest.mark.asyncio
-async def test_dm_bootstrap_handles_network_error(
-    mock_client: _MockClient,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """bootstrap_dms() catches OSError and doesn't crash."""
-
-    async def _iter_dialogs():
-        if False:
-            yield None
-        raise OSError("Connection reset")
-
-    mock_client.iter_dialogs = _iter_dialogs
-
-    worker = make_worker(mock_client, sync_db, shutdown_event)
-    count = await worker.bootstrap_dms()
-    assert count == 0
-
-
-@pytest.mark.asyncio
-async def test_dm_bootstrap_retries_admission_deferred_after_committing_partial_progress(
-    mock_client: _MockClient,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    from telethon.tl import types  # type: ignore[import-untyped]
-
-    first_user = MagicMock(spec=types.User)
-    second_user = MagicMock(spec=types.User)
-    first_dialog = SimpleNamespace(entity=first_user, id=40011)
-    second_dialog = SimpleNamespace(entity=second_user, id=40012)
-    calls = 0
-
-    async def _iter_dialogs(**_kwargs: object):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            yield first_dialog
-            raise TelegramRpcAdmissionDeferred(retry_after_seconds=7)
-        yield second_dialog
-
-    mock_client.iter_dialogs = _iter_dialogs
-    worker = make_worker(mock_client, sync_db, shutdown_event)
-
-    with patch("mcp_telegram.sync_worker.sleep_through_flood", new=AsyncMock(return_value=False)) as sleep:
-        count = await worker.bootstrap_dms()
-
-    assert count == 2
-    assert calls == 2
-    sleep.assert_awaited_once_with(shutdown_event, 7)
-    assert sync_db.execute("SELECT COUNT(*) FROM synced_dialogs WHERE dialog_id IN (40011, 40012)").fetchone() == (2,)
-
-
-@pytest.mark.asyncio
-async def test_dm_bootstrap_propagates_closed_admission_after_committing_partial_progress(
-    mock_client: _MockClient,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    from telethon.tl import types  # type: ignore[import-untyped]
-
-    user = MagicMock(spec=types.User)
-    dialog = SimpleNamespace(entity=user, id=40013)
-
-    async def _iter_dialogs():
-        yield dialog
-        raise RpcAdmissionClosedError(current_rpc_scope(), "scheduler closed")
-
-    mock_client.iter_dialogs = _iter_dialogs
-    worker = make_worker(mock_client, sync_db, shutdown_event)
-
-    with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
-        await worker.bootstrap_dms()
-
-    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id = 40013").fetchone() == (40013,)
-
-
-@pytest.mark.asyncio
-async def test_dm_bootstrap_stops_deferred_retry_when_shutdown_is_signalled(
-    mock_client: _MockClient,
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    from telethon.tl import types  # type: ignore[import-untyped]
-
-    user = MagicMock(spec=types.User)
-    dialog = SimpleNamespace(entity=user, id=40014)
-    calls = 0
-
-    async def _iter_dialogs():
-        nonlocal calls
-        calls += 1
-        yield dialog
-        raise TelegramRpcAdmissionDeferred(retry_after_seconds=120)
-
-    async def _stop_during_retry(event: asyncio.Event, seconds: float) -> bool:
-        assert seconds == 30
-        event.set()
-        return True
-
-    mock_client.iter_dialogs = _iter_dialogs
-    worker = make_worker(mock_client, sync_db, shutdown_event)
-    with patch("mcp_telegram.sync_worker.sleep_through_flood", new=_stop_during_retry):
-        count = await worker.bootstrap_dms()
-
-    assert count == 1
-    assert calls == 1
-    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id = 40014").fetchone() == (40014,)
 
 
 # ---------------------------------------------------------------------------

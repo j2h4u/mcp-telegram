@@ -25,6 +25,7 @@ import pytest
 from helpers import build_mock_message
 from mcp_telegram.event_handlers import (
     EventHandlerManager,
+    UpdateProcessingBarrier,
     _DeletedMessagesEvent,
     _EditedMessageEvent,
     _NewMessageEvent,
@@ -41,6 +42,24 @@ from mcp_telegram.telegram_rpc_consumers import DemandKind, TelegramRpcSource
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 _SQLiteConnection = sqlite3.Connection
+
+
+@pytest.mark.asyncio
+async def test_startup_update_barrier_waits_then_cancels_cleanly() -> None:
+    shutdown = asyncio.Event()
+    barrier = UpdateProcessingBarrier(closed=True)
+    waiting = asyncio.create_task(barrier.wait(shutdown))
+    await asyncio.sleep(0)
+    assert not waiting.done()
+    barrier.open()
+    await waiting
+
+    cancelled = UpdateProcessingBarrier(closed=True)
+    waiting = asyncio.create_task(cancelled.wait(shutdown))
+    await asyncio.sleep(0)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
 
 
 def make_new_message_event(
@@ -570,10 +589,12 @@ async def test_first_seen_private_event_preserves_existing_dialog_facts(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     assert manager._auto_enroll_dm(dialog_id, sender=sender, message_date=msg.date, observed_at=100)
 
+    # Realtime presence intentionally exposes an absent-from-snapshot row; other
+    # durable dialog facts must survive the thin first-event projection.
     assert sync_db.execute(
         "SELECT name, archived, pinned, members, hidden, unread_count, draft_text FROM dialogs WHERE dialog_id=?",
         (dialog_id,),
-    ).fetchone() == ("Saved", 1, 1, 9, 1, 4, "draft")
+    ).fetchone() == ("Saved", 1, 1, 9, 0, 4, "draft")
 
 
 @pytest.mark.asyncio
@@ -1331,11 +1352,29 @@ def test_register_adds_handlers(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """register() includes scheduled-message and raw topic handlers."""
+    """register() attaches every current real-time callback exactly once."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    assert mock_client.add_event_handler.call_count == 14
+    expected = [
+        manager.on_new_message,
+        manager.on_raw_topic_message,
+        manager.on_message_edited,
+        manager.on_message_deleted,
+        manager.on_outbox_read,
+        manager.on_raw_reaction_update,
+        manager.on_raw_transcribed_audio,
+        manager.on_raw_new_scheduled_message,
+        manager.on_raw_delete_scheduled_messages,
+        manager.on_raw_dialog_pinned,
+        manager.on_raw_channel_chat_update,
+        manager.on_raw_identity_or_notify,
+        manager.on_raw_participant,
+        manager.on_raw_inbox_read,
+        manager.on_raw_forum_topic_pinned,
+    ]
+    registered = [call.args[0] for call in mock_client.add_event_handler.call_args_list if call.args]
+    assert registered == expected
 
 
 def test_unregister_removes_handlers(
@@ -1343,12 +1382,30 @@ def test_unregister_removes_handlers(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """unregister() removes scheduled-message and raw topic handlers."""
+    """unregister() removes every callback attached by register()."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
     manager.unregister()
 
-    assert mock_client.remove_event_handler.call_count == 14
+    expected = [
+        manager.on_new_message,
+        manager.on_raw_topic_message,
+        manager.on_message_edited,
+        manager.on_message_deleted,
+        manager.on_outbox_read,
+        manager.on_raw_reaction_update,
+        manager.on_raw_transcribed_audio,
+        manager.on_raw_new_scheduled_message,
+        manager.on_raw_delete_scheduled_messages,
+        manager.on_raw_dialog_pinned,
+        manager.on_raw_channel_chat_update,
+        manager.on_raw_identity_or_notify,
+        manager.on_raw_participant,
+        manager.on_raw_inbox_read,
+        manager.on_raw_forum_topic_pinned,
+    ]
+    removed = [call.args[0] for call in mock_client.remove_event_handler.call_args_list if call.args]
+    assert removed == expected
 
 
 def test_refresh_synced_dialogs(

@@ -31,6 +31,7 @@ from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.reading.sqlite_projection import _LIST_DIALOG_MESSAGE_AGGREGATES_SQL, _LIST_DIALOGS_SQL
 from mcp_telegram.sync_read_model import build_sync_read_model
 from tests.daemon_api_policy import make_daemon_api_policy
+from tests.dialog_directory_coverage_fixtures import install_dialog_directory_coverage_schema
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
 
@@ -159,7 +160,10 @@ def _make_db() -> Iterator[sqlite3.Connection]:
                 unread_mark             INTEGER,
                 unread_count_observed_at INTEGER,
                 unread_mark_observed_at INTEGER,
-                draft_text              TEXT
+                draft_text              TEXT,
+                identity_observed_at    INTEGER,
+                identity_complete       INTEGER NOT NULL DEFAULT 0,
+                identity_source         TEXT
             )
             """
         )
@@ -168,6 +172,7 @@ def _make_db() -> Iterator[sqlite3.Connection]:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_snapshot_at ON dialogs(snapshot_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_needs_refresh_hidden ON dialogs(needs_refresh, hidden)")
         conn.execute("CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT)")
+        install_dialog_directory_coverage_schema(conn)
         conn.commit()
         yield conn
     finally:

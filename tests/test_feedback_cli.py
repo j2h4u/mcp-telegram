@@ -31,6 +31,7 @@ class _FeedbackRowOptions:
 @dataclass
 class _FeedbackStatusConn:
     update_feedback_status: AsyncMock
+    recover_dialog_directory: AsyncMock
 
 
 @pytest.fixture
@@ -215,6 +216,25 @@ def test_feedback_status_daemon_error(feedback_db: Path) -> None:
         result = runner.invoke(app, ["feedback", "status", "99", "done"])
     assert result.exit_code == 1
     assert "not found" in result.stdout.lower()
+
+
+def test_recover_dialog_directory_cli_routes_to_daemon() -> None:
+    mock_conn = cast(_FeedbackStatusConn, AsyncMock())
+    mock_conn.recover_dialog_directory.return_value = {
+        "ok": True,
+        "data": {
+            "previous": {"generation": 4, "status": "invalid", "reason": "ordinary:bad"},
+            "current": {"generation": 5, "status": "in_progress", "reason": None},
+        },
+    }
+    async_cm = MagicMock()
+    async_cm.__aenter__ = AsyncMock(return_value=mock_conn)
+    async_cm.__aexit__ = AsyncMock(return_value=False)
+    with patch("mcp_telegram.daemon_client.daemon_connection", return_value=async_cm):
+        result = runner.invoke(app, ["recover-dialog-directory"])
+    assert result.exit_code == 0, result.stdout
+    assert "Directory recovery started" in result.stdout
+    mock_conn.recover_dialog_directory.assert_called_once_with()
 
 
 def _set_status_direct(db_path: Path, rid: int, status: str) -> None:

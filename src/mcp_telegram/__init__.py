@@ -81,6 +81,29 @@ def sync() -> None:
     asyncio.run(sync_main())
 
 
+@app.command("recover-dialog-directory")
+def recover_dialog_directory() -> None:
+    """Start a fresh directory attempt after an explicit semantic-invalid latch."""
+    import sys
+
+    from .daemon_client import daemon_connection
+
+    async def _run() -> None:
+        async with daemon_connection() as conn:
+            response = await conn.recover_dialog_directory()
+        data = response.get("data")
+        if response.get("ok") and isinstance(data, dict):
+            previous = data.get("previous")
+            current = data.get("current")
+            print(f"Directory recovery started: {previous} -> {current}")
+            return
+        message = response.get("message") or response.get("error") or "unknown error"
+        print(f"Error: {message}")
+        sys.exit(1)
+
+    asyncio.run(_run())
+
+
 @app.command()
 def serve(
     host: Annotated[

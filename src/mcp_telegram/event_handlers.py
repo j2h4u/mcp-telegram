@@ -39,6 +39,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     MessageService,
     PeerChannel,
     PeerChat,
+    PeerUser,
     TypeInputChannel,
     TypePeer,
     UpdateChannel,
@@ -52,20 +53,33 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     UpdateNewChannelMessage,
     UpdateNewMessage,
     UpdateNewScheduledMessage,
+    UpdateNotifySettings,
     UpdatePinnedDialogs,
     UpdatePinnedForumTopic,
     UpdatePinnedForumTopics,
     UpdateReadChannelInbox,
     UpdateReadHistoryInbox,
     UpdateTranscribedAudio,
+    UpdateUserName,
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from .access_lifecycle import AccessLossEvidence, set_access_lost
+from .access_lifecycle import AccessLossEvidence, set_access_lost, unhide_after_realtime_presence
 from .activity_contracts import InputPeerResolver
 from .demand_wiring import DemandOfferSink, offer_durable_demand
+from .dialog_directory import (
+    IDENTITY_OMITTED,
+    _IdentityOmitted,
+    apply_active_generation_pin_delta,
+    apply_realtime_eligibility,
+    apply_realtime_identity,
+    clear_realtime_mute,
+    record_realtime_pin_fence,
+    sync_active_generation_pins_from_publication,
+)
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
+from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .history_enrollment import EnrollmentOutcome, ensure_automatic_dm_enrollment
 from .hydration_queue import HydrationPriority
 from .messages.sqlite_bundle import (
@@ -151,6 +165,8 @@ def _demand_root[**P, R](
     def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
         @wraps(func)
         async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            manager = cast(EventHandlerManager, args[0])
+            await manager._wait_for_update_barrier()
             try:
                 current_demand_token()
             except UnclassifiedTelegramDemandError:
@@ -161,6 +177,41 @@ def _demand_root[**P, R](
         return wrapped
 
     return decorator
+
+
+class UpdateProcessingBarrier:
+    """Startup-only gate that retains Telethon-delivered updates until account bind."""
+
+    def __init__(self, *, closed: bool = False) -> None:
+        self._opened = asyncio.Event()
+        self._cancelled = False
+        if not closed:
+            self._opened.set()
+
+    def open(self) -> None:
+        if not self._cancelled:
+            self._opened.set()
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        self._opened.set()
+
+    async def wait(self, shutdown_event: asyncio.Event) -> None:
+        if self._cancelled or shutdown_event.is_set():
+            raise asyncio.CancelledError
+        if self._opened.is_set():
+            return
+        opened_wait = asyncio.create_task(self._opened.wait())
+        shutdown_wait = asyncio.create_task(shutdown_event.wait())
+        try:
+            await asyncio.wait((opened_wait, shutdown_wait), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (opened_wait, shutdown_wait):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(opened_wait, shutdown_wait, return_exceptions=True)
+        if self._cancelled or shutdown_event.is_set():
+            raise asyncio.CancelledError
 
 
 def _acquisition[**P, R](
@@ -405,8 +456,31 @@ def _apply_inbox_read_fact(
         observed_at=observed_at,
         create_missing=True,
     )
+    apply_realtime_eligibility(
+        conn,
+        dialog_id,
+        unread=_current_unread_eligibility(conn, dialog_id),
+        observed_at=observed_at,
+    )
     conn.execute(_UPDATE_LAST_EVENT_SQL, (observed_at, dialog_id))
     return cursor_rowcount, unread_rowcount
+
+
+def _current_unread_eligibility(conn: sqlite3.Connection, dialog_id: int) -> int | None:
+    row = cast(
+        tuple[int | None, int | None, int | None] | None,
+        conn.execute(
+            "SELECT unread_count,unread_mentions_count,unread_mark FROM dialogs WHERE dialog_id=?", (dialog_id,)
+        ).fetchone(),
+    )
+    if row is None:
+        return None
+    # Realtime inbox and mark updates do not carry an unread-mentions
+    # observation. A stored zero may merely be the row default, so they can
+    # establish a positive aggregate but cannot manufacture a false one.
+    if any(value is not None and value > 0 for value in row[:2]) or row[2] == 1:
+        return 1
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -497,6 +571,8 @@ _SELECT_SYNCED_ONLY_SQL = (
 # snapshot_at=NULL and needs_refresh=1 without unhiding an existing row.
 # ---------------------------------------------------------------------------
 
+# All dialogs.pinned writers also synchronize the published-pin relation below;
+# publication and active staging are the authoritative cross-source pin record.
 _UPDATE_DIALOG_PINNED_SQL = "UPDATE dialogs SET pinned=?, snapshot_at=? WHERE dialog_id=?"
 
 _UPDATE_DIALOG_NEEDS_REFRESH_SQL = "UPDATE dialogs SET needs_refresh=1, snapshot_at=? WHERE dialog_id=?"
@@ -553,10 +629,12 @@ class EventHandlerManager:
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
         input_peer_resolver: InputPeerResolver,
+        update_barrier: UpdateProcessingBarrier | None = None,
     ) -> None:
         self._client = client
         self._conn = conn
         self._shutdown_event = shutdown_event
+        self._update_barrier = update_barrier
         self._input_peer_resolver = input_peer_resolver
         self._shutdown_event.is_set()
         self._synced_dialog_ids: set[int] = set()
@@ -568,6 +646,10 @@ class EventHandlerManager:
     def bind_demand_sink(self, sink: DemandOfferSink) -> None:
         """Attach post-commit durable wakeups after daemon composition."""
         self._demand_sink = sink
+
+    async def _wait_for_update_barrier(self) -> None:
+        if self._update_barrier is not None:
+            await self._update_barrier.wait(self._shutdown_event)
 
     def _require_demand_sink(self) -> DemandOfferSink:
         sink = self._demand_sink
@@ -644,6 +726,10 @@ class EventHandlerManager:
             events.Raw(types=[UpdateChannel, UpdateChat]),
         )
         self._client.add_event_handler(
+            self.on_raw_identity_or_notify,
+            events.Raw(types=[UpdateUserName, UpdateNotifySettings]),
+        )
+        self._client.add_event_handler(
             self.on_raw_participant,
             events.Raw(types=[UpdateChannelParticipant, UpdateChatParticipant]),
         )
@@ -659,6 +745,8 @@ class EventHandlerManager:
 
     def unregister(self) -> None:
         """Remove all handlers from the client (graceful shutdown)."""
+        if self._update_barrier is not None:
+            self._update_barrier.cancel()
         self._client.remove_event_handler(self.on_new_message)
         self._client.remove_event_handler(self.on_raw_topic_message)
         self._client.remove_event_handler(self.on_message_edited)
@@ -670,6 +758,7 @@ class EventHandlerManager:
         self._client.remove_event_handler(self.on_raw_delete_scheduled_messages)
         self._client.remove_event_handler(self.on_raw_dialog_pinned)
         self._client.remove_event_handler(self.on_raw_channel_chat_update)
+        self._client.remove_event_handler(self.on_raw_identity_or_notify)
         self._client.remove_event_handler(self.on_raw_participant)
         self._client.remove_event_handler(self.on_raw_inbox_read)
         self._client.remove_event_handler(self.on_raw_forum_topic_pinned)
@@ -750,6 +839,7 @@ class EventHandlerManager:
                     observed_at,
                 ),
             )
+            unhide_after_realtime_presence(self._conn, dialog_id)
             self._conn.commit()
             return outcome
         except BaseException:
@@ -1668,25 +1758,94 @@ class EventHandlerManager:
             return None
         return int(cast(int, get_peer_id(inner_peer)))
 
-    def _collect_synced_pinned_dialog_ids(self, order: Sequence[object]) -> list[int]:
+    def _collect_pinned_dialog_ids(self, order: Sequence[object]) -> list[int]:
         pinned_ids: list[int] = []
+        seen: set[int] = set()
         for dialog_peer in order:
             inner_peer = dialog_peer.peer if isinstance(dialog_peer, _PeerContainer) else dialog_peer
             try:
                 dialog_id = int(cast(int, get_peer_id(inner_peer)))
             except TypeError, ValueError:
                 continue
-            if dialog_id in self._synced_dialog_ids:
+            if dialog_id not in seen:
                 pinned_ids.append(dialog_id)
+                seen.add(dialog_id)
         return pinned_ids
+
+    @staticmethod
+    def _published_pin_folder(folder_id: object) -> int | None:
+        if folder_id is None or folder_id == 0:
+            return 0
+        if folder_id == 1:
+            return 1
+        return None
+
+    def _apply_published_pin_mutation(self, folder_id: int | None, dialog_id: int, pinned: int) -> None:
+        """Apply one published pin change within the caller's transaction."""
+        if folder_id is None:
+            return
+        current = [
+            int(cast(int, pin[0]))
+            for pin in cast(
+                list[tuple[object, object]],
+                self._conn.execute(
+                    "SELECT dialog_id,position FROM dialog_directory_published_pins "
+                    "WHERE folder_id=? ORDER BY position,dialog_id",
+                    (folder_id,),
+                ).fetchall(),
+            )
+        ]
+        if pinned:
+            current = [dialog_id, *(existing for existing in current if existing != dialog_id)]
+        else:
+            current = [existing for existing in current if existing != dialog_id]
+        self._conn.execute("DELETE FROM dialog_directory_published_pins WHERE folder_id=?", (folder_id,))
+        self._conn.executemany(
+            "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (?,?,?)",
+            [(folder_id, current_id, position) for position, current_id in enumerate(current)],
+        )
+        apply_active_generation_pin_delta(self._conn, folder_id, dialog_id, bool(pinned))
+        record_realtime_pin_fence(
+            self._conn,
+            folder_id,
+            {"kind": "delta", "dialog_id": dialog_id, "pinned": bool(pinned)},
+        )
+
+    def _project_pinned_eligibility(
+        self,
+        dialog_id: int,
+        folder_id: object,
+        *,
+        known_dialog: bool,
+        now: int,
+    ) -> None:
+        """Project archive membership for a known dialog within the caller's transaction."""
+        if not known_dialog or not isinstance(folder_id, int) or isinstance(folder_id, bool) or folder_id not in {0, 1}:
+            return
+        apply_realtime_eligibility(
+            self._conn,
+            dialog_id,
+            archived=int(folder_id == 1),
+            observed_at=now,
+        )
 
     def _update_dialog_pinned(self, update: UpdateDialogPinned, now: int) -> None:
         dialog_id = self._dialog_id_from_peer(update.peer)
-        if dialog_id is None or dialog_id not in self._synced_dialog_ids:
+        if dialog_id is None:
             return
+        folder_id = getattr(update, "folder_id", None)
+        published_folder = self._published_pin_folder(folder_id)
         pinned = 1 if update.pinned else 0
         with self._conn:
-            self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
+            known_dialog = (
+                self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
+            )
+            # ``dialogs.pinned`` is the projection for the main list.  A pin
+            # update scoped to another folder must not change that bit.
+            if known_dialog and published_folder == 0:
+                self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
+            self._apply_published_pin_mutation(published_folder, dialog_id, pinned)
+            self._project_pinned_eligibility(dialog_id, folder_id, known_dialog=known_dialog, now=now)
         logger.info("event_dialog_pinned dialog_id=%d pinned=%d", dialog_id, pinned)
 
     def _rewrite_pinned_dialogs(self, update: UpdatePinnedDialogs, now: int) -> None:
@@ -1698,16 +1857,18 @@ class EventHandlerManager:
         # A folder-scoped update carries only pins *within* that folder, so we
         # must not use it to clear pins in other folders.
         folder_id = update.folder_id
-        # Decode peers; gate by _synced_dialog_ids so we never UPDATE
-        # rows for dialogs the daemon does not own.
-        pinned_ids = self._collect_synced_pinned_dialog_ids(cast(Sequence[object], order))
+        published_folder = self._published_pin_folder(folder_id)
+        is_main_folder = published_folder == 0
+        pinned_ids = self._collect_pinned_dialog_ids(cast(Sequence[object], order))
         with self._conn:
             for dialog_id in pinned_ids:
-                self._conn.execute(
-                    _UPDATE_DIALOG_PINNED_SQL,
-                    (1, now, dialog_id),
-                )
-            if folder_id is None:
+                if (
+                    is_main_folder
+                    and self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()
+                    is not None
+                ):
+                    self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (1, now, dialog_id))
+            if is_main_folder:
                 # Main list: rewrite the full pin set — the update is
                 # authoritative for all main-list pins.
                 if pinned_ids:
@@ -1720,6 +1881,18 @@ class EventHandlerManager:
                     # Empty order list → all dialogs unpinned in main list.
                     # NOT IN () is invalid SQLite — use the dedicated SQL.
                     self._conn.execute(_CLEAR_ALL_PINS_SQL, (now,))
+            if published_folder is not None:
+                self._conn.execute("DELETE FROM dialog_directory_published_pins WHERE folder_id=?", (published_folder,))
+                self._conn.executemany(
+                    "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (?,?,?)",
+                    [(published_folder, dialog_id, position) for position, dialog_id in enumerate(pinned_ids)],
+                )
+                sync_active_generation_pins_from_publication(self._conn, published_folder)
+                record_realtime_pin_fence(
+                    self._conn,
+                    published_folder,
+                    {"kind": "rewrite", "dialog_ids": pinned_ids},
+                )
             # For folder-scoped updates (folder_id != None) we only set the
             # pinned=1 rows above; we do not clear other dialogs because the
             # update does not describe pins outside that folder.
@@ -1742,6 +1915,12 @@ class EventHandlerManager:
                 mark_needs_refresh=True,
                 create_missing=True,
             )
+            apply_realtime_eligibility(
+                self._conn,
+                dialog_id,
+                unread=_current_unread_eligibility(self._conn, dialog_id),
+                observed_at=now,
+            )
         if rowcount:
             self._offer(DemandKind.DIALOG_LIGHT_RECONCILIATION)
         logger.info(
@@ -1750,6 +1929,77 @@ class EventHandlerManager:
             getattr(update, "unread", None),
             rowcount,
         )
+
+    @staticmethod
+    def _username_update_name(update: UpdateUserName) -> str | _IdentityOmitted | None:
+        if not hasattr(update, "first_name") and not hasattr(update, "last_name"):
+            return IDENTITY_OMITTED
+        return " ".join(part for part in (update.first_name, update.last_name) if part) or None
+
+    @staticmethod
+    def _username_update_alias(update: UpdateUserName) -> str | _IdentityOmitted | None:
+        if not hasattr(update, "usernames"):
+            return IDENTITY_OMITTED
+        return next(
+            (
+                username.removeprefix("@")
+                for candidate in (update.usernames or ())
+                if getattr(candidate, "active", False)
+                and isinstance(username := getattr(candidate, "username", None), str)
+            ),
+            None,
+        )
+
+    def _update_realtime_username(self, update: UpdateUserName, now: int) -> None:
+        with self._conn:
+            apply_realtime_identity(
+                self._conn,
+                int(update.user_id),
+                name=self._username_update_name(update),
+                username=self._username_update_alias(update),
+                dialog_type=None,
+                observed_at=now,
+                complete=False,
+            )
+
+    def _update_realtime_notify(self, update: UpdateNotifySettings, now: int) -> None:
+        peer = getattr(getattr(update, "peer", None), "peer", None)
+        if not isinstance(peer, (PeerUser, PeerChat, PeerChannel)):
+            return
+        try:
+            dialog_id = int(get_peer_id(peer))
+        except TypeError, ValueError:
+            return
+        settings = cast(object | None, getattr(update, "notify_settings", None))
+        if settings is None:
+            return
+        mute_until = getattr(settings, "mute_until", None)
+        if isinstance(mute_until, datetime):
+            mute_until = int(mute_until.timestamp())
+        if mute_until is None:
+            with self._conn:
+                if clear_realtime_mute(self._conn, dialog_id, observed_at=now):
+                    SQLiteFolderSnapshotRepository(self._conn).reproject_current_rules_in_transaction(now=now)
+            return
+        if not _is_valid_nonnegative_int(mute_until):
+            return
+        with self._conn:
+            apply_realtime_eligibility(self._conn, dialog_id, mute_until=mute_until, observed_at=now)
+            SQLiteFolderSnapshotRepository(self._conn).reproject_current_rules_in_transaction(now=now)
+
+    def _update_realtime_identity_or_notify(self, update: UpdateUserName | UpdateNotifySettings, now: int) -> None:
+        if isinstance(update, UpdateUserName):
+            self._update_realtime_username(update, now)
+            return
+        self._update_realtime_notify(update, now)
+
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
+    async def on_raw_identity_or_notify(self, update: UpdateUserName | UpdateNotifySettings) -> None:
+        """Persist complete name updates and exact notification mute deadlines."""
+        try:
+            self._update_realtime_identity_or_notify(update, int(time.time()))
+        except Exception:
+            logger.exception("event_identity_or_notify_failed update=%r", type(update).__name__)
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_dialog_pinned(self, update: object) -> None:
@@ -2077,6 +2327,7 @@ class EventHandlerManager:
                 type(update).__name__,
             )
 
+    @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_forum_topics_pinned(self, update: object) -> None:
         """Apply UpdatePinnedForumTopics as a complete known-topic membership set."""
         try:
@@ -2181,6 +2432,7 @@ class EventHandlerManager:
 
 
 _EXPORTED_SYMBOLS = (
+    UpdateProcessingBarrier,
     EventHandlerManager,
     EventHandlerManager.register,
     EventHandlerManager.unregister,

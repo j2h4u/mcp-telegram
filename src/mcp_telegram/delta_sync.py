@@ -145,6 +145,7 @@ SELECT sd.dialog_id, sd.last_synced_at, sd.last_delta_checked_at, sd.delta_refre
 FROM synced_dialogs sd
 JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
 WHERE sd.status = 'synced'
+  AND NOT EXISTS (SELECT 1 FROM dialogs directory WHERE directory.dialog_id=sd.dialog_id AND directory.hidden=1)
 ORDER BY
     CASE WHEN sd.delta_refresh_requested_at IS NULL THEN 1 ELSE 0 END,
     COALESCE(sd.delta_refresh_requested_at, sd.last_delta_checked_at, sd.last_synced_at, 0),
@@ -162,6 +163,7 @@ SELECT
 FROM synced_dialogs sd
 JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
 WHERE sd.status = 'synced'
+  AND NOT EXISTS (SELECT 1 FROM dialogs directory WHERE directory.dialog_id=sd.dialog_id AND directory.hidden=1)
 """
 
 # Stamp delta checkpoint on successful delta completion.
@@ -189,6 +191,7 @@ SELECT sd.dialog_id
   JOIN entities AS entity ON entity.id = sd.dialog_id
  WHERE sd.status = 'synced'
    AND entity.type IN ('user', 'bot')
+   AND NOT EXISTS (SELECT 1 FROM dialogs directory WHERE directory.dialog_id=sd.dialog_id AND directory.hidden=1)
  ORDER BY sd.dialog_id
 """
 

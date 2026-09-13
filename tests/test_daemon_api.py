@@ -20,7 +20,6 @@ from typing import Final, Protocol, TypedDict, Unpack, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from telethon.errors import ServerError
 from telethon.tl.types import PeerUser, UpdateReadHistoryInbox
 
 from mcp_telegram.activity_contracts import InputPeerResolver
@@ -38,7 +37,7 @@ from mcp_telegram.dialog_selector import required_dialog_selector
 from mcp_telegram.event_handlers import EventHandlerManager, _InboxReadUpdateLike
 from mcp_telegram.feedback_db import SQLiteFeedbackStore
 from mcp_telegram.feedback_service import FeedbackApplicationService
-from mcp_telegram.flood import FloodWaitKillSwitchStatus, TelegramRpcThrottled
+from mcp_telegram.flood import FloodWaitKillSwitchStatus
 from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
@@ -63,6 +62,7 @@ from mcp_telegram.topics.contracts import TopicFact
 from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from tests.daemon_api_policy import make_daemon_api_policy
+from tests.dialog_directory_coverage_fixtures import install_dialog_directory_coverage_schema
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
 
@@ -369,6 +369,73 @@ def make_server(
     return server
 
 
+@pytest.mark.asyncio
+async def test_recover_dialog_directory_uses_daemon_writer_and_preserves_publication(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE dialog_directory_state SET generation=4,status='invalid',ordinary_status='invalid',"
+            "reason='ordinary:unexpected_response',retry_at=NULL"
+        )
+        conn.execute(
+            "UPDATE dialog_directory_publication SET generation=3,observation_started_at=10,observation_completed_at=20"
+        )
+        result = await make_server(conn)._dispatch({"method": "recover_dialog_directory"})
+        assert result["ok"] is True
+        data = cast(dict[str, object], result["data"])
+        assert data["previous"] == {"generation": 4, "status": "invalid", "reason": "ordinary:unexpected_response"}
+        assert data["current"] == {"generation": 5, "status": "in_progress", "reason": None}
+        publication = conn.execute("SELECT generation FROM dialog_directory_publication WHERE singleton=1").fetchone()
+        assert publication is not None and publication[0] == 3
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_recover_dialog_directory_rejects_non_invalid_state(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE dialog_directory_state SET generation=4,status='incomplete',reason='ordinary:TimeoutError'"
+        )
+        result = await make_server(conn)._dispatch({"method": "recover_dialog_directory"})
+        assert result == {
+            "ok": False,
+            "error": "dialog_directory_not_invalid",
+            "data": {"state": {"generation": 4, "status": "incomplete", "reason": "ordinary:TimeoutError"}},
+        }
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_entity_info_folder_title_uses_current_folder_rules(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("INSERT INTO telegram_folders(folder_id,title) VALUES (2,'Legacy title')")
+        conn.execute(
+            "INSERT INTO telegram_folder_rules(namespace,folder_id,title,rule_kind,source_position,rule_json) "
+            "VALUES ('filter',2,'Renamed folder','filter',0,'{}')"
+        )
+        service = make_server(conn)._get_entity_info_service()
+        assert await service._resolve_folder_name(2) == "Renamed folder"
+        conn.execute("UPDATE telegram_folder_rules SET title='Newest title' WHERE namespace='filter' AND folder_id=2")
+        assert await service._resolve_folder_name(2) == "Newest title"
+        conn.execute(
+            "INSERT INTO telegram_folder_rules(namespace,folder_id,title,rule_kind,source_position,rule_json) "
+            "VALUES ('default',0,'All chats','default',0,'{}')"
+        )
+        assert await service._resolve_folder_name(0) == "All chats"
+    finally:
+        conn.close()
+
+
 def test_daemon_api_server_uses_explicit_sync_db_path(tmp_path: Path) -> None:
     conn = _make_db()
     sync_db_path = tmp_path / "sync.db"
@@ -638,7 +705,12 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             dialog_id   INTEGER PRIMARY KEY,
             name        TEXT,
             type        TEXT,
-            members     INTEGER
+            members     INTEGER,
+            hidden      INTEGER NOT NULL DEFAULT 0,
+            username    TEXT,
+            identity_observed_at INTEGER,
+            identity_complete INTEGER NOT NULL DEFAULT 0,
+            identity_source TEXT
         )
         """
     )
@@ -703,6 +775,7 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
     )
     if with_fts:
         conn.execute(MESSAGES_FTS_DDL)
+    install_dialog_directory_coverage_schema(conn)
     conn.commit()
     return conn
 
@@ -731,7 +804,11 @@ def _make_db_with_dialogs(*, with_fts: bool = False, with_entities: bool = False
             unread_mark             INTEGER,
             unread_count_observed_at INTEGER,
             unread_mark_observed_at INTEGER,
-            draft_text              TEXT
+            draft_text              TEXT,
+            username                TEXT,
+            identity_observed_at    INTEGER,
+            identity_complete       INTEGER NOT NULL DEFAULT 0,
+            identity_source         TEXT
         )
         """
     )
@@ -739,6 +816,7 @@ def _make_db_with_dialogs(*, with_fts: bool = False, with_entities: bool = False
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_type ON dialogs(type)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_snapshot_at ON dialogs(snapshot_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_needs_refresh_hidden ON dialogs(needs_refresh, hidden)")
+    install_dialog_directory_coverage_schema(conn)
     conn.commit()
     return conn
 
@@ -906,6 +984,35 @@ def _seed_dialog_row(
             unread_reactions_count,
             draft_text,
         ),
+    )
+    conn.commit()
+
+
+def _publish_test_dialog_directory(
+    conn: sqlite3.Connection,
+    *,
+    completed_at: int | None = None,
+    started_at: int | None = None,
+    refresh_status: str = "complete",
+) -> None:
+    """Mark the current test directory snapshot as published."""
+    install_dialog_directory_coverage_schema(conn)
+    started_at = int(time.time()) - 1 if started_at is None else started_at
+    if completed_at is None:
+        completed_at = started_at
+    conn.execute(
+        "UPDATE dialogs SET identity_complete=1, identity_observed_at=?, identity_source='test'",
+        (started_at,),
+    )
+    conn.execute(
+        "UPDATE dialog_directory_publication SET generation=?, observation_started_at=?, "
+        "observation_completed_at=? WHERE singleton=1",
+        (1, started_at, completed_at),
+    )
+    conn.execute(
+        "UPDATE dialog_directory_state SET status=?, ordinary_status=?, pinned_main_status=?, "
+        "pinned_archive_status=?, observation_started_at=?, reason=NULL WHERE singleton=1",
+        (refresh_status, refresh_status, refresh_status, refresh_status, started_at),
     )
     conn.commit()
 
@@ -1211,30 +1318,28 @@ async def test_list_messages_context_window_own_only_uses_fragment_fetch() -> No
 
 @pytest.mark.asyncio
 async def test_list_messages_name_resolution() -> None:
-    """Natural names resolve after enumerating the complete remote dialog set."""
-    conn = _make_db()
-    enumerated: list[str] = []
+    """Natural names resolve from the published canonical dialog directory."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 123, name="Alice", type_="user")
+    _seed_dialog_row(conn, 456, name="Other", type_="user")
+    _publish_test_dialog_directory(conn)
     client = _TestClient()
     client.get_entity = AsyncMock(side_effect=AssertionError("natural names must not use exact get_entity"))
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("natural names must stay local"))
 
-    async def _remote_dialogs():
-        for dialog_id, name in [(123, "Alice"), (456, "Other")]:
-            enumerated.append(name)
-            yield SimpleNamespace(name=name, entity=SimpleNamespace(id=dialog_id))
+    async def _empty_messages(*args: object, **kwargs: object):  # type: ignore[misc]
+        del args, kwargs
+        if False:
+            yield None
 
-    async def _fake_iter(*args: object, **kwargs: object):  # type: ignore[misc]
-        return
-        yield  # make it an async generator
-
-    client.iter_dialogs = MagicMock(return_value=_remote_dialogs())
-    client.iter_messages = _fake_iter
+    client.iter_messages = _empty_messages
     server = make_server(conn, client)
 
     result = await server._list_messages({"dialog": "Alice", "limit": 10})
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
-    assert enumerated == ["Alice", "Other"]
     cast(AsyncMock, client.get_entity).assert_not_awaited()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1252,18 +1357,52 @@ async def test_list_messages_name_resolution_not_found() -> None:
     client = _TestClient()
     client.get_entity = AsyncMock(side_effect=ValueError("Not found"))
 
-    # iter_dialogs returns nothing
-    async def _no_dialogs(*args: object, **kwargs: object):  # type: ignore[misc]
-        return
-        yield
-
-    client.iter_dialogs = _no_dialogs
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("natural names must stay local"))
     server = make_server(conn, client)
 
     result = await server._list_messages({"dialog": "nonexistent", "limit": 10})
 
     assert result["ok"] is False
-    assert result["error"] == "dialog_not_found"
+    assert result["error"] == "dialog_directory_incomplete"
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("coverage_state", "expected_error", "expected_status"),
+    [
+        pytest.param("never", "dialog_directory_incomplete", "never"),
+        pytest.param("in_progress", "dialog_directory_incomplete", "in_progress"),
+        pytest.param("stale", "stale_local_directory", "stale"),
+        pytest.param("complete", "dialog_not_found", "complete"),
+    ],
+)
+async def test_local_name_miss_reports_directory_coverage(
+    coverage_state: str,
+    expected_error: str,
+    expected_status: str,
+) -> None:
+    conn = _make_db_with_dialogs()
+    if coverage_state == "in_progress":
+        conn.execute(
+            "UPDATE dialog_directory_state SET status='in_progress', observation_started_at=?, reason=NULL "
+            "WHERE singleton=1",
+            (int(time.time()),),
+        )
+        conn.commit()
+    elif coverage_state == "stale":
+        _publish_test_dialog_directory(conn, started_at=int(time.time()) - 901)
+    elif coverage_state == "complete":
+        _publish_test_dialog_directory(conn)
+
+    client = _TestClient()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("natural names must stay local"))
+    result = await make_server(conn, client)._resolve_dialog_id(required_dialog_selector(dialog="missing"))
+
+    assert isinstance(result, dict)
+    assert result["error"] == expected_error
+    assert cast(dict[str, object], result["directory_coverage"])["status"] == expected_status
+    client.iter_dialogs.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1381,25 +1520,21 @@ async def test_search_messages_without_searchable_tokens(query: str) -> None:
 
 @pytest.mark.asyncio
 async def test_search_messages_name_resolution() -> None:
-    """search_messages resolves a natural name from the full remote directory."""
-    conn = _make_db(with_fts=True)
-    enumerated: list[str] = []
+    """search_messages resolves a natural name from the local canonical directory."""
+    conn = _make_db_with_dialogs(with_fts=True)
+    _seed_dialog_row(conn, 123, name="Alice", type_="user")
+    _seed_dialog_row(conn, 456, name="Other", type_="user")
+    _publish_test_dialog_directory(conn)
     client = _TestClient()
     client.get_entity = AsyncMock(side_effect=AssertionError("natural names must not use exact get_entity"))
-
-    async def _remote_dialogs():
-        for dialog_id, name in [(123, "Alice"), (456, "Other")]:
-            enumerated.append(name)
-            yield SimpleNamespace(name=name, entity=SimpleNamespace(id=dialog_id))
-
-    client.iter_dialogs = MagicMock(return_value=_remote_dialogs())
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("natural names must stay local"))
     server = make_server(conn, client)
 
     result = await server._search_messages({"dialog": "Alice", "query": "hello"})
 
     assert result["ok"] is True
-    assert enumerated == ["Alice", "Other"]
     cast(AsyncMock, client.get_entity).assert_not_awaited()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1633,6 +1768,39 @@ async def test_list_dialogs_with_folder_filter_uses_preserved_snapshot(tmp_path:
     assert len(dialogs) == 1
     assert dialogs[0]["folder_ids"] == [3]
     assert dialogs[0]["folders"] == [{"id": 3, "title": "Old"}]
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_archive_folder_uses_canonical_archive_facts(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _register_sqlite_connection(sqlite3.connect(db_path))
+    _seed_dialog_row(conn, 1, name="Archived", type_="User", archived=True)
+    _seed_dialog_row(conn, 2, name="Main", type_="User", archived=False)
+    conn.execute("INSERT INTO dialog_directory_facts VALUES (1,NULL,1,NULL,NULL,NULL)")
+    conn.execute("INSERT INTO dialog_directory_facts VALUES (2,NULL,0,NULL,NULL,NULL)")
+    server = make_server(conn)
+
+    result = await server._list_dialogs({"folder_id": 1})
+
+    data = cast(dict[str, object], _response_data(result))
+    assert [dialog["id"] for dialog in cast(list[dict[str, object]], data["dialogs"])] == [1]
+    assert data["folder_membership_unknown_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_ignore_pinned_keeps_archive_only_pin(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _register_sqlite_connection(sqlite3.connect(db_path))
+    _seed_dialog_row(conn, 1, name="Archived", type_="User", pinned=0)
+    conn.execute("INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (1,1,0)")
+    server = make_server(conn)
+
+    result = await server._list_dialogs({"ignore_pinned": True})
+
+    assert result["ok"] is True
+    assert [dialog["id"] for dialog in cast(list[dict[str, object]], _response_data(result)["dialogs"])] == [1]
 
 
 @pytest.mark.asyncio
@@ -2125,7 +2293,7 @@ async def test_list_topics_name_miss_does_not_iterate_telegram_dialogs() -> None
     result = await server._list_topics({"dialog": "integration-smoke-placeholder"})
 
     assert result["ok"] is False
-    assert result["error"] == "dialog_not_found"
+    assert result["error"] == "dialog_directory_incomplete"
     cast(MagicMock, client.iter_dialogs).assert_not_called()
     cast(AsyncMock, client.get_entity).assert_not_called()
 
@@ -2133,9 +2301,10 @@ async def test_list_topics_name_miss_does_not_iterate_telegram_dialogs() -> None
 @pytest.mark.asyncio
 @pytest.mark.parametrize("selector", ["Cached Forum", "cached forum"])
 async def test_list_topics_cached_display_name_resolves_without_rpc(selector: str) -> None:
-    """ListTopics resolves exact and fuzzy cached display names locally."""
+    """ListTopics resolves exact and fuzzy names from canonical dialog rows."""
     conn = _make_db_with_topics()
-    _insert_entity(conn, 321, name="Cached Forum", name_normalized="cached forum")
+    conn.execute("INSERT INTO dialogs (dialog_id, name, type) VALUES (321, 'Cached Forum', 'supergroup')")
+    _publish_test_dialog_directory(conn)
     client = _TestClient()
     client.get_entity = AsyncMock(side_effect=AssertionError("remote lookup forbidden"))
     client.iter_dialogs = MagicMock(side_effect=AssertionError("live lookup forbidden"))
@@ -2154,9 +2323,12 @@ async def test_list_topics_cached_display_name_resolves_without_rpc(selector: st
 @pytest.mark.asyncio
 @pytest.mark.parametrize("selector", ["@forum_bot", "https://t.me/forum_bot"])
 async def test_list_topics_cached_username_selectors_resolve_without_rpc(selector: str) -> None:
-    """Cached @username and t.me selectors resolve without Telegram lookups."""
+    """Canonical @username and t.me selectors resolve without Telegram lookups."""
     conn = _make_db_with_topics()
-    _insert_entity(conn, 322, name="Forum Bot", username="forum_bot")
+    conn.execute("INSERT INTO dialogs (dialog_id, name, type) VALUES (322, 'Forum Bot', 'user')")
+    _publish_test_dialog_directory(conn)
+    conn.execute("UPDATE dialogs SET username='forum_bot' WHERE dialog_id=322")
+    conn.commit()
     client = _TestClient()
     client.get_entity = AsyncMock(side_effect=AssertionError("remote lookup forbidden"))
     client.iter_dialogs = MagicMock(side_effect=AssertionError("live lookup forbidden"))
@@ -2182,7 +2354,10 @@ async def test_list_topics_cached_selector_still_refreshes_topic_catalog() -> No
             return (TopicFact(topic_id=306001, title="Topic"),)
 
     conn = _make_db_with_topics()
-    _insert_entity(conn, 323, name="Forum Group", username="forum_group")
+    conn.execute("INSERT INTO dialogs (dialog_id, name, type) VALUES (323, 'Forum Group', 'supergroup')")
+    _publish_test_dialog_directory(conn)
+    conn.execute("UPDATE dialogs SET username='forum_group' WHERE dialog_id=323")
+    conn.commit()
     client = _TestClient()
     client.get_entity = AsyncMock(return_value=SimpleNamespace(forum=True))
     topic_refresher = TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn))
@@ -6205,26 +6380,22 @@ async def test_get_dialog_stats_access_lost_allowed() -> None:
 
 @pytest.mark.asyncio
 async def test_get_dialog_stats_resolves_fuzzy_dialog_name() -> None:
-    """_get_dialog_stats resolves a natural name after full remote enumeration."""
+    """_get_dialog_stats resolves a natural name from canonical local rows."""
     conn = _make_db_for_dialog_stats()
     _insert_synced_dialog(conn, 1, status="synced")
-    enumerated: list[str] = []
+    conn.execute("INSERT INTO dialogs (dialog_id, name, type) VALUES (1, 'Chat Foo', 'user')")
+    conn.execute("INSERT INTO dialogs (dialog_id, name, type) VALUES (2, 'Other', 'user')")
+    _publish_test_dialog_directory(conn)
     client = _TestClient()
     client.get_entity = AsyncMock(side_effect=AssertionError("natural names must not use exact get_entity"))
-
-    async def _remote_dialogs():
-        for dialog_id, name in [(1, "Chat Foo"), (2, "Other")]:
-            enumerated.append(name)
-            yield SimpleNamespace(name=name, entity=SimpleNamespace(id=dialog_id))
-
-    client.iter_dialogs = MagicMock(return_value=_remote_dialogs())
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("natural names must stay local"))
     server = make_server(conn, client)
     result = await server._get_dialog_stats({"dialog": "Chat Foo"})
 
     assert result["ok"] is True
     assert result["data"]["dialog_id"] == 1
-    assert enumerated == ["Chat Foo", "Other"]
     cast(AsyncMock, client.get_entity).assert_not_awaited()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 # - Simplify _format_reactions to only handle count-only display path
@@ -7343,7 +7514,6 @@ async def test_resolve_dialog_name_dialogs_snapshot_substring_is_suggestion_only
     server = make_server(conn, client)
     result = await server._resolve_dialog_id(
         required_dialog_selector(dialog="acme corp"),
-        allow_remote_lookup=False,
     )
 
     assert isinstance(result, dict)
@@ -7354,32 +7524,21 @@ async def test_resolve_dialog_name_dialogs_snapshot_substring_is_suggestion_only
 
 @pytest.mark.asyncio
 async def test_resolve_dialog_name_dialogs_snapshot_skips_hidden() -> None:
-    """Remote fallback cannot reintroduce a locally hidden dialog id."""
+    """Local resolution cannot reintroduce a hidden dialog id."""
     conn = _make_db_with_dialogs()
     _seed_dialog_row(conn, 999, name="Old Group", type_="supergroup", hidden=1)
-
-    fake_entity = MagicMock()
-    fake_entity.id = 999
-
-    fake_dialog = MagicMock()
-    fake_dialog.name = "Old Group"
-    fake_dialog.entity = fake_entity
 
     client = _TestClient()
     client.get_entity = AsyncMock(side_effect=ValueError(""))
     client.iter_messages = MagicMock(side_effect=AssertionError("hidden selector must not read messages"))
-
-    async def fake_iter(*args: object, **kwargs: object):  # type: ignore[misc]
-        yield fake_dialog
-
-    client.iter_dialogs = MagicMock(return_value=fake_iter())
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("hidden selector must stay local"))
 
     server = make_server(conn, client)
     result = await server._dispatch({"method": "list_messages", "dialog": "Old Group"})
 
     assert result["ok"] is False
-    assert result["error"] == "dialog_not_found"
-    cast(MagicMock, client.iter_dialogs).assert_called_once()
+    assert result["error"] == "dialog_directory_incomplete"
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
     cast(MagicMock, client.iter_messages).assert_not_called()
 
 
@@ -7403,7 +7562,7 @@ async def test_resolve_dialog_name_dialogs_snapshot_matches_hidden_access_lost()
 
 @pytest.mark.asyncio
 async def test_resolve_dialog_name_combines_entities_and_dialogs_before_fail_closed_decision() -> None:
-    """Distinct ids with one exact name are ambiguous across both local snapshots."""
+    """Entity-only rows do not expand the canonical natural-name directory."""
     conn = _make_db_with_dialogs()
     conn.execute(
         "INSERT INTO entities (id, type, name, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?)",
@@ -7417,82 +7576,10 @@ async def test_resolve_dialog_name_combines_entities_and_dialogs_before_fail_clo
     client.iter_dialogs = MagicMock(side_effect=AssertionError("forbidden"))
 
     server = make_server(conn, client)
-    result = await server._resolve_dialog_id(
-        required_dialog_selector(dialog="Same Name"),
-        allow_remote_lookup=False,
-    )
+    result = await server._resolve_dialog_id(required_dialog_selector(dialog="Same Name"))
 
-    assert isinstance(result, dict)
-    assert result["error"] == "ambiguous_dialog"
-    candidates = cast(list[dict[str, object]], result["candidates"])
-    assert {candidate["entity_id"] for candidate in candidates} == {111, 222}
+    assert result == 222
     cast(MagicMock, client.iter_dialogs).assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_resolve_dialog_name_falls_through_to_iter_dialogs_when_miss() -> None:
-    """Empty entities + empty dialogs → step 3 iter_dialogs runs (regression check)."""
-    conn = _make_db_with_dialogs()
-    # No rows inserted — both tables empty
-
-    fake_entity = MagicMock()
-    fake_entity.id = 42
-
-    fake_dialog = MagicMock()
-    fake_dialog.name = "Brand New Chat"
-    fake_dialog.entity = fake_entity
-
-    client = _TestClient()
-    client.get_entity = AsyncMock(side_effect=ValueError(""))
-
-    async def fake_iter(*args: object, **kwargs: object):  # type: ignore[misc]
-        yield fake_dialog
-
-    client.iter_dialogs = MagicMock(return_value=fake_iter())
-
-    server = make_server(conn, client)
-    result = await server._resolve_dialog_id(required_dialog_selector(dialog="Brand New Chat"))
-
-    # Came from iter_dialogs — step 3 fallback is still functional
-    assert result == 42
-    cast(MagicMock, client.iter_dialogs).assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_remote_dialog_resolution_has_explicit_rpc_source() -> None:
-    scopes: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
-
-    async def missing_entity(_dialog: str) -> object:
-        scope = current_rpc_scope()
-        assert scope.demand_kind is not None
-        scopes.append((scope.source, scope.demand_kind, scope.acquisition_kind))
-        raise ValueError("not found")
-
-    async def remote_dialogs():
-        scope = current_rpc_scope()
-        assert scope.demand_kind is not None
-        scopes.append((scope.source, scope.demand_kind, scope.acquisition_kind))
-        yield SimpleNamespace(name="Remote Chat", entity=SimpleNamespace(id=42))
-
-    client = _TestClient()
-    client.get_entity = AsyncMock(side_effect=missing_entity)
-    client.iter_dialogs = MagicMock(return_value=remote_dialogs())
-    server = make_server(_make_db_with_dialogs(), client)
-
-    assert await server._resolve_dialog_entity("Remote Chat") is None
-    assert await server._resolve_dialog_id(required_dialog_selector(dialog="Remote Chat")) == 42
-    assert scopes == [
-        (
-            TelegramRpcSource.DIALOG_RESOLUTION,
-            DemandKind.DIALOG_TRAVERSAL,
-            AcquisitionKind.ENTITY_LOOKUP,
-        ),
-        (
-            TelegramRpcSource.DIALOG_RESOLUTION,
-            DemandKind.DIALOG_TRAVERSAL,
-            AcquisitionKind.DIALOG_TRAVERSAL,
-        ),
-    ]
 
 
 @pytest.mark.asyncio
@@ -7650,33 +7737,9 @@ async def test_list_topics_dialog_resolution_remains_local_only() -> None:
     result = await server._dispatch({"method": "list_topics", "dialog": "Remote Only"})
 
     assert result["ok"] is False
-    assert result["error"] == "dialog_not_found"
+    assert result["error"] == "dialog_directory_incomplete"
     cast(AsyncMock, client.get_entity).assert_not_awaited()
     cast(MagicMock, client.iter_dialogs).assert_not_called()
-
-
-async def test_remote_fallback_enumerates_all_matches_before_ambiguity_decision() -> None:
-    yielded_ids: list[int] = []
-
-    async def iter_dialogs():
-        for dialog_id, name in [(1101, "Remote Project Alpha"), (1202, "Remote Project Beta")]:
-            yielded_ids.append(dialog_id)
-            yield SimpleNamespace(name=name, entity=SimpleNamespace(id=dialog_id))
-
-    client = _TestClient()
-    client.get_entity = AsyncMock(side_effect=ValueError("not found"))
-    client.iter_dialogs = MagicMock(return_value=iter_dialogs())
-    server = make_server(_make_db_with_dialogs(), client)
-
-    result = await server._resolve_dialog_id(required_dialog_selector(dialog="Remote Project"))
-
-    assert yielded_ids == [1101, 1202]
-    assert isinstance(result, dict)
-    assert result["error"] == "ambiguous_dialog"
-    candidates = cast(list[dict[str, object]], result["candidates"])
-    assert {candidate["entity_id"] for candidate in candidates} == {1101, 1202}
-    assert all(candidate["entity_type"] is None for candidate in candidates)
-    assert all(candidate["username"] is None for candidate in candidates)
 
 
 async def test_duplicate_username_candidates_preserve_truthful_cached_metadata() -> None:
@@ -7705,42 +7768,6 @@ async def test_duplicate_username_candidates_preserve_truthful_cached_metadata()
         1404: ("shared", "supergroup"),
     }
     cast(AsyncMock, client.get_entity).assert_not_awaited()
-
-
-@pytest.mark.parametrize(
-    ("failure", "expected_retry_after", "expected_retryable"),
-    [
-        pytest.param(TelegramRpcThrottled(retry_after_seconds=17), 17, True, id="flood-wait"),
-        pytest.param(TelegramRpcThrottled(latched=True), None, False, id="latched-circuit"),
-        pytest.param(ServerError(None, "temporary"), None, True, id="retryable-rpc"),
-        pytest.param(TimeoutError("incomplete enumeration"), None, True, id="timeout"),
-    ],
-)
-async def test_remote_dialog_enumeration_failure_is_retryable_and_never_reads(
-    failure: Exception,
-    expected_retry_after: int | None,
-    expected_retryable: bool,
-) -> None:
-    async def interrupted_dialogs():
-        yield SimpleNamespace(name="Remote Project", entity=SimpleNamespace(id=1505))
-        raise failure
-
-    client = _TestClient()
-    client.iter_dialogs = MagicMock(return_value=interrupted_dialogs())
-    client.iter_messages = MagicMock(side_effect=AssertionError("incomplete selector must not read messages"))
-    server = make_server(_make_db_with_dialogs(), client)
-
-    result = await server._dispatch({"method": "list_messages", "dialog": "Remote Project"})
-
-    assert result == {
-        "ok": False,
-        "error": "dialog_resolution_retryable",
-        "message": "Telegram dialog enumeration did not complete; no dialog was selected.",
-        "retryable": expected_retryable,
-        "required_action": "Retry the request; use an exact dialog id when already known.",
-        **({"retry_after": expected_retry_after} if expected_retry_after is not None else {}),
-    }
-    cast(MagicMock, client.iter_messages).assert_not_called()
 
 
 # ---------------------------------------------------------------------------

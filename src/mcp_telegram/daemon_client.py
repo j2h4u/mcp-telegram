@@ -271,7 +271,8 @@ class DaemonConnection:
 
         Args:
             dialog_id: Numeric dialog id (preferred over dialog name).
-            dialog: Fuzzy dialog name — daemon resolves via get_entity/iter_dialogs.
+            dialog: Natural name resolved from the daemon's canonical local directory;
+                explicit usernames may use a targeted exact-peer lookup.
             limit: Max messages to return (daemon clamps to 1..500).
             navigation: Opaque cursor token from a previous next_navigation response.
             direction: Internal page-selection direction; response presentation is chronological.
@@ -407,6 +408,10 @@ class DaemonConnection:
     async def get_sync_status(self, *, dialog_id: int) -> dict:
         """Return sync status and message stats for a dialog."""
         return await self.request({"method": "get_sync_status", "dialog_id": dialog_id})
+
+    async def recover_dialog_directory(self) -> dict:
+        """Ask the daemon writer to replace an explicitly latched invalid attempt."""
+        return await self.request({"method": "recover_dialog_directory"})
 
     async def list_conversation_changes(  # noqa: PLR0913
         self,

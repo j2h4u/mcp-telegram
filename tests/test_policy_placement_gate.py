@@ -52,22 +52,6 @@ def _findings(source: str) -> set[tuple[str, str]]:
 NON_OPERATOR_POLICY_CASES = (
     ("src/mcp_telegram/delta_sync.py", "_DELTA_SLICE_MESSAGE_LIMIT = 100\n"),
     (
-        "src/mcp_telegram/dialog_sync.py",
-        (
-            "class DialogReconciliationWorker:\n"
-            "    async def run_full_pass(self) -> None:\n"
-            "        await work(wait_on_throttle=True)\n"
-        ),
-    ),
-    (
-        "src/mcp_telegram/dialog_sync.py",
-        (
-            "class DialogFullReconciliationDemandAdapter:\n"
-            "    async def run_slice(self) -> None:\n"
-            "        await work(wait_on_throttle=False)\n"
-        ),
-    ),
-    (
         "src/mcp_telegram/reactions/refresh.py",
         "_PERSISTENCE_RETRY_DELAYS_SECONDS = (0.25, 1.0, 2.0)\n",
     ),
@@ -177,17 +161,6 @@ def test_demand_cadence_and_injected_timeout_remain_policy_findings() -> None:
             "policy_call_keywords",
             "src/mcp_telegram/demand_composition.py:build_durable_adapter_map:interval_seconds",
         ),
-    }
-    assert _findings_at(
-        "src/mcp_telegram/dialog_sync.py",
-        "class DialogFullReconciliationDemandAdapter:\n"
-        "    def __init__(self, *, interval_seconds: float = 86_400.0) -> None:\n"
-        "        pass\n",
-    ) == {
-        (
-            "policy_defaults",
-            "src/mcp_telegram/dialog_sync.py:DialogFullReconciliationDemandAdapter.__init__:interval_seconds",
-        )
     }
     assert _findings_at(
         "src/mcp_telegram/scheduled_messages.py",

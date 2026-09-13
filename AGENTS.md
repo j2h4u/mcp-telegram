@@ -43,7 +43,7 @@ MCP serving code uses daemon APIs and read-only DB access for lightweight querie
 - `__init__.py` — CLI entrypoint: `logout`, `sync`, `serve`, `feedback`
 
 ### Dialog & Own-Message Substrate
-- `dialog_sync.py` — dialog snapshot synchronisation: bootstrap sweep + (Phase 43) reconciliation
+- `dialog_sync.py` — entity and topic reconciliation for the canonical dialog directory
 - `activity_sync.py` — global own-message archive worker
 - `activity_hot_sweep.py` — Tier A `HotSweep`: hourly incremental per-peer self-search scheduler
 - `activity_cold_backfill.py` — Tier B `ColdBackfill`: full-history low-priority per-peer self-search scheduler

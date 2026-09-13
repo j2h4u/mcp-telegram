@@ -48,13 +48,46 @@ list, or a successful empty catalog. An empty list is authoritative only when
 the applicable source completed and the source contract permits an empty
 result to prove absence.
 
-Every published dialog row has, at minimum, a canonical peer identity and
-type, a display name when Telegram supplied one, placement facts such as
-archived and pinned when supplied, top-message identity and date when supplied,
-and source observation/provenance. Unavailable or omitted fields remain
-`unknown`; a row may be useful while some optional facts are unknown. Read and
-unread facts retain their own observation times and cannot be renewed by a
-later observation of unrelated fields.
+Every published dialog row has, at minimum, a canonical peer identity. Entity
+classification, display name, placement facts, top-message identity and date,
+and source-derived details are recorded when Telegram supplied them. An
+unresolved entity does not let the directory infer a user type or eligibility
+from `PeerUser`; those facts remain `unknown`. Read and unread facts retain
+their own observation times and cannot be renewed by a later observation of
+unrelated fields.
+
+The canonical identity bundle is the signed peer ID together with the supplied
+display name, primary username without `@` (while retaining Telegram's display
+spelling), and the authoritative domain type. Its current row stores
+`identity_complete`, `identity_source`, and `identity_observed_at`. A full
+directory or realtime observation replaces the whole bundle, including a known
+username removal. A min, missing, or otherwise partial entity never infers a
+subtype or an absent field and cannot erase a known value. When a partial
+observation contributes alongside retained facts, the row says `mixed` and
+keeps the earliest contributing acquisition-start boundary. Legacy names and
+types are retained with incomplete identity and no invented source or time.
+Realtime `UpdateUserName` omissions retain known fields. An explicit empty
+name or active-username removal clears that field only; the retained type keeps
+the row mixed at its oldest boundary and does not renew whole-bundle freshness.
+Generic entity-cache writes are not directory identity writes.
+
+Eligibility is a separate current-state projection keyed by dialog ID. It has
+nullable `category`, `archived`, `unread`, `mute_until`, and `observed_at`
+fields and follows the same conservative bundle boundary. A bot wins over a
+contact classification; a full non-bot user with an explicit negative contact
+flag is `non_contact`; a basic chat or megagroup is `group`; and only an
+authoritative channel broadcast flag makes `broadcast`. Missing or min entities
+remain unknown. Unread is the three-valued OR of unread messages, unread
+mentions, and unread mark: any true is true, all known false is false, and all
+other cases are unknown. Reactions are excluded. `mute_until=0` is known
+unmuted, while absent settings or deadline are unknown. Realtime identity,
+unread, archive-placement, and notification changes update only their relevant
+bundle in their transaction and advance the dialog revision; pin, message,
+read-cursor, folder, publication, and restart events do not renew unrelated
+facts.
+Directory publication and absence handling apply the same revision fence to
+these facts. Folder projection consumes this table later; it is not called by
+these writers.
 
 Folder rules carry a folder ID and title, category selectors, explicit included
 and excluded peers, pinned peers, and applicable exclusion flags such as
@@ -100,6 +133,9 @@ custom filter IDs and their rules come from `messages.getDialogFilters`.
 Equal numeric IDs must not be treated as the same source or rule. Membership
 for each folder stores the folder's pinned order independently from the
 unordered membership set.
+Because Telegram reserves custom filter ID 1 for the archive peer-folder, the
+adapter rejects a custom filter with that ID at the source boundary rather than
+allowing the two namespaces to collide.
 
 ## One owner of the full catalog
 
@@ -141,37 +177,68 @@ uses the last committed raw cursor. Telegram documents `limit`,
 [`messages.getDialogs`](https://core.telegram.org/method/messages.getDialogs),
 and identifies `top_message` as the message ID used for pagination.
 
+### Dialog liveness amendment
+
+Catalog membership completeness, optional row-fact availability, and
+pagination ability are independent. Every raw dialog with a resolvable
+canonical identity is retained. Missing entity-derived fields or
+classification, a matched top message or date, and a reconstructible
+`InputPeer` become `unknown` facts; they never block a terminal `Dialogs`
+constructor, including an empty terminal response.
+
+For a nonterminal `DialogsSlice`, the safe cursor is the last source-order row
+with both a matched top-message date and a reconstructible input peer. Rows
+after that candidate are staged and may repeat on retry. If no safe cursor
+exists, or it equals the committed cursor, the ordinary source becomes
+`incomplete` with `stalled:missing_safe_cursor` or
+`stalled:non_advancing_cursor`, retains its staging and committed cursor, and
+retries after 900 seconds. It does not publish partial acquisition. Unknown
+constructors, unresolvable canonical identities, and contradictory identities
+within one response remain blocking.
+
+Successive observations of one canonical peer are not conflicts merely because
+mutable facts differ. Later source order replaces the staged mutable bundle,
+including source, top-message, matched date, and provenance; a lower
+top-message ID is valid and a later missing date replaces the earlier date with
+`unknown`. Pinned membership and source order remain separate from ordinary
+facts, so ordinary observation cannot erase them.
+
+The unread-sweep metadata describes the last published observation as one
+receipt: `status`, `observed_count`, `completed_at`, and
+`last_visible_count` are left intact while a generation starts or fails, while
+`attempted_at` records the new attempt. A successful publication replaces all
+four receipt fields in its publication transaction. Fresh installs have no
+such receipt and therefore report unknown coverage.
+
 ### Project cursor algorithm
 
 The following algorithm is project-owned. For each raw dialog in source order,
-first resolve its raw peer and look up a response message by the pair `(peer,
-top_message)`. From the last raw
-dialog with a matched message, take that message's `date`, the dialog's
-`top_message` ID, and the dialog's reconstructible `offset_peer` as the next
-cursor. The pair key prevents a message ID belonging to another peer from
-being used. The selected cursor is compared with the prior cursor before it
-is committed.
+first resolve its canonical peer identity and look up a response message by the
+pair `(peer, top_message)`. All identifiable rows are retained. For a
+nonterminal page, the last row with a matched message date and reconstructible
+`offset_peer` supplies the next cursor. The pair key prevents a message ID
+belonging to another peer from being used. The selected cursor is compared with
+the prior cursor before it is committed.
 
 The adapter has these explicit edge rules:
 
-- a missing entity or missing `(peer, top_message)` message may leave that row
-  with an unknown top-message fact, but it is skipped as a cursor candidate and
-  the page is incomplete; the adapter does not commit a cursor past the page;
+- missing entity, classification, matched `(peer, top_message)` message, date,
+  or reconstructible peer facts leave that row `unknown` and skip it as a
+  cursor candidate; they do not prevent terminal completion;
 - `DialogFolder` is a folder marker, not a dialog row. It is skipped for facts
   and cursor selection, does not count as EOF, and a page containing only such
-  markers is incomplete because it has no safe cursor candidate;
+  markers is stalled because it has no safe cursor candidate;
 - an exact duplicate of a canonical peer ID with the same identity and
   `top_message` is skipped after the first occurrence; conflicting identity,
   type, or top-message data is invalid and cannot advance the cursor;
 - equal dates are allowed when the message ID and peer make the cursor tuple
   distinct. An exact `(date, top_message, offset_peer)` collision with the
-  prior cursor, or an unresolvable `offset_peer`, is a non-advancing invalid
-  outcome, never an EOF signal.
+  prior cursor is a non-advancing stalled outcome, never an EOF signal.
 
-Valid facts from a partial page may be staged for retry diagnostics, but only a
-transaction containing a safe next cursor can advance the source. These rules
-make every skip explicit and prevent a missing raw object or tie from silently
-losing the remainder of the catalog.
+Valid facts from a stalled page are staged for retry, but only a transaction
+containing a safe next cursor can advance the source. These rules make every
+skip explicit and prevent a missing raw object or tie from silently losing the
+remainder of the catalog.
 
 Pinned dialogs are acquired as a separate source, once for `folder_id=0` and
 once for `folder_id=1`, through `messages.getPinnedDialogs`. They are not
@@ -184,14 +251,16 @@ documentation.
 
 For a raw `messages.DialogsSlice`, the adapter continues until it receives an
 empty raw `dialogs` page or a terminal `messages.Dialogs` result. The wrapper's
-page length is not EOF. A terminal result is authoritative only after all
-required raw records in the preceding pages passed the cursor rules above. The
-adapter must preserve the exact identity needed to reconstruct the next raw
-request; it must not invent a peer or silently drop an unresolved one.
+page length is not EOF. A terminal result needs no cursor and is authoritative
+even when optional row facts are unknown or a hypothetical cursor would repeat.
+The adapter must preserve the exact identity needed to reconstruct the next raw
+request; it must not invent a peer or silently drop an unresolved canonical
+identity.
 
 The following outcomes are never complete:
 
-- the next cursor repeats the prior cursor or otherwise does not advance;
+- a nonterminal next cursor repeats the prior cursor or otherwise does not
+  advance;
 - a raw dialog's identity cannot be resolved to the canonical peer identity;
 - a response is `messages.DialogsNotModified` and there is no cached response
   that can be used under this acquisition contract;
@@ -202,10 +271,26 @@ Such an attempt is recorded as `incomplete` or `invalid` with the relevant
 reason. It may retain useful facts, but it cannot authorize hiding a dialog or
 claiming catalog completeness.
 
+Transport and stalled pagination remain retryable `incomplete` outcomes. A
+`DialogsNotModified` reply to the hash-zero/no-cache request is also
+`incomplete`, with a 900-second retry and an explicit source reason. A
+contradictory duplicate, unresolvable canonical identity, or unexpected raw
+response latches that source and the acquisition as `invalid` with no retry.
+It preserves the generation, committed cursor, valid staged work, and prior
+publication until the explicit maintenance recovery operation starts a fresh
+unpublished generation.
+
+The operator performs that maintenance through the running daemon, which is
+the sole writer: `mcp-telegram recover-dialog-directory`. The command only
+accepts a semantic-invalid state, reports the prior and new generation and
+reason, performs no Telegram RPC, and leaves the published catalog and receipt
+in place. The ordinary scheduler resumes the newly started attempt; it never
+calls recovery automatically.
+
 Each raw page and its next cursor are stored in one local transaction. A crash
 before commit leaves the prior cursor and prior staged facts in force; a
-successful commit makes both visible together. Publication is a separate
-short transaction after every required source has a complete receipt.
+successful commit makes both visible together. Publication is a separate short
+transaction after every required source has a complete receipt.
 
 ## Minimal staging and atomic publication
 
@@ -255,18 +340,19 @@ advance the row revision after publication.
 
 ## Migration and resume: current generation 1
 
-Migration initializes the directory's current lifecycle marker as generation 1
-and preserves the existing published catalog, pending status, valid cursor,
-folder facts, DM enrollment, and read cursors. An in-progress operation resumes
-from its committed page and cursor; it is not reset to an empty catalog.
+Migration initializes the directory's current lifecycle marker to
+`max(1, legacy generation)` and preserves the existing published catalog,
+pending status, folder facts, DM enrollment, and read cursors. An in-progress
+legacy operation retains its identity and prior rows, but its wrapper cursor is
+not treated as a raw directory cursor: the first owner slice safely restarts
+from an empty cursor.
 
 The migration does not manufacture a completeness receipt, observation time,
 or freshness claim for old rows. Existing rows remain usable with their actual
 provenance, while the new directory status reports the coverage that has and
-has not been proven. If a legacy cursor cannot be shown to represent the raw
-cursor contract, the attempt is incomplete or invalid and requires the
-directory's explicit recovery path; it must not be silently marked complete or
-used to hide rows. No migration step clears catalog rows, enrollment, or read
+has not been proven. A legacy cursor that cannot be shown to represent the raw
+cursor contract is discarded for that fresh restart; migration never marks it
+complete, uses it to hide rows, or clears catalog rows, enrollment, or read
 cursors merely to make the new worker start.
 
 Subsequent publications may advance the current lifecycle marker, but only the
@@ -282,6 +368,11 @@ These three dimensions are evaluated independently:
 | Catalog completeness | The required ordinary, pinned, and rule sources reached their declared terminal conditions for one publication. | That every field in every row is fresh now. |
 | Dialog-fact freshness | A particular identity, name, placement, top-message, or read/unread fact was observed within the consumer's age limit. | That a missing dialog is absent, or that folder rules are current. |
 | Folder-rule freshness | The rules used to compute folder membership were observed within the consumer's age limit. | That the directory traversal or each dialog fact is complete and fresh. |
+
+A directory receipt ages from its published acquisition start, never the later
+completion timestamp: it is fresh through 899 seconds and stale at 900
+seconds. An unpublished attempt, or a receipt missing that start boundary,
+does not claim coverage.
 
 A consumer declares which dimensions it needs. A complete but old catalog is
 complete and stale; a fresh row does not make an incomplete catalog complete;
@@ -361,7 +452,8 @@ next consumer on its existing path, but it must not leave a partially writable
 catalog or a migration that requires clearing state.
 
 1. **State and raw adapter.** `sync_db.py` owns the generation-1 migration and
-   current staging state; `dialog_sync.py` owns the directory state machine;
+   current staging state; the canonical dialog directory owns the directory
+   state machine;
    the new raw-TL adapter module owns `GetDialogs` and `GetPinnedDialogs`
    decoding and cursor construction. Result: generation 1 resumes existing
    state, ordinary and pinned sources have explicit outcomes, and page/cursor
@@ -369,8 +461,8 @@ catalog or a migration that requires clearing state.
    reset, exact request arguments, raw `DialogsSlice`/`Dialogs`/`NotModified`
    handling, matched-message cursor selection, duplicate/tie rules, and
    missing entity/message cases.
-2. **Staging, publication, and realtime fencing.** `dialog_sync.py` and
-   `sync_db.py` implement minimal staging and atomic publication;
+2. **Staging, publication, and realtime fencing.** The canonical dialog
+   directory and `sync_db.py` implement minimal staging and atomic publication;
    `event_handlers.py` remains the realtime writer protected by
    `dialogs.revision`. Result: publication first merges facts with revision
    fencing, then computes membership from final facts and the accepted rules
@@ -412,9 +504,11 @@ projection, revision fencing, raw pagination, and freshness:
 | Realtime event changes a row while a catalog RPC is in flight | Event facts and the newer revision survive publication. |
 | A previously unseen row is created while the walk is in flight | The absence candidate is rejected and the new row remains visible. |
 | Archive, read, or mute changes after baseline and before publication | Facts are merged first; membership is then computed from final facts and accepted rules version. |
-| A raw page has a missing entity or matched message | The row/cursor candidate is skipped under the explicit rule, the page stays incomplete, and no cursor advances past it. |
-| A raw page contains `DialogFolder` markers | Markers are skipped as non-dialogs; they are not EOF, and a marker-only page is incomplete. |
-| Raw IDs overlap or dates are equal | Exact identity duplicates are skipped only when equivalent; conflicting IDs/facts or a non-advancing cursor is invalid. Equal dates are accepted only when peer and message ID disambiguate the tuple. |
+| A slice has identifiable rows with missing entity or matched-message facts | Every row is staged with unknown optional facts; the slice advances from its last safe candidate when one exists. |
+| A terminal response has missing optional facts or repeats a hypothetical cursor | It completes without a cursor and publishes once the required sources are complete. |
+| A raw page contains `DialogFolder` markers | Markers are skipped as non-dialogs; they are not EOF, and a marker-only slice stalls as incomplete. |
+| Raw IDs overlap or dates are equal | Exact identity duplicates are skipped only when equivalent; conflicting in-response identities are invalid. A non-advancing slice stalls; equal dates are accepted when peer and message ID disambiguate the tuple. |
+| A nonterminal page repeats only already-staged canonical dialog IDs | Its safe cursor commits, then the owner cools down for the 900-second freshness interval without publishing partial acquisition. |
 | Fact age is just below, exactly at, or above 900 seconds | Below is fresh; at and above are stale. |
 | A projection has required inputs from different acquisition starts | Its age is the oldest required input age; publication and restart do not renew it. |
 
@@ -442,8 +536,8 @@ projection, revision fencing, raw pagination, and freshness:
   no historical generations, feature flag, or publication-bus event.
 - Realtime changes protected by `dialogs.revision` survive an older snapshot;
   incomplete enumeration cannot hide a changed or unseen dialog.
-- Migration starts current generation 1, preserves existing state, and resumes
-  a valid cursor without a reset or invented receipt.
+- Migration preserves `max(1, legacy generation)`, existing state, and a valid
+  cursor without a reset or invented receipt.
 - Completeness, dialog-fact freshness, and folder-rule freshness are separately
   represented and evaluated. Default-folder consumers use the current 900
   second target, with below/at/above boundary tests and age measured from

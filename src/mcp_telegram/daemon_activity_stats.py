@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Protocol, cast
 
 from .daemon_message import fetch_text_links
+from .dialog_directory_coverage import DialogDirectoryCoverage
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
 from .message_content import MessageSnapshot, project_message_content
 
@@ -546,6 +547,7 @@ class DaemonActivityStatsService:
         if isinstance(resolved, dict):
             return resolved
         dialog_id = resolved
+        directory_coverage = cast(DialogDirectoryCoverage | None, getattr(resolved, "coverage", None))
         row = cast(tuple[object] | None, self._deps.conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone())
         if row is None or row[0] not in ("synced", "syncing", "access_lost"):
             return {
@@ -582,15 +584,18 @@ class DaemonActivityStatsService:
                 self._deps.conn.execute(_GET_DIALOG_TOP_FORWARDS_SQL, (dialog_id, limit)).fetchall(),
             )
         ]
+        data: dict[str, object] = {
+            "dialog_id": dialog_id,
+            "top_reactions": reactions,
+            "top_mentions": mentions,
+            "top_hashtags": hashtags,
+            "top_forwards": forwards,
+        }
+        if directory_coverage is not None:
+            data["directory_coverage"] = directory_coverage.to_wire()
         return {
             "ok": True,
-            "data": {
-                "dialog_id": dialog_id,
-                "top_reactions": reactions,
-                "top_mentions": mentions,
-                "top_hashtags": hashtags,
-                "top_forwards": forwards,
-            },
+            "data": data,
         }
 
     async def get_my_recent_activity(self, req: Mapping[str, object]) -> dict[str, object]:

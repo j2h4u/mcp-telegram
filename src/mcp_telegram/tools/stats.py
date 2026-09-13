@@ -24,6 +24,16 @@ from .dialog_resolution import project_dialog_resolution_error
 logger = logging.getLogger(__name__)
 _DEEP_PAGE_DEPTH_THRESHOLD = 5
 _USAGE_SUMMARY_TOKEN_LIMIT = 100
+_DEFAULT_DIRECTORY_COVERAGE = {
+    "status": "never",
+    "publication_generation": 0,
+    "observation_started_at": 0,
+    "age_seconds": 0,
+    "refresh_status": "never",
+    "reason": None,
+    "lookup_complete": False,
+    "lookup_fresh": False,
+}
 
 GET_USAGE_STATS_OUTPUT_SCHEMA = {
     "type": "object",
@@ -70,6 +80,7 @@ GET_DIALOG_STATS_OUTPUT_SCHEMA = {
     "properties": {
         "dialog": {"type": "string"},
         "dialog_id": {"type": ["integer", "null"]},
+        "directory_coverage": {"type": "object"},
         "top_n": {"type": "integer"},
         "top_reactions": {
             "type": "array",
@@ -137,6 +148,7 @@ GET_DIALOG_STATS_OUTPUT_SCHEMA = {
     "required": [
         "dialog",
         "dialog_id",
+        "directory_coverage",
         "top_n",
         "top_reactions",
         "top_mentions",
@@ -350,6 +362,7 @@ async def get_dialog_stats(args: GetDialogStats) -> ToolResult:
     structured_content = {
         "dialog": args.dialog,
         "dialog_id": data.get("dialog_id", dialog_id),
+        "directory_coverage": data.get("directory_coverage") or dict(_DEFAULT_DIRECTORY_COVERAGE),
         "top_n": args.top_n,
         "top_reactions": reactions,
         "top_mentions": mentions,

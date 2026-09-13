@@ -776,6 +776,7 @@ async def test_list_dialogs_folder_view_returns_structural_summary():
             "unread_dialog_count": 3,
             "unread_count": 7,
             "last_message_at": "2024-01-15T10:00:00+00:00",
+            "unknown_membership_count": 0,
         }
     ]
     conn.list_folders.assert_called_once_with()

@@ -6,7 +6,6 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import AsyncIterator, Iterator, Sequence
-from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -14,7 +13,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from telethon.errors import ChannelPrivateError, RPCError  # type: ignore[import-untyped]
-from telethon.tl import types
 
 from helpers import MockTotalList, build_mock_message
 from mcp_telegram.delta_sync import (
@@ -24,16 +22,11 @@ from mcp_telegram.delta_sync import (
     DeltaSyncWorker,
     _DeltaSyncClient,
 )
-from mcp_telegram.dialog_sync import (
-    DialogBootstrapDemandAdapter,
-    DialogFullReconciliationDemandAdapter,
-    DialogLightReconciliationDemandAdapter,
-    DialogReconciliationWorker,
-)
+from mcp_telegram.dialog_sync import DialogLightReconciliationDemandAdapter, DialogReconciliationWorker
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter, FullSyncWorker
-from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
+from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
@@ -117,87 +110,122 @@ async def test_full_sync_adapter_status_is_read_only_and_slice_has_precise_scope
     assert adapter.status(500.0) is None
 
 
-@pytest.mark.asyncio
-async def test_dm_enrollment_adapter_resumes_committed_cursor_with_distinct_root(conn: sqlite3.Connection) -> None:
-    user = types.User(id=111, first_name="Alice", access_hash=999)
-    dialog = SimpleNamespace(
-        id=111,
-        entity=user,
-        message=SimpleNamespace(id=777),
-        date=datetime(2026, 1, 1, tzinfo=UTC),
-    )
-    observed_options: list[dict[str, object]] = []
-    observed_scopes: list[TelegramRpcScope] = []
+def _publish_generation(conn: sqlite3.Connection, generation: int = 1) -> None:
+    conn.execute("UPDATE dialog_directory_publication SET generation=?", (generation,))
+    conn.commit()
 
-    async def iter_dialogs(**kwargs: object) -> AsyncIterator[object]:
-        observed_options.append(kwargs)
-        observed_scopes.append(current_rpc_scope())
-        if len(observed_options) == 1:
-            yield dialog
-            raise RpcAttemptBudgetExhaustedError("slice complete")
 
-    worker = FullSyncWorker(SimpleNamespace(iter_dialogs=iter_dialogs), conn, asyncio.Event())
-    adapter = FullSyncDmEnrollmentDemandAdapter(worker)
-    changes_before = conn.total_changes
-    assert adapter.status(10.0) is not None
-    assert conn.total_changes == changes_before
-
-    first_budget = RpcAttemptBudget(limit=32)
-    await adapter.run_slice(first_budget)
-
-    assert adapter.status(10.0) is not None
-    assert observed_options[0] == {}
-    assert observed_scopes[0].demand_kind is DemandKind.FULL_SYNC_DM_ENROLLMENT
-    assert observed_scopes[0].acquisition_kind is AcquisitionKind.DIALOG_TRAVERSAL
-    assert observed_scopes[0].attempt_budget is first_budget
-    assert conn.execute(
-        "SELECT value FROM daemon_state WHERE key = 'full_sync_dm_enrollment_offset_id'"
-    ).fetchone() == ("777",)
-
-    restarted_adapter = FullSyncDmEnrollmentDemandAdapter(
-        FullSyncWorker(SimpleNamespace(iter_dialogs=iter_dialogs), conn, asyncio.Event())
-    )
-    await restarted_adapter.run_slice(RpcAttemptBudget(limit=32))
-
-    assert observed_options[1]["offset_id"] == 777
-    assert isinstance(observed_options[1]["offset_peer"], types.InputPeerUser)
-    assert observed_options[1]["ignore_pinned"] is True
-    assert restarted_adapter.status(10.0) is None
+def test_dm_enrollment_source_has_no_telegram_dialog_traversal() -> None:
+    source = Path(__file__).parents[1].joinpath("src/mcp_telegram/sync_worker.py").read_text(encoding="utf-8")
+    assert "iter_dialogs" not in source
+    assert "GetDialogsRequest" not in source
 
 
 @pytest.mark.asyncio
-async def test_dm_enrollment_adapter_propagates_rpc_failure_without_completing_cycle(
+async def test_dm_enrollment_consumes_completed_publication_locally_and_idempotently(
     conn: sqlite3.Connection,
 ) -> None:
-    async def iter_dialogs(**_kwargs: object) -> AsyncIterator[object]:
-        raise RPCError(None, "enrollment failed")
-        yield  # pragma: no cover
-
-    worker = FullSyncWorker(SimpleNamespace(iter_dialogs=iter_dialogs), conn, asyncio.Event())
-    adapter = FullSyncDmEnrollmentDemandAdapter(worker)
-
-    with pytest.raises(RPCError, match="enrollment failed"):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-    assert conn.execute("SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_status'").fetchone() == (
-        "in_progress",
+    conn.executemany(
+        "INSERT INTO dialogs(dialog_id,type,name,read_inbox_max_id,read_outbox_max_id,identity_complete) VALUES (?,?,?,?,?,1)",
+        [(111, "user", "Alice", 17, None), (112, "bot", "Helper", None, 23), (113, "group", "Group", 99, 99)],
     )
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (114,'access_lost')")
+    seed_full_history_enrollment(conn, 114, enabled=True, source="automatic")
+    conn.execute(
+        "INSERT INTO dialogs(dialog_id,type,name,read_inbox_max_id,read_outbox_max_id,identity_complete) VALUES (114,'user','Lost',31,41,1)"
+    )
+    seed_full_history_enrollment(conn, 112, enabled=False, source="explicit")
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (112,'not_synced')")
+    conn.execute(
+        "INSERT INTO entities(id,type,name,username,name_normalized,updated_at) VALUES (111,'user','Richer','richer','richer',100)"
+    )
+    _publish_generation(conn)
+
+    class NoTelegramCalls:
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"unexpected Telegram method: {name}")
+
+    worker = FullSyncWorker(NoTelegramCalls(), conn, asyncio.Event())
+    adapter = FullSyncDmEnrollmentDemandAdapter(worker)
+    assert adapter.status(10.0) is not None
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute(
+        "SELECT dialog_id,status,read_inbox_max_id,read_outbox_max_id FROM synced_dialogs ORDER BY dialog_id"
+    ).fetchall() == [
+        (111, "syncing", 17, None),
+        (112, "not_synced", None, 23),
+        (114, "access_lost", 31, 41),
+    ]
+    assert conn.execute("SELECT dialog_id FROM full_history_enrollment ORDER BY dialog_id").fetchall() == [
+        (111,),
+        (112,),
+        (114,),
+    ]
+    assert conn.execute("SELECT name,username FROM entities WHERE id=111").fetchone() == ("Richer", "richer")
+    assert conn.execute("SELECT id,type,name FROM entities WHERE id IN (112,113,114) ORDER BY id").fetchall() == [
+        (112, "bot", "Helper"),
+        (114, "user", "Lost"),
+    ]
+    assert conn.execute(
+        "SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_last_publication_generation'"
+    ).fetchone() == ("1",)
+    assert adapter.status(10.0) is None
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert conn.execute(
+        "SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_last_publication_generation'"
+    ).fetchone() == ("1",)
+
+
+def test_dm_enrollment_waits_for_a_completed_publication(conn: sqlite3.Connection) -> None:
+    worker = FullSyncWorker(object(), conn, asyncio.Event())
+    adapter = FullSyncDmEnrollmentDemandAdapter(worker)
+    assert adapter.status(10.0) is None
+    conn.execute("UPDATE dialog_directory_state SET status='in_progress'")
+    conn.commit()
+    assert adapter.status(10.0) is None
 
 
 @pytest.mark.asyncio
-async def test_dm_enrollment_adapter_defers_to_coordinator_without_local_retry(conn: sqlite3.Connection) -> None:
-    async def iter_dialogs(**_kwargs: object) -> AsyncIterator[object]:
-        raise TelegramRpcAdmissionDeferred(retry_after_seconds=7)
-        yield  # pragma: no cover
-
-    adapter = FullSyncDmEnrollmentDemandAdapter(
-        FullSyncWorker(SimpleNamespace(iter_dialogs=iter_dialogs), conn, asyncio.Event())
+async def test_dm_enrollment_restarts_after_interruption_without_replaying_telegram(
+    conn: sqlite3.Connection,
+) -> None:
+    conn.executemany(
+        "INSERT INTO dialogs(dialog_id,type,name,read_inbox_max_id,read_outbox_max_id,identity_complete) VALUES (?,?,?,?,?,1)",
+        [(121, "user", "One", 1, 2), (122, "user", "Two", 3, 4)],
     )
-    with (
-        patch("mcp_telegram.sync_worker.sleep_through_flood", new=AsyncMock()) as sleep,
-        pytest.raises(TelegramRpcAdmissionDeferred),
-    ):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-    sleep.assert_not_awaited()
+    _publish_generation(conn, 7)
+    worker = FullSyncWorker(object(), conn, asyncio.Event())
+    original = worker._consume_one_canonical_dm
+    calls = 0
+
+    def fail_once(row: tuple[object, ...], now: int) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("interrupted")
+        return original(row, now)
+
+    worker._consume_one_canonical_dm = fail_once  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="interrupted"):
+        await FullSyncDmEnrollmentDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    assert (
+        conn.execute(
+            "SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_last_publication_generation'"
+        ).fetchone()
+        is None
+    )
+    assert conn.execute("SELECT dialog_id FROM full_history_enrollment").fetchall() == []
+
+    worker._consume_one_canonical_dm = original  # type: ignore[method-assign]
+    await FullSyncDmEnrollmentDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+    assert conn.execute("SELECT dialog_id FROM full_history_enrollment ORDER BY dialog_id").fetchall() == [
+        (121,),
+        (122,),
+    ]
+    assert conn.execute(
+        "SELECT value FROM daemon_state WHERE key='full_sync_dm_enrollment_last_publication_generation'"
+    ).fetchone() == ("7",)
 
 
 def test_delta_gap_status_uses_refresh_or_recency_boundary_without_writes(conn: sqlite3.Connection) -> None:
@@ -592,83 +620,6 @@ async def test_access_probe_slice_records_retry_policy_for_probe_outcomes(
 
 
 @pytest.mark.asyncio
-async def test_dialog_bootstrap_adapter_status_and_slice_use_committed_state(
-    conn: sqlite3.Connection,
-    db_path: Path,
-) -> None:
-    observed_scopes: list[TelegramRpcScope] = []
-
-    async def iter_dialogs(**_kwargs: object) -> AsyncIterator[object]:
-        observed_scopes.append(current_rpc_scope())
-        return
-        yield  # pragma: no cover
-
-    adapter = DialogBootstrapDemandAdapter(
-        SimpleNamespace(iter_dialogs=iter_dialogs),
-        conn,
-        db_path,
-        asyncio.Event(),
-    )
-    changes_before = conn.total_changes
-    assert adapter.status(10.0) is not None
-    assert conn.total_changes == changes_before
-
-    budget = RpcAttemptBudget(limit=32)
-    await adapter.run_slice(budget)
-
-    assert adapter.status(10.0) is None
-    assert observed_scopes[0].demand_kind is DemandKind.DIALOG_BOOTSTRAP
-    assert observed_scopes[0].acquisition_kind is AcquisitionKind.DIALOG_TRAVERSAL
-    assert observed_scopes[0].attempt_budget is budget
-
-
-@pytest.mark.asyncio
-async def test_dialog_bootstrap_adapter_propagates_rpc_failure_and_preserves_in_progress_state(
-    conn: sqlite3.Connection,
-    db_path: Path,
-) -> None:
-    async def iter_dialogs(**_kwargs: object) -> AsyncIterator[object]:
-        raise RPCError(None, "bootstrap failed")
-        yield  # pragma: no cover
-
-    adapter = DialogBootstrapDemandAdapter(
-        SimpleNamespace(iter_dialogs=iter_dialogs),
-        conn,
-        db_path,
-        asyncio.Event(),
-    )
-
-    with pytest.raises(RPCError, match="bootstrap failed"):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-    assert conn.execute("SELECT value FROM daemon_state WHERE key='bootstrap_sweep_status'").fetchone() == (
-        "in_progress",
-    )
-
-
-@pytest.mark.asyncio
-async def test_dialog_bootstrap_adapter_defers_to_coordinator_without_local_retry(
-    conn: sqlite3.Connection,
-    db_path: Path,
-) -> None:
-    async def iter_dialogs(**_kwargs: object) -> AsyncIterator[object]:
-        raise TelegramRpcAdmissionDeferred(retry_after_seconds=5)
-        yield  # pragma: no cover
-
-    adapter = DialogBootstrapDemandAdapter(
-        SimpleNamespace(iter_dialogs=iter_dialogs),
-        conn,
-        db_path,
-        asyncio.Event(),
-    )
-    with (
-        patch("mcp_telegram.dialog_sync.sleep_through_flood", new=AsyncMock()) as sleep,
-        pytest.raises(TelegramRpcAdmissionDeferred),
-    ):
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-    sleep.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_dialog_light_adapter_clears_one_durable_dirty_flag(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT INTO dialogs (dialog_id, name, type, hidden, needs_refresh, snapshot_at) "
@@ -705,146 +656,3 @@ async def test_dialog_light_adapter_clears_one_durable_dirty_flag(conn: sqlite3.
     assert observed_scopes[0].demand_kind is DemandKind.DIALOG_LIGHT_RECONCILIATION
     assert observed_scopes[0].acquisition_kind is AcquisitionKind.ENTITY_LOOKUP
     assert observed_scopes[0].attempt_budget is budget
-
-
-@pytest.mark.asyncio
-async def test_dialog_full_adapter_completes_generation_under_precise_scope(conn: sqlite3.Connection) -> None:
-    conn.execute("INSERT INTO daemon_state (key, value) VALUES ('dialog_reconciliation_last_full_at', '100')")
-    conn.commit()
-    observed_scopes: list[TelegramRpcScope] = []
-
-    async def iter_dialogs(**_kwargs: object) -> AsyncIterator[object]:
-        observed_scopes.append(current_rpc_scope())
-        return
-        yield  # pragma: no cover
-
-    worker = DialogReconciliationWorker(SimpleNamespace(iter_dialogs=iter_dialogs), conn, asyncio.Event())
-    adapter = DialogFullReconciliationDemandAdapter(worker, interval_seconds=50.0)
-    changes_before = conn.total_changes
-
-    status = adapter.status(200.0)
-    assert status.release_at == 150.0
-    assert status.freshness_deadline == 150.0
-    assert conn.total_changes == changes_before
-    budget = RpcAttemptBudget(limit=32)
-    await adapter.run_slice(budget)
-
-    scope = observed_scopes[0]
-    assert scope.demand_kind is DemandKind.DIALOG_FULL_RECONCILIATION
-    assert scope.acquisition_kind is AcquisitionKind.DIALOG_TRAVERSAL
-    assert scope.attempt_budget is budget
-    assert conn.execute(
-        "SELECT status, generation FROM dialog_full_reconciliation_state WHERE singleton=1"
-    ).fetchone() == ("idle", 1)
-    assert conn.execute("SELECT value FROM daemon_state WHERE key='dialog_reconciliation_last_full_at'").fetchone() != (
-        "100",
-    )
-
-
-@pytest.mark.asyncio
-async def test_dialog_full_adapter_propagates_throttle_and_preserves_generation(conn: sqlite3.Connection) -> None:
-    async def iter_dialogs(**_kwargs: object) -> AsyncIterator[object]:
-        raise TelegramRpcThrottled(retry_after_seconds=13)
-        yield  # pragma: no cover
-
-    worker = DialogReconciliationWorker(SimpleNamespace(iter_dialogs=iter_dialogs), conn, asyncio.Event())
-    adapter = DialogFullReconciliationDemandAdapter(worker, interval_seconds=50.0)
-
-    with pytest.raises(TelegramRpcThrottled) as caught:
-        await adapter.run_slice(RpcAttemptBudget(limit=1))
-    assert caught.value.retry_after_seconds == 13
-    assert conn.execute(
-        "SELECT status, generation FROM dialog_full_reconciliation_state WHERE singleton=1"
-    ).fetchone() == ("in_progress", 1)
-
-
-@pytest.mark.parametrize("state", ["idle", "in_progress"])
-def test_dialog_full_adapter_never_completed_has_no_freshness_debt(
-    conn: sqlite3.Connection,
-    state: str,
-) -> None:
-    conn.execute(
-        "UPDATE dialog_full_reconciliation_state SET status=? WHERE singleton=1",
-        (state,),
-    )
-    conn.commit()
-    worker = DialogReconciliationWorker(SimpleNamespace(iter_dialogs=AsyncMock()), conn, asyncio.Event())
-    adapter = DialogFullReconciliationDemandAdapter(worker, interval_seconds=50.0)
-
-    status = adapter.status(1_700_000_000.0)
-
-    assert status.release_at == 0.0
-    assert status.freshness_deadline is None
-    assert status.is_ready(1_700_000_000.0)
-    assert status.overdue_seconds(1_700_000_000.0) == 0.0
-
-
-def test_dialog_full_adapter_status_sees_in_progress_with_row_factory(conn: sqlite3.Connection) -> None:
-    conn.row_factory = sqlite3.Row
-    conn.execute("INSERT INTO daemon_state (key, value) VALUES ('dialog_reconciliation_last_full_at', '100')")
-    conn.execute("UPDATE dialog_full_reconciliation_state SET status='in_progress' WHERE singleton=1")
-    conn.commit()
-    worker = DialogReconciliationWorker(SimpleNamespace(iter_dialogs=AsyncMock()), conn, asyncio.Event())
-    adapter = DialogFullReconciliationDemandAdapter(worker, interval_seconds=50.0)
-
-    status = adapter.status(200.0)
-
-    assert status.release_at == 0.0
-    assert status.freshness_deadline == 150.0
-
-
-@pytest.mark.asyncio
-async def test_dialog_full_adapter_resumes_message_cursor_and_preserves_changed_unseen_row(
-    conn: sqlite3.Connection,
-) -> None:
-    cursor_date = datetime(2026, 1, 2, tzinfo=UTC)
-    user = types.User(id=401, first_name="Seen", access_hash=999)
-    dialog = SimpleNamespace(
-        id=401,
-        dialog=SimpleNamespace(read_inbox_max_id=None, read_outbox_max_id=None, unread_mark=False),
-        entity=user,
-        message=SimpleNamespace(id=777, date=cursor_date),
-        pinned=False,
-        folder_id=None,
-        read_inbox_max_id=None,
-        read_outbox_max_id=None,
-        unread_mentions_count=0,
-        unread_reactions_count=0,
-        unread_count=0,
-        unread_mark=False,
-        draft=None,
-        date=cursor_date,
-    )
-    conn.executemany(
-        "INSERT INTO dialogs(dialog_id, name, type, hidden) VALUES (?, ?, 'user', 0)",
-        ((401, "Old seen"), (402, "Locally changed")),
-    )
-    conn.commit()
-    observed_options: list[dict[str, object]] = []
-
-    async def iter_dialogs(**kwargs: object) -> AsyncIterator[object]:
-        observed_options.append(kwargs)
-        if len(observed_options) == 1:
-            yield dialog
-            raise RpcAttemptBudgetExhaustedError("slice complete")
-
-    worker = DialogReconciliationWorker(SimpleNamespace(iter_dialogs=iter_dialogs), conn, asyncio.Event())
-    adapter = DialogFullReconciliationDemandAdapter(worker, interval_seconds=50.0)
-
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
-
-    assert conn.execute(
-        "SELECT status, offset_id, observed_count FROM dialog_full_reconciliation_state WHERE singleton=1"
-    ).fetchone() == ("in_progress", 777, 1)
-    conn.execute("UPDATE dialogs SET name='Changed during sweep' WHERE dialog_id=402")
-    conn.commit()
-
-    await adapter.run_slice(RpcAttemptBudget(limit=1))
-
-    assert observed_options[1]["offset_date"] == cursor_date
-    assert observed_options[1]["offset_id"] == 777
-    assert isinstance(observed_options[1]["offset_peer"], types.InputPeerUser)
-    assert conn.execute("SELECT hidden FROM dialogs WHERE dialog_id=402").fetchone() == (0,)
-    assert conn.execute(
-        "SELECT status, generation FROM dialog_full_reconciliation_state WHERE singleton=1"
-    ).fetchone() == ("idle", 1)

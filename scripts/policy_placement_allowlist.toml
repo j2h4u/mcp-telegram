@@ -325,16 +325,6 @@ category = "policy_assignments"
 key = "src/mcp_telegram/tools/_base.py:<module>:_DAEMON_TIMEOUT_TEXT"
 rationale = "This is fixed text for a daemon timeout error response."
 
-[[entry]]
-category = "policy_defaults"
-key = "src/mcp_telegram/dialog_sync.py:run_reconciliation_loop:daily_interval"
-rationale = "This legacy reconciliation-loop default is retained outside the TTL configuration change."
-
-[[entry]]
-category = "policy_defaults"
-key = "src/mcp_telegram/dialog_sync.py:run_reconciliation_loop:hourly_interval"
-rationale = "This legacy reconciliation-loop default is retained outside the TTL configuration change."
-
 # These are local SQLite/API contract values, not daemon operator policy.  Keep
 # each new exclusion individually justified so additions are reviewable.
 [[entry]]
@@ -421,3 +411,18 @@ rationale = "This pre-existing worker scheduling default is retained as a compat
 category = "policy_assignments"
 key = "src/mcp_telegram/transcription_hydration.py:TranscriptionHydrationHandler:batch_size"
 rationale = "Telegram's TranscribeAudio request accepts one message per request; this is a fixed protocol contract, not an operator schedule."
+
+[[entry]]
+category = "policy_call_keywords"
+key = "src/mcp_telegram/dialog_directory.py:CanonicalDialogDirectory.status:freshness_deadline"
+rationale = "This is the canonical directory's computed publication freshness receipt."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/folders/contracts.py:<module>:RULE_TTL_SECONDS"
+rationale = "This folder-rule freshness contract is local domain behavior, not operator policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/folders/worker.py:FolderProjectionDemandAdapter.status:deadline"
+rationale = "This is the computed folder projection freshness deadline from the local rule contract."
