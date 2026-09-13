@@ -62,7 +62,8 @@ def test_published_directory_age_uses_acquisition_start_at_exact_stale_boundary(
     conn = sqlite3.connect(path)
     try:
         conn.execute(
-            "UPDATE dialog_directory_publication SET generation=3,observation_started_at=100,observation_completed_at=9_000"
+            "UPDATE dialog_directory_publication SET generation=3,observation_started_at=100,observation_completed_at=?",
+            (9000,),
         )
         conn.execute(
             "INSERT INTO dialogs(dialog_id,type,identity_complete,identity_observed_at,hidden) VALUES (1,'user',1,100,0)"
