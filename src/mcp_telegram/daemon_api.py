@@ -1463,6 +1463,7 @@ class DaemonAPIServer:
             "ok": True,
             "data": {
                 "folders": folder_summaries(self._conn),
+                "directory_coverage": read_dialog_directory_coverage(self._conn).to_wire(),
                 "folder_snapshot": folder_snapshot(
                     self._conn,
                     stale_after_seconds=self._policy.folder_snapshot_stale_after_seconds,

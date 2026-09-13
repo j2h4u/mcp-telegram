@@ -323,6 +323,19 @@ def _unavailable_folder_snapshot_payload() -> dict[str, object]:
     }
 
 
+def _directory_coverage_payload() -> dict[str, object]:
+    return {
+        "status": "never",
+        "publication_generation": None,
+        "observation_started_at": None,
+        "age_seconds": None,
+        "refresh_status": "pending",
+        "reason": None,
+        "lookup_complete": False,
+        "lookup_fresh": False,
+    }
+
+
 def _canonical_list_dialogs_data(dialogs: list[dict[str, object]]) -> dict[str, object]:
     return {
         "dialogs": dialogs,
@@ -757,15 +770,19 @@ async def test_list_dialogs_folder_view_returns_structural_summary():
                         "last_message_at": 1_705_312_800,
                     }
                 ],
+                "directory_coverage": _directory_coverage_payload(),
                 "folder_snapshot": _unavailable_folder_snapshot_payload(),
             },
         }
     )
 
     with _patch_daemon(conn):
-        result = await list_dialogs(ListDialogs(view="folders"))
+        result = await server.call_tool("list_dialogs", {"view": "folders"})
 
     payload = assert_structured_success_payload(result)
+    output_schema = server.tool_by_name["list_dialogs"].output_schema
+    assert output_schema is not None
+    validate(payload, output_schema)
     assert payload["view"] == "folders"
     assert payload["dialogs"] == []
     assert payload["folders"] == [
@@ -779,6 +796,12 @@ async def test_list_dialogs_folder_view_returns_structural_summary():
             "unknown_membership_count": 0,
         }
     ]
+    assert payload["directory_coverage"] == {
+        "status": "never",
+        "refresh_status": "pending",
+        "lookup_complete": False,
+        "lookup_fresh": False,
+    }
     conn.list_folders.assert_called_once_with()
     conn.list_dialogs.assert_not_called()
 

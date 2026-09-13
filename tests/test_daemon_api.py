@@ -33,6 +33,7 @@ from mcp_telegram.daemon_api import (
 )
 from mcp_telegram.daemon_ipc import get_daemon_socket_path
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
+from mcp_telegram.dialog_directory_coverage import read_dialog_directory_coverage
 from mcp_telegram.dialog_selector import required_dialog_selector
 from mcp_telegram.event_handlers import EventHandlerManager, _InboxReadUpdateLike
 from mcp_telegram.feedback_db import SQLiteFeedbackStore
@@ -1751,6 +1752,30 @@ async def test_list_dialogs_serves_preserved_folder_snapshot_without_refresh(tmp
     response_data = cast(dict[str, object], _response_data(result))
     snapshot = cast(dict[str, object], response_data["folder_snapshot"])
     assert snapshot["status"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_list_folders_includes_canonical_directory_coverage(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _register_sqlite_connection(sqlite3.connect(db_path))
+    replace_folder_snapshot(conn, [(3, "Work")], [])
+    server = make_server(conn)
+
+    result = await server._list_folders({})
+
+    assert result["ok"] is True
+    data = cast(dict[str, object], _response_data(result))
+    assert data["directory_coverage"] == read_dialog_directory_coverage(conn).to_wire()
+    assert data["folder_snapshot"] == {
+        "generation": None,
+        "status": "unavailable",
+        "completed_at": None,
+        "age_seconds": None,
+        "complete": False,
+    }
+    folders = cast(list[dict[str, object]], data["folders"])
+    assert folders[0]["unknown_membership_count"] == 0
 
 
 @pytest.mark.asyncio
