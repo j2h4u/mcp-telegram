@@ -40,6 +40,7 @@ from mcp_telegram.telegram_demand import (
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
 from mcp_telegram.tools.entity_info import GET_ENTITY_INFO_OUTPUT_SCHEMA, GetEntityInfo, _entity_structured_content
+from tests.helpers import LoudGroupProfilePort
 
 
 class _UnusedClient:
@@ -438,7 +439,6 @@ def _test_service(conn: sqlite3.Connection, *, limits: RefreshLimits) -> DaemonE
             get_full_channel_request=lambda **_kwargs: object(),
             get_participants_request=lambda **_kwargs: object(),
             channel_participants_contacts_request=lambda **_kwargs: object(),
-            get_full_chat_request=lambda **_kwargs: object(),
             input_messages_filter_chat_photos=object,
             message_action_chat_edit_photo=object,
             chat_reactions_all=object,
@@ -446,6 +446,7 @@ def _test_service(conn: sqlite3.Connection, *, limits: RefreshLimits) -> DaemonE
             chat_reactions_none=object,
             channel_type=object,
             chat_type=object,
+            group_profile_port=LoudGroupProfilePort(),
             refresh_limits=limits,
         )
     )

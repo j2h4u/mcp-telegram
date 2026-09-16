@@ -21,8 +21,6 @@
     "daemon_api.py::DaemonAPIServer._get_sync_status": 11,
     "daemon_api.py::_get_sync_status": 11,
     "daemon_api.py::_resolve_dialog_name": 14,
-    "daemon_entity_info.py::DaemonEntityInfoService._search_chat_photo_history": 17,
-    "daemon_entity_info.py::_search_chat_photo_history": 17,
     "reading/sqlite_projection.py::_build_list_messages_query": 12,
     "reading/sqlite_projection.py::_read_state_for_dialog": 13,
     "reading/service.py::ReadingService._dialog_row_matches_filter": 13,

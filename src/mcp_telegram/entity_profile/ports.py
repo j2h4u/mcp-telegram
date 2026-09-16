@@ -4,6 +4,14 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from .contracts import GroupProfileObservation
+
+
+class GroupProfilePort(Protocol):
+    """Fetch one normalized legacy group profile observation."""
+
+    async def fetch_group_profile(self, group_id: int) -> GroupProfileObservation: ...
+
 
 class ProfilePairObservationHook(Protocol):
     """Best-effort aggregate observer for Entity Profile pair lifecycles."""
@@ -29,4 +37,4 @@ class ProfilePairObservationHook(Protocol):
     ) -> None: ...
 
 
-__all__ = ["ProfilePairObservationHook"]
+__all__ = ["GroupProfilePort", "ProfilePairObservationHook"]

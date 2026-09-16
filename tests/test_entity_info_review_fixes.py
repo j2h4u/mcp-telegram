@@ -23,6 +23,7 @@ from telethon.tl.types import User  # type: ignore[import-untyped]
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.tools.entity_info import _entity_input_label, _format_relative_ymd
 from tests.daemon_api_policy import make_daemon_api_policy
+from tests.helpers import LoudGroupProfilePort
 from tests.reaction_helpers import make_reaction_freshener
 
 # ---------------------------------------------------------------------------
@@ -94,6 +95,7 @@ def _make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLik
         cast(DaemonClientLike, client),
         asyncio.Event(),
         reaction_freshener=make_reaction_freshener(conn, client),
+        group_profile_port=LoudGroupProfilePort(),
         policy=make_daemon_api_policy(),
     )
     server._ready = True

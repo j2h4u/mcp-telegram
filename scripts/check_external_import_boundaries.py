@@ -118,6 +118,10 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
     ),
 }
 
+EXACT_SYMBOL_OWNER_PATHS: Mapping[str, str] = {
+    "telethon.tl.functions.messages.GetFullChatRequest": "telegram_gateway.py",
+}
+
 
 @dataclass(frozen=True)
 class ExternalImport:
@@ -145,6 +149,58 @@ def find_external_imports(source: str) -> list[ExternalImport]:
     return sorted(imports, key=lambda item: (item.line, item.dependency))
 
 
+def _dotted_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _dotted_name(node.value)
+        return None if parent is None else f"{parent}.{node.attr}"
+    return None
+
+
+def _resolve_module_alias(name: str, aliases: Mapping[str, str]) -> str:
+    parts = name.split(".")
+    for end in range(len(parts), 0, -1):
+        prefix = ".".join(parts[:end])
+        module = aliases.get(prefix)
+        if module is not None:
+            suffix = ".".join(parts[end:])
+            return f"{module}.{suffix}" if suffix else module
+    return name
+
+
+def _exact_symbol_uses(source: str) -> list[tuple[str, int]]:  # noqa: PLR0912
+    """Find exact owned symbols through direct, aliased, and qualified access."""
+    tree = ast.parse(source)
+    module_aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                module_aliases[alias.asname or alias.name.split(".", 1)[0]] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            for alias in node.names:
+                module_aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    uses: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            for alias in node.names:
+                full_name = f"{node.module}.{alias.name}"
+                if full_name in EXACT_SYMBOL_OWNER_PATHS:
+                    uses.append((full_name, node.lineno))
+            continue
+        if not isinstance(node, ast.Attribute):
+            continue
+        dotted = _dotted_name(node)
+        if dotted is None:
+            continue
+        if dotted in EXACT_SYMBOL_OWNER_PATHS or (
+            dotted.endswith(".GetFullChatRequest")
+            and _resolve_module_alias(dotted, module_aliases) in EXACT_SYMBOL_OWNER_PATHS
+        ):
+            uses.append(("telethon.tl.functions.messages.GetFullChatRequest", node.lineno))
+    return uses
+
+
 def _package_relative_path(path: Path, source_root: Path) -> str:
     return path.resolve().relative_to(source_root.resolve()).as_posix()
 
@@ -165,11 +221,16 @@ def violations_for(
 ) -> list[str]:
     """Return direct-import owner violations for one package source file."""
     package_path = _package_relative_path(path, source_root)
-    return [
+    violations = [
         f"{_display_path(path)}:{item.line}: unexpected {item.dependency} import owner"
         for item in find_external_imports(source)
         if package_path not in allowed_importer_paths[item.dependency]
     ]
+    for symbol, line in _exact_symbol_uses(source):
+        owner = EXACT_SYMBOL_OWNER_PATHS[symbol]
+        if package_path != owner:
+            violations.append(f"{_display_path(path)}:{line}: unexpected {symbol.rsplit('.', 1)[-1]} owner")
+    return sorted(violations, key=lambda item: int(item.split(":", 2)[1]))
 
 
 def boundary_violations(
@@ -199,6 +260,13 @@ def boundary_violations(
             f"{package_path}: stale {dependency} import allowlist entry"
             for package_path in sorted(allowed_importer_paths[dependency] - import_owners[dependency])
         )
+    for symbol, owner in EXACT_SYMBOL_OWNER_PATHS.items():
+        if not (source_root / owner).exists() or not any(
+            symbol_name == symbol
+            for path in source_root.rglob("*.py")
+            for symbol_name, _ in _exact_symbol_uses(path.read_text(encoding="utf-8"))
+        ):
+            violations.append(f"{owner}: stale {symbol} owner entry")
     return violations
 
 

@@ -23,7 +23,6 @@ from telethon.errors import (  # type: ignore[import-untyped]
     UsernameInvalidError,
     UsernameNotOccupiedError,
 )
-from telethon.tl import types as tl_types  # type: ignore[import-untyped]
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
 from .auth_scope import TelegramAuthScope
@@ -31,9 +30,13 @@ from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .entity_profile.contracts import (
     FULL_PROFILE_OWNED_FIELDS,
     FULL_USER_ENDPOINT,
+    GROUP_PROFILE_ENDPOINT,
+    GROUP_PROFILE_NORMALIZATION_VERSION,
     NORMALIZATION_VERSION,
     PERSONAL_CHANNEL_OWNED_FIELDS,
     PROFILE_SECTIONS,
+    GroupCurrentPhoto,
+    GroupProfileObservation,
     ProfileAcquisitionEvidence,
     completeness,
 )
@@ -44,7 +47,7 @@ from .entity_profile.full_user_normalization import (
     TargetKind,
     normalize_full_user_response,
 )
-from .entity_profile.ports import ProfilePairObservationHook
+from .entity_profile.ports import GroupProfilePort, ProfilePairObservationHook
 from .entity_profile.refresh import (
     DurableRefreshSliceResult,
     DurableRefreshTerminal,
@@ -78,8 +81,6 @@ _MEMBERSHIP_THRESHOLD_LARGE = 1000
 _CHANNEL_DIALOG_ID_OFFSET = 1_000_000_000_000
 _PERSONAL_CHANNEL_PREVIEW_CHARS = 100
 _PAIR_SECTION_COUNT = 2
-_GROUP_FULL_CHAT_ENDPOINT = "messages.GetFullChat"
-_GROUP_FULL_CHAT_NORMALIZATION_VERSION = "entity-profile-group-full-chat-v1"
 _ENTITY_NOT_FOUND_ERRORS = (
     ChatIdInvalidError,
     PeerIdInvalidError,
@@ -140,10 +141,6 @@ class _FullChannelResult(Protocol):
     full_chat: object
 
 
-class _FullChatResult(Protocol):
-    full_chat: object
-
-
 class _MessagesSearchResult(Protocol):
     count: int
     messages: Sequence[object]
@@ -166,10 +163,6 @@ def _opt_int_attr(obj: object, name: str) -> int | None:
     return value if isinstance(value, int) else None
 
 
-def _positive_non_bool_id(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
-
-
 def _opt_str_attr(obj: object, name: str) -> str | None:
     value = _attr(obj, name)
     return value if isinstance(value, str) else None
@@ -189,6 +182,20 @@ def _isoformat_or_none(value: object | None) -> str | None:
     if isinstance(value, _SupportsIsoformat):
         return cast(_SupportsIsoformat, value).isoformat()
     return None
+
+
+def _current_chat_photo(
+    full_chat: object,
+    current_photo: GroupCurrentPhoto | None,
+) -> tuple[int | None, str | None]:
+    if current_photo is not None:
+        return current_photo.photo_id, current_photo.date
+    if full_chat is None:
+        return None, None
+    chat_photo = _attr(full_chat, "chat_photo", None)
+    if chat_photo is None:
+        return None, None
+    return _opt_int_attr(chat_photo, "id"), _isoformat_or_none(_attr(chat_photo, "date", None))
 
 
 def _text_or_none(value: object | None) -> str | None:
@@ -264,7 +271,6 @@ class EntityInfoDeps:
     get_full_channel_request: Callable[..., object]
     get_participants_request: Callable[..., object]
     channel_participants_contacts_request: Callable[..., object]
-    get_full_chat_request: Callable[..., object]
     input_messages_filter_chat_photos: type[object]
     message_action_chat_edit_photo: type[object]
     chat_reactions_all: type[object]
@@ -272,6 +278,7 @@ class EntityInfoDeps:
     chat_reactions_none: type[object]
     channel_type: type[object]
     chat_type: type[object]
+    group_profile_port: GroupProfilePort
     get_dialog_placement: Callable[[int], dict[str, object]] | None = None
     refresh_limits: RefreshLimits = field(default_factory=RefreshLimits)
     enable_full_user_pair: bool = False
@@ -1812,8 +1819,6 @@ class DaemonEntityInfoService:
         if entity_type in {DialogType.CHANNEL, DialogType.SUPERGROUP, DialogType.FORUM}:
             return await self._acquire_channel_full_profile(entity_id, entity_type)
 
-        if entity_type is DialogType.GROUP:
-            return await self._acquire_group_full_profile(entity_id)
         return EntitySectionCommit({}, status="unavailable", reason="unsupported_entity_type")
 
     async def _acquire_user_full_profile(self, entity_id: int) -> EntitySectionCommit:
@@ -1887,11 +1892,6 @@ class DaemonEntityInfoService:
             patch.update(members_count=member_count, linked_broadcast_id=patch.pop("linked_chat_id"))
         return EntitySectionCommit(patch)
 
-    async def _acquire_group_full_profile(self, entity_id: int) -> EntitySectionCommit:
-        result = await self._deps.client(self._deps.get_full_chat_request(chat_id=self._legacy_chat_raw_id(entity_id)))
-        full_chat, participants, _reason = self._validate_group_full_chat_result(result, entity_id)
-        return self._group_full_profile_commit(full_chat, participants)
-
     async def _acquire_group_full_chat_pair(
         self,
         cursor: EntityRefreshCursor,
@@ -1900,18 +1900,16 @@ class DaemonEntityInfoService:
         captured_scope = self._capture_pair_scope()
         if self._deps.full_user_auth_scope is not None and captured_scope is None:
             raise _AuthScopeUnavailableError("authenticated session scope is unavailable")
-        started_at = int(self._deps.now_provider())
-        result = await self._deps.client(
-            self._deps.get_full_chat_request(chat_id=self._legacy_chat_raw_id(cursor.entity_id))
-        )
-        completed_at = int(self._deps.now_provider())
-        full_chat, participants, participants_reason = self._validate_group_full_chat_result(
-            result,
-            cursor.entity_id,
-        )
+        observation = await self._deps.group_profile_port.fetch_group_profile(cursor.entity_id)
+        if observation.group_id != cursor.entity_id:
+            raise ValueError("group profile observation target does not match")
+        completed_at = observation.observation_completed_at
+        started_at = observation.observation_started_at
+        participants = observation.participant_ids
+        participants_reason = observation.participants_unavailable_reason
         identity = self._group_full_chat_identity(captured_scope)
         full_profile = self._group_full_profile_commit(
-            full_chat,
+            observation,
             participants,
             evidence=self._group_full_chat_evidence(
                 cursor,
@@ -1943,15 +1941,8 @@ class DaemonEntityInfoService:
                 ),
             )
         else:
-            participant_ids = self._extract_group_participants(participants)
-            contacts = self._enrich_contact_ids_with_names(participant_ids & self._deps.dm_peer_ids())
-            contact_overlap = EntitySectionCommit(
-                {
-                    "contacts_subscribed": contacts,
-                    "contacts_subscribed_partial": False,
-                    "contacts_reason": None,
-                },
-                payload=contacts,
+            contact_overlap = self._group_contact_overlap_commit(
+                observation,
                 evidence=self._group_full_chat_evidence(
                     cursor,
                     outcome="usable",
@@ -1966,74 +1957,18 @@ class DaemonEntityInfoService:
 
     def _group_full_profile_commit(
         self,
-        full_chat: object,
-        participants: Sequence[object] | None,
+        observation: GroupProfileObservation,
+        participants: tuple[int, ...] | None,
         *,
         evidence: ProfileAcquisitionEvidence | None = None,
     ) -> EntitySectionCommit:
-        exported_invite = _attr(full_chat, "exported_invite", None)
         return EntitySectionCommit(
             {
-                "about": _opt_str_attr(full_chat, "about"),
-                "invite_link": _opt_str_attr(exported_invite, "link") if exported_invite is not None else None,
+                "about": observation.about,
+                "invite_link": observation.invite_link,
                 "members_count": len(participants) if participants is not None else None,
             },
             evidence=evidence,
-        )
-
-    def _validate_group_full_chat_result(
-        self,
-        result: object,
-        entity_id: int,
-    ) -> tuple[object, Sequence[object] | None, str | None]:
-        """Validate the exact legacy GetFullChat envelope and participant shape."""
-        if not isinstance(result, tl_types.messages.ChatFull):
-            raise ValueError("full chat envelope is invalid")
-        full_chat = _attr(result, "full_chat", None)
-        if not isinstance(full_chat, tl_types.ChatFull):
-            raise ValueError("legacy chat full payload is invalid")
-        if not isinstance(entity_id, int) or isinstance(entity_id, bool):
-            raise ValueError("legacy chat target id is invalid")
-        raw_chat_id = self._legacy_chat_raw_id(entity_id)
-        if _positive_non_bool_id(_attr(full_chat, "id")) != raw_chat_id:
-            raise ValueError("legacy chat full target does not match")
-        participants, reason = self._validate_group_participants(
-            _attr(full_chat, "participants", None),
-            raw_chat_id,
-        )
-        return full_chat, participants, reason
-
-    @staticmethod
-    def _validate_group_participants(  # noqa: PLR0911
-        raw_participants: object | None,
-        raw_chat_id: int,
-    ) -> tuple[Sequence[object] | None, str | None]:
-        if isinstance(raw_participants, tl_types.ChatParticipants):
-            if _positive_non_bool_id(_attr(raw_participants, "chat_id")) != raw_chat_id:
-                return None, "participants_target_mismatch"
-            candidate = _attr(raw_participants, "participants", None)
-            if not isinstance(candidate, Sequence) or isinstance(candidate, str | bytes | bytearray):
-                return None, "participants_not_sequence"
-            if not DaemonEntityInfoService._group_participants_are_valid(candidate):
-                return None, "participants_malformed"
-            return candidate, None
-        if isinstance(raw_participants, tl_types.ChatParticipantsForbidden):
-            return None, "participants_forbidden"
-        if raw_participants is None:
-            return None, "participants_missing"
-        return None, "participants_malformed"
-
-    @staticmethod
-    def _group_participants_are_valid(participants: Sequence[object]) -> bool:
-        participant_types = (
-            tl_types.ChatParticipant,
-            tl_types.ChatParticipantAdmin,
-            tl_types.ChatParticipantCreator,
-        )
-        return all(
-            isinstance(participant, participant_types)
-            and _positive_non_bool_id(_attr(participant, "user_id")) is not None
-            for participant in participants
         )
 
     @staticmethod
@@ -2043,8 +1978,8 @@ class DaemonEntityInfoService:
         return {
             "auth_scope": scope.as_private_mapping(),
             "entity_type": DialogType.GROUP.value,
-            "endpoint": _GROUP_FULL_CHAT_ENDPOINT,
-            "normalization_version": _GROUP_FULL_CHAT_NORMALIZATION_VERSION,
+            "endpoint": GROUP_PROFILE_ENDPOINT,
+            "normalization_version": GROUP_PROFILE_NORMALIZATION_VERSION,
         }
 
     @staticmethod
@@ -2062,12 +1997,12 @@ class DaemonEntityInfoService:
             generation=cursor.generation,
             outcome=outcome,
             provenance={
-                "endpoint": _GROUP_FULL_CHAT_ENDPOINT,
+                "endpoint": GROUP_PROFILE_ENDPOINT,
                 "declared_fields": list(declared_fields),
                 "materialized_fields": list(declared_fields),
                 "authoritative": authoritative,
             },
-            normalization_version=_GROUP_FULL_CHAT_NORMALIZATION_VERSION,
+            normalization_version=GROUP_PROFILE_NORMALIZATION_VERSION,
             observation_started_at=started_at,
             observation_completed_at=completed_at,
             identity=identity,
@@ -2096,20 +2031,29 @@ class DaemonEntityInfoService:
         return await self._acquire_channel_contact_overlap(entity_id)
 
     async def _acquire_group_contact_overlap(self, entity_id: int) -> EntitySectionCommit:
-        result = await self._deps.client(self._deps.get_full_chat_request(chat_id=self._legacy_chat_raw_id(entity_id)))
-        _full_chat, participants, reason = self._validate_group_full_chat_result(result, entity_id)
-        if participants is None:
+        observation = await self._deps.group_profile_port.fetch_group_profile(entity_id)
+        if observation.group_id != entity_id:
+            raise ValueError("group profile observation target does not match")
+        return self._group_contact_overlap_commit(observation)
+
+    def _group_contact_overlap_commit(
+        self,
+        observation: GroupProfileObservation,
+        *,
+        evidence: ProfileAcquisitionEvidence | None = None,
+    ) -> EntitySectionCommit:
+        if observation.participant_ids is None:
             return EntitySectionCommit(
                 {
                     "contacts_subscribed": None,
                     "contacts_subscribed_partial": False,
-                    "contacts_reason": reason,
+                    "contacts_reason": observation.participants_unavailable_reason,
                 },
                 status="unavailable",
-                reason=reason,
+                reason=observation.participants_unavailable_reason,
+                evidence=evidence,
             )
-        participant_ids = self._extract_group_participants(participants)
-        contacts = self._enrich_contact_ids_with_names(participant_ids & self._deps.dm_peer_ids())
+        contacts = self._enrich_contact_ids_with_names(set(observation.participant_ids) & self._deps.dm_peer_ids())
         return EntitySectionCommit(
             {
                 "contacts_subscribed": contacts,
@@ -2117,6 +2061,7 @@ class DaemonEntityInfoService:
                 "contacts_reason": None,
             },
             payload=contacts,
+            evidence=evidence,
         )
 
     async def _acquire_channel_contact_overlap(self, entity_id: int) -> EntitySectionCommit:
@@ -2280,10 +2225,6 @@ class DaemonEntityInfoService:
             except TypeError, ValueError:
                 continue
         return None
-
-    @staticmethod
-    def _legacy_chat_raw_id(entity_id: int) -> int:
-        return -entity_id if entity_id < 0 else entity_id
 
     def _core_from_entity(self, entity: object) -> dict[str, object]:
         entity_id = int(self._deps.get_peer_id(entity))
@@ -3190,7 +3131,13 @@ class DaemonEntityInfoService:
             for rr in cast(Sequence[object], _attr(entity, "restriction_reason", None) or [])
         ]
 
-    async def _search_chat_photo_history(self, peer: object, full_chat: object) -> tuple[list[dict[str, object]], int]:
+    async def _search_chat_photo_history(
+        self,
+        peer: object,
+        full_chat: object,
+        *,
+        current_photo: GroupCurrentPhoto | None = None,
+    ) -> tuple[list[dict[str, object]], int]:
         """Avatar history via messages.Search(filter=ChatPhotos)."""
         peer_id = int(self._deps.get_peer_id(peer))
         avatar_history: list[dict[str, object]] = []
@@ -3245,6 +3192,7 @@ class DaemonEntityInfoService:
             avatar_history,
             avatar_count,
             full_chat=full_chat,
+            current_photo=current_photo,
             search_failed=search_failed,
         )
 
@@ -3254,29 +3202,19 @@ class DaemonEntityInfoService:
         avatar_count: int,
         *,
         full_chat: object,
+        current_photo: GroupCurrentPhoto | None = None,
         search_failed: bool,
     ) -> tuple[list[dict[str, object]], int]:
-        chat_photo = _attr(full_chat, "chat_photo", None) if full_chat is not None else None
-        current_photo_id = _opt_int_attr(chat_photo, "id") if chat_photo is not None else None
-        if current_photo_id is not None and not any(p["photo_id"] == int(current_photo_id) for p in avatar_history):
-            chat_photo_date = _attr(chat_photo, "date", None)
-            avatar_history.insert(
-                0,
-                {
-                    "photo_id": int(current_photo_id),
-                    "date": _isoformat_or_none(chat_photo_date),
-                },
-            )
-        if search_failed and current_photo_id is not None:
+        current_photo_id, chat_photo_date = _current_chat_photo(full_chat, current_photo)
+        if current_photo_id is None:
+            return avatar_history, avatar_count
+        current_entry: dict[str, object] = {"photo_id": current_photo_id, "date": chat_photo_date}
+        if not any(p["photo_id"] == current_photo_id for p in avatar_history):
+            avatar_history.insert(0, current_entry)
+        if search_failed:
             avatar_count = max(avatar_count, 1)
-        if not avatar_history and current_photo_id is not None:
-            chat_photo_date = _attr(chat_photo, "date", None)
-            avatar_history = [
-                {
-                    "photo_id": int(current_photo_id),
-                    "date": _isoformat_or_none(chat_photo_date),
-                }
-            ]
+        if not avatar_history:
+            avatar_history = [current_entry]
             avatar_count = max(avatar_count, 1)
         return avatar_history, avatar_count
 
@@ -3572,18 +3510,36 @@ class DaemonEntityInfoService:
             )
             return None, False, "enumeration_failed"
 
-    async def _fetch_group_detail(self, chat: object) -> dict[str, object]:
-        chat_id = int(self._deps.get_peer_id(chat))
-        migrated_to = self._resolve_group_migrated_to(chat)
-        group_meta = await self._collect_group_full_chat(chat)
-        my_membership = self._build_chat_membership(chat)
-
-        contacts_subscribed: list[dict[str, object]] | None = []
-        contacts_reason: str | None = None
+    async def _fetch_group_profile_observation(self, chat_id: int) -> GroupProfileObservation | None:
         try:
-            participant_ids = self._extract_group_participants(cast(Sequence[object], group_meta["participants"]))
-            intersect_ids = participant_ids & self._deps.dm_peer_ids()
-            contacts_subscribed = self._enrich_contact_ids_with_names(intersect_ids)
+            observation = await self._deps.group_profile_port.fetch_group_profile(chat_id)
+            if observation.group_id != chat_id:
+                raise ValueError("group profile observation target does not match")
+            return observation
+        except TelegramRpcThrottled:
+            raise
+        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+            raise_if_flood_wait_error(exc)
+            self._record_section_failure("full_profile", type(exc).__name__.lower())
+            self._deps.logger.warning(
+                "entity_info group full_profile_failed chat_id=%r error=%s%s",
+                chat_id,
+                exc,
+                self._deps.rid(),
+                exc_info=not isinstance(exc, TimeoutError),
+            )
+            return None
+
+    def _legacy_group_contacts(
+        self,
+        chat_id: int,
+        observation: GroupProfileObservation | None,
+    ) -> tuple[list[dict[str, object]] | None, str | None]:
+        if observation is None or observation.participant_ids is None:
+            return [], None
+        try:
+            intersect_ids = set(observation.participant_ids) & self._deps.dm_peer_ids()
+            return self._enrich_contact_ids_with_names(intersect_ids), None
         except (TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
             self._record_section_failure("contact_overlap", type(exc).__name__.lower())
             self._deps.logger.warning(
@@ -3592,28 +3548,41 @@ class DaemonEntityInfoService:
                 exc,
                 self._deps.rid(),
             )
-            contacts_subscribed = None
-            contacts_reason = "enumeration_failed"
+            return None, "enumeration_failed"
 
-        avatar_history, avatar_count = await self._search_chat_photo_history(chat, group_meta["full_chat"])
+    async def _fetch_group_detail(self, chat: object) -> dict[str, object]:
+        chat_id = int(self._deps.get_peer_id(chat))
+        migrated_to = self._resolve_group_migrated_to(chat)
+        observation = await self._fetch_group_profile_observation(chat_id)
+        my_membership = self._build_chat_membership(chat)
+        contacts_subscribed, contacts_reason = self._legacy_group_contacts(chat_id, observation)
+        participant_ids = observation.participant_ids if observation is not None else None
+        members_count = (
+            len(participant_ids) if participant_ids is not None else _opt_int_attr(chat, "participants_count")
+        )
+        avatar_history, avatar_count = await self._search_chat_photo_history(
+            chat,
+            None,
+            current_photo=observation.current_photo if observation is not None else None,
+        )
 
         return {
             "id": chat_id,
             "type": DialogType.GROUP.value,
             "name": _attr(chat, "title", None),
             "username": None,
-            "about": group_meta["about"],
+            "about": (observation.about or None) if observation is not None else None,
             "my_membership": my_membership,
             "avatar_history": avatar_history,
             "avatar_count": avatar_count,
-            "members_count": group_meta["members_count"],
+            "members_count": members_count,
             "migrated_to": migrated_to,
-            "invite_link": group_meta["invite_link"],
+            "invite_link": observation.invite_link if observation is not None else None,
             "restrictions": self._collect_restrictions(chat),
             "contacts_subscribed": contacts_subscribed,
             "contacts_subscribed_partial": False,
             "contacts_reason": contacts_reason,
-            "_full_fetch_ok": True,
+            "_full_fetch_ok": observation is not None,
         }
 
     def _resolve_group_migrated_to(self, chat: object) -> int | None:
@@ -3630,50 +3599,3 @@ class DaemonEntityInfoService:
                 self._deps.rid(),
             )
             return None
-
-    async def _collect_group_full_chat(self, chat: object) -> dict[str, object]:
-        group_meta: dict[str, object] = {
-            "full_chat": None,
-            "about": None,
-            "invite_link": None,
-            "participants": [],
-            "members_count": None,
-        }
-        try:
-            chat_id = _opt_int_attr(chat, "id")
-            if chat_id is None:
-                raise ValueError("chat id missing")
-            full_result = cast(
-                _FullChatResult, await self._deps.client(self._deps.get_full_chat_request(chat_id=chat_id))
-            )
-            full_chat = full_result.full_chat
-            group_meta["full_chat"] = full_chat
-            group_meta["about"] = _attr(full_chat, "about", None) or None
-            exported_invite = _attr(full_chat, "exported_invite", None)
-            if exported_invite is not None:
-                group_meta["invite_link"] = _attr(exported_invite, "link", None)
-            raw_participants = _attr(full_chat, "participants", None)
-            if raw_participants is not None:
-                participants = list(cast(Sequence[object], _attr(raw_participants, "participants", []) or []))
-                group_meta["participants"] = participants
-                group_meta["members_count"] = len(participants)
-            if group_meta["members_count"] is None:
-                group_meta["members_count"] = _attr(chat, "participants_count", None)
-        except TelegramRpcThrottled:
-            raise
-        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
-            raise_if_flood_wait_error(exc)
-            self._record_section_failure("full_profile", type(exc).__name__.lower())
-            self._deps.logger.warning(
-                "entity_info group full_chat_failed chat_id=%r error=%s%s",
-                int(self._deps.get_peer_id(chat)),
-                exc,
-                self._deps.rid(),
-                exc_info=not isinstance(exc, TimeoutError),
-            )
-        return group_meta
-
-    def _extract_group_participants(self, participants: Sequence[object]) -> set[int]:
-        return {
-            p_user_id for p in participants if (p_user_id := _positive_non_bool_id(_attr(p, "user_id"))) is not None
-        }

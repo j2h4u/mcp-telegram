@@ -64,6 +64,7 @@ from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.dialog_directory_coverage_fixtures import install_dialog_directory_coverage_schema
+from tests.helpers import LoudGroupProfilePort
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
 
@@ -364,6 +365,7 @@ def make_server(
         reaction_freshener=make_reaction_freshener(conn, client),
         hydration_requester=hydration_requester,
         topic_refresher=topic_refresher,
+        group_profile_port=LoudGroupProfilePort(),
         policy=make_daemon_api_policy(),
     )
     server._ready = True
@@ -448,6 +450,7 @@ def test_daemon_api_server_uses_explicit_sync_db_path(tmp_path: Path) -> None:
         asyncio.Event(),
         sync_db_path=sync_db_path,
         reaction_freshener=make_reaction_freshener(conn, client),
+        group_profile_port=LoudGroupProfilePort(),
         policy=make_daemon_api_policy(),
     )
 
