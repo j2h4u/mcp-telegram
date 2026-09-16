@@ -171,6 +171,15 @@ def _make_db() -> Iterator[sqlite3.Connection]:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_type ON dialogs(type)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_snapshot_at ON dialogs(snapshot_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_needs_refresh_hidden ON dialogs(needs_refresh, hidden)")
+        conn.execute(
+            """
+            CREATE TABLE own_only_dialogs (
+                dialog_id INTEGER PRIMARY KEY,
+                inclusion_basis TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
         conn.execute("CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT)")
         install_dialog_directory_coverage_schema(conn)
         conn.commit()

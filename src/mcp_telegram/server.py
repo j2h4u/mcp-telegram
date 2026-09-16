@@ -43,6 +43,7 @@ from .config import (
     resolve_logging_config,
 )
 from .correlation import correlation_context, current_correlation_ids
+from .request_timing import standalone_operation_id
 from .runtime_logging import install_telethon_log_filter
 from .tools._base import _send_telemetry_event, safe_error_code
 
@@ -205,6 +206,7 @@ def _telemetry_event(  # noqa: PLR0913 - explicit telemetry fields keep the cont
     result: object | None,
     error_type: str | None = None,
     error_code: object = None,
+    operation_id: str | None = None,
 ) -> dict[str, object]:
     """Build the privacy-safe event shared by all MCP boundary outcomes."""
     if outcome not in _TELEMETRY_OUTCOMES:
@@ -218,7 +220,7 @@ def _telemetry_event(  # noqa: PLR0913 - explicit telemetry fields keep the cont
     else:
         machine_code = outcome
     tool_capability = "conversation_changes" if tool_name == "list_conversation_changes" else tool_name
-    return {
+    event: dict[str, object] = {
         "tool_name": tool_name,
         "tool_capability": tool_capability,
         "contract_version": 1,
@@ -233,7 +235,9 @@ def _telemetry_event(  # noqa: PLR0913 - explicit telemetry fields keep the cont
         "error_type": error_type,
         "outcome": outcome,
         "error_code": machine_code,
+        "operation_id": operation_id,
     }
+    return event
 
 
 def _safe_boundary_error_text(*, tool_name: str, stage: str, exc: Exception) -> str:
@@ -461,14 +465,16 @@ async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
         raise ValueError(f"Unknown tool: {name}")
 
     t0 = time.monotonic()
+    operation_id = standalone_operation_id(None)
     telemetry = _CallTelemetry()
     try:
-        with correlation_context():
+        with correlation_context(operation_id):
             return await _execute_tool(name, tool, arguments, t0, telemetry)
     finally:
         _schedule_telemetry(
             _telemetry_event(
                 tool_name=name,
+                operation_id=operation_id,
                 outcome=telemetry.outcome,
                 duration_ms=(time.monotonic() - t0) * 1000,
                 result=telemetry.result,

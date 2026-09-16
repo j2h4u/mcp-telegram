@@ -155,14 +155,11 @@ def enroll_own_only_sync_dialog(conn: sqlite3.Connection, dialog_id: int) -> Non
 
 
 def own_only_basis_by_dialog(conn: sqlite3.Connection) -> dict[int, tuple[str, ...]]:
-    """Return persisted ownership bases, tolerating pre-cache test databases."""
-    try:
-        rows = cast(
-            list[tuple[object, object]],
-            conn.execute("SELECT dialog_id, inclusion_basis FROM own_only_dialogs").fetchall(),
-        )
-    except sqlite3.OperationalError:
-        return {}
+    """Return persisted ownership bases from the required ownership cache."""
+    rows = cast(
+        list[tuple[object, object]],
+        conn.execute("SELECT dialog_id, inclusion_basis FROM own_only_dialogs").fetchall(),
+    )
     result: dict[int, tuple[str, ...]] = {}
     for dialog_id, raw_basis in rows:
         try:

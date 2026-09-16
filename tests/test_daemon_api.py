@@ -483,14 +483,14 @@ async def test_get_entity_info_uses_startup_snapshot_for_self_id() -> None:
 @pytest.mark.asyncio
 async def test_daemon_api_logs_request_completion_for_errors(caplog: pytest.LogCaptureFixture) -> None:
     server = make_server()
-    line = json.dumps({"method": "unknown_method", "request_id": "req123"}).encode()
+    line = json.dumps({"method": "unknown_method", "request_id": "abcdef12"}).encode()
 
     with caplog.at_level("INFO", logger="mcp_telegram.daemon_api"):
         response, method, request_id = await server._handle_client_line(line, "", None)
 
     assert response["ok"] is False
     assert method == "unknown_method"
-    assert request_id == "req123"
+    assert request_id == "abcdef12"
     records = [r for r in caplog.records if r.message.startswith("daemon_api_request_complete")]
     assert len(records) == 1
     assert "method=unknown_method" in records[0].message
@@ -817,6 +817,15 @@ def _make_db_with_dialogs(*, with_fts: bool = False, with_entities: bool = False
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_type ON dialogs(type)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_snapshot_at ON dialogs(snapshot_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_needs_refresh_hidden ON dialogs(needs_refresh, hidden)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS own_only_dialogs (
+            dialog_id INTEGER PRIMARY KEY,
+            inclusion_basis TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        """
+    )
     install_dialog_directory_coverage_schema(conn)
     conn.commit()
     return conn
@@ -2579,13 +2588,13 @@ async def test_daemon_api_returns_unhealthy_when_flood_wait_kill_switch_is_open(
     )
 
     response, method, request_id = await server._handle_client_line(
-        b'{"method":"get_sync_status","request_id":"health"}',
+        b'{"method":"get_sync_status","request_id":"deadbeef"}',
         "",
         None,
     )
 
     assert method == "get_sync_status"
-    assert request_id == "health"
+    assert request_id == "deadbeef"
     assert response["ok"] is False
     assert response["error"] == "flood_wait_kill_switch_open"
     assert "too_many_flood_wait_events" in str(response["detail"])

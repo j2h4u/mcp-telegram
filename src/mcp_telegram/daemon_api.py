@@ -97,8 +97,18 @@ from .folders.read_model import dialog_placement, folder_snapshot, folder_summar
 from .history_enrollment import disable_history, enable_history, read_intent
 from .models import ReadMessage
 from .reading import ReadingDeps, ReadingService
+from .request_timing import (
+    TIMING_KIND,
+    DaemonRequestTiming,
+    is_valid_operation_id,
+    is_valid_request_id,
+    standalone_operation_id,
+    standalone_request_id,
+    timing_context,
+)
 from .runtime_observations import (
     RuntimeObservationPolicy,
+    RuntimeObservationSink,
     prune_runtime_observations,
     record_runtime_observation,
     tool_telemetry_identity,
@@ -170,6 +180,33 @@ def _telemetry_input_error(message: str) -> dict[str, object]:
     return {"ok": False, "error": "invalid_input", "message": message}
 
 
+def _operation_id_or_error(value: object) -> str | dict[str, object]:
+    if value is None:
+        return standalone_operation_id(None)
+    if not is_valid_operation_id(value):
+        return {"ok": False, "error": "invalid_operation_id", "message": "operation_id is invalid"}
+    return cast(str, value)
+
+
+def _request_id_or_error(value: object) -> str | dict[str, object] | None:
+    if value is None:
+        return None
+    if not is_valid_request_id(value):
+        return {"ok": False, "error": "invalid_request_id", "message": "request_id is invalid"}
+    return cast(str, value)
+
+
+def _served_source(response: Mapping[str, object]) -> str:
+    data = response.get("data")
+    if isinstance(data, Mapping):
+        source = data.get("source")
+        if source in {"sync_db", "scheduled_messages", "sync_db+scheduled_messages"}:
+            return "local"
+        if source in {"telegram", "telegram_topic_fallback"}:
+            return "telegram"
+    return "unknown" if response.get("ok") else "error"
+
+
 def _normalize_telemetry_outcome(event: dict[str, object]) -> tuple[str, str | None] | dict[str, object]:
     raw_outcome = event.get("outcome")
     if raw_outcome is None:
@@ -197,6 +234,9 @@ def _normalize_telemetry_event(
     if not isinstance(tool_name, str) or len(tool_name) > _TELEMETRY_TOOL_NAME_MAX_LEN:
         return None, _telemetry_input_error("tool_name must be a string (max 200 chars)")
     event["tool_name"] = tool_name
+    operation_id = event.get("operation_id")
+    if operation_id is not None and not is_valid_operation_id(operation_id):
+        return None, _telemetry_input_error("operation_id is invalid")
     event["tool_capability"], event["contract_version"] = tool_telemetry_identity(tool_name)
     return event, None
 
@@ -209,6 +249,7 @@ def _insert_telemetry_row(
         conn,
         kind="mcp.call",
         observed_at_ms=int(float(cast(float, event.get("timestamp", time.time()))) * 1000),
+        operation_id=cast(str | None, event.get("operation_id")),
         tool_name=str(event["tool_name"]),
         tool_capability=cast(str | None, event.get("tool_capability")),
         contract_version=cast(int | None, event.get("contract_version")),
@@ -596,6 +637,11 @@ class DaemonAPIServer:
         self._demand_sink: DemandOfferSink | None = None
         self._profile_observer: ProfilePairObservationHook | None = None
         self._conversation_changes_token_codec = ConversationChangesTokenCodec()
+        self._runtime_observation_sink: RuntimeObservationSink | None = None
+
+    def bind_runtime_observation_sink(self, sink: RuntimeObservationSink) -> None:
+        """Attach the bounded asynchronous sink used for daemon timing evidence."""
+        self._runtime_observation_sink = sink
 
     def bind_demand_sink(self, sink: DemandOfferSink) -> None:
         """Attach the process-wide coordinator after daemon composition."""
@@ -712,9 +758,16 @@ class DaemonAPIServer:
             )
 
         request_id_obj = req.get("request_id")
-        request_id = request_id_obj if isinstance(request_id_obj, str) else None
         method_obj = req.get("method", "")
         method = method_obj if isinstance(method_obj, str) else ""
+        request_result = _request_id_or_error(request_id_obj)
+        if isinstance(request_result, dict):
+            return (
+                request_result,
+                method,
+                None,
+            )
+        request_id = request_result
         if not self._ready:
             return (
                 {
@@ -738,6 +791,14 @@ class DaemonAPIServer:
                 request_id,
             )
 
+        operation_result = _operation_id_or_error(req.get("operation_id"))
+        if isinstance(operation_result, dict):
+            return (
+                operation_result,
+                method,
+                request_id,
+            )
+        operation_id = operation_result
         if request_id:
             logger.debug(
                 "daemon_api_request method=%s request_id=%s",
@@ -745,18 +806,63 @@ class DaemonAPIServer:
                 request_id,
             )
 
-        token = _current_request_id.set(request_id)
-        started_at = time.perf_counter()
-        try:
-            response = await self._dispatch_with_error_projection(req, method=method, request_id=request_id)
-        finally:
-            _current_request_id.reset(token)
-
-        self._log_request_completion(method, request_id, response, time.perf_counter() - started_at)
+        response = await self._dispatch_request_with_timing(req, method, request_id, operation_id)
 
         if request_id:
             response = {**response, "request_id": request_id}
         return response, method, request_id
+
+    async def _dispatch_request_with_timing(
+        self,
+        req: dict[str, object],
+        method: str,
+        request_id: str | None,
+        operation_id: str,
+    ) -> dict[str, object]:
+        request_token = _current_request_id.set(request_id)
+        started_at = time.perf_counter()
+        cancelled = False
+        with timing_context(operation_id, request_id=standalone_request_id(request_id)) as timing:
+            response: dict[str, object] = {"ok": False, "error": "cancelled"}
+            try:
+                response = await self._dispatch_with_error_projection(req, method=method, request_id=request_id)
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            finally:
+                _current_request_id.reset(request_token)
+                if method == "list_messages" and timing is not None:
+                    timing.set_served_source(_served_source(response))
+                    self._record_request_timing(timing, response, cancelled=cancelled)
+
+        self._log_request_completion(method, request_id, response, time.perf_counter() - started_at)
+        return response
+
+    def _record_request_timing(
+        self,
+        timing: DaemonRequestTiming,
+        response: Mapping[str, object],
+        *,
+        cancelled: bool = False,
+    ) -> None:
+        """Enqueue one content-free list_messages timing observation."""
+        if self._runtime_observation_sink is None:
+            return
+        try:
+            payload = timing.payload()
+            duration_ms = timing.duration_ms()
+            operation_id = timing.operation_id
+            self._runtime_observation_sink.record(
+                kind=TIMING_KIND,
+                operation_id=operation_id,
+                dialog_id=None,
+                outcome=("cancelled" if cancelled else "success" if response.get("ok") else "tool_error"),
+                reason_code=("cancelled" if cancelled else None if response.get("ok") else "request_failed"),
+                duration_ms=duration_ms,
+                payload=payload,
+            )
+        except Exception:
+            logger.debug("daemon_request_timing_record_failed", exc_info=True)
 
     async def _dispatch_with_error_projection(
         self,

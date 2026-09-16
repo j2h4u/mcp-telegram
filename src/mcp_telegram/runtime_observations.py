@@ -33,6 +33,7 @@ ALLOWED_KINDS = frozenset(
         "runtime.task_failed",
         "telegram.rpc_admission",
         "telegram.demand",
+        "daemon.request_timing",
         "entity_profile.pair",
         "runtime.telemetry_loss",
     }

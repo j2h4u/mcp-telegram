@@ -17,6 +17,7 @@ from jsonschema import ValidationError, validate
 from mcp.types import CallToolResult, Prompt, TextContent, Tool
 
 from mcp_telegram import server
+from mcp_telegram.request_timing import is_valid_operation_id
 from mcp_telegram.tools._base import ToolRegistryEntry, ToolResult, tool_description
 from mcp_telegram.tools.discovery import ListDialogs
 
@@ -357,6 +358,7 @@ async def test_call_tool_emits_one_boundary_telemetry_event_with_result_metadata
     assert event["has_filter"] is True
     assert event["tool_capability"] == "list_dialogs"
     assert event["contract_version"] == 1
+    assert is_valid_operation_id(event["operation_id"])
 
 
 def test_conversation_changes_telemetry_keeps_stable_capability() -> None:

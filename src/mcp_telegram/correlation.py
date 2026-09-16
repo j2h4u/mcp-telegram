@@ -13,16 +13,19 @@ from contextlib import contextmanager
 
 _CorrelationState = contextvars.ContextVar[list[str] | None]
 _state: _CorrelationState = contextvars.ContextVar("correlation_ids", default=None)
+_operation_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("operation_id", default=None)
 
 
 @contextmanager
-def correlation_context() -> Iterator[None]:
-    """Install an empty request-correlation context for the current task."""
+def correlation_context(operation_id: str | None = None) -> Iterator[None]:
+    """Install an empty request-correlation context for one logical operation."""
     token = _state.set([])
+    operation_token = _operation_id.set(operation_id)
     try:
         yield
     finally:
         _state.reset(token)
+        _operation_id.reset(operation_token)
 
 
 def record_correlation_id(request_id: str) -> None:
@@ -38,4 +41,9 @@ def current_correlation_ids() -> tuple[str, ...]:
     return tuple(request_ids) if request_ids is not None else ()
 
 
-__all__ = ["correlation_context", "current_correlation_ids", "record_correlation_id"]
+def current_operation_id() -> str | None:
+    """Return the opaque logical operation ID active in this task."""
+    return _operation_id.get()
+
+
+__all__ = ["correlation_context", "current_correlation_ids", "current_operation_id", "record_correlation_id"]

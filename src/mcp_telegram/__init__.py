@@ -46,8 +46,13 @@ def summary(
 
     try:
         since_seconds = parse_since(since)
-        state_dir = load_config().state.dir
-        report = build_operator_summary(state_dir / "sync.db", since_seconds=since_seconds)
+        operator_config = load_config()
+        state_dir = operator_config.state.dir
+        report = build_operator_summary(
+            state_dir / "sync.db",
+            since_seconds=since_seconds,
+            slow_request_seconds=operator_config.logging.daemon_api_slow_request_seconds,
+        )
     except (ConfigError, OSError, sqlite3.Error, ValueError) as exc:
         raise BadParameter(str(exc)) from exc
     print(report.text)

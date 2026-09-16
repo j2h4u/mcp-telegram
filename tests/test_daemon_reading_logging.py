@@ -268,13 +268,14 @@ def _telegram_service(gateway: _PagedHistoryGateway, conn: sqlite3.Connection | 
 
 
 @pytest.mark.parametrize("file_backed", [False, True])
-def test_own_only_probe_handles_sqlite_row_without_own_only_table(tmp_path: Path, file_backed: bool) -> None:
+def test_own_only_cache_missing_schema_fails_closed(tmp_path: Path, file_backed: bool) -> None:
     database = tmp_path / "reading.db" if file_backed else ":memory:"
     conn = sqlite3.connect(database)
     conn.row_factory = sqlite3.Row
     service = _telegram_service(_PagedHistoryGateway([]), conn)
     try:
-        assert service._own_only_basis_by_dialog() is None
+        with pytest.raises(sqlite3.OperationalError):
+            service._own_only_basis_by_dialog()
     finally:
         conn.close()
 

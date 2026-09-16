@@ -32,6 +32,7 @@ from ..pagination import (
     encode_search_navigation,
 )
 from ..reactions.contracts import ReactionFreshness
+from ..request_timing import current_timing, timing_phase
 from ..resolver import latinize
 from ..sync_db import open_sync_db_reader
 from ..sync_read_model import SyncReadModelContractError, build_sync_read_model
@@ -98,6 +99,16 @@ def _safe_exception_message(exc: BaseException) -> str:
     if not message:
         return type(exc).__name__
     return message
+
+
+def _set_timing_route(route: str, *, fallback: bool = False) -> None:
+    timing = current_timing()
+    if timing is None:
+        return
+    if fallback:
+        timing.mark_fallback(route)
+    else:
+        timing.set_route(route)
 
 
 def _log_rendered_message_stats(logger: LoggerLike, dialog_id: int, messages: Sequence[ReadMessage]) -> None:
@@ -214,7 +225,6 @@ class _ListMessagesDbRequest:
     until_utc: int | None = None
 
 
-_OWN_ONLY_DIALOGS_TABLE_SQL = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'own_only_dialogs'"
 _MAX_TELEGRAM_BOUNDARY_BATCHES = 16
 
 
@@ -797,14 +807,16 @@ class ReadingService:
         *,
         log_rendered: bool,
     ) -> tuple[list[ReadMessage], ReactionFreshness]:
-        messages = project_cached_message_facts(
-            self._conn,
-            dialog_id,
-            [read_message_from_row(r) for r in rows],
-        )
-        freshness = cached_reaction_freshness(len(messages))
+        with timing_phase("local_projection"):
+            messages = project_cached_message_facts(
+                self._conn,
+                dialog_id,
+                [read_message_from_row(r) for r in rows],
+            )
+            freshness = cached_reaction_freshness(len(messages))
         if log_rendered:
-            _log_rendered_message_stats(self._logger, dialog_id, messages)
+            with timing_phase("response_shape"):
+                _log_rendered_message_stats(self._logger, dialog_id, messages)
         return messages, freshness
 
     def _enrich_cached_facts(self, messages: Sequence[ReadMessage]) -> list[ReadMessage]:
@@ -816,15 +828,17 @@ class ReadingService:
         Missing fact tables/rows are intentionally represented by the helpers'
         nullable/unavailable defaults.
         """
-        return project_cached_message_facts_by_dialog(self._conn, messages)
+        with timing_phase("local_projection"):
+            return project_cached_message_facts_by_dialog(self._conn, messages)
 
     def _read_state_per_dialog(self, messages: list[ReadMessage]) -> dict[int, ReadState]:
         read_state_per_dialog: dict[int, ReadState] = {}
-        for dialog_id in {m.dialog_id for m in messages if m.dialog_id}:
-            dialog_type = _dialog_type_from_db(self._conn, dialog_id)
-            read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
-            if read_state is not None:
-                read_state_per_dialog[dialog_id] = read_state
+        with timing_phase("local_projection"):
+            for dialog_id in {m.dialog_id for m in messages if m.dialog_id}:
+                dialog_type = _dialog_type_from_db(self._conn, dialog_id)
+                read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
+                if read_state is not None:
+                    read_state_per_dialog[dialog_id] = read_state
         return read_state_per_dialog
 
     async def _list_messages_context_result(
@@ -832,14 +846,17 @@ class ReadingService:
         dialog_id: int,
         request: _ListMessagesRequest,
     ) -> dict:
-        row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)))
-        current_status = _status_from_row(row)
+        with timing_phase("local_projection"):
+            row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)))
+            current_status = _status_from_row(row)
         if current_status in (None, "not_synced", "fragment", "own_only"):
-            fragment_result = await self._deps.fragment_context.fetch(
-                dialog_id,
-                request.context_message_id or 0,
-                request.context_size,
-            )
+            _set_timing_route("telegram_context_fallback", fallback=True)
+            with timing_phase("telegram_fallback"):
+                fragment_result = await self._deps.fragment_context.fetch(
+                    dialog_id,
+                    request.context_message_id or 0,
+                    request.context_size,
+                )
             if not fragment_result.ok:
                 failure = fragment_result.failure
                 detail = failure.as_dict() if failure is not None else None
@@ -874,6 +891,7 @@ class ReadingService:
                 "context_availability": "context_window_unavailable",
                 "dialog_status": current_status or "not_synced",
             }
+        _set_timing_route("local_context")
         return await self._list_messages_context_window(
             dialog_id=dialog_id,
             anchor_message_id=request.context_message_id or 0,
@@ -908,13 +926,14 @@ class ReadingService:
         if request.unread:
             unread_after_id = await self._resolve_unread_position(dialog_id, request.unread_after_id)
 
-        row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)))
-        status = _status_from_row(row)
-
-        dialog_type = _dialog_type_from_db(self._conn, dialog_id)
-        read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
+        with timing_phase("local_projection"):
+            row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)))
+            status = _status_from_row(row)
+            dialog_type = _dialog_type_from_db(self._conn, dialog_id)
+            read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
 
         if status in ("synced", "syncing", "access_lost"):
+            _set_timing_route("local_history")
             db_request = _ListMessagesDbRequest(
                 dialog_id=dialog_id,
                 limit=request.limit,
@@ -931,19 +950,29 @@ class ReadingService:
                 until_utc=request.until_utc,
             )
             result = await self._list_messages_from_db(db_request)
-            result["data"].update(_build_access_metadata(self._conn, dialog_id, status))
+            with timing_phase("local_projection"):
+                access_metadata = _build_access_metadata(self._conn, dialog_id, status)
+            result["data"].update(access_metadata)
             result["data"]["dialog_type"] = dialog_type
             result["data"]["read_state"] = read_state
-            if _should_fetch_topic_from_telegram(self._conn, dialog_id, request.topic_id, result["data"]["messages"]):
+            with timing_phase("local_projection"):
+                fetch_topic = _should_fetch_topic_from_telegram(
+                    self._conn, dialog_id, request.topic_id, result["data"]["messages"]
+                )
+            if fetch_topic:
+                _set_timing_route("telegram_topic_fallback", fallback=True)
                 telegram_result = await self._list_messages_from_telegram(_telegram_request_from_db_request(db_request))
                 if telegram_result.get("ok") and telegram_result["data"]["messages"]:
                     telegram_result["data"]["source"] = "telegram_topic_fallback"
-                    telegram_result["data"].update(_build_access_metadata(self._conn, dialog_id, status))
+                    with timing_phase("local_projection"):
+                        telegram_access_metadata = _build_access_metadata(self._conn, dialog_id, status)
+                    telegram_result["data"].update(telegram_access_metadata)
                     telegram_result["data"]["dialog_type"] = dialog_type
                     telegram_result["data"]["read_state"] = read_state
                     return telegram_result
             return result
 
+        _set_timing_route("telegram_fallback", fallback=True)
         telegram_result = await self._list_messages_from_telegram(
             _ListMessagesTelegramRequest(
                 dialog_id=dialog_id,
@@ -969,19 +998,20 @@ class ReadingService:
         request: _SearchMessagesRequest,
         stemmed: str,
     ) -> dict:
-        rows = _fetchall_rows(
-            self._conn.execute(
-                _SELECT_FTS_ALL_SQL,
-                {
-                    "query": stemmed,
-                    "limit": request.limit,
-                    "offset": request.offset,
-                    "self_id": self._deps.self_id,
-                    "since_utc": request.since_utc,
-                    "until_utc": request.until_utc,
-                },
+        with timing_phase("local_projection"):
+            rows = _fetchall_rows(
+                self._conn.execute(
+                    _SELECT_FTS_ALL_SQL,
+                    {
+                        "query": stemmed,
+                        "limit": request.limit,
+                        "offset": request.offset,
+                        "self_id": self._deps.self_id,
+                        "since_utc": request.since_utc,
+                        "until_utc": request.until_utc,
+                    },
+                )
             )
-        )
         messages = self._enrich_search_messages(rows)
         next_nav = self._search_next_navigation(request, messages, global_mode=True)
         return {
@@ -999,26 +1029,28 @@ class ReadingService:
         request: _SearchMessagesRequest,
         stemmed: str,
     ) -> dict:
-        rows = _fetchall_rows(
-            self._conn.execute(
-                _SELECT_FTS_SQL,
-                {
-                    "query": stemmed,
-                    "dialog_id": request.dialog_id,
-                    "limit": request.limit,
-                    "offset": request.offset,
-                    "self_id": self._deps.self_id,
-                    "since_utc": request.since_utc,
-                    "until_utc": request.until_utc,
-                },
+        with timing_phase("local_projection"):
+            rows = _fetchall_rows(
+                self._conn.execute(
+                    _SELECT_FTS_SQL,
+                    {
+                        "query": stemmed,
+                        "dialog_id": request.dialog_id,
+                        "limit": request.limit,
+                        "offset": request.offset,
+                        "self_id": self._deps.self_id,
+                        "since_utc": request.since_utc,
+                        "until_utc": request.until_utc,
+                    },
+                )
             )
-        )
         messages, freshness = await self._build_read_messages_from_rows(request.dialog_id, rows, log_rendered=False)
         messages = self._restore_search_plain_text(rows, messages)
         next_nav = self._search_next_navigation(request, messages, global_mode=False)
-        row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (request.dialog_id,)))
-        scoped_status = _status_from_row(row)
-        access_meta = _build_access_metadata(self._conn, request.dialog_id, scoped_status or "not_synced")
+        with timing_phase("local_projection"):
+            row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (request.dialog_id,)))
+            scoped_status = _status_from_row(row)
+            access_meta = _build_access_metadata(self._conn, request.dialog_id, scoped_status or "not_synced")
         return {
             "ok": True,
             "data": {
@@ -1093,45 +1125,35 @@ class ReadingService:
                 "ok": True,
                 "data": {"messages": [], "total": 0, "next_navigation": None, "source": "scheduled_messages"},
             }
-        own_basis = self._own_only_basis_by_dialog()
-        if own_basis is not None and (
-            (request.dialog_id and request.dialog_id not in own_basis) or (not request.dialog_id and not own_basis)
-        ):
-            return {
-                "ok": True,
-                "data": {
-                    "messages": [],
-                    "total": 0,
-                    "next_navigation": None,
-                    "source": "scheduled_messages",
-                    "scope": "own_only",
-                },
-            }
-        own_dialog_ids = sorted(own_basis) if own_basis is not None else None
-        sql, params = build_scheduled_search_query(
-            dialog_id=request.dialog_id,
-            own_dialog_ids=own_dialog_ids,
-            query=stem_query(request.query),
-            limit=request.limit,
-            offset=request.offset,
-            scheduled_now=int(time.time()),
-            since_utc=request.since_utc,
-            until_utc=request.until_utc,
-        )
-        rows = [
-            scheduled_row_to_wire(
-                cast(Mapping[str, object], raw_row),
-                inclusion_basis=own_basis.get(_object_to_int(_row_value(raw_row, "dialog_id")), ())
-                if own_basis is not None
-                else (),
+        with timing_phase("local_projection"):
+            own_basis = self._own_only_basis_by_dialog()
+            if (request.dialog_id and request.dialog_id not in own_basis) or (not request.dialog_id and not own_basis):
+                raw_rows: list[object] = []
+            else:
+                sql, params = build_scheduled_search_query(
+                    dialog_id=request.dialog_id,
+                    own_dialog_ids=sorted(own_basis),
+                    query=stem_query(request.query),
+                    limit=request.limit,
+                    offset=request.offset,
+                    scheduled_now=int(time.time()),
+                    since_utc=request.since_utc,
+                    until_utc=request.until_utc,
+                )
+                raw_rows = _fetchall_rows(self._conn.execute(sql, params))
+        with timing_phase("response_shape"):
+            rows = [
+                scheduled_row_to_wire(
+                    cast(Mapping[str, object], raw_row),
+                    inclusion_basis=own_basis.get(_object_to_int(_row_value(raw_row, "dialog_id")), ()),
+                )
+                for raw_row in raw_rows
+            ]
+            next_nav = self._search_next_navigation(
+                request,
+                rows,
+                global_mode=not request.dialog_id,
             )
-            for raw_row in _fetchall_rows(self._conn.execute(sql, params))
-        ]
-        next_nav = self._search_next_navigation(
-            request,
-            rows,
-            global_mode=not request.dialog_id,
-        )
         return {
             "ok": True,
             "data": {
@@ -1335,7 +1357,8 @@ class ReadingService:
         """Resolve unread cutoff from synced_dialogs."""
         if unread_after_id is not None:
             return unread_after_id
-        row = _fetchone_row(self._conn.execute(_GET_READ_POSITION_SQL, (dialog_id,)))
+        with timing_phase("local_projection"):
+            row = _fetchone_row(self._conn.execute(_GET_READ_POSITION_SQL, (dialog_id,)))
         if row is not None:
             values = _row_sequence(row)
             if values and values[0] is not None:
@@ -1353,61 +1376,64 @@ class ReadingService:
         """Return messages centred on anchor_message_id from sync.db."""
         before_count = context_size // 2
         after_count = context_size - before_count - 1
-        before_rows = _fetchall_rows(
-            self._conn.execute(
-                _LIST_MESSAGES_BASE_SQL
-                + " AND m.message_id <= :anchor AND (:since_utc IS NULL OR m.sent_at >= :since_utc) AND (:until_utc IS NULL OR m.sent_at < :until_utc) ORDER BY m.message_id DESC LIMIT :limit",
-                {
-                    "dialog_id": dialog_id,
-                    "self_id": self._deps.self_id,
-                    "anchor": anchor_message_id,
-                    "limit": context_size,
-                    "since_utc": since_utc,
-                    "until_utc": until_utc,
-                },
+        with timing_phase("local_projection"):
+            before_rows = _fetchall_rows(
+                self._conn.execute(
+                    _LIST_MESSAGES_BASE_SQL
+                    + " AND m.message_id <= :anchor AND (:since_utc IS NULL OR m.sent_at >= :since_utc) AND (:until_utc IS NULL OR m.sent_at < :until_utc) ORDER BY m.message_id DESC LIMIT :limit",
+                    {
+                        "dialog_id": dialog_id,
+                        "self_id": self._deps.self_id,
+                        "anchor": anchor_message_id,
+                        "limit": context_size,
+                        "since_utc": since_utc,
+                        "until_utc": until_utc,
+                    },
+                )
             )
-        )
 
-        after_rows = _fetchall_rows(
-            self._conn.execute(
-                _LIST_MESSAGES_BASE_SQL
-                + " AND m.message_id > :anchor AND (:since_utc IS NULL OR m.sent_at >= :since_utc) AND (:until_utc IS NULL OR m.sent_at < :until_utc) ORDER BY m.message_id ASC LIMIT :limit",
-                {
-                    "dialog_id": dialog_id,
-                    "self_id": self._deps.self_id,
-                    "anchor": anchor_message_id,
-                    "limit": context_size,
-                    "since_utc": since_utc,
-                    "until_utc": until_utc,
-                },
+            after_rows = _fetchall_rows(
+                self._conn.execute(
+                    _LIST_MESSAGES_BASE_SQL
+                    + " AND m.message_id > :anchor AND (:since_utc IS NULL OR m.sent_at >= :since_utc) AND (:until_utc IS NULL OR m.sent_at < :until_utc) ORDER BY m.message_id ASC LIMIT :limit",
+                    {
+                        "dialog_id": dialog_id,
+                        "self_id": self._deps.self_id,
+                        "anchor": anchor_message_id,
+                        "limit": context_size,
+                        "since_utc": since_utc,
+                        "until_utc": until_utc,
+                    },
+                )
             )
-        )
 
-        selected_before = before_rows[: before_count + 1]
-        selected_after = after_rows[:after_count]
-        remaining = context_size - len(selected_before) - len(selected_after)
-        if remaining > 0:
-            selected_after.extend(after_rows[after_count : after_count + remaining])
+        with timing_phase("response_shape"):
+            selected_before = before_rows[: before_count + 1]
+            selected_after = after_rows[:after_count]
             remaining = context_size - len(selected_before) - len(selected_after)
-        if remaining > 0:
-            selected_before.extend(before_rows[before_count + 1 : before_count + 1 + remaining])
-        rows = list(reversed(selected_before)) + list(selected_after)
+            if remaining > 0:
+                selected_after.extend(after_rows[after_count : after_count + remaining])
+                remaining = context_size - len(selected_before) - len(selected_after)
+            if remaining > 0:
+                selected_before.extend(before_rows[before_count + 1 : before_count + 1 + remaining])
+            rows = list(reversed(selected_before)) + list(selected_after)
         messages, freshness = await self._build_read_messages_from_rows(dialog_id, rows, log_rendered=True)
-
-        dialog_type = _dialog_type_from_db(self._conn, dialog_id)
-        read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
-        return {
-            "ok": True,
-            "data": {
-                "messages": [dataclasses.asdict(m) for m in messages],
-                "source": "sync_db",
-                "anchor_message_id": anchor_message_id,
-                "next_navigation": None,
-                "dialog_type": dialog_type,
-                "read_state": read_state,
-                "reaction_freshness": freshness.as_dict(),
-            },
-        }
+        with timing_phase("local_projection"):
+            dialog_type = _dialog_type_from_db(self._conn, dialog_id)
+            read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
+        with timing_phase("response_shape"):
+            return {
+                "ok": True,
+                "data": {
+                    "messages": [dataclasses.asdict(m) for m in messages],
+                    "source": "sync_db",
+                    "anchor_message_id": anchor_message_id,
+                    "next_navigation": None,
+                    "dialog_type": dialog_type,
+                    "read_state": read_state,
+                    "reaction_freshness": freshness.as_dict(),
+                },
+            }
 
     async def _list_messages_from_telegram(
         self,
@@ -1418,29 +1444,31 @@ class ReadingService:
         base_kwargs = _telegram_history_kwargs(req)
         has_time_bounds = req.since_utc is not None or req.until_utc is not None
         max_batches = _MAX_TELEGRAM_BOUNDARY_BATCHES if has_time_bounds else 1
-        batch_run = await self._fetch_telegram_batches(req, base_kwargs, max_batches)
+        with timing_phase("telegram_fallback"):
+            batch_run = await self._fetch_telegram_batches(req, base_kwargs, max_batches)
         if batch_run.failure is not None:
             return self._list_messages_telegram_error(req, batch_run.failure)
-        messages = batch_run.messages
-        batch_cap_reached = _telegram_batch_cap_reached(
-            _TelegramBatchCapContext(
-                has_time_bounds=has_time_bounds,
-                message_count=len(messages),
-                limit=req.limit,
-                batch_size=batch_run.last_batch_size,
-                batch_index=batch_run.last_batch_index,
-                max_batches=max_batches,
-                last_message_id=batch_run.last_batch_message_id,
-                previous_offset=batch_run.last_batch_previous_offset,
-            ),
-        )
-        messages = messages[: req.limit]
+        with timing_phase("response_shape"):
+            messages = batch_run.messages
+            batch_cap_reached = _telegram_batch_cap_reached(
+                _TelegramBatchCapContext(
+                    has_time_bounds=has_time_bounds,
+                    message_count=len(messages),
+                    limit=req.limit,
+                    batch_size=batch_run.last_batch_size,
+                    batch_index=batch_run.last_batch_index,
+                    max_batches=max_batches,
+                    last_message_id=batch_run.last_batch_message_id,
+                    previous_offset=batch_run.last_batch_previous_offset,
+                ),
+            )
+            messages = messages[: req.limit]
 
-        next_nav = self._telegram_next_navigation(req, messages, batch_run.last_raw_message, batch_cap_reached)
-        return {
-            "ok": True,
-            "data": {"messages": messages, "source": "telegram", "next_navigation": next_nav},
-        }
+            next_nav = self._telegram_next_navigation(req, messages, batch_run.last_raw_message, batch_cap_reached)
+            return {
+                "ok": True,
+                "data": {"messages": messages, "source": "telegram", "next_navigation": next_nav},
+            }
 
     async def _fetch_telegram_batches(
         self,
@@ -1541,39 +1569,40 @@ class ReadingService:
 
     async def _list_messages_from_db(self, req: _ListMessagesDbRequest) -> dict:
         """Read messages from sync.db using the dynamic query builder."""
-        sql, params = _build_list_messages_query(req, query_logger=self._logger)
-        rows = _fetchall_rows(self._conn.execute(sql, params))
-        messages, freshness = await self._build_read_messages_from_rows(req.dialog_id, rows, log_rendered=True)
-        next_nav = self._maybe_encode_next_nav(
-            _NextNavContext(
-                messages=messages,
-                limit=req.limit,
-                dialog_id=req.dialog_id,
-                direction=req.direction,
-                direction_enum=req.direction_enum,
-                topic_id=req.topic_id,
-                logger=self._logger,
-                request_id=self._deps.rid,
-                message_state="sent",
-                since_utc=req.since_utc,
-                until_utc=req.until_utc,
-            ),
-        )
-        return {
-            "ok": True,
-            "data": {
-                "messages": [dataclasses.asdict(m) for m in messages],
-                "source": "sync_db",
-                "next_navigation": next_nav,
-                "reaction_freshness": freshness.as_dict(),
-            },
-        }
+        with timing_phase("local_projection"):
+            sql, params = _build_list_messages_query(req, query_logger=self._logger)
+            rows = _fetchall_rows(self._conn.execute(sql, params))
 
-    def _own_only_basis_by_dialog(self, conn: sqlite3.Connection | None = None) -> dict[int, tuple[str, ...]] | None:
-        """Return the ownership cache, or None for pre-cache test databases."""
+        messages, freshness = await self._build_read_messages_from_rows(req.dialog_id, rows, log_rendered=True)
+        with timing_phase("response_shape"):
+            next_nav = self._maybe_encode_next_nav(
+                _NextNavContext(
+                    messages=messages,
+                    limit=req.limit,
+                    dialog_id=req.dialog_id,
+                    direction=req.direction,
+                    direction_enum=req.direction_enum,
+                    topic_id=req.topic_id,
+                    logger=self._logger,
+                    request_id=self._deps.rid,
+                    message_state="sent",
+                    since_utc=req.since_utc,
+                    until_utc=req.until_utc,
+                ),
+            )
+            return {
+                "ok": True,
+                "data": {
+                    "messages": [dataclasses.asdict(m) for m in messages],
+                    "source": "sync_db",
+                    "next_navigation": next_nav,
+                    "reaction_freshness": freshness.as_dict(),
+                },
+            }
+
+    def _own_only_basis_by_dialog(self, conn: sqlite3.Connection | None = None) -> dict[int, tuple[str, ...]]:
+        """Return the required ownership cache; schema errors fail closed."""
         source = self._conn if conn is None else conn
-        if _fetchone_row(source.execute(_OWN_ONLY_DIALOGS_TABLE_SQL)) is None:
-            return None
         return own_only_basis_by_dialog(source)
 
     def _list_scheduled_messages_from_db(self, req: _ListMessagesDbRequest) -> dict:
@@ -1582,25 +1611,29 @@ class ReadingService:
         Scheduled messages deliberately do not use ``messages`` or any of its
         derived tables.  This path is local-only: it never falls back to a
         Telegram request when the mirror is empty or unavailable.
+        When ``own_only_dialogs`` exists, its ownership cache is authoritative.
         """
-        if not scheduled_messages_available(self._conn):
-            rows: list[dict[str, object]] = []
-        else:
-            own_basis = self._own_only_basis_by_dialog()
-            if own_basis is not None and req.dialog_id not in own_basis:
-                rows = []
-                own_basis = {}
+        with timing_phase("local_projection"):
+            own_basis: dict[int, tuple[str, ...]] = {}
+            if scheduled_messages_available(self._conn):
+                existing_basis = self._own_only_basis_by_dialog()
+                if req.dialog_id not in existing_basis:
+                    raw_rows: list[object] = []
+                else:
+                    own_basis = existing_basis
+                    anchor_sent_at = req.anchor_sent_at
+                    if req.anchor_msg_id is not None and anchor_sent_at is None:
+                        anchor_sent_at = scheduled_message_time(self._conn, req.dialog_id, req.anchor_msg_id)
+                    sql, params = build_scheduled_list_query(
+                        req,
+                        scheduled_now=int(time.time()),
+                        anchor_sent_at=anchor_sent_at,
+                    )
+                    raw_rows = _fetchall_rows(self._conn.execute(sql, params))
             else:
-                own_basis = own_basis or {}
-            anchor_sent_at = req.anchor_sent_at
-            if req.anchor_msg_id is not None and anchor_sent_at is None:
-                anchor_sent_at = scheduled_message_time(self._conn, req.dialog_id, req.anchor_msg_id)
-            sql, params = build_scheduled_list_query(
-                req,
-                scheduled_now=int(time.time()),
-                anchor_sent_at=anchor_sent_at,
-            )
-            raw_rows = _fetchall_rows(self._conn.execute(sql, params))
+                raw_rows = []
+
+        with timing_phase("response_shape"):
             rows = [
                 scheduled_row_to_wire(
                     cast(Mapping[str, object], raw_row),
@@ -1608,31 +1641,31 @@ class ReadingService:
                 )
                 for raw_row in raw_rows
             ]
-        next_nav = self._maybe_encode_next_nav(
-            _NextNavContext(
-                messages=rows,
-                limit=req.limit,
-                dialog_id=req.dialog_id,
-                direction=req.direction,
-                direction_enum=req.direction_enum,
-                topic_id=req.topic_id,
-                logger=self._logger,
-                request_id=self._deps.rid,
-                message_state="scheduled",
-                since_utc=req.since_utc,
-                until_utc=req.until_utc,
+            next_nav = self._maybe_encode_next_nav(
+                _NextNavContext(
+                    messages=rows,
+                    limit=req.limit,
+                    dialog_id=req.dialog_id,
+                    direction=req.direction,
+                    direction_enum=req.direction_enum,
+                    topic_id=req.topic_id,
+                    logger=self._logger,
+                    request_id=self._deps.rid,
+                    message_state="scheduled",
+                    since_utc=req.since_utc,
+                    until_utc=req.until_utc,
+                )
             )
-        )
-        return {
-            "ok": True,
-            "data": {
-                "messages": rows,
-                "source": "scheduled_messages",
-                "next_navigation": next_nav,
-                "message_state": "scheduled",
-                "scope": "own_only",
-            },
-        }
+            return {
+                "ok": True,
+                "data": {
+                    "messages": rows,
+                    "source": "scheduled_messages",
+                    "next_navigation": next_nav,
+                    "message_state": "scheduled",
+                    "scope": "own_only",
+                },
+            }
 
     async def _list_messages_local_state_result(  # noqa: PLR0913, PLR0917
         self,
@@ -1661,9 +1694,12 @@ class ReadingService:
         )
         scheduled_result = self._list_scheduled_messages_from_db(db_request)
         if request.message_state == "scheduled":
-            scheduled_result["data"]["dialog_type"] = _dialog_type_from_db(self._conn, dialog_id)
-            scheduled_result["data"]["read_state"] = None
-            return scheduled_result
+            with timing_phase("local_projection"):
+                dialog_type = _dialog_type_from_db(self._conn, dialog_id)
+            with timing_phase("response_shape"):
+                scheduled_result["data"]["dialog_type"] = dialog_type
+                scheduled_result["data"]["read_state"] = None
+                return scheduled_result
 
         if status in ("synced", "syncing", "access_lost"):
             sent_result = await self._list_messages_from_db(db_request)
@@ -1671,41 +1707,42 @@ class ReadingService:
         else:
             sent_rows = []
         scheduled_rows = scheduled_result["data"]["messages"]
-        combined = [*sent_rows, *scheduled_rows]
-        combined.sort(
-            key=lambda row: (int(row.get("sent_at") or 0), int(row.get("message_id") or 0)),
-            reverse=direction != "oldest",
-        )
-        has_more = len(combined) > request.limit
-        combined = combined[: request.limit]
-        next_nav = None
-        if has_more and combined:
-            last = combined[-1]
-            next_nav = encode_history_navigation(
-                _message_id_from_item(last),
-                dialog_id,
-                direction=HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST,
-                sent_at=_object_to_int(last.get("sent_at")),
-                message_state="all",
-                since_utc=request.since_utc,
-                until_utc=request.until_utc,
+        with timing_phase("local_projection"):
+            dialog_type = _dialog_type_from_db(self._conn, dialog_id)
+            read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
+            access_metadata = _build_access_metadata(self._conn, dialog_id, status or "not_synced")
+        with timing_phase("response_shape"):
+            combined = [*sent_rows, *scheduled_rows]
+            combined.sort(
+                key=lambda row: (int(row.get("sent_at") or 0), int(row.get("message_id") or 0)),
+                reverse=direction != "oldest",
             )
-        return {
-            "ok": True,
-            "data": {
-                "messages": combined,
-                "source": "sync_db+scheduled_messages",
-                "next_navigation": next_nav,
-                "message_state": "all",
-                "dialog_type": _dialog_type_from_db(self._conn, dialog_id),
-                "read_state": _read_state_for_dialog(
-                    self._conn,
+            has_more = len(combined) > request.limit
+            combined = combined[: request.limit]
+            next_nav = None
+            if has_more and combined:
+                last = combined[-1]
+                next_nav = encode_history_navigation(
+                    _message_id_from_item(last),
                     dialog_id,
-                    _dialog_type_from_db(self._conn, dialog_id),
-                ),
-                **_build_access_metadata(self._conn, dialog_id, status or "not_synced"),
-            },
-        }
+                    direction=HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST,
+                    sent_at=_object_to_int(last.get("sent_at")),
+                    message_state="all",
+                    since_utc=request.since_utc,
+                    until_utc=request.until_utc,
+                )
+            return {
+                "ok": True,
+                "data": {
+                    "messages": combined,
+                    "source": "sync_db+scheduled_messages",
+                    "next_navigation": next_nav,
+                    "message_state": "all",
+                    "dialog_type": dialog_type,
+                    "read_state": read_state,
+                    **access_metadata,
+                },
+            }
 
     async def _list_messages_non_sent(
         self,
@@ -1713,7 +1750,9 @@ class ReadingService:
         request: _ListMessagesRequest,
         direction: str,
     ) -> dict:
-        row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)))
+        _set_timing_route("local_non_sent_state")
+        with timing_phase("local_projection"):
+            row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)))
         status = _status_from_row(row)
         if request.context_message_id is not None:
             return {
@@ -1782,7 +1821,8 @@ class ReadingService:
         if direction not in ("newest", "oldest"):
             direction = "newest"
 
-        resolved = await self._deps.resolve_dialog_id(selector)
+        with timing_phase("resolution"):
+            resolved = await self._deps.resolve_dialog_id(selector)
         if isinstance(resolved, dict):
             return resolved
         dialog_id = resolved
@@ -1793,7 +1833,8 @@ class ReadingService:
                 "message": "Either dialog_id or dialog name is required",
             }
         result = await self._list_messages_for_state(dialog_id, request, direction)
-        return self._attach_directory_coverage(result, getattr(resolved, "coverage", None))
+        with timing_phase("response_shape"):
+            return self._attach_directory_coverage(result, getattr(resolved, "coverage", None))
 
     async def _search_messages_scoped_for_state(
         self,
@@ -2299,7 +2340,7 @@ class ReadingService:
             }
         dialog_filter = self._prepare_list_dialogs_filter(request.filter_raw)
         scheduled_summary = scheduled_summary_by_dialog(conn, scheduled_now=int(time.time()))
-        own_basis = self._own_only_basis_by_dialog(conn)
+        own_basis: dict[int, tuple[str, ...]] = self._own_only_basis_by_dialog(conn)
         sql_rows = self._fetch_list_dialog_rows(conn, request, dialog_filter)
         if not sql_rows:
             count_total = count_dialog_rows(conn)
@@ -2317,13 +2358,10 @@ class ReadingService:
         selected_rows: list[tuple[Mapping[str, object], tuple[int, int | None], tuple[str, ...] | None]] = []
         for row in sql_rows:
             dialog_id = _object_to_int(row["dialog_id"])
-            if request.scope == "own_only" and (
-                (own_basis is not None and dialog_id not in own_basis)
-                or (own_basis is None and str(_row_value(row, "sync_status") or "") != "own_only")
-            ):
+            if request.scope == "own_only" and dialog_id not in own_basis:
                 continue
             summary = scheduled_summary.get(dialog_id, (0, None))
-            if own_basis is not None and dialog_id not in own_basis:
+            if dialog_id not in own_basis:
                 summary = (0, None)
             if request.message_state == "scheduled" and summary[0] == 0:
                 continue
@@ -2333,7 +2371,7 @@ class ReadingService:
                 (
                     row,
                     summary,
-                    own_basis.get(dialog_id) if own_basis is not None else None,
+                    own_basis.get(dialog_id),
                 )
             )
 
