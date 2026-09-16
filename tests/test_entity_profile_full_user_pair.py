@@ -20,6 +20,7 @@ from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, Refr
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
+from tests.helpers import LoudGroupProfilePort
 
 
 def _fenced_schema(conn: sqlite3.Connection) -> None:
@@ -121,7 +122,6 @@ def _pair_service(conn: sqlite3.Connection, client: _PairClient, *, enabled: boo
             get_full_channel_request=lambda **kwargs: ("full_channel", kwargs),
             get_participants_request=lambda **kwargs: ("participants", kwargs),
             channel_participants_contacts_request=lambda **kwargs: ("contacts", kwargs),
-            get_full_chat_request=lambda **kwargs: ("full_chat", kwargs),
             input_messages_filter_chat_photos=object,
             message_action_chat_edit_photo=object,
             chat_reactions_all=object,
@@ -129,6 +129,7 @@ def _pair_service(conn: sqlite3.Connection, client: _PairClient, *, enabled: boo
             chat_reactions_none=object,
             channel_type=object,
             chat_type=object,
+            group_profile_port=LoudGroupProfilePort(),
             refresh_limits=RefreshLimits(),
             enable_full_user_pair=enabled,
             full_user_auth_scope=lambda: TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99),

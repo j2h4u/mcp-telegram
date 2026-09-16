@@ -42,6 +42,7 @@ from mcp_telegram.message_contracts import (
     StoredMessage,
 )
 from tests.daemon_api_policy import make_daemon_api_policy
+from tests.helpers import LoudGroupProfilePort
 from tests.reaction_helpers import make_reaction_freshener
 
 
@@ -146,6 +147,7 @@ def trace_enrichment_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, s
         client,
         asyncio.Event(),
         reaction_freshener=make_reaction_freshener(conn, client),
+        group_profile_port=LoudGroupProfilePort(),
         policy=make_daemon_api_policy(),
     )
     server.self_id = 101

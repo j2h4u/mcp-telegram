@@ -81,6 +81,36 @@ def test_forbidden_import_owner_is_rejected() -> None:
     ) == ["src/mcp_telegram/not_an_owner.py:1: unexpected telethon import owner"]
 
 
+def test_get_full_chat_request_has_one_exact_owner_for_import_and_qualified_forms() -> None:
+    gate = _load_gate()
+    path = gate.SOURCE_ROOT / "daemon_api.py"
+
+    assert gate.violations_for(
+        path,
+        "from telethon.tl.functions.messages import GetFullChatRequest as FullChat\n",
+        allowed_importer_paths=gate.ALLOWED_IMPORTER_PATHS,
+        source_root=gate.SOURCE_ROOT,
+    ) == ["src/mcp_telegram/daemon_api.py:1: unexpected GetFullChatRequest owner"]
+    assert gate.violations_for(
+        path,
+        "import telethon.tl.functions.messages as messages\nmessages.GetFullChatRequest(chat_id=1)\n",
+        allowed_importer_paths=gate.ALLOWED_IMPORTER_PATHS,
+        source_root=gate.SOURCE_ROOT,
+    ) == ["src/mcp_telegram/daemon_api.py:2: unexpected GetFullChatRequest owner"]
+    assert gate.violations_for(
+        path,
+        "import telethon.tl.functions.messages\ntelethon.tl.functions.messages.GetFullChatRequest(chat_id=1)\n",
+        allowed_importer_paths=gate.ALLOWED_IMPORTER_PATHS,
+        source_root=gate.SOURCE_ROOT,
+    ) == ["src/mcp_telegram/daemon_api.py:2: unexpected GetFullChatRequest owner"]
+    assert gate.violations_for(
+        path,
+        "from telethon.tl import functions\nfunctions.messages.GetFullChatRequest(chat_id=1)\n",
+        allowed_importer_paths=gate.ALLOWED_IMPORTER_PATHS,
+        source_root=gate.SOURCE_ROOT,
+    ) == ["src/mcp_telegram/daemon_api.py:2: unexpected GetFullChatRequest owner"]
+
+
 def test_stale_allowlist_entry_is_rejected(tmp_path: Path) -> None:
     gate = _load_gate()
     source_root = tmp_path / "mcp_telegram"
@@ -89,7 +119,8 @@ def test_stale_allowlist_entry_is_rejected(tmp_path: Path) -> None:
     allowlists = {"telethon": frozenset({"active.py", "obsolete.py"}), "sqlite3": frozenset()}
 
     assert gate.boundary_violations(source_root, allowed_importer_paths=allowlists) == [
-        "obsolete.py: stale telethon import allowlist entry"
+        "obsolete.py: stale telethon import allowlist entry",
+        "telegram_gateway.py: stale telethon.tl.functions.messages.GetFullChatRequest owner entry",
     ]
 
 

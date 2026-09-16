@@ -97,7 +97,7 @@ depends_on = [
     "mcp_telegram.runtime_observations", "mcp_telegram.self_profile_maintenance", "mcp_telegram.startup_identity", "mcp_telegram.state", "mcp_telegram.sync_db", "mcp_telegram.sync_worker", "mcp_telegram.telegram", "mcp_telegram.daemon_shutdown",
     "mcp_telegram.telegram_read_receipts", "mcp_telegram.topics.refresh", "mcp_telegram.transcription_hydration",
     "mcp_telegram.topics.sqlite_repository", "mcp_telegram.topics.telegram_adapter",
-    "mcp_telegram.telegram_demand", "mcp_telegram.telegram_demand_coordinator", "mcp_telegram.telegram_rpc", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler",
+    "mcp_telegram.telegram_demand", "mcp_telegram.telegram_demand_coordinator", "mcp_telegram.telegram_gateway", "mcp_telegram.telegram_rpc", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler",
 ]
 
 # application — each horizontal worker/facade has its own narrow declaration.
@@ -436,7 +436,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.telegram_gateway"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.telegram_access", "mcp_telegram.telegram_reading", "mcp_telegram.flood", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.entity_profile.contracts", "mcp_telegram.entity_profile.ports", "mcp_telegram.telegram_access", "mcp_telegram.telegram_reading", "mcp_telegram.flood", "mcp_telegram.telegram_rpc_scheduler"]
 [[modules]]
 path = "mcp_telegram.telegram"
 layer = "telegram_gateway"
@@ -469,11 +469,6 @@ depends_on = ["mcp_telegram.telegram_gateway", "mcp_telegram.telegram_message_pr
 path = "mcp_telegram.telegram_message_projection"
 layer = "telegram_gateway"
 depends_on = ["mcp_telegram.formatter", "mcp_telegram.media_fact", "mcp_telegram.message_content", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message"]
-
-[[modules]]
-path = "mcp_telegram.entity_profile.telegram_gateway"
-layer = "telegram_gateway"
-depends_on = []
 
 [[modules]]
 path = "mcp_telegram.telegram_read_receipts"
@@ -650,7 +645,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.entity_profile.ports"
 layer = "foundation"
-depends_on = []
+depends_on = ["mcp_telegram.entity_profile.contracts"]
 
 [[modules]]
 path = "mcp_telegram.auth_scope"

@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import TypedDict, Unpack
 
+from mcp_telegram.entity_profile.contracts import GroupProfileObservation
+
 
 class _BuildMockMessageKwargs(TypedDict, total=False):
     text: str | None
@@ -85,3 +87,10 @@ class MockTotalList(list):
     def __init__(self, items: list, total: int | None = None) -> None:
         super().__init__(items)
         self.total = total if total is not None else len(items)
+
+
+class LoudGroupProfilePort:
+    """Test-only port that fails if an unrelated composition invokes it."""
+
+    async def fetch_group_profile(self, group_id: int) -> GroupProfileObservation:
+        raise AssertionError(f"unexpected group profile request for {group_id}")

@@ -56,7 +56,6 @@ from telethon.tl.functions.channels import (
 )
 from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
     GetCommonChatsRequest,
-    GetFullChatRequest,  # type: ignore[import-untyped]
 )
 from telethon.tl.functions.messages import SearchRequest as MessagesSearchRequest  # type: ignore[import-untyped]
 from telethon.tl.functions.photos import GetUserPhotosRequest  # type: ignore[import-untyped]
@@ -89,7 +88,7 @@ from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import recover_invalid_generation_in_transaction
 from .dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
-from .entity_profile.ports import ProfilePairObservationHook
+from .entity_profile.ports import GroupProfilePort, ProfilePairObservationHook
 from .entity_profile.refresh import RefreshLimits
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
@@ -605,6 +604,7 @@ class DaemonAPIServer:
         hydration_requester: Callable[[sqlite3.Connection, int, int], None] | None = None,
         topic_refresher: TopicRefresher | None = None,
         folder_projection_reproject: Callable[[], object] | None = None,
+        group_profile_port: GroupProfilePort,
         policy: DaemonApiPolicy,
         health_status: Callable[[], DaemonHealthStatus] = _healthy_daemon_status,
     ) -> None:
@@ -629,6 +629,7 @@ class DaemonAPIServer:
         self._reading_service: ReadingService | None = None
         self._topic_refresher = topic_refresher
         self._folder_projection_reproject = folder_projection_reproject
+        self._group_profile_port = group_profile_port
         self._hydration_requester = hydration_requester
         self._policy = policy
         self._health_status = health_status
@@ -1823,7 +1824,7 @@ class DaemonAPIServer:
                     get_full_channel_request=GetFullChannelRequest,
                     get_participants_request=GetParticipantsRequest,
                     channel_participants_contacts_request=ChannelParticipantsContacts,
-                    get_full_chat_request=GetFullChatRequest,
+                    group_profile_port=self._group_profile_port,
                     input_messages_filter_chat_photos=InputMessagesFilterChatPhotos,
                     message_action_chat_edit_photo=MessageActionChatEditPhoto,
                     chat_reactions_all=ChatReactionsAll,

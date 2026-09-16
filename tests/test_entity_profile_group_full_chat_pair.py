@@ -14,6 +14,7 @@ import pytest
 from telethon.tl import types
 
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
+from mcp_telegram.entity_profile.contracts import GroupProfileObservation
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.entity_profile.repository import EntitySectionCommit
 from mcp_telegram.flood import TelegramRpcThrottled
@@ -75,6 +76,69 @@ class _GroupClient:
         raise AssertionError("group pair does not traverse dialogs")
 
 
+class _GroupProfilePort:
+    def __init__(self, client: _GroupClient) -> None:
+        self._client = client
+
+    async def fetch_group_profile(self, group_id: int) -> GroupProfileObservation:  # noqa: PLR0912
+        scope = current_rpc_scope()
+        assert scope.attempt_budget is not None
+        scope.attempt_budget.debit()
+        self._client.calls.append("full_chat")
+        if self._client.failure is not None:
+            raise self._client.failure
+        response = self._client.response
+        if self._client.after_call is not None:
+            self._client.after_call()
+        if not isinstance(response, types.messages.ChatFull):
+            raise ValueError("full chat envelope is invalid")
+        full_chat = response.full_chat
+        if not isinstance(full_chat, types.ChatFull):
+            raise ValueError("legacy chat full payload is invalid")
+        raw_group_id = -group_id if group_id < 0 else group_id
+        if not isinstance(full_chat.id, int) or isinstance(full_chat.id, bool) or full_chat.id != raw_group_id:
+            raise ValueError("legacy chat full target does not match")
+        raw_participants = full_chat.participants
+        if isinstance(raw_participants, types.ChatParticipantsForbidden):
+            participant_ids, reason = None, "participants_forbidden"
+        elif raw_participants is None:
+            participant_ids, reason = None, "participants_missing"
+        elif not isinstance(raw_participants, types.ChatParticipants):
+            participant_ids, reason = None, "participants_malformed"
+        elif (
+            not isinstance(raw_participants.chat_id, int)
+            or isinstance(raw_participants.chat_id, bool)
+            or raw_participants.chat_id != raw_group_id
+        ):
+            participant_ids, reason = None, "participants_target_mismatch"
+        elif not isinstance(raw_participants.participants, list):
+            participant_ids, reason = None, "participants_not_sequence"
+        elif not all(
+            isinstance(item, (types.ChatParticipant, types.ChatParticipantAdmin, types.ChatParticipantCreator))
+            and isinstance(item.user_id, int)
+            and not isinstance(item.user_id, bool)
+            and item.user_id > 0
+            for item in raw_participants.participants
+        ):
+            participant_ids, reason = None, "participants_malformed"
+        else:
+            participant_ids, reason = tuple(item.user_id for item in raw_participants.participants), None
+        return GroupProfileObservation(
+            group_id=group_id,
+            about=full_chat.about,
+            invite_link=(
+                getattr(cast(object, full_chat.exported_invite), "link", None)
+                if full_chat.exported_invite is not None
+                else None
+            ),
+            participant_ids=participant_ids,
+            participants_unavailable_reason=reason,
+            current_photo=None,
+            observation_started_at=100,
+            observation_completed_at=100,
+        )
+
+
 def _service() -> tuple[sqlite3.Connection, DaemonEntityInfoService, _GroupClient]:
     conn = sqlite3.connect(":memory:")
     _fenced_schema(conn)
@@ -86,7 +150,7 @@ def _service() -> tuple[sqlite3.Connection, DaemonEntityInfoService, _GroupClien
         service._deps,
         client=client,
         dm_peer_ids=lambda: {7},
-        get_full_chat_request=lambda **kwargs: ("full_chat", kwargs),
+        group_profile_port=_GroupProfilePort(client),
         get_messages_search_request=lambda **kwargs: ("search", kwargs),
         get_dialog_placement=lambda _entity_id: {},
     )

@@ -11,16 +11,21 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
-from typing import cast
+from typing import Protocol, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
+from mcp_telegram.entity_profile.contracts import GroupProfileObservation
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.reaction_helpers import make_reaction_freshener
 
 _TEST_DBS: list[sqlite3.Connection] = []
+
+
+class _FullChatEnvelope(Protocol):
+    full_chat: object
 
 
 def _dict(value: object) -> dict[str, object]:
@@ -92,6 +97,7 @@ def make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike
         cast(DaemonClientLike, client),
         shutdown_event,
         reaction_freshener=make_reaction_freshener(conn, client),
+        group_profile_port=_GroupProfilePort(cast(DaemonClientLike, client)),
         policy=make_daemon_api_policy(),
     )
     server._ready = True
@@ -139,6 +145,33 @@ def _empty_search() -> MagicMock:
     return MagicMock(count=0, messages=[])
 
 
+class _GroupProfilePort:
+    def __init__(self, client: DaemonClientLike) -> None:
+        self._client = client
+
+    async def fetch_group_profile(self, group_id: int) -> GroupProfileObservation:
+        response = cast(_FullChatEnvelope, await self._client(object()))
+        full_chat = response.full_chat
+        raw_participants = getattr(full_chat, "participants", None)
+        if raw_participants is None:
+            participant_ids, reason = None, "participants_missing"
+        else:
+            participants = getattr(cast(object, raw_participants), "participants", None)
+            participant_ids, reason = tuple(int(item.user_id) for item in (participants or [])), None
+        invite = getattr(full_chat, "exported_invite", None)
+        invite_link = getattr(cast(object, invite), "link", None) if invite is not None else None
+        return GroupProfileObservation(
+            group_id=group_id,
+            about=getattr(full_chat, "about", None),
+            invite_link=invite_link,
+            participant_ids=participant_ids,
+            participants_unavailable_reason=reason,
+            current_photo=None,
+            observation_started_at=100,
+            observation_completed_at=100,
+        )
+
+
 @pytest.mark.asyncio
 async def test_get_entity_info_group_type() -> None:
     """SPEC Req 2: legacy basic chat returns type='group'."""
@@ -152,10 +185,7 @@ async def test_get_entity_info_group_type() -> None:
         client.get_entity = AsyncMock(return_value=chat)
         client.side_effect = [_full_chat_result(), _empty_search()]
         server = make_server(client=client)
-        with (
-            patch("mcp_telegram.daemon_api.GetFullChatRequest"),
-            patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
-        ):
+        with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -100})
     assert r["ok"] is True, r
     assert _dict(r["data"])["type"] == "group"
@@ -176,10 +206,7 @@ async def test_get_entity_info_group_field_surface() -> None:
             _empty_search(),
         ]
         server = make_server(client=client)
-        with (
-            patch("mcp_telegram.daemon_api.GetFullChatRequest"),
-            patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
-        ):
+        with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -101})
     d = _dict(r["data"])
     for key in ("members_count", "migrated_to", "invite_link", "contacts_subscribed"):
@@ -213,10 +240,7 @@ async def test_get_entity_info_group_dm_intersection() -> None:
             _empty_search(),
         ]
         server = make_server(conn=conn, client=client)
-        with (
-            patch("mcp_telegram.daemon_api.GetFullChatRequest"),
-            patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
-        ):
+        with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -102})
     d = _dict(r["data"])
     contacts = cast(list[dict[str, object]], d["contacts_subscribed"])
@@ -254,10 +278,7 @@ async def test_get_entity_info_group_migrated_to_verbatim() -> None:
         client.get_entity = AsyncMock(return_value=chat)
         client.side_effect = [_full_chat_result(), _empty_search()]
         server = make_server(client=client)
-        with (
-            patch("mcp_telegram.daemon_api.GetFullChatRequest"),
-            patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
-        ):
+        with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -103})
     d = _dict(r["data"])
     assert d["type"] == "group"
@@ -286,10 +307,7 @@ async def test_get_entity_info_no_download_keys_group() -> None:
         client.get_entity = AsyncMock(return_value=chat)
         client.side_effect = [_full_chat_result(), _empty_search()]
         server = make_server(client=client)
-        with (
-            patch("mcp_telegram.daemon_api.GetFullChatRequest"),
-            patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
-        ):
+        with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -104})
 
     def _walk(o: object):
@@ -304,3 +322,99 @@ async def test_get_entity_info_no_download_keys_group() -> None:
     forbidden = re.compile(r"^(file_id|file_reference|download_)")
     bad = [k for k in _walk(_dict(r["data"])) if forbidden.match(str(k))]
     assert not bad
+
+
+@pytest.mark.asyncio
+async def test_get_entity_info_group_profile_failure_keeps_legacy_degraded_detail(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    chat = _legacy_chat(id_=-105, participants_count=42)
+    with patch(
+        "mcp_telegram.daemon_api.telethon_utils.get_peer_id",
+        side_effect=lambda e: -105 if e is chat else int(getattr(e, "id", 0)),
+    ):
+        client = AsyncMock()
+        client.get_entity = AsyncMock(return_value=chat)
+        client.side_effect = [RuntimeError("profile unavailable"), _empty_search()]
+        server = make_server(client=client)
+        with caplog.at_level("WARNING"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+            r = await server._dispatch({"method": "get_entity_info", "entity_id": -105})
+
+    assert r["ok"] is True
+    detail = _dict(r["data"])
+    assert detail["about"] is None
+    assert detail["members_count"] == 42
+    assert detail["contacts_subscribed"] == []
+    assert detail["contacts_reason"] is None
+    assert "entity_info group full_profile_failed" in caplog.text
+    assert server._entity_info_service is not None
+    assert "full_profile" in server._entity_info_service._section_failures
+
+
+@pytest.mark.asyncio
+async def test_get_entity_info_group_empty_about_is_normalized_to_none() -> None:
+    chat = _legacy_chat(id_=-106, participants_count=9)
+    with patch(
+        "mcp_telegram.daemon_api.telethon_utils.get_peer_id",
+        side_effect=lambda e: -106 if e is chat else int(getattr(e, "id", 0)),
+    ):
+        client = AsyncMock()
+        client.get_entity = AsyncMock(return_value=chat)
+        client.side_effect = [_full_chat_result(about="", participant_user_ids=(1,)), _empty_search()]
+        server = make_server(client=client)
+        with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+            r = await server._dispatch({"method": "get_entity_info", "entity_id": -106})
+
+    detail = _dict(r["data"])
+    assert detail["about"] is None
+    assert detail["members_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_entity_info_group_contact_enrichment_failure_is_degraded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    chat = _legacy_chat(id_=-107, participants_count=1)
+    with patch(
+        "mcp_telegram.daemon_api.telethon_utils.get_peer_id",
+        side_effect=lambda e: -107 if e is chat else int(getattr(e, "id", 0)),
+    ):
+        client = AsyncMock()
+        client.get_entity = AsyncMock(return_value=chat)
+        client.side_effect = [_full_chat_result(participant_user_ids=(1,)), _empty_search()]
+        server = make_server(client=client)
+        service = server._get_entity_info_service()
+        with (
+            caplog.at_level("WARNING"),
+            patch.object(service, "_enrich_contact_ids_with_names", side_effect=sqlite3.OperationalError("db")),
+            patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
+        ):
+            r = await server._dispatch({"method": "get_entity_info", "entity_id": -107})
+
+    detail = _dict(r["data"])
+    assert detail["contacts_subscribed"] is None
+    assert detail["contacts_reason"] == "enumeration_failed"
+    assert "entity_info group contacts_intersect_failed" in caplog.text
+    assert "contact_overlap" in service._section_failures
+
+
+@pytest.mark.asyncio
+async def test_get_entity_info_group_unavailable_participants_use_legacy_empty_contacts() -> None:
+    chat = _legacy_chat(id_=-108, participants_count=12)
+    response = _full_chat_result()
+    object.__setattr__(cast(object, response.full_chat), "participants", None)
+    with patch(
+        "mcp_telegram.daemon_api.telethon_utils.get_peer_id",
+        side_effect=lambda e: -108 if e is chat else int(getattr(e, "id", 0)),
+    ):
+        client = AsyncMock()
+        client.get_entity = AsyncMock(return_value=chat)
+        client.side_effect = [response, _empty_search()]
+        server = make_server(client=client)
+        with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+            r = await server._dispatch({"method": "get_entity_info", "entity_id": -108})
+
+    detail = _dict(r["data"])
+    assert detail["members_count"] == 12
+    assert detail["contacts_subscribed"] == []
+    assert detail["contacts_reason"] is None
