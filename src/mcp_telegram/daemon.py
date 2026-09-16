@@ -1129,6 +1129,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         rpc_observation_sink,
         policy=config.telemetry.runtime_observations,
     )
+    api_server.bind_runtime_observation_sink(rpc_observation_sink)
     api_server.bind_profile_observer(rpc_admission_observer)
     ctx = _SyncMainContext(
         db_path=db_path,

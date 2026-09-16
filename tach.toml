@@ -29,12 +29,12 @@ require_ignore_directive_reasons = "error"
 [[modules]]
 path = "mcp_telegram"
 layer = "delivery"
-depends_on = ["mcp_telegram.config", "mcp_telegram.daemon", "mcp_telegram.daemon_client", "mcp_telegram.feedback_db", "mcp_telegram.runtime_logging", "mcp_telegram.server", "mcp_telegram.telegram"]
+depends_on = ["mcp_telegram.config", "mcp_telegram.daemon", "mcp_telegram.daemon_client", "mcp_telegram.feedback_db", "mcp_telegram.request_timing", "mcp_telegram.runtime_logging", "mcp_telegram.server", "mcp_telegram.telegram"]
 
 [[modules]]
 path = "mcp_telegram.server"
 layer = "delivery"
-depends_on = ["mcp_telegram.config", "mcp_telegram.correlation", "mcp_telegram.daemon_client", "mcp_telegram.runtime_logging", "mcp_telegram.tools"]
+depends_on = ["mcp_telegram.config", "mcp_telegram.correlation", "mcp_telegram.daemon_client", "mcp_telegram.request_timing", "mcp_telegram.runtime_logging", "mcp_telegram.tools"]
 
 [[modules]]
 path = "mcp_telegram.tools"
@@ -130,6 +130,7 @@ depends_on = [
     "mcp_telegram.flood",
     "mcp_telegram.topics.contracts", "mcp_telegram.topics.refresh",
     "mcp_telegram.folders.read_model",
+    "mcp_telegram.request_timing",
     "mcp_telegram.runtime_observations",
     "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler",
 ]
@@ -202,6 +203,7 @@ depends_on = [
     "mcp_telegram.models", "mcp_telegram.own_only", "mcp_telegram.pagination",
     "mcp_telegram.reading.query_records", "mcp_telegram.reading.scheduled_projection",
     "mcp_telegram.reading.sqlite_projection", "mcp_telegram.reactions.contracts",
+    "mcp_telegram.request_timing",
     "mcp_telegram.sync_read_model",
     "mcp_telegram.resolver", "mcp_telegram.sync_db", "mcp_telegram.telegram_fragments",
     "mcp_telegram.telegram_reading", "mcp_telegram.temporal",
@@ -443,7 +445,7 @@ depends_on = ["mcp_telegram.config", "mcp_telegram.flood", "mcp_telegram.state",
 [[modules]]
 path = "mcp_telegram.telegram_rpc"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.flood", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.flood", "mcp_telegram.request_timing", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
 [[modules]]
 path = "mcp_telegram.telegram_fact_queries"
 layer = "telegram_gateway"
@@ -537,6 +539,11 @@ depends_on = ["mcp_telegram.alert_policy", "mcp_telegram.dialog_classification",
 [[modules]]
 path = "mcp_telegram.runtime_observations"
 layer = "persistence"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.request_timing"
+layer = "foundation"
 depends_on = []
 
 [[modules]]

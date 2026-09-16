@@ -28,7 +28,7 @@ from typing import Literal, NotRequired, TypedDict, Unpack, cast
 
 from . import config as _config
 from .config import ENTITY_PROFILE_DAEMON_TIMEOUT_SECONDS, load_config
-from .correlation import record_correlation_id
+from .correlation import current_operation_id, record_correlation_id
 from .daemon_ipc import get_daemon_socket_path
 
 logger = logging.getLogger(__name__)
@@ -215,6 +215,8 @@ class DaemonConnection:
         rid = uuid.uuid4().hex[:8]
         record_correlation_id(rid)
         payload = {**payload, "request_id": rid}
+        if (operation_id := current_operation_id()) is not None:
+            payload["operation_id"] = operation_id
         encoded = json.dumps(payload).encode() + b"\n"
         logger.debug("daemon_request method=%s request_id=%s", payload.get("method"), rid)
         self._writer.write(encoded)

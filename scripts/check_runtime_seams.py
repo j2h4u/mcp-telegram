@@ -72,8 +72,8 @@ def _check_public_consumption() -> list[str]:
         if isinstance(node, ast.ImportFrom) and node.module == "correlation"
         for alias in node.names
     }
-    if daemon_imports != {"record_correlation_id"}:
-        errors.append("daemon_client.py must consume correlation.record_correlation_id")
+    if daemon_imports != {"current_operation_id", "record_correlation_id"}:
+        errors.append("daemon_client.py must consume the public operation and request correlation API")
 
     server_imports = {
         alias.name

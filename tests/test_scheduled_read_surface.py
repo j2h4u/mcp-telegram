@@ -222,6 +222,7 @@ def _create_scheduled_table(conn: sqlite3.Connection) -> None:
         "CREATE VIRTUAL TABLE scheduled_messages_fts "
         "USING fts5(dialog_id UNINDEXED, message_id UNINDEXED, stemmed_text, tokenize='unicode61')"
     )
+    _create_own_only_table(conn)
 
 
 def _insert_scheduled(  # noqa: PLR0913
@@ -246,12 +247,16 @@ def _insert_scheduled(  # noqa: PLR0913
         "INSERT INTO scheduled_messages_fts(dialog_id, message_id, stemmed_text) VALUES (?, ?, ?)",
         (dialog_id, message_id, text),
     )
+    conn.execute(
+        "INSERT OR IGNORE INTO own_only_dialogs(dialog_id, inclusion_basis, updated_at) VALUES (?, ?, ?)",
+        (dialog_id, '["direct_message"]', 1700000000),
+    )
     conn.commit()
 
 
 def _create_own_only_table(conn: sqlite3.Connection) -> None:
     conn.execute(
-        "CREATE TABLE own_only_dialogs (dialog_id INTEGER PRIMARY KEY, inclusion_basis TEXT NOT NULL, updated_at INTEGER NOT NULL)"
+        "CREATE TABLE IF NOT EXISTS own_only_dialogs (dialog_id INTEGER PRIMARY KEY, inclusion_basis TEXT NOT NULL, updated_at INTEGER NOT NULL)"
     )
     conn.commit()
 
@@ -327,6 +332,37 @@ async def test_list_messages_all_paginates_across_sent_and_scheduled_rows() -> N
         }
     )
     assert [row["text"] for row in second["data"]["messages"]] == ["sent three", "scheduled four"]
+
+
+@pytest.mark.asyncio
+async def test_own_only_cache_fails_closed_for_scheduled_projection() -> None:
+    server = make_server()
+    conn = server._conn
+    dialog_id = 42
+    _insert_synced_dialog(conn, dialog_id, status="synced")
+    _insert_message(conn, dialog_id, 1, sent_at=FUTURE_BASE - 300, text="sent")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 2, FUTURE_BASE + 100, "scheduled", dialog_id=dialog_id)
+    conn.execute("DELETE FROM own_only_dialogs WHERE dialog_id = ?", (dialog_id,))
+    conn.commit()
+    scheduled_without_basis = await server._list_messages({"dialog_id": dialog_id, "message_state": "scheduled"})
+    all_without_basis = await server._list_messages(
+        {"dialog_id": dialog_id, "message_state": "all", "direction": "oldest"}
+    )
+    assert scheduled_without_basis["data"]["messages"] == []
+    assert [row["message_id"] for row in all_without_basis["data"]["messages"]] == [1]
+
+    conn.execute(
+        "INSERT INTO own_only_dialogs(dialog_id, inclusion_basis, updated_at) VALUES (?, ?, ?)",
+        (dialog_id, '["direct_message"]', 1700000000),
+    )
+    conn.commit()
+    scheduled_with_basis = await server._list_messages({"dialog_id": dialog_id, "message_state": "scheduled"})
+    all_with_basis = await server._list_messages(
+        {"dialog_id": dialog_id, "message_state": "all", "direction": "oldest"}
+    )
+    assert [row["message_id"] for row in scheduled_with_basis["data"]["messages"]] == [2]
+    assert [row["message_id"] for row in all_with_basis["data"]["messages"]] == [1, 2]
 
 
 @pytest.mark.asyncio
@@ -558,7 +594,6 @@ async def test_scheduled_reads_filter_own_scope_and_expose_basis() -> None:
     _seed_dialog_row(conn, 1, name="Own chat")
     _seed_dialog_row(conn, 2, name="Other chat")
     _create_scheduled_table(conn)
-    _create_own_only_table(conn)
     conn.execute("INSERT INTO own_only_dialogs VALUES (1, '[\"direct_message\"]', 1700000000)")
     _insert_scheduled(conn, 11, FUTURE_BASE + 200, "own future")
     conn.execute(

@@ -15,11 +15,20 @@ from pathlib import Path
 from typing import cast
 
 from .daemon import read_operator_summary_snapshot
+from .request_timing import (
+    TIMING_NESTED_LEAF_PHASES,
+    TIMING_NESTED_PARENTS,
+    TIMING_ROUTES,
+    TIMING_SERVED_SOURCES,
+    TIMING_TOP_LEVEL_PHASES,
+    attribution_from_counts,
+    is_valid_request_id,
+)
 
 _DURATION_UNITS = {"m": 60, "h": 3600, "d": 86400}
 _MIN_DURATION_LENGTH = 2
 _MILLISECONDS_PER_SECOND = 1000
-_SLOW_MCP_MS = 1000
+_DEFAULT_SLOW_MCP_MS = 1_000.0
 _RUNTIME_FAILURE_KINDS = {"runtime.task_failed", "runtime.catch_up_request_failed"}
 _SNAPSHOT_METADATA_INDEX = 3
 
@@ -148,22 +157,50 @@ def _error_counts(rows: list[Observation]) -> dict[str, int]:
     return dict(errors)
 
 
-def _slow_calls(rows: list[Observation]) -> list[Observation]:
+def _slow_calls(rows: list[Observation], *, slow_mcp_ms: float) -> list[Observation]:
     return sorted(
-        (row for row in rows if row["duration_ms"] is not None and _as_float(row["duration_ms"]) >= _SLOW_MCP_MS),
+        (row for row in rows if row["duration_ms"] is not None and _as_float(row["duration_ms"]) >= slow_mcp_ms),
         key=lambda row: _as_float(row["duration_ms"]),
         reverse=True,
     )
 
 
-def _mcp_summary(observations: list[Observation]) -> McpSummary:
+def _mcp_summary(observations: list[Observation], *, slow_mcp_ms: float) -> McpSummary:
     rows = _rows_for_kind(observations, "mcp.call")
+    timings: dict[object, list[Observation]] = defaultdict(list)
+    for timing in _rows_for_kind(observations, "daemon.request_timing"):
+        operation_id = timing.get("operation_id")
+        if operation_id:
+            timings[operation_id].append(timing)
+    slow_calls = []
+    for row in _slow_calls(rows, slow_mcp_ms=slow_mcp_ms):
+        enriched = dict(row)
+        matching_timing_rows = timings.get(row.get("operation_id"), [])
+        timing_rows = [timing for timing in matching_timing_rows if _timing_duration(timing) is not None]
+        if timing_rows:
+            enriched["_timing"] = max(
+                timing_rows,
+                key=lambda timing: (_timing_duration(timing) or 0.0, str(timing.get("payload_json", ""))),
+            )
+        if matching_timing_rows:
+            enriched["_timing_total_count"] = len(matching_timing_rows)
+            enriched["_timing_valid_count"] = len(timing_rows)
+            enriched["_timing_invalid_count"] = len(matching_timing_rows) - len(timing_rows)
+        slow_calls.append(enriched)
     return McpSummary(
         calls=len(rows),
         errors=_error_counts(rows),
         latencies=_duration_values(rows),
-        slow_calls=_slow_calls(rows),
+        slow_calls=slow_calls,
     )
+
+
+def _timing_duration(row: Observation) -> float | None:
+    try:
+        duration = float(cast(float | int | str, row.get("duration_ms")))
+    except TypeError, ValueError:
+        return None
+    return duration if math.isfinite(duration) and duration >= 0 else None
 
 
 def _rpc_summary(observations: list[Observation]) -> tuple[int, int, dict[str, RpcSourceSummary]]:
@@ -265,11 +302,161 @@ def _mcp_lines(summary: McpSummary) -> list[str]:
         )
     ]
     if summary.slow_calls:
-        lines.append(
-            "Slow MCP calls: "
-            + ", ".join(f"{row['tool_name']}={_ms(_as_float(row['duration_ms']))}" for row in summary.slow_calls[:5])
-        )
+        details = [_slow_call_detail(row) for row in summary.slow_calls[:5]]
+        lines.append("Slow MCP calls: " + "; ".join(details))
     return lines
+
+
+def _slow_call_detail(row: Observation) -> str:
+    detail = f"{row['tool_name']}={_ms(_as_float(row['duration_ms']))}"
+    timing = row.get("_timing")
+    if not isinstance(timing, dict):
+        return detail + ", attribution=unavailable" + _timing_detail_metadata(None, row)
+    payload = _timing_payload(timing)
+    if payload is None:
+        return detail + ", attribution=unavailable" + _timing_detail_metadata(None, row)
+    detail += (
+        f", contributor={_timing_contributor(payload)}, attribution={_timing_attribution(payload)}, "
+        f"completeness={_timing_completeness(payload)}"
+    )
+    return detail + _timing_detail_metadata(payload, row)
+
+
+def _timing_detail_metadata(payload: Mapping[str, object] | None, row: Observation) -> str:
+    detail = ""
+    if payload is not None:
+        unattributed = payload.get("unattributed_ms")
+        if isinstance(unattributed, (int, float)) and math.isfinite(float(unattributed)) and unattributed >= 0:
+            detail += f", unattributed={_ms(float(unattributed))}"
+    total_count = row.get("_timing_total_count")
+    valid_count = row.get("_timing_valid_count")
+    invalid_count = row.get("_timing_invalid_count")
+    if isinstance(total_count, int) and total_count > 0:
+        valid = valid_count if isinstance(valid_count, int) else 0
+        discarded = invalid_count if isinstance(invalid_count, int) else total_count - valid
+        detail += f", timing_rows={valid}/{total_count}, discarded={discarded}, aggregation=largest_request"
+    return detail + (_timing_route_source_detail(payload) if payload is not None else "")
+
+
+def _timing_route_source_detail(payload: Mapping[str, object]) -> str:
+    route_attempted = payload.get("route_attempted")
+    served_source = payload.get("served_source")
+    request_id = payload.get("request_id")
+    attempted = (
+        route_attempted if isinstance(route_attempted, str) and route_attempted in TIMING_ROUTES else "unavailable"
+    )
+    served = (
+        served_source if isinstance(served_source, str) and served_source in TIMING_SERVED_SOURCES else "unavailable"
+    )
+    request = request_id if is_valid_request_id(request_id) else "unavailable"
+    return f", attempted={attempted}, served={served}, request_id={request}"
+
+
+def _timing_payload(timing: Mapping[str, object]) -> dict[str, object] | None:
+    try:
+        decoded = json.loads(str(timing.get("payload_json") or "{}"))
+    except TypeError, ValueError:
+        return None
+    return dict(decoded) if isinstance(decoded, Mapping) else None
+
+
+def _timing_contributor(payload: Mapping[str, object]) -> str:
+    """Return the largest measured boundary without summing nested timings."""
+    candidates = _timing_candidates(payload)
+    if not candidates:
+        return "unavailable"
+    winner = max(candidates, key=lambda candidate: candidates[candidate])
+    return f"{winner}={_ms(candidates[winner])}"
+
+
+def _timing_candidates(payload: Mapping[str, object]) -> dict[str, float]:
+    nested = _nested_timing_candidates(payload)
+    candidates: dict[str, float] = {}
+    for phase in TIMING_TOP_LEVEL_PHASES:
+        value = _finite_nonnegative(payload.get(f"{phase}_ms"))
+        if value is None:
+            continue
+        exclusive = nested.get(phase)
+        candidates[f"{phase}_exclusive"] = max(0.0, value - exclusive) if exclusive is not None else value
+    candidates.update(_nested_timing_leaf_candidates(payload))
+    candidates.update(
+        {
+            phase: value
+            for phase in TIMING_NESTED_LEAF_PHASES
+            if (value := _finite_nonnegative(payload.get(f"{phase}_ms"))) is not None
+        }
+    )
+    return candidates
+
+
+def _finite_nonnegative(value: object) -> float | None:
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
+        return None
+    return float(value)
+
+
+def _nested_timing_candidates(payload: Mapping[str, object]) -> dict[str, float]:
+    raw_nested = payload.get("nested_phases")
+    if not isinstance(raw_nested, Mapping):
+        return {}
+    totals: dict[str, float] = {}
+    for parent in TIMING_NESTED_PARENTS:
+        group = raw_nested.get(parent)
+        if not isinstance(group, Mapping):
+            continue
+        nested_total = sum(_nested_timing_leaves(group).values())
+        parent_value = _finite_nonnegative(payload.get(f"{parent}_ms"))
+        if parent_value is not None:
+            totals[parent] = min(parent_value, nested_total)
+    return totals
+
+
+def _nested_timing_leaves(payload: Mapping[str, object]) -> dict[str, float]:
+    leaves: dict[str, float] = {}
+    for phase in TIMING_NESTED_LEAF_PHASES:
+        value = _finite_nonnegative(payload.get(f"{phase}_ms"))
+        if value is not None:
+            leaves[phase] = value
+    return leaves
+
+
+def _nested_timing_leaf_candidates(payload: Mapping[str, object]) -> dict[str, float]:
+    raw_nested = payload.get("nested_phases")
+    if not isinstance(raw_nested, Mapping):
+        return {}
+    candidates: dict[str, float] = {}
+    for parent in TIMING_NESTED_PARENTS:
+        group = raw_nested.get(parent)
+        if not isinstance(group, Mapping):
+            continue
+        for phase, value in _nested_timing_leaves(group).items():
+            candidates[f"{parent}.{phase}"] = value
+    return candidates
+
+
+def _timing_completeness(payload: Mapping[str, object]) -> str:
+    measured = payload.get("measured_required_phase_count")
+    total = payload.get("required_phase_count")
+    if isinstance(measured, int) and isinstance(total, int) and 0 <= measured <= total:
+        return f"{measured}/{total}"
+    return "unavailable"
+
+
+def _timing_attribution(payload: Mapping[str, object]) -> str:
+    measured = payload.get("measured_required_phase_count")
+    total = payload.get("required_phase_count")
+    if isinstance(measured, int) and isinstance(total, int) and 0 <= measured <= total:
+        return attribution_from_counts(measured, total)
+    return "unavailable"
+
+
+def _coverage_text(window_complete: bool, reasons: list[str]) -> str:
+    text = "complete" if window_complete else "partial/unreliable"
+    return f"{text} ({', '.join(reasons)})" if reasons else text
+
+
+def _slow_threshold_ms(seconds: float) -> float:
+    return seconds * _MILLISECONDS_PER_SECOND if math.isfinite(seconds) and seconds > 0 else _DEFAULT_SLOW_MCP_MS
 
 
 def _rpc_lines(summary_count: int, cancelled: int, sources: dict[str, RpcSourceSummary]) -> list[str]:
@@ -361,7 +548,11 @@ def _notable_lines(observations: list[Observation]) -> list[str]:
 
 
 def build_operator_summary(  # noqa: PLR0914
-    db_path: Path, *, since_seconds: int, now: float | None = None
+    db_path: Path,
+    *,
+    since_seconds: int,
+    now: float | None = None,
+    slow_request_seconds: float = _DEFAULT_SLOW_MCP_MS / _MILLISECONDS_PER_SECOND,
 ) -> OperatorSummary:
     """Build a content-free operational report from one read-only DB connection."""
     effective_now = time.time() if now is None else now
@@ -374,16 +565,14 @@ def build_operator_summary(  # noqa: PLR0914
     status_text = ", ".join(f"{status}={count}" for status, count in snapshot.dialog_counts) or "none"
     rpc_count, rpc_cancelled, rpc_sources = _rpc_summary(observations)
     demand_summary = _demand_summary(observations)
-    coverage_text = "complete" if window_complete else "partial/unreliable"
-    if coverage_reasons:
-        coverage_text += " (" + ", ".join(coverage_reasons) + ")"
-
+    coverage_text = _coverage_text(window_complete, coverage_reasons)
+    slow_mcp_ms = _slow_threshold_ms(slow_request_seconds)
     lines = [
         f"mcp-telegram operational summary: {_utc(effective_now - since_seconds)} .. {_utc(effective_now)}",
         f"Telemetry: {len(observations)} events; window={coverage_text}; last event={last_event}",
         *_runtime_lines(observations),
         f"Dialog state: {status_text}",
-        *_mcp_lines(_mcp_summary(observations)),
+        *_mcp_lines(_mcp_summary(observations, slow_mcp_ms=slow_mcp_ms)),
         *_rpc_lines(rpc_count, rpc_cancelled, rpc_sources),
         *_demand_lines(demand_summary),
     ]

@@ -31,6 +31,7 @@ from telethon.tl.functions.updates import (  # type: ignore[import-untyped]
 from telethon.utils import is_list_like  # type: ignore[import-untyped]
 
 from .flood import TelegramRpcThrottled, flood_seconds
+from .request_timing import current_timing, timing_phase
 from .telegram_demand import (
     AcquisitionKind,
     UnclassifiedTelegramDemandError,
@@ -110,7 +111,8 @@ class _AdmissionAwareSender:
             if budget is not None and budget.exhausted:
                 self._gate._admission_scheduler.record_attempt_budget_exhausted(self._scope)
                 budget.debit()
-            admission = await self._gate._admit(self._scope)
+            with timing_phase("rpc_admission"):
+                admission = await self._gate._admit(self._scope)
             try:
                 if not self._gate._scheduler_transport_ready():
                     self._gate._admission_scheduler.record_retry(
@@ -123,10 +125,13 @@ class _AdmissionAwareSender:
                         self._gate._admission_scheduler.record_attempt_budget_exhausted(self._scope)
                     budget.debit()
                 self._gate._admission_scheduler.record_dispatch(admission)
+                if (timing := current_timing()) is not None:
+                    timing.record_rpc_attempt()
                 future = self._send_attempt(request, ordered=ordered)
                 if isinstance(future, list):
                     self._reject_batch(future)
-                return await future
+                with timing_phase("rpc_execution"):
+                    return await future
             finally:
                 self._gate._admission_scheduler.complete(admission)
 
