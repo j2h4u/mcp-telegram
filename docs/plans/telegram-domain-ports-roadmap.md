@@ -132,6 +132,12 @@ behavior together. Complexity cleanup is not a separate workstream or PR
 series. The expected order of magnitude is four to seven substantial PRs, but
 evidence and cohesion determine the actual boundaries.
 
+Before the first substantial acquisition refactor, land one small enabling PR
+for causal request observability. It does not increase the expected number of
+substantial domain slices and does not require a baseline observation period.
+Deploy it, verify that the evidence is emitted, and proceed directly to the
+next architectural slice.
+
 ### Lock the intended boundary
 
 - [ ] Add an explicit architecture test that permits Telethon imports only in
@@ -143,6 +149,37 @@ evidence and cohesion determine the actual boundaries.
   named owner of the facts it acquires.
 - [ ] Make the allowed-import set shrink with each accepted slice; do not
   replace exact exceptions with a broader package-level allowance.
+
+### Enable causal request observability
+
+- [ ] Generate one opaque operation ID at the MCP boundary and propagate it
+  explicitly through daemon requests without exposing it in product schemas.
+- [ ] Persist a bounded, versioned daemon timing observation in the existing
+  `runtime_observations` store and correlate it with the terminal `mcp.call`
+  observation by operation ID.
+- [ ] Instrument `list_messages` first with a closed route vocabulary covering
+  local history, local context, local non-sent state, ordinary Telegram
+  fallback, and Telegram topic fallback.
+- [ ] Measure fixed causal boundaries: resolution, local projection, Telegram
+  fallback, RPC admission wait, RPC execution, and response shaping. Preserve
+  missing measurements as unavailable and nested measurements as nested.
+- [ ] Record actual RPC attempt count and attempted fallback even when the
+  fallback fails, returns no rows, or the final response remains local.
+- [ ] Extend the existing operator summary so a slow call shows its largest
+  measured contributor, attribution completeness, and any unattributed time.
+- [ ] Keep the payload privacy-safe: no arguments, selectors, message text,
+  names, peer or message IDs, cursor values, raw exceptions, SQL, or response
+  bodies.
+- [ ] Reuse the existing TTL, row cap, asynchronous loss reporting, and
+  operator command. Do not add a telemetry database, tracing backend,
+  dashboard, exporter, sampler, or per-statement/per-message events.
+- [ ] Prove local delay, admission delay, RPC execution delay, fallback,
+  shaping, cancellation, concurrency, telemetry loss, and legacy-row behavior
+  with deterministic tests and one live devtools-client smoke.
+- [ ] Reduce any Radon or CRAP legacy debt touched by this enabling slice; do
+  not add a generic tracing abstraction or increase either baseline.
+- [ ] Deploy the slice and proceed directly to `GetFullChat`; do not wait for a
+  weekly baseline or make later domain work contingent on traffic volume.
 
 ### Complete the next proven overlap
 
@@ -257,6 +294,8 @@ questions, not additional implementation PRs and not cumulative progress boxes.
   additional orchestration layers.
 - [ ] Targeted contract tests and a real scenario smoke prove the intended
   product behavior.
+- [ ] Instrumented paths produce causally correlated timing evidence, while
+  uninstrumented or lossy paths are reported as unavailable rather than zero.
 - [ ] The release-candidate full gate passes; coverage is collected only as
   input to the CRAP score.
 - [ ] The deployed runtime exposes the new behavior and remains healthy.
@@ -279,5 +318,8 @@ questions, not additional implementation PRs and not cumulative progress boxes.
   replacement compatibility complexity.
 - [ ] Production telemetry shows no unexplained duplicate acquisition for the
   same fact bundle and observation window.
+- [ ] Slow instrumented MCP calls can be attributed to a measured local,
+  admission, RPC-execution, or shaping boundary, or explicitly report the
+  remaining evidence gap.
 - [ ] The operator-facing architecture documentation matches the deployed
   system.
