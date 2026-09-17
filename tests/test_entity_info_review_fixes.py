@@ -2,8 +2,8 @@
 
 Covers:
 - WR-01: _format_relative_ymd future-date and today branches (fix(47-08))
-- CR-01: subscribers_count/members_count=None → contacts_reason="count_unavailable"
-         when GetFullChannelRequest fails on an admin-caller (fix(47-06))
+- CR-01: a channel profile failure does not suppress the independent bounded
+         contact-overlap operation
 - WR-05: degraded full-fetch (user or channel profile request raises)
          skips entity_details cache write (fix(47-09))
 """
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,10 +22,21 @@ from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
-from mcp_telegram.entity_profile.ports import UserProfilePort
+from mcp_telegram.entity_profile.contracts import (
+    ChannelContactOverlapObservation,
+    ChannelProfileObservation,
+    ChannelReference,
+    ProjectionStatus,
+)
+from mcp_telegram.entity_profile.ports import ChannelProfilePort, UserProfilePort
 from mcp_telegram.tools.entity_info import _entity_input_label, _format_relative_ymd
 from tests.daemon_api_policy import make_daemon_api_policy
-from tests.helpers import FakeUserProfilePort, LoudGroupProfilePort, LoudUserProfilePort
+from tests.helpers import (
+    FakeUserProfilePort,
+    LoudChannelProfilePort,
+    LoudGroupProfilePort,
+    LoudUserProfilePort,
+)
 from tests.reaction_helpers import make_reaction_freshener
 
 # ---------------------------------------------------------------------------
@@ -90,6 +102,8 @@ def _make_server(
     conn: sqlite3.Connection | None = None,
     client: DaemonClientLike | None = None,
     user_profile_port: UserProfilePort | None = None,
+    *,
+    channel_profile_port: ChannelProfilePort,
 ) -> DaemonAPIServer:
     if conn is None:
         conn = _make_db()
@@ -100,6 +114,7 @@ def _make_server(
         cast(DaemonClientLike, client),
         asyncio.Event(),
         reaction_freshener=make_reaction_freshener(conn, client),
+        channel_profile_port=channel_profile_port,
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=user_profile_port if user_profile_port is not None else LoudUserProfilePort(),
         policy=make_daemon_api_policy(),
@@ -113,6 +128,8 @@ def _channel(id_: int = -1001, admin: bool = True, **kw: object) -> MagicMock:
     c.id = id_
     c.title = kw.get("title", "Chan")
     c.username = kw.get("username", "chan")
+    c.access_hash = 0
+    c.min = False
     c.megagroup = False
     c.broadcast = True
     c.forum = False
@@ -128,6 +145,8 @@ def _supergroup(id_: int = -2001, admin: bool = True, **kw: object) -> MagicMock
     c.id = id_
     c.title = kw.get("title", "SG")
     c.username = kw.get("username", "sg")
+    c.access_hash = 0
+    c.min = False
     c.megagroup = True
     c.broadcast = False
     c.forum = False
@@ -138,6 +157,41 @@ def _supergroup(id_: int = -2001, admin: bool = True, **kw: object) -> MagicMock
     c.noforwards = False
     c.hidden_members = False
     return c
+
+
+class _FailingChannelProfilePort:
+    def __init__(
+        self,
+        channel_id: int,
+        error: BaseException,
+        *,
+        overlap_status: ProjectionStatus = ProjectionStatus.PARTIAL,
+        overlap_reason: str = "bounded_contacts_page",
+        contact_ids: tuple[int, ...] | None = (),
+    ) -> None:
+        self.error = error
+        self.profile_calls = 0
+        self.overlap_calls = 0
+        self.overlap = ChannelContactOverlapObservation(
+            channel_id=channel_id,
+            contact_ids=contact_ids,
+            status=overlap_status,
+            reason=overlap_reason,
+            observation_started_at=100,
+            observation_completed_at=100,
+        )
+
+    def get_channel_reference(self, channel_id: int) -> ChannelReference | None:
+        canonical_id = channel_id if channel_id <= -1_000_000_000_001 else -1_000_000_000_000 - abs(channel_id)
+        return ChannelReference(canonical_id, 0)
+
+    async def fetch_channel_profile(self, reference: ChannelReference) -> ChannelProfileObservation:
+        self.profile_calls += 1
+        raise self.error
+
+    async def fetch_channel_contact_overlap(self, reference: ChannelReference) -> ChannelContactOverlapObservation:
+        self.overlap_calls += 1
+        return replace(self.overlap, channel_id=reference.channel_id)
 
 
 def _user_entity(id_: int = 99) -> MagicMock:
@@ -192,63 +246,62 @@ def test_entity_input_label_prefers_entity_string() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CR-01: count=None → contacts_reason="count_unavailable"
+# CR-01: profile and overlap are independent bounded operations
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_channel_admin_full_request_fails_returns_count_unavailable() -> None:
-    """CR-01: when GetFullChannelRequest raises, admin channel returns
-    contacts_subscribed=None with reason='count_unavailable' instead of
-    triggering unbounded iter_participants."""
+async def test_channel_profile_failure_still_runs_bounded_overlap() -> None:
+    """A profile failure leaves the successful bounded overlap available."""
     chan = _channel(id_=-1001, admin=True)
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=chan)
     client.side_effect = [MagicMock(count=0, messages=[])]
-    iter_participants = MagicMock()
-    client.iter_participants = iter_participants
-    server = _make_server(client=client)
+    port = _FailingChannelProfilePort(-1001, RuntimeError("simulated profile failure"))
+    server = _make_server(
+        client=client,
+        channel_profile_port=port,
+    )
 
-    with (
-        patch("mcp_telegram.daemon_api.GetFullChannelRequest", side_effect=RuntimeError("simulated flood")),
-        patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
-    ):
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001})
 
     assert r["ok"] is True, f"expected ok=True, got {r}"
     d = cast(dict[str, object], r["data"])
-    assert d["contacts_subscribed"] is None
-    assert d["contacts_reason"] == "count_unavailable", (
-        f"expected 'count_unavailable', got {d.get('contacts_reason')!r}"
-    )
-    iter_participants.assert_not_called()
+    assert d["contacts_subscribed"] == []
+    assert d["contacts_subscribed_partial"] is True
+    assert d["contacts_reason"] == "bounded_contacts_page"
+    assert port.profile_calls == port.overlap_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_supergroup_admin_full_request_fails_returns_count_unavailable() -> None:
-    """CR-01: when GetFullChannelRequest raises on supergroup, returns
-    contacts_reason='count_unavailable' (members_count stays None)."""
+async def test_supergroup_profile_failure_preserves_overlap_adapter_reason() -> None:
+    """A profile failure leaves an independent adapter-unavailable reason intact."""
     sg = _supergroup(id_=-2001, admin=True)
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=sg)
     client.side_effect = [MagicMock(count=0, messages=[])]
-    iter_participants = MagicMock()
-    client.iter_participants = iter_participants
-    server = _make_server(client=client)
+    port = _FailingChannelProfilePort(
+        -2001,
+        RuntimeError("simulated profile failure"),
+        overlap_status=ProjectionStatus.UNAVAILABLE,
+        overlap_reason="access_lost",
+        contact_ids=None,
+    )
+    server = _make_server(
+        client=client,
+        channel_profile_port=port,
+    )
 
-    with (
-        patch("mcp_telegram.daemon_api.GetFullChannelRequest", side_effect=RuntimeError("simulated flood")),
-        patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
-    ):
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -2001})
 
     assert r["ok"] is True, f"expected ok=True, got {r}"
     d = cast(dict[str, object], r["data"])
     assert d["contacts_subscribed"] is None
-    assert d["contacts_reason"] == "count_unavailable", (
-        f"expected 'count_unavailable', got {d.get('contacts_reason')!r}"
-    )
-    iter_participants.assert_not_called()
+    assert d["contacts_reason"] == "access_lost"
+    assert d["members_count"] is None
+    assert port.profile_calls == port.overlap_calls == 1
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +319,10 @@ async def test_user_degraded_full_fetch_skips_entity_details_cache() -> None:
     client.get_entity = AsyncMock(return_value=user)
 
     server = _make_server(
-        conn=conn, client=client, user_profile_port=FakeUserProfilePort(error=RuntimeError("simulated FloodWait"))
+        conn=conn,
+        client=client,
+        user_profile_port=FakeUserProfilePort(error=RuntimeError("simulated FloodWait")),
+        channel_profile_port=LoudChannelProfilePort(),
     )
 
     with (
@@ -290,7 +346,7 @@ async def test_user_degraded_full_fetch_skips_entity_details_cache() -> None:
 
 @pytest.mark.asyncio
 async def test_channel_degraded_full_fetch_skips_entity_details_cache() -> None:
-    """WR-05: GetFullChannelRequest raises → full_channel_ok=False →
+    """WR-05: channel profile observation raises → full_channel_ok=False →
     entity_details row NOT written."""
     conn = _make_db()
     chan = _channel(id_=-3001, admin=False)
@@ -298,12 +354,13 @@ async def test_channel_degraded_full_fetch_skips_entity_details_cache() -> None:
     client.get_entity = AsyncMock(return_value=chan)
     client.side_effect = [MagicMock(count=0, messages=[])]
 
-    server = _make_server(conn=conn, client=client)
+    server = _make_server(
+        conn=conn,
+        client=client,
+        channel_profile_port=_FailingChannelProfilePort(-3001, RuntimeError("simulated flood")),
+    )
 
-    with (
-        patch("mcp_telegram.daemon_api.GetFullChannelRequest", side_effect=RuntimeError("simulated flood")),
-        patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
-    ):
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -3001})
 
     assert r["ok"] is True, f"expected ok=True despite degraded fetch, got {r}"
@@ -311,4 +368,4 @@ async def test_channel_degraded_full_fetch_skips_entity_details_cache() -> None:
     detail = cast(
         tuple[int] | None, conn.execute("SELECT entity_id FROM entity_details WHERE entity_id = -3001").fetchone()
     )
-    assert detail is None, "entity_details must NOT be written when GetFullChannelRequest fails"
+    assert detail is None, "entity_details must NOT be written when the channel profile observation fails"

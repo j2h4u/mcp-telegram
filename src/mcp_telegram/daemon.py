@@ -130,7 +130,11 @@ from .sync_worker import FullSyncWorker
 from .telegram import create_client
 from .telegram_demand import DemandStatus, RpcAttemptBudget, demand_context
 from .telegram_demand_coordinator import TelegramDemandCoordinator
-from .telegram_gateway import TelethonGroupProfileGateway, TelethonUserProfileGateway
+from .telegram_gateway import (
+    TelethonChannelProfileGateway,
+    TelethonGroupProfileGateway,
+    TelethonUserProfileGateway,
+)
 from .telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from .telegram_rpc import TelegramRpcCooldownPersistence
 from .telegram_rpc_consumers import DemandKind, demand_contract
@@ -1073,6 +1077,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
     )
     group_profile_port = TelethonGroupProfileGateway(client)
     user_profile_port = TelethonUserProfileGateway(client)
+    channel_profile_port = TelethonChannelProfileGateway(client)
     api_server = DaemonAPIServer(
         conn,
         cast(DaemonClientLike, client),
@@ -1090,6 +1095,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         folder_projection_reproject=lambda: folder_repository.ensure_mute_projection(now=int(time.time())),
         group_profile_port=group_profile_port,
         user_profile_port=user_profile_port,
+        channel_profile_port=channel_profile_port,
         policy=DaemonApiPolicy(
             read_at_ttl_seconds=config.freshness.read_receipts.read_at_ttl_seconds,
             deleted_message_visibility_seconds=config.freshness.inbox.deleted_message_visibility_seconds,

@@ -180,3 +180,29 @@ async def test_group_gateway_photo_empty_zero_id_means_no_current_photo() -> Non
     ).fetch_group_profile(-123)
 
     assert observation.current_photo is None
+
+
+@pytest.mark.asyncio
+async def test_group_gateway_unknown_photo_subtype_is_an_optional_absence() -> None:
+    response = _full_chat(photo=object())
+    observation = await TelethonGroupProfileGateway(_Client(response), now_provider=lambda: 100).fetch_group_profile(
+        -123
+    )
+
+    assert observation.current_photo is None
+
+
+@pytest.mark.asyncio
+async def test_group_gateway_rejects_malformed_known_photo_subtype() -> None:
+    malformed = types.Photo(
+        id=0,
+        access_hash=1,
+        file_reference=b"ref",
+        date=datetime(2026, 9, 16, tzinfo=UTC),
+        sizes=[],
+        dc_id=1,
+    )
+    with pytest.raises(ValueError, match="current photo id"):
+        await TelethonGroupProfileGateway(
+            _Client(_full_chat(photo=malformed)), now_provider=lambda: 100
+        ).fetch_group_profile(-123)

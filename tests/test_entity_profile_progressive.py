@@ -21,9 +21,12 @@ from telethon.tl.types import User  # type: ignore[import-untyped]
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from mcp_telegram.entity_profile.contracts import (
     PROFILE_SECTIONS,
+    ChannelContactOverlapObservation,
+    ChannelProfileObservation,
     ObservationBoundary,
     PersonalChannelPost,
     PersonalChannelReference,
+    ProjectionStatus,
     TargetKind,
     UserProfileObservation,
 )
@@ -38,6 +41,7 @@ from mcp_telegram.entity_profile.refresh import (
 )
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.models import DialogType
 from mcp_telegram.sync_db import _CURRENT_SCHEMA_VERSION, _apply_migration_57, _apply_migrations, ensure_sync_schema
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
@@ -48,7 +52,7 @@ from mcp_telegram.telegram_demand import (
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
 from mcp_telegram.tools.entity_info import GET_ENTITY_INFO_OUTPUT_SCHEMA, GetEntityInfo, _entity_structured_content
-from tests.helpers import LoudGroupProfilePort
+from tests.helpers import FakeChannelProfilePort, LoudChannelProfilePort, LoudGroupProfilePort
 
 
 class _UserProfilePort:
@@ -84,9 +88,6 @@ class _UnusedClient:
         raise AssertionError("client should not be called in this test")
 
     async def __call__(self, request: object) -> object:
-        raise AssertionError("client should not be called in this test")
-
-    def iter_participants(self, peer: object, limit: int = 0) -> AsyncIterator[object]:
         raise AssertionError("client should not be called in this test")
 
     def iter_dialogs(self) -> AsyncIterator[object]:
@@ -469,22 +470,254 @@ def _test_service(conn: sqlite3.Connection, *, limits: RefreshLimits) -> DaemonE
             user_profile_port=_UserProfilePort(_UnusedClient()),
             get_user_photos_request=lambda **_kwargs: object(),
             get_messages_search_request=lambda **_kwargs: object(),
-            get_full_channel_request=lambda **_kwargs: object(),
-            get_participants_request=lambda **_kwargs: object(),
-            channel_participants_contacts_request=lambda **_kwargs: object(),
             input_messages_filter_chat_photos=object,
             message_action_chat_edit_photo=object,
-            chat_reactions_all=object,
-            chat_reactions_some=object,
-            chat_reactions_none=object,
             channel_type=object,
             chat_type=object,
             group_profile_port=LoudGroupProfilePort(),
+            channel_profile_port=LoudChannelProfilePort(),
+            channel_reference_provider=LoudChannelProfilePort(),
             refresh_limits=limits,
         )
     )
     service.bind_demand_sink(MagicMock())
     return service
+
+
+def _channel_profile_service(
+    *,
+    channel_id: int,
+    linked_chat_id: int | None,
+    participants_count: int | None = 10,
+    overlap: ChannelContactOverlapObservation | None = None,
+) -> tuple[DaemonEntityInfoService, sqlite3.Connection, FakeChannelProfilePort]:
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+    )
+    _sections_schema(conn)
+    conn.execute(
+        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE dialogs (dialog_id INTEGER PRIMARY KEY, linked_chat_id INTEGER, linked_chat_resolved_at INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO dialogs VALUES (?, ?, ?)",
+        (channel_id, linked_chat_id, 100 if linked_chat_id is not None else None),
+    )
+    profile = ChannelProfileObservation(
+        channel_id=channel_id,
+        about="profile",
+        participants_count=participants_count,
+        linked_chat_id=-100777,
+        pinned_msg_id=None,
+        slow_mode_seconds=None,
+        available_reactions={"kind": "none", "emojis": []},
+        current_photo=None,
+        observation_started_at=100,
+        observation_completed_at=100,
+    )
+    overlap_observation = overlap or ChannelContactOverlapObservation(
+        channel_id=channel_id,
+        contact_ids=(),
+        status=ProjectionStatus.PARTIAL,
+        reason="bounded_contacts_page",
+        observation_started_at=100,
+        observation_completed_at=100,
+    )
+    port = FakeChannelProfilePort(profile, overlap_observation)
+    service = _test_service(conn, limits=RefreshLimits())
+    service._deps = replace(
+        service._deps,
+        channel_profile_port=port,
+        channel_reference_provider=port,
+        get_dialog_placement=lambda _entity_id: {},
+    )
+    service._profiles.save_core(
+        {"id": channel_id, "type": DialogType.CHANNEL.value, "name": "Channel"},
+        now=100,
+    )
+    service._profiles.mark_pending(channel_id, now=100)
+    return service, conn, port
+
+
+@pytest.mark.asyncio
+async def test_channel_profile_commit_advances_once_and_overlays_canonical_link_without_persisting_it() -> None:
+    service, conn, port = _channel_profile_service(channel_id=-10042, linked_chat_id=-10099)
+    try:
+        cursor = service._profiles.next_due_refresh(now=100)
+        assert cursor is not None
+        assert service._profiles.advance_acquisition_cursor(cursor, next_acquisition_cursor=1, now=100)
+        cursor = service._profiles.next_due_refresh(now=100)
+        assert cursor is not None and cursor.next_section == "full_profile"
+
+        commit = await service._acquire_channel_full_profile(-10042, DialogType.CHANNEL)
+        assert service._profiles.commit_section(cursor, commit, now=100)
+        assert port.profile_calls == [-1000000010042]
+        stored = service._profiles.read(-10042, now=100)
+        assert stored is not None
+        assert "linked_chat_id" not in stored.detail
+        result = service._progressive_result(-10042, stored.detail, stored.sections, now=100, admit_refresh=False)
+        data = cast(dict[str, object], result["data"])
+        assert data["linked_chat_id"] == -10099
+    finally:
+        await service.shutdown()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_channel_progressive_link_overlay_replaces_stale_and_unresolved_with_none() -> None:
+    service, conn, _port = _channel_profile_service(channel_id=-10043, linked_chat_id=None)
+    try:
+        stale = {"id": -10043, "type": DialogType.CHANNEL.value, "linked_chat_id": -10088}
+        sections: dict[str, dict[str, object]] = {section: {"status": "fresh"} for section in PROFILE_SECTIONS}
+        result = service._progressive_result(-10043, stale, sections, now=100, admit_refresh=False)
+        assert cast(dict[str, object], result["data"])["linked_chat_id"] is None
+    finally:
+        await service.shutdown()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_channel_profile_unavailable_commits_adapter_reason() -> None:
+    service, conn, _port = _channel_profile_service(
+        channel_id=-10045,
+        linked_chat_id=None,
+    )
+    try:
+        _port.profile = replace(_port.profile, status=ProjectionStatus.UNAVAILABLE, reason="access_lost")
+        cursor = service._profiles.next_due_refresh(now=100)
+        assert cursor is not None
+        assert service._profiles.advance_acquisition_cursor(cursor, next_acquisition_cursor=1, now=100)
+        cursor = service._profiles.next_due_refresh(now=100)
+        assert cursor is not None
+        commit = await service._acquire_channel_full_profile(-10045, DialogType.CHANNEL)
+        assert commit.status == "unavailable"
+        assert commit.reason == "access_lost"
+        assert service._profiles.commit_section(cursor, commit, now=100)
+        section = service._profiles.read(-10045, now=100)
+        assert section is not None
+        assert section.sections["full_profile"]["status"] == "unavailable"
+        assert section.sections["full_profile"]["reason"] == "access_lost"
+    finally:
+        await service.shutdown()
+        conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entity_type", "expected_reason"),
+    (
+        (DialogType.SUPERGROUP, "hidden_by_admin"),
+        (DialogType.FORUM, "hidden_by_admin"),
+        (DialogType.CHANNEL, "not_an_admin"),
+    ),
+)
+async def test_progressive_contact_permission_reason_depends_on_entity_type(
+    entity_type: DialogType,
+    expected_reason: str,
+) -> None:
+    service, conn, _port = _channel_profile_service(
+        channel_id=-10046,
+        linked_chat_id=None,
+        overlap=ChannelContactOverlapObservation(
+            channel_id=-10046,
+            contact_ids=None,
+            status=ProjectionStatus.UNAVAILABLE,
+            reason="not_an_admin",
+            observation_started_at=100,
+            observation_completed_at=100,
+        ),
+    )
+    try:
+        commit = await service._acquire_channel_contact_overlap(-10046, entity_type)
+        assert commit.status == "unavailable"
+        assert commit.reason == expected_reason
+        assert commit.detail_patch["contacts_reason"] == expected_reason
+    finally:
+        await service.shutdown()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_supergroup_profile_persists_reverse_link_fact_only() -> None:
+    service, conn, port = _channel_profile_service(channel_id=-10044, linked_chat_id=-10055)
+    try:
+        cursor = service._profiles.next_due_refresh(now=100)
+        assert cursor is not None
+        assert service._profiles.advance_acquisition_cursor(cursor, next_acquisition_cursor=1, now=100)
+        cursor = service._profiles.next_due_refresh(now=100)
+        assert cursor is not None
+        commit = await service._acquire_channel_full_profile(-10044, DialogType.SUPERGROUP)
+        assert port.profile_calls == [-1000000010044]
+        assert commit.detail_patch["linked_broadcast_id"] == -100777
+        assert "linked_chat_id" not in commit.detail_patch
+        assert service._profiles.commit_section(cursor, commit, now=100)
+        stored = service._profiles.read(-10044, now=100)
+        assert stored is not None
+        assert stored.detail["linked_broadcast_id"] == -100777
+        assert "linked_chat_id" not in stored.detail
+    finally:
+        await service.shutdown()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_channel_reference_miss_commits_unavailable_without_rpc_attempt() -> None:
+    class MissingReferenceProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_channel_reference(self, _channel_id: int) -> None:
+            self.calls += 1
+            return
+
+    channel_id = -1000000000047
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+    )
+    _sections_schema(conn)
+    conn.execute(
+        "INSERT INTO entities VALUES (?, 'channel', 'Channel', NULL, NULL, 100)",
+        (channel_id,),
+    )
+    conn.execute(
+        "INSERT INTO entity_profile_refresh_state(entity_id,status,retry_at,reason,updated_at,next_section,acquisition_cursor) "
+        "VALUES (?, 'pending', NULL, 'refresh_queued', 100, 'full_profile', 0)",
+        (channel_id,),
+    )
+    provider = MissingReferenceProvider()
+    service = _test_service(conn, limits=RefreshLimits())
+    service._deps = replace(
+        service._deps,
+        channel_reference_provider=provider,
+        channel_profile_port=LoudChannelProfilePort(),
+    )
+    coordinator = service.refresh_coordinator
+    assert coordinator is not None
+    budget = RpcAttemptBudget(limit=1)
+
+    await EntityProfileDemandAdapter(coordinator).run_slice(budget)
+
+    assert provider.calls == 1
+    assert budget.attempts == 0
+    assert conn.execute(
+        "SELECT status, reason, next_section FROM entity_profile_refresh_state WHERE entity_id=?",
+        (channel_id,),
+    ).fetchone() == ("pending", "refresh_queued", "common_chats")
+    assert conn.execute(
+        "SELECT status, reason FROM entity_detail_sections WHERE entity_id=? AND section='full_profile'",
+        (channel_id,),
+    ).fetchone() == ("unavailable", "channel_reference_unavailable")
+    await service.shutdown()
+    conn.close()
 
 
 @pytest.mark.asyncio
@@ -516,9 +749,6 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt() 
 
         async def get_messages(self, entity: object, ids: list[int]) -> object:
             raise AssertionError((entity, ids))
-
-        def iter_participants(self, peer: object, limit: int = 0) -> AsyncIterator[object]:
-            raise AssertionError((peer, limit))
 
         def iter_dialogs(self) -> AsyncIterator[object]:
             raise AssertionError("dialog traversal is not part of a profile section")

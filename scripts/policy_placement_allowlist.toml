@@ -22,11 +22,6 @@ rationale = "This variable tracks per-response budget arithmetic rather than an 
 
 [[entry]]
 category = "policy_assignments"
-key = "src/mcp_telegram/daemon_entity_info.py:<module>:_MEMBERSHIP_THRESHOLD_LARGE"
-rationale = "This entity-info response classification cutoff is an API semantic, not daemon retention policy."
-
-[[entry]]
-category = "policy_assignments"
 key = "src/mcp_telegram/telegram_rpc.py:<module>:_COOLDOWN_DEADLINE"
 rationale = "This is process-global mutable gate state, not an operator-configured policy value."
 
@@ -87,11 +82,6 @@ rationale = "This CLI argument default bounds local feedback listing output."
 
 [[entry]]
 category = "policy_defaults"
-key = "src/mcp_telegram/daemon_api.py:DaemonClientLike.iter_participants:limit"
-rationale = "This protocol method's participant limit is an interface request contract."
-
-[[entry]]
-category = "policy_defaults"
 key = "src/mcp_telegram/daemon_client.py:DaemonConnection.get_sync_alerts:limit"
 rationale = "This daemon-client alert page limit is a request contract."
 
@@ -119,11 +109,6 @@ rationale = "This daemon-client statistics page limit is a request contract."
 category = "policy_defaults"
 key = "src/mcp_telegram/daemon_client.py:DaemonConnection.get_my_recent_activity:limit"
 rationale = "This daemon-client activity page limit is a request contract."
-
-[[entry]]
-category = "policy_defaults"
-key = "src/mcp_telegram/daemon_entity_info.py:_EntityInfoClient.iter_participants:limit"
-rationale = "This entity-info participant limit is a Telegram request contract."
 
 [[entry]]
 category = "environment_reads"

@@ -2,32 +2,47 @@
 
 from __future__ import annotations
 
+import inspect
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime
 from typing import Protocol, cast
 
+from telethon.errors import ChatAdminRequiredError  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
+from telethon.tl.functions.channels import (  # type: ignore[import-untyped]
+    GetFullChannelRequest,
+    GetParticipantsRequest,
+)
 from telethon.tl.functions.messages import (
     GetFullChatRequest,  # type: ignore[import-untyped]
     GetScheduledHistoryRequest,  # type: ignore[import-untyped]
 )
 from telethon.tl.functions.users import GetFullUserRequest  # type: ignore[import-untyped]
-from telethon.tl.types import TypeInputPeer, TypeInputUser  # type: ignore[import-untyped]
+from telethon.tl.types import (  # type: ignore[import-untyped]
+    ChannelParticipantsContacts,
+    TypeInputPeer,
+    TypeInputUser,
+)
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .entity_profile.contracts import (
-    GroupCurrentPhoto,
+    CHANNEL_ID_MARKER,
+    ChannelContactOverlapObservation,
+    ChannelProfileObservation,
+    ChannelReference,
+    ChatCurrentPhoto,
     GroupProfileObservation,
     ObservationBoundary,
     PersonalChannelPost,
     PersonalChannelReference,
+    ProjectionStatus,
     TargetKind,
     UserProfileObservation,
 )
 from .entity_profile.full_user_normalization import normalize_full_user_response
-from .entity_profile.ports import GroupProfilePort, UserProfilePort
+from .entity_profile.ports import ChannelProfilePort, GroupProfilePort, UserProfilePort
 from .flood import TelegramRpcThrottled
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_reading import GatewayFailure, GatewayFailureKind
@@ -46,10 +61,109 @@ class GroupProfileClient(Protocol):
     async def __call__(self, _request: object, **_kwargs: object) -> object: ...
 
 
+class ChannelProfileClient(Protocol):
+    async def __call__(self, _request: object, **_kwargs: object) -> object: ...
+
+
 class UserProfileClient(Protocol):
     async def __call__(self, _request: object, **_kwargs: object) -> object: ...
 
     async def get_messages(self, _entity: object, ids: list[int]) -> object: ...
+
+
+class TelethonChannelProfileGateway(ChannelProfilePort):
+    """Normalize channel profile capabilities at the Telethon boundary."""
+
+    def __init__(self, client: object, *, now_provider: Callable[[], float] | None = None) -> None:
+        self._client = cast(ChannelProfileClient, client)
+        self._now_provider = now_provider or time.time
+
+    def get_channel_reference(self, channel_id: int) -> ChannelReference | None:
+        if not _is_canonical_channel_id(channel_id):
+            return None
+        session = getattr(self._client, "session", None)
+        getter = getattr(session, "get_input_entity", None)
+        if not callable(getter):
+            return None
+        if inspect.iscoroutinefunction(getter):
+            return None
+        try:
+            input_entity = getter(channel_id)
+        except AttributeError, KeyError, TypeError, ValueError:
+            return None
+        return _channel_reference_from_session_entity(input_entity, channel_id)
+
+    async def fetch_channel_profile(self, reference: ChannelReference) -> ChannelProfileObservation:
+        _validate_channel_reference(reference)
+        channel_id = reference.channel_id
+        started_at = self._now_provider()
+        try:
+            result = await self._client(GetFullChannelRequest(channel=_input_channel(reference)))
+            full_chat = _validated_full_channel(result, channel_id)
+            completed_at = self._now_provider()
+        except ACCESS_LOST_ERRORS:
+            completed_at = self._now_provider()
+            return _unavailable_channel_profile(channel_id, started_at, completed_at, "access_lost")
+        except ChatAdminRequiredError:
+            completed_at = self._now_provider()
+            return _unavailable_channel_profile(channel_id, started_at, completed_at, "not_an_admin")
+        return ChannelProfileObservation(
+            channel_id=channel_id,
+            about=_optional_string(getattr(full_chat, "about", None)),
+            participants_count=_nonnegative_int(getattr(full_chat, "participants_count", None)),
+            linked_chat_id=_normalize_linked_channel_id(getattr(full_chat, "linked_chat_id", None)),
+            pinned_msg_id=_nonnegative_int(getattr(full_chat, "pinned_msg_id", None)),
+            slow_mode_seconds=_nonnegative_int(getattr(full_chat, "slowmode_seconds", None)),
+            available_reactions=_normalize_reactions(getattr(full_chat, "available_reactions", None)),
+            current_photo=_normalize_channel_photo(getattr(full_chat, "chat_photo", None)),
+            observation_started_at=started_at,
+            observation_completed_at=completed_at,
+        )
+
+    async def fetch_channel_contact_overlap(self, reference: ChannelReference) -> ChannelContactOverlapObservation:
+        _validate_channel_reference(reference)
+        channel_id = reference.channel_id
+        started_at = self._now_provider()
+        try:
+            result = await self._client(
+                GetParticipantsRequest(
+                    channel=_input_channel(reference),
+                    filter=ChannelParticipantsContacts(q=""),
+                    offset=0,
+                    limit=200,
+                    hash=0,
+                )
+            )
+            contact_ids = _validated_contact_ids(result)
+            completed_at = self._now_provider()
+        except ACCESS_LOST_ERRORS:
+            completed_at = self._now_provider()
+            return ChannelContactOverlapObservation(
+                channel_id=channel_id,
+                contact_ids=None,
+                status=ProjectionStatus.UNAVAILABLE,
+                reason="access_lost",
+                observation_started_at=started_at,
+                observation_completed_at=completed_at,
+            )
+        except ChatAdminRequiredError:
+            completed_at = self._now_provider()
+            return ChannelContactOverlapObservation(
+                channel_id=channel_id,
+                contact_ids=None,
+                status=ProjectionStatus.UNAVAILABLE,
+                reason="not_an_admin",
+                observation_started_at=started_at,
+                observation_completed_at=completed_at,
+            )
+        return ChannelContactOverlapObservation(
+            channel_id=channel_id,
+            contact_ids=contact_ids,
+            status=ProjectionStatus.PARTIAL,
+            reason="bounded_contacts_page",
+            observation_started_at=started_at,
+            observation_completed_at=completed_at,
+        )
 
 
 class TelethonGroupProfileGateway(GroupProfilePort):
@@ -114,6 +228,147 @@ class TelethonUserProfileGateway(UserProfilePort):
         peer = _personal_channel_peer(reference)
         fetched = await self._client.get_messages(peer, ids=[message_id])
         return _normalize_personal_channel_post(_first_message(fetched), message_id)
+
+
+def _is_canonical_channel_id(channel_id: object) -> bool:
+    return isinstance(channel_id, int) and not isinstance(channel_id, bool) and channel_id <= -CHANNEL_ID_MARKER - 1
+
+
+def _canonical_channel_id(raw_channel_id: int) -> int:
+    return -CHANNEL_ID_MARKER - raw_channel_id
+
+
+def _channel_reference_from_session_entity(  # noqa: PLR0911
+    input_entity: object, channel_id: int
+) -> ChannelReference | None:
+    if inspect.isawaitable(input_entity):
+        close = getattr(input_entity, "close", None)
+        if callable(close):
+            close()
+        return None
+    if not isinstance(input_entity, types.InputPeerChannel):
+        return None
+    raw_channel_id = getattr(input_entity, "channel_id", None)
+    if not isinstance(raw_channel_id, int) or isinstance(raw_channel_id, bool):
+        return None
+    if _canonical_channel_id(raw_channel_id) != channel_id:
+        return None
+    normalized_hash = _signed_64(getattr(input_entity, "access_hash", None))
+    if normalized_hash is None:
+        return None
+    try:
+        return ChannelReference(channel_id=channel_id, access_hash=normalized_hash)
+    except ValueError:
+        return None
+
+
+def _validate_channel_reference(reference: object) -> ChannelReference:
+    if not isinstance(reference, ChannelReference):
+        raise TypeError("channel reference is invalid")
+    return reference
+
+
+def _input_channel(reference: ChannelReference) -> types.InputChannel:
+    raw_channel_id = -CHANNEL_ID_MARKER - reference.channel_id
+    return types.InputChannel(channel_id=raw_channel_id, access_hash=reference.access_hash)
+
+
+def _channel_target_matches(channel_id: int, raw_id: object) -> bool:
+    if not isinstance(raw_id, int) or isinstance(raw_id, bool) or raw_id <= 0:
+        return False
+    if channel_id == raw_id or abs(channel_id) == raw_id:
+        return True
+    return channel_id == -1000000000000 - raw_id
+
+
+def _validated_full_channel(result: object, channel_id: int) -> types.ChannelFull:
+    if not isinstance(result, types.messages.ChatFull):
+        raise ValueError("full channel envelope is invalid")
+    full_chat = getattr(result, "full_chat", None)
+    if not isinstance(full_chat, types.ChannelFull):
+        raise ValueError("channel full payload is invalid")
+    if not _channel_target_matches(channel_id, getattr(full_chat, "id", None)):
+        raise ValueError("channel full target does not match")
+    return full_chat
+
+
+def _unavailable_channel_profile(
+    channel_id: int,
+    started_at: float,
+    completed_at: float,
+    reason: str,
+) -> ChannelProfileObservation:
+    return ChannelProfileObservation(
+        channel_id=channel_id,
+        about=None,
+        participants_count=None,
+        linked_chat_id=None,
+        pinned_msg_id=None,
+        slow_mode_seconds=None,
+        available_reactions={"kind": "none", "emojis": []},
+        current_photo=None,
+        observation_started_at=started_at,
+        observation_completed_at=completed_at,
+        status=ProjectionStatus.UNAVAILABLE,
+        reason=reason,
+    )
+
+
+def _nonnegative_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _normalize_linked_channel_id(value: object) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("linked channel id is invalid")
+    if value == 0:
+        return None
+    if value < 0:
+        raise ValueError("linked channel id must be a positive raw channel id")
+    raw_id = value
+    return int(get_peer_id(types.PeerChannel(raw_id)))
+
+
+def _normalize_channel_photo(photo: object) -> ChatCurrentPhoto | None:
+    if photo is None:
+        return None
+    if not isinstance(photo, (types.Photo, types.PhotoEmpty)):
+        return None
+    photo_id = _positive_id(getattr(photo, "id", None))
+    if isinstance(photo, types.PhotoEmpty) and getattr(photo, "id", None) == 0:
+        return None
+    if photo_id is None:
+        raise ValueError("channel current photo id is invalid")
+    raw_date = getattr(photo, "date", None)
+    date = raw_date.isoformat() if isinstance(raw_date, datetime) else None
+    return ChatCurrentPhoto(photo_id=photo_id, date=date)
+
+
+def _normalize_reactions(raw_reactions: object) -> dict[str, object]:
+    if isinstance(raw_reactions, types.ChatReactionsAll):
+        return {"kind": "all", "emojis": []}
+    if isinstance(raw_reactions, types.ChatReactionsSome):
+        emojis = [
+            value
+            for reaction in cast(Sequence[object], getattr(raw_reactions, "reactions", ()) or ())
+            if (value := getattr(cast(object, reaction), "emoticon", None)) is not None and isinstance(value, str)
+        ]
+        return {"kind": "some", "emojis": emojis}
+    if raw_reactions is None or isinstance(raw_reactions, types.ChatReactionsNone):
+        return {"kind": "none", "emojis": []}
+    return {"kind": "unknown", "emojis": []}
+
+
+def _validated_contact_ids(result: object) -> tuple[int, ...]:
+    if not isinstance(result, types.channels.ChannelParticipants):
+        raise ValueError("channel participants envelope is invalid")
+    users = getattr(result, "users", None)
+    if not isinstance(users, Sequence) or isinstance(users, str | bytes | bytearray):
+        raise ValueError("channel participants users are invalid")
+    ids = {user_id for user in users if (user_id := _positive_id(getattr(user, "id", None))) is not None}
+    return tuple(sorted(ids))
 
 
 def _raw_group_id(group_id: int) -> int:
@@ -236,11 +491,11 @@ def _normalize_participants(  # noqa: PLR0911
     return tuple(ids), None
 
 
-def _normalize_current_photo(photo: object) -> GroupCurrentPhoto | None:
+def _normalize_current_photo(photo: object) -> ChatCurrentPhoto | None:
     if photo is None:
         return None
     if not isinstance(photo, (types.Photo, types.PhotoEmpty)):
-        raise ValueError("legacy group current photo is invalid")
+        return None
     if isinstance(photo, types.PhotoEmpty) and getattr(photo, "id", None) == 0:
         return None
     photo_id = _positive_id(getattr(photo, "id", None))
@@ -248,7 +503,7 @@ def _normalize_current_photo(photo: object) -> GroupCurrentPhoto | None:
         raise ValueError("legacy group current photo id is invalid")
     raw_date = getattr(photo, "date", None)
     date = raw_date.isoformat() if isinstance(raw_date, datetime) else None
-    return GroupCurrentPhoto(photo_id=photo_id, date=date)
+    return ChatCurrentPhoto(photo_id=photo_id, date=date)
 
 
 def translate_gateway_failure(exc: BaseException) -> GatewayFailure:

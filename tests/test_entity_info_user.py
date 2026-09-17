@@ -37,7 +37,7 @@ from mcp_telegram.entity_profile.contracts import (
 from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
 from mcp_telegram.entity_profile.ports import UserProfilePort
 from tests.daemon_api_policy import make_daemon_api_policy
-from tests.helpers import FakeUserProfilePort, LoudGroupProfilePort, LoudUserProfilePort
+from tests.helpers import FakeUserProfilePort, LoudChannelProfilePort, LoudGroupProfilePort, LoudUserProfilePort
 from tests.reaction_helpers import make_reaction_freshener
 
 _TEST_DBS: list[sqlite3.Connection] = []
@@ -123,6 +123,7 @@ def make_server(
         cast(DaemonClientLike, client),
         shutdown_event,
         reaction_freshener=make_reaction_freshener(conn, client),
+        channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=user_profile_port if user_profile_port is not None else LoudUserProfilePort(),
         policy=make_daemon_api_policy(),
