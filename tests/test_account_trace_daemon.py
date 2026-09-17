@@ -56,7 +56,14 @@ from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
 from mcp_telegram.tools import TOOL_REGISTRY
 from tests.daemon_api_policy import make_daemon_api_policy
-from tests.helpers import LoudChannelProfilePort, LoudGroupProfilePort, LoudUserProfilePort
+from tests.helpers import (
+    LoudChannelProfilePort,
+    LoudChatAvatarHistoryPort,
+    LoudCommonChatsPort,
+    LoudGroupProfilePort,
+    LoudUserAvatarHistoryPort,
+    LoudUserProfilePort,
+)
 from tests.reaction_helpers import make_reaction_freshener
 
 
@@ -72,6 +79,9 @@ def trace_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, sqlite3.Conn
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
+        common_chats_port=LoudCommonChatsPort(),
+        user_avatar_history_port=LoudUserAvatarHistoryPort(),
+        chat_avatar_history_port=LoudChatAvatarHistoryPort(),
         policy=make_daemon_api_policy(),
     )
     server.self_id = 101

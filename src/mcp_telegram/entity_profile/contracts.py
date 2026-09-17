@@ -72,6 +72,35 @@ class ChannelReference:
 
 
 @dataclass(frozen=True, slots=True)
+class UserReference:
+    """A reconstructible user capability obtained from the local session."""
+
+    user_id: int
+    access_hash: int
+    is_self: bool = False
+
+    def __post_init__(self) -> None:
+        _validate_positive_id(self.user_id, field_name="user_id")
+        if not isinstance(self.access_hash, int) or isinstance(self.access_hash, bool):
+            raise ValueError("access_hash must be an integer")
+        if not -(2**63) <= self.access_hash <= 2**63 - 1:
+            raise ValueError("access_hash must be a signed 64-bit integer")
+        if not isinstance(self.is_self, bool):
+            raise TypeError("is_self must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class GroupReference:
+    """A canonical legacy group identity."""
+
+    group_id: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.group_id, int) or isinstance(self.group_id, bool) or self.group_id == 0:
+            raise ValueError("group_id must be a non-zero integer")
+
+
+@dataclass(frozen=True, slots=True)
 class ObservationBoundary:
     """Original acquisition boundaries supplied by the adapter."""
 
@@ -130,11 +159,14 @@ class UserProfileObservation:
     full_profile: ProjectionOutcome
     personal_channel: ProjectionOutcome
     personal_channel_reference: PersonalChannelReference | None = None
+    current_photo: ChatCurrentPhoto | None = None
 
     def __post_init__(self) -> None:
         _validate_positive_id(self.target_id, field_name="target_id")
         if not isinstance(self.target_kind, TargetKind):
             raise TypeError("target_kind must be a TargetKind")
+        if self.current_photo is not None and not isinstance(self.current_photo, ChatCurrentPhoto):
+            raise TypeError("current_photo must be ChatCurrentPhoto or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +213,107 @@ class ChatCurrentPhoto:
         _validate_positive_id(self.photo_id, field_name="photo_id")
         if self.date is not None and not isinstance(self.date, str):
             raise TypeError("date must be an ISO string or None")
+
+
+@dataclass(frozen=True, slots=True)
+class CommonChatSummary:
+    """One common-chat row with only transport-neutral fields."""
+
+    chat_id: int
+    name: str | None
+    kind: str
+
+    def __post_init__(self) -> None:
+        _validate_nonzero_id(self.chat_id, field_name="chat_id")
+        if self.name is not None and not isinstance(self.name, str):
+            raise TypeError("name must be a string or None")
+        if not isinstance(self.kind, str) or not self.kind:
+            raise ValueError("kind must be a non-empty string")
+
+
+@dataclass(frozen=True, slots=True)
+class UserAvatarHistoryObservation:
+    """One bounded user profile-photo page."""
+
+    user_id: int
+    photos: tuple[ChatCurrentPhoto, ...]
+    reported_count: int
+    status: ProjectionStatus
+    reason: str | None
+    observation_started_at: float
+    observation_completed_at: float
+
+    def __post_init__(self) -> None:
+        _validate_positive_id(self.user_id, field_name="user_id")
+        _validate_photos(self.photos)
+        _validate_count(self.reported_count)
+        _validate_bounded_status(self.status, self.reason)
+        _validate_observation_boundary(self.observation_started_at, self.observation_completed_at)
+
+
+@dataclass(frozen=True, slots=True)
+class CommonChatsObservation:
+    """One bounded common-chat page for a user."""
+
+    user_id: int
+    chats: tuple[CommonChatSummary, ...]
+    reported_count: int
+    status: ProjectionStatus
+    reason: str | None
+    observation_started_at: float
+    observation_completed_at: float
+
+    def __post_init__(self) -> None:
+        _validate_positive_id(self.user_id, field_name="user_id")
+        if not isinstance(self.chats, tuple) or any(not isinstance(item, CommonChatSummary) for item in self.chats):
+            raise TypeError("chats must be a tuple of CommonChatSummary")
+        _validate_count(self.reported_count)
+        _validate_bounded_status(self.status, self.reason)
+        _validate_observation_boundary(self.observation_started_at, self.observation_completed_at)
+
+
+ChatAvatarReference = ChannelReference | GroupReference
+
+
+def reconcile_chat_avatar_history(
+    history: tuple[ChatCurrentPhoto, ...], current_photo: ChatCurrentPhoto | None, reported_count: int
+) -> tuple[tuple[ChatCurrentPhoto, ...], int]:
+    """Merge current avatar into a bounded history deterministically."""
+    output: list[ChatCurrentPhoto] = []
+    positions: dict[int, int] = {}
+    if current_photo is not None:
+        output.append(current_photo)
+        positions[current_photo.photo_id] = 0
+    for photo in history:
+        position = positions.get(photo.photo_id)
+        if position is None:
+            positions[photo.photo_id] = len(output)
+            output.append(photo)
+            continue
+        if output[position].date is None and photo.date is not None:
+            output[position] = photo
+    return tuple(output), max(reported_count, len(output))
+
+
+@dataclass(frozen=True, slots=True)
+class ChatAvatarHistoryObservation:
+    """One bounded chat avatar-history page."""
+
+    reference: ChatAvatarReference
+    photos: tuple[ChatCurrentPhoto, ...]
+    reported_count: int
+    status: ProjectionStatus
+    reason: str | None
+    observation_started_at: float
+    observation_completed_at: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reference, (ChannelReference, GroupReference)):
+            raise TypeError("chat avatar reference is invalid")
+        _validate_photos(self.photos)
+        _validate_count(self.reported_count)
+        _validate_bounded_status(self.status, self.reason)
+        _validate_observation_boundary(self.observation_started_at, self.observation_completed_at)
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +400,29 @@ def _validate_positive_id(value: object, *, field_name: str) -> None:
 def _validate_nonzero_id(value: object, *, field_name: str) -> None:
     if not isinstance(value, int) or isinstance(value, bool) or value == 0:
         raise ValueError(f"{field_name} must be a non-zero integer")
+
+
+def _validate_count(value: object) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("reported_count must be a non-negative integer")
+
+
+def _validate_photos(value: object) -> None:
+    if not isinstance(value, tuple) or any(not isinstance(item, ChatCurrentPhoto) for item in value):
+        raise TypeError("photos must be a tuple of ChatCurrentPhoto")
+    if len({item.photo_id for item in value}) != len(value):
+        raise ValueError("photos must be deduplicated")
+
+
+def _validate_bounded_status(status: object, reason: str | None) -> None:
+    if status not in {ProjectionStatus.USABLE, ProjectionStatus.PARTIAL, ProjectionStatus.UNAVAILABLE}:
+        raise ValueError("bounded observation status is invalid")
+    if status is ProjectionStatus.USABLE and reason is not None:
+        raise ValueError("usable bounded observation cannot have a reason")
+    if status is ProjectionStatus.PARTIAL and reason != "bounded_page":
+        raise ValueError("partial bounded observation requires bounded_page")
+    if status is ProjectionStatus.UNAVAILABLE and not reason:
+        raise ValueError("unavailable bounded observation requires a reason")
 
 
 def _validate_optional_nonzero_id(value: object, *, field_name: str) -> None:

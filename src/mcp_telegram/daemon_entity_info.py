@@ -36,20 +36,27 @@ from .entity_profile.contracts import (
     ChannelContactOverlapObservation,
     ChannelProfileObservation,
     ChannelReference,
+    ChatAvatarReference,
     ChatCurrentPhoto,
     GroupProfileObservation,
+    GroupReference,
     PersonalChannelReference,
     ProfileAcquisitionEvidence,
     ProjectionOutcome,
     ProjectionStatus,
     TargetKind,
+    UserReference,
     completeness,
+    reconcile_chat_avatar_history,
 )
 from .entity_profile.ports import (
     ChannelProfilePort,
     ChannelReferenceProvider,
+    ChatAvatarHistoryPort,
+    CommonChatsPort,
     GroupProfilePort,
     ProfilePairObservationHook,
+    UserAvatarHistoryPort,
     UserProfilePort,
 )
 from .entity_profile.refresh import (
@@ -121,22 +128,6 @@ class _EntityInfoClient(Protocol):
 
     def get_messages(self, entity: object, ids: list[int]) -> Awaitable[object]: ...
 
-    def __call__(self, request: object) -> Awaitable[object]: ...
-
-
-class _CommonChatsResult(Protocol):
-    chats: Sequence[object]
-
-
-class _UserPhotosResult(Protocol):
-    count: int
-    photos: Sequence[object]
-
-
-class _MessagesSearchResult(Protocol):
-    count: int
-    messages: Sequence[object]
-
 
 @runtime_checkable
 class _SupportsIsoformat(Protocol):
@@ -181,27 +172,6 @@ def _isoformat_or_none(value: object | None) -> str | None:
     return None
 
 
-def _current_chat_photo(
-    full_chat: object,
-    current_photo: ChatCurrentPhoto | None,
-) -> tuple[int | None, str | None]:
-    if current_photo is not None:
-        return current_photo.photo_id, current_photo.date
-    if full_chat is None:
-        return None, None
-    chat_photo = _attr(full_chat, "chat_photo", None)
-    if chat_photo is None:
-        return None, None
-    return _opt_int_attr(chat_photo, "id"), _isoformat_or_none(_attr(chat_photo, "date", None))
-
-
-def _sequence_attr(obj: object, name: str) -> Sequence[object]:
-    value = _attr(obj, name, None)
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-        return value
-    return ()
-
-
 def _compact_dict(items: Mapping[str, object | None]) -> dict[str, object]:
     return {key: value for key, value in items.items() if value is not None}
 
@@ -224,6 +194,58 @@ def _row_str_or_none(row: Mapping[str, object], key: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _current_photo_from_payload(payload: object) -> ChatCurrentPhoto | None:
+    if not isinstance(payload, Mapping):
+        return None
+    value = payload.get("current_photo")
+    if not isinstance(value, Mapping):
+        return None
+    photo_id = value.get("photo_id")
+    date = value.get("date")
+    if not isinstance(photo_id, int) or isinstance(photo_id, bool) or photo_id <= 0:
+        return None
+    if date is not None and not isinstance(date, str):
+        return None
+    return ChatCurrentPhoto(photo_id, date)
+
+
+def _reconcile_history_payload(
+    history: Sequence[object], current_photo: ChatCurrentPhoto | None, reported_count: int
+) -> tuple[list[dict[str, object]], int]:
+    photos = tuple(item for item in history if isinstance(item, ChatCurrentPhoto))
+    merged, count = reconcile_chat_avatar_history(photos, current_photo, reported_count)
+    return [{"photo_id": photo.photo_id, "date": photo.date} for photo in merged], count
+
+
+def _project_current_photo(
+    result: dict[str, object], sections: Mapping[str, Mapping[str, object]], current_photo: ChatCurrentPhoto | None
+) -> None:
+    if current_photo is None:
+        return
+    avatar_data = sections.get("avatar_history", {}).get("data")
+    existing_values = _avatar_history_values(avatar_data)
+    raw_count = result.get("avatar_count")
+    prior_count = raw_count if isinstance(raw_count, int) else 0
+    merged, merged_count = reconcile_chat_avatar_history(tuple(existing_values), current_photo, prior_count)
+    result["avatar_history"] = [{"photo_id": item.photo_id, "date": item.date} for item in merged]
+    result["avatar_count"] = merged_count
+
+
+def _avatar_history_values(value: object) -> tuple[ChatCurrentPhoto, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes | bytearray):
+        return ()
+    output: list[ChatCurrentPhoto] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        photo_id = item.get("photo_id")
+        if not isinstance(photo_id, int) or isinstance(photo_id, bool) or photo_id <= 0:
+            continue
+        date = item.get("date")
+        output.append(ChatCurrentPhoto(photo_id, date if isinstance(date, str) else None))
+    return tuple(output)
+
+
 @dataclass(frozen=True)
 class EntityInfoDeps:
     """Dependency container for entity-info orchestration."""
@@ -239,17 +261,13 @@ class EntityInfoDeps:
     now_provider: Callable[[], float]
     detail_ttl_seconds: int
     slow_stage_seconds: float
-    get_common_chats_request: Callable[..., object]
-    get_user_photos_request: Callable[..., object]
-    get_messages_search_request: Callable[..., object]
-    input_messages_filter_chat_photos: type[object]
-    message_action_chat_edit_photo: type[object]
-    channel_type: type[object]
-    chat_type: type[object]
     group_profile_port: GroupProfilePort
     user_profile_port: UserProfilePort
     channel_profile_port: ChannelProfilePort
     channel_reference_provider: ChannelReferenceProvider
+    common_chats_port: CommonChatsPort
+    user_avatar_history_port: UserAvatarHistoryPort
+    chat_avatar_history_port: ChatAvatarHistoryPort
     get_dialog_placement: Callable[[int], dict[str, object]] | None = None
     refresh_limits: RefreshLimits = field(default_factory=RefreshLimits)
     enable_full_user_pair: bool = False
@@ -1234,7 +1252,9 @@ class DaemonEntityInfoService:
             if captured_scope is None or verified_scope != captured_scope:
                 raise _AuthScopeUnavailableError("authenticated session scope changed during acquisition")
         identity = self._full_user_pair_identity(target_kind, scope=captured_scope)
-        full_profile = self._normalized_full_profile_commit(normalized.full_profile, cursor, identity)
+        full_profile = self._normalized_full_profile_commit(
+            normalized.full_profile, cursor, identity, current_photo=normalized.current_photo
+        )
         personal_channel = self._normalized_personal_channel_commit(
             normalized.personal_channel,
             cursor,
@@ -1500,12 +1520,19 @@ class DaemonEntityInfoService:
         outcome: ProjectionOutcome,
         cursor: EntityRefreshCursor,
         identity: Mapping[str, object] | None,
+        *,
+        current_photo: ChatCurrentPhoto | None = None,
     ) -> EntitySectionCommit:
         payload = dict(outcome.payload or {})
+        private_payload = {
+            "current_photo": (
+                {"photo_id": current_photo.photo_id, "date": current_photo.date} if current_photo is not None else None
+            )
+        }
         return EntitySectionCommit(
             payload,
             status="fresh",
-            payload=payload,
+            payload=private_payload,
             evidence=self._projection_evidence(outcome, cursor=cursor, identity=identity),
             observation_owner_account_id=self._scope_account_id(identity),
             observation_auth_scope=self._scope_mapping(identity),
@@ -1814,7 +1841,15 @@ class DaemonEntityInfoService:
         patch = dict(outcome.payload)
         folder_id = patch.get("folder_id")
         patch["folder_name"] = await self._resolve_folder_name(folder_id if isinstance(folder_id, int) else None)
-        return EntitySectionCommit(patch)
+        current_photo = observation.current_photo
+        private_payload = {
+            "current_photo": (
+                {"photo_id": current_photo.photo_id, "date": current_photo.date}
+                if isinstance(current_photo, ChatCurrentPhoto)
+                else None
+            )
+        }
+        return EntitySectionCommit(patch, payload=private_payload)
 
     async def _acquire_channel_full_profile(self, entity_id: int, entity_type: DialogType) -> EntitySectionCommit:
         port = self._deps.channel_profile_port
@@ -1841,7 +1876,11 @@ class DaemonEntityInfoService:
             )
         else:
             patch.update(members_count=member_count, linked_broadcast_id=observation.linked_chat_id)
-        return EntitySectionCommit(patch)
+        current = observation.current_photo
+        payload = {
+            "current_photo": {"photo_id": current.photo_id, "date": current.date} if current is not None else None
+        }
+        return EntitySectionCommit(patch, payload=payload)
 
     async def _acquire_group_full_chat_pair(
         self,
@@ -1919,6 +1958,13 @@ class DaemonEntityInfoService:
                 "invite_link": observation.invite_link,
                 "members_count": len(participants) if participants is not None else None,
             },
+            payload={
+                "current_photo": (
+                    {"photo_id": observation.current_photo.photo_id, "date": observation.current_photo.date}
+                    if observation.current_photo is not None
+                    else None
+                )
+            },
             evidence=evidence,
         )
 
@@ -1960,15 +2006,15 @@ class DaemonEntityInfoService:
         )
 
     async def _acquire_common_chats(self, entity_id: int) -> EntitySectionCommit:
-        result = await self._deps.client(self._deps.get_common_chats_request(user_id=entity_id, max_id=0, limit=100))
-        chats = [
-            {
-                "id": int(self._deps.get_peer_id(chat)),
-                "name": _opt_str_attr(chat, "title") or str(_attr(chat, "id", "")),
-                "type": self._classify_chat_type(chat),
-            }
-            for chat in _sequence_attr(result, "chats")
-        ]
+        reference = self._user_reference(entity_id)
+        if reference is None:
+            return EntitySectionCommit({}, status="unavailable", reason="user_reference_unavailable")
+        observation = await self._deps.common_chats_port.fetch_common_chats(reference)
+        if observation.user_id != entity_id:
+            raise ValueError("common chats observation target does not match")
+        chats = [{"id": item.chat_id, "name": item.name, "type": item.kind} for item in observation.chats]
+        if observation.status is ProjectionStatus.UNAVAILABLE:
+            return EntitySectionCommit({}, status="unavailable", reason=observation.reason, payload=None)
         return EntitySectionCommit({"common_chats": chats}, payload=chats)
 
     async def _acquire_contact_overlap(
@@ -2069,65 +2115,35 @@ class DaemonEntityInfoService:
         return await self._acquire_chat_avatar_history(entity_id)
 
     async def _acquire_user_avatar_history(self, entity_id: int) -> EntitySectionCommit:
-        result = await self._deps.client(
-            self._deps.get_user_photos_request(user_id=entity_id, offset=0, max_id=0, limit=100)
-        )
-        photos = _sequence_attr(result, "photos")
-        user_history = [
-            {"photo_id": photo_id, "date": _isoformat_or_none(_attr(photo, "date", None))}
-            for photo in photos
-            if (photo_id := _opt_int_attr(photo, "id")) is not None
-        ]
-        count = _opt_int_attr(result, "count")
-        return EntitySectionCommit(
-            {
-                "avatar_history": user_history,
-                "avatar_count": count if count is not None else len(user_history),
-            },
-            payload=user_history,
-        )
+        reference = self._user_reference(entity_id)
+        if reference is None:
+            return EntitySectionCommit({}, status="unavailable", reason="user_reference_unavailable")
+        observation = await self._deps.user_avatar_history_port.fetch_user_avatar_history(reference)
+        if observation.user_id != entity_id:
+            raise ValueError("user avatar observation target does not match")
+        if observation.status is ProjectionStatus.UNAVAILABLE:
+            return EntitySectionCommit({}, status="unavailable", reason=observation.reason, payload=None)
+        current = _current_photo_from_payload(self._profiles.read_section_payload(entity_id, "full_profile"))
+        history, count = _reconcile_history_payload(observation.photos, current, observation.reported_count)
+        return EntitySectionCommit({"avatar_history": history, "avatar_count": count}, payload=history)
 
     async def _acquire_chat_avatar_history(self, entity_id: int) -> EntitySectionCommit:
-        result = await self._deps.client(
-            self._deps.get_messages_search_request(
-                peer=entity_id,
-                q="",
-                filter=self._deps.input_messages_filter_chat_photos(),
-                min_date=None,
-                max_date=None,
-                offset_id=0,
-                add_offset=0,
-                limit=100,
-                max_id=0,
-                min_id=0,
-                hash=0,
-                from_id=None,
-            )
-        )
-        chat_history = self._chat_avatar_history_from_result(result)
-        count = _opt_int_attr(result, "count")
-        return EntitySectionCommit(
-            {
-                "avatar_history": chat_history,
-                "avatar_count": count if count is not None else len(chat_history),
-            },
-            payload=chat_history,
-        )
+        reference = self._chat_avatar_reference(entity_id)
+        if reference is None:
+            return EntitySectionCommit({}, status="unavailable", reason="chat_reference_unavailable", payload=None)
+        observation = await self._deps.chat_avatar_history_port.fetch_chat_avatar_history(reference)
+        if observation.reference != reference:
+            raise ValueError("chat avatar observation reference does not match")
+        if observation.status is ProjectionStatus.UNAVAILABLE:
+            return EntitySectionCommit({}, status="unavailable", reason=observation.reason, payload=None)
+        current = _current_photo_from_payload(self._profiles.read_section_payload(entity_id, "full_profile"))
+        merged, count = _reconcile_history_payload(observation.photos, current, observation.reported_count)
+        return EntitySectionCommit({"avatar_history": merged, "avatar_count": count}, payload=merged)
 
-    def _chat_avatar_history_from_result(self, result: object) -> list[dict[str, object]]:
-        chat_history: list[dict[str, object]] = []
-        for message in _sequence_attr(result, "messages"):
-            action = _attr(message, "action", None)
-            if not isinstance(action, self._deps.message_action_chat_edit_photo):
-                continue
-            photo = _attr(action, "photo", None)
-            if photo is None:
-                continue
-            photo_id = _opt_int_attr(photo, "id")
-            if photo_id is None:
-                continue
-            chat_history.append({"photo_id": photo_id, "date": _isoformat_or_none(_attr(message, "date", None))})
-        return chat_history
+    def _user_reference(self, entity_id: int) -> UserReference | None:
+        is_self = self._deps.self_id == entity_id
+        reference = self._deps.user_profile_port.get_user_reference(entity_id, is_self=is_self)
+        return reference if isinstance(reference, UserReference) else None
 
     async def _acquire_personal_channel(self, entity_id: int, entity_type: DialogType) -> EntitySectionCommit:
         target_kind = self._target_kind(entity_type)
@@ -2252,6 +2268,8 @@ class DaemonEntityInfoService:
             self._enqueue_section_refresh(entity_id, sections)
         result = dict(detail)
         result["id"] = entity_id
+        current_photo = _current_photo_from_payload(self._profiles.read_section_payload(entity_id, "full_profile"))
+        _project_current_photo(result, sections, current_photo)
         if result.get("type") == DialogType.CHANNEL.value:
             result["linked_chat_id"] = self._read_canonical_linked_chat_id(entity_id)
         result["dialog_placement"] = result.get(
@@ -2611,12 +2629,17 @@ class DaemonEntityInfoService:
         if user_id is None:
             raise ValueError("user id missing")
 
-        common_chats = await self._collect_common_chats(user_id)
-        profile = await self._collect_user_profile(user)
+        reference = self._user_reference(user_id)
+        common_chats = await self._collect_common_chats(user_id, reference=reference)
+        profile, current_photo = await self._collect_user_profile(user)
         profile["folder_name"] = await self._resolve_folder_name(cast(int | None, profile["folder_id"]))
         extra_usernames = self._collect_extra_usernames(user)
         emoji_status_id = self._collect_emoji_status_id(user)
-        avatar_history, avatar_count = await self._collect_user_avatar_history(user)
+        avatar_history, avatar_count = await self._collect_user_avatar_history(
+            user,
+            reference=reference,
+            current_photo=current_photo,
+        )
         my_membership = self._build_user_membership(user, cast(bool, profile["blocked"]))
 
         first_name = _opt_str_attr(user, "first_name")
@@ -2667,21 +2690,19 @@ class DaemonEntityInfoService:
             "_full_fetch_ok": profile["full_user_ok"],
         }
 
-    async def _collect_common_chats(self, user_id: int) -> list[dict[str, object]]:
-        chats: list[dict[str, object]] = []
+    async def _collect_common_chats(
+        self, user_id: int, *, reference: UserReference | None = None
+    ) -> list[dict[str, object]]:
+        reference = reference if reference is not None else self._user_reference(user_id)
+        if reference is None:
+            self._record_section_failure("common_chats", "user_reference_unavailable")
+            return []
         try:
-            common_result = cast(
-                _CommonChatsResult,
-                await self._deps.client(self._deps.get_common_chats_request(user_id=user_id, max_id=0, limit=100)),
-            )
-            chats.extend(
-                {
-                    "id": int(self._deps.get_peer_id(chat)),
-                    "name": _opt_str_attr(chat, "title") or str(_attr(chat, "id", "")),
-                    "type": self._classify_chat_type(chat),
-                }
-                for chat in common_result.chats
-            )
+            observation = await self._deps.common_chats_port.fetch_common_chats(reference)
+            if observation.status is ProjectionStatus.UNAVAILABLE:
+                self._record_section_failure("common_chats", observation.reason or "unavailable")
+                return []
+            return [{"id": item.chat_id, "name": item.name, "type": item.kind} for item in observation.chats]
         except TelegramRpcThrottled:
             raise
         except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
@@ -2694,16 +2715,9 @@ class DaemonEntityInfoService:
                 self._deps.rid(),
                 exc_info=not isinstance(exc, TimeoutError),
             )
-        return chats
+        return []
 
-    def _classify_chat_type(self, chat: object) -> str:
-        if isinstance(chat, self._deps.channel_type):
-            return DialogType.SUPERGROUP.value if _attr(chat, "megagroup", False) else DialogType.CHANNEL.value
-        if isinstance(chat, self._deps.chat_type):
-            return DialogType.GROUP.value
-        return DialogType.USER.value
-
-    async def _collect_user_profile(self, user: object) -> dict[str, object]:
+    async def _collect_user_profile(self, user: object) -> tuple[dict[str, object], ChatCurrentPhoto | None]:
         user_id = _opt_int_attr(user, "id")
         if user_id is None:
             raise ValueError("user id missing")
@@ -2725,9 +2739,11 @@ class DaemonEntityInfoService:
             "note": None,
             "full_user_ok": False,
         }
+        current_photo: ChatCurrentPhoto | None = None
         try:
             target_kind = self._target_kind(classify_dialog_type(user))
             observation = await self._deps.user_profile_port.fetch_user_profile(user_id, target_kind)
+            current_photo = observation.current_photo
             full_outcome = observation.full_profile
             if full_outcome.status is ProjectionStatus.UNAVAILABLE or full_outcome.payload is None:
                 raise ValueError(full_outcome.reason or "full user payload is unavailable")
@@ -2755,7 +2771,7 @@ class DaemonEntityInfoService:
                 self._deps.rid(),
                 exc_info=not isinstance(exc, TimeoutError),
             )
-        return profile
+        return profile, current_photo
 
     async def _collect_personal_channel(
         self,
@@ -3024,24 +3040,25 @@ class DaemonEntityInfoService:
             return None
         return _opt_int_attr(emoji_status, "document_id")
 
-    async def _collect_user_avatar_history(self, user: object) -> tuple[list[dict[str, object]], int]:
-        avatar_history: list[dict[str, object]] = []
-        avatar_count = 0
+    async def _collect_user_avatar_history(
+        self,
+        user: object,
+        *,
+        reference: UserReference | None = None,
+        current_photo: ChatCurrentPhoto | None = None,
+    ) -> tuple[list[dict[str, object]], int]:
+        user_id = _opt_int_attr(user, "id")
+        if user_id is None:
+            return [], 0
+        reference = reference if reference is not None else self._user_reference(user_id)
+        if reference is None:
+            self._record_section_failure("avatar_history", "user_reference_unavailable")
+            return [], 0
         try:
-            photos_result = cast(
-                _UserPhotosResult,
-                await self._deps.client(
-                    self._deps.get_user_photos_request(user_id=user, offset=0, max_id=0, limit=100)
-                ),
-            )
-            photos = list(photos_result.photos)
-            avatar_count = int(getattr(photos_result, "count", len(photos)))
-            for photo in photos:
-                photo_id = _opt_int_attr(photo, "id")
-                photo_date = _attr(photo, "date", None)
-                if photo_id is None or photo_date is None:
-                    continue
-                avatar_history.append({"photo_id": int(photo_id), "date": _isoformat_or_none(photo_date)})
+            observation = await self._deps.user_avatar_history_port.fetch_user_avatar_history(reference)
+            if observation.status is ProjectionStatus.UNAVAILABLE:
+                self._record_section_failure("avatar_history", observation.reason or "unavailable")
+            return _reconcile_history_payload(observation.photos, current_photo, observation.reported_count)
         except TelegramRpcThrottled:
             raise
         except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
@@ -3054,7 +3071,7 @@ class DaemonEntityInfoService:
                 self._deps.rid(),
                 exc_info=not isinstance(exc, TimeoutError),
             )
-        return avatar_history, avatar_count
+        return [], 0
 
     def _build_user_membership(self, user: object, blocked: bool) -> dict[str, object]:
         contact_flag = _bool_attr(user, "contact")
@@ -3084,90 +3101,33 @@ class DaemonEntityInfoService:
 
     async def _search_chat_photo_history(
         self,
-        peer: object,
-        full_chat: object,
+        reference: ChatAvatarReference | None,
         *,
         current_photo: ChatCurrentPhoto | None = None,
     ) -> tuple[list[dict[str, object]], int]:
         """Avatar history via messages.Search(filter=ChatPhotos)."""
-        peer_id = int(self._deps.get_peer_id(peer))
-        avatar_history: list[dict[str, object]] = []
-        avatar_count = 0
-        search_failed = False
+        if reference is None:
+            return _reconcile_history_payload((), current_photo, 0)
         try:
-            search_result = cast(
-                _MessagesSearchResult,
-                await self._deps.client(
-                    self._deps.get_messages_search_request(
-                        peer=peer,
-                        q="",
-                        filter=self._deps.input_messages_filter_chat_photos(),
-                        min_date=None,
-                        max_date=None,
-                        offset_id=0,
-                        add_offset=0,
-                        limit=100,
-                        max_id=0,
-                        min_id=0,
-                        hash=0,
-                        from_id=None,
-                    )
-                ),
-            )
-            avatar_count = search_result.count
-            for msg in search_result.messages:
-                action = _attr(msg, "action", None)
-                if not isinstance(action, self._deps.message_action_chat_edit_photo):
-                    continue
-                photo = _attr(action, "photo", None)
-                photo_date = _attr(msg, "date", None)
-                if photo is None or photo_date is None or _opt_int_attr(photo, "id") is None:
-                    continue
-                avatar_history.append(
-                    {"photo_id": int(_opt_int_attr(photo, "id") or 0), "date": _isoformat_or_none(photo_date)},
-                )
+            observation = await self._deps.chat_avatar_history_port.fetch_chat_avatar_history(reference)
+            if observation.reference != reference:
+                raise ValueError("chat avatar observation reference does not match")
+            if observation.status is ProjectionStatus.UNAVAILABLE:
+                self._record_section_failure("avatar_history", observation.reason or "unavailable")
+            history = tuple(observation.photos)
+            merged, count = reconcile_chat_avatar_history(history, current_photo, observation.reported_count)
+            return _reconcile_history_payload(merged, None, count)
         except TelegramRpcThrottled:
             raise
         except (TimeoutError, RPCError, TypeError, AttributeError, ValueError) as exc:
             raise_if_flood_wait_error(exc)
             self._record_section_failure("avatar_history", type(exc).__name__.lower())
-            search_failed = True
             self._deps.logger.warning(
-                "entity_info avatar_search_failed peer_id=%r error=%s%s",
-                peer_id,
+                "entity_info avatar_search_failed error=%s%s",
                 exc,
                 self._deps.rid(),
             )
-
-        return self._finalize_chat_photo_history(
-            avatar_history,
-            avatar_count,
-            full_chat=full_chat,
-            current_photo=current_photo,
-            search_failed=search_failed,
-        )
-
-    def _finalize_chat_photo_history(
-        self,
-        avatar_history: list[dict[str, object]],
-        avatar_count: int,
-        *,
-        full_chat: object,
-        current_photo: ChatCurrentPhoto | None = None,
-        search_failed: bool,
-    ) -> tuple[list[dict[str, object]], int]:
-        current_photo_id, chat_photo_date = _current_chat_photo(full_chat, current_photo)
-        if current_photo_id is None:
-            return avatar_history, avatar_count
-        current_entry: dict[str, object] = {"photo_id": current_photo_id, "date": chat_photo_date}
-        if not any(p["photo_id"] == current_photo_id for p in avatar_history):
-            avatar_history.insert(0, current_entry)
-        if search_failed:
-            avatar_count = max(avatar_count, 1)
-        if not avatar_history:
-            avatar_history = [current_entry]
-            avatar_count = max(avatar_count, 1)
-        return avatar_history, avatar_count
+        return _reconcile_history_payload((), current_photo, 0)
 
     async def _fetch_channel_detail(self, channel: object) -> dict[str, object]:
         channel_id = int(self._deps.get_peer_id(channel))
@@ -3179,8 +3139,7 @@ class DaemonEntityInfoService:
             is_admin=cast(bool, memberships["is_admin"]),
         )
         avatar_history, avatar_count = await self._search_chat_photo_history(
-            channel,
-            None,
+            reference,
             current_photo=profile.current_photo if profile is not None else None,
         )
 
@@ -3208,22 +3167,9 @@ class DaemonEntityInfoService:
         }
 
     def _channel_reference_from_entity(self, channel: object) -> ChannelReference | None:
-        if _attr(channel, "min", None) is True:
-            return None
         channel_id = self._deps.get_peer_id(channel)
-        if not isinstance(channel_id, int) or isinstance(channel_id, bool):
-            return None
-        if -CHANNEL_ID_MARKER - 1 < channel_id < 0:
-            channel_id = -CHANNEL_ID_MARKER - abs(channel_id)
-        if channel_id >= -CHANNEL_ID_MARKER:
-            return None
-        access_hash = _attr(channel, "access_hash", None)
-        if not isinstance(access_hash, int) or isinstance(access_hash, bool):
-            return None
-        try:
-            return ChannelReference(channel_id=channel_id, access_hash=access_hash)
-        except ValueError:
-            return None
+        reference = self._deps.channel_reference_provider.get_channel_reference(channel_id)
+        return reference if isinstance(reference, ChannelReference) else None
 
     async def _fetch_channel_profile_observation(
         self, reference: ChannelReference | None
@@ -3369,8 +3315,7 @@ class DaemonEntityInfoService:
             unavailable_reason="hidden_by_admin",
         )
         avatar_history, avatar_count = await self._search_chat_photo_history(
-            channel,
-            None,
+            reference,
             current_photo=profile.current_photo if profile is not None else None,
         )
 
@@ -3445,8 +3390,7 @@ class DaemonEntityInfoService:
             len(participant_ids) if participant_ids is not None else _opt_int_attr(chat, "participants_count")
         )
         avatar_history, avatar_count = await self._search_chat_photo_history(
-            chat,
-            None,
+            self._chat_avatar_reference(chat_id),
             current_photo=observation.current_photo if observation is not None else None,
         )
 
@@ -3468,6 +3412,14 @@ class DaemonEntityInfoService:
             "contacts_reason": contacts_reason,
             "_full_fetch_ok": observation is not None,
         }
+
+    def _chat_avatar_reference(self, entity_id: int) -> ChatAvatarReference | None:
+        if entity_id <= -CHANNEL_ID_MARKER - 1:
+            channel_reference = self._deps.channel_reference_provider.get_channel_reference(entity_id)
+            if isinstance(channel_reference, ChannelReference):
+                return channel_reference
+        reference = self._deps.chat_avatar_history_port.get_chat_avatar_reference(entity_id)
+        return reference if isinstance(reference, (ChannelReference, GroupReference)) else None
 
     def _resolve_group_migrated_to(self, chat: object) -> int | None:
         migrated_to_obj = _attr(chat, "migrated_to", None)

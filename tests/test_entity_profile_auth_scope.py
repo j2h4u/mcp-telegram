@@ -20,6 +20,7 @@ from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_consumers import DemandKind
+from tests.helpers import ClientCommonChatsPort
 from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient, _prepare
 
 
@@ -315,7 +316,12 @@ async def test_public_wait_reread_does_not_requeue_flooded_refresh(tmp_path: Pat
                 raise TelegramRpcThrottled(retry_after_seconds=777)
             return await super().__call__(request)
 
-    service._deps = replace(service._deps, client=RecoveryClient())
+    recovery_client = RecoveryClient()
+    service._deps = replace(
+        service._deps,
+        client=recovery_client,
+        common_chats_port=ClientCommonChatsPort(recovery_client),
+    )
     request = asyncio.create_task(service.get_entity_info({"entity_id": 42}))
     await asyncio.sleep(0)
     assert coordinator.queue_depth == 1

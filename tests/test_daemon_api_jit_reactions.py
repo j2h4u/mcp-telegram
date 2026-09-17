@@ -26,7 +26,14 @@ from mcp_telegram.reading.sqlite_projection import _FETCH_UNREAD_MESSAGES_SQL
 from mcp_telegram.tools.message_view import project_message_view
 from mcp_telegram.topic_identity import project_topic
 from tests.daemon_api_policy import make_daemon_api_policy
-from tests.helpers import LoudChannelProfilePort, LoudGroupProfilePort, LoudUserProfilePort
+from tests.helpers import (
+    LoudChannelProfilePort,
+    LoudChatAvatarHistoryPort,
+    LoudCommonChatsPort,
+    LoudGroupProfilePort,
+    LoudUserAvatarHistoryPort,
+    LoudUserProfilePort,
+)
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
 
@@ -131,6 +138,9 @@ def make_server(conn: sqlite3.Connection, client: object) -> DaemonAPIServer:
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
+        common_chats_port=LoudCommonChatsPort(),
+        user_avatar_history_port=LoudUserAvatarHistoryPort(),
+        chat_avatar_history_port=LoudChatAvatarHistoryPort(),
         policy=make_daemon_api_policy(),
     )
 

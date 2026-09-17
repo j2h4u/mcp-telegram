@@ -25,7 +25,13 @@ from mcp_telegram.entity_profile.contracts import (
 )
 from mcp_telegram.entity_profile.ports import ChannelProfilePort
 from tests.daemon_api_policy import make_daemon_api_policy
-from tests.helpers import LoudGroupProfilePort, LoudUserProfilePort
+from tests.helpers import (
+    ClientChatAvatarHistoryPort,
+    LoudCommonChatsPort,
+    LoudGroupProfilePort,
+    LoudUserAvatarHistoryPort,
+    LoudUserProfilePort,
+)
 from tests.reaction_helpers import make_reaction_freshener
 
 _TEST_DBS: list[sqlite3.Connection] = []
@@ -226,6 +232,9 @@ def _make_server(
         channel_profile_port=channel_profile_port,
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
+        common_chats_port=LoudCommonChatsPort(),
+        user_avatar_history_port=LoudUserAvatarHistoryPort(),
+        chat_avatar_history_port=ClientChatAvatarHistoryPort(client),
         policy=make_daemon_api_policy(),
     )
     server._ready = True
@@ -253,9 +262,8 @@ async def test_get_entity_info_supergroup_small_rpc_count_le_9() -> None:
     client.set_call_responses([_empty_search()])
     channel_profile_port = _CountingChannelProfilePort(-1001000000001, 1000)
 
-    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-        server = _make_server(client=client, channel_profile_port=channel_profile_port)
-        r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001000000001})
+    server = _make_server(client=client, channel_profile_port=channel_profile_port)
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001000000001})
 
     assert r["ok"] is True, f"expected ok=True, got {r!r}"
     total = client.total_rpc_count + channel_profile_port.rpc_count
@@ -283,9 +291,8 @@ async def test_get_entity_info_supergroup_large_rpc_count_le_4() -> None:
     client.set_call_responses([_empty_search()])
     channel_profile_port = _CountingChannelProfilePort(-1001000000002, 50000)
 
-    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-        server = _make_server(client=client, channel_profile_port=channel_profile_port)
-        r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001000000002})
+    server = _make_server(client=client, channel_profile_port=channel_profile_port)
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001000000002})
 
     assert r["ok"] is True, f"expected ok=True, got {r!r}"
     total = client.total_rpc_count + channel_profile_port.rpc_count
@@ -314,9 +321,8 @@ async def test_get_entity_info_broadcast_channel_small_rpc_count_le_9() -> None:
     client.set_call_responses([_empty_search()])
     channel_profile_port = _CountingChannelProfilePort(-1009999999999, 1000)
 
-    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-        server = _make_server(client=client, channel_profile_port=channel_profile_port)
-        r = await server._dispatch({"method": "get_entity_info", "entity_id": -1009999999999})
+    server = _make_server(client=client, channel_profile_port=channel_profile_port)
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -1009999999999})
 
     assert r["ok"] is True, f"expected ok=True, got {r!r}"
     total = client.total_rpc_count + channel_profile_port.rpc_count

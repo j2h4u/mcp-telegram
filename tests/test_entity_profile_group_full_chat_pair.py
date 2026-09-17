@@ -20,6 +20,7 @@ from mcp_telegram.entity_profile.repository import EntitySectionCommit
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcAttemptBudgetExhaustedError
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
+from tests.helpers import ClientChatAvatarHistoryPort
 from tests.test_entity_profile_full_user_pair import _fenced_schema, _pair_service
 
 
@@ -151,7 +152,7 @@ def _service() -> tuple[sqlite3.Connection, DaemonEntityInfoService, _GroupClien
         client=client,
         dm_peer_ids=lambda: {7},
         group_profile_port=_GroupProfilePort(client),
-        get_messages_search_request=lambda **kwargs: ("search", kwargs),
+        chat_avatar_history_port=ClientChatAvatarHistoryPort(client),
         get_dialog_placement=lambda _entity_id: {},
     )
     service._profiles.save_core({"id": -123, "type": "group", "name": "Group"}, now=100)  # type: ignore[attr-defined]

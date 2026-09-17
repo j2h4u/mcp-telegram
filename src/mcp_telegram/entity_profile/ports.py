@@ -8,11 +8,16 @@ from .contracts import (
     ChannelContactOverlapObservation,
     ChannelProfileObservation,
     ChannelReference,
+    ChatAvatarHistoryObservation,
+    ChatAvatarReference,
+    CommonChatsObservation,
     GroupProfileObservation,
     PersonalChannelPost,
     PersonalChannelReference,
     TargetKind,
+    UserAvatarHistoryObservation,
     UserProfileObservation,
+    UserReference,
 )
 
 
@@ -28,6 +33,26 @@ class GroupProfilePort(Protocol):
     async def fetch_group_profile(self, group_id: int) -> GroupProfileObservation: ...
 
 
+class CommonChatsPort(Protocol):
+    """Fetch one bounded common-chat page."""
+
+    async def fetch_common_chats(self, reference: UserReference) -> CommonChatsObservation: ...
+
+
+class UserAvatarHistoryPort(Protocol):
+    """Fetch one bounded user avatar-history page."""
+
+    async def fetch_user_avatar_history(self, reference: UserReference) -> UserAvatarHistoryObservation: ...
+
+
+class ChatAvatarHistoryPort(Protocol):
+    """Fetch one bounded chat avatar-history page."""
+
+    def get_chat_avatar_reference(self, entity_id: int) -> ChatAvatarReference | None: ...
+
+    async def fetch_chat_avatar_history(self, reference: ChatAvatarReference) -> ChatAvatarHistoryObservation: ...
+
+
 class ChannelProfilePort(ChannelReferenceProvider, Protocol):
     """Fetch channel profile and bounded contact overlap independently."""
 
@@ -38,6 +63,8 @@ class ChannelProfilePort(ChannelReferenceProvider, Protocol):
 
 class UserProfilePort(Protocol):
     """Fetch one normalized user or bot profile observation."""
+
+    def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference | None: ...
 
     async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation: ...
 
@@ -73,7 +100,10 @@ class ProfilePairObservationHook(Protocol):
 __all__ = [
     "ChannelProfilePort",
     "ChannelReferenceProvider",
+    "ChatAvatarHistoryPort",
+    "CommonChatsPort",
     "GroupProfilePort",
     "ProfilePairObservationHook",
+    "UserAvatarHistoryPort",
     "UserProfilePort",
 ]

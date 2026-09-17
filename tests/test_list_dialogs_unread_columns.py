@@ -32,7 +32,14 @@ from mcp_telegram.reading.sqlite_projection import _LIST_DIALOG_MESSAGE_AGGREGAT
 from mcp_telegram.sync_read_model import build_sync_read_model
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.dialog_directory_coverage_fixtures import install_dialog_directory_coverage_schema
-from tests.helpers import LoudChannelProfilePort, LoudGroupProfilePort, LoudUserProfilePort
+from tests.helpers import (
+    LoudChannelProfilePort,
+    LoudChatAvatarHistoryPort,
+    LoudCommonChatsPort,
+    LoudGroupProfilePort,
+    LoudUserAvatarHistoryPort,
+    LoudUserProfilePort,
+)
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
 
@@ -245,6 +252,9 @@ def _make_server(conn: sqlite3.Connection, client: object) -> DaemonAPIServer:
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
+        common_chats_port=LoudCommonChatsPort(),
+        user_avatar_history_port=LoudUserAvatarHistoryPort(),
+        chat_avatar_history_port=LoudChatAvatarHistoryPort(),
         policy=make_daemon_api_policy(),
     )
     server._ready = True

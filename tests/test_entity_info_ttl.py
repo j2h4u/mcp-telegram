@@ -30,7 +30,14 @@ from mcp_telegram.entity_profile.contracts import (
     UserProfileObservation,
 )
 from tests.daemon_api_policy import make_daemon_api_policy
-from tests.helpers import LoudChannelProfilePort, LoudGroupProfilePort
+from tests.helpers import (
+    ClientChatAvatarHistoryPort,
+    ClientCommonChatsPort,
+    ClientUserAvatarHistoryPort,
+    LoudChannelProfilePort,
+    LoudGroupProfilePort,
+    UserReference,
+)
 from tests.reaction_helpers import make_reaction_freshener
 
 _TEST_DBS: list[sqlite3.Connection] = []
@@ -96,6 +103,9 @@ def make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike
     shutdown_event = asyncio.Event()
 
     class _GenericUserProfilePort:
+        def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference:
+            return UserReference(user_id, 0, is_self=is_self)
+
         async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
             usable = ProjectionOutcome(ProjectionStatus.USABLE, {}, None, None)
             absent = ProjectionOutcome(ProjectionStatus.ABSENT, {"personal_channel_id": None}, None, None)
@@ -114,6 +124,9 @@ def make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=_GenericUserProfilePort(),
+        common_chats_port=ClientCommonChatsPort(client),
+        user_avatar_history_port=ClientUserAvatarHistoryPort(client),
+        chat_avatar_history_port=ClientChatAvatarHistoryPort(client),
         policy=make_daemon_api_policy(),
     )
     server._ready = True
@@ -173,11 +186,7 @@ async def test_get_entity_info_serves_from_db_within_ttl(monkeypatch: pytest.Mon
 
     base = 1_000_000
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base)
-    with (
-        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
-    ):
-        r1 = await server._dispatch({"method": "get_entity_info", "entity_id": 42})
+    r1 = await server._dispatch({"method": "get_entity_info", "entity_id": 42})
     assert r1["ok"]
     first_call_count = get_entity.call_count
     assert first_call_count == 1
@@ -190,11 +199,7 @@ async def test_get_entity_info_serves_from_db_within_ttl(monkeypatch: pytest.Mon
 
     # After TTL → fresh fetch
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base + 400)
-    with (
-        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
-    ):
-        r3 = await server._dispatch({"method": "get_entity_info", "entity_id": 42})
+    r3 = await server._dispatch({"method": "get_entity_info", "entity_id": 42})
     assert r3["ok"]
     assert get_entity.call_count == first_call_count + 1
 
@@ -210,18 +215,10 @@ async def test_get_entity_info_at_exact_ttl_age_refetches(monkeypatch: pytest.Mo
     ttl_seconds = server._policy.entity_detail_ttl_seconds
     base = 2_000_000
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base)
-    with (
-        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
-    ):
-        assert (await server._dispatch({"method": "get_entity_info", "entity_id": 43}))["ok"]
+    assert (await server._dispatch({"method": "get_entity_info", "entity_id": 43}))["ok"]
 
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base + ttl_seconds)
-    with (
-        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
-    ):
-        assert (await server._dispatch({"method": "get_entity_info", "entity_id": 43}))["ok"]
+    assert (await server._dispatch({"method": "get_entity_info", "entity_id": 43}))["ok"]
 
     assert get_entity.call_count == 2
 
@@ -239,11 +236,7 @@ async def test_get_entity_info_auto_resolve_writes_both_rows(monkeypatch: pytest
     client.side_effect = _trio_results()
     server = make_server(conn=conn, client=client)
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: 5_000_000)
-    with (
-        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
-    ):
-        r = await server._dispatch({"method": "get_entity_info", "entity_id": 100})
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": 100})
 
     assert r["ok"]
     # Post-condition: BOTH rows now exist

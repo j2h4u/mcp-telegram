@@ -18,7 +18,14 @@ from mcp_telegram.feedback_contracts import VALID_SEVERITIES
 from mcp_telegram.feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
 from mcp_telegram.feedback_service import FeedbackApplicationService
 from tests.daemon_api_policy import make_daemon_api_policy
-from tests.helpers import LoudChannelProfilePort, LoudGroupProfilePort, LoudUserProfilePort
+from tests.helpers import (
+    LoudChannelProfilePort,
+    LoudChatAvatarHistoryPort,
+    LoudCommonChatsPort,
+    LoudGroupProfilePort,
+    LoudUserAvatarHistoryPort,
+    LoudUserProfilePort,
+)
 from tests.reaction_helpers import make_reaction_freshener
 
 
@@ -39,6 +46,9 @@ def _make_feedback_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, sql
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
+        common_chats_port=LoudCommonChatsPort(),
+        user_avatar_history_port=LoudUserAvatarHistoryPort(),
+        chat_avatar_history_port=LoudChatAvatarHistoryPort(),
         policy=make_daemon_api_policy(),
     )
     server._ready = True
@@ -291,6 +301,9 @@ async def test_submit_feedback_db_error_returns_internal(tmp_path: Path) -> None
             channel_profile_port=LoudChannelProfilePort(),
             group_profile_port=LoudGroupProfilePort(),
             user_profile_port=LoudUserProfilePort(),
+            common_chats_port=LoudCommonChatsPort(),
+            user_avatar_history_port=LoudUserAvatarHistoryPort(),
+            chat_avatar_history_port=LoudChatAvatarHistoryPort(),
             policy=make_daemon_api_policy(),
         )
         server._ready = True
@@ -320,6 +333,9 @@ async def test_feedback_without_wired_service_returns_not_initialised() -> None:
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
+        common_chats_port=LoudCommonChatsPort(),
+        user_avatar_history_port=LoudUserAvatarHistoryPort(),
+        chat_avatar_history_port=LoudChatAvatarHistoryPort(),
         policy=make_daemon_api_policy(),
     )
     try:

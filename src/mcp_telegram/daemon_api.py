@@ -50,17 +50,6 @@ from typing import TYPE_CHECKING, Protocol, SupportsIndex, cast
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 from telethon.errors import RPCError  # type: ignore[import-untyped]
-from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
-    GetCommonChatsRequest,
-)
-from telethon.tl.functions.messages import SearchRequest as MessagesSearchRequest  # type: ignore[import-untyped]
-from telethon.tl.functions.photos import GetUserPhotosRequest  # type: ignore[import-untyped]
-from telethon.tl.types import (  # type: ignore[import-untyped]
-    Channel,
-    Chat,
-    InputMessagesFilterChatPhotos,
-    MessageActionChatEditPhoto,
-)
 
 from . import daemon_activity_stats as _activity_stats
 from .auth_scope import TelegramAuthScope
@@ -82,8 +71,11 @@ from .dialog_selector import DialogSelector, DialogSelectorError, required_dialo
 from .entity_profile.ports import (
     ChannelProfilePort,
     ChannelReferenceProvider,
+    ChatAvatarHistoryPort,
+    CommonChatsPort,
     GroupProfilePort,
     ProfilePairObservationHook,
+    UserAvatarHistoryPort,
     UserProfilePort,
 )
 from .entity_profile.refresh import RefreshLimits
@@ -604,6 +596,9 @@ class DaemonAPIServer:
         channel_profile_port: ChannelProfilePort,
         policy: DaemonApiPolicy,
         health_status: Callable[[], DaemonHealthStatus] = _healthy_daemon_status,
+        common_chats_port: CommonChatsPort,
+        user_avatar_history_port: UserAvatarHistoryPort,
+        chat_avatar_history_port: ChatAvatarHistoryPort,
     ) -> None:
         conn.row_factory = sqlite3.Row
         self._conn = conn
@@ -629,6 +624,9 @@ class DaemonAPIServer:
         self._group_profile_port = group_profile_port
         self._user_profile_port = user_profile_port
         self._channel_profile_port = channel_profile_port
+        self._common_chats_port = common_chats_port
+        self._user_avatar_history_port = user_avatar_history_port
+        self._chat_avatar_history_port = chat_avatar_history_port
         self._hydration_requester = hydration_requester
         self._policy = policy
         self._health_status = health_status
@@ -1816,17 +1814,13 @@ class DaemonAPIServer:
                     now_provider=lambda: time.time(),
                     detail_ttl_seconds=self._policy.entity_detail_ttl_seconds,
                     slow_stage_seconds=self._policy.slow_request_seconds,
-                    get_common_chats_request=GetCommonChatsRequest,
-                    get_user_photos_request=GetUserPhotosRequest,
-                    get_messages_search_request=MessagesSearchRequest,
                     group_profile_port=self._group_profile_port,
                     user_profile_port=self._user_profile_port,
                     channel_profile_port=self._channel_profile_port,
                     channel_reference_provider=cast(ChannelReferenceProvider, self._channel_profile_port),
-                    input_messages_filter_chat_photos=InputMessagesFilterChatPhotos,
-                    message_action_chat_edit_photo=MessageActionChatEditPhoto,
-                    channel_type=Channel,
-                    chat_type=Chat,
+                    common_chats_port=self._common_chats_port,
+                    user_avatar_history_port=self._user_avatar_history_port,
+                    chat_avatar_history_port=self._chat_avatar_history_port,
                     get_dialog_placement=lambda entity_id: dialog_placement(self._conn, entity_id),
                     refresh_limits=self._policy.entity_profile,
                     enable_full_user_pair=self._policy.full_user_pair_enabled,

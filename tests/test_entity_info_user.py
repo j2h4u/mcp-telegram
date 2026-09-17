@@ -37,7 +37,15 @@ from mcp_telegram.entity_profile.contracts import (
 from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
 from mcp_telegram.entity_profile.ports import UserProfilePort
 from tests.daemon_api_policy import make_daemon_api_policy
-from tests.helpers import FakeUserProfilePort, LoudChannelProfilePort, LoudGroupProfilePort, LoudUserProfilePort
+from tests.helpers import (
+    ClientChatAvatarHistoryPort,
+    ClientCommonChatsPort,
+    ClientUserAvatarHistoryPort,
+    FakeUserProfilePort,
+    LoudChannelProfilePort,
+    LoudGroupProfilePort,
+    LoudUserProfilePort,
+)
 from tests.reaction_helpers import make_reaction_freshener
 
 _TEST_DBS: list[sqlite3.Connection] = []
@@ -126,6 +134,9 @@ def make_server(
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=user_profile_port if user_profile_port is not None else LoudUserProfilePort(),
+        common_chats_port=ClientCommonChatsPort(client),
+        user_avatar_history_port=ClientUserAvatarHistoryPort(client),
+        chat_avatar_history_port=ClientChatAvatarHistoryPort(client),
         policy=make_daemon_api_policy(),
     )
     server._ready = True
@@ -225,10 +236,7 @@ async def test_get_entity_info_user_type() -> None:
     photos.photos = []
     client.side_effect = [common, photos]
     server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
-    with (
-        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
-    ):
+    with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 1})
     assert r["ok"] is True, f"got {r}"
     assert _dict(r["data"])["type"] == "user"
@@ -261,10 +269,7 @@ async def test_get_entity_info_user_avatar_history_handles_photos_without_count(
     photos.photos = [photo]
     client.side_effect = [common, photos]
     server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
-    with (
-        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
-    ):
+    with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 11})
     assert r["ok"] is True, f"got {r}"
     d = _dict(r["data"])
@@ -298,10 +303,7 @@ async def test_get_entity_info_bot_type() -> None:
     photos.photos = []
     client.side_effect = [common, photos]
     server = make_server(client=client, user_profile_port=_user_profile_port(bot, full))
-    with (
-        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
-    ):
+    with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 2})
     assert r["ok"] is True
     d = _dict(r["data"])
@@ -333,10 +335,7 @@ async def test_legacy_bot_profile_uses_resolved_kind_without_local_entity_row() 
     port = _user_profile_port(bot, full)
     server = make_server(client=client, user_profile_port=port)
 
-    with (
-        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
-    ):
+    with patch.object(server, "_ready", True):
         result = await server._dispatch({"method": "get_entity_info", "entity_id": 6})
 
     assert result["ok"] is True
@@ -373,10 +372,7 @@ async def test_get_entity_info_common_envelope_user() -> None:
     photos.photos = []
     client.side_effect = [common, photos]
     server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
-    with (
-        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
-    ):
+    with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 3})
     assert r["ok"] is True
     d = _dict(r["data"])
@@ -412,10 +408,7 @@ async def test_get_entity_info_user_field_surface_preserved() -> None:
     photos.photos = []
     client.side_effect = [common, photos]
     server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
-    with (
-        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
-    ):
+    with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 4})
     d = _dict(r["data"])
     # Every field the prior user-info data dict carried — see daemon_api.py history.
@@ -503,10 +496,7 @@ async def test_get_entity_info_user_personal_channel_card_from_full_user_chats()
         ),
     )
 
-    with (
-        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
-    ):
+    with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 44})
 
     d = _dict(r["data"])
@@ -600,10 +590,7 @@ async def test_get_entity_info_user_partial_personal_channel_skips_local_enrichm
     client.side_effect = [common, photos]
     server = make_server(conn=conn, client=client, user_profile_port=_user_profile_port(user, full))
 
-    with (
-        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
-    ):
+    with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 45})
 
     d = _dict(r["data"])
@@ -643,10 +630,7 @@ async def test_get_entity_info_no_download_keys_user() -> None:
     photos.photos = [photo]
     client.side_effect = [common, photos]
     server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
-    with (
-        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
-    ):
+    with patch.object(server, "_ready", True):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 5})
 
     def _walk_keys(o: object):
