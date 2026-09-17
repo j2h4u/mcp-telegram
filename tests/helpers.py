@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import TypedDict, Unpack
 
 from mcp_telegram.entity_profile.contracts import (
+    ChannelContactOverlapObservation,
+    ChannelProfileObservation,
+    ChannelReference,
     GroupProfileObservation,
     PersonalChannelPost,
     PersonalChannelReference,
@@ -102,6 +106,47 @@ class LoudGroupProfilePort:
 
     async def fetch_group_profile(self, group_id: int) -> GroupProfileObservation:
         raise AssertionError(f"unexpected group profile request for {group_id}")
+
+
+class LoudChannelProfilePort:
+    """Test-only port that fails if a channel composition unexpectedly calls it."""
+
+    def get_channel_reference(self, channel_id: int) -> ChannelReference | None:
+        raise AssertionError(f"unexpected channel reference request for {channel_id}")
+
+    async def fetch_channel_profile(self, reference: ChannelReference) -> ChannelProfileObservation:
+        raise AssertionError(f"unexpected channel profile request for {reference.channel_id}")
+
+    async def fetch_channel_contact_overlap(self, reference: ChannelReference) -> ChannelContactOverlapObservation:
+        raise AssertionError(f"unexpected channel contact overlap request for {reference.channel_id}")
+
+
+class FakeChannelProfilePort:
+    """Deterministic channel profile port double with independent call accounting."""
+
+    def __init__(
+        self,
+        profile: ChannelProfileObservation,
+        overlap: ChannelContactOverlapObservation,
+    ) -> None:
+        self.profile = profile
+        self.overlap = overlap
+        self.profile_calls: list[int] = []
+        self.overlap_calls: list[int] = []
+        self.references: list[ChannelReference] = []
+
+    def get_channel_reference(self, channel_id: int) -> ChannelReference | None:
+        canonical_id = channel_id if channel_id <= -1_000_000_000_001 else -1_000_000_000_000 - abs(channel_id)
+        return ChannelReference(channel_id=canonical_id, access_hash=0)
+
+    async def fetch_channel_profile(self, reference: ChannelReference) -> ChannelProfileObservation:
+        self.references.append(reference)
+        self.profile_calls.append(reference.channel_id)
+        return replace(self.profile, channel_id=reference.channel_id)
+
+    async def fetch_channel_contact_overlap(self, reference: ChannelReference) -> ChannelContactOverlapObservation:
+        self.overlap_calls.append(reference.channel_id)
+        return replace(self.overlap, channel_id=reference.channel_id)
 
 
 class LoudUserProfilePort:

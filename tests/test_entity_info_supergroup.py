@@ -17,8 +17,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
+from mcp_telegram.entity_profile.contracts import (
+    ChannelContactOverlapObservation,
+    ChannelProfileObservation,
+    ProjectionStatus,
+)
+from mcp_telegram.entity_profile.ports import ChannelProfilePort
 from tests.daemon_api_policy import make_daemon_api_policy
-from tests.helpers import LoudGroupProfilePort, LoudUserProfilePort
+from tests.helpers import FakeChannelProfilePort, LoudGroupProfilePort, LoudUserProfilePort
 from tests.reaction_helpers import make_reaction_freshener
 
 _TEST_DBS: list[sqlite3.Connection] = []
@@ -87,7 +93,12 @@ def _make_db() -> sqlite3.Connection:
     return conn
 
 
-def make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike | None = None) -> DaemonAPIServer:
+def make_server(
+    conn: sqlite3.Connection | None = None,
+    client: DaemonClientLike | None = None,
+    *,
+    channel_profile_port: ChannelProfilePort,
+) -> DaemonAPIServer:
     if conn is None:
         conn = _make_db()
     if client is None:
@@ -98,6 +109,7 @@ def make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike
         cast(DaemonClientLike, client),
         shutdown_event,
         reaction_freshener=make_reaction_freshener(conn, client),
+        channel_profile_port=channel_profile_port,
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
         policy=make_daemon_api_policy(),
@@ -113,6 +125,8 @@ def _supergroup(id_: int = -1001, **kwargs: object) -> MagicMock:
     c.id = id_
     c.title = kwargs.get("title", "Test Supergroup")
     c.username = kwargs.get("username", "test_super")
+    c.access_hash = 0
+    c.min = False
     c.megagroup = True
     c.broadcast = False
     c.forum = kwargs.get("forum", False)
@@ -144,6 +158,47 @@ def _empty_search():
     return MagicMock(count=0, messages=[])
 
 
+def _channel_port(
+    channel_id: int,
+    full: object,
+    *,
+    contact_ids: tuple[int, ...] = (),
+    overlap_status: ProjectionStatus = ProjectionStatus.PARTIAL,
+    overlap_reason: str = "bounded_contacts_page",
+) -> FakeChannelProfilePort:
+    full_chat = getattr(full, "full_chat", full)
+    raw_link = getattr(full_chat, "linked_chat_id", None)
+    linked_id = None
+    if isinstance(raw_link, int) and raw_link > 0:
+        # Keep the test port neutral while matching Telethon's canonical peer id.
+        linked_id = -1_000_000_000_000 - raw_link
+    raw_pinned = getattr(full_chat, "pinned_msg_id", None)
+    pinned_id = raw_pinned if isinstance(raw_pinned, int) and not isinstance(raw_pinned, bool) else None
+    raw_slow_mode = getattr(full_chat, "slowmode_seconds", None)
+    slow_mode = raw_slow_mode if isinstance(raw_slow_mode, int) and not isinstance(raw_slow_mode, bool) else None
+    profile = ChannelProfileObservation(
+        channel_id=channel_id,
+        about=getattr(full_chat, "about", None),
+        participants_count=getattr(full_chat, "participants_count", None),
+        linked_chat_id=linked_id,
+        pinned_msg_id=pinned_id,
+        slow_mode_seconds=slow_mode,
+        available_reactions={"kind": "none", "emojis": []},
+        current_photo=None,
+        observation_started_at=100,
+        observation_completed_at=100,
+    )
+    overlap = ChannelContactOverlapObservation(
+        channel_id=channel_id,
+        contact_ids=contact_ids if overlap_status is not ProjectionStatus.UNAVAILABLE else None,
+        status=overlap_status,
+        reason=overlap_reason,
+        observation_started_at=100,
+        observation_completed_at=100,
+    )
+    return FakeChannelProfilePort(profile, overlap)
+
+
 @pytest.mark.asyncio
 async def test_get_entity_info_supergroup_type() -> None:
     """SPEC Req 2: megagroup returns type='supergroup'."""
@@ -151,14 +206,10 @@ async def test_get_entity_info_supergroup_type() -> None:
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=sg)
 
-    async def empty_iter(*args: object, **kwargs: object):
-        if False:
-            yield None  # make this a generator
-
-    client.iter_participants = MagicMock(side_effect=empty_iter)
-    client.side_effect = [_full_supergroup(), _empty_search()]
-    server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    full = _full_supergroup()
+    client.side_effect = [_empty_search()]
+    server = make_server(client=client, channel_profile_port=_channel_port(-1001, full))
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001})
     assert r["ok"] is True, r
     assert _dict(r["data"])["type"] == "supergroup"
@@ -171,17 +222,10 @@ async def test_get_entity_info_supergroup_field_surface() -> None:
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=sg)
 
-    async def empty_iter(*args: object, **kwargs: object):
-        if False:
-            yield None
-
-    client.iter_participants = MagicMock(side_effect=empty_iter)
-    client.side_effect = [
-        _full_supergroup(participants_count=42, slowmode_seconds=60, linked_chat_id=200500),
-        _empty_search(),
-    ]
-    server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    full = _full_supergroup(participants_count=42, slowmode_seconds=60, linked_chat_id=200500)
+    client.side_effect = [_empty_search()]
+    server = make_server(client=client, channel_profile_port=_channel_port(-1002, full))
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1002})
     d = _dict(r["data"])
     for key in (
@@ -195,18 +239,7 @@ async def test_get_entity_info_supergroup_field_surface() -> None:
         assert key in d, f"missing supergroup key: {key}"
     assert d["members_count"] == 42
     assert d["slow_mode_seconds"] == 60
-    # linked_chat_id 200500 → peer-id form via telethon_utils.get_peer_id(PeerChannel(200500)).
-    # MEDIUM from 47-REVIEWS.md cycle 2 (codex): the prior test asserted
-    # `-100200500` (the brittle `int(f"-100{raw}")` string-concat result),
-    # which is WRONG under the canonical Telethon helper — the helper
-    # returns -1000000200500 (channel ids are zero-padded to a fixed width
-    # in peer-id form). The assertion is updated to derive the expected
-    # value from the same helper the production code uses, so the test
-    # is robust to any future Telethon peer-id encoding tweaks.
-    from telethon import utils as telethon_utils
-    from telethon.tl.types import PeerChannel
-
-    assert d["linked_broadcast_id"] == int(telethon_utils.get_peer_id(PeerChannel(200500)))
+    assert d["linked_broadcast_id"] == -1_000_000_200_500
     assert d["has_topics"] is False
 
 
@@ -217,14 +250,10 @@ async def test_get_entity_info_forum_supergroup_has_topics() -> None:
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=sg)
 
-    async def empty_iter(*args: object, **kwargs: object):
-        if False:
-            yield None
-
-    client.iter_participants = MagicMock(side_effect=empty_iter)
-    client.side_effect = [_full_supergroup(), _empty_search()]
-    server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    full = _full_supergroup()
+    client.side_effect = [_empty_search()]
+    server = make_server(client=client, channel_profile_port=_channel_port(-1003, full))
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1003})
     assert r["ok"] is True
     assert _dict(r["data"])["type"] == "supergroup"
@@ -233,7 +262,7 @@ async def test_get_entity_info_forum_supergroup_has_topics() -> None:
 
 @pytest.mark.asyncio
 async def test_get_entity_info_supergroup_small_enumerates_dm_intersection() -> None:
-    """SPEC Req 9 + CONTEXT D-14: members_count<=1000 → intersect iter_participants with DM peers.
+    """SPEC Req 9: members_count<=1000 uses the bounded contacts page and intersects it with DM peers.
 
     Setup: 3 participants (ids 10, 20, 30); DM-peer set (synced_dialogs) has {10, 30, 999}.
     Expected: contacts_subscribed = entries for ids 10 and 30, partial=False.
@@ -251,21 +280,18 @@ async def test_get_entity_info_supergroup_small_enumerates_dm_intersection() -> 
 
     sg = _supergroup(id_=-1004, creator=True)  # creator → is_admin=True
 
-    async def iter_three(*args: object, **kwargs: object):
-        for pid in (10, 20, 30):
-            p = MagicMock()
-            p.id = pid
-            yield p
-
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=sg)
-    client.iter_participants = MagicMock(side_effect=iter_three)
-    client.side_effect = [_full_supergroup(participants_count=3), _empty_search()]
-    server = make_server(conn=conn, client=client)
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    full = _full_supergroup(participants_count=3)
+    client.side_effect = [_empty_search()]
+    server = make_server(
+        conn=conn, client=client, channel_profile_port=_channel_port(-1004, full, contact_ids=(10, 20, 30))
+    )
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1004})
     d = _dict(r["data"])
-    assert d["contacts_subscribed_partial"] is False
+    assert d["contacts_subscribed_partial"] is True
+    assert d["contacts_reason"] == "bounded_contacts_page"
     contacts = cast(list[dict[str, object]], d["contacts_subscribed"])
     ids = {entry["id"] for entry in contacts}
     assert ids == {10, 30}, f"expected {{10,30}}, got {ids}"
@@ -276,7 +302,7 @@ async def test_get_entity_info_supergroup_small_enumerates_dm_intersection() -> 
 
 @pytest.mark.asyncio
 async def test_get_entity_info_supergroup_large_uses_contact_filter() -> None:
-    """SPEC Req 9 + CONTEXT D-15: members_count>1000 → ChannelParticipantsContacts intersect; partial=True."""
+    """SPEC Req 9: members_count>1000 uses the same bounded contacts page; partial=True."""
     conn = _make_db()
     for did in (50, 60, 70):
         conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (did,))
@@ -289,31 +315,18 @@ async def test_get_entity_info_supergroup_large_uses_contact_filter() -> None:
     sg = _supergroup(id_=-1005, creator=True)
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=sg)
-    # iter_participants must NOT be called on the >1000 path; raise if it is.
-    client.iter_participants = MagicMock(
-        side_effect=AssertionError("iter_participants must not be called on the >1000 path")
+    full = _full_supergroup(participants_count=5000)
+    client.side_effect = [_empty_search()]
+    server = make_server(
+        conn=conn,
+        client=client,
+        channel_profile_port=_channel_port(-1005, full, contact_ids=(50, 60)),
     )
-    # Raw GetParticipantsRequest returns 2 contacts (50 and 60) — only 50/60 are in DM peers
-    gp_users = [MagicMock(), MagicMock()]
-    gp_users[0].id = 50
-    gp_users[1].id = 60
-    gp_result = MagicMock()
-    gp_result.users = gp_users
-    client.side_effect = [
-        _full_supergroup(participants_count=5000),
-        gp_result,  # GetParticipantsRequest call
-        _empty_search(),  # MessagesSearchRequest call (avatar history)
-    ]
-    server = make_server(conn=conn, client=client)
-    with (
-        patch("mcp_telegram.daemon_api.GetFullChannelRequest"),
-        patch("mcp_telegram.daemon_api.GetParticipantsRequest"),
-        patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
-    ):
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1005})
     d = _dict(r["data"])
     assert d["contacts_subscribed_partial"] is True
-    assert d["contacts_reason"] == "too_large"
+    assert d["contacts_reason"] == "bounded_contacts_page"
     contacts = cast(list[dict[str, object]], d["contacts_subscribed"])
     ids = {entry["id"] for entry in contacts}
     assert ids == {50, 60}
@@ -326,13 +339,10 @@ async def test_get_entity_info_supergroup_hidden_members_null() -> None:
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=sg)
 
-    async def must_not_iter(*args: object, **kwargs: object):
-        raise AssertionError("must not enumerate when hidden_members and non-admin")
-
-    client.iter_participants = MagicMock(side_effect=must_not_iter)
-    client.side_effect = [_full_supergroup(), _empty_search()]
-    server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    full = _full_supergroup()
+    client.side_effect = [_empty_search()]
+    server = make_server(client=client, channel_profile_port=_channel_port(-1006, full))
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1006})
     assert r["ok"]
     d = _dict(r["data"])
@@ -342,27 +352,28 @@ async def test_get_entity_info_supergroup_hidden_members_null() -> None:
 
 @pytest.mark.asyncio
 async def test_get_entity_info_supergroup_chat_admin_required_treated_as_hidden() -> None:
-    """HIGH-3 from 47-REVIEWS.md: when channel.hidden_members is absent/False
-    but the API still rejects enumeration with ChatAdminRequiredError, treat
-    the rejection as ground-truth hidden membership and return
+    """HIGH-3: when channel.hidden_members is absent/False but the bounded
+    contact page is unavailable, preserve the hidden-members result and return
     contacts_subscribed=null + reason='hidden_by_admin'.
     """
-    from telethon.errors import ChatAdminRequiredError
-
     # No explicit hidden_members attribute set (defaults to False in _supergroup),
-    # but iter_participants raises ChatAdminRequiredError — the ground-truth case.
+    # but the bounded contact page is unavailable — the ground-truth case.
     sg = _supergroup(id_=-1011, hidden_members=False, creator=False, admin_rights=None)
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=sg)
 
-    async def raise_admin_required(*args: object, **kwargs: object):
-        raise ChatAdminRequiredError(request=None)
-        yield None  # pragma: no cover — make this an async generator
-
-    client.iter_participants = MagicMock(side_effect=raise_admin_required)
-    client.side_effect = [_full_supergroup(participants_count=500), _empty_search()]
-    server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    full = _full_supergroup(participants_count=500)
+    client.side_effect = [_empty_search()]
+    server = make_server(
+        client=client,
+        channel_profile_port=_channel_port(
+            -1011,
+            full,
+            overlap_status=ProjectionStatus.UNAVAILABLE,
+            overlap_reason="not_an_admin",
+        ),
+    )
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1011})
     assert r["ok"]
     d = _dict(r["data"])
@@ -377,14 +388,10 @@ async def test_get_entity_info_no_download_keys_supergroup() -> None:
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=sg)
 
-    async def empty_iter(*args: object, **kwargs: object):
-        if False:
-            yield None
-
-    client.iter_participants = MagicMock(side_effect=empty_iter)
-    client.side_effect = [_full_supergroup(), _empty_search()]
-    server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    full = _full_supergroup()
+    client.side_effect = [_empty_search()]
+    server = make_server(client=client, channel_profile_port=_channel_port(-1007, full))
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1007})
 
     def _walk(o: object):

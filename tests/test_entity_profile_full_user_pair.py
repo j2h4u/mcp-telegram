@@ -28,7 +28,7 @@ from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, Refr
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
-from tests.helpers import LoudGroupProfilePort
+from tests.helpers import LoudChannelProfilePort, LoudGroupProfilePort
 
 
 def _fenced_schema(conn: sqlite3.Connection) -> None:
@@ -107,10 +107,6 @@ class _PairClient:
         del entity
         raise AssertionError(ids)
 
-    def iter_participants(self, peer: object, limit: int = 0) -> AsyncIterator[object]:
-        del peer
-        raise AssertionError(limit)
-
     def iter_dialogs(self) -> AsyncIterator[object]:
         raise AssertionError("dialog traversal is not part of this test")
 
@@ -138,17 +134,13 @@ def _pair_service(conn: sqlite3.Connection, client: _PairClient, *, enabled: boo
             get_common_chats_request=lambda **kwargs: ("common_chats", kwargs),
             get_user_photos_request=lambda **kwargs: ("photos", kwargs),
             get_messages_search_request=lambda **kwargs: ("search", kwargs),
-            get_full_channel_request=lambda **kwargs: ("full_channel", kwargs),
-            get_participants_request=lambda **kwargs: ("participants", kwargs),
-            channel_participants_contacts_request=lambda **kwargs: ("contacts", kwargs),
             input_messages_filter_chat_photos=object,
             message_action_chat_edit_photo=object,
-            chat_reactions_all=object,
-            chat_reactions_some=object,
-            chat_reactions_none=object,
             channel_type=object,
             chat_type=object,
             group_profile_port=LoudGroupProfilePort(),
+            channel_profile_port=LoudChannelProfilePort(),
+            channel_reference_provider=LoudChannelProfilePort(),
             user_profile_port=client,
             refresh_limits=RefreshLimits(),
             enable_full_user_pair=enabled,

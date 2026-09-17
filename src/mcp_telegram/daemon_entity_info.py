@@ -8,13 +8,12 @@ import asyncio
 import json
 import logging
 import sqlite3
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
 from typing import Protocol, cast, runtime_checkable
 
 from telethon.errors import (  # type: ignore[import-untyped]
-    ChatAdminRequiredError,
     ChatIdInvalidError,
     PeerIdInvalidError,
     RPCError,
@@ -22,11 +21,11 @@ from telethon.errors import (  # type: ignore[import-untyped]
     UsernameInvalidError,
     UsernameNotOccupiedError,
 )
-from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
 from .auth_scope import TelegramAuthScope
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .entity_profile.contracts import (
+    CHANNEL_ID_MARKER,
     FULL_PROFILE_OWNED_FIELDS,
     FULL_USER_ENDPOINT,
     GROUP_PROFILE_ENDPOINT,
@@ -34,7 +33,10 @@ from .entity_profile.contracts import (
     NORMALIZATION_VERSION,
     PERSONAL_CHANNEL_OWNED_FIELDS,
     PROFILE_SECTIONS,
-    GroupCurrentPhoto,
+    ChannelContactOverlapObservation,
+    ChannelProfileObservation,
+    ChannelReference,
+    ChatCurrentPhoto,
     GroupProfileObservation,
     PersonalChannelReference,
     ProfileAcquisitionEvidence,
@@ -43,7 +45,13 @@ from .entity_profile.contracts import (
     TargetKind,
     completeness,
 )
-from .entity_profile.ports import GroupProfilePort, ProfilePairObservationHook, UserProfilePort
+from .entity_profile.ports import (
+    ChannelProfilePort,
+    ChannelReferenceProvider,
+    GroupProfilePort,
+    ProfilePairObservationHook,
+    UserProfilePort,
+)
 from .entity_profile.refresh import (
     DurableRefreshSliceResult,
     DurableRefreshTerminal,
@@ -73,7 +81,6 @@ from .telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_sc
 from .telethon_dialog import classify_dialog_type
 
 _ENTITY_DETAIL_SCHEMA_VERSION = 1
-_MEMBERSHIP_THRESHOLD_LARGE = 1000
 _CHANNEL_DIALOG_ID_OFFSET = 1_000_000_000_000
 _PERSONAL_CHANNEL_PREVIEW_CHARS = 100
 _PAIR_SECTION_COUNT = 2
@@ -116,8 +123,6 @@ class _EntityInfoClient(Protocol):
 
     def __call__(self, request: object) -> Awaitable[object]: ...
 
-    def iter_participants(self, peer: object, limit: int = 0) -> AsyncIterator[object]: ...
-
 
 class _CommonChatsResult(Protocol):
     chats: Sequence[object]
@@ -126,10 +131,6 @@ class _CommonChatsResult(Protocol):
 class _UserPhotosResult(Protocol):
     count: int
     photos: Sequence[object]
-
-
-class _FullChannelResult(Protocol):
-    full_chat: object
 
 
 class _MessagesSearchResult(Protocol):
@@ -182,7 +183,7 @@ def _isoformat_or_none(value: object | None) -> str | None:
 
 def _current_chat_photo(
     full_chat: object,
-    current_photo: GroupCurrentPhoto | None,
+    current_photo: ChatCurrentPhoto | None,
 ) -> tuple[int | None, str | None]:
     if current_photo is not None:
         return current_photo.photo_id, current_photo.date
@@ -241,18 +242,14 @@ class EntityInfoDeps:
     get_common_chats_request: Callable[..., object]
     get_user_photos_request: Callable[..., object]
     get_messages_search_request: Callable[..., object]
-    get_full_channel_request: Callable[..., object]
-    get_participants_request: Callable[..., object]
-    channel_participants_contacts_request: Callable[..., object]
     input_messages_filter_chat_photos: type[object]
     message_action_chat_edit_photo: type[object]
-    chat_reactions_all: type[object]
-    chat_reactions_some: type[object]
-    chat_reactions_none: type[object]
     channel_type: type[object]
     chat_type: type[object]
     group_profile_port: GroupProfilePort
     user_profile_port: UserProfilePort
+    channel_profile_port: ChannelProfilePort
+    channel_reference_provider: ChannelReferenceProvider
     get_dialog_placement: Callable[[int], dict[str, object]] | None = None
     refresh_limits: RefreshLimits = field(default_factory=RefreshLimits)
     enable_full_user_pair: bool = False
@@ -791,6 +788,7 @@ class DaemonEntityInfoService:
             DialogType.GROUP,
             full_profile,
             committed=committed,
+            actual_attempts=self._rpc_attempt_count() - context.attempt_start,
         )
         return DurableRefreshSliceResult(
             cursor.entity_id,
@@ -1013,7 +1011,13 @@ class DaemonEntityInfoService:
                 self._emit_pair_summary(summary)
             return committed
         committed = self._profiles.commit_section(cursor, result, now=now)
-        self._observe_profile_section_commit(cursor, entity_type, result, committed=committed)
+        self._observe_profile_section_commit(
+            cursor,
+            entity_type,
+            result,
+            committed=committed,
+            actual_attempts=actual_attempts,
+        )
         return committed
 
     async def _acquire_and_commit_full_user_pair(
@@ -1476,6 +1480,7 @@ class DaemonEntityInfoService:
         result: EntitySectionCommit,
         *,
         committed: bool,
+        actual_attempts: int,
     ) -> None:
         if cursor.next_section not in {"full_profile", "personal_channel"}:
             return
@@ -1484,7 +1489,7 @@ class DaemonEntityInfoService:
             mode="enabled" if self._deps.enable_full_user_pair else "disabled",
             eligible_pair=cursor.pair_eligible and entity_type in {DialogType.USER, DialogType.BOT},
             outcome="section_committed" if committed else "stale_writer_rejected",
-            actual_attempts=1,
+            actual_attempts=actual_attempts,
             full_profile_outcome=section_outcome if cursor.next_section == "full_profile" else None,
             personal_channel_outcome=section_outcome if cursor.next_section == "personal_channel" else None,
             stale_writer_rejected=not committed,
@@ -1812,24 +1817,30 @@ class DaemonEntityInfoService:
         return EntitySectionCommit(patch)
 
     async def _acquire_channel_full_profile(self, entity_id: int, entity_type: DialogType) -> EntitySectionCommit:
-        result = await self._deps.client(self._deps.get_full_channel_request(channel=entity_id))
-        full_chat = _attr(result, "full_chat", None)
-        if full_chat is None:
-            raise ValueError("full channel payload is missing")
+        port = self._deps.channel_profile_port
+        reference = self._deps.channel_reference_provider.get_channel_reference(entity_id)
+        if reference is None:
+            return EntitySectionCommit({}, status="unavailable", reason="channel_reference_unavailable")
+        observation = await port.fetch_channel_profile(reference)
+        if observation.channel_id != reference.channel_id:
+            raise ValueError("channel profile observation target does not match")
+        if observation.status is ProjectionStatus.UNAVAILABLE:
+            return EntitySectionCommit({}, status="unavailable", reason=observation.reason)
+        if observation.status is not ProjectionStatus.USABLE:
+            raise ValueError(observation.reason or "channel profile is unavailable")
         patch: dict[str, object] = {
-            "about": _opt_str_attr(full_chat, "about"),
-            "linked_chat_id": self._normalize_linked_chat_id(_opt_int_attr(full_chat, "linked_chat_id")),
-            "pinned_msg_id": _opt_int_attr(full_chat, "pinned_msg_id"),
-            "slow_mode_seconds": _opt_int_attr(full_chat, "slowmode_seconds"),
+            "about": observation.about,
+            "pinned_msg_id": observation.pinned_msg_id,
+            "slow_mode_seconds": observation.slow_mode_seconds,
         }
-        member_count = _opt_int_attr(full_chat, "participants_count")
+        member_count = observation.participants_count
         if entity_type is DialogType.CHANNEL:
             patch.update(
                 subscribers_count=member_count,
-                available_reactions=self._collect_reactions(_attr(full_chat, "available_reactions", None)),
+                available_reactions=dict(observation.available_reactions),
             )
         else:
-            patch.update(members_count=member_count, linked_broadcast_id=patch.pop("linked_chat_id"))
+            patch.update(members_count=member_count, linked_broadcast_id=observation.linked_chat_id)
         return EntitySectionCommit(patch)
 
     async def _acquire_group_full_chat_pair(
@@ -1968,7 +1979,7 @@ class DaemonEntityInfoService:
         if entity_type is DialogType.GROUP:
             return await self._acquire_group_contact_overlap(entity_id)
 
-        return await self._acquire_channel_contact_overlap(entity_id)
+        return await self._acquire_channel_contact_overlap(entity_id, entity_type)
 
     async def _acquire_group_contact_overlap(self, entity_id: int) -> EntitySectionCommit:
         observation = await self._deps.group_profile_port.fetch_group_profile(entity_id)
@@ -2004,25 +2015,45 @@ class DaemonEntityInfoService:
             evidence=evidence,
         )
 
-    async def _acquire_channel_contact_overlap(self, entity_id: int) -> EntitySectionCommit:
-        result = await self._deps.client(
-            self._deps.get_participants_request(
-                channel=entity_id,
-                filter=self._deps.channel_participants_contacts_request(q=""),
-                offset=0,
-                limit=200,
-                hash=0,
+    async def _acquire_channel_contact_overlap(
+        self,
+        entity_id: int,
+        entity_type: DialogType,
+    ) -> EntitySectionCommit:
+        port = self._deps.channel_profile_port
+        reference = self._deps.channel_reference_provider.get_channel_reference(entity_id)
+        if reference is None:
+            return EntitySectionCommit(
+                {
+                    "contacts_subscribed": None,
+                    "contacts_subscribed_partial": False,
+                    "contacts_reason": "channel_reference_unavailable",
+                },
+                status="unavailable",
+                reason="channel_reference_unavailable",
             )
-        )
-        contact_ids = {
-            user_id for user in _sequence_attr(result, "users") if (user_id := _opt_int_attr(user, "id")) is not None
-        }
-        contacts = self._enrich_contact_ids_with_names(contact_ids & self._deps.dm_peer_ids())
+        observation = await port.fetch_channel_contact_overlap(reference)
+        if observation.channel_id != reference.channel_id:
+            raise ValueError("channel contact overlap observation target does not match")
+        reason = observation.reason
+        if reason == "not_an_admin" and entity_type in {DialogType.SUPERGROUP, DialogType.FORUM}:
+            reason = "hidden_by_admin"
+        if observation.status is ProjectionStatus.UNAVAILABLE or observation.contact_ids is None:
+            return EntitySectionCommit(
+                {
+                    "contacts_subscribed": None,
+                    "contacts_subscribed_partial": False,
+                    "contacts_reason": reason,
+                },
+                status="unavailable",
+                reason=reason,
+            )
+        contacts = self._enrich_contact_ids_with_names(set(observation.contact_ids) & self._deps.dm_peer_ids())
         return EntitySectionCommit(
             {
                 "contacts_subscribed": contacts,
                 "contacts_subscribed_partial": True,
-                "contacts_reason": "bounded_contacts_page",
+                "contacts_reason": reason,
             },
             payload=contacts,
         )
@@ -2221,6 +2252,8 @@ class DaemonEntityInfoService:
             self._enqueue_section_refresh(entity_id, sections)
         result = dict(detail)
         result["id"] = entity_id
+        if result.get("type") == DialogType.CHANNEL.value:
+            result["linked_chat_id"] = self._read_canonical_linked_chat_id(entity_id)
         result["dialog_placement"] = result.get(
             "dialog_placement",
             self._deps.get_dialog_placement(entity_id)
@@ -2435,6 +2468,8 @@ class DaemonEntityInfoService:
                     )
                     return None
                 if detail.get("schema") == _ENTITY_DETAIL_SCHEMA_VERSION:
+                    if detail.get("type") == DialogType.CHANNEL.value:
+                        detail["linked_chat_id"] = self._read_canonical_linked_chat_id(entity_id)
                     return {"ok": True, "data": self._strip_envelope_schema(detail)}
         return None
 
@@ -2518,7 +2553,10 @@ class DaemonEntityInfoService:
                 ),
             )
             if full_fetch_ok:
-                payload_with_schema = {"schema": _ENTITY_DETAIL_SCHEMA_VERSION, **detail}
+                payload_with_schema = {
+                    "schema": _ENTITY_DETAIL_SCHEMA_VERSION,
+                    **{key: value for key, value in detail.items() if key != "linked_chat_id"},
+                }
                 self._deps.conn.execute(
                     "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
                     (entity_id, json.dumps(payload_with_schema), now),
@@ -3049,7 +3087,7 @@ class DaemonEntityInfoService:
         peer: object,
         full_chat: object,
         *,
-        current_photo: GroupCurrentPhoto | None = None,
+        current_photo: ChatCurrentPhoto | None = None,
     ) -> tuple[list[dict[str, object]], int]:
         """Avatar history via messages.Search(filter=ChatPhotos)."""
         peer_id = int(self._deps.get_peer_id(peer))
@@ -3115,7 +3153,7 @@ class DaemonEntityInfoService:
         avatar_count: int,
         *,
         full_chat: object,
-        current_photo: GroupCurrentPhoto | None = None,
+        current_photo: ChatCurrentPhoto | None = None,
         search_failed: bool,
     ) -> tuple[list[dict[str, object]], int]:
         current_photo_id, chat_photo_date = _current_chat_photo(full_chat, current_photo)
@@ -3133,64 +3171,70 @@ class DaemonEntityInfoService:
 
     async def _fetch_channel_detail(self, channel: object) -> dict[str, object]:
         channel_id = int(self._deps.get_peer_id(channel))
-        full_context = await self._collect_full_channel_context(channel, collect_reactions=True)
+        reference = self._channel_reference_from_entity(channel)
+        profile = await self._fetch_channel_profile_observation(reference)
         memberships = self._build_chat_membership(channel)
-        contacts_subscribed, contacts_subscribed_partial, contacts_reason = await self._collect_channel_contacts(
-            channel,
+        contacts_subscribed, contacts_subscribed_partial, contacts_reason = await self._fetch_channel_contacts(
+            reference,
             is_admin=cast(bool, memberships["is_admin"]),
-            subscribers_count=cast(int | None, full_context["subscribers_count"]),
         )
-        avatar_history, avatar_count = await self._search_chat_photo_history(channel, full_context["full_chat"])
+        avatar_history, avatar_count = await self._search_chat_photo_history(
+            channel,
+            None,
+            current_photo=profile.current_photo if profile is not None else None,
+        )
 
         return {
             "id": channel_id,
             "type": DialogType.CHANNEL.value,
             "name": _attr(channel, "title", None),
             "username": _attr(channel, "username", None),
-            "about": full_context["about"],
+            "about": profile.about if profile is not None else None,
             "my_membership": memberships,
             "avatar_history": avatar_history,
             "avatar_count": avatar_count,
-            "subscribers_count": full_context["subscribers_count"],
-            "linked_chat_id": full_context["linked_chat_id"],
-            "pinned_msg_id": full_context["pinned_msg_id"],
-            "slow_mode_seconds": full_context["slow_mode_seconds"],
-            "available_reactions": full_context["available_reactions"],
+            "subscribers_count": profile.participants_count if profile is not None else None,
+            "linked_chat_id": self._read_canonical_linked_chat_id(channel_id),
+            "pinned_msg_id": profile.pinned_msg_id if profile is not None else None,
+            "slow_mode_seconds": profile.slow_mode_seconds if profile is not None else None,
+            "available_reactions": dict(profile.available_reactions)
+            if profile is not None
+            else {"kind": "none", "emojis": []},
             "restrictions": self._collect_restrictions(channel),
             "contacts_subscribed": contacts_subscribed,
             "contacts_subscribed_partial": contacts_subscribed_partial,
             "contacts_reason": contacts_reason,
-            "_full_fetch_ok": full_context["full_channel_ok"],
+            "_full_fetch_ok": profile is not None,
         }
 
-    async def _collect_full_channel_context(self, channel: object, *, collect_reactions: bool) -> dict[str, object]:
-        context: dict[str, object] = {
-            "full_chat": None,
-            "subscribers_count": None,
-            "linked_chat_id": None,
-            "pinned_msg_id": None,
-            "slow_mode_seconds": None,
-            "about": None,
-            "available_reactions": {"kind": "none", "emojis": []},
-            "full_channel_ok": False,
-        }
+    def _channel_reference_from_entity(self, channel: object) -> ChannelReference | None:
+        if _attr(channel, "min", None) is True:
+            return None
+        channel_id = self._deps.get_peer_id(channel)
+        if not isinstance(channel_id, int) or isinstance(channel_id, bool):
+            return None
+        if -CHANNEL_ID_MARKER - 1 < channel_id < 0:
+            channel_id = -CHANNEL_ID_MARKER - abs(channel_id)
+        if channel_id >= -CHANNEL_ID_MARKER:
+            return None
+        access_hash = _attr(channel, "access_hash", None)
+        if not isinstance(access_hash, int) or isinstance(access_hash, bool):
+            return None
         try:
-            full_result = cast(
-                _FullChannelResult,
-                await self._deps.client(self._deps.get_full_channel_request(channel=channel)),
-            )
-            full_chat = full_result.full_chat
-            context["full_chat"] = full_chat
-            context["subscribers_count"] = _opt_int_attr(full_chat, "participants_count")
-            context["linked_chat_id"] = self._normalize_linked_chat_id(_opt_int_attr(full_chat, "linked_chat_id"))
-            context["pinned_msg_id"] = _opt_int_attr(full_chat, "pinned_msg_id")
-            context["slow_mode_seconds"] = _opt_int_attr(full_chat, "slowmode_seconds")
-            context["about"] = _opt_str_attr(full_chat, "about")
-            if collect_reactions:
-                context["available_reactions"] = self._collect_reactions(
-                    _attr(full_chat, "available_reactions", None),
-                )
-            context["full_channel_ok"] = True
+            return ChannelReference(channel_id=channel_id, access_hash=access_hash)
+        except ValueError:
+            return None
+
+    async def _fetch_channel_profile_observation(
+        self, reference: ChannelReference | None
+    ) -> ChannelProfileObservation | None:
+        if reference is None:
+            self._record_section_failure("full_profile", "channel_reference_unavailable")
+            return None
+        channel_id = reference.channel_id
+        port = self._deps.channel_profile_port
+        try:
+            observation = await port.fetch_channel_profile(reference)
         except TelegramRpcThrottled:
             raise
         except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
@@ -3198,32 +3242,42 @@ class DaemonEntityInfoService:
             self._record_section_failure("full_profile", type(exc).__name__.lower())
             self._deps.logger.warning(
                 "entity_info channel full_channel_failed channel_id=%r error=%s%s",
-                int(self._deps.get_peer_id(channel)),
+                channel_id,
                 exc,
                 self._deps.rid(),
                 exc_info=not isinstance(exc, TimeoutError),
             )
-        return context
-
-    def _collect_reactions(self, raw_reactions: object) -> dict[str, object]:
-        if isinstance(raw_reactions, self._deps.chat_reactions_all):
-            return {"kind": "all", "emojis": []}
-        if isinstance(raw_reactions, self._deps.chat_reactions_some):
-            emojis = [
-                _opt_str_attr(r, "emoticon")
-                for r in cast(Sequence[object], _attr(raw_reactions, "reactions", []) or [])
-            ]
-            return {"kind": "some", "emojis": [emoji for emoji in emojis if emoji]}
-        if isinstance(raw_reactions, self._deps.chat_reactions_none) or raw_reactions is None:
-            return {"kind": "none", "emojis": []}
-        return {"kind": "none", "emojis": []}
-
-    def _normalize_linked_chat_id(self, raw_linked_chat_id: int | None) -> int | None:
-        if raw_linked_chat_id is None:
             return None
-        if raw_linked_chat_id > 0:
-            return int(self._deps.get_peer_id(PeerChannel(raw_linked_chat_id)))
-        return int(raw_linked_chat_id)
+        if observation.channel_id != channel_id:
+            raise ValueError("channel profile observation target does not match")
+        if observation.status is ProjectionStatus.UNAVAILABLE:
+            reason = observation.reason or "channel_profile_unavailable"
+            self._record_section_failure("full_profile", reason)
+            self._deps.logger.warning(
+                "entity_info channel full_channel_unavailable channel_id=%r reason=%s%s",
+                channel_id,
+                reason,
+                self._deps.rid(),
+            )
+            return None
+        if observation.status is not ProjectionStatus.USABLE:
+            raise ValueError(observation.reason or "channel profile is unavailable")
+        return observation
+
+    def _read_canonical_linked_chat_id(self, channel_id: int) -> int | None:
+        try:
+            row = cast(
+                tuple[object, object] | None,
+                self._deps.conn.execute(
+                    "SELECT linked_chat_id, linked_chat_resolved_at FROM dialogs WHERE dialog_id=?",
+                    (channel_id,),
+                ).fetchone(),
+            )
+        except sqlite3.Error:
+            return None
+        if row is None or row[1] is None:
+            return None
+        return row[0] if isinstance(row[0], int) else None
 
     def _build_chat_membership(self, entity: object) -> dict[str, object]:
         is_creator = _bool_attr(entity, "creator")
@@ -3241,97 +3295,51 @@ class DaemonEntityInfoService:
             return None
         return {field: bool(_attr(admin_rights_obj, field, False)) for field in _ADMIN_RIGHT_FIELDS}
 
-    async def _collect_channel_contacts(
+    async def _fetch_channel_contacts(
         self,
-        channel: object,
+        reference: ChannelReference | None,
         *,
         is_admin: bool,
-        subscribers_count: int | None,
+        unavailable_reason: str = "not_an_admin",
     ) -> tuple[list[dict[str, object]] | None, bool, str | None]:
         if not is_admin:
-            return None, False, "not_an_admin"
-        if subscribers_count is None:
-            return None, False, "count_unavailable"
-        if subscribers_count > _MEMBERSHIP_THRESHOLD_LARGE:
-            return await self._collect_contacts_via_filter(
-                channel,
-                not_admin_reason="not_an_admin",
-                large_error_log="entity_info channel contacts_enumeration_failed channel_id=%r error=%s%s",
-            )
-        return await self._collect_contacts_via_participants(
-            channel,
-            not_admin_reason="not_an_admin",
-            small_error_log="entity_info channel contacts_enumeration_failed channel_id=%r error=%s%s",
-        )
+            return None, False, unavailable_reason
+        if reference is None:
+            return None, False, "channel_reference_unavailable"
+        channel_id = reference.channel_id
+        observation = await self._fetch_channel_contact_overlap_observation(reference)
+        if observation is None:
+            return None, False, "unavailable"
+        if observation.channel_id != channel_id:
+            raise ValueError("channel contact overlap observation target does not match")
+        if observation.status is ProjectionStatus.UNAVAILABLE or observation.contact_ids is None:
+            return None, False, self._channel_contact_unavailable_reason(observation.reason, unavailable_reason)
+        if observation.status is not ProjectionStatus.PARTIAL:
+            raise ValueError("channel contact overlap status is invalid")
+        contacts = self._enrich_contact_ids_with_names(set(observation.contact_ids) & self._deps.dm_peer_ids())
+        return contacts, True, observation.reason
 
-    async def _collect_contacts_via_participants(
-        self,
-        channel: object,
-        *,
-        not_admin_reason: str,
-        small_error_log: str,
-    ) -> tuple[list[dict[str, object]] | None, bool, str | None]:
+    async def _fetch_channel_contact_overlap_observation(
+        self, reference: ChannelReference
+    ) -> ChannelContactOverlapObservation | None:
         try:
-            participant_ids: set[int] = set()
-            async for p in self._deps.client.iter_participants(channel, limit=1000):
-                pid = _attr(p, "id", None)
-                if pid is not None:
-                    participant_ids.add(int(cast(int | str, pid)))
-            intersect_ids = participant_ids & self._deps.dm_peer_ids()
-            return self._enrich_contact_ids_with_names(intersect_ids), False, None
-        except ChatAdminRequiredError:
-            return None, False, not_admin_reason
+            return await self._deps.channel_profile_port.fetch_channel_contact_overlap(reference)
         except TelegramRpcThrottled:
             raise
-        except (TimeoutError, RPCError, TypeError, AttributeError, ValueError) as exc:
+        except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
             raise_if_flood_wait_error(exc)
             self._record_section_failure("contact_overlap", type(exc).__name__.lower())
             self._deps.logger.warning(
-                small_error_log,
-                int(cast(int, self._deps.get_peer_id(channel))),
+                "entity_info channel contacts_fetch_failed channel_id=%r error=%s%s",
+                reference.channel_id,
                 exc,
                 self._deps.rid(),
             )
-            return None, False, "enumeration_failed"
+            return None
 
-    async def _collect_contacts_via_filter(
-        self,
-        channel: object,
-        *,
-        not_admin_reason: str,
-        large_error_log: str,
-    ) -> tuple[list[dict[str, object]] | None, bool, str | None]:
-        try:
-            gp_result = await self._deps.client(
-                self._deps.get_participants_request(
-                    channel=channel,
-                    filter=self._deps.channel_participants_contacts_request(q=""),
-                    offset=0,
-                    limit=200,
-                    hash=0,
-                )
-            )
-            contact_ids = {
-                int(cast(int, _opt_int_attr(u, "id")))
-                for u in cast(Sequence[object], _attr(gp_result, "users", []) or [])
-                if _opt_int_attr(u, "id") is not None
-            }
-            intersect_ids = contact_ids & self._deps.dm_peer_ids()
-            return self._enrich_contact_ids_with_names(intersect_ids), True, "too_large"
-        except ChatAdminRequiredError:
-            return None, False, not_admin_reason
-        except TelegramRpcThrottled:
-            raise
-        except (TimeoutError, RPCError, TypeError, AttributeError, ValueError) as exc:
-            raise_if_flood_wait_error(exc)
-            self._record_section_failure("contact_overlap", type(exc).__name__.lower())
-            self._deps.logger.warning(
-                large_error_log,
-                int(self._deps.get_peer_id(channel)),
-                exc,
-                self._deps.rid(),
-            )
-            return None, False, "enumeration_failed"
+    @staticmethod
+    def _channel_contact_unavailable_reason(reason: str | None, fallback: str) -> str | None:
+        return fallback if reason == "not_an_admin" and fallback != "not_an_admin" else reason
 
     def _enrich_contact_ids_with_names(self, ids: set[int]) -> list[dict[str, object]]:
         if not ids:
@@ -3351,77 +3359,40 @@ class DaemonEntityInfoService:
 
     async def _fetch_supergroup_detail(self, channel: object) -> dict[str, object]:
         channel_id = int(self._deps.get_peer_id(channel))
-        full_context = await self._collect_full_channel_context(channel, collect_reactions=False)
+        reference = self._channel_reference_from_entity(channel)
+        profile = await self._fetch_channel_profile_observation(reference)
         memberships = self._build_chat_membership(channel)
         hidden_members = bool(_attr(channel, "hidden_members", False)) and not memberships["is_admin"]
-        contacts_subscribed, contacts_subscribed_partial, contacts_reason = await self._collect_supergroup_contacts(
-            channel,
-            is_admin=cast(bool, memberships["is_admin"]),
-            members_count=cast(int | None, full_context["subscribers_count"]),
-            hidden_members=hidden_members,
+        contacts_subscribed, contacts_subscribed_partial, contacts_reason = await self._fetch_channel_contacts(
+            reference,
+            is_admin=not hidden_members,
+            unavailable_reason="hidden_by_admin",
         )
-        avatar_history, avatar_count = await self._search_chat_photo_history(channel, full_context["full_chat"])
+        avatar_history, avatar_count = await self._search_chat_photo_history(
+            channel,
+            None,
+            current_photo=profile.current_photo if profile is not None else None,
+        )
 
         return {
             "id": channel_id,
             "type": DialogType.SUPERGROUP.value,
             "name": _attr(channel, "title", None),
             "username": _attr(channel, "username", None),
-            "about": full_context["about"],
+            "about": profile.about if profile is not None else None,
             "my_membership": memberships,
             "avatar_history": avatar_history,
             "avatar_count": avatar_count,
-            "members_count": full_context["subscribers_count"],
-            "linked_broadcast_id": full_context["linked_chat_id"],
-            "slow_mode_seconds": full_context["slow_mode_seconds"],
+            "members_count": profile.participants_count if profile is not None else None,
+            "linked_broadcast_id": profile.linked_chat_id if profile is not None else None,
+            "slow_mode_seconds": profile.slow_mode_seconds if profile is not None else None,
             "has_topics": bool(_attr(channel, "forum", False)),
             "restrictions": self._collect_restrictions(channel),
             "contacts_subscribed": contacts_subscribed,
             "contacts_subscribed_partial": contacts_subscribed_partial,
             "contacts_reason": contacts_reason,
-            "_full_fetch_ok": full_context["full_channel_ok"],
+            "_full_fetch_ok": profile is not None,
         }
-
-    async def _collect_supergroup_contacts(
-        self,
-        channel: object,
-        *,
-        is_admin: bool,
-        members_count: int | None,
-        hidden_members: bool,
-    ) -> tuple[list[dict[str, object]] | None, bool, str | None]:
-        if hidden_members:
-            return None, False, "hidden_by_admin"
-        if members_count is None:
-            return None, False, "count_unavailable"
-        if members_count > _MEMBERSHIP_THRESHOLD_LARGE:
-            return await self._collect_contacts_via_filter(
-                channel,
-                not_admin_reason="hidden_by_admin",
-                large_error_log="entity_info supergroup contacts_filter_failed channel_id=%r error=%s%s",
-            )
-        try:
-            participant_ids: set[int] = set()
-            async for participant in self._deps.client.iter_participants(channel, limit=1000):
-                pid = _attr(participant, "id", None)
-                if pid is not None:
-                    participant_ids.add(int(cast(int | str, pid)))
-            intersect_ids = participant_ids & self._deps.dm_peer_ids()
-            return self._enrich_contact_ids_with_names(intersect_ids), False, None
-        except ChatAdminRequiredError:
-            return None, False, "hidden_by_admin"
-        except TelegramRpcThrottled:
-            raise
-        except (TimeoutError, RPCError, TypeError, AttributeError, ValueError) as exc:
-            raise_if_flood_wait_error(exc)
-            self._record_section_failure("contact_overlap", type(exc).__name__.lower())
-            self._deps.logger.warning(
-                "entity_info supergroup iter_participants_failed channel_id=%r error=%s%s",
-                int(cast(int, self._deps.get_peer_id(channel))),
-                exc,
-                self._deps.rid(),
-            )
-            return None, False, "enumeration_failed"
 
     async def _fetch_group_profile_observation(self, chat_id: int) -> GroupProfileObservation | None:
         try:

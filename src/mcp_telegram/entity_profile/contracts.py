@@ -10,6 +10,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import cast
 
 PROFILE_SECTIONS: tuple[str, ...] = (
     "full_profile",
@@ -25,6 +26,11 @@ FULL_USER_ENDPOINT = "users.GetFullUser"
 NORMALIZATION_VERSION = "entity-profile-full-user-v1"
 GROUP_PROFILE_ENDPOINT = "messages.GetFullChat"
 GROUP_PROFILE_NORMALIZATION_VERSION = "entity-profile-group-full-chat-v1"
+CHANNEL_PROFILE_ENDPOINT = "channels.GetFullChannel"
+CHANNEL_PROFILE_NORMALIZATION_VERSION = "entity-profile-channel-full-v1"
+CHANNEL_CONTACT_OVERLAP_ENDPOINT = "channels.GetParticipants"
+CHANNEL_CONTACT_OVERLAP_NORMALIZATION_VERSION = "entity-profile-channel-contacts-v1"
+CHANNEL_ID_MARKER = 1_000_000_000_000
 
 
 class TargetKind(StrEnum):
@@ -41,6 +47,28 @@ class ProjectionStatus(StrEnum):
     PARTIAL = "partial"
     ABSENT = "absent"
     UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelReference:
+    """A canonical channel identity and its signed access hash."""
+
+    channel_id: int
+    access_hash: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.channel_id, int)
+            or isinstance(self.channel_id, bool)
+            or self.channel_id >= -CHANNEL_ID_MARKER
+        ):
+            raise ValueError("channel_id must be a canonical marked channel id")
+        if (
+            not isinstance(self.access_hash, int)
+            or isinstance(self.access_hash, bool)
+            or not -(2**63) <= self.access_hash <= 2**63 - 1
+        ):
+            raise ValueError("access_hash must be a signed 64-bit integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,8 +171,8 @@ class PersonalChannelPost:
 
 
 @dataclass(frozen=True, slots=True)
-class GroupCurrentPhoto:
-    """Transport-neutral primitives for the current group avatar."""
+class ChatCurrentPhoto:
+    """Transport-neutral primitives for a chat or channel's current avatar."""
 
     photo_id: int
     date: str | None = None
@@ -156,6 +184,60 @@ class GroupCurrentPhoto:
 
 
 @dataclass(frozen=True, slots=True)
+class ChannelProfileObservation:
+    """Normalized result of one ``channels.GetFullChannel`` observation."""
+
+    channel_id: int
+    about: str | None
+    participants_count: int | None
+    linked_chat_id: int | None
+    pinned_msg_id: int | None
+    slow_mode_seconds: int | None
+    available_reactions: Mapping[str, object]
+    current_photo: ChatCurrentPhoto | None
+    observation_started_at: float
+    observation_completed_at: float
+    status: ProjectionStatus = ProjectionStatus.USABLE
+    reason: str | None = None
+    endpoint: str = CHANNEL_PROFILE_ENDPOINT
+    normalization_version: str = CHANNEL_PROFILE_NORMALIZATION_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_nonzero_id(self.channel_id, field_name="channel_id")
+        _validate_optional_nonnegative(self.participants_count, field_name="participants_count")
+        _validate_optional_nonzero_id(self.linked_chat_id, field_name="linked_chat_id")
+        _validate_optional_nonnegative(self.pinned_msg_id, field_name="pinned_msg_id")
+        _validate_optional_nonnegative(self.slow_mode_seconds, field_name="slow_mode_seconds")
+        if not isinstance(self.available_reactions, Mapping):
+            raise TypeError("available_reactions must be a mapping")
+        status = _coerce_projection_status(self.status, error="channel profile status is invalid")
+        object.__setattr__(self, "status", status)
+        _validate_projection_reason(status, self.reason, usable_message="usable channel profile cannot have a reason")
+        _validate_observation_boundary(self.observation_started_at, self.observation_completed_at)
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelContactOverlapObservation:
+    """Bounded contact overlap from one contacts-filter page."""
+
+    channel_id: int
+    contact_ids: tuple[int, ...] | None
+    status: ProjectionStatus
+    reason: str | None
+    observation_started_at: float | None = None
+    observation_completed_at: float | None = None
+    endpoint: str = CHANNEL_CONTACT_OVERLAP_ENDPOINT
+    normalization_version: str = CHANNEL_CONTACT_OVERLAP_NORMALIZATION_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_nonzero_id(self.channel_id, field_name="channel_id")
+        status = _coerce_projection_status(self.status, error="channel contact overlap status is invalid")
+        object.__setattr__(self, "status", status)
+        _validate_contact_overlap(status, self.contact_ids, self.reason)
+        _validate_optional_observation_boundary(self.observation_started_at, self.observation_completed_at)
+
+
+@dataclass(frozen=True, slots=True)
 class GroupProfileObservation:
     """Normalized result of one legacy group profile observation."""
 
@@ -164,7 +246,7 @@ class GroupProfileObservation:
     invite_link: str | None
     participant_ids: tuple[int, ...] | None
     participants_unavailable_reason: str | None
-    current_photo: GroupCurrentPhoto | None
+    current_photo: ChatCurrentPhoto | None
     observation_started_at: int
     observation_completed_at: int
     endpoint: str = GROUP_PROFILE_ENDPOINT
@@ -180,6 +262,78 @@ class GroupProfileObservation:
 def _validate_positive_id(value: object, *, field_name: str) -> None:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ValueError(f"{field_name} must be a positive integer")
+
+
+def _validate_nonzero_id(value: object, *, field_name: str) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or value == 0:
+        raise ValueError(f"{field_name} must be a non-zero integer")
+
+
+def _validate_optional_nonzero_id(value: object, *, field_name: str) -> None:
+    if value is not None:
+        _validate_nonzero_id(value, field_name=field_name)
+
+
+def _validate_optional_nonnegative(value: object, *, field_name: str) -> None:
+    if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+        raise ValueError(f"{field_name} must be a non-negative integer or None")
+
+
+def _coerce_projection_status(value: object, *, error: str) -> ProjectionStatus:
+    try:
+        return ProjectionStatus(cast(str, value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(error) from exc
+
+
+def _validate_projection_reason(status: ProjectionStatus, reason: str | None, *, usable_message: str) -> None:
+    if status is ProjectionStatus.USABLE and reason is not None:
+        raise ValueError(usable_message)
+    if status is ProjectionStatus.UNAVAILABLE and not reason:
+        raise ValueError("unavailable channel profile requires a reason")
+
+
+def _validate_contact_overlap(
+    status: ProjectionStatus,
+    contact_ids: tuple[int, ...] | None,
+    reason: str | None,
+) -> None:
+    if status not in {ProjectionStatus.PARTIAL, ProjectionStatus.UNAVAILABLE}:
+        raise ValueError("channel contact overlap status must be partial or unavailable")
+    if contact_ids is None:
+        _validate_missing_contact_overlap(status, reason)
+        return
+    _validate_present_contact_overlap(status, contact_ids, reason)
+
+
+def _validate_missing_contact_overlap(status: ProjectionStatus, reason: str | None) -> None:
+    if status is not ProjectionStatus.UNAVAILABLE:
+        raise ValueError("partial contact overlap requires contact ids")
+    if not reason:
+        raise ValueError("unavailable contact overlap requires a reason")
+
+
+def _validate_present_contact_overlap(
+    status: ProjectionStatus,
+    contact_ids: tuple[int, ...],
+    reason: str | None,
+) -> None:
+    if not isinstance(contact_ids, tuple):
+        raise TypeError("contact_ids must be a tuple or None")
+    if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in contact_ids):
+        raise ValueError("contact_ids must contain positive integers")
+    if len(set(contact_ids)) != len(contact_ids):
+        raise ValueError("contact_ids must be deduplicated")
+    if status is not ProjectionStatus.PARTIAL or reason != "bounded_contacts_page":
+        raise ValueError("successful contact overlap must be partial for bounded_contacts_page")
+
+
+def _validate_optional_observation_boundary(started_at: float | None, completed_at: float | None) -> None:
+    if started_at is None and completed_at is None:
+        return
+    if started_at is None or completed_at is None:
+        raise ValueError("contact overlap timing must include both boundaries")
+    _validate_observation_boundary(started_at, completed_at)
 
 
 def _validate_participant_observation(ids: tuple[int, ...] | None, reason: str | None) -> None:
@@ -202,6 +356,15 @@ def _validate_observation_interval(started_at: int, completed_at: int) -> None:
         raise ValueError("observation_completed_at must be a non-negative integer")
     if completed_at < started_at:
         raise ValueError("observation interval is reversed")
+
+
+def _validate_observation_boundary(started_at: float, completed_at: float) -> None:
+    if not _finite_number(started_at) or not _finite_number(completed_at) or completed_at < started_at:
+        raise ValueError("observation timing is invalid")
+
+
+def _finite_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
 
 
 FULL_PROFILE_OWNED_FIELDS: tuple[str, ...] = (

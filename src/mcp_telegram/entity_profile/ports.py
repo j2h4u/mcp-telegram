@@ -5,6 +5,9 @@ from __future__ import annotations
 from typing import Protocol
 
 from .contracts import (
+    ChannelContactOverlapObservation,
+    ChannelProfileObservation,
+    ChannelReference,
     GroupProfileObservation,
     PersonalChannelPost,
     PersonalChannelReference,
@@ -13,10 +16,24 @@ from .contracts import (
 )
 
 
+class ChannelReferenceProvider(Protocol):
+    """Resolve one canonical channel through the local Telethon session cache."""
+
+    def get_channel_reference(self, channel_id: int) -> ChannelReference | None: ...
+
+
 class GroupProfilePort(Protocol):
     """Fetch one normalized legacy group profile observation."""
 
     async def fetch_group_profile(self, group_id: int) -> GroupProfileObservation: ...
+
+
+class ChannelProfilePort(ChannelReferenceProvider, Protocol):
+    """Fetch channel profile and bounded contact overlap independently."""
+
+    async def fetch_channel_profile(self, reference: ChannelReference) -> ChannelProfileObservation: ...
+
+    async def fetch_channel_contact_overlap(self, reference: ChannelReference) -> ChannelContactOverlapObservation: ...
 
 
 class UserProfilePort(Protocol):
@@ -53,4 +70,10 @@ class ProfilePairObservationHook(Protocol):
     ) -> None: ...
 
 
-__all__ = ["GroupProfilePort", "ProfilePairObservationHook", "UserProfilePort"]
+__all__ = [
+    "ChannelProfilePort",
+    "ChannelReferenceProvider",
+    "GroupProfilePort",
+    "ProfilePairObservationHook",
+    "UserProfilePort",
+]

@@ -1,38 +1,15 @@
 """RPC budget enforcement tests for GetEntityInfo (HIGH-C from 47-REVIEWS.md cycle 2).
 
-Asserts the SPEC Constraints ``**Rate-limit budget:**`` bound for the
-non-User paths:
-  - small-group enumeration path (members_count <= 1000): <= 9 MTProto requests
-  - above-threshold path (members_count > 1000):          <= 4 MTProto requests
-
-The cycle-2 review correction (opencode + codex consensus, 2026-04-25)
-raised the small-group bound from a wrongly-claimed <=6 to the realistic
-<=9, accounting for Telethon's iter_participants(limit=1000) pagination
-at the 200/page server-side default.
-
-Call sequence for the supergroup <=1000 path:
-  1. client.get_entity(entity_id)          — _get_entity_info orchestrator
-  2. client(GetFullChannelRequest)         — _fetch_supergroup_detail
-  3. client.iter_participants(...)         — _fetch_supergroup_detail D-14 branch
-     (ceil(1000/200) = 5 pages => 5 MTProto requests)
-  4. client(MessagesSearchRequest)        — _search_chat_photo_history
-
-Total: 1 + 1 + 5 + 1 = 8 RPCs (well within the <=9 bound).
-
-Call sequence for the supergroup >1000 path:
-  1. client.get_entity(entity_id)          — _get_entity_info orchestrator
-  2. client(GetFullChannelRequest)         — _fetch_supergroup_detail
-  3. client(GetParticipantsRequest)        — _fetch_supergroup_detail D-15 branch
-  4. client(MessagesSearchRequest)        — _search_chat_photo_history
-
-Total: 1 + 1 + 1 + 1 = 4 RPCs (exactly at the <=4 bound).
+Asserts the SPEC rate-limit bound for channel and supergroup paths. Each
+path performs one entity lookup, one channel profile observation, one bounded
+contact page, and one avatar-history search, for at most four RPCs.
 """
 
 from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -40,6 +17,13 @@ import pytest
 from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
+from mcp_telegram.entity_profile.contracts import (
+    ChannelContactOverlapObservation,
+    ChannelProfileObservation,
+    ChannelReference,
+    ProjectionStatus,
+)
+from mcp_telegram.entity_profile.ports import ChannelProfilePort
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import LoudGroupProfilePort, LoudUserProfilePort
 from tests.reaction_helpers import make_reaction_freshener
@@ -104,29 +88,26 @@ class _CountingClient:
     Captures:
     - ``await client.get_entity(...)``  counted via get_entity property
     - ``await client(<Request>)``       counted via __call__
-    - ``async for ... in client.iter_participants(...)``
-      counted as ceil(total_yields / 200) pages
-
-    ``total_rpc_count`` = call_count + iter_pages
+    ``total_rpc_count`` = entity_calls + call_count
     """
 
     def __init__(self) -> None:
+        self.entity_calls = 0
         self.get_entity = AsyncMock()
         self.call_count = 0
-        self.iter_pages = 0
         self._call_responses: list[object] = []
-        self._iter_participants_yields: list[int] = []
 
     # --- configuration helpers ---
 
     def set_entity(self, entity: object) -> None:
-        self.get_entity.return_value = entity
+        async def _get_entity(*_args: object, **_kwargs: object) -> object:
+            self.entity_calls += 1
+            return entity
+
+        self.get_entity.side_effect = _get_entity
 
     def set_call_responses(self, responses: list[object]) -> None:
         self._call_responses = list(responses)
-
-    def set_iter_participants(self, ids: list[int]) -> None:
-        self._iter_participants_yields = list(ids)
 
     # --- protocol ---
 
@@ -139,22 +120,46 @@ class _CountingClient:
             )
         return self._call_responses.pop(0)
 
-    def iter_participants(self, *args: object, **kwargs: object) -> AsyncIterator[object]:
-        """Return an async generator; count pages as ceil(yields / 200)."""
-        ids = self._iter_participants_yields
-        self.iter_pages = (len(ids) + 199) // 200 if ids else 0
-
-        async def _iter():
-            for pid in ids:
-                p = MagicMock()
-                p.id = pid
-                yield p
-
-        return _iter()
-
     @property
     def total_rpc_count(self) -> int:
-        return self.call_count + self.iter_pages
+        return self.entity_calls + self.call_count
+
+
+class _CountingChannelProfilePort:
+    def __init__(self, channel_id: int, members: int) -> None:
+        self.rpc_count = 0
+        self.profile = ChannelProfileObservation(
+            channel_id=channel_id,
+            about=None,
+            participants_count=members,
+            linked_chat_id=None,
+            pinned_msg_id=None,
+            slow_mode_seconds=None,
+            available_reactions={"kind": "none", "emojis": []},
+            current_photo=None,
+            observation_started_at=100,
+            observation_completed_at=100,
+        )
+        self.overlap = ChannelContactOverlapObservation(
+            channel_id=channel_id,
+            contact_ids=(),
+            status=ProjectionStatus.PARTIAL,
+            reason="bounded_contacts_page",
+            observation_started_at=100,
+            observation_completed_at=100,
+        )
+
+    def get_channel_reference(self, channel_id: int) -> ChannelReference | None:
+        canonical_id = channel_id if channel_id <= -1_000_000_000_001 else -1_000_000_000_000 - abs(channel_id)
+        return ChannelReference(canonical_id, 0)
+
+    async def fetch_channel_profile(self, reference: ChannelReference) -> ChannelProfileObservation:
+        self.rpc_count += 1
+        return replace(self.profile, channel_id=reference.channel_id)
+
+    async def fetch_channel_contact_overlap(self, reference: ChannelReference) -> ChannelContactOverlapObservation:
+        self.rpc_count += 1
+        return replace(self.overlap, channel_id=reference.channel_id)
 
 
 def _make_supergroup_mock(*, id_: int, members: int, is_admin: bool = True) -> MagicMock:
@@ -162,6 +167,8 @@ def _make_supergroup_mock(*, id_: int, members: int, is_admin: bool = True) -> M
     ch.id = id_
     ch.title = "RPC budget test group"
     ch.username = None
+    ch.access_hash = 0
+    ch.min = False
     ch.megagroup = True
     ch.broadcast = False
     ch.forum = False
@@ -179,6 +186,8 @@ def _make_channel_mock(*, id_: int, members: int, is_admin: bool = True) -> Magi
     ch.id = id_
     ch.title = "RPC budget test channel"
     ch.username = None
+    ch.access_hash = 0
+    ch.min = False
     ch.megagroup = False
     ch.broadcast = True
     ch.forum = False
@@ -191,25 +200,6 @@ def _make_channel_mock(*, id_: int, members: int, is_admin: bool = True) -> Magi
     return ch
 
 
-def _full_chat_mock(*, participants_count: int) -> MagicMock:
-    """Return a GetFullChannelRequest result mock with all fields set to concrete values.
-
-    Using explicit None/int assignments prevents MagicMock from auto-creating
-    attributes that json.dumps would refuse to serialize.
-    """
-    full = MagicMock()
-    fc = MagicMock()
-    fc.participants_count = participants_count
-    fc.linked_chat_id = None
-    fc.pinned_msg_id = None
-    fc.slowmode_seconds = None
-    fc.about = None
-    fc.chat_photo = None
-    fc.available_reactions = None  # triggers the ChatReactionsNone branch
-    full.full_chat = fc
-    return full
-
-
 def _empty_search() -> MagicMock:
     s = MagicMock()
     s.count = 0
@@ -217,7 +207,12 @@ def _empty_search() -> MagicMock:
     return s
 
 
-def _make_server(conn: sqlite3.Connection | None = None, client: object | None = None) -> DaemonAPIServer:
+def _make_server(
+    conn: sqlite3.Connection | None = None,
+    client: object | None = None,
+    *,
+    channel_profile_port: ChannelProfilePort,
+) -> DaemonAPIServer:
     if conn is None:
         conn = _make_db()
     if client is None:
@@ -228,6 +223,7 @@ def _make_server(conn: sqlite3.Connection | None = None, client: object | None =
         cast(DaemonClientLike, client),
         shutdown_event,
         reaction_freshener=make_reaction_freshener(conn, client),
+        channel_profile_port=channel_profile_port,
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
         policy=make_daemon_api_policy(),
@@ -243,8 +239,8 @@ async def test_get_entity_info_supergroup_small_rpc_count_le_9() -> None:
 
     Composition:
       1  get_entity
-      1  GetFullChannelRequest
-      5  channels.GetParticipants pages  (iter_participants(limit=1000) at 200/page)
+      1  channels.GetFullChannel
+      1  channels.GetParticipants (bounded contacts page)
       1  messages.Search(ChatPhotos)
     ---
       8  total  (well within the <=9 SPEC bound)
@@ -253,41 +249,29 @@ async def test_get_entity_info_supergroup_small_rpc_count_le_9() -> None:
     sg = _make_supergroup_mock(id_=-1001000000001, members=1000, is_admin=True)
     client.set_entity(sg)
 
-    # __call__ sequence: GetFullChannelRequest -> MessagesSearchRequest
-    full = _full_chat_mock(participants_count=1000)
-    client.set_call_responses([full, _empty_search()])
+    # The profile port owns one profile RPC and one bounded contact-page RPC.
+    client.set_call_responses([_empty_search()])
+    channel_profile_port = _CountingChannelProfilePort(-1001000000001, 1000)
 
-    # iter_participants yields 1000 participants => 5 pages at 200/page.
-    client.set_iter_participants(list(range(1, 1001)))
-
-    with (
-        patch("mcp_telegram.daemon_api.GetFullChannelRequest"),
-        patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
-        patch("mcp_telegram.daemon_api.InputMessagesFilterChatPhotos"),
-    ):
-        server = _make_server(client=client)
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+        server = _make_server(client=client, channel_profile_port=channel_profile_port)
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001000000001})
 
     assert r["ok"] is True, f"expected ok=True, got {r!r}"
-    assert client.total_rpc_count <= 9, (
-        f"HIGH-C budget violation: small-group path made {client.total_rpc_count} RPCs "
-        f"(call_count={client.call_count}, iter_pages={client.iter_pages}); "
-        "SPEC bound is <=9."
-    )
-    # iter_participants MUST have been called on the <=1000 path.
-    assert client.iter_pages > 0, f"small-group path must call iter_participants (got iter_pages={client.iter_pages})"
+    total = client.total_rpc_count + channel_profile_port.rpc_count
+    assert total <= 4, f"bounded channel profile path made {total} RPCs"
+    assert channel_profile_port.rpc_count == 2
 
 
 @pytest.mark.asyncio
 async def test_get_entity_info_supergroup_large_rpc_count_le_4() -> None:
-    """HIGH-C from 47-REVIEWS.md cycle 2: above-threshold path for a
-    50000-member supergroup must NOT exceed 4 MTProto RPCs total and
-    must NOT call iter_participants.
+    """HIGH-C: a 50000-member supergroup must stay within the bounded
+    four-RPC composition.
 
     Composition:
       1  get_entity
-      1  GetFullChannelRequest
-      1  GetParticipants(filter=ChannelParticipantsContacts)
+      1  channels.GetFullChannel
+      1  channels.GetParticipants (bounded contacts page)
       1  messages.Search(ChatPhotos)
     ---
       4  total (exactly at the <=4 SPEC bound)
@@ -296,34 +280,17 @@ async def test_get_entity_info_supergroup_large_rpc_count_le_4() -> None:
     sg = _make_supergroup_mock(id_=-1001000000002, members=50000, is_admin=True)
     client.set_entity(sg)
 
-    # __call__ sequence: GetFullChannelRequest -> GetParticipantsRequest -> MessagesSearchRequest
-    full = _full_chat_mock(participants_count=50000)
-    gp_result = MagicMock()
-    gp_result.users = []
-    client.set_call_responses([full, gp_result, _empty_search()])
+    client.set_call_responses([_empty_search()])
+    channel_profile_port = _CountingChannelProfilePort(-1001000000002, 50000)
 
-    # iter_participants must NOT be invoked on the >1000 path.
-    client.set_iter_participants([])
-
-    with (
-        patch("mcp_telegram.daemon_api.GetFullChannelRequest"),
-        patch("mcp_telegram.daemon_api.GetParticipantsRequest"),
-        patch("mcp_telegram.daemon_api.ChannelParticipantsContacts"),
-        patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
-        patch("mcp_telegram.daemon_api.InputMessagesFilterChatPhotos"),
-    ):
-        server = _make_server(client=client)
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+        server = _make_server(client=client, channel_profile_port=channel_profile_port)
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001000000002})
 
     assert r["ok"] is True, f"expected ok=True, got {r!r}"
-    assert client.iter_pages == 0, (
-        f"HIGH-C: iter_participants must not run on the >1000 path (observed iter_pages={client.iter_pages})"
-    )
-    assert client.total_rpc_count <= 4, (
-        f"HIGH-C budget violation: above-threshold path made {client.total_rpc_count} RPCs "
-        f"(call_count={client.call_count}, iter_pages={client.iter_pages}); "
-        "SPEC bound is <=4."
-    )
+    total = client.total_rpc_count + channel_profile_port.rpc_count
+    assert total <= 4, f"bounded channel profile path made {total} RPCs"
+    assert channel_profile_port.rpc_count == 2
 
 
 @pytest.mark.asyncio
@@ -334,8 +301,8 @@ async def test_get_entity_info_broadcast_channel_small_rpc_count_le_9() -> None:
 
     Composition mirrors the supergroup <=1000 path:
       1  get_entity
-      1  GetFullChannelRequest
-      5  channels.GetParticipants pages  (iter_participants at 200/page)
+      1  channels.GetFullChannel
+      1  channels.GetParticipants (bounded contacts page)
       1  messages.Search(ChatPhotos)
     ---
       8  total (within <=9)
@@ -344,19 +311,14 @@ async def test_get_entity_info_broadcast_channel_small_rpc_count_le_9() -> None:
     ch = _make_channel_mock(id_=-1009999999999, members=1000, is_admin=True)
     client.set_entity(ch)
 
-    full = _full_chat_mock(participants_count=1000)
-    client.set_call_responses([full, _empty_search()])
-    client.set_iter_participants(list(range(1, 1001)))
+    client.set_call_responses([_empty_search()])
+    channel_profile_port = _CountingChannelProfilePort(-1009999999999, 1000)
 
-    with (
-        patch("mcp_telegram.daemon_api.GetFullChannelRequest"),
-        patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
-        patch("mcp_telegram.daemon_api.InputMessagesFilterChatPhotos"),
-    ):
-        server = _make_server(client=client)
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+        server = _make_server(client=client, channel_profile_port=channel_profile_port)
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1009999999999})
 
     assert r["ok"] is True, f"expected ok=True, got {r!r}"
-    assert client.total_rpc_count <= 9, (
-        f"HIGH-C: broadcast Channel admin small-group path made {client.total_rpc_count} RPCs; SPEC bound is <=9."
-    )
+    total = client.total_rpc_count + channel_profile_port.rpc_count
+    assert total <= 4, f"bounded channel profile path made {total} RPCs"
+    assert channel_profile_port.rpc_count == 2

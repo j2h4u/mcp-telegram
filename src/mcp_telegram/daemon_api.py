@@ -50,10 +50,6 @@ from typing import TYPE_CHECKING, Protocol, SupportsIndex, cast
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 from telethon.errors import RPCError  # type: ignore[import-untyped]
-from telethon.tl.functions.channels import (
-    GetFullChannelRequest,  # type: ignore[import-untyped]
-    GetParticipantsRequest,  # type: ignore[import-untyped]
-)
 from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
     GetCommonChatsRequest,
 )
@@ -61,11 +57,7 @@ from telethon.tl.functions.messages import SearchRequest as MessagesSearchReques
 from telethon.tl.functions.photos import GetUserPhotosRequest  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     Channel,
-    ChannelParticipantsContacts,
     Chat,
-    ChatReactionsAll,
-    ChatReactionsNone,
-    ChatReactionsSome,
     InputMessagesFilterChatPhotos,
     MessageActionChatEditPhoto,
 )
@@ -87,7 +79,13 @@ from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import recover_invalid_generation_in_transaction
 from .dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
-from .entity_profile.ports import GroupProfilePort, ProfilePairObservationHook, UserProfilePort
+from .entity_profile.ports import (
+    ChannelProfilePort,
+    ChannelReferenceProvider,
+    GroupProfilePort,
+    ProfilePairObservationHook,
+    UserProfilePort,
+)
 from .entity_profile.refresh import RefreshLimits
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
@@ -352,8 +350,6 @@ class DaemonClientLike(Protocol):
 
     async def get_messages(self, entity: object, ids: list[int]) -> object: ...
 
-    def iter_participants(self, peer: object, limit: int = 0) -> AsyncIterator[object]: ...
-
     def iter_messages(self, dialog_id: int, **kwargs: object) -> AsyncIterator[object]: ...
 
     async def __call__(self, request: object) -> object: ...
@@ -605,6 +601,7 @@ class DaemonAPIServer:
         folder_projection_reproject: Callable[[], object] | None = None,
         group_profile_port: GroupProfilePort,
         user_profile_port: UserProfilePort,
+        channel_profile_port: ChannelProfilePort,
         policy: DaemonApiPolicy,
         health_status: Callable[[], DaemonHealthStatus] = _healthy_daemon_status,
     ) -> None:
@@ -631,6 +628,7 @@ class DaemonAPIServer:
         self._folder_projection_reproject = folder_projection_reproject
         self._group_profile_port = group_profile_port
         self._user_profile_port = user_profile_port
+        self._channel_profile_port = channel_profile_port
         self._hydration_requester = hydration_requester
         self._policy = policy
         self._health_status = health_status
@@ -1821,16 +1819,12 @@ class DaemonAPIServer:
                     get_common_chats_request=GetCommonChatsRequest,
                     get_user_photos_request=GetUserPhotosRequest,
                     get_messages_search_request=MessagesSearchRequest,
-                    get_full_channel_request=GetFullChannelRequest,
-                    get_participants_request=GetParticipantsRequest,
-                    channel_participants_contacts_request=ChannelParticipantsContacts,
                     group_profile_port=self._group_profile_port,
                     user_profile_port=self._user_profile_port,
+                    channel_profile_port=self._channel_profile_port,
+                    channel_reference_provider=cast(ChannelReferenceProvider, self._channel_profile_port),
                     input_messages_filter_chat_photos=InputMessagesFilterChatPhotos,
                     message_action_chat_edit_photo=MessageActionChatEditPhoto,
-                    chat_reactions_all=ChatReactionsAll,
-                    chat_reactions_some=ChatReactionsSome,
-                    chat_reactions_none=ChatReactionsNone,
                     channel_type=Channel,
                     chat_type=Chat,
                     get_dialog_placement=lambda entity_id: dialog_placement(self._conn, entity_id),

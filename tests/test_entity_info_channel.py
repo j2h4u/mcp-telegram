@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
+from collections.abc import Callable
 from datetime import UTC
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,15 +21,22 @@ import pytest
 from telethon.errors import RPCError
 
 # HIGH-2 from 47-REVIEWS.md cycle 3 (codex 2026-04-25): Module-level import
-# of `TelethonChannel` so that tests appended by Plan 03 Task 3 (broadcast
-# admin enumeration: small/large/ChatAdminRequiredError) — which reference
+# of `TelethonChannel` so that broadcast admin tests — which reference
 # `MagicMock(spec=TelethonChannel)` directly in their bodies — do not
 # NameError. The `_broadcast_channel()` helper below also uses this name.
 from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
+from mcp_telegram.entity_profile.contracts import (
+    ChannelContactOverlapObservation,
+    ChannelProfileObservation,
+    ChannelReference,
+    ChatCurrentPhoto,
+    ProjectionStatus,
+)
+from mcp_telegram.entity_profile.ports import ChannelProfilePort
 from tests.daemon_api_policy import make_daemon_api_policy
-from tests.helpers import LoudGroupProfilePort, LoudUserProfilePort
+from tests.helpers import FakeChannelProfilePort, LoudGroupProfilePort, LoudUserProfilePort
 from tests.reaction_helpers import make_reaction_freshener
 
 _TEST_DBS: list[sqlite3.Connection] = []
@@ -97,7 +105,12 @@ def _make_db() -> sqlite3.Connection:
     return conn
 
 
-def make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike | None = None) -> DaemonAPIServer:
+def make_server(
+    conn: sqlite3.Connection | None = None,
+    client: DaemonClientLike | None = None,
+    *,
+    channel_profile_port: ChannelProfilePort,
+) -> DaemonAPIServer:
     if conn is None:
         conn = _make_db()
     if client is None:
@@ -108,6 +121,7 @@ def make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike
         cast(DaemonClientLike, client),
         shutdown_event,
         reaction_freshener=make_reaction_freshener(conn, client),
+        channel_profile_port=channel_profile_port,
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
         policy=make_daemon_api_policy(),
@@ -132,6 +146,65 @@ def _mock_client(*call_results: object) -> MagicMock:
     return client
 
 
+def _channel_port(
+    channel_id: int,
+    full: object,
+    *,
+    contact_ids: tuple[int, ...] = (),
+    overlap_status: ProjectionStatus = ProjectionStatus.PARTIAL,
+    overlap_reason: str = "bounded_contacts_page",
+) -> FakeChannelProfilePort:
+    full_chat = getattr(full, "full_chat", full)
+    raw_reactions: object = cast(object, getattr(full_chat, "available_reactions", None))
+    raw_items = getattr(raw_reactions, "reactions", None)
+    if isinstance(raw_items, list):
+        emojis: list[str] = []
+        for item in raw_items:
+            emoticon = getattr(cast(object, item), "emoticon", "")
+            emojis.append(emoticon if isinstance(emoticon, str) else "")
+        reactions: dict[str, object] = {
+            "kind": "some",
+            "emojis": emojis,
+        }
+    else:
+        reactions = {"kind": "none", "emojis": []}
+    photo: object = cast(object, getattr(full_chat, "chat_photo", None))
+    current_photo = None
+    photo_id = getattr(photo, "id", None)
+    if isinstance(photo_id, int):
+        date_obj = getattr(photo, "date", None)
+        isoformat = getattr(date_obj, "isoformat", None)
+        date_value = None
+        if callable(isoformat):
+            raw_date = cast(Callable[[], object], isoformat)()
+            date_value = raw_date if isinstance(raw_date, str) else None
+        current_photo = ChatCurrentPhoto(
+            photo_id,
+            date_value,
+        )
+    profile = ChannelProfileObservation(
+        channel_id=channel_id,
+        about=getattr(full_chat, "about", None),
+        participants_count=getattr(full_chat, "participants_count", None),
+        linked_chat_id=getattr(full_chat, "linked_chat_id", None),
+        pinned_msg_id=getattr(full_chat, "pinned_msg_id", None),
+        slow_mode_seconds=getattr(full_chat, "slowmode_seconds", None),
+        available_reactions=reactions,
+        current_photo=current_photo,
+        observation_started_at=100,
+        observation_completed_at=100,
+    )
+    overlap = ChannelContactOverlapObservation(
+        channel_id=channel_id,
+        contact_ids=contact_ids if overlap_status is not ProjectionStatus.UNAVAILABLE else None,
+        status=overlap_status,
+        reason=overlap_reason,
+        observation_started_at=100,
+        observation_completed_at=100,
+    )
+    return FakeChannelProfilePort(profile, overlap)
+
+
 def _broadcast_channel(id_: int = -1001, **kwargs: object) -> MagicMock:
     # `TelethonChannel` is now imported at module scope (see top of file)
     # per HIGH-2 from 47-REVIEWS.md cycle 3 — Plan 03 Task 3 appends
@@ -140,6 +213,8 @@ def _broadcast_channel(id_: int = -1001, **kwargs: object) -> MagicMock:
     c.id = id_
     c.title = kwargs.get("title", "Test Channel")
     c.username = kwargs.get("username", "test_channel")
+    c.access_hash = kwargs.get("access_hash", 0)
+    c.min = False
     c.megagroup = False
     c.broadcast = True
     c.forum = False
@@ -172,10 +247,10 @@ async def test_get_entity_info_channel_type() -> None:
     chan = _broadcast_channel(id_=-1001)
     full = _full_channel()
     search = MagicMock(count=0, messages=[])
-    client = _mock_client(full, search)
+    client = _mock_client(search)
     client.get_entity = AsyncMock(return_value=chan)
-    server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    server = make_server(client=client, channel_profile_port=_channel_port(-1001, full))
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001})
     assert r["ok"] is True, f"got {r}"
     assert _dict(r["data"])["type"] == "channel"
@@ -187,10 +262,10 @@ async def test_get_entity_info_channel_common_envelope() -> None:
     chan = _broadcast_channel(id_=-1002, title="News", username="news_chan")
     full = _full_channel(about="Channel about text")
     search = MagicMock(count=0, messages=[])
-    client = _mock_client(full, search)
+    client = _mock_client(search)
     client.get_entity = AsyncMock(return_value=chan)
-    server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    server = make_server(client=client, channel_profile_port=_channel_port(-1002, full))
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1002})
     d = _dict(r["data"])
     for key in ("id", "type", "name", "username", "about", "my_membership", "avatar_history", "avatar_count"):
@@ -203,13 +278,14 @@ async def test_get_entity_info_channel_common_envelope() -> None:
 @pytest.mark.asyncio
 async def test_get_entity_info_channel_field_surface() -> None:
     """SPEC Req 5: Channel response carries all per-type fields."""
-    chan = _broadcast_channel(id_=-1003)
+    chan = _broadcast_channel(id_=-1003, access_hash=17)
     full = _full_channel(participants_count=12345, pinned_msg_id=999, slowmode_seconds=30)
     search = MagicMock(count=0, messages=[])
-    client = _mock_client(full, search)
+    client = _mock_client(search)
     client.get_entity = AsyncMock(return_value=chan)
-    server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    port = _channel_port(-1003, full)
+    server = make_server(client=client, channel_profile_port=port)
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1003})
     d = _dict(r["data"])
     for key in (
@@ -225,6 +301,7 @@ async def test_get_entity_info_channel_field_surface() -> None:
     assert d["subscribers_count"] == 12345
     assert d["pinned_msg_id"] == 999
     assert d["slow_mode_seconds"] == 30
+    assert port.references[0] == ChannelReference(-1000000001003, 17)
 
 
 @pytest.mark.asyncio
@@ -233,10 +310,10 @@ async def test_get_entity_info_channel_non_admin_contacts_null() -> None:
     chan = _broadcast_channel(id_=-1004, creator=False, admin_rights=None)
     full = _full_channel()
     search = MagicMock(count=0, messages=[])
-    client = _mock_client(full, search)
+    client = _mock_client(search)
     client.get_entity = AsyncMock(return_value=chan)
-    server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    server = make_server(client=client, channel_profile_port=_channel_port(-1004, full))
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1004})
     d = _dict(r["data"])
     assert d["contacts_subscribed"] is None
@@ -254,10 +331,10 @@ async def test_get_entity_info_channel_available_reactions_some() -> None:
     chan = _broadcast_channel(id_=-1005)
     full = _full_channel(available_reactions=reactions)
     search = MagicMock(count=0, messages=[])
-    client = _mock_client(full, search)
+    client = _mock_client(search)
     client.get_entity = AsyncMock(return_value=chan)
-    server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    server = make_server(client=client, channel_profile_port=_channel_port(-1005, full))
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1005})
     ar = _dict(r["data"])["available_reactions"]
     assert ar == {"kind": "some", "emojis": ["👍"]}
@@ -269,10 +346,10 @@ async def test_get_entity_info_no_download_keys_channel() -> None:
     chan = _broadcast_channel(id_=-1006)
     full = _full_channel()
     search = MagicMock(count=0, messages=[])
-    client = _mock_client(full, search)
+    client = _mock_client(search)
     client.get_entity = AsyncMock(return_value=chan)
-    server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    server = make_server(client=client, channel_profile_port=_channel_port(-1006, full))
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1006})
 
     def _walk_keys(o: object):
@@ -314,10 +391,10 @@ async def test_get_entity_info_channel_avatar_search_fails_d20_fallback() -> Non
     # messages.Search(ChatPhotos) RAISES — search_failed branch.
     search_exc = RPCError(None, "flood wait simulated")
 
-    client = _mock_client(full, search_exc)
+    client = _mock_client(search_exc)
     client.get_entity = AsyncMock(return_value=chan)
-    server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    server = make_server(client=client, channel_profile_port=_channel_port(-1007, full))
+    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1007})
 
     d = _dict(r["data"])
@@ -362,28 +439,23 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_small() -> N
     ch.id = -1001234567890
     ch.title = "Broadcast Admin"
     ch.username = "broadcast_admin"
+    ch.access_hash = 0
+    ch.min = False
     ch.megagroup = False
     ch.broadcast = True
     ch.creator = True  # is_admin=True via creator
     ch.admin_rights = None
     ch.left = False
     ch.restriction_reason = None
-    # GetFullChannelRequest returns subscribers_count=42 (≤1000 path).
+    # The channel profile port returns a normalized subscriber count.
     full = MagicMock()
     full.full_chat = _full_broadcast_channel(participants_count=42)
-    client = _mock_client(full, MagicMock(count=0, messages=[]))  # full_fetch + photo history search
+    client = _mock_client(MagicMock(count=0, messages=[]))
     client.get_entity = AsyncMock(return_value=ch)
 
-    # iter_participants yields 3 participant objects with ids 111, 222, 333.
-    async def _iter(*args: object, **kwargs: object):
-        for pid in (111, 222, 333):
-            p = MagicMock()
-            p.id = pid
-            yield p
-
-    client.iter_participants = _iter
-
-    server = make_server(client=client)
+    server = make_server(
+        client=client, channel_profile_port=_channel_port(-1001234567890, full, contact_ids=(111, 222, 333))
+    )
     # Seed _dm_peer_ids: operator has DMed 111 and 333 (NOT 222).
     server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (111,))
     server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (333,))
@@ -402,26 +474,26 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_small() -> N
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001234567890})
     d = _dict(r["data"])
     assert d["type"] == "channel"
-    assert d["contacts_subscribed_partial"] is False
-    assert d["contacts_reason"] is None
-    # Real enumeration result — must be {111, 333} (222 is not a DM peer).
+    assert d["contacts_subscribed_partial"] is True
+    assert d["contacts_reason"] == "bounded_contacts_page"
+    # Bounded contact page result — must be {111, 333} (222 is not a DM peer).
     contacts = cast(list[dict[str, object]], d["contacts_subscribed"])
     ids = sorted(cast(int, c["id"]) for c in contacts)
     assert ids == [111, 333], f"expected [111, 333], got {ids}"
-    # The Plan 02 stub MUST NOT survive into production responses.
-    assert d.get("contacts_reason") != "enumeration_owned_by_plan_03"
 
 
 @pytest.mark.asyncio
 async def test_get_entity_info_channel_admin_enumerates_subscribers_large() -> None:
     """HIGH-A from 47-REVIEWS.md cycle 2: broadcast Channel with admin caller
-    and subscribers_count > 1000 uses ChannelParticipantsContacts filter
-    and returns contacts_subscribed_partial=True, reason='too_large'.
+    and subscribers_count > 1000 uses the same bounded contacts page
+    and returns contacts_subscribed_partial=True, reason='bounded_contacts_page'.
     """
     ch = MagicMock(spec=TelethonChannel)
     ch.id = -1009876543210
     ch.title = "Big Broadcast"
     ch.username = "big_broadcast"
+    ch.access_hash = 0
+    ch.min = False
     ch.megagroup = False
     ch.broadcast = True
     ch.creator = True
@@ -431,24 +503,19 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_large() -> N
     full = MagicMock()
     full.full_chat = _full_broadcast_channel(participants_count=50000)
 
-    # GetParticipantsRequest(filter=ChannelParticipantsContacts) returns 2 contacts.
+    # The bounded contact page returns 2 contacts.
     gp_result = MagicMock()
     u1 = MagicMock()
     u1.id = 111
     u2 = MagicMock()
     u2.id = 222
     gp_result.users = [u1, u2]
-    client = _mock_client(full, gp_result, MagicMock(count=0, messages=[]))
+    client = _mock_client(MagicMock(count=0, messages=[]))
     client.get_entity = AsyncMock(return_value=ch)
 
-    # iter_participants MUST NOT be called on the >1000 path.
-    async def _iter_should_not_be_called(*args: object, **kwargs: object):
-        raise AssertionError("iter_participants must not run on >1000 broadcast path")
-        yield  # pragma: no cover
-
-    client.iter_participants = _iter_should_not_be_called
-
-    server = make_server(client=client)
+    server = make_server(
+        client=client, channel_profile_port=_channel_port(-1009876543210, full, contact_ids=(111, 222))
+    )
     server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (111,))
     server._conn.execute(
         "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) "
@@ -459,7 +526,7 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_large() -> N
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1009876543210})
     d = _dict(r["data"])
     assert d["contacts_subscribed_partial"] is True
-    assert d["contacts_reason"] == "too_large"
+    assert d["contacts_reason"] == "bounded_contacts_page"
     contacts = cast(list[dict[str, object]], d["contacts_subscribed"])
     ids = sorted(cast(int, c["id"]) for c in contacts)
     assert ids == [111]
@@ -467,18 +534,17 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_large() -> N
 
 @pytest.mark.asyncio
 async def test_get_entity_info_channel_admin_chat_admin_required_falls_back_to_not_an_admin() -> None:
-    """HIGH-A from 47-REVIEWS.md cycle 2: defensive ChatAdminRequiredError
-    handler — if Telegram raises ChatAdminRequiredError on the enumeration
-    call (e.g. admin rights revoked between cache and call), the response
+    """HIGH-A: defensive unavailable overlap handler — if Telegram rejects
+    the bounded contact page (e.g. admin rights revoked between cache and call), the response
     falls back to contacts_subscribed=null, reason='not_an_admin' rather
     than crashing or surfacing the exception.
     """
-    from telethon.errors import ChatAdminRequiredError
-
     ch = MagicMock(spec=TelethonChannel)
     ch.id = -1001112223334
     ch.title = "Revoked Admin"
     ch.username = None
+    ch.access_hash = 0
+    ch.min = False
     ch.megagroup = False
     ch.broadcast = True
     ch.creator = True
@@ -487,16 +553,18 @@ async def test_get_entity_info_channel_admin_chat_admin_required_falls_back_to_n
     ch.restriction_reason = None
     full = MagicMock()
     full.full_chat = _full_broadcast_channel(participants_count=42)
-    client = _mock_client(full, RPCError(None, "avatar search unavailable"))
+    client = _mock_client(RPCError(None, "avatar search unavailable"))
     client.get_entity = AsyncMock(return_value=ch)
 
-    async def _iter_raises(*args: object, **kwargs: object):
-        raise ChatAdminRequiredError(request=None)
-        yield  # pragma: no cover
-
-    client.iter_participants = _iter_raises
-
-    server = make_server(client=client)
+    server = make_server(
+        client=client,
+        channel_profile_port=_channel_port(
+            -1001112223334,
+            full,
+            overlap_status=ProjectionStatus.UNAVAILABLE,
+            overlap_reason="not_an_admin",
+        ),
+    )
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001112223334})
     d = _dict(r["data"])
     assert d["contacts_subscribed"] is None
