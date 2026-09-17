@@ -120,6 +120,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
 
 EXACT_SYMBOL_OWNER_PATHS: Mapping[str, str] = {
     "telethon.tl.functions.messages.GetFullChatRequest": "telegram_gateway.py",
+    "telethon.tl.functions.users.GetFullUserRequest": "telegram_gateway.py",
 }
 
 
@@ -193,11 +194,11 @@ def _exact_symbol_uses(source: str) -> list[tuple[str, int]]:  # noqa: PLR0912
         dotted = _dotted_name(node)
         if dotted is None:
             continue
-        if dotted in EXACT_SYMBOL_OWNER_PATHS or (
-            dotted.endswith(".GetFullChatRequest")
-            and _resolve_module_alias(dotted, module_aliases) in EXACT_SYMBOL_OWNER_PATHS
-        ):
-            uses.append(("telethon.tl.functions.messages.GetFullChatRequest", node.lineno))
+        resolved = _resolve_module_alias(dotted, module_aliases)
+        if dotted in EXACT_SYMBOL_OWNER_PATHS:
+            uses.append((dotted, node.lineno))
+        elif resolved in EXACT_SYMBOL_OWNER_PATHS:
+            uses.append((resolved, node.lineno))
     return uses
 
 

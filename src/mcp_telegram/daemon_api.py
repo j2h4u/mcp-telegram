@@ -59,7 +59,6 @@ from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
 )
 from telethon.tl.functions.messages import SearchRequest as MessagesSearchRequest  # type: ignore[import-untyped]
 from telethon.tl.functions.photos import GetUserPhotosRequest  # type: ignore[import-untyped]
-from telethon.tl.functions.users import GetFullUserRequest  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     Channel,
     ChannelParticipantsContacts,
@@ -88,7 +87,7 @@ from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import recover_invalid_generation_in_transaction
 from .dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
-from .entity_profile.ports import GroupProfilePort, ProfilePairObservationHook
+from .entity_profile.ports import GroupProfilePort, ProfilePairObservationHook, UserProfilePort
 from .entity_profile.refresh import RefreshLimits
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled
@@ -605,6 +604,7 @@ class DaemonAPIServer:
         topic_refresher: TopicRefresher | None = None,
         folder_projection_reproject: Callable[[], object] | None = None,
         group_profile_port: GroupProfilePort,
+        user_profile_port: UserProfilePort,
         policy: DaemonApiPolicy,
         health_status: Callable[[], DaemonHealthStatus] = _healthy_daemon_status,
     ) -> None:
@@ -630,6 +630,7 @@ class DaemonAPIServer:
         self._topic_refresher = topic_refresher
         self._folder_projection_reproject = folder_projection_reproject
         self._group_profile_port = group_profile_port
+        self._user_profile_port = user_profile_port
         self._hydration_requester = hydration_requester
         self._policy = policy
         self._health_status = health_status
@@ -1818,13 +1819,13 @@ class DaemonAPIServer:
                     detail_ttl_seconds=self._policy.entity_detail_ttl_seconds,
                     slow_stage_seconds=self._policy.slow_request_seconds,
                     get_common_chats_request=GetCommonChatsRequest,
-                    get_full_user_request=GetFullUserRequest,
                     get_user_photos_request=GetUserPhotosRequest,
                     get_messages_search_request=MessagesSearchRequest,
                     get_full_channel_request=GetFullChannelRequest,
                     get_participants_request=GetParticipantsRequest,
                     channel_participants_contacts_request=ChannelParticipantsContacts,
                     group_profile_port=self._group_profile_port,
+                    user_profile_port=self._user_profile_port,
                     input_messages_filter_chat_photos=InputMessagesFilterChatPhotos,
                     message_action_chat_edit_photo=MessageActionChatEditPhoto,
                     chat_reactions_all=ChatReactionsAll,

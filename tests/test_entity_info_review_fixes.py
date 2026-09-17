@@ -4,7 +4,7 @@ Covers:
 - WR-01: _format_relative_ymd future-date and today branches (fix(47-08))
 - CR-01: subscribers_count/members_count=None → contacts_reason="count_unavailable"
          when GetFullChannelRequest fails on an admin-caller (fix(47-06))
-- WR-05: degraded full-fetch (GetFullUserRequest / GetFullChannelRequest raises)
+- WR-05: degraded full-fetch (user or channel profile request raises)
          skips entity_details cache write (fix(47-09))
 """
 
@@ -21,9 +21,10 @@ from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
+from mcp_telegram.entity_profile.ports import UserProfilePort
 from mcp_telegram.tools.entity_info import _entity_input_label, _format_relative_ymd
 from tests.daemon_api_policy import make_daemon_api_policy
-from tests.helpers import LoudGroupProfilePort
+from tests.helpers import FakeUserProfilePort, LoudGroupProfilePort, LoudUserProfilePort
 from tests.reaction_helpers import make_reaction_freshener
 
 # ---------------------------------------------------------------------------
@@ -85,7 +86,11 @@ def _make_db() -> sqlite3.Connection:
     return conn
 
 
-def _make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike | None = None) -> DaemonAPIServer:
+def _make_server(
+    conn: sqlite3.Connection | None = None,
+    client: DaemonClientLike | None = None,
+    user_profile_port: UserProfilePort | None = None,
+) -> DaemonAPIServer:
     if conn is None:
         conn = _make_db()
     if client is None:
@@ -96,6 +101,7 @@ def _make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLik
         asyncio.Event(),
         reaction_freshener=make_reaction_freshener(conn, client),
         group_profile_port=LoudGroupProfilePort(),
+        user_profile_port=user_profile_port if user_profile_port is not None else LoudUserProfilePort(),
         policy=make_daemon_api_policy(),
     )
     server._ready = True
@@ -252,17 +258,18 @@ async def test_supergroup_admin_full_request_fails_returns_count_unavailable() -
 
 @pytest.mark.asyncio
 async def test_user_degraded_full_fetch_skips_entity_details_cache() -> None:
-    """WR-05: GetFullUserRequest raises → full_user_ok=False →
+    """WR-05: user profile request raises → full_user_ok=False →
     entity_details row NOT written (prevents caching degraded response)."""
     conn = _make_db()
     user = _user_entity(id_=77)
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=user)
 
-    server = _make_server(conn=conn, client=client)
+    server = _make_server(
+        conn=conn, client=client, user_profile_port=FakeUserProfilePort(error=RuntimeError("simulated FloodWait"))
+    )
 
     with (
-        patch("mcp_telegram.daemon_api.GetFullUserRequest", side_effect=RuntimeError("simulated FloodWait")),
         patch("mcp_telegram.daemon_api.GetCommonChatsRequest", return_value=MagicMock(chats=[])),
         patch("mcp_telegram.daemon_api.GetUserPhotosRequest", return_value=MagicMock(count=0, photos=[])),
     ):
@@ -278,7 +285,7 @@ async def test_user_degraded_full_fetch_skips_entity_details_cache() -> None:
     detail = cast(
         tuple[int] | None, conn.execute("SELECT entity_id FROM entity_details WHERE entity_id = 77").fetchone()
     )
-    assert detail is None, "entity_details must NOT be written when GetFullUserRequest fails"
+    assert detail is None, "entity_details must NOT be written when the user profile request fails"
 
 
 @pytest.mark.asyncio

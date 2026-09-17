@@ -11,7 +11,6 @@ import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
-from datetime import datetime
 from typing import Protocol, cast, runtime_checkable
 
 from telethon.errors import (  # type: ignore[import-untyped]
@@ -37,17 +36,14 @@ from .entity_profile.contracts import (
     PROFILE_SECTIONS,
     GroupCurrentPhoto,
     GroupProfileObservation,
+    PersonalChannelReference,
     ProfileAcquisitionEvidence,
-    completeness,
-)
-from .entity_profile.full_user_normalization import (
-    ObservationBoundary,
     ProjectionOutcome,
     ProjectionStatus,
     TargetKind,
-    normalize_full_user_response,
+    completeness,
 )
-from .entity_profile.ports import GroupProfilePort, ProfilePairObservationHook
+from .entity_profile.ports import GroupProfilePort, ProfilePairObservationHook, UserProfilePort
 from .entity_profile.refresh import (
     DurableRefreshSliceResult,
     DurableRefreshTerminal,
@@ -127,11 +123,6 @@ class _CommonChatsResult(Protocol):
     chats: Sequence[object]
 
 
-class _FullUserResult(Protocol):
-    full_user: object
-    chats: Sequence[object]
-
-
 class _UserPhotosResult(Protocol):
     count: int
     photos: Sequence[object]
@@ -168,6 +159,11 @@ def _opt_str_attr(obj: object, name: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _positive_personal_channel_id(payload: Mapping[str, object]) -> int | None:
+    value = payload.get("personal_channel_id")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
 def _bool_attr(obj: object, name: str) -> bool:
     return bool(_attr(obj, name, False))
 
@@ -198,15 +194,6 @@ def _current_chat_photo(
     return _opt_int_attr(chat_photo, "id"), _isoformat_or_none(_attr(chat_photo, "date", None))
 
 
-def _text_or_none(value: object | None) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    text = _attr(value, "text", None)
-    return text if isinstance(text, str) else None
-
-
 def _sequence_attr(obj: object, name: str) -> Sequence[object]:
     value = _attr(obj, name, None)
     if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
@@ -214,21 +201,8 @@ def _sequence_attr(obj: object, name: str) -> Sequence[object]:
     return ()
 
 
-def _positive_int_attr(obj: object, name: str) -> int | None:
-    value = _opt_int_attr(obj, name)
-    if value is None or value <= 0:
-        return None
-    return value
-
-
 def _compact_dict(items: Mapping[str, object | None]) -> dict[str, object]:
     return {key: value for key, value in items.items() if value is not None}
-
-
-def _timestamp_or_none(value: object | None) -> int | None:
-    if isinstance(value, datetime):
-        return int(value.timestamp())
-    return None
 
 
 def _row_sequence(row: object) -> Sequence[object]:
@@ -265,7 +239,6 @@ class EntityInfoDeps:
     detail_ttl_seconds: int
     slow_stage_seconds: float
     get_common_chats_request: Callable[..., object]
-    get_full_user_request: Callable[..., object]
     get_user_photos_request: Callable[..., object]
     get_messages_search_request: Callable[..., object]
     get_full_channel_request: Callable[..., object]
@@ -279,6 +252,7 @@ class EntityInfoDeps:
     channel_type: type[object]
     chat_type: type[object]
     group_profile_port: GroupProfilePort
+    user_profile_port: UserProfilePort
     get_dialog_placement: Callable[[int], dict[str, object]] | None = None
     refresh_limits: RefreshLimits = field(default_factory=RefreshLimits)
     enable_full_user_pair: bool = False
@@ -353,8 +327,9 @@ class _PersonalChannelCard:
     channel_id: int
     dialog_id: int
     metadata: Mapping[str, object]
+    metadata_source: str
     local_preview: Mapping[str, object] | None
-    local_reason: str
+    local_reason: str | None
 
 
 class DaemonEntityInfoService:
@@ -851,7 +826,7 @@ class DaemonEntityInfoService:
         return DurableRefreshSliceResult(cursor.entity_id, terminal)
 
     def _target_kind(self, entity_type: DialogType) -> TargetKind:
-        return TargetKind.BOT if entity_type is DialogType.BOT else TargetKind.USER
+        return TargetKind.BOT if entity_type in {DialogType.BOT, DialogType.SERVICE} else TargetKind.USER
 
     def _complete_paired_personal_channel(
         self,
@@ -1241,20 +1216,13 @@ class DaemonEntityInfoService:
         cursor: EntityRefreshCursor,
     ) -> tuple[EntitySectionCommit, EntitySectionCommit]:
         captured_scope = self._capture_pair_scope()
-        started_at = self._deps.now_provider()
+        now = self._deps.now_provider()
         target_kind = (
             TargetKind.BOT
-            if self._stored_entity_type(cursor.entity_id, now=int(started_at)) is DialogType.BOT
+            if self._stored_entity_type(cursor.entity_id, now=int(now)) is DialogType.BOT
             else TargetKind.USER
         )
-        result = await self._deps.client(self._deps.get_full_user_request(id=cursor.entity_id))
-        completed_at = self._deps.now_provider()
-        normalized = normalize_full_user_response(
-            result,
-            target_id=cursor.entity_id,
-            target_kind=target_kind,
-            observation=ObservationBoundary(started_at=started_at, completed_at=completed_at),
-        )
+        normalized = await self._deps.user_profile_port.fetch_user_profile(cursor.entity_id, target_kind)
         if normalized.full_profile.status is ProjectionStatus.UNAVAILABLE:
             raise ValueError(normalized.full_profile.reason or "full user payload is unavailable")
         if self._deps.full_user_auth_scope is not None:
@@ -1555,8 +1523,17 @@ class DaemonEntityInfoService:
                 reason=outcome.reason or "personal_channel_unavailable",
                 evidence_outcome="partial",
             )
+        if outcome.status is ProjectionStatus.PARTIAL:
+            return self._missing_channel_metadata_commit(
+                context,
+                channel_id=channel_id,
+                reason=outcome.reason or "personal_channel_unavailable",
+            )
         dialog_id = self._normalize_channel_dialog_id(channel_id)
-        metadata = self._personal_channel_metadata(None, dialog_id=dialog_id)
+        metadata, metadata_source = self._personal_channel_metadata(
+            dialog_id=dialog_id,
+            normalized=context.payload,
+        )
         if metadata is None:
             return self._missing_channel_metadata_commit(
                 context,
@@ -1573,6 +1550,7 @@ class DaemonEntityInfoService:
                 metadata=metadata,
                 local_preview=local_preview,
                 local_reason=local_reason,
+                metadata_source=metadata_source,
             ),
         )
 
@@ -1642,6 +1620,7 @@ class DaemonEntityInfoService:
                 "personal_channel_id": channel_id,
                 "personal_channel_message": context.payload.get("personal_channel_message"),
                 "personal_channel": None,
+                "personal_channel_unavailable_reason": reason,
             },
             status="unavailable",
             reason=reason,
@@ -1664,7 +1643,7 @@ class DaemonEntityInfoService:
                 "title": card_context.metadata.get("title"),
                 "username": card_context.metadata.get("username"),
                 "url": self._tme_url(cast(str | None, card_context.metadata.get("username"))),
-                "metadata_source": "local_entities",
+                "metadata_source": card_context.metadata_source,
                 "attached_message_id": context.payload.get("personal_channel_message"),
                 "latest_or_attached_post": card_context.local_preview,
                 "post_preview_unavailable_reason": (
@@ -1768,7 +1747,7 @@ class DaemonEntityInfoService:
         if section == "avatar_history":
             return await self._acquire_avatar_history(cursor.entity_id, entity_type)
         if section == "personal_channel":
-            return await self._acquire_personal_channel(cursor.entity_id)
+            return await self._acquire_personal_channel(cursor.entity_id, entity_type)
         raise ValueError(f"unsupported entity profile section: {section}")
 
     @staticmethod
@@ -1814,61 +1793,22 @@ class DaemonEntityInfoService:
         entity_type: DialogType,
     ) -> EntitySectionCommit:
         if entity_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}:
-            return await self._acquire_user_full_profile(entity_id)
+            return await self._acquire_user_full_profile(entity_id, entity_type)
 
         if entity_type in {DialogType.CHANNEL, DialogType.SUPERGROUP, DialogType.FORUM}:
             return await self._acquire_channel_full_profile(entity_id, entity_type)
 
         return EntitySectionCommit({}, status="unavailable", reason="unsupported_entity_type")
 
-    async def _acquire_user_full_profile(self, entity_id: int) -> EntitySectionCommit:
-        result = await self._deps.client(self._deps.get_full_user_request(id=entity_id))
-        full_user = _attr(result, "full_user", None)
-        if full_user is None:
-            raise ValueError("full user payload is missing")
-        folder_id = _opt_int_attr(full_user, "folder_id")
-        blocked = _bool_attr(full_user, "blocked")
-        patch: dict[str, object] = {
-            "about": _opt_str_attr(full_user, "about"),
-            "blocked": blocked,
-            "ttl_period": _opt_int_attr(full_user, "ttl_period"),
-            "private_forward_name": _opt_str_attr(full_user, "private_forward_name"),
-            "folder_id": folder_id,
-            "folder_name": await self._resolve_folder_name(folder_id),
-            "birthday": self._extract_user_birthday(full_user),
-            "bot_info": self._extract_user_bot_info(full_user),
-            "business_location": self._extract_user_business_location(full_user),
-            "business_intro": self._extract_user_business_intro(full_user),
-            "business_work_hours": self._extract_user_business_work_hours(full_user),
-            "note": self._extract_user_note(full_user),
-        }
-        user = self._find_result_entity(result, entity_id)
-        if user is not None:
-            first_name = _opt_str_attr(user, "first_name")
-            last_name = _opt_str_attr(user, "last_name")
-            patch.update(
-                name=" ".join(part for part in (first_name, last_name) if part) or None,
-                username=_opt_str_attr(user, "username"),
-                first_name=first_name,
-                last_name=last_name,
-                extra_usernames=self._collect_extra_usernames(user),
-                emoji_status_id=self._collect_emoji_status_id(user),
-                status=self._format_user_status(_attr(user, "status", None)),
-                phone=_opt_str_attr(user, "phone"),
-                lang_code=_opt_str_attr(user, "lang_code"),
-                contact=_bool_attr(user, "contact"),
-                mutual_contact=_bool_attr(user, "mutual_contact"),
-                close_friend=_bool_attr(user, "close_friend"),
-                send_paid_messages_stars=_opt_int_attr(user, "send_paid_messages_stars"),
-                verified=_bool_attr(user, "verified"),
-                premium=_bool_attr(user, "premium"),
-                bot=_bool_attr(user, "bot"),
-                scam=_bool_attr(user, "scam"),
-                fake=_bool_attr(user, "fake"),
-                restricted=_bool_attr(user, "restricted"),
-                restriction_reason=self._collect_restrictions(user),
-                my_membership=self._build_user_membership(user, blocked),
-            )
+    async def _acquire_user_full_profile(self, entity_id: int, entity_type: DialogType) -> EntitySectionCommit:
+        target_kind = self._target_kind(entity_type)
+        observation = await self._deps.user_profile_port.fetch_user_profile(entity_id, target_kind)
+        outcome = observation.full_profile
+        if outcome.status is ProjectionStatus.UNAVAILABLE or outcome.payload is None:
+            raise ValueError(outcome.reason or "full user payload is unavailable")
+        patch = dict(outcome.payload)
+        folder_id = patch.get("folder_id")
+        patch["folder_name"] = await self._resolve_folder_name(folder_id if isinstance(folder_id, int) else None)
         return EntitySectionCommit(patch)
 
     async def _acquire_channel_full_profile(self, entity_id: int, entity_type: DialogType) -> EntitySectionCommit:
@@ -2158,73 +2098,96 @@ class DaemonEntityInfoService:
             chat_history.append({"photo_id": photo_id, "date": _isoformat_or_none(_attr(message, "date", None))})
         return chat_history
 
-    async def _acquire_personal_channel(self, entity_id: int) -> EntitySectionCommit:
-        result = await self._deps.client(self._deps.get_full_user_request(id=entity_id))
-        full_user = _attr(result, "full_user", None)
-        if full_user is None:
-            raise ValueError("full user payload is missing")
-        raw_channel_id = _positive_int_attr(full_user, "personal_channel_id")
-        if raw_channel_id is None:
-            patch: dict[str, object] = {
-                "personal_channel_id": None,
-                "personal_channel": None,
-                "personal_channel_unavailable_reason": None,
-            }
-            return EntitySectionCommit(patch, payload=None)
-        dialog_id = self._normalize_channel_dialog_id(raw_channel_id)
-        return self._build_personal_channel_commit(result, full_user, raw_channel_id, dialog_id=dialog_id)
+    async def _acquire_personal_channel(self, entity_id: int, entity_type: DialogType) -> EntitySectionCommit:
+        target_kind = self._target_kind(entity_type)
+        observation = await self._deps.user_profile_port.fetch_user_profile(entity_id, target_kind)
+        return self._personal_channel_section_commit(observation.personal_channel)
 
-    def _build_personal_channel_commit(
-        self,
-        result: object,
-        full_user: object,
-        raw_channel_id: int,
-        *,
-        dialog_id: int,
-    ) -> EntitySectionCommit:
-        channel = self._find_personal_channel_chat(
-            _sequence_attr(result, "chats"),
-            raw_channel_id=raw_channel_id,
-            dialog_id=dialog_id,
-        )
-        metadata = self._personal_channel_metadata(channel, dialog_id=dialog_id)
+    def _personal_channel_section_commit(self, outcome: ProjectionOutcome) -> EntitySectionCommit:
+        payload = dict(outcome.payload or {})
+        if outcome.status is ProjectionStatus.ABSENT:
+            return EntitySectionCommit(
+                {"personal_channel_id": None, "personal_channel": None, "personal_channel_unavailable_reason": None},
+                payload=None,
+            )
+        channel_id = _positive_personal_channel_id(payload)
+        if channel_id is None:
+            return EntitySectionCommit(
+                {}, status="unavailable", reason=outcome.reason or "personal_channel_unavailable"
+            )
+        if outcome.status is ProjectionStatus.PARTIAL:
+            reason = outcome.reason or "personal_channel_unavailable"
+            return EntitySectionCommit(
+                {
+                    "personal_channel_id": channel_id,
+                    "personal_channel_message": payload.get("personal_channel_message"),
+                    "personal_channel": None,
+                    "personal_channel_unavailable_reason": reason,
+                },
+                status="unavailable",
+                reason=reason,
+                payload=payload,
+            )
+        dialog_id = self._normalize_channel_dialog_id(channel_id)
+        metadata, metadata_source = self._personal_channel_metadata(dialog_id=dialog_id, normalized=payload)
         if metadata is None:
-            patch: dict[str, object] = {
-                "personal_channel_id": raw_channel_id,
-                "personal_channel": None,
-                "personal_channel_unavailable_reason": "channel_metadata_unavailable",
-            }
-            return EntitySectionCommit(patch, status="unavailable", reason="channel_metadata_unavailable")
+            return EntitySectionCommit(
+                {
+                    "personal_channel_id": channel_id,
+                    "personal_channel": None,
+                    "personal_channel_unavailable_reason": outcome.reason or "channel_metadata_unavailable",
+                },
+                status="unavailable",
+                reason=outcome.reason or "channel_metadata_unavailable",
+                payload=payload,
+            )
         local_preview, local_reason = self._latest_local_personal_channel_post(dialog_id)
-        attached_message_id = _positive_int_attr(full_user, "personal_channel_message")
+        return self._personal_channel_section_card_commit(
+            _PersonalChannelCard(
+                outcome=outcome,
+                channel_id=channel_id,
+                dialog_id=dialog_id,
+                metadata=metadata,
+                metadata_source=metadata_source,
+                local_preview=local_preview,
+                local_reason=local_reason,
+            ),
+            attached_message_id=payload.get("personal_channel_message"),
+        )
+
+    def _personal_channel_section_card_commit(
+        self,
+        card_context: _PersonalChannelCard,
+        *,
+        attached_message_id: object,
+    ) -> EntitySectionCommit:
         card = _compact_dict(
             {
-                "channel_id": raw_channel_id,
-                "dialog_id": dialog_id,
-                "title": metadata.get("title"),
-                "username": metadata.get("username"),
-                "url": self._tme_url(cast(str | None, metadata.get("username"))),
-                "metadata_source": "user_full_chats" if channel is not None else "local_entities",
+                "channel_id": card_context.channel_id,
+                "dialog_id": card_context.dialog_id,
+                "title": card_context.metadata.get("title"),
+                "username": card_context.metadata.get("username"),
+                "url": self._tme_url(cast(str | None, card_context.metadata.get("username"))),
+                "metadata_source": card_context.metadata_source,
                 "attached_message_id": attached_message_id,
-                "latest_or_attached_post": local_preview,
-                "post_preview_unavailable_reason": local_reason if local_preview is None else None,
+                "latest_or_attached_post": card_context.local_preview,
+                "post_preview_unavailable_reason": (
+                    card_context.local_reason if card_context.local_preview is None else None
+                ),
             }
         )
-        patch = {
-            "personal_channel_id": raw_channel_id,
-            "personal_channel": card,
-            "personal_channel_unavailable_reason": None,
-        }
-        return EntitySectionCommit(patch, payload=card)
-
-    def _find_result_entity(self, result: object, entity_id: int) -> object | None:
-        for entity in _sequence_attr(result, "users"):
-            try:
-                if int(self._deps.get_peer_id(entity)) == entity_id:
-                    return entity
-            except TypeError, ValueError:
-                continue
-        return None
+        usable = card_context.outcome.status is ProjectionStatus.USABLE
+        return EntitySectionCommit(
+            {
+                "personal_channel_id": card_context.channel_id,
+                "personal_channel_message": attached_message_id,
+                "personal_channel": card,
+                "personal_channel_unavailable_reason": None if usable else card_context.outcome.reason,
+            },
+            status="fresh" if usable else "unavailable",
+            reason=None if usable else card_context.outcome.reason,
+            payload=card,
+        )
 
     def _core_from_entity(self, entity: object) -> dict[str, object]:
         entity_id = int(self._deps.get_peer_id(entity))
@@ -2588,21 +2551,22 @@ class DaemonEntityInfoService:
         if status is None:
             return None
         status_type = type(status).__name__
-        online_like = {
+        static_statuses = {
+            "UserStatusRecently": "recently",
+            "UserStatusLastWeek": "last_week",
+            "UserStatusLastMonth": "last_month",
+        }
+        if status_type in static_statuses:
+            return {"type": static_statuses[status_type]}
+        timestamp_fields = {
             "UserStatusOnline": ("online", "expires"),
             "UserStatusOffline": ("offline", "was_online"),
         }
-        if status_type in online_like:
-            key, ts_key = online_like[status_type]
-            value = _attr(status, "expires" if ts_key == "expires" else "was_online", None)
-            return {"type": key, ts_key: _isoformat_or_none(value)}
-        if status_type == "UserStatusRecently":
-            return {"type": "recently"}
-        if status_type == "UserStatusLastWeek":
-            return {"type": "last_week"}
-        if status_type == "UserStatusLastMonth":
-            return {"type": "last_month"}
-        return None
+        status_value = timestamp_fields.get(status_type)
+        if status_value is None:
+            return None
+        status_name, timestamp_name = status_value
+        return {"type": status_name, timestamp_name: _isoformat_or_none(_attr(status, timestamp_name, None))}
 
     async def _fetch_user_detail(self, user: object) -> dict[str, object]:
         user_id = _opt_int_attr(user, "id")
@@ -2610,7 +2574,7 @@ class DaemonEntityInfoService:
             raise ValueError("user id missing")
 
         common_chats = await self._collect_common_chats(user_id)
-        profile = await self._collect_user_profile(user_id)
+        profile = await self._collect_user_profile(user)
         profile["folder_name"] = await self._resolve_folder_name(cast(int | None, profile["folder_id"]))
         extra_usernames = self._collect_extra_usernames(user)
         emoji_status_id = self._collect_emoji_status_id(user)
@@ -2701,7 +2665,10 @@ class DaemonEntityInfoService:
             return DialogType.GROUP.value
         return DialogType.USER.value
 
-    async def _collect_user_profile(self, user_id: int) -> dict[str, object]:
+    async def _collect_user_profile(self, user: object) -> dict[str, object]:
+        user_id = _opt_int_attr(user, "id")
+        if user_id is None:
+            raise ValueError("user id missing")
         profile: dict[str, object] = {
             "about": None,
             "personal_channel_id": None,
@@ -2721,30 +2688,23 @@ class DaemonEntityInfoService:
             "full_user_ok": False,
         }
         try:
-            full_result = cast(
-                _FullUserResult,
-                await self._deps.client(self._deps.get_full_user_request(id=user_id)),
-            )
-            user_full = full_result.full_user
-            profile["about"] = _opt_str_attr(user_full, "about")
-            profile["personal_channel_id"] = _positive_int_attr(user_full, "personal_channel_id")
-            profile["blocked"] = _bool_attr(user_full, "blocked")
-            profile["ttl_period"] = _opt_int_attr(user_full, "ttl_period")
-            profile["private_forward_name"] = _opt_str_attr(user_full, "private_forward_name")
-            profile["folder_id"] = _opt_int_attr(user_full, "folder_id")
-            profile["note"] = self._extract_user_note(user_full)
-            profile["bot_info"] = self._extract_user_bot_info(user_full)
-            profile["business_location"] = self._extract_user_business_location(user_full)
-            profile["business_intro"] = self._extract_user_business_intro(user_full)
-            profile["business_work_hours"] = self._extract_user_business_work_hours(user_full)
-            profile["birthday"] = self._extract_user_birthday(user_full)
-            personal_channel, reason = await self._collect_personal_channel(
-                user_full,
-                _sequence_attr(full_result, "chats"),
-            )
-            profile["personal_channel"] = personal_channel
-            profile["personal_channel_unavailable_reason"] = reason
+            target_kind = self._target_kind(classify_dialog_type(user))
+            observation = await self._deps.user_profile_port.fetch_user_profile(user_id, target_kind)
+            full_outcome = observation.full_profile
+            if full_outcome.status is ProjectionStatus.UNAVAILABLE or full_outcome.payload is None:
+                raise ValueError(full_outcome.reason or "full user payload is unavailable")
+            profile.update(full_outcome.payload)
             profile["full_user_ok"] = True
+            channel_payload = observation.personal_channel.payload or {}
+            channel_id = channel_payload.get("personal_channel_id")
+            if isinstance(channel_id, int) and channel_id > 0:
+                profile["personal_channel_id"] = channel_id
+            channel = await self._collect_personal_channel(
+                observation.personal_channel,
+                observation.personal_channel_reference,
+            )
+            profile["personal_channel"] = channel[0]
+            profile["personal_channel_unavailable_reason"] = channel[1]
         except TelegramRpcThrottled:
             raise
         except (TimeoutError, RPCError, RuntimeError, TypeError, AttributeError, ValueError, KeyError) as exc:
@@ -2761,99 +2721,119 @@ class DaemonEntityInfoService:
 
     async def _collect_personal_channel(
         self,
-        user_full: object,
-        chats: Sequence[object],
+        outcome: ProjectionOutcome,
+        reference: PersonalChannelReference | None = None,
     ) -> tuple[dict[str, object] | None, str | None]:
-        raw_channel_id = _positive_int_attr(user_full, "personal_channel_id")
-        if raw_channel_id is None:
+        if outcome.status is ProjectionStatus.ABSENT:
             return None, None
-
+        payload = dict(outcome.payload or {})
+        raw_channel_id = _positive_personal_channel_id(payload)
+        if raw_channel_id is None:
+            return None, outcome.reason or "personal_channel_unavailable"
+        if outcome.status is ProjectionStatus.PARTIAL:
+            return None, outcome.reason or "personal_channel_unavailable"
         dialog_id = self._normalize_channel_dialog_id(raw_channel_id)
-        channel = self._find_personal_channel_chat(
-            chats,
-            raw_channel_id=raw_channel_id,
-            dialog_id=dialog_id,
-        )
-        metadata = self._personal_channel_metadata(channel, dialog_id=dialog_id)
-        metadata_source = "user_full_chats" if channel is not None else "local_entities"
+        metadata, metadata_source = self._personal_channel_metadata(dialog_id=dialog_id, normalized=payload)
         if metadata is None:
-            return None, "channel_metadata_unavailable"
-
-        attached_message_id = _positive_int_attr(user_full, "personal_channel_message")
+            return None, outcome.reason or "channel_metadata_unavailable"
+        attached_message_id = payload.get("personal_channel_message")
+        attached_message_id = attached_message_id if isinstance(attached_message_id, int) else None
         preview, preview_reason = await self._collect_personal_channel_post_preview(
-            channel,
-            dialog_id=dialog_id,
+            reference, dialog_id=dialog_id, attached_message_id=attached_message_id
+        )
+        return self._personal_channel_card_result(
+            _PersonalChannelCard(
+                outcome=outcome,
+                channel_id=raw_channel_id,
+                dialog_id=dialog_id,
+                metadata=metadata,
+                metadata_source=metadata_source,
+                local_preview=preview,
+                local_reason=preview_reason,
+            ),
             attached_message_id=attached_message_id,
         )
+
+    def _personal_channel_card_result(
+        self,
+        card_context: _PersonalChannelCard,
+        *,
+        attached_message_id: int | None,
+    ) -> tuple[dict[str, object], str | None]:
         card = _compact_dict(
             {
-                "channel_id": raw_channel_id,
-                "dialog_id": dialog_id,
-                "title": metadata.get("title"),
-                "username": metadata.get("username"),
-                "url": self._tme_url(cast(str | None, metadata.get("username"))),
-                "metadata_source": metadata_source,
+                "channel_id": card_context.channel_id,
+                "dialog_id": card_context.dialog_id,
+                "title": card_context.metadata.get("title"),
+                "username": card_context.metadata.get("username"),
+                "url": self._tme_url(cast(str | None, card_context.metadata.get("username"))),
+                "metadata_source": card_context.metadata_source,
                 "attached_message_id": attached_message_id,
-                "latest_or_attached_post": preview,
-                "post_preview_unavailable_reason": preview_reason if preview is None else None,
+                "latest_or_attached_post": card_context.local_preview,
+                "post_preview_unavailable_reason": (
+                    card_context.local_reason if card_context.local_preview is None else None
+                ),
             }
         )
-        return card, None
+        return card, None if card_context.outcome.status is ProjectionStatus.USABLE else card_context.outcome.reason
 
-    def _find_personal_channel_chat(
-        self,
-        chats: Sequence[object],
-        *,
-        raw_channel_id: int,
-        dialog_id: int,
-    ) -> object | None:
-        for chat in chats:
-            chat_id = _opt_int_attr(chat, "id")
-            if chat_id in (raw_channel_id, dialog_id):
-                return chat
-            try:
-                if int(self._deps.get_peer_id(chat)) == dialog_id:
-                    return chat
-            except TypeError, ValueError:
-                continue
-        return None
+    @staticmethod
+    def _normalized_personal_channel_metadata(normalized: Mapping[str, object] | None) -> dict[str, object]:
+        if normalized is None:
+            return {}
+        return _compact_dict({"title": normalized.get("title"), "username": normalized.get("username")})
 
-    def _personal_channel_metadata(self, channel: object | None, *, dialog_id: int) -> dict[str, object] | None:
-        if channel is not None:
-            metadata = _compact_dict(
-                {
-                    "title": _opt_str_attr(channel, "title"),
-                    "username": _opt_str_attr(channel, "username"),
-                }
-            )
-            if metadata:
-                return metadata
-
+    def _local_personal_channel_metadata(self, dialog_id: int) -> dict[str, object]:
         row = cast(
             tuple[object | None, object | None] | None,
             self._deps.conn.execute("SELECT name, username FROM entities WHERE id = ?", (dialog_id,)).fetchone(),
         )
         if row is None:
-            return None
-        metadata = _compact_dict(
+            return {}
+        return _compact_dict(
             {
                 "title": row[0] if isinstance(row[0], str) else None,
                 "username": row[1] if isinstance(row[1], str) else None,
             }
         )
-        return metadata or None
+
+    @staticmethod
+    def _merge_personal_channel_metadata(
+        normalized: Mapping[str, object], local: Mapping[str, object]
+    ) -> dict[str, object]:
+        metadata: dict[str, object] = {}
+        for key in ("title", "username"):
+            value = normalized.get(key)
+            if value is None:
+                value = local.get(key)
+            if value is not None:
+                metadata[key] = value
+        return metadata
+
+    def _personal_channel_metadata(
+        self,
+        *,
+        dialog_id: int,
+        normalized: Mapping[str, object] | None = None,
+    ) -> tuple[dict[str, object] | None, str]:
+        normalized_metadata = self._normalized_personal_channel_metadata(normalized)
+        local_metadata = self._local_personal_channel_metadata(dialog_id)
+        metadata = self._merge_personal_channel_metadata(normalized_metadata, local_metadata)
+        if not metadata:
+            return None, "local_entities"
+        return metadata, "user_full_chats" if normalized_metadata else "local_entities"
 
     async def _collect_personal_channel_post_preview(
         self,
-        channel: object | None,
+        reference: PersonalChannelReference | None,
         *,
         dialog_id: int,
         attached_message_id: int | None,
     ) -> tuple[dict[str, object] | None, str | None]:
         attached_failure: str | None = None
-        if channel is not None and attached_message_id is not None:
+        if reference is not None and attached_message_id is not None:
             preview, attached_failure = await self._fetch_attached_personal_channel_post(
-                channel,
+                reference,
                 message_id=attached_message_id,
             )
             if preview is not None:
@@ -2866,12 +2846,12 @@ class DaemonEntityInfoService:
 
     async def _fetch_attached_personal_channel_post(
         self,
-        channel: object,
+        reference: PersonalChannelReference,
         *,
         message_id: int,
     ) -> tuple[dict[str, object] | None, str]:
         try:
-            fetched = await self._deps.client.get_messages(channel, ids=[message_id])
+            post = await self._deps.user_profile_port.fetch_personal_channel_post(reference, message_id)
         except TelegramRpcThrottled:
             raise
         except (TimeoutError, RPCError, TypeError, AttributeError, ValueError) as exc:
@@ -2879,33 +2859,24 @@ class DaemonEntityInfoService:
             self._record_section_failure("personal_channel", type(exc).__name__.lower())
             self._deps.logger.warning(
                 "entity_info personal_channel_message_failed channel_id=%r message_id=%r error=%s%s",
-                int(self._deps.get_peer_id(channel)),
+                reference.channel_id,
                 message_id,
                 exc,
                 self._deps.rid(),
             )
             return None, "attached_message_fetch_failed"
 
-        message = self._first_message(fetched)
-        if message is None:
+        if post is None:
             return None, "attached_message_not_found"
         preview = self._post_preview_from_text(
             source="personal_channel_message",
             message_id=message_id,
-            sent_at=_timestamp_or_none(_attr(message, "date", None)),
-            text=self._message_text(message),
+            sent_at=post.sent_at,
+            text=post.text,
         )
         if preview is None:
             return None, "attached_message_has_no_text"
         return preview, ""
-
-    @staticmethod
-    def _first_message(fetched: object) -> object | None:
-        if fetched is None:
-            return None
-        if isinstance(fetched, Sequence) and not isinstance(fetched, str | bytes | bytearray):
-            return fetched[0] if fetched else None
-        return fetched
 
     def _latest_local_personal_channel_post(self, dialog_id: int) -> tuple[dict[str, object] | None, str]:
         try:
@@ -2938,10 +2909,6 @@ class DaemonEntityInfoService:
             text=row[2] if isinstance(row[2], str) else None,
         )
         return (preview, "") if preview is not None else (None, "local_latest_message_has_no_text")
-
-    @staticmethod
-    def _message_text(message: object) -> str | None:
-        return _opt_str_attr(message, "message") or _opt_str_attr(message, "text")
 
     @staticmethod
     def _post_preview_from_text(
@@ -2979,60 +2946,6 @@ class DaemonEntityInfoService:
         if not username:
             return None
         return f"https://t.me/{username}"
-
-    def _extract_user_note(self, user_full: object) -> str | None:
-        return _text_or_none(_attr(user_full, "note", None))
-
-    def _extract_user_bot_info(self, user_full: object) -> dict[str, object] | None:
-        raw_bot_info = _attr(user_full, "bot_info", None)
-        if raw_bot_info is None:
-            return None
-        return {
-            "description": _opt_str_attr(raw_bot_info, "description"),
-            "commands": [
-                {
-                    "command": _opt_str_attr(cmd, "command") or "",
-                    "description": _opt_str_attr(cmd, "description") or "",
-                }
-                for cmd in cast(Sequence[object], _attr(raw_bot_info, "commands", None) or [])
-            ],
-        }
-
-    def _extract_user_business_location(self, user_full: object) -> dict[str, object] | None:
-        raw_loc = _attr(user_full, "business_location", None)
-        if raw_loc is None:
-            return None
-        geo = _attr(raw_loc, "geo_point", None)
-        return {
-            "address": _opt_str_attr(raw_loc, "address"),
-            "lat": _attr(geo, "lat", None) if geo is not None else None,
-            "long": _attr(geo, "long", None) if geo is not None else None,
-        }
-
-    def _extract_user_business_intro(self, user_full: object) -> dict[str, object] | None:
-        raw_intro = _attr(user_full, "business_intro", None)
-        if raw_intro is None:
-            return None
-        return {
-            "title": _opt_str_attr(raw_intro, "title"),
-            "description": _opt_str_attr(raw_intro, "description"),
-        }
-
-    def _extract_user_business_work_hours(self, user_full: object) -> dict[str, object] | None:
-        raw_hours = _attr(user_full, "business_work_hours", None)
-        if raw_hours is None:
-            return None
-        return {"timezone": _opt_str_attr(raw_hours, "timezone_id")}
-
-    def _extract_user_birthday(self, user_full: object) -> dict[str, object] | None:
-        bday = _attr(user_full, "birthday", None)
-        if bday is None:
-            return None
-        return {
-            "day": _opt_int_attr(bday, "day"),
-            "month": _opt_int_attr(bday, "month"),
-            "year": _opt_int_attr(bday, "year"),
-        }
 
     async def _resolve_folder_name(self, folder_id: int | None) -> str | None:
         if folder_id is None:

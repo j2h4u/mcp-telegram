@@ -21,6 +21,12 @@ from mcp_telegram.daemon import (
     _wait_for_startup_identity,
 )
 from mcp_telegram.dialog_directory import CanonicalDialogDirectory
+from mcp_telegram.entity_profile.contracts import (
+    ProjectionOutcome,
+    ProjectionStatus,
+    TargetKind,
+    UserProfileObservation,
+)
 from mcp_telegram.own_only_contracts import OwnOnlyContext
 from mcp_telegram.startup_identity import (
     StartupIdentityResult,
@@ -41,6 +47,7 @@ def _ctx(**overrides: object) -> SimpleNamespace:
         "api_server": _ApiStub(),
         "conn": MagicMock(),
         "client": _ClientStub(),
+        "user_profile_port": _UserProfilePort(),
         "folder_projection_worker": SimpleNamespace(),
         "fact_hydration_worker": SimpleNamespace(),
         "socket_path": Path("/tmp/mcp-telegram-test.sock"),
@@ -120,6 +127,20 @@ class _ClientStub:
 
     async def get_me(self) -> object:
         return SimpleNamespace(id=1)
+
+
+class _UserProfilePort:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, TargetKind]] = []
+
+    async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
+        self.calls.append((user_id, target_kind))
+        full = ProjectionOutcome(ProjectionStatus.USABLE, {}, None, None)
+        personal = ProjectionOutcome(ProjectionStatus.ABSENT, {"personal_channel_id": None}, None, None)
+        return UserProfileObservation(user_id, target_kind, full, personal)
+
+    async def fetch_personal_channel_post(self, _reference: object, _message_id: int) -> None:
+        return None
 
 
 class _ConnectionStub:
@@ -281,6 +302,7 @@ async def test_classified_startup_identity_binds_matching_account(tmp_path: Path
     startup = await _acquire_startup_identity_before_updates(ctx, directory)
 
     assert not startup.pending
+    assert cast(_UserProfilePort, ctx.user_profile_port).calls == [(101, TargetKind.USER)]
     assert ctx.api_server.self_id == 101
     conn = _open_sync_db(db_path)
     try:

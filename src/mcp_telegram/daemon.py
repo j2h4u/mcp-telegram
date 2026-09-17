@@ -49,12 +49,10 @@ from typing import Protocol, cast
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 from telethon.errors.rpcerrorlist import RPCError  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetPeerDialogsRequest  # type: ignore[import-untyped]
-from telethon.tl.functions.users import GetFullUserRequest  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     InputDialogPeer,
     TypeInputDialogPeer,
     TypeInputPeer,
-    TypeInputUser,
 )
 
 from . import daemon_shutdown
@@ -73,6 +71,7 @@ from .demand_composition import (
 )
 from .dialog_directory import CanonicalDialogDirectory
 from .dialog_sync import DialogReconciliationWorker
+from .entity_profile.ports import UserProfilePort
 from .entity_profile.refresh import RefreshLimits
 from .event_handlers import EventHandlerManager, UpdateProcessingBarrier
 from .fact_hydration import MessageFactHydrationWorker
@@ -131,7 +130,7 @@ from .sync_worker import FullSyncWorker
 from .telegram import create_client
 from .telegram_demand import DemandStatus, RpcAttemptBudget, demand_context
 from .telegram_demand_coordinator import TelegramDemandCoordinator
-from .telegram_gateway import TelethonGroupProfileGateway
+from .telegram_gateway import TelethonGroupProfileGateway, TelethonUserProfileGateway
 from .telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from .telegram_rpc import TelegramRpcCooldownPersistence
 from .telegram_rpc_consumers import DemandKind, demand_contract
@@ -309,6 +308,7 @@ class _SyncMainContext:
     reaction_freshness_ttl_seconds: int
     message_fact_refresh_policy: MessageFactRefreshPolicy
     api_server: DaemonAPIServer
+    user_profile_port: UserProfilePort
     topic_refresher: TopicRefresher
     folder_projection_worker: FolderProjectionWorker
     fact_hydration_worker: MessageFactHydrationWorker
@@ -1072,6 +1072,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         folder_repository,
     )
     group_profile_port = TelethonGroupProfileGateway(client)
+    user_profile_port = TelethonUserProfileGateway(client)
     api_server = DaemonAPIServer(
         conn,
         cast(DaemonClientLike, client),
@@ -1088,6 +1089,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         topic_refresher=topic_refresher,
         folder_projection_reproject=lambda: folder_repository.ensure_mute_projection(now=int(time.time())),
         group_profile_port=group_profile_port,
+        user_profile_port=user_profile_port,
         policy=DaemonApiPolicy(
             read_at_ttl_seconds=config.freshness.read_receipts.read_at_ttl_seconds,
             deleted_message_visibility_seconds=config.freshness.inbox.deleted_message_visibility_seconds,
@@ -1144,6 +1146,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         reaction_freshness_ttl_seconds=config.freshness.reactions.freshness_ttl_seconds,
         message_fact_refresh_policy=_message_fact_refresh_policy_from_config(config),
         api_server=api_server,
+        user_profile_port=user_profile_port,
         topic_refresher=topic_refresher,
         folder_projection_worker=FolderProjectionWorker(
             folder_refresher,
@@ -1249,9 +1252,6 @@ async def _acquire_startup_identity_before_updates(
     async def get_self_input_entity(account_id: int) -> object:
         return await ctx.client.get_input_entity(account_id)
 
-    async def get_full_self_user(input_user: object) -> object:
-        return await ctx.client(GetFullUserRequest(id=cast(TypeInputUser, input_user)))
-
     def publish(profile: object, own_only_context: OwnOnlyContext) -> None:
         directory.bind_account_id(own_only_context.account_id)
         _publish_startup_identity(ctx, profile, own_only_context)
@@ -1263,7 +1263,7 @@ async def _acquire_startup_identity_before_updates(
             update_profile=lambda profile: _update_self_profile(ctx.api_server, cast(_MeLike, profile)),
             startup=startup,
             get_input_entity=get_self_input_entity,
-            get_full_user=get_full_self_user,
+            user_profile_port=ctx.user_profile_port,
             publish_startup_identity=publish,
         )
     )
@@ -1491,9 +1491,6 @@ def _build_demand_runtime(
     async def get_self_input_entity(account_id: int) -> object:
         return await ctx.client.get_input_entity(account_id)
 
-    async def get_full_self_user(input_user: object) -> object:
-        return await ctx.client(GetFullUserRequest(id=cast(TypeInputUser, input_user)))
-
     def publish_startup_identity(profile: object, own_only_context: OwnOnlyContext) -> None:
         _publish_startup_identity(ctx, profile, own_only_context)
         scheduled_reconciler._own_only_context = own_only_context
@@ -1525,7 +1522,7 @@ def _build_demand_runtime(
             update_self_profile=lambda me: _update_self_profile(ctx.api_server, cast(_MeLike, me)),
             startup_identity=startup_identity,
             get_self_input_entity=get_self_input_entity,
-            get_full_self_user=get_full_self_user,
+            user_profile_port=ctx.user_profile_port,
             publish_startup_identity=publish_startup_identity,
             startup_detail_setter=lambda detail: setattr(ctx.api_server, "startup_detail", detail),
         )

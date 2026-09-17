@@ -111,6 +111,34 @@ def test_get_full_chat_request_has_one_exact_owner_for_import_and_qualified_form
     ) == ["src/mcp_telegram/daemon_api.py:2: unexpected GetFullChatRequest owner"]
 
 
+def test_get_full_user_request_has_one_exact_owner_for_import_and_qualified_forms() -> None:
+    gate = _load_gate()
+    path = gate.SOURCE_ROOT / "daemon_api.py"
+    expected = ["src/mcp_telegram/daemon_api.py:1: unexpected GetFullUserRequest owner"]
+
+    assert (
+        gate.violations_for(
+            path,
+            "from telethon.tl.functions.users import GetFullUserRequest as FullUser\n",
+            allowed_importer_paths=gate.ALLOWED_IMPORTER_PATHS,
+            source_root=gate.SOURCE_ROOT,
+        )
+        == expected
+    )
+    assert gate.violations_for(
+        path,
+        "import telethon.tl.functions.users as users\nusers.GetFullUserRequest(id=1)\n",
+        allowed_importer_paths=gate.ALLOWED_IMPORTER_PATHS,
+        source_root=gate.SOURCE_ROOT,
+    ) == ["src/mcp_telegram/daemon_api.py:2: unexpected GetFullUserRequest owner"]
+    assert gate.violations_for(
+        path,
+        "from telethon.tl import functions\nfunctions.users.GetFullUserRequest(id=1)\n",
+        allowed_importer_paths=gate.ALLOWED_IMPORTER_PATHS,
+        source_root=gate.SOURCE_ROOT,
+    ) == ["src/mcp_telegram/daemon_api.py:2: unexpected GetFullUserRequest owner"]
+
+
 def test_stale_allowlist_entry_is_rejected(tmp_path: Path) -> None:
     gate = _load_gate()
     source_root = tmp_path / "mcp_telegram"
@@ -121,6 +149,7 @@ def test_stale_allowlist_entry_is_rejected(tmp_path: Path) -> None:
     assert gate.boundary_violations(source_root, allowed_importer_paths=allowlists) == [
         "obsolete.py: stale telethon import allowlist entry",
         "telegram_gateway.py: stale telethon.tl.functions.messages.GetFullChatRequest owner entry",
+        "telegram_gateway.py: stale telethon.tl.functions.users.GetFullUserRequest owner entry",
     ]
 
 

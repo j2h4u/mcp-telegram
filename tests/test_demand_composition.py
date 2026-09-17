@@ -5,7 +5,6 @@ import sqlite3
 from collections.abc import Awaitable, Callable, Generator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
 
@@ -57,6 +56,7 @@ from mcp_telegram.telegram_rpc_consumers import (
     DemandKind,
     demand_freshness_seconds,
 )
+from tests.helpers import LoudUserProfilePort
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,9 +167,6 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
     async def get_self_input_entity(_account_id: int) -> object:
         return object()
 
-    async def get_full_self_user(_input_user: object) -> object:
-        return SimpleNamespace(full_user=SimpleNamespace(personal_channel_id=None))
-
     update_profile: Callable[[object], None] = MagicMock()
     publish_startup_identity: Callable[[object, OwnOnlyContext], None] = MagicMock()
     dependencies = DemandCompositionDependencies(
@@ -197,7 +194,7 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         update_self_profile=update_profile,
         startup_identity=StartupIdentityState.begin(now=100.0),
         get_self_input_entity=get_self_input_entity,
-        get_full_self_user=get_full_self_user,
+        user_profile_port=LoudUserProfilePort(),
         publish_startup_identity=publish_startup_identity,
     )
     objects["read_receipt_batch"] = read_receipt_batch

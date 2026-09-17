@@ -10,11 +10,8 @@ boundary.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
 from datetime import date, datetime
-from enum import StrEnum
 from typing import TypedDict, cast
 
 from .contracts import (
@@ -22,23 +19,13 @@ from .contracts import (
     FULL_USER_ENDPOINT,
     NORMALIZATION_VERSION,
     PERSONAL_CHANNEL_OWNED_FIELDS,
+    ObservationBoundary,
+    ProjectionOutcome,
+    ProjectionProvenance,
+    ProjectionStatus,
+    TargetKind,
+    UserProfileObservation,
 )
-
-
-class TargetKind(StrEnum):
-    """The only target kinds for which the paired operation is applicable."""
-
-    USER = "user"
-    BOT = "bot"
-
-
-class ProjectionStatus(StrEnum):
-    """Independent materialization status for one profile projection."""
-
-    USABLE = "usable"
-    PARTIAL = "partial"
-    ABSENT = "absent"
-    UNAVAILABLE = "unavailable"
 
 
 class FullProfileFacts(TypedDict, total=False):
@@ -81,72 +68,6 @@ class PersonalChannelFacts(TypedDict, total=False):
     personal_channel_message: int
     title: str
     username: str
-
-
-@dataclass(frozen=True, slots=True)
-class ObservationBoundary:
-    """Original acquisition boundaries supplied by the worker.
-
-    ``None`` means that the normalizer was used without timing information;
-    such an outcome may still be materialized, but cannot authorize freshness
-    reuse until the worker supplies valid boundaries.
-    """
-
-    started_at: float | None = None
-    completed_at: float | None = None
-
-    @property
-    def valid(self) -> bool:
-        return (
-            self.started_at is not None
-            and self.completed_at is not None
-            and math.isfinite(self.started_at)
-            and math.isfinite(self.completed_at)
-            and self.started_at <= self.completed_at
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class ProjectionProvenance:
-    """Bounded evidence describing where one projection's fields came from."""
-
-    endpoint: str
-    normalization_version: str
-    declared_fields: tuple[str, ...]
-    materialized_fields: tuple[str, ...]
-    authoritative: bool
-    observation: ObservationBoundary
-
-    @property
-    def reusable(self) -> bool:
-        """Whether this provenance has a valid original observation interval."""
-        return self.observation.valid
-
-
-@dataclass(frozen=True, slots=True)
-class ProjectionOutcome:
-    """One independent projection result from the shared observation."""
-
-    status: ProjectionStatus
-    payload: Mapping[str, object] | None
-    reason: str | None
-    provenance: ProjectionProvenance | None
-
-    @property
-    def authoritative_absence(self) -> bool:
-        return self.status is ProjectionStatus.ABSENT and bool(
-            self.provenance is not None and self.provenance.authoritative
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class FullUserNormalization:
-    """The two independently consumable outcomes of one FullUser response."""
-
-    target_id: int
-    target_kind: TargetKind
-    full_profile: ProjectionOutcome
-    personal_channel: ProjectionOutcome
 
 
 _MISSING = object()
@@ -464,6 +385,8 @@ def _normalize_full_profile(full_user: object, user: object) -> tuple[dict[str, 
     nested, nested_complete = _normalize_nested_fields(full_user)
     names, names_complete = _normalize_names(user)
     user_scalars, user_scalars_complete = _normalize_scalar_fields(user, _USER_SCALAR_FIELDS)
+    if _attr(user, "bot") is None:
+        user_scalars["bot"] = False
     optional, optional_complete = _normalize_user_optional(user)
     facts = full_scalars | nested | names | user_scalars | optional
     _add_membership(facts)
@@ -484,7 +407,8 @@ def _find_matching_user(
     if len(matches) != 1:
         return None, "target_identity_ambiguous"
     user = matches[0]
-    is_bot = _boolean(_attr(user, "bot"))
+    raw_bot = _attr(user, "bot")
+    is_bot = False if raw_bot is None else _boolean(raw_bot)
     if is_bot is None or is_bot is not (target_kind is TargetKind.BOT):
         return None, "target_kind_mismatch"
     return user, None
@@ -609,7 +533,7 @@ def normalize_full_user_response(
     target_id: int,
     target_kind: TargetKind | str,
     observation: ObservationBoundary | None = None,
-) -> FullUserNormalization:
+) -> UserProfileObservation:
     """Validate and normalize one response for a User or Bot target.
 
     A valid target identity produces a usable full-profile outcome even when
@@ -624,7 +548,7 @@ def normalize_full_user_response(
     full_user, user, reason = _resolve_response_target(response, target_id, normalized_kind)
     if reason is not None or user is None:
         failure_reason = reason or "target_identity_missing"
-        return FullUserNormalization(
+        return UserProfileObservation(
             target_id=target_id,
             target_kind=normalized_kind,
             full_profile=_unavailable(failure_reason),
@@ -633,7 +557,7 @@ def normalize_full_user_response(
 
     profile, complete = _normalize_full_profile(full_user, user)
     profile_provenance = _projection_provenance(FULL_PROFILE_OWNED_FIELDS, profile, boundary, authoritative=complete)
-    return FullUserNormalization(
+    return UserProfileObservation(
         target_id=target_id,
         target_kind=normalized_kind,
         full_profile=ProjectionOutcome(
@@ -648,7 +572,6 @@ def normalize_full_user_response(
 
 __all__ = [
     "FullProfileFacts",
-    "FullUserNormalization",
     "ObservationBoundary",
     "PersonalChannelFacts",
     "ProjectionOutcome",
