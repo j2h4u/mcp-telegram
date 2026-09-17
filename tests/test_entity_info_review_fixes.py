@@ -32,6 +32,9 @@ from mcp_telegram.entity_profile.ports import ChannelProfilePort, UserProfilePor
 from mcp_telegram.tools.entity_info import _entity_input_label, _format_relative_ymd
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
+    ClientChatAvatarHistoryPort,
+    ClientCommonChatsPort,
+    ClientUserAvatarHistoryPort,
     FakeUserProfilePort,
     LoudChannelProfilePort,
     LoudGroupProfilePort,
@@ -117,6 +120,9 @@ def _make_server(
         channel_profile_port=channel_profile_port,
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=user_profile_port if user_profile_port is not None else LoudUserProfilePort(),
+        common_chats_port=ClientCommonChatsPort(client),
+        user_avatar_history_port=ClientUserAvatarHistoryPort(client),
+        chat_avatar_history_port=ClientChatAvatarHistoryPort(client),
         policy=make_daemon_api_policy(),
     )
     server._ready = True
@@ -263,8 +269,7 @@ async def test_channel_profile_failure_still_runs_bounded_overlap() -> None:
         channel_profile_port=port,
     )
 
-    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-        r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001})
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001})
 
     assert r["ok"] is True, f"expected ok=True, got {r}"
     d = cast(dict[str, object], r["data"])
@@ -293,8 +298,7 @@ async def test_supergroup_profile_failure_preserves_overlap_adapter_reason() -> 
         channel_profile_port=port,
     )
 
-    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-        r = await server._dispatch({"method": "get_entity_info", "entity_id": -2001})
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -2001})
 
     assert r["ok"] is True, f"expected ok=True, got {r}"
     d = cast(dict[str, object], r["data"])
@@ -325,11 +329,7 @@ async def test_user_degraded_full_fetch_skips_entity_details_cache() -> None:
         channel_profile_port=LoudChannelProfilePort(),
     )
 
-    with (
-        patch("mcp_telegram.daemon_api.GetCommonChatsRequest", return_value=MagicMock(chats=[])),
-        patch("mcp_telegram.daemon_api.GetUserPhotosRequest", return_value=MagicMock(count=0, photos=[])),
-    ):
-        r = await server._dispatch({"method": "get_entity_info", "entity_id": 77})
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": 77})
 
     assert r["ok"] is True, f"expected ok=True despite degraded fetch, got {r}"
 
@@ -360,8 +360,7 @@ async def test_channel_degraded_full_fetch_skips_entity_details_cache() -> None:
         channel_profile_port=_FailingChannelProfilePort(-3001, RuntimeError("simulated flood")),
     )
 
-    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-        r = await server._dispatch({"method": "get_entity_info", "entity_id": -3001})
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -3001})
 
     assert r["ok"] is True, f"expected ok=True despite degraded fetch, got {r}"
 

@@ -1,5 +1,8 @@
 """Shared test helpers for sync/event/delta tests."""
 
+# Telethon-shaped MagicMock fixtures intentionally expose dynamic attributes.
+# pyright: reportAny=false
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -11,13 +14,21 @@ from mcp_telegram.entity_profile.contracts import (
     ChannelContactOverlapObservation,
     ChannelProfileObservation,
     ChannelReference,
+    ChatAvatarHistoryObservation,
+    ChatAvatarReference,
+    ChatCurrentPhoto,
+    CommonChatsObservation,
+    CommonChatSummary,
     GroupProfileObservation,
+    GroupReference,
     PersonalChannelPost,
     PersonalChannelReference,
     ProjectionOutcome,
     ProjectionStatus,
     TargetKind,
+    UserAvatarHistoryObservation,
     UserProfileObservation,
+    UserReference,
 )
 
 
@@ -108,6 +119,97 @@ class LoudGroupProfilePort:
         raise AssertionError(f"unexpected group profile request for {group_id}")
 
 
+class LoudCommonChatsPort:
+    async def fetch_common_chats(self, reference: UserReference) -> CommonChatsObservation:
+        raise AssertionError(f"unexpected common-chat request for {reference.user_id}")
+
+
+class LoudUserAvatarHistoryPort:
+    async def fetch_user_avatar_history(self, reference: UserReference) -> UserAvatarHistoryObservation:
+        raise AssertionError(f"unexpected user-avatar request for {reference.user_id}")
+
+
+class LoudChatAvatarHistoryPort:
+    def get_chat_avatar_reference(self, entity_id: int) -> None:
+        raise AssertionError(f"unexpected chat-avatar reference request for {entity_id}")
+
+    async def fetch_chat_avatar_history(self, reference: ChatAvatarReference) -> ChatAvatarHistoryObservation:
+        raise AssertionError(f"unexpected chat-avatar request for {reference}")
+
+
+class ClientCommonChatsPort:
+    """Neutral common-chat port backed by a test client's response queue."""
+
+    def __init__(self, client: object) -> None:
+        self.client = client
+
+    async def fetch_common_chats(self, reference: UserReference) -> CommonChatsObservation:
+        result = await self.client(("common_chats", {"user_id": reference.user_id, "limit": 100}))  # type: ignore[operator]
+        chats: list[CommonChatSummary] = []
+        for chat in getattr(result, "chats", ()) or ():
+            chat_id = getattr(chat, "id", None)
+            if not isinstance(chat_id, int) or isinstance(chat_id, bool) or chat_id == 0:
+                raise ValueError("test common-chat id is invalid")
+            kind = "supergroup" if bool(getattr(chat, "megagroup", False)) else "channel"
+            if type(chat).__name__ == "Chat":
+                kind = "group"
+            chats.append(CommonChatSummary(chat_id, getattr(chat, "title", None), kind))
+        return CommonChatsObservation(
+            reference.user_id, tuple(chats), len(chats), ProjectionStatus.USABLE, None, 100.0, 100.0
+        )
+
+
+class ClientUserAvatarHistoryPort:
+    """Neutral user-avatar port backed by a test client's response queue."""
+
+    def __init__(self, client: object) -> None:
+        self.client = client
+
+    async def fetch_user_avatar_history(self, reference: UserReference) -> UserAvatarHistoryObservation:
+        result = await self.client(("user_photos", {"user_id": reference.user_id, "limit": 100}))  # type: ignore[operator]
+        photos: list[ChatCurrentPhoto] = []
+        for photo in getattr(result, "photos", ()) or ():
+            photo_id = getattr(photo, "id", None)
+            if not isinstance(photo_id, int) or isinstance(photo_id, bool) or photo_id <= 0:
+                raise ValueError("test user-photo id is invalid")
+            date = getattr(photo, "date", None)
+            photos.append(ChatCurrentPhoto(photo_id, date.isoformat() if date is not None else None))
+        count = getattr(result, "count", len(photos))
+        if not isinstance(count, int):
+            count = len(photos)
+        return UserAvatarHistoryObservation(
+            reference.user_id, tuple(photos), max(count, len(photos)), ProjectionStatus.USABLE, None, 100.0, 100.0
+        )
+
+
+class ClientChatAvatarHistoryPort:
+    """Neutral chat-avatar port backed by a test client's response queue."""
+
+    def __init__(self, client: object) -> None:
+        self.client = client
+
+    def get_chat_avatar_reference(self, entity_id: int) -> ChatAvatarReference | None:
+        return GroupReference(entity_id) if isinstance(entity_id, int) and entity_id < 0 else None
+
+    async def fetch_chat_avatar_history(self, reference: ChatAvatarReference) -> ChatAvatarHistoryObservation:
+        result = await self.client(("search", {"limit": 100}))  # type: ignore[operator]
+        photos: list[ChatCurrentPhoto] = []
+        for message in getattr(result, "messages", ()) or ():
+            action = getattr(message, "action", None)
+            photo = getattr(action, "photo", None)
+            photo_id = getattr(photo, "id", None)
+            if not isinstance(photo_id, int) or isinstance(photo_id, bool) or photo_id <= 0:
+                continue
+            date = getattr(message, "date", None)
+            photos.append(ChatCurrentPhoto(photo_id, date.isoformat() if date is not None else None))
+        count = getattr(result, "count", len(photos))
+        if not isinstance(count, int):
+            count = len(photos)
+        return ChatAvatarHistoryObservation(
+            reference, tuple(photos), max(count, len(photos)), ProjectionStatus.USABLE, None, 100.0, 100.0
+        )
+
+
 class LoudChannelProfilePort:
     """Test-only port that fails if a channel composition unexpectedly calls it."""
 
@@ -128,16 +230,19 @@ class FakeChannelProfilePort:
         self,
         profile: ChannelProfileObservation,
         overlap: ChannelContactOverlapObservation,
+        *,
+        access_hash: int = 0,
     ) -> None:
         self.profile = profile
         self.overlap = overlap
         self.profile_calls: list[int] = []
         self.overlap_calls: list[int] = []
         self.references: list[ChannelReference] = []
+        self.access_hash = access_hash
 
     def get_channel_reference(self, channel_id: int) -> ChannelReference | None:
         canonical_id = channel_id if channel_id <= -1_000_000_000_001 else -1_000_000_000_000 - abs(channel_id)
-        return ChannelReference(channel_id=canonical_id, access_hash=0)
+        return ChannelReference(channel_id=canonical_id, access_hash=self.access_hash)
 
     async def fetch_channel_profile(self, reference: ChannelReference) -> ChannelProfileObservation:
         self.references.append(reference)
@@ -151,6 +256,9 @@ class FakeChannelProfilePort:
 
 class LoudUserProfilePort:
     """Test-only port that fails if a user profile request is unexpected."""
+
+    def get_user_reference(self, user_id: int, *, is_self: bool = False) -> None:
+        raise AssertionError(f"unexpected user reference request for {user_id}/{is_self}")
 
     async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
         raise AssertionError(f"unexpected user profile request for {user_id} ({target_kind})")
@@ -176,6 +284,9 @@ class FakeUserProfilePort:
         self.post = post
         self.post_error = post_error
         self.calls: list[tuple[int, TargetKind]] = []
+
+    def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference:
+        return UserReference(user_id, 0, is_self=is_self)
 
     async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
         self.calls.append((user_id, target_kind))

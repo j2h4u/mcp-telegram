@@ -24,7 +24,14 @@ from mcp_telegram.entity_profile.contracts import (
 )
 from mcp_telegram.entity_profile.ports import ChannelProfilePort
 from tests.daemon_api_policy import make_daemon_api_policy
-from tests.helpers import FakeChannelProfilePort, LoudGroupProfilePort, LoudUserProfilePort
+from tests.helpers import (
+    ClientChatAvatarHistoryPort,
+    FakeChannelProfilePort,
+    LoudCommonChatsPort,
+    LoudGroupProfilePort,
+    LoudUserAvatarHistoryPort,
+    LoudUserProfilePort,
+)
 from tests.reaction_helpers import make_reaction_freshener
 
 _TEST_DBS: list[sqlite3.Connection] = []
@@ -112,6 +119,9 @@ def make_server(
         channel_profile_port=channel_profile_port,
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
+        common_chats_port=LoudCommonChatsPort(),
+        user_avatar_history_port=LoudUserAvatarHistoryPort(),
+        chat_avatar_history_port=ClientChatAvatarHistoryPort(client),
         policy=make_daemon_api_policy(),
     )
     server._ready = True
@@ -209,8 +219,7 @@ async def test_get_entity_info_supergroup_type() -> None:
     full = _full_supergroup()
     client.side_effect = [_empty_search()]
     server = make_server(client=client, channel_profile_port=_channel_port(-1001, full))
-    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-        r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001})
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001})
     assert r["ok"] is True, r
     assert _dict(r["data"])["type"] == "supergroup"
 
@@ -225,8 +234,7 @@ async def test_get_entity_info_supergroup_field_surface() -> None:
     full = _full_supergroup(participants_count=42, slowmode_seconds=60, linked_chat_id=200500)
     client.side_effect = [_empty_search()]
     server = make_server(client=client, channel_profile_port=_channel_port(-1002, full))
-    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-        r = await server._dispatch({"method": "get_entity_info", "entity_id": -1002})
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -1002})
     d = _dict(r["data"])
     for key in (
         "members_count",
@@ -253,8 +261,7 @@ async def test_get_entity_info_forum_supergroup_has_topics() -> None:
     full = _full_supergroup()
     client.side_effect = [_empty_search()]
     server = make_server(client=client, channel_profile_port=_channel_port(-1003, full))
-    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-        r = await server._dispatch({"method": "get_entity_info", "entity_id": -1003})
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -1003})
     assert r["ok"] is True
     assert _dict(r["data"])["type"] == "supergroup"
     assert _dict(r["data"])["has_topics"] is True
@@ -287,8 +294,7 @@ async def test_get_entity_info_supergroup_small_enumerates_dm_intersection() -> 
     server = make_server(
         conn=conn, client=client, channel_profile_port=_channel_port(-1004, full, contact_ids=(10, 20, 30))
     )
-    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-        r = await server._dispatch({"method": "get_entity_info", "entity_id": -1004})
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -1004})
     d = _dict(r["data"])
     assert d["contacts_subscribed_partial"] is True
     assert d["contacts_reason"] == "bounded_contacts_page"
@@ -322,8 +328,7 @@ async def test_get_entity_info_supergroup_large_uses_contact_filter() -> None:
         client=client,
         channel_profile_port=_channel_port(-1005, full, contact_ids=(50, 60)),
     )
-    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-        r = await server._dispatch({"method": "get_entity_info", "entity_id": -1005})
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -1005})
     d = _dict(r["data"])
     assert d["contacts_subscribed_partial"] is True
     assert d["contacts_reason"] == "bounded_contacts_page"
@@ -342,8 +347,7 @@ async def test_get_entity_info_supergroup_hidden_members_null() -> None:
     full = _full_supergroup()
     client.side_effect = [_empty_search()]
     server = make_server(client=client, channel_profile_port=_channel_port(-1006, full))
-    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-        r = await server._dispatch({"method": "get_entity_info", "entity_id": -1006})
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -1006})
     assert r["ok"]
     d = _dict(r["data"])
     assert d["contacts_subscribed"] is None
@@ -373,8 +377,7 @@ async def test_get_entity_info_supergroup_chat_admin_required_treated_as_hidden(
             overlap_reason="not_an_admin",
         ),
     )
-    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-        r = await server._dispatch({"method": "get_entity_info", "entity_id": -1011})
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -1011})
     assert r["ok"]
     d = _dict(r["data"])
     assert d["contacts_subscribed"] is None
@@ -391,8 +394,7 @@ async def test_get_entity_info_no_download_keys_supergroup() -> None:
     full = _full_supergroup()
     client.side_effect = [_empty_search()]
     server = make_server(client=client, channel_profile_port=_channel_port(-1007, full))
-    with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-        r = await server._dispatch({"method": "get_entity_info", "entity_id": -1007})
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -1007})
 
     def _walk(o: object):
         if isinstance(o, dict):

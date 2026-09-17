@@ -22,13 +22,20 @@ from mcp_telegram.entity_profile.contracts import (
     PersonalChannelReference,
     TargetKind,
     UserProfileObservation,
+    UserReference,
 )
 from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, RefreshLimits
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
-from tests.helpers import LoudChannelProfilePort, LoudGroupProfilePort
+from tests.helpers import (
+    LoudChannelProfilePort,
+    LoudChatAvatarHistoryPort,
+    LoudCommonChatsPort,
+    LoudGroupProfilePort,
+    LoudUserAvatarHistoryPort,
+)
 
 
 def _fenced_schema(conn: sqlite3.Connection) -> None:
@@ -67,6 +74,9 @@ class _PairClient:
         self.bot = bot
         self.omit_channel_id = omit_channel_id
         self.full_user_calls = 0
+
+    def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference:
+        return UserReference(user_id, 0, is_self=is_self)
 
     async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
         scope = current_rpc_scope()
@@ -131,16 +141,12 @@ def _pair_service(conn: sqlite3.Connection, client: _PairClient, *, enabled: boo
             now_provider=lambda: 100.0,
             detail_ttl_seconds=300,
             slow_stage_seconds=1.0,
-            get_common_chats_request=lambda **kwargs: ("common_chats", kwargs),
-            get_user_photos_request=lambda **kwargs: ("photos", kwargs),
-            get_messages_search_request=lambda **kwargs: ("search", kwargs),
-            input_messages_filter_chat_photos=object,
-            message_action_chat_edit_photo=object,
-            channel_type=object,
-            chat_type=object,
             group_profile_port=LoudGroupProfilePort(),
             channel_profile_port=LoudChannelProfilePort(),
             channel_reference_provider=LoudChannelProfilePort(),
+            common_chats_port=LoudCommonChatsPort(),
+            user_avatar_history_port=LoudUserAvatarHistoryPort(),
+            chat_avatar_history_port=LoudChatAvatarHistoryPort(),
             user_profile_port=client,
             refresh_limits=RefreshLimits(),
             enable_full_user_pair=enabled,

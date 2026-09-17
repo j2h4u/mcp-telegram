@@ -19,7 +19,13 @@ import pytest
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.entity_profile.contracts import GroupProfileObservation
 from tests.daemon_api_policy import make_daemon_api_policy
-from tests.helpers import LoudChannelProfilePort, LoudUserProfilePort
+from tests.helpers import (
+    ClientChatAvatarHistoryPort,
+    LoudChannelProfilePort,
+    LoudCommonChatsPort,
+    LoudUserAvatarHistoryPort,
+    LoudUserProfilePort,
+)
 from tests.reaction_helpers import make_reaction_freshener
 
 _TEST_DBS: list[sqlite3.Connection] = []
@@ -101,6 +107,9 @@ def make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=_GroupProfilePort(cast(DaemonClientLike, client)),
         user_profile_port=LoudUserProfilePort(),
+        common_chats_port=LoudCommonChatsPort(),
+        user_avatar_history_port=LoudUserAvatarHistoryPort(),
+        chat_avatar_history_port=ClientChatAvatarHistoryPort(client),
         policy=make_daemon_api_policy(),
     )
     server._ready = True
@@ -188,8 +197,7 @@ async def test_get_entity_info_group_type() -> None:
         client.get_entity = AsyncMock(return_value=chat)
         client.side_effect = [_full_chat_result(), _empty_search()]
         server = make_server(client=client)
-        with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-            r = await server._dispatch({"method": "get_entity_info", "entity_id": -100})
+        r = await server._dispatch({"method": "get_entity_info", "entity_id": -100})
     assert r["ok"] is True, r
     assert _dict(r["data"])["type"] == "group"
 
@@ -209,8 +217,7 @@ async def test_get_entity_info_group_field_surface() -> None:
             _empty_search(),
         ]
         server = make_server(client=client)
-        with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-            r = await server._dispatch({"method": "get_entity_info", "entity_id": -101})
+        r = await server._dispatch({"method": "get_entity_info", "entity_id": -101})
     d = _dict(r["data"])
     for key in ("members_count", "migrated_to", "invite_link", "contacts_subscribed"):
         assert key in d, f"missing group key: {key}"
@@ -243,8 +250,7 @@ async def test_get_entity_info_group_dm_intersection() -> None:
             _empty_search(),
         ]
         server = make_server(conn=conn, client=client)
-        with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-            r = await server._dispatch({"method": "get_entity_info", "entity_id": -102})
+        r = await server._dispatch({"method": "get_entity_info", "entity_id": -102})
     d = _dict(r["data"])
     contacts = cast(list[dict[str, object]], d["contacts_subscribed"])
     ids = {entry["id"] for entry in contacts}
@@ -281,8 +287,7 @@ async def test_get_entity_info_group_migrated_to_verbatim() -> None:
         client.get_entity = AsyncMock(return_value=chat)
         client.side_effect = [_full_chat_result(), _empty_search()]
         server = make_server(client=client)
-        with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-            r = await server._dispatch({"method": "get_entity_info", "entity_id": -103})
+        r = await server._dispatch({"method": "get_entity_info", "entity_id": -103})
     d = _dict(r["data"])
     assert d["type"] == "group"
     assert d["migrated_to"] == -1002005000000
@@ -310,8 +315,7 @@ async def test_get_entity_info_no_download_keys_group() -> None:
         client.get_entity = AsyncMock(return_value=chat)
         client.side_effect = [_full_chat_result(), _empty_search()]
         server = make_server(client=client)
-        with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-            r = await server._dispatch({"method": "get_entity_info", "entity_id": -104})
+        r = await server._dispatch({"method": "get_entity_info", "entity_id": -104})
 
     def _walk(o: object):
         if isinstance(o, dict):
@@ -340,7 +344,7 @@ async def test_get_entity_info_group_profile_failure_keeps_legacy_degraded_detai
         client.get_entity = AsyncMock(return_value=chat)
         client.side_effect = [RuntimeError("profile unavailable"), _empty_search()]
         server = make_server(client=client)
-        with caplog.at_level("WARNING"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+        with caplog.at_level("WARNING"):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -105})
 
     assert r["ok"] is True
@@ -365,8 +369,7 @@ async def test_get_entity_info_group_empty_about_is_normalized_to_none() -> None
         client.get_entity = AsyncMock(return_value=chat)
         client.side_effect = [_full_chat_result(about="", participant_user_ids=(1,)), _empty_search()]
         server = make_server(client=client)
-        with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-            r = await server._dispatch({"method": "get_entity_info", "entity_id": -106})
+        r = await server._dispatch({"method": "get_entity_info", "entity_id": -106})
 
     detail = _dict(r["data"])
     assert detail["about"] is None
@@ -390,7 +393,6 @@ async def test_get_entity_info_group_contact_enrichment_failure_is_degraded(
         with (
             caplog.at_level("WARNING"),
             patch.object(service, "_enrich_contact_ids_with_names", side_effect=sqlite3.OperationalError("db")),
-            patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
         ):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -107})
 
@@ -414,8 +416,7 @@ async def test_get_entity_info_group_unavailable_participants_use_legacy_empty_c
         client.get_entity = AsyncMock(return_value=chat)
         client.side_effect = [response, _empty_search()]
         server = make_server(client=client)
-        with patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
-            r = await server._dispatch({"method": "get_entity_info", "entity_id": -108})
+        r = await server._dispatch({"method": "get_entity_info", "entity_id": -108})
 
     detail = _dict(r["data"])
     assert detail["members_count"] == 12

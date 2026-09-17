@@ -154,6 +154,19 @@ class EntityProfileRepository:
         """Return the bounded receipt projection, if a migration-created row has one."""
         return self._read_section_evidence(entity_id=entity_id, section=section)
 
+    def read_section_payload(self, entity_id: int, section: str) -> object | None:
+        """Read one private section payload without projecting public detail."""
+        if not isinstance(entity_id, int) or not isinstance(section, str) or not section:
+            return None
+        try:
+            row = self._conn.execute(
+                "SELECT payload_json FROM entity_detail_sections WHERE entity_id=? AND section=?",
+                (entity_id, section),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        return None if row is None else _decode_payload(row[0])
+
     def section_is_reusable(
         self,
         entity_id: int,

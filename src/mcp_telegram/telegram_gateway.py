@@ -16,9 +16,12 @@ from telethon.tl.functions.channels import (  # type: ignore[import-untyped]
     GetParticipantsRequest,
 )
 from telethon.tl.functions.messages import (
+    GetCommonChatsRequest,
     GetFullChatRequest,  # type: ignore[import-untyped]
     GetScheduledHistoryRequest,  # type: ignore[import-untyped]
+    SearchRequest,
 )
+from telethon.tl.functions.photos import GetUserPhotosRequest  # type: ignore[import-untyped]
 from telethon.tl.functions.users import GetFullUserRequest  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     ChannelParticipantsContacts,
@@ -32,17 +35,31 @@ from .entity_profile.contracts import (
     ChannelContactOverlapObservation,
     ChannelProfileObservation,
     ChannelReference,
+    ChatAvatarHistoryObservation,
+    ChatAvatarReference,
     ChatCurrentPhoto,
+    CommonChatsObservation,
+    CommonChatSummary,
     GroupProfileObservation,
+    GroupReference,
     ObservationBoundary,
     PersonalChannelPost,
     PersonalChannelReference,
     ProjectionStatus,
     TargetKind,
+    UserAvatarHistoryObservation,
     UserProfileObservation,
+    UserReference,
 )
 from .entity_profile.full_user_normalization import normalize_full_user_response
-from .entity_profile.ports import ChannelProfilePort, GroupProfilePort, UserProfilePort
+from .entity_profile.ports import (
+    ChannelProfilePort,
+    ChatAvatarHistoryPort,
+    CommonChatsPort,
+    GroupProfilePort,
+    UserAvatarHistoryPort,
+    UserProfilePort,
+)
 from .flood import TelegramRpcThrottled
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_reading import GatewayFailure, GatewayFailureKind
@@ -195,12 +212,153 @@ class TelethonGroupProfileGateway(GroupProfilePort):
         )
 
 
+class TelethonCommonChatsGateway(CommonChatsPort):
+    """Normalize one bounded ``messages.GetCommonChats`` page."""
+
+    def __init__(self, client: object, *, now_provider: Callable[[], float] | None = None) -> None:
+        self._client = cast(GroupProfileClient, client)
+        self._now_provider = now_provider or time.time
+
+    async def fetch_common_chats(self, reference: UserReference) -> CommonChatsObservation:
+        _validate_user_reference(reference)
+        started_at = self._now_provider()
+        try:
+            result = await self._client(GetCommonChatsRequest(user_id=_input_user(reference), max_id=0, limit=100))
+        except ACCESS_LOST_ERRORS:
+            completed_at = self._now_provider()
+            return CommonChatsObservation(
+                reference.user_id, (), 0, ProjectionStatus.UNAVAILABLE, "access_lost", started_at, completed_at
+            )
+        except ChatAdminRequiredError:
+            completed_at = self._now_provider()
+            return CommonChatsObservation(
+                reference.user_id, (), 0, ProjectionStatus.UNAVAILABLE, "not_an_admin", started_at, completed_at
+            )
+        chats, reported_count, status = _normalize_common_chats(result)
+        completed_at = self._now_provider()
+        return CommonChatsObservation(
+            user_id=reference.user_id,
+            chats=chats,
+            reported_count=reported_count,
+            status=status,
+            reason="bounded_page" if status is ProjectionStatus.PARTIAL else None,
+            observation_started_at=started_at,
+            observation_completed_at=completed_at,
+        )
+
+
+class TelethonUserAvatarHistoryGateway(UserAvatarHistoryPort):
+    """Normalize one bounded ``photos.GetUserPhotos`` page."""
+
+    def __init__(self, client: object, *, now_provider: Callable[[], float] | None = None) -> None:
+        self._client = cast(GroupProfileClient, client)
+        self._now_provider = now_provider or time.time
+
+    async def fetch_user_avatar_history(self, reference: UserReference) -> UserAvatarHistoryObservation:
+        _validate_user_reference(reference)
+        started_at = self._now_provider()
+        try:
+            result = await self._client(
+                GetUserPhotosRequest(
+                    user_id=_input_user(reference),
+                    offset=0,
+                    max_id=0,
+                    limit=100,
+                )
+            )
+        except ACCESS_LOST_ERRORS:
+            completed_at = self._now_provider()
+            return UserAvatarHistoryObservation(
+                reference.user_id, (), 0, ProjectionStatus.UNAVAILABLE, "access_lost", started_at, completed_at
+            )
+        except ChatAdminRequiredError:
+            completed_at = self._now_provider()
+            return UserAvatarHistoryObservation(
+                reference.user_id, (), 0, ProjectionStatus.UNAVAILABLE, "not_an_admin", started_at, completed_at
+            )
+        photos, reported_count, status = _normalize_user_photos(result, reference.user_id)
+        completed_at = self._now_provider()
+        return UserAvatarHistoryObservation(
+            user_id=reference.user_id,
+            photos=photos,
+            reported_count=reported_count,
+            status=status,
+            reason="bounded_page" if status is ProjectionStatus.PARTIAL else None,
+            observation_started_at=started_at,
+            observation_completed_at=completed_at,
+        )
+
+
+class TelethonChatAvatarHistoryGateway(ChatAvatarHistoryPort):
+    """Normalize one bounded chat-photo message search page."""
+
+    def __init__(self, client: object, *, now_provider: Callable[[], float] | None = None) -> None:
+        self._client = cast(GroupProfileClient, client)
+        self._now_provider = now_provider or time.time
+
+    def get_chat_avatar_reference(self, entity_id: int) -> ChatAvatarReference | None:
+        return _chat_avatar_reference_from_peer(_session_entity(self._client, entity_id), entity_id)
+
+    async def fetch_chat_avatar_history(self, reference: ChatAvatarReference) -> ChatAvatarHistoryObservation:
+        if not isinstance(reference, (ChannelReference, GroupReference)):
+            raise TypeError("chat avatar reference is invalid")
+        started_at = self._now_provider()
+        peer: object = (
+            _input_channel(reference)
+            if isinstance(reference, ChannelReference)
+            else types.InputPeerChat(chat_id=abs(reference.group_id))
+        )
+        try:
+            result = await self._client(
+                SearchRequest(
+                    peer=cast(TypeInputPeer, peer),
+                    q="",
+                    filter=types.InputMessagesFilterChatPhotos(),
+                    min_date=None,
+                    max_date=None,
+                    offset_id=0,
+                    add_offset=0,
+                    limit=100,
+                    max_id=0,
+                    min_id=0,
+                    hash=0,
+                    from_id=None,
+                )
+            )
+            photos, reported_count, status = _normalize_chat_photos(result, reference)
+            completed_at = self._now_provider()
+        except ACCESS_LOST_ERRORS:
+            completed_at = self._now_provider()
+            return ChatAvatarHistoryObservation(
+                reference, (), 0, ProjectionStatus.UNAVAILABLE, "access_lost", started_at, completed_at
+            )
+        except ChatAdminRequiredError:
+            completed_at = self._now_provider()
+            return ChatAvatarHistoryObservation(
+                reference, (), 0, ProjectionStatus.UNAVAILABLE, "not_an_admin", started_at, completed_at
+            )
+        return ChatAvatarHistoryObservation(
+            reference,
+            photos,
+            reported_count,
+            status,
+            "bounded_page" if status is ProjectionStatus.PARTIAL else None,
+            started_at,
+            completed_at,
+        )
+
+
 class TelethonUserProfileGateway(UserProfilePort):
     """Normalize ``users.GetFullUser`` at the Telethon boundary."""
 
     def __init__(self, client: object, *, now_provider: Callable[[], float] | None = None) -> None:
         self._client = cast(UserProfileClient, client)
         self._now_provider = now_provider or time.time
+
+    def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference | None:
+        if not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0:
+            return None
+        return _user_reference_from_peer(_session_entity(self._client, user_id), user_id, is_self=is_self)
 
     async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
         if not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0:
@@ -219,7 +377,8 @@ class TelethonUserProfileGateway(UserProfilePort):
             observation=ObservationBoundary(started_at=started_at, completed_at=completed_at),
         )
         reference = _personal_channel_reference(result, observation.personal_channel.payload)
-        return replace(observation, personal_channel_reference=reference)
+        current_photo = _normalize_user_current_photo(result, user_id)
+        return replace(observation, personal_channel_reference=reference, current_photo=current_photo)
 
     async def fetch_personal_channel_post(
         self, reference: PersonalChannelReference, message_id: int
@@ -346,6 +505,19 @@ def _normalize_channel_photo(photo: object) -> ChatCurrentPhoto | None:
     return ChatCurrentPhoto(photo_id=photo_id, date=date)
 
 
+def _normalize_user_current_photo(result: object, user_id: int) -> ChatCurrentPhoto | None:
+    users = getattr(result, "users", None)
+    if not isinstance(users, Sequence) or isinstance(users, str | bytes | bytearray):
+        return None
+    for user in users:
+        if _positive_id(getattr(user, "id", None)) != user_id:
+            continue
+        photo = getattr(user, "photo", None)
+        photo_id = _positive_id(getattr(photo, "photo_id", None))
+        return None if photo_id is None else ChatCurrentPhoto(photo_id)
+    return None
+
+
 def _normalize_reactions(raw_reactions: object) -> dict[str, object]:
     if isinstance(raw_reactions, types.ChatReactionsAll):
         return {"kind": "all", "emojis": []}
@@ -369,6 +541,237 @@ def _validated_contact_ids(result: object) -> tuple[int, ...]:
         raise ValueError("channel participants users are invalid")
     ids = {user_id for user in users if (user_id := _positive_id(getattr(user, "id", None))) is not None}
     return tuple(sorted(ids))
+
+
+def _close_awaitable(value: object) -> None:
+    close = getattr(value, "close", None)
+    if callable(close):
+        close()
+
+
+def _validate_user_reference(reference: object) -> UserReference:
+    if not isinstance(reference, UserReference):
+        raise TypeError("user reference is invalid")
+    return reference
+
+
+def _input_user(reference: UserReference) -> TypeInputUser:
+    return types.InputUserSelf() if reference.is_self else types.InputUser(reference.user_id, reference.access_hash)
+
+
+def _session_entity(client: object, entity_id: int) -> object | None:
+    session = getattr(client, "session", None)
+    getter = getattr(session, "get_input_entity", None)
+    if not callable(getter) or inspect.iscoroutinefunction(getter):
+        return None
+    try:
+        peer = getter(entity_id)
+    except AttributeError, KeyError, TypeError, ValueError:
+        return None
+    if inspect.isawaitable(peer):
+        _close_awaitable(peer)
+        return None
+    return peer
+
+
+def _chat_avatar_reference_from_peer(peer: object | None, entity_id: int) -> ChatAvatarReference | None:
+    if isinstance(peer, types.InputPeerChannel):
+        raw_id = getattr(peer, "channel_id", None)
+        access_hash = _signed_64(getattr(peer, "access_hash", None))
+        if not isinstance(raw_id, int) or access_hash is None:
+            return None
+        canonical_id = _canonical_channel_id(raw_id)
+        return ChannelReference(canonical_id, access_hash) if canonical_id == entity_id else None
+    if isinstance(peer, types.InputPeerChat):
+        raw_id = getattr(peer, "chat_id", None)
+        if isinstance(raw_id, int) and -raw_id == entity_id:
+            return GroupReference(-raw_id)
+    return None
+
+
+def _user_reference_from_peer(peer: object | None, user_id: int, *, is_self: bool) -> UserReference | None:
+    if isinstance(peer, types.InputPeerSelf):
+        return UserReference(user_id, 0, is_self=True) if is_self else None
+    if not isinstance(peer, types.InputPeerUser):
+        return None
+    raw_id = getattr(peer, "user_id", None)
+    access_hash = _signed_64(getattr(peer, "access_hash", None))
+    if raw_id != user_id or access_hash is None:
+        return None
+    return UserReference(user_id, access_hash, is_self=is_self)
+
+
+def _normalize_common_chats(result: object) -> tuple[tuple[CommonChatSummary, ...], int, ProjectionStatus]:
+    if not isinstance(result, (types.messages.Chats, types.messages.ChatsSlice)):
+        raise ValueError("common chats envelope is invalid")
+    raw_chats = getattr(result, "chats", None)
+    if not isinstance(raw_chats, Sequence) or isinstance(raw_chats, str | bytes | bytearray):
+        raise ValueError("common chats rows are invalid")
+    output: list[CommonChatSummary] = []
+    seen: set[int] = set()
+    for chat in raw_chats:
+        summary = _normalize_common_chat(chat, seen)
+        if summary is not None:
+            output.append(summary)
+    reported = _count_or_length(result, len(output))
+    return (
+        tuple(output),
+        max(reported, len(output)),
+        ProjectionStatus.PARTIAL if isinstance(result, types.messages.ChatsSlice) else ProjectionStatus.USABLE,
+    )
+
+
+def _normalize_common_chat(chat: object, seen: set[int]) -> CommonChatSummary | None:
+    identity = _common_chat_identity(chat, seen)
+    if identity is None:
+        return None
+    chat_id, raw_id, kind = identity
+    title = getattr(chat, "title", None)
+    if title is None:
+        title = str(raw_id)
+    elif not isinstance(title, str):
+        raise ValueError("common chat title is invalid")
+    elif not title:
+        title = str(raw_id)
+    return CommonChatSummary(chat_id, title, kind)
+
+
+def _common_chat_identity(chat: object, seen: set[int]) -> tuple[int, int, str] | None:
+    if isinstance(chat, types.ChatEmpty):
+        return None
+    if not isinstance(chat, (types.Chat, types.ChatForbidden, types.Channel, types.ChannelForbidden)):
+        raise ValueError("common chat row is invalid")
+    raw_id = _positive_id(getattr(chat, "id", None))
+    if raw_id is None:
+        raise ValueError("common chat id is invalid")
+    chat_id = -raw_id if isinstance(chat, (types.Chat, types.ChatForbidden)) else _canonical_channel_id(raw_id)
+    if chat_id in seen:
+        return None
+    seen.add(chat_id)
+    kind = "group"
+    if isinstance(chat, (types.Channel, types.ChannelForbidden)):
+        kind = "supergroup" if bool(getattr(chat, "megagroup", False)) else "channel"
+    return chat_id, raw_id, kind
+
+
+def _normalize_user_photos(result: object, user_id: int) -> tuple[tuple[ChatCurrentPhoto, ...], int, ProjectionStatus]:
+    if not isinstance(result, (types.photos.Photos, types.photos.PhotosSlice)):
+        raise ValueError("user photos envelope is invalid")
+    raw_photos = getattr(result, "photos", None)
+    if not isinstance(raw_photos, Sequence) or isinstance(raw_photos, str | bytes | bytearray):
+        raise ValueError("user photos rows are invalid")
+    users = getattr(result, "users", None)
+    if not isinstance(users, Sequence) or isinstance(users, str | bytes | bytearray):
+        raise ValueError("user photos users are invalid")
+    user_ids = _normalize_photo_user_ids(users)
+    if users and user_id not in user_ids:
+        raise ValueError("user photos target does not match")
+    photos = _normalize_photo_rows(raw_photos, context="user avatar")
+    reported = _count_or_length(result, len(photos))
+    status = ProjectionStatus.PARTIAL if isinstance(result, types.photos.PhotosSlice) else ProjectionStatus.USABLE
+    return photos, max(reported, len(photos)), status
+
+
+def _normalize_photo_user_ids(users: Sequence[object]) -> set[int]:
+    user_ids: set[int] = set()
+    for user in users:
+        if not isinstance(user, (types.User, types.UserEmpty)):
+            raise ValueError("user photos user row is invalid")
+        normalized_id = _positive_id(getattr(user, "id", None))
+        if normalized_id is None:
+            raise ValueError("user photos user id is invalid")
+        user_ids.add(normalized_id)
+    return user_ids
+
+
+def _normalize_chat_photos(
+    result: object, reference: ChatAvatarReference
+) -> tuple[tuple[ChatCurrentPhoto, ...], int, ProjectionStatus]:
+    accepted = (types.messages.Messages, types.messages.MessagesSlice, types.messages.ChannelMessages)
+    if not isinstance(result, accepted):
+        raise ValueError("chat photos envelope is invalid")
+    raw_messages = getattr(result, "messages", None)
+    if not isinstance(raw_messages, Sequence) or isinstance(raw_messages, str | bytes | bytearray):
+        raise ValueError("chat photo messages are invalid")
+    photos: list[ChatCurrentPhoto] = []
+    seen: set[int] = set()
+    for message in raw_messages:
+        photo = _normalize_chat_photo(message, reference, seen)
+        if photo is not None:
+            photos.append(photo)
+    reported = _count_or_length(result, len(photos))
+    status = (
+        ProjectionStatus.PARTIAL
+        if isinstance(result, (types.messages.MessagesSlice, types.messages.ChannelMessages))
+        else ProjectionStatus.USABLE
+    )
+    return tuple(photos), max(reported, len(photos)), status
+
+
+def _normalize_chat_photo(message: object, reference: ChatAvatarReference, seen: set[int]) -> ChatCurrentPhoto | None:
+    if isinstance(message, types.MessageEmpty):
+        return None
+    if not isinstance(message, (types.Message, types.MessageService)):
+        raise ValueError("chat photo message is invalid")
+    if not _chat_message_matches_reference(message, reference):
+        raise ValueError("chat photo message target does not match")
+    action = getattr(message, "action", None)
+    if not isinstance(action, types.MessageActionChatEditPhoto):
+        return None
+    return _normalize_chat_photo_action(action, message, seen)
+
+
+def _normalize_chat_photo_action(action: object, message: object, seen: set[int]) -> ChatCurrentPhoto | None:
+    photo = getattr(action, "photo", None)
+    if not isinstance(photo, (types.Photo, types.PhotoEmpty)):
+        raise ValueError("chat photo action payload is invalid")
+    photo_id = _positive_id(getattr(photo, "id", None))
+    if photo_id is None and isinstance(photo, types.PhotoEmpty):
+        return None
+    if photo_id is None:
+        raise ValueError("chat avatar photo id is invalid")
+    if photo_id in seen:
+        return None
+    seen.add(photo_id)
+    raw_date = getattr(message, "date", None)
+    if raw_date is not None and not isinstance(raw_date, datetime):
+        raise ValueError("chat avatar date is invalid")
+    return ChatCurrentPhoto(photo_id, raw_date.isoformat() if raw_date is not None else None)
+
+
+def _chat_message_matches_reference(message: object, reference: ChatAvatarReference) -> bool:
+    peer = getattr(message, "peer_id", None)
+    if isinstance(reference, ChannelReference):
+        return isinstance(peer, types.PeerChannel) and peer.channel_id == -CHANNEL_ID_MARKER - reference.channel_id
+    return isinstance(peer, types.PeerChat) and peer.chat_id == abs(reference.group_id)
+
+
+def _normalize_photo_rows(raw_photos: Sequence[object], *, context: str) -> tuple[ChatCurrentPhoto, ...]:
+    output: list[ChatCurrentPhoto] = []
+    seen: set[int] = set()
+    for photo in raw_photos:
+        if not isinstance(photo, (types.Photo, types.PhotoEmpty)):
+            raise ValueError(f"{context} photo row is invalid")
+        photo_id = _positive_id(getattr(photo, "id", None))
+        if photo_id is None and isinstance(photo, types.PhotoEmpty):
+            continue
+        if photo_id is None:
+            raise ValueError(f"{context} photo id is invalid")
+        if photo_id in seen:
+            continue
+        seen.add(photo_id)
+        raw_date = getattr(photo, "date", None)
+        if raw_date is not None and not isinstance(raw_date, datetime):
+            raise ValueError(f"{context} photo date is invalid")
+        output.append(ChatCurrentPhoto(photo_id, raw_date.isoformat() if raw_date is not None else None))
+    return tuple(output)
+
+
+def _count_or_length(result: object, fallback: int) -> int:
+    count = getattr(result, "count", fallback)
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        raise ValueError("reported count is invalid")
+    return count
 
 
 def _raw_group_id(group_id: int) -> int:

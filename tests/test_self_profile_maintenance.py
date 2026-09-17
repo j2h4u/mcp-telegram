@@ -13,6 +13,7 @@ from mcp_telegram.entity_profile.contracts import (
     ProjectionStatus,
     TargetKind,
     UserProfileObservation,
+    UserReference,
 )
 from mcp_telegram.own_only_contracts import OwnOnlyContext
 from mcp_telegram.self_profile_maintenance import (
@@ -52,6 +53,9 @@ class _StartupUserProfilePort:
         self.personal_channel_status = personal_channel_status
         self.error = error
         self.observer = observer
+
+    def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference:
+        return UserReference(user_id, 0, is_self=is_self)
 
     async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
         if self.error is not None:

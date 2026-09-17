@@ -23,11 +23,15 @@ from mcp_telegram.entity_profile.contracts import (
     PROFILE_SECTIONS,
     ChannelContactOverlapObservation,
     ChannelProfileObservation,
+    ChatAvatarHistoryObservation,
+    CommonChatsObservation,
+    GroupReference,
     ObservationBoundary,
     PersonalChannelPost,
     PersonalChannelReference,
     ProjectionStatus,
     TargetKind,
+    UserAvatarHistoryObservation,
     UserProfileObservation,
 )
 from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
@@ -52,12 +56,25 @@ from mcp_telegram.telegram_demand import (
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
 from mcp_telegram.tools.entity_info import GET_ENTITY_INFO_OUTPUT_SCHEMA, GetEntityInfo, _entity_structured_content
-from tests.helpers import FakeChannelProfilePort, LoudChannelProfilePort, LoudGroupProfilePort
+from tests.helpers import (
+    ClientCommonChatsPort,
+    FakeChannelProfilePort,
+    LoudChannelProfilePort,
+    LoudChatAvatarHistoryPort,
+    LoudCommonChatsPort,
+    LoudGroupProfilePort,
+    LoudUserAvatarHistoryPort,
+)
 
 
 class _UserProfilePort:
     def __init__(self, client: object) -> None:
         self.client = client
+
+    def get_user_reference(self, user_id: int, *, is_self: bool = False):
+        from mcp_telegram.entity_profile.contracts import UserReference
+
+        return UserReference(user_id, 0, is_self=is_self)
 
     async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
         response = await self.client(("full_user", {"id": user_id}))  # type: ignore[operator]
@@ -370,14 +387,18 @@ def test_last_good_survives_refresh_failure() -> None:
     assert repo.commit_section(cursor, EntitySectionCommit({}, status="fresh"), now=100)
     cursor = repo.next_due_refresh(now=100)
     assert cursor is not None and cursor.next_section == "common_chats"
-    assert repo.commit_section(cursor, EntitySectionCommit({}, status="fresh"), now=100)
+    assert repo.commit_section(
+        cursor,
+        EntitySectionCommit({}, status="unavailable", reason="not_an_admin", payload=None),
+        now=100,
+    )
     repo.mark_refresh_failure(42, now=101, reason="timeout")
     stored = repo.read(42, now=101)
     assert stored is not None
     assert stored.detail["common_chats"] == [{"id": 7}]
     assert stored.observed_at == 100
-    assert stored.sections["common_chats"]["status"] == "stale"
-    assert stored.sections["common_chats"]["observed_at"] == 100
+    assert stored.sections["common_chats"]["status"] == "unavailable"
+    assert stored.sections["common_chats"]["reason"] == "timeout"
     conn.close()
 
 
@@ -466,22 +487,80 @@ def _test_service(conn: sqlite3.Connection, *, limits: RefreshLimits) -> DaemonE
             now_provider=lambda: 100.0,
             detail_ttl_seconds=300,
             slow_stage_seconds=1.0,
-            get_common_chats_request=lambda **_kwargs: object(),
             user_profile_port=_UserProfilePort(_UnusedClient()),
-            get_user_photos_request=lambda **_kwargs: object(),
-            get_messages_search_request=lambda **_kwargs: object(),
-            input_messages_filter_chat_photos=object,
-            message_action_chat_edit_photo=object,
-            channel_type=object,
-            chat_type=object,
             group_profile_port=LoudGroupProfilePort(),
             channel_profile_port=LoudChannelProfilePort(),
             channel_reference_provider=LoudChannelProfilePort(),
+            common_chats_port=LoudCommonChatsPort(),
+            user_avatar_history_port=LoudUserAvatarHistoryPort(),
+            chat_avatar_history_port=LoudChatAvatarHistoryPort(),
             refresh_limits=limits,
         )
     )
     service.bind_demand_sink(MagicMock())
     return service
+
+
+@pytest.mark.asyncio
+async def test_unavailable_common_and_avatar_commits_preserve_existing_projection() -> None:
+    class DeniedCommonChatsPort:
+        async def fetch_common_chats(self, _reference: object) -> CommonChatsObservation:
+            return CommonChatsObservation(42, (), 0, ProjectionStatus.UNAVAILABLE, "not_an_admin", 100, 100)
+
+    class DeniedUserAvatarPort:
+        async def fetch_user_avatar_history(self, _reference: object) -> UserAvatarHistoryObservation:
+            return UserAvatarHistoryObservation(42, (), 0, ProjectionStatus.UNAVAILABLE, "access_lost", 100, 100)
+
+    class MissingChatAvatarPort:
+        def get_chat_avatar_reference(self, _entity_id: int) -> None:
+            return None
+
+        async def fetch_chat_avatar_history(self, _reference: object) -> ChatAvatarHistoryObservation:
+            raise AssertionError("reference miss must not fetch")
+
+    conn = sqlite3.connect(":memory:")
+    _sections_schema(conn)
+    service = _test_service(conn, limits=RefreshLimits())
+    service._deps = replace(
+        service._deps,
+        common_chats_port=DeniedCommonChatsPort(),
+        user_avatar_history_port=DeniedUserAvatarPort(),
+        chat_avatar_history_port=MissingChatAvatarPort(),
+    )
+    try:
+        common = await service._acquire_common_chats(42)
+        user_avatar = await service._acquire_user_avatar_history(42)
+        chat_avatar = await service._acquire_chat_avatar_history(-123)
+        assert common.detail_patch == {} and common.payload is None
+        assert common.status == "unavailable" and common.reason == "not_an_admin"
+        assert user_avatar.detail_patch == {} and user_avatar.payload is None
+        assert user_avatar.status == "unavailable" and user_avatar.reason == "access_lost"
+        assert chat_avatar.detail_patch == {} and chat_avatar.payload is None
+        assert chat_avatar.status == "unavailable" and chat_avatar.reason == "chat_reference_unavailable"
+    finally:
+        await service.shutdown()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_avatar_observation_reference_mismatch_is_rejected() -> None:
+    class WrongChatAvatarPort:
+        def get_chat_avatar_reference(self, _entity_id: int) -> GroupReference:
+            return GroupReference(-123)
+
+        async def fetch_chat_avatar_history(self, _reference: object) -> ChatAvatarHistoryObservation:
+            return ChatAvatarHistoryObservation(GroupReference(-456), (), 0, ProjectionStatus.USABLE, None, 100, 100)
+
+    conn = sqlite3.connect(":memory:")
+    _sections_schema(conn)
+    service = _test_service(conn, limits=RefreshLimits())
+    service._deps = replace(service._deps, chat_avatar_history_port=WrongChatAvatarPort())
+    try:
+        with pytest.raises(ValueError, match="reference"):
+            await service._acquire_chat_avatar_history(-123)
+    finally:
+        await service.shutdown()
+        conn.close()
 
 
 def _channel_profile_service(
@@ -773,7 +852,7 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt() 
         client=cast(object, client),
         get_peer_id=lambda value: int(value.id),
         user_profile_port=_UserProfilePort(client),
-        get_common_chats_request=lambda **_kwargs: ("common_chats", _kwargs),
+        common_chats_port=ClientCommonChatsPort(client),
     )
     coordinator = service.refresh_coordinator
     assert coordinator is not None
@@ -798,7 +877,7 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt() 
         client=cast(object, client),
         get_peer_id=lambda value: int(value.id),
         user_profile_port=_UserProfilePort(client),
-        get_common_chats_request=lambda **_kwargs: ("common_chats", _kwargs),
+        common_chats_port=ClientCommonChatsPort(client),
     )
     restarted_coordinator = restarted.refresh_coordinator
     assert restarted_coordinator is not None
@@ -1057,7 +1136,11 @@ async def test_expected_enrichment_timeout_does_not_emit_traceback(caplog: pytes
 
     conn = sqlite3.connect(":memory:")
     service = _test_service(conn, limits=RefreshLimits())
-    service._deps = replace(service._deps, client=TimeoutClient())
+    service._deps = replace(
+        service._deps,
+        client=TimeoutClient(),
+        common_chats_port=ClientCommonChatsPort(TimeoutClient()),
+    )
 
     with caplog.at_level(logging.WARNING):
         assert await service._collect_common_chats(42) == []
@@ -1083,6 +1166,83 @@ async def test_cached_core_path_is_local_and_fast() -> None:
     assert data["name"] == "Cached"
     assert data["completeness"] == "partial"
     conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entity_type", ("user", "bot"))
+@pytest.mark.parametrize("avatar_status", ("pending", "unavailable"))
+async def test_progressive_cached_avatar_projects_persisted_current_photo_without_full_profile_rpc(
+    entity_type: str, avatar_status: str
+) -> None:
+    class CountingClient(_UnusedClient):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def __call__(self, _request: object) -> object:
+            self.calls += 1
+            raise AssertionError("cached projection must not fetch full profile")
+
+    entity_id = 42 if entity_type == "user" else 43
+    client = CountingClient()
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+    )
+    _sections_schema(conn)
+    detail = {
+        "schema": 1,
+        "id": entity_id,
+        "type": entity_type,
+        "name": "Cached profile",
+        "avatar_history": [{"photo_id": 7, "date": None}],
+        "avatar_count": 1,
+    }
+    conn.execute("INSERT INTO entities VALUES (?, ?, ?, NULL, NULL, 100)", (entity_id, entity_type, "Cached profile"))
+    conn.execute("INSERT INTO entity_details VALUES (?, ?, 100)", (entity_id, json.dumps(detail)))
+    section_rows = {
+        "full_profile": ("fresh", 100, None, {"current_photo": {"photo_id": 99, "date": None}}),
+        "common_chats": ("fresh", 100, None, []),
+        "contact_overlap": ("not_applicable", None, None, None),
+        "avatar_history": (
+            avatar_status,
+            100,
+            "history_pending" if avatar_status == "pending" else "access_lost",
+            detail["avatar_history"],
+        ),
+        "personal_channel": ("fresh", 100, None, None),
+    }
+    conn.executemany(
+        "INSERT INTO entity_detail_sections(entity_id, section, status, observed_at, reason, payload_json, retry_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+        (
+            (entity_id, section, status, observed_at, reason, json.dumps(payload) if payload is not None else None)
+            for section, (status, observed_at, reason, payload) in section_rows.items()
+        ),
+    )
+    service = _test_service(conn, limits=RefreshLimits(foreground_refresh_wait_seconds=0.01))
+    service._deps = replace(
+        service._deps,
+        client=client,
+        user_profile_port=_UserProfilePort(client),
+        get_dialog_placement=lambda _entity_id: {},
+    )
+    try:
+        result = await service.get_entity_info({"entity_id": entity_id})
+        data = cast(dict[str, object], result["data"])
+        assert data["avatar_history"] == [
+            {"photo_id": 99, "date": None},
+            {"photo_id": 7, "date": None},
+        ]
+        assert data["avatar_count"] == 2
+        assert cast(dict[str, dict[str, object]], data["sections"])["avatar_history"]["status"] == avatar_status
+        assert client.calls == 0
+    finally:
+        await service.shutdown()
+        conn.close()
 
 
 @pytest.mark.asyncio
