@@ -113,7 +113,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Instrumented halves currently take about 23 minutes end to end; keep the
+    # timeout bounded while leaving enough room for runner variance.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
