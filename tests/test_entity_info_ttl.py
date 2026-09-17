@@ -21,6 +21,14 @@ import pytest
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
+from mcp_telegram.entity_profile.contracts import (
+    PersonalChannelPost,
+    PersonalChannelReference,
+    ProjectionOutcome,
+    ProjectionStatus,
+    TargetKind,
+    UserProfileObservation,
+)
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import LoudGroupProfilePort
 from tests.reaction_helpers import make_reaction_freshener
@@ -86,12 +94,25 @@ def make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike
     if client is None:
         client = MagicMock()
     shutdown_event = asyncio.Event()
+
+    class _GenericUserProfilePort:
+        async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
+            usable = ProjectionOutcome(ProjectionStatus.USABLE, {}, None, None)
+            absent = ProjectionOutcome(ProjectionStatus.ABSENT, {"personal_channel_id": None}, None, None)
+            return UserProfileObservation(user_id, target_kind, usable, absent)
+
+        async def fetch_personal_channel_post(
+            self, reference: PersonalChannelReference, message_id: int
+        ) -> PersonalChannelPost | None:
+            raise AssertionError(f"personal channel post fetch is not part of TTL tests: {reference}/{message_id}")
+
     server = DaemonAPIServer(
         conn,
         cast(DaemonClientLike, client),
         shutdown_event,
         reaction_freshener=make_reaction_freshener(conn, client),
         group_profile_port=LoudGroupProfilePort(),
+        user_profile_port=_GenericUserProfilePort(),
         policy=make_daemon_api_policy(),
     )
     server._ready = True
@@ -153,7 +174,6 @@ async def test_get_entity_info_serves_from_db_within_ttl(monkeypatch: pytest.Mon
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base)
     with (
         patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
     ):
         r1 = await server._dispatch({"method": "get_entity_info", "entity_id": 42})
@@ -171,7 +191,6 @@ async def test_get_entity_info_serves_from_db_within_ttl(monkeypatch: pytest.Mon
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base + 400)
     with (
         patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
     ):
         r3 = await server._dispatch({"method": "get_entity_info", "entity_id": 42})
@@ -192,7 +211,6 @@ async def test_get_entity_info_at_exact_ttl_age_refetches(monkeypatch: pytest.Mo
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base)
     with (
         patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
     ):
         assert (await server._dispatch({"method": "get_entity_info", "entity_id": 43}))["ok"]
@@ -200,7 +218,6 @@ async def test_get_entity_info_at_exact_ttl_age_refetches(monkeypatch: pytest.Mo
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base + ttl_seconds)
     with (
         patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
     ):
         assert (await server._dispatch({"method": "get_entity_info", "entity_id": 43}))["ok"]
@@ -223,7 +240,6 @@ async def test_get_entity_info_auto_resolve_writes_both_rows(monkeypatch: pytest
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: 5_000_000)
     with (
         patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
     ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 100})

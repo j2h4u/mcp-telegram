@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -26,8 +28,16 @@ from telethon.errors import ChannelPrivateError
 from telethon.tl.types import Channel, User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
+from mcp_telegram.entity_profile.contracts import (
+    ObservationBoundary,
+    PersonalChannelPost,
+    PersonalChannelReference,
+    TargetKind,
+)
+from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
+from mcp_telegram.entity_profile.ports import UserProfilePort
 from tests.daemon_api_policy import make_daemon_api_policy
-from tests.helpers import LoudGroupProfilePort
+from tests.helpers import FakeUserProfilePort, LoudGroupProfilePort, LoudUserProfilePort
 from tests.reaction_helpers import make_reaction_freshener
 
 _TEST_DBS: list[sqlite3.Connection] = []
@@ -98,7 +108,11 @@ def _make_db() -> sqlite3.Connection:
     return conn
 
 
-def make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike | None = None) -> DaemonAPIServer:
+def make_server(
+    conn: sqlite3.Connection | None = None,
+    client: DaemonClientLike | None = None,
+    user_profile_port: UserProfilePort | None = None,
+) -> DaemonAPIServer:
     if conn is None:
         conn = _make_db()
     if client is None:
@@ -110,6 +124,7 @@ def make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike
         shutdown_event,
         reaction_freshener=make_reaction_freshener(conn, client),
         group_profile_port=LoudGroupProfilePort(),
+        user_profile_port=user_profile_port if user_profile_port is not None else LoudUserProfilePort(),
         policy=make_daemon_api_policy(),
     )
     server._ready = True
@@ -156,6 +171,33 @@ def _make_channel_mock(**kwargs: object) -> MagicMock:
     return channel
 
 
+def _user_profile_port(
+    user: MagicMock,
+    full: MagicMock,
+    *,
+    post: PersonalChannelPost | None = None,
+    reference: PersonalChannelReference | None = None,
+    post_error: BaseException | None = None,
+) -> FakeUserProfilePort:
+    full_user = cast(object, full.full_user)
+    user_id = cast(int, user.id)
+    user_is_bot = cast(bool, user.bot)
+    response = SimpleNamespace(full_user=full_user, users=[user], chats=getattr(full, "chats", []))
+    observation = normalize_full_user_response(
+        response,
+        target_id=user_id,
+        target_kind=TargetKind.BOT if user_is_bot else TargetKind.USER,
+        observation=ObservationBoundary(100.0, 100.0),
+    )
+    if reference is not None:
+        observation = replace(observation, personal_channel_reference=reference)
+    return FakeUserProfilePort(
+        observation,
+        post=post,
+        post_error=post_error,
+    )
+
+
 @pytest.mark.asyncio
 async def test_get_entity_info_user_type() -> None:
     """SPEC Req 2: User entity (bot=False) returns type='user'."""
@@ -180,11 +222,10 @@ async def test_get_entity_info_user_type() -> None:
     )
     photos.count = 0
     photos.photos = []
-    client.side_effect = [common, full, photos]
-    server = make_server(client=client)
+    client.side_effect = [common, photos]
+    server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
     with (
         patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
     ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 1})
@@ -217,11 +258,10 @@ async def test_get_entity_info_user_avatar_history_handles_photos_without_count(
     photo = MagicMock(id=77, date=datetime(2026, 6, 23, 12, 0, tzinfo=UTC))
     del photos.count
     photos.photos = [photo]
-    client.side_effect = [common, full, photos]
-    server = make_server(client=client)
+    client.side_effect = [common, photos]
+    server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
     with (
         patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
     ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 11})
@@ -255,11 +295,10 @@ async def test_get_entity_info_bot_type() -> None:
     )
     photos.count = 0
     photos.photos = []
-    client.side_effect = [common, full, photos]
-    server = make_server(client=client)
+    client.side_effect = [common, photos]
+    server = make_server(client=client, user_profile_port=_user_profile_port(bot, full))
     with (
         patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
     ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 2})
@@ -267,6 +306,44 @@ async def test_get_entity_info_bot_type() -> None:
     d = _dict(r["data"])
     assert d["type"] == "bot"
     assert d["bot"] is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_bot_profile_uses_resolved_kind_without_local_entity_row() -> None:
+    bot = _make_user_mock(id=6, bot=True, first_name="ProfileBot")
+    channel = _make_channel_mock(id=777, title="Bot Notes", username="bot_notes")
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=bot)
+    common, full, photos = MagicMock(), MagicMock(), MagicMock()
+    common.chats = []
+    full.full_user = MagicMock(
+        about="bot bio",
+        personal_channel_id=777,
+        personal_channel_message=None,
+        blocked=False,
+        ttl_period=None,
+        private_forward_name=None,
+        folder_id=None,
+    )
+    full.chats = [channel]
+    photos.count = 0
+    photos.photos = []
+    client.side_effect = [common, photos]
+    port = _user_profile_port(bot, full)
+    server = make_server(client=client, user_profile_port=port)
+
+    with (
+        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
+        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
+    ):
+        result = await server._dispatch({"method": "get_entity_info", "entity_id": 6})
+
+    assert result["ok"] is True
+    assert port.calls == [(6, TargetKind.BOT)]
+    personal_channel = _dict(_dict(result["data"])["personal_channel"])
+    assert personal_channel["metadata_source"] == "user_full_chats"
+    assert personal_channel["title"] == "Bot Notes"
+    await server.shutdown()
 
 
 @pytest.mark.asyncio
@@ -293,11 +370,10 @@ async def test_get_entity_info_common_envelope_user() -> None:
     )
     photos.count = 0
     photos.photos = []
-    client.side_effect = [common, full, photos]
-    server = make_server(client=client)
+    client.side_effect = [common, photos]
+    server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
     with (
         patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
     ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 3})
@@ -333,11 +409,10 @@ async def test_get_entity_info_user_field_surface_preserved() -> None:
     )
     photos.count = 0
     photos.photos = []
-    client.side_effect = [common, full, photos]
-    server = make_server(client=client)
+    client.side_effect = [common, photos]
+    server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
     with (
         patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
     ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 4})
@@ -392,7 +467,8 @@ async def test_get_entity_info_user_personal_channel_card_from_full_user_chats()
     long_text = "0123456789" * 12
     attached_message = MagicMock()
     attached_message.message = long_text
-    attached_message.date = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    attached_date = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    attached_message.date = attached_date
     get_messages = AsyncMock(return_value=[attached_message])
     client.get_messages = get_messages
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
@@ -415,12 +491,19 @@ async def test_get_entity_info_user_personal_channel_card_from_full_user_chats()
     full.chats = [channel]
     photos.count = 0
     photos.photos = []
-    client.side_effect = [common, full, photos]
-    server = make_server(client=client)
+    client.side_effect = [common, photos]
+    server = make_server(
+        client=client,
+        user_profile_port=_user_profile_port(
+            user,
+            full,
+            post=PersonalChannelPost(message_id=55, sent_at=int(attached_date.timestamp()), text=long_text),
+            reference=PersonalChannelReference(channel_id=777, access_hash=-123),
+        ),
+    )
 
     with (
         patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
     ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 44})
@@ -444,11 +527,25 @@ async def test_get_entity_info_user_personal_channel_card_from_full_user_chats()
             "is_truncated": True,
         },
     }
-    get_messages.assert_awaited_once_with(channel, ids=[55])
+    assert "access_hash" not in repr(r["data"])
+    get_messages.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_get_entity_info_user_personal_channel_falls_back_to_local_latest_post() -> None:
+async def test_personal_channel_post_port_failure_returns_fallback_reason() -> None:
+    port = FakeUserProfilePort(post_error=TimeoutError("timed out"))
+    server = make_server(user_profile_port=port)
+
+    preview, reason = await server._get_entity_info_service()._fetch_attached_personal_channel_post(
+        PersonalChannelReference(channel_id=777, access_hash=-123), message_id=55
+    )
+
+    assert preview is None
+    assert reason == "attached_message_fetch_failed"
+
+
+@pytest.mark.asyncio
+async def test_get_entity_info_user_partial_personal_channel_skips_local_enrichment() -> None:
     conn = _make_db()
     conn.execute(
         """CREATE TABLE messages (
@@ -499,29 +596,19 @@ async def test_get_entity_info_user_personal_channel_falls_back_to_local_latest_
     full.chats = []
     photos.count = 0
     photos.photos = []
-    client.side_effect = [common, full, photos]
-    server = make_server(conn=conn, client=client)
+    client.side_effect = [common, photos]
+    server = make_server(conn=conn, client=client, user_profile_port=_user_profile_port(user, full))
 
     with (
         patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
     ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 45})
 
     d = _dict(r["data"])
-    personal_channel = _dict(d["personal_channel"])
-    assert personal_channel["title"] == "Local Channel"
-    assert personal_channel["username"] == "local_channel"
-    assert personal_channel["metadata_source"] == "local_entities"
-    assert personal_channel["latest_or_attached_post"] == {
-        "source": "local_latest_message",
-        "message_id": 11,
-        "sent_at": 200,
-        "text_preview": "latest local post",
-        "char_count": 17,
-        "is_truncated": False,
-    }
+    assert d["personal_channel_id"] == 777
+    assert d["personal_channel"] is None
+    assert d["personal_channel_unavailable_reason"] == "channel_metadata_invalid"
     assert get_messages.await_count == 0
 
 
@@ -553,11 +640,10 @@ async def test_get_entity_info_no_download_keys_user() -> None:
     photo.date = MagicMock(isoformat=lambda: "2024-01-01T00:00:00")
     photos.count = 1
     photos.photos = [photo]
-    client.side_effect = [common, full, photos]
-    server = make_server(client=client)
+    client.side_effect = [common, photos]
+    server = make_server(client=client, user_profile_port=_user_profile_port(user, full))
     with (
         patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
-        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
     ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 5})

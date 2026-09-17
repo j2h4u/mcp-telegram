@@ -6,7 +6,15 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import TypedDict, Unpack
 
-from mcp_telegram.entity_profile.contracts import GroupProfileObservation
+from mcp_telegram.entity_profile.contracts import (
+    GroupProfileObservation,
+    PersonalChannelPost,
+    PersonalChannelReference,
+    ProjectionOutcome,
+    ProjectionStatus,
+    TargetKind,
+    UserProfileObservation,
+)
 
 
 class _BuildMockMessageKwargs(TypedDict, total=False):
@@ -94,3 +102,50 @@ class LoudGroupProfilePort:
 
     async def fetch_group_profile(self, group_id: int) -> GroupProfileObservation:
         raise AssertionError(f"unexpected group profile request for {group_id}")
+
+
+class LoudUserProfilePort:
+    """Test-only port that fails if a user profile request is unexpected."""
+
+    async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
+        raise AssertionError(f"unexpected user profile request for {user_id} ({target_kind})")
+
+    async def fetch_personal_channel_post(
+        self, reference: PersonalChannelReference, message_id: int
+    ) -> PersonalChannelPost | None:
+        raise AssertionError(f"unexpected personal channel post request for {reference.channel_id}/{message_id}")
+
+
+class FakeUserProfilePort:
+    """Deterministic user profile port double with explicit call accounting."""
+
+    def __init__(
+        self,
+        observation: UserProfileObservation | None = None,
+        error: BaseException | None = None,
+        post: PersonalChannelPost | None = None,
+        post_error: BaseException | None = None,
+    ) -> None:
+        self.observation = observation
+        self.error = error
+        self.post = post
+        self.post_error = post_error
+        self.calls: list[tuple[int, TargetKind]] = []
+
+    async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
+        self.calls.append((user_id, target_kind))
+        if self.error is not None:
+            raise self.error
+        if self.observation is None:
+            unavailable = ProjectionOutcome(ProjectionStatus.UNAVAILABLE, None, "unset", None)
+            return UserProfileObservation(user_id, target_kind, unavailable, unavailable)
+        return self.observation
+
+    async def fetch_personal_channel_post(
+        self, reference: PersonalChannelReference, message_id: int
+    ) -> PersonalChannelPost | None:
+        if self.post_error is not None:
+            raise self.post_error
+        if self.post is not None and self.post.message_id != message_id:
+            return None
+        return self.post

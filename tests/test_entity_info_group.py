@@ -19,6 +19,7 @@ import pytest
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.entity_profile.contracts import GroupProfileObservation
 from tests.daemon_api_policy import make_daemon_api_policy
+from tests.helpers import LoudUserProfilePort
 from tests.reaction_helpers import make_reaction_freshener
 
 _TEST_DBS: list[sqlite3.Connection] = []
@@ -98,6 +99,7 @@ def make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike
         shutdown_event,
         reaction_freshener=make_reaction_freshener(conn, client),
         group_profile_port=_GroupProfilePort(cast(DaemonClientLike, client)),
+        user_profile_port=LoudUserProfilePort(),
         policy=make_daemon_api_policy(),
     )
     server._ready = True

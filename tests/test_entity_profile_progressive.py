@@ -19,7 +19,15 @@ from telethon.errors import PeerIdInvalidError  # type: ignore[import-untyped]
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
-from mcp_telegram.entity_profile.contracts import PROFILE_SECTIONS
+from mcp_telegram.entity_profile.contracts import (
+    PROFILE_SECTIONS,
+    ObservationBoundary,
+    PersonalChannelPost,
+    PersonalChannelReference,
+    TargetKind,
+    UserProfileObservation,
+)
+from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
 from mcp_telegram.entity_profile.refresh import (
     DurableRefreshSliceResult,
     DurableRefreshTerminal,
@@ -41,6 +49,31 @@ from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope
 from mcp_telegram.tools.entity_info import GET_ENTITY_INFO_OUTPUT_SCHEMA, GetEntityInfo, _entity_structured_content
 from tests.helpers import LoudGroupProfilePort
+
+
+class _UserProfilePort:
+    def __init__(self, client: object) -> None:
+        self.client = client
+
+    async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
+        response = await self.client(("full_user", {"id": user_id}))  # type: ignore[operator]
+        if not hasattr(response, "users") or not response.users:
+            response = SimpleNamespace(
+                full_user=getattr(response, "full_user", SimpleNamespace()),
+                users=[SimpleNamespace(id=user_id, bot=target_kind is TargetKind.BOT)],
+                chats=getattr(response, "chats", []),
+            )
+        return normalize_full_user_response(
+            response,
+            target_id=user_id,
+            target_kind=target_kind,
+            observation=ObservationBoundary(100.0, 100.0),
+        )
+
+    async def fetch_personal_channel_post(
+        self, reference: PersonalChannelReference, message_id: int
+    ) -> PersonalChannelPost | None:
+        raise AssertionError(f"personal channel post fetch is not part of progressive tests: {reference}/{message_id}")
 
 
 class _UnusedClient:
@@ -396,7 +429,7 @@ async def test_flood_wait_refresh_failure_signals_terminal_waiter_and_persists_r
     service._deps = replace(
         service._deps,
         client=cast(object, _FloodClient()),
-        get_full_user_request=lambda **_kwargs: object(),
+        user_profile_port=_UserProfilePort(_FloodClient()),
     )
     coordinator = service.refresh_coordinator
     assert coordinator is not None
@@ -433,7 +466,7 @@ def _test_service(conn: sqlite3.Connection, *, limits: RefreshLimits) -> DaemonE
             detail_ttl_seconds=300,
             slow_stage_seconds=1.0,
             get_common_chats_request=lambda **_kwargs: object(),
-            get_full_user_request=lambda **_kwargs: object(),
+            user_profile_port=_UserProfilePort(_UnusedClient()),
             get_user_photos_request=lambda **_kwargs: object(),
             get_messages_search_request=lambda **_kwargs: object(),
             get_full_channel_request=lambda **_kwargs: object(),
@@ -509,7 +542,7 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt() 
         service._deps,
         client=cast(object, client),
         get_peer_id=lambda value: int(value.id),
-        get_full_user_request=lambda **_kwargs: ("full_user", _kwargs),
+        user_profile_port=_UserProfilePort(client),
         get_common_chats_request=lambda **_kwargs: ("common_chats", _kwargs),
     )
     coordinator = service.refresh_coordinator
@@ -534,7 +567,7 @@ async def test_durable_profile_adapter_resumes_one_section_per_actual_attempt() 
         restarted._deps,
         client=cast(object, client),
         get_peer_id=lambda value: int(value.id),
-        get_full_user_request=lambda **_kwargs: ("full_user", _kwargs),
+        user_profile_port=_UserProfilePort(client),
         get_common_chats_request=lambda **_kwargs: ("common_chats", _kwargs),
     )
     restarted_coordinator = restarted.refresh_coordinator
@@ -706,7 +739,7 @@ async def test_entity_profile_adapter_sets_bounded_rpc_scope() -> None:
     service._deps = replace(
         service._deps,
         client=ScopedClient(),
-        get_full_user_request=lambda **_kwargs: object(),
+        user_profile_port=_UserProfilePort(ScopedClient()),
     )
     coordinator = service.refresh_coordinator
     assert coordinator is not None

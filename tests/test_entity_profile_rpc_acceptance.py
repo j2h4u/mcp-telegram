@@ -15,17 +15,20 @@ import pytest
 from jsonschema import validate  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
-from mcp_telegram.entity_profile.full_user_normalization import (
+from mcp_telegram.entity_profile.contracts import (
+    ObservationBoundary,
     ProjectionStatus,
     TargetKind,
-    normalize_full_user_response,
+    UserProfileObservation,
 )
+from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.entity_profile.repository import EntityProfileRepository
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.models import DialogType
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import RpcAttemptBudget, demand_context
+from mcp_telegram.telegram_gateway import TelethonUserProfileGateway
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 from mcp_telegram.tools.entity_info import (
@@ -37,19 +40,39 @@ from mcp_telegram.tools.entity_info import (
 from tests.test_entity_profile_full_user_pair import _PairClient, _prepare
 
 
+class _RawUserProfileClient:
+    def __init__(self, response: object) -> None:
+        self.response = response
+        self.requests: list[object] = []
+
+    async def __call__(self, request: object) -> object:
+        self.requests.append(request)
+        return self.response
+
+    async def get_messages(self, _entity: object, ids: list[int]) -> object:
+        raise AssertionError(ids)
+
+
 class _FailureClient(_PairClient):
     def __init__(self, *, failure: BaseException | None = None, response: object | None = None) -> None:
         super().__init__()
         self.failure = failure
         self.response = response
 
-    async def __call__(self, request: object) -> object:
+    async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
         scope = current_rpc_scope()
         assert scope.attempt_budget is not None
         scope.attempt_budget.debit()
         if self.failure is not None:
             raise self.failure
-        return self.response
+        if self.response is None:
+            return await super().fetch_user_profile(user_id, target_kind)
+        return normalize_full_user_response(
+            self.response,
+            target_id=user_id,
+            target_kind=target_kind,
+            observation=ObservationBoundary(100.0, 100.0),
+        )
 
 
 class _CompletePairClient(_FailureClient):
@@ -129,7 +152,7 @@ async def _baseline_then_fail(path: Path, client: _FailureClient) -> tuple[sqlit
     baseline = service._profiles.read(42, now=100)  # type: ignore[attr-defined]
     assert baseline is not None and baseline.detail["about"] == "about"
     _requeue_new_generation(conn)
-    service._deps = replace(service._deps, client=client)
+    service._deps = replace(service._deps, client=client, user_profile_port=client)
     return conn, service
 
 
@@ -221,13 +244,87 @@ def test_normalization_rejects_target_mismatch_and_pair_is_only_user_or_bot() ->
 
 
 @pytest.mark.asyncio
+async def test_service_full_profile_uses_bot_target_and_keeps_personal_channel_inapplicable(tmp_path: Path) -> None:
+    conn, service = _prepare(tmp_path / "service.sqlite", entity_type="service")
+    raw = _RawUserProfileClient(
+        SimpleNamespace(
+            full_user=SimpleNamespace(about="service bio", personal_channel_id=None),
+            users=[SimpleNamespace(id=42, first_name="Replies", username="replies", bot=True)],
+            chats=[],
+        )
+    )
+    service._deps = replace(service._deps, user_profile_port=TelethonUserProfileGateway(raw))  # type: ignore[attr-defined]
+
+    result = await service._acquire_full_profile(42, DialogType.SERVICE)  # type: ignore[attr-defined]
+
+    assert raw.requests and getattr(raw.requests[0], "id", None) == 42
+    assert result.detail_patch["about"] == "service bio"
+    assert not DaemonEntityInfoService._section_applies(DialogType.SERVICE, "personal_channel")  # type: ignore[attr-defined]
+    await service.shutdown()  # type: ignore[attr-defined]
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_personal_channel_keeps_id_reason_and_no_local_card(tmp_path: Path) -> None:
+    conn, service = _prepare(tmp_path / "partial-channel.sqlite")
+    raw = _RawUserProfileClient(
+        SimpleNamespace(
+            full_user=SimpleNamespace(personal_channel_id=123, personal_channel_message=9),
+            users=[SimpleNamespace(id=42, first_name="Target", username="target", bot=False)],
+            chats=[],
+        )
+    )
+    observation = await TelethonUserProfileGateway(raw, now_provider=lambda: 100.0).fetch_user_profile(
+        42, TargetKind.USER
+    )
+    assert observation.personal_channel.status is ProjectionStatus.PARTIAL
+    assert observation.personal_channel.reason is not None
+    assert observation.personal_channel.payload == {
+        "personal_channel_id": 123,
+        "personal_channel_message": 9,
+    }
+
+    sequential = service._personal_channel_section_commit(observation.personal_channel)  # type: ignore[attr-defined]
+    assert sequential.status == "unavailable"
+    assert sequential.reason == observation.personal_channel.reason
+    assert sequential.payload == observation.personal_channel.payload
+    assert sequential.detail_patch == {
+        "personal_channel_id": 123,
+        "personal_channel_message": 9,
+        "personal_channel": None,
+        "personal_channel_unavailable_reason": observation.personal_channel.reason,
+    }
+
+    cursor = service._profiles.next_due_refresh(now=100)  # type: ignore[attr-defined]
+    assert cursor is not None
+    paired = service._normalized_personal_channel_commit(  # type: ignore[attr-defined]
+        observation.personal_channel,
+        cursor,
+        service._full_user_pair_identity(TargetKind.USER),  # type: ignore[attr-defined]
+    )
+    assert paired.status == "unavailable"
+    assert paired.reason == observation.personal_channel.reason
+    assert paired.payload == observation.personal_channel.payload
+    assert paired.detail_patch["personal_channel_id"] == 123
+    assert paired.detail_patch["personal_channel"] is None
+    assert paired.detail_patch["personal_channel_unavailable_reason"] == observation.personal_channel.reason
+    assert paired.evidence is not None
+    assert paired.evidence.outcome == "unavailable"
+    assert paired.evidence.provenance is not None
+    assert paired.evidence.provenance["authoritative"] is False
+    await service.shutdown()  # type: ignore[attr-defined]
+    conn.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("now", (109, 110, 111))
 async def test_file_backed_pair_receipt_ttl_is_strict_across_reopen(tmp_path: Path, now: int) -> None:
     path = tmp_path / "ttl.sqlite"
     ensure_sync_schema(path)
     conn, raw_service = _prepare(path, migrated=True)
     service = cast(DaemonEntityInfoService, raw_service)
-    service._deps = replace(service._deps, client=_CompletePairClient())
+    complete_client = _CompletePairClient()
+    service._deps = replace(service._deps, client=complete_client, user_profile_port=complete_client)
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
@@ -366,6 +463,7 @@ async def test_actual_entity_info_tool_renders_persisted_partial_on_target_kind_
     service._deps = replace(  # type: ignore[attr-defined]
         service._deps,
         client=_PairClient(bot=True),
+        user_profile_port=_PairClient(bot=True),
         refresh_limits=replace(service._deps.refresh_limits, foreground_refresh_wait_seconds=0.01),
     )
     coordinator = service.refresh_coordinator
@@ -373,7 +471,7 @@ async def test_actual_entity_info_tool_renders_persisted_partial_on_target_kind_
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
     _requeue_new_generation(conn)
     mismatch_client = _PairClient(bot=False)
-    service._deps = replace(service._deps, client=mismatch_client)  # type: ignore[attr-defined]
+    service._deps = replace(service._deps, client=mismatch_client, user_profile_port=mismatch_client)  # type: ignore[attr-defined]
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
     assert mismatch_client.full_user_calls == 1
 

@@ -15,6 +15,7 @@ import pytest
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.daemon import capture_auth_scope
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
+from mcp_telegram.entity_profile.contracts import UserProfileObservation
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.telegram_demand import RpcAttemptBudget
@@ -353,14 +354,16 @@ async def test_scope_change_during_rpc_rejects_receipt_and_progress(tmp_path: Pa
     current = [first]
 
     class ChangingClient(_PairClient):
-        async def __call__(self, request: object) -> object:
-            result = await super().__call__(request)
+        async def fetch_user_profile(self, user_id: int, target_kind: object) -> UserProfileObservation:
+            result = await super().fetch_user_profile(user_id, target_kind)  # type: ignore[arg-type]
             current[0] = second
             return result
 
+    client = ChangingClient()
     service._deps = replace(
         service._deps,
-        client=ChangingClient(),
+        client=client,
+        user_profile_port=client,
         full_user_auth_scope=lambda: current[0],
     )
     coordinator = service.refresh_coordinator

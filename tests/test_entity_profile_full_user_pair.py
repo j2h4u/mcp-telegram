@@ -16,6 +16,14 @@ from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
+from mcp_telegram.entity_profile.contracts import (
+    ObservationBoundary,
+    PersonalChannelPost,
+    PersonalChannelReference,
+    TargetKind,
+    UserProfileObservation,
+)
+from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, RefreshLimits
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import RpcAttemptBudget
@@ -60,24 +68,36 @@ class _PairClient:
         self.omit_channel_id = omit_channel_id
         self.full_user_calls = 0
 
-    async def __call__(self, request: object) -> object:
+    async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation:
         scope = current_rpc_scope()
         assert scope.attempt_budget is not None
         scope.attempt_budget.debit()
-        request_name = cast(tuple[str, object], request)[0]
-        if request_name != "full_user":
-            raise AssertionError(request_name)
         self.full_user_calls += 1
         user = User(id=42, first_name="Target", username="target", bot=self.bot)
         full_user_data = {"about": "about", "personal_channel_message": 9}
         if not self.omit_channel_id:
             full_user_data["personal_channel_id"] = self.channel_id
         full_user = SimpleNamespace(**full_user_data)
-        return SimpleNamespace(
+        response = SimpleNamespace(
             full_user=full_user,
             users=[user],
             chats=[SimpleNamespace(id=123, title="Local Channel", username="local_channel")],
         )
+        return normalize_full_user_response(
+            response,
+            target_id=user_id,
+            target_kind=target_kind,
+            observation=ObservationBoundary(100.0, 100.0),
+        )
+
+    async def fetch_personal_channel_post(
+        self, reference: PersonalChannelReference, message_id: int
+    ) -> PersonalChannelPost | None:
+        raise AssertionError(f"personal channel post fetch is not part of pair tests: {reference}/{message_id}")
+
+    async def __call__(self, request: object) -> object:
+        del request
+        raise AssertionError("unexpected entity info request")
 
     async def get_entity(self, entity_id: int) -> object:
         del entity_id
@@ -116,7 +136,6 @@ def _pair_service(conn: sqlite3.Connection, client: _PairClient, *, enabled: boo
             detail_ttl_seconds=300,
             slow_stage_seconds=1.0,
             get_common_chats_request=lambda **kwargs: ("common_chats", kwargs),
-            get_full_user_request=lambda **kwargs: ("full_user", kwargs),
             get_user_photos_request=lambda **kwargs: ("photos", kwargs),
             get_messages_search_request=lambda **kwargs: ("search", kwargs),
             get_full_channel_request=lambda **kwargs: ("full_channel", kwargs),
@@ -130,6 +149,7 @@ def _pair_service(conn: sqlite3.Connection, client: _PairClient, *, enabled: boo
             channel_type=object,
             chat_type=object,
             group_profile_port=LoudGroupProfilePort(),
+            user_profile_port=client,
             refresh_limits=RefreshLimits(),
             enable_full_user_pair=enabled,
             full_user_auth_scope=lambda: TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99),
@@ -190,7 +210,7 @@ async def test_enabled_pair_commits_two_projections_with_one_full_user_call(tmp_
     assert evidence is not None and evidence["outcome"] == "usable"
     detail = service._profiles.read(42, now=100)  # type: ignore[attr-defined]
     assert detail is not None
-    assert detail.detail["personal_channel"]["metadata_source"] == "local_entities"
+    assert detail.detail["personal_channel"]["metadata_source"] == "user_full_chats"
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()
 
@@ -199,7 +219,8 @@ async def test_enabled_pair_commits_two_projections_with_one_full_user_call(tmp_
 @pytest.mark.parametrize(("entity_type", "bot"), (("user", False), ("bot", True)))
 async def test_enabled_pair_applies_to_user_and_bot(tmp_path: Path, entity_type: str, bot: bool) -> None:
     conn, service = _prepare(tmp_path / f"pair-{entity_type}.sqlite", entity_type=entity_type, bot=bot)
-    service._deps = replace(service._deps, client=_PairClient(bot=bot))  # type: ignore[attr-defined]
+    replacement = _PairClient(bot=bot)
+    service._deps = replace(service._deps, client=replacement, user_profile_port=replacement)  # type: ignore[attr-defined]
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
@@ -339,7 +360,7 @@ async def test_disabled_pair_measurement_survives_restart_at_section_boundary(tm
 async def test_partial_channel_preserves_usable_profile_and_non_reusable_channel(tmp_path: Path) -> None:
     conn, service = _prepare(tmp_path / "pair-partial.sqlite")
     client = _PairClient(channel_id=None)
-    service._deps = replace(service._deps, client=client)  # type: ignore[attr-defined]
+    service._deps = replace(service._deps, client=client, user_profile_port=client)  # type: ignore[attr-defined]
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
@@ -356,7 +377,8 @@ async def test_partial_channel_preserves_usable_profile_and_non_reusable_channel
 @pytest.mark.asyncio
 async def test_missing_channel_field_is_partial_while_full_profile_is_usable(tmp_path: Path) -> None:
     conn, service = _prepare(tmp_path / "pair-missing.sqlite")
-    service._deps = replace(service._deps, client=_PairClient(omit_channel_id=True))  # type: ignore[attr-defined]
+    replacement = _PairClient(omit_channel_id=True)
+    service._deps = replace(service._deps, client=replacement, user_profile_port=replacement)  # type: ignore[attr-defined]
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))

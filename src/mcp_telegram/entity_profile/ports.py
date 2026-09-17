@@ -4,13 +4,29 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from .contracts import GroupProfileObservation
+from .contracts import (
+    GroupProfileObservation,
+    PersonalChannelPost,
+    PersonalChannelReference,
+    TargetKind,
+    UserProfileObservation,
+)
 
 
 class GroupProfilePort(Protocol):
     """Fetch one normalized legacy group profile observation."""
 
     async def fetch_group_profile(self, group_id: int) -> GroupProfileObservation: ...
+
+
+class UserProfilePort(Protocol):
+    """Fetch one normalized user or bot profile observation."""
+
+    async def fetch_user_profile(self, user_id: int, target_kind: TargetKind) -> UserProfileObservation: ...
+
+    async def fetch_personal_channel_post(
+        self, reference: PersonalChannelReference, message_id: int
+    ) -> PersonalChannelPost | None: ...
 
 
 class ProfilePairObservationHook(Protocol):
@@ -37,4 +53,4 @@ class ProfilePairObservationHook(Protocol):
     ) -> None: ...
 
 
-__all__ = ["GroupProfilePort", "ProfilePairObservationHook"]
+__all__ = ["GroupProfilePort", "ProfilePairObservationHook", "UserProfilePort"]

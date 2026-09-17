@@ -4,15 +4,16 @@ from datetime import UTC, date, datetime
 from types import SimpleNamespace
 
 import pytest
+from telethon.tl.types import User  # type: ignore[import-untyped]
 
-from mcp_telegram.entity_profile.contracts import NORMALIZATION_VERSION
-from mcp_telegram.entity_profile.full_user_normalization import (
-    FullUserNormalization,
+from mcp_telegram.entity_profile.contracts import (
+    NORMALIZATION_VERSION,
     ObservationBoundary,
     ProjectionStatus,
     TargetKind,
-    normalize_full_user_response,
+    UserProfileObservation,
 )
+from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
 
 _UNSET = object()
 
@@ -72,6 +73,29 @@ def test_user_and_bot_targets_normalize_independently() -> None:
         assert result.full_profile.provenance is not None
         assert result.full_profile.provenance.normalization_version == NORMALIZATION_VERSION
         assert result.full_profile.provenance.reusable is True
+
+
+def test_telethon_user_with_unspecified_bot_flag_is_a_user() -> None:
+    user = User(id=42, first_name="Ada", last_name=None, username=None, phone=None)
+    response = SimpleNamespace(full_user=SimpleNamespace(), users=[user], chats=[])
+
+    result = normalize_full_user_response(response, target_id=42, target_kind=TargetKind.USER)
+
+    assert result.full_profile.status is ProjectionStatus.USABLE
+    assert result.full_profile.payload is not None
+    assert result.full_profile.payload["bot"] is False
+
+
+def test_malformed_bot_flag_rejects_both_projections() -> None:
+    result = normalize_full_user_response(
+        _response(bot="yes"),  # type: ignore[arg-type]
+        target_id=42,
+        target_kind=TargetKind.USER,
+    )
+
+    assert result.full_profile.status is ProjectionStatus.UNAVAILABLE
+    assert result.personal_channel.status is ProjectionStatus.UNAVAILABLE
+    assert result.full_profile.reason == "target_kind_mismatch"
 
 
 @pytest.mark.parametrize(
@@ -163,7 +187,7 @@ def test_invalid_channel_id_is_partial_and_attached_message_is_bounded() -> None
     }
 
 
-def _optional_facts_result() -> FullUserNormalization:
+def _optional_facts_result() -> UserProfileObservation:
     return normalize_full_user_response(
         _response(
             personal_channel_id=777,

@@ -7,6 +7,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Protocol, cast
 
+from .entity_profile.contracts import ProjectionStatus, TargetKind, UserProfileObservation
+from .entity_profile.ports import UserProfilePort
 from .flood import TelegramRpcThrottled
 from .own_only_contracts import OwnOnlyContext
 from .startup_identity import (
@@ -55,13 +57,13 @@ class SelfProfileMaintenanceDependencies:
     update_profile: Callable[[object], None]
     startup: StartupIdentityState | None = None
     get_input_entity: Callable[[int], Awaitable[object]] | None = None
-    get_full_user: Callable[[object], Awaitable[object]] | None = None
+    user_profile_port: UserProfilePort | None = None
     publish_startup_identity: Callable[[object, OwnOnlyContext], None] | None = None
 
     def __post_init__(self) -> None:
         if self.startup is None:
             return
-        if self.get_input_entity is None or self.get_full_user is None or self.publish_startup_identity is None:
+        if self.get_input_entity is None or self.user_profile_port is None or self.publish_startup_identity is None:
             raise ValueError("startup identity requires all own-only dependencies")
 
 
@@ -150,12 +152,12 @@ class SelfProfileMaintenanceDemandAdapter(DurableDemandAdapter):
         input_user = startup.input_user
         assert profile is not None
         assert input_user is not None
-        get_full_user = self._dependencies.get_full_user
+        user_profile_port = self._dependencies.user_profile_port
         publish_startup_identity = self._dependencies.publish_startup_identity
-        assert get_full_user is not None
+        assert user_profile_port is not None
         assert publish_startup_identity is not None
-        full_result = await get_full_user(input_user)
-        personal_channel_id = self._personal_channel_id(full_result)
+        observation = await user_profile_port.fetch_user_profile(int(cast(_MeLike, profile).id), TargetKind.USER)
+        personal_channel_id = self._personal_channel_id(observation)
         own_only_context = OwnOnlyContext(
             account_id=int(cast(_MeLike, profile).id),
             personal_channel_id=personal_channel_id,
@@ -165,9 +167,11 @@ class SelfProfileMaintenanceDemandAdapter(DurableDemandAdapter):
         startup.complete(StartupIdentityResult(profile, own_only_context))
 
     @staticmethod
-    def _personal_channel_id(full_result: object) -> int | None:
-        user_full = getattr(full_result, "full_user", None)
-        value = getattr(user_full, "personal_channel_id", None)
+    def _personal_channel_id(observation: UserProfileObservation) -> int | None:
+        if observation.personal_channel.status not in {ProjectionStatus.USABLE, ProjectionStatus.PARTIAL}:
+            return None
+        payload = observation.personal_channel.payload or {}
+        value = payload.get("personal_channel_id")
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             return value
         return None

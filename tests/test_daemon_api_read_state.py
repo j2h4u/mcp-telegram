@@ -26,7 +26,7 @@ from mcp_telegram.reading.sqlite_projection import _dialog_type_from_db, _read_s
 from mcp_telegram.telethon_dialog import classify_dialog_type
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.dialog_directory_coverage_fixtures import install_dialog_directory_coverage_schema
-from tests.helpers import LoudGroupProfilePort
+from tests.helpers import LoudGroupProfilePort, LoudUserProfilePort
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
 
@@ -270,6 +270,7 @@ def make_server(
         shutdown_event,
         reaction_freshener=make_reaction_freshener(conn, client),
         group_profile_port=LoudGroupProfilePort(),
+        user_profile_port=LoudUserProfilePort(),
         policy=make_daemon_api_policy(),
     )
 
