@@ -6,12 +6,19 @@ import asyncio
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
+import pytest
+
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.message_fact_refresh import (
     _NEXT_REACTION_RELEASE_SQL,
+    MessageFactRefreshDeps,
+    MessageFactRefreshPolicy,
     _next_release_at,
     _reaction_candidates,
     _terminal_reaction_suppressed,
+    refresh_message_facts_once,
 )
 from mcp_telegram.reactions.contracts import (
     ReactionAggregate,
@@ -19,11 +26,14 @@ from mcp_telegram.reactions.contracts import (
     ReactionDetailPage,
     ReactionEvent,
 )
-from mcp_telegram.reactions.detail import ReactionDetailRefresher
-from mcp_telegram.reactions.persistence import apply_aggregate_observation
+from mcp_telegram.reactions.detail import ReactionDetailRefresher, ReactionDetailResult
+from mcp_telegram.reactions.persistence import allocate_observation_boundary, apply_aggregate_observation
 from mcp_telegram.reactions.telegram_adapter import TelethonTelegramReactionGateway
 from mcp_telegram.sync_db import _apply_migration_68, ensure_sync_schema
-from mcp_telegram.telegram_reading import GatewayFailure, GatewayFailureKind
+from mcp_telegram.telegram_fact_queries import reaction_event_projection
+from mcp_telegram.telegram_reading import GatewayFailure, GatewayFailureKind, TelegramReadReceiptGateway
+from mcp_telegram.telegram_rpc_consumers import TelegramRpcSource
+from mcp_telegram.telegram_rpc_scheduler import RpcAdmissionClosedError, rpc_scope
 
 
 def _db(tmp_path: Path) -> sqlite3.Connection:
@@ -42,6 +52,7 @@ def test_aggregate_ordering_accepts_empty_and_rejects_older(tmp_path: Path) -> N
         conn, 1, 2, [ReactionAggregate("👍", 2)], source="history", observed_at=10, observation_sequence=1
     )
     assert apply_aggregate_observation(conn, 1, 2, [], source="raw_update", observed_at=10, observation_sequence=2)
+    assert reaction_event_projection(conn, 1, [2]) == ({}, {2: "complete"})
     assert not apply_aggregate_observation(
         conn, 1, 2, [ReactionAggregate("🔥", 1)], source="history", observed_at=9, observation_sequence=3
     )
@@ -80,6 +91,8 @@ def test_detail_partial_offset_survives_restart_and_publishes(tmp_path: Path) ->
     first = asyncio.run(refresher.refresh_one(1, 2, 1, entity=SimpleNamespace(), now=20))
     assert first.status == "partial"
     assert conn.execute("SELECT next_offset FROM message_reaction_event_status").fetchone() == ("next",)
+    assert conn.execute("SELECT COUNT(*) FROM message_reaction_events WHERE display_generation=0").fetchone() == (1,)
+    assert reaction_event_projection(conn, 1, [2]) == ({}, {2: "partial"})
 
     second = asyncio.run(refresher.refresh_one(1, 2, 1, entity=SimpleNamespace(), offset="next", now=21))
     assert second.status == "complete"
@@ -115,6 +128,132 @@ def test_detail_gateway_uses_one_page_and_never_get_messages() -> None:
     assert result.ok
     assert client.pages == 1
     assert client.resolved == [42]
+
+
+@pytest.mark.parametrize(
+    ("error", "kind", "retry_after"),
+    [
+        (ValueError("private chat"), GatewayFailureKind.INVALID_TARGET, None),
+        (TelegramRpcThrottled(retry_after_seconds=17), GatewayFailureKind.FLOOD_WAIT, 17),
+    ],
+)
+def test_detail_gateway_translates_private_and_flood_failures(
+    error: Exception, kind: GatewayFailureKind, retry_after: int | None
+) -> None:
+    class Client:
+        async def get_input_entity(self, entity: object) -> object:
+            del entity
+            raise error
+
+        async def __call__(self, request: object) -> object:
+            del request
+            raise AssertionError("request must not be sent after entity failure")
+
+    result = asyncio.run(TelethonTelegramReactionGateway(Client()).fetch_reaction_page(42, 2, offset=None, limit=100))
+    assert not result.ok
+    assert result.failure is not None
+    assert result.failure.kind == kind
+    assert result.failure.retry_after == retry_after
+
+
+def test_detail_gateway_propagates_rpc_admission_closed() -> None:
+    with rpc_scope(TelegramRpcSource.MESSAGE_FACT_REFRESH) as scope:
+        closed = RpcAdmissionClosedError(scope, "scheduler closed")
+
+    class Client:
+        async def get_input_entity(self, entity: object) -> object:
+            del entity
+            raise closed
+
+        async def __call__(self, request: object) -> object:
+            del request
+            raise AssertionError("request must not be sent after admission close")
+
+    with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
+        asyncio.run(TelethonTelegramReactionGateway(Client()).fetch_reaction_page(42, 2, offset=None, limit=100))
+
+
+def test_identical_aggregate_advances_boundary_without_invalidating_detail(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    assert apply_aggregate_observation(
+        conn, 1, 2, [ReactionAggregate("👍", 1)], source="history", observed_at=10, observation_sequence=1
+    )
+    conn.execute(
+        "UPDATE message_reaction_event_status SET status='complete', detail_generation=1, display_generation=1, "
+        "published_generation=1 WHERE dialog_id=1 AND message_id=2"
+    )
+    assert apply_aggregate_observation(
+        conn, 1, 2, [ReactionAggregate("👍", 1)], source="history", observed_at=11, observation_sequence=2
+    )
+    assert conn.execute(
+        "SELECT generation, observed_at, observation_sequence, status, detail_generation, display_generation "
+        "FROM message_reaction_aggregate_state JOIN message_reaction_event_status USING (dialog_id, message_id)"
+    ).fetchone() == (1, 11, 2, "complete", 1, 1)
+    conn.close()
+
+
+def test_observation_counter_is_durable_and_monotonic(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    conn.execute("UPDATE message_reaction_observation_counter SET next_sequence=40 WHERE singleton=1")
+    first = allocate_observation_boundary(conn, "history", observed_at=1)
+    second = allocate_observation_boundary(conn, "raw_update", observed_at=1)
+    assert (first.sequence, second.sequence) == (41, 42)
+    conn.close()
+
+
+def test_refresh_cycle_passes_generation_and_offset_and_limits_detail_pages(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (1,3,2)")
+    conn.execute("UPDATE messages SET sent_at=3 WHERE dialog_id=1 AND message_id=2")
+    apply_aggregate_observation(
+        conn, 1, 2, [ReactionAggregate("👍", 1)], source="history", observed_at=1, observation_sequence=1
+    )
+    apply_aggregate_observation(
+        conn, 1, 3, [ReactionAggregate("🔥", 1)], source="history", observed_at=2, observation_sequence=2
+    )
+    conn.execute(
+        "UPDATE message_reaction_event_status SET status='partial', next_offset='resume', next_attempt_at=0 "
+        "WHERE dialog_id=1 AND message_id=2"
+    )
+
+    class Refresher:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int, int, str | None]] = []
+
+        async def refresh_one(  # noqa: PLR0913
+            self,
+            dialog_id: int,
+            message_id: int,
+            generation: int,
+            *,
+            entity: object,
+            offset: str | None,
+            cancellation_event: asyncio.Event | None,
+            now: int,
+        ) -> ReactionDetailResult:
+            del entity, cancellation_event, now
+            self.calls.append((dialog_id, message_id, generation, offset))
+            return ReactionDetailResult("partial", fetched_pages=1)
+
+    refresher = Refresher()
+    result = asyncio.run(
+        refresh_message_facts_once(
+            MessageFactRefreshDeps(
+                conn, cast(ReactionDetailRefresher, refresher), cast(TelegramReadReceiptGateway, object())
+            ),
+            MessageFactRefreshPolicy(
+                reaction_max_messages_per_cycle=10,
+                read_at_max_messages_per_cycle=0,
+                pause_seconds=0,
+                read_at_ttl_seconds=600,
+                reaction_detail_max_pages_per_cycle=1,
+            ),
+            now=10,
+        )
+    )
+    assert refresher.calls == [(1, 2, 1, "resume")]
+    assert result.reaction_refreshed == 1
+    conn.close()
 
 
 def test_reaction_migration_preserves_empty_receipts_and_cleans_orphans() -> None:
@@ -170,6 +309,7 @@ def test_reaction_migration_preserves_empty_receipts_and_cleans_orphans() -> Non
         (4,),
         (5,),
     ]
+    assert conn.execute("SELECT next_sequence FROM message_reaction_observation_counter").fetchone() == (5,)
     assert conn.execute("SELECT name FROM sqlite_master WHERE name='message_reactions_freshness'").fetchone() is None
     conn.close()
 
@@ -288,7 +428,7 @@ def test_detail_rechecks_enrollment_after_gateway_returns(tmp_path: Path) -> Non
             await self.release.wait()
             return ReactionDetailFetchResult(page=ReactionDetailPage((), None))
 
-    async def run() -> ReactionDetailFetchResult | object:
+    async def run() -> ReactionDetailResult:
         gateway = BlockingGateway()
         task = asyncio.create_task(
             ReactionDetailRefresher(conn, gateway, now=lambda: 4).refresh_one(1, 2, 1, entity=1, now=4)

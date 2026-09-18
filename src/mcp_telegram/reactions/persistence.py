@@ -172,6 +172,7 @@ def apply_aggregate_observation(  # noqa: PLR0913
                 message_id,
             ),
         )
+        _finish_identical_detail(conn, dialog_id, message_id, generation, boundary.observed_at, aggregates)
         return True
 
     conn.execute(_DELETE_REACTIONS_SQL, (dialog_id, message_id))
@@ -198,8 +199,61 @@ def apply_aggregate_observation(  # noqa: PLR0913
             len(aggregates),
         ),
     )
-    _invalidate_detail(conn, dialog_id, message_id, generation, boundary.observed_at)
+    _finish_detail_for_aggregate(conn, dialog_id, message_id, generation, boundary.observed_at, aggregates)
     return True
+
+
+def _finish_detail_for_aggregate(  # noqa: PLR0913, PLR0917
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    generation: int,
+    now: int,
+    aggregates: Sequence[ReactionAggregate],
+) -> None:
+    if aggregates:
+        _invalidate_detail(conn, dialog_id, message_id, generation, now)
+    else:
+        _mark_empty_detail_terminal(conn, dialog_id, message_id, generation, now)
+
+
+def _finish_identical_detail(  # noqa: PLR0913, PLR0917
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    generation: int,
+    now: int,
+    aggregates: Sequence[ReactionAggregate],
+) -> None:
+    if not aggregates:
+        _mark_empty_detail_terminal(conn, dialog_id, message_id, generation, now)
+
+
+def _mark_empty_detail_terminal(
+    conn: sqlite3.Connection, dialog_id: int, message_id: int, generation: int, now: int
+) -> None:
+    """Publish an authoritative empty aggregate without probing detail RPCs."""
+    try:
+        conn.execute(
+            "DELETE FROM message_reaction_events WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        )
+        conn.execute(
+            "INSERT INTO message_reaction_event_status "
+            "(dialog_id, message_id, aggregate_generation, detail_generation, display_generation, "
+            "published_generation, checked_at, status, returned_count, staged_count, next_offset, next_attempt_at, failure_kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'complete', 0, 0, NULL, NULL, NULL) "
+            "ON CONFLICT(dialog_id, message_id) DO UPDATE SET aggregate_generation=excluded.aggregate_generation, "
+            "detail_generation=excluded.detail_generation, display_generation=excluded.display_generation, "
+            "published_generation=excluded.published_generation, checked_at=excluded.checked_at, status='complete', "
+            "returned_count=0, staged_count=0, next_offset=NULL, next_attempt_at=NULL, failure_kind=NULL",
+            (dialog_id, message_id, generation, generation, generation, generation, now),
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+        # Legacy projection-only fixtures do not have detail lifecycle tables.
+        return
 
 
 def _invalidate_detail(conn: sqlite3.Connection, dialog_id: int, message_id: int, generation: int, now: int) -> None:
