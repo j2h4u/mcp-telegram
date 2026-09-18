@@ -15,6 +15,7 @@ from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshPolicy,
     refresh_message_facts_once,
 )
+from mcp_telegram.reactions.detail import ReactionDetailRefresher
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_reading import ReadDateFetchResult, TelegramReadReceiptGateway
 
@@ -92,7 +93,7 @@ async def test_read_at_disable_during_fetch_skips_read_fact_write(tmp_path: Path
             refresh_message_facts_once(
                 MessageFactRefreshDeps(
                     handler_conn,
-                    object(),
+                    cast(ReactionDetailRefresher, object()),
                     cast(TelegramReadReceiptGateway, gateway),
                 ),
                 _policy(),
@@ -123,7 +124,7 @@ async def test_read_at_enabled_path_persists_read_fact(tmp_path: Path) -> None:
         result = await refresh_message_facts_once(
             MessageFactRefreshDeps(
                 handler_conn,
-                object(),
+                cast(ReactionDetailRefresher, object()),
                 cast(TelegramReadReceiptGateway, gateway),
             ),
             _policy(),
