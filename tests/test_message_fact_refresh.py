@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast
 
@@ -13,6 +14,7 @@ from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshDemandAdapter,
     MessageFactRefreshDeps,
     MessageFactRefreshPolicy,
+    _claim_reaction_pages,
     _next_release_at,
     _reaction_release_at,
     _read_at_candidates,
@@ -20,7 +22,7 @@ from mcp_telegram.message_fact_refresh import (
 )
 from mcp_telegram.reactions import ReactionDetailRefresher
 from mcp_telegram.reactions.detail import ReactionDetailResult
-from mcp_telegram.telegram_demand import RpcAttemptBudgetExhaustedError
+from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcAttemptBudgetExhaustedError
 from mcp_telegram.telegram_reading import ReadDateFetchResult, TelegramReadReceiptGateway
 from mcp_telegram.telegram_rpc_consumers import TelegramRpcSource
 from mcp_telegram.telegram_rpc_scheduler import RpcAdmissionClosedError, rpc_scope
@@ -277,6 +279,39 @@ async def test_open_reaction_window_accepts_only_one_claim_batch() -> None:
     conn.close()
 
 
+def test_concurrent_reaction_claims_share_one_window(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    conn = _make_db(path)
+    _seed_reaction_candidates(conn)
+    conn.close()
+
+    def claim() -> int:
+        worker_conn = sqlite3.connect(path, timeout=5)
+        try:
+            return len(
+                _claim_reaction_pages(
+                    worker_conn,
+                    now=100,
+                    max_pages=5,
+                    cycle_seconds=600,
+                    candidate_limit=10,
+                )
+            )
+        finally:
+            worker_conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = sorted(executor.map(lambda _: claim(), range(2)))
+
+    assert results == [0, 5]
+    check = sqlite3.connect(path)
+    assert check.execute(
+        "SELECT window_started_at, release_at, claimed_pages, started_pages "
+        "FROM reaction_detail_pacing_state"
+    ).fetchone() == (100, 700, 5, 0)
+    check.close()
+
+
 @pytest.mark.asyncio
 async def test_empty_reaction_scan_does_not_open_or_reset_window() -> None:
     conn = _make_db()
@@ -315,6 +350,33 @@ async def test_set_shutdown_skips_reaction_claim() -> None:
         now=100,
         shutdown_event=shutdown_event,
     )
+    assert calls == []
+    assert conn.execute(
+        "SELECT window_started_at, release_at, claimed_pages, started_pages "
+        "FROM reaction_detail_pacing_state"
+    ).fetchone() == (0, 0, 0, 0)
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_demand_adapter_passes_shutdown_to_message_fact_refresh() -> None:
+    conn = _make_db()
+    _seed_reaction_candidates(conn, count=1)
+    calls: list[int] = []
+    shutdown_event = asyncio.Event()
+    shutdown_event.set()
+    adapter = MessageFactRefreshDemandAdapter(
+        MessageFactRefreshDeps(
+            conn,
+            cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
+            cast(TelegramReadReceiptGateway, object()),
+        ),
+        MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600),
+        shutdown_event=shutdown_event,
+    )
+
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
     assert calls == []
     assert conn.execute(
         "SELECT window_started_at, release_at, claimed_pages, started_pages "

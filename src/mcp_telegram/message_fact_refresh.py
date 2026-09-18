@@ -219,9 +219,16 @@ class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
 
     demand_kind = DemandKind.MESSAGE_FACT_REFRESH
 
-    def __init__(self, deps: MessageFactRefreshDeps, policy: MessageFactRefreshPolicy) -> None:
+    def __init__(
+        self,
+        deps: MessageFactRefreshDeps,
+        policy: MessageFactRefreshPolicy,
+        *,
+        shutdown_event: asyncio.Event | None = None,
+    ) -> None:
         self._deps = deps
         self._policy = policy
+        self._shutdown_event = shutdown_event
 
     def status(self, now: float) -> DemandStatus | None:
         """Return the first missing or TTL-expired candidate release boundary."""
@@ -253,7 +260,11 @@ class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
         with demand_context(DemandKind.MESSAGE_FACT_REFRESH):
             with rpc_attempt_budget(budget):
                 try:
-                    await refresh_message_facts_once(self._deps, self._policy)
+                    await refresh_message_facts_once(
+                        self._deps,
+                        self._policy,
+                        shutdown_event=self._shutdown_event,
+                    )
                 except RpcAttemptBudgetExhaustedError:
                     return
 
@@ -344,6 +355,17 @@ def _claim_reaction_pages(
     # atomic unit and is committed before any Telegram call.
     if conn.in_transaction:
         conn.commit()
+    state = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT release_at, claimed_pages FROM reaction_detail_pacing_state WHERE singleton=1"
+        ).fetchone(),
+    )
+    if state is not None and now < int(cast(int | str, state[0])):
+        return []
+    candidates = _reaction_candidates(conn, stale_before_utc=now, limit=min(candidate_limit, max_pages))
+    if not candidates:
+        return []
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = cast(
@@ -355,10 +377,6 @@ def _claim_reaction_pages(
         if row is not None and now < int(cast(int | str, row[0])):
             conn.commit()
             return []
-        rows = _reaction_candidates(conn, stale_before_utc=now, limit=min(candidate_limit, max_pages))
-        if not rows:
-            conn.commit()
-            return []
         release_at = now + cycle_seconds
         conn.execute(
             "INSERT INTO reaction_detail_pacing_state "
@@ -366,10 +384,10 @@ def _claim_reaction_pages(
             "VALUES (1, ?, ?, ?, 0) "
             "ON CONFLICT(singleton) DO UPDATE SET window_started_at=excluded.window_started_at, "
             "release_at=excluded.release_at, claimed_pages=excluded.claimed_pages, started_pages=0",
-            (now, release_at, len(rows)),
+            (now, release_at, len(candidates)),
         )
         conn.commit()
-        return rows
+        return candidates
     except BaseException:
         conn.rollback()
         raise
