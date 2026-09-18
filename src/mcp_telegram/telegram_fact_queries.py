@@ -13,8 +13,10 @@ from collections.abc import Sequence
 from typing import cast
 
 from .models import DialogType, ReadMessage, ReadReactionEvent
+from .telegram_demand import RpcAttemptBudgetExhaustedError
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES
 from .telegram_reading import ReadDateFetchResult, TelegramReadReceiptGateway
+from .telegram_rpc_scheduler import RpcAdmissionClosedError
 
 
 def reaction_event_projection(
@@ -149,6 +151,8 @@ async def _refresh_stale_read_at_facts(  # noqa: PLR0913
     for message_id in stale_read_at_ids(conn, dialog_id, message_ids, stale_before_utc):
         try:
             result = await gateway.fetch_outbox_read_date(dialog_id, message_id)
+        except (RpcAdmissionClosedError, RpcAttemptBudgetExhaustedError):
+            raise
         except CATCHABLE_GATEWAY_FAILURES:
             # A single privacy/retention failure must not break list/search.
             result = ReadDateFetchResult(status="unavailable")
@@ -242,7 +246,7 @@ def stale_read_at_ids(
     message_ids: Sequence[int],
     stale_before_utc: int,
 ) -> list[int]:
-    """Return message ids whose read-date probe is absent or older than TTL."""
+    """Return absent or retryable stale ids; terminal facts are never returned."""
 
     if not message_ids:
         return []
