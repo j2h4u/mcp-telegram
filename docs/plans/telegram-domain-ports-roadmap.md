@@ -1,12 +1,12 @@
 # Telegram Behind Domain Ports
 
-Status: working architectural compass  
+Status: completed first program; awaiting expert-panel rescoping
 Last reviewed: 2026-09-18
 
-This document keeps the target architecture and the next acceptance slices in
-one place. Use it when accepting each slice to determine whether the service is
-moving toward the intended boundary or merely relocating direct Telegram
-coupling.
+This document records the target architecture, the program completed through
+PR #270, and the remaining candidates that need fresh prioritization. It is an
+input to the next expert panel, not an approved sequence of future pull
+requests.
 
 The accepted catalog-specific contract remains
 [Canonical Dialog Snapshot](canonical-dialog-snapshot.md). The broader current
@@ -101,7 +101,7 @@ Telethon method and not an MCP tool.
   baselines are temporary debt ceilings, not complexity budgets that new code
   may consume.
 
-## Current state
+## Current state after the completed program
 
 The MCP delivery boundary already satisfies the target: production modules
 under `tools/` have no direct Telethon imports and communicate with the daemon
@@ -123,177 +123,135 @@ Telethon error types for not-found classification. That is separate from the
 completed entity-profile fact ports. The external-import ratchet still allows
 legacy owners elsewhere in the service.
 
-The boundary below delivery is therefore still transitional. Folders, topics,
-reactions, and messages have recognizable Telegram adapter modules. The
-canonical dialog directory has a dedicated raw TL adapter and owns
-account-wide dialog acquisition. Other application and worker modules still
-import Telethon or invoke client methods directly, especially daemon-level
-orchestration, message synchronization, activity sweeps, account trace, read
-receipts, scheduled messages, transcription, and realtime event enrichment.
+Full message-history backfill and bounded forward gap synchronization now use
+separate message-history ports and one Telegram normalization boundary. Their
+different completeness, restart, access-loss, cancellation, and checkpoint
+semantics remain explicit. The obsolete unbounded delta path and its inert
+operator configuration were removed.
+
+The boundary below delivery remains transitional. Folders, topics, reactions,
+entity profiles, and persistent message history have recognizable Telegram
+adapters. The canonical dialog directory owns account-wide dialog acquisition.
+Other application and worker modules still import Telethon or invoke client
+methods directly, especially activity sweeps, account trace, read receipts,
+scheduled messages, transcription, generic entity resolution, and realtime
+event enrichment.
 
 The current external-import check is a ratchet over the brownfield state. It
 prevents an unreviewed new Telethon importer, but its allowlist still recognizes
-28 production import owners. Passing that check does not yet prove that
+27 production import owners. Passing that check does not yet prove that
 Telegram is hidden behind domain ports.
 
-## Action plan
+## Completed program through PR #270
 
-The checkboxes below are decision and acceptance points, not a one-checkbox-per-PR
-plan. Implement the roadmap as a small sequence of coherent vertical slices.
-One slice should normally close several related action points: introduce the
-port and adapter, move one proven acquisition path, simplify the affected
-legacy functions, remove the superseded path, and verify the resulting product
-behavior together. Complexity cleanup is not a separate workstream or PR
-series. The expected order of magnitude is four to seven substantial PRs, but
-evidence and cohesion determine the actual boundaries.
+The completed program was a coherent sequence, not 49 independent pull
+requests. It delivered these product and architecture outcomes:
 
-Before the first substantial acquisition refactor, land one small enabling PR
-for causal request observability. It does not increase the expected number of
-substantial domain slices and does not require a baseline observation period.
-Deploy it, verify that the evidence is emitted, and proceed directly to the
-next architectural slice.
+- [x] Added privacy-safe causal request observability for slow MCP calls,
+  including local work, admission delay, Telegram execution, fallback, and
+  response shaping.
+- [x] Made the canonical dialog snapshot the single account-wide dialog owner;
+  folder projection, DM enrollment, and local resolution consume it locally.
+- [x] Consolidated the proven `GetFullChat` overlap so one observation supplies
+  both group profile and contact-overlap facts.
+- [x] Moved user, channel, group, participant, common-chat, and avatar profile
+  acquisition behind capability-specific ports and Telegram adapters.
+- [x] Moved persistent full-history and bounded forward-gap acquisition behind
+  separate message-history ports with one normalization boundary.
+- [x] Preserved truthful completeness, freshness, retry, cancellation,
+  access-loss, and restart behavior for the migrated capabilities.
+- [x] Removed superseded direct paths, including the unused unbounded delta
+  implementation and its inert configuration.
+- [x] Tightened structural and complexity ratchets when migrated ownership made
+  old exceptions and debt entries obsolete.
+- [x] At acceptance time, each slice passed its release gate, was merged and
+  deployed, and received a live MCP runtime smoke. This is the recorded
+  completion status through 2026-09-18, not fresh runtime evidence for a
+  future panel; refresh operational state when the next program is designed.
 
-### Lock the intended boundary
+This closes the previously approved implementation sequence. No further slice
+is approved merely because it appeared later in the old roadmap.
 
-- [ ] Add an explicit architecture test that permits Telethon imports only in
-  Telegram adapters, inbound Telegram event adapters, transport/runtime
-  composition, authentication, and narrowly documented compatibility leaves.
-- [ ] Classify every currently allowed Telethon-importing module as a target
-  adapter, composition owner, inbound event adapter, or migration candidate.
-- [ ] Give every migration candidate a destination domain capability and a
-  named owner of the facts it acquires.
-- [ ] Make the allowed-import set shrink with each accepted slice; do not
-  replace exact exceptions with a broader package-level allowance.
+## Known residual state
 
-### Enable causal request observability
+These are current facts for the panel to evaluate, not a predetermined backlog:
 
-- [x] Generate one opaque operation ID at the MCP boundary and propagate it
-  explicitly through daemon requests without exposing it in product schemas.
-- [x] Persist a bounded, versioned daemon timing observation in the existing
-  `runtime_observations` store and correlate it with the terminal `mcp.call`
-  observation by operation ID.
-- [x] Instrument `list_messages` first with a closed route vocabulary covering
-  local history, local context, local non-sent state, ordinary Telegram
-  fallback, and Telegram topic fallback.
-- [x] Measure fixed causal boundaries: resolution, local projection, Telegram
-  fallback, RPC admission wait, RPC execution, and response shaping. Preserve
-  missing measurements as unavailable and nested measurements as nested.
-- [x] Record actual RPC attempt count and attempted fallback even when the
-  fallback fails, returns no rows, or the final response remains local.
-- [x] Extend the existing operator summary so a slow call shows its largest
-  measured contributor, attribution completeness, and any unattributed time.
-- [x] Keep the payload privacy-safe: no arguments, selectors, message text,
-  names, peer or message IDs, cursor values, raw exceptions, SQL, or response
-  bodies.
-- [x] Reuse the existing TTL, row cap, asynchronous loss reporting, and
-  operator command. Do not add a telemetry database, tracing backend,
-  dashboard, exporter, sampler, or per-statement/per-message events.
-- [x] Prove local delay, admission delay, RPC execution delay, fallback,
-  shaping, cancellation, concurrency, telemetry loss, and legacy-row behavior
-  with deterministic tests and one live devtools-client smoke.
-- [ ] Reduce any Radon or CRAP legacy debt touched by this enabling slice; do
-  not add a generic tracing abstraction or increase either baseline.
-- [x] Deploy the slice and proceed directly to `GetFullChat`; do not wait for a
-  weekly baseline or make later domain work contingent on traffic volume.
+- Generic entity resolution in `daemon_entity_info.py` still calls
+  `client.get_entity` and imports Telethon error types even though the profile
+  fact acquisitions themselves are ported.
+- The external-import ratchet still names 27 Telethon-owning production
+  modules. Some are legitimate final-boundary owners; others are migration
+  candidates that have not been freshly classified.
+- Activity sweeps and peer resolution, read receipts, scheduled messages,
+  transcription, media hydration, account trace, and some realtime enrichment
+  still own direct Telegram or Telethon behavior.
+- Authentication, connection lifecycle, RPC admission, update transport, and
+  inbound Telegram events are expected to remain in infrastructure/runtime
+  modules; moving them behind application-domain ports may add ceremony
+  without product value.
+- The remaining Radon and CRAP baselines include code both inside and outside
+  likely migration candidates. Complexity cleanup remains attached to code
+  that a chosen slice materially changes; it is not a separate cleanup phase.
+- A service-wide proof that no consumers reacquire the same facts through
+  different paths has not been completed. Existing observability should be
+  used only for intersections that source and tests cannot resolve.
 
-### Complete the next proven overlap
+## Candidate work for expert reassessment
 
-- [x] Introduce a group-profile port and Telegram adapter for the existing
-  `GetFullChat` acquisition.
-- [x] Let one successful group observation materialize both the full-profile
-  facts and the contact-overlap facts atomically.
-- [x] Make the second consumer reuse the same observation locally without an
-  additional RPC.
-- [x] Remove the superseded direct `GetFullChat` path from the application
-  service after parity is proven.
-- [x] Prove with deterministic tests that one group refresh performs one
-  `GetFullChat` attempt and produces both domain sections.
+The following candidates are deliberately unordered and unapproved. The panel
+may merge, split, defer, replace, or reject them after inspecting current code,
+runtime evidence, product demand, and remaining complexity.
 
-### Extract entity-profile acquisition
+- [ ] Reclassify all 27 Telethon import owners into accepted final-boundary
+  owners and migration candidates before choosing another implementation
+  slice.
+- [ ] Decide whether generic entity resolution belongs in the existing entity
+  profile capability, a shared entity-reference capability, or infrastructure.
+- [ ] Evaluate activity search, peer resolution, and account trace together for
+  shared authored-message, identity, and peer-reference facts.
+- [ ] Evaluate read receipts and scheduled messages as separate lifecycle
+  capabilities rather than assuming they belong in one mechanical RPC slice.
+- [ ] Evaluate transcription and media hydration around durable media facts,
+  download ownership, and retry semantics.
+- [ ] Separate outbound enrichment initiated by realtime events from the
+  inbound event transport where that separation removes duplicate acquisition
+  or mixed policy.
+- [ ] Inventory remaining repeated fact acquisition and remote fallbacks, then
+  consolidate only overlaps with a clear product benefit.
+- [ ] Decide which current local projections need explicit bundle-level
+  observation time and completeness before consumers can safely drop remote
+  fallbacks.
+- [ ] Attach each selected slice to the Radon and CRAP entries it will remove
+  or reduce, and reject designs that merely move complexity into wrappers.
+- [ ] Tighten the Telethon-import gate toward the final boundary as a result of
+  accepted migrations, rather than as an isolated mass-rewrite objective.
 
-- [x] Define domain ports for user, channel, and legacy-group profile facts
-  currently acquired inside daemon application services.
-- [x] Move `GetFullUser`, `GetFullChannel`, `GetFullChat`, participant, common
-  chat, avatar, and related request construction into capability-specific
-  Telegram adapters.
-- [x] Keep profile orchestration, section ownership, generation fences, and
-  local publication in application/domain code using transport-neutral
-  contracts.
-- [x] Identify additional response pairs that obtain the same facts and merge
-  only overlaps supported by source and test evidence.
-- [ ] Remove direct Telethon imports from the entity-profile application path.
+## Expert panel mandate
 
-### Next slice: extract message history and gap synchronization
+The next panel should start from the deployed system and may overturn the old
+ordering. Its output should:
 
-The next coherent vertical slice is to put full message-history backfill and
-delta gap synchronization behind message-history ports. Preserve their
-distinct progress, restart, access-loss, and completeness semantics, remove
-the superseded direct paths, and verify both local publication and real
-history behavior together.
+1. Revalidate the product problem: where duplicate acquisition, inconsistent
+   local facts, weak freshness/completeness, or mixed ownership still causes a
+   real cost.
+2. Classify the remaining direct Telegram owners and identify which ones are
+   already legitimate adapters, runtime composition, authentication, or
+   inbound-event infrastructure.
+3. Recommend the smallest coherent next program, normally two to four vertical
+   slices, without inventing a PR per checkbox or per RPC.
+4. State which candidates should be deferred or rejected and why.
+5. For every recommended slice, name the product facts, acquisition owner,
+   consumers, local projection, superseded paths, complexity debt, dependencies,
+   acceptance criteria, and definition of done.
+6. Order slices by product value, duplication removed, architectural leverage,
+   and implementation risk. Observability should be added only for unresolved
+   intersections.
+7. Provide an approximate PR count only after the boundaries are chosen; the
+   count is an estimate, not a commitment.
 
-- [x] Put history and gap synchronization behind separate message-history
-  ports while preserving their distinct progress, restart, access-loss, and
-  completeness semantics. Telegram request construction and canonical message
-  extraction live in the Telegram adapter; workers retain local policy and
-  caller-owned publication transactions.
-
-### Later slices: remaining acquisition paths
-
-- [ ] Put activity search and peer resolution behind activity-domain ports.
-- [ ] Put read-receipt, scheduled-message, transcription, media hydration, and
-  account-trace RPCs behind their owning capability ports.
-- [ ] Separate outbound enrichment triggered by realtime events from the
-  inbound Telethon event adapter.
-- [ ] Keep authentication, connection lifecycle, update transport, and adapter
-  construction in the composition/runtime boundary.
-
-### Consolidate shared facts
-
-- [ ] For each extracted capability, list which product facts each consumer
-  needs and which Telegram observations can supply them.
-- [ ] Detect consumers that acquire the same facts through different RPCs or
-  pagination strategies.
-- [ ] Assign one owner and one local projection where shared acquisition has a
-  clear product benefit.
-- [ ] Record observation time and completeness at the smallest coherent domain
-  bundle rather than mechanically timestamping every column.
-- [ ] Remove remote fallbacks from consumers once the local projection has an
-  honest stale, incomplete, and unavailable contract.
-- [ ] Add focused telemetry only for overlaps that cannot be resolved from
-  source, tests, and existing runtime observations.
-
-### Pay down legacy complexity
-
-- [ ] Assign every existing Radon and CRAP legacy baseline entry to the
-  architectural slice that already needs to change or remove that code.
-- [ ] Identify the Radon and CRAP baseline entries owned or materially touched
-  by each vertical slice before implementation.
-- [ ] Delete superseded branches, compatibility wrappers, duplicate
-  orchestration, and obsolete recovery code as part of the same slice.
-- [ ] Split mixed application/RPC functions along the accepted domain boundary
-  so that the resulting units have coherent responsibilities and lower
-  cyclomatic complexity.
-- [ ] Tighten or remove affected Radon and CRAP baseline entries whenever the
-  measured debt falls; do not preserve an obsolete ceiling for convenience.
-- [ ] Require an explicit architectural reason when a touched legacy baseline
-  cannot be reduced, and prevent the slice from increasing either ceiling.
-- [ ] Prefer deletion and direct domain contracts over forwarding layers that
-  merely move complexity or inflate the call graph.
-- [ ] Remove the final legacy baseline entries within the last architectural
-  slice; do not schedule a separate complexity-cleanup phase afterward.
-
-### Reach the final boundary
-
-- [ ] Reduce the Telethon importer allowlist to the accepted adapter,
-  composition, authentication, transport, and inbound-event modules.
-- [ ] Make the structural gate fail on any Telethon import from delivery,
-  application, domain contract, or persistence modules.
-- [ ] Verify that every registered RPC demand maps to a named domain capability
-  and acquisition owner.
-- [ ] Verify that no MCP scenario can bypass a published local projection to
-  repeat account-wide or shared-fact acquisition.
-- [ ] Update the architecture map and remove this roadmap when all remaining
-  items have become enforced invariants.
+The panel should not assume that every Telegram RPC deserves a domain entity,
+that every local field needs its own timestamp, or that completing the final
+boundary is more valuable than simplifying a high-cost consumer path.
 
 ## Acceptance checklist for every slice
 
@@ -328,7 +286,12 @@ questions, not additional implementation PRs and not cumulative progress boxes.
 - [ ] The deployed runtime exposes the new behavior and remains healthy.
 - [ ] Temporary work and review artifacts created for the slice are removed.
 
-## Definition of done for the roadmap
+## Long-term definition of done for the architecture
+
+The unchecked boxes below describe the eventual target boundary. They are not
+unfinished obligations from the program completed through PR #270, an approved
+backlog, or required scope for the next expert panel. The panel should use them
+as constraints when choosing what is valuable now and may leave them open.
 
 - [ ] MCP delivery and application services contain no direct Telethon imports
   or client calls.
