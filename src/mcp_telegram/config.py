@@ -352,6 +352,7 @@ class SchedulingConfig:
     access_probe_cooldown_seconds: int = 604_800
     message_fact_refresh_reaction_max_messages_per_cycle: int = 5
     reaction_detail_max_pages_per_cycle: int = 5
+    reaction_detail_cycle_seconds: int = 600
     reaction_detail_unavailable_retry_seconds: int = 600
     message_fact_refresh_read_at_max_messages_per_cycle: int = 5
     message_fact_refresh_pause_seconds: float = 1.0
@@ -690,6 +691,11 @@ def resolve_scheduling_config(
             env,
             "REACTION_DETAIL_MAX_PAGES_PER_CYCLE",
             config.reaction_detail_max_pages_per_cycle,
+        ),
+        reaction_detail_cycle_seconds=_env_positive_int(
+            env,
+            "REACTION_DETAIL_CYCLE_SECONDS",
+            config.reaction_detail_cycle_seconds,
         ),
         reaction_detail_unavailable_retry_seconds=_env_positive_int(
             env,
@@ -1405,6 +1411,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "access_probe_cooldown_seconds",
         "message_fact_refresh_reaction_max_messages_per_cycle",
         "reaction_detail_max_pages_per_cycle",
+        "reaction_detail_cycle_seconds",
         "reaction_detail_unavailable_retry_seconds",
         "message_fact_refresh_read_at_max_messages_per_cycle",
         "message_fact_refresh_pause_seconds",
@@ -1519,6 +1526,13 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             "scheduling",
             path,
             defaults.reaction_detail_max_pages_per_cycle,
+        ),
+        reaction_detail_cycle_seconds=_positive_int(
+            scheduling_data,
+            "reaction_detail_cycle_seconds",
+            "scheduling",
+            path,
+            defaults.reaction_detail_cycle_seconds,
         ),
         reaction_detail_unavailable_retry_seconds=_positive_int(
             scheduling_data,

@@ -160,6 +160,7 @@ def build_durable_adapter_map(dependencies: DemandCompositionDependencies) -> Ma
         DemandKind.MESSAGE_FACT_REFRESH: MessageFactRefreshDemandAdapter(
             dependencies.message_fact_refresh_deps,
             dependencies.message_fact_refresh_policy,
+            shutdown_event=dependencies.shutdown_event,
         ),
         DemandKind.READ_RECEIPT_BATCH: ReadReceiptDemandAdapter(
             dependencies.conn,

@@ -3,6 +3,22 @@
 Status: panel accepted; Slice 1 deployed; Slice 2 is a code-complete PR candidate pending release
 Last reviewed: 2026-09-18
 
+## Incident guardrail: reaction-detail demand
+
+The reaction-detail lifecycle introduced by PR #275 still allowed repeated
+durable refresh slices to reopen the same raw candidates. In the stopped
+production runtime this produced 321 `message_fact_refresh` dispatches in
+about 20 seconds from 8,279 observed dispatches. The lifecycle contract now
+requires a database-backed singleton pacing window: at most five logical
+reaction-detail pages may be claimed in each 600-second window by default;
+claims and starts are committed before Telegram work, and cancellation,
+restart, failure, or a FloodWait cannot return a claimed slot to the window.
+The raw reaction due boundary is combined with this release boundary while
+exact outgoing-DM read-date work remains independently due and runs first when
+both lanes are ready. The operator may change the positive cycle duration and
+page cap through scheduling configuration, with the page cap retaining its
+default of five.
+
 Latest panel recommendation:
 [Expert Panel Recommendation, 2026-09-18](telegram-domain-ports-panel-2026-09-18.md).
 It proposes two evidence-backed slices. Slice 1 is deployed; Slice 2 is

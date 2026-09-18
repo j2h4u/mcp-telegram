@@ -67,6 +67,7 @@ update_loop_retry_seconds = 5
 [scheduling]
 # Bound reactor-detail acquisition and retry unavailable pages after ten minutes.
 reaction_detail_max_pages_per_cycle = 5
+reaction_detail_cycle_seconds = 600
 reaction_detail_unavailable_retry_seconds = 600
 # Local daemon maintenance intervals. Compose environment variables can override these.
 scheduled_reconciliation_seconds = 900

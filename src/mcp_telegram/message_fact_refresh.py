@@ -154,6 +154,7 @@ class MessageFactRefreshPolicy:
     pause_seconds: float
     read_at_ttl_seconds: int
     reaction_detail_max_pages_per_cycle: int = 5
+    reaction_detail_cycle_seconds: int = 600
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,12 +183,30 @@ class MessageFactRefreshDeps:
     reaction_detail_refresher: ReactionDetailRefresher
     read_receipt_gateway: TelegramReadReceiptGateway
     read_at_observer: Callable[[Mapping[str, object]], None] | None = None
+    clock: Callable[[], float] = time.time
 
 
 def _next_release_at(conn: sqlite3.Connection, query: str, ttl_seconds: int) -> float | None:
     row = cast(tuple[object] | None, conn.execute(query, (ttl_seconds,)).fetchone())
     value = None if row is None else row[0]
     return None if value is None else float(cast(int | float, value))
+
+
+def _reaction_pacing_release_at(conn: sqlite3.Connection) -> float | None:
+    row = cast(
+        tuple[object] | None,
+        conn.execute("SELECT release_at FROM reaction_detail_pacing_state WHERE singleton=1").fetchone(),
+    )
+    return None if row is None else float(cast(int | float, row[0]))
+
+
+def _reaction_release_at(conn: sqlite3.Connection) -> float | None:
+    """Combine raw reaction due state with the durable pacing window."""
+    raw_release = _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, 0)
+    if raw_release is None:
+        return None
+    pacing_release = _reaction_pacing_release_at(conn)
+    return raw_release if pacing_release is None else max(raw_release, pacing_release)
 
 
 class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
@@ -200,16 +219,23 @@ class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
 
     demand_kind = DemandKind.MESSAGE_FACT_REFRESH
 
-    def __init__(self, deps: MessageFactRefreshDeps, policy: MessageFactRefreshPolicy) -> None:
+    def __init__(
+        self,
+        deps: MessageFactRefreshDeps,
+        policy: MessageFactRefreshPolicy,
+        *,
+        shutdown_event: asyncio.Event | None = None,
+    ) -> None:
         self._deps = deps
         self._policy = policy
+        self._shutdown_event = shutdown_event
 
     def status(self, now: float) -> DemandStatus | None:
         """Return the first missing or TTL-expired candidate release boundary."""
         del now
         releases: list[float] = []
         if self._policy.reaction_max_messages_per_cycle > 0:
-            reaction_release = _next_release_at(self._deps.conn, _NEXT_REACTION_RELEASE_SQL, 0)
+            reaction_release = _reaction_release_at(self._deps.conn)
             if reaction_release is not None:
                 releases.append(reaction_release)
         if self._policy.read_at_max_messages_per_cycle > 0:
@@ -234,7 +260,11 @@ class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
         with demand_context(DemandKind.MESSAGE_FACT_REFRESH):
             with rpc_attempt_budget(budget):
                 try:
-                    await refresh_message_facts_once(self._deps, self._policy)
+                    await refresh_message_facts_once(
+                        self._deps,
+                        self._policy,
+                        shutdown_event=self._shutdown_event,
+                    )
                 except RpcAttemptBudgetExhaustedError:
                     return
 
@@ -307,6 +337,89 @@ def _reaction_candidates(
         )
         for row in rows
     ]
+
+
+def _claim_reaction_pages(
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+    max_pages: int,
+    cycle_seconds: int,
+    candidate_limit: int,
+) -> list[tuple[int, int, int, str | None]]:
+    """Reserve one pacing window and its candidate pages transactionally."""
+    if max_pages <= 0 or candidate_limit <= 0:
+        return []
+    # Candidate maintenance may have left a local transaction open.  Flush it
+    # before taking the singleton's write lock so the reservation is the next
+    # atomic unit and is committed before any Telegram call.
+    if conn.in_transaction:
+        conn.commit()
+    state = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT release_at, claimed_pages FROM reaction_detail_pacing_state WHERE singleton=1").fetchone(),
+    )
+    if state is not None and now < int(cast(int | str, state[0])):
+        return []
+    candidates = _reaction_candidates(conn, stale_before_utc=now, limit=min(candidate_limit, max_pages))
+    if not candidates:
+        return []
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = cast(
+            tuple[object, ...] | None,
+            conn.execute(
+                "SELECT release_at, claimed_pages FROM reaction_detail_pacing_state WHERE singleton=1"
+            ).fetchone(),
+        )
+        if row is not None and now < int(cast(int | str, row[0])):
+            conn.commit()
+            return []
+        release_at = now + cycle_seconds
+        conn.execute(
+            "INSERT INTO reaction_detail_pacing_state "
+            "(singleton, window_started_at, release_at, claimed_pages, started_pages) "
+            "VALUES (1, ?, ?, ?, 0) "
+            "ON CONFLICT(singleton) DO UPDATE SET window_started_at=excluded.window_started_at, "
+            "release_at=excluded.release_at, claimed_pages=excluded.claimed_pages, started_pages=0",
+            (now, release_at, len(candidates)),
+        )
+        conn.commit()
+        return candidates
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _start_reaction_page(conn: sqlite3.Connection) -> bool:
+    """Consume a previously claimed page before making its Telegram call."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = conn.execute(
+            "UPDATE reaction_detail_pacing_state SET started_pages=started_pages+1 "
+            "WHERE singleton=1 AND started_pages < claimed_pages"
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _extend_reaction_release(conn: sqlite3.Connection, *, now: int, retry_after: int) -> None:
+    """Extend the durable window after a FloodWait without reopening it."""
+    if retry_after <= 0:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "UPDATE reaction_detail_pacing_state SET release_at=MAX(release_at, ?) WHERE singleton=1",
+            (now + retry_after,),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def _read_at_candidates(
@@ -462,6 +575,63 @@ async def _refresh_read_at_cycle(
     )
 
 
+async def _refresh_one_reaction_page(
+    deps: MessageFactRefreshDeps,
+    row: tuple[int, int, int, str | None],
+    *,
+    checked_at: int,
+    shutdown_event: asyncio.Event | None,
+) -> tuple[int, bool]:
+    dialog_id, message_id, generation, offset = row
+    if not _start_reaction_page(deps.conn):
+        return 0, True
+    detail = await deps.reaction_detail_refresher.refresh_one(
+        dialog_id,
+        message_id,
+        generation,
+        entity=dialog_id,
+        offset=offset,
+        cancellation_event=shutdown_event,
+        now=checked_at,
+    )
+    if detail.retry_after is not None and detail.stop_cycle:
+        _extend_reaction_release(deps.conn, now=int(deps.clock()), retry_after=detail.retry_after)
+    return detail.fetched_pages, detail.stop_cycle or detail.status == "cancelled"
+
+
+async def _refresh_reaction_pages(
+    deps: MessageFactRefreshDeps,
+    policy: MessageFactRefreshPolicy,
+    *,
+    checked_at: int,
+    claim_at: int,
+    shutdown_event: asyncio.Event | None,
+) -> int:
+    if shutdown_event is not None and shutdown_event.is_set():
+        return 0
+    selected_reaction_rows = _claim_reaction_pages(
+        deps.conn,
+        now=claim_at,
+        max_pages=policy.reaction_detail_max_pages_per_cycle,
+        cycle_seconds=policy.reaction_detail_cycle_seconds,
+        candidate_limit=policy.reaction_max_messages_per_cycle,
+    )
+    reaction_refreshed = 0
+    for index, row in enumerate(selected_reaction_rows):
+        fetched_pages, stop_page = await _refresh_one_reaction_page(
+            deps,
+            row,
+            checked_at=checked_at,
+            shutdown_event=shutdown_event,
+        )
+        reaction_refreshed += fetched_pages
+        if stop_page:
+            break
+        if shutdown_event is not None and index < len(selected_reaction_rows) - 1:
+            await _interruptible_pause(shutdown_event, policy.pause_seconds)
+    return reaction_refreshed
+
+
 async def refresh_message_facts_once(
     deps: MessageFactRefreshDeps,
     policy: MessageFactRefreshPolicy,
@@ -474,29 +644,6 @@ async def refresh_message_facts_once(
         return MessageFactRefreshResult(reaction_refreshed=0)
 
     checked_at = int(time.time() if now is None else now)
-    reaction_rows = _reaction_candidates(
-        deps.conn,
-        stale_before_utc=checked_at,
-        limit=policy.reaction_max_messages_per_cycle,
-    )
-    reaction_refreshed = 0
-    selected_reaction_rows = reaction_rows[: policy.reaction_detail_max_pages_per_cycle]
-    for index, (dialog_id, message_id, generation, offset) in enumerate(selected_reaction_rows):
-        detail = await deps.reaction_detail_refresher.refresh_one(
-            dialog_id,
-            message_id,
-            generation,
-            entity=dialog_id,
-            offset=offset,
-            cancellation_event=shutdown_event,
-            now=checked_at,
-        )
-        reaction_refreshed += detail.fetched_pages
-        if detail.stop_cycle:
-            break
-        if shutdown_event is not None and index < len(selected_reaction_rows) - 1:
-            await _interruptible_pause(shutdown_event, policy.pause_seconds)
-
     if policy.read_at_max_messages_per_cycle > 0:
         stats = await _refresh_read_at_cycle(
             deps,
@@ -506,6 +653,15 @@ async def refresh_message_facts_once(
         )
     else:
         stats = None
+
+    claim_at = checked_at if now is not None else int(deps.clock())
+    reaction_refreshed = await _refresh_reaction_pages(
+        deps,
+        policy,
+        checked_at=checked_at,
+        claim_at=claim_at,
+        shutdown_event=shutdown_event,
+    )
 
     if stats is not None and stats.measurement_complete:
         _observe_read_at_cycle(

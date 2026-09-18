@@ -36,7 +36,7 @@ from mcp_telegram.reactions.contracts import (
 from mcp_telegram.reactions.detail import ReactionDetailRefresher, ReactionDetailResult
 from mcp_telegram.reactions.persistence import allocate_observation_boundary, apply_aggregate_observation
 from mcp_telegram.reactions.telegram_adapter import TelethonTelegramReactionGateway
-from mcp_telegram.sync_db import _apply_migration_68, ensure_sync_schema
+from mcp_telegram.sync_db import _apply_migration_68, _apply_migration_69, ensure_sync_schema
 from mcp_telegram.telegram_fact_queries import reaction_event_projection
 from mcp_telegram.telegram_reading import GatewayFailure, GatewayFailureKind, TelegramReadReceiptGateway
 from mcp_telegram.telegram_rpc_consumers import TelegramRpcSource
@@ -497,6 +497,45 @@ def test_reaction_migration_preserves_empty_receipts_and_cleans_orphans() -> Non
     ]
     assert conn.execute("SELECT next_sequence FROM message_reaction_observation_counter").fetchone() == (5,)
     assert conn.execute("SELECT name FROM sqlite_master WHERE name='message_reactions_freshness'").fetchone() is None
+    conn.close()
+
+
+def test_pacing_migration_preserves_reaction_candidate_and_detail_state() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE schema_version(version INTEGER, applied_at INTEGER);
+        INSERT INTO schema_version VALUES (68, 1);
+        CREATE TABLE message_reaction_aggregate_state(
+            dialog_id INTEGER, message_id INTEGER, generation INTEGER,
+            aggregate_row_count INTEGER, PRIMARY KEY(dialog_id, message_id)
+        );
+        CREATE TABLE message_reaction_event_status(
+            dialog_id INTEGER, message_id INTEGER, status TEXT,
+            next_offset TEXT, PRIMARY KEY(dialog_id, message_id)
+        );
+        CREATE TABLE message_reaction_events(
+            event_id INTEGER PRIMARY KEY, dialog_id INTEGER, message_id INTEGER, emoji TEXT
+        );
+        INSERT INTO message_reaction_aggregate_state VALUES (1, 2, 7, 1);
+        INSERT INTO message_reaction_event_status VALUES (1, 2, 'partial', 'resume');
+        INSERT INTO message_reaction_events VALUES (9, 1, 2, '👍');
+        """
+    )
+
+    assert _apply_migration_69(conn, 68) == 69
+    assert conn.execute("SELECT generation, aggregate_row_count FROM message_reaction_aggregate_state").fetchone() == (
+        7,
+        1,
+    )
+    assert conn.execute("SELECT status, next_offset FROM message_reaction_event_status").fetchone() == (
+        "partial",
+        "resume",
+    )
+    assert conn.execute("SELECT event_id, emoji FROM message_reaction_events").fetchone() == (9, "👍")
+    assert conn.execute(
+        "SELECT window_started_at, release_at, claimed_pages, started_pages FROM reaction_detail_pacing_state"
+    ).fetchone() == (0, 0, 0, 0)
     conn.close()
 
 

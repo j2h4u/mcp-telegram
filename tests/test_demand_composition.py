@@ -261,6 +261,7 @@ def test_adapter_map_is_exact_against_literal_20_kind_class_map(
     assert adapters[DemandKind.FOLDER_SNAPSHOT]._worker is objects["folder"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.SCHEDULED_REPAIR]._reconciler is objects["scheduled"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.SCHEDULED_DISCOVERY]._reconciler is objects["scheduled"]  # type: ignore[attr-defined]
+    assert adapters[DemandKind.MESSAGE_FACT_REFRESH]._shutdown_event is objects["shutdown"]  # type: ignore[attr-defined]
     with pytest.raises(TypeError):
         adapters[DemandKind.SCHEDULED_REPAIR] = adapters[DemandKind.SCHEDULED_DISCOVERY]  # type: ignore[index]
 

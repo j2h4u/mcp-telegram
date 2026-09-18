@@ -994,6 +994,7 @@ def _message_fact_refresh_policy_from_config(
     return MessageFactRefreshPolicy(
         reaction_max_messages_per_cycle=resolved.message_fact_refresh_reaction_max_messages_per_cycle,
         reaction_detail_max_pages_per_cycle=resolved.reaction_detail_max_pages_per_cycle,
+        reaction_detail_cycle_seconds=resolved.reaction_detail_cycle_seconds,
         read_at_max_messages_per_cycle=resolved.message_fact_refresh_read_at_max_messages_per_cycle,
         pause_seconds=resolved.message_fact_refresh_pause_seconds,
         read_at_ttl_seconds=config.freshness.read_receipts.read_at_ttl_seconds,
