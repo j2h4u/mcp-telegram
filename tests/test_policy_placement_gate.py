@@ -52,10 +52,6 @@ def _findings(source: str) -> set[tuple[str, str]]:
 NON_OPERATOR_POLICY_CASES = (
     ("src/mcp_telegram/delta_sync.py", "_DELTA_SLICE_MESSAGE_LIMIT = 100\n"),
     (
-        "src/mcp_telegram/reactions/refresh.py",
-        "_PERSISTENCE_RETRY_DELAYS_SECONDS = (0.25, 1.0, 2.0)\n",
-    ),
-    (
         "src/mcp_telegram/scheduled_messages.py",
         "class ScheduledReconciliationPolicy:\n    failure_retry_seconds: int = 300\n",
     ),

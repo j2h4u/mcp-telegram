@@ -44,7 +44,6 @@ from tests.helpers import (
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
 )
-from tests.reaction_helpers import make_reaction_freshener
 
 _TEST_DBS: list[sqlite3.Connection] = []
 
@@ -127,7 +126,6 @@ def make_server(
         conn,
         cast(DaemonClientLike, client),
         shutdown_event,
-        reaction_freshener=make_reaction_freshener(conn, client),
         channel_profile_port=channel_profile_port,
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import cast
 
 from .models import ReadMessage
-from .reactions.refresh import ReactionFreshener
+from .reactions import ReactionDetailRefresher
 from .telegram_demand import (
     AcquisitionKind,
     DemandStatus,
@@ -31,25 +31,32 @@ from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import rpc_attempt_budget
 
 _REACTION_CANDIDATES_SQL = """
-SELECT m.dialog_id, m.message_id
+SELECT m.dialog_id, m.message_id, a.generation, d.next_offset
 FROM messages m
 JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
 JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
+JOIN message_reaction_aggregate_state a ON a.dialog_id=m.dialog_id AND a.message_id=m.message_id
+LEFT JOIN message_reaction_event_status d ON d.dialog_id=m.dialog_id AND d.message_id=m.message_id
 WHERE sd.status = 'synced'
-  AND EXISTS (
-      SELECT 1
-      FROM message_reactions r
-      WHERE r.dialog_id = m.dialog_id
-        AND r.message_id = m.message_id
-  )
-  AND NOT EXISTS (
-      SELECT 1
-      FROM message_reactions_freshness f
-      WHERE f.dialog_id = m.dialog_id
-        AND f.message_id = m.message_id
-        AND f.checked_at > ?
-  )
-ORDER BY m.sent_at DESC, m.dialog_id, m.message_id
+  AND m.is_deleted = 0
+  AND (a.aggregate_row_count > 0
+       OR d.status IN ('partial','unavailable'))
+  AND (d.dialog_id IS NULL OR d.aggregate_generation < a.generation
+       OR d.status = 'stale'
+       OR (d.status IN ('partial','unavailable') AND d.next_attempt_at IS NOT NULL
+           AND d.next_attempt_at <= ?))
+ORDER BY
+  CASE
+    WHEN d.status = 'partial' AND d.next_offset IS NOT NULL THEN 0
+    WHEN d.dialog_id IS NULL OR d.aggregate_generation < a.generation OR d.status = 'stale' THEN 1
+    ELSE 2
+  END,
+  CASE
+    WHEN d.dialog_id IS NULL OR d.aggregate_generation < a.generation OR d.status = 'stale' THEN 0
+    ELSE COALESCE(d.next_attempt_at, 0)
+  END,
+  COALESCE(d.checked_at, 0),
+  m.sent_at DESC, m.dialog_id, m.message_id
 LIMIT ?
 """
 
@@ -75,19 +82,24 @@ LIMIT ?
 
 
 _NEXT_REACTION_RELEASE_SQL = """
-SELECT MIN(CASE WHEN f.checked_at IS NULL THEN 0 ELSE f.checked_at + ? END)
-FROM messages m
-JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
-JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
-LEFT JOIN message_reactions_freshness f
-  ON f.dialog_id = m.dialog_id AND f.message_id = m.message_id
-WHERE sd.status = 'synced'
-  AND EXISTS (
-      SELECT 1
-      FROM message_reactions r
-      WHERE r.dialog_id = m.dialog_id
-        AND r.message_id = m.message_id
+SELECT MIN(
+  CASE
+    WHEN d.dialog_id IS NULL OR d.aggregate_generation < a.generation OR d.status = 'stale' THEN 0
+    ELSE COALESCE(d.next_attempt_at, ?)
+  END
+)
+FROM message_reaction_aggregate_state a
+JOIN synced_dialogs sd ON sd.dialog_id=a.dialog_id AND sd.status='synced'
+JOIN full_history_enrollment fhe ON fhe.dialog_id=a.dialog_id AND fhe.enabled=1
+LEFT JOIN message_reaction_event_status d ON d.dialog_id=a.dialog_id AND d.message_id=a.message_id
+WHERE EXISTS (
+    SELECT 1 FROM messages m
+    WHERE m.dialog_id=a.dialog_id AND m.message_id=a.message_id AND m.is_deleted=0
   )
+  AND (a.aggregate_row_count > 0 OR d.status IN ('partial','unavailable'))
+  AND (d.dialog_id IS NULL OR d.aggregate_generation < a.generation
+       OR d.status = 'stale'
+       OR (d.status IN ('partial','unavailable') AND d.next_attempt_at IS NOT NULL))
 """
 
 
@@ -140,8 +152,8 @@ class MessageFactRefreshPolicy:
     reaction_max_messages_per_cycle: int
     read_at_max_messages_per_cycle: int
     pause_seconds: float
-    reaction_ttl_seconds: int
     read_at_ttl_seconds: int
+    reaction_detail_max_pages_per_cycle: int = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,7 +179,7 @@ class MessageFactRefreshDeps:
     """Infrastructure dependencies for one optional fact refresh cycle."""
 
     conn: sqlite3.Connection
-    reaction_freshener: ReactionFreshener
+    reaction_detail_refresher: ReactionDetailRefresher
     read_receipt_gateway: TelegramReadReceiptGateway
     read_at_observer: Callable[[Mapping[str, object]], None] | None = None
 
@@ -179,7 +191,7 @@ def _next_release_at(conn: sqlite3.Connection, query: str, ttl_seconds: int) -> 
 
 
 class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
-    """Read the existing optional-fact candidate state for PR1 shadow mode.
+    """Read the durable optional-fact candidate state.
 
     This is the durable orchestration root for background per-message reaction
     and exact read-date candidates. The nested acquisition adapters do not
@@ -197,11 +209,7 @@ class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
         del now
         releases: list[float] = []
         if self._policy.reaction_max_messages_per_cycle > 0:
-            reaction_release = _next_release_at(
-                self._deps.conn,
-                _NEXT_REACTION_RELEASE_SQL,
-                self._policy.reaction_ttl_seconds,
-            )
+            reaction_release = _next_release_at(self._deps.conn, _NEXT_REACTION_RELEASE_SQL, 0)
             if reaction_release is not None:
                 releases.append(reaction_release)
         if self._policy.read_at_max_messages_per_cycle > 0:
@@ -232,7 +240,7 @@ class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
 
 
 class ReadReceiptDemandAdapter(DurableDemandAdapter):
-    """Read the durable read-position reconciliation state in shadow mode.
+    """Read the durable read-position reconciliation state.
 
     Per-message exact read dates are nested acquisitions selected by
     ``MESSAGE_FACT_REFRESH`` and are intentionally absent from this status.
@@ -285,12 +293,20 @@ def _reaction_candidates(
     *,
     stale_before_utc: int,
     limit: int,
-) -> list[tuple[int, int]]:
+) -> list[tuple[int, int, int, str | None]]:
     rows = cast(
         list[tuple[object, ...]],
         conn.execute(_REACTION_CANDIDATES_SQL, (stale_before_utc, limit)).fetchall(),
     )
-    return [cast(tuple[int, int], _row_ints(row)) for row in rows]
+    return [
+        (
+            int(cast(int, row[0])),
+            int(cast(int, row[1])),
+            int(cast(int, row[2])),
+            None if row[3] is None else str(row[3]),
+        )
+        for row in rows
+    ]
 
 
 def _read_at_candidates(
@@ -378,13 +394,6 @@ def _observe_read_at_cycle(  # noqa: PLR0913 - bounded telemetry fields are expl
         return
 
 
-def _group_message_ids(rows: Sequence[tuple[int, int]]) -> dict[int, list[int]]:
-    grouped: dict[int, list[int]] = {}
-    for dialog_id, message_id in rows:
-        grouped.setdefault(dialog_id, []).append(message_id)
-    return grouped
-
-
 def _group_messages(messages: Sequence[ReadMessage]) -> dict[int, list[ReadMessage]]:
     grouped: dict[int, list[ReadMessage]] = {}
     for message in messages:
@@ -467,15 +476,25 @@ async def refresh_message_facts_once(
     checked_at = int(time.time() if now is None else now)
     reaction_rows = _reaction_candidates(
         deps.conn,
-        stale_before_utc=checked_at - policy.reaction_ttl_seconds,
+        stale_before_utc=checked_at,
         limit=policy.reaction_max_messages_per_cycle,
     )
     reaction_refreshed = 0
-    reaction_groups = _group_message_ids(reaction_rows)
-    for index, (dialog_id, message_ids) in enumerate(reaction_groups.items()):
-        freshness = await deps.reaction_freshener.refresh(dialog_id, dialog_id, message_ids)
-        reaction_refreshed += freshness.refreshed_count
-        if shutdown_event is not None and index < len(reaction_groups) - 1:
+    selected_reaction_rows = reaction_rows[: policy.reaction_detail_max_pages_per_cycle]
+    for index, (dialog_id, message_id, generation, offset) in enumerate(selected_reaction_rows):
+        detail = await deps.reaction_detail_refresher.refresh_one(
+            dialog_id,
+            message_id,
+            generation,
+            entity=dialog_id,
+            offset=offset,
+            cancellation_event=shutdown_event,
+            now=checked_at,
+        )
+        reaction_refreshed += detail.fetched_pages
+        if detail.stop_cycle:
+            break
+        if shutdown_event is not None and index < len(selected_reaction_rows) - 1:
             await _interruptible_pause(shutdown_event, policy.pause_seconds)
 
     if policy.read_at_max_messages_per_cycle > 0:

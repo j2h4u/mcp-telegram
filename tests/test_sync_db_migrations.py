@@ -1,7 +1,4 @@
-"""Tests for sync_db migrations — Phase 39.2-01 Task 3.
-
-Covers v11: message_reactions_freshness side-table.
-"""
+"""Tests for sync_db migrations, including the reaction lifecycle cutover."""
 
 from __future__ import annotations
 
@@ -147,19 +144,25 @@ def _downgrade_media_tables_to_v43(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
-def test_migration_v11_creates_freshness_table(db_path: Path) -> None:
+def test_reaction_state_projection_is_current(db_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         rows = _fetchall_rows(
-            conn, "SELECT name FROM sqlite_master WHERE type='table' AND name='message_reactions_freshness'"
+            conn, "SELECT name FROM sqlite_master WHERE type='table' AND name='message_reaction_aggregate_state'"
         )
-        assert rows == [("message_reactions_freshness",)]
-        cols = _table_info(conn, "message_reactions_freshness")
+        assert rows == [("message_reaction_aggregate_state",)]
+        cols = _table_info(conn, "message_reaction_aggregate_state")
         # Each row: (cid, name, type, notnull, dflt_value, pk)
         col_map = {c[1]: (c[2], c[3], c[5]) for c in cols}
         assert col_map["dialog_id"] == ("INTEGER", 1, 1)
         assert col_map["message_id"] == ("INTEGER", 1, 2)
-        assert col_map["checked_at"] == ("INTEGER", 1, 0)
+        assert col_map["generation"] == ("INTEGER", 1, 0)
+        assert (
+            _fetchall_rows(
+                conn, "SELECT name FROM sqlite_master WHERE type='table' AND name='message_reactions_freshness'"
+            )
+            == []
+        )
 
 
 def test_migration_v37_rebuilds_media_tables_without_legacy_description(db_path: Path) -> None:
@@ -481,32 +484,32 @@ def test_v41_shape_seeds_voice_transcription_hydration_as_backfill(tmp_path: Pat
         )
 
 
-def test_migration_v11_idempotent(db_path: Path) -> None:
+def test_reaction_state_migration_is_idempotent(db_path: Path) -> None:
     ensure_sync_schema(db_path)
     ensure_sync_schema(db_path)  # second call: must not raise
     with _sync_db_connection(db_path) as conn:
-        cols_before = _table_info(conn, "message_reactions_freshness")
-        assert len(cols_before) == 3
+        cols_before = _table_info(conn, "message_reaction_aggregate_state")
+        assert "generation" in {row[1] for row in cols_before}
 
 
-def test_migration_v11_without_rowid(db_path: Path) -> None:
+def test_reaction_state_uses_without_rowid(db_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         row = _fetchone_row(
-            conn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='message_reactions_freshness'"
+            conn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='message_reaction_aggregate_state'"
         )
         assert row is not None
         assert "WITHOUT ROWID" in str(row[0]).upper()
 
 
-def test_migration_v11_does_not_touch_synced_dialogs(db_path: Path) -> None:
+def test_legacy_reaction_migration_does_not_touch_synced_dialogs(db_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         cols = [c[1] for c in _table_info(conn, "synced_dialogs")]
         assert "reactions_reconciled_at" not in cols
 
 
-def test_schema_version_records_current_v11(db_path: Path) -> None:
+def test_schema_version_records_current_reaction_migration(db_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
@@ -715,7 +718,7 @@ def test_schema_version_records_current(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-    assert _CURRENT_SCHEMA_VERSION == 67
+    assert _CURRENT_SCHEMA_VERSION == 68
 
 
 def test_genuine_v61_fixture_upgrades_to_v62_and_reopens_idempotently(
@@ -1496,7 +1499,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 67
+        assert _CURRENT_SCHEMA_VERSION == 68
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:

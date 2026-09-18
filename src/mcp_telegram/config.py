@@ -34,13 +34,6 @@ class StateConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class ReactionsConfig:
-    """Freshness policy for locally projected reaction facts."""
-
-    freshness_ttl_seconds: int = 600
-
-
-@dataclass(frozen=True, slots=True)
 class ReadReceiptsConfig:
     """Freshness policy for Telegram read-receipt facts."""
 
@@ -145,7 +138,6 @@ class FolderProjectionConfig:
 class FreshnessConfig:
     """All Telegram-derived fact freshness policies."""
 
-    reactions: ReactionsConfig = field(default_factory=ReactionsConfig)
     read_receipts: ReadReceiptsConfig = field(default_factory=ReadReceiptsConfig)
     inbox: InboxConfig = field(default_factory=InboxConfig)
     entities: EntitiesConfig = field(default_factory=EntitiesConfig)
@@ -359,6 +351,8 @@ class SchedulingConfig:
     access_probe_max_dialogs_per_cycle: int = 3
     access_probe_cooldown_seconds: int = 604_800
     message_fact_refresh_reaction_max_messages_per_cycle: int = 5
+    reaction_detail_max_pages_per_cycle: int = 5
+    reaction_detail_unavailable_retry_seconds: int = 600
     message_fact_refresh_read_at_max_messages_per_cycle: int = 5
     message_fact_refresh_pause_seconds: float = 1.0
     activity_rpc_timeout_seconds: float = 120.0
@@ -692,6 +686,16 @@ def resolve_scheduling_config(
             "MESSAGE_FACT_REFRESH_REACTION_MAX_MESSAGES_PER_CYCLE",
             config.message_fact_refresh_reaction_max_messages_per_cycle,
         ),
+        reaction_detail_max_pages_per_cycle=_env_positive_int(
+            env,
+            "REACTION_DETAIL_MAX_PAGES_PER_CYCLE",
+            config.reaction_detail_max_pages_per_cycle,
+        ),
+        reaction_detail_unavailable_retry_seconds=_env_positive_int(
+            env,
+            "REACTION_DETAIL_UNAVAILABLE_RETRY_SECONDS",
+            config.reaction_detail_unavailable_retry_seconds,
+        ),
         message_fact_refresh_read_at_max_messages_per_cycle=_env_non_negative_int(
             env,
             "MESSAGE_FACT_REFRESH_READ_AT_MAX_MESSAGES_PER_CYCLE",
@@ -822,12 +826,10 @@ def _parse_state(data: dict[str, object], path: Path) -> StateConfig:
 def _parse_freshness(data: dict[str, object], path: Path) -> FreshnessConfig:
     freshness_data = _table(data, "freshness", path, required=False)
     if freshness_data is not None:
-        _reject_unknown_keys(freshness_data, {"reactions", "read_receipts", "inbox", "entities"}, "freshness", path)
-    reactions_data = _nested_table(freshness_data, "reactions", "freshness.reactions", path) or {}
+        _reject_unknown_keys(freshness_data, {"read_receipts", "inbox", "entities"}, "freshness", path)
     receipts_data = _nested_table(freshness_data, "read_receipts", "freshness.read_receipts", path) or {}
     inbox_data = _nested_table(freshness_data, "inbox", "freshness.inbox", path) or {}
     entities_data = _nested_table(freshness_data, "entities", "freshness.entities", path) or {}
-    _reject_unknown_keys(reactions_data, {"freshness_ttl_seconds"}, "freshness.reactions", path)
     _reject_unknown_keys(receipts_data, {"read_at_ttl_seconds"}, "freshness.read_receipts", path)
     _reject_unknown_keys(inbox_data, {"deleted_message_visibility_seconds"}, "freshness.inbox", path)
     _reject_unknown_keys(
@@ -843,15 +845,6 @@ def _parse_freshness(data: dict[str, object], path: Path) -> FreshnessConfig:
     )
     defaults = FreshnessConfig()
     return FreshnessConfig(
-        reactions=ReactionsConfig(
-            freshness_ttl_seconds=_positive_int(
-                reactions_data,
-                "freshness_ttl_seconds",
-                "freshness.reactions",
-                path,
-                defaults.reactions.freshness_ttl_seconds,
-            )
-        ),
         read_receipts=ReadReceiptsConfig(
             read_at_ttl_seconds=_positive_int(
                 receipts_data,
@@ -1411,6 +1404,8 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "access_probe_max_dialogs_per_cycle",
         "access_probe_cooldown_seconds",
         "message_fact_refresh_reaction_max_messages_per_cycle",
+        "reaction_detail_max_pages_per_cycle",
+        "reaction_detail_unavailable_retry_seconds",
         "message_fact_refresh_read_at_max_messages_per_cycle",
         "message_fact_refresh_pause_seconds",
         "activity_hot_sweep",
@@ -1517,6 +1512,20 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             "scheduling",
             path,
             defaults.message_fact_refresh_reaction_max_messages_per_cycle,
+        ),
+        reaction_detail_max_pages_per_cycle=_positive_int(
+            scheduling_data,
+            "reaction_detail_max_pages_per_cycle",
+            "scheduling",
+            path,
+            defaults.reaction_detail_max_pages_per_cycle,
+        ),
+        reaction_detail_unavailable_retry_seconds=_positive_int(
+            scheduling_data,
+            "reaction_detail_unavailable_retry_seconds",
+            "scheduling",
+            path,
+            defaults.reaction_detail_unavailable_retry_seconds,
         ),
         message_fact_refresh_read_at_max_messages_per_cycle=_non_negative_int(
             scheduling_data,

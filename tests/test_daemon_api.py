@@ -73,7 +73,6 @@ from tests.helpers import (
     LoudUserProfilePort,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
-from tests.reaction_helpers import make_reaction_freshener
 
 # Track sqlite connections created by module helpers and close them after each test.
 _TRACKED_SQLITE_CONN_CLEANUP: Final[list[sqlite3.Connection]] = []
@@ -369,7 +368,6 @@ def make_server(
         cast(DaemonClientLike, client),
         shutdown_event,
         FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn)),
-        reaction_freshener=make_reaction_freshener(conn, client),
         channel_profile_port=LoudChannelProfilePort(),
         hydration_requester=hydration_requester,
         topic_refresher=topic_refresher,
@@ -461,7 +459,6 @@ def test_daemon_api_server_uses_explicit_sync_db_path(tmp_path: Path) -> None:
         cast(DaemonClientLike, client),
         asyncio.Event(),
         sync_db_path=sync_db_path,
-        reaction_freshener=make_reaction_freshener(conn, client),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
@@ -5879,7 +5876,10 @@ async def test_global_search_projects_cached_reaction_events_and_read_at() -> No
             reactor_id INTEGER,
             emoji TEXT NOT NULL,
             reacted_at INTEGER,
-            fetched_at INTEGER NOT NULL
+            fetched_at INTEGER NOT NULL,
+            detail_generation INTEGER NOT NULL DEFAULT 1,
+            page_ordinal INTEGER NOT NULL DEFAULT 0,
+            display_generation INTEGER NOT NULL DEFAULT 1
         );
         CREATE TABLE message_reaction_event_status (
             dialog_id INTEGER NOT NULL,
@@ -5887,6 +5887,14 @@ async def test_global_search_projects_cached_reaction_events_and_read_at() -> No
             checked_at INTEGER NOT NULL,
             status TEXT NOT NULL,
             returned_count INTEGER NOT NULL DEFAULT 0,
+            aggregate_generation INTEGER NOT NULL DEFAULT 1,
+            detail_generation INTEGER NOT NULL DEFAULT 1,
+            display_generation INTEGER NOT NULL DEFAULT 1,
+            published_generation INTEGER NOT NULL DEFAULT 1,
+            staged_count INTEGER NOT NULL DEFAULT 0,
+            next_offset TEXT,
+            next_attempt_at INTEGER,
+            failure_kind TEXT,
             PRIMARY KEY (dialog_id, message_id)
         );
         CREATE TABLE message_read_facts (

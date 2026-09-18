@@ -13,7 +13,7 @@ from ..alert_policy import incoming_human_dm_sql
 from ..fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
 from ..hydration_queue import HydrationPriority, HydrationQueueRepository
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
-from ..reactions.contracts import ReactionAggregate
+from ..reactions.contracts import ReactionAggregate, ReactionAggregateSource
 from ..reactions.persistence import replace_reaction_aggregates
 from .sqlite_hydration_jobs import _FACT_HYDRATION_EMPTY_KINDS, _is_canonical_media_pair, reconcile_fact_hydration_job
 
@@ -88,13 +88,14 @@ def read_message_out(conn: sqlite3.Connection, dialog_id: int, message_id: int) 
     return MessageOutLookup(found=row is not None, outgoing=bool(row[0]) if row is not None else False)
 
 
-def persist_edited_message(
+def persist_edited_message(  # noqa: PLR0913
     conn: sqlite3.Connection,
     extracted: _message_contracts.ExtractedMessage,
     *,
     old_text: str | None,
     edit_date: int,
     priority: HydrationPriority = HydrationPriority.FOREGROUND,
+    reaction_source: ReactionAggregateSource | str = ReactionAggregateSource.MESSAGE_EDIT,
 ) -> int | None:
     """Version and persist a changed message in the caller's transaction."""
     dialog_id, message_id = extracted.message.dialog_id, extracted.message.message_id
@@ -104,12 +105,16 @@ def persist_edited_message(
     old_text = current.text
     keep_history = conn.execute(_SELECT_HUMAN_DM_MESSAGE_SQL, (dialog_id, message_id)).fetchone() is not None
     if not keep_history:
-        insert_messages_with_fts(conn, [extracted], priority=priority)
+        insert_messages_with_fts(
+            conn, [extracted], priority=priority, reaction_source=reaction_source, reaction_observed_at=edit_date
+        )
         return None
     version_row = cast(tuple[int], conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone())
     next_version = int(version_row[0])
     conn.execute(_INSERT_VERSION_SQL, (dialog_id, message_id, next_version, old_text, edit_date, "telegram_edit"))
-    insert_messages_with_fts(conn, [extracted], priority=priority)
+    insert_messages_with_fts(
+        conn, [extracted], priority=priority, reaction_source=reaction_source, reaction_observed_at=edit_date
+    )
     conn.execute(
         _INSERT_HUMAN_DM_EDIT_ALERT_SQL,
         (edit_date, dialog_id, message_id, next_version, dialog_id, message_id),
@@ -175,12 +180,14 @@ def insert_messages_with_fts(
     extracted: Sequence[_message_contracts.ExtractedMessage],
     *,
     priority: HydrationPriority = HydrationPriority.FOREGROUND,
+    reaction_source: ReactionAggregateSource | str = ReactionAggregateSource.HISTORY,
+    reaction_observed_at: int | None = None,
 ) -> None:
     """Persist message bundles in the caller-owned transaction."""
     projected = _overlay_message_transcriptions(conn, _preserve_transcribed_texts(conn, extracted))
     _write_message_rows_and_fts(conn, projected, priority=priority)
     _delete_entity_and_forward_projections(conn, projected)
-    _replace_reaction_projections(conn, projected)
+    _replace_reaction_projections(conn, projected, source=reaction_source, observed_at=reaction_observed_at)
     _insert_entity_and_forward_projections(conn, projected)
 
 
@@ -235,7 +242,11 @@ def _delete_entity_and_forward_projections(
 
 
 def _replace_reaction_projections(
-    conn: sqlite3.Connection, extracted: Sequence[_message_contracts.ExtractedMessage]
+    conn: sqlite3.Connection,
+    extracted: Sequence[_message_contracts.ExtractedMessage],
+    *,
+    source: ReactionAggregateSource | str = ReactionAggregateSource.HISTORY,
+    observed_at: int | None = None,
 ) -> None:
     for item in extracted:
         replace_reaction_aggregates(
@@ -243,6 +254,8 @@ def _replace_reaction_projections(
             item.message.dialog_id,
             item.message.message_id,
             tuple(ReactionAggregate(emoji=row.emoji, count=row.count) for row in item.reactions),
+            source=source,
+            observed_at=observed_at,
         )
 
 

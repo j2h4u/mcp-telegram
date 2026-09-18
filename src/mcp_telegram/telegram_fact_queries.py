@@ -37,9 +37,12 @@ def reaction_event_projection(
         event_rows = cast(
             list[tuple[object, ...]],
             conn.execute(
-                f"SELECT message_id, reactor_id, emoji, reacted_at "
-                f"FROM message_reaction_events WHERE dialog_id = ? AND message_id IN ({placeholders}) "
-                "ORDER BY message_id, event_id",
+                f"SELECT e.message_id, e.reactor_id, e.emoji, e.reacted_at "
+                f"FROM message_reaction_events e JOIN message_reaction_event_status s "
+                f"ON s.dialog_id=e.dialog_id AND s.message_id=e.message_id "
+                f"WHERE e.dialog_id = ? AND e.message_id IN ({placeholders}) "
+                "AND e.display_generation = s.display_generation AND e.display_generation > 0 "
+                "ORDER BY e.message_id, e.event_id",
                 [dialog_id, *message_ids],
             ).fetchall(),
         )
@@ -51,7 +54,9 @@ def reaction_event_projection(
                 [dialog_id, *message_ids],
             ).fetchall(),
         )
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
         return {}, {}
 
     events: dict[int, tuple[ReadReactionEvent, ...]] = {}
@@ -172,7 +177,9 @@ async def _refresh_stale_read_at_facts(  # noqa: PLR0913
                 checked_at=checked_at,
                 status=result.status,
             )
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
             # Keep pre-v28 read paths usable while the daemon is upgrading.
             measurement_complete = False
             break
@@ -231,7 +238,9 @@ def read_at_map(conn: sqlite3.Connection, dialog_id: int, message_ids: Sequence[
                 [dialog_id, *message_ids],
             ).fetchall(),
         )
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
         return {}
     values: dict[int, int | None] = {}
     for row in rows:
@@ -261,7 +270,9 @@ def stale_read_at_ids(
                 [dialog_id, *message_ids, stale_before_utc],
             ).fetchall(),
         )
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
         return list(dict.fromkeys(message_ids))
     fresh = {int(cast(int | str, row[0])) for row in rows}
     selected: list[int] = []

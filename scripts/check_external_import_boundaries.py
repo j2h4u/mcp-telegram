@@ -65,7 +65,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "media_hydration.py",
             "own_only.py",
             "reactions/persistence.py",
-            "reactions/sqlite_repository.py",
+            "reactions/detail.py",
             "read_state.py",
             "runtime_observations.py",
             "event_recovery.py",

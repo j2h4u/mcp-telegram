@@ -316,7 +316,6 @@ def _topic_icons_need_refresh(rows: list[tuple[object, object, object, object, o
 
 
 from .feedback_service import FeedbackService
-from .reactions.refresh import ReactionFreshener
 from .telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from .telegram_history import TelethonTelegramHistoryGateway
 
@@ -587,7 +586,6 @@ class DaemonAPIServer:
         feedback_service: FeedbackService | None = None,
         sync_db_path: Path | None = None,
         *,
-        reaction_freshener: ReactionFreshener,
         hydration_requester: Callable[[sqlite3.Connection, int, int], None] | None = None,
         topic_refresher: TopicRefresher | None = None,
         folder_projection_reproject: Callable[[], object] | None = None,

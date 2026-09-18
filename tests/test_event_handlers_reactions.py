@@ -36,7 +36,6 @@ from mcp_telegram.event_handlers import (
     _EditedMessageEvent,
     _RawReactionUpdate,
 )
-from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
@@ -240,24 +239,21 @@ async def test_on_raw_reaction_update_user_peer(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """AC-UPD-USER: UpdateMessageReactions for DM, get_messages called with int dialog_id."""
+    """AC-UPD-USER: aggregate is applied directly from the raw update."""
     dialog_id = 268071163  # DM (positive int)
     _enroll(sync_db, dialog_id)
     _insert_msg(sync_db, dialog_id, 500, text="hi")
 
-    fetched = build_mock_message(id=500, text="hi", reactions=build_mock_reactions({"🔥": 4}))
-    mock_client.get_messages = AsyncMock(return_value=[fetched])
-
-    update = cast(_RawReactionUpdate, SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=500))
+    update = cast(
+        _RawReactionUpdate,
+        SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=500, reactions=build_mock_reactions({"🔥": 4})),
+    )
 
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     await mgr.on_raw_reaction_update(update)
 
     assert _reactions(sync_db, dialog_id, 500) == [("🔥", 4)]
-    # Assert called with integer dialog_id (NOT entity)
-    args, kwargs = mock_client.get_messages.call_args
-    assert args[0] == dialog_id
-    assert kwargs.get("ids") == [500]
+    mock_client.get_messages.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -266,7 +262,7 @@ async def test_on_raw_reaction_update_channel_peer(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """AC-UPD-CHANNEL: UpdateMessageReactions(peer=PeerChannel), dialog_id derived via get_peer_id."""
+    """AC-UPD-CHANNEL: peer identity is derived without a message lookup."""
     from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
     channel_id = 1234567890
@@ -274,17 +270,16 @@ async def test_on_raw_reaction_update_channel_peer(
     _enroll(sync_db, dialog_id)
     _insert_msg(sync_db, dialog_id, 700, text="hi")
 
-    fetched = build_mock_message(id=700, text="hi", reactions=build_mock_reactions({"💯": 9}))
-    mock_client.get_messages = AsyncMock(return_value=[fetched])
-
-    update = cast(_RawReactionUpdate, SimpleNamespace(peer=PeerChannel(channel_id), msg_id=700))
+    update = cast(
+        _RawReactionUpdate,
+        SimpleNamespace(peer=PeerChannel(channel_id), msg_id=700, reactions=build_mock_reactions({"💯": 9})),
+    )
 
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     await mgr.on_raw_reaction_update(update)
 
     assert _reactions(sync_db, dialog_id, 700) == [("💯", 9)]
-    args, _ = mock_client.get_messages.call_args
-    assert args[0] == dialog_id
+    mock_client.get_messages.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -299,10 +294,10 @@ async def test_on_raw_reaction_removal(
     _insert_msg(sync_db, dialog_id, 800, text="hi")
     _insert_reaction(sync_db, dialog_id, 800, "👍", 1)
 
-    fetched = build_mock_message(id=800, text="hi", reactions=SimpleNamespace(results=[]))
-    mock_client.get_messages = AsyncMock(return_value=[fetched])
-
-    update = cast(_RawReactionUpdate, SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=800))
+    update = cast(
+        _RawReactionUpdate,
+        SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=800, reactions=SimpleNamespace(results=[])),
+    )
 
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     await mgr.on_raw_reaction_update(update)
@@ -333,21 +328,22 @@ async def test_on_raw_reaction_update_floodwait_logs_and_skips(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """AC-6 supporting: TelegramRpcThrottled -> no DB mutation, warning logged."""
+    """Raw aggregate updates have no Telegram failure path."""
     dialog_id = 268071163
     _enroll(sync_db, dialog_id)
     _insert_msg(sync_db, dialog_id, 900, text="hi")
     _insert_reaction(sync_db, dialog_id, 900, "👍", 2)
 
-    mock_client.get_messages = AsyncMock(side_effect=TelegramRpcThrottled(retry_after_seconds=60))
-
-    update = cast(_RawReactionUpdate, SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=900))
+    update = cast(
+        _RawReactionUpdate,
+        SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=900, reactions=SimpleNamespace(results=[])),
+    )
 
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     await mgr.on_raw_reaction_update(update)
 
-    # No mutation
-    assert _reactions(sync_db, dialog_id, 900) == [("👍", 2)]
+    assert _reactions(sync_db, dialog_id, 900) == []
+    mock_client.get_messages.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -356,20 +352,21 @@ async def test_on_raw_reaction_update_missing_message_no_op(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """get_messages returns [None] -> no DB mutation."""
+    """A raw update can publish an empty aggregate for a full-history key."""
     dialog_id = 268071163
     _enroll(sync_db, dialog_id)
     _insert_msg(sync_db, dialog_id, 1000, text="hi")
     _insert_reaction(sync_db, dialog_id, 1000, "👍", 1)
 
-    mock_client.get_messages = AsyncMock(return_value=[None])
-
-    update = cast(_RawReactionUpdate, SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=1000))
+    update = cast(
+        _RawReactionUpdate,
+        SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=1000, reactions=SimpleNamespace(results=[])),
+    )
 
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     await mgr.on_raw_reaction_update(update)
 
-    assert _reactions(sync_db, dialog_id, 1000) == [("👍", 1)]
+    assert _reactions(sync_db, dialog_id, 1000) == []
 
 
 @pytest.mark.asyncio
@@ -394,13 +391,15 @@ async def test_idempotency_edited_then_raw_same_state(
     after_edited = _reactions(sync_db, dialog_id, 1100)
 
     # Raw path with same reactions
-    fetched = build_mock_message(id=1100, text="hi", reactions=reactions_obj)
-    mock_client.get_messages = AsyncMock(return_value=[fetched])
-    update = cast(_RawReactionUpdate, SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=1100))
+    update = cast(
+        _RawReactionUpdate,
+        SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=1100, reactions=reactions_obj),
+    )
     await mgr.on_raw_reaction_update(update)
     after_raw = _reactions(sync_db, dialog_id, 1100)
 
     assert after_edited == after_raw == [("👍", 3)]
+    mock_client.get_messages.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

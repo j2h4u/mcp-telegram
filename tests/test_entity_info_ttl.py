@@ -38,7 +38,6 @@ from tests.helpers import (
     LoudGroupProfilePort,
     UserReference,
 )
-from tests.reaction_helpers import make_reaction_freshener
 
 _TEST_DBS: list[sqlite3.Connection] = []
 
@@ -120,7 +119,6 @@ def make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike
         conn,
         cast(DaemonClientLike, client),
         shutdown_event,
-        reaction_freshener=make_reaction_freshener(conn, client),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=_GenericUserProfilePort(),

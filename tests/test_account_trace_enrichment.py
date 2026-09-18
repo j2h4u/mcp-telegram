@@ -50,7 +50,6 @@ from tests.helpers import (
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
 )
-from tests.reaction_helpers import make_reaction_freshener
 
 
 def test_trace_content_projection_renders_persisted_hidden_link() -> None:
@@ -153,7 +152,6 @@ def trace_enrichment_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, s
         conn,
         client,
         asyncio.Event(),
-        reaction_freshener=make_reaction_freshener(conn, client),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),

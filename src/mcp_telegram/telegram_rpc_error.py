@@ -9,6 +9,21 @@ from telethon.errors import rpc_errors_dict  # type: ignore[import-untyped]
 
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}\Z", re.ASCII)
 _SYMBOL_RE = re.compile(r"[A-Z][A-Z0-9_]{0,127}\Z", re.ASCII)
+REACTION_DETAIL_TERMINAL_RPC_SYMBOLS = frozenset(
+    {
+        "CHANNEL_ID_INVALID",
+        "CHANNEL_INVALID",
+        "CHAT_ADMIN_INVITE_REQUIRED",
+        "CHAT_ADMIN_REQUIRED",
+        "CHAT_ID_INVALID",
+        "CHAT_INVALID",
+        "MEGAGROUP_PREHISTORY_HIDDEN",
+        "MESSAGE_ID_INVALID",
+        "MSG_ID_INVALID",
+        "PEER_ID_INVALID",
+        "REACTION_INVALID",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,4 +80,14 @@ def describe_telegram_rpc_error(exc: BaseException) -> TelegramRpcErrorDescripto
     return TelegramRpcErrorDescriptor(error_type=error_type, code=_error_code(exc), symbol=symbol)
 
 
-__all__ = ["TelegramRpcErrorDescriptor", "describe_telegram_rpc_error"]
+def is_reaction_detail_terminal_rpc_error(exc: BaseException) -> bool:
+    """Match safe Telegram symbols that permanently reject detail acquisition."""
+    return describe_telegram_rpc_error(exc).symbol in REACTION_DETAIL_TERMINAL_RPC_SYMBOLS
+
+
+__all__ = [
+    "REACTION_DETAIL_TERMINAL_RPC_SYMBOLS",
+    "TelegramRpcErrorDescriptor",
+    "describe_telegram_rpc_error",
+    "is_reaction_detail_terminal_rpc_error",
+]

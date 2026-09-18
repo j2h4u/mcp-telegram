@@ -1,17 +1,22 @@
 # Telegram Behind Domain Ports
 
-Status: panel accepted; Slice 1 active
+Status: panel accepted; Slice 1 deployed; Slice 2 is a code-complete PR candidate pending release
 Last reviewed: 2026-09-18
 
 Latest panel recommendation:
 [Expert Panel Recommendation, 2026-09-18](telegram-domain-ports-panel-2026-09-18.md).
-It proposes two evidence-backed slices. Slice 1 is active; deployment and
-completion remain pending.
+It proposes two evidence-backed slices. Slice 1 is deployed; Slice 2 is
+implemented locally and awaits release and deployment.
+
+Before deploying Slice 2, the orchestrator must remove the obsolete
+`[freshness.reactions]` section from the host-owned config. The source parser
+intentionally rejects that retired section; this checkout does not rewrite the
+live `/opt/docker/mcp-telegram/config.toml` automatically.
 
 This document records the target architecture, the program completed through
 PR #270, and the residual state considered by the 2026-09-18 expert panel. The
-panel produced a separate recommendation that is now accepted for Slice 1;
-neither document is a deployment approval.
+panel produced a separate recommendation that is now accepted for both slices;
+the second slice is not yet a deployment approval.
 
 The accepted catalog-specific contract remains
 [Canonical Dialog Snapshot](canonical-dialog-snapshot.md). The broader current

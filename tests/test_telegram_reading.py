@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import sqlite3
-import time
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,17 +12,11 @@ from typing import Protocol, cast
 from unittest.mock import AsyncMock
 
 import pytest
-from telethon.errors import ChannelPrivateError
 from telethon.tl import types
 
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.models import ReadMessage
-from mcp_telegram.reactions.contracts import ReactionAggregate, ReactionEvent, ReactionFetchResult, ReactionSnapshot
-from mcp_telegram.reactions.ports import ReactionSnapshotRepository, TelegramReactionGateway
-from mcp_telegram.reactions.refresh import ReactionFreshener
-from mcp_telegram.reactions.sqlite_repository import SQLiteReactionSnapshotRepository
 from mcp_telegram.reactions.telegram_adapter import TelethonTelegramReactionGateway
-from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudgetExhaustedError
 from mcp_telegram.telegram_fact_queries import enrich_read_at, persist_read_at, stale_read_at_ids
 from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
@@ -148,25 +141,6 @@ def test_reaction_gateway_peer_id_normalizes_telethon_and_narrow_doubles(peer: o
     assert TelethonTelegramReactionGateway._peer_id(peer) == expected
 
 
-class _WarningLogger:
-    def __init__(self, warnings: list[tuple[object, ...]]) -> None:
-        self._warnings = warnings
-
-    def warning(self, msg: str, *args: object) -> None:
-        _ = msg
-        self._warnings.append(args)
-
-
-@pytest.mark.parametrize("freshness_ttl_seconds", [0, -1, True, "600"])
-def test_reaction_freshener_requires_positive_integer_ttl(freshness_ttl_seconds: object) -> None:
-    with pytest.raises(ValueError, match="freshness_ttl_seconds"):
-        ReactionFreshener(
-            cast(ReactionSnapshotRepository, object()),
-            cast(TelegramReactionGateway, object()),
-            freshness_ttl_seconds=cast(int, freshness_ttl_seconds),
-        )
-
-
 @pytest.mark.asyncio
 async def test_fragment_gateway_preserves_fixed_window_and_normalized_persistence(
     make_synced_db: Callable[[], sqlite3.Connection],
@@ -248,319 +222,15 @@ async def test_fragment_gateway_translates_floodwait_without_partial_persistence
 
 
 @pytest.mark.asyncio
-async def test_reaction_freshener_refreshes_only_stale_active_window(
-    make_synced_db: Callable[[], sqlite3.Connection],
-) -> None:
-    conn = make_synced_db()
-    dialog_id = 1001
-    _seed_synced(conn, dialog_id)
-    now = int(time.time())
-    conn.executemany(
-        "INSERT INTO message_reactions_freshness (dialog_id, message_id, checked_at) VALUES (?, ?, ?)",
-        [(dialog_id, 1, now - 10), (dialog_id, 2, now - 10)],
-    )
-    conn.commit()
-    fetch_reactions = AsyncMock(
-        return_value=ReactionFetchResult(
-            messages=(
-                ReactionSnapshot(
-                    3,
-                    (ReactionAggregate(emoji="🔥", count=4),),
-                ),
-            )
-        )
-    )
-    gateway = SimpleNamespace(fetch_reactions=fetch_reactions)
-
-    freshness = await ReactionFreshener(
-        SQLiteReactionSnapshotRepository(conn),
-        cast(TelegramReactionGateway, gateway),
-        freshness_ttl_seconds=600,
-    ).refresh(dialog_id, dialog_id, [1, 2, 3])
-
-    assert freshness.status == "refreshed"
-    assert freshness.fresh_count == 2
-    assert freshness.stale_count == 1
-    assert freshness.refreshed_count == 1
-    fetch_reactions.assert_awaited_once_with(dialog_id, [3])
-    assert conn.execute(
-        "SELECT message_id, emoji, count FROM message_reactions WHERE dialog_id=?", (dialog_id,)
-    ).fetchall() == [(3, "🔥", 4)]
-
-
 @pytest.mark.asyncio
-async def test_reaction_refresh_preserves_realtime_scope(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
-    conn = make_synced_db()
-    dialog_id = 1001
-    _seed_synced(conn, dialog_id)
-    conn.execute(
-        "INSERT INTO message_reactions_freshness (dialog_id, message_id, checked_at) VALUES (?, ?, ?)",
-        (dialog_id, 3, 0),
-    )
-    conn.commit()
-    sources: list[TelegramRpcSource] = []
-
-    async def fetch_reactions(_entity: object, _message_ids: list[int]) -> ReactionFetchResult:
-        sources.append(current_rpc_scope().source)
-        return ReactionFetchResult(messages=(ReactionSnapshot(3, (ReactionAggregate(emoji="🔥", count=1),)),))
-
-    try:
-        with rpc_scope(TelegramRpcSource.REALTIME_EVENT):
-            await ReactionFreshener(
-                SQLiteReactionSnapshotRepository(conn),
-                cast(TelegramReactionGateway, SimpleNamespace(fetch_reactions=fetch_reactions)),
-                freshness_ttl_seconds=600,
-                now=lambda: 1_000,
-            ).refresh(dialog_id, dialog_id, [3])
-    finally:
-        conn.close()
-
-    assert sources == [TelegramRpcSource.REALTIME_EVENT]
-
-
-def test_reaction_freshness_at_exact_ttl_age_is_stale(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
-    """A reaction snapshot at exactly the cutoff is refreshed, never reused."""
-    conn = make_synced_db()
-    dialog_id, message_id, now, ttl = 1001, 1, 2_000, 600
-    _seed_synced(conn, dialog_id)
-    conn.execute(
-        "INSERT INTO message_reactions_freshness (dialog_id, message_id, checked_at) VALUES (?, ?, ?)",
-        (dialog_id, message_id, now - ttl),
-    )
-    conn.commit()
-
-    state, fresh_ids, stale_ids = SQLiteReactionSnapshotRepository(conn).stale_reaction_ids(
-        dialog_id, [message_id], now - ttl
-    )
-
-    assert (state, fresh_ids, stale_ids) == ("active", set(), [message_id])
-
-
 @pytest.mark.asyncio
-async def test_reaction_freshener_commits_successful_refresh_to_other_connection(tmp_path: Path) -> None:
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    writer = _open_sync_db(db_path)
-    reader = _open_sync_db(db_path)
-    try:
-        dialog_id = 1001
-        _seed_synced(writer, dialog_id)
-        gateway = SimpleNamespace(
-            fetch_reactions=AsyncMock(
-                return_value=ReactionFetchResult(
-                    messages=(ReactionSnapshot(3, (ReactionAggregate(emoji="🔥", count=4),)),)
-                )
-            )
-        )
-
-        freshness = await ReactionFreshener(
-            SQLiteReactionSnapshotRepository(writer),
-            cast(TelegramReactionGateway, gateway),
-            freshness_ttl_seconds=600,
-        ).refresh(dialog_id, dialog_id, [3])
-
-        assert freshness.status == "refreshed"
-        assert reader.execute(
-            "SELECT emoji, count FROM message_reactions WHERE dialog_id=? AND message_id=?", (dialog_id, 3)
-        ).fetchall() == [("🔥", 4)]
-        assert (
-            reader.execute(
-                "SELECT checked_at FROM message_reactions_freshness WHERE dialog_id=? AND message_id=?", (dialog_id, 3)
-            ).fetchone()
-            is not None
-        )
-    finally:
-        reader.close()
-        writer.close()
-
-
 @pytest.mark.asyncio
-async def test_reaction_freshener_rolls_back_failed_refresh_on_file_database(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    db_path = tmp_path / "sync.db"
-    ensure_sync_schema(db_path)
-    writer = _open_sync_db(db_path)
-    reader = _open_sync_db(db_path)
-    try:
-        dialog_id = 1001
-        _seed_synced(writer, dialog_id)
-        repository = SQLiteReactionSnapshotRepository(writer)
-
-        def fail_after_aggregate_write(*_args: object) -> None:
-            raise RuntimeError("event persistence failed")
-
-        monkeypatch.setattr(repository, "_replace_event_snapshot", fail_after_aggregate_write)
-        gateway = SimpleNamespace(
-            fetch_reactions=AsyncMock(
-                return_value=ReactionFetchResult(
-                    messages=(ReactionSnapshot(3, (ReactionAggregate(emoji="🔥", count=4),)),)
-                )
-            )
-        )
-
-        with pytest.raises(RuntimeError, match="event persistence failed"):
-            await ReactionFreshener(
-                repository,
-                cast(TelegramReactionGateway, gateway),
-                freshness_ttl_seconds=600,
-            ).refresh(dialog_id, dialog_id, [3])
-
-        assert reader.execute(
-            "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=? AND message_id=?", (dialog_id, 3)
-        ).fetchone() == (0,)
-        assert reader.execute(
-            "SELECT COUNT(*) FROM message_reactions_freshness WHERE dialog_id=? AND message_id=?", (dialog_id, 3)
-        ).fetchone() == (0,)
-    finally:
-        reader.close()
-        writer.close()
-
-
 @pytest.mark.asyncio
-async def test_reaction_freshener_access_lost_is_quiet_and_structured(
-    make_synced_db: Callable[[], sqlite3.Connection],
-) -> None:
-    conn = make_synced_db()
-    dialog_id = 1001
-    _seed_synced(conn, dialog_id)
-    fetch_reactions = AsyncMock(
-        return_value=ReactionFetchResult(
-            failure=GatewayFailure(
-                kind=GatewayFailureKind.ACCESS_LOST,
-                error_type="ChannelPrivateError",
-                error_message="private",
-                retryable=False,
-            )
-        )
-    )
-    gateway = SimpleNamespace(fetch_reactions=fetch_reactions)
-    warnings: list[tuple[object, ...]] = []
-    log = _WarningLogger(warnings)
-
-    freshness = await ReactionFreshener(
-        SQLiteReactionSnapshotRepository(conn),
-        cast(TelegramReactionGateway, gateway),
-        freshness_ttl_seconds=600,
-        log=log,
-    ).refresh(dialog_id, dialog_id, [1, 2])
-
-    assert freshness.as_dict() == {
-        "requested_count": 2,
-        "fresh_count": 0,
-        "stale_count": 2,
-        "refreshed_count": 0,
-        "status": "access_lost",
-        "retry_after": None,
-    }
-    assert warnings == []
-
-
 @pytest.mark.asyncio
-async def test_reaction_gateway_translates_private_and_floodwait_failures() -> None:
-    private_client = SimpleNamespace(get_messages=AsyncMock(side_effect=ChannelPrivateError(request=None)))
-    private = await TelethonTelegramReactionGateway(private_client).fetch_reactions(1, [10])
-    assert private.failure is not None
-    assert private.failure.kind is GatewayFailureKind.ACCESS_LOST
-
-    flood = TelegramRpcThrottled(retry_after_seconds=23)
-    flood_client = SimpleNamespace(get_messages=AsyncMock(side_effect=flood))
-    result = await TelethonTelegramReactionGateway(flood_client).fetch_reactions(1, [10])
-    assert result.failure is not None
-    assert result.failure.kind is GatewayFailureKind.FLOOD_WAIT
-    assert result.failure.retry_after == 23
-
-
 @pytest.mark.asyncio
-async def test_reaction_gateway_propagates_scheduler_close() -> None:
-    with rpc_scope(TelegramRpcSource.REACTION_REFRESH) as scope:
-        closed = RpcAdmissionClosedError(scope, "scheduler closed")
-    client = SimpleNamespace(get_messages=AsyncMock(side_effect=closed))
-
-    with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
-        await TelethonTelegramReactionGateway(client).fetch_reactions(1, [10])
-
-
 @pytest.mark.asyncio
-async def test_reaction_detail_unavailable_keeps_aggregate_rows() -> None:
-    class Client:
-        async def get_messages(self, entity: object, ids: list[int]) -> list[object]:
-            _ = entity, ids
-            return [_message(10)]
-
-    result = await TelethonTelegramReactionGateway(Client()).fetch_reactions(42, [10])
-
-    assert result.failure is None
-    detail = result.messages[0]
-    assert detail is not None
-    assert [(row.emoji, row.count) for row in detail.aggregates] == [("👍", 2)]
-    assert detail.events == ()
-    assert detail.events_status == "unavailable"
-
-
 @pytest.mark.asyncio
-async def test_reaction_gateway_reads_only_reaction_fields() -> None:
-    """The Telegram adapter must not depend on general message extraction."""
-
-    class ReactionOnlyMessage:
-        reactions = SimpleNamespace(results=[SimpleNamespace(reaction=SimpleNamespace(emoticon="👍"), count=2)])
-
-        def __getattr__(self, name: str) -> object:
-            raise AssertionError(f"reaction adapter accessed unrelated field: {name}")
-
-    class Client:
-        async def get_messages(self, _entity: object, ids: list[int]) -> list[object]:
-            assert ids == [101]
-            return [ReactionOnlyMessage()]
-
-    result = await TelethonTelegramReactionGateway(Client()).fetch_reactions(123, [101])
-
-    assert result.ok is True
-    assert result.messages == (
-        ReactionSnapshot(
-            message_id=101,
-            aggregates=(ReactionAggregate(emoji="👍", count=2),),
-        ),
-    )
-
-
 @pytest.mark.asyncio
-async def test_reaction_gateway_persists_individual_dates_without_affecting_aggregate() -> None:
-    class Client:
-        async def get_messages(self, entity: object, ids: list[int]) -> list[object]:
-            _ = entity, ids
-            return [_message(10)]
-
-        async def __call__(self, request: object) -> object:
-            assert request.__class__.__name__ == "GetMessageReactionsListRequest"
-            return SimpleNamespace(
-                reactions=[
-                    SimpleNamespace(
-                        peer_id=SimpleNamespace(user_id=77),
-                        reaction=SimpleNamespace(emoticon="👍"),
-                        date=datetime.fromtimestamp(1_700_000_100, tz=UTC),
-                    ),
-                    SimpleNamespace(
-                        peer_id=SimpleNamespace(user_id=78),
-                        reaction=SimpleNamespace(emoticon="🔥"),
-                        date=None,
-                    ),
-                ],
-                next_offset=None,
-            )
-
-    result = await TelethonTelegramReactionGateway(Client()).fetch_reactions(42, [10])
-    assert result.failure is None
-    assert result.messages[0] is not None
-    detail = result.messages[0]
-    assert detail.aggregates[0].count == 2
-    assert detail.events_status == "complete"
-    assert detail.events == (
-        ReactionEvent(reactor_id=77, emoji="👍", reacted_at=1_700_000_100),
-        ReactionEvent(reactor_id=78, emoji="🔥", reacted_at=None),
-    )
-
-
 @pytest.mark.asyncio
 async def test_read_receipt_gateway_keeps_telegram_date_nullable() -> None:
     class Client:
@@ -824,7 +494,7 @@ async def test_read_at_stops_after_persistence_operational_error_with_prior_comm
         status: str,
     ) -> None:
         if message_id == 2:
-            raise sqlite3.OperationalError("simulated missing table")
+            raise sqlite3.OperationalError("no such table: message_read_facts")
         original_persist(
             connection,
             current_dialog_id,
@@ -855,39 +525,6 @@ async def test_read_at_stops_after_persistence_operational_error_with_prior_comm
     ).fetchone() == (0,)
 
 
-def test_v28_reaction_snapshot_projects_nullable_event_time_and_status_without_aggregate_time(
-    make_synced_db: Callable[[], sqlite3.Connection],
-) -> None:
-    conn = make_synced_db()
-    SQLiteReactionSnapshotRepository(conn).persist_reaction_snapshots(
-        42,
-        [
-            ReactionSnapshot(
-                10,
-                (ReactionAggregate(emoji="👍", count=2),),
-                events=(
-                    ReactionEvent(reactor_id=77, emoji="👍", reacted_at=1_700_000_100),
-                    ReactionEvent(reactor_id=None, emoji="🔥", reacted_at=None),
-                ),
-                events_status="partial",
-            )
-        ],
-        checked_at=2_000,
-    )
-
-    # The compact aggregate projection remains emoji/count only.
-    assert conn.execute(
-        "SELECT emoji, count FROM message_reactions WHERE dialog_id=42 AND message_id=10"
-    ).fetchall() == [("👍", 2)]
-    assert conn.execute(
-        "SELECT reactor_id, emoji, reacted_at FROM message_reaction_events "
-        "WHERE dialog_id=42 AND message_id=10 ORDER BY event_id"
-    ).fetchall() == [(77, "👍", 1_700_000_100), (None, "🔥", None)]
-    assert conn.execute(
-        "SELECT status, returned_count FROM message_reaction_event_status WHERE dialog_id=42 AND message_id=10"
-    ).fetchone() == ("partial", 2)
-
-
 def test_reading_query_modules_have_no_telethon_or_client_calls() -> None:
     paths = [
         Path("src/mcp_telegram/reading/service.py"),
@@ -895,7 +532,6 @@ def test_reading_query_modules_have_no_telethon_or_client_calls() -> None:
         Path("src/mcp_telegram/daemon_dialog_queries.py"),
         Path("src/mcp_telegram/reading/sqlite_projection.py"),
         Path("src/mcp_telegram/telegram_reading.py"),
-        Path("src/mcp_telegram/reactions/sqlite_repository.py"),
     ]
     for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

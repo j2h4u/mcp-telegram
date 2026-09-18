@@ -40,7 +40,6 @@ from tests.helpers import (
     LoudGroupProfilePort,
     LoudUserProfilePort,
 )
-from tests.reaction_helpers import make_reaction_freshener
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -116,7 +115,6 @@ def _make_server(
         conn,
         cast(DaemonClientLike, client),
         asyncio.Event(),
-        reaction_freshener=make_reaction_freshener(conn, client),
         channel_profile_port=channel_profile_port,
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=user_profile_port if user_profile_port is not None else LoudUserProfilePort(),

@@ -29,6 +29,22 @@ def _purge_hydration_jobs(conn: sqlite3.Connection, dialog_id: int) -> None:
     HydrationQueueRepository(conn).remove_active_for_dialog(dialog_id)
 
 
+def _rearm_terminal_reaction_details(conn: sqlite3.Connection, dialog_id: int, now: int) -> None:
+    conn.execute(
+        "DELETE FROM message_reaction_events WHERE dialog_id=? AND display_generation=0 "
+        "AND EXISTS (SELECT 1 FROM message_reaction_event_status s "
+        "WHERE s.dialog_id=message_reaction_events.dialog_id AND s.message_id=message_reaction_events.message_id "
+        "AND s.status='unavailable' AND s.failure_kind IN ('access_lost','invalid_target'))",
+        (dialog_id,),
+    )
+    conn.execute(
+        "UPDATE message_reaction_event_status SET status='stale', checked_at=?, next_offset=NULL, "
+        "next_attempt_at=?, staged_count=0, failure_kind=NULL "
+        "WHERE dialog_id=? AND status='unavailable' AND failure_kind IN ('access_lost','invalid_target')",
+        (now, now, dialog_id),
+    )
+
+
 @contextmanager
 def _lifecycle_savepoint(conn: sqlite3.Connection) -> Iterator[None]:
     """Isolate one lifecycle operation without consuming an outer transaction."""
@@ -111,6 +127,7 @@ def restore_access_after_revalidation(
             (now, dialog_id),
         )
         restore_access_status(conn, dialog_id)
+        _rearm_terminal_reaction_details(conn, dialog_id, now)
         conn.execute(
             """INSERT INTO dialogs (dialog_id, hidden, needs_refresh, snapshot_at, archived, pinned,
                unread_mentions_count, unread_reactions_count)

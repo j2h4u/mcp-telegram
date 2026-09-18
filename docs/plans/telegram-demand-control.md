@@ -144,7 +144,6 @@ The initial exhaustive mapping is:
 | `FOLDER_RECONCILIATION` | Folder snapshot | `DURABLE` | Folder state |
 | `TOPIC_RECONCILIATION` | Nested dialog/API topic snapshot | `INLINE` | — |
 | `MESSAGE_FACT_REFRESH` | Message-fact refresh | `DURABLE` | Fact-refresh state |
-| `REACTION_REFRESH` | Nested or JIT reaction refresh batch | `INLINE` | — (message-fact refresh owns background candidates) |
 | `READ_RECEIPT_PROBE` | Read-receipt batch | `DURABLE` | Read-receipt state |
 | `SCHEDULED_MESSAGES` | Scheduled repair; scheduled discovery | `DURABLE` | Scheduled state |
 | `MAINTENANCE` | Self-profile maintenance | `DURABLE` | Maintenance state |

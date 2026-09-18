@@ -411,3 +411,13 @@ rationale = "This folder-rule freshness contract is local domain behavior, not o
 category = "policy_assignments"
 key = "src/mcp_telegram/folders/worker.py:FolderProjectionDemandAdapter.status:deadline"
 rationale = "This is the computed folder projection freshness deadline from the local rule contract."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/reactions/detail.py:ReactionDetailPolicy:unavailable_retry_seconds"
+rationale = "This is the injected reaction-detail retry policy; configuration ownership remains in SchedulingConfig."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/reactions/detail.py:ReactionDetailPolicy:page_size"
+rationale = "GetMessageReactionsList page size is a fixed Telegram adapter protocol bound."

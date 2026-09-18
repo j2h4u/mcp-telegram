@@ -93,7 +93,6 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
         TelegramRpcSource.FOLDER_RECONCILIATION: {DemandKind.FOLDER_SNAPSHOT},
         TelegramRpcSource.TOPIC_RECONCILIATION: {DemandKind.TOPIC_SNAPSHOT},
         TelegramRpcSource.MESSAGE_FACT_REFRESH: {DemandKind.MESSAGE_FACT_REFRESH},
-        TelegramRpcSource.REACTION_REFRESH: {DemandKind.REACTION_REFRESH_BATCH},
         TelegramRpcSource.READ_RECEIPT_PROBE: {DemandKind.READ_RECEIPT_BATCH},
         TelegramRpcSource.SCHEDULED_MESSAGES: {
             DemandKind.SCHEDULED_REPAIR,
@@ -158,7 +157,6 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
     assert demand_contract(DemandKind.FOLDER_SNAPSHOT).max_rpc_attempts_per_slice == 2
     assert demand_contract(DemandKind.LIVE_HYDRATION_BATCH).max_rpc_attempts_per_slice == 2
     assert demand_contract(DemandKind.BACKFILL_HYDRATION_BATCH).max_rpc_attempts_per_slice == 2
-    assert demand_contract(DemandKind.REACTION_REFRESH_BATCH).execution_mode is ExecutionMode.INLINE
     assert demand_contract(DemandKind.TOPIC_SNAPSHOT).execution_mode is ExecutionMode.INLINE
     assert demand_contract(DemandKind.RECONNECT_DIFFERENCE).execution_mode is ExecutionMode.INLINE
 

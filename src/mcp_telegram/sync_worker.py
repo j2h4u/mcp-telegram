@@ -141,6 +141,7 @@ class _FetchedBatchPage:
     total_messages: int | None
     batch: tuple[_ExtractedMessage, ...]
     retry: tuple[int, bool] | None = None
+    reaction_observed_at: int | None = None
 
 
 def _dm_enrollment_state(conn: sqlite3.Connection, key: str) -> str | None:
@@ -456,6 +457,7 @@ class FullSyncWorker:
 
     async def _fetch_batch_page(self, dialog_id: int, sync_progress: int) -> _FetchedBatchPage:
         self._last_page_error = None
+        reaction_observed_at = int(time.time())
         try:
             page = await self._history_port.fetch_page(dialog_id, before_message_id=sync_progress)
         except MessageHistoryAccessLostError as exc:
@@ -471,7 +473,7 @@ class FullSyncWorker:
             self._last_page_error = exc
             return _FetchedBatchPage(None, (), (sync_progress, False))
         total_messages = page.total_messages if sync_progress == 0 else None
-        return _FetchedBatchPage(total_messages, page.messages)
+        return _FetchedBatchPage(total_messages, page.messages, reaction_observed_at=reaction_observed_at)
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def _fetch_batch(self, dialog_id: int, sync_progress: int) -> tuple[int, bool]:
@@ -496,7 +498,13 @@ class FullSyncWorker:
         page = await self._fetch_batch_page(dialog_id, sync_progress)
         if page.retry is not None:
             return page.retry
-        return await self._store_batch_page(dialog_id, sync_progress, page.total_messages, page.batch)
+        return await self._store_batch_page(
+            dialog_id,
+            sync_progress,
+            page.total_messages,
+            page.batch,
+            reaction_observed_at=page.reaction_observed_at,
+        )
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def _store_batch_page(
@@ -505,6 +513,8 @@ class FullSyncWorker:
         sync_progress: int,
         total_messages: int | None,
         batch: Sequence[_ExtractedMessage],
+        *,
+        reaction_observed_at: int | None = None,
     ) -> tuple[int, bool]:
         """Persist one fetched batch and update sync progress."""
         if not batch:
@@ -527,7 +537,12 @@ class FullSyncWorker:
             if not full_history_enabled(self._conn, dialog_id):
                 logger.info("sync_batch_discarded_disabled dialog_id=%d fetched=%d", dialog_id, len(rows))
                 return sync_progress, True
-            insert_messages_with_fts(self._conn, rows, priority=HydrationPriority.BACKFILL)
+            insert_messages_with_fts(
+                self._conn,
+                rows,
+                priority=HydrationPriority.BACKFILL,
+                reaction_observed_at=reaction_observed_at,
+            )
             if is_done:
                 now = int(time.time())
                 self._conn.execute(

@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
 
 import pytest
 
@@ -23,13 +21,8 @@ from mcp_telegram.fact_hydration import (
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.hydration_queue import HydrationJob, HydrationPriority, HydrationQueueRepository
 from mcp_telegram.message_fact_refresh import (
-    MessageFactRefreshDemandAdapter,
-    MessageFactRefreshDeps,
-    MessageFactRefreshPolicy,
     ReadReceiptDemandAdapter,
 )
-from mcp_telegram.reactions.contracts import ReactionFetchResult, ReactionFreshness, ReactionSnapshot
-from mcp_telegram.reactions.refresh import ReactionFreshener
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
@@ -39,7 +32,6 @@ from mcp_telegram.telegram_demand import (
 )
 from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator
 from mcp_telegram.telegram_read_receipts import TelethonTelegramReadReceiptGateway
-from mcp_telegram.telegram_reading import TelegramReadReceiptGateway
 from mcp_telegram.telegram_rpc_consumers import DURABLE_DEMAND_ORDER, DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcScope,
@@ -360,190 +352,6 @@ async def test_entity_profile_adapter_observes_queue_and_entity_lookup_context()
     assert observed == [(DemandKind.ENTITY_PROFILE_REFRESH, AcquisitionKind.ENTITY_LOOKUP)]
     assert adapter.status(101.0) is None
     await coordinator.shutdown()
-
-
-def _message_fact_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
-    conn.executescript(
-        """
-        CREATE TABLE synced_dialogs (
-            dialog_id INTEGER PRIMARY KEY,
-            status TEXT NOT NULL,
-            read_outbox_max_id INTEGER
-        );
-        CREATE TABLE full_history_enrollment (dialog_id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL);
-        CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL);
-        CREATE TABLE messages (
-            dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
-            sent_at INTEGER NOT NULL, out INTEGER NOT NULL
-        );
-        CREATE TABLE message_reactions (
-            dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
-            emoji TEXT NOT NULL, count INTEGER NOT NULL
-        );
-        CREATE TABLE message_reactions_freshness (
-            dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
-            checked_at INTEGER NOT NULL, PRIMARY KEY (dialog_id, message_id)
-        );
-        CREATE TABLE message_read_facts (
-            dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
-            read_at INTEGER, checked_at INTEGER NOT NULL, status TEXT NOT NULL,
-            PRIMARY KEY (dialog_id, message_id)
-        );
-        """
-    )
-    return conn
-
-
-def _message_fact_policy(*, read_limit: int = 0) -> MessageFactRefreshPolicy:
-    return MessageFactRefreshPolicy(
-        reaction_max_messages_per_cycle=10,
-        read_at_max_messages_per_cycle=read_limit,
-        pause_seconds=0.01,
-        reaction_ttl_seconds=60,
-        read_at_ttl_seconds=120,
-    )
-
-
-@pytest.mark.asyncio
-async def test_message_fact_status_owns_reaction_candidates_without_mutation() -> None:
-    conn = _message_fact_db()
-    conn.executescript(
-        """
-        INSERT INTO synced_dialogs (dialog_id, status) VALUES (10, 'synced');
-        INSERT INTO full_history_enrollment VALUES (10, 1);
-        INSERT INTO entities VALUES (10, 'user');
-        INSERT INTO messages VALUES (10, 1, 100, 0);
-        INSERT INTO message_reactions VALUES (10, 1, 'x', 1);
-        INSERT INTO message_reactions_freshness VALUES (10, 1, 100);
-        """
-    )
-    deps = MessageFactRefreshDeps(
-        conn,
-        cast(ReactionFreshener, _MessageFactReactionFreshener()),
-        cast(TelegramReadReceiptGateway, object()),
-    )
-    adapter = MessageFactRefreshDemandAdapter(deps, _message_fact_policy())
-    before = conn.total_changes
-
-    status = adapter.status(120.0)
-    assert status is not None and status.release_at == 160.0
-    assert adapter.demand_kind is DemandKind.MESSAGE_FACT_REFRESH
-    assert conn.total_changes == before
-    conn.close()
-
-
-class _MessageFactReactionFreshener:
-    def __init__(self) -> None:
-        self.scopes: list[TelegramRpcScope] = []
-
-    async def refresh(self, dialog_id: int, entity: object, message_ids: list[int]) -> ReactionFreshness:
-        del dialog_id, entity
-        scope = current_rpc_scope()
-        self.scopes.append(scope)
-        assert scope.attempt_budget is not None
-        scope.attempt_budget.debit()
-        return ReactionFreshness(len(message_ids), 0, len(message_ids), len(message_ids), "refreshed")
-
-
-@pytest.mark.asyncio
-async def test_message_fact_slice_runs_existing_cycle_under_budget() -> None:
-    conn = _message_fact_db()
-    conn.executescript(
-        """
-        INSERT INTO synced_dialogs (dialog_id, status) VALUES (10, 'synced');
-        INSERT INTO full_history_enrollment VALUES (10, 1);
-        INSERT INTO entities VALUES (10, 'user');
-        INSERT INTO messages VALUES (10, 1, 100, 0);
-        INSERT INTO message_reactions VALUES (10, 1, 'x', 1);
-        """
-    )
-    freshener = _MessageFactReactionFreshener()
-    adapter = MessageFactRefreshDemandAdapter(
-        MessageFactRefreshDeps(
-            conn,
-            cast(ReactionFreshener, freshener),
-            cast(TelegramReadReceiptGateway, object()),
-        ),
-        _message_fact_policy(),
-    )
-    budget = RpcAttemptBudget(limit=1)
-
-    await adapter.run_slice(budget)
-
-    assert budget.attempts == 1
-    assert len(freshener.scopes) == 1
-    assert freshener.scopes[0].demand_kind is DemandKind.MESSAGE_FACT_REFRESH
-    conn.close()
-
-
-class _ReactionRepository:
-    def stale_reaction_ids(
-        self, dialog_id: int, message_ids: Sequence[int], threshold: int
-    ) -> tuple[str, set[int], list[int]]:
-        del dialog_id, threshold
-        return "active", set(), list(message_ids)
-
-    @contextmanager
-    def transaction(self) -> Iterator[None]:
-        yield
-
-    def history_enabled(self, dialog_id: int) -> bool:
-        del dialog_id
-        return True
-
-    def persist_reaction_snapshots(
-        self, dialog_id: int, snapshots: Sequence[ReactionSnapshot | None], checked_at: int
-    ) -> int:
-        del dialog_id, checked_at
-        return len(snapshots)
-
-
-class _ReactionGateway:
-    def __init__(self) -> None:
-        self.scope: TelegramRpcScope | None = None
-
-    async def fetch_reactions(self, entity: object, message_ids: Sequence[int]) -> ReactionFetchResult:
-        del entity
-        self.scope = current_rpc_scope()
-        return ReactionFetchResult(
-            messages=tuple(ReactionSnapshot(message_id=message_id, aggregates=()) for message_id in message_ids)
-        )
-
-
-@pytest.mark.asyncio
-async def test_reaction_acquisition_refines_message_fact_root() -> None:
-    gateway = _ReactionGateway()
-    freshener = ReactionFreshener(
-        _ReactionRepository(),
-        gateway,
-        freshness_ttl_seconds=60,
-        now=lambda: 100.0,
-    )
-
-    with rpc_scope(TelegramRpcSource.MESSAGE_FACT_REFRESH):
-        await freshener.refresh(10, 10, [1])
-
-    assert gateway.scope is not None
-    assert gateway.scope.demand_kind is DemandKind.MESSAGE_FACT_REFRESH
-    assert gateway.scope.acquisition_kind is AcquisitionKind.REACTION_SNAPSHOT
-
-
-@pytest.mark.asyncio
-async def test_direct_reaction_acquisition_uses_inline_root() -> None:
-    gateway = _ReactionGateway()
-    freshener = ReactionFreshener(
-        _ReactionRepository(),
-        gateway,
-        freshness_ttl_seconds=60,
-        now=lambda: 100.0,
-    )
-
-    await freshener.refresh(10, 10, [1])
-
-    assert gateway.scope is not None
-    assert gateway.scope.demand_kind is DemandKind.REACTION_REFRESH_BATCH
-    assert gateway.scope.acquisition_kind is AcquisitionKind.REACTION_SNAPSHOT
 
 
 def _read_position_db() -> sqlite3.Connection:

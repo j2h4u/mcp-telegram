@@ -1,10 +1,6 @@
 [state]
 dir = "/srv/mcp-telegram/database"
 
-[freshness.reactions]
-# Re-fetch reaction counts after this local snapshot expires.
-freshness_ttl_seconds = 600
-
 [freshness.read_receipts]
 # Refresh Telegram read-at facts after ten minutes.
 read_at_ttl_seconds = 600
@@ -69,6 +65,9 @@ admission_retry_seconds = 1
 update_loop_retry_seconds = 5
 
 [scheduling]
+# Bound reactor-detail acquisition and retry unavailable pages after ten minutes.
+reaction_detail_max_pages_per_cycle = 5
+reaction_detail_unavailable_retry_seconds = 600
 # Local daemon maintenance intervals. Compose environment variables can override these.
 scheduled_reconciliation_seconds = 900
 # Refresh the cached account display identity without delaying MCP sessions.

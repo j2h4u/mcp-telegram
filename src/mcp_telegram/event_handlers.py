@@ -104,8 +104,8 @@ from .messages.telegram_adapter import (
 from .messages.telegram_adapter import (
     extract_message_row,
 )
-from .reactions.contracts import ReactionAggregate
-from .reactions.persistence import replace_reaction_aggregates
+from .reactions.contracts import ReactionAggregate, ReactionAggregateSource, ReactionObservationBoundary
+from .reactions.persistence import allocate_observation_boundary, replace_reaction_aggregates
 from .reactions.projection import project_reaction_aggregates
 from .read_state import apply_read_cursor
 from .realtime_history_policy import (
@@ -354,6 +354,7 @@ def _apply_observed_inbox_read(  # noqa: PLR0913
 class _RawReactionUpdate(Protocol):
     peer: object | None
     msg_id: int | None
+    reactions: object | None
 
 
 class _ChannelChatUpdateLike(Protocol):
@@ -950,6 +951,7 @@ class EventHandlerManager:
         dialog_id = event.chat_id
         if dialog_id is None:
             return
+        reaction_observed_at = int(time.time())
         msg = event.message
         coverage = await self._new_message_coverage(dialog_id, event)
         if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
@@ -974,7 +976,13 @@ class EventHandlerManager:
                     self._realtime_coverage(dialog_id), outgoing=bool(getattr(msg, "out", False))
                 ):
                     return
-                insert_messages_with_fts(self._conn, [extracted], priority=HydrationPriority.FOREGROUND)
+                insert_messages_with_fts(
+                    self._conn,
+                    [extracted],
+                    priority=HydrationPriority.FOREGROUND,
+                    reaction_source=ReactionAggregateSource.REALTIME_MESSAGE,
+                    reaction_observed_at=reaction_observed_at,
+                )
                 # A normal message carrying from_scheduled is the verification
                 # point for the untrusted sent_messages hint retained by the
                 # scheduled-queue delete update.
@@ -1257,7 +1265,13 @@ class EventHandlerManager:
                 self._realtime_coverage(dialog_id), RealtimeBodyEvent.EDIT, outgoing=outgoing
             ):
                 return False
-            insert_messages_with_fts(self._conn, [extracted], priority=HydrationPriority.FOREGROUND)
+            insert_messages_with_fts(
+                self._conn,
+                [extracted],
+                priority=HydrationPriority.FOREGROUND,
+                reaction_source=ReactionAggregateSource.MESSAGE_EDIT,
+                reaction_observed_at=now,
+            )
             self._record_body_event(dialog_id, now)
         self._offer_message_ingestion()
         return True
@@ -1280,7 +1294,14 @@ class EventHandlerManager:
             return
         aggregates = project_reaction_aggregates(reactions_obj)
         with self._conn:
-            replace_reaction_aggregates(self._conn, dialog_id, message_id, aggregates)
+            replace_reaction_aggregates(
+                self._conn,
+                dialog_id,
+                message_id,
+                aggregates,
+                source=ReactionAggregateSource.MESSAGE_EDIT,
+                observed_at=now,
+            )
             self._record_body_event(dialog_id, now)
         logger.debug(
             "event_edit_reactions dialog_id=%d message_id=%d count=%d",
@@ -1504,7 +1525,6 @@ class EventHandlerManager:
             )
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
-    @_acquisition(AcquisitionKind.MESSAGE_LOOKUP)
     async def on_raw_reaction_update(self, update: _RawReactionUpdate) -> None:
         """Handle raw UpdateMessageReactions for synced dialogs.
 
@@ -1515,17 +1535,14 @@ class EventHandlerManager:
         ``update`` is the raw TL Update with attributes:
             .peer (PeerUser | PeerChat | PeerChannel), .msg_id, .reactions
 
-        For synced dialogs only: re-fetch the message via
-        ``client.get_messages(dialog_id, ids=[msg_id])`` (integer dialog_id —
-        no get_entity round-trip), extract reaction rows, apply per-message
-        delta. FloodWait is logged + dropped (next JIT read repairs).
-        Phase 39.2-01: AC-1 / AC-2 / AC-2-RAW / AC-UPD-USER / AC-UPD-CHANNEL.
+        For synced dialogs only, apply ``update.reactions`` directly.  The raw
+        update is already the aggregate observation, including an authoritative
+        empty value; it never performs a message lookup.
         """
         event_ids = self._reaction_event_ids(update)
         if event_ids is None:
             return
         dialog_id, msg_id = event_ids
-
         coverage = self._realtime_coverage(dialog_id)
         if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
             logger.debug(
@@ -1543,33 +1560,55 @@ class EventHandlerManager:
         ):
             return
 
-        msg = await self._fetch_reaction_message(dialog_id, msg_id)
-        if msg is None:
-            logger.debug(
-                "raw_reaction_update_missing_message dialog_id=%d message_id=%d",
-                dialog_id,
-                msg_id,
-            )
-            return
-
         try:
-            aggregates = project_reaction_aggregates(msg.reactions)
-            if not self._apply_reaction_event(dialog_id, msg_id, aggregates):
+            aggregates = project_reaction_aggregates(update.reactions)
+            previous_generation = self._reaction_generation(dialog_id, msg_id)
+            boundary = allocate_observation_boundary(self._conn, ReactionAggregateSource.RAW_UPDATE)
+            if not self._apply_reaction_event(dialog_id, msg_id, aggregates, boundary):
+                _record_runtime_observation_best_effort(
+                    self._conn,
+                    kind="reaction.aggregate",
+                    outcome="rejected",
+                    result_count=len(aggregates),
+                    payload={"source": ReactionAggregateSource.RAW_UPDATE.value},
+                )
                 return
+            _record_runtime_observation_best_effort(
+                self._conn,
+                kind="reaction.aggregate",
+                outcome="accepted",
+                result_count=len(aggregates),
+                payload={"source": ReactionAggregateSource.RAW_UPDATE.value},
+            )
+            if self._reaction_generation(dialog_id, msg_id) != previous_generation:
+                _record_runtime_observation_best_effort(
+                    self._conn,
+                    kind="reaction.invalidation",
+                    outcome="detail_stale",
+                    payload={"source": ReactionAggregateSource.RAW_UPDATE.value},
+                )
             logger.debug(
                 "event_raw_reaction dialog_id=%d message_id=%d count=%d",
                 dialog_id,
                 msg_id,
                 len(aggregates),
             )
-        except RpcAdmissionClosedError:
-            raise
         except Exception:
             logger.exception(
                 "event_raw_reaction_apply_failed dialog_id=%d message_id=%d",
                 dialog_id,
                 msg_id,
             )
+
+    def _reaction_generation(self, dialog_id: int, msg_id: int) -> int | None:
+        row = cast(
+            tuple[object, ...] | None,
+            self._conn.execute(
+                "SELECT generation FROM message_reaction_aggregate_state WHERE dialog_id=? AND message_id=?",
+                (dialog_id, msg_id),
+            ).fetchone(),
+        )
+        return None if row is None else int(cast(int, row[0]))
 
     @staticmethod
     def _reaction_event_ids(update: _RawReactionUpdate) -> tuple[int, int] | None:
@@ -1583,33 +1622,12 @@ class EventHandlerManager:
             logger.debug("raw_reaction_update_unparseable_peer peer=%r", peer)
             return None
 
-    async def _fetch_reaction_message(self, dialog_id: int, msg_id: int) -> _MessageLike | None:
-        try:
-            result = cast(Sequence[_MessageLike | None], await self._client.get_messages(dialog_id, ids=[msg_id]))
-        except TelegramRpcThrottled as exc:
-            logger.warning(
-                "raw_reaction_floodwait dialog_id=%d message_id=%d seconds=%s",
-                dialog_id,
-                msg_id,
-                exc.retry_after_seconds,
-            )
-            return None
-        except RpcAdmissionClosedError:
-            raise
-        except RPCError, RuntimeError:
-            logger.exception(
-                "event_raw_reaction_failed dialog_id=%d message_id=%d",
-                dialog_id,
-                msg_id,
-            )
-            return None
-        return result[0] if result else None
-
     def _apply_reaction_event(
         self,
         dialog_id: int,
         msg_id: int,
         aggregates: Sequence[ReactionAggregate],
+        boundary: ReactionObservationBoundary | None = None,
     ) -> bool:
         coverage = self._realtime_coverage(dialog_id)
         existing_out = read_message_out(self._conn, dialog_id, msg_id)
@@ -1619,7 +1637,17 @@ class EventHandlerManager:
             return False
         now = int(time.time())
         with self._conn:
-            replace_reaction_aggregates(self._conn, dialog_id, msg_id, aggregates)
+            accepted = replace_reaction_aggregates(
+                self._conn,
+                dialog_id,
+                msg_id,
+                aggregates,
+                source=ReactionAggregateSource.RAW_UPDATE,
+                observed_at=None if boundary is None else boundary.observed_at,
+                observation_sequence=None if boundary is None else boundary.sequence,
+            )
+            if not accepted:
+                return False
             self._record_body_event(dialog_id, now)
         return True
 
