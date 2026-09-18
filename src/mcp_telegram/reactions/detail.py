@@ -29,7 +29,6 @@ class ReactionDetailPolicy:
 class ReactionDetailResult:
     status: str
     fetched_pages: int = 0
-    fetched_events: int = 0
     next_offset: str | None = None
     failure_kind: str | None = None
     retry_after: int | None = None
@@ -306,7 +305,7 @@ class ReactionDetailRefresher:
                     self._conn.rollback()
                     return ReactionDetailResult("stale_writer")
                 self._observe("reaction.detail", "complete")
-                return ReactionDetailResult("complete", 1, len(events))
+                return ReactionDetailResult("complete", fetched_pages=1)
             status_update = self._conn.execute(
                 "UPDATE message_reaction_event_status SET detail_generation=?, checked_at=?, status='partial', "
                 "returned_count=?, staged_count=?, next_offset=?, next_attempt_at=?, failure_kind=NULL "
@@ -330,7 +329,7 @@ class ReactionDetailRefresher:
                 self._conn.rollback()
                 return ReactionDetailResult("stale_writer")
             self._observe("reaction.detail", "partial")
-            return ReactionDetailResult("partial", 1, len(events), next_offset)
+            return ReactionDetailResult("partial", fetched_pages=1, next_offset=next_offset)
 
     def _persist_failure(  # noqa: PLR0913
         self,
