@@ -193,8 +193,9 @@ class ReadMessage:
     # incoming/group messages and for privacy/retention-limited responses.
     read_at: int | None = None
     # Individual reaction facts are separate from aggregate counters.  The
-    # status reports whether Telegram detail retrieval was complete, partial,
-    # missing, or unavailable for this message.
+    # status reports whether Telegram detail retrieval is complete, stale,
+    # partial, missing, or unavailable for this message.  ``stale`` means a
+    # newer aggregate generation exists while the last-good display may remain.
     reaction_events: tuple[ReadReactionEvent, ...] = ()
     reaction_events_status: str = "unavailable"
     reactions_display: str = ""

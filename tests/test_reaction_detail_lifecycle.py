@@ -10,6 +10,7 @@ from typing import cast
 
 import pytest
 
+from mcp_telegram.daemon_message import cached_reaction_freshness, project_cached_message_facts
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.message_fact_refresh import (
     _NEXT_REACTION_RELEASE_SQL,
@@ -20,6 +21,7 @@ from mcp_telegram.message_fact_refresh import (
     _terminal_reaction_suppressed,
     refresh_message_facts_once,
 )
+from mcp_telegram.models import ReadMessage
 from mcp_telegram.reactions.contracts import (
     ReactionAggregate,
     ReactionDetailFetchResult,
@@ -60,6 +62,12 @@ def test_aggregate_ordering_accepts_empty_and_rejects_older(tmp_path: Path) -> N
     assert conn.execute("SELECT generation,source FROM message_reaction_aggregate_state").fetchone() == (
         2,
         "raw_update",
+    )
+    assert conn.execute(
+        "SELECT aggregate_generation, detail_generation FROM message_reaction_event_status"
+    ).fetchone() == (
+        2,
+        2,
     )
     conn.close()
 
@@ -198,6 +206,21 @@ def test_observation_counter_is_durable_and_monotonic(tmp_path: Path) -> None:
     first = allocate_observation_boundary(conn, "history", observed_at=1)
     second = allocate_observation_boundary(conn, "raw_update", observed_at=1)
     assert (first.sequence, second.sequence) == (41, 42)
+    conn.close()
+
+
+def test_cached_read_projection_is_local_and_reports_cached_only(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    apply_aggregate_observation(
+        conn, 1, 2, [ReactionAggregate("👍", 1)], source="history", observed_at=1, observation_sequence=1
+    )
+    message = ReadMessage(message_id=2, sent_at=1, dialog_id=1)
+
+    projected = project_cached_message_facts(conn, 1, [message])
+
+    assert projected[0].reaction_events == ()
+    assert projected[0].reaction_events_status == "stale"
+    assert cached_reaction_freshness(1).status == "cached_only"
     conn.close()
 
 
@@ -410,6 +433,34 @@ def test_detail_stale_writer_failure_and_non_advancing_offset_preserve_display(t
     conn.close()
 
 
+def test_detail_final_cas_discards_page_when_status_changes_before_update(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    apply_aggregate_observation(
+        conn, 1, 2, [ReactionAggregate("👍", 1)], source="history", observed_at=1, observation_sequence=1
+    )
+    conn.execute(
+        "CREATE TRIGGER detail_status_race BEFORE INSERT ON message_reaction_events BEGIN "
+        "UPDATE message_reaction_event_status SET status='partial', next_offset='race' "
+        "WHERE dialog_id=1 AND message_id=2; END"
+    )
+
+    class Gateway:
+        async def fetch_reaction_page(
+            self, entity: object, message_id: int, *, offset: str | None, limit: int
+        ) -> ReactionDetailFetchResult:
+            del entity, message_id, offset, limit
+            return ReactionDetailFetchResult(page=ReactionDetailPage((ReactionEvent(4, "👍", None),), None))
+
+    result = asyncio.run(ReactionDetailRefresher(conn, Gateway(), now=lambda: 5).refresh_one(1, 2, 1, entity=1, now=5))
+    assert result.status == "stale_writer"
+    assert conn.execute("SELECT COUNT(*) FROM message_reaction_events").fetchone() == (0,)
+    assert conn.execute("SELECT status, next_offset FROM message_reaction_event_status").fetchone() == (
+        "partial",
+        "race",
+    )
+    conn.close()
+
+
 def test_detail_rechecks_enrollment_after_gateway_returns(tmp_path: Path) -> None:
     conn = _db(tmp_path)
     apply_aggregate_observation(
@@ -463,4 +514,34 @@ def test_empty_aggregate_is_not_a_detail_candidate_without_explicit_retry(tmp_pa
     assert _reaction_candidates(conn, stale_before_utc=10, limit=10) == []
     assert _terminal_reaction_suppressed(conn)
     assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, 600) is None
+
+    class TerminalRefresher:
+        suppressed = 0
+
+        def observe_terminal_suppressed(self) -> None:
+            self.suppressed += 1
+
+        async def refresh_one(self, *args: object, **kwargs: object) -> ReactionDetailResult:
+            del args, kwargs
+            raise AssertionError("terminal empty aggregate must not issue detail RPC")
+
+    terminal_refresher = TerminalRefresher()
+    result = asyncio.run(
+        refresh_message_facts_once(
+            MessageFactRefreshDeps(
+                conn,
+                cast(ReactionDetailRefresher, terminal_refresher),
+                cast(TelegramReadReceiptGateway, object()),
+            ),
+            MessageFactRefreshPolicy(
+                reaction_max_messages_per_cycle=1,
+                read_at_max_messages_per_cycle=0,
+                pause_seconds=0,
+                read_at_ttl_seconds=600,
+            ),
+            now=10,
+        )
+    )
+    assert result.reaction_refreshed == 0
+    assert terminal_refresher.suppressed == 1
     conn.close()

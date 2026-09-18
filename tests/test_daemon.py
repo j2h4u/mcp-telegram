@@ -10,9 +10,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from mcp_telegram.config import load_config
 from mcp_telegram.daemon import (
     _acquire_startup_identity_before_updates,
     _ensure_demand_runtime,
+    _message_fact_refresh_policy_from_config,
     _offer_startup_demands,
     _prime_runtime,
     _run_daemon_lifetime,
@@ -62,6 +64,19 @@ def _ctx(**overrides: object) -> SimpleNamespace:
 
 def _typed_ctx(**overrides: object) -> _SyncMainContext:
     return cast(_SyncMainContext, _ctx(**overrides))
+
+
+def test_message_fact_policy_uses_resolved_scheduling_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('[state]\ndir = "/state"\n', encoding="utf-8")
+    config = load_config(config_path)
+    monkeypatch.setenv("REACTION_DETAIL_MAX_PAGES_PER_CYCLE", "2")
+
+    policy = _message_fact_refresh_policy_from_config(config)
+
+    assert policy.reaction_detail_max_pages_per_cycle == 2
 
 
 class _CoordinatorStub:

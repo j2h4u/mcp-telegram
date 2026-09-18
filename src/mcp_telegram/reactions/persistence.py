@@ -138,7 +138,9 @@ def apply_aggregate_observation(  # noqa: PLR0913
                 [(dialog_id, message_id, aggregate.emoji, aggregate.count) for aggregate in aggregates],
             )
         return True
+    previous_generation = 0
     if existing is not None:
+        previous_generation = int(cast(int | str, existing[0]))
         old_boundary = ReactionObservationBoundary(
             int(cast(int | str, existing[1])),
             int(cast(int | str, existing[2])),
@@ -147,7 +149,7 @@ def apply_aggregate_observation(  # noqa: PLR0913
         )
         if boundary <= old_boundary:
             return False
-        generation = int(cast(int | str, existing[0])) + 1
+        generation = previous_generation + 1
     else:
         generation = 1
 
@@ -172,7 +174,9 @@ def apply_aggregate_observation(  # noqa: PLR0913
                 message_id,
             ),
         )
-        _finish_identical_detail(conn, dialog_id, message_id, generation, boundary.observed_at, aggregates)
+        _finish_identical_detail(
+            conn, dialog_id, message_id, previous_generation, boundary.observed_at, aggregates
+        )
         return True
 
     conn.execute(_DELETE_REACTIONS_SQL, (dialog_id, message_id))

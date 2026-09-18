@@ -987,12 +987,15 @@ def _install_flood_wait_kill_switch(config: McpTelegramConfig, event: asyncio.Ev
     )
 
 
-def _message_fact_refresh_policy_from_config(config: McpTelegramConfig) -> MessageFactRefreshPolicy:
+def _message_fact_refresh_policy_from_config(
+    config: McpTelegramConfig, *, scheduling: SchedulingConfig | None = None
+) -> MessageFactRefreshPolicy:
+    resolved = scheduling or resolve_scheduling_config(config.scheduling)
     return MessageFactRefreshPolicy(
-        reaction_max_messages_per_cycle=config.scheduling.message_fact_refresh_reaction_max_messages_per_cycle,
-        reaction_detail_max_pages_per_cycle=config.scheduling.reaction_detail_max_pages_per_cycle,
-        read_at_max_messages_per_cycle=config.scheduling.message_fact_refresh_read_at_max_messages_per_cycle,
-        pause_seconds=config.scheduling.message_fact_refresh_pause_seconds,
+        reaction_max_messages_per_cycle=resolved.message_fact_refresh_reaction_max_messages_per_cycle,
+        reaction_detail_max_pages_per_cycle=resolved.reaction_detail_max_pages_per_cycle,
+        read_at_max_messages_per_cycle=resolved.message_fact_refresh_read_at_max_messages_per_cycle,
+        pause_seconds=resolved.message_fact_refresh_pause_seconds,
         read_at_ttl_seconds=config.freshness.read_receipts.read_at_ttl_seconds,
     )
 
@@ -1159,7 +1162,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         feedback_conn=feedback_conn,
         shutdown_event=shutdown_event,
         client=client,
-        message_fact_refresh_policy=_message_fact_refresh_policy_from_config(config),
+        message_fact_refresh_policy=_message_fact_refresh_policy_from_config(config, scheduling=scheduling),
         api_server=api_server,
         user_profile_port=user_profile_port,
         topic_refresher=topic_refresher,

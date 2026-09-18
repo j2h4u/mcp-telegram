@@ -186,6 +186,20 @@ class ReactionDetailRefresher:
             (dialog_id, message_id, generation, when, when),
         )
 
+    def _begin_persistence(self) -> bool:
+        """Serialize final CAS reads and writes when this connection is idle."""
+        if self._conn.in_transaction:
+            return False
+        self._conn.execute("BEGIN IMMEDIATE")
+        return True
+
+    def _discard_staged_page(self, dialog_id: int, message_id: int, generation: int, first_ordinal: int) -> None:
+        self._conn.execute(
+            "DELETE FROM message_reaction_events WHERE dialog_id=? AND message_id=? "
+            "AND detail_generation=? AND page_ordinal>=?",
+            (dialog_id, message_id, generation, first_ordinal),
+        )
+
     def _persist_page(  # noqa: PLR0913
         self,
         dialog_id: int,
@@ -199,6 +213,7 @@ class ReactionDetailRefresher:
         when: int,
     ) -> ReactionDetailResult:
         with self._conn:
+            own_transaction = self._begin_persistence()
             if not self._eligible(dialog_id):
                 return ReactionDetailResult("ineligible")
             if not self._cas_status(dialog_id, message_id, generation, expected_status, expected_offset):
@@ -242,20 +257,54 @@ class ReactionDetailRefresher:
                     "AND display_generation > 0 AND detail_generation != ?",
                     (dialog_id, message_id, generation),
                 )
-                self._conn.execute(
+                status_update = self._conn.execute(
                     "UPDATE message_reaction_event_status SET detail_generation=?, display_generation=?, "
                     "published_generation=?, checked_at=?, status='complete', returned_count=?, staged_count=0, "
-                    "next_offset=NULL, next_attempt_at=NULL, failure_kind=NULL WHERE dialog_id=? AND message_id=?",
-                    (generation, generation, generation, when, total, dialog_id, message_id),
+                    "next_offset=NULL, next_attempt_at=NULL, failure_kind=NULL WHERE dialog_id=? AND message_id=? "
+                    "AND aggregate_generation=? AND status=? AND next_offset IS ?",
+                    (
+                        generation,
+                        generation,
+                        generation,
+                        when,
+                        total,
+                        dialog_id,
+                        message_id,
+                        generation,
+                        expected_status,
+                        expected_offset,
+                    ),
                 )
+                if status_update.rowcount != 1:
+                    self._discard_staged_page(dialog_id, message_id, generation, staged_count)
+                    if own_transaction:
+                        self._conn.rollback()
+                    return ReactionDetailResult("stale_writer")
                 self._observe("reaction.detail", "complete")
                 return ReactionDetailResult("complete", 1, len(events))
-            self._conn.execute(
+            status_update = self._conn.execute(
                 "UPDATE message_reaction_event_status SET detail_generation=?, checked_at=?, status='partial', "
                 "returned_count=?, staged_count=?, next_offset=?, next_attempt_at=?, failure_kind=NULL "
-                "WHERE dialog_id=? AND message_id=?",
-                (generation, when, total, total, next_offset, when, dialog_id, message_id),
+                "WHERE dialog_id=? AND message_id=? AND aggregate_generation=? AND status=? AND next_offset IS ?",
+                (
+                    generation,
+                    when,
+                    total,
+                    total,
+                    next_offset,
+                    when,
+                    dialog_id,
+                    message_id,
+                    generation,
+                    expected_status,
+                    expected_offset,
+                ),
             )
+            if status_update.rowcount != 1:
+                self._discard_staged_page(dialog_id, message_id, generation, staged_count)
+                if own_transaction:
+                    self._conn.rollback()
+                return ReactionDetailResult("stale_writer")
             self._observe("reaction.detail", "partial")
             return ReactionDetailResult("partial", 1, len(events), next_offset)
 
@@ -281,15 +330,30 @@ class ReactionDetailRefresher:
             else self._policy.unavailable_retry_seconds
         )
         with self._conn:
+            own_transaction = self._begin_persistence()
             if not self._eligible(dialog_id):
                 return ReactionDetailResult("ineligible")
             if not self._cas_status(dialog_id, message_id, generation, expected_status, expected_offset):
                 return ReactionDetailResult("stale_writer")
             self._ensure_status(dialog_id, message_id, generation, when)
-            self._conn.execute(
+            status_update = self._conn.execute(
                 "UPDATE message_reaction_event_status SET checked_at=?, status=?, next_attempt_at=?, failure_kind=? "
-                "WHERE dialog_id=? AND message_id=?",
-                (when, status, when + retry_seconds, kind, dialog_id, message_id),
+                "WHERE dialog_id=? AND message_id=? AND aggregate_generation=? AND status=? AND next_offset IS ?",
+                (
+                    when,
+                    status,
+                    when + retry_seconds,
+                    kind,
+                    dialog_id,
+                    message_id,
+                    generation,
+                    expected_status,
+                    expected_offset,
+                ),
             )
+            if status_update.rowcount != 1:
+                if own_transaction:
+                    self._conn.rollback()
+                return ReactionDetailResult("stale_writer")
             self._observe("reaction.detail", status)
         return ReactionDetailResult(status, next_offset=expected_offset)
