@@ -325,6 +325,57 @@ def test_refresh_cycle_passes_generation_and_offset_and_limits_detail_pages(tmp_
     conn.close()
 
 
+def test_refresh_cycle_stops_reaction_probes_after_flood_wait(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (1,3,2)")
+    apply_aggregate_observation(
+        conn, 1, 2, [ReactionAggregate("👍", 1)], source="history", observed_at=1, observation_sequence=1
+    )
+    apply_aggregate_observation(
+        conn, 1, 3, [ReactionAggregate("🔥", 1)], source="history", observed_at=2, observation_sequence=2
+    )
+    conn.commit()
+
+    class Refresher:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        async def refresh_one(  # noqa: PLR0913
+            self,
+            dialog_id: int,
+            message_id: int,
+            generation: int,
+            *,
+            entity: object,
+            offset: str | None,
+            cancellation_event: asyncio.Event | None,
+            now: int,
+        ) -> ReactionDetailResult:
+            del dialog_id, generation, entity, offset, cancellation_event, now
+            self.calls.append(message_id)
+            return ReactionDetailResult("unavailable", failure_kind="flood_wait", retry_after=17)
+
+    refresher = Refresher()
+    result = asyncio.run(
+        refresh_message_facts_once(
+            MessageFactRefreshDeps(
+                conn, cast(ReactionDetailRefresher, refresher), cast(TelegramReadReceiptGateway, object())
+            ),
+            MessageFactRefreshPolicy(
+                reaction_max_messages_per_cycle=10,
+                read_at_max_messages_per_cycle=0,
+                pause_seconds=0,
+                read_at_ttl_seconds=600,
+                reaction_detail_max_pages_per_cycle=5,
+            ),
+            now=10,
+        )
+    )
+    assert refresher.calls == [2]
+    assert result.reaction_refreshed == 0
+    conn.close()
+
+
 def test_reaction_migration_preserves_empty_receipts_and_cleans_orphans() -> None:
     conn = sqlite3.connect(":memory:")
     conn.executescript(
@@ -482,6 +533,58 @@ def test_detail_stale_writer_failure_and_non_advancing_offset_preserve_display(t
     conn.close()
 
 
+@pytest.mark.parametrize("failure_kind", [GatewayFailureKind.INVALID_TARGET, GatewayFailureKind.ACCESS_LOST])
+def test_permanent_detail_failure_is_terminal_until_new_aggregate(
+    tmp_path: Path, failure_kind: GatewayFailureKind
+) -> None:
+    conn = _db(tmp_path)
+    apply_aggregate_observation(
+        conn, 1, 2, [ReactionAggregate("👍", 1)], source="history", observed_at=1, observation_sequence=1
+    )
+    conn.execute(
+        "UPDATE message_reaction_event_status SET status='complete', detail_generation=1, display_generation=1, "
+        "published_generation=1 WHERE dialog_id=1 AND message_id=2"
+    )
+    conn.execute(
+        "INSERT INTO message_reaction_events(dialog_id,message_id,reactor_id,emoji,fetched_at,detail_generation,page_ordinal,display_generation) "
+        "VALUES (1,2,8,'legacy',2,1,0,1)"
+    )
+    conn.commit()
+    observations: list[tuple[str, str]] = []
+
+    class Gateway:
+        async def fetch_reaction_page(
+            self, entity: object, message_id: int, *, offset: str | None, limit: int
+        ) -> ReactionDetailFetchResult:
+            del entity, message_id, offset, limit
+            return ReactionDetailFetchResult(failure=GatewayFailure(failure_kind, "Permanent", "unavailable", False))
+
+    result = asyncio.run(
+        ReactionDetailRefresher(
+            conn, Gateway(), observation_sink=lambda kind, outcome: observations.append((kind, outcome))
+        ).refresh_one(1, 2, 1, entity=1, now=10)
+    )
+    assert result.status == "unavailable"
+    assert result.failure_kind == failure_kind.value
+    assert result.retry_after is None
+    assert observations[-1] == ("reaction.detail", "terminal_unavailable")
+    assert conn.execute(
+        "SELECT status, next_attempt_at, failure_kind, display_generation, published_generation "
+        "FROM message_reaction_event_status"
+    ).fetchone() == ("unavailable", None, failure_kind.value, 1, 1)
+    assert conn.execute("SELECT emoji FROM message_reaction_events WHERE display_generation=1").fetchone() == (
+        "legacy",
+    )
+    assert _reaction_candidates(conn, stale_before_utc=10, limit=10) == []
+    assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, 0) is None
+
+    assert apply_aggregate_observation(
+        conn, 1, 2, [ReactionAggregate("🔥", 2)], source="raw_update", observed_at=2, observation_sequence=2
+    )
+    assert _reaction_candidates(conn, stale_before_utc=10, limit=10) == [(1, 2, 2, None)]
+    conn.close()
+
+
 def test_detail_final_cas_discards_page_when_status_changes_before_update(tmp_path: Path) -> None:
     conn = _db(tmp_path)
     apply_aggregate_observation(
@@ -617,6 +720,30 @@ def test_reaction_candidates_prioritize_due_retries_over_future_unavailable_rows
     rows = _reaction_candidates(conn, stale_before_utc=100, limit=3)
     assert [row[1] for row in rows] == [5, 4, 3]
     assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, 0) == 0
+    conn.close()
+
+
+def test_partial_resume_candidates_precede_stale_backlog_fairly(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    for message_id, sent_at in ((6, 20), (7, 10), (8, 1)):
+        conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (1,?,?)", (message_id, sent_at))
+        apply_aggregate_observation(
+            conn,
+            1,
+            message_id,
+            [ReactionAggregate("👍", 1)],
+            source="history",
+            observed_at=1,
+            observation_sequence=message_id,
+        )
+    conn.commit()
+    conn.executemany(
+        "UPDATE message_reaction_event_status SET status=?, next_offset=?, next_attempt_at=?, checked_at=? "
+        "WHERE dialog_id=1 AND message_id=?",
+        [("partial", "resume-6", 0, 50, 6), ("partial", "resume-7", 0, 10, 7), ("stale", None, 0, 0, 8)],
+    )
+    conn.commit()
+    assert [row[1] for row in _reaction_candidates(conn, stale_before_utc=10, limit=3)] == [7, 6, 8]
     conn.close()
 
 

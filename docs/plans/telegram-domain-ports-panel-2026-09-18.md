@@ -107,6 +107,11 @@ or make its completeness ambiguous.
 - Complete detail is terminal until a newer aggregate/update invalidates it.
 - History, delta, edit, and realtime aggregate writers share one persistence
   contract.
+- Materially changed aggregates re-page detail; identical observations advance
+  their ordering boundary without invalidating an existing detail result.
+- Detail work is bounded by the configured pages-per-cycle budget. A FloodWait
+  stops remaining reaction probes in that cycle, while the shared coordinator
+  controls later-cycle cooldown and retry admission.
 
 ### Ownership and dependencies
 
@@ -128,7 +133,7 @@ projections; aggregate receipts and detail lifecycle state remain local facts.
 - Partial or unavailable detail does not delete last-good rows.
 - An older history observation cannot overwrite a newer realtime aggregate.
 - Telemetry distinguishes aggregate observations, detail attempts,
-  invalidations, and terminal suppression.
+  invalidations, and terminal detail outcomes without Telegram identifiers.
 
 ### Definition of done
 

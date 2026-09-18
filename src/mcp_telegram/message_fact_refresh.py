@@ -43,8 +43,14 @@ WHERE sd.status = 'synced'
        OR d.status IN ('partial','unavailable'))
   AND (d.dialog_id IS NULL OR d.aggregate_generation < a.generation
        OR d.status = 'stale'
-       OR (d.status IN ('partial','unavailable') AND COALESCE(d.next_attempt_at, 0) <= ?))
+       OR (d.status IN ('partial','unavailable') AND d.next_attempt_at IS NOT NULL
+           AND d.next_attempt_at <= ?))
 ORDER BY
+  CASE
+    WHEN d.status = 'partial' AND d.next_offset IS NOT NULL THEN 0
+    WHEN d.dialog_id IS NULL OR d.aggregate_generation < a.generation OR d.status = 'stale' THEN 1
+    ELSE 2
+  END,
   CASE
     WHEN d.dialog_id IS NULL OR d.aggregate_generation < a.generation OR d.status = 'stale' THEN 0
     ELSE COALESCE(d.next_attempt_at, 0)
@@ -92,7 +98,8 @@ WHERE EXISTS (
   )
   AND (a.aggregate_row_count > 0 OR d.status IN ('partial','unavailable'))
   AND (d.dialog_id IS NULL OR d.aggregate_generation < a.generation
-       OR d.status IN ('stale','partial','unavailable'))
+       OR d.status = 'stale'
+       OR (d.status IN ('partial','unavailable') AND d.next_attempt_at IS NOT NULL))
 """
 
 
@@ -485,6 +492,8 @@ async def refresh_message_facts_once(
             now=checked_at,
         )
         reaction_refreshed += detail.fetched_pages
+        if detail.stop_cycle:
+            break
         if shutdown_event is not None and index < len(selected_reaction_rows) - 1:
             await _interruptible_pause(shutdown_event, policy.pause_seconds)
 

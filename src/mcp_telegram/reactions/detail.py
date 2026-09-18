@@ -31,6 +31,13 @@ class ReactionDetailResult:
     fetched_pages: int = 0
     fetched_events: int = 0
     next_offset: str | None = None
+    failure_kind: str | None = None
+    retry_after: int | None = None
+
+    @property
+    def stop_cycle(self) -> bool:
+        """Stop this cycle after a FloodWait while leaving later cycles eligible."""
+        return self.failure_kind == "flood_wait"
 
 
 class ReactionDetailRefresher:
@@ -195,6 +202,30 @@ class ReactionDetailRefresher:
             (dialog_id, message_id, generation, first_ordinal),
         )
 
+    @staticmethod
+    def _positive_retry_after(failure: object | None) -> int | None:
+        value = getattr(failure, "retry_after", None)
+        return value if isinstance(value, int) and value > 0 else None
+
+    @staticmethod
+    def _is_terminal_failure(failure: object | None, kind: str) -> bool:
+        return (
+            failure is not None
+            and not bool(getattr(failure, "retryable", True))
+            and kind in {"invalid_target", "access_lost"}
+        )
+
+    @staticmethod
+    def _failure_status(staged_count: int, expected_status: str, terminal: bool) -> str:
+        if terminal:
+            return "unavailable"
+        return "partial" if staged_count > 0 and expected_status == "partial" else "unavailable"
+
+    def _failure_next_attempt_at(self, when: int, retry_after: int | None, terminal: bool) -> int | None:
+        if terminal:
+            return None
+        return when + (retry_after or self._policy.unavailable_retry_seconds)
+
     def _persist_page(  # noqa: PLR0913
         self,
         dialog_id: int,
@@ -315,13 +346,10 @@ class ReactionDetailRefresher:
         failure_kind: str | None = None,
     ) -> ReactionDetailResult:
         kind = failure_kind or str(getattr(getattr(failure, "kind", None), "value", "unavailable"))
-        status = "partial" if staged_count > 0 and expected_status == "partial" else "unavailable"
-        retry_after = getattr(failure, "retry_after", None)
-        retry_seconds = (
-            int(retry_after)
-            if isinstance(retry_after, int) and retry_after > 0
-            else self._policy.unavailable_retry_seconds
-        )
+        retry_after = self._positive_retry_after(failure)
+        terminal = self._is_terminal_failure(failure, kind)
+        status = self._failure_status(staged_count, expected_status, terminal)
+        next_attempt_at = self._failure_next_attempt_at(when, retry_after, terminal)
         self._begin_persistence()
         with self._conn:
             if not self._eligible(dialog_id):
@@ -335,7 +363,7 @@ class ReactionDetailRefresher:
                 (
                     when,
                     status,
-                    when + retry_seconds,
+                    next_attempt_at,
                     kind,
                     dialog_id,
                     message_id,
@@ -347,5 +375,10 @@ class ReactionDetailRefresher:
             if status_update.rowcount != 1:
                 self._conn.rollback()
                 return ReactionDetailResult("stale_writer")
-            self._observe("reaction.detail", status)
-        return ReactionDetailResult(status, next_offset=expected_offset)
+            self._observe("reaction.detail", "terminal_unavailable" if terminal else status)
+        return ReactionDetailResult(
+            status,
+            next_offset=expected_offset,
+            failure_kind=kind,
+            retry_after=retry_after,
+        )
