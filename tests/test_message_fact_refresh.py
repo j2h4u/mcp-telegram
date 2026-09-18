@@ -48,7 +48,8 @@ def _make_db() -> sqlite3.Connection:
             message_id INTEGER NOT NULL,
             sent_at INTEGER NOT NULL,
             out INTEGER NOT NULL,
-            media_kind TEXT
+            media_kind TEXT,
+            is_deleted INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE message_reaction_aggregate_state (
             dialog_id INTEGER NOT NULL,
@@ -143,9 +144,9 @@ async def test_read_at_cycle_telemetry_is_aggregate_and_terminal_safe() -> None:
         INSERT INTO synced_dialogs VALUES (20, 'synced', 10);
         INSERT INTO entities VALUES (20, 'user');
         INSERT INTO messages VALUES
-            (20, 1, 1000, 1, NULL),
-            (20, 2, 1001, 1, NULL),
-            (20, 3, 1002, 1, NULL);
+                (20, 1, 1000, 1, NULL, 0),
+                (20, 2, 1001, 1, NULL, 0),
+                (20, 3, 1002, 1, NULL, 0);
         INSERT INTO message_read_facts VALUES
             (20, 2, NULL, 1000, 'missing'),
             (20, 3, 1700000003, 1000, 'complete');
@@ -187,7 +188,7 @@ async def test_read_at_attempt_telemetry_distinguishes_equal_message_ids_across_
         """
         INSERT INTO synced_dialogs VALUES (20, 'synced', 10), (21, 'synced', 10);
         INSERT INTO entities VALUES (20, 'user'), (21, 'user');
-        INSERT INTO messages VALUES (20, 1, 1000, 1, NULL), (21, 1, 1001, 1, NULL);
+            INSERT INTO messages VALUES (20, 1, 1000, 1, NULL, 0), (21, 1, 1001, 1, NULL, 0);
         INSERT INTO message_read_facts VALUES (20, 1, NULL, 1000, 'missing');
         """
     )
@@ -219,7 +220,7 @@ async def test_canceled_read_at_cycle_publishes_no_incomplete_telemetry() -> Non
         """
         INSERT INTO synced_dialogs VALUES (20, 'synced', 10);
         INSERT INTO entities VALUES (20, 'user');
-        INSERT INTO messages VALUES (20, 1, 1000, 1, NULL);
+        INSERT INTO messages VALUES (20, 1, 1000, 1, NULL, 0);
         """
     )
     seed_full_history_enrollment(conn, 20, enabled=True)
@@ -261,7 +262,7 @@ async def test_read_at_control_errors_leave_facts_and_telemetry_untouched(
         """
         INSERT INTO synced_dialogs VALUES (20, 'synced', 10);
         INSERT INTO entities VALUES (20, 'user');
-        INSERT INTO messages VALUES (20, 1, 1000, 1, NULL);
+        INSERT INTO messages VALUES (20, 1, 1000, 1, NULL, 0);
         """
     )
     seed_full_history_enrollment(conn, 20, enabled=True)
@@ -292,7 +293,7 @@ def test_read_at_cursor_null_has_no_candidate_or_release() -> None:
         """
         INSERT INTO synced_dialogs VALUES (20, 'synced', NULL);
         INSERT INTO entities VALUES (20, 'user');
-        INSERT INTO messages VALUES (20, 1, 1000, 1, NULL);
+        INSERT INTO messages VALUES (20, 1, 1000, 1, NULL, 0);
         """
     )
     seed_full_history_enrollment(conn, 20, enabled=True)
@@ -316,8 +317,8 @@ def test_read_at_message_above_cursor_is_excluded() -> None:
         INSERT INTO synced_dialogs VALUES (20, 'synced', 5);
         INSERT INTO entities VALUES (20, 'user');
         INSERT INTO messages VALUES
-            (20, 5, 1000, 1, NULL),
-            (20, 6, 1001, 1, NULL);
+            (20, 5, 1000, 1, NULL, 0),
+            (20, 6, 1001, 1, NULL, 0);
         """
     )
     seed_full_history_enrollment(conn, 20, enabled=True)
@@ -332,7 +333,7 @@ def test_terminal_read_at_set_has_no_status_or_release() -> None:
         """
         INSERT INTO synced_dialogs VALUES (20, 'synced', 5);
         INSERT INTO entities VALUES (20, 'user');
-        INSERT INTO messages VALUES (20, 5, 1000, 1, NULL);
+        INSERT INTO messages VALUES (20, 5, 1000, 1, NULL, 0);
         INSERT INTO message_read_facts VALUES (20, 5, 1700000005, 1000, 'complete');
         """
     )

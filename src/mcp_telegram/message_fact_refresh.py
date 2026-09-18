@@ -38,6 +38,7 @@ JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled
 JOIN message_reaction_aggregate_state a ON a.dialog_id=m.dialog_id AND a.message_id=m.message_id
 LEFT JOIN message_reaction_event_status d ON d.dialog_id=m.dialog_id AND d.message_id=m.message_id
 WHERE sd.status = 'synced'
+  AND m.is_deleted = 0
   AND (a.aggregate_row_count > 0
        OR d.status IN ('partial','unavailable'))
   AND (d.dialog_id IS NULL OR d.aggregate_generation < a.generation
@@ -85,7 +86,11 @@ FROM message_reaction_aggregate_state a
 JOIN synced_dialogs sd ON sd.dialog_id=a.dialog_id AND sd.status='synced'
 JOIN full_history_enrollment fhe ON fhe.dialog_id=a.dialog_id AND fhe.enabled=1
 LEFT JOIN message_reaction_event_status d ON d.dialog_id=a.dialog_id AND d.message_id=a.message_id
-WHERE (a.aggregate_row_count > 0 OR d.status IN ('partial','unavailable'))
+WHERE EXISTS (
+    SELECT 1 FROM messages m
+    WHERE m.dialog_id=a.dialog_id AND m.message_id=a.message_id AND m.is_deleted=0
+  )
+  AND (a.aggregate_row_count > 0 OR d.status IN ('partial','unavailable'))
   AND (d.dialog_id IS NULL OR d.aggregate_generation < a.generation
        OR d.status IN ('stale','partial','unavailable'))
 """
@@ -380,13 +385,6 @@ def _observe_read_at_cycle(  # noqa: PLR0913 - bounded telemetry fields are expl
     except Exception:  # noqa: BLE001 - telemetry must not affect fact persistence
         # Telemetry is best effort and must not affect fact persistence.
         return
-
-
-def _group_message_ids(rows: Sequence[tuple[int, int]]) -> dict[int, list[int]]:
-    grouped: dict[int, list[int]] = {}
-    for dialog_id, message_id in rows:
-        grouped.setdefault(dialog_id, []).append(message_id)
-    return grouped
 
 
 def _group_messages(messages: Sequence[ReadMessage]) -> dict[int, list[ReadMessage]]:

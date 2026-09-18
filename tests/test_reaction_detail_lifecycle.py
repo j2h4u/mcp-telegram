@@ -618,3 +618,19 @@ def test_reaction_candidates_prioritize_due_retries_over_future_unavailable_rows
     assert [row[1] for row in rows] == [5, 4, 3]
     assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, 0) == 0
     conn.close()
+
+
+def test_deleted_reaction_message_is_not_released_or_selected(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    apply_aggregate_observation(
+        conn, 1, 2, [ReactionAggregate("👍", 1)], source="history", observed_at=1, observation_sequence=1
+    )
+    conn.execute(
+        "UPDATE message_reaction_event_status SET status='unavailable', next_attempt_at=0 "
+        "WHERE dialog_id=1 AND message_id=2"
+    )
+    conn.execute("UPDATE messages SET is_deleted=1 WHERE dialog_id=1 AND message_id=2")
+    conn.commit()
+    assert _reaction_candidates(conn, stale_before_utc=10, limit=10) == []
+    assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, 0) is None
+    conn.close()
