@@ -1,14 +1,14 @@
 # Telegram Behind Domain Ports
 
-Status: panel accepted; Slice 1 deployed; Slice 2 is a code-complete PR candidate pending release
-Last reviewed: 2026-09-18
+Status: panel accepted; both recommended slices deployed
+Last reviewed: 2026-09-19
 
 ## Incident guardrail: reaction-detail demand
 
-The reaction-detail lifecycle introduced by PR #275 still allowed repeated
-durable refresh slices to reopen the same raw candidates. In the stopped
-production runtime this produced 321 `message_fact_refresh` dispatches in
-about 20 seconds from 8,279 observed dispatches. The lifecycle contract now
+The reaction-detail lifecycle introduced by PR #275 initially allowed repeated
+durable refresh slices to reopen the remaining backlog. In production this
+produced 321 Telegram RPC attempts in about 20 seconds while 8,279 candidates
+were immediately eligible. The deployed lifecycle contract now
 requires a database-backed singleton pacing window: at most five logical
 reaction-detail pages may be claimed in each 600-second window by default;
 claims and starts are committed before Telegram work, and cancellation,
@@ -18,21 +18,21 @@ exact outgoing-DM read-date work remains independently due and runs first when
 both lanes are ready. The operator may change the positive cycle duration and
 page cap through scheduling configuration, with the page cap retaining its
 default of five.
+The shared scheduling model and this guardrail are documented in
+[Telegram Demand Control](telegram-demand-control.md).
 
 Latest panel recommendation:
 [Expert Panel Recommendation, 2026-09-18](telegram-domain-ports-panel-2026-09-18.md).
-It proposes two evidence-backed slices. Slice 1 is deployed; Slice 2 is
-implemented locally and awaits release and deployment.
+It proposes two evidence-backed slices. Both are deployed.
 
-Before deploying Slice 2, the orchestrator must remove the obsolete
-`[freshness.reactions]` section from the host-owned config. The source parser
-intentionally rejects that retired section; this checkout does not rewrite the
-live `/opt/docker/mcp-telegram/config.toml` automatically.
+The Slice 2 deployment removed the obsolete `[freshness.reactions]` section
+from the host-owned config and installed the durable five-page, 600-second
+reaction-detail pacing policy.
 
 This document records the target architecture, the program completed through
 PR #270, and the residual state considered by the 2026-09-18 expert panel. The
-panel produced a separate recommendation that is now accepted for both slices;
-the second slice is not yet a deployment approval.
+panel produced a separate recommendation that was accepted and deployed for
+both slices.
 
 The accepted catalog-specific contract remains
 [Canonical Dialog Snapshot](canonical-dialog-snapshot.md). The broader current
