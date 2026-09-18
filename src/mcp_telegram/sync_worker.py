@@ -32,7 +32,7 @@ from .entity_store import EntitySnapshot, upsert_entity_stub
 from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
 from .history_enrollment import ensure_automatic_dm_enrollment, full_history_enabled
 from .hydration_queue import HydrationPriority
-from .message_contracts import ExtractedMessage
+from .message_contracts import ExtractedMessage as _ExtractedMessage
 from .message_history.contracts import MessageHistoryAccessLostError, MessageHistoryUnavailableError
 from .message_history.ports import FullHistoryPagePort
 from .messages.sqlite_bundle import insert_messages_with_fts
@@ -139,7 +139,7 @@ class TotalMessagesProbe(Protocol):
 @dataclass(frozen=True, slots=True)
 class _FetchedBatchPage:
     total_messages: int | None
-    batch: tuple[ExtractedMessage, ...]
+    batch: tuple[_ExtractedMessage, ...]
     retry: tuple[int, bool] | None = None
 
 
@@ -504,7 +504,7 @@ class FullSyncWorker:
         dialog_id: int,
         sync_progress: int,
         total_messages: int | None,
-        batch: Sequence[ExtractedMessage],
+        batch: Sequence[_ExtractedMessage],
     ) -> tuple[int, bool]:
         """Persist one fetched batch and update sync progress."""
         if not batch:
