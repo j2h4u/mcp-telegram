@@ -59,10 +59,6 @@ class ReactionDetailRefresher:
         except Exception:  # noqa: BLE001 - telemetry must not affect acquisition
             return
 
-    def observe_terminal_suppressed(self) -> None:
-        """Record that a complete detail row was intentionally not retried."""
-        self._observe("reaction.terminal_suppressed", "complete")
-
     async def refresh_one(  # noqa: PLR0913, PLR0911
         self,
         dialog_id: int,
@@ -186,12 +182,11 @@ class ReactionDetailRefresher:
             (dialog_id, message_id, generation, when, when),
         )
 
-    def _begin_persistence(self) -> bool:
-        """Serialize final CAS reads and writes when this connection is idle."""
+    def _begin_persistence(self) -> None:
+        """Require the dedicated connection to be idle before taking the write lock."""
         if self._conn.in_transaction:
-            return False
+            raise RuntimeError("reaction detail persistence requires an idle dedicated connection")
         self._conn.execute("BEGIN IMMEDIATE")
-        return True
 
     def _discard_staged_page(self, dialog_id: int, message_id: int, generation: int, first_ordinal: int) -> None:
         self._conn.execute(
@@ -212,8 +207,8 @@ class ReactionDetailRefresher:
         next_offset: str | None,
         when: int,
     ) -> ReactionDetailResult:
+        self._begin_persistence()
         with self._conn:
-            own_transaction = self._begin_persistence()
             if not self._eligible(dialog_id):
                 return ReactionDetailResult("ineligible")
             if not self._cas_status(dialog_id, message_id, generation, expected_status, expected_offset):
@@ -277,8 +272,7 @@ class ReactionDetailRefresher:
                 )
                 if status_update.rowcount != 1:
                     self._discard_staged_page(dialog_id, message_id, generation, staged_count)
-                    if own_transaction:
-                        self._conn.rollback()
+                    self._conn.rollback()
                     return ReactionDetailResult("stale_writer")
                 self._observe("reaction.detail", "complete")
                 return ReactionDetailResult("complete", 1, len(events))
@@ -302,8 +296,7 @@ class ReactionDetailRefresher:
             )
             if status_update.rowcount != 1:
                 self._discard_staged_page(dialog_id, message_id, generation, staged_count)
-                if own_transaction:
-                    self._conn.rollback()
+                self._conn.rollback()
                 return ReactionDetailResult("stale_writer")
             self._observe("reaction.detail", "partial")
             return ReactionDetailResult("partial", 1, len(events), next_offset)
@@ -329,8 +322,8 @@ class ReactionDetailRefresher:
             if isinstance(retry_after, int) and retry_after > 0
             else self._policy.unavailable_retry_seconds
         )
+        self._begin_persistence()
         with self._conn:
-            own_transaction = self._begin_persistence()
             if not self._eligible(dialog_id):
                 return ReactionDetailResult("ineligible")
             if not self._cas_status(dialog_id, message_id, generation, expected_status, expected_offset):
@@ -352,8 +345,7 @@ class ReactionDetailRefresher:
                 ),
             )
             if status_update.rowcount != 1:
-                if own_transaction:
-                    self._conn.rollback()
+                self._conn.rollback()
                 return ReactionDetailResult("stale_writer")
             self._observe("reaction.detail", status)
         return ReactionDetailResult(status, next_offset=expected_offset)

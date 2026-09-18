@@ -18,7 +18,6 @@ from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshPolicy,
     _next_release_at,
     _reaction_candidates,
-    _terminal_reaction_suppressed,
     refresh_message_facts_once,
 )
 from mcp_telegram.models import ReadMessage
@@ -45,6 +44,7 @@ def _db(tmp_path: Path) -> sqlite3.Connection:
     conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (1,'synced')")
     conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (1,1,'explicit',1)")
     conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (1,2,1)")
+    conn.commit()
     return conn
 
 
@@ -80,6 +80,7 @@ def test_detail_partial_offset_survives_restart_and_publishes(tmp_path: Path) ->
     # A migrated aggregate may predate its detail receipt. The first page
     # acquisition must recreate that stale receipt transactionally.
     conn.execute("DELETE FROM message_reaction_event_status WHERE dialog_id=1 AND message_id=2")
+    conn.commit()
 
     class Gateway:
         def __init__(self) -> None:
@@ -110,6 +111,28 @@ def test_detail_partial_offset_survives_restart_and_publishes(tmp_path: Path) ->
         1,
     )
     assert conn.execute("SELECT COUNT(*) FROM message_reaction_events WHERE display_generation=1").fetchone() == (2,)
+    conn.close()
+
+
+def test_detail_persistence_requires_an_idle_dedicated_connection(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    apply_aggregate_observation(
+        conn, 1, 2, [ReactionAggregate("👍", 1)], source="history", observed_at=1, observation_sequence=1
+    )
+    conn.commit()
+    conn.execute("UPDATE message_reaction_event_status SET checked_at=2 WHERE dialog_id=1 AND message_id=2")
+
+    class Gateway:
+        async def fetch_reaction_page(
+            self, entity: object, message_id: int, *, offset: str | None, limit: int
+        ) -> ReactionDetailFetchResult:
+            del entity, message_id, offset, limit
+            return ReactionDetailFetchResult(page=ReactionDetailPage((ReactionEvent(7, "👍", None),), None))
+
+    with pytest.raises(RuntimeError, match="idle dedicated connection"):
+        asyncio.run(ReactionDetailRefresher(conn, Gateway()).refresh_one(1, 2, 1, entity=1))
+    assert conn.execute("SELECT COUNT(*) FROM message_reaction_events").fetchone() == (0,)
+    conn.rollback()
     conn.close()
 
 
@@ -197,6 +220,29 @@ def test_identical_aggregate_advances_boundary_without_invalidating_detail(tmp_p
         "SELECT generation, observed_at, observation_sequence, status, detail_generation, display_generation "
         "FROM message_reaction_aggregate_state JOIN message_reaction_event_status USING (dialog_id, message_id)"
     ).fetchone() == (1, 11, 2, "complete", 1, 1)
+    conn.close()
+
+
+def test_identical_empty_aggregate_keeps_current_detail_generation(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    assert apply_aggregate_observation(
+        conn, 1, 2, [ReactionAggregate("👍", 1)], source="history", observed_at=10, observation_sequence=1
+    )
+    assert apply_aggregate_observation(conn, 1, 2, [], source="raw_update", observed_at=11, observation_sequence=2)
+    assert conn.execute(
+        "SELECT generation, detail_generation, status FROM message_reaction_aggregate_state "
+        "JOIN message_reaction_event_status USING (dialog_id, message_id)"
+    ).fetchone() == (2, 2, "complete")
+    assert apply_aggregate_observation(conn, 1, 2, [], source="raw_update", observed_at=12, observation_sequence=3)
+    assert conn.execute("SELECT generation, observation_sequence FROM message_reaction_aggregate_state").fetchone() == (
+        2,
+        3,
+    )
+    assert conn.execute(
+        "SELECT aggregate_generation, detail_generation, display_generation, published_generation, status "
+        "FROM message_reaction_event_status"
+    ).fetchone() == (2, 2, 2, 2, "complete")
+    assert conn.execute("SELECT COUNT(*) FROM message_reaction_events").fetchone() == (0,)
     conn.close()
 
 
@@ -350,6 +396,7 @@ def test_detail_replaces_migrated_display_rows_on_first_complete_page(tmp_path: 
         "INSERT INTO message_reaction_events(dialog_id,message_id,reactor_id,emoji,fetched_at,detail_generation,page_ordinal,display_generation) "
         "VALUES (1,2,8,'legacy',2,0,0,1)"
     )
+    conn.commit()
 
     class Gateway:
         async def fetch_reaction_page(
@@ -382,6 +429,7 @@ def test_detail_stale_writer_failure_and_non_advancing_offset_preserve_display(t
     apply_aggregate_observation(
         conn, 1, 2, [ReactionAggregate("🔥", 2)], source="raw_update", observed_at=2, observation_sequence=2
     )
+    conn.commit()
 
     class FailingGateway:
         calls = 0
@@ -413,6 +461,7 @@ def test_detail_stale_writer_failure_and_non_advancing_offset_preserve_display(t
         "UPDATE message_reaction_event_status SET status='partial', next_offset='same', staged_count=1, "
         "aggregate_generation=2 WHERE dialog_id=1 AND message_id=2"
     )
+    conn.commit()
 
     class RepeatingGateway:
         async def fetch_reaction_page(
@@ -443,6 +492,7 @@ def test_detail_final_cas_discards_page_when_status_changes_before_update(tmp_pa
         "UPDATE message_reaction_event_status SET status='partial', next_offset='race' "
         "WHERE dialog_id=1 AND message_id=2; END"
     )
+    conn.commit()
 
     class Gateway:
         async def fetch_reaction_page(
@@ -455,8 +505,8 @@ def test_detail_final_cas_discards_page_when_status_changes_before_update(tmp_pa
     assert result.status == "stale_writer"
     assert conn.execute("SELECT COUNT(*) FROM message_reaction_events").fetchone() == (0,)
     assert conn.execute("SELECT status, next_offset FROM message_reaction_event_status").fetchone() == (
-        "partial",
-        "race",
+        "stale",
+        None,
     )
     conn.close()
 
@@ -512,25 +562,18 @@ def test_empty_aggregate_is_not_a_detail_candidate_without_explicit_retry(tmp_pa
         "published_generation=2 WHERE dialog_id=1 AND message_id=2"
     )
     assert _reaction_candidates(conn, stale_before_utc=10, limit=10) == []
-    assert _terminal_reaction_suppressed(conn)
     assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, 600) is None
 
     class TerminalRefresher:
-        suppressed = 0
-
-        def observe_terminal_suppressed(self) -> None:
-            self.suppressed += 1
-
         async def refresh_one(self, *args: object, **kwargs: object) -> ReactionDetailResult:
             del args, kwargs
             raise AssertionError("terminal empty aggregate must not issue detail RPC")
 
-    terminal_refresher = TerminalRefresher()
     result = asyncio.run(
         refresh_message_facts_once(
             MessageFactRefreshDeps(
                 conn,
-                cast(ReactionDetailRefresher, terminal_refresher),
+                cast(ReactionDetailRefresher, TerminalRefresher()),
                 cast(TelegramReadReceiptGateway, object()),
             ),
             MessageFactRefreshPolicy(
@@ -543,5 +586,35 @@ def test_empty_aggregate_is_not_a_detail_candidate_without_explicit_retry(tmp_pa
         )
     )
     assert result.reaction_refreshed == 0
-    assert terminal_refresher.suppressed == 1
+    conn.close()
+
+
+def test_reaction_candidates_prioritize_due_retries_over_future_unavailable_rows(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    for message_id, sent_at in ((3, 30), (4, 20), (5, 10)):
+        conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (1,?,?)", (message_id, sent_at))
+        apply_aggregate_observation(
+            conn,
+            1,
+            message_id,
+            [ReactionAggregate("👍", 1)],
+            source="history",
+            observed_at=1,
+            observation_sequence=message_id,
+        )
+    conn.commit()
+    conn.executemany(
+        "UPDATE message_reaction_event_status SET status=?, next_attempt_at=?, checked_at=? "
+        "WHERE dialog_id=1 AND message_id=?",
+        [
+            ("unavailable", 100, 1, 2),
+            ("unavailable", 0, 50, 3),
+            ("unavailable", 0, 10, 4),
+            ("stale", 999, 0, 5),
+        ],
+    )
+    conn.commit()
+    rows = _reaction_candidates(conn, stale_before_utc=100, limit=3)
+    assert [row[1] for row in rows] == [5, 4, 3]
+    assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, 0) == 0
     conn.close()

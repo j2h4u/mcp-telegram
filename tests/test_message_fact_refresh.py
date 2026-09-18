@@ -69,6 +69,7 @@ def _make_db() -> sqlite3.Connection:
             display_generation INTEGER NOT NULL DEFAULT 0,
             published_generation INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL,
+            checked_at INTEGER NOT NULL DEFAULT 0,
             next_offset TEXT,
             next_attempt_at INTEGER,
             staged_count INTEGER NOT NULL DEFAULT 0,

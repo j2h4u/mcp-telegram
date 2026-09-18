@@ -41,8 +41,15 @@ WHERE sd.status = 'synced'
   AND (a.aggregate_row_count > 0
        OR d.status IN ('partial','unavailable'))
   AND (d.dialog_id IS NULL OR d.aggregate_generation < a.generation
-       OR (d.status IN ('stale','partial','unavailable') AND COALESCE(d.next_attempt_at, 0) <= ?))
-ORDER BY m.sent_at DESC, m.dialog_id, m.message_id
+       OR d.status = 'stale'
+       OR (d.status IN ('partial','unavailable') AND COALESCE(d.next_attempt_at, 0) <= ?))
+ORDER BY
+  CASE
+    WHEN d.dialog_id IS NULL OR d.aggregate_generation < a.generation OR d.status = 'stale' THEN 0
+    ELSE COALESCE(d.next_attempt_at, 0)
+  END,
+  COALESCE(d.checked_at, 0),
+  m.sent_at DESC, m.dialog_id, m.message_id
 LIMIT ?
 """
 
@@ -68,7 +75,12 @@ LIMIT ?
 
 
 _NEXT_REACTION_RELEASE_SQL = """
-SELECT MIN(COALESCE(d.next_attempt_at, ?))
+SELECT MIN(
+  CASE
+    WHEN d.dialog_id IS NULL OR d.aggregate_generation < a.generation OR d.status = 'stale' THEN 0
+    ELSE COALESCE(d.next_attempt_at, ?)
+  END
+)
 FROM message_reaction_aggregate_state a
 JOIN synced_dialogs sd ON sd.dialog_id=a.dialog_id AND sd.status='synced'
 JOIN full_history_enrollment fhe ON fhe.dialog_id=a.dialog_id AND fhe.enabled=1
@@ -76,15 +88,6 @@ LEFT JOIN message_reaction_event_status d ON d.dialog_id=a.dialog_id AND d.messa
 WHERE (a.aggregate_row_count > 0 OR d.status IN ('partial','unavailable'))
   AND (d.dialog_id IS NULL OR d.aggregate_generation < a.generation
        OR d.status IN ('stale','partial','unavailable'))
-"""
-
-_TERMINAL_REACTION_SUPPRESSED_SQL = """
-SELECT COUNT(*)
-FROM message_reaction_aggregate_state a
-JOIN synced_dialogs sd ON sd.dialog_id=a.dialog_id AND sd.status='synced'
-JOIN full_history_enrollment fhe ON fhe.dialog_id=a.dialog_id AND fhe.enabled=1
-JOIN message_reaction_event_status d ON d.dialog_id=a.dialog_id AND d.message_id=a.message_id
-WHERE d.status='complete' AND d.aggregate_generation=a.generation
 """
 
 
@@ -294,11 +297,6 @@ def _reaction_candidates(
     ]
 
 
-def _terminal_reaction_suppressed(conn: sqlite3.Connection) -> bool:
-    row = cast(tuple[object] | None, conn.execute(_TERMINAL_REACTION_SUPPRESSED_SQL).fetchone())
-    return row is not None and int(cast(int | str, row[0])) > 0
-
-
 def _read_at_candidates(
     conn: sqlite3.Connection,
     *,
@@ -476,10 +474,6 @@ async def refresh_message_facts_once(
         stale_before_utc=checked_at,
         limit=policy.reaction_max_messages_per_cycle,
     )
-    if policy.reaction_max_messages_per_cycle > 0 and _terminal_reaction_suppressed(deps.conn):
-        observe_terminal_suppressed = getattr(deps.reaction_detail_refresher, "observe_terminal_suppressed", None)
-        if callable(observe_terminal_suppressed):
-            observe_terminal_suppressed()
     reaction_refreshed = 0
     selected_reaction_rows = reaction_rows[: policy.reaction_detail_max_pages_per_cycle]
     for index, (dialog_id, message_id, generation, offset) in enumerate(selected_reaction_rows):
