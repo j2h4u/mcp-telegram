@@ -104,8 +104,7 @@ from .message_history.telegram_adapter import (
 from .messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
 from .own_only import ensure_own_only_schema
 from .own_only_contracts import OwnOnlyContext
-from .reactions.refresh import ReactionFreshener
-from .reactions.sqlite_repository import SQLiteReactionSnapshotRepository
+from .reactions import ReactionDetailPolicy, ReactionDetailRefresher
 from .reactions.telegram_adapter import TelethonTelegramReactionGateway
 from .read_state import apply_read_cursor, apply_reconciled_unread_count
 from .reconnect import run_reconnect_catch_up_loop
@@ -316,8 +315,6 @@ class _SyncMainContext:
     feedback_conn: sqlite3.Connection
     shutdown_event: asyncio.Event
     client: _DaemonClient
-    reaction_freshener: ReactionFreshener
-    reaction_freshness_ttl_seconds: int
     message_fact_refresh_policy: MessageFactRefreshPolicy
     api_server: DaemonAPIServer
     user_profile_port: UserProfilePort
@@ -993,9 +990,9 @@ def _install_flood_wait_kill_switch(config: McpTelegramConfig, event: asyncio.Ev
 def _message_fact_refresh_policy_from_config(config: McpTelegramConfig) -> MessageFactRefreshPolicy:
     return MessageFactRefreshPolicy(
         reaction_max_messages_per_cycle=config.scheduling.message_fact_refresh_reaction_max_messages_per_cycle,
+        reaction_detail_max_pages_per_cycle=config.scheduling.reaction_detail_max_pages_per_cycle,
         read_at_max_messages_per_cycle=config.scheduling.message_fact_refresh_read_at_max_messages_per_cycle,
         pause_seconds=config.scheduling.message_fact_refresh_pause_seconds,
-        reaction_ttl_seconds=config.freshness.reactions.freshness_ttl_seconds,
         read_at_ttl_seconds=config.freshness.read_receipts.read_at_ttl_seconds,
     )
 
@@ -1075,12 +1072,6 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
             return _RpcSchedulerFailureStatus(rpc_scheduler_failure["detail"])
         return flood_wait_kill_switch_status()
 
-    reaction_freshener = ReactionFreshener(
-        SQLiteReactionSnapshotRepository(conn),
-        TelethonTelegramReactionGateway(client),
-        freshness_ttl_seconds=config.freshness.reactions.freshness_ttl_seconds,
-        log=logger,
-    )
     topic_refresher = TopicRefresher(
         TelethonTelegramTopicGateway(cast(TopicClient, client)),
         SQLiteTopicSnapshotRepository(conn),
@@ -1102,7 +1093,6 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         shutdown_event,
         feedback_service,
         db_path,
-        reaction_freshener=reaction_freshener,
         hydration_requester=lambda hydration_conn, dialog_id, due_at: reconcile_fact_hydration_jobs_for_dialog(
             hydration_conn,
             dialog_id,
@@ -1169,8 +1159,6 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
         feedback_conn=feedback_conn,
         shutdown_event=shutdown_event,
         client=client,
-        reaction_freshener=reaction_freshener,
-        reaction_freshness_ttl_seconds=config.freshness.reactions.freshness_ttl_seconds,
         message_fact_refresh_policy=_message_fact_refresh_policy_from_config(config),
         api_server=api_server,
         user_profile_port=user_profile_port,
@@ -1459,6 +1447,7 @@ def _publish_startup_identity(ctx: _SyncMainContext, profile: object, own_only_c
 def _build_message_fact_refresh_dependencies(ctx: _SyncMainContext) -> MessageFactRefreshDeps:
     conn = _open_sync_db(ctx.db_path)
     read_at_callback: Callable[[Mapping[str, object]], None] | None = None
+    reaction_callback: Callable[[str, str], None] | None = None
     sink = ctx.rpc_observation_sink
     if sink is not None:
 
@@ -1473,13 +1462,21 @@ def _build_message_fact_refresh_dependencies(ctx: _SyncMainContext) -> MessageFa
 
         read_at_callback = record_read_at_cycle
 
+        def record_reaction_observation(kind: str, outcome: str) -> None:
+            sink.record(kind=kind, outcome=outcome)
+
+        reaction_callback = record_reaction_observation
+
     return MessageFactRefreshDeps(
         conn,
-        ReactionFreshener(
-            SQLiteReactionSnapshotRepository(conn),
+        ReactionDetailRefresher(
+            conn,
             TelethonTelegramReactionGateway(ctx.client),
-            freshness_ttl_seconds=ctx.reaction_freshness_ttl_seconds,
-            log=logger,
+            policy=ReactionDetailPolicy(
+                max_pages_per_cycle=ctx.scheduling.reaction_detail_max_pages_per_cycle,
+                unavailable_retry_seconds=ctx.scheduling.reaction_detail_unavailable_retry_seconds,
+            ),
+            observation_sink=reaction_callback,
         ),
         TelethonTelegramReadReceiptGateway(ctx.client),
         read_at_observer=read_at_callback,

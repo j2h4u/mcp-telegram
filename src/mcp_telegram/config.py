@@ -35,7 +35,7 @@ class StateConfig:
 
 @dataclass(frozen=True, slots=True)
 class ReactionsConfig:
-    """Freshness policy for locally projected reaction facts."""
+    """Deprecated aggregate compatibility section; detail has no TTL."""
 
     freshness_ttl_seconds: int = 600
 
@@ -359,6 +359,8 @@ class SchedulingConfig:
     access_probe_max_dialogs_per_cycle: int = 3
     access_probe_cooldown_seconds: int = 604_800
     message_fact_refresh_reaction_max_messages_per_cycle: int = 5
+    reaction_detail_max_pages_per_cycle: int = 5
+    reaction_detail_unavailable_retry_seconds: int = 600
     message_fact_refresh_read_at_max_messages_per_cycle: int = 5
     message_fact_refresh_pause_seconds: float = 1.0
     activity_rpc_timeout_seconds: float = 120.0
@@ -691,6 +693,16 @@ def resolve_scheduling_config(
             env,
             "MESSAGE_FACT_REFRESH_REACTION_MAX_MESSAGES_PER_CYCLE",
             config.message_fact_refresh_reaction_max_messages_per_cycle,
+        ),
+        reaction_detail_max_pages_per_cycle=_env_non_negative_int(
+            env,
+            "REACTION_DETAIL_MAX_PAGES_PER_CYCLE",
+            config.reaction_detail_max_pages_per_cycle,
+        ),
+        reaction_detail_unavailable_retry_seconds=_env_non_negative_int(
+            env,
+            "REACTION_DETAIL_UNAVAILABLE_RETRY_SECONDS",
+            config.reaction_detail_unavailable_retry_seconds,
         ),
         message_fact_refresh_read_at_max_messages_per_cycle=_env_non_negative_int(
             env,
@@ -1411,6 +1423,8 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "access_probe_max_dialogs_per_cycle",
         "access_probe_cooldown_seconds",
         "message_fact_refresh_reaction_max_messages_per_cycle",
+        "reaction_detail_max_pages_per_cycle",
+        "reaction_detail_unavailable_retry_seconds",
         "message_fact_refresh_read_at_max_messages_per_cycle",
         "message_fact_refresh_pause_seconds",
         "activity_hot_sweep",
@@ -1517,6 +1531,20 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             "scheduling",
             path,
             defaults.message_fact_refresh_reaction_max_messages_per_cycle,
+        ),
+        reaction_detail_max_pages_per_cycle=_positive_int(
+            scheduling_data,
+            "reaction_detail_max_pages_per_cycle",
+            "scheduling",
+            path,
+            defaults.reaction_detail_max_pages_per_cycle,
+        ),
+        reaction_detail_unavailable_retry_seconds=_positive_int(
+            scheduling_data,
+            "reaction_detail_unavailable_retry_seconds",
+            "scheduling",
+            path,
+            defaults.reaction_detail_unavailable_retry_seconds,
         ),
         message_fact_refresh_read_at_max_messages_per_cycle=_non_negative_int(
             scheduling_data,

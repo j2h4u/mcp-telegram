@@ -38,8 +38,11 @@ def reaction_event_projection(
             list[tuple[object, ...]],
             conn.execute(
                 f"SELECT message_id, reactor_id, emoji, reacted_at "
-                f"FROM message_reaction_events WHERE dialog_id = ? AND message_id IN ({placeholders}) "
-                "ORDER BY message_id, event_id",
+                f"FROM message_reaction_events e JOIN message_reaction_event_status s "
+                f"ON s.dialog_id=e.dialog_id AND s.message_id=e.message_id "
+                f"WHERE e.dialog_id = ? AND e.message_id IN ({placeholders}) "
+                "AND e.display_generation = s.display_generation AND e.display_generation > 0 "
+                "ORDER BY e.message_id, e.event_id",
                 [dialog_id, *message_ids],
             ).fetchall(),
         )

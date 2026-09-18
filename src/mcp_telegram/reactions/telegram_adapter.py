@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from typing import Protocol, cast
 
@@ -11,15 +11,20 @@ from telethon.tl.functions.messages import GetMessageReactionsListRequest
 
 from ..telegram_gateway import CATCHABLE_GATEWAY_FAILURES, translate_gateway_failure
 from ..telegram_rpc_scheduler import RpcAdmissionClosedError
-from .contracts import ReactionEvent, ReactionFetchResult, ReactionSnapshot
+from .contracts import (
+    ReactionDetailFetchResult,
+    ReactionDetailPage,
+    ReactionEvent,
+    ReactionFetchResult,
+    ReactionSnapshot,
+)
 from .ports import TelegramReactionGateway
-from .projection import project_reaction_aggregates
 
 
 class _TelegramClientLike(Protocol):
-    async def get_messages(self, entity: object, ids: list[int]) -> object: ...
+    async def get_input_entity(self, entity: object) -> object: ...
 
-    async def __call__(self, request: object) -> object: ...
+    def __call__(self, request: object) -> Awaitable[object]: ...
 
 
 class TelethonTelegramReactionGateway(TelegramReactionGateway):
@@ -64,68 +69,54 @@ class TelethonTelegramReactionGateway(TelegramReactionGateway):
     def _timestamp(value: object) -> int | None:
         return int(value.timestamp()) if isinstance(value, datetime) else None
 
-    async def _fetch_reaction_events(self, entity: object, message_id: int) -> tuple[tuple[ReactionEvent, ...], str]:
-        if not callable(self._client):
-            return (), "unavailable"
-        events: list[ReactionEvent] = []
-        offset: str | None = None
-        for _ in range(10):
-            try:
-                response = cast(
-                    types.messages.MessageReactionsList,
-                    await self._client(
-                        GetMessageReactionsListRequest(
-                            peer=cast(types.TypeInputPeer, entity), id=message_id, limit=100, offset=offset
-                        )
-                    ),
-                )
-                events.extend(
-                    ReactionEvent(
-                        reactor_id=self._peer_id(item.peer_id),
-                        emoji=self._emoji(item.reaction),
-                        reacted_at=self._timestamp(item.date),
-                    )
-                    for item in response.reactions
-                )
-                next_offset = response.next_offset
-            except RpcAdmissionClosedError:
-                raise
-            except CATCHABLE_GATEWAY_FAILURES:
-                return tuple(events), "unavailable"
-            if next_offset is None:
-                return tuple(events), "complete"
-            try:
-                offset = str(next_offset)
-            except TypeError, ValueError:
-                return tuple(events), "partial"
-        return tuple(events), "partial"
-
-    async def fetch_reactions(self, entity: object, message_ids: Sequence[int]) -> ReactionFetchResult:
+    async def fetch_reaction_page(
+        self, entity: object, message_id: int, *, offset: str | None, limit: int
+    ) -> ReactionDetailFetchResult:
+        """Fetch exactly one detail page; aggregate data is never re-read here."""
         try:
-            fetched = await self._client.get_messages(entity, ids=list(message_ids))
-            snapshots: list[ReactionSnapshot | None] = []
-            for message_id, message in zip(message_ids, cast(Sequence[object | None], fetched), strict=False):
-                snapshots.append(
-                    None if message is None else await self._snapshot_with_events(entity, message_id, message)
+            resolve = getattr(self._client, "get_input_entity", None)
+            peer = (
+                await cast(Callable[[object], Awaitable[object]], resolve)(entity)
+                if isinstance(entity, int) and callable(resolve)
+                else entity
+            )
+            response = cast(
+                types.messages.MessageReactionsList,
+                await self._client(
+                    GetMessageReactionsListRequest(
+                        peer=cast(types.TypeInputPeer, peer), id=message_id, limit=limit, offset=offset
+                    )
+                ),
+            )
+            next_raw = response.next_offset
+            next_offset = None if next_raw is None else str(next_raw)
+            events = tuple(
+                ReactionEvent(
+                    reactor_id=self._peer_id(item.peer_id),
+                    emoji=self._emoji(item.reaction),
+                    reacted_at=self._timestamp(item.date),
                 )
-            return ReactionFetchResult(messages=tuple(snapshots))
+                for item in response.reactions
+            )
+            return ReactionDetailFetchResult(page=ReactionDetailPage(events, next_offset))
         except RpcAdmissionClosedError:
             raise
         except CATCHABLE_GATEWAY_FAILURES as exc:
-            return ReactionFetchResult(failure=translate_gateway_failure(exc))
+            return ReactionDetailFetchResult(failure=translate_gateway_failure(exc))
 
-    async def _snapshot_with_events(self, entity: object, message_id: int, message: object) -> ReactionSnapshot:
-        events: tuple[ReactionEvent, ...] = ()
-        events_status = "unavailable"
-        try:
-            events, events_status = await self._fetch_reaction_events(entity, message_id)
-        except RpcAdmissionClosedError:
-            raise
-        except CATCHABLE_GATEWAY_FAILURES:
-            pass
-        return ReactionSnapshot(
-            message_id=message_id,
-            aggregates=project_reaction_aggregates(getattr(message, "reactions", None)),
-            events=events,
-            events_status=events_status,
-        )
+    async def fetch_reactions(self, entity: object, message_ids: Sequence[int]) -> ReactionFetchResult:
+        snapshots: list[ReactionSnapshot] = []
+        for message_id in message_ids:
+            result = await self.fetch_reaction_page(entity, message_id, offset=None, limit=100)
+            if not result.ok:
+                return ReactionFetchResult(failure=result.failure)
+            assert result.page is not None
+            snapshots.append(
+                ReactionSnapshot(
+                    message_id=message_id,
+                    aggregates=(),
+                    events=result.page.events,
+                    events_status="complete" if result.page.next_offset is None else "partial",
+                )
+            )
+        return ReactionFetchResult(messages=tuple(snapshots))

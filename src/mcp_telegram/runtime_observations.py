@@ -36,6 +36,10 @@ ALLOWED_KINDS = frozenset(
         "daemon.request_timing",
         "entity_profile.pair",
         "message_fact.read_at",
+        "reaction.aggregate",
+        "reaction.detail",
+        "reaction.invalidation",
+        "reaction.terminal_suppressed",
         "runtime.telemetry_loss",
     }
 )

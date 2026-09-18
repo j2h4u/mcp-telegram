@@ -36,6 +36,7 @@ from .message_contracts import ExtractedMessage
 from .message_history.contracts import MessageHistoryAccessLostError, MessageHistoryUnavailableError
 from .message_history.ports import ForwardGapPagePort
 from .messages.sqlite_bundle import insert_messages_with_fts
+from .reactions.contracts import ReactionAggregateSource
 from .telegram_demand import (
     AcquisitionKind,
     DemandStatus,
@@ -283,6 +284,7 @@ class _DeltaFetchOutcome:
     rows: list[ExtractedMessage]
     result: int | None = None
     completed: bool = True
+    reaction_observed_at: int | None = None
 
 
 def _row_first_int(row: tuple[object | None, ...] | None) -> int:
@@ -378,6 +380,7 @@ class DeltaSyncWorker:
         self._last_delta_slice_succeeded = True
 
     async def _collect_delta_slice(self, dialog_id: int, max_known_id: int) -> _DeltaFetchOutcome:
+        reaction_observed_at = int(time.time())
         try:
             page = await self._history_port.fetch_page(
                 dialog_id,
@@ -402,7 +405,9 @@ class DeltaSyncWorker:
             logger.warning("delta_slice_rpc_error dialog_id=%d error=%s", dialog_id, exc)
             self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
-        return _DeltaFetchOutcome(list(page.messages), completed=page.complete)
+        return _DeltaFetchOutcome(
+            list(page.messages), completed=page.complete, reaction_observed_at=reaction_observed_at
+        )
 
     def _commit_delta_slice(self, dialog_id: int, outcome: _DeltaFetchOutcome) -> int:
         continuation_required = not outcome.completed or len(outcome.rows) == _DELTA_SLICE_MESSAGE_LIMIT
@@ -411,7 +416,13 @@ class DeltaSyncWorker:
             if not full_history_enabled(self._conn, dialog_id):
                 return 0
             if outcome.rows:
-                insert_messages_with_fts(self._conn, outcome.rows, priority=HydrationPriority.BACKFILL)
+                insert_messages_with_fts(
+                    self._conn,
+                    outcome.rows,
+                    priority=HydrationPriority.BACKFILL,
+                    reaction_source=ReactionAggregateSource.DELTA,
+                    reaction_observed_at=outcome.reaction_observed_at or now,
+                )
             if continuation_required:
                 self._conn.execute(_REQUEST_DELTA_CONTINUATION_SQL, (now, dialog_id, dialog_id))
             else:

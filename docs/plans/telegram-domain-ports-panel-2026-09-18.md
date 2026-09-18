@@ -1,6 +1,6 @@
 # Telegram Domain Ports: Expert Panel Recommendation
 
-Status: accepted; Slice 1 active/implemented
+Status: accepted; Slice 1 deployed; Slice 2 implemented locally and pending release
 
 Date: 2026-09-18
 

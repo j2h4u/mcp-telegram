@@ -7,8 +7,8 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import cast
 
-from .contracts import ReactionPersistenceBusyError, ReactionSnapshot
-from .persistence import replace_reaction_aggregates
+from .contracts import ReactionAggregateSource, ReactionPersistenceBusyError, ReactionSnapshot
+from .persistence import apply_aggregate_observation
 
 
 class SQLiteReactionSnapshotRepository:
@@ -62,8 +62,10 @@ class SQLiteReactionSnapshotRepository:
         rows = cast(
             list[tuple[object, ...]],
             self._conn.execute(
-                "SELECT message_id FROM message_reactions_freshness "
-                f"WHERE dialog_id = ? AND message_id IN ({placeholders}) AND checked_at > ?",
+                "SELECT s.message_id FROM message_reaction_aggregate_state s "
+                "LEFT JOIN message_reaction_event_status d ON d.dialog_id=s.dialog_id AND d.message_id=s.message_id "
+                f"WHERE s.dialog_id = ? AND s.message_id IN ({placeholders}) AND s.observed_at > ? "
+                "AND d.status = 'complete' AND d.aggregate_generation = s.generation",
                 [dialog_id, *message_ids, threshold],
             ).fetchall(),
         )
@@ -78,12 +80,15 @@ class SQLiteReactionSnapshotRepository:
         for snapshot in snapshots:
             if snapshot is None:
                 continue
-            replace_reaction_aggregates(self._conn, dialog_id, snapshot.message_id, snapshot.aggregates)
-            self._replace_event_snapshot(dialog_id, snapshot, checked_at)
-            self._conn.execute(
-                "INSERT OR REPLACE INTO message_reactions_freshness (dialog_id, message_id, checked_at) VALUES (?, ?, ?)",
-                (dialog_id, snapshot.message_id, checked_at),
+            apply_aggregate_observation(
+                self._conn,
+                dialog_id,
+                snapshot.message_id,
+                snapshot.aggregates,
+                source=ReactionAggregateSource.BACKGROUND,
+                observed_at=checked_at,
             )
+            self._replace_event_snapshot(dialog_id, snapshot, checked_at)
             refreshed += 1
         return refreshed
 
@@ -91,14 +96,14 @@ class SQLiteReactionSnapshotRepository:
         """Persist best-effort individual details without weakening aggregates."""
         try:
             self._conn.execute(
-                "DELETE FROM message_reaction_events WHERE dialog_id = ? AND message_id = ?",
+                "DELETE FROM message_reaction_events WHERE dialog_id = ? AND message_id = ? AND display_generation = 0",
                 (dialog_id, snapshot.message_id),
             )
             if snapshot.events_status != "unavailable":
                 self._conn.executemany(
                     "INSERT INTO message_reaction_events "
-                    "(dialog_id, message_id, reactor_id, emoji, reacted_at, fetched_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "(dialog_id, message_id, reactor_id, emoji, reacted_at, fetched_at, detail_generation, page_ordinal, display_generation) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         (
                             dialog_id,
@@ -107,14 +112,31 @@ class SQLiteReactionSnapshotRepository:
                             event.emoji,
                             event.reacted_at,
                             checked_at,
+                            1,
+                            index,
+                            1,
                         )
-                        for event in snapshot.events
+                        for index, event in enumerate(snapshot.events)
                     ],
                 )
             self._conn.execute(
-                "INSERT OR REPLACE INTO message_reaction_event_status "
-                "(dialog_id, message_id, checked_at, status, returned_count) VALUES (?, ?, ?, ?, ?)",
-                (dialog_id, snapshot.message_id, checked_at, snapshot.events_status, len(snapshot.events)),
+                "INSERT INTO message_reaction_event_status "
+                "(dialog_id, message_id, aggregate_generation, detail_generation, display_generation, "
+                "published_generation, checked_at, status, returned_count, staged_count, next_offset, next_attempt_at, failure_kind) "
+                "SELECT ?, ?, generation, 1, 1, 1, ?, ?, ?, 0, NULL, NULL, NULL "
+                "FROM message_reaction_aggregate_state WHERE dialog_id=? AND message_id=? "
+                "ON CONFLICT(dialog_id, message_id) DO UPDATE SET checked_at=excluded.checked_at, "
+                "status=excluded.status, returned_count=excluded.returned_count, detail_generation=excluded.detail_generation, "
+                "display_generation=excluded.display_generation, published_generation=excluded.published_generation",
+                (
+                    dialog_id,
+                    snapshot.message_id,
+                    checked_at,
+                    snapshot.events_status,
+                    len(snapshot.events),
+                    dialog_id,
+                    snapshot.message_id,
+                ),
             )
         except sqlite3.OperationalError:
             # Pre-v28 databases lack detail tables; aggregate freshness remains usable.

@@ -6,11 +6,15 @@ from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from typing import Protocol
 
-from .contracts import ReactionFetchResult, ReactionSnapshot
+from .contracts import ReactionDetailFetchResult, ReactionFetchResult, ReactionSnapshot
 
 
 class TelegramReactionGateway(Protocol):
     async def fetch_reactions(self, entity: object, message_ids: Sequence[int]) -> ReactionFetchResult: ...
+
+    async def fetch_reaction_page(
+        self, entity: object, message_id: int, *, offset: str | None, limit: int
+    ) -> ReactionDetailFetchResult: ...
 
 
 class ReactionSnapshotRepository(Protocol):
