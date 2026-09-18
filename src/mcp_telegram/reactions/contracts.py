@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from ..telegram_reading import GatewayFailure
+from ..telegram_reading import (  # noqa: F401 - re-exported for reaction lifecycle typing
+    GatewayFailure,
+    GatewayFailureKind,
+)
 
 
 class ReactionAggregateSource(StrEnum):

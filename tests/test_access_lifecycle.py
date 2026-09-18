@@ -39,6 +39,22 @@ def _db() -> sqlite3.Connection:
              reason_code TEXT, previous_status TEXT,
              source_namespace TEXT, source_event_id INTEGER,
              access_change_cause TEXT, actor_id INTEGER);
+        CREATE TABLE message_reaction_events (
+             event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+             dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+             reactor_id INTEGER, emoji TEXT NOT NULL, reacted_at INTEGER,
+             fetched_at INTEGER NOT NULL, detail_generation INTEGER NOT NULL DEFAULT 0,
+             page_ordinal INTEGER NOT NULL DEFAULT 0, display_generation INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE message_reaction_event_status (
+             dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+             aggregate_generation INTEGER NOT NULL DEFAULT 1,
+             detail_generation INTEGER NOT NULL DEFAULT 0,
+             display_generation INTEGER NOT NULL DEFAULT 0,
+             published_generation INTEGER NOT NULL DEFAULT 0,
+             checked_at INTEGER NOT NULL, status TEXT NOT NULL,
+             returned_count INTEGER NOT NULL DEFAULT 0, staged_count INTEGER NOT NULL DEFAULT 0,
+             next_offset TEXT, next_attempt_at INTEGER, failure_kind TEXT,
+             PRIMARY KEY (dialog_id, message_id)) WITHOUT ROWID;
         """
     )
     return conn
@@ -84,27 +100,23 @@ def test_access_restore_clears_read_position_retry() -> None:
 
 def test_access_restore_rearms_terminal_reaction_details() -> None:
     conn = _db()
-    conn.execute(
-        "CREATE TABLE message_reaction_event_status ("
-        "dialog_id INTEGER, message_id INTEGER, status TEXT, checked_at INTEGER, next_offset TEXT, "
-        "next_attempt_at INTEGER, staged_count INTEGER, failure_kind TEXT, display_generation INTEGER, "
-        "PRIMARY KEY(dialog_id, message_id))"
-    )
-    conn.execute(
-        "CREATE TABLE message_reaction_events ("
-        "event_id INTEGER PRIMARY KEY, dialog_id INTEGER, message_id INTEGER, display_generation INTEGER)"
-    )
     conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (9, 'access_lost')")
     seed_full_history_enrollment(conn, 9, enabled=True)
     conn.execute("INSERT INTO dialogs VALUES (9, 1, 0, 1, 0, 0, 0, 0, 'x')")
     conn.executemany(
-        "INSERT INTO message_reaction_event_status VALUES (?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO message_reaction_event_status "
+        "(dialog_id, message_id, status, checked_at, next_offset, next_attempt_at, staged_count, failure_kind, display_generation) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
         [
             (9, 1, "unavailable", 5, "old", None, 2, "access_lost", 4),
             (9, 2, "unavailable", 5, None, None, 0, "invalid_target", 6),
         ],
     )
-    conn.execute("INSERT INTO message_reaction_events VALUES (1, 9, 2, 0)")
+    conn.execute(
+        "INSERT INTO message_reaction_events "
+        "(dialog_id, message_id, emoji, fetched_at, display_generation) VALUES (?,?,?,?,?)",
+        (9, 2, "👍", 5, 0),
+    )
     conn.commit()
     try:
         assert restore_access_after_revalidation(conn, 9, 12)

@@ -11,7 +11,7 @@ from typing import cast
 
 from ..telegram_demand import AcquisitionKind, acquisition_context
 from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
-from .contracts import ReactionEvent
+from .contracts import GatewayFailure, GatewayFailureKind, ReactionEvent
 from .ports import TelegramReactionGateway
 
 
@@ -208,15 +208,11 @@ class ReactionDetailRefresher:
         return value if isinstance(value, int) and value > 0 else None
 
     @staticmethod
-    def _is_terminal_failure(failure: object | None, kind: str) -> bool:
+    def _is_terminal_failure(failure: GatewayFailure | None) -> bool:
         return (
             failure is not None
-            and not bool(getattr(failure, "retryable", True))
-            and kind
-            not in {
-                "flood_wait",
-                "transient",
-            }
+            and not failure.retryable
+            and failure.kind in (GatewayFailureKind.INVALID_TARGET, GatewayFailureKind.ACCESS_LOST)
         )
 
     @staticmethod
@@ -345,13 +341,13 @@ class ReactionDetailRefresher:
         expected_status: str,
         expected_offset: str | None,
         staged_count: int,
-        failure: object | None,
+        failure: GatewayFailure | None,
         when: int,
         failure_kind: str | None = None,
     ) -> ReactionDetailResult:
         kind = failure_kind or str(getattr(getattr(failure, "kind", None), "value", "unavailable"))
         retry_after = self._positive_retry_after(failure)
-        terminal = self._is_terminal_failure(failure, kind)
+        terminal = self._is_terminal_failure(failure)
         status = self._failure_status(staged_count, expected_status, terminal)
         next_attempt_at = self._failure_next_attempt_at(when, retry_after, terminal)
         self._begin_persistence()

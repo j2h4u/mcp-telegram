@@ -263,6 +263,13 @@ def test_real_refresher_exposes_flood_wait_cycle_stop(tmp_path: Path) -> None:
     conn.close()
 
 
+@pytest.mark.parametrize("kind", list(GatewayFailureKind))
+def test_only_explicit_terminal_failure_kinds_are_terminal(kind: GatewayFailureKind) -> None:
+    failure = GatewayFailure(kind, "synthetic", "synthetic", retryable=False)
+    terminal = ReactionDetailRefresher._is_terminal_failure(failure)
+    assert terminal is (kind in (GatewayFailureKind.INVALID_TARGET, GatewayFailureKind.ACCESS_LOST))
+
+
 def test_identical_aggregate_advances_boundary_without_invalidating_detail(tmp_path: Path) -> None:
     conn = _db(tmp_path)
     assert apply_aggregate_observation(

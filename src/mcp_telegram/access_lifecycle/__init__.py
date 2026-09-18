@@ -30,26 +30,13 @@ def _purge_hydration_jobs(conn: sqlite3.Connection, dialog_id: int) -> None:
 
 
 def _rearm_terminal_reaction_details(conn: sqlite3.Connection, dialog_id: int, now: int) -> None:
-    table = cast(
-        tuple[object, ...] | None,
-        conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_reaction_event_status'"
-        ).fetchone(),
+    conn.execute(
+        "DELETE FROM message_reaction_events WHERE dialog_id=? AND display_generation=0 "
+        "AND EXISTS (SELECT 1 FROM message_reaction_event_status s "
+        "WHERE s.dialog_id=message_reaction_events.dialog_id AND s.message_id=message_reaction_events.message_id "
+        "AND s.status='unavailable' AND s.failure_kind IN ('access_lost','invalid_target'))",
+        (dialog_id,),
     )
-    if table is None:
-        return
-    events_table = cast(
-        tuple[object, ...] | None,
-        conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_reaction_events'").fetchone(),
-    )
-    if events_table is not None:
-        conn.execute(
-            "DELETE FROM message_reaction_events WHERE dialog_id=? AND display_generation=0 "
-            "AND EXISTS (SELECT 1 FROM message_reaction_event_status s "
-            "WHERE s.dialog_id=message_reaction_events.dialog_id AND s.message_id=message_reaction_events.message_id "
-            "AND s.status='unavailable' AND s.failure_kind IN ('access_lost','invalid_target'))",
-            (dialog_id,),
-        )
     conn.execute(
         "UPDATE message_reaction_event_status SET status='stale', checked_at=?, next_offset=NULL, "
         "next_attempt_at=?, staged_count=0, failure_kind=NULL "
