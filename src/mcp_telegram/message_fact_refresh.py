@@ -575,6 +575,63 @@ async def _refresh_read_at_cycle(
     )
 
 
+async def _refresh_one_reaction_page(
+    deps: MessageFactRefreshDeps,
+    row: tuple[int, int, int, str | None],
+    *,
+    checked_at: int,
+    shutdown_event: asyncio.Event | None,
+) -> tuple[int, bool]:
+    dialog_id, message_id, generation, offset = row
+    if not _start_reaction_page(deps.conn):
+        return 0, True
+    detail = await deps.reaction_detail_refresher.refresh_one(
+        dialog_id,
+        message_id,
+        generation,
+        entity=dialog_id,
+        offset=offset,
+        cancellation_event=shutdown_event,
+        now=checked_at,
+    )
+    if detail.retry_after is not None and detail.stop_cycle:
+        _extend_reaction_release(deps.conn, now=int(deps.clock()), retry_after=detail.retry_after)
+    return detail.fetched_pages, detail.stop_cycle or detail.status == "cancelled"
+
+
+async def _refresh_reaction_pages(
+    deps: MessageFactRefreshDeps,
+    policy: MessageFactRefreshPolicy,
+    *,
+    checked_at: int,
+    claim_at: int,
+    shutdown_event: asyncio.Event | None,
+) -> int:
+    if shutdown_event is not None and shutdown_event.is_set():
+        return 0
+    selected_reaction_rows = _claim_reaction_pages(
+        deps.conn,
+        now=claim_at,
+        max_pages=policy.reaction_detail_max_pages_per_cycle,
+        cycle_seconds=policy.reaction_detail_cycle_seconds,
+        candidate_limit=policy.reaction_max_messages_per_cycle,
+    )
+    reaction_refreshed = 0
+    for index, row in enumerate(selected_reaction_rows):
+        fetched_pages, stop_page = await _refresh_one_reaction_page(
+            deps,
+            row,
+            checked_at=checked_at,
+            shutdown_event=shutdown_event,
+        )
+        reaction_refreshed += fetched_pages
+        if stop_page:
+            break
+        if shutdown_event is not None and index < len(selected_reaction_rows) - 1:
+            await _interruptible_pause(shutdown_event, policy.pause_seconds)
+    return reaction_refreshed
+
+
 async def refresh_message_facts_once(
     deps: MessageFactRefreshDeps,
     policy: MessageFactRefreshPolicy,
@@ -597,38 +654,14 @@ async def refresh_message_facts_once(
     else:
         stats = None
 
-    reaction_refreshed = 0
     claim_at = checked_at if now is not None else int(deps.clock())
-    selected_reaction_rows = (
-        []
-        if shutdown_event is not None and shutdown_event.is_set()
-        else _claim_reaction_pages(
-            deps.conn,
-            now=claim_at,
-            max_pages=policy.reaction_detail_max_pages_per_cycle,
-            cycle_seconds=policy.reaction_detail_cycle_seconds,
-            candidate_limit=policy.reaction_max_messages_per_cycle,
-        )
+    reaction_refreshed = await _refresh_reaction_pages(
+        deps,
+        policy,
+        checked_at=checked_at,
+        claim_at=claim_at,
+        shutdown_event=shutdown_event,
     )
-    for index, (dialog_id, message_id, generation, offset) in enumerate(selected_reaction_rows):
-        if not _start_reaction_page(deps.conn):
-            break
-        detail = await deps.reaction_detail_refresher.refresh_one(
-            dialog_id,
-            message_id,
-            generation,
-            entity=dialog_id,
-            offset=offset,
-            cancellation_event=shutdown_event,
-            now=checked_at,
-        )
-        reaction_refreshed += detail.fetched_pages
-        if detail.retry_after is not None and detail.stop_cycle:
-            _extend_reaction_release(deps.conn, now=int(deps.clock()), retry_after=detail.retry_after)
-        if detail.stop_cycle or detail.status == "cancelled":
-            break
-        if shutdown_event is not None and index < len(selected_reaction_rows) - 1:
-            await _interruptible_pause(shutdown_event, policy.pause_seconds)
 
     if stats is not None and stats.measurement_complete:
         _observe_read_at_cycle(

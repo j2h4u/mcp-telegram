@@ -4021,6 +4021,25 @@ def _apply_migrations_64_to_67(conn: sqlite3.Connection, current: int) -> int:
     return current
 
 
+def _repair_v54_schema_ledger(conn: sqlite3.Connection, current: int) -> int:
+    """Repair the v54 migration ledger when its physical tables already exist."""
+    v54_tables = {
+        str(item[0])
+        for item in cast(
+            list[tuple[object]], conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        )
+    }
+    if {"runtime_observations", "conversation_history_events", "event_recovery_ledger"} <= v54_tables:
+        for version in range(51, 55):
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
+                (version,),
+            )
+        conn.commit()
+        return 54
+    return current
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -4071,20 +4090,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     # A schema-version ledger can be manually damaged while the v54 tables
     # remain intact. Never replay the destructive event-store migrations over
     # that already-current physical schema; repair only the ledger.
-    v54_tables = {
-        str(item[0])
-        for item in cast(
-            list[tuple[object]], conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        )
-    }
-    if {"runtime_observations", "conversation_history_events", "event_recovery_ledger"} <= v54_tables:
-        for version in range(51, 55):
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
-                (version,),
-            )
-        conn.commit()
-        current = 54
+    current = _repair_v54_schema_ledger(conn, current)
     current = _apply_migration_51(conn, current)
     current = _apply_migration_52(conn, current)
     current = _apply_migration_53(conn, current)
