@@ -48,9 +48,25 @@
         "dialog": "@__integration_smoke_missing__"
       },
       "expect": {
-        "is_error": true,
-        "content_text_contains": [
-          "not found"
+        "one_of": [
+          {
+            "is_error": true,
+            "path_equals": {
+              "structuredContent.error": "dialog_not_found"
+            }
+          },
+          {
+            "is_error": true,
+            "path_equals": {
+              "structuredContent.error": "dialog_directory_incomplete"
+            }
+          },
+          {
+            "is_error": true,
+            "path_equals": {
+              "structuredContent.error": "stale_local_directory"
+            }
+          }
         ]
       }
     },
