@@ -320,16 +320,11 @@ def _read_at_attempt_counts(
         list[tuple[object, ...]],
         conn.execute(
             "SELECT dialog_id, message_id FROM message_read_facts "
-            "WHERE (dialog_id, message_id) IN ("
-            + ",".join("(?, ?)" for _ in messages)
-            + ")",
+            "WHERE (dialog_id, message_id) IN (" + ",".join("(?, ?)" for _ in messages) + ")",
             [value for message in messages for value in (message.dialog_id, message.message_id)],
         ).fetchall(),
     )
-    retry_keys = {
-        (int(cast(int | str, row[0])), int(cast(int | str, row[1])))
-        for row in rows
-    }
+    retry_keys = {(int(cast(int | str, row[0])), int(cast(int | str, row[1]))) for row in rows}
     return len(messages) - len(retry_keys), len(retry_keys)
 
 
@@ -339,14 +334,14 @@ def _terminal_read_at_suppressed(conn: sqlite3.Connection) -> int:
         tuple[object] | None,
         conn.execute(
             "SELECT COUNT(*) "
-        "FROM messages m "
-        "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id "
-        "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
-        "JOIN entities e ON e.id = m.dialog_id "
-        "JOIN message_read_facts f ON f.dialog_id = m.dialog_id AND f.message_id = m.message_id "
-        "WHERE sd.status = 'synced' AND lower(e.type) = 'user' AND m.out = 1 "
-        "AND sd.read_outbox_max_id IS NOT NULL AND m.message_id <= sd.read_outbox_max_id "
-        "AND f.status = 'complete' AND f.read_at IS NOT NULL"
+            "FROM messages m "
+            "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id "
+            "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
+            "JOIN entities e ON e.id = m.dialog_id "
+            "JOIN message_read_facts f ON f.dialog_id = m.dialog_id AND f.message_id = m.message_id "
+            "WHERE sd.status = 'synced' AND lower(e.type) = 'user' AND m.out = 1 "
+            "AND sd.read_outbox_max_id IS NOT NULL AND m.message_id <= sd.read_outbox_max_id "
+            "AND f.status = 'complete' AND f.read_at IS NOT NULL"
         ).fetchone(),
     )
     return 0 if row is None else int(cast(int | str, row[0]))

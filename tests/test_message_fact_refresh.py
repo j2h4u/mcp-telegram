@@ -344,7 +344,9 @@ def test_read_at_cursor_null_has_no_candidate_or_release() -> None:
     assert _read_at_candidates(conn, stale_before_utc=2_000, limit=10) == []
     assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL, 600) is None
     adapter = MessageFactRefreshDemandAdapter(
-        MessageFactRefreshDeps(conn, cast(ReactionFreshener, _ReactionFreshener()), cast(TelegramReadReceiptGateway, object())),
+        MessageFactRefreshDeps(
+            conn, cast(ReactionFreshener, _ReactionFreshener()), cast(TelegramReadReceiptGateway, object())
+        ),
         _policy(reaction_max=0),
     )
     assert adapter.status(2_000) is None
@@ -380,7 +382,9 @@ def test_terminal_read_at_set_has_no_status_or_release() -> None:
     )
     seed_full_history_enrollment(conn, 20, enabled=True)
     adapter = MessageFactRefreshDemandAdapter(
-        MessageFactRefreshDeps(conn, cast(ReactionFreshener, _ReactionFreshener()), cast(TelegramReadReceiptGateway, object())),
+        MessageFactRefreshDeps(
+            conn, cast(ReactionFreshener, _ReactionFreshener()), cast(TelegramReadReceiptGateway, object())
+        ),
         _policy(reaction_max=0),
     )
 

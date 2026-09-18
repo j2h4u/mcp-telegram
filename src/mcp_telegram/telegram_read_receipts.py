@@ -44,7 +44,7 @@ class TelethonTelegramReadReceiptGateway:
                 if value.tzinfo is None:
                     value = value.replace(tzinfo=UTC)
                 return ReadDateFetchResult(read_at=int(value.timestamp()), status="complete")
-            except (RpcAdmissionClosedError, RpcAttemptBudgetExhaustedError):
+            except RpcAdmissionClosedError, RpcAttemptBudgetExhaustedError:
                 raise
             except CATCHABLE_GATEWAY_FAILURES as exc:
                 return ReadDateFetchResult(

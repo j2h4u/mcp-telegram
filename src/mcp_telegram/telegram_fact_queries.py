@@ -151,7 +151,7 @@ async def _refresh_stale_read_at_facts(  # noqa: PLR0913
     for message_id in stale_read_at_ids(conn, dialog_id, message_ids, stale_before_utc):
         try:
             result = await gateway.fetch_outbox_read_date(dialog_id, message_id)
-        except (RpcAdmissionClosedError, RpcAttemptBudgetExhaustedError):
+        except RpcAdmissionClosedError, RpcAttemptBudgetExhaustedError:
             raise
         except CATCHABLE_GATEWAY_FAILURES:
             # A single privacy/retention failure must not break list/search.

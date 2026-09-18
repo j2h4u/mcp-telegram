@@ -1461,6 +1461,7 @@ def _build_message_fact_refresh_dependencies(ctx: _SyncMainContext) -> MessageFa
     read_at_callback: Callable[[Mapping[str, object]], None] | None = None
     sink = ctx.rpc_observation_sink
     if sink is not None:
+
         def record_read_at_cycle(payload: Mapping[str, object]) -> None:
             result_count = sum(int(cast(int, payload.get(name, 0))) for name in ("complete", "missing", "unavailable"))
             sink.record(
