@@ -524,17 +524,17 @@ def test_pacing_migration_preserves_reaction_candidate_and_detail_state() -> Non
     )
 
     assert _apply_migration_69(conn, 68) == 69
-    assert conn.execute(
-        "SELECT generation, aggregate_row_count FROM message_reaction_aggregate_state"
-    ).fetchone() == (7, 1)
+    assert conn.execute("SELECT generation, aggregate_row_count FROM message_reaction_aggregate_state").fetchone() == (
+        7,
+        1,
+    )
     assert conn.execute("SELECT status, next_offset FROM message_reaction_event_status").fetchone() == (
         "partial",
         "resume",
     )
     assert conn.execute("SELECT event_id, emoji FROM message_reaction_events").fetchone() == (9, "👍")
     assert conn.execute(
-        "SELECT window_started_at, release_at, claimed_pages, started_pages "
-        "FROM reaction_detail_pacing_state"
+        "SELECT window_started_at, release_at, claimed_pages, started_pages FROM reaction_detail_pacing_state"
     ).fetchone() == (0, 0, 0, 0)
     conn.close()
 

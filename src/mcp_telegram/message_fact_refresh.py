@@ -357,9 +357,7 @@ def _claim_reaction_pages(
         conn.commit()
     state = cast(
         tuple[object, ...] | None,
-        conn.execute(
-            "SELECT release_at, claimed_pages FROM reaction_detail_pacing_state WHERE singleton=1"
-        ).fetchone(),
+        conn.execute("SELECT release_at, claimed_pages FROM reaction_detail_pacing_state WHERE singleton=1").fetchone(),
     )
     if state is not None and now < int(cast(int | str, state[0])):
         return []

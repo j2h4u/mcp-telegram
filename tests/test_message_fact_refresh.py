@@ -172,7 +172,9 @@ class _RecordingReactionRefresher:
         self.calls = calls
         self.result = result or ReactionDetailResult("partial", fetched_pages=1)
 
-    async def refresh_one(self, dialog_id: int, message_id: int, generation: int, **kwargs: object) -> ReactionDetailResult:
+    async def refresh_one(
+        self, dialog_id: int, message_id: int, generation: int, **kwargs: object
+    ) -> ReactionDetailResult:
         cancellation_event = kwargs.get("cancellation_event")
         del dialog_id, generation
         self.calls.append(message_id)
@@ -204,8 +206,7 @@ async def test_reaction_pacing_caps_repeated_slices_and_opens_next_window() -> N
         await refresh_message_facts_once(deps, policy, now=100)
     assert len(calls) == 5
     assert conn.execute(
-        "SELECT window_started_at, release_at, claimed_pages, started_pages "
-        "FROM reaction_detail_pacing_state"
+        "SELECT window_started_at, release_at, claimed_pages, started_pages FROM reaction_detail_pacing_state"
     ).fetchone() == (100, 700, 5, 5)
 
     await refresh_message_facts_once(deps, policy, now=699)
@@ -244,9 +245,10 @@ async def test_reaction_pacing_claim_survives_cancellation_and_restart(tmp_path:
     )
     await refresh_message_facts_once(reopened_deps, policy, now=100)
     assert calls == []
-    assert reopened.execute(
-        "SELECT claimed_pages, started_pages FROM reaction_detail_pacing_state"
-    ).fetchone() == (5, 5)
+    assert reopened.execute("SELECT claimed_pages, started_pages FROM reaction_detail_pacing_state").fetchone() == (
+        5,
+        5,
+    )
     reopened.close()
 
 
@@ -306,8 +308,7 @@ def test_concurrent_reaction_claims_share_one_window(tmp_path: Path) -> None:
     assert results == [0, 5]
     check = sqlite3.connect(path)
     assert check.execute(
-        "SELECT window_started_at, release_at, claimed_pages, started_pages "
-        "FROM reaction_detail_pacing_state"
+        "SELECT window_started_at, release_at, claimed_pages, started_pages FROM reaction_detail_pacing_state"
     ).fetchone() == (100, 700, 5, 0)
     check.close()
 
@@ -326,8 +327,7 @@ async def test_empty_reaction_scan_does_not_open_or_reset_window() -> None:
     await refresh_message_facts_once(deps, policy, now=100)
     assert calls == []
     assert conn.execute(
-        "SELECT window_started_at, release_at, claimed_pages, started_pages "
-        "FROM reaction_detail_pacing_state"
+        "SELECT window_started_at, release_at, claimed_pages, started_pages FROM reaction_detail_pacing_state"
     ).fetchone() == (0, 0, 0, 0)
     conn.close()
 
@@ -352,8 +352,7 @@ async def test_set_shutdown_skips_reaction_claim() -> None:
     )
     assert calls == []
     assert conn.execute(
-        "SELECT window_started_at, release_at, claimed_pages, started_pages "
-        "FROM reaction_detail_pacing_state"
+        "SELECT window_started_at, release_at, claimed_pages, started_pages FROM reaction_detail_pacing_state"
     ).fetchone() == (0, 0, 0, 0)
     conn.close()
 
@@ -379,8 +378,7 @@ async def test_demand_adapter_passes_shutdown_to_message_fact_refresh() -> None:
 
     assert calls == []
     assert conn.execute(
-        "SELECT window_started_at, release_at, claimed_pages, started_pages "
-        "FROM reaction_detail_pacing_state"
+        "SELECT window_started_at, release_at, claimed_pages, started_pages FROM reaction_detail_pacing_state"
     ).fetchone() == (0, 0, 0, 0)
     conn.close()
 
