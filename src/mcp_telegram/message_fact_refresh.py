@@ -582,12 +582,13 @@ async def refresh_message_facts_once(
         stats = None
 
     reaction_refreshed = 0
+    claim_at = checked_at if now is not None else int(deps.clock())
     selected_reaction_rows = (
         []
         if shutdown_event is not None and shutdown_event.is_set()
         else _claim_reaction_pages(
             deps.conn,
-            now=checked_at,
+            now=claim_at,
             max_pages=policy.reaction_detail_max_pages_per_cycle,
             cycle_seconds=policy.reaction_detail_cycle_seconds,
             candidate_limit=policy.reaction_max_messages_per_cycle,
