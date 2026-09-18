@@ -1,7 +1,7 @@
 # Telegram Behind Domain Ports
 
 Status: working architectural compass  
-Last reviewed: 2026-09-13
+Last reviewed: 2026-09-18
 
 This document keeps the target architecture and the next acceptance slices in
 one place. Use it when accepting each slice to determine whether the service is
@@ -107,18 +107,33 @@ The MCP delivery boundary already satisfies the target: production modules
 under `tools/` have no direct Telethon imports and communicate with the daemon
 API.
 
-The boundary below delivery is transitional. Folders, topics, reactions, and
-messages have recognizable Telegram adapter modules. The canonical dialog
-directory has a dedicated raw TL adapter and owns account-wide dialog
-acquisition. Other application and worker modules still import Telethon or
-invoke client methods directly, especially entity profile acquisition,
-daemon-level orchestration, message synchronization, activity sweeps, account
-trace, read receipts, scheduled messages, transcription, and realtime event
-enrichment.
+The causal request observability slice is deployed: MCP operation IDs reach the
+daemon, bounded timing observations correlate with terminal `mcp.call` rows,
+and `list_messages` records privacy-safe route, phase, fallback, and RPC
+attempt evidence. A live devtools-client call and deterministic tests cover
+the instrumented behavior.
+
+The group, user, channel, and remaining entity-profile fact acquisitions now
+cross capability-specific ports and Telegram adapters. Group profile and
+contact overlap share one `GetFullChat` observation, and the profile adapters
+own `GetFullUser`, `GetFullChannel`, participant, common-chat, and avatar
+request construction. Generic entity resolution remains migration debt:
+`daemon_entity_info.py` still calls `client.get_entity` and translates
+Telethon error types for not-found classification. That is separate from the
+completed entity-profile fact ports. The external-import ratchet still allows
+legacy owners elsewhere in the service.
+
+The boundary below delivery is therefore still transitional. Folders, topics,
+reactions, and messages have recognizable Telegram adapter modules. The
+canonical dialog directory has a dedicated raw TL adapter and owns
+account-wide dialog acquisition. Other application and worker modules still
+import Telethon or invoke client methods directly, especially daemon-level
+orchestration, message synchronization, activity sweeps, account trace, read
+receipts, scheduled messages, transcription, and realtime event enrichment.
 
 The current external-import check is a ratchet over the brownfield state. It
 prevents an unreviewed new Telethon importer, but its allowlist still recognizes
-30 production import owners. Passing that check does not yet prove that
+28 production import owners. Passing that check does not yet prove that
 Telegram is hidden behind domain ports.
 
 ## Action plan
@@ -152,66 +167,75 @@ next architectural slice.
 
 ### Enable causal request observability
 
-- [ ] Generate one opaque operation ID at the MCP boundary and propagate it
+- [x] Generate one opaque operation ID at the MCP boundary and propagate it
   explicitly through daemon requests without exposing it in product schemas.
-- [ ] Persist a bounded, versioned daemon timing observation in the existing
+- [x] Persist a bounded, versioned daemon timing observation in the existing
   `runtime_observations` store and correlate it with the terminal `mcp.call`
   observation by operation ID.
-- [ ] Instrument `list_messages` first with a closed route vocabulary covering
+- [x] Instrument `list_messages` first with a closed route vocabulary covering
   local history, local context, local non-sent state, ordinary Telegram
   fallback, and Telegram topic fallback.
-- [ ] Measure fixed causal boundaries: resolution, local projection, Telegram
+- [x] Measure fixed causal boundaries: resolution, local projection, Telegram
   fallback, RPC admission wait, RPC execution, and response shaping. Preserve
   missing measurements as unavailable and nested measurements as nested.
-- [ ] Record actual RPC attempt count and attempted fallback even when the
+- [x] Record actual RPC attempt count and attempted fallback even when the
   fallback fails, returns no rows, or the final response remains local.
-- [ ] Extend the existing operator summary so a slow call shows its largest
+- [x] Extend the existing operator summary so a slow call shows its largest
   measured contributor, attribution completeness, and any unattributed time.
-- [ ] Keep the payload privacy-safe: no arguments, selectors, message text,
+- [x] Keep the payload privacy-safe: no arguments, selectors, message text,
   names, peer or message IDs, cursor values, raw exceptions, SQL, or response
   bodies.
-- [ ] Reuse the existing TTL, row cap, asynchronous loss reporting, and
+- [x] Reuse the existing TTL, row cap, asynchronous loss reporting, and
   operator command. Do not add a telemetry database, tracing backend,
   dashboard, exporter, sampler, or per-statement/per-message events.
-- [ ] Prove local delay, admission delay, RPC execution delay, fallback,
+- [x] Prove local delay, admission delay, RPC execution delay, fallback,
   shaping, cancellation, concurrency, telemetry loss, and legacy-row behavior
   with deterministic tests and one live devtools-client smoke.
 - [ ] Reduce any Radon or CRAP legacy debt touched by this enabling slice; do
   not add a generic tracing abstraction or increase either baseline.
-- [ ] Deploy the slice and proceed directly to `GetFullChat`; do not wait for a
+- [x] Deploy the slice and proceed directly to `GetFullChat`; do not wait for a
   weekly baseline or make later domain work contingent on traffic volume.
 
 ### Complete the next proven overlap
 
-- [ ] Introduce a group-profile port and Telegram adapter for the existing
+- [x] Introduce a group-profile port and Telegram adapter for the existing
   `GetFullChat` acquisition.
-- [ ] Let one successful group observation materialize both the full-profile
+- [x] Let one successful group observation materialize both the full-profile
   facts and the contact-overlap facts atomically.
-- [ ] Make the second consumer reuse the same observation locally without an
+- [x] Make the second consumer reuse the same observation locally without an
   additional RPC.
-- [ ] Remove the superseded direct `GetFullChat` path from the application
+- [x] Remove the superseded direct `GetFullChat` path from the application
   service after parity is proven.
-- [ ] Prove with deterministic tests that one group refresh performs one
+- [x] Prove with deterministic tests that one group refresh performs one
   `GetFullChat` attempt and produces both domain sections.
 
 ### Extract entity-profile acquisition
 
-- [ ] Define domain ports for user, channel, and legacy-group profile facts
+- [x] Define domain ports for user, channel, and legacy-group profile facts
   currently acquired inside daemon application services.
-- [ ] Move `GetFullUser`, `GetFullChannel`, `GetFullChat`, participant, common
+- [x] Move `GetFullUser`, `GetFullChannel`, `GetFullChat`, participant, common
   chat, avatar, and related request construction into capability-specific
   Telegram adapters.
-- [ ] Keep profile orchestration, section ownership, generation fences, and
+- [x] Keep profile orchestration, section ownership, generation fences, and
   local publication in application/domain code using transport-neutral
   contracts.
-- [ ] Identify additional response pairs that obtain the same facts and merge
+- [x] Identify additional response pairs that obtain the same facts and merge
   only overlaps supported by source and test evidence.
 - [ ] Remove direct Telethon imports from the entity-profile application path.
 
-### Extract remaining acquisition paths
+### Next slice: extract message history and gap synchronization
+
+The next coherent vertical slice is to put full message-history backfill and
+delta gap synchronization behind message-history ports. Preserve their
+distinct progress, restart, access-loss, and completeness semantics, remove
+the superseded direct paths, and verify both local publication and real
+history behavior together.
 
 - [ ] Put history and gap synchronization behind message-history ports while
   preserving their distinct progress and completeness semantics.
+
+### Later slices: remaining acquisition paths
+
 - [ ] Put activity search and peer resolution behind activity-domain ports.
 - [ ] Put read-receipt, scheduled-message, transcription, media hydration, and
   account-trace RPCs behind their owning capability ports.
