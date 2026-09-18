@@ -107,7 +107,6 @@ LEGACY_DEMAND_KIND_BY_SOURCE: Mapping[TelegramRpcSource, DemandKind] = MappingPr
         TelegramRpcSource.FOLDER_RECONCILIATION: DemandKind.FOLDER_SNAPSHOT,
         TelegramRpcSource.TOPIC_RECONCILIATION: DemandKind.TOPIC_SNAPSHOT,
         TelegramRpcSource.MESSAGE_FACT_REFRESH: DemandKind.MESSAGE_FACT_REFRESH,
-        TelegramRpcSource.REACTION_REFRESH: DemandKind.REACTION_REFRESH_BATCH,
         TelegramRpcSource.READ_RECEIPT_PROBE: DemandKind.READ_RECEIPT_BATCH,
         TelegramRpcSource.SCHEDULED_MESSAGES: DemandKind.SCHEDULED_REPAIR,
         TelegramRpcSource.MAINTENANCE: DemandKind.SELF_PROFILE_MAINTENANCE,

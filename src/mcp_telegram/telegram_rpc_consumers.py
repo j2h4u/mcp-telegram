@@ -42,7 +42,6 @@ class TelegramRpcSource(StrEnum):
     FOLDER_RECONCILIATION = "folder_reconciliation"
     TOPIC_RECONCILIATION = "topic_reconciliation"
     MESSAGE_FACT_REFRESH = "message_fact_refresh"
-    REACTION_REFRESH = "reaction_refresh"
     READ_RECEIPT_PROBE = "read_receipt_probe"
     SCHEDULED_MESSAGES = "scheduled_messages"
     MAINTENANCE = "maintenance"
@@ -76,7 +75,6 @@ class DemandKind(StrEnum):
     FOLDER_SNAPSHOT = "folder_snapshot"
     TOPIC_SNAPSHOT = "topic_snapshot"
     MESSAGE_FACT_REFRESH = "message_fact_refresh"
-    REACTION_REFRESH_BATCH = "reaction_refresh_batch"
     READ_RECEIPT_BATCH = "read_receipt_batch"
     SCHEDULED_REPAIR = "scheduled_repair"
     SCHEDULED_DISCOVERY = "scheduled_discovery"
@@ -515,18 +513,6 @@ _REGISTRY: dict[TelegramRpcSource, TelegramRpcConsumerSpec] = {
         _PRODUCER,
         demand_bound=DemandBound.PRODUCER_BOUNDED,
     ),
-    TelegramRpcSource.REACTION_REFRESH: _consumer(
-        "Reaction refresh",
-        "Refresh detailed reactions for one message",
-        _B,
-        TelegramFactDomain.REACTIONS,
-        AcquisitionRole.ENRICHMENT,
-        AcquisitionTrigger.DURABLE_BACKLOG,
-        FanoutScope.MESSAGE,
-        _PRODUCER,
-        demand_bound=DemandBound.PRODUCER_BOUNDED,
-        repairs=(TelegramRpcSource.REALTIME_EVENT,),
-    ),
     TelegramRpcSource.READ_RECEIPT_PROBE: _consumer(
         "Read receipt probe",
         "Reconcile read positions not established by updates",
@@ -724,11 +710,6 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         TelegramRpcSource.MESSAGE_FACT_REFRESH,
         _DURABLE,
         max_rpc_attempts_per_slice=16,
-    ),
-    DemandKind.REACTION_REFRESH_BATCH: _contract(
-        DemandKind.REACTION_REFRESH_BATCH,
-        TelegramRpcSource.REACTION_REFRESH,
-        _INLINE,
     ),
     DemandKind.READ_RECEIPT_BATCH: _contract(
         DemandKind.READ_RECEIPT_BATCH,

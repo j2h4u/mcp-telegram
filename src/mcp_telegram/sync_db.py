@@ -3833,15 +3833,39 @@ def _apply_migration_68(conn: sqlite3.Connection, current: int) -> int:
         # event status, or event row.  This intentionally keeps empty receipts:
         # a freshness/status row is evidence even when message_reactions has no
         # rows for the message.
+        observation_queries = [
+            "SELECT dialog_id, message_id, checked_at AS observed_at FROM message_reactions_freshness",
+            "SELECT dialog_id, message_id, checked_at FROM message_reaction_event_status",
+            "SELECT dialog_id, message_id, fetched_at FROM message_reaction_events",
+            "SELECT dialog_id, message_id, 0 FROM message_reactions",
+        ]
+        existing_tables = {
+            str(row[0])
+            for row in cast(
+                list[tuple[object, ...]],
+                conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+                    "('message_reactions_freshness','message_reaction_event_status','message_reaction_events','message_reactions')"
+                ).fetchall(),
+            )
+        }
+        observation_queries = [
+            query
+            for query, table in zip(
+                observation_queries,
+                (
+                    "message_reactions_freshness",
+                    "message_reaction_event_status",
+                    "message_reaction_events",
+                    "message_reactions",
+                ),
+                strict=True,
+            )
+            if table in existing_tables
+        ]
         keys = cast(
             list[tuple[int, int, int]],
-            conn.execute(
-                "SELECT dialog_id, message_id, observed_at FROM ("
-                "SELECT dialog_id, message_id, checked_at AS observed_at FROM message_reactions_freshness "
-                "UNION ALL SELECT dialog_id, message_id, checked_at FROM message_reaction_event_status "
-                "UNION ALL SELECT dialog_id, message_id, fetched_at FROM message_reaction_events "
-                "UNION ALL SELECT dialog_id, message_id, 0 FROM message_reactions)"
-            ).fetchall(),
+            conn.execute(" UNION ALL ".join(observation_queries)).fetchall() if observation_queries else [],
         )
         seen: set[tuple[int, int]] = set()
         sequence = 0

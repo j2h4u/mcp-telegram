@@ -15,10 +15,6 @@ from mcp_telegram.daemon import (
     _apply_read_positions_from_dialogs,
 )
 from mcp_telegram.history_enrollment import disable_history
-from mcp_telegram.message_fact_refresh import MessageFactRefreshDeps, refresh_message_facts_once
-from mcp_telegram.reactions.contracts import ReactionAggregate, ReactionFetchResult, ReactionSnapshot
-from mcp_telegram.reactions.refresh import ReactionFreshener
-from mcp_telegram.reactions.sqlite_repository import SQLiteReactionSnapshotRepository
 from mcp_telegram.sync_db import _apply_migrations
 
 
@@ -28,41 +24,6 @@ def _dbs() -> tuple[sqlite3.Connection, sqlite3.Connection]:
     second = sqlite3.connect(":memory:")
     _apply_migrations(second)
     return first, second
-
-
-@pytest.mark.asyncio
-async def test_message_fact_refresh_disable_during_reaction_await_discards_snapshot() -> None:
-    from tests.test_message_fact_refresh import _make_db, _policy
-
-    conn = _make_db()
-    conn.execute("INSERT INTO synced_dialogs VALUES (4, 'synced', 1)")
-    conn.execute("INSERT INTO full_history_enrollment VALUES (4, 1, 'explicit', 1)")
-    conn.execute("INSERT INTO messages VALUES (4, 1, 1, 0, NULL)")
-    conn.execute("INSERT INTO message_reactions VALUES (4, 1, '👍', 1)")
-    conn.commit()
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    class Gateway:
-        async def fetch_reactions(self, _entity: object, _ids: list[int]) -> ReactionFetchResult:
-            entered.set()
-            await release.wait()
-            return ReactionFetchResult((ReactionSnapshot(1, (ReactionAggregate("🔥", 9),)),))
-
-    freshener = ReactionFreshener(
-        SQLiteReactionSnapshotRepository(conn), Gateway(), freshness_ttl_seconds=1, now=lambda: 1000
-    )
-    task = asyncio.create_task(
-        refresh_message_facts_once(MessageFactRefreshDeps(conn, freshener, None), _policy(read_at_max=0), now=1000)
-    )
-    await entered.wait()
-    conn.execute("UPDATE full_history_enrollment SET enabled = 0 WHERE dialog_id = 4")
-    conn.commit()
-    release.set()
-    await task
-    assert conn.execute("SELECT emoji, count FROM message_reactions WHERE dialog_id=4").fetchall() == [("👍", 1)]
-    assert conn.execute("SELECT * FROM message_reactions_freshness").fetchall() == []
-    conn.close()
 
 
 @pytest.mark.asyncio

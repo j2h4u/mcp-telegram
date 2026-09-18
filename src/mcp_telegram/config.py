@@ -34,13 +34,6 @@ class StateConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class ReactionsConfig:
-    """Deprecated aggregate compatibility section; detail has no TTL."""
-
-    freshness_ttl_seconds: int = 600
-
-
-@dataclass(frozen=True, slots=True)
 class ReadReceiptsConfig:
     """Freshness policy for Telegram read-receipt facts."""
 
@@ -145,7 +138,6 @@ class FolderProjectionConfig:
 class FreshnessConfig:
     """All Telegram-derived fact freshness policies."""
 
-    reactions: ReactionsConfig = field(default_factory=ReactionsConfig)
     read_receipts: ReadReceiptsConfig = field(default_factory=ReadReceiptsConfig)
     inbox: InboxConfig = field(default_factory=InboxConfig)
     entities: EntitiesConfig = field(default_factory=EntitiesConfig)
@@ -834,12 +826,10 @@ def _parse_state(data: dict[str, object], path: Path) -> StateConfig:
 def _parse_freshness(data: dict[str, object], path: Path) -> FreshnessConfig:
     freshness_data = _table(data, "freshness", path, required=False)
     if freshness_data is not None:
-        _reject_unknown_keys(freshness_data, {"reactions", "read_receipts", "inbox", "entities"}, "freshness", path)
-    reactions_data = _nested_table(freshness_data, "reactions", "freshness.reactions", path) or {}
+        _reject_unknown_keys(freshness_data, {"read_receipts", "inbox", "entities"}, "freshness", path)
     receipts_data = _nested_table(freshness_data, "read_receipts", "freshness.read_receipts", path) or {}
     inbox_data = _nested_table(freshness_data, "inbox", "freshness.inbox", path) or {}
     entities_data = _nested_table(freshness_data, "entities", "freshness.entities", path) or {}
-    _reject_unknown_keys(reactions_data, {"freshness_ttl_seconds"}, "freshness.reactions", path)
     _reject_unknown_keys(receipts_data, {"read_at_ttl_seconds"}, "freshness.read_receipts", path)
     _reject_unknown_keys(inbox_data, {"deleted_message_visibility_seconds"}, "freshness.inbox", path)
     _reject_unknown_keys(
@@ -855,15 +845,6 @@ def _parse_freshness(data: dict[str, object], path: Path) -> FreshnessConfig:
     )
     defaults = FreshnessConfig()
     return FreshnessConfig(
-        reactions=ReactionsConfig(
-            freshness_ttl_seconds=_positive_int(
-                reactions_data,
-                "freshness_ttl_seconds",
-                "freshness.reactions",
-                path,
-                defaults.reactions.freshness_ttl_seconds,
-            )
-        ),
         read_receipts=ReadReceiptsConfig(
             read_at_ttl_seconds=_positive_int(
                 receipts_data,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Protocol, cast
 
@@ -15,8 +15,6 @@ from .contracts import (
     ReactionDetailFetchResult,
     ReactionDetailPage,
     ReactionEvent,
-    ReactionFetchResult,
-    ReactionSnapshot,
 )
 from .ports import TelegramReactionGateway
 
@@ -103,20 +101,3 @@ class TelethonTelegramReactionGateway(TelegramReactionGateway):
             raise
         except CATCHABLE_GATEWAY_FAILURES as exc:
             return ReactionDetailFetchResult(failure=translate_gateway_failure(exc))
-
-    async def fetch_reactions(self, entity: object, message_ids: Sequence[int]) -> ReactionFetchResult:
-        snapshots: list[ReactionSnapshot] = []
-        for message_id in message_ids:
-            result = await self.fetch_reaction_page(entity, message_id, offset=None, limit=100)
-            if not result.ok:
-                return ReactionFetchResult(failure=result.failure)
-            assert result.page is not None
-            snapshots.append(
-                ReactionSnapshot(
-                    message_id=message_id,
-                    aggregates=(),
-                    events=result.page.events,
-                    events_status="complete" if result.page.next_offset is None else "partial",
-                )
-            )
-        return ReactionFetchResult(messages=tuple(snapshots))

@@ -44,7 +44,7 @@ cannot_depend_on = [
     "mcp_telegram.daemon", "mcp_telegram.daemon_api", "mcp_telegram.feedback_db",
     "mcp_telegram.folders.sqlite_repository", "mcp_telegram.folders.telegram_adapter",
     "mcp_telegram.messages.sqlite_bundle", "mcp_telegram.messages.sqlite_hydration_jobs", "mcp_telegram.messages.telegram_adapter",
-    "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.reactions.telegram_adapter",
+    "mcp_telegram.reactions.telegram_adapter",
     "mcp_telegram.sync_db", "mcp_telegram.telegram",
     "mcp_telegram.topics.sqlite_repository", "mcp_telegram.topics.telegram_adapter",
 ]
@@ -134,7 +134,7 @@ depends_on = [
 ]
 cannot_depend_on = [
     "mcp_telegram.folders.telegram_adapter", "mcp_telegram.messages", "mcp_telegram.messages.telegram_adapter",
-    "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.reactions.telegram_adapter",
+    "mcp_telegram.reactions.telegram_adapter",
     "mcp_telegram.topics.sqlite_repository", "mcp_telegram.topics.telegram_adapter",
 ]
 [[modules]]
@@ -150,13 +150,13 @@ depends_on = ["mcp_telegram.feedback_contracts"]
 path = "mcp_telegram.daemon_activity_stats"
 layer = "application"
 depends_on = ["mcp_telegram.daemon_message", "mcp_telegram.dialog_directory_coverage", "mcp_telegram.dialog_selector", "mcp_telegram.message_content"]
-cannot_depend_on = ["mcp_telegram.folders.sqlite_repository", "mcp_telegram.messages", "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.topics.sqlite_repository"]
+cannot_depend_on = ["mcp_telegram.folders.sqlite_repository", "mcp_telegram.messages", "mcp_telegram.topics.sqlite_repository"]
 
 [[modules]]
 path = "mcp_telegram.daemon_dialog_queries"
 layer = "application"
 depends_on = []
-cannot_depend_on = ["mcp_telegram.folders.sqlite_repository", "mcp_telegram.messages", "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.topics.sqlite_repository"]
+cannot_depend_on = ["mcp_telegram.folders.sqlite_repository", "mcp_telegram.messages", "mcp_telegram.topics.sqlite_repository"]
 
 [[modules]]
 path = "mcp_telegram.conversation_changes"
@@ -208,7 +208,7 @@ depends_on = [
 ]
 cannot_depend_on = [
     "mcp_telegram.folders.sqlite_repository", "mcp_telegram.messages",
-    "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.topics.sqlite_repository",
+    "mcp_telegram.topics.sqlite_repository",
 ]
 
 [[modules]]
@@ -423,11 +423,6 @@ layer = "capability"
 depends_on = ["mcp_telegram.reactions.contracts", "mcp_telegram.reactions.detail"]
 
 [[modules]]
-path = "mcp_telegram.reactions.refresh"
-layer = "capability"
-depends_on = ["mcp_telegram.reactions.contracts", "mcp_telegram.reactions.ports", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_scheduler"]
-
-[[modules]]
 path = "mcp_telegram.reactions.detail"
 layer = "capability"
 depends_on = ["mcp_telegram.reactions.contracts", "mcp_telegram.reactions.ports", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_scheduler"]
@@ -624,11 +619,6 @@ depends_on = ["mcp_telegram.folders.contracts", "mcp_telegram.folders.membership
 path = "mcp_telegram.reactions.persistence"
 layer = "persistence"
 depends_on = ["mcp_telegram.reactions.contracts"]
-
-[[modules]]
-path = "mcp_telegram.reactions.sqlite_repository"
-layer = "persistence"
-depends_on = ["mcp_telegram.reactions.contracts", "mcp_telegram.reactions.persistence"]
 
 [[modules]]
 path = "mcp_telegram.topics.sqlite_repository"

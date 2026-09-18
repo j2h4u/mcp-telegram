@@ -8,10 +8,6 @@ from enum import StrEnum
 from ..telegram_reading import GatewayFailure
 
 
-class ReactionPersistenceBusyError(RuntimeError):
-    """Raised when local reaction persistence is temporarily contended."""
-
-
 class ReactionAggregateSource(StrEnum):
     """Writers of Telegram reaction aggregate observations, ordered by rank."""
 
@@ -61,26 +57,6 @@ class ReactionEvent:
     reactor_id: int | None
     emoji: str
     reacted_at: int | None
-
-
-@dataclass(frozen=True, slots=True)
-class ReactionSnapshot:
-    """Reaction facts for one message, independent of their persistence model."""
-
-    message_id: int
-    aggregates: tuple[ReactionAggregate, ...]
-    events: tuple[ReactionEvent, ...] = ()
-    events_status: str = "unavailable"
-
-
-@dataclass(frozen=True, slots=True)
-class ReactionFetchResult:
-    messages: tuple[ReactionSnapshot | None, ...] = ()
-    failure: GatewayFailure | None = None
-
-    @property
-    def ok(self) -> bool:
-        return self.failure is None
 
 
 @dataclass(frozen=True, slots=True)

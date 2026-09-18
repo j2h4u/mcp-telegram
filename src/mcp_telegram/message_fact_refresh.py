@@ -136,7 +136,6 @@ class MessageFactRefreshPolicy:
     pause_seconds: float
     read_at_ttl_seconds: int
     reaction_detail_max_pages_per_cycle: int = 5
-    reaction_ttl_seconds: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +173,7 @@ def _next_release_at(conn: sqlite3.Connection, query: str, ttl_seconds: int) -> 
 
 
 class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
-    """Read the existing optional-fact candidate state for PR1 shadow mode.
+    """Read the durable optional-fact candidate state.
 
     This is the durable orchestration root for background per-message reaction
     and exact read-date candidates. The nested acquisition adapters do not
@@ -192,27 +191,7 @@ class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
         del now
         releases: list[float] = []
         if self._policy.reaction_max_messages_per_cycle > 0:
-            has_lifecycle = (
-                self._deps.conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_reaction_aggregate_state'"
-                ).fetchone()
-                is not None
-            )
-            if has_lifecycle:
-                reaction_release = _next_release_at(self._deps.conn, _NEXT_REACTION_RELEASE_SQL, 0)
-            else:
-                row = cast(
-                    tuple[object, ...] | None,
-                    self._deps.conn.execute(
-                        "SELECT MIN(COALESCE(f.checked_at + ?, 0)) FROM messages m "
-                        "JOIN synced_dialogs sd ON sd.dialog_id=m.dialog_id AND sd.status='synced' "
-                        "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
-                        "JOIN message_reactions r ON r.dialog_id=m.dialog_id AND r.message_id=m.message_id "
-                        "LEFT JOIN message_reactions_freshness f ON f.dialog_id=m.dialog_id AND f.message_id=m.message_id",
-                        (self._policy.reaction_ttl_seconds or 0,),
-                    ).fetchone(),
-                )
-                reaction_release = None if row is None or row[0] is None else float(cast(int | float | str, row[0]))
+            reaction_release = _next_release_at(self._deps.conn, _NEXT_REACTION_RELEASE_SQL, 0)
             if reaction_release is not None:
                 releases.append(reaction_release)
         if self._policy.read_at_max_messages_per_cycle > 0:
@@ -243,7 +222,7 @@ class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
 
 
 class ReadReceiptDemandAdapter(DurableDemandAdapter):
-    """Read the durable read-position reconciliation state in shadow mode.
+    """Read the durable read-position reconciliation state.
 
     Per-message exact read dates are nested acquisitions selected by
     ``MESSAGE_FACT_REFRESH`` and are intentionally absent from this status.
@@ -489,45 +468,16 @@ async def refresh_message_facts_once(
         return MessageFactRefreshResult(reaction_refreshed=0)
 
     checked_at = int(time.time() if now is None else now)
-    has_lifecycle = (
-        deps.conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_reaction_aggregate_state'"
-        ).fetchone()
-        is not None
+    reaction_rows = _reaction_candidates(
+        deps.conn,
+        stale_before_utc=checked_at,
+        limit=policy.reaction_max_messages_per_cycle,
     )
-    if not has_lifecycle and hasattr(deps.reaction_detail_refresher, "refresh"):
-        reaction_rows_legacy = cast(
-            list[tuple[int, int]],
-            deps.conn.execute(
-                "SELECT m.dialog_id, m.message_id FROM messages m "
-                "JOIN synced_dialogs sd ON sd.dialog_id=m.dialog_id "
-                "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
-                "WHERE sd.status='synced' AND EXISTS (SELECT 1 FROM message_reactions r "
-                "WHERE r.dialog_id=m.dialog_id AND r.message_id=m.message_id) LIMIT ?",
-                (policy.reaction_max_messages_per_cycle,),
-            ).fetchall(),
-        )
-        legacy_refreshed = 0
-        for dialog_id, message_id in reaction_rows_legacy:
-            outcome = await deps.reaction_detail_refresher.refresh(dialog_id, dialog_id, [message_id])  # type: ignore[attr-defined]
-            legacy_refreshed += int(getattr(outcome, "refreshed_count", 0))
-        reaction_rows_legacy = []
-    else:
-        legacy_refreshed = 0
-    reaction_rows = (
-        _reaction_candidates(
-            deps.conn,
-            stale_before_utc=checked_at,
-            limit=policy.reaction_max_messages_per_cycle,
-        )
-        if has_lifecycle
-        else []
-    )
-    if has_lifecycle and _terminal_reaction_suppressed(deps.conn):
+    if _terminal_reaction_suppressed(deps.conn):
         observe_terminal_suppressed = getattr(deps.reaction_detail_refresher, "observe_terminal_suppressed", None)
         if callable(observe_terminal_suppressed):
             observe_terminal_suppressed()
-    reaction_refreshed = legacy_refreshed
+    reaction_refreshed = 0
     for index, (dialog_id, message_id, generation, offset) in enumerate(
         reaction_rows[: policy.reaction_detail_max_pages_per_cycle]
     ):

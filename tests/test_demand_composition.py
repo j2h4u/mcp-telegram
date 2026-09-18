@@ -131,7 +131,6 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
     folder_repository = _IdleFolderRepository()
     folder_worker = FolderProjectionWorker(MagicMock(), folder_repository, asyncio.Event(), _FolderPolicy())
     message_fact_policy = MessageFactRefreshPolicy(
-        reaction_ttl_seconds=60,
         read_at_ttl_seconds=60,
         reaction_max_messages_per_cycle=1,
         read_at_max_messages_per_cycle=1,

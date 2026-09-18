@@ -16,8 +16,7 @@ from mcp_telegram.message_fact_refresh import (
     _read_at_candidates,
     refresh_message_facts_once,
 )
-from mcp_telegram.reactions.contracts import ReactionFreshness
-from mcp_telegram.reactions.refresh import ReactionFreshener
+from mcp_telegram.reactions import ReactionDetailRefresher
 from mcp_telegram.telegram_demand import RpcAttemptBudgetExhaustedError
 from mcp_telegram.telegram_reading import ReadDateFetchResult, TelegramReadReceiptGateway
 from mcp_telegram.telegram_rpc_consumers import TelegramRpcSource
@@ -51,16 +50,28 @@ def _make_db() -> sqlite3.Connection:
             out INTEGER NOT NULL,
             media_kind TEXT
         );
-        CREATE TABLE message_reactions (
+        CREATE TABLE message_reaction_aggregate_state (
             dialog_id INTEGER NOT NULL,
             message_id INTEGER NOT NULL,
-            emoji TEXT NOT NULL,
-            count INTEGER NOT NULL
+            generation INTEGER NOT NULL,
+            observed_at INTEGER NOT NULL,
+            observation_sequence INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            source_rank INTEGER NOT NULL,
+            aggregate_row_count INTEGER NOT NULL,
+            PRIMARY KEY (dialog_id, message_id)
         );
-        CREATE TABLE message_reactions_freshness (
+        CREATE TABLE message_reaction_event_status (
             dialog_id INTEGER NOT NULL,
             message_id INTEGER NOT NULL,
-            checked_at INTEGER NOT NULL,
+            aggregate_generation INTEGER NOT NULL,
+            detail_generation INTEGER NOT NULL DEFAULT 0,
+            display_generation INTEGER NOT NULL DEFAULT 0,
+            published_generation INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            next_offset TEXT,
+            next_attempt_at INTEGER,
+            staged_count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (dialog_id, message_id)
         );
         CREATE TABLE message_read_facts (
@@ -81,24 +92,8 @@ def _policy(*, reaction_max: int = 10, read_at_max: int = 10) -> MessageFactRefr
         reaction_max_messages_per_cycle=reaction_max,
         read_at_max_messages_per_cycle=read_at_max,
         pause_seconds=0.01,
-        reaction_ttl_seconds=600,
         read_at_ttl_seconds=600,
     )
-
-
-class _ReactionFreshener:
-    def __init__(self) -> None:
-        self.calls: list[tuple[int, object, list[int]]] = []
-
-    async def refresh(self, dialog_id: int, entity: object, message_ids: list[int]) -> ReactionFreshness:
-        self.calls.append((dialog_id, entity, message_ids))
-        return ReactionFreshness(
-            requested_count=len(message_ids),
-            fresh_count=0,
-            stale_count=len(message_ids),
-            refreshed_count=len(message_ids),
-            status="refreshed",
-        )
 
 
 class _ReadReceiptGateway:
@@ -140,46 +135,6 @@ def _admission_closed_error() -> Exception:
 
 
 @pytest.mark.asyncio
-async def test_refresh_message_facts_once_refreshes_reactions_and_read_at() -> None:
-    conn = _make_db()
-    conn.executescript(
-        """
-        INSERT INTO synced_dialogs VALUES (10, 'synced', 10), (20, 'synced', 10), (30, 'access_lost', 10);
-        INSERT INTO entities VALUES (10, 'user'), (20, 'user'), (30, 'user');
-            INSERT INTO messages VALUES
-                (10, 1, 1000, 0, NULL),
-                (20, 2, 1001, 1, NULL),
-                (30, 3, 1002, 1, NULL);
-        INSERT INTO message_reactions VALUES (10, 1, '👍', 1);
-        """
-    )
-    seed_full_history_enrollment(conn, 10, enabled=True)
-    seed_full_history_enrollment(conn, 20, enabled=True)
-    seed_full_history_enrollment(conn, 30, enabled=False)
-    reactions = _ReactionFreshener()
-    read_receipts = _ReadReceiptGateway()
-
-    try:
-        result = await refresh_message_facts_once(
-            MessageFactRefreshDeps(
-                conn,
-                cast(ReactionFreshener, reactions),
-                cast(TelegramReadReceiptGateway, read_receipts),
-            ),
-            _policy(),
-            now=2_000,
-        )
-        stored_read_facts = conn.execute("SELECT read_at, checked_at, status FROM message_read_facts").fetchall()
-    finally:
-        conn.close()
-
-    assert result.reaction_refreshed == 1
-    assert reactions.calls == [(10, 10, [1])]
-    assert read_receipts.calls == [(20, 2)]
-    assert stored_read_facts == [(1_700_000_002, 2_000, "complete")]
-
-
-@pytest.mark.asyncio
 async def test_read_at_cycle_telemetry_is_aggregate_and_terminal_safe() -> None:
     conn = _make_db()
     conn.executescript(
@@ -201,7 +156,7 @@ async def test_read_at_cycle_telemetry_is_aggregate_and_terminal_safe() -> None:
         await refresh_message_facts_once(
             MessageFactRefreshDeps(
                 conn,
-                cast(ReactionFreshener, _ReactionFreshener()),
+                cast(ReactionDetailRefresher, object()),
                 cast(TelegramReadReceiptGateway, _ReadReceiptGateway()),
                 read_at_observer=observations.append,
             ),
@@ -242,7 +197,7 @@ async def test_read_at_attempt_telemetry_distinguishes_equal_message_ids_across_
         await refresh_message_facts_once(
             MessageFactRefreshDeps(
                 conn,
-                cast(ReactionFreshener, _ReactionFreshener()),
+                cast(ReactionDetailRefresher, object()),
                 cast(TelegramReadReceiptGateway, _ReadReceiptGateway()),
                 read_at_observer=observations.append,
             ),
@@ -273,7 +228,7 @@ async def test_canceled_read_at_cycle_publishes_no_incomplete_telemetry() -> Non
         refresh_message_facts_once(
             MessageFactRefreshDeps(
                 conn,
-                cast(ReactionFreshener, _ReactionFreshener()),
+                cast(ReactionDetailRefresher, object()),
                 cast(TelegramReadReceiptGateway, gateway),
                 read_at_observer=observations.append,
             ),
@@ -317,7 +272,7 @@ async def test_read_at_control_errors_leave_facts_and_telemetry_untouched(
             await refresh_message_facts_once(
                 MessageFactRefreshDeps(
                     conn,
-                    cast(ReactionFreshener, _ReactionFreshener()),
+                    cast(ReactionDetailRefresher, object()),
                     cast(TelegramReadReceiptGateway, _FailingReadReceiptGateway(error)),
                     read_at_observer=observations.append,
                 ),
@@ -345,7 +300,7 @@ def test_read_at_cursor_null_has_no_candidate_or_release() -> None:
     assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL, 600) is None
     adapter = MessageFactRefreshDemandAdapter(
         MessageFactRefreshDeps(
-            conn, cast(ReactionFreshener, _ReactionFreshener()), cast(TelegramReadReceiptGateway, object())
+            conn, cast(ReactionDetailRefresher, object()), cast(TelegramReadReceiptGateway, object())
         ),
         _policy(reaction_max=0),
     )
@@ -383,7 +338,7 @@ def test_terminal_read_at_set_has_no_status_or_release() -> None:
     seed_full_history_enrollment(conn, 20, enabled=True)
     adapter = MessageFactRefreshDemandAdapter(
         MessageFactRefreshDeps(
-            conn, cast(ReactionFreshener, _ReactionFreshener()), cast(TelegramReadReceiptGateway, object())
+            conn, cast(ReactionDetailRefresher, object()), cast(TelegramReadReceiptGateway, object())
         ),
         _policy(reaction_max=0),
     )
@@ -397,14 +352,13 @@ def test_terminal_read_at_set_has_no_status_or_release() -> None:
 @pytest.mark.asyncio
 async def test_refresh_message_facts_once_respects_zero_budget() -> None:
     conn = _make_db()
-    reactions = _ReactionFreshener()
     read_receipts = _ReadReceiptGateway()
 
     try:
         result = await refresh_message_facts_once(
             MessageFactRefreshDeps(
                 conn,
-                cast(ReactionFreshener, reactions),
+                cast(ReactionDetailRefresher, object()),
                 cast(TelegramReadReceiptGateway, read_receipts),
             ),
             _policy(reaction_max=0, read_at_max=0),
@@ -415,5 +369,4 @@ async def test_refresh_message_facts_once_respects_zero_budget() -> None:
         conn.close()
 
     assert result.reaction_refreshed == 0
-    assert reactions.calls == []
     assert read_receipts.calls == []

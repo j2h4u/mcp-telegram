@@ -12,8 +12,8 @@ def project_reaction_aggregates(reactions: object | None) -> tuple[ReactionAggre
     """Project only Telegram's aggregate reaction fields.
 
     This intentionally accepts the nested ``MessageReactions`` object rather
-    than a full message.  JIT reaction reads must not depend on unrelated
-    message fields such as text, sender, or timestamp.
+    than a full message, so aggregate projection does not depend on unrelated
+    fields such as text, sender, or timestamp.
     """
     if reactions is None:
         return ()

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,12 +12,11 @@ from mcp_telegram.reactions.contracts import (
     ReactionDetailFetchResult,
     ReactionDetailPage,
     ReactionEvent,
-    ReactionFetchResult,
 )
 from mcp_telegram.reactions.detail import ReactionDetailRefresher
 from mcp_telegram.reactions.persistence import apply_aggregate_observation
 from mcp_telegram.reactions.telegram_adapter import TelethonTelegramReactionGateway
-from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.sync_db import _apply_migration_68, ensure_sync_schema
 
 
 def _db(tmp_path: Path) -> sqlite3.Connection:
@@ -60,10 +58,6 @@ def test_detail_partial_offset_survives_restart_and_publishes(tmp_path: Path) ->
     class Gateway:
         def __init__(self) -> None:
             self.offsets: list[str | None] = []
-
-        async def fetch_reactions(self, entity: object, message_ids: Sequence[int]) -> ReactionFetchResult:
-            del entity, message_ids
-            raise AssertionError("legacy multi-message gateway must not be used")
 
         async def fetch_reaction_page(
             self, entity: object, message_id: int, *, offset: str | None, limit: int
@@ -114,3 +108,50 @@ def test_detail_gateway_uses_one_page_and_never_get_messages() -> None:
     assert result.ok
     assert client.pages == 1
     assert client.resolved == [42]
+
+
+def test_reaction_migration_preserves_empty_receipts_and_cleans_orphans() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE schema_version(version INTEGER, applied_at INTEGER);
+        CREATE TABLE messages(dialog_id INTEGER, message_id INTEGER, PRIMARY KEY(dialog_id, message_id));
+        CREATE TABLE message_reactions_freshness(
+            dialog_id INTEGER, message_id INTEGER, checked_at INTEGER,
+            PRIMARY KEY(dialog_id, message_id)
+        );
+        CREATE TABLE message_reactions(
+            dialog_id INTEGER, message_id INTEGER, emoji TEXT, count INTEGER,
+            PRIMARY KEY(dialog_id, message_id, emoji)
+        );
+        CREATE TABLE message_reaction_events(
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dialog_id INTEGER, message_id INTEGER, reactor_id INTEGER,
+            emoji TEXT, reacted_at INTEGER, fetched_at INTEGER NOT NULL
+        );
+        CREATE TABLE message_reaction_event_status(
+            dialog_id INTEGER, message_id INTEGER, checked_at INTEGER NOT NULL,
+            status TEXT NOT NULL, returned_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(dialog_id, message_id)
+        );
+        INSERT INTO messages VALUES (1, 2), (1, 3);
+        INSERT INTO message_reactions_freshness VALUES (1, 2, 100);
+        INSERT INTO message_reaction_event_status VALUES (1, 2, 101, 'complete', 0);
+        INSERT INTO message_reaction_event_status VALUES (1, 3, 102, 'unavailable', 1);
+        INSERT INTO message_reaction_event_status VALUES (1, 99, 103, 'complete', 1);
+        INSERT INTO message_reaction_events(dialog_id, message_id, emoji, fetched_at)
+            VALUES (1, 3, '👍', 102), (1, 99, '🔥', 103);
+        """
+    )
+
+    _apply_migration_68(conn, 67)
+
+    assert conn.execute(
+        "SELECT dialog_id, message_id, aggregate_row_count FROM message_reaction_aggregate_state ORDER BY message_id"
+    ).fetchall() == [(1, 2, 0), (1, 3, 0)]
+    assert conn.execute(
+        "SELECT message_id, status, display_generation FROM message_reaction_event_status ORDER BY message_id"
+    ).fetchall() == [(2, "complete", 1), (3, "unavailable", 1)]
+    assert conn.execute("SELECT message_id FROM message_reaction_events").fetchall() == [(3,)]
+    assert conn.execute("SELECT name FROM sqlite_master WHERE name='message_reactions_freshness'").fetchone() is None
+    conn.close()

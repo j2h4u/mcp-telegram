@@ -15,7 +15,6 @@ from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshPolicy,
     refresh_message_facts_once,
 )
-from mcp_telegram.reactions.refresh import ReactionFreshener
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_reading import ReadDateFetchResult, TelegramReadReceiptGateway
 
@@ -49,7 +48,6 @@ def _policy() -> MessageFactRefreshPolicy:
         reaction_max_messages_per_cycle=0,
         read_at_max_messages_per_cycle=1,
         pause_seconds=0.01,
-        reaction_ttl_seconds=600,
         read_at_ttl_seconds=600,
     )
 
@@ -85,7 +83,7 @@ def _close_dbs(*connections: _SQLiteConnection) -> None:
 
 
 @pytest.mark.asyncio
-async def test_read_at_disable_during_fetch_skips_read_fact_and_freshness_write(tmp_path: Path) -> None:
+async def test_read_at_disable_during_fetch_skips_read_fact_write(tmp_path: Path) -> None:
     dialog_id, message_id = 5101, 11
     handler_conn, disable_conn = _open_seeded_db(tmp_path / "read-at-race.db", dialog_id, message_id)
     gateway = _BlockingReadGateway()
@@ -94,7 +92,7 @@ async def test_read_at_disable_during_fetch_skips_read_fact_and_freshness_write(
             refresh_message_facts_once(
                 MessageFactRefreshDeps(
                     handler_conn,
-                    cast(ReactionFreshener, object()),
+                    object(),
                     cast(TelegramReadReceiptGateway, gateway),
                 ),
                 _policy(),
@@ -109,7 +107,6 @@ async def test_read_at_disable_during_fetch_skips_read_fact_and_freshness_write(
 
         assert gateway.calls == [(dialog_id, message_id)]
         assert handler_conn.execute("SELECT * FROM message_read_facts").fetchall() == []
-        assert handler_conn.execute("SELECT * FROM message_reactions_freshness").fetchall() == []
         assert disable_conn.execute(
             "SELECT enabled FROM full_history_enrollment WHERE dialog_id = ?", (dialog_id,)
         ).fetchone() == (0,)
@@ -126,7 +123,7 @@ async def test_read_at_enabled_path_persists_read_fact(tmp_path: Path) -> None:
         result = await refresh_message_facts_once(
             MessageFactRefreshDeps(
                 handler_conn,
-                cast(ReactionFreshener, object()),
+                object(),
                 cast(TelegramReadReceiptGateway, gateway),
             ),
             _policy(),
