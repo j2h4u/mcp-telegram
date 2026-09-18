@@ -183,6 +183,7 @@ class MessageFactRefreshDeps:
     reaction_detail_refresher: ReactionDetailRefresher
     read_receipt_gateway: TelegramReadReceiptGateway
     read_at_observer: Callable[[Mapping[str, object]], None] | None = None
+    clock: Callable[[], float] = time.time
 
 
 def _next_release_at(conn: sqlite3.Connection, query: str, ttl_seconds: int) -> float | None:
@@ -351,33 +352,22 @@ def _claim_reaction_pages(
                 "SELECT release_at, claimed_pages FROM reaction_detail_pacing_state WHERE singleton=1"
             ).fetchone(),
         )
-        if row is None:
-            conn.execute(
-                "INSERT INTO reaction_detail_pacing_state "
-                "(singleton, window_started_at, release_at, claimed_pages, started_pages) VALUES (1, 0, 0, 0, 0)"
-            )
-            release_at, claimed_pages = 0, 0
-        else:
-            release_at = int(cast(int | str, row[0]))
-            claimed_pages = int(cast(int | str, row[1]))
-        if now >= release_at:
-            release_at = now + cycle_seconds
-            claimed_pages = 0
-            conn.execute(
-                "UPDATE reaction_detail_pacing_state SET window_started_at=?, release_at=?, "
-                "claimed_pages=0, started_pages=0 WHERE singleton=1",
-                (now, release_at),
-            )
-        remaining = max_pages - claimed_pages
-        if remaining <= 0:
+        if row is not None and now < int(cast(int | str, row[0])):
             conn.commit()
             return []
-        rows = _reaction_candidates(conn, stale_before_utc=now, limit=min(candidate_limit, remaining))
-        if rows:
-            conn.execute(
-                "UPDATE reaction_detail_pacing_state SET claimed_pages=claimed_pages+? WHERE singleton=1",
-                (len(rows),),
-            )
+        rows = _reaction_candidates(conn, stale_before_utc=now, limit=min(candidate_limit, max_pages))
+        if not rows:
+            conn.commit()
+            return []
+        release_at = now + cycle_seconds
+        conn.execute(
+            "INSERT INTO reaction_detail_pacing_state "
+            "(singleton, window_started_at, release_at, claimed_pages, started_pages) "
+            "VALUES (1, ?, ?, ?, 0) "
+            "ON CONFLICT(singleton) DO UPDATE SET window_started_at=excluded.window_started_at, "
+            "release_at=excluded.release_at, claimed_pages=excluded.claimed_pages, started_pages=0",
+            (now, release_at, len(rows)),
+        )
         conn.commit()
         return rows
     except BaseException:
@@ -592,12 +582,16 @@ async def refresh_message_facts_once(
         stats = None
 
     reaction_refreshed = 0
-    selected_reaction_rows = _claim_reaction_pages(
-        deps.conn,
-        now=checked_at,
-        max_pages=policy.reaction_detail_max_pages_per_cycle,
-        cycle_seconds=policy.reaction_detail_cycle_seconds,
-        candidate_limit=policy.reaction_max_messages_per_cycle,
+    selected_reaction_rows = (
+        []
+        if shutdown_event is not None and shutdown_event.is_set()
+        else _claim_reaction_pages(
+            deps.conn,
+            now=checked_at,
+            max_pages=policy.reaction_detail_max_pages_per_cycle,
+            cycle_seconds=policy.reaction_detail_cycle_seconds,
+            candidate_limit=policy.reaction_max_messages_per_cycle,
+        )
     )
     for index, (dialog_id, message_id, generation, offset) in enumerate(selected_reaction_rows):
         if not _start_reaction_page(deps.conn):
@@ -613,7 +607,7 @@ async def refresh_message_facts_once(
         )
         reaction_refreshed += detail.fetched_pages
         if detail.retry_after is not None and detail.stop_cycle:
-            _extend_reaction_release(deps.conn, now=checked_at, retry_after=detail.retry_after)
+            _extend_reaction_release(deps.conn, now=int(deps.clock()), retry_after=detail.retry_after)
         if detail.stop_cycle or detail.status == "cancelled":
             break
         if shutdown_event is not None and index < len(selected_reaction_rows) - 1:

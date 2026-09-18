@@ -14,6 +14,7 @@ from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshDeps,
     MessageFactRefreshPolicy,
     _next_release_at,
+    _reaction_release_at,
     _read_at_candidates,
     refresh_message_facts_once,
 )
@@ -219,7 +220,6 @@ async def test_reaction_pacing_claim_survives_cancellation_and_restart(tmp_path:
     _seed_reaction_candidates(conn)
     calls: list[int] = []
     event = asyncio.Event()
-    event.set()
     policy = MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600)
     deps = MessageFactRefreshDeps(
         conn,
@@ -227,7 +227,10 @@ async def test_reaction_pacing_claim_survives_cancellation_and_restart(tmp_path:
         cast(TelegramReadReceiptGateway, object()),
     )
     await refresh_message_facts_once(deps, policy, now=100, shutdown_event=event)
-    assert len(calls) == 1
+    assert len(calls) == 5
+    event.set()
+    await refresh_message_facts_once(deps, policy, now=100, shutdown_event=event)
+    assert len(calls) == 5
     conn.close()
 
     reopened = sqlite3.connect(path)
@@ -241,8 +244,83 @@ async def test_reaction_pacing_claim_survives_cancellation_and_restart(tmp_path:
     assert calls == []
     assert reopened.execute(
         "SELECT claimed_pages, started_pages FROM reaction_detail_pacing_state"
-    ).fetchone() == (5, 1)
+    ).fetchone() == (5, 5)
     reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_open_reaction_window_accepts_only_one_claim_batch() -> None:
+    conn = _make_db()
+    _seed_reaction_candidates(conn, count=2)
+    calls: list[int] = []
+    deps = MessageFactRefreshDeps(
+        conn,
+        cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
+        cast(TelegramReadReceiptGateway, object()),
+    )
+    policy = MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600)
+
+    await refresh_message_facts_once(deps, policy, now=100)
+    conn.execute("INSERT INTO messages VALUES (1, 3, 3, 0, NULL, 0)")
+    conn.execute("INSERT INTO message_reaction_aggregate_state VALUES (1, 3, 1, 1, 3, 'history', 1, 1)")
+    conn.execute(
+        "INSERT INTO message_reaction_event_status "
+        "(dialog_id, message_id, aggregate_generation, status, checked_at, next_attempt_at) "
+        "VALUES (1, 3, 1, 'stale', 1, 1)"
+    )
+    conn.commit()
+    await refresh_message_facts_once(deps, policy, now=101)
+    assert len(calls) == 2
+    assert conn.execute(
+        "SELECT window_started_at, release_at, claimed_pages FROM reaction_detail_pacing_state"
+    ).fetchone() == (100, 700, 2)
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_reaction_scan_does_not_open_or_reset_window() -> None:
+    conn = _make_db()
+    calls: list[int] = []
+    deps = MessageFactRefreshDeps(
+        conn,
+        cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
+        cast(TelegramReadReceiptGateway, object()),
+    )
+    policy = MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600)
+
+    await refresh_message_facts_once(deps, policy, now=100)
+    assert calls == []
+    assert conn.execute(
+        "SELECT window_started_at, release_at, claimed_pages, started_pages "
+        "FROM reaction_detail_pacing_state"
+    ).fetchone() == (0, 0, 0, 0)
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_set_shutdown_skips_reaction_claim() -> None:
+    conn = _make_db()
+    _seed_reaction_candidates(conn, count=1)
+    calls: list[int] = []
+    deps = MessageFactRefreshDeps(
+        conn,
+        cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
+        cast(TelegramReadReceiptGateway, object()),
+    )
+    shutdown_event = asyncio.Event()
+    shutdown_event.set()
+    await refresh_message_facts_once(
+        deps,
+        MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600),
+        now=100,
+        shutdown_event=shutdown_event,
+    )
+    assert calls == []
+    assert conn.execute(
+        "SELECT window_started_at, release_at, claimed_pages, started_pages "
+        "FROM reaction_detail_pacing_state"
+    ).fetchone() == (0, 0, 0, 0)
+    conn.close()
 
 
 @pytest.mark.asyncio
@@ -255,13 +333,14 @@ async def test_reaction_flood_wait_extends_durable_release() -> None:
         conn,
         cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls, result)),
         cast(TelegramReadReceiptGateway, object()),
+        clock=lambda: 350,
     )
     await refresh_message_facts_once(
         deps,
         MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600),
         now=100,
     )
-    assert conn.execute("SELECT release_at FROM reaction_detail_pacing_state").fetchone() == (1_100,)
+    assert conn.execute("SELECT release_at FROM reaction_detail_pacing_state").fetchone() == (1_350,)
     conn.close()
 
 
@@ -301,6 +380,31 @@ async def test_read_date_runs_before_reaction_when_both_lanes_are_due() -> None:
         now=2_000,
     )
     assert order == ["read", "reaction"]
+    conn.close()
+
+
+def test_open_reaction_pacing_boundary_does_not_hide_due_read_dates() -> None:
+    conn = _make_db()
+    _seed_reaction_candidates(conn, count=1)
+    conn.execute("UPDATE reaction_detail_pacing_state SET release_at=700 WHERE singleton=1")
+    conn.executescript(
+        """
+        INSERT INTO synced_dialogs VALUES (20, 'synced', 2);
+        INSERT INTO entities VALUES (20, 'user');
+        INSERT INTO messages VALUES (20, 2, 1000, 1, NULL, 0);
+        """
+    )
+    seed_full_history_enrollment(conn, 20, enabled=True)
+    deps = MessageFactRefreshDeps(
+        conn,
+        cast(ReactionDetailRefresher, object()),
+        cast(TelegramReadReceiptGateway, object()),
+    )
+    policy = MessageFactRefreshPolicy(10, 1, 0, 600, 5, 600)
+    status = MessageFactRefreshDemandAdapter(deps, policy).status(100)
+    assert _reaction_release_at(conn) == 700
+    assert status is not None
+    assert status.release_at == 0
     conn.close()
 
 
