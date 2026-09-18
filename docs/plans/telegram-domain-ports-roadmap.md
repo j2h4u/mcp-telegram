@@ -1,12 +1,17 @@
 # Telegram Behind Domain Ports
 
-Status: completed first program; awaiting expert-panel rescoping
+Status: completed first program; panel recommendation awaiting operator acceptance
 Last reviewed: 2026-09-18
 
+Latest panel recommendation:
+[Expert Panel Recommendation, 2026-09-18](telegram-domain-ports-panel-2026-09-18.md).
+It proposes two evidence-backed slices and remains subject to operator
+acceptance.
+
 This document records the target architecture, the program completed through
-PR #270, and the remaining candidates that need fresh prioritization. It is an
-input to the next expert panel, not an approved sequence of future pull
-requests.
+PR #270, and the residual state considered by the 2026-09-18 expert panel. The
+panel produced a separate recommendation that remains subject to operator
+acceptance; neither document is an approved sequence of future pull requests.
 
 The accepted catalog-specific contract remains
 [Canonical Dialog Snapshot](canonical-dialog-snapshot.md). The broader current
