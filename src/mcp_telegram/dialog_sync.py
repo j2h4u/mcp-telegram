@@ -90,17 +90,6 @@ class _EntityLike(Protocol):
     date: datetime | None
 
 
-class _ForumTopicLike(Protocol):
-    id: int
-    title: str | None
-    icon_emoji_id: int | None
-    date: datetime | None
-
-
-class _ForumTopicsResultLike(Protocol):
-    topics: list[_ForumTopicLike]
-
-
 class _DialogSyncClient(Protocol):
     async def get_entity(self, _peer: object) -> _EntityLike: ...
 
