@@ -9,6 +9,11 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from telethon.errors import (  # type: ignore[import-untyped]
+    ChatAdminRequiredError,
+    MsgIdInvalidError,
+    PeerIdInvalidError,
+)
 
 from mcp_telegram.daemon_message import cached_reaction_freshness, project_cached_message_facts
 from mcp_telegram.flood import TelegramRpcThrottled
@@ -187,6 +192,33 @@ def test_detail_gateway_translates_private_and_flood_failures(
     assert result.failure.retry_after == retry_after
 
 
+@pytest.mark.parametrize(
+    ("error_type", "kind"),
+    [
+        (MsgIdInvalidError, GatewayFailureKind.INVALID_TARGET),
+        (PeerIdInvalidError, GatewayFailureKind.INVALID_TARGET),
+        (ChatAdminRequiredError, GatewayFailureKind.INVALID_TARGET),
+    ],
+)
+def test_detail_gateway_classifies_known_permanent_rpc_symbols(
+    error_type: type[Exception], kind: GatewayFailureKind
+) -> None:
+    class Client:
+        async def get_input_entity(self, entity: object) -> object:
+            del entity
+            raise error_type(None)
+
+        async def __call__(self, request: object) -> object:
+            del request
+            raise AssertionError("request must not be sent after permanent entity failure")
+
+    result = asyncio.run(TelethonTelegramReactionGateway(Client()).fetch_reaction_page(42, 2, offset=None, limit=100))
+    assert not result.ok
+    assert result.failure is not None
+    assert result.failure.kind is kind
+    assert result.failure.retryable is False
+
+
 def test_detail_gateway_propagates_rpc_admission_closed() -> None:
     with rpc_scope(TelegramRpcSource.MESSAGE_FACT_REFRESH) as scope:
         closed = RpcAdmissionClosedError(scope, "scheduler closed")
@@ -202,6 +234,31 @@ def test_detail_gateway_propagates_rpc_admission_closed() -> None:
 
     with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
         asyncio.run(TelethonTelegramReactionGateway(Client()).fetch_reaction_page(42, 2, offset=None, limit=100))
+
+
+def test_real_refresher_exposes_flood_wait_cycle_stop(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    apply_aggregate_observation(
+        conn, 1, 2, [ReactionAggregate("👍", 1)], source="history", observed_at=1, observation_sequence=1
+    )
+    conn.commit()
+
+    class Gateway:
+        async def fetch_reaction_page(
+            self, entity: object, message_id: int, *, offset: str | None, limit: int
+        ) -> ReactionDetailFetchResult:
+            del entity, message_id, offset, limit
+            return ReactionDetailFetchResult(
+                failure=GatewayFailure(GatewayFailureKind.FLOOD_WAIT, "Flood", "wait", False, retry_after=17)
+            )
+
+    result = asyncio.run(ReactionDetailRefresher(conn, Gateway()).refresh_one(1, 2, 1, entity=1, now=10))
+    assert result.status == "unavailable"
+    assert result.failure_kind == GatewayFailureKind.FLOOD_WAIT.value
+    assert result.retry_after == 17
+    assert result.stop_cycle
+    assert conn.execute("SELECT next_attempt_at FROM message_reaction_event_status").fetchone() == (27,)
+    conn.close()
 
 
 def test_identical_aggregate_advances_boundary_without_invalidating_detail(tmp_path: Path) -> None:
@@ -582,6 +639,68 @@ def test_permanent_detail_failure_is_terminal_until_new_aggregate(
         conn, 1, 2, [ReactionAggregate("🔥", 2)], source="raw_update", observed_at=2, observation_sequence=2
     )
     assert _reaction_candidates(conn, stale_before_utc=10, limit=10) == [(1, 2, 2, None)]
+    conn.close()
+
+
+def test_terminal_failure_clears_partial_staging_without_erasing_display(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    apply_aggregate_observation(
+        conn, 1, 2, [ReactionAggregate("👍", 1)], source="history", observed_at=1, observation_sequence=1
+    )
+    conn.execute(
+        "UPDATE message_reaction_event_status SET status='partial', detail_generation=1, display_generation=1, "
+        "published_generation=1, next_offset='resume', staged_count=1 WHERE dialog_id=1 AND message_id=2"
+    )
+    conn.execute(
+        "INSERT INTO message_reaction_events(dialog_id,message_id,reactor_id,emoji,fetched_at,detail_generation,page_ordinal,display_generation) "
+        "VALUES (1,2,8,'legacy',2,1,0,1), (1,2,9,'staged',2,1,1,0)"
+    )
+    conn.commit()
+
+    class Gateway:
+        async def fetch_reaction_page(
+            self, entity: object, message_id: int, *, offset: str | None, limit: int
+        ) -> ReactionDetailFetchResult:
+            del entity, message_id, offset, limit
+            return ReactionDetailFetchResult(
+                failure=GatewayFailure(GatewayFailureKind.INVALID_TARGET, "Permanent", "target", False)
+            )
+
+    result = asyncio.run(
+        ReactionDetailRefresher(conn, Gateway()).refresh_one(1, 2, 1, entity=1, offset="resume", now=10)
+    )
+    assert result.status == "unavailable"
+    assert result.next_offset is None
+    assert conn.execute(
+        "SELECT next_offset, staged_count, next_attempt_at FROM message_reaction_event_status"
+    ).fetchone() == (None, 0, None)
+    assert conn.execute(
+        "SELECT emoji, display_generation FROM message_reaction_events ORDER BY display_generation, emoji"
+    ).fetchall() == [("legacy", 1)]
+    conn.close()
+
+
+def test_identical_aggregate_keeps_terminal_detail_suppressed(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    apply_aggregate_observation(
+        conn, 1, 2, [ReactionAggregate("👍", 1)], source="history", observed_at=1, observation_sequence=1
+    )
+    conn.execute(
+        "UPDATE message_reaction_event_status SET status='unavailable', failure_kind='access_lost', "
+        "next_attempt_at=NULL WHERE dialog_id=1 AND message_id=2"
+    )
+    conn.commit()
+    assert apply_aggregate_observation(
+        conn, 1, 2, [ReactionAggregate("👍", 1)], source="history", observed_at=2, observation_sequence=2
+    )
+    assert conn.execute("SELECT generation, observation_sequence FROM message_reaction_aggregate_state").fetchone() == (
+        1,
+        2,
+    )
+    assert conn.execute(
+        "SELECT status, failure_kind, next_attempt_at FROM message_reaction_event_status"
+    ).fetchone() == ("unavailable", "access_lost", None)
+    assert _reaction_candidates(conn, stale_before_utc=10, limit=10) == []
     conn.close()
 
 

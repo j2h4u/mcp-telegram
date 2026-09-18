@@ -63,6 +63,7 @@ from .entity_profile.ports import (
 from .flood import TelegramRpcThrottled
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_reading import GatewayFailure, GatewayFailureKind
+from .telegram_rpc_error import is_reaction_detail_terminal_rpc_error
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, RpcAdmissionError, UnclassifiedTelegramRpcError
 
 CATCHABLE_GATEWAY_FAILURES = (Exception,)
@@ -934,6 +935,14 @@ def translate_gateway_failure(exc: BaseException) -> GatewayFailure:
     if isinstance(exc, ValueError):
         return GatewayFailure(GatewayFailureKind.INVALID_TARGET, type(exc).__name__, message, False)
     return GatewayFailure(GatewayFailureKind.TRANSIENT, type(exc).__name__, message, True)
+
+
+def translate_reaction_detail_failure(exc: BaseException) -> GatewayFailure:
+    """Translate one reaction-detail error with its bounded terminal RPC set."""
+    failure = translate_gateway_failure(exc)
+    if not is_reaction_detail_terminal_rpc_error(exc):
+        return failure
+    return GatewayFailure(GatewayFailureKind.INVALID_TARGET, failure.error_type, failure.error_message, False)
 
 
 async def fetch_scheduled_history_snapshot(

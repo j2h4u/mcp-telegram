@@ -9,7 +9,10 @@ from typing import Protocol, cast
 from telethon.tl import types
 from telethon.tl.functions.messages import GetMessageReactionsListRequest
 
-from ..telegram_gateway import CATCHABLE_GATEWAY_FAILURES, translate_gateway_failure
+from ..telegram_gateway import (
+    CATCHABLE_GATEWAY_FAILURES,
+    translate_reaction_detail_failure,
+)
 from ..telegram_rpc_scheduler import RpcAdmissionClosedError
 from .contracts import (
     ReactionDetailFetchResult,
@@ -22,7 +25,7 @@ from .ports import TelegramReactionGateway
 class _TelegramClientLike(Protocol):
     async def get_input_entity(self, entity: object) -> object: ...
 
-    def __call__(self, request: object) -> Awaitable[object]: ...
+    def __call__(self, _request: object) -> Awaitable[object]: ...
 
 
 class TelethonTelegramReactionGateway(TelegramReactionGateway):
@@ -100,4 +103,4 @@ class TelethonTelegramReactionGateway(TelegramReactionGateway):
         except RpcAdmissionClosedError:
             raise
         except CATCHABLE_GATEWAY_FAILURES as exc:
-            return ReactionDetailFetchResult(failure=translate_gateway_failure(exc))
+            return ReactionDetailFetchResult(failure=translate_reaction_detail_failure(exc))

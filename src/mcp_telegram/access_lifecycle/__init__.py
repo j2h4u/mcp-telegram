@@ -29,6 +29,23 @@ def _purge_hydration_jobs(conn: sqlite3.Connection, dialog_id: int) -> None:
     HydrationQueueRepository(conn).remove_active_for_dialog(dialog_id)
 
 
+def _rearm_access_lost_reaction_details(conn: sqlite3.Connection, dialog_id: int, now: int) -> None:
+    table = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_reaction_event_status'"
+        ).fetchone(),
+    )
+    if table is None:
+        return
+    conn.execute(
+        "UPDATE message_reaction_event_status SET status='stale', checked_at=?, next_offset=NULL, "
+        "next_attempt_at=?, staged_count=0, failure_kind=NULL "
+        "WHERE dialog_id=? AND status='unavailable' AND failure_kind='access_lost'",
+        (now, now, dialog_id),
+    )
+
+
 @contextmanager
 def _lifecycle_savepoint(conn: sqlite3.Connection) -> Iterator[None]:
     """Isolate one lifecycle operation without consuming an outer transaction."""
@@ -111,6 +128,7 @@ def restore_access_after_revalidation(
             (now, dialog_id),
         )
         restore_access_status(conn, dialog_id)
+        _rearm_access_lost_reaction_details(conn, dialog_id, now)
         conn.execute(
             """INSERT INTO dialogs (dialog_id, hidden, needs_refresh, snapshot_at, archived, pinned,
                unread_mentions_count, unread_reactions_count)

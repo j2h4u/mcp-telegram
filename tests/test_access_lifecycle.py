@@ -82,6 +82,39 @@ def test_access_restore_clears_read_position_retry() -> None:
         conn.close()
 
 
+def test_access_restore_rearms_only_access_lost_reaction_terminals() -> None:
+    conn = _db()
+    conn.execute(
+        "CREATE TABLE message_reaction_event_status ("
+        "dialog_id INTEGER, message_id INTEGER, status TEXT, checked_at INTEGER, next_offset TEXT, "
+        "next_attempt_at INTEGER, staged_count INTEGER, failure_kind TEXT, display_generation INTEGER, "
+        "PRIMARY KEY(dialog_id, message_id))"
+    )
+    conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (9, 'access_lost')")
+    seed_full_history_enrollment(conn, 9, enabled=True)
+    conn.execute("INSERT INTO dialogs VALUES (9, 1, 0, 1, 0, 0, 0, 0, 'x')")
+    conn.executemany(
+        "INSERT INTO message_reaction_event_status VALUES (?,?,?,?,?,?,?,?,?)",
+        [
+            (9, 1, "unavailable", 5, "old", None, 2, "access_lost", 4),
+            (9, 2, "unavailable", 5, None, None, 0, "invalid_target", 6),
+        ],
+    )
+    conn.commit()
+    try:
+        assert restore_access_after_revalidation(conn, 9, 12)
+        assert conn.execute(
+            "SELECT status, checked_at, next_offset, next_attempt_at, staged_count, failure_kind, display_generation "
+            "FROM message_reaction_event_status WHERE dialog_id=9 AND message_id=1"
+        ).fetchone() == ("stale", 12, None, 12, 0, None, 4)
+        assert conn.execute(
+            "SELECT status, next_attempt_at, failure_kind, display_generation "
+            "FROM message_reaction_event_status WHERE dialog_id=9 AND message_id=2"
+        ).fetchone() == ("unavailable", None, "invalid_target", 6)
+    finally:
+        conn.close()
+
+
 def test_complete_access_revalidation_keeps_access_lost_and_clears_retry() -> None:
     conn = _db()
     conn.execute(

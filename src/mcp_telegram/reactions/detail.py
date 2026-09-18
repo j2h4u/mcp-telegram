@@ -212,7 +212,11 @@ class ReactionDetailRefresher:
         return (
             failure is not None
             and not bool(getattr(failure, "retryable", True))
-            and kind in {"invalid_target", "access_lost"}
+            and kind
+            not in {
+                "flood_wait",
+                "transient",
+            }
         )
 
     @staticmethod
@@ -356,14 +360,23 @@ class ReactionDetailRefresher:
                 return ReactionDetailResult("ineligible")
             if not self._cas_status(dialog_id, message_id, generation, expected_status, expected_offset):
                 return ReactionDetailResult("stale_writer")
+            if terminal:
+                self._conn.execute(
+                    "DELETE FROM message_reaction_events WHERE dialog_id=? AND message_id=? "
+                    "AND detail_generation=? AND display_generation=0",
+                    (dialog_id, message_id, generation),
+                )
             self._ensure_status(dialog_id, message_id, generation, when)
             status_update = self._conn.execute(
-                "UPDATE message_reaction_event_status SET checked_at=?, status=?, next_attempt_at=?, failure_kind=? "
+                "UPDATE message_reaction_event_status SET checked_at=?, status=?, next_attempt_at=?, "
+                "next_offset=?, staged_count=?, failure_kind=? "
                 "WHERE dialog_id=? AND message_id=? AND aggregate_generation=? AND status=? AND next_offset IS ?",
                 (
                     when,
                     status,
                     next_attempt_at,
+                    None if terminal else expected_offset,
+                    0 if terminal else staged_count,
                     kind,
                     dialog_id,
                     message_id,
@@ -378,7 +391,7 @@ class ReactionDetailRefresher:
             self._observe("reaction.detail", "terminal_unavailable" if terminal else status)
         return ReactionDetailResult(
             status,
-            next_offset=expected_offset,
+            next_offset=None if terminal else expected_offset,
             failure_kind=kind,
             retry_after=retry_after,
         )
