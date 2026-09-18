@@ -354,14 +354,10 @@ class SchedulingConfig:
     read_position_reconciliation_batch_size: int = 15
     read_position_reconciliation_batch_pause_seconds: float = 1.5
     reconciliation_hourly_seconds: float = 3_600.0
-    delta_catch_up_interval_seconds: float = 300.0
-    delta_catch_up_max_probes_per_cycle: int = 10
-    delta_catch_up_probe_pause_seconds: float = 1.0
     reconnect_catch_up_interval_seconds: float = 5.0
     access_probe_interval_seconds: float = 86_400.0
     access_probe_max_dialogs_per_cycle: int = 3
     access_probe_cooldown_seconds: int = 604_800
-    access_probe_pause_seconds: float = 1.0
     message_fact_refresh_seconds: float = 600.0
     message_fact_refresh_reaction_max_messages_per_cycle: int = 5
     message_fact_refresh_read_at_max_messages_per_cycle: int = 5
@@ -680,15 +676,6 @@ def resolve_scheduling_config(
         reconciliation_hourly_seconds=_env_positive_float(
             env, "RECON_HOURLY_SECONDS", config.reconciliation_hourly_seconds
         ),
-        delta_catch_up_interval_seconds=_env_positive_float(
-            env, "DELTA_CATCH_UP_INTERVAL_SECONDS", config.delta_catch_up_interval_seconds
-        ),
-        delta_catch_up_max_probes_per_cycle=_env_non_negative_int(
-            env, "DELTA_CATCH_UP_MAX_PROBES_PER_CYCLE", config.delta_catch_up_max_probes_per_cycle
-        ),
-        delta_catch_up_probe_pause_seconds=_env_positive_float(
-            env, "DELTA_CATCH_UP_PROBE_PAUSE_SECONDS", config.delta_catch_up_probe_pause_seconds
-        ),
         reconnect_catch_up_interval_seconds=_env_positive_float(
             env, "RECONNECT_CATCH_UP_INTERVAL_SECONDS", config.reconnect_catch_up_interval_seconds
         ),
@@ -700,9 +687,6 @@ def resolve_scheduling_config(
         ),
         access_probe_cooldown_seconds=_env_non_negative_int(
             env, "ACCESS_PROBE_COOLDOWN_SECONDS", config.access_probe_cooldown_seconds
-        ),
-        access_probe_pause_seconds=_env_positive_float(
-            env, "ACCESS_PROBE_PAUSE_SECONDS", config.access_probe_pause_seconds
         ),
         message_fact_refresh_seconds=_env_positive_float(
             env, "MESSAGE_FACT_REFRESH_SECONDS", config.message_fact_refresh_seconds
@@ -1426,14 +1410,10 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "read_position_reconciliation_batch_size",
         "read_position_reconciliation_batch_pause_seconds",
         "reconciliation_hourly_seconds",
-        "delta_catch_up_interval_seconds",
-        "delta_catch_up_max_probes_per_cycle",
-        "delta_catch_up_probe_pause_seconds",
         "reconnect_catch_up_interval_seconds",
         "access_probe_interval_seconds",
         "access_probe_max_dialogs_per_cycle",
         "access_probe_cooldown_seconds",
-        "access_probe_pause_seconds",
         "message_fact_refresh_seconds",
         "message_fact_refresh_reaction_max_messages_per_cycle",
         "message_fact_refresh_read_at_max_messages_per_cycle",
@@ -1508,27 +1488,6 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             path,
             defaults.reconciliation_hourly_seconds,
         ),
-        delta_catch_up_interval_seconds=_positive_float(
-            scheduling_data,
-            "delta_catch_up_interval_seconds",
-            "scheduling",
-            path,
-            defaults.delta_catch_up_interval_seconds,
-        ),
-        delta_catch_up_max_probes_per_cycle=_non_negative_int(
-            scheduling_data,
-            "delta_catch_up_max_probes_per_cycle",
-            "scheduling",
-            path,
-            defaults.delta_catch_up_max_probes_per_cycle,
-        ),
-        delta_catch_up_probe_pause_seconds=_positive_float(
-            scheduling_data,
-            "delta_catch_up_probe_pause_seconds",
-            "scheduling",
-            path,
-            defaults.delta_catch_up_probe_pause_seconds,
-        ),
         reconnect_catch_up_interval_seconds=_positive_float(
             scheduling_data,
             "reconnect_catch_up_interval_seconds",
@@ -1556,13 +1515,6 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             "scheduling",
             path,
             defaults.access_probe_cooldown_seconds,
-        ),
-        access_probe_pause_seconds=_positive_float(
-            scheduling_data,
-            "access_probe_pause_seconds",
-            "scheduling",
-            path,
-            defaults.access_probe_pause_seconds,
         ),
         message_fact_refresh_seconds=_positive_float(
             scheduling_data,

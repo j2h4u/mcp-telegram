@@ -14,6 +14,7 @@ from mcp_telegram.activity_hot_sweep import HotActivityDemandAdapter, HotSweepPo
 from mcp_telegram.activity_substrate import ActivityClient
 from mcp_telegram.activity_sync import ArchiveBackfillDemandAdapter, ArchiveIncrementalDemandAdapter
 from mcp_telegram.delta_sync import (
+    AccessProbe,
     AccessProbePolicy,
     DeltaAccessProbeDemandAdapter,
     DeltaGapFillDemandAdapter,
@@ -74,6 +75,7 @@ class DemandCompositionDependencies:
     shutdown_event: asyncio.Event
     full_sync_worker: FullSyncWorker
     delta_sync_worker: DeltaSyncWorker
+    access_probe: AccessProbe
     dm_gap_scanner: DmGapScanPage
     dialog_directory: CanonicalDialogDirectory
     dialog_reconciliation_worker: DialogReconciliationWorker
@@ -108,6 +110,7 @@ def build_durable_adapter_map(dependencies: DemandCompositionDependencies) -> Ma
         DemandKind.DELTA_ACCESS_PROBE: DeltaAccessProbeDemandAdapter(
             dependencies.delta_sync_worker,
             dependencies.access_probe_policy,
+            dependencies.access_probe,
         ),
         DemandKind.HOT_ACTIVITY_PAGE: HotActivityDemandAdapter(
             dependencies.client,

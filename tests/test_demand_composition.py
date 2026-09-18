@@ -144,6 +144,7 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         "shutdown": asyncio.Event(),
         "full": MagicMock(),
         "delta": MagicMock(),
+        "access_probe": MagicMock(),
         "dm_gap_scanner": _DmGapScanner(),
         "dialog": MagicMock(),
         "directory": CanonicalDialogDirectory(MagicMock(), db_path, asyncio.Event()),
@@ -176,6 +177,7 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         shutdown_event=cast(asyncio.Event, objects["shutdown"]),
         full_sync_worker=cast(object, objects["full"]),  # type: ignore[arg-type]
         delta_sync_worker=cast(object, objects["delta"]),  # type: ignore[arg-type]
+        access_probe=cast(object, objects["access_probe"]),  # type: ignore[arg-type]
         dm_gap_scanner=cast(DmGapScanPage, objects["dm_gap_scanner"]),
         dialog_directory=cast(CanonicalDialogDirectory, objects["directory"]),
         dialog_reconciliation_worker=cast(object, objects["dialog"]),  # type: ignore[arg-type]

@@ -198,17 +198,18 @@ def test_runtime_observation_config_rejects_blocking_writer_timeout() -> None:
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
 def test_load_config_rejects_non_finite_positive_float(tmp_path: Path, value: str) -> None:
     path = _write_config(
-        tmp_path, f'[state]\ndir = "/state"\n\n[scheduling]\ndelta_catch_up_interval_seconds = {value}\n'
+        tmp_path,
+        f'[state]\ndir = "/state"\n\n[scheduling]\nread_position_reconciliation_seconds = {value}\n',
     )
 
-    with pytest.raises(ConfigError, match="delta_catch_up_interval_seconds"):
+    with pytest.raises(ConfigError, match="read_position_reconciliation_seconds"):
         load_config(path)
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
 def test_resolve_scheduling_rejects_non_finite_positive_float(value: str) -> None:
-    with pytest.raises(ConfigError, match="DELTA_CATCH_UP_INTERVAL_SECONDS"):
-        resolve_scheduling_config(SchedulingConfig(), {"DELTA_CATCH_UP_INTERVAL_SECONDS": value})
+    with pytest.raises(ConfigError, match="READ_POSITION_RECONCILIATION_SECONDS"):
+        resolve_scheduling_config(SchedulingConfig(), {"READ_POSITION_RECONCILIATION_SECONDS": value})
 
 
 def test_load_config_reads_nested_policy_overrides(tmp_path: Path) -> None:
@@ -270,13 +271,9 @@ read_position_reconciliation_failure_cooldown_seconds = 47
 read_position_reconciliation_batch_size = 16
 read_position_reconciliation_batch_pause_seconds = 1.75
 reconciliation_hourly_seconds = 49
-delta_catch_up_interval_seconds = 50
-delta_catch_up_max_probes_per_cycle = 7
-delta_catch_up_probe_pause_seconds = 3
 access_probe_interval_seconds = 86401
 access_probe_max_dialogs_per_cycle = 2
 access_probe_cooldown_seconds = 604801
-access_probe_pause_seconds = 5
 message_fact_refresh_seconds = 52
 message_fact_refresh_reaction_max_messages_per_cycle = 6
 message_fact_refresh_read_at_max_messages_per_cycle = 7
@@ -346,13 +343,9 @@ daemon_api_slow_request_seconds = 2.5
         read_position_reconciliation_batch_size=16,
         read_position_reconciliation_batch_pause_seconds=1.75,
         reconciliation_hourly_seconds=49.0,
-        delta_catch_up_interval_seconds=50.0,
-        delta_catch_up_max_probes_per_cycle=7,
-        delta_catch_up_probe_pause_seconds=3.0,
         access_probe_interval_seconds=86401.0,
         access_probe_max_dialogs_per_cycle=2,
         access_probe_cooldown_seconds=604801,
-        access_probe_pause_seconds=5.0,
         message_fact_refresh_seconds=52.0,
         message_fact_refresh_reaction_max_messages_per_cycle=6,
         message_fact_refresh_read_at_max_messages_per_cycle=7,
@@ -404,9 +397,6 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
             "READ_POSITION_RECONCILIATION_BATCH_PAUSE_SECONDS": "1.75",
             "SCHEDULED_FLOOD_SLEEP_THRESHOLD_SECONDS": "0",
             "RECON_HOURLY_SECONDS": "48",
-            "DELTA_CATCH_UP_INTERVAL_SECONDS": "54",
-            "DELTA_CATCH_UP_MAX_PROBES_PER_CYCLE": "8",
-            "DELTA_CATCH_UP_PROBE_PAUSE_SECONDS": "9",
             "MESSAGE_FACT_REFRESH_SECONDS": "55",
             "MESSAGE_FACT_REFRESH_REACTION_MAX_MESSAGES_PER_CYCLE": "6",
             "MESSAGE_FACT_REFRESH_READ_AT_MAX_MESSAGES_PER_CYCLE": "7",
@@ -425,7 +415,6 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
             "ACCESS_PROBE_INTERVAL_SECONDS": "86402",
             "ACCESS_PROBE_MAX_DIALOGS_PER_CYCLE": "4",
             "ACCESS_PROBE_COOLDOWN_SECONDS": "604802",
-            "ACCESS_PROBE_PAUSE_SECONDS": "6",
             "FACT_HYDRATION_INTERVAL_SECONDS": "47",
             "FACT_HYDRATION_MAX_REQUESTS_PER_CYCLE": "4",
             "FACT_HYDRATION_MAX_JOBS_PER_CYCLE": "301",
@@ -454,13 +443,9 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         read_position_reconciliation_batch_size=16,
         read_position_reconciliation_batch_pause_seconds=1.75,
         reconciliation_hourly_seconds=48.0,
-        delta_catch_up_interval_seconds=54.0,
-        delta_catch_up_max_probes_per_cycle=8,
-        delta_catch_up_probe_pause_seconds=9.0,
         access_probe_interval_seconds=86402.0,
         access_probe_max_dialogs_per_cycle=4,
         access_probe_cooldown_seconds=604802,
-        access_probe_pause_seconds=6.0,
         message_fact_refresh_seconds=55.0,
         message_fact_refresh_reaction_max_messages_per_cycle=6,
         message_fact_refresh_read_at_max_messages_per_cycle=7,
@@ -555,8 +540,20 @@ def test_resolve_scheduling_rejects_activity_hot_sweep_inverted_due_bounds() -> 
             "read_position_reconciliation_batch_pause_seconds",
         ),
         (
-            '[state]\ndir = "/state"\n\n[scheduling]\ndelta_catch_up_max_probes_per_cycle = true\n',
+            '[state]\ndir = "/state"\n\n[scheduling]\ndelta_catch_up_interval_seconds = 1\n',
+            "delta_catch_up_interval_seconds",
+        ),
+        (
+            '[state]\ndir = "/state"\n\n[scheduling]\ndelta_catch_up_max_probes_per_cycle = 1\n',
             "delta_catch_up_max_probes_per_cycle",
+        ),
+        (
+            '[state]\ndir = "/state"\n\n[scheduling]\ndelta_catch_up_probe_pause_seconds = 1\n',
+            "delta_catch_up_probe_pause_seconds",
+        ),
+        (
+            '[state]\ndir = "/state"\n\n[scheduling]\naccess_probe_pause_seconds = 1\n',
+            "access_probe_pause_seconds",
         ),
         (
             '[state]\ndir = "/state"\n\n[telegram_rpc]\nmax_calls_per_period = -1\n',

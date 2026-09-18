@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from telethon.errors import ChannelPrivateError, RPCError  # type: ignore[import-untyped]
+from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
 from helpers import MockTotalList, build_mock_message
 from mcp_telegram.delta_sync import (
@@ -20,13 +21,19 @@ from mcp_telegram.delta_sync import (
     DeltaAccessProbeDemandAdapter,
     DeltaGapFillDemandAdapter,
     DeltaSyncWorker,
-    _DeltaSyncClient,
 )
 from mcp_telegram.dialog_sync import DialogLightReconciliationDemandAdapter, DialogReconciliationWorker
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.message_history.contracts import MessageHistoryAccessLostError, MessageHistoryUnavailableError
+from mcp_telegram.message_history.ports import ForwardGapPagePort, FullHistoryPagePort
+from mcp_telegram.message_history.telegram_adapter import (
+    TelethonForwardGapPageAdapter,
+    TelethonFullHistoryPageAdapter,
+    TelethonHistoryAccessProbe,
+)
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter, FullSyncWorker
-from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
+from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget, acquisition_context
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
@@ -79,7 +86,6 @@ def _delta_policy() -> AccessProbePolicy:
         interval_seconds=86_400.0,
         max_dialogs_per_cycle=1,
         cooldown_seconds=100,
-        probe_pause_seconds=0.0,
     )
 
 
@@ -94,7 +100,7 @@ async def test_full_sync_adapter_status_is_read_only_and_slice_has_precise_scope
         return MockTotalList([], total=0)
 
     client = SimpleNamespace(get_messages=get_messages)
-    worker = FullSyncWorker(client, conn, asyncio.Event())
+    worker = FullSyncWorker(TelethonFullHistoryPageAdapter(client), conn, asyncio.Event())
     adapter = FullSyncDemandAdapter(worker)
     changes_before = conn.total_changes
 
@@ -108,6 +114,44 @@ async def test_full_sync_adapter_status_is_read_only_and_slice_has_precise_scope
     assert scope.acquisition_kind is AcquisitionKind.MESSAGE_HISTORY_PAGE
     assert scope.attempt_budget is budget
     assert adapter.status(500.0) is None
+
+
+@pytest.mark.asyncio
+async def test_full_history_forward_name_enrichment_keeps_entity_lookup_attribution(
+    conn: sqlite3.Connection,
+) -> None:
+    dialog_id = 102
+    _seed_history_dialog(conn, dialog_id, status="syncing")
+    observed_scopes: list[TelegramRpcScope] = []
+    message = build_mock_message(id=1)
+    message.fwd_from = SimpleNamespace(
+        from_id=PeerChannel(channel_id=123),
+        from_name=None,
+        date=None,
+        channel_post=None,
+    )
+
+    async def get_messages(**_kwargs: object) -> MockTotalList:
+        return MockTotalList([message], total=1)
+
+    async def get_entity(_peer: object) -> object:
+        observed_scopes.append(current_rpc_scope())
+        return SimpleNamespace(title="Forwarded source")
+
+    worker = FullSyncWorker(
+        TelethonFullHistoryPageAdapter(
+            SimpleNamespace(get_messages=get_messages, get_entity=get_entity),
+            entity_lookup_context=lambda: acquisition_context(AcquisitionKind.ENTITY_LOOKUP),
+        ),
+        conn,
+        asyncio.Event(),
+    )
+    budget = RpcAttemptBudget(limit=1)
+    await FullSyncDemandAdapter(worker).run_slice(budget)
+
+    assert observed_scopes[0].demand_kind is DemandKind.FULL_SYNC_PAGE
+    assert observed_scopes[0].acquisition_kind is AcquisitionKind.ENTITY_LOOKUP
+    assert observed_scopes[0].attempt_budget is budget
 
 
 def _publish_generation(conn: sqlite3.Connection, generation: int = 1) -> None:
@@ -145,7 +189,7 @@ async def test_dm_enrollment_consumes_completed_publication_locally_and_idempote
         def __getattr__(self, name: str) -> object:
             raise AssertionError(f"unexpected Telegram method: {name}")
 
-    worker = FullSyncWorker(NoTelegramCalls(), conn, asyncio.Event())
+    worker = FullSyncWorker(cast(FullHistoryPagePort, NoTelegramCalls()), conn, asyncio.Event())
     adapter = FullSyncDmEnrollmentDemandAdapter(worker)
     assert adapter.status(10.0) is not None
     await adapter.run_slice(RpcAttemptBudget(limit=1))
@@ -178,7 +222,7 @@ async def test_dm_enrollment_consumes_completed_publication_locally_and_idempote
 
 
 def test_dm_enrollment_waits_for_a_completed_publication(conn: sqlite3.Connection) -> None:
-    worker = FullSyncWorker(object(), conn, asyncio.Event())
+    worker = FullSyncWorker(cast(FullHistoryPagePort, object()), conn, asyncio.Event())
     adapter = FullSyncDmEnrollmentDemandAdapter(worker)
     assert adapter.status(10.0) is None
     conn.execute("UPDATE dialog_directory_state SET status='in_progress'")
@@ -195,7 +239,7 @@ async def test_dm_enrollment_restarts_after_interruption_without_replaying_teleg
         [(121, "user", "One", 1, 2), (122, "user", "Two", 3, 4)],
     )
     _publish_generation(conn, 7)
-    worker = FullSyncWorker(object(), conn, asyncio.Event())
+    worker = FullSyncWorker(cast(FullHistoryPagePort, object()), conn, asyncio.Event())
     original = worker._consume_one_canonical_dm
     calls = 0
 
@@ -230,7 +274,7 @@ async def test_dm_enrollment_restarts_after_interruption_without_replaying_teleg
 
 def test_delta_gap_status_uses_refresh_or_recency_boundary_without_writes(conn: sqlite3.Connection) -> None:
     _seed_history_dialog(conn, 201, status="synced", last_delta_checked_at=100)
-    worker = DeltaSyncWorker(cast(_DeltaSyncClient, SimpleNamespace()), conn, asyncio.Event())
+    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event())
     adapter = DeltaGapFillDemandAdapter(worker)
     changes_before = conn.total_changes
 
@@ -264,7 +308,7 @@ async def test_delta_gap_slice_commits_one_page_and_keeps_durable_continuation(
             yield message
 
     worker = DeltaSyncWorker(
-        cast(_DeltaSyncClient, SimpleNamespace(iter_messages=iter_messages)), conn, asyncio.Event()
+        TelethonForwardGapPageAdapter(SimpleNamespace(iter_messages=iter_messages)), conn, asyncio.Event()
     )
     adapter = DeltaGapFillDemandAdapter(worker)
     budget = RpcAttemptBudget(limit=1)
@@ -316,7 +360,7 @@ async def test_delta_gap_adapter_resumes_dm_tombstone_cursor_after_restart(conn:
             return 0
 
     scanner = Scanner()
-    worker = DeltaSyncWorker(cast(_DeltaSyncClient, SimpleNamespace()), conn, asyncio.Event())
+    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event())
     adapter = DeltaGapFillDemandAdapter(worker, scanner)
 
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
@@ -357,7 +401,7 @@ async def test_delta_gap_tombstone_cursor_does_not_skip_after_earlier_dialog_is_
             return 0
 
     scanner = Scanner()
-    worker = DeltaSyncWorker(cast(_DeltaSyncClient, SimpleNamespace()), conn, asyncio.Event())
+    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event())
     adapter = DeltaGapFillDemandAdapter(worker, scanner)
 
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
@@ -407,10 +451,13 @@ async def test_delta_gap_adapter_propagates_coordinator_outcomes_without_checkpo
         yield  # pragma: no cover
 
     adapter = DeltaGapFillDemandAdapter(
-        DeltaSyncWorker(cast(_DeltaSyncClient, SimpleNamespace(iter_messages=iter_messages)), conn, asyncio.Event())
+        DeltaSyncWorker(
+            TelethonForwardGapPageAdapter(SimpleNamespace(iter_messages=iter_messages)), conn, asyncio.Event()
+        )
     )
 
-    with pytest.raises(failure_type):
+    expected_failure = MessageHistoryUnavailableError if failure_type is RPCError else failure_type
+    with pytest.raises(expected_failure):
         await adapter.run_slice(RpcAttemptBudget(limit=1))
     assert conn.execute(
         "SELECT delta_refresh_requested_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id=?",
@@ -434,10 +481,16 @@ async def test_full_sync_total_repair_uses_durable_retry_boundary(conn: sqlite3.
             raise OSError("temporary Telegram failure")
         return MockTotalList([], total=17)
 
-    worker = FullSyncWorker(SimpleNamespace(get_messages=get_messages), conn, asyncio.Event())
+    client = SimpleNamespace(get_messages=get_messages)
+    worker = FullSyncWorker(
+        TelethonFullHistoryPageAdapter(client),
+        conn,
+        asyncio.Event(),
+        total_messages_probe=TelethonHistoryAccessProbe(client),
+    )
     adapter = FullSyncDemandAdapter(worker)
     with patch("mcp_telegram.sync_worker.time.time", return_value=1000):
-        with pytest.raises(OSError, match="temporary Telegram failure"):
+        with pytest.raises(MessageHistoryUnavailableError):
             await adapter.run_slice(RpcAttemptBudget(limit=1))
     assert calls == 1
     assert conn.execute(
@@ -456,6 +509,33 @@ async def test_full_sync_total_repair_uses_durable_retry_boundary(conn: sqlite3.
 
 
 @pytest.mark.asyncio
+async def test_full_sync_total_repair_persists_access_loss_reason(conn: sqlite3.Connection) -> None:
+    dialog_id = 205
+    _seed_history_dialog(conn, dialog_id, status="synced")
+
+    class AccessLostProbe:
+        async def probe_total_messages(self, dialog_id: int) -> int | None:
+            del dialog_id
+            raise MessageHistoryAccessLostError("history access lost", reason_code="ChannelPrivateError")
+
+    worker = FullSyncWorker(
+        cast(FullHistoryPagePort, object()),
+        conn,
+        asyncio.Event(),
+        total_messages_probe=AccessLostProbe(),
+    )
+
+    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        "access_lost",
+    )
+    assert conn.execute(
+        "SELECT reason_code FROM conversation_history_events WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == ("ChannelPrivateError",)
+
+
+@pytest.mark.asyncio
 async def test_full_sync_page_adapter_propagates_rpc_failure_and_preserves_progress(conn: sqlite3.Connection) -> None:
     dialog_id = 207
     _seed_history_dialog(conn, dialog_id, status="syncing")
@@ -465,8 +545,9 @@ async def test_full_sync_page_adapter_propagates_rpc_failure_and_preserves_progr
     async def get_messages(**_kwargs: object) -> MockTotalList:
         raise RPCError(None, "history failed")
 
-    adapter = FullSyncDemandAdapter(FullSyncWorker(SimpleNamespace(get_messages=get_messages), conn, asyncio.Event()))
-    with pytest.raises(RPCError, match="history failed"):
+    client = SimpleNamespace(get_messages=get_messages)
+    adapter = FullSyncDemandAdapter(FullSyncWorker(TelethonFullHistoryPageAdapter(client), conn, asyncio.Event()))
+    with pytest.raises(MessageHistoryUnavailableError):
         await adapter.run_slice(RpcAttemptBudget(limit=1))
     assert conn.execute(
         "SELECT status, sync_progress FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
@@ -484,7 +565,8 @@ async def test_full_sync_page_adapter_defers_to_coordinator_without_local_sleep(
     async def get_messages(**_kwargs: object) -> MockTotalList:
         raise TelegramRpcAdmissionDeferred(retry_after_seconds=9)
 
-    adapter = FullSyncDemandAdapter(FullSyncWorker(SimpleNamespace(get_messages=get_messages), conn, asyncio.Event()))
+    client = SimpleNamespace(get_messages=get_messages)
+    adapter = FullSyncDemandAdapter(FullSyncWorker(TelethonFullHistoryPageAdapter(client), conn, asyncio.Event()))
     with (
         patch("mcp_telegram.sync_worker.sleep_through_flood", new=AsyncMock()) as sleep,
         pytest.raises(TelegramRpcAdmissionDeferred),
@@ -508,9 +590,9 @@ async def test_access_probe_adapter_restores_non_enrolled_peer_with_precise_scop
         observed_scopes.append(current_rpc_scope())
         return MockTotalList([], total=0)
 
-    client = cast(_DeltaSyncClient, SimpleNamespace(get_messages=get_messages))
-    worker = DeltaSyncWorker(client, conn, asyncio.Event())
-    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy())
+    client = SimpleNamespace(get_messages=get_messages)
+    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event())
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), TelethonHistoryAccessProbe(client))
     changes_before = conn.total_changes
 
     assert adapter.status(500.0).release_at == 101.0  # type: ignore[union-attr]
@@ -541,12 +623,9 @@ async def test_access_probe_adapter_persists_probe_to_gap_fill_handoff(conn: sql
         return
         yield  # pragma: no cover
 
-    worker = DeltaSyncWorker(
-        cast(_DeltaSyncClient, SimpleNamespace(get_messages=get_messages, iter_messages=iter_messages)),
-        conn,
-        asyncio.Event(),
-    )
-    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy())
+    client = SimpleNamespace(get_messages=get_messages, iter_messages=iter_messages)
+    worker = DeltaSyncWorker(TelethonForwardGapPageAdapter(client), conn, asyncio.Event())
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), TelethonHistoryAccessProbe(client))
 
     await adapter.run_slice(RpcAttemptBudget(limit=1))
 
@@ -558,7 +637,7 @@ async def test_access_probe_adapter_persists_probe_to_gap_fill_handoff(conn: sql
         "access_lost",
     )
 
-    restarted = DeltaAccessProbeDemandAdapter(worker, _delta_policy())
+    restarted = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), TelethonHistoryAccessProbe(client))
     await restarted.run_slice(RpcAttemptBudget(limit=1))
 
     assert conn.execute("SELECT 1 FROM delta_access_recovery_state WHERE dialog_id=?", (dialog_id,)).fetchone() is None
@@ -604,8 +683,9 @@ async def test_access_probe_slice_records_retry_policy_for_probe_outcomes(
         raise RPCError(None, "probe RPC failed")
 
     get_messages.side_effect = fail
-    worker = DeltaSyncWorker(cast(_DeltaSyncClient, SimpleNamespace(get_messages=get_messages)), conn, asyncio.Event())
-    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy())
+    client = SimpleNamespace(get_messages=get_messages)
+    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event())
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), TelethonHistoryAccessProbe(client))
 
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
         await adapter.run_slice(RpcAttemptBudget(limit=1))
