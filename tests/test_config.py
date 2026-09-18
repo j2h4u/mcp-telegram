@@ -195,6 +195,23 @@ def test_runtime_observation_config_rejects_blocking_writer_timeout() -> None:
         RuntimeObservationConfig(writer_busy_timeout_ms=51)
 
 
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_load_config_rejects_non_finite_positive_float(tmp_path: Path, value: str) -> None:
+    path = _write_config(
+        tmp_path,
+        f'[state]\ndir = "/state"\n\n[scheduling]\nread_position_reconciliation_seconds = {value}\n',
+    )
+
+    with pytest.raises(ConfigError, match="read_position_reconciliation_seconds"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_resolve_scheduling_rejects_non_finite_positive_float(value: str) -> None:
+    with pytest.raises(ConfigError, match="READ_POSITION_RECONCILIATION_SECONDS"):
+        resolve_scheduling_config(SchedulingConfig(), {"READ_POSITION_RECONCILIATION_SECONDS": value})
+
+
 def test_load_config_reads_nested_policy_overrides(tmp_path: Path) -> None:
     path = _write_config(
         tmp_path,
