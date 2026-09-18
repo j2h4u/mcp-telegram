@@ -24,22 +24,20 @@ import time
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
 from functools import wraps
 from typing import Protocol, cast
-
-from telethon.errors import RPCError  # type: ignore[import-untyped]
 
 from .access_lifecycle import set_access_lost
 from .entity_store import EntitySnapshot, upsert_entity_stub
 from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
 from .history_enrollment import ensure_automatic_dm_enrollment, full_history_enabled
 from .hydration_queue import HydrationPriority
+from .message_contracts import ExtractedMessage
+from .message_history.contracts import MessageHistoryAccessLostError, MessageHistoryUnavailableError
+from .message_history.ports import FullHistoryPagePort
 from .messages.sqlite_bundle import insert_messages_with_fts
-from .messages.telegram_adapter import PeerNameClient, extract_message_row, resolve_forward_entity_name_map
 from .read_state import apply_read_cursor
 from .resolver import latinize
-from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import (
     AcquisitionKind,
     DemandStatus,
@@ -132,46 +130,16 @@ _UPDATE_PROGRESS_DONE_SQL = (
 )
 
 
-class _EntityLike(Protocol):
-    id: int
+class TotalMessagesProbe(Protocol):
+    """Single-message access probe used by total repair, outside page ports."""
 
-
-class _MessageLike(Protocol):
-    id: int
-
-
-class _ForumTopicLike(Protocol):
-    id: int
-    title: str | None
-    icon_emoji_id: int | None
-    date: datetime | None
-
-
-class _ForumTopicsResultLike(Protocol):
-    topics: Sequence[_ForumTopicLike]
-
-
-class _MessagesPageLike(Protocol):
-    total: int
-
-    def __iter__(self) -> Iterator[_MessageLike]: ...
-
-
-class _SyncWorkerClient(Protocol):
-    async def get_messages(self, **_kwargs: object) -> _MessagesPageLike: ...
-
-    async def get_entity(self, _entity_id: object) -> _EntityLike: ...
-
-    async def __call__(self, _request: object) -> _ForumTopicsResultLike: ...
-
-
-_DialogRow = dict[str, object]
+    async def probe_total_messages(self, dialog_id: int) -> int | None: ...
 
 
 @dataclass(frozen=True, slots=True)
 class _FetchedBatchPage:
     total_messages: int | None
-    batch: list[_MessageLike]
+    batch: tuple[ExtractedMessage, ...]
     retry: tuple[int, bool] | None = None
 
 
@@ -218,19 +186,23 @@ class FullSyncWorker:
     between heartbeat ticks in sync_main().
 
     Args:
-        client: Telethon TelegramClient (daemon owns the connection).
+        history_port: Transport-neutral backward history page port.
         conn: Open SQLite writer connection to sync.db.
         shutdown_event: asyncio.Event set when SIGTERM is received.
             Used to make FloodWait sleeps interruptible.
+        total_messages_probe: Narrow access/total probe kept outside page ports.
     """
 
     def __init__(
         self,
-        client: object,
+        history_port: FullHistoryPagePort,
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
+        *,
+        total_messages_probe: TotalMessagesProbe | None = None,
     ) -> None:
-        self._client = cast(_SyncWorkerClient, client)
+        self._history_port = history_port
+        self._total_messages_probe = total_messages_probe
         self._conn = conn
         self._shutdown_event = shutdown_event
         self._last_page_error: BaseException | None = None
@@ -346,8 +318,12 @@ class FullSyncWorker:
         dialog_id = self._next_total_messages_repair_dialog()
         if dialog_id is None:
             return True
+        if self._total_messages_probe is None:
+            error = RuntimeError("total-message repair requires an explicit access probe")
+            self._last_total_repair_error = error
+            return False
         try:
-            result = await self._client.get_messages(entity=dialog_id, limit=1)
+            total_messages = await self._total_messages_probe.probe_total_messages(dialog_id)
         except RpcAttemptBudgetExhaustedError:
             raise
         except RpcAdmissionClosedError:
@@ -371,17 +347,16 @@ class FullSyncWorker:
             self._set_total_repair_retry(exc.retry_after_seconds)
             self._last_total_repair_error = exc
             return False
-        except ACCESS_LOST_ERRORS as exc:
+        except MessageHistoryAccessLostError as exc:
             set_access_lost(self._conn, dialog_id, int(time.time()), reason=type(exc).__name__)
             self._conn.commit()
             return False
-        except (RPCError, TimeoutError, OSError) as exc:
+        except MessageHistoryUnavailableError as exc:
             logger.warning("sync_total_repair_failed dialog_id=%d error=%s", dialog_id, exc)
             self._set_total_repair_retry(None)
             self._last_total_repair_error = exc
             return False
 
-        total_messages = cast(int | None, getattr(result, "total", None))
         if total_messages is None:
             logger.warning("sync_total_repair_missing_total dialog_id=%d", dialog_id)
             self._set_total_repair_retry(None)
@@ -454,7 +429,7 @@ class FullSyncWorker:
                 type(exc).__name__,
             )
         self._last_page_error = exc
-        return _FetchedBatchPage(None, [], (sync_progress, False))
+        return _FetchedBatchPage(None, (), (sync_progress, False))
 
     async def _handle_batch_page_error(
         self,
@@ -471,32 +446,32 @@ class FullSyncWorker:
             logger.warning("Telegram RPC throttled dialog_id=%d — retry_after=%s", dialog_id, exc.retry_after_seconds)
             await self._sleep_for_batch_retry(exc.retry_after_seconds)
             self._last_page_error = exc
-            return _FetchedBatchPage(None, [], (sync_progress, False))
-        if isinstance(exc, ACCESS_LOST_ERRORS):
+            return _FetchedBatchPage(None, (), (sync_progress, False))
+        if isinstance(exc, MessageHistoryAccessLostError):
             now = int(time.time())
             set_access_lost(self._conn, dialog_id, now, reason=type(exc).__name__)
             self._conn.commit()
-            return _FetchedBatchPage(None, [], (sync_progress, True))
+            return _FetchedBatchPage(None, (), (sync_progress, True))
         raise exc
 
     async def _fetch_batch_page(self, dialog_id: int, sync_progress: int) -> _FetchedBatchPage:
         self._last_page_error = None
         try:
-            result = await self._client.get_messages(entity=dialog_id, limit=_BATCH_SIZE, offset_id=sync_progress)
-        except ACCESS_LOST_ERRORS as exc:
+            page = await self._history_port.fetch_page(dialog_id, before_message_id=sync_progress)
+        except MessageHistoryAccessLostError as exc:
             return await self._handle_batch_page_error(dialog_id, sync_progress, exc)
         except (TelegramRpcThrottled, RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
             return await self._handle_batch_page_error(dialog_id, sync_progress, exc)
-        except RPCError as exc:
+        except MessageHistoryUnavailableError as exc:
             logger.exception(
                 "sync_batch_rpc_error dialog_id=%d error=%s — dialog NOT marked synced, will retry",
                 dialog_id,
                 exc,
             )
             self._last_page_error = exc
-            return _FetchedBatchPage(None, [], (sync_progress, False))
-        total_messages = result.total if sync_progress == 0 else None
-        return _FetchedBatchPage(total_messages, list(result))
+            return _FetchedBatchPage(None, (), (sync_progress, False))
+        total_messages = page.total_messages if sync_progress == 0 else None
+        return _FetchedBatchPage(total_messages, page.messages)
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def _fetch_batch(self, dialog_id: int, sync_progress: int) -> tuple[int, bool]:
@@ -508,7 +483,7 @@ class FullSyncWorker:
         message_id; a partial or empty batch marks the dialog 'synced'.
 
         On TelegramRpcThrottled: sleep interruptibly, return (same_progress, False).
-        On other RPCError: log ERROR, return (same_progress, False) — dialog stays
+        On an ordinary remote error: log ERROR, return (same_progress, False) — dialog stays
         in-progress for retry on the next sync cycle.
 
         Returns:
@@ -523,18 +498,13 @@ class FullSyncWorker:
             return page.retry
         return await self._store_batch_page(dialog_id, sync_progress, page.total_messages, page.batch)
 
-    @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.ENTITY_LOOKUP)
-    async def _resolve_batch_entity_name_map(self, batch: Sequence[_MessageLike]) -> dict[int, str]:
-        """Resolve forward source names for messages in a fetched batch."""
-        return await resolve_forward_entity_name_map(batch, cast(PeerNameClient, self._client))
-
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def _store_batch_page(
         self,
         dialog_id: int,
         sync_progress: int,
         total_messages: int | None,
-        batch: Sequence[_MessageLike],
+        batch: Sequence[ExtractedMessage],
     ) -> tuple[int, bool]:
         """Persist one fetched batch and update sync progress."""
         if not batch:
@@ -547,14 +517,8 @@ class FullSyncWorker:
             logger.info("sync_done dialog_id=%d status=synced (empty batch)", dialog_id)
             return sync_progress, True
 
-        # Resolve forward-source names from the batch entity cache.
-        # Telegram includes users/chats for forward sources in the same
-        # GetHistory response, so get_entity() hits the local cache — no
-        # extra API round-trips in the common case.
-        entity_name_map = await self._resolve_batch_entity_name_map(batch)
-
-        rows = [extract_message_row(dialog_id, msg, entity_name_map=entity_name_map) for msg in batch]
-        new_progress = min(msg.id for msg in batch)
+        rows = list(batch)
+        new_progress = min(item.message.message_id for item in batch)
         is_done = len(batch) < _BATCH_SIZE
         new_status = "synced" if is_done else "syncing"
 
@@ -658,3 +622,10 @@ _EXPORTED_SYMBOLS = (
     FullSyncWorker.process_one_batch,
     FullSyncWorker.repair_one_total_messages,
 )
+
+__all__ = [
+    "FullSyncDemandAdapter",
+    "FullSyncDmEnrollmentDemandAdapter",
+    "FullSyncWorker",
+    "TotalMessagesProbe",
+]

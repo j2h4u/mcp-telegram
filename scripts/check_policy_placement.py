@@ -89,6 +89,8 @@ NON_OPERATOR_POLICY_FINDINGS: frozenset[tuple[str, str]] = frozenset(
             "policy_assignments",
             "src/mcp_telegram/telegram_rpc_consumers.py:validate_demand_contracts:source_limits",
         ),
+        ("policy_assignments", "src/mcp_telegram/message_history/contracts.py:<module>:_MAX_HISTORY_PAGE_SIZE"),
+        ("policy_assignments", "src/mcp_telegram/message_history/telegram_adapter.py:<module>:_HISTORY_PAGE_SIZE"),
     }
 )
 

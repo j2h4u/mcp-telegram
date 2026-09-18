@@ -2,11 +2,11 @@
 
 Fetches messages newer than the max known message_id per dialog in bounded
 maintenance cycles. Idempotent: dialogs with no gap complete instantly when
-iter_messages returns empty.
+the forward history port returns an empty page.
 
 Architecture:
-- Mirrors FullSyncWorker structural pattern (client/conn/shutdown_event).
-- Fetches FORWARD (min_id + reverse=True) vs FullSyncWorker's backward.
+- Mirrors FullSyncWorker structural pattern (history port/conn/shutdown_event).
+- Fetches forward pages vs FullSyncWorker's backward pages.
 - Runs as a paced background maintenance loop, not as a blocking startup sweep.
 - Only processes dialogs with status='synced' — FullSyncWorker handles
   'syncing' and 'not_synced' dialogs.
@@ -17,13 +17,11 @@ import json
 import logging
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from typing import Protocol, cast
-
-from telethon.errors import RPCError  # type: ignore[import-untyped]
 
 from .access_lifecycle import (
     complete_access_revalidation,
@@ -31,14 +29,13 @@ from .access_lifecycle import (
     set_access_lost,
     stamp_access_revalidation,
 )
-from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
+from .flood import TelegramRpcThrottled, _raise_if_latched
 from .history_enrollment import full_history_enabled
 from .hydration_queue import HydrationPriority
-from .maintenance_logging import log_maintenance_cycle
 from .message_contracts import ExtractedMessage
+from .message_history.contracts import MessageHistoryAccessLostError, MessageHistoryUnavailableError
+from .message_history.ports import ForwardGapPagePort
 from .messages.sqlite_bundle import insert_messages_with_fts
-from .messages.telegram_adapter import extract_message_row
-from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import (
     AcquisitionKind,
     DemandStatus,
@@ -101,29 +98,12 @@ def _delta_rpc_scope[**P, R](
 
 
 @dataclass(frozen=True, slots=True)
-class DeltaCatchUpPolicy:
-    """Bounded background policy for forward gap-fill probes."""
-
-    interval_seconds: float
-    max_probes_per_cycle: int
-    probe_pause_seconds: float
-
-    @property
-    def enabled(self) -> bool:
-        return self.max_probes_per_cycle > 0
-
-    def probe_budget_exhausted(self, probed: int) -> bool:
-        return probed >= self.max_probes_per_cycle
-
-
-@dataclass(frozen=True, slots=True)
 class AccessProbePolicy:
     """Budgeted cold policy for access-lost archive revalidation."""
 
     interval_seconds: float
     max_dialogs_per_cycle: int
     cooldown_seconds: int
-    probe_pause_seconds: float
 
     @property
     def enabled(self) -> bool:
@@ -152,20 +132,6 @@ ORDER BY
     sd.dialog_id
 """
 _SELECT_MAX_MESSAGE_ID_SQL = "SELECT COALESCE(MAX(message_id), 0) FROM messages WHERE dialog_id = ?"
-_SELECT_DELTA_OBSERVABILITY_SQL = """
-SELECT
-    COUNT(*) AS total_synced,
-    SUM(last_delta_checked_at IS NOT NULL) AS checked_total,
-    SUM(last_delta_checked_at IS NULL) AS never_checked,
-    MIN(last_delta_checked_at) AS oldest_delta_checked_at,
-    MAX(last_delta_checked_at) AS newest_delta_checked_at,
-    SUM(delta_refresh_requested_at IS NOT NULL) AS pending_refresh
-FROM synced_dialogs sd
-JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
-WHERE sd.status = 'synced'
-  AND NOT EXISTS (SELECT 1 FROM dialogs directory WHERE directory.dialog_id=sd.dialog_id AND directory.hidden=1)
-"""
-
 # Stamp delta checkpoint on successful delta completion.
 # Distinct from FullSyncWorker's _UPDATE_PROGRESS_DONE_SQL (different column set).
 _UPDATE_DELTA_CHECKPOINT_SQL = (
@@ -306,10 +272,10 @@ def _dm_gap_scan_release_at(conn: sqlite3.Connection, now: float) -> float | Non
     return float(state.next_run_at) if state.next_run_at > now else 0.0
 
 
-class _DeltaSyncClient(Protocol):
-    def iter_messages(self, **_kwargs: object) -> AsyncIterator[object]: ...
+class AccessProbe(Protocol):
+    """Existing narrow access probe kept separate from paged history ports."""
 
-    async def get_messages(self, **_kwargs: object) -> object: ...
+    async def probe_total_messages(self, dialog_id: int) -> int | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,35 +294,6 @@ def _row_first_int(row: tuple[object | None, ...] | None) -> int:
     if isinstance(value, str) and value.isdecimal():
         return int(value)
     return 0
-
-
-def _object_to_int_or_none(value: object | None) -> int | None:
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.isdecimal():
-        return int(value)
-    return None
-
-
-def _object_to_int(value: object | None) -> int:
-    parsed = _object_to_int_or_none(value)
-    return parsed if parsed is not None else 0
-
-
-def _recently_synced(last_synced_at: int | None, now: int) -> bool:
-    return last_synced_at is not None and (now - last_synced_at) < RECENT_SYNC_SKIP_THRESHOLD_S
-
-
-@dataclass(frozen=True, slots=True)
-class DeltaCatchUpObservability:
-    """Aggregate local progress state for the bounded delta catch-up loop."""
-
-    total_synced: int
-    checked_total: int
-    never_checked: int
-    pending_refresh: int
-    oldest_delta_checked_age_s: int | None
-    newest_delta_checked_age_s: int | None
 
 
 def _delta_skip_anchor(last_synced_at: int | None, last_delta_checked_at: int | None) -> int | None:
@@ -379,67 +316,23 @@ def _delta_release_at(
     return float(anchor + RECENT_SYNC_SKIP_THRESHOLD_S)
 
 
-def _remaining_probe_candidates(*, total_rows: int, skipped: int, probed: int) -> int:
-    return max(0, total_rows - skipped - probed)
-
-
-def _log_probe_budget_exhausted(policy: DeltaCatchUpPolicy, *, total_rows: int, skipped: int, probed: int) -> None:
-    # A bounded cycle reaching its probe budget is normal while backlog is
-    # being drained. The complete-cycle INFO summary below retains aggregate
-    # coverage/backlog evidence; keep this per-cycle detail available at DEBUG
-    # without emitting an INFO line forever.
-    logger.debug(
-        "delta_catch_up_probe_budget_exhausted max_probes=%d remaining=%d",
-        policy.max_probes_per_cycle,
-        _remaining_probe_candidates(total_rows=total_rows, skipped=skipped, probed=probed),
-    )
-
-
-def _delta_checked_age(timestamp: int | None, now: int) -> int | None:
-    if timestamp is None:
-        return None
-    return max(0, now - timestamp)
-
-
-async def _pause_after_probe(shutdown_event: asyncio.Event, policy: DeltaCatchUpPolicy | None) -> bool:
-    if policy is None or policy.probe_pause_seconds <= 0 or shutdown_event.is_set():
-        return False
-    try:
-        await asyncio.wait_for(shutdown_event.wait(), timeout=policy.probe_pause_seconds)
-        return True
-    except TimeoutError:
-        return False
-
-
 # ---------------------------------------------------------------------------
 # DeltaSyncWorker
 # ---------------------------------------------------------------------------
 
 
 class DeltaSyncWorker:
-    """Forward gap-fill engine for the v1.5 sync daemon.
-
-    Fetches messages newer than the max known message_id per dialog in a
-    single pass at daemon startup. One instance is created per daemon run
-    and called once before FullSyncWorker's bootstrap loop.
-
-    Args:
-        client: Telethon TelegramClient (daemon owns the connection).
-        conn: Open SQLite writer connection to sync.db.
-        shutdown_event: asyncio.Event set when SIGTERM is received.
-            Used to make FloodWait sleeps and the dialog loop interruptible.
-    """
+    """Forward gap-fill engine for one bounded page per demand slice."""
 
     def __init__(
         self,
-        client: _DeltaSyncClient,
+        history_port: ForwardGapPagePort,
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
     ) -> None:
-        self._client = client
+        self._history_port = history_port
         self._conn = conn
         self._shutdown_event = shutdown_event
-        self._last_fetch_admission_deferred = False
         self._last_delta_slice_completed = False
         self._last_delta_slice_succeeded = False
         self._last_delta_slice_error: BaseException | None = None
@@ -449,218 +342,6 @@ class DeltaSyncWorker:
 
     def _stamp_delta_checked(self, dialog_id: int, checked_at: int) -> None:
         self._conn.execute(_UPDATE_DELTA_CHECKED_SQL, (checked_at, dialog_id, dialog_id))
-
-    def _delta_observability(self, now: int) -> DeltaCatchUpObservability:
-        row = cast(
-            tuple[object | None, object | None, object | None, object | None, object | None, object | None] | None,
-            self._conn.execute(_SELECT_DELTA_OBSERVABILITY_SQL).fetchone(),
-        )
-        if row is None:
-            return DeltaCatchUpObservability(
-                total_synced=0,
-                checked_total=0,
-                never_checked=0,
-                pending_refresh=0,
-                oldest_delta_checked_age_s=None,
-                newest_delta_checked_age_s=None,
-            )
-        oldest_checked_at = _object_to_int_or_none(row[3])
-        newest_checked_at = _object_to_int_or_none(row[4])
-        return DeltaCatchUpObservability(
-            total_synced=_object_to_int(row[0]),
-            checked_total=_object_to_int(row[1]),
-            never_checked=_object_to_int(row[2]),
-            pending_refresh=_object_to_int(row[5]),
-            oldest_delta_checked_age_s=_delta_checked_age(oldest_checked_at, now),
-            newest_delta_checked_age_s=_delta_checked_age(newest_checked_at, now),
-        )
-
-    @_delta_rpc_scope(DemandKind.DELTA_GAP_FILL, AcquisitionKind.MESSAGE_HISTORY_PAGE)
-    async def run_delta_catch_up(
-        self,
-        *,
-        policy: DeltaCatchUpPolicy | None = None,
-    ) -> int:
-        """Fetch messages newer than max known id for all 'synced' dialogs.
-
-        Returns:
-            Total count of new messages stored across all dialogs.
-
-        Idempotent: dialogs with no gap complete instantly (empty first
-        batch from iter_messages). Skips dialogs with no baseline
-        (max_known_id=0) — FullSyncWorker handles those.
-
-        Quick-restart guard: dialogs whose last delta check or completed sync
-        is within RECENT_SYNC_SKIP_THRESHOLD_S are skipped to prevent a
-        GetHistoryRequest storm after a rapid daemon restart (D-01). Explicit
-        refresh requests bypass this skip once, but still consume the same
-        bounded probe budget.
-        """
-        rows = cast(
-            list[tuple[int, int | None, int | None, int | None]],
-            self._conn.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL).fetchall(),
-        )
-        now = int(time.time())
-        total_new = 0
-        skipped = 0
-        probed = 0
-        for dialog_id, last_synced_at, last_delta_checked_at, refresh_requested_at in rows:
-            if self._shutdown_event.is_set():
-                break
-            if policy is not None and policy.probe_budget_exhausted(probed):
-                _log_probe_budget_exhausted(policy, total_rows=len(rows), skipped=skipped, probed=probed)
-                break
-            skip_anchor = _delta_skip_anchor(last_synced_at, last_delta_checked_at)
-            if refresh_requested_at is None and _recently_synced(skip_anchor, now):
-                assert skip_anchor is not None
-                age_s = now - skip_anchor
-                # DEBUG, not INFO — with 300+ skipped dialogs this floods the
-                # log and obscures real signal. The aggregate count lives in
-                # the delta_catch_up complete summary at the end of this loop.
-                logger.debug(
-                    "delta_catch_up_skip dialog_id=%d age_s=%d",
-                    dialog_id,
-                    age_s,
-                )
-                skipped += 1
-                continue
-            probed += 1
-            total_new += await self.fetch_delta_for_dialog(dialog_id)
-            if self._last_fetch_admission_deferred:
-                probed -= 1
-                break
-            if await _pause_after_probe(self._shutdown_event, policy):
-                break
-        observability = self._delta_observability(int(time.time()))
-        log_maintenance_cycle(
-            logger,
-            any((total_new, observability.never_checked, observability.pending_refresh)),
-            "delta_catch_up complete — new_messages=%d skipped=%d probed=%d "
-            "total_synced=%d checked_total=%d never_checked=%d pending_refresh=%d "
-            "oldest_delta_checked_age_s=%s newest_delta_checked_age_s=%s",
-            total_new,
-            skipped,
-            probed,
-            observability.total_synced,
-            observability.checked_total,
-            observability.never_checked,
-            observability.pending_refresh,
-            observability.oldest_delta_checked_age_s,
-            observability.newest_delta_checked_age_s,
-        )
-        return total_new
-
-    async def _handle_delta_throttling(
-        self, dialog_id: int, new_message_rows: list[ExtractedMessage], exc: TelegramRpcThrottled
-    ) -> int:
-        _raise_if_latched(exc)
-        logger.warning(
-            "FloodWait delta dialog_id=%d — %ss (preserving %d already-fetched messages)",
-            dialog_id,
-            exc.retry_after_seconds,
-            len(new_message_rows),
-        )
-        now = int(time.time())
-        with self._conn:
-            if not full_history_enabled(self._conn, dialog_id):
-                logger.info("delta_discarded_disabled dialog_id=%d fetched=%d", dialog_id, len(new_message_rows))
-                return 0
-            if new_message_rows:
-                insert_messages_with_fts(self._conn, new_message_rows, priority=HydrationPriority.BACKFILL)
-            self._stamp_delta_checkpoint(dialog_id, now)
-        if new_message_rows:
-            logger.info("delta dialog_id=%d preserved_messages=%d before FloodWait", dialog_id, len(new_message_rows))
-        await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds or 1)
-        return len(new_message_rows)
-
-    async def _collect_delta_rows(self, dialog_id: int, max_known_id: int) -> _DeltaFetchOutcome:
-        new_message_rows: list[ExtractedMessage] = []
-        try:
-            async for msg in self._client.iter_messages(
-                entity=dialog_id, min_id=max_known_id, reverse=True, limit=None
-            ):
-                if self._shutdown_event.is_set():
-                    break
-                new_message_rows.append(extract_message_row(dialog_id, msg))
-        except TelegramRpcAdmissionDeferred as exc:
-            self._last_fetch_admission_deferred = True
-            logger.info(
-                "delta admission_deferred dialog_id=%d retry_after=%s — preserving checkpoint",
-                dialog_id,
-                exc.retry_after_seconds,
-            )
-            if exc.retry_after_seconds is not None:
-                await sleep_through_flood(self._shutdown_event, exc.retry_after_seconds)
-            return _DeltaFetchOutcome([], 0)
-        except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
-            self._last_fetch_admission_deferred = True
-            logger.info(
-                "delta admission_deferred dialog_id=%d error_type=%s — preserving checkpoint",
-                dialog_id,
-                type(exc).__name__,
-            )
-            return _DeltaFetchOutcome([], 0)
-        except TelegramRpcThrottled as exc:
-            return _DeltaFetchOutcome([], await self._handle_delta_throttling(dialog_id, new_message_rows, exc))
-        except ACCESS_LOST_ERRORS as exc:
-            now = int(time.time())
-            set_access_lost(self._conn, dialog_id, now, reason=type(exc).__name__)
-            self._conn.commit()
-            return _DeltaFetchOutcome([], 0)
-        except RPCError as exc:
-            logger.exception(
-                "RPC error delta dialog_id=%d — skipping: %s",
-                dialog_id,
-                exc,
-            )
-            return _DeltaFetchOutcome([], 0)
-        return _DeltaFetchOutcome(new_message_rows)
-
-    @_delta_rpc_scope(DemandKind.DELTA_GAP_FILL, AcquisitionKind.MESSAGE_HISTORY_PAGE)
-    async def fetch_delta_for_dialog(self, dialog_id: int) -> int:
-        """Fetch all messages newer than max known message_id for one dialog.
-
-        Public API: used by probe-worker for gap-fill after access recovery.
-        Uses iter_messages(min_id=max_known_id, reverse=True) to fetch
-        the gap in chronological order. INSERT OR REPLACE ensures
-        idempotency across restarts.
-
-        Returns:
-            Count of new messages stored. 0 if no gap, no baseline, or error.
-        """
-        self._last_fetch_admission_deferred = False
-        if not full_history_enabled(self._conn, dialog_id):
-            return 0
-        row = cast(
-            tuple[object | None, ...] | None, self._conn.execute(_SELECT_MAX_MESSAGE_ID_SQL, (dialog_id,)).fetchone()
-        )
-        max_known_id = _row_first_int(row)
-        if max_known_id == 0:
-            # No baseline yet — FullSyncWorker handles this dialog
-            with self._conn:
-                self._stamp_delta_checked(dialog_id, int(time.time()))
-            return 0
-
-        outcome = await self._collect_delta_rows(dialog_id, max_known_id)
-        if outcome.result is not None:
-            return outcome.result
-        new_message_rows = outcome.rows
-
-        if new_message_rows:
-            with self._conn:
-                if not full_history_enabled(self._conn, dialog_id):
-                    logger.info("delta_discarded_disabled dialog_id=%d fetched=%d", dialog_id, len(new_message_rows))
-                    return 0
-                insert_messages_with_fts(self._conn, new_message_rows, priority=HydrationPriority.BACKFILL)
-            logger.info("delta dialog_id=%d new_messages=%d", dialog_id, len(new_message_rows))
-        # Stamp last_synced_at unconditionally on the success path so that
-        # run_delta_catch_up's quick-restart skip check has a fresh anchor.
-        with self._conn:
-            now = int(time.time())
-            if not full_history_enabled(self._conn, dialog_id):
-                return 0
-            self._stamp_delta_checkpoint(dialog_id, now)
-        return len(new_message_rows)
 
     @_delta_rpc_scope(DemandKind.DELTA_GAP_FILL, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def fetch_delta_slice_for_dialog(self, dialog_id: int) -> int:
@@ -679,7 +360,6 @@ class DeltaSyncWorker:
         return self._commit_delta_slice(dialog_id, outcome)
 
     def _reset_delta_slice_state(self) -> None:
-        self._last_fetch_admission_deferred = False
         self._last_delta_slice_completed = False
         self._last_delta_slice_succeeded = False
         self._last_delta_slice_error = None
@@ -698,40 +378,31 @@ class DeltaSyncWorker:
         self._last_delta_slice_succeeded = True
 
     async def _collect_delta_slice(self, dialog_id: int, max_known_id: int) -> _DeltaFetchOutcome:
-        rows: list[ExtractedMessage] = []
-        completed = True
         try:
-            async for message in self._client.iter_messages(
-                entity=dialog_id,
-                min_id=max_known_id,
-                reverse=True,
-                limit=_DELTA_SLICE_MESSAGE_LIMIT,
-            ):
-                if self._shutdown_event.is_set():
-                    completed = False
-                    break
-                rows.append(extract_message_row(dialog_id, message))
+            page = await self._history_port.fetch_page(
+                dialog_id,
+                after_message_id=max_known_id,
+                should_stop=self._shutdown_event.is_set,
+            )
         except TelegramRpcAdmissionDeferred as exc:
-            self._last_fetch_admission_deferred = True
             self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
         except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
-            self._last_fetch_admission_deferred = True
             self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
             self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
-        except ACCESS_LOST_ERRORS as exc:
+        except MessageHistoryAccessLostError as exc:
             set_access_lost(self._conn, dialog_id, int(time.time()), reason=type(exc).__name__)
             self._conn.commit()
             return _DeltaFetchOutcome([], 0)
-        except RPCError as exc:
+        except MessageHistoryUnavailableError as exc:
             logger.warning("delta_slice_rpc_error dialog_id=%d error=%s", dialog_id, exc)
             self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
-        return _DeltaFetchOutcome(rows, completed=completed)
+        return _DeltaFetchOutcome(list(page.messages), completed=page.complete)
 
     def _commit_delta_slice(self, dialog_id: int, outcome: _DeltaFetchOutcome) -> int:
         continuation_required = not outcome.completed or len(outcome.rows) == _DELTA_SLICE_MESSAGE_LIMIT
@@ -967,9 +638,10 @@ class DeltaAccessProbeDemandAdapter:
 
     demand_kind = DemandKind.DELTA_ACCESS_PROBE
 
-    def __init__(self, worker: DeltaSyncWorker, policy: AccessProbePolicy) -> None:
+    def __init__(self, worker: DeltaSyncWorker, policy: AccessProbePolicy, probe: AccessProbe) -> None:
         self._worker = worker
         self._policy = policy
+        self._probe = probe
 
     def status(self, now: float) -> DemandStatus | None:
         """Report the earliest access revalidation boundary without writes."""
@@ -1047,10 +719,10 @@ class DeltaAccessProbeDemandAdapter:
         )
         return None if row is None else row[0]
 
-    async def _request_probe(self, dialog_id: int) -> object:
+    async def _request_probe(self, dialog_id: int) -> int | None:
         with acquisition_context(AcquisitionKind.MESSAGE_LOOKUP):
             with rpc_scope(TelegramRpcSource.DELTA_SYNC):
-                return await self._worker._client.get_messages(entity=dialog_id, limit=1)
+                return await self._probe.probe_total_messages(dialog_id)
 
     async def _probe_dialog_for_recovery(self, dialog_id: int, now: int) -> None:
         try:
@@ -1069,15 +741,14 @@ class DeltaAccessProbeDemandAdapter:
         ) as exc:
             self._handle_probe_error(dialog_id, now, exc)
             return
-        except ACCESS_LOST_ERRORS as exc:
+        except MessageHistoryAccessLostError as exc:
             self._handle_probe_error(dialog_id, now, exc)
             return
-        except RPCError as exc:
+        except MessageHistoryUnavailableError as exc:
             self._handle_probe_error(dialog_id, now, exc)
             return
 
-        total_messages = cast(int | None, getattr(result, "total", None))
-        self._persist_probe_success(dialog_id, now, total_messages)
+        self._persist_probe_success(dialog_id, now, result)
 
     def _handle_probe_error(self, dialog_id: int, now: int, exc: BaseException) -> None:
         conn = self._worker._conn
@@ -1092,7 +763,7 @@ class DeltaAccessProbeDemandAdapter:
                 stamp_access_revalidation(conn, dialog_id, now, retry)
                 conn.commit()
             return
-        if isinstance(exc, ACCESS_LOST_ERRORS):
+        if isinstance(exc, MessageHistoryAccessLostError):
             logger.debug("access_still_lost dialog_id=%d", dialog_id)
             stamp_access_revalidation(conn, dialog_id, now, self._policy.cooldown_seconds)
             conn.commit()
@@ -1103,7 +774,7 @@ class DeltaAccessProbeDemandAdapter:
             stamp_access_revalidation(conn, dialog_id, now, retry)
             conn.commit()
             return
-        error_kind = "probe_rpc_error" if isinstance(exc, RPCError) else "probe_network_error"
+        error_kind = "probe_rpc_error" if isinstance(exc, MessageHistoryUnavailableError) else "probe_network_error"
         logger.warning("%s dialog_id=%d error=%s", error_kind, dialog_id, exc)
         stamp_access_revalidation(conn, dialog_id, now, self._policy.cooldown_seconds)
         conn.commit()
@@ -1160,9 +831,8 @@ class DeltaAccessProbeDemandAdapter:
 
 _EXPORTED_SYMBOLS = (
     AccessProbePolicy,
+    AccessProbe,
     DeltaAccessProbeDemandAdapter,
-    DeltaCatchUpPolicy,
     DeltaGapFillDemandAdapter,
     DeltaSyncWorker,
-    DeltaSyncWorker.run_delta_catch_up,
 )

@@ -231,8 +231,11 @@ distinct progress, restart, access-loss, and completeness semantics, remove
 the superseded direct paths, and verify both local publication and real
 history behavior together.
 
-- [ ] Put history and gap synchronization behind message-history ports while
-  preserving their distinct progress and completeness semantics.
+- [x] Put history and gap synchronization behind separate message-history
+  ports while preserving their distinct progress, restart, access-loss, and
+  completeness semantics. Telegram request construction and canonical message
+  extraction live in the Telegram adapter; workers retain local policy and
+  caller-owned publication transactions.
 
 ### Later slices: remaining acquisition paths
 

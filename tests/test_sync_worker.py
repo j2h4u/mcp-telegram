@@ -17,11 +17,13 @@ from typing import Protocol, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from telethon.errors import ChannelPrivateError  # type: ignore[import-untyped]
 
 from helpers import MockTotalList, build_mock_message, build_mock_reactions
 from mcp_telegram.fts import stem_text
 from mcp_telegram.history_enrollment import disable_history
 from mcp_telegram.message_contracts import StoredMessage
+from mcp_telegram.message_history.telegram_adapter import TelethonFullHistoryPageAdapter, TelethonHistoryAccessProbe
 from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
 from mcp_telegram.messages.telegram_adapter import _PeerLike, extract_message_row
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
@@ -117,7 +119,12 @@ def make_worker(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> FullSyncWorker:
-    return FullSyncWorker(mock_client, cast(sqlite3.Connection, sync_db), shutdown_event)
+    return FullSyncWorker(
+        TelethonFullHistoryPageAdapter(mock_client),
+        cast(sqlite3.Connection, sync_db),
+        shutdown_event,
+        total_messages_probe=TelethonHistoryAccessProbe(mock_client),
+    )
 
 
 def publish_local_dialogs(
@@ -220,9 +227,7 @@ async def test_full_sync_disable_race_discards_fetched_body_and_checkpoint(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_full_sync_stale_access_error_records_lost_for_tracked_dialog(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_full_sync_stale_access_error_records_lost_for_tracked_dialog(tmp_path: Path) -> None:
     db_path = tmp_path / "access-race.db"
     ensure_sync_schema(db_path)
     first = cast(sqlite3.Connection, _open_sync_db(db_path))
@@ -236,9 +241,8 @@ async def test_full_sync_stale_access_error_records_lost_for_tracked_dialog(
     async def fail(**_kwargs: object) -> MockTotalList:
         entered.set()
         await release.wait()
-        raise RuntimeError("stale access error")
+        raise ChannelPrivateError(request=None)
 
-    monkeypatch.setattr("mcp_telegram.sync_worker.ACCESS_LOST_ERRORS", (RuntimeError,))
     client = _MockClient()
     client.get_messages.side_effect = fail
     task = asyncio.create_task(make_worker(client, first, asyncio.Event())._fetch_batch(79, 0))
@@ -253,6 +257,37 @@ async def test_full_sync_stale_access_error_records_lost_for_tracked_dialog(
     )
     first.close()
     second.close()
+
+
+@pytest.mark.asyncio
+async def test_full_sync_cancellation_leaves_rows_and_checkpoint_unchanged(
+    sync_db: _SQLiteConnection,
+) -> None:
+    dialog_id = 80
+    sync_db.execute(
+        "INSERT INTO synced_dialogs(dialog_id, status, sync_progress) VALUES (?, 'syncing', ?)",
+        (dialog_id, 40),
+    )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
+    sync_db.execute(
+        "INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, ?, 1)",
+        (dialog_id, 40),
+    )
+    sync_db.commit()
+
+    client = _MockClient()
+    client.get_messages.side_effect = asyncio.CancelledError()
+    worker = make_worker(client, sync_db, asyncio.Event())
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker._fetch_batch(dialog_id, 40)
+
+    assert sync_db.execute(
+        "SELECT sync_progress, status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (40, "syncing")
+    assert sync_db.execute(
+        "SELECT COUNT(*) FROM messages WHERE dialog_id=? AND message_id>40", (dialog_id,)
+    ).fetchone() == (0,)
 
 
 # ---------------------------------------------------------------------------

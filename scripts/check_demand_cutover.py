@@ -82,7 +82,6 @@ RETIRED_DURABLE_TASK_LABELS = frozenset(
 # excluded below because it is the one allowed global lifecycle task.
 DIRECT_DURABLE_METHODS = frozenset(
     {
-        "bootstrap_dms",
         "process_one_batch",
         "run",
         "run_cycle",

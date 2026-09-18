@@ -63,7 +63,7 @@ from .activity_substrate import ActivityClient
 from .auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from .config import McpTelegramConfig, SchedulingConfig, load_config, resolve_scheduling_config
 from .daemon_api import DaemonApiPolicy, DaemonAPIServer, DaemonClientLike, DaemonHealthStatus
-from .delta_sync import AccessProbePolicy, DeltaSyncWorker, DmGapScanPage, _DeltaSyncClient
+from .delta_sync import AccessProbe, AccessProbePolicy, DeltaSyncWorker, DmGapScanPage
 from .demand_composition import (
     DemandCompositionClient,
     DemandCompositionDependencies,
@@ -95,6 +95,11 @@ from .media_hydration import MediaFactHydrationHandler
 from .message_fact_refresh import (
     MessageFactRefreshDeps,
     MessageFactRefreshPolicy,
+)
+from .message_history.telegram_adapter import (
+    TelethonForwardGapPageAdapter,
+    TelethonFullHistoryPageAdapter,
+    TelethonHistoryAccessProbe,
 )
 from .messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
 from .own_only import ensure_own_only_schema
@@ -344,6 +349,15 @@ class _DemandRuntime:
     message_fact_refresh_deps: MessageFactRefreshDeps
     read_receipt_batch: Callable[[], Awaitable[object]]
     startup_identity: StartupIdentityState
+
+
+@dataclass(frozen=True, slots=True)
+class _HistorySyncRuntime:
+    """Transport-neutral history workers plus their explicit access probe."""
+
+    full_sync_worker: FullSyncWorker
+    delta_sync_worker: DeltaSyncWorker
+    access_probe: AccessProbe
 
 
 @dataclass(frozen=True, slots=True)
@@ -992,7 +1006,6 @@ def _access_probe_policy_from_scheduling(scheduling: SchedulingConfig) -> Access
         interval_seconds=scheduling.access_probe_interval_seconds,
         max_dialogs_per_cycle=scheduling.access_probe_max_dialogs_per_cycle,
         cooldown_seconds=scheduling.access_probe_cooldown_seconds,
-        probe_pause_seconds=scheduling.access_probe_pause_seconds,
     )
 
 
@@ -1460,8 +1473,7 @@ def _build_message_fact_refresh_dependencies(ctx: _SyncMainContext) -> MessageFa
 
 def _build_demand_runtime(
     ctx: _SyncMainContext,
-    full_sync_worker: FullSyncWorker,
-    delta_sync_worker: DeltaSyncWorker,
+    history_runtime: _HistorySyncRuntime,
     dialog_directory: CanonicalDialogDirectory,
     startup_identity: StartupIdentityState,
 ) -> _DemandRuntime:
@@ -1517,8 +1529,9 @@ def _build_demand_runtime(
             conn=ctx.conn,
             db_path=ctx.db_path,
             shutdown_event=ctx.shutdown_event,
-            full_sync_worker=full_sync_worker,
-            delta_sync_worker=delta_sync_worker,
+            full_sync_worker=history_runtime.full_sync_worker,
+            delta_sync_worker=history_runtime.delta_sync_worker,
+            access_probe=history_runtime.access_probe,
             dm_gap_scanner=cast(DmGapScanPage, ctx.handler_manager),
             dialog_directory=dialog_directory,
             dialog_reconciliation_worker=dialog_reconciliation_worker,
@@ -1558,8 +1571,7 @@ def _build_demand_runtime(
 
 def _ensure_demand_runtime(
     ctx: _SyncMainContext,
-    full_sync_worker: FullSyncWorker,
-    delta_sync_worker: DeltaSyncWorker,
+    history_runtime: _HistorySyncRuntime,
     dialog_directory: CanonicalDialogDirectory,
     startup_identity: StartupIdentityState,
 ) -> _DemandRuntime:
@@ -1568,8 +1580,7 @@ def _ensure_demand_runtime(
         return ctx.demand_runtime
     demand_runtime = _build_demand_runtime(
         ctx,
-        full_sync_worker,
-        delta_sync_worker,
+        history_runtime,
         dialog_directory,
         startup_identity,
     )
@@ -1779,9 +1790,23 @@ async def sync_main() -> None:
         assert ctx.api_server.self_id is not None
         ctx.handler_manager.set_self_id(ctx.api_server.self_id)
 
-        delta_worker = DeltaSyncWorker(cast(_DeltaSyncClient, ctx.client), ctx.conn, ctx.shutdown_event)
-        worker = FullSyncWorker(ctx.client, ctx.conn, ctx.shutdown_event)
-        _ensure_demand_runtime(ctx, worker, delta_worker, dialog_directory, startup_identity)
+        full_history_port = TelethonFullHistoryPageAdapter(ctx.client)
+        forward_gap_port = TelethonForwardGapPageAdapter(ctx.client)
+        history_access_probe = TelethonHistoryAccessProbe(ctx.client)
+        delta_worker = DeltaSyncWorker(forward_gap_port, ctx.conn, ctx.shutdown_event)
+        worker = FullSyncWorker(
+            full_history_port,
+            ctx.conn,
+            ctx.shutdown_event,
+            total_messages_probe=history_access_probe,
+        )
+        history_runtime = _HistorySyncRuntime(worker, delta_worker, history_access_probe)
+        _ensure_demand_runtime(
+            ctx,
+            history_runtime,
+            dialog_directory,
+            startup_identity,
+        )
         update_barrier.open()
 
         # Keep the transition watcher live for later reconnects. Initial
