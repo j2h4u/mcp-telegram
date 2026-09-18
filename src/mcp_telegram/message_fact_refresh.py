@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import cast
 
@@ -60,16 +60,15 @@ FROM messages m
 JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
 JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
 JOIN entities e ON e.id = m.dialog_id
+LEFT JOIN message_read_facts f
+  ON f.dialog_id = m.dialog_id AND f.message_id = m.message_id
 WHERE sd.status = 'synced'
   AND lower(e.type) = 'user'
   AND m.out = 1
-  AND NOT EXISTS (
-      SELECT 1
-      FROM message_read_facts f
-      WHERE f.dialog_id = m.dialog_id
-        AND f.message_id = m.message_id
-        AND f.checked_at > ?
-  )
+  AND sd.read_outbox_max_id IS NOT NULL
+  AND m.message_id <= sd.read_outbox_max_id
+  AND (f.dialog_id IS NULL OR f.status != 'complete' OR f.read_at IS NULL)
+  AND (f.dialog_id IS NULL OR f.checked_at <= ?)
 ORDER BY m.sent_at DESC, m.dialog_id, m.message_id
 LIMIT ?
 """
@@ -103,6 +102,9 @@ LEFT JOIN message_read_facts f
 WHERE sd.status = 'synced'
   AND lower(e.type) = 'user'
   AND m.out = 1
+  AND sd.read_outbox_max_id IS NOT NULL
+  AND m.message_id <= sd.read_outbox_max_id
+  AND (f.dialog_id IS NULL OR f.status != 'complete' OR f.read_at IS NULL)
 """
 
 
@@ -128,12 +130,13 @@ WHERE sd.status = 'synced'
   )
 """
 
+_READ_AT_CYCLE_COUNT_FIELDS = 4
+
 
 @dataclass(frozen=True, slots=True)
 class MessageFactRefreshPolicy:
     """Bounded daemon-side policy for optional Telegram fact acquisition."""
 
-    interval_seconds: float
     reaction_max_messages_per_cycle: int
     read_at_max_messages_per_cycle: int
     pause_seconds: float
@@ -149,12 +152,24 @@ class MessageFactRefreshResult:
 
 
 @dataclass(frozen=True, slots=True)
+class _ReadAtCycleStats:
+    first_attempts: int
+    retry_attempts: int
+    terminal_suppressed: int
+    complete: int
+    missing: int
+    unavailable: int
+    measurement_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
 class MessageFactRefreshDeps:
     """Infrastructure dependencies for one optional fact refresh cycle."""
 
     conn: sqlite3.Connection
     reaction_freshener: ReactionFreshener
     read_receipt_gateway: TelegramReadReceiptGateway
+    read_at_observer: Callable[[Mapping[str, object]], None] | None = None
 
 
 def _next_release_at(conn: sqlite3.Connection, query: str, ttl_seconds: int) -> float | None:
@@ -294,6 +309,75 @@ def _read_at_candidates(
     ]
 
 
+def _read_at_attempt_counts(
+    conn: sqlite3.Connection,
+    messages: Sequence[ReadMessage],
+) -> tuple[int, int]:
+    """Return first-attempt and retry counts for one selected batch."""
+    if not messages:
+        return 0, 0
+    rows = cast(
+        list[tuple[object, ...]],
+        conn.execute(
+            "SELECT dialog_id, message_id FROM message_read_facts "
+            "WHERE (dialog_id, message_id) IN (" + ",".join("(?, ?)" for _ in messages) + ")",
+            [value for message in messages for value in (message.dialog_id, message.message_id)],
+        ).fetchall(),
+    )
+    retry_keys = {(int(cast(int | str, row[0])), int(cast(int | str, row[1]))) for row in rows}
+    return len(messages) - len(retry_keys), len(retry_keys)
+
+
+def _terminal_read_at_suppressed(conn: sqlite3.Connection) -> int:
+    """Count eligible terminal rows omitted from acquisition forever."""
+    row = cast(
+        tuple[object] | None,
+        conn.execute(
+            "SELECT COUNT(*) "
+            "FROM messages m "
+            "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id "
+            "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
+            "JOIN entities e ON e.id = m.dialog_id "
+            "JOIN message_read_facts f ON f.dialog_id = m.dialog_id AND f.message_id = m.message_id "
+            "WHERE sd.status = 'synced' AND lower(e.type) = 'user' AND m.out = 1 "
+            "AND sd.read_outbox_max_id IS NOT NULL AND m.message_id <= sd.read_outbox_max_id "
+            "AND f.status = 'complete' AND f.read_at IS NOT NULL"
+        ).fetchone(),
+    )
+    return 0 if row is None else int(cast(int | str, row[0]))
+
+
+def _observe_read_at_cycle(  # noqa: PLR0913 - bounded telemetry fields are explicit
+    deps: MessageFactRefreshDeps,
+    *,
+    first_attempts: int,
+    retry_attempts: int,
+    terminal_suppressed: int,
+    complete: int,
+    missing: int,
+    unavailable: int,
+) -> None:
+    """Publish one bounded, content-free observation after a complete cycle."""
+    observer = deps.read_at_observer
+    if observer is None:
+        return
+    try:
+        observer(
+            {
+                "first_attempts": first_attempts,
+                "retry_attempts": retry_attempts,
+                "terminal_suppressed": terminal_suppressed,
+                "complete": complete,
+                "missing": missing,
+                "unavailable": unavailable,
+                "measurement_complete": True,
+            }
+        )
+    except Exception:  # noqa: BLE001 - telemetry must not affect fact persistence
+        # Telemetry is best effort and must not affect fact persistence.
+        return
+
+
 def _group_message_ids(rows: Sequence[tuple[int, int]]) -> dict[int, list[int]]:
     grouped: dict[int, list[int]] = {}
     for dialog_id, message_id in rows:
@@ -313,6 +397,60 @@ async def _interruptible_pause(shutdown_event: asyncio.Event, seconds: float) ->
         await asyncio.wait_for(shutdown_event.wait(), timeout=seconds)
     except TimeoutError:
         return
+
+
+async def _refresh_read_at_cycle(
+    deps: MessageFactRefreshDeps,
+    policy: MessageFactRefreshPolicy,
+    *,
+    checked_at: int,
+    shutdown_event: asyncio.Event | None,
+) -> _ReadAtCycleStats:
+    if shutdown_event is not None and shutdown_event.is_set():
+        return _ReadAtCycleStats(0, 0, 0, 0, 0, 0, False)
+    messages = _read_at_candidates(
+        deps.conn,
+        stale_before_utc=checked_at - policy.read_at_ttl_seconds,
+        limit=policy.read_at_max_messages_per_cycle,
+    )
+    first_attempts, retry_attempts = _read_at_attempt_counts(deps.conn, messages)
+    terminal_suppressed = _terminal_read_at_suppressed(deps.conn)
+    complete = missing = unavailable = 0
+    measurement_complete = True
+    groups = _group_messages(messages)
+    for index, (dialog_id, group) in enumerate(groups.items()):
+        counts: list[int] = []
+        await enrich_read_at(
+            deps.conn,
+            deps.read_receipt_gateway,
+            dialog_id,
+            group,
+            dialog_type="user",
+            read_at_ttl_seconds=policy.read_at_ttl_seconds,
+            checked_at=checked_at,
+            cycle_counts=counts,
+        )
+        if len(counts) != _READ_AT_CYCLE_COUNT_FIELDS:
+            measurement_complete = False
+        else:
+            complete += counts[0]
+            missing += counts[1]
+            unavailable += counts[2]
+            measurement_complete = measurement_complete and bool(counts[3])
+        if shutdown_event is not None and shutdown_event.is_set():
+            measurement_complete = False
+            break
+        if shutdown_event is not None and index < len(groups) - 1:
+            await _interruptible_pause(shutdown_event, policy.pause_seconds)
+    return _ReadAtCycleStats(
+        first_attempts=first_attempts,
+        retry_attempts=retry_attempts,
+        terminal_suppressed=terminal_suppressed,
+        complete=complete,
+        missing=missing,
+        unavailable=unavailable,
+        measurement_complete=measurement_complete,
+    )
 
 
 async def refresh_message_facts_once(
@@ -340,24 +478,26 @@ async def refresh_message_facts_once(
         if shutdown_event is not None and index < len(reaction_groups) - 1:
             await _interruptible_pause(shutdown_event, policy.pause_seconds)
 
-    read_at_messages = _read_at_candidates(
-        deps.conn,
-        stale_before_utc=checked_at - policy.read_at_ttl_seconds,
-        limit=policy.read_at_max_messages_per_cycle,
-    )
-    read_at_groups = _group_messages(read_at_messages)
-    for index, (dialog_id, messages) in enumerate(read_at_groups.items()):
-        await enrich_read_at(
-            deps.conn,
-            deps.read_receipt_gateway,
-            dialog_id,
-            messages,
-            dialog_type="user",
-            read_at_ttl_seconds=policy.read_at_ttl_seconds,
+    if policy.read_at_max_messages_per_cycle > 0:
+        stats = await _refresh_read_at_cycle(
+            deps,
+            policy,
             checked_at=checked_at,
+            shutdown_event=shutdown_event,
         )
-        if shutdown_event is not None and index < len(read_at_groups) - 1:
-            await _interruptible_pause(shutdown_event, policy.pause_seconds)
+    else:
+        stats = None
+
+    if stats is not None and stats.measurement_complete:
+        _observe_read_at_cycle(
+            deps,
+            first_attempts=stats.first_attempts,
+            retry_attempts=stats.retry_attempts,
+            terminal_suppressed=stats.terminal_suppressed,
+            complete=stats.complete,
+            missing=stats.missing,
+            unavailable=stats.unavailable,
+        )
 
     return MessageFactRefreshResult(
         reaction_refreshed=reaction_refreshed,

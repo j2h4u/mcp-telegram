@@ -465,7 +465,7 @@ depends_on = ["mcp_telegram.flood", "mcp_telegram.request_timing", "mcp_telegram
 [[modules]]
 path = "mcp_telegram.telegram_fact_queries"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.models", "mcp_telegram.telegram_gateway", "mcp_telegram.telegram_reading"]
+depends_on = ["mcp_telegram.models", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_gateway", "mcp_telegram.telegram_reading", "mcp_telegram.telegram_rpc_scheduler"]
 
 [[modules]]
 path = "mcp_telegram.dialog_directory_tl"

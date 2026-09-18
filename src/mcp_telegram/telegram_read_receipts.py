@@ -8,7 +8,7 @@ from typing import Protocol, cast
 from telethon.tl.functions.messages import GetOutboxReadDateRequest
 from telethon.tl.types import TypeInputPeer
 
-from .telegram_demand import AcquisitionKind
+from .telegram_demand import AcquisitionKind, RpcAttemptBudgetExhaustedError
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES, translate_gateway_failure
 from .telegram_reading import ReadDateFetchResult, TelegramReadReceiptGateway
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
@@ -44,7 +44,7 @@ class TelethonTelegramReadReceiptGateway:
                 if value.tzinfo is None:
                     value = value.replace(tzinfo=UTC)
                 return ReadDateFetchResult(read_at=int(value.timestamp()), status="complete")
-            except RpcAdmissionClosedError:
+            except RpcAdmissionClosedError, RpcAttemptBudgetExhaustedError:
                 raise
             except CATCHABLE_GATEWAY_FAILURES as exc:
                 return ReadDateFetchResult(

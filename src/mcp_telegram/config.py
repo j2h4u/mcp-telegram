@@ -358,7 +358,6 @@ class SchedulingConfig:
     access_probe_interval_seconds: float = 86_400.0
     access_probe_max_dialogs_per_cycle: int = 3
     access_probe_cooldown_seconds: int = 604_800
-    message_fact_refresh_seconds: float = 600.0
     message_fact_refresh_reaction_max_messages_per_cycle: int = 5
     message_fact_refresh_read_at_max_messages_per_cycle: int = 5
     message_fact_refresh_pause_seconds: float = 1.0
@@ -687,9 +686,6 @@ def resolve_scheduling_config(
         ),
         access_probe_cooldown_seconds=_env_non_negative_int(
             env, "ACCESS_PROBE_COOLDOWN_SECONDS", config.access_probe_cooldown_seconds
-        ),
-        message_fact_refresh_seconds=_env_positive_float(
-            env, "MESSAGE_FACT_REFRESH_SECONDS", config.message_fact_refresh_seconds
         ),
         message_fact_refresh_reaction_max_messages_per_cycle=_env_non_negative_int(
             env,
@@ -1414,7 +1410,6 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "access_probe_interval_seconds",
         "access_probe_max_dialogs_per_cycle",
         "access_probe_cooldown_seconds",
-        "message_fact_refresh_seconds",
         "message_fact_refresh_reaction_max_messages_per_cycle",
         "message_fact_refresh_read_at_max_messages_per_cycle",
         "message_fact_refresh_pause_seconds",
@@ -1515,13 +1510,6 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             "scheduling",
             path,
             defaults.access_probe_cooldown_seconds,
-        ),
-        message_fact_refresh_seconds=_positive_float(
-            scheduling_data,
-            "message_fact_refresh_seconds",
-            "scheduling",
-            path,
-            defaults.message_fact_refresh_seconds,
         ),
         message_fact_refresh_reaction_max_messages_per_cycle=_non_negative_int(
             scheduling_data,

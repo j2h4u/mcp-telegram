@@ -1,17 +1,17 @@
 # Telegram Behind Domain Ports
 
-Status: completed first program; panel recommendation awaiting operator acceptance
+Status: panel accepted; Slice 1 active
 Last reviewed: 2026-09-18
 
 Latest panel recommendation:
 [Expert Panel Recommendation, 2026-09-18](telegram-domain-ports-panel-2026-09-18.md).
-It proposes two evidence-backed slices and remains subject to operator
-acceptance.
+It proposes two evidence-backed slices. Slice 1 is active; deployment and
+completion remain pending.
 
 This document records the target architecture, the program completed through
 PR #270, and the residual state considered by the 2026-09-18 expert panel. The
-panel produced a separate recommendation that remains subject to operator
-acceptance; neither document is an approved sequence of future pull requests.
+panel produced a separate recommendation that is now accepted for Slice 1;
+neither document is a deployment approval.
 
 The accepted catalog-specific contract remains
 [Canonical Dialog Snapshot](canonical-dialog-snapshot.md). The broader current

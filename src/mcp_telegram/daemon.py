@@ -39,7 +39,7 @@ import math
 import os
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextvars import Context
 from dataclasses import dataclass, field
 from functools import partial
@@ -992,7 +992,6 @@ def _install_flood_wait_kill_switch(config: McpTelegramConfig, event: asyncio.Ev
 
 def _message_fact_refresh_policy_from_config(config: McpTelegramConfig) -> MessageFactRefreshPolicy:
     return MessageFactRefreshPolicy(
-        interval_seconds=config.scheduling.message_fact_refresh_seconds,
         reaction_max_messages_per_cycle=config.scheduling.message_fact_refresh_reaction_max_messages_per_cycle,
         read_at_max_messages_per_cycle=config.scheduling.message_fact_refresh_read_at_max_messages_per_cycle,
         pause_seconds=config.scheduling.message_fact_refresh_pause_seconds,
@@ -1459,6 +1458,21 @@ def _publish_startup_identity(ctx: _SyncMainContext, profile: object, own_only_c
 
 def _build_message_fact_refresh_dependencies(ctx: _SyncMainContext) -> MessageFactRefreshDeps:
     conn = _open_sync_db(ctx.db_path)
+    read_at_callback: Callable[[Mapping[str, object]], None] | None = None
+    sink = ctx.rpc_observation_sink
+    if sink is not None:
+
+        def record_read_at_cycle(payload: Mapping[str, object]) -> None:
+            result_count = sum(int(cast(int, payload.get(name, 0))) for name in ("complete", "missing", "unavailable"))
+            sink.record(
+                kind="message_fact.read_at",
+                outcome="completed",
+                result_count=result_count,
+                payload=payload,
+            )
+
+        read_at_callback = record_read_at_cycle
+
     return MessageFactRefreshDeps(
         conn,
         ReactionFreshener(
@@ -1468,6 +1482,7 @@ def _build_message_fact_refresh_dependencies(ctx: _SyncMainContext) -> MessageFa
             log=logger,
         ),
         TelethonTelegramReadReceiptGateway(ctx.client),
+        read_at_observer=read_at_callback,
     )
 
 
