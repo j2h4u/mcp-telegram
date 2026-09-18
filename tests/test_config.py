@@ -274,7 +274,6 @@ reconciliation_hourly_seconds = 49
 access_probe_interval_seconds = 86401
 access_probe_max_dialogs_per_cycle = 2
 access_probe_cooldown_seconds = 604801
-message_fact_refresh_seconds = 52
 message_fact_refresh_reaction_max_messages_per_cycle = 6
 message_fact_refresh_read_at_max_messages_per_cycle = 7
 message_fact_refresh_pause_seconds = 4
@@ -346,7 +345,6 @@ daemon_api_slow_request_seconds = 2.5
         access_probe_interval_seconds=86401.0,
         access_probe_max_dialogs_per_cycle=2,
         access_probe_cooldown_seconds=604801,
-        message_fact_refresh_seconds=52.0,
         message_fact_refresh_reaction_max_messages_per_cycle=6,
         message_fact_refresh_read_at_max_messages_per_cycle=7,
         message_fact_refresh_pause_seconds=4.0,
@@ -397,7 +395,6 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
             "READ_POSITION_RECONCILIATION_BATCH_PAUSE_SECONDS": "1.75",
             "SCHEDULED_FLOOD_SLEEP_THRESHOLD_SECONDS": "0",
             "RECON_HOURLY_SECONDS": "48",
-            "MESSAGE_FACT_REFRESH_SECONDS": "55",
             "MESSAGE_FACT_REFRESH_REACTION_MAX_MESSAGES_PER_CYCLE": "6",
             "MESSAGE_FACT_REFRESH_READ_AT_MAX_MESSAGES_PER_CYCLE": "7",
             "MESSAGE_FACT_REFRESH_PAUSE_SECONDS": "7",
@@ -446,7 +443,6 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         access_probe_interval_seconds=86402.0,
         access_probe_max_dialogs_per_cycle=4,
         access_probe_cooldown_seconds=604802,
-        message_fact_refresh_seconds=55.0,
         message_fact_refresh_reaction_max_messages_per_cycle=6,
         message_fact_refresh_read_at_max_messages_per_cycle=7,
         message_fact_refresh_pause_seconds=7.0,

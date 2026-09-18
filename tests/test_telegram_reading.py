@@ -25,7 +25,7 @@ from mcp_telegram.reactions.sqlite_repository import SQLiteReactionSnapshotRepos
 from mcp_telegram.reactions.telegram_adapter import TelethonTelegramReactionGateway
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_demand import AcquisitionKind
-from mcp_telegram.telegram_fact_queries import enrich_read_at, stale_read_at_ids
+from mcp_telegram.telegram_fact_queries import enrich_read_at, persist_read_at, stale_read_at_ids
 from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from mcp_telegram.telegram_history import TelethonTelegramHistoryGateway
 from mcp_telegram.telegram_read_receipts import TelethonTelegramReadReceiptGateway
@@ -632,10 +632,10 @@ async def test_read_at_enrichment_only_probes_outgoing_user_dm_and_never_falls_b
 
 
 @pytest.mark.asyncio
-async def test_read_at_preserves_duplicate_eligible_ids_in_source_order(
+async def test_read_at_suppresses_terminal_duplicate_ids_in_source_order(
     make_synced_db: Callable[[], sqlite3.Connection],
 ) -> None:
-    """Each eligible source row is probed and projected in its original order."""
+    """A terminal fact is reused for later duplicate source rows."""
     conn = make_synced_db()
     _seed_enrollment(conn, 42)
     calls: list[int] = []
@@ -668,7 +668,7 @@ async def test_read_at_preserves_duplicate_eligible_ids_in_source_order(
         checked_at=3_000,
     )
 
-    assert calls == [3, 1, 3]
+    assert calls == [3, 1]
     assert [message.message_id for message in enriched] == [3, 1, 3]
     assert [message.read_at for message in enriched] == [
         1_700_000_003,
@@ -692,7 +692,7 @@ async def test_read_at_rejects_boolean_ttl_before_shortcut(make_synced_db: Calla
 
 
 def test_read_receipt_at_exact_ttl_age_is_stale(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
-    """A read-receipt probe at exactly the cutoff is fetched again."""
+    """A terminal read receipt remains suppressed at every TTL age."""
     conn = make_synced_db()
     dialog_id, message_id, now, ttl = 42, 1, 2_000, 600
     conn.execute(
@@ -701,7 +701,27 @@ def test_read_receipt_at_exact_ttl_age_is_stale(make_synced_db: Callable[[], sql
     )
     conn.commit()
 
-    assert stale_read_at_ids(conn, dialog_id, [message_id], now - ttl) == [message_id]
+    assert stale_read_at_ids(conn, dialog_id, [message_id], now - ttl) == []
+
+
+def test_read_at_persistence_is_terminal_and_monotonic(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
+    conn = make_synced_db()
+    seed_full_history_enrollment(conn, 42, enabled=True)
+
+    persist_read_at(conn, 42, 1, read_at=None, checked_at=200, status="missing")
+    persist_read_at(conn, 42, 1, read_at=None, checked_at=199, status="unavailable")
+    assert conn.execute(
+        "SELECT read_at, checked_at, status FROM message_read_facts WHERE dialog_id=42 AND message_id=1"
+    ).fetchone() == (None, 200, "missing")
+
+    persist_read_at(conn, 42, 1, read_at=1_700_000_001, checked_at=100, status="complete")
+    persist_read_at(conn, 42, 1, read_at=None, checked_at=300, status="unavailable")
+    assert conn.execute(
+        "SELECT read_at, checked_at, status FROM message_read_facts WHERE dialog_id=42 AND message_id=1"
+    ).fetchone() == (1_700_000_001, 100, "complete")
+
+    with pytest.raises(ValueError, match="non-null read_at"):
+        persist_read_at(conn, 42, 2, read_at=None, checked_at=1, status="complete")
 
 
 @pytest.mark.asyncio

@@ -94,6 +94,7 @@ async def enrich_read_at(  # noqa: PLR0913
     dialog_type: str | DialogType | None,
     read_at_ttl_seconds: int,
     checked_at: int | None = None,
+    cycle_counts: list[int] | None = None,
 ) -> list[ReadMessage]:
     """Best-effort enrich own outgoing User-DM messages with Telegram dates.
 
@@ -108,7 +109,7 @@ async def enrich_read_at(  # noqa: PLR0913
     if not candidate_ids:
         return list(messages)
     now = int(checked_at if checked_at is not None else time.time())
-    await _refresh_stale_read_at_facts(
+    counts = await _refresh_stale_read_at_facts(
         conn,
         gateway,
         dialog_id,
@@ -116,6 +117,8 @@ async def enrich_read_at(  # noqa: PLR0913
         stale_before_utc=now - read_at_ttl_seconds,
         checked_at=now,
     )
+    if cycle_counts is not None:
+        cycle_counts.extend(counts)
     values = read_at_map(conn, dialog_id, candidate_ids)
     return [dataclasses.replace(message, read_at=values.get(message.message_id)) for message in messages]
 
@@ -139,8 +142,10 @@ async def _refresh_stale_read_at_facts(  # noqa: PLR0913
     *,
     stale_before_utc: int,
     checked_at: int,
-) -> None:
+) -> tuple[int, int, int, bool]:
     """Refresh stale probes, retaining committed earlier facts on a later failure."""
+    complete = missing = unavailable = 0
+    measurement_complete = True
     for message_id in stale_read_at_ids(conn, dialog_id, message_ids, stale_before_utc):
         try:
             result = await gateway.fetch_outbox_read_date(dialog_id, message_id)
@@ -148,6 +153,12 @@ async def _refresh_stale_read_at_facts(  # noqa: PLR0913
             # A single privacy/retention failure must not break list/search.
             result = ReadDateFetchResult(status="unavailable")
         read_at = result.read_at if result.status == "complete" else None
+        if result.status == "complete":
+            complete += 1
+        elif result.status == "missing":
+            missing += 1
+        elif result.status == "unavailable":
+            unavailable += 1
         try:
             persist_read_at(
                 conn,
@@ -159,7 +170,9 @@ async def _refresh_stale_read_at_facts(  # noqa: PLR0913
             )
         except sqlite3.OperationalError:
             # Keep pre-v28 read paths usable while the daemon is upgrading.
+            measurement_complete = False
             break
+    return complete, missing, unavailable, measurement_complete
 
 
 def persist_read_at(  # noqa: PLR0913
@@ -171,14 +184,26 @@ def persist_read_at(  # noqa: PLR0913
     checked_at: int,
     status: str,
 ) -> None:
-    """Store one outbox-read-date probe, including its availability status."""
+    """Store one outbox-read-date probe with terminal and timestamp fences."""
+
+    if status not in {"complete", "missing", "unavailable"}:
+        raise ValueError(f"unsupported read-date status: {status}")
+    if status == "complete" and read_at is None:
+        raise ValueError("complete read-date result requires a non-null read_at")
 
     with conn:
         conn.execute(
-            "INSERT OR REPLACE INTO message_read_facts "
+            "INSERT INTO message_read_facts "
             "(dialog_id, message_id, read_at, checked_at, status) "
             "SELECT ?, ?, ?, ?, ? WHERE EXISTS ("
-            "SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)",
+            "SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1) "
+            "ON CONFLICT(dialog_id, message_id) DO UPDATE SET "
+            "read_at = excluded.read_at, checked_at = excluded.checked_at, status = excluded.status "
+            "WHERE NOT (message_read_facts.status = 'complete' AND message_read_facts.read_at IS NOT NULL) "
+            "AND ("
+            "(excluded.status = 'complete' AND excluded.read_at IS NOT NULL) "
+            "OR excluded.checked_at > message_read_facts.checked_at"
+            ")",
             (dialog_id, message_id, read_at, checked_at, status, dialog_id),
         )
 
@@ -227,11 +252,16 @@ def stale_read_at_ids(
             list[tuple[object, ...]],
             conn.execute(
                 f"SELECT message_id, checked_at FROM message_read_facts "
-                f"WHERE dialog_id = ? AND message_id IN ({placeholders}) AND checked_at > ?",
+                f"WHERE dialog_id = ? AND message_id IN ({placeholders}) "
+                "AND ((status = 'complete' AND read_at IS NOT NULL) OR checked_at > ?)",
                 [dialog_id, *message_ids, stale_before_utc],
             ).fetchall(),
         )
     except sqlite3.OperationalError:
-        return list(message_ids)
+        return list(dict.fromkeys(message_ids))
     fresh = {int(cast(int | str, row[0])) for row in rows}
-    return [message_id for message_id in message_ids if message_id not in fresh]
+    selected: list[int] = []
+    for message_id in message_ids:
+        if message_id not in fresh and message_id not in selected:
+            selected.append(message_id)
+    return selected

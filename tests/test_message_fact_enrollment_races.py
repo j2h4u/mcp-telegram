@@ -46,7 +46,6 @@ class _ImmediateReadGateway:
 
 def _policy() -> MessageFactRefreshPolicy:
     return MessageFactRefreshPolicy(
-        interval_seconds=600.0,
         reaction_max_messages_per_cycle=0,
         read_at_max_messages_per_cycle=1,
         pause_seconds=0.01,
@@ -68,6 +67,10 @@ def _open_seeded_db(path: Path, dialog_id: int, message_id: int) -> tuple[_SQLit
     handler_conn.execute(
         "INSERT INTO messages(dialog_id, message_id, sent_at, out, text) VALUES (?, ?, 1000, 1, NULL)",
         (dialog_id, message_id),
+    )
+    handler_conn.execute(
+        "UPDATE synced_dialogs SET read_outbox_max_id = ? WHERE dialog_id = ?",
+        (message_id, dialog_id),
     )
     handler_conn.commit()
     assert handler_conn.execute(

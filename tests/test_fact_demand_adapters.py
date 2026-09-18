@@ -393,7 +393,6 @@ def _message_fact_db() -> sqlite3.Connection:
 
 def _message_fact_policy(*, read_limit: int = 0) -> MessageFactRefreshPolicy:
     return MessageFactRefreshPolicy(
-        interval_seconds=600,
         reaction_max_messages_per_cycle=10,
         read_at_max_messages_per_cycle=read_limit,
         pause_seconds=0.01,

@@ -35,6 +35,7 @@ ALLOWED_KINDS = frozenset(
         "telegram.demand",
         "daemon.request_timing",
         "entity_profile.pair",
+        "message_fact.read_at",
         "runtime.telemetry_loss",
     }
 )
