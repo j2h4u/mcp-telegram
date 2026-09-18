@@ -395,7 +395,7 @@ class DeltaSyncWorker:
             self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
         except MessageHistoryAccessLostError as exc:
-            set_access_lost(self._conn, dialog_id, int(time.time()), reason=type(exc).__name__)
+            set_access_lost(self._conn, dialog_id, int(time.time()), reason=exc.reason_code)
             self._conn.commit()
             return _DeltaFetchOutcome([], 0)
         except MessageHistoryUnavailableError as exc:
@@ -736,8 +736,6 @@ class DeltaAccessProbeDemandAdapter:
             RpcAdmissionSaturatedError,
             RpcAdmissionExpiredError,
             TelegramRpcThrottled,
-            TimeoutError,
-            OSError,
         ) as exc:
             self._handle_probe_error(dialog_id, now, exc)
             return
@@ -774,8 +772,7 @@ class DeltaAccessProbeDemandAdapter:
             stamp_access_revalidation(conn, dialog_id, now, retry)
             conn.commit()
             return
-        error_kind = "probe_rpc_error" if isinstance(exc, MessageHistoryUnavailableError) else "probe_network_error"
-        logger.warning("%s dialog_id=%d error=%s", error_kind, dialog_id, exc)
+        logger.warning("probe_rpc_error dialog_id=%d error=%s", dialog_id, exc)
         stamp_access_revalidation(conn, dialog_id, now, self._policy.cooldown_seconds)
         conn.commit()
 

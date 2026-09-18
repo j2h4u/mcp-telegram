@@ -9,6 +9,7 @@ import pytest
 from telethon.errors import ChannelPrivateError, RPCError  # type: ignore[import-untyped]
 
 from helpers import MockTotalList, build_mock_message
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.message_history.contracts import (
     MessageHistoryAccessLostError,
     MessageHistoryUnavailableError,
@@ -18,6 +19,9 @@ from mcp_telegram.message_history.telegram_adapter import (
     TelethonFullHistoryPageAdapter,
     TelethonHistoryAccessProbe,
 )
+from mcp_telegram.telegram_demand import demand_context
+from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred
 
 
 class _Client:
@@ -52,7 +56,8 @@ class _Client:
 @pytest.mark.asyncio
 async def test_full_history_maps_one_backward_page_and_reads_total() -> None:
     client = _Client()
-    page = await TelethonFullHistoryPageAdapter(client).fetch_page(7, before_message_id=13)
+    with demand_context(DemandKind.FULL_SYNC_PAGE):
+        page = await TelethonFullHistoryPageAdapter(client).fetch_page(7, before_message_id=13)
 
     assert client.get_messages_calls == [{"entity": 7, "limit": 100, "offset_id": 13}]
     assert [row.message.message_id for row in page.messages] == [2, 1]
@@ -71,6 +76,36 @@ async def test_forward_gap_maps_one_bounded_exclusive_page() -> None:
     assert client.iter_messages_calls == [{"entity": 7, "min_id": 13, "reverse": True, "limit": 100}]
     assert [row.message.message_id for row in page.messages] == [2, 1]
     assert page.complete is True
+
+
+@pytest.mark.asyncio
+async def test_forward_gap_empty_page_is_complete() -> None:
+    client = _Client()
+    client.messages = []
+
+    page = await TelethonForwardGapPageAdapter(client).fetch_page(
+        7,
+        after_message_id=13,
+        should_stop=lambda: False,
+    )
+
+    assert page.messages == ()
+    assert page.complete is True
+
+
+@pytest.mark.asyncio
+async def test_forward_gap_exactly_full_page_requires_continuation() -> None:
+    client = _Client()
+    client.messages = [build_mock_message(id=message_id) for message_id in range(1, 101)]
+
+    page = await TelethonForwardGapPageAdapter(client).fetch_page(
+        7,
+        after_message_id=13,
+        should_stop=lambda: False,
+    )
+
+    assert len(page.messages) == 100
+    assert page.complete is False
 
 
 @pytest.mark.asyncio
@@ -120,13 +155,29 @@ async def test_access_probe_is_separate_and_uses_limit_one() -> None:
 async def test_access_loss_is_translated_at_telegram_boundary(adapter_kind: str) -> None:
     client = _Client()
     client.error = ChannelPrivateError(request=None)
-    with pytest.raises(MessageHistoryAccessLostError):
+    with pytest.raises(MessageHistoryAccessLostError) as caught:
         if adapter_kind == "full":
             await TelethonFullHistoryPageAdapter(client).fetch_page(7, before_message_id=0)
         elif adapter_kind == "forward":
             await TelethonForwardGapPageAdapter(client).fetch_page(7, after_message_id=0, should_stop=lambda: False)
         else:
             await TelethonHistoryAccessProbe(client).probe_total_messages(7)
+    assert caught.value.reason_code == "ChannelPrivateError"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [TelegramRpcAdmissionDeferred(retry_after_seconds=3), TelegramRpcThrottled(retry_after_seconds=4)],
+)
+async def test_forward_gap_passes_scheduler_outcomes_without_translation(error: BaseException) -> None:
+    client = _Client()
+    client.error = error
+
+    with pytest.raises(type(error)) as caught:
+        await TelethonForwardGapPageAdapter(client).fetch_page(7, after_message_id=0, should_stop=lambda: False)
+
+    assert caught.value is error
 
 
 @pytest.mark.asyncio

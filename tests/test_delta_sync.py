@@ -210,7 +210,7 @@ async def test_access_loss_marks_dialog_without_publishing(sync_db: _SQLiteConne
     _seed_dialog(sync_db, dialog_id, refresh_requested_at=1)
     sync_db.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, ?, 1)", (dialog_id, 10))
     sync_db.commit()
-    port = _ForwardPort([MessageHistoryAccessLostError("gone")])
+    port = _ForwardPort([MessageHistoryAccessLostError("gone", reason_code="ChannelPrivateError")])
     worker = DeltaSyncWorker(port, cast(sqlite3.Connection, sync_db), asyncio.Event())
 
     assert await worker.fetch_delta_slice_for_dialog(dialog_id) == 0
@@ -218,6 +218,9 @@ async def test_access_loss_marks_dialog_without_publishing(sync_db: _SQLiteConne
         "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
     ).fetchone()
     assert access_row is not None and access_row[0] == "access_lost"
+    assert sync_db.execute(
+        "SELECT reason_code FROM conversation_history_events WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == ("ChannelPrivateError",)
 
 
 @pytest.mark.asyncio

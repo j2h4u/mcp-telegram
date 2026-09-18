@@ -348,7 +348,7 @@ class FullSyncWorker:
             self._last_total_repair_error = exc
             return False
         except MessageHistoryAccessLostError as exc:
-            set_access_lost(self._conn, dialog_id, int(time.time()), reason=type(exc).__name__)
+            set_access_lost(self._conn, dialog_id, int(time.time()), reason=exc.reason_code)
             self._conn.commit()
             return False
         except MessageHistoryUnavailableError as exc:
@@ -449,7 +449,7 @@ class FullSyncWorker:
             return _FetchedBatchPage(None, (), (sync_progress, False))
         if isinstance(exc, MessageHistoryAccessLostError):
             now = int(time.time())
-            set_access_lost(self._conn, dialog_id, now, reason=type(exc).__name__)
+            set_access_lost(self._conn, dialog_id, now, reason=exc.reason_code)
             self._conn.commit()
             return _FetchedBatchPage(None, (), (sync_progress, True))
         raise exc

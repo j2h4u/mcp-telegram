@@ -133,7 +133,7 @@ from .sync_db import (
 )
 from .sync_worker import FullSyncWorker
 from .telegram import create_client
-from .telegram_demand import DemandStatus, RpcAttemptBudget, demand_context
+from .telegram_demand import AcquisitionKind, DemandStatus, RpcAttemptBudget, acquisition_context, demand_context
 from .telegram_demand_coordinator import TelegramDemandCoordinator
 from .telegram_gateway import (
     TelethonChannelProfileGateway,
@@ -1790,7 +1790,10 @@ async def sync_main() -> None:
         assert ctx.api_server.self_id is not None
         ctx.handler_manager.set_self_id(ctx.api_server.self_id)
 
-        full_history_port = TelethonFullHistoryPageAdapter(ctx.client)
+        full_history_port = TelethonFullHistoryPageAdapter(
+            ctx.client,
+            entity_lookup_context=lambda: acquisition_context(AcquisitionKind.ENTITY_LOOKUP),
+        )
         forward_gap_port = TelethonForwardGapPageAdapter(ctx.client)
         history_access_probe = TelethonHistoryAccessProbe(ctx.client)
         delta_worker = DeltaSyncWorker(forward_gap_port, ctx.conn, ctx.shutdown_event)

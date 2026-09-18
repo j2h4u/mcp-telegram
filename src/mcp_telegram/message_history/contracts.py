@@ -13,6 +13,12 @@ _MAX_HISTORY_PAGE_SIZE: Final = 100
 class MessageHistoryAccessLostError(RuntimeError):
     """The remote dialog is no longer accessible to the authenticated account."""
 
+    reason_code: str
+
+    def __init__(self, message: str, *, reason_code: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
 
 class MessageHistoryUnavailableError(RuntimeError):
     """A message-history request failed with an ordinary remote error."""

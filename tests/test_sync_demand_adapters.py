@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from telethon.errors import ChannelPrivateError, RPCError  # type: ignore[import-untyped]
+from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
 from helpers import MockTotalList, build_mock_message
 from mcp_telegram.delta_sync import (
@@ -23,7 +24,7 @@ from mcp_telegram.delta_sync import (
 )
 from mcp_telegram.dialog_sync import DialogLightReconciliationDemandAdapter, DialogReconciliationWorker
 from mcp_telegram.flood import TelegramRpcThrottled
-from mcp_telegram.message_history.contracts import MessageHistoryUnavailableError
+from mcp_telegram.message_history.contracts import MessageHistoryAccessLostError, MessageHistoryUnavailableError
 from mcp_telegram.message_history.ports import ForwardGapPagePort, FullHistoryPagePort
 from mcp_telegram.message_history.telegram_adapter import (
     TelethonForwardGapPageAdapter,
@@ -32,7 +33,7 @@ from mcp_telegram.message_history.telegram_adapter import (
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter, FullSyncWorker
-from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget
+from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget, acquisition_context
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
@@ -113,6 +114,44 @@ async def test_full_sync_adapter_status_is_read_only_and_slice_has_precise_scope
     assert scope.acquisition_kind is AcquisitionKind.MESSAGE_HISTORY_PAGE
     assert scope.attempt_budget is budget
     assert adapter.status(500.0) is None
+
+
+@pytest.mark.asyncio
+async def test_full_history_forward_name_enrichment_keeps_entity_lookup_attribution(
+    conn: sqlite3.Connection,
+) -> None:
+    dialog_id = 102
+    _seed_history_dialog(conn, dialog_id, status="syncing")
+    observed_scopes: list[TelegramRpcScope] = []
+    message = build_mock_message(id=1)
+    message.fwd_from = SimpleNamespace(
+        from_id=PeerChannel(channel_id=123),
+        from_name=None,
+        date=None,
+        channel_post=None,
+    )
+
+    async def get_messages(**_kwargs: object) -> MockTotalList:
+        return MockTotalList([message], total=1)
+
+    async def get_entity(_peer: object) -> object:
+        observed_scopes.append(current_rpc_scope())
+        return SimpleNamespace(title="Forwarded source")
+
+    worker = FullSyncWorker(
+        TelethonFullHistoryPageAdapter(
+            SimpleNamespace(get_messages=get_messages, get_entity=get_entity),
+            entity_lookup_context=lambda: acquisition_context(AcquisitionKind.ENTITY_LOOKUP),
+        ),
+        conn,
+        asyncio.Event(),
+    )
+    budget = RpcAttemptBudget(limit=1)
+    await FullSyncDemandAdapter(worker).run_slice(budget)
+
+    assert observed_scopes[0].demand_kind is DemandKind.FULL_SYNC_PAGE
+    assert observed_scopes[0].acquisition_kind is AcquisitionKind.ENTITY_LOOKUP
+    assert observed_scopes[0].attempt_budget is budget
 
 
 def _publish_generation(conn: sqlite3.Connection, generation: int = 1) -> None:
@@ -467,6 +506,33 @@ async def test_full_sync_total_repair_uses_durable_retry_boundary(conn: sqlite3.
         await adapter.run_slice(RpcAttemptBudget(limit=1))
     assert calls == 2
     assert conn.execute("SELECT total_messages FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (17,)
+
+
+@pytest.mark.asyncio
+async def test_full_sync_total_repair_persists_access_loss_reason(conn: sqlite3.Connection) -> None:
+    dialog_id = 205
+    _seed_history_dialog(conn, dialog_id, status="synced")
+
+    class AccessLostProbe:
+        async def probe_total_messages(self, dialog_id: int) -> int | None:
+            del dialog_id
+            raise MessageHistoryAccessLostError("history access lost", reason_code="ChannelPrivateError")
+
+    worker = FullSyncWorker(
+        cast(FullHistoryPagePort, object()),
+        conn,
+        asyncio.Event(),
+        total_messages_probe=AccessLostProbe(),
+    )
+
+    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        "access_lost",
+    )
+    assert conn.execute(
+        "SELECT reason_code FROM conversation_history_events WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == ("ChannelPrivateError",)
 
 
 @pytest.mark.asyncio

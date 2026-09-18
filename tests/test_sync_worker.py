@@ -255,6 +255,9 @@ async def test_full_sync_stale_access_error_records_lost_for_tracked_dialog(tmp_
     assert first.execute("SELECT kind FROM conversation_history_events WHERE dialog_id=79").fetchone() == (
         "access_lost",
     )
+    assert first.execute("SELECT reason_code FROM conversation_history_events WHERE dialog_id=79").fetchone() == (
+        "ChannelPrivateError",
+    )
     first.close()
     second.close()
 
