@@ -1,9 +1,9 @@
 # Telegram Domain Ports: Expert Panel Recommendation
 
-Status: accepted; Slice 1 deployed; Slice 2 is a code-complete PR candidate pending release
+Status: accepted; both recommended slices deployed
 
-Release prerequisite: remove the retired `[freshness.reactions]` section from
-the host-owned deployment config before restarting the Slice 2 image.
+Release completed with the retired `[freshness.reactions]` section removed and
+the durable reaction-detail pacing window enabled in the host-owned config.
 
 Date: 2026-09-18
 
@@ -109,9 +109,9 @@ or make its completeness ambiguous.
   contract.
 - Materially changed aggregates re-page detail; identical observations advance
   their ordering boundary without invalidating an existing detail result.
-- Detail work is bounded by the configured pages-per-cycle budget. A FloodWait
-  stops remaining reaction probes in that cycle, while the shared coordinator
-  controls later-cycle cooldown and retry admission.
+- Detail work is bounded by a durable global pacing window: five claimed pages
+  per 600 seconds by default. A FloodWait stops remaining probes and can only
+  extend the persisted release boundary.
 
 ### Ownership and dependencies
 

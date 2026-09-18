@@ -1,6 +1,6 @@
 # Telegram Demand Control
 
-Status: proposal for expert review  
+Status: deployed; durable reaction-detail pacing hardening deployed
 Basis: Astra architecture proposal and expert-panel convergence, 2026-09-09
 
 ## Decision
