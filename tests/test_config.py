@@ -391,6 +391,7 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
             "SCHEDULED_FLOOD_SLEEP_THRESHOLD_SECONDS": "0",
             "RECON_HOURLY_SECONDS": "48",
             "MESSAGE_FACT_REFRESH_REACTION_MAX_MESSAGES_PER_CYCLE": "6",
+            "REACTION_DETAIL_CYCLE_SECONDS": "601",
             "MESSAGE_FACT_REFRESH_READ_AT_MAX_MESSAGES_PER_CYCLE": "7",
             "MESSAGE_FACT_REFRESH_PAUSE_SECONDS": "7",
             "ACTIVITY_HOT_SWEEP_LOOP_INTERVAL_SECONDS": "49",
@@ -439,6 +440,7 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         access_probe_max_dialogs_per_cycle=4,
         access_probe_cooldown_seconds=604802,
         message_fact_refresh_reaction_max_messages_per_cycle=6,
+        reaction_detail_cycle_seconds=601,
         message_fact_refresh_read_at_max_messages_per_cycle=7,
         message_fact_refresh_pause_seconds=7.0,
         activity_hot_sweep=ActivityHotSweepConfig(
@@ -480,7 +482,11 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
 
 @pytest.mark.parametrize(
     "name",
-    ["REACTION_DETAIL_MAX_PAGES_PER_CYCLE", "REACTION_DETAIL_UNAVAILABLE_RETRY_SECONDS"],
+    [
+        "REACTION_DETAIL_MAX_PAGES_PER_CYCLE",
+        "REACTION_DETAIL_CYCLE_SECONDS",
+        "REACTION_DETAIL_UNAVAILABLE_RETRY_SECONDS",
+    ],
 )
 def test_runtime_environment_rejects_zero_for_positive_reaction_detail_policy(name: str) -> None:
     with pytest.raises(ConfigError, match="must be an integer > 0"):

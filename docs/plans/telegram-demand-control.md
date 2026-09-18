@@ -39,6 +39,17 @@ Telegram semantics, eligibility, cursors, coalescing keys and atomic result
 application. Their existing tables remain the durable source of truth; there is
 no universal job database.
 
+### Reaction-detail pacing contract
+
+Reaction-detail demand is a durable bounded slice. The singleton pacing state
+allows at most five logical pages per 600-second window by default. A window
+and its candidate claims are committed before Telegram work; each started page
+consumes its slot before the request, and restart, cancellation, failure, or a
+FloodWait cannot reopen a claimed slot. FloodWait retry time extends the
+durable release boundary. The raw reaction due state is combined with this
+release boundary for demand readiness. Exact outgoing-DM read-date demand has
+its own release boundary and runs first when both lanes are due.
+
 This is a complete migration of all Telegram demand, delivered in two pull
 requests. The first introduces the final model, complete attribution, adapters
 and shadow execution. The second performs one global durable cutover and removes

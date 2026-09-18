@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -17,6 +18,7 @@ from mcp_telegram.message_fact_refresh import (
     refresh_message_facts_once,
 )
 from mcp_telegram.reactions import ReactionDetailRefresher
+from mcp_telegram.reactions.detail import ReactionDetailResult
 from mcp_telegram.telegram_demand import RpcAttemptBudgetExhaustedError
 from mcp_telegram.telegram_reading import ReadDateFetchResult, TelegramReadReceiptGateway
 from mcp_telegram.telegram_rpc_consumers import TelegramRpcSource
@@ -24,8 +26,8 @@ from mcp_telegram.telegram_rpc_scheduler import RpcAdmissionClosedError, rpc_sco
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
-def _make_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
+def _make_db(path: str | Path = ":memory:") -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
     conn.executescript(
         """
         CREATE TABLE synced_dialogs (
@@ -84,6 +86,14 @@ def _make_db() -> sqlite3.Connection:
             status TEXT NOT NULL,
             PRIMARY KEY (dialog_id, message_id)
         );
+        CREATE TABLE reaction_detail_pacing_state (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            window_started_at INTEGER NOT NULL,
+            release_at INTEGER NOT NULL,
+            claimed_pages INTEGER NOT NULL DEFAULT 0,
+            started_pages INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO reaction_detail_pacing_state VALUES (1, 0, 0, 0, 0);
         """
     )
     return conn
@@ -134,6 +144,164 @@ def _budget_exhausted_error() -> Exception:
 def _admission_closed_error() -> Exception:
     with rpc_scope(TelegramRpcSource.READ_RECEIPT_PROBE) as scope:
         return RpcAdmissionClosedError(scope, "scheduler closed")
+
+
+def _seed_reaction_candidates(conn: sqlite3.Connection, count: int = 8) -> None:
+    conn.execute("INSERT INTO synced_dialogs VALUES (1, 'synced', NULL)")
+    seed_full_history_enrollment(conn, 1, enabled=True)
+    for message_id in range(1, count + 1):
+        conn.execute("INSERT INTO messages VALUES (1, ?, ?, 0, NULL, 0)", (message_id, message_id))
+        conn.execute(
+            "INSERT INTO message_reaction_aggregate_state VALUES (1, ?, 1, 1, ?, 'history', 1, 1)",
+            (message_id, message_id),
+        )
+        conn.execute(
+            "INSERT INTO message_reaction_event_status "
+            "(dialog_id, message_id, aggregate_generation, status, checked_at, next_attempt_at) "
+            "VALUES (1, ?, 1, 'stale', 1, 1)",
+            (message_id,),
+        )
+    conn.commit()
+
+
+class _RecordingReactionRefresher:
+    def __init__(self, calls: list[int], result: ReactionDetailResult | None = None) -> None:
+        self.calls = calls
+        self.result = result or ReactionDetailResult("partial", fetched_pages=1)
+
+    async def refresh_one(self, dialog_id: int, message_id: int, generation: int, **kwargs: object) -> ReactionDetailResult:
+        cancellation_event = kwargs.get("cancellation_event")
+        del dialog_id, generation
+        self.calls.append(message_id)
+        if isinstance(cancellation_event, asyncio.Event) and cancellation_event.is_set():
+            return ReactionDetailResult("cancelled")
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_reaction_pacing_caps_repeated_slices_and_opens_next_window() -> None:
+    conn = _make_db()
+    _seed_reaction_candidates(conn)
+    calls: list[int] = []
+    deps = MessageFactRefreshDeps(
+        conn,
+        cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
+        cast(TelegramReadReceiptGateway, object()),
+    )
+    policy = MessageFactRefreshPolicy(
+        reaction_max_messages_per_cycle=10,
+        read_at_max_messages_per_cycle=0,
+        pause_seconds=0,
+        read_at_ttl_seconds=600,
+        reaction_detail_max_pages_per_cycle=5,
+        reaction_detail_cycle_seconds=600,
+    )
+
+    for _ in range(3):
+        await refresh_message_facts_once(deps, policy, now=100)
+    assert len(calls) == 5
+    assert conn.execute(
+        "SELECT window_started_at, release_at, claimed_pages, started_pages "
+        "FROM reaction_detail_pacing_state"
+    ).fetchone() == (100, 700, 5, 5)
+
+    await refresh_message_facts_once(deps, policy, now=699)
+    assert len(calls) == 5
+    await refresh_message_facts_once(deps, policy, now=700)
+    assert len(calls) == 10
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reaction_pacing_claim_survives_cancellation_and_restart(tmp_path: object) -> None:
+    path = cast(Path, tmp_path) / "sync.db"
+    conn = _make_db(path)
+    _seed_reaction_candidates(conn)
+    calls: list[int] = []
+    event = asyncio.Event()
+    event.set()
+    policy = MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600)
+    deps = MessageFactRefreshDeps(
+        conn,
+        cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
+        cast(TelegramReadReceiptGateway, object()),
+    )
+    await refresh_message_facts_once(deps, policy, now=100, shutdown_event=event)
+    assert len(calls) == 1
+    conn.close()
+
+    reopened = sqlite3.connect(path)
+    calls.clear()
+    reopened_deps = MessageFactRefreshDeps(
+        reopened,
+        cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls)),
+        cast(TelegramReadReceiptGateway, object()),
+    )
+    await refresh_message_facts_once(reopened_deps, policy, now=100)
+    assert calls == []
+    assert reopened.execute(
+        "SELECT claimed_pages, started_pages FROM reaction_detail_pacing_state"
+    ).fetchone() == (5, 1)
+    reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_reaction_flood_wait_extends_durable_release() -> None:
+    conn = _make_db()
+    _seed_reaction_candidates(conn, count=1)
+    calls: list[int] = []
+    result = ReactionDetailResult("unavailable", failure_kind="flood_wait", retry_after=1_000)
+    deps = MessageFactRefreshDeps(
+        conn,
+        cast(ReactionDetailRefresher, _RecordingReactionRefresher(calls, result)),
+        cast(TelegramReadReceiptGateway, object()),
+    )
+    await refresh_message_facts_once(
+        deps,
+        MessageFactRefreshPolicy(10, 0, 0, 600, 5, 600),
+        now=100,
+    )
+    assert conn.execute("SELECT release_at FROM reaction_detail_pacing_state").fetchone() == (1_100,)
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_read_date_runs_before_reaction_when_both_lanes_are_due() -> None:
+    conn = _make_db()
+    _seed_reaction_candidates(conn, count=1)
+    conn.executescript(
+        """
+        INSERT INTO synced_dialogs VALUES (20, 'synced', 2);
+        INSERT INTO entities VALUES (20, 'user');
+        INSERT INTO messages VALUES (20, 2, 1000, 1, NULL, 0);
+        """
+    )
+    seed_full_history_enrollment(conn, 20, enabled=True)
+    order: list[str] = []
+
+    class OrderedReadGateway(_ReadReceiptGateway):
+        async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult:
+            order.append("read")
+            return await super().fetch_outbox_read_date(entity, message_id)
+
+    class OrderedReactionRefresher(_RecordingReactionRefresher):
+        async def refresh_one(
+            self, dialog_id: int, message_id: int, generation: int, **kwargs: object
+        ) -> ReactionDetailResult:
+            order.append("reaction")
+            return await super().refresh_one(dialog_id, message_id, generation, **kwargs)
+
+    await refresh_message_facts_once(
+        MessageFactRefreshDeps(
+            conn,
+            cast(ReactionDetailRefresher, OrderedReactionRefresher([])),
+            cast(TelegramReadReceiptGateway, OrderedReadGateway()),
+        ),
+        MessageFactRefreshPolicy(10, 1, 0, 600, 5, 600),
+        now=2_000,
+    )
+    assert order == ["read", "reaction"]
+    conn.close()
 
 
 @pytest.mark.asyncio

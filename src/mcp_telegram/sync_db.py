@@ -14,7 +14,7 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 68
+_CURRENT_SCHEMA_VERSION = 69
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -34,6 +34,7 @@ _PUBLISHED_DIALOG_READ_CURSORS_MIGRATION_65 = 65
 _CANONICAL_DIALOG_FACTS_MIGRATION_66 = 66
 _LOCAL_FOLDER_PROJECTION_MIGRATION_67 = 67
 _REACTION_DETAIL_LIFECYCLE_MIGRATION_68 = 68
+_REACTION_DETAIL_PACING_MIGRATION_69 = 69
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
@@ -1159,6 +1160,17 @@ CREATE TABLE IF NOT EXISTS message_reaction_observation_counter (
 _MESSAGE_REACTION_DETAIL_DUE_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_message_reaction_detail_due
 ON message_reaction_event_status(status, next_attempt_at, aggregate_generation)
+"""
+
+_REACTION_DETAIL_PACING_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS reaction_detail_pacing_state (
+    singleton         INTEGER PRIMARY KEY CHECK (singleton = 1),
+    window_started_at INTEGER NOT NULL CHECK (window_started_at >= 0),
+    release_at        INTEGER NOT NULL CHECK (release_at >= 0),
+    claimed_pages     INTEGER NOT NULL DEFAULT 0 CHECK (claimed_pages >= 0),
+    started_pages     INTEGER NOT NULL DEFAULT 0 CHECK (started_pages >= 0),
+    CHECK (started_pages <= claimed_pages)
+) WITHOUT ROWID
 """
 
 _MESSAGE_READ_FACTS_DDL = """
@@ -3967,6 +3979,35 @@ def _apply_migration_68(conn: sqlite3.Connection, current: int) -> int:  # noqa:
         raise
 
 
+def _apply_migration_69(conn: sqlite3.Connection, current: int) -> int:
+    """Add the singleton reaction-detail pacing window.
+
+    The window is independent of per-message detail receipts.  Its counters
+    reserve logical pages before any Telegram work starts, so a process
+    restart or cancelled/failing request cannot make the same window eligible
+    again.
+    """
+    if current >= _REACTION_DETAIL_PACING_MIGRATION_69:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(_REACTION_DETAIL_PACING_STATE_DDL)
+        conn.execute(
+            "INSERT OR IGNORE INTO reaction_detail_pacing_state "
+            "(singleton, window_started_at, release_at, claimed_pages, started_pages) "
+            "VALUES (1, 0, 0, 0, 0)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
+            (_REACTION_DETAIL_PACING_MIGRATION_69,),
+        )
+        conn.commit()
+        return _REACTION_DETAIL_PACING_MIGRATION_69
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _apply_migrations_64_to_67(conn: sqlite3.Connection, current: int) -> int:
     """Apply the ordered canonical-directory and folder migrations."""
     if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64:
@@ -4063,6 +4104,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_migrations_64_to_67(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _REACTION_DETAIL_LIFECYCLE_MIGRATION_68:
         current = _apply_migration_68(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _REACTION_DETAIL_PACING_MIGRATION_69:
+        current = _apply_migration_69(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
