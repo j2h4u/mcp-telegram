@@ -366,7 +366,11 @@ def _message_fact_db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.executescript(
         """
-        CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL);
+        CREATE TABLE synced_dialogs (
+            dialog_id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL,
+            read_outbox_max_id INTEGER
+        );
         CREATE TABLE full_history_enrollment (dialog_id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL);
         CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL);
         CREATE TABLE messages (
@@ -406,7 +410,7 @@ async def test_message_fact_status_owns_reaction_candidates_without_mutation() -
     conn = _message_fact_db()
     conn.executescript(
         """
-        INSERT INTO synced_dialogs VALUES (10, 'synced');
+        INSERT INTO synced_dialogs (dialog_id, status) VALUES (10, 'synced');
         INSERT INTO full_history_enrollment VALUES (10, 1);
         INSERT INTO entities VALUES (10, 'user');
         INSERT INTO messages VALUES (10, 1, 100, 0);
@@ -447,7 +451,7 @@ async def test_message_fact_slice_runs_existing_cycle_under_budget() -> None:
     conn = _message_fact_db()
     conn.executescript(
         """
-        INSERT INTO synced_dialogs VALUES (10, 'synced');
+        INSERT INTO synced_dialogs (dialog_id, status) VALUES (10, 'synced');
         INSERT INTO full_history_enrollment VALUES (10, 1);
         INSERT INTO entities VALUES (10, 'user');
         INSERT INTO messages VALUES (10, 1, 100, 0);

@@ -24,7 +24,7 @@ from mcp_telegram.reactions.refresh import ReactionFreshener
 from mcp_telegram.reactions.sqlite_repository import SQLiteReactionSnapshotRepository
 from mcp_telegram.reactions.telegram_adapter import TelethonTelegramReactionGateway
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-from mcp_telegram.telegram_demand import AcquisitionKind
+from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudgetExhaustedError
 from mcp_telegram.telegram_fact_queries import enrich_read_at, persist_read_at, stale_read_at_ids
 from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from mcp_telegram.telegram_history import TelethonTelegramHistoryGateway
@@ -592,6 +592,21 @@ async def test_read_receipt_gateway_propagates_scheduler_close() -> None:
             raise closed
 
     with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
+        await TelethonTelegramReadReceiptGateway(Client()).fetch_outbox_read_date(42, 10)
+
+
+@pytest.mark.asyncio
+async def test_read_receipt_gateway_propagates_attempt_budget_exhaustion() -> None:
+    exhausted = RpcAttemptBudgetExhaustedError("slice budget exhausted")
+
+    class Client:
+        async def get_input_entity(self, _entity: object) -> object:
+            return object()
+
+        async def __call__(self, _request: object) -> object:
+            raise exhausted
+
+    with pytest.raises(RpcAttemptBudgetExhaustedError, match="slice budget exhausted"):
         await TelethonTelegramReadReceiptGateway(Client()).fetch_outbox_read_date(42, 10)
 
 

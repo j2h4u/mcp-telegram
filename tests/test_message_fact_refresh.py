@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from collections.abc import Mapping
 from typing import cast
 
 import pytest
 
 from mcp_telegram.message_fact_refresh import (
+    _NEXT_READ_AT_RELEASE_SQL,
+    MessageFactRefreshDemandAdapter,
     MessageFactRefreshDeps,
     MessageFactRefreshPolicy,
+    _next_release_at,
+    _read_at_candidates,
     refresh_message_facts_once,
 )
 from mcp_telegram.reactions.contracts import ReactionFreshness
@@ -170,7 +175,7 @@ async def test_read_at_cycle_telemetry_is_aggregate_and_terminal_safe() -> None:
         """
     )
     seed_full_history_enrollment(conn, 20, enabled=True)
-    observations: list[dict[str, object]] = []
+    observations: list[Mapping[str, object]] = []
     try:
         await refresh_message_facts_once(
             MessageFactRefreshDeps(
@@ -211,7 +216,7 @@ async def test_read_at_attempt_telemetry_distinguishes_equal_message_ids_across_
     )
     seed_full_history_enrollment(conn, 20, enabled=True)
     seed_full_history_enrollment(conn, 21, enabled=True)
-    observations: list[dict[str, object]] = []
+    observations: list[Mapping[str, object]] = []
     try:
         await refresh_message_facts_once(
             MessageFactRefreshDeps(
@@ -242,7 +247,7 @@ async def test_canceled_read_at_cycle_publishes_no_incomplete_telemetry() -> Non
     )
     seed_full_history_enrollment(conn, 20, enabled=True)
     gateway = _BlockingReadReceiptGateway()
-    observations: list[dict[str, object]] = []
+    observations: list[Mapping[str, object]] = []
     task = asyncio.create_task(
         refresh_message_facts_once(
             MessageFactRefreshDeps(
@@ -262,6 +267,66 @@ async def test_canceled_read_at_cycle_publishes_no_incomplete_telemetry() -> Non
 
     assert observations == []
     assert conn.execute("SELECT COUNT(*) FROM message_read_facts").fetchone() == (0,)
+    conn.close()
+
+
+def test_read_at_cursor_null_has_no_candidate_or_release() -> None:
+    conn = _make_db()
+    conn.executescript(
+        """
+        INSERT INTO synced_dialogs VALUES (20, 'synced', NULL);
+        INSERT INTO entities VALUES (20, 'user');
+        INSERT INTO messages VALUES (20, 1, 1000, 1, NULL);
+        """
+    )
+    seed_full_history_enrollment(conn, 20, enabled=True)
+
+    assert _read_at_candidates(conn, stale_before_utc=2_000, limit=10) == []
+    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL, 600) is None
+    adapter = MessageFactRefreshDemandAdapter(
+        MessageFactRefreshDeps(conn, cast(ReactionFreshener, _ReactionFreshener()), cast(TelegramReadReceiptGateway, object())),
+        _policy(reaction_max=0),
+    )
+    assert adapter.status(2_000) is None
+    conn.close()
+
+
+def test_read_at_message_above_cursor_is_excluded() -> None:
+    conn = _make_db()
+    conn.executescript(
+        """
+        INSERT INTO synced_dialogs VALUES (20, 'synced', 5);
+        INSERT INTO entities VALUES (20, 'user');
+        INSERT INTO messages VALUES
+            (20, 5, 1000, 1, NULL),
+            (20, 6, 1001, 1, NULL);
+        """
+    )
+    seed_full_history_enrollment(conn, 20, enabled=True)
+
+    assert [message.message_id for message in _read_at_candidates(conn, stale_before_utc=2_000, limit=10)] == [5]
+    conn.close()
+
+
+def test_terminal_read_at_set_has_no_status_or_release() -> None:
+    conn = _make_db()
+    conn.executescript(
+        """
+        INSERT INTO synced_dialogs VALUES (20, 'synced', 5);
+        INSERT INTO entities VALUES (20, 'user');
+        INSERT INTO messages VALUES (20, 5, 1000, 1, NULL);
+        INSERT INTO message_read_facts VALUES (20, 5, 1700000005, 1000, 'complete');
+        """
+    )
+    seed_full_history_enrollment(conn, 20, enabled=True)
+    adapter = MessageFactRefreshDemandAdapter(
+        MessageFactRefreshDeps(conn, cast(ReactionFreshener, _ReactionFreshener()), cast(TelegramReadReceiptGateway, object())),
+        _policy(reaction_max=0),
+    )
+
+    assert _read_at_candidates(conn, stale_before_utc=2_000, limit=10) == []
+    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL, 600) is None
+    assert adapter.status(2_000) is None
     conn.close()
 
 
