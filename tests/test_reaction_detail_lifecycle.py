@@ -10,6 +10,7 @@ from typing import cast
 
 import pytest
 from telethon.errors import (  # type: ignore[import-untyped]
+    ChannelPrivateError,
     ChatAdminRequiredError,
     MsgIdInvalidError,
     PeerIdInvalidError,
@@ -170,6 +171,7 @@ def test_detail_gateway_uses_one_page_and_never_get_messages() -> None:
     ("error", "kind", "retry_after"),
     [
         (ValueError("private chat"), GatewayFailureKind.INVALID_TARGET, None),
+        (ChannelPrivateError(request=None), GatewayFailureKind.ACCESS_LOST, None),
         (TelegramRpcThrottled(retry_after_seconds=17), GatewayFailureKind.FLOOD_WAIT, 17),
     ],
 )
