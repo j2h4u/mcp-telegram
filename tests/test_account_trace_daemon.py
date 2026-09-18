@@ -64,7 +64,6 @@ from tests.helpers import (
     LoudUserAvatarHistoryPort,
     LoudUserProfilePort,
 )
-from tests.reaction_helpers import make_reaction_freshener
 
 
 @pytest.fixture()
@@ -75,7 +74,6 @@ def trace_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, sqlite3.Conn
         conn,
         client,
         asyncio.Event(),
-        reaction_freshener=make_reaction_freshener(conn, client),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),

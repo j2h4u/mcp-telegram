@@ -1473,7 +1473,6 @@ def _build_message_fact_refresh_dependencies(ctx: _SyncMainContext) -> MessageFa
             conn,
             TelethonTelegramReactionGateway(ctx.client),
             policy=ReactionDetailPolicy(
-                max_pages_per_cycle=ctx.scheduling.reaction_detail_max_pages_per_cycle,
                 unavailable_retry_seconds=ctx.scheduling.reaction_detail_unavailable_retry_seconds,
             ),
             observation_sink=reaction_callback,

@@ -686,12 +686,12 @@ def resolve_scheduling_config(
             "MESSAGE_FACT_REFRESH_REACTION_MAX_MESSAGES_PER_CYCLE",
             config.message_fact_refresh_reaction_max_messages_per_cycle,
         ),
-        reaction_detail_max_pages_per_cycle=_env_non_negative_int(
+        reaction_detail_max_pages_per_cycle=_env_positive_int(
             env,
             "REACTION_DETAIL_MAX_PAGES_PER_CYCLE",
             config.reaction_detail_max_pages_per_cycle,
         ),
-        reaction_detail_unavailable_retry_seconds=_env_non_negative_int(
+        reaction_detail_unavailable_retry_seconds=_env_positive_int(
             env,
             "REACTION_DETAIL_UNAVAILABLE_RETRY_SECONDS",
             config.reaction_detail_unavailable_retry_seconds,

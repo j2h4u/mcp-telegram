@@ -55,7 +55,9 @@ def fetch_text_links(
                 [dialog_id, *message_ids],
             ).fetchall(),
         )
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
         return {}
     result: dict[int, list[tuple[int, int, str]]] = {}
     for message_id, offset, length, value in rows:

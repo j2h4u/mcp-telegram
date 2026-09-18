@@ -28,7 +28,7 @@ def replace_reaction_aggregates(  # noqa: PLR0913
     source: ReactionAggregateSource | str = ReactionAggregateSource.HISTORY,
     observed_at: int | None = None,
     observation_sequence: int | None = None,
-) -> None:
+) -> bool:
     """Apply one aggregate observation under the durable ordering contract.
 
     The function name is retained for the message projection call sites, but
@@ -36,7 +36,7 @@ def replace_reaction_aggregates(  # noqa: PLR0913
     fence.  Empty ``aggregates`` is an authoritative observation and therefore
     removes the old projection only after the boundary has been accepted.
     """
-    apply_aggregate_observation(
+    return apply_aggregate_observation(
         conn,
         dialog_id,
         message_id,
@@ -63,14 +63,20 @@ def allocate_observation_boundary(
     *,
     observed_at: int | None = None,
 ) -> ReactionObservationBoundary:
-    """Allocate a deterministic process-local sequence from durable state."""
+    """Allocate a durable monotonic sequence without scanning message state."""
     value = _source_value(source)
     when = int(time.time()) if observed_at is None else int(observed_at)
+    conn.execute("INSERT OR IGNORE INTO message_reaction_observation_counter(singleton, next_sequence) VALUES (1, 0)")
     row = cast(
         tuple[object] | None,
-        conn.execute("SELECT COALESCE(MAX(observation_sequence), 0) FROM message_reaction_aggregate_state").fetchone(),
+        conn.execute(
+            "UPDATE message_reaction_observation_counter SET next_sequence=next_sequence+1 "
+            "WHERE singleton=1 RETURNING next_sequence"
+        ).fetchone(),
     )
-    sequence = (0 if row is None or row[0] is None else int(cast(int | str, row[0]))) + 1
+    if row is None:
+        raise sqlite3.OperationalError("reaction observation counter did not return a sequence")
+    sequence = int(cast(int | str, row[0]))
     return ReactionObservationBoundary(when, _SOURCE_RANKS[value], sequence, value)
 
 
@@ -120,7 +126,9 @@ def apply_aggregate_observation(  # noqa: PLR0913
                 (dialog_id, message_id),
             ).fetchone(),
         )
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
         # Small isolated unit fixtures may intentionally model only the legacy
         # projection. Production connections always run migration 68.
         conn.execute(_DELETE_REACTIONS_SQL, (dialog_id, message_id))
@@ -142,6 +150,29 @@ def apply_aggregate_observation(  # noqa: PLR0913
         generation = int(cast(int | str, existing[0])) + 1
     else:
         generation = 1
+
+    current_rows = cast(
+        list[tuple[object, ...]],
+        conn.execute(
+            "SELECT emoji, count FROM message_reactions WHERE dialog_id=? AND message_id=? ORDER BY emoji, count",
+            (dialog_id, message_id),
+        ).fetchall(),
+    )
+    observed_rows = sorted((aggregate.emoji, aggregate.count) for aggregate in aggregates)
+    if existing is not None and current_rows == observed_rows:
+        conn.execute(
+            "UPDATE message_reaction_aggregate_state SET observed_at=?, observation_sequence=?, source=?, source_rank=? "
+            "WHERE dialog_id=? AND message_id=?",
+            (
+                boundary.observed_at,
+                boundary.sequence,
+                boundary.source,
+                boundary.source_rank,
+                dialog_id,
+                message_id,
+            ),
+        )
+        return True
 
     conn.execute(_DELETE_REACTIONS_SQL, (dialog_id, message_id))
     if aggregates:
@@ -198,7 +229,9 @@ def _invalidate_detail(conn: sqlite3.Connection, dialog_id: int, message_id: int
             "next_attempt_at=excluded.next_attempt_at, failure_kind=NULL",
             (dialog_id, message_id, generation, display_generation, now, now),
         )
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
         # v67 fixtures can call the aggregate primitive before migration; the
         # v68 database migration installs these tables for production.
         return

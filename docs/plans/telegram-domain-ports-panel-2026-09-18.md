@@ -1,6 +1,9 @@
 # Telegram Domain Ports: Expert Panel Recommendation
 
-Status: accepted; Slice 1 deployed; Slice 2 implemented locally and pending release
+Status: accepted; Slice 1 deployed; Slice 2 is a code-complete PR candidate pending release
+
+Release prerequisite: remove the retired `[freshness.reactions]` section from
+the host-owned deployment config before restarting the Slice 2 image.
 
 Date: 2026-09-18
 

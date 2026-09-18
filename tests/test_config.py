@@ -478,6 +478,15 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["REACTION_DETAIL_MAX_PAGES_PER_CYCLE", "REACTION_DETAIL_UNAVAILABLE_RETRY_SECONDS"],
+)
+def test_runtime_environment_rejects_zero_for_positive_reaction_detail_policy(name: str) -> None:
+    with pytest.raises(ConfigError, match="must be an integer > 0"):
+        resolve_scheduling_config(SchedulingConfig(), {name: "0"})
+
+
 def test_runtime_environment_rejects_subsecond_read_position_failure_cooldown() -> None:
     with pytest.raises(ConfigError, match="READ_POSITION_RECONCILIATION_FAILURE_COOLDOWN_SECONDS"):
         resolve_scheduling_config(SchedulingConfig(), {"READ_POSITION_RECONCILIATION_FAILURE_COOLDOWN_SECONDS": "0.5"})
@@ -564,6 +573,7 @@ def test_resolve_scheduling_rejects_activity_hot_sweep_inverted_due_bounds() -> 
         ('[state]\ndir = "/state"\n\n[freshness]\nunknown = 1\n', "freshness"),
         ('[state]\ndir = "/state"\n\nfreshness = "invalid"\n', "[freshness]"),
         ('[state]\ndir = "/state"\n\n[reactions]\nfreshness_ttl_seconds = 42\n', "root"),
+        ('[state]\ndir = "/state"\n\n[freshness.reactions]\nttl_seconds = 42\n', "freshness"),
     ],
 )
 def test_load_config_rejects_invalid_policy(tmp_path: Path, contents: str, expected: str) -> None:

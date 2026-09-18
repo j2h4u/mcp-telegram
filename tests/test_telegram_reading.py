@@ -494,7 +494,7 @@ async def test_read_at_stops_after_persistence_operational_error_with_prior_comm
         status: str,
     ) -> None:
         if message_id == 2:
-            raise sqlite3.OperationalError("simulated missing table")
+            raise sqlite3.OperationalError("no such table: message_read_facts")
         original_persist(
             connection,
             current_dialog_id,

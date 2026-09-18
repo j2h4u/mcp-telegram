@@ -486,7 +486,10 @@ async def test_build_read_messages_projects_persisted_reaction_events() -> None:
             reactor_id INTEGER,
             emoji TEXT NOT NULL,
             reacted_at INTEGER,
-            fetched_at INTEGER NOT NULL
+            fetched_at INTEGER NOT NULL,
+            detail_generation INTEGER NOT NULL DEFAULT 0,
+            page_ordinal INTEGER NOT NULL DEFAULT 0,
+            display_generation INTEGER NOT NULL DEFAULT 1
         );
         CREATE TABLE message_reaction_event_status (
             dialog_id INTEGER NOT NULL,
@@ -494,6 +497,14 @@ async def test_build_read_messages_projects_persisted_reaction_events() -> None:
             checked_at INTEGER NOT NULL,
             status TEXT NOT NULL,
             returned_count INTEGER NOT NULL,
+            aggregate_generation INTEGER NOT NULL DEFAULT 1,
+            detail_generation INTEGER NOT NULL DEFAULT 1,
+            display_generation INTEGER NOT NULL DEFAULT 1,
+            published_generation INTEGER NOT NULL DEFAULT 1,
+            staged_count INTEGER NOT NULL DEFAULT 0,
+            next_offset TEXT,
+            next_attempt_at INTEGER,
+            failure_kind TEXT,
             PRIMARY KEY (dialog_id, message_id)
         );
         INSERT INTO message_reactions VALUES (7, 42, '👍', 2);
@@ -502,7 +513,9 @@ async def test_build_read_messages_projects_persisted_reaction_events() -> None:
             (dialog_id, message_id, reactor_id, emoji, reacted_at, fetched_at)
         VALUES (7, 42, 99, '👍', 1700000000, 1700000100),
                (7, 42, NULL, '🔥', NULL, 1700000100);
-        INSERT INTO message_reaction_event_status VALUES (7, 42, 1700000100, 'partial', 2);
+        INSERT INTO message_reaction_event_status
+            (dialog_id, message_id, checked_at, status, returned_count)
+        VALUES (7, 42, 1700000100, 'partial', 2);
         """
     )
     logger = _TestLogger()

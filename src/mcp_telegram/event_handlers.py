@@ -1543,8 +1543,6 @@ class EventHandlerManager:
         if event_ids is None:
             return
         dialog_id, msg_id = event_ids
-        boundary = allocate_observation_boundary(self._conn, ReactionAggregateSource.RAW_UPDATE)
-
         coverage = self._realtime_coverage(dialog_id)
         if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
             logger.debug(
@@ -1564,7 +1562,16 @@ class EventHandlerManager:
 
         try:
             aggregates = project_reaction_aggregates(update.reactions)
+            previous_generation = self._reaction_generation(dialog_id, msg_id)
+            boundary = allocate_observation_boundary(self._conn, ReactionAggregateSource.RAW_UPDATE)
             if not self._apply_reaction_event(dialog_id, msg_id, aggregates, boundary):
+                _record_runtime_observation_best_effort(
+                    self._conn,
+                    kind="reaction.aggregate",
+                    outcome="rejected",
+                    result_count=len(aggregates),
+                    payload={"source": ReactionAggregateSource.RAW_UPDATE.value},
+                )
                 return
             _record_runtime_observation_best_effort(
                 self._conn,
@@ -1573,12 +1580,13 @@ class EventHandlerManager:
                 result_count=len(aggregates),
                 payload={"source": ReactionAggregateSource.RAW_UPDATE.value},
             )
-            _record_runtime_observation_best_effort(
-                self._conn,
-                kind="reaction.invalidation",
-                outcome="detail_stale",
-                payload={"source": ReactionAggregateSource.RAW_UPDATE.value},
-            )
+            if self._reaction_generation(dialog_id, msg_id) != previous_generation:
+                _record_runtime_observation_best_effort(
+                    self._conn,
+                    kind="reaction.invalidation",
+                    outcome="detail_stale",
+                    payload={"source": ReactionAggregateSource.RAW_UPDATE.value},
+                )
             logger.debug(
                 "event_raw_reaction dialog_id=%d message_id=%d count=%d",
                 dialog_id,
@@ -1591,6 +1599,16 @@ class EventHandlerManager:
                 dialog_id,
                 msg_id,
             )
+
+    def _reaction_generation(self, dialog_id: int, msg_id: int) -> int | None:
+        row = cast(
+            tuple[object, ...] | None,
+            self._conn.execute(
+                "SELECT generation FROM message_reaction_aggregate_state WHERE dialog_id=? AND message_id=?",
+                (dialog_id, msg_id),
+            ).fetchone(),
+        )
+        return None if row is None else int(cast(int, row[0]))
 
     @staticmethod
     def _reaction_event_ids(update: _RawReactionUpdate) -> tuple[int, int] | None:
@@ -1619,7 +1637,7 @@ class EventHandlerManager:
             return False
         now = int(time.time())
         with self._conn:
-            replace_reaction_aggregates(
+            accepted = replace_reaction_aggregates(
                 self._conn,
                 dialog_id,
                 msg_id,
@@ -1628,6 +1646,8 @@ class EventHandlerManager:
                 observed_at=None if boundary is None else boundary.observed_at,
                 observation_sequence=None if boundary is None else boundary.sequence,
             )
+            if not accepted:
+                return False
             self._record_body_event(dialog_id, now)
         return True
 

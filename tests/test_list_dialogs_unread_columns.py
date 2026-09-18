@@ -41,7 +41,6 @@ from tests.helpers import (
     LoudUserProfilePort,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
-from tests.reaction_helpers import make_reaction_freshener
 
 # ---------------------------------------------------------------------------
 # get_peer_id patch (daemon_api imports telethon_utils.get_peer_id; tests
@@ -248,7 +247,6 @@ def _make_server(conn: sqlite3.Connection, client: object) -> DaemonAPIServer:
         conn,
         cast(DaemonClientLike, client),
         asyncio.Event(),
-        reaction_freshener=make_reaction_freshener(conn, client),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),

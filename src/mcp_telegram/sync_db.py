@@ -1149,6 +1149,13 @@ CREATE TABLE IF NOT EXISTS message_reaction_aggregate_state (
 ) WITHOUT ROWID
 """
 
+_MESSAGE_REACTION_OBSERVATION_COUNTER_DDL = """
+CREATE TABLE IF NOT EXISTS message_reaction_observation_counter (
+    singleton     INTEGER PRIMARY KEY CHECK (singleton = 1),
+    next_sequence INTEGER NOT NULL CHECK (next_sequence >= 0)
+) WITHOUT ROWID
+"""
+
 _MESSAGE_REACTION_DETAIL_DUE_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_message_reaction_detail_due
 ON message_reaction_event_status(status, next_attempt_at, aggregate_generation)
@@ -3797,13 +3804,16 @@ def _apply_migration_67(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
-def _apply_migration_68(conn: sqlite3.Connection, current: int) -> int:
+def _apply_migration_68(conn: sqlite3.Connection, current: int) -> int:  # noqa: PLR0912, PLR0915
     """Split reaction aggregate observations from reactor-detail lifecycle."""
     if current >= _REACTION_DETAIL_LIFECYCLE_MIGRATION_68:
         return current
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(_MESSAGE_REACTION_AGGREGATE_STATE_DDL)
+        conn.execute(_MESSAGE_REACTION_OBSERVATION_COUNTER_DDL)
+        conn.execute(_MESSAGE_REACTION_EVENTS_DDL)
+        conn.execute(_MESSAGE_REACTION_EVENT_STATUS_DDL)
         event_columns = _table_column_names(conn, "message_reaction_events")
         event_alters = {
             "detail_generation": "ALTER TABLE message_reaction_events ADD COLUMN detail_generation INTEGER NOT NULL DEFAULT 0",
@@ -3830,36 +3840,34 @@ def _apply_migration_68(conn: sqlite3.Connection, current: int) -> int:
                 conn.execute(statement)
 
         # Build one legacy observation for every aggregate, freshness receipt,
-        # event status, or event row.  This intentionally keeps empty receipts:
-        # a freshness/status row is evidence even when message_reactions has no
-        # rows for the message.
-        observation_queries = [
-            "SELECT dialog_id, message_id, checked_at AS observed_at FROM message_reactions_freshness",
-            "SELECT dialog_id, message_id, checked_at FROM message_reaction_event_status",
-            "SELECT dialog_id, message_id, fetched_at FROM message_reaction_events",
-            "SELECT dialog_id, message_id, 0 FROM message_reactions",
-        ]
+        # event status, or event row. A receipt is evidence even when the
+        # aggregate projection is empty.
         existing_tables = {
             str(row[0])
             for row in cast(
                 list[tuple[object, ...]],
                 conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
-                    "('message_reactions_freshness','message_reaction_event_status','message_reaction_events','message_reactions')"
+                    "('messages','message_reactions_freshness','message_reaction_event_status','message_reaction_events','message_reactions')"
                 ).fetchall(),
             )
         }
         observation_queries = [
             query
-            for query, table in zip(
-                observation_queries,
+            for query, table in (
                 (
+                    "SELECT dialog_id, message_id, checked_at FROM message_reactions_freshness",
                     "message_reactions_freshness",
-                    "message_reaction_event_status",
-                    "message_reaction_events",
-                    "message_reactions",
                 ),
-                strict=True,
+                (
+                    "SELECT dialog_id, message_id, checked_at FROM message_reaction_event_status",
+                    "message_reaction_event_status",
+                ),
+                (
+                    "SELECT dialog_id, message_id, fetched_at FROM message_reaction_events",
+                    "message_reaction_events",
+                ),
+                ("SELECT dialog_id, message_id, 0 FROM message_reactions", "message_reactions"),
             )
             if table in existing_tables
         ]
@@ -3875,15 +3883,17 @@ def _apply_migration_68(conn: sqlite3.Connection, current: int) -> int:
                 continue
             seen.add(key)
             sequence += 1
-            row_count = int(
-                cast(
-                    int,
-                    conn.execute(
-                        "SELECT COUNT(*) FROM message_reactions WHERE dialog_id = ? AND message_id = ?",
-                        key,
-                    ).fetchone()[0],
+            row_count = 0
+            if "message_reactions" in existing_tables:
+                row_count = int(
+                    cast(
+                        int,
+                        conn.execute(
+                            "SELECT COUNT(*) FROM message_reactions WHERE dialog_id = ? AND message_id = ?",
+                            key,
+                        ).fetchone()[0],
+                    )
                 )
-            )
             conn.execute(
                 "INSERT OR IGNORE INTO message_reaction_aggregate_state "
                 "(dialog_id, message_id, generation, observed_at, observation_sequence, source, source_rank, aggregate_row_count) "
@@ -3891,6 +3901,14 @@ def _apply_migration_68(conn: sqlite3.Connection, current: int) -> int:
                 (*key, int(observed_at or 0), sequence, row_count),
             )
 
+        conn.execute(
+            "INSERT OR IGNORE INTO message_reaction_observation_counter(singleton, next_sequence) VALUES (1, 0)"
+        )
+        conn.execute(
+            "UPDATE message_reaction_observation_counter SET next_sequence=MAX(next_sequence, "
+            "COALESCE((SELECT MAX(observation_sequence) FROM message_reaction_aggregate_state), 0)) "
+            "WHERE singleton=1"
+        )
         now = int(time.time())
         conn.execute(
             "INSERT OR IGNORE INTO message_reaction_event_status "
@@ -3906,49 +3924,36 @@ def _apply_migration_68(conn: sqlite3.Connection, current: int) -> int:
         conn.execute(
             "UPDATE message_reaction_event_status SET "
             "aggregate_generation=COALESCE(aggregate_generation, 1), "
-            "detail_generation=CASE WHEN status = 'complete' THEN 1 ELSE COALESCE(detail_generation, 0) END, "
-            "display_generation=CASE WHEN status IN ('complete', 'unavailable') THEN 1 ELSE COALESCE(display_generation, 0) END, "
-            "published_generation=CASE WHEN status = 'complete' THEN 1 ELSE COALESCE(published_generation, 0) END, "
-            "staged_count=COALESCE(staged_count, returned_count), "
-            "status=CASE WHEN status = 'partial' AND next_offset IS NULL THEN 'stale' ELSE status END, "
-            "next_attempt_at=CASE WHEN status = 'partial' AND next_offset IS NULL THEN ? ELSE next_attempt_at END",
+            "staged_count=0, "
+            "display_generation=CASE WHEN status IN ('complete','partial','unavailable') "
+            "OR EXISTS (SELECT 1 FROM message_reaction_events e "
+            "WHERE e.dialog_id=message_reaction_event_status.dialog_id "
+            "AND e.message_id=message_reaction_event_status.message_id) THEN 1 ELSE 0 END, "
+            "detail_generation=CASE WHEN status='complete' THEN aggregate_generation ELSE 0 END, "
+            "published_generation=CASE WHEN status='complete' THEN aggregate_generation ELSE 0 END, "
+            "next_attempt_at=CASE WHEN status IN ('partial','unavailable') THEN COALESCE(next_attempt_at, ?) ELSE next_attempt_at END",
             (now,),
         )
         conn.execute(
-            "UPDATE message_reaction_events SET detail_generation=1, "
-            "display_generation=CASE WHEN EXISTS (SELECT 1 FROM message_reaction_event_status s "
-            "WHERE s.dialog_id=message_reaction_events.dialog_id AND s.message_id=message_reaction_events.message_id "
-            "AND s.display_generation=1) THEN 1 ELSE 0 END"
+            "UPDATE message_reaction_events SET detail_generation=CASE WHEN EXISTS ("
+            "SELECT 1 FROM message_reaction_event_status s WHERE s.dialog_id=message_reaction_events.dialog_id "
+            "AND s.message_id=message_reaction_events.message_id AND s.status='complete') "
+            "THEN 1 ELSE 0 END, display_generation=1"
         )
-        conn.execute(
-            "DELETE FROM message_reactions WHERE NOT EXISTS ("
-            "SELECT 1 FROM messages m WHERE m.dialog_id=message_reactions.dialog_id AND m.message_id=message_reactions.message_id)"
-        )
-        conn.execute(
-            "DELETE FROM message_reaction_events WHERE NOT EXISTS ("
-            "SELECT 1 FROM messages m WHERE m.dialog_id=message_reaction_events.dialog_id "
-            "AND m.message_id=message_reaction_events.message_id)"
-        )
-        conn.execute(
-            "DELETE FROM message_reaction_event_status WHERE NOT EXISTS ("
-            "SELECT 1 FROM messages m WHERE m.dialog_id=message_reaction_event_status.dialog_id "
-            "AND m.message_id=message_reaction_event_status.message_id)"
-        )
-        conn.execute(
-            "DELETE FROM message_reaction_aggregate_state WHERE NOT EXISTS ("
-            "SELECT 1 FROM messages m WHERE m.dialog_id=message_reaction_aggregate_state.dialog_id "
-            "AND m.message_id=message_reaction_aggregate_state.message_id)"
-        )
-        conn.execute(
-            "DELETE FROM message_reaction_event_status WHERE NOT EXISTS ("
-            "SELECT 1 FROM messages m WHERE m.dialog_id=message_reaction_event_status.dialog_id "
-            "AND m.message_id=message_reaction_event_status.message_id)"
-        )
-        conn.execute(
-            "DELETE FROM message_reaction_events WHERE NOT EXISTS ("
-            "SELECT 1 FROM messages m WHERE m.dialog_id=message_reaction_events.dialog_id "
-            "AND m.message_id=message_reaction_events.message_id)"
-        )
+        if "messages" in existing_tables:
+            for table in (
+                "message_reactions",
+                "message_reaction_events",
+                "message_reaction_event_status",
+                "message_reaction_aggregate_state",
+            ):
+                if table not in existing_tables and table != "message_reaction_aggregate_state":
+                    continue
+                conn.execute(
+                    f"DELETE FROM {table} WHERE NOT EXISTS ("
+                    f"SELECT 1 FROM messages m WHERE m.dialog_id={table}.dialog_id "
+                    f"AND m.message_id={table}.message_id)"
+                )
         conn.execute(_MESSAGE_REACTION_DETAIL_DUE_INDEX_DDL)
         conn.execute("DROP TABLE IF EXISTS message_reactions_freshness")
         conn.execute(

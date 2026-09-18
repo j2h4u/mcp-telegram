@@ -17,12 +17,11 @@ from .ports import TelegramReactionGateway
 
 @dataclass(frozen=True, slots=True)
 class ReactionDetailPolicy:
-    max_pages_per_cycle: int = 5
     unavailable_retry_seconds: int = 600
     page_size: int = 100
 
     def __post_init__(self) -> None:
-        if self.max_pages_per_cycle < 1 or self.unavailable_retry_seconds < 1 or self.page_size < 1:
+        if self.unavailable_retry_seconds < 1 or self.page_size < 1:
             raise ValueError("reaction detail policy values must be positive")
 
 
@@ -63,33 +62,6 @@ class ReactionDetailRefresher:
     def observe_terminal_suppressed(self) -> None:
         """Record that a complete detail row was intentionally not retried."""
         self._observe("reaction.terminal_suppressed", "complete")
-
-    def due_candidates(self, *, now: int | None = None, limit: int = 5) -> list[tuple[int, int, int, str | None]]:
-        when = int(self._now() if now is None else now)
-        rows = cast(
-            list[tuple[object, ...]],
-            self._conn.execute(
-                "SELECT s.dialog_id, s.message_id, s.generation, d.next_offset "
-                "FROM message_reaction_aggregate_state s "
-                "JOIN messages m ON m.dialog_id=s.dialog_id AND m.message_id=s.message_id "
-                "JOIN synced_dialogs sd ON sd.dialog_id=s.dialog_id AND sd.status='synced' "
-                "JOIN full_history_enrollment fhe ON fhe.dialog_id=s.dialog_id AND fhe.enabled=1 "
-                "LEFT JOIN message_reaction_event_status d ON d.dialog_id=s.dialog_id AND d.message_id=s.message_id "
-                "WHERE d.dialog_id IS NULL OR d.aggregate_generation < s.generation "
-                "OR (d.status IN ('stale','partial','unavailable') AND COALESCE(d.next_attempt_at, 0) <= ?) "
-                "ORDER BY s.observed_at, s.dialog_id, s.message_id LIMIT ?",
-                (when, limit),
-            ).fetchall(),
-        )
-        return [
-            (
-                int(cast(int | str, row[0])),
-                int(cast(int | str, row[1])),
-                int(cast(int | str, row[2])),
-                None if row[3] is None else str(row[3]),
-            )
-            for row in rows
-        ]
 
     async def refresh_one(  # noqa: PLR0913, PLR0911
         self,
@@ -267,7 +239,7 @@ class ReactionDetailRefresher:
                 )
                 self._conn.execute(
                     "DELETE FROM message_reaction_events WHERE dialog_id=? AND message_id=? "
-                    "AND display_generation > 0 AND display_generation < ?",
+                    "AND display_generation > 0 AND detail_generation != ?",
                     (dialog_id, message_id, generation),
                 )
                 self._conn.execute(

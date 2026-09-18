@@ -38,6 +38,8 @@ JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled
 JOIN message_reaction_aggregate_state a ON a.dialog_id=m.dialog_id AND a.message_id=m.message_id
 LEFT JOIN message_reaction_event_status d ON d.dialog_id=m.dialog_id AND d.message_id=m.message_id
 WHERE sd.status = 'synced'
+  AND (a.aggregate_row_count > 0
+       OR d.status IN ('partial','unavailable'))
   AND (d.dialog_id IS NULL OR d.aggregate_generation < a.generation
        OR (d.status IN ('stale','partial','unavailable') AND COALESCE(d.next_attempt_at, 0) <= ?))
 ORDER BY m.sent_at DESC, m.dialog_id, m.message_id
@@ -71,8 +73,9 @@ FROM message_reaction_aggregate_state a
 JOIN synced_dialogs sd ON sd.dialog_id=a.dialog_id AND sd.status='synced'
 JOIN full_history_enrollment fhe ON fhe.dialog_id=a.dialog_id AND fhe.enabled=1
 LEFT JOIN message_reaction_event_status d ON d.dialog_id=a.dialog_id AND d.message_id=a.message_id
-WHERE d.dialog_id IS NULL OR d.aggregate_generation < a.generation
-   OR d.status IN ('stale','partial','unavailable')
+WHERE (a.aggregate_row_count > 0 OR d.status IN ('partial','unavailable'))
+  AND (d.dialog_id IS NULL OR d.aggregate_generation < a.generation
+       OR d.status IN ('stale','partial','unavailable'))
 """
 
 _TERMINAL_REACTION_SUPPRESSED_SQL = """
@@ -473,14 +476,13 @@ async def refresh_message_facts_once(
         stale_before_utc=checked_at,
         limit=policy.reaction_max_messages_per_cycle,
     )
-    if _terminal_reaction_suppressed(deps.conn):
+    if policy.reaction_max_messages_per_cycle > 0 and _terminal_reaction_suppressed(deps.conn):
         observe_terminal_suppressed = getattr(deps.reaction_detail_refresher, "observe_terminal_suppressed", None)
         if callable(observe_terminal_suppressed):
             observe_terminal_suppressed()
     reaction_refreshed = 0
-    for index, (dialog_id, message_id, generation, offset) in enumerate(
-        reaction_rows[: policy.reaction_detail_max_pages_per_cycle]
-    ):
+    selected_reaction_rows = reaction_rows[: policy.reaction_detail_max_pages_per_cycle]
+    for index, (dialog_id, message_id, generation, offset) in enumerate(selected_reaction_rows):
         detail = await deps.reaction_detail_refresher.refresh_one(
             dialog_id,
             message_id,
@@ -491,7 +493,7 @@ async def refresh_message_facts_once(
             now=checked_at,
         )
         reaction_refreshed += detail.fetched_pages
-        if shutdown_event is not None and index < len(reaction_rows) - 1:
+        if shutdown_event is not None and index < len(selected_reaction_rows) - 1:
             await _interruptible_pause(shutdown_event, policy.pause_seconds)
 
     if policy.read_at_max_messages_per_cycle > 0:

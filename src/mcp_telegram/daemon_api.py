@@ -586,7 +586,6 @@ class DaemonAPIServer:
         feedback_service: FeedbackService | None = None,
         sync_db_path: Path | None = None,
         *,
-        reaction_freshener: object | None = None,
         hydration_requester: Callable[[sqlite3.Connection, int, int], None] | None = None,
         topic_refresher: TopicRefresher | None = None,
         folder_projection_reproject: Callable[[], object] | None = None,
@@ -599,7 +598,6 @@ class DaemonAPIServer:
         user_avatar_history_port: UserAvatarHistoryPort,
         chat_avatar_history_port: ChatAvatarHistoryPort,
     ) -> None:
-        del reaction_freshener  # legacy constructor argument; reads are SQLite-only
         conn.row_factory = sqlite3.Row
         self._conn = conn
         self._sync_db_path = _resolve_sync_db_path(conn, sync_db_path)
