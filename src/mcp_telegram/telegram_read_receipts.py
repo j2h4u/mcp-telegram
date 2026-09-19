@@ -3,14 +3,28 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from importlib import import_module
 from typing import Protocol, cast
 
+from telethon.errors import (  # type: ignore[import-untyped]
+    MsgTooOldError,
+    PeerIdInvalidError,
+    UserNotMutualContactError,
+    UserPrivacyRestrictedError,
+)
 from telethon.tl.functions.messages import GetOutboxReadDateRequest
 from telethon.tl.types import TypeInputPeer
 
+from .flood import TelegramRpcThrottled
 from .telegram_demand import AcquisitionKind, RpcAttemptBudgetExhaustedError
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES, translate_gateway_failure
-from .telegram_reading import ReadDateFetchResult, TelegramReadReceiptGateway
+from .telegram_reading import (
+    GatewayFailure,
+    GatewayFailureKind,
+    ReadDateFetchResult,
+    ReadDateReason,
+    TelegramReadReceiptGateway,
+)
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
 
 
@@ -18,6 +32,60 @@ class _TelegramClientLike(Protocol):
     async def get_input_entity(self, entity: object) -> object: ...
 
     async def __call__(self, request: object) -> object: ...
+
+
+def _optional_error(name: str) -> type[BaseException] | None:
+    candidate = getattr(import_module("telethon.errors"), name, None)
+    return candidate if isinstance(candidate, type) and issubclass(candidate, BaseException) else None
+
+
+def _read_failure(
+    exc: BaseException,
+    *,
+    reason: ReadDateReason,
+    retryable: bool,
+    retry_after: int | None = None,
+) -> ReadDateFetchResult:
+    failure = GatewayFailure(
+        kind=GatewayFailureKind.TRANSIENT,
+        error_type=type(exc).__name__,
+        error_message=str(exc).replace("\n", "\\n") or type(exc).__name__,
+        retryable=retryable,
+        retry_after=retry_after,
+    )
+    return ReadDateFetchResult(status="unavailable", failure=failure, reason=reason)
+
+
+def classify_read_date_exception(exc: BaseException) -> ReadDateFetchResult:  # noqa: PLR0911
+    """Classify read-date-only Telegram failures without changing shared translation."""
+    not_read_yet = _optional_error("MessageNotReadYetError")
+    your_privacy = _optional_error("YourPrivacyRestrictedError")
+    if not_read_yet is not None and isinstance(exc, not_read_yet):
+        return ReadDateFetchResult(status="missing", reason=ReadDateReason.MESSAGE_NOT_READ_YET)
+    if isinstance(exc, MsgTooOldError):
+        return _read_failure(exc, reason=ReadDateReason.MESSAGE_TOO_OLD, retryable=False)
+    if isinstance(exc, (UserPrivacyRestrictedError,)) or (your_privacy is not None and isinstance(exc, your_privacy)):
+        return _read_failure(exc, reason=ReadDateReason.PRIVACY_RESTRICTED, retryable=False)
+    if isinstance(exc, UserNotMutualContactError):
+        return _read_failure(exc, reason=ReadDateReason.NOT_MUTUAL_CONTACT, retryable=False)
+    if isinstance(exc, PeerIdInvalidError):
+        return _read_failure(exc, reason=ReadDateReason.INVALID_TARGET, retryable=False)
+    if isinstance(exc, TelegramRpcThrottled):
+        failure = translate_gateway_failure(exc)
+        return ReadDateFetchResult(
+            status="unavailable",
+            failure=failure,
+            reason=ReadDateReason.FLOOD_WAIT,
+        )
+
+    failure = translate_gateway_failure(exc)
+    reason = {
+        GatewayFailureKind.INVALID_TARGET: ReadDateReason.INVALID_TARGET,
+        GatewayFailureKind.ACCESS_LOST: ReadDateReason.ACCESS_LOST,
+        GatewayFailureKind.FLOOD_WAIT: ReadDateReason.FLOOD_WAIT,
+        GatewayFailureKind.TRANSIENT: ReadDateReason.TRANSIENT,
+    }[failure.kind]
+    return ReadDateFetchResult(status="unavailable", failure=failure, reason=reason)
 
 
 class TelethonTelegramReadReceiptGateway:
@@ -40,17 +108,22 @@ class TelethonTelegramReadReceiptGateway:
                 if not isinstance(value, datetime):
                     # Telegram can return an empty/permission-limited response. It
                     # is a successful probe with no event timestamp, not an error.
-                    return ReadDateFetchResult(status="missing")
+                    return ReadDateFetchResult(status="missing", reason=ReadDateReason.DATE_OMITTED)
                 if value.tzinfo is None:
                     value = value.replace(tzinfo=UTC)
-                return ReadDateFetchResult(read_at=int(value.timestamp()), status="complete")
+                return ReadDateFetchResult(
+                    read_at=int(value.timestamp()),
+                    status="complete",
+                    reason=ReadDateReason.RESOLVED,
+                )
             except RpcAdmissionClosedError, RpcAttemptBudgetExhaustedError:
                 raise
             except CATCHABLE_GATEWAY_FAILURES as exc:
-                return ReadDateFetchResult(
-                    status="unavailable",
-                    failure=translate_gateway_failure(exc),
-                )
+                return classify_read_date_exception(exc)
 
 
-__all__ = ["TelegramReadReceiptGateway", "TelethonTelegramReadReceiptGateway"]
+__all__ = [
+    "TelegramReadReceiptGateway",
+    "TelethonTelegramReadReceiptGateway",
+    "classify_read_date_exception",
+]

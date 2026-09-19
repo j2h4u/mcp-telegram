@@ -12,6 +12,13 @@ from typing import Protocol, cast
 from unittest.mock import AsyncMock
 
 import pytest
+from telethon import errors as telethon_errors
+from telethon.errors import (
+    MsgTooOldError,
+    PeerIdInvalidError,
+    UserNotMutualContactError,
+    UserPrivacyRestrictedError,
+)
 from telethon.tl import types
 
 from mcp_telegram.flood import TelegramRpcThrottled
@@ -21,11 +28,15 @@ from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudgetExhaus
 from mcp_telegram.telegram_fact_queries import enrich_read_at, persist_read_at, stale_read_at_ids
 from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from mcp_telegram.telegram_history import TelethonTelegramHistoryGateway
-from mcp_telegram.telegram_read_receipts import TelethonTelegramReadReceiptGateway
+from mcp_telegram.telegram_read_receipts import (
+    TelethonTelegramReadReceiptGateway,
+    classify_read_date_exception,
+)
 from mcp_telegram.telegram_reading import (
     GatewayFailure,
     GatewayFailureKind,
     ReadDateFetchResult,
+    ReadDateReason,
 )
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
@@ -248,8 +259,68 @@ async def test_read_receipt_gateway_keeps_telegram_date_nullable() -> None:
 
     client = Client()
     result = await TelethonTelegramReadReceiptGateway(client).fetch_outbox_read_date(42, 10)
-    assert result == ReadDateFetchResult(read_at=1_700_000_200, status="complete")
+    assert result == ReadDateFetchResult(
+        read_at=1_700_000_200,
+        status="complete",
+        reason=ReadDateReason.RESOLVED,
+    )
     assert client.resolved == [42]
+
+
+@pytest.mark.asyncio
+async def test_read_receipt_gateway_distinguishes_omitted_date() -> None:
+    class Client:
+        async def get_input_entity(self, entity: object) -> object:
+            return entity
+
+        async def __call__(self, request: object) -> object:
+            del request
+            return SimpleNamespace(date=None)
+
+    result = await TelethonTelegramReadReceiptGateway(Client()).fetch_outbox_read_date(42, 10)
+    assert result.status == "missing"
+    assert result.reason is ReadDateReason.DATE_OMITTED
+
+
+@pytest.mark.parametrize(
+    ("error", "reason", "retryable"),
+    [
+        (MsgTooOldError(request=None), ReadDateReason.MESSAGE_TOO_OLD, False),
+        (UserPrivacyRestrictedError(request=None), ReadDateReason.PRIVACY_RESTRICTED, False),
+        (UserNotMutualContactError(request=None), ReadDateReason.NOT_MUTUAL_CONTACT, False),
+        (PeerIdInvalidError(request=None), ReadDateReason.INVALID_TARGET, False),
+        (TimeoutError("temporary"), ReadDateReason.TRANSIENT, True),
+    ],
+)
+def test_read_date_exception_classifier_covers_installed_symbols(
+    error: Exception,
+    reason: ReadDateReason,
+    retryable: bool,
+) -> None:
+    result = classify_read_date_exception(error)
+    assert result.reason is reason
+    assert result.failure is not None
+    assert result.failure.retryable is retryable
+
+
+def test_read_date_exception_classifier_covers_optional_symbols(monkeypatch: pytest.MonkeyPatch) -> None:
+    class MessageNotReadYetError(Exception):
+        pass
+
+    class YourPrivacyRestrictedError(Exception):
+        pass
+
+    monkeypatch.setattr(telethon_errors, "MessageNotReadYetError", MessageNotReadYetError, raising=False)
+    monkeypatch.setattr(telethon_errors, "YourPrivacyRestrictedError", YourPrivacyRestrictedError, raising=False)
+    assert classify_read_date_exception(MessageNotReadYetError()).reason is ReadDateReason.MESSAGE_NOT_READ_YET
+    assert classify_read_date_exception(YourPrivacyRestrictedError()).reason is ReadDateReason.PRIVACY_RESTRICTED
+
+
+def test_read_date_exception_classifier_preserves_flood_deadline() -> None:
+    result = classify_read_date_exception(TelegramRpcThrottled(retry_after_seconds=917))
+    assert result.reason is ReadDateReason.FLOOD_WAIT
+    assert result.failure is not None
+    assert result.failure.retry_after == 917
 
 
 @pytest.mark.asyncio
@@ -405,6 +476,20 @@ def test_read_at_persistence_is_terminal_and_monotonic(make_synced_db: Callable[
         "SELECT read_at, checked_at, status FROM message_read_facts WHERE dialog_id=42 AND message_id=1"
     ).fetchone() == (1_700_000_001, 100, "complete")
 
+    persist_read_at(
+        conn,
+        42,
+        2,
+        read_at=None,
+        checked_at=300,
+        status="unavailable",
+        reason=ReadDateReason.MESSAGE_TOO_OLD,
+        next_attempt_at=999,
+    )
+    assert conn.execute(
+        "SELECT status, reason, next_attempt_at FROM message_read_facts WHERE dialog_id=42 AND message_id=2"
+    ).fetchone() == ("unavailable", "message_too_old", None)
+
     with pytest.raises(ValueError, match="non-null read_at"):
         persist_read_at(conn, 42, 2, read_at=None, checked_at=1, status="complete")
 
@@ -463,6 +548,42 @@ async def test_read_at_unavailable_is_nullable_but_probe_status_is_persisted(
     assert conn.execute(
         "SELECT read_at, checked_at, status FROM message_read_facts WHERE dialog_id=42 AND message_id=7"
     ).fetchone() == (None, 3_000, "unavailable")
+
+
+@pytest.mark.asyncio
+async def test_read_at_retry_deadline_uses_maximum_of_ttl_and_flood_wait(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    conn = make_synced_db()
+    _seed_enrollment(conn, 42)
+
+    class Gateway:
+        async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult:
+            del entity, message_id
+            return ReadDateFetchResult(
+                status="unavailable",
+                reason=ReadDateReason.FLOOD_WAIT,
+                failure=GatewayFailure(
+                    kind=GatewayFailureKind.FLOOD_WAIT,
+                    error_type="TelegramRpcThrottled",
+                    error_message="redacted from telemetry",
+                    retryable=True,
+                    retry_after=917,
+                ),
+            )
+
+    await enrich_read_at(
+        conn,
+        Gateway(),
+        42,
+        [ReadMessage(message_id=7, sent_at=1_000, dialog_id=42, out=1)],
+        dialog_type="user",
+        read_at_ttl_seconds=600,
+        checked_at=3_000,
+    )
+    assert conn.execute(
+        "SELECT status, reason, next_attempt_at FROM message_read_facts WHERE dialog_id=42 AND message_id=7"
+    ).fetchone() == ("unavailable", "flood_wait", 3_917)
 
 
 @pytest.mark.asyncio

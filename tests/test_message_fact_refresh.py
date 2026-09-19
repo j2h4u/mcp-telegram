@@ -508,6 +508,18 @@ async def test_read_at_cycle_telemetry_is_aggregate_and_terminal_safe() -> None:
             "complete": 2,
             "missing": 0,
             "unavailable": 0,
+            "reason_counts": {
+                "resolved": 2,
+                "date_omitted": 0,
+                "message_not_read_yet": 0,
+                "flood_wait": 0,
+                "transient": 0,
+                "message_too_old": 0,
+                "privacy_restricted": 0,
+                "not_mutual_contact": 0,
+                "invalid_target": 0,
+                "access_lost": 0,
+            },
             "measurement_complete": True,
         }
     ]

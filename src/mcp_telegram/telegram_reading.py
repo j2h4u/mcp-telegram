@@ -17,6 +17,43 @@ class GatewayFailureKind(StrEnum):
     INVALID_TARGET = "invalid_target"
 
 
+class ReadDateReason(StrEnum):
+    """Normalized internal outcomes for one exact Telegram read-date probe."""
+
+    RESOLVED = "resolved"
+    DATE_OMITTED = "date_omitted"
+    MESSAGE_NOT_READ_YET = "message_not_read_yet"
+    FLOOD_WAIT = "flood_wait"
+    TRANSIENT = "transient"
+    MESSAGE_TOO_OLD = "message_too_old"
+    PRIVACY_RESTRICTED = "privacy_restricted"
+    NOT_MUTUAL_CONTACT = "not_mutual_contact"
+    INVALID_TARGET = "invalid_target"
+    ACCESS_LOST = "access_lost"
+    LEGACY = "legacy"
+
+
+READ_DATE_REASONS = tuple(reason for reason in ReadDateReason if reason is not ReadDateReason.LEGACY)
+
+
+def normalize_read_date_reason(result: ReadDateFetchResult) -> ReadDateReason:
+    """Return a valid reason for a result, including compatibility results."""
+    if result.status == "complete" and result.read_at is not None:
+        return ReadDateReason.RESOLVED
+    if result.reason is not None:
+        return ReadDateReason(result.reason)
+    if result.status == "missing":
+        return ReadDateReason.DATE_OMITTED
+    if result.failure is not None:
+        return {
+            GatewayFailureKind.FLOOD_WAIT: ReadDateReason.FLOOD_WAIT,
+            GatewayFailureKind.ACCESS_LOST: ReadDateReason.ACCESS_LOST,
+            GatewayFailureKind.INVALID_TARGET: ReadDateReason.INVALID_TARGET,
+            GatewayFailureKind.TRANSIENT: ReadDateReason.TRANSIENT,
+        }[result.failure.kind]
+    return ReadDateReason.TRANSIENT
+
+
 @dataclass(frozen=True, slots=True)
 class GatewayFailure:
     kind: GatewayFailureKind
@@ -56,6 +93,7 @@ class ReadDateFetchResult:
     read_at: int | None = None
     status: str = "unavailable"
     failure: GatewayFailure | None = None
+    reason: ReadDateReason | None = None
 
     @property
     def ok(self) -> bool:
