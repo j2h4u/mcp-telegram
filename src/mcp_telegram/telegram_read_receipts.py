@@ -52,27 +52,21 @@ def _read_failure(
     return ReadDateFetchResult(status="unavailable", failure=failure, reason=reason)
 
 
-def classify_read_date_exception(exc: BaseException) -> ReadDateFetchResult:  # noqa: PLR0911
-    """Classify read-date-only Telegram failures without changing shared translation."""
+def _classify_throttle_exception(exc: BaseException) -> ReadDateFetchResult | None:
     if isinstance(exc, TelegramRpcAdmissionDeferred) or (isinstance(exc, TelegramRpcThrottled) and exc.latched):
         failure = replace(
             translate_gateway_failure(exc),
             kind=GatewayFailureKind.TRANSIENT,
             retryable=True,
         )
-        return ReadDateFetchResult(
-            status="unavailable",
-            failure=failure,
-            reason=ReadDateReason.TRANSIENT,
-        )
+        return ReadDateFetchResult(status="unavailable", failure=failure, reason=ReadDateReason.TRANSIENT)
     if isinstance(exc, TelegramRpcThrottled):
         failure = replace(translate_gateway_failure(exc), retryable=True)
-        return ReadDateFetchResult(
-            status="unavailable",
-            failure=failure,
-            reason=ReadDateReason.FLOOD_WAIT,
-        )
+        return ReadDateFetchResult(status="unavailable", failure=failure, reason=ReadDateReason.FLOOD_WAIT)
+    return None
 
+
+def _classify_known_rpc_symbol(exc: BaseException) -> ReadDateFetchResult | None:
     symbol = describe_telegram_rpc_error(exc).symbol
     if symbol == "MESSAGE_NOT_READ_YET":
         return ReadDateFetchResult(status="missing", reason=ReadDateReason.MESSAGE_NOT_READ_YET)
@@ -89,7 +83,10 @@ def classify_read_date_exception(exc: BaseException) -> ReadDateFetchResult:  # 
             retryable=False,
             kind=GatewayFailureKind.INVALID_TARGET,
         )
+    return None
 
+
+def _classify_translated_failure(exc: BaseException) -> ReadDateFetchResult:
     failure = translate_gateway_failure(exc)
     if failure.kind is GatewayFailureKind.INVALID_TARGET:
         failure = replace(failure, kind=GatewayFailureKind.TRANSIENT, retryable=True)
@@ -101,6 +98,17 @@ def classify_read_date_exception(exc: BaseException) -> ReadDateFetchResult:  # 
         GatewayFailureKind.TRANSIENT: ReadDateReason.TRANSIENT,
     }[failure.kind]
     return ReadDateFetchResult(status="unavailable", failure=failure, reason=reason)
+
+
+def classify_read_date_exception(exc: BaseException) -> ReadDateFetchResult:
+    """Classify read-date-only Telegram failures without changing shared translation."""
+    result = _classify_throttle_exception(exc)
+    if result is not None:
+        return result
+    result = _classify_known_rpc_symbol(exc)
+    if result is not None:
+        return result
+    return _classify_translated_failure(exc)
 
 
 class TelethonTelegramReadReceiptGateway:
