@@ -681,7 +681,7 @@ def test_permanent_detail_failure_is_terminal_until_new_aggregate(
         "legacy",
     )
     assert _reaction_candidates(conn, stale_before_utc=10, limit=10) == []
-    assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, 0) is None
+    assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, (0,)) is None
 
     assert apply_aggregate_observation(
         conn, 1, 2, [ReactionAggregate("🔥", 2)], source="raw_update", observed_at=2, observation_sequence=2
@@ -832,7 +832,7 @@ def test_empty_aggregate_is_not_a_detail_candidate_without_explicit_retry(tmp_pa
         "published_generation=2 WHERE dialog_id=1 AND message_id=2"
     )
     assert _reaction_candidates(conn, stale_before_utc=10, limit=10) == []
-    assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, 600) is None
+    assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, (600,)) is None
 
     class TerminalRefresher:
         async def refresh_one(self, *args: object, **kwargs: object) -> ReactionDetailResult:
@@ -886,7 +886,7 @@ def test_reaction_candidates_prioritize_due_retries_over_future_unavailable_rows
     conn.commit()
     rows = _reaction_candidates(conn, stale_before_utc=100, limit=3)
     assert [row[1] for row in rows] == [5, 4, 3]
-    assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, 0) == 0
+    assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, (0,)) == 0
     conn.close()
 
 
@@ -926,5 +926,5 @@ def test_deleted_reaction_message_is_not_released_or_selected(tmp_path: Path) ->
     conn.execute("UPDATE messages SET is_deleted=1 WHERE dialog_id=1 AND message_id=2")
     conn.commit()
     assert _reaction_candidates(conn, stale_before_utc=10, limit=10) == []
-    assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, 0) is None
+    assert _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, (0,)) is None
     conn.close()

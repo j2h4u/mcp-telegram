@@ -35,9 +35,10 @@ def _read_failure(
     reason: ReadDateReason,
     retryable: bool,
     retry_after: int | None = None,
+    kind: GatewayFailureKind = GatewayFailureKind.TRANSIENT,
 ) -> ReadDateFetchResult:
     failure = GatewayFailure(
-        kind=GatewayFailureKind.TRANSIENT,
+        kind=kind,
         error_type=type(exc).__name__,
         error_message=str(exc).replace("\n", "\\n") or type(exc).__name__,
         retryable=retryable,
@@ -66,9 +67,17 @@ def classify_read_date_exception(exc: BaseException) -> ReadDateFetchResult:  # 
     if symbol == "USER_NOT_MUTUAL_CONTACT":
         return _read_failure(exc, reason=ReadDateReason.NOT_MUTUAL_CONTACT, retryable=False)
     if symbol in {"PEER_ID_INVALID", "MESSAGE_ID_INVALID", "MSG_ID_INVALID"}:
-        return _read_failure(exc, reason=ReadDateReason.INVALID_TARGET, retryable=False)
+        return _read_failure(
+            exc,
+            reason=ReadDateReason.INVALID_TARGET,
+            retryable=False,
+            kind=GatewayFailureKind.INVALID_TARGET,
+        )
 
     failure = translate_gateway_failure(exc)
+    if failure.kind is GatewayFailureKind.INVALID_TARGET:
+        failure = replace(failure, kind=GatewayFailureKind.TRANSIENT, retryable=True)
+        return ReadDateFetchResult(status="unavailable", failure=failure, reason=ReadDateReason.TRANSIENT)
     reason = {
         GatewayFailureKind.INVALID_TARGET: ReadDateReason.INVALID_TARGET,
         GatewayFailureKind.ACCESS_LOST: ReadDateReason.ACCESS_LOST,

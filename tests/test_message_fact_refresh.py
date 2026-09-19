@@ -651,7 +651,7 @@ def test_read_at_cursor_null_has_no_candidate_or_release() -> None:
     seed_full_history_enrollment(conn, 20, enabled=True)
 
     assert _read_at_candidates(conn, stale_before_utc=2_000, limit=10) == []
-    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL, 600) is None
+    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL) is None
     adapter = MessageFactRefreshDemandAdapter(
         MessageFactRefreshDeps(
             conn, cast(ReactionDetailRefresher, object()), cast(TelegramReadReceiptGateway, object())
@@ -698,7 +698,7 @@ def test_terminal_read_at_set_has_no_status_or_release() -> None:
     )
 
     assert _read_at_candidates(conn, stale_before_utc=2_000, limit=10) == []
-    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL, 600) is None
+    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL) is None
     assert adapter.status(2_000) is None
     conn.close()
 
@@ -726,13 +726,13 @@ def test_read_at_candidate_and_release_boundaries_match_v70_schedule() -> None:
     seed_full_history_enrollment(conn, 20, enabled=True)
 
     assert [message.message_id for message in _read_at_candidates(conn, stale_before_utc=2000, limit=10)] == [1]
-    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL, 600) == 2000
+    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL) == 2000
     assert _terminal_read_at_suppressed(conn) == 2
 
     conn.execute("UPDATE message_read_facts SET next_attempt_at = 3000 WHERE message_id = 1")
     conn.commit()
     assert _read_at_candidates(conn, stale_before_utc=2000, limit=10) == []
-    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL, 600) == 3000
+    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL) == 3000
 
     conn.close()
 

@@ -143,7 +143,7 @@ WHERE sd.status = 'synced'
   )
 """
 
-_READ_AT_CYCLE_COUNT_FIELDS = 4
+_READ_AT_RESULT_COUNT_FIELDS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,8 +188,7 @@ class MessageFactRefreshDeps:
     clock: Callable[[], float] = time.time
 
 
-def _next_release_at(conn: sqlite3.Connection, query: str, ttl_seconds: int) -> float | None:
-    params: tuple[int, ...] = (ttl_seconds,) if query.count("?") else ()
+def _next_release_at(conn: sqlite3.Connection, query: str, params: tuple[int, ...] = ()) -> float | None:
     row = cast(tuple[object] | None, conn.execute(query, params).fetchone())
     value = None if row is None else row[0]
     return None if value is None else float(cast(int | float, value))
@@ -205,7 +204,7 @@ def _reaction_pacing_release_at(conn: sqlite3.Connection) -> float | None:
 
 def _reaction_release_at(conn: sqlite3.Connection) -> float | None:
     """Combine raw reaction due state with the durable pacing window."""
-    raw_release = _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, 0)
+    raw_release = _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, (0,))
     if raw_release is None:
         return None
     pacing_release = _reaction_pacing_release_at(conn)
@@ -245,7 +244,7 @@ class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
             read_at_release = _next_release_at(
                 self._deps.conn,
                 _NEXT_READ_AT_RELEASE_SQL,
-                self._policy.read_at_ttl_seconds,
+                (),
             )
             if read_at_release is not None:
                 releases.append(read_at_release)
@@ -533,13 +532,13 @@ def _merge_read_at_counts(
     unavailable: int,
     measurement_complete: bool,
 ) -> tuple[int, int, int, bool]:
-    if len(counts) != _READ_AT_CYCLE_COUNT_FIELDS:
+    if len(counts) != _READ_AT_RESULT_COUNT_FIELDS:
         return complete, missing, unavailable, False
     return (
         complete + counts[0],
         missing + counts[1],
         unavailable + counts[2],
-        measurement_complete and bool(counts[3]),
+        measurement_complete,
     )
 
 

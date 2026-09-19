@@ -163,7 +163,7 @@ async def _fetch_read_date_result(
     except CATCHABLE_GATEWAY_FAILURES as exc:
         return classify_read_date_exception(exc)
     if result.status == "complete" and result.read_at is None:
-        return ReadDateFetchResult(status="missing", reason=ReadDateReason.DATE_OMITTED)
+        raise ValueError("complete read-date result requires a non-null read_at")
     return result
 
 
@@ -220,10 +220,9 @@ async def _refresh_stale_read_at_facts(  # noqa: PLR0913
     checked_at: int,
     read_at_ttl_seconds: int,
     cycle_reason_counts: dict[str, int] | None = None,
-) -> tuple[int, int, int, bool]:
+) -> tuple[int, int, int]:
     """Refresh stale probes, retaining committed earlier facts on a later failure."""
     complete = missing = unavailable = 0
-    measurement_complete = True
     for message_id in stale_read_at_ids(conn, dialog_id, message_ids, stale_before_utc):
         result = await _fetch_read_date_result(gateway, dialog_id, message_id)
         reason = normalize_read_date_reason(result)
@@ -248,7 +247,7 @@ async def _refresh_stale_read_at_facts(  # noqa: PLR0913
             checked_at=checked_at,
             next_attempt_at=next_attempt_at,
         )
-    return complete, missing, unavailable, measurement_complete
+    return complete, missing, unavailable
 
 
 def _normalize_persist_reason(status: str, reason: ReadDateReason | str | None) -> ReadDateReason:

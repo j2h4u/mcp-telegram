@@ -321,6 +321,8 @@ def test_read_date_exception_classifier_uses_privacy_safe_rpc_symbols(
     else:
         assert result.failure is not None
         assert result.failure.retryable is retryable
+        if reason is ReadDateReason.INVALID_TARGET:
+            assert result.failure.kind is GatewayFailureKind.INVALID_TARGET
 
 
 def test_read_date_exception_classifier_keeps_generic_failures_retryable() -> None:
@@ -329,6 +331,39 @@ def test_read_date_exception_classifier_keeps_generic_failures_retryable() -> No
     assert result.reason is ReadDateReason.TRANSIENT
     assert result.failure is not None
     assert result.failure.retryable is True
+
+
+def test_read_date_exception_classifier_keeps_local_value_error_retryable() -> None:
+    result = classify_read_date_exception(ValueError("entity cache miss"))
+
+    assert result.reason is ReadDateReason.TRANSIENT
+    assert result.failure is not None
+    assert result.failure.kind is GatewayFailureKind.TRANSIENT
+    assert result.failure.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_read_at_rejects_complete_result_without_date(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    conn = make_synced_db()
+    _seed_enrollment(conn, 42)
+
+    class Gateway:
+        async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult:
+            del entity, message_id
+            return ReadDateFetchResult(status="complete")
+
+    with pytest.raises(ValueError, match="complete read-date result"):
+        await enrich_read_at(
+            conn,
+            Gateway(),
+            42,
+            [ReadMessage(message_id=1, sent_at=1_000, dialog_id=42, out=1)],
+            dialog_type="user",
+            read_at_ttl_seconds=600,
+            checked_at=3_000,
+        )
 
 
 def test_read_date_exception_classifier_preserves_flood_deadline() -> None:

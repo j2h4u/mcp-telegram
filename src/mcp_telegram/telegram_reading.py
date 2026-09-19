@@ -30,10 +30,9 @@ class ReadDateReason(StrEnum):
     NOT_MUTUAL_CONTACT = "not_mutual_contact"
     INVALID_TARGET = "invalid_target"
     ACCESS_LOST = "access_lost"
-    LEGACY = "legacy"
 
 
-READ_DATE_REASONS = tuple(reason for reason in ReadDateReason if reason is not ReadDateReason.LEGACY)
+READ_DATE_REASONS = tuple(ReadDateReason)
 _RETRYABLE_READ_DATE_REASONS = frozenset(
     {
         ReadDateReason.DATE_OMITTED,
@@ -51,11 +50,12 @@ def is_read_date_reason_retryable(reason: ReadDateReason) -> bool:
 
 def normalize_read_date_reason(result: ReadDateFetchResult) -> ReadDateReason:
     """Return a valid reason for a result, including compatibility results."""
-    if result.status == "complete" and result.read_at is not None:
+    if result.status == "complete":
+        if result.read_at is None:
+            raise ValueError("complete read-date result requires a non-null read_at")
         return ReadDateReason.RESOLVED
     if result.reason is not None:
-        reason = ReadDateReason(result.reason)
-        return ReadDateReason.TRANSIENT if reason is ReadDateReason.LEGACY else reason
+        return ReadDateReason(result.reason)
     if result.status == "missing":
         return ReadDateReason.DATE_OMITTED
     if result.failure is not None:
