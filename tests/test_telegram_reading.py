@@ -316,6 +316,24 @@ def test_read_date_exception_classifier_covers_optional_symbols(monkeypatch: pyt
     assert classify_read_date_exception(YourPrivacyRestrictedError()).reason is ReadDateReason.PRIVACY_RESTRICTED
 
 
+def test_read_date_exception_classifier_tolerates_missing_optional_symbols(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "MessageNotReadYetError",
+        "MsgTooOldError",
+        "PeerIdInvalidError",
+        "UserNotMutualContactError",
+        "UserPrivacyRestrictedError",
+        "YourPrivacyRestrictedError",
+    ):
+        monkeypatch.delattr(telethon_errors, name, raising=False)
+
+    result = classify_read_date_exception(RuntimeError("temporary"))
+
+    assert result.reason is ReadDateReason.TRANSIENT
+    assert result.failure is not None
+    assert result.failure.retryable is True
+
+
 def test_read_date_exception_classifier_preserves_flood_deadline() -> None:
     result = classify_read_date_exception(TelegramRpcThrottled(retry_after_seconds=917))
     assert result.reason is ReadDateReason.FLOOD_WAIT

@@ -6,12 +6,6 @@ from datetime import UTC, datetime
 from importlib import import_module
 from typing import Protocol, cast
 
-from telethon.errors import (  # type: ignore[import-untyped]
-    MsgTooOldError,
-    PeerIdInvalidError,
-    UserNotMutualContactError,
-    UserPrivacyRestrictedError,
-)
 from telethon.tl.functions.messages import GetOutboxReadDateRequest
 from telethon.tl.types import TypeInputPeer
 
@@ -39,6 +33,11 @@ def _optional_error(name: str) -> type[BaseException] | None:
     return candidate if isinstance(candidate, type) and issubclass(candidate, BaseException) else None
 
 
+def _is_optional_error(exc: BaseException, name: str) -> bool:
+    error_type = _optional_error(name)
+    return error_type is not None and isinstance(exc, error_type)
+
+
 def _read_failure(
     exc: BaseException,
     *,
@@ -58,17 +57,15 @@ def _read_failure(
 
 def classify_read_date_exception(exc: BaseException) -> ReadDateFetchResult:  # noqa: PLR0911
     """Classify read-date-only Telegram failures without changing shared translation."""
-    not_read_yet = _optional_error("MessageNotReadYetError")
-    your_privacy = _optional_error("YourPrivacyRestrictedError")
-    if not_read_yet is not None and isinstance(exc, not_read_yet):
+    if _is_optional_error(exc, "MessageNotReadYetError"):
         return ReadDateFetchResult(status="missing", reason=ReadDateReason.MESSAGE_NOT_READ_YET)
-    if isinstance(exc, MsgTooOldError):
+    if _is_optional_error(exc, "MsgTooOldError"):
         return _read_failure(exc, reason=ReadDateReason.MESSAGE_TOO_OLD, retryable=False)
-    if isinstance(exc, (UserPrivacyRestrictedError,)) or (your_privacy is not None and isinstance(exc, your_privacy)):
+    if _is_optional_error(exc, "UserPrivacyRestrictedError") or _is_optional_error(exc, "YourPrivacyRestrictedError"):
         return _read_failure(exc, reason=ReadDateReason.PRIVACY_RESTRICTED, retryable=False)
-    if isinstance(exc, UserNotMutualContactError):
+    if _is_optional_error(exc, "UserNotMutualContactError"):
         return _read_failure(exc, reason=ReadDateReason.NOT_MUTUAL_CONTACT, retryable=False)
-    if isinstance(exc, PeerIdInvalidError):
+    if _is_optional_error(exc, "PeerIdInvalidError"):
         return _read_failure(exc, reason=ReadDateReason.INVALID_TARGET, retryable=False)
     if isinstance(exc, TelegramRpcThrottled):
         failure = translate_gateway_failure(exc)

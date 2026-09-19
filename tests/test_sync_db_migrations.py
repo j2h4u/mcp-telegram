@@ -1532,12 +1532,52 @@ def test_migration_v70_normalizes_legacy_read_date_rows() -> None:
             (None, 200, "unavailable", "legacy", 800),
             (None, 300, "unavailable", "legacy", 900),
         ]
-        assert (
-            conn.execute("SELECT sql FROM sqlite_master WHERE name='idx_message_read_facts_next_attempt'")
-            .fetchone()[0]
-            .lower()
-            .endswith("where next_attempt_at is not null\n")
+        index_sql = cast(
+            str,
+            conn.execute("SELECT sql FROM sqlite_master WHERE name='idx_message_read_facts_next_attempt'").fetchone()[
+                0
+            ],
         )
+        assert index_sql.lower().endswith("where next_attempt_at is not null\n")
+    finally:
+        conn.close()
+
+
+def test_migration_v70_is_idempotent_after_partial_ledger_replay() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE schema_version(version INTEGER NOT NULL, applied_at INTEGER NOT NULL);
+        CREATE TABLE message_read_facts(
+            dialog_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            read_at INTEGER,
+            checked_at INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            PRIMARY KEY(dialog_id, message_id)
+        ) WITHOUT ROWID;
+        INSERT INTO message_read_facts VALUES
+            (1, 1, 1700000001, 100, 'complete'),
+            (1, 2, NULL, 200, 'missing');
+        INSERT INTO schema_version VALUES (69, 0);
+        """
+    )
+    try:
+        assert _apply_migration_70(conn, 69) == 70
+        first = conn.execute(
+            "SELECT read_at, checked_at, status, reason, next_attempt_at FROM message_read_facts ORDER BY message_id"
+        ).fetchall()
+
+        conn.execute("DELETE FROM schema_version WHERE version = 70")
+        assert _apply_migration_70(conn, 69) == 70
+
+        assert (
+            conn.execute(
+                "SELECT read_at, checked_at, status, reason, next_attempt_at FROM message_read_facts ORDER BY message_id"
+            ).fetchall()
+            == first
+        )
+        assert conn.execute("SELECT COUNT(*) FROM schema_version WHERE version = 70").fetchone() == (1,)
     finally:
         conn.close()
 
