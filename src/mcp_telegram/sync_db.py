@@ -4026,6 +4026,8 @@ def _apply_migration_70(conn: sqlite3.Connection, current: int) -> int:
         "ALTER TABLE message_read_facts ADD COLUMN next_attempt_at INTEGER",
         "UPDATE message_read_facts SET reason='resolved', next_attempt_at=NULL WHERE status='complete' AND read_at IS NOT NULL",
         (
+            # One bounded retry is only for legacy rows that predate normalized reasons;
+            # current probes compute deadlines from the active TTL and RPC retry-after.
             "UPDATE message_read_facts SET status='unavailable', read_at=NULL, reason='legacy', "
             "next_attempt_at=checked_at + 600 "
             "WHERE reason='legacy' AND NOT (status='complete' AND read_at IS NOT NULL)"

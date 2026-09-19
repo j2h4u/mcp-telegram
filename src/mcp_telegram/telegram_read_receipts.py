@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
-from importlib import import_module
 from typing import Protocol, cast
 
 from telethon.tl.functions.messages import GetOutboxReadDateRequest
@@ -19,6 +19,7 @@ from .telegram_reading import (
     ReadDateReason,
     TelegramReadReceiptGateway,
 )
+from .telegram_rpc_error import describe_telegram_rpc_error
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
 
 
@@ -26,16 +27,6 @@ class _TelegramClientLike(Protocol):
     async def get_input_entity(self, entity: object) -> object: ...
 
     async def __call__(self, request: object) -> object: ...
-
-
-def _optional_error(name: str) -> type[BaseException] | None:
-    candidate = getattr(import_module("telethon.errors"), name, None)
-    return candidate if isinstance(candidate, type) and issubclass(candidate, BaseException) else None
-
-
-def _is_optional_error(exc: BaseException, name: str) -> bool:
-    error_type = _optional_error(name)
-    return error_type is not None and isinstance(exc, error_type)
 
 
 def _read_failure(
@@ -57,23 +48,25 @@ def _read_failure(
 
 def classify_read_date_exception(exc: BaseException) -> ReadDateFetchResult:  # noqa: PLR0911
     """Classify read-date-only Telegram failures without changing shared translation."""
-    if _is_optional_error(exc, "MessageNotReadYetError"):
-        return ReadDateFetchResult(status="missing", reason=ReadDateReason.MESSAGE_NOT_READ_YET)
-    if _is_optional_error(exc, "MsgTooOldError"):
-        return _read_failure(exc, reason=ReadDateReason.MESSAGE_TOO_OLD, retryable=False)
-    if _is_optional_error(exc, "UserPrivacyRestrictedError") or _is_optional_error(exc, "YourPrivacyRestrictedError"):
-        return _read_failure(exc, reason=ReadDateReason.PRIVACY_RESTRICTED, retryable=False)
-    if _is_optional_error(exc, "UserNotMutualContactError"):
-        return _read_failure(exc, reason=ReadDateReason.NOT_MUTUAL_CONTACT, retryable=False)
-    if _is_optional_error(exc, "PeerIdInvalidError"):
-        return _read_failure(exc, reason=ReadDateReason.INVALID_TARGET, retryable=False)
     if isinstance(exc, TelegramRpcThrottled):
-        failure = translate_gateway_failure(exc)
+        failure = replace(translate_gateway_failure(exc), retryable=True)
         return ReadDateFetchResult(
             status="unavailable",
             failure=failure,
             reason=ReadDateReason.FLOOD_WAIT,
         )
+
+    symbol = describe_telegram_rpc_error(exc).symbol
+    if symbol == "MESSAGE_NOT_READ_YET":
+        return ReadDateFetchResult(status="missing", reason=ReadDateReason.MESSAGE_NOT_READ_YET)
+    if symbol == "MSG_TOO_OLD":
+        return _read_failure(exc, reason=ReadDateReason.MESSAGE_TOO_OLD, retryable=False)
+    if symbol in {"USER_PRIVACY_RESTRICTED", "YOUR_PRIVACY_RESTRICTED"}:
+        return _read_failure(exc, reason=ReadDateReason.PRIVACY_RESTRICTED, retryable=False)
+    if symbol == "USER_NOT_MUTUAL_CONTACT":
+        return _read_failure(exc, reason=ReadDateReason.NOT_MUTUAL_CONTACT, retryable=False)
+    if symbol in {"PEER_ID_INVALID", "MESSAGE_ID_INVALID", "MSG_ID_INVALID"}:
+        return _read_failure(exc, reason=ReadDateReason.INVALID_TARGET, retryable=False)
 
     failure = translate_gateway_failure(exc)
     reason = {
@@ -97,7 +90,10 @@ class TelethonTelegramReadReceiptGateway:
             acquisition_kind=AcquisitionKind.READ_RECEIPT_SNAPSHOT,
         ):
             try:
-                peer = await self._client.get_input_entity(entity) if isinstance(entity, int) else entity
+                try:
+                    peer = await self._client.get_input_entity(entity) if isinstance(entity, int) else entity
+                except (KeyError, ValueError) as exc:
+                    return _read_failure(exc, reason=ReadDateReason.TRANSIENT, retryable=True)
                 response = await self._client(
                     GetOutboxReadDateRequest(peer=cast(TypeInputPeer, peer), msg_id=message_id)
                 )

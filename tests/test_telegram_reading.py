@@ -12,12 +12,8 @@ from typing import Protocol, cast
 from unittest.mock import AsyncMock
 
 import pytest
-from telethon import errors as telethon_errors
 from telethon.errors import (
-    MsgTooOldError,
-    PeerIdInvalidError,
-    UserNotMutualContactError,
-    UserPrivacyRestrictedError,
+    RPCError,
 )
 from telethon.tl import types
 
@@ -282,52 +278,53 @@ async def test_read_receipt_gateway_distinguishes_omitted_date() -> None:
     assert result.reason is ReadDateReason.DATE_OMITTED
 
 
+@pytest.mark.asyncio
+async def test_read_receipt_gateway_retries_local_entity_cache_miss() -> None:
+    class Client:
+        async def get_input_entity(self, entity: object) -> object:
+            del entity
+            raise ValueError("entity cache miss")
+
+        async def __call__(self, request: object) -> object:
+            del request
+            raise AssertionError("RPC must not run after local entity resolution failure")
+
+    result = await TelethonTelegramReadReceiptGateway(Client()).fetch_outbox_read_date(42, 10)
+
+    assert result.reason is ReadDateReason.TRANSIENT
+    assert result.failure is not None
+    assert result.failure.retryable is True
+
+
 @pytest.mark.parametrize(
-    ("error", "reason", "retryable"),
+    ("symbol", "reason", "retryable"),
     [
-        (MsgTooOldError(request=None), ReadDateReason.MESSAGE_TOO_OLD, False),
-        (UserPrivacyRestrictedError(request=None), ReadDateReason.PRIVACY_RESTRICTED, False),
-        (UserNotMutualContactError(request=None), ReadDateReason.NOT_MUTUAL_CONTACT, False),
-        (PeerIdInvalidError(request=None), ReadDateReason.INVALID_TARGET, False),
-        (TimeoutError("temporary"), ReadDateReason.TRANSIENT, True),
+        ("MESSAGE_NOT_READ_YET", ReadDateReason.MESSAGE_NOT_READ_YET, None),
+        ("MSG_TOO_OLD", ReadDateReason.MESSAGE_TOO_OLD, False),
+        ("USER_PRIVACY_RESTRICTED", ReadDateReason.PRIVACY_RESTRICTED, False),
+        ("YOUR_PRIVACY_RESTRICTED", ReadDateReason.PRIVACY_RESTRICTED, False),
+        ("USER_NOT_MUTUAL_CONTACT", ReadDateReason.NOT_MUTUAL_CONTACT, False),
+        ("PEER_ID_INVALID", ReadDateReason.INVALID_TARGET, False),
+        ("MESSAGE_ID_INVALID", ReadDateReason.INVALID_TARGET, False),
+        ("MSG_ID_INVALID", ReadDateReason.INVALID_TARGET, False),
     ],
 )
-def test_read_date_exception_classifier_covers_installed_symbols(
-    error: Exception,
+def test_read_date_exception_classifier_uses_privacy_safe_rpc_symbols(
+    symbol: str,
     reason: ReadDateReason,
-    retryable: bool,
+    retryable: bool | None,
 ) -> None:
-    result = classify_read_date_exception(error)
+    result = classify_read_date_exception(RPCError(request=None, message=symbol))
     assert result.reason is reason
-    assert result.failure is not None
-    assert result.failure.retryable is retryable
+    if retryable is None:
+        assert result.failure is None
+    else:
+        assert result.failure is not None
+        assert result.failure.retryable is retryable
 
 
-def test_read_date_exception_classifier_covers_optional_symbols(monkeypatch: pytest.MonkeyPatch) -> None:
-    class MessageNotReadYetError(Exception):
-        pass
-
-    class YourPrivacyRestrictedError(Exception):
-        pass
-
-    monkeypatch.setattr(telethon_errors, "MessageNotReadYetError", MessageNotReadYetError, raising=False)
-    monkeypatch.setattr(telethon_errors, "YourPrivacyRestrictedError", YourPrivacyRestrictedError, raising=False)
-    assert classify_read_date_exception(MessageNotReadYetError()).reason is ReadDateReason.MESSAGE_NOT_READ_YET
-    assert classify_read_date_exception(YourPrivacyRestrictedError()).reason is ReadDateReason.PRIVACY_RESTRICTED
-
-
-def test_read_date_exception_classifier_tolerates_missing_optional_symbols(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in (
-        "MessageNotReadYetError",
-        "MsgTooOldError",
-        "PeerIdInvalidError",
-        "UserNotMutualContactError",
-        "UserPrivacyRestrictedError",
-        "YourPrivacyRestrictedError",
-    ):
-        monkeypatch.delattr(telethon_errors, name, raising=False)
-
-    result = classify_read_date_exception(RuntimeError("temporary"))
+def test_read_date_exception_classifier_keeps_generic_failures_retryable() -> None:
+    result = classify_read_date_exception(TimeoutError("temporary"))
 
     assert result.reason is ReadDateReason.TRANSIENT
     assert result.failure is not None
@@ -339,6 +336,15 @@ def test_read_date_exception_classifier_preserves_flood_deadline() -> None:
     assert result.reason is ReadDateReason.FLOOD_WAIT
     assert result.failure is not None
     assert result.failure.retry_after == 917
+
+
+def test_read_date_exception_classifier_retries_latched_flood_wait() -> None:
+    result = classify_read_date_exception(TelegramRpcThrottled(latched=True))
+
+    assert result.reason is ReadDateReason.FLOOD_WAIT
+    assert result.failure is not None
+    assert result.failure.retryable is True
+    assert result.failure.retry_after is None
 
 
 @pytest.mark.asyncio
@@ -482,14 +488,41 @@ def test_read_at_persistence_is_terminal_and_monotonic(make_synced_db: Callable[
     conn = make_synced_db()
     seed_full_history_enrollment(conn, 42, enabled=True)
 
-    persist_read_at(conn, 42, 1, read_at=None, checked_at=200, status="missing")
-    persist_read_at(conn, 42, 1, read_at=None, checked_at=199, status="unavailable")
+    persist_read_at(
+        conn,
+        42,
+        1,
+        read_at=None,
+        checked_at=200,
+        status="missing",
+        reason=ReadDateReason.DATE_OMITTED,
+        next_attempt_at=800,
+    )
+    persist_read_at(
+        conn,
+        42,
+        1,
+        read_at=None,
+        checked_at=199,
+        status="unavailable",
+        reason=ReadDateReason.TRANSIENT,
+        next_attempt_at=799,
+    )
     assert conn.execute(
         "SELECT read_at, checked_at, status FROM message_read_facts WHERE dialog_id=42 AND message_id=1"
     ).fetchone() == (None, 200, "missing")
 
     persist_read_at(conn, 42, 1, read_at=1_700_000_001, checked_at=100, status="complete")
-    persist_read_at(conn, 42, 1, read_at=None, checked_at=300, status="unavailable")
+    persist_read_at(
+        conn,
+        42,
+        1,
+        read_at=None,
+        checked_at=300,
+        status="unavailable",
+        reason=ReadDateReason.TRANSIENT,
+        next_attempt_at=900,
+    )
     assert conn.execute(
         "SELECT read_at, checked_at, status FROM message_read_facts WHERE dialog_id=42 AND message_id=1"
     ).fetchone() == (1_700_000_001, 100, "complete")
@@ -507,6 +540,17 @@ def test_read_at_persistence_is_terminal_and_monotonic(make_synced_db: Callable[
     assert conn.execute(
         "SELECT status, reason, next_attempt_at FROM message_read_facts WHERE dialog_id=42 AND message_id=2"
     ).fetchone() == ("unavailable", "message_too_old", None)
+
+    with pytest.raises(ValueError, match="requires next_attempt_at"):
+        persist_read_at(
+            conn,
+            42,
+            3,
+            read_at=None,
+            checked_at=300,
+            status="missing",
+            reason=ReadDateReason.DATE_OMITTED,
+        )
 
     with pytest.raises(ValueError, match="non-null read_at"):
         persist_read_at(conn, 42, 2, read_at=None, checked_at=1, status="complete")
@@ -585,7 +629,7 @@ async def test_read_at_retry_deadline_uses_maximum_of_ttl_and_flood_wait(
                     kind=GatewayFailureKind.FLOOD_WAIT,
                     error_type="TelegramRpcThrottled",
                     error_message="redacted from telemetry",
-                    retryable=True,
+                    retryable=False,
                     retry_after=917,
                 ),
             )
@@ -605,7 +649,7 @@ async def test_read_at_retry_deadline_uses_maximum_of_ttl_and_flood_wait(
 
 
 @pytest.mark.asyncio
-async def test_read_at_stops_after_persistence_operational_error_with_prior_commits(
+async def test_read_at_propagates_persistence_operational_error_after_prior_commits(
     make_synced_db: Callable[[], sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Earlier probe facts remain committed when a later local write cannot persist."""
@@ -631,9 +675,11 @@ async def test_read_at_stops_after_persistence_operational_error_with_prior_comm
         read_at: int | None,
         checked_at: int,
         status: str,
+        reason: ReadDateReason,
+        next_attempt_at: int | None,
     ) -> None:
         if message_id == 2:
-            raise sqlite3.OperationalError("no such table: message_read_facts")
+            raise sqlite3.OperationalError("persistence failed")
         original_persist(
             connection,
             current_dialog_id,
@@ -641,6 +687,8 @@ async def test_read_at_stops_after_persistence_operational_error_with_prior_comm
             read_at=read_at,
             checked_at=checked_at,
             status=status,
+            reason=reason,
+            next_attempt_at=next_attempt_at,
         )
 
     monkeypatch.setattr(fact_queries, "persist_read_at", fail_second_persist)
@@ -650,12 +698,12 @@ async def test_read_at_stops_after_persistence_operational_error_with_prior_comm
         ReadMessage(message_id=3, sent_at=1_002, dialog_id=42, out=1),
     ]
 
-    enriched = await enrich_read_at(
-        conn, Gateway(), 42, messages, dialog_type="user", read_at_ttl_seconds=600, checked_at=3_000
-    )
+    with pytest.raises(sqlite3.OperationalError, match="persistence failed"):
+        await enrich_read_at(
+            conn, Gateway(), 42, messages, dialog_type="user", read_at_ttl_seconds=600, checked_at=3_000
+        )
 
     assert calls == [1, 2]
-    assert [message.read_at for message in enriched] == [1_700_000_001, None, None]
     assert conn.execute(
         "SELECT read_at, checked_at, status FROM message_read_facts WHERE dialog_id=42 AND message_id=1"
     ).fetchone() == (1_700_000_001, 3_000, "complete")

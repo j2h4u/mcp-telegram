@@ -72,6 +72,7 @@ LEFT JOIN message_read_facts f
 WHERE sd.status = 'synced'
   AND lower(e.type) = 'user'
   AND m.out = 1
+  AND m.is_deleted = 0
   AND sd.read_outbox_max_id IS NOT NULL
   AND m.message_id <= sd.read_outbox_max_id
   AND (f.dialog_id IS NULL OR (f.next_attempt_at IS NOT NULL AND f.next_attempt_at <= ?))
@@ -113,6 +114,7 @@ LEFT JOIN message_read_facts f
 WHERE sd.status = 'synced'
   AND lower(e.type) = 'user'
   AND m.out = 1
+  AND m.is_deleted = 0
   AND sd.read_outbox_max_id IS NOT NULL
   AND m.message_id <= sd.read_outbox_max_id
   AND (f.dialog_id IS NULL OR f.next_attempt_at IS NOT NULL)
@@ -188,25 +190,7 @@ class MessageFactRefreshDeps:
 
 def _next_release_at(conn: sqlite3.Connection, query: str, ttl_seconds: int) -> float | None:
     params: tuple[int, ...] = (ttl_seconds,) if query.count("?") else ()
-    try:
-        row = cast(tuple[object] | None, conn.execute(query, params).fetchone())
-    except sqlite3.OperationalError as exc:
-        if query != _NEXT_READ_AT_RELEASE_SQL or "no such column" not in str(exc).lower():
-            raise
-        row = cast(
-            tuple[object] | None,
-            conn.execute(
-                "SELECT MIN(CASE WHEN f.checked_at IS NULL THEN 0 ELSE f.checked_at + ? END) "
-                "FROM messages m JOIN synced_dialogs sd ON sd.dialog_id=m.dialog_id "
-                "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
-                "JOIN entities e ON e.id=m.dialog_id "
-                "LEFT JOIN message_read_facts f ON f.dialog_id=m.dialog_id AND f.message_id=m.message_id "
-                "WHERE sd.status='synced' AND lower(e.type)='user' AND m.out=1 "
-                "AND sd.read_outbox_max_id IS NOT NULL AND m.message_id <= sd.read_outbox_max_id "
-                "AND (f.dialog_id IS NULL OR f.status != 'complete' OR f.read_at IS NULL)",
-                (ttl_seconds,),
-            ).fetchone(),
-        )
+    row = cast(tuple[object] | None, conn.execute(query, params).fetchone())
     value = None if row is None else row[0]
     return None if value is None else float(cast(int | float, value))
 
@@ -447,30 +431,10 @@ def _read_at_candidates(
     stale_before_utc: int,
     limit: int,
 ) -> list[ReadMessage]:
-    try:
-        rows = cast(
-            list[tuple[object, ...]],
-            conn.execute(_READ_AT_CANDIDATES_SQL, (stale_before_utc, limit)).fetchall(),
-        )
-    except sqlite3.OperationalError as exc:
-        if "no such column" not in str(exc).lower():
-            raise
-        rows = cast(
-            list[tuple[object, ...]],
-            conn.execute(
-                "SELECT m.dialog_id, m.message_id, m.sent_at FROM messages m "
-                "JOIN synced_dialogs sd ON sd.dialog_id=m.dialog_id "
-                "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
-                "JOIN entities e ON e.id=m.dialog_id "
-                "LEFT JOIN message_read_facts f ON f.dialog_id=m.dialog_id AND f.message_id=m.message_id "
-                "WHERE sd.status='synced' AND lower(e.type)='user' AND m.out=1 "
-                "AND sd.read_outbox_max_id IS NOT NULL AND m.message_id <= sd.read_outbox_max_id "
-                "AND (f.dialog_id IS NULL OR f.status != 'complete' OR f.read_at IS NULL) "
-                "AND (f.dialog_id IS NULL OR f.checked_at <= ?) "
-                "ORDER BY m.sent_at DESC, m.dialog_id, m.message_id LIMIT ?",
-                (stale_before_utc, limit),
-            ).fetchall(),
-        )
+    rows = cast(
+        list[tuple[object, ...]],
+        conn.execute(_READ_AT_CANDIDATES_SQL, (stale_before_utc, limit)).fetchall(),
+    )
     return [
         ReadMessage(message_id=message_id, sent_at=sent_at, dialog_id=dialog_id, out=1)
         for dialog_id, message_id, sent_at in (_row_ints(row) for row in rows)
@@ -497,7 +461,7 @@ def _read_at_attempt_counts(
 
 
 def _terminal_read_at_suppressed(conn: sqlite3.Connection) -> int:
-    """Count eligible terminal rows omitted from acquisition forever."""
+    """Count every eligible terminal outcome omitted from acquisition forever."""
     query = (
         "SELECT COUNT(*) FROM messages m "
         "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id "
@@ -505,20 +469,13 @@ def _terminal_read_at_suppressed(conn: sqlite3.Connection) -> int:
         "JOIN entities e ON e.id = m.dialog_id "
         "JOIN message_read_facts f ON f.dialog_id = m.dialog_id AND f.message_id = m.message_id "
         "WHERE sd.status = 'synced' AND lower(e.type) = 'user' AND m.out = 1 "
+        "AND m.is_deleted = 0 "
         "AND sd.read_outbox_max_id IS NOT NULL AND m.message_id <= sd.read_outbox_max_id "
-        "AND f.next_attempt_at IS NULL"
+        "AND f.next_attempt_at IS NULL "
+        "AND f.reason IN ('resolved', 'message_too_old', 'privacy_restricted', "
+        "'not_mutual_contact', 'invalid_target', 'access_lost')"
     )
-    try:
-        row = cast(tuple[object] | None, conn.execute(query).fetchone())
-    except sqlite3.OperationalError as exc:
-        if "no such column" not in str(exc).lower():
-            raise
-        row = cast(
-            tuple[object] | None,
-            conn.execute(
-                query.replace("f.next_attempt_at IS NULL", "f.status = 'complete' AND f.read_at IS NOT NULL")
-            ).fetchone(),
-        )
+    row = cast(tuple[object] | None, conn.execute(query).fetchone())
     return 0 if row is None else int(cast(int | str, row[0]))
 
 

@@ -34,6 +34,19 @@ class ReadDateReason(StrEnum):
 
 
 READ_DATE_REASONS = tuple(reason for reason in ReadDateReason if reason is not ReadDateReason.LEGACY)
+_RETRYABLE_READ_DATE_REASONS = frozenset(
+    {
+        ReadDateReason.DATE_OMITTED,
+        ReadDateReason.MESSAGE_NOT_READ_YET,
+        ReadDateReason.FLOOD_WAIT,
+        ReadDateReason.TRANSIENT,
+    }
+)
+
+
+def is_read_date_reason_retryable(reason: ReadDateReason) -> bool:
+    """Return whether a normalized read-date reason should be retried."""
+    return reason in _RETRYABLE_READ_DATE_REASONS
 
 
 def normalize_read_date_reason(result: ReadDateFetchResult) -> ReadDateReason:
@@ -41,7 +54,8 @@ def normalize_read_date_reason(result: ReadDateFetchResult) -> ReadDateReason:
     if result.status == "complete" and result.read_at is not None:
         return ReadDateReason.RESOLVED
     if result.reason is not None:
-        return ReadDateReason(result.reason)
+        reason = ReadDateReason(result.reason)
+        return ReadDateReason.TRANSIENT if reason is ReadDateReason.LEGACY else reason
     if result.status == "missing":
         return ReadDateReason.DATE_OMITTED
     if result.failure is not None:

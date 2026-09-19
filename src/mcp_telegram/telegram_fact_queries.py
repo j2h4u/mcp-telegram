@@ -7,10 +7,9 @@ an unavailable/forbidden Telegram RPC must not look like a timestamped event.
 from __future__ import annotations
 
 import dataclasses
-import inspect
 import sqlite3
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import cast
 
 from .models import DialogType, ReadMessage, ReadReactionEvent
@@ -21,19 +20,10 @@ from .telegram_reading import (
     ReadDateFetchResult,
     ReadDateReason,
     TelegramReadReceiptGateway,
+    is_read_date_reason_retryable,
     normalize_read_date_reason,
 )
 from .telegram_rpc_scheduler import RpcAdmissionClosedError
-
-_DEFAULT_READ_AT_RETRY_SECONDS = 600
-_RETRYABLE_READ_DATE_REASONS = frozenset(
-    {
-        ReadDateReason.DATE_OMITTED,
-        ReadDateReason.MESSAGE_NOT_READ_YET,
-        ReadDateReason.FLOOD_WAIT,
-        ReadDateReason.TRANSIENT,
-    }
-)
 
 
 def reaction_event_projection(
@@ -192,8 +182,7 @@ def _read_date_retry_deadline(
     checked_at: int,
     read_at_ttl_seconds: int,
 ) -> int | None:
-    retryable = result.failure.retryable if result.failure is not None else reason in _RETRYABLE_READ_DATE_REASONS
-    if not retryable or result.status == "complete":
+    if not is_read_date_reason_retryable(reason):
         return None
     retry_after = result.failure.retry_after if result.failure is not None else None
     return checked_at + max(read_at_ttl_seconds, retry_after or 0)
@@ -209,23 +198,16 @@ def _persist_read_date_result(  # noqa: PLR0913
     checked_at: int,
     next_attempt_at: int | None,
 ) -> None:
-    persist = cast(Callable[..., None], persist_read_at)
-    kwargs = {
-        "read_at": result.read_at if result.status == "complete" else None,
-        "checked_at": checked_at,
-        "status": result.status,
-    }
-    if "reason" in inspect.signature(persist_read_at).parameters:
-        persist(
-            conn,
-            dialog_id,
-            message_id,
-            **kwargs,
-            reason=reason,
-            next_attempt_at=next_attempt_at,
-        )
-        return
-    persist(conn, dialog_id, message_id, **kwargs)
+    persist_read_at(
+        conn,
+        dialog_id,
+        message_id,
+        read_at=result.read_at if result.status == "complete" else None,
+        checked_at=checked_at,
+        status=result.status,
+        reason=reason,
+        next_attempt_at=next_attempt_at,
+    )
 
 
 async def _refresh_stale_read_at_facts(  # noqa: PLR0913
@@ -257,22 +239,15 @@ async def _refresh_stale_read_at_facts(  # noqa: PLR0913
             checked_at=checked_at,
             read_at_ttl_seconds=read_at_ttl_seconds,
         )
-        try:
-            _persist_read_date_result(
-                conn,
-                dialog_id,
-                message_id,
-                result,
-                reason=reason,
-                checked_at=checked_at,
-                next_attempt_at=next_attempt_at,
-            )
-        except sqlite3.OperationalError as exc:
-            if not any(part in str(exc).lower() for part in ("no such table", "no such column")):
-                raise
-            # Keep pre-v28 read paths usable while the daemon is upgrading.
-            measurement_complete = False
-            break
+        _persist_read_date_result(
+            conn,
+            dialog_id,
+            message_id,
+            result,
+            reason=reason,
+            checked_at=checked_at,
+            next_attempt_at=next_attempt_at,
+        )
     return complete, missing, unavailable, measurement_complete
 
 
@@ -310,29 +285,6 @@ def _persist_read_at_v70(  # noqa: PLR0913
     )
 
 
-def _persist_read_at_legacy(  # noqa: PLR0913
-    conn: sqlite3.Connection,
-    dialog_id: int,
-    message_id: int,
-    *,
-    read_at: int | None,
-    checked_at: int,
-    status: str,
-) -> None:
-    conn.execute(
-        "INSERT INTO message_read_facts "
-        "(dialog_id, message_id, read_at, checked_at, status) "
-        "SELECT ?, ?, ?, ?, ? WHERE EXISTS ("
-        "SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1) "
-        "ON CONFLICT(dialog_id, message_id) DO UPDATE SET "
-        "read_at = excluded.read_at, checked_at = excluded.checked_at, status = excluded.status "
-        "WHERE NOT (message_read_facts.status = 'complete' AND message_read_facts.read_at IS NOT NULL) "
-        "AND ((excluded.status = 'complete' AND excluded.read_at IS NOT NULL) "
-        "OR excluded.checked_at > message_read_facts.checked_at)",
-        (dialog_id, message_id, read_at, checked_at, status, dialog_id),
-    )
-
-
 def persist_read_at(  # noqa: PLR0913
     conn: sqlite3.Connection,
     dialog_id: int,
@@ -351,59 +303,38 @@ def persist_read_at(  # noqa: PLR0913
     if status == "complete" and read_at is None:
         raise ValueError("complete read-date result requires a non-null read_at")
     normalized_reason = _normalize_persist_reason(status, reason)
-    if status == "complete" or normalized_reason not in _RETRYABLE_READ_DATE_REASONS:
+    if not is_read_date_reason_retryable(normalized_reason):
         next_attempt_at = None
     elif next_attempt_at is None:
-        next_attempt_at = checked_at + _DEFAULT_READ_AT_RETRY_SECONDS
+        raise ValueError("retryable read-date result requires next_attempt_at")
 
     with conn:
-        try:
-            _persist_read_at_v70(
-                conn,
-                dialog_id,
-                message_id,
-                read_at=read_at,
-                checked_at=checked_at,
-                status=status,
-                reason=normalized_reason,
-                next_attempt_at=next_attempt_at,
-            )
-        except sqlite3.OperationalError as exc:
-            if not any(part in str(exc).lower() for part in ("no such column", "no column named")):
-                raise
-            _persist_read_at_legacy(
-                conn,
-                dialog_id,
-                message_id,
-                read_at=read_at,
-                checked_at=checked_at,
-                status=status,
-            )
+        _persist_read_at_v70(
+            conn,
+            dialog_id,
+            message_id,
+            read_at=read_at,
+            checked_at=checked_at,
+            status=status,
+            reason=normalized_reason,
+            next_attempt_at=next_attempt_at,
+        )
 
 
 def read_at_map(conn: sqlite3.Connection, dialog_id: int, message_ids: Sequence[int]) -> dict[int, int | None]:
-    """Return persisted read dates; absent rows remain cache misses.
-
-    A missing table is tolerated for lightweight/legacy test databases and
-    pre-migration read paths.
-    """
+    """Return persisted read dates; absent rows remain cache misses."""
 
     if not message_ids:
         return {}
     placeholders = ",".join("?" for _ in message_ids)
-    try:
-        rows = cast(
-            list[tuple[object, ...]],
-            conn.execute(
-                f"SELECT message_id, read_at FROM message_read_facts "
-                f"WHERE dialog_id = ? AND message_id IN ({placeholders})",
-                [dialog_id, *message_ids],
-            ).fetchall(),
-        )
-    except sqlite3.OperationalError as exc:
-        if "no such table" not in str(exc).lower():
-            raise
-        return {}
+    rows = cast(
+        list[tuple[object, ...]],
+        conn.execute(
+            f"SELECT message_id, read_at FROM message_read_facts "
+            f"WHERE dialog_id = ? AND message_id IN ({placeholders})",
+            [dialog_id, *message_ids],
+        ).fetchall(),
+    )
     values: dict[int, int | None] = {}
     for row in rows:
         message_id = int(cast(int | str, row[0]))
@@ -422,20 +353,15 @@ def stale_read_at_ids(
     if not message_ids:
         return []
     placeholders = ",".join("?" for _ in message_ids)
-    try:
-        rows = cast(
-            list[tuple[object, ...]],
-            conn.execute(
-                f"SELECT message_id, next_attempt_at FROM message_read_facts "
-                f"WHERE dialog_id = ? AND message_id IN ({placeholders}) "
-                "AND (next_attempt_at IS NULL OR next_attempt_at > ?)",
-                [dialog_id, *message_ids, stale_before_utc],
-            ).fetchall(),
-        )
-    except sqlite3.OperationalError as exc:
-        if not any(part in str(exc).lower() for part in ("no such table", "no such column")):
-            raise
-        return list(dict.fromkeys(message_ids))
+    rows = cast(
+        list[tuple[object, ...]],
+        conn.execute(
+            f"SELECT message_id, next_attempt_at FROM message_read_facts "
+            f"WHERE dialog_id = ? AND message_id IN ({placeholders}) "
+            "AND (next_attempt_at IS NULL OR next_attempt_at > ?)",
+            [dialog_id, *message_ids, stale_before_utc],
+        ).fetchall(),
+    )
     fresh = {int(cast(int | str, row[0])) for row in rows}
     selected: list[int] = []
     for message_id in message_ids:
