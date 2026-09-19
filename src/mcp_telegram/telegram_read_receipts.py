@@ -76,7 +76,7 @@ def classify_read_date_exception(exc: BaseException) -> ReadDateFetchResult:  # 
     symbol = describe_telegram_rpc_error(exc).symbol
     if symbol == "MESSAGE_NOT_READ_YET":
         return ReadDateFetchResult(status="missing", reason=ReadDateReason.MESSAGE_NOT_READ_YET)
-    if symbol == "MSG_TOO_OLD":
+    if symbol in {"MSG_TOO_OLD", "MESSAGE_TOO_OLD"}:
         return _read_failure(exc, reason=ReadDateReason.MESSAGE_TOO_OLD, retryable=False)
     if symbol in {"USER_PRIVACY_RESTRICTED", "YOUR_PRIVACY_RESTRICTED"}:
         return _read_failure(exc, reason=ReadDateReason.PRIVACY_RESTRICTED, retryable=False)

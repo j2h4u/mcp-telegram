@@ -302,6 +302,7 @@ async def test_read_receipt_gateway_retries_local_entity_cache_miss() -> None:
     [
         ("MESSAGE_NOT_READ_YET", ReadDateReason.MESSAGE_NOT_READ_YET, None),
         ("MSG_TOO_OLD", ReadDateReason.MESSAGE_TOO_OLD, False),
+        ("MESSAGE_TOO_OLD", ReadDateReason.MESSAGE_TOO_OLD, False),
         ("USER_PRIVACY_RESTRICTED", ReadDateReason.PRIVACY_RESTRICTED, False),
         ("YOUR_PRIVACY_RESTRICTED", ReadDateReason.PRIVACY_RESTRICTED, False),
         ("USER_NOT_MUTUAL_CONTACT", ReadDateReason.NOT_MUTUAL_CONTACT, False),
