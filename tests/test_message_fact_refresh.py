@@ -88,7 +88,11 @@ def _make_db(path: str | Path = ":memory:") -> sqlite3.Connection:
             read_at INTEGER,
             checked_at INTEGER NOT NULL,
             status TEXT NOT NULL,
-            reason TEXT NOT NULL DEFAULT 'legacy',
+            reason TEXT NOT NULL CHECK (reason IN (
+                'resolved', 'date_omitted', 'message_not_read_yet', 'flood_wait',
+                'transient', 'message_too_old', 'privacy_restricted',
+                'not_mutual_contact', 'invalid_target', 'access_lost'
+            )),
             next_attempt_at INTEGER,
             PRIMARY KEY (dialog_id, message_id)
         ) WITHOUT ROWID;

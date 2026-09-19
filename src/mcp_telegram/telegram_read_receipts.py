@@ -20,7 +20,12 @@ from .telegram_reading import (
     TelegramReadReceiptGateway,
 )
 from .telegram_rpc_error import describe_telegram_rpc_error
-from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
+from .telegram_rpc_scheduler import (
+    RpcAdmissionClosedError,
+    TelegramRpcAdmissionDeferred,
+    TelegramRpcSource,
+    rpc_scope,
+)
 
 
 class _TelegramClientLike(Protocol):
@@ -49,6 +54,17 @@ def _read_failure(
 
 def classify_read_date_exception(exc: BaseException) -> ReadDateFetchResult:  # noqa: PLR0911
     """Classify read-date-only Telegram failures without changing shared translation."""
+    if isinstance(exc, TelegramRpcAdmissionDeferred) or (isinstance(exc, TelegramRpcThrottled) and exc.latched):
+        failure = replace(
+            translate_gateway_failure(exc),
+            kind=GatewayFailureKind.TRANSIENT,
+            retryable=True,
+        )
+        return ReadDateFetchResult(
+            status="unavailable",
+            failure=failure,
+            reason=ReadDateReason.TRANSIENT,
+        )
     if isinstance(exc, TelegramRpcThrottled):
         failure = replace(translate_gateway_failure(exc), retryable=True)
         return ReadDateFetchResult(

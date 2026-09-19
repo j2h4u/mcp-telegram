@@ -162,6 +162,8 @@ async def _fetch_read_date_result(
         raise
     except CATCHABLE_GATEWAY_FAILURES as exc:
         return classify_read_date_exception(exc)
+    if result.status not in {"complete", "missing", "unavailable"}:
+        raise ValueError(f"unsupported read-date status: {result.status}")
     if result.status == "complete" and result.read_at is None:
         raise ValueError("complete read-date result requires a non-null read_at")
     return result
@@ -172,7 +174,7 @@ def _read_date_result_counts(result: ReadDateFetchResult) -> tuple[int, int, int
         "complete": (1, 0, 0),
         "missing": (0, 1, 0),
         "unavailable": (0, 0, 1),
-    }.get(result.status, (0, 0, 0))
+    }[result.status]
 
 
 def _read_date_retry_deadline(
@@ -251,11 +253,33 @@ async def _refresh_stale_read_at_facts(  # noqa: PLR0913
 
 
 def _normalize_persist_reason(status: str, reason: ReadDateReason | str | None) -> ReadDateReason:
-    if status == "complete":
-        return ReadDateReason.RESOLVED
-    if reason is not None:
-        return ReadDateReason(reason)
-    return ReadDateReason.DATE_OMITTED if status == "missing" else ReadDateReason.TRANSIENT
+    normalized = (
+        ReadDateReason.RESOLVED
+        if status == "complete"
+        else ReadDateReason(reason)
+        if reason is not None
+        else ReadDateReason.DATE_OMITTED
+        if status == "missing"
+        else ReadDateReason.TRANSIENT
+    )
+    valid_by_status = {
+        "complete": frozenset({ReadDateReason.RESOLVED}),
+        "missing": frozenset({ReadDateReason.DATE_OMITTED, ReadDateReason.MESSAGE_NOT_READ_YET}),
+        "unavailable": frozenset(
+            {
+                ReadDateReason.FLOOD_WAIT,
+                ReadDateReason.TRANSIENT,
+                ReadDateReason.MESSAGE_TOO_OLD,
+                ReadDateReason.PRIVACY_RESTRICTED,
+                ReadDateReason.NOT_MUTUAL_CONTACT,
+                ReadDateReason.INVALID_TARGET,
+                ReadDateReason.ACCESS_LOST,
+            }
+        ),
+    }
+    if normalized not in valid_by_status[status]:
+        raise ValueError(f"read-date reason {normalized.value!r} is invalid for status {status!r}")
+    return normalized
 
 
 def _persist_read_at_v70(  # noqa: PLR0913

@@ -652,7 +652,11 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             read_at        INTEGER,
             checked_at     INTEGER NOT NULL,
             status         TEXT NOT NULL,
-            reason         TEXT NOT NULL DEFAULT 'legacy',
+            reason         TEXT NOT NULL CHECK (reason IN (
+                'resolved', 'date_omitted', 'message_not_read_yet', 'flood_wait',
+                'transient', 'message_too_old', 'privacy_restricted',
+                'not_mutual_contact', 'invalid_target', 'access_lost'
+            )),
             next_attempt_at INTEGER,
             PRIMARY KEY (dialog_id, message_id)
         ) WITHOUT ROWID
@@ -5930,7 +5934,11 @@ async def test_global_search_projects_cached_reaction_events_and_read_at() -> No
             read_at INTEGER,
             checked_at INTEGER NOT NULL,
             status TEXT NOT NULL,
-            reason TEXT NOT NULL DEFAULT 'legacy',
+            reason TEXT NOT NULL CHECK (reason IN (
+                'resolved', 'date_omitted', 'message_not_read_yet', 'flood_wait',
+                'transient', 'message_too_old', 'privacy_restricted',
+                'not_mutual_contact', 'invalid_target', 'access_lost'
+            )),
             next_attempt_at INTEGER,
             PRIMARY KEY (dialog_id, message_id)
         );
@@ -5941,8 +5949,8 @@ async def test_global_search_projects_cached_reaction_events_and_read_at() -> No
             (dialog_id, message_id, checked_at, status, returned_count)
         VALUES (5, 301, 1700000200, 'complete', 1);
         INSERT INTO message_read_facts
-            (dialog_id, message_id, read_at, checked_at, status)
-        VALUES (5, 301, 1700000300, 1700000400, 'complete');
+            (dialog_id, message_id, read_at, checked_at, status, reason, next_attempt_at)
+        VALUES (5, 301, 1700000300, 1700000400, 'complete', 'resolved', NULL);
         """
     )
     conn.commit()

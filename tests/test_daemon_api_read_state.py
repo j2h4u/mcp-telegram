@@ -133,6 +133,37 @@ def _make_db() -> Iterator[sqlite3.Connection]:
     )
     conn.execute(
         """
+        CREATE TABLE message_read_facts (
+            dialog_id      INTEGER NOT NULL,
+            message_id     INTEGER NOT NULL,
+            read_at        INTEGER,
+            checked_at     INTEGER NOT NULL,
+            status         TEXT NOT NULL,
+            reason         TEXT NOT NULL CHECK (reason IN (
+                'resolved', 'date_omitted', 'message_not_read_yet', 'flood_wait',
+                'transient', 'message_too_old', 'privacy_restricted',
+                'not_mutual_contact', 'invalid_target', 'access_lost'
+            )),
+            next_attempt_at INTEGER,
+            PRIMARY KEY (dialog_id, message_id)
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX idx_message_read_facts_checked
+        ON message_read_facts(dialog_id, checked_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX idx_message_read_facts_next_attempt
+        ON message_read_facts(dialog_id, next_attempt_at)
+        WHERE next_attempt_at IS NOT NULL
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS message_reactions_freshness (
             dialog_id   INTEGER NOT NULL,
             message_id  INTEGER NOT NULL,

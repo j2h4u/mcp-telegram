@@ -37,6 +37,7 @@ from mcp_telegram.telegram_reading import (
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
+    TelegramRpcAdmissionDeferred,
     TelegramRpcSource,
     current_rpc_scope,
     rpc_scope,
@@ -366,6 +367,30 @@ async def test_read_at_rejects_complete_result_without_date(
         )
 
 
+@pytest.mark.asyncio
+async def test_read_at_rejects_unknown_result_status(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    conn = make_synced_db()
+    _seed_enrollment(conn, 42)
+
+    class Gateway:
+        async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult:
+            del entity, message_id
+            return ReadDateFetchResult(status="unexpected")
+
+    with pytest.raises(ValueError, match="unsupported read-date status"):
+        await enrich_read_at(
+            conn,
+            Gateway(),
+            42,
+            [ReadMessage(message_id=1, sent_at=1_000, dialog_id=42, out=1)],
+            dialog_type="user",
+            read_at_ttl_seconds=600,
+            checked_at=3_000,
+        )
+
+
 def test_read_date_exception_classifier_preserves_flood_deadline() -> None:
     result = classify_read_date_exception(TelegramRpcThrottled(retry_after_seconds=917))
     assert result.reason is ReadDateReason.FLOOD_WAIT
@@ -373,11 +398,52 @@ def test_read_date_exception_classifier_preserves_flood_deadline() -> None:
     assert result.failure.retry_after == 917
 
 
+def test_read_date_exception_classifier_marks_local_admission_deferral_transient() -> None:
+    result = classify_read_date_exception(TelegramRpcAdmissionDeferred(retry_after_seconds=3))
+
+    assert result.reason is ReadDateReason.TRANSIENT
+    assert result.failure is not None
+    assert result.failure.kind is GatewayFailureKind.TRANSIENT
+    assert result.failure.retryable is True
+    assert result.failure.retry_after == 3
+
+
+@pytest.mark.asyncio
+async def test_read_at_telemetry_counts_local_admission_deferral_as_transient(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    conn = make_synced_db()
+    _seed_enrollment(conn, 42)
+    reason_counts: dict[str, int] = {}
+
+    class Gateway:
+        async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult:
+            del entity, message_id
+            raise TelegramRpcAdmissionDeferred(retry_after_seconds=3)
+
+    await enrich_read_at(
+        conn,
+        Gateway(),
+        42,
+        [ReadMessage(message_id=1, sent_at=1_000, dialog_id=42, out=1)],
+        dialog_type="user",
+        read_at_ttl_seconds=600,
+        checked_at=3_000,
+        cycle_reason_counts=reason_counts,
+    )
+
+    assert reason_counts == {ReadDateReason.TRANSIENT.value: 1}
+    assert conn.execute(
+        "SELECT status, reason, next_attempt_at FROM message_read_facts WHERE dialog_id=42 AND message_id=1"
+    ).fetchone() == ("unavailable", "transient", 3_600)
+
+
 def test_read_date_exception_classifier_retries_latched_flood_wait() -> None:
     result = classify_read_date_exception(TelegramRpcThrottled(latched=True))
 
-    assert result.reason is ReadDateReason.FLOOD_WAIT
+    assert result.reason is ReadDateReason.TRANSIENT
     assert result.failure is not None
+    assert result.failure.kind is GatewayFailureKind.TRANSIENT
     assert result.failure.retryable is True
     assert result.failure.retry_after is None
 
@@ -511,8 +577,10 @@ def test_read_receipt_at_exact_ttl_age_is_stale(make_synced_db: Callable[[], sql
     conn = make_synced_db()
     dialog_id, message_id, now, ttl = 42, 1, 2_000, 600
     conn.execute(
-        "INSERT INTO message_read_facts (dialog_id, message_id, read_at, checked_at, status) VALUES (?, ?, ?, ?, ?)",
-        (dialog_id, message_id, 1_700_000_000, now - ttl, "complete"),
+        "INSERT INTO message_read_facts "
+        "(dialog_id, message_id, read_at, checked_at, status, reason, next_attempt_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (dialog_id, message_id, 1_700_000_000, now - ttl, "complete", ReadDateReason.RESOLVED, None),
     )
     conn.commit()
 
@@ -585,6 +653,18 @@ def test_read_at_persistence_is_terminal_and_monotonic(make_synced_db: Callable[
             checked_at=300,
             status="missing",
             reason=ReadDateReason.DATE_OMITTED,
+        )
+
+    with pytest.raises(ValueError, match="invalid for status"):
+        persist_read_at(
+            conn,
+            42,
+            3,
+            read_at=None,
+            checked_at=300,
+            status="missing",
+            reason=ReadDateReason.FLOOD_WAIT,
+            next_attempt_at=900,
         )
 
     with pytest.raises(ValueError, match="non-null read_at"):

@@ -143,8 +143,6 @@ WHERE sd.status = 'synced'
   )
 """
 
-_READ_AT_RESULT_COUNT_FIELDS = 3
-
 
 @dataclass(frozen=True, slots=True)
 class MessageFactRefreshPolicy:
@@ -530,15 +528,11 @@ def _merge_read_at_counts(
     complete: int,
     missing: int,
     unavailable: int,
-    measurement_complete: bool,
-) -> tuple[int, int, int, bool]:
-    if len(counts) != _READ_AT_RESULT_COUNT_FIELDS:
-        return complete, missing, unavailable, False
+) -> tuple[int, int, int]:
     return (
         complete + counts[0],
         missing + counts[1],
         unavailable + counts[2],
-        measurement_complete,
     )
 
 
@@ -575,12 +569,11 @@ async def _refresh_read_at_cycle(
             cycle_counts=counts,
             cycle_reason_counts=reason_counts,
         )
-        complete, missing, unavailable, measurement_complete = _merge_read_at_counts(
+        complete, missing, unavailable = _merge_read_at_counts(
             counts,
             complete,
             missing,
             unavailable,
-            measurement_complete,
         )
         if shutdown_event is not None and shutdown_event.is_set():
             measurement_complete = False

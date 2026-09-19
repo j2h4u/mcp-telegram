@@ -151,6 +151,25 @@ def test_cached_message_projection_renders_persisted_hidden_link() -> None:
             CREATE TABLE message_reactions (
                 dialog_id INTEGER, message_id INTEGER, emoji TEXT, count INTEGER
             );
+            CREATE TABLE message_read_facts (
+                dialog_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                read_at INTEGER,
+                checked_at INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL CHECK (reason IN (
+                    'resolved', 'date_omitted', 'message_not_read_yet', 'flood_wait',
+                    'transient', 'message_too_old', 'privacy_restricted',
+                    'not_mutual_contact', 'invalid_target', 'access_lost'
+                )),
+                next_attempt_at INTEGER,
+                PRIMARY KEY (dialog_id, message_id)
+            ) WITHOUT ROWID;
+            CREATE INDEX idx_message_read_facts_checked
+            ON message_read_facts(dialog_id, checked_at);
+            CREATE INDEX idx_message_read_facts_next_attempt
+            ON message_read_facts(dialog_id, next_attempt_at)
+            WHERE next_attempt_at IS NOT NULL;
             """
         )
         conn.execute(
@@ -181,6 +200,25 @@ def test_cross_dialog_folder_projection_preserves_media_and_hidden_links() -> No
             CREATE TABLE message_reactions (
                 dialog_id INTEGER, message_id INTEGER, emoji TEXT, count INTEGER
             );
+            CREATE TABLE message_read_facts (
+                dialog_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                read_at INTEGER,
+                checked_at INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL CHECK (reason IN (
+                    'resolved', 'date_omitted', 'message_not_read_yet', 'flood_wait',
+                    'transient', 'message_too_old', 'privacy_restricted',
+                    'not_mutual_contact', 'invalid_target', 'access_lost'
+                )),
+                next_attempt_at INTEGER,
+                PRIMARY KEY (dialog_id, message_id)
+            ) WITHOUT ROWID;
+            CREATE INDEX idx_message_read_facts_checked
+            ON message_read_facts(dialog_id, checked_at);
+            CREATE INDEX idx_message_read_facts_next_attempt
+            ON message_read_facts(dialog_id, next_attempt_at)
+            WHERE next_attempt_at IS NOT NULL;
             """
         )
         conn.execute(
