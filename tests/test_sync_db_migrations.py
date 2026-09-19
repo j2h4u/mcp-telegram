@@ -24,6 +24,7 @@ from mcp_telegram.sync_db import (
     _apply_migration_60,
     _apply_migration_64,
     _apply_migration_66,
+    _apply_migration_70,
     _open_sync_db,
     ensure_sync_schema,
 )
@@ -718,7 +719,7 @@ def test_schema_version_records_current(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-    assert _CURRENT_SCHEMA_VERSION == 69
+    assert _CURRENT_SCHEMA_VERSION == 70
 
 
 def test_genuine_v61_fixture_upgrades_to_v62_and_reopens_idempotently(
@@ -1499,7 +1500,86 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 69
+        assert _CURRENT_SCHEMA_VERSION == 70
+
+
+def test_migration_v70_normalizes_legacy_read_date_rows() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE schema_version(version INTEGER NOT NULL, applied_at INTEGER NOT NULL);
+        CREATE TABLE message_read_facts(
+            dialog_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            read_at INTEGER,
+            checked_at INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            PRIMARY KEY(dialog_id, message_id)
+        ) WITHOUT ROWID;
+        INSERT INTO message_read_facts VALUES
+            (1, 1, 1700000001, 100, 'complete'),
+            (1, 2, NULL, 200, 'missing'),
+            (1, 3, 1700000003, 300, 'unavailable');
+        INSERT INTO schema_version VALUES (69, 0);
+        """
+    )
+    try:
+        assert _apply_migration_70(conn, 69) == 70
+        assert conn.execute(
+            "SELECT read_at, checked_at, status, reason, next_attempt_at FROM message_read_facts ORDER BY message_id"
+        ).fetchall() == [
+            (1700000001, 100, "complete", "resolved", None),
+            (None, 200, "unavailable", "legacy", 800),
+            (None, 300, "unavailable", "legacy", 900),
+        ]
+        index_sql = cast(
+            str,
+            conn.execute("SELECT sql FROM sqlite_master WHERE name='idx_message_read_facts_next_attempt'").fetchone()[
+                0
+            ],
+        )
+        assert index_sql.lower().endswith("where next_attempt_at is not null\n")
+    finally:
+        conn.close()
+
+
+def test_migration_v70_is_idempotent_after_partial_ledger_replay() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE schema_version(version INTEGER NOT NULL, applied_at INTEGER NOT NULL);
+        CREATE TABLE message_read_facts(
+            dialog_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            read_at INTEGER,
+            checked_at INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            PRIMARY KEY(dialog_id, message_id)
+        ) WITHOUT ROWID;
+        INSERT INTO message_read_facts VALUES
+            (1, 1, 1700000001, 100, 'complete'),
+            (1, 2, NULL, 200, 'missing');
+        INSERT INTO schema_version VALUES (69, 0);
+        """
+    )
+    try:
+        assert _apply_migration_70(conn, 69) == 70
+        first = conn.execute(
+            "SELECT read_at, checked_at, status, reason, next_attempt_at FROM message_read_facts ORDER BY message_id"
+        ).fetchall()
+
+        conn.execute("DELETE FROM schema_version WHERE version = 70")
+        assert _apply_migration_70(conn, 69) == 70
+
+        assert (
+            conn.execute(
+                "SELECT read_at, checked_at, status, reason, next_attempt_at FROM message_read_facts ORDER BY message_id"
+            ).fetchall()
+            == first
+        )
+        assert conn.execute("SELECT COUNT(*) FROM schema_version WHERE version = 70").fetchone() == (1,)
+    finally:
+        conn.close()
 
 
 def test_migration_v34_maps_coverage_and_preserves_rows_idempotently(tmp_path: Path) -> None:

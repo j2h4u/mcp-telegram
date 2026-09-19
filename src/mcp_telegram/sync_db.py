@@ -14,7 +14,7 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 69
+_CURRENT_SCHEMA_VERSION = 70
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -35,6 +35,7 @@ _CANONICAL_DIALOG_FACTS_MIGRATION_66 = 66
 _LOCAL_FOLDER_PROJECTION_MIGRATION_67 = 67
 _REACTION_DETAIL_LIFECYCLE_MIGRATION_68 = 68
 _REACTION_DETAIL_PACING_MIGRATION_69 = 69
+_READ_DATE_OUTCOME_MIGRATION_70 = 70
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
@@ -1175,11 +1176,17 @@ CREATE TABLE IF NOT EXISTS reaction_detail_pacing_state (
 
 _MESSAGE_READ_FACTS_DDL = """
 CREATE TABLE IF NOT EXISTS message_read_facts (
-    dialog_id  INTEGER NOT NULL,
-    message_id INTEGER NOT NULL,
-    read_at    INTEGER,
-    checked_at INTEGER NOT NULL,
-    status     TEXT NOT NULL,
+    dialog_id      INTEGER NOT NULL,
+    message_id     INTEGER NOT NULL,
+    read_at        INTEGER,
+    checked_at     INTEGER NOT NULL,
+    status         TEXT NOT NULL,
+    reason         TEXT NOT NULL CHECK (reason IN (
+        'resolved', 'date_omitted', 'message_not_read_yet', 'flood_wait',
+        'transient', 'message_too_old', 'privacy_restricted',
+        'not_mutual_contact', 'invalid_target', 'access_lost'
+    )),
+    next_attempt_at INTEGER,
     PRIMARY KEY (dialog_id, message_id)
 ) WITHOUT ROWID
 """
@@ -1187,6 +1194,12 @@ CREATE TABLE IF NOT EXISTS message_read_facts (
 _MESSAGE_READ_FACTS_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_message_read_facts_checked
 ON message_read_facts(dialog_id, checked_at)
+"""
+
+_MESSAGE_READ_FACTS_NEXT_ATTEMPT_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_message_read_facts_next_attempt
+ON message_read_facts(dialog_id, next_attempt_at)
+WHERE next_attempt_at IS NOT NULL
 """
 
 _SCHEDULED_MESSAGES_ACTIVE_INDEX_DDL = """
@@ -4008,6 +4021,26 @@ def _apply_migration_69(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
+def _apply_migration_70(conn: sqlite3.Connection, current: int) -> int:
+    """Persist normalized read-date outcomes and durable retry deadlines."""
+    if current >= _READ_DATE_OUTCOME_MIGRATION_70:
+        return current
+    statements = [
+        "ALTER TABLE message_read_facts ADD COLUMN reason TEXT NOT NULL DEFAULT 'legacy'",
+        "ALTER TABLE message_read_facts ADD COLUMN next_attempt_at INTEGER",
+        "UPDATE message_read_facts SET reason='resolved', next_attempt_at=NULL WHERE status='complete' AND read_at IS NOT NULL",
+        (
+            # One bounded retry is only for legacy rows that predate normalized reasons;
+            # current probes compute deadlines from the active TTL and RPC retry-after.
+            "UPDATE message_read_facts SET status='unavailable', read_at=NULL, reason='legacy', "
+            "next_attempt_at=checked_at + 600 "
+            "WHERE reason='legacy' AND NOT (status='complete' AND read_at IS NOT NULL)"
+        ),
+        _MESSAGE_READ_FACTS_NEXT_ATTEMPT_INDEX_DDL,
+    ]
+    return _apply_migration(conn, current, _READ_DATE_OUTCOME_MIGRATION_70, statements, ignore_duplicate_column=True)
+
+
 def _apply_migrations_64_to_67(conn: sqlite3.Connection, current: int) -> int:
     """Apply the ordered canonical-directory and folder migrations."""
     if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64:
@@ -4112,6 +4145,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_68(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _REACTION_DETAIL_PACING_MIGRATION_69:
         current = _apply_migration_69(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _READ_DATE_OUTCOME_MIGRATION_70:
+        current = _apply_migration_70(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

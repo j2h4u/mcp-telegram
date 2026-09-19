@@ -463,7 +463,7 @@ depends_on = ["mcp_telegram.flood", "mcp_telegram.request_timing", "mcp_telegram
 [[modules]]
 path = "mcp_telegram.telegram_fact_queries"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.models", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_gateway", "mcp_telegram.telegram_reading", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.models", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_gateway", "mcp_telegram.telegram_reading", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.telegram_read_receipts"]
 
 [[modules]]
 path = "mcp_telegram.dialog_directory_tl"
@@ -487,7 +487,7 @@ depends_on = ["mcp_telegram.formatter", "mcp_telegram.media_fact", "mcp_telegram
 [[modules]]
 path = "mcp_telegram.telegram_read_receipts"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.telegram_demand", "mcp_telegram.telegram_gateway", "mcp_telegram.telegram_reading", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.telegram_demand", "mcp_telegram.telegram_gateway", "mcp_telegram.telegram_reading", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.flood", "mcp_telegram.telegram_rpc_error"]
 
 [[modules]]
 path = "mcp_telegram.telethon_dialog"

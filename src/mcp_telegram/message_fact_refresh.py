@@ -26,7 +26,7 @@ from .telegram_demand import (
     demand_context,
 )
 from .telegram_fact_queries import enrich_read_at
-from .telegram_reading import TelegramReadReceiptGateway
+from .telegram_reading import READ_DATE_REASONS, TelegramReadReceiptGateway
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import rpc_attempt_budget
 
@@ -72,10 +72,10 @@ LEFT JOIN message_read_facts f
 WHERE sd.status = 'synced'
   AND lower(e.type) = 'user'
   AND m.out = 1
+  AND m.is_deleted = 0
   AND sd.read_outbox_max_id IS NOT NULL
   AND m.message_id <= sd.read_outbox_max_id
-  AND (f.dialog_id IS NULL OR f.status != 'complete' OR f.read_at IS NULL)
-  AND (f.dialog_id IS NULL OR f.checked_at <= ?)
+  AND (f.dialog_id IS NULL OR (f.next_attempt_at IS NOT NULL AND f.next_attempt_at <= ?))
 ORDER BY m.sent_at DESC, m.dialog_id, m.message_id
 LIMIT ?
 """
@@ -104,7 +104,7 @@ WHERE EXISTS (
 
 
 _NEXT_READ_AT_RELEASE_SQL = """
-SELECT MIN(CASE WHEN f.checked_at IS NULL THEN 0 ELSE f.checked_at + ? END)
+SELECT MIN(CASE WHEN f.dialog_id IS NULL THEN 0 ELSE f.next_attempt_at END)
 FROM messages m
 JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
 JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
@@ -114,9 +114,10 @@ LEFT JOIN message_read_facts f
 WHERE sd.status = 'synced'
   AND lower(e.type) = 'user'
   AND m.out = 1
+  AND m.is_deleted = 0
   AND sd.read_outbox_max_id IS NOT NULL
   AND m.message_id <= sd.read_outbox_max_id
-  AND (f.dialog_id IS NULL OR f.status != 'complete' OR f.read_at IS NULL)
+  AND (f.dialog_id IS NULL OR f.next_attempt_at IS NOT NULL)
 """
 
 
@@ -141,8 +142,6 @@ WHERE sd.status = 'synced'
       )
   )
 """
-
-_READ_AT_CYCLE_COUNT_FIELDS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +171,7 @@ class _ReadAtCycleStats:
     complete: int
     missing: int
     unavailable: int
+    reason_counts: dict[str, int]
     measurement_complete: bool
 
 
@@ -186,8 +186,8 @@ class MessageFactRefreshDeps:
     clock: Callable[[], float] = time.time
 
 
-def _next_release_at(conn: sqlite3.Connection, query: str, ttl_seconds: int) -> float | None:
-    row = cast(tuple[object] | None, conn.execute(query, (ttl_seconds,)).fetchone())
+def _next_release_at(conn: sqlite3.Connection, query: str, params: tuple[int, ...] = ()) -> float | None:
+    row = cast(tuple[object] | None, conn.execute(query, params).fetchone())
     value = None if row is None else row[0]
     return None if value is None else float(cast(int | float, value))
 
@@ -202,7 +202,7 @@ def _reaction_pacing_release_at(conn: sqlite3.Connection) -> float | None:
 
 def _reaction_release_at(conn: sqlite3.Connection) -> float | None:
     """Combine raw reaction due state with the durable pacing window."""
-    raw_release = _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, 0)
+    raw_release = _next_release_at(conn, _NEXT_REACTION_RELEASE_SQL, (0,))
     if raw_release is None:
         return None
     pacing_release = _reaction_pacing_release_at(conn)
@@ -242,7 +242,7 @@ class MessageFactRefreshDemandAdapter(DurableDemandAdapter):
             read_at_release = _next_release_at(
                 self._deps.conn,
                 _NEXT_READ_AT_RELEASE_SQL,
-                self._policy.read_at_ttl_seconds,
+                (),
             )
             if read_at_release is not None:
                 releases.append(read_at_release)
@@ -458,21 +458,21 @@ def _read_at_attempt_counts(
 
 
 def _terminal_read_at_suppressed(conn: sqlite3.Connection) -> int:
-    """Count eligible terminal rows omitted from acquisition forever."""
-    row = cast(
-        tuple[object] | None,
-        conn.execute(
-            "SELECT COUNT(*) "
-            "FROM messages m "
-            "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id "
-            "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
-            "JOIN entities e ON e.id = m.dialog_id "
-            "JOIN message_read_facts f ON f.dialog_id = m.dialog_id AND f.message_id = m.message_id "
-            "WHERE sd.status = 'synced' AND lower(e.type) = 'user' AND m.out = 1 "
-            "AND sd.read_outbox_max_id IS NOT NULL AND m.message_id <= sd.read_outbox_max_id "
-            "AND f.status = 'complete' AND f.read_at IS NOT NULL"
-        ).fetchone(),
+    """Count every eligible terminal outcome omitted from acquisition forever."""
+    query = (
+        "SELECT COUNT(*) FROM messages m "
+        "JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id "
+        "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
+        "JOIN entities e ON e.id = m.dialog_id "
+        "JOIN message_read_facts f ON f.dialog_id = m.dialog_id AND f.message_id = m.message_id "
+        "WHERE sd.status = 'synced' AND lower(e.type) = 'user' AND m.out = 1 "
+        "AND m.is_deleted = 0 "
+        "AND sd.read_outbox_max_id IS NOT NULL AND m.message_id <= sd.read_outbox_max_id "
+        "AND f.next_attempt_at IS NULL "
+        "AND f.reason IN ('resolved', 'message_too_old', 'privacy_restricted', "
+        "'not_mutual_contact', 'invalid_target', 'access_lost')"
     )
+    row = cast(tuple[object] | None, conn.execute(query).fetchone())
     return 0 if row is None else int(cast(int | str, row[0]))
 
 
@@ -485,6 +485,7 @@ def _observe_read_at_cycle(  # noqa: PLR0913 - bounded telemetry fields are expl
     complete: int,
     missing: int,
     unavailable: int,
+    reason_counts: Mapping[str, int],
 ) -> None:
     """Publish one bounded, content-free observation after a complete cycle."""
     observer = deps.read_at_observer
@@ -499,6 +500,7 @@ def _observe_read_at_cycle(  # noqa: PLR0913 - bounded telemetry fields are expl
                 "complete": complete,
                 "missing": missing,
                 "unavailable": unavailable,
+                "reason_counts": dict(reason_counts),
                 "measurement_complete": True,
             }
         )
@@ -521,6 +523,19 @@ async def _interruptible_pause(shutdown_event: asyncio.Event, seconds: float) ->
         return
 
 
+def _merge_read_at_counts(
+    counts: list[int],
+    complete: int,
+    missing: int,
+    unavailable: int,
+) -> tuple[int, int, int]:
+    return (
+        complete + counts[0],
+        missing + counts[1],
+        unavailable + counts[2],
+    )
+
+
 async def _refresh_read_at_cycle(
     deps: MessageFactRefreshDeps,
     policy: MessageFactRefreshPolicy,
@@ -529,16 +544,17 @@ async def _refresh_read_at_cycle(
     shutdown_event: asyncio.Event | None,
 ) -> _ReadAtCycleStats:
     if shutdown_event is not None and shutdown_event.is_set():
-        return _ReadAtCycleStats(0, 0, 0, 0, 0, 0, False)
+        return _ReadAtCycleStats(0, 0, 0, 0, 0, 0, {}, False)
     messages = _read_at_candidates(
         deps.conn,
-        stale_before_utc=checked_at - policy.read_at_ttl_seconds,
+        stale_before_utc=checked_at,
         limit=policy.read_at_max_messages_per_cycle,
     )
     first_attempts, retry_attempts = _read_at_attempt_counts(deps.conn, messages)
     terminal_suppressed = _terminal_read_at_suppressed(deps.conn)
     complete = missing = unavailable = 0
     measurement_complete = True
+    reason_counts = {reason.value: 0 for reason in READ_DATE_REASONS}
     groups = _group_messages(messages)
     for index, (dialog_id, group) in enumerate(groups.items()):
         counts: list[int] = []
@@ -551,14 +567,14 @@ async def _refresh_read_at_cycle(
             read_at_ttl_seconds=policy.read_at_ttl_seconds,
             checked_at=checked_at,
             cycle_counts=counts,
+            cycle_reason_counts=reason_counts,
         )
-        if len(counts) != _READ_AT_CYCLE_COUNT_FIELDS:
-            measurement_complete = False
-        else:
-            complete += counts[0]
-            missing += counts[1]
-            unavailable += counts[2]
-            measurement_complete = measurement_complete and bool(counts[3])
+        complete, missing, unavailable = _merge_read_at_counts(
+            counts,
+            complete,
+            missing,
+            unavailable,
+        )
         if shutdown_event is not None and shutdown_event.is_set():
             measurement_complete = False
             break
@@ -571,6 +587,7 @@ async def _refresh_read_at_cycle(
         complete=complete,
         missing=missing,
         unavailable=unavailable,
+        reason_counts=reason_counts,
         measurement_complete=measurement_complete,
     )
 
@@ -672,6 +689,7 @@ async def refresh_message_facts_once(
             complete=stats.complete,
             missing=stats.missing,
             unavailable=stats.unavailable,
+            reason_counts=stats.reason_counts,
         )
 
     return MessageFactRefreshResult(

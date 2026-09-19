@@ -18,6 +18,7 @@ from mcp_telegram.message_fact_refresh import (
     _next_release_at,
     _reaction_release_at,
     _read_at_candidates,
+    _terminal_read_at_suppressed,
     refresh_message_facts_once,
 )
 from mcp_telegram.reactions import ReactionDetailRefresher
@@ -87,8 +88,19 @@ def _make_db(path: str | Path = ":memory:") -> sqlite3.Connection:
             read_at INTEGER,
             checked_at INTEGER NOT NULL,
             status TEXT NOT NULL,
+            reason TEXT NOT NULL CHECK (reason IN (
+                'resolved', 'date_omitted', 'message_not_read_yet', 'flood_wait',
+                'transient', 'message_too_old', 'privacy_restricted',
+                'not_mutual_contact', 'invalid_target', 'access_lost'
+            )),
+            next_attempt_at INTEGER,
             PRIMARY KEY (dialog_id, message_id)
-        );
+        ) WITHOUT ROWID;
+        CREATE INDEX idx_message_read_facts_checked
+        ON message_read_facts(dialog_id, checked_at);
+        CREATE INDEX idx_message_read_facts_next_attempt
+        ON message_read_facts(dialog_id, next_attempt_at)
+        WHERE next_attempt_at IS NOT NULL;
         CREATE TABLE reaction_detail_pacing_state (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             window_started_at INTEGER NOT NULL,
@@ -480,8 +492,8 @@ async def test_read_at_cycle_telemetry_is_aggregate_and_terminal_safe() -> None:
                 (20, 2, 1001, 1, NULL, 0),
                 (20, 3, 1002, 1, NULL, 0);
         INSERT INTO message_read_facts VALUES
-            (20, 2, NULL, 1000, 'missing'),
-            (20, 3, 1700000003, 1000, 'complete');
+            (20, 2, NULL, 1000, 'missing', 'date_omitted', 1600),
+            (20, 3, 1700000003, 1000, 'complete', 'resolved', NULL);
         """
     )
     seed_full_history_enrollment(conn, 20, enabled=True)
@@ -508,6 +520,18 @@ async def test_read_at_cycle_telemetry_is_aggregate_and_terminal_safe() -> None:
             "complete": 2,
             "missing": 0,
             "unavailable": 0,
+            "reason_counts": {
+                "resolved": 2,
+                "date_omitted": 0,
+                "message_not_read_yet": 0,
+                "flood_wait": 0,
+                "transient": 0,
+                "message_too_old": 0,
+                "privacy_restricted": 0,
+                "not_mutual_contact": 0,
+                "invalid_target": 0,
+                "access_lost": 0,
+            },
             "measurement_complete": True,
         }
     ]
@@ -521,7 +545,7 @@ async def test_read_at_attempt_telemetry_distinguishes_equal_message_ids_across_
         INSERT INTO synced_dialogs VALUES (20, 'synced', 10), (21, 'synced', 10);
         INSERT INTO entities VALUES (20, 'user'), (21, 'user');
             INSERT INTO messages VALUES (20, 1, 1000, 1, NULL, 0), (21, 1, 1001, 1, NULL, 0);
-        INSERT INTO message_read_facts VALUES (20, 1, NULL, 1000, 'missing');
+            INSERT INTO message_read_facts VALUES (20, 1, NULL, 1000, 'missing', 'date_omitted', 1600);
         """
     )
     seed_full_history_enrollment(conn, 20, enabled=True)
@@ -631,7 +655,7 @@ def test_read_at_cursor_null_has_no_candidate_or_release() -> None:
     seed_full_history_enrollment(conn, 20, enabled=True)
 
     assert _read_at_candidates(conn, stale_before_utc=2_000, limit=10) == []
-    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL, 600) is None
+    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL) is None
     adapter = MessageFactRefreshDemandAdapter(
         MessageFactRefreshDeps(
             conn, cast(ReactionDetailRefresher, object()), cast(TelegramReadReceiptGateway, object())
@@ -666,7 +690,7 @@ def test_terminal_read_at_set_has_no_status_or_release() -> None:
         INSERT INTO synced_dialogs VALUES (20, 'synced', 5);
         INSERT INTO entities VALUES (20, 'user');
         INSERT INTO messages VALUES (20, 5, 1000, 1, NULL, 0);
-        INSERT INTO message_read_facts VALUES (20, 5, 1700000005, 1000, 'complete');
+        INSERT INTO message_read_facts VALUES (20, 5, 1700000005, 1000, 'complete', 'resolved', NULL);
         """
     )
     seed_full_history_enrollment(conn, 20, enabled=True)
@@ -678,8 +702,42 @@ def test_terminal_read_at_set_has_no_status_or_release() -> None:
     )
 
     assert _read_at_candidates(conn, stale_before_utc=2_000, limit=10) == []
-    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL, 600) is None
+    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL) is None
     assert adapter.status(2_000) is None
+    conn.close()
+
+
+def test_read_at_candidate_and_release_boundaries_match_v70_schedule() -> None:
+    conn = _make_db()
+    conn.executescript(
+        """
+        INSERT INTO synced_dialogs VALUES (20, 'synced', 10);
+        INSERT INTO entities VALUES (20, 'user');
+        INSERT INTO messages VALUES
+            (20, 1, 1000, 1, NULL, 0),
+            (20, 2, 1001, 1, NULL, 0),
+            (20, 3, 1002, 1, NULL, 0),
+            (20, 4, 1003, 1, NULL, 0),
+            (20, 5, 1004, 1, NULL, 1);
+        INSERT INTO message_read_facts VALUES
+            (20, 1, NULL, 1000, 'unavailable', 'transient', 2000),
+            (20, 2, NULL, 1000, 'unavailable', 'transient', 3000),
+            (20, 3, NULL, 1000, 'unavailable', 'invalid_target', NULL),
+            (20, 4, 1700000004, 1000, 'complete', 'resolved', NULL),
+            (20, 5, NULL, 1000, 'unavailable', 'invalid_target', NULL);
+        """
+    )
+    seed_full_history_enrollment(conn, 20, enabled=True)
+
+    assert [message.message_id for message in _read_at_candidates(conn, stale_before_utc=2000, limit=10)] == [1]
+    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL) == 2000
+    assert _terminal_read_at_suppressed(conn) == 2
+
+    conn.execute("UPDATE message_read_facts SET next_attempt_at = 3000 WHERE message_id = 1")
+    conn.commit()
+    assert _read_at_candidates(conn, stale_before_utc=2000, limit=10) == []
+    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL) == 3000
+
     conn.close()
 
 
