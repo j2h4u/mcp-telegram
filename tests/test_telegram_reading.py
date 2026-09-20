@@ -645,6 +645,59 @@ def test_read_at_persistence_is_terminal_and_monotonic(make_synced_db: Callable[
         "SELECT status, reason, next_attempt_at FROM message_read_facts WHERE dialog_id=42 AND message_id=2"
     ).fetchone() == ("unavailable", "message_too_old", None)
 
+    # Only the Telegram age witness is permanently fenced; reversible access
+    # outcomes remain eligible for a later policy-driven retry.
+    persist_read_at(
+        conn,
+        42,
+        4,
+        read_at=None,
+        checked_at=300,
+        status="unavailable",
+        reason=ReadDateReason.PRIVACY_RESTRICTED,
+    )
+    persist_read_at(
+        conn,
+        42,
+        4,
+        read_at=None,
+        checked_at=400,
+        status="unavailable",
+        reason=ReadDateReason.TRANSIENT,
+        next_attempt_at=900,
+    )
+    assert conn.execute(
+        "SELECT status, reason, next_attempt_at FROM message_read_facts WHERE dialog_id=42 AND message_id=4"
+    ).fetchone() == ("unavailable", "transient", 900)
+
+    persist_read_at(
+        conn,
+        42,
+        2,
+        read_at=None,
+        checked_at=400,
+        status="unavailable",
+        reason=ReadDateReason.TRANSIENT,
+        next_attempt_at=900,
+    )
+    assert conn.execute(
+        "SELECT status, reason, next_attempt_at FROM message_read_facts WHERE dialog_id=42 AND message_id=2"
+    ).fetchone() == ("unavailable", "message_too_old", None)
+    persist_read_at(conn, 42, 2, read_at=1_700_000_002, checked_at=100, status="complete")
+    persist_read_at(
+        conn,
+        42,
+        2,
+        read_at=None,
+        checked_at=500,
+        status="unavailable",
+        reason=ReadDateReason.TRANSIENT,
+        next_attempt_at=1_000,
+    )
+    assert conn.execute(
+        "SELECT read_at, status, reason, next_attempt_at FROM message_read_facts WHERE dialog_id=42 AND message_id=2"
+    ).fetchone() == (1_700_000_002, "complete", "resolved", None)
+
     with pytest.raises(ValueError, match="requires next_attempt_at"):
         persist_read_at(
             conn,

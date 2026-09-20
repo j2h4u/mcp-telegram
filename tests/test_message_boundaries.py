@@ -103,6 +103,14 @@ def test_current_query_owner_is_allowed() -> None:
     )
 
 
+def test_exact_read_date_fact_sql_has_a_reviewed_owner() -> None:
+    gate = _gate()
+    path = gate.SOURCE_ROOT / "telegram_fact_queries.py"
+    assert "telegram_fact_queries.py" in gate.MESSAGE_SQL_OWNER_PATHS
+    findings = gate.violations_for(path, 'QUERY = "INSERT INTO message_read_facts SELECT 1 FROM messages"')
+    assert not any("outside a reviewed owner" in finding.message for finding in findings)
+
+
 def test_current_legacy_exception_is_named_but_new_path_is_rejected() -> None:
     gate = _gate()
     legacy = gate.SOURCE_ROOT / "daemon.py"

@@ -2,6 +2,9 @@
 
 These helpers deliberately keep event availability separate from event time:
 an unavailable/forbidden Telegram RPC must not look like a timestamped event.
+
+This module owns exact read-date fact persistence and cutoff classification SQL;
+general message queries remain in their canonical query modules.
 """
 
 from __future__ import annotations
@@ -24,6 +27,44 @@ from .telegram_reading import (
     normalize_read_date_reason,
 )
 from .telegram_rpc_scheduler import RpcAdmissionClosedError
+
+_READ_DATE_EXPIRY_INSERT_SQL = (
+    "INSERT INTO message_read_facts "
+    "(dialog_id, message_id, read_at, checked_at, status, reason, next_attempt_at) "
+    "SELECT m.dialog_id, m.message_id, NULL, ?, 'unavailable', 'message_too_old', NULL "
+    "FROM messages m "
+    "JOIN synced_dialogs sd ON sd.dialog_id=m.dialog_id "
+    "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
+    "JOIN entities e ON e.id=m.dialog_id "
+    "WHERE sd.status='synced' AND lower(e.type)='user' AND m.out=1 AND m.is_deleted=0 "
+    "AND sd.read_outbox_max_id IS NOT NULL AND m.message_id <= sd.read_outbox_max_id "
+    "AND m.sent_at <= ? "
+    "AND NOT (m.dialog_id=? AND m.message_id=?) "
+    "AND NOT EXISTS (SELECT 1 FROM message_read_facts f "
+    "WHERE f.dialog_id=m.dialog_id AND f.message_id=m.message_id)"
+)
+
+# Cutoff propagation records current exact-date availability: retryable and
+# legacy "not read yet" rows below a proven cutoff become unavailable.
+_READ_DATE_EXPIRY_UPDATE_SQL = (
+    "UPDATE message_read_facts SET read_at=NULL, checked_at=?, status='unavailable', "
+    "reason='message_too_old', next_attempt_at=NULL "
+    "WHERE reason IN ('legacy', 'date_omitted', 'message_not_read_yet', 'flood_wait', 'transient') "
+    "AND EXISTS (SELECT 1 FROM messages m "
+    "JOIN synced_dialogs sd ON sd.dialog_id=m.dialog_id "
+    "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
+    "JOIN entities e ON e.id=m.dialog_id "
+    "WHERE sd.status='synced' AND lower(e.type)='user' AND m.out=1 AND m.is_deleted=0 "
+    "AND sd.read_outbox_max_id IS NOT NULL AND m.message_id <= sd.read_outbox_max_id "
+    "AND m.sent_at <= ? "
+    "AND NOT (m.dialog_id=? AND m.message_id=?) "
+    "AND m.dialog_id=message_read_facts.dialog_id "
+    "AND m.message_id=message_read_facts.message_id)"
+)
+
+
+class InvalidReadDateWitnessError(ValueError):
+    """A Telegram age witness cannot be used for a future local message date."""
 
 
 def reaction_event_projection(
@@ -110,6 +151,7 @@ async def enrich_read_at(  # noqa: PLR0913
     checked_at: int | None = None,
     cycle_counts: list[int] | None = None,
     cycle_reason_counts: dict[str, int] | None = None,
+    cycle_metrics: dict[str, int] | None = None,
 ) -> list[ReadMessage]:
     """Best-effort enrich own outgoing User-DM messages with Telegram dates.
 
@@ -128,11 +170,12 @@ async def enrich_read_at(  # noqa: PLR0913
         conn,
         gateway,
         dialog_id,
-        candidate_ids,
+        [message for message in messages if message.message_id in candidate_ids],
         stale_before_utc=now,
         checked_at=now,
         read_at_ttl_seconds=read_at_ttl_seconds,
         cycle_reason_counts=cycle_reason_counts,
+        cycle_metrics=cycle_metrics,
     )
     if cycle_counts is not None:
         cycle_counts.extend(counts)
@@ -194,12 +237,21 @@ def _persist_read_date_result(  # noqa: PLR0913
     conn: sqlite3.Connection,
     dialog_id: int,
     message_id: int,
+    sent_at: int,
     result: ReadDateFetchResult,
     *,
     reason: ReadDateReason,
     checked_at: int,
     next_attempt_at: int | None,
-) -> None:
+) -> int:
+    if reason is ReadDateReason.MESSAGE_TOO_OLD:
+        return _persist_message_too_old(
+            conn,
+            dialog_id,
+            message_id,
+            sent_at=sent_at,
+            checked_at=checked_at,
+        )
     persist_read_at(
         conn,
         dialog_id,
@@ -210,46 +262,265 @@ def _persist_read_date_result(  # noqa: PLR0913
         reason=reason,
         next_attempt_at=next_attempt_at,
     )
+    return 0
+
+
+def _has_read_date_fact(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM message_read_facts WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        ).fetchone()
+        is not None
+    )
+
+
+def _read_date_rpc_still_eligible(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    *,
+    sent_at: int,
+    stale_before_utc: int,
+) -> tuple[bool, bool, bool]:
+    """Recheck cutoff and fact freshness immediately before one Telegram call."""
+    state = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state WHERE singleton=1").fetchone(),
+    )
+    if state is None:
+        raise RuntimeError("read_date_expiry_state singleton is missing")
+    cutoff = None if state[0] is None else int(cast(int | str, state[0]))
+    if cutoff is not None and sent_at <= cutoff:
+        return False, True, False
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT next_attempt_at FROM message_read_facts WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        ).fetchone(),
+    )
+    if row is None:
+        return True, False, False
+    next_attempt_at = row[0]
+    return (
+        next_attempt_at is not None and int(cast(int | str, next_attempt_at)) <= stale_before_utc,
+        False,
+        True,
+    )
+
+
+def _persist_message_too_old(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    *,
+    sent_at: int,
+    checked_at: int,
+) -> int:
+    """Persist one age witness in a transaction owned entirely by this helper.
+
+    Callers must finish any prior local transaction before invoking this helper;
+    Telegram I/O always happens before this transaction begins.
+    """
+    if conn.in_transaction:
+        raise RuntimeError("_persist_message_too_old requires no open transaction")
+    if not 0 < sent_at <= checked_at:
+        raise InvalidReadDateWitnessError("read-date witness must satisfy 0 < sent_at <= checked_at")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        state = cast(
+            tuple[object, ...],
+            conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state WHERE singleton=1").fetchone(),
+        )
+        current_cutoff = None if state[0] is None else int(cast(int | str, state[0]))
+        cutoff = sent_at if current_cutoff is None else max(current_cutoff, sent_at)
+        if current_cutoff is None or sent_at >= current_cutoff:
+            conn.execute(
+                "UPDATE read_date_expiry_state SET expired_through_sent_at=?, observed_at=?, "
+                "witness_dialog_id=?, witness_message_id=? WHERE singleton=1",
+                (cutoff, checked_at, dialog_id, message_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE read_date_expiry_state SET observed_at=? WHERE singleton=1",
+                (checked_at,),
+            )
+
+        inserted = conn.execute(
+            _READ_DATE_EXPIRY_INSERT_SQL,
+            (checked_at, cutoff, dialog_id, message_id),
+        ).rowcount
+        updated = conn.execute(
+            _READ_DATE_EXPIRY_UPDATE_SQL,
+            (checked_at, cutoff, dialog_id, message_id),
+        ).rowcount
+        _persist_read_at_v70(
+            conn,
+            dialog_id,
+            message_id,
+            read_at=None,
+            checked_at=checked_at,
+            status="unavailable",
+            reason=ReadDateReason.MESSAGE_TOO_OLD,
+            next_attempt_at=None,
+        )
+        conn.commit()
+        return int(inserted or 0) + int(updated or 0)
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 async def _refresh_stale_read_at_facts(  # noqa: PLR0913
     conn: sqlite3.Connection,
     gateway: TelegramReadReceiptGateway,
     dialog_id: int,
-    message_ids: Sequence[int],
+    messages: Sequence[ReadMessage],
     *,
     stale_before_utc: int,
     checked_at: int,
     read_at_ttl_seconds: int,
     cycle_reason_counts: dict[str, int] | None = None,
+    cycle_metrics: dict[str, int] | None = None,
 ) -> tuple[int, int, int]:
     """Refresh stale probes, retaining committed earlier facts on a later failure."""
     complete = missing = unavailable = 0
-    for message_id in stale_read_at_ids(conn, dialog_id, message_ids, stale_before_utc):
-        result = await _fetch_read_date_result(gateway, dialog_id, message_id)
-        reason = normalize_read_date_reason(result)
-        result_complete, result_missing, result_unavailable = _read_date_result_counts(result)
-        complete += result_complete
-        missing += result_missing
-        unavailable += result_unavailable
-        if cycle_reason_counts is not None:
-            cycle_reason_counts[reason.value] = cycle_reason_counts.get(reason.value, 0) + 1
-        next_attempt_at = _read_date_retry_deadline(
-            result,
-            reason,
-            checked_at=checked_at,
-            read_at_ttl_seconds=read_at_ttl_seconds,
-        )
-        _persist_read_date_result(
+    message_by_id = {message.message_id: message for message in messages}
+    candidate_ids = stale_read_at_ids(conn, dialog_id, tuple(message_by_id), stale_before_utc)
+    for message_id in candidate_ids:
+        message = message_by_id[message_id]
+        eligible, cutoff_skipped, fresh_skipped = _read_date_rpc_still_eligible(
             conn,
             dialog_id,
             message_id,
+            sent_at=message.sent_at,
+            stale_before_utc=stale_before_utc,
+        )
+        if not eligible:
+            _record_cutoff_skip(cycle_metrics, cutoff_skipped)
+            _record_fresh_skip(cycle_metrics, fresh_skipped)
+            continue
+        attempt_kind = _read_date_attempt_kind(conn, dialog_id, message_id)
+        result = await _fetch_read_date_result(gateway, dialog_id, message_id)
+        _record_read_date_attempt(cycle_metrics, attempt_kind)
+        result_complete, result_missing, result_unavailable = _persist_fetched_read_date(
+            conn,
+            dialog_id,
+            message,
+            result,
+            checked_at=checked_at,
+            read_at_ttl_seconds=read_at_ttl_seconds,
+            cycle_reason_counts=cycle_reason_counts,
+            cycle_metrics=cycle_metrics,
+        )
+        complete += result_complete
+        missing += result_missing
+        unavailable += result_unavailable
+    return complete, missing, unavailable
+
+
+def _record_cutoff_skip(metrics: dict[str, int] | None, cutoff_skipped: bool) -> None:
+    if metrics is not None and cutoff_skipped:
+        metrics["cutoff_skipped"] = metrics.get("cutoff_skipped", 0) + 1
+
+
+def _record_fresh_skip(metrics: dict[str, int] | None, fresh_skipped: bool) -> None:
+    if metrics is not None and fresh_skipped:
+        metrics["fresh_skipped"] = metrics.get("fresh_skipped", 0) + 1
+
+
+def _read_date_attempt_kind(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+) -> str:
+    return "retry_attempts" if _has_read_date_fact(conn, dialog_id, message_id) else "first_attempts"
+
+
+def _record_read_date_attempt(
+    metrics: dict[str, int] | None,
+    attempt_kind: str,
+) -> None:
+    if metrics is None:
+        return
+    metrics["rpc_attempts"] = metrics.get("rpc_attempts", 0) + 1
+    metrics[attempt_kind] = metrics.get(attempt_kind, 0) + 1
+
+
+def _quarantine_invalid_read_date_witness(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    *,
+    checked_at: int,
+) -> None:
+    """Store a malformed age witness through the ordinary monotonic fence."""
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT checked_at FROM message_read_facts WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        ).fetchone(),
+    )
+    persisted_checked_at = checked_at
+    if row is not None:
+        persisted_checked_at = max(persisted_checked_at, int(cast(int | str, row[0])) + 1)
+    persist_read_at(
+        conn,
+        dialog_id,
+        message_id,
+        read_at=None,
+        checked_at=persisted_checked_at,
+        status="unavailable",
+        reason=ReadDateReason.MESSAGE_TOO_OLD,
+        next_attempt_at=None,
+    )
+
+
+def _persist_fetched_read_date(  # noqa: PLR0913
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message: ReadMessage,
+    result: ReadDateFetchResult,
+    *,
+    checked_at: int,
+    read_at_ttl_seconds: int,
+    cycle_reason_counts: dict[str, int] | None,
+    cycle_metrics: dict[str, int] | None,
+) -> tuple[int, int, int]:
+    reason = normalize_read_date_reason(result)
+    if cycle_reason_counts is not None:
+        cycle_reason_counts[reason.value] = cycle_reason_counts.get(reason.value, 0) + 1
+    next_attempt_at = _read_date_retry_deadline(
+        result,
+        reason,
+        checked_at=checked_at,
+        read_at_ttl_seconds=read_at_ttl_seconds,
+    )
+    try:
+        locally_classified = _persist_read_date_result(
+            conn,
+            dialog_id,
+            message.message_id,
+            message.sent_at,
             result,
             reason=reason,
             checked_at=checked_at,
             next_attempt_at=next_attempt_at,
         )
-    return complete, missing, unavailable
+    except InvalidReadDateWitnessError:
+        # Telegram explicitly returned MESSAGE_TOO_OLD. Quarantine only this
+        # malformed local witness; it must not advance or classify globally.
+        _quarantine_invalid_read_date_witness(conn, dialog_id, message.message_id, checked_at=checked_at)
+        locally_classified = 0
+        if cycle_metrics is not None:
+            cycle_metrics["invalid_cutoff_witnesses"] = cycle_metrics.get("invalid_cutoff_witnesses", 0) + 1
+    if cycle_metrics is not None:
+        cycle_metrics["locally_classified"] = cycle_metrics.get("locally_classified", 0) + locally_classified
+        if reason is ReadDateReason.MESSAGE_TOO_OLD:
+            cycle_metrics["message_too_old_responses"] = cycle_metrics.get("message_too_old_responses", 0) + 1
+    return _read_date_result_counts(result)
 
 
 def _normalize_persist_reason(status: str, reason: ReadDateReason | str | None) -> ReadDateReason:
@@ -303,7 +574,8 @@ def _persist_read_at_v70(  # noqa: PLR0913
         "reason = excluded.reason, next_attempt_at = excluded.next_attempt_at "
         "WHERE NOT (message_read_facts.status = 'complete' AND message_read_facts.read_at IS NOT NULL) "
         "AND ((excluded.status = 'complete' AND excluded.read_at IS NOT NULL) "
-        "OR excluded.checked_at > message_read_facts.checked_at)",
+        "OR (message_read_facts.reason != 'message_too_old' "
+        "AND excluded.checked_at > message_read_facts.checked_at))",
         (dialog_id, message_id, read_at, checked_at, status, reason.value, next_attempt_at, dialog_id),
     )
 
