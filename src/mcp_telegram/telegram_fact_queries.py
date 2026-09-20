@@ -365,7 +365,7 @@ async def _refresh_stale_read_at_facts(  # noqa: PLR0913
     candidate_ids = stale_read_at_ids(conn, dialog_id, tuple(message_by_id), stale_before_utc)
     for message_id in candidate_ids:
         message = message_by_id[message_id]
-        eligible, cutoff_suppressed = _read_date_rpc_still_eligible(
+        eligible, cutoff_skipped = _read_date_rpc_still_eligible(
             conn,
             dialog_id,
             message_id,
@@ -373,10 +373,11 @@ async def _refresh_stale_read_at_facts(  # noqa: PLR0913
             stale_before_utc=stale_before_utc,
         )
         if not eligible:
-            _record_cutoff_suppression(cycle_metrics, cutoff_suppressed)
+            _record_cutoff_skip(cycle_metrics, cutoff_skipped)
             continue
-        _record_read_date_attempt(cycle_metrics, conn, dialog_id, message_id)
+        attempt_kind = _read_date_attempt_kind(conn, dialog_id, message_id)
         result = await _fetch_read_date_result(gateway, dialog_id, message_id)
+        _record_read_date_attempt(cycle_metrics, attempt_kind)
         result_complete, result_missing, result_unavailable = _persist_fetched_read_date(
             conn,
             dialog_id,
@@ -393,22 +394,27 @@ async def _refresh_stale_read_at_facts(  # noqa: PLR0913
     return complete, missing, unavailable
 
 
-def _record_cutoff_suppression(metrics: dict[str, int] | None, cutoff_suppressed: bool) -> None:
-    if metrics is not None and cutoff_suppressed:
-        metrics["cutoff_suppressed"] = metrics.get("cutoff_suppressed", 0) + 1
+def _record_cutoff_skip(metrics: dict[str, int] | None, cutoff_skipped: bool) -> None:
+    if metrics is not None and cutoff_skipped:
+        metrics["cutoff_skipped"] = metrics.get("cutoff_skipped", 0) + 1
+
+
+def _read_date_attempt_kind(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+) -> str:
+    return "retry_attempts" if _has_read_date_fact(conn, dialog_id, message_id) else "first_attempts"
 
 
 def _record_read_date_attempt(
     metrics: dict[str, int] | None,
-    conn: sqlite3.Connection,
-    dialog_id: int,
-    message_id: int,
+    attempt_kind: str,
 ) -> None:
     if metrics is None:
         return
     metrics["rpc_attempts"] = metrics.get("rpc_attempts", 0) + 1
-    key = "retry_attempts" if _has_read_date_fact(conn, dialog_id, message_id) else "first_attempts"
-    metrics[key] = metrics.get(key, 0) + 1
+    metrics[attempt_kind] = metrics.get(attempt_kind, 0) + 1
 
 
 def _persist_fetched_read_date(  # noqa: PLR0913

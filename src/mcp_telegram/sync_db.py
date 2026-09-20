@@ -4052,24 +4052,6 @@ def _apply_migration_70(conn: sqlite3.Connection, current: int) -> int:
     return _apply_migration(conn, current, _READ_DATE_OUTCOME_MIGRATION_70, statements, ignore_duplicate_column=True)
 
 
-def _read_date_expiry_schema_supported(conn: sqlite3.Connection) -> bool:
-    tables = {
-        str(row[0])
-        for row in cast(
-            list[tuple[object, ...]],
-            conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall(),
-        )
-    }
-    required_tables = {"messages", "synced_dialogs", "full_history_enrollment", "entities", "message_read_facts"}
-    if not required_tables <= tables:
-        return False
-    required_columns = {
-        "synced_dialogs": {"status", "read_outbox_max_id"},
-        "messages": {"sent_at", "out", "is_deleted"},
-    }
-    return all(columns <= _table_column_names(conn, table) for table, columns in required_columns.items())
-
-
 def _read_date_expiry_witness(conn: sqlite3.Connection) -> tuple[object, ...] | None:
     return cast(
         tuple[object, ...] | None,
@@ -4101,11 +4083,6 @@ def _seed_read_date_expiry_witness(conn: sqlite3.Connection, witness: tuple[obje
             "UPDATE read_date_expiry_state SET expired_through_sent_at=?, observed_at=?, "
             "witness_dialog_id=?, witness_message_id=? WHERE singleton=1",
             (witness_sent_at, int(time.time()), int(cast(int | str, witness[1])), int(cast(int | str, witness[2]))),
-        )
-    elif conn.execute("SELECT witness_dialog_id FROM read_date_expiry_state WHERE singleton=1").fetchone()[0] is None:
-        conn.execute(
-            "UPDATE read_date_expiry_state SET witness_dialog_id=?, witness_message_id=? WHERE singleton=1",
-            (int(cast(int | str, witness[1])), int(cast(int | str, witness[2]))),
         )
 
 
@@ -4156,9 +4133,8 @@ def _apply_migration_71(conn: sqlite3.Connection, current: int) -> int:
     try:
         conn.execute(_READ_DATE_EXPIRY_STATE_DDL)
         conn.execute("INSERT OR IGNORE INTO read_date_expiry_state(singleton) VALUES (1)")
-        if _read_date_expiry_schema_supported(conn):
-            _seed_read_date_expiry_witness(conn, _read_date_expiry_witness(conn))
-            _classify_read_date_expiry_tail(conn)
+        _seed_read_date_expiry_witness(conn, _read_date_expiry_witness(conn))
+        _classify_read_date_expiry_tail(conn)
         conn.execute(
             "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
             (_READ_DATE_EXPIRY_CUTOFF_MIGRATION_71,),

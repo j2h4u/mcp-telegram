@@ -24,6 +24,7 @@ from mcp_telegram.message_fact_refresh import (
 from mcp_telegram.reactions import ReactionDetailRefresher
 from mcp_telegram.reactions.detail import ReactionDetailResult
 from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcAttemptBudgetExhaustedError
+from mcp_telegram.telegram_fact_queries import _persist_message_too_old
 from mcp_telegram.telegram_reading import ReadDateFetchResult, ReadDateReason, TelegramReadReceiptGateway
 from mcp_telegram.telegram_rpc_consumers import TelegramRpcSource
 from mcp_telegram.telegram_rpc_scheduler import RpcAdmissionClosedError, rpc_scope
@@ -543,7 +544,8 @@ async def test_read_at_cycle_telemetry_is_aggregate_and_terminal_safe() -> None:
             "rpc_attempts": 2,
             "message_too_old_responses": 0,
             "locally_classified": 0,
-            "cutoff_suppressed": 0,
+            "cutoff_backlog_suppressed": 0,
+            "cutoff_skipped": 0,
             "candidate_count": 2,
             "measurement_complete": True,
         }
@@ -635,6 +637,7 @@ async def test_message_too_old_cutoff_is_global_and_sent_at_based() -> None:
     seed_full_history_enrollment(conn, 20, enabled=True)
     seed_full_history_enrollment(conn, 21, enabled=True)
     calls: list[tuple[int, int]] = []
+    observations: list[Mapping[str, object]] = []
 
     class Gateway:
         async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult:
@@ -646,7 +649,10 @@ async def test_message_too_old_cutoff_is_global_and_sent_at_based() -> None:
 
     await refresh_message_facts_once(
         MessageFactRefreshDeps(
-            conn, cast(ReactionDetailRefresher, object()), cast(TelegramReadReceiptGateway, Gateway())
+            conn,
+            cast(ReactionDetailRefresher, object()),
+            cast(TelegramReadReceiptGateway, Gateway()),
+            read_at_observer=observations.append,
         ),
         _policy(reaction_max=0, read_at_max=10),
         now=2_000,
@@ -661,6 +667,65 @@ async def test_message_too_old_cutoff_is_global_and_sent_at_based() -> None:
         "SELECT message_id, reason FROM message_read_facts WHERE dialog_id=21 ORDER BY message_id"
     ).fetchall() == [(1, "message_too_old"), (2, "resolved"), (3, "resolved")]
     assert [message.message_id for message in _read_at_candidates(conn, stale_before_utc=2_000, limit=10)] == []
+
+    first_observation = observations[0]
+    assert first_observation["candidate_count"] == 5
+    assert first_observation["rpc_attempts"] == 3
+    assert cast(int, first_observation["first_attempts"]) + cast(int, first_observation["retry_attempts"]) == 3
+    assert first_observation["message_too_old_responses"] == 1
+    assert first_observation["locally_classified"] == 3
+    assert first_observation["cutoff_backlog_suppressed"] == 0
+    assert first_observation["cutoff_skipped"] == 1
+
+    # History imported after the witness remains outside both candidate and
+    # release SQL, so it cannot trigger a gateway call.
+    conn.execute("INSERT INTO messages VALUES (20, 3, 200, 1, NULL, 0)")
+    conn.commit()
+    await refresh_message_facts_once(
+        MessageFactRefreshDeps(
+            conn,
+            cast(ReactionDetailRefresher, object()),
+            cast(TelegramReadReceiptGateway, Gateway()),
+            read_at_observer=observations.append,
+        ),
+        _policy(reaction_max=0, read_at_max=10),
+        now=2_001,
+    )
+    assert _read_at_candidates(conn, stale_before_utc=2_001, limit=10) == []
+    assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL) is None
+    assert calls == [(21, 3), (21, 2), (20, 2)]
+    second_observation = observations[1]
+    assert second_observation["candidate_count"] == 0
+    assert second_observation["rpc_attempts"] == 0
+    assert second_observation["cutoff_backlog_suppressed"] == 1
+    assert second_observation["cutoff_skipped"] == 0
+    conn.close()
+
+
+def test_older_message_too_old_witness_does_not_advance_or_reclassify() -> None:
+    conn = _make_db()
+    conn.executescript(
+        """
+        INSERT INTO synced_dialogs VALUES (20, 'synced', 2);
+        INSERT INTO entities VALUES (20, 'user');
+        INSERT INTO messages VALUES (20, 1, 100, 1, NULL, 0), (20, 2, 300, 1, NULL, 0);
+        INSERT INTO message_read_facts VALUES
+            (20, 1, NULL, 1000, 'unavailable', 'message_too_old', NULL),
+            (20, 2, NULL, 1000, 'unavailable', 'message_too_old', NULL);
+        """
+    )
+    seed_full_history_enrollment(conn, 20, enabled=True)
+    conn.execute(
+        "UPDATE read_date_expiry_state SET expired_through_sent_at=300, observed_at=1000, "
+        "witness_dialog_id=20, witness_message_id=2 WHERE singleton=1"
+    )
+    conn.commit()
+
+    classified = _persist_message_too_old(conn, 20, 1, sent_at=100, checked_at=2000)
+
+    assert classified == 0
+    assert conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state").fetchone() == (300,)
+    assert conn.execute("SELECT COUNT(*) FROM message_read_facts WHERE reason='message_too_old'").fetchone() == (2,)
     conn.close()
 
 

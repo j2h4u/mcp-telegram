@@ -12,6 +12,7 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import groupby
 from typing import cast
 
 from .models import ReadMessage
@@ -179,7 +180,8 @@ class _ReadAtCycleStats:
     rpc_attempts: int
     message_too_old_responses: int
     locally_classified: int
-    cutoff_suppressed: int
+    cutoff_backlog_suppressed: int
+    cutoff_skipped: int
     candidate_count: int
     measurement_complete: bool
 
@@ -447,25 +449,6 @@ def _read_at_candidates(
     ]
 
 
-def _read_at_attempt_counts(
-    conn: sqlite3.Connection,
-    messages: Sequence[ReadMessage],
-) -> tuple[int, int]:
-    """Return first-attempt and retry counts for one selected batch."""
-    if not messages:
-        return 0, 0
-    rows = cast(
-        list[tuple[object, ...]],
-        conn.execute(
-            "SELECT dialog_id, message_id FROM message_read_facts "
-            "WHERE (dialog_id, message_id) IN (" + ",".join("(?, ?)" for _ in messages) + ")",
-            [value for message in messages for value in (message.dialog_id, message.message_id)],
-        ).fetchall(),
-    )
-    retry_keys = {(int(cast(int | str, row[0])), int(cast(int | str, row[1]))) for row in rows}
-    return len(messages) - len(retry_keys), len(retry_keys)
-
-
 def _terminal_read_at_suppressed(conn: sqlite3.Connection) -> int:
     """Count every eligible terminal outcome omitted from acquisition forever."""
     query = (
@@ -485,7 +468,7 @@ def _terminal_read_at_suppressed(conn: sqlite3.Connection) -> int:
     return 0 if row is None else int(cast(int | str, row[0]))
 
 
-def _cutoff_read_at_suppressed(conn: sqlite3.Connection, checked_at: int) -> int:
+def _cutoff_backlog_suppressed(conn: sqlite3.Connection, checked_at: int) -> int:
     """Count due candidates omitted because their Telegram sent date expired."""
     row = cast(
         tuple[object, ...] | None,
@@ -519,7 +502,8 @@ def _observe_read_at_cycle(  # noqa: PLR0913 - bounded telemetry fields are expl
     rpc_attempts: int,
     message_too_old_responses: int,
     locally_classified: int,
-    cutoff_suppressed: int,
+    cutoff_backlog_suppressed: int,
+    cutoff_skipped: int,
     candidate_count: int,
 ) -> None:
     """Publish one bounded, content-free observation after a complete cycle."""
@@ -539,7 +523,8 @@ def _observe_read_at_cycle(  # noqa: PLR0913 - bounded telemetry fields are expl
                 "rpc_attempts": rpc_attempts,
                 "message_too_old_responses": message_too_old_responses,
                 "locally_classified": locally_classified,
-                "cutoff_suppressed": cutoff_suppressed,
+                "cutoff_backlog_suppressed": cutoff_backlog_suppressed,
+                "cutoff_skipped": cutoff_skipped,
                 "candidate_count": candidate_count,
                 "measurement_complete": True,
             }
@@ -547,13 +532,6 @@ def _observe_read_at_cycle(  # noqa: PLR0913 - bounded telemetry fields are expl
     except Exception:  # noqa: BLE001 - telemetry must not affect fact persistence
         # Telemetry is best effort and must not affect fact persistence.
         return
-
-
-def _group_messages(messages: Sequence[ReadMessage]) -> dict[int, list[ReadMessage]]:
-    grouped: dict[int, list[ReadMessage]] = {}
-    for message in messages:
-        grouped.setdefault(message.dialog_id, []).append(message)
-    return grouped
 
 
 async def _interruptible_pause(shutdown_event: asyncio.Event, seconds: float) -> None:
@@ -584,7 +562,22 @@ async def _refresh_read_at_cycle(
     shutdown_event: asyncio.Event | None,
 ) -> _ReadAtCycleStats:
     if shutdown_event is not None and shutdown_event.is_set():
-        return _ReadAtCycleStats(0, 0, 0, 0, 0, 0, {}, 0, 0, 0, 0, 0, False)
+        return _ReadAtCycleStats(
+            first_attempts=0,
+            retry_attempts=0,
+            terminal_suppressed=0,
+            complete=0,
+            missing=0,
+            unavailable=0,
+            reason_counts={},
+            rpc_attempts=0,
+            message_too_old_responses=0,
+            locally_classified=0,
+            cutoff_backlog_suppressed=0,
+            cutoff_skipped=0,
+            candidate_count=0,
+            measurement_complete=False,
+        )
     messages = _read_at_candidates(
         deps.conn,
         stale_before_utc=checked_at,
@@ -597,18 +590,20 @@ async def _refresh_read_at_cycle(
         "rpc_attempts": 0,
         "message_too_old_responses": 0,
         "locally_classified": 0,
-        "cutoff_suppressed": _cutoff_read_at_suppressed(deps.conn, checked_at),
+        "cutoff_backlog_suppressed": _cutoff_backlog_suppressed(deps.conn, checked_at),
+        "cutoff_skipped": 0,
     }
     complete = missing = unavailable = 0
     measurement_complete = True
     reason_counts = {reason.value: 0 for reason in READ_DATE_REASONS}
-    for index, message in enumerate(messages):
+    grouped_messages = [list(group) for _, group in groupby(messages, key=lambda message: message.dialog_id)]
+    for index, grouped in enumerate(grouped_messages):
         counts: list[int] = []
         await enrich_read_at(
             deps.conn,
             deps.read_receipt_gateway,
-            message.dialog_id,
-            [message],
+            grouped[0].dialog_id,
+            grouped,
             dialog_type="user",
             read_at_ttl_seconds=policy.read_at_ttl_seconds,
             checked_at=checked_at,
@@ -625,7 +620,7 @@ async def _refresh_read_at_cycle(
         if shutdown_event is not None and shutdown_event.is_set():
             measurement_complete = False
             break
-        if shutdown_event is not None and index < len(messages) - 1:
+        if shutdown_event is not None and index < len(grouped_messages) - 1:
             await _interruptible_pause(shutdown_event, policy.pause_seconds)
     return _ReadAtCycleStats(
         first_attempts=cycle_metrics["first_attempts"],
@@ -638,7 +633,8 @@ async def _refresh_read_at_cycle(
         rpc_attempts=cycle_metrics["rpc_attempts"],
         message_too_old_responses=cycle_metrics["message_too_old_responses"],
         locally_classified=cycle_metrics["locally_classified"],
-        cutoff_suppressed=cycle_metrics["cutoff_suppressed"],
+        cutoff_backlog_suppressed=cycle_metrics["cutoff_backlog_suppressed"],
+        cutoff_skipped=cycle_metrics["cutoff_skipped"],
         candidate_count=len(messages),
         measurement_complete=measurement_complete,
     )
@@ -745,7 +741,8 @@ async def refresh_message_facts_once(
             rpc_attempts=stats.rpc_attempts,
             message_too_old_responses=stats.message_too_old_responses,
             locally_classified=stats.locally_classified,
-            cutoff_suppressed=stats.cutoff_suppressed,
+            cutoff_backlog_suppressed=stats.cutoff_backlog_suppressed,
+            cutoff_skipped=stats.cutoff_skipped,
             candidate_count=stats.candidate_count,
         )
 

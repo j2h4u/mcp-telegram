@@ -13,6 +13,7 @@ import pytest
 import mcp_telegram.sync_db as sync_db_module
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
+    _ENTITY_TABLE_DDL,
     _apply_migration_51,
     _apply_migration_52,
     _apply_migration_53,
@@ -1034,7 +1035,8 @@ def test_migration_v21_runs_from_v20_database(tmp_path: Path) -> None:
         # synced_dialogs exists since v1; stub it so the v25 own_only backfill
         # (INSERT...SELECT FROM synced_dialogs) succeeds when seeding mid-chain.
         conn.execute(
-            "CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending')"
+            "CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending', "
+            "read_outbox_max_id INTEGER)"
         )
         conn.execute("INSERT INTO schema_version VALUES (20, 1700000000)")
         conn.commit()
@@ -1185,7 +1187,8 @@ def test_migration_v23_runs_from_v22_database(tmp_path: Path) -> None:
         # synced_dialogs exists since v1; stub it so the v25 own_only backfill
         # (INSERT...SELECT FROM synced_dialogs) succeeds when seeding mid-chain.
         conn.execute(
-            "CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending')"
+            "CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending', "
+            "read_outbox_max_id INTEGER)"
         )
         conn.execute("INSERT INTO schema_version VALUES (22, 1700000000)")
         conn.commit()
@@ -1330,7 +1333,8 @@ def test_migration_v24_backfill_three_shapes(tmp_path: Path) -> None:
         # synced_dialogs exists since v1; stub it so the v25 own_only backfill
         # (INSERT...SELECT FROM synced_dialogs) succeeds when seeding mid-chain.
         pre_conn.execute(
-            "CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending')"
+            "CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending', "
+            "read_outbox_max_id INTEGER)"
         )
         pre_conn.execute("INSERT INTO schema_version VALUES (23, 1700000000)")
         pre_conn.commit()
@@ -1469,12 +1473,17 @@ def _make_v24_db(tmp_path: Path) -> Path:
                 linked_chat_resolved_at INTEGER
             )"""
         )
+        # Current v71 migration scans eligible User-DM witnesses.  This table
+        # is present in every real v24 database; the fixture starts at v24 and
+        # therefore supplies the skipped historical v16 table explicitly.
+        conn.execute(_ENTITY_TABLE_DDL)
         # Minimal synced_dialogs table
         conn.execute(
             """CREATE TABLE synced_dialogs (
                 dialog_id   INTEGER PRIMARY KEY,
                 status      TEXT NOT NULL DEFAULT 'pending',
-                access_lost_at INTEGER
+                access_lost_at INTEGER,
+                read_outbox_max_id INTEGER
             )"""
         )
         # Minimal message_forwards table (exists since v7 in real DBs; v26 UPDATEs it)
