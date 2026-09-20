@@ -896,6 +896,31 @@ def test_message_too_old_requires_a_clean_local_transaction() -> None:
     conn.close()
 
 
+def test_future_dated_message_too_old_witness_fails_without_cutoff_or_classification() -> None:
+    conn = _make_db()
+    conn.executescript(
+        """
+        INSERT INTO synced_dialogs VALUES (20, 'synced', 2);
+        INSERT INTO entities VALUES (20, 'user');
+        INSERT INTO messages VALUES (20, 1, 300, 1, NULL, 0), (20, 2, 100, 1, NULL, 0);
+        INSERT INTO message_read_facts VALUES
+            (20, 2, NULL, 100, 'unavailable', 'transient', 5000);
+        """
+    )
+    seed_full_history_enrollment(conn, 20, enabled=True)
+    conn.commit()
+
+    with pytest.raises(ValueError, match="cannot be later than checked_at"):
+        _persist_message_too_old(conn, 20, 1, sent_at=300, checked_at=200)
+
+    assert conn.in_transaction is False
+    assert conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state").fetchone() == (None,)
+    assert conn.execute(
+        "SELECT status, reason, next_attempt_at FROM message_read_facts WHERE dialog_id=20 AND message_id=2"
+    ).fetchone() == ("unavailable", "transient", 5000)
+    conn.close()
+
+
 @pytest.mark.asyncio
 async def test_privacy_outcome_does_not_advance_read_date_cutoff() -> None:
     conn = _make_db()

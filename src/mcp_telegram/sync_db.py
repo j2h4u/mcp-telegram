@@ -4063,7 +4063,7 @@ def _read_date_expiry_witness(conn: sqlite3.Connection) -> tuple[object, ...] | 
             "JOIN message_read_facts f ON f.dialog_id=m.dialog_id AND f.message_id=m.message_id "
             "WHERE sd.status='synced' AND lower(e.type)='user' AND m.out=1 AND m.is_deleted=0 "
             "AND sd.read_outbox_max_id IS NOT NULL AND m.message_id <= sd.read_outbox_max_id "
-            "AND f.reason='message_too_old' "
+            "AND f.reason='message_too_old' AND m.sent_at <= f.checked_at "
             "ORDER BY m.sent_at DESC, m.dialog_id DESC, m.message_id DESC LIMIT 1"
         ).fetchone(),
     )
