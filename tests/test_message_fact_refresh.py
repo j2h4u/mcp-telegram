@@ -561,6 +561,54 @@ async def test_read_at_cycle_telemetry_is_aggregate_and_terminal_safe() -> None:
 
 
 @pytest.mark.asyncio
+async def test_read_at_cycle_groups_interleaved_candidates_by_dialog() -> None:
+    conn = _make_db()
+    conn.executescript(
+        """
+        INSERT INTO synced_dialogs VALUES (20, 'synced', 10), (21, 'synced', 10);
+        INSERT INTO entities VALUES (20, 'user'), (21, 'user');
+        INSERT INTO messages VALUES
+            (20, 1, 400, 1, NULL, 0),
+            (21, 1, 300, 1, NULL, 0),
+            (20, 2, 200, 1, NULL, 0),
+            (21, 2, 100, 1, NULL, 0);
+        """
+    )
+    seed_full_history_enrollment(conn, 20, enabled=True)
+    seed_full_history_enrollment(conn, 21, enabled=True)
+    calls: list[tuple[int, int]] = []
+
+    class Gateway:
+        async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult:
+            calls.append((int(cast(int, entity)), message_id))
+            return ReadDateFetchResult(status="complete", read_at=1700000000 + message_id)
+
+    try:
+        assert [
+            (message.dialog_id, message.message_id)
+            for message in _read_at_candidates(conn, stale_before_utc=1000, limit=10)
+        ] == [
+            (20, 1),
+            (21, 1),
+            (20, 2),
+            (21, 2),
+        ]
+        await refresh_message_facts_once(
+            MessageFactRefreshDeps(
+                conn,
+                cast(ReactionDetailRefresher, object()),
+                cast(TelegramReadReceiptGateway, Gateway()),
+            ),
+            MessageFactRefreshPolicy(10, 4, 0, 600, 5, 600),
+            now=1000,
+        )
+    finally:
+        conn.close()
+
+    assert calls == [(20, 1), (20, 2), (21, 1), (21, 2)]
+
+
+@pytest.mark.asyncio
 async def test_read_at_attempt_telemetry_distinguishes_equal_message_ids_across_dialogs() -> None:
     conn = _make_db()
     conn.executescript(
@@ -666,22 +714,22 @@ async def test_message_too_old_cutoff_is_global_and_sent_at_based() -> None:
         now=2_000,
     )
 
-    assert calls == [(21, 3), (21, 2), (20, 2)]
+    assert calls == [(21, 3), (21, 2), (21, 1), (20, 2)]
     assert conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state").fetchone() == (300,)
     assert conn.execute(
         "SELECT message_id, reason FROM message_read_facts WHERE dialog_id=20 ORDER BY message_id"
     ).fetchall() == [(1, "message_too_old"), (2, "message_too_old")]
     assert conn.execute(
         "SELECT message_id, reason FROM message_read_facts WHERE dialog_id=21 ORDER BY message_id"
-    ).fetchall() == [(1, "message_too_old"), (2, "resolved"), (3, "resolved")]
+    ).fetchall() == [(1, "resolved"), (2, "resolved"), (3, "resolved")]
     assert [message.message_id for message in _read_at_candidates(conn, stale_before_utc=2_000, limit=10)] == []
 
     first_observation = observations[0]
     assert first_observation["candidate_count"] == 5
-    assert first_observation["rpc_attempts"] == 3
-    assert cast(int, first_observation["first_attempts"]) + cast(int, first_observation["retry_attempts"]) == 3
+    assert first_observation["rpc_attempts"] == 4
+    assert cast(int, first_observation["first_attempts"]) + cast(int, first_observation["retry_attempts"]) == 4
     assert first_observation["message_too_old_responses"] == 1
-    assert first_observation["locally_classified"] == 2
+    assert first_observation["locally_classified"] == 1
     assert first_observation["cutoff_backlog_suppressed"] == 0
     assert first_observation["cutoff_skipped"] == 1
     assert first_observation["fresh_skipped"] == 0
@@ -702,7 +750,7 @@ async def test_message_too_old_cutoff_is_global_and_sent_at_based() -> None:
     )
     assert _read_at_candidates(conn, stale_before_utc=2_001, limit=10) == []
     assert _next_release_at(conn, _NEXT_READ_AT_RELEASE_SQL) is None
-    assert calls == [(21, 3), (21, 2), (20, 2)]
+    assert calls == [(21, 3), (21, 2), (21, 1), (20, 2)]
     second_observation = observations[1]
     assert second_observation["candidate_count"] == 0
     assert second_observation["rpc_attempts"] == 0

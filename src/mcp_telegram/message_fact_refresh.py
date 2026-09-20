@@ -12,7 +12,6 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from itertools import groupby
 from typing import cast
 
 from .models import ReadMessage
@@ -608,7 +607,10 @@ async def _refresh_read_at_cycle(
     complete = missing = unavailable = 0
     measurement_complete = True
     reason_counts = {reason.value: 0 for reason in READ_DATE_REASONS}
-    grouped_messages = [list(group) for _, group in groupby(messages, key=lambda message: message.dialog_id)]
+    grouped_by_dialog: dict[int, list[ReadMessage]] = {}
+    for message in messages:
+        grouped_by_dialog.setdefault(message.dialog_id, []).append(message)
+    grouped_messages = list(grouped_by_dialog.values())
     for index, grouped in enumerate(grouped_messages):
         counts: list[int] = []
         await enrich_read_at(
