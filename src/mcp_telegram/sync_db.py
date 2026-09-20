@@ -14,7 +14,7 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 70
+_CURRENT_SCHEMA_VERSION = 71
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -36,6 +36,7 @@ _LOCAL_FOLDER_PROJECTION_MIGRATION_67 = 67
 _REACTION_DETAIL_LIFECYCLE_MIGRATION_68 = 68
 _REACTION_DETAIL_PACING_MIGRATION_69 = 69
 _READ_DATE_OUTCOME_MIGRATION_70 = 70
+_READ_DATE_EXPIRY_CUTOFF_MIGRATION_71 = 71
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
@@ -1194,6 +1195,16 @@ CREATE TABLE IF NOT EXISTS message_read_facts (
 _MESSAGE_READ_FACTS_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_message_read_facts_checked
 ON message_read_facts(dialog_id, checked_at)
+"""
+
+_READ_DATE_EXPIRY_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS read_date_expiry_state (
+    singleton                INTEGER PRIMARY KEY CHECK (singleton = 1),
+    expired_through_sent_at  INTEGER,
+    observed_at              INTEGER,
+    witness_dialog_id        INTEGER,
+    witness_message_id       INTEGER
+) WITHOUT ROWID
 """
 
 _MESSAGE_READ_FACTS_NEXT_ATTEMPT_INDEX_DDL = """
@@ -4041,6 +4052,124 @@ def _apply_migration_70(conn: sqlite3.Connection, current: int) -> int:
     return _apply_migration(conn, current, _READ_DATE_OUTCOME_MIGRATION_70, statements, ignore_duplicate_column=True)
 
 
+def _read_date_expiry_schema_supported(conn: sqlite3.Connection) -> bool:
+    tables = {
+        str(row[0])
+        for row in cast(
+            list[tuple[object, ...]],
+            conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall(),
+        )
+    }
+    required_tables = {"messages", "synced_dialogs", "full_history_enrollment", "entities", "message_read_facts"}
+    if not required_tables <= tables:
+        return False
+    required_columns = {
+        "synced_dialogs": {"status", "read_outbox_max_id"},
+        "messages": {"sent_at", "out", "is_deleted"},
+    }
+    return all(columns <= _table_column_names(conn, table) for table, columns in required_columns.items())
+
+
+def _read_date_expiry_witness(conn: sqlite3.Connection) -> tuple[object, ...] | None:
+    return cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT m.sent_at, m.dialog_id, m.message_id FROM messages m "
+            "JOIN synced_dialogs sd ON sd.dialog_id=m.dialog_id "
+            "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
+            "JOIN entities e ON e.id=m.dialog_id "
+            "JOIN message_read_facts f ON f.dialog_id=m.dialog_id AND f.message_id=m.message_id "
+            "WHERE sd.status='synced' AND lower(e.type)='user' AND m.out=1 AND m.is_deleted=0 "
+            "AND sd.read_outbox_max_id IS NOT NULL AND m.message_id <= sd.read_outbox_max_id "
+            "AND f.reason='message_too_old' "
+            "ORDER BY m.sent_at DESC, m.dialog_id DESC, m.message_id DESC LIMIT 1"
+        ).fetchone(),
+    )
+
+
+def _seed_read_date_expiry_witness(conn: sqlite3.Connection, witness: tuple[object, ...] | None) -> None:
+    if witness is None:
+        return
+    state = cast(
+        tuple[object, ...],
+        conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state WHERE singleton=1").fetchone(),
+    )
+    current_cutoff = None if state[0] is None else int(cast(int | str, state[0]))
+    witness_sent_at = int(cast(int | str, witness[0]))
+    if current_cutoff is None or witness_sent_at > current_cutoff:
+        conn.execute(
+            "UPDATE read_date_expiry_state SET expired_through_sent_at=?, observed_at=?, "
+            "witness_dialog_id=?, witness_message_id=? WHERE singleton=1",
+            (witness_sent_at, int(time.time()), int(cast(int | str, witness[1])), int(cast(int | str, witness[2]))),
+        )
+    elif conn.execute("SELECT witness_dialog_id FROM read_date_expiry_state WHERE singleton=1").fetchone()[0] is None:
+        conn.execute(
+            "UPDATE read_date_expiry_state SET witness_dialog_id=?, witness_message_id=? WHERE singleton=1",
+            (int(cast(int | str, witness[1])), int(cast(int | str, witness[2]))),
+        )
+
+
+def _classify_read_date_expiry_tail(conn: sqlite3.Connection) -> None:
+    cutoff_row = cast(
+        tuple[object, ...],
+        conn.execute(
+            "SELECT expired_through_sent_at, observed_at FROM read_date_expiry_state WHERE singleton=1"
+        ).fetchone(),
+    )
+    if cutoff_row[0] is None:
+        return
+    cutoff = int(cast(int | str, cutoff_row[0]))
+    observed_at = int(cast(int | str, cutoff_row[1] or int(time.time())))
+    eligibility = (
+        "JOIN synced_dialogs sd ON sd.dialog_id=m.dialog_id "
+        "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
+        "JOIN entities e ON e.id=m.dialog_id "
+        "WHERE sd.status='synced' AND lower(e.type)='user' AND m.out=1 AND m.is_deleted=0 "
+        "AND sd.read_outbox_max_id IS NOT NULL AND m.message_id <= sd.read_outbox_max_id "
+        "AND m.sent_at <= ?"
+    )
+    conn.execute(
+        "INSERT INTO message_read_facts "
+        "(dialog_id, message_id, read_at, checked_at, status, reason, next_attempt_at) "
+        "SELECT m.dialog_id, m.message_id, NULL, ?, 'unavailable', 'message_too_old', NULL "
+        "FROM messages m " + eligibility + " AND NOT EXISTS (SELECT 1 FROM message_read_facts f "
+        "WHERE f.dialog_id=m.dialog_id AND f.message_id=m.message_id)",
+        (observed_at, cutoff),
+    )
+    conn.execute(
+        "UPDATE message_read_facts SET read_at=NULL, checked_at=?, status='unavailable', "
+        "reason='message_too_old', next_attempt_at=NULL "
+        "WHERE reason IN ('legacy', 'date_omitted', 'message_not_read_yet', 'flood_wait', 'transient') "
+        "AND EXISTS (SELECT 1 FROM messages m " + eligibility + " AND m.dialog_id=message_read_facts.dialog_id "
+        "AND m.message_id=message_read_facts.message_id)",
+        (observed_at, cutoff),
+    )
+
+
+def _apply_migration_71(conn: sqlite3.Connection, current: int) -> int:
+    """Seed the durable Telegram read-date expiry cutoff from old witnesses."""
+    if current >= _READ_DATE_EXPIRY_CUTOFF_MIGRATION_71:
+        return current
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(_READ_DATE_EXPIRY_STATE_DDL)
+        conn.execute("INSERT OR IGNORE INTO read_date_expiry_state(singleton) VALUES (1)")
+        if _read_date_expiry_schema_supported(conn):
+            _seed_read_date_expiry_witness(conn, _read_date_expiry_witness(conn))
+            _classify_read_date_expiry_tail(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
+            (_READ_DATE_EXPIRY_CUTOFF_MIGRATION_71,),
+        )
+        conn.commit()
+        return _READ_DATE_EXPIRY_CUTOFF_MIGRATION_71
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _apply_migrations_64_to_67(conn: sqlite3.Connection, current: int) -> int:
     """Apply the ordered canonical-directory and folder migrations."""
     if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64:
@@ -4147,6 +4276,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_69(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _READ_DATE_OUTCOME_MIGRATION_70:
         current = _apply_migration_70(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _READ_DATE_EXPIRY_CUTOFF_MIGRATION_71:
+        current = _apply_migration_71(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

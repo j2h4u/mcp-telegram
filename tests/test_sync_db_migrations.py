@@ -25,6 +25,7 @@ from mcp_telegram.sync_db import (
     _apply_migration_64,
     _apply_migration_66,
     _apply_migration_70,
+    _apply_migration_71,
     _open_sync_db,
     ensure_sync_schema,
 )
@@ -719,7 +720,7 @@ def test_schema_version_records_current(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-    assert _CURRENT_SCHEMA_VERSION == 70
+    assert _CURRENT_SCHEMA_VERSION == 71
 
 
 def test_genuine_v61_fixture_upgrades_to_v62_and_reopens_idempotently(
@@ -1500,7 +1501,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 70
+        assert _CURRENT_SCHEMA_VERSION == 71
 
 
 def test_migration_v70_normalizes_legacy_read_date_rows() -> None:
@@ -1578,6 +1579,64 @@ def test_migration_v70_is_idempotent_after_partial_ledger_replay() -> None:
             == first
         )
         assert conn.execute("SELECT COUNT(*) FROM schema_version WHERE version = 70").fetchone() == (1,)
+    finally:
+        conn.close()
+
+
+def test_migration_v71_seeds_cutoff_and_prunes_only_eligible_tail() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        sync_db_module._apply_migrations(conn)
+        conn.execute("INSERT INTO synced_dialogs(dialog_id, status, read_outbox_max_id) VALUES (42, 'synced', 9)")
+        conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (42, 'user', 1)")
+        conn.execute(
+            "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (42, 1, 'explicit', 1)"
+        )
+        conn.executemany(
+            "INSERT INTO messages(dialog_id, message_id, sent_at, out, is_deleted) VALUES (42, ?, ?, 1, 0)",
+            [(1, 100), (2, 50), (3, 300), (4, 80), (5, 40)],
+        )
+        conn.executemany(
+            "INSERT INTO message_read_facts "
+            "(dialog_id, message_id, read_at, checked_at, status, reason, next_attempt_at) "
+            "VALUES (42, ?, ?, 10, ?, ?, ?)",
+            [
+                (1, None, "unavailable", "message_too_old", None),
+                (2, None, "unavailable", "transient", 500),
+                (4, 1_700_000_004, "complete", "resolved", None),
+            ],
+        )
+        conn.commit()
+        conn.execute("DELETE FROM schema_version WHERE version=71")
+        conn.commit()
+        assert _apply_migration_71(conn, 70) == 71
+
+        assert conn.execute(
+            "SELECT expired_through_sent_at, witness_dialog_id, witness_message_id FROM read_date_expiry_state"
+        ).fetchone() == (100, 42, 1)
+        assert conn.execute(
+            "SELECT message_id, status, reason, next_attempt_at FROM message_read_facts ORDER BY message_id"
+        ).fetchall() == [
+            (1, "unavailable", "message_too_old", None),
+            (2, "unavailable", "message_too_old", None),
+            (4, "complete", "resolved", None),
+            (5, "unavailable", "message_too_old", None),
+        ]
+        first = cast(
+            tuple[object, ...] | None,
+            conn.execute(
+                "SELECT expired_through_sent_at, witness_dialog_id, witness_message_id FROM read_date_expiry_state"
+            ).fetchone(),
+        )
+        conn.execute("DELETE FROM schema_version WHERE version=71")
+        conn.commit()
+        assert _apply_migration_71(conn, 70) == 71
+        assert (
+            conn.execute(
+                "SELECT expired_through_sent_at, witness_dialog_id, witness_message_id FROM read_date_expiry_state"
+            ).fetchone()
+            == first
+        )
     finally:
         conn.close()
 

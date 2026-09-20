@@ -67,6 +67,7 @@ FROM messages m
 JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
 JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
 JOIN entities e ON e.id = m.dialog_id
+JOIN read_date_expiry_state x ON x.singleton = 1
 LEFT JOIN message_read_facts f
   ON f.dialog_id = m.dialog_id AND f.message_id = m.message_id
 WHERE sd.status = 'synced'
@@ -75,6 +76,7 @@ WHERE sd.status = 'synced'
   AND m.is_deleted = 0
   AND sd.read_outbox_max_id IS NOT NULL
   AND m.message_id <= sd.read_outbox_max_id
+  AND (x.expired_through_sent_at IS NULL OR m.sent_at > x.expired_through_sent_at)
   AND (f.dialog_id IS NULL OR (f.next_attempt_at IS NOT NULL AND f.next_attempt_at <= ?))
 ORDER BY m.sent_at DESC, m.dialog_id, m.message_id
 LIMIT ?
@@ -109,6 +111,7 @@ FROM messages m
 JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
 JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
 JOIN entities e ON e.id = m.dialog_id
+JOIN read_date_expiry_state x ON x.singleton = 1
 LEFT JOIN message_read_facts f
   ON f.dialog_id = m.dialog_id AND f.message_id = m.message_id
 WHERE sd.status = 'synced'
@@ -117,6 +120,7 @@ WHERE sd.status = 'synced'
   AND m.is_deleted = 0
   AND sd.read_outbox_max_id IS NOT NULL
   AND m.message_id <= sd.read_outbox_max_id
+  AND (x.expired_through_sent_at IS NULL OR m.sent_at > x.expired_through_sent_at)
   AND (f.dialog_id IS NULL OR f.next_attempt_at IS NOT NULL)
 """
 
@@ -172,6 +176,11 @@ class _ReadAtCycleStats:
     missing: int
     unavailable: int
     reason_counts: dict[str, int]
+    rpc_attempts: int
+    message_too_old_responses: int
+    locally_classified: int
+    cutoff_suppressed: int
+    candidate_count: int
     measurement_complete: bool
 
 
@@ -476,6 +485,27 @@ def _terminal_read_at_suppressed(conn: sqlite3.Connection) -> int:
     return 0 if row is None else int(cast(int | str, row[0]))
 
 
+def _cutoff_read_at_suppressed(conn: sqlite3.Connection, checked_at: int) -> int:
+    """Count due candidates omitted because their Telegram sent date expired."""
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT COUNT(*) FROM messages m "
+            "JOIN synced_dialogs sd ON sd.dialog_id=m.dialog_id "
+            "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
+            "JOIN entities e ON e.id=m.dialog_id "
+            "JOIN read_date_expiry_state x ON x.singleton=1 "
+            "LEFT JOIN message_read_facts f ON f.dialog_id=m.dialog_id AND f.message_id=m.message_id "
+            "WHERE sd.status='synced' AND lower(e.type)='user' AND m.out=1 AND m.is_deleted=0 "
+            "AND sd.read_outbox_max_id IS NOT NULL AND m.message_id <= sd.read_outbox_max_id "
+            "AND x.expired_through_sent_at IS NOT NULL AND m.sent_at <= x.expired_through_sent_at "
+            "AND (f.dialog_id IS NULL OR (f.next_attempt_at IS NOT NULL AND f.next_attempt_at <= ?))",
+            (checked_at,),
+        ).fetchone(),
+    )
+    return 0 if row is None else int(cast(int | str, row[0]))
+
+
 def _observe_read_at_cycle(  # noqa: PLR0913 - bounded telemetry fields are explicit
     deps: MessageFactRefreshDeps,
     *,
@@ -486,6 +516,11 @@ def _observe_read_at_cycle(  # noqa: PLR0913 - bounded telemetry fields are expl
     missing: int,
     unavailable: int,
     reason_counts: Mapping[str, int],
+    rpc_attempts: int,
+    message_too_old_responses: int,
+    locally_classified: int,
+    cutoff_suppressed: int,
+    candidate_count: int,
 ) -> None:
     """Publish one bounded, content-free observation after a complete cycle."""
     observer = deps.read_at_observer
@@ -501,6 +536,11 @@ def _observe_read_at_cycle(  # noqa: PLR0913 - bounded telemetry fields are expl
                 "missing": missing,
                 "unavailable": unavailable,
                 "reason_counts": dict(reason_counts),
+                "rpc_attempts": rpc_attempts,
+                "message_too_old_responses": message_too_old_responses,
+                "locally_classified": locally_classified,
+                "cutoff_suppressed": cutoff_suppressed,
+                "candidate_count": candidate_count,
                 "measurement_complete": True,
             }
         )
@@ -544,30 +584,37 @@ async def _refresh_read_at_cycle(
     shutdown_event: asyncio.Event | None,
 ) -> _ReadAtCycleStats:
     if shutdown_event is not None and shutdown_event.is_set():
-        return _ReadAtCycleStats(0, 0, 0, 0, 0, 0, {}, False)
+        return _ReadAtCycleStats(0, 0, 0, 0, 0, 0, {}, 0, 0, 0, 0, 0, False)
     messages = _read_at_candidates(
         deps.conn,
         stale_before_utc=checked_at,
         limit=policy.read_at_max_messages_per_cycle,
     )
-    first_attempts, retry_attempts = _read_at_attempt_counts(deps.conn, messages)
     terminal_suppressed = _terminal_read_at_suppressed(deps.conn)
+    cycle_metrics = {
+        "first_attempts": 0,
+        "retry_attempts": 0,
+        "rpc_attempts": 0,
+        "message_too_old_responses": 0,
+        "locally_classified": 0,
+        "cutoff_suppressed": _cutoff_read_at_suppressed(deps.conn, checked_at),
+    }
     complete = missing = unavailable = 0
     measurement_complete = True
     reason_counts = {reason.value: 0 for reason in READ_DATE_REASONS}
-    groups = _group_messages(messages)
-    for index, (dialog_id, group) in enumerate(groups.items()):
+    for index, message in enumerate(messages):
         counts: list[int] = []
         await enrich_read_at(
             deps.conn,
             deps.read_receipt_gateway,
-            dialog_id,
-            group,
+            message.dialog_id,
+            [message],
             dialog_type="user",
             read_at_ttl_seconds=policy.read_at_ttl_seconds,
             checked_at=checked_at,
             cycle_counts=counts,
             cycle_reason_counts=reason_counts,
+            cycle_metrics=cycle_metrics,
         )
         complete, missing, unavailable = _merge_read_at_counts(
             counts,
@@ -578,16 +625,21 @@ async def _refresh_read_at_cycle(
         if shutdown_event is not None and shutdown_event.is_set():
             measurement_complete = False
             break
-        if shutdown_event is not None and index < len(groups) - 1:
+        if shutdown_event is not None and index < len(messages) - 1:
             await _interruptible_pause(shutdown_event, policy.pause_seconds)
     return _ReadAtCycleStats(
-        first_attempts=first_attempts,
-        retry_attempts=retry_attempts,
+        first_attempts=cycle_metrics["first_attempts"],
+        retry_attempts=cycle_metrics["retry_attempts"],
         terminal_suppressed=terminal_suppressed,
         complete=complete,
         missing=missing,
         unavailable=unavailable,
         reason_counts=reason_counts,
+        rpc_attempts=cycle_metrics["rpc_attempts"],
+        message_too_old_responses=cycle_metrics["message_too_old_responses"],
+        locally_classified=cycle_metrics["locally_classified"],
+        cutoff_suppressed=cycle_metrics["cutoff_suppressed"],
+        candidate_count=len(messages),
         measurement_complete=measurement_complete,
     )
 
@@ -690,6 +742,11 @@ async def refresh_message_facts_once(
             missing=stats.missing,
             unavailable=stats.unavailable,
             reason_counts=stats.reason_counts,
+            rpc_attempts=stats.rpc_attempts,
+            message_too_old_responses=stats.message_too_old_responses,
+            locally_classified=stats.locally_classified,
+            cutoff_suppressed=stats.cutoff_suppressed,
+            candidate_count=stats.candidate_count,
         )
 
     return MessageFactRefreshResult(

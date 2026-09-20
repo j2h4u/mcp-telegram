@@ -24,7 +24,7 @@ from mcp_telegram.message_fact_refresh import (
 from mcp_telegram.reactions import ReactionDetailRefresher
 from mcp_telegram.reactions.detail import ReactionDetailResult
 from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcAttemptBudgetExhaustedError
-from mcp_telegram.telegram_reading import ReadDateFetchResult, TelegramReadReceiptGateway
+from mcp_telegram.telegram_reading import ReadDateFetchResult, ReadDateReason, TelegramReadReceiptGateway
 from mcp_telegram.telegram_rpc_consumers import TelegramRpcSource
 from mcp_telegram.telegram_rpc_scheduler import RpcAdmissionClosedError, rpc_scope
 from tests.history_enrollment_helpers import seed_full_history_enrollment
@@ -96,6 +96,14 @@ def _make_db(path: str | Path = ":memory:") -> sqlite3.Connection:
             next_attempt_at INTEGER,
             PRIMARY KEY (dialog_id, message_id)
         ) WITHOUT ROWID;
+        CREATE TABLE read_date_expiry_state (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            expired_through_sent_at INTEGER,
+            observed_at INTEGER,
+            witness_dialog_id INTEGER,
+            witness_message_id INTEGER
+        ) WITHOUT ROWID;
+        INSERT INTO read_date_expiry_state(singleton) VALUES (1);
         CREATE INDEX idx_message_read_facts_checked
         ON message_read_facts(dialog_id, checked_at);
         CREATE INDEX idx_message_read_facts_next_attempt
@@ -532,6 +540,11 @@ async def test_read_at_cycle_telemetry_is_aggregate_and_terminal_safe() -> None:
                 "invalid_target": 0,
                 "access_lost": 0,
             },
+            "rpc_attempts": 2,
+            "message_too_old_responses": 0,
+            "locally_classified": 0,
+            "cutoff_suppressed": 0,
+            "candidate_count": 2,
             "measurement_complete": True,
         }
     ]
@@ -601,6 +614,84 @@ async def test_canceled_read_at_cycle_publishes_no_incomplete_telemetry() -> Non
 
     assert observations == []
     assert conn.execute("SELECT COUNT(*) FROM message_read_facts").fetchone() == (0,)
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_message_too_old_cutoff_is_global_and_sent_at_based() -> None:
+    conn = _make_db()
+    conn.executescript(
+        """
+        INSERT INTO synced_dialogs VALUES (20, 'synced', 10), (21, 'synced', 10);
+        INSERT INTO entities VALUES (20, 'user'), (21, 'user');
+        INSERT INTO messages VALUES
+            (20, 1, 100, 1, NULL, 0),
+            (20, 2, 300, 1, NULL, 0),
+            (21, 1, 50, 1, NULL, 0),
+            (21, 2, 301, 1, NULL, 0),
+            (21, 3, 302, 1, NULL, 0);
+        """
+    )
+    seed_full_history_enrollment(conn, 20, enabled=True)
+    seed_full_history_enrollment(conn, 21, enabled=True)
+    calls: list[tuple[int, int]] = []
+
+    class Gateway:
+        async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult:
+            dialog_id = int(cast(int, entity))
+            calls.append((dialog_id, message_id))
+            if (dialog_id, message_id) == (20, 2):
+                return ReadDateFetchResult(status="unavailable", reason=ReadDateReason.MESSAGE_TOO_OLD)
+            return ReadDateFetchResult(read_at=1_700_000_000, status="complete")
+
+    await refresh_message_facts_once(
+        MessageFactRefreshDeps(
+            conn, cast(ReactionDetailRefresher, object()), cast(TelegramReadReceiptGateway, Gateway())
+        ),
+        _policy(reaction_max=0, read_at_max=10),
+        now=2_000,
+    )
+
+    assert calls == [(21, 3), (21, 2), (20, 2)]
+    assert conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state").fetchone() == (300,)
+    assert conn.execute(
+        "SELECT message_id, reason FROM message_read_facts WHERE dialog_id=20 ORDER BY message_id"
+    ).fetchall() == [(1, "message_too_old"), (2, "message_too_old")]
+    assert conn.execute(
+        "SELECT message_id, reason FROM message_read_facts WHERE dialog_id=21 ORDER BY message_id"
+    ).fetchall() == [(1, "message_too_old"), (2, "resolved"), (3, "resolved")]
+    assert [message.message_id for message in _read_at_candidates(conn, stale_before_utc=2_000, limit=10)] == []
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_privacy_outcome_does_not_advance_read_date_cutoff() -> None:
+    conn = _make_db()
+    conn.executescript(
+        """
+        INSERT INTO synced_dialogs VALUES (20, 'synced', 1);
+        INSERT INTO entities VALUES (20, 'user');
+        INSERT INTO messages VALUES (20, 1, 100, 1, NULL, 0);
+        """
+    )
+    seed_full_history_enrollment(conn, 20, enabled=True)
+
+    class Gateway:
+        async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult:
+            del entity, message_id
+            return ReadDateFetchResult(status="unavailable", reason=ReadDateReason.PRIVACY_RESTRICTED)
+
+    await refresh_message_facts_once(
+        MessageFactRefreshDeps(
+            conn, cast(ReactionDetailRefresher, object()), cast(TelegramReadReceiptGateway, Gateway())
+        ),
+        _policy(reaction_max=0, read_at_max=1),
+        now=2_000,
+    )
+    assert conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state").fetchone() == (None,)
+    assert conn.execute(
+        "SELECT status, reason, next_attempt_at FROM message_read_facts WHERE dialog_id=20 AND message_id=1"
+    ).fetchone() == ("unavailable", "privacy_restricted", None)
     conn.close()
 
 
