@@ -2,6 +2,9 @@
 
 These helpers deliberately keep event availability separate from event time:
 an unavailable/forbidden Telegram RPC must not look like a timestamped event.
+
+This module owns exact read-date fact persistence and cutoff classification SQL;
+general message queries remain in their canonical query modules.
 """
 
 from __future__ import annotations
@@ -24,6 +27,36 @@ from .telegram_reading import (
     normalize_read_date_reason,
 )
 from .telegram_rpc_scheduler import RpcAdmissionClosedError
+
+_READ_DATE_EXPIRY_INSERT_SQL = (
+    "INSERT INTO message_read_facts "
+    "(dialog_id, message_id, read_at, checked_at, status, reason, next_attempt_at) "
+    "SELECT m.dialog_id, m.message_id, NULL, ?, 'unavailable', 'message_too_old', NULL "
+    "FROM messages m "
+    "JOIN synced_dialogs sd ON sd.dialog_id=m.dialog_id "
+    "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
+    "JOIN entities e ON e.id=m.dialog_id "
+    "WHERE sd.status='synced' AND lower(e.type)='user' AND m.out=1 AND m.is_deleted=0 "
+    "AND sd.read_outbox_max_id IS NOT NULL AND m.message_id <= sd.read_outbox_max_id "
+    "AND m.sent_at <= ? "
+    "AND NOT EXISTS (SELECT 1 FROM message_read_facts f "
+    "WHERE f.dialog_id=m.dialog_id AND f.message_id=m.message_id)"
+)
+
+_READ_DATE_EXPIRY_UPDATE_SQL = (
+    "UPDATE message_read_facts SET read_at=NULL, checked_at=?, status='unavailable', "
+    "reason='message_too_old', next_attempt_at=NULL "
+    "WHERE reason IN ('legacy', 'date_omitted', 'message_not_read_yet', 'flood_wait', 'transient') "
+    "AND EXISTS (SELECT 1 FROM messages m "
+    "JOIN synced_dialogs sd ON sd.dialog_id=m.dialog_id "
+    "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
+    "JOIN entities e ON e.id=m.dialog_id "
+    "WHERE sd.status='synced' AND lower(e.type)='user' AND m.out=1 AND m.is_deleted=0 "
+    "AND sd.read_outbox_max_id IS NOT NULL AND m.message_id <= sd.read_outbox_max_id "
+    "AND m.sent_at <= ? "
+    "AND m.dialog_id=message_read_facts.dialog_id "
+    "AND m.message_id=message_read_facts.message_id)"
+)
 
 
 def reaction_event_projection(
@@ -268,19 +301,6 @@ def _read_date_rpc_still_eligible(
     )
 
 
-def _read_date_cutoff_eligibility_sql() -> str:
-    """Return the common local eligible-tail predicate for cutoff classification."""
-    return (
-        "FROM messages m "
-        "JOIN synced_dialogs sd ON sd.dialog_id=m.dialog_id "
-        "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
-        "JOIN entities e ON e.id=m.dialog_id "
-        "WHERE sd.status='synced' AND lower(e.type)='user' AND m.out=1 "
-        "AND m.is_deleted=0 AND sd.read_outbox_max_id IS NOT NULL "
-        "AND m.message_id <= sd.read_outbox_max_id AND m.sent_at <= ?"
-    )
-
-
 def _persist_message_too_old(
     conn: sqlite3.Connection,
     dialog_id: int,
@@ -312,24 +332,8 @@ def _persist_message_too_old(
                 (checked_at,),
             )
 
-        eligibility = _read_date_cutoff_eligibility_sql()
-        inserted = conn.execute(
-            "INSERT INTO message_read_facts "
-            "(dialog_id, message_id, read_at, checked_at, status, reason, next_attempt_at) "
-            "SELECT m.dialog_id, m.message_id, NULL, ?, 'unavailable', 'message_too_old', NULL "
-            + eligibility
-            + " AND NOT EXISTS (SELECT 1 FROM message_read_facts f "
-            "WHERE f.dialog_id=m.dialog_id AND f.message_id=m.message_id)",
-            (checked_at, cutoff),
-        ).rowcount
-        updated = conn.execute(
-            "UPDATE message_read_facts SET read_at=NULL, checked_at=?, status='unavailable', "
-            "reason='message_too_old', next_attempt_at=NULL "
-            "WHERE reason IN ('legacy', 'date_omitted', 'message_not_read_yet', 'flood_wait', 'transient') "
-            "AND EXISTS (SELECT 1 " + eligibility + " AND m.dialog_id=message_read_facts.dialog_id "
-            "AND m.message_id=message_read_facts.message_id)",
-            (checked_at, cutoff),
-        ).rowcount
+        inserted = conn.execute(_READ_DATE_EXPIRY_INSERT_SQL, (checked_at, cutoff)).rowcount
+        updated = conn.execute(_READ_DATE_EXPIRY_UPDATE_SQL, (checked_at, cutoff)).rowcount
         _persist_read_at_v70(
             conn,
             dialog_id,

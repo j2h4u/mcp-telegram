@@ -40,6 +40,7 @@ MESSAGE_SQL_OWNER_PATHS = frozenset(
         "reading/sqlite_projection.py",
         "fts.py",
         "message_fact_refresh.py",
+        "telegram_fact_queries.py",
         "messages/sqlite_bundle.py",
         "messages/sqlite_hydration.py",
         "messages/sqlite_hydration_jobs.py",
