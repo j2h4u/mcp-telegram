@@ -26,7 +26,11 @@ from mcp_telegram.models import ReadMessage
 from mcp_telegram.reactions import ReactionDetailRefresher
 from mcp_telegram.reactions.detail import ReactionDetailResult
 from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcAttemptBudgetExhaustedError
-from mcp_telegram.telegram_fact_queries import _persist_message_too_old, _refresh_stale_read_at_facts
+from mcp_telegram.telegram_fact_queries import (
+    _persist_message_too_old,
+    _refresh_stale_read_at_facts,
+    persist_read_at,
+)
 from mcp_telegram.telegram_reading import ReadDateFetchResult, ReadDateReason, TelegramReadReceiptGateway
 from mcp_telegram.telegram_rpc_consumers import TelegramRpcSource
 from mcp_telegram.telegram_rpc_scheduler import RpcAdmissionClosedError, rpc_scope
@@ -545,6 +549,7 @@ async def test_read_at_cycle_telemetry_is_aggregate_and_terminal_safe() -> None:
             },
             "rpc_attempts": 2,
             "message_too_old_responses": 0,
+            "invalid_cutoff_witnesses": 0,
             "locally_classified": 0,
             "cutoff_backlog_suppressed": 0,
             "cutoff_skipped": 0,
@@ -918,6 +923,83 @@ def test_future_dated_message_too_old_witness_fails_without_cutoff_or_classifica
     assert conn.execute(
         "SELECT status, reason, next_attempt_at FROM message_read_facts WHERE dialog_id=20 AND message_id=2"
     ).fetchone() == ("unavailable", "transient", 5000)
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_future_witness_is_quarantined_and_cycle_continues() -> None:
+    conn = _make_db()
+    conn.executescript(
+        """
+        INSERT INTO synced_dialogs VALUES (20, 'synced', 2);
+        INSERT INTO entities VALUES (20, 'user');
+        INSERT INTO messages VALUES (20, 1, 300, 1, NULL, 0), (20, 2, 200, 1, NULL, 0);
+        INSERT INTO message_read_facts VALUES
+            (20, 1, NULL, 200, 'unavailable', 'transient', 200);
+        """
+    )
+    seed_full_history_enrollment(conn, 20, enabled=True)
+    conn.commit()
+    observations: list[Mapping[str, object]] = []
+    calls: list[int] = []
+
+    class Gateway:
+        async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult:
+            del entity
+            calls.append(message_id)
+            if message_id == 1:
+                return ReadDateFetchResult(status="unavailable", reason=ReadDateReason.MESSAGE_TOO_OLD)
+            return ReadDateFetchResult(status="complete", read_at=1700000200)
+
+    await refresh_message_facts_once(
+        MessageFactRefreshDeps(
+            conn,
+            cast(ReactionDetailRefresher, object()),
+            cast(TelegramReadReceiptGateway, Gateway()),
+            read_at_observer=observations.append,
+        ),
+        _policy(reaction_max=0, read_at_max=2),
+        now=200,
+    )
+
+    assert calls == [1, 2]
+    assert conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state").fetchone() == (None,)
+    assert conn.execute(
+        "SELECT status, reason, next_attempt_at FROM message_read_facts WHERE dialog_id=20 AND message_id=1"
+    ).fetchone() == ("unavailable", "message_too_old", None)
+    assert conn.execute(
+        "SELECT status, reason FROM message_read_facts WHERE dialog_id=20 AND message_id=2"
+    ).fetchone() == ("complete", "resolved")
+    assert observations[0]["message_too_old_responses"] == 1
+    assert observations[0]["invalid_cutoff_witnesses"] == 1
+    assert observations[0]["locally_classified"] == 0
+
+    await refresh_message_facts_once(
+        MessageFactRefreshDeps(
+            conn,
+            cast(ReactionDetailRefresher, object()),
+            cast(TelegramReadReceiptGateway, Gateway()),
+            read_at_observer=observations.append,
+        ),
+        _policy(reaction_max=0, read_at_max=2),
+        now=201,
+    )
+    assert calls == [1, 2]
+    assert observations[1]["candidate_count"] == 0
+
+    # The invalid witness remains recoverable by a real exact date, even when
+    # that date arrives with an older local observation time.
+    persist_read_at(
+        conn,
+        20,
+        1,
+        read_at=1700000300,
+        checked_at=100,
+        status="complete",
+    )
+    assert conn.execute(
+        "SELECT status, reason, read_at FROM message_read_facts WHERE dialog_id=20 AND message_id=1"
+    ).fetchone() == ("complete", "resolved", 1700000300)
     conn.close()
 
 

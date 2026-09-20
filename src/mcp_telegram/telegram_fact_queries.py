@@ -63,6 +63,10 @@ _READ_DATE_EXPIRY_UPDATE_SQL = (
 )
 
 
+class InvalidReadDateWitnessError(ValueError):
+    """A Telegram age witness cannot be used for a future local message date."""
+
+
 def reaction_event_projection(
     conn: sqlite3.Connection,
     dialog_id: int,
@@ -322,7 +326,7 @@ def _persist_message_too_old(
     if conn.in_transaction:
         raise RuntimeError("_persist_message_too_old requires no open transaction")
     if sent_at > checked_at:
-        raise ValueError("read-date witness sent_at cannot be later than checked_at")
+        raise InvalidReadDateWitnessError("read-date witness sent_at cannot be later than checked_at")
     conn.execute("BEGIN IMMEDIATE")
     try:
         state = cast(
@@ -444,6 +448,36 @@ def _record_read_date_attempt(
     metrics[attempt_kind] = metrics.get(attempt_kind, 0) + 1
 
 
+def _quarantine_invalid_read_date_witness(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    *,
+    checked_at: int,
+) -> None:
+    """Store a malformed age witness through the ordinary monotonic fence."""
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT checked_at FROM message_read_facts WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        ).fetchone(),
+    )
+    persisted_checked_at = checked_at
+    if row is not None:
+        persisted_checked_at = max(persisted_checked_at, int(cast(int | str, row[0])) + 1)
+    persist_read_at(
+        conn,
+        dialog_id,
+        message_id,
+        read_at=None,
+        checked_at=persisted_checked_at,
+        status="unavailable",
+        reason=ReadDateReason.MESSAGE_TOO_OLD,
+        next_attempt_at=None,
+    )
+
+
 def _persist_fetched_read_date(  # noqa: PLR0913
     conn: sqlite3.Connection,
     dialog_id: int,
@@ -464,16 +498,24 @@ def _persist_fetched_read_date(  # noqa: PLR0913
         checked_at=checked_at,
         read_at_ttl_seconds=read_at_ttl_seconds,
     )
-    locally_classified = _persist_read_date_result(
-        conn,
-        dialog_id,
-        message.message_id,
-        message.sent_at,
-        result,
-        reason=reason,
-        checked_at=checked_at,
-        next_attempt_at=next_attempt_at,
-    )
+    try:
+        locally_classified = _persist_read_date_result(
+            conn,
+            dialog_id,
+            message.message_id,
+            message.sent_at,
+            result,
+            reason=reason,
+            checked_at=checked_at,
+            next_attempt_at=next_attempt_at,
+        )
+    except InvalidReadDateWitnessError:
+        # Telegram explicitly returned MESSAGE_TOO_OLD. Quarantine only this
+        # malformed local witness; it must not advance or classify globally.
+        _quarantine_invalid_read_date_witness(conn, dialog_id, message.message_id, checked_at=checked_at)
+        locally_classified = 0
+        if cycle_metrics is not None:
+            cycle_metrics["invalid_cutoff_witnesses"] = cycle_metrics.get("invalid_cutoff_witnesses", 0) + 1
     if cycle_metrics is not None:
         cycle_metrics["locally_classified"] = cycle_metrics.get("locally_classified", 0) + locally_classified
         if reason is ReadDateReason.MESSAGE_TOO_OLD:

@@ -179,6 +179,7 @@ class _ReadAtCycleStats:
     reason_counts: dict[str, int]
     rpc_attempts: int
     message_too_old_responses: int
+    invalid_cutoff_witnesses: int
     locally_classified: int
     cutoff_backlog_suppressed: int
     cutoff_skipped: int
@@ -502,6 +503,7 @@ def _observe_read_at_cycle(  # noqa: PLR0913 - bounded telemetry fields are expl
     reason_counts: Mapping[str, int],
     rpc_attempts: int,
     message_too_old_responses: int,
+    invalid_cutoff_witnesses: int,
     locally_classified: int,
     cutoff_backlog_suppressed: int,
     cutoff_skipped: int,
@@ -513,6 +515,8 @@ def _observe_read_at_cycle(  # noqa: PLR0913 - bounded telemetry fields are expl
     if observer is None:
         return
     try:
+        # invalid_cutoff_witnesses is a subset of age responses quarantined
+        # locally; locally_classified counts only propagation to other rows.
         observer(
             {
                 "first_attempts": first_attempts,
@@ -524,6 +528,7 @@ def _observe_read_at_cycle(  # noqa: PLR0913 - bounded telemetry fields are expl
                 "reason_counts": dict(reason_counts),
                 "rpc_attempts": rpc_attempts,
                 "message_too_old_responses": message_too_old_responses,
+                "invalid_cutoff_witnesses": invalid_cutoff_witnesses,
                 "locally_classified": locally_classified,
                 "cutoff_backlog_suppressed": cutoff_backlog_suppressed,
                 "cutoff_skipped": cutoff_skipped,
@@ -575,6 +580,7 @@ async def _refresh_read_at_cycle(
             reason_counts={},
             rpc_attempts=0,
             message_too_old_responses=0,
+            invalid_cutoff_witnesses=0,
             locally_classified=0,
             cutoff_backlog_suppressed=0,
             cutoff_skipped=0,
@@ -593,6 +599,7 @@ async def _refresh_read_at_cycle(
         "retry_attempts": 0,
         "rpc_attempts": 0,
         "message_too_old_responses": 0,
+        "invalid_cutoff_witnesses": 0,
         "locally_classified": 0,
         "cutoff_backlog_suppressed": _cutoff_backlog_suppressed(deps.conn, checked_at),
         "cutoff_skipped": 0,
@@ -637,6 +644,7 @@ async def _refresh_read_at_cycle(
         reason_counts=reason_counts,
         rpc_attempts=cycle_metrics["rpc_attempts"],
         message_too_old_responses=cycle_metrics["message_too_old_responses"],
+        invalid_cutoff_witnesses=cycle_metrics["invalid_cutoff_witnesses"],
         locally_classified=cycle_metrics["locally_classified"],
         cutoff_backlog_suppressed=cycle_metrics["cutoff_backlog_suppressed"],
         cutoff_skipped=cycle_metrics["cutoff_skipped"],
@@ -746,6 +754,7 @@ async def refresh_message_facts_once(
             reason_counts=stats.reason_counts,
             rpc_attempts=stats.rpc_attempts,
             message_too_old_responses=stats.message_too_old_responses,
+            invalid_cutoff_witnesses=stats.invalid_cutoff_witnesses,
             locally_classified=stats.locally_classified,
             cutoff_backlog_suppressed=stats.cutoff_backlog_suppressed,
             cutoff_skipped=stats.cutoff_skipped,
