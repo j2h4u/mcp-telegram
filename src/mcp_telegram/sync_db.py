@@ -4113,6 +4113,8 @@ def _classify_read_date_expiry_tail(conn: sqlite3.Connection) -> None:
         "WHERE f.dialog_id=m.dialog_id AND f.message_id=m.message_id)",
         (observed_at, cutoff),
     )
+    # The fact table stores current exact-date availability, so retryable and
+    # legacy "not read yet" rows below the proven cutoff are converted here.
     conn.execute(
         "UPDATE message_read_facts SET read_at=NULL, checked_at=?, status='unavailable', "
         "reason='message_too_old', next_attempt_at=NULL "

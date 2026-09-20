@@ -182,6 +182,7 @@ class _ReadAtCycleStats:
     locally_classified: int
     cutoff_backlog_suppressed: int
     cutoff_skipped: int
+    fresh_skipped: int
     candidate_count: int
     measurement_complete: bool
 
@@ -504,6 +505,7 @@ def _observe_read_at_cycle(  # noqa: PLR0913 - bounded telemetry fields are expl
     locally_classified: int,
     cutoff_backlog_suppressed: int,
     cutoff_skipped: int,
+    fresh_skipped: int,
     candidate_count: int,
 ) -> None:
     """Publish one bounded, content-free observation after a complete cycle."""
@@ -525,6 +527,7 @@ def _observe_read_at_cycle(  # noqa: PLR0913 - bounded telemetry fields are expl
                 "locally_classified": locally_classified,
                 "cutoff_backlog_suppressed": cutoff_backlog_suppressed,
                 "cutoff_skipped": cutoff_skipped,
+                "fresh_skipped": fresh_skipped,
                 "candidate_count": candidate_count,
                 "measurement_complete": True,
             }
@@ -575,6 +578,7 @@ async def _refresh_read_at_cycle(
             locally_classified=0,
             cutoff_backlog_suppressed=0,
             cutoff_skipped=0,
+            fresh_skipped=0,
             candidate_count=0,
             measurement_complete=False,
         )
@@ -592,6 +596,7 @@ async def _refresh_read_at_cycle(
         "locally_classified": 0,
         "cutoff_backlog_suppressed": _cutoff_backlog_suppressed(deps.conn, checked_at),
         "cutoff_skipped": 0,
+        "fresh_skipped": 0,
     }
     complete = missing = unavailable = 0
     measurement_complete = True
@@ -635,6 +640,7 @@ async def _refresh_read_at_cycle(
         locally_classified=cycle_metrics["locally_classified"],
         cutoff_backlog_suppressed=cycle_metrics["cutoff_backlog_suppressed"],
         cutoff_skipped=cycle_metrics["cutoff_skipped"],
+        fresh_skipped=cycle_metrics["fresh_skipped"],
         candidate_count=len(messages),
         measurement_complete=measurement_complete,
     )
@@ -743,6 +749,7 @@ async def refresh_message_facts_once(
             locally_classified=stats.locally_classified,
             cutoff_backlog_suppressed=stats.cutoff_backlog_suppressed,
             cutoff_skipped=stats.cutoff_skipped,
+            fresh_skipped=stats.fresh_skipped,
             candidate_count=stats.candidate_count,
         )
 
