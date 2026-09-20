@@ -1650,24 +1650,24 @@ def test_migration_v71_seeds_cutoff_and_prunes_only_eligible_tail() -> None:
         conn.close()
 
 
-def test_migration_v71_ignores_future_witness_and_uses_newest_valid_witness() -> None:
+def test_migration_v71_ignores_invalid_witnesses_and_uses_newest_valid_witness() -> None:
     conn = sqlite3.connect(":memory:")
     try:
         sync_db_module._apply_migrations(conn)
-        conn.execute("INSERT INTO synced_dialogs(dialog_id, status, read_outbox_max_id) VALUES (42, 'synced', 3)")
+        conn.execute("INSERT INTO synced_dialogs(dialog_id, status, read_outbox_max_id) VALUES (42, 'synced', 4)")
         conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (42, 'user', 1)")
         conn.execute(
             "INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at) VALUES (42, 1, 'explicit', 1)"
         )
         conn.executemany(
             "INSERT INTO messages(dialog_id, message_id, sent_at, out, is_deleted) VALUES (42, ?, ?, 1, 0)",
-            [(1, 500), (2, 200), (3, 150)],
+            [(1, 500), (2, 200), (3, 0), (4, -10)],
         )
         conn.executemany(
             "INSERT INTO message_read_facts "
             "(dialog_id, message_id, read_at, checked_at, status, reason, next_attempt_at) "
             "VALUES (42, ?, NULL, ?, 'unavailable', 'message_too_old', NULL)",
-            [(1, 100), (2, 300)],
+            [(1, 100), (2, 300), (3, 100), (4, 100)],
         )
         conn.commit()
         conn.execute("DELETE FROM schema_version WHERE version=71")
@@ -1681,6 +1681,7 @@ def test_migration_v71_ignores_future_witness_and_uses_newest_valid_witness() ->
             (1, "message_too_old"),
             (2, "message_too_old"),
             (3, "message_too_old"),
+            (4, "message_too_old"),
         ]
     finally:
         conn.close()

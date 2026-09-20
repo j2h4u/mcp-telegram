@@ -963,7 +963,7 @@ def test_future_dated_message_too_old_witness_fails_without_cutoff_or_classifica
     seed_full_history_enrollment(conn, 20, enabled=True)
     conn.commit()
 
-    with pytest.raises(ValueError, match="cannot be later than checked_at"):
+    with pytest.raises(ValueError, match="0 < sent_at <= checked_at"):
         _persist_message_too_old(conn, 20, 1, sent_at=300, checked_at=200)
 
     assert conn.in_transaction is False
@@ -975,7 +975,8 @@ def test_future_dated_message_too_old_witness_fails_without_cutoff_or_classifica
 
 
 @pytest.mark.asyncio
-async def test_invalid_future_witness_is_quarantined_and_cycle_continues() -> None:
+@pytest.mark.parametrize("invalid_sent_at", [0, -1, 300])
+async def test_invalid_witness_is_quarantined_and_cycle_continues(invalid_sent_at: int) -> None:
     conn = _make_db()
     conn.executescript(
         """
@@ -986,6 +987,7 @@ async def test_invalid_future_witness_is_quarantined_and_cycle_continues() -> No
             (20, 1, NULL, 200, 'unavailable', 'transient', 200);
         """
     )
+    conn.execute("UPDATE messages SET sent_at=? WHERE dialog_id=20 AND message_id=1", (invalid_sent_at,))
     seed_full_history_enrollment(conn, 20, enabled=True)
     conn.commit()
     observations: list[Mapping[str, object]] = []
@@ -1010,7 +1012,7 @@ async def test_invalid_future_witness_is_quarantined_and_cycle_continues() -> No
         now=200,
     )
 
-    assert calls == [1, 2]
+    assert calls == ([1, 2] if invalid_sent_at == 300 else [2, 1])
     assert conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state").fetchone() == (None,)
     assert conn.execute(
         "SELECT status, reason, next_attempt_at FROM message_read_facts WHERE dialog_id=20 AND message_id=1"
@@ -1032,7 +1034,7 @@ async def test_invalid_future_witness_is_quarantined_and_cycle_continues() -> No
         _policy(reaction_max=0, read_at_max=2),
         now=201,
     )
-    assert calls == [1, 2]
+    assert calls == ([1, 2] if invalid_sent_at == 300 else [2, 1])
     assert observations[1]["candidate_count"] == 0
 
     # The invalid witness remains recoverable by a real exact date, even when

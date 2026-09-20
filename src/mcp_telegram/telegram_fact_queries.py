@@ -325,8 +325,8 @@ def _persist_message_too_old(
     """
     if conn.in_transaction:
         raise RuntimeError("_persist_message_too_old requires no open transaction")
-    if sent_at > checked_at:
-        raise InvalidReadDateWitnessError("read-date witness sent_at cannot be later than checked_at")
+    if not 0 < sent_at <= checked_at:
+        raise InvalidReadDateWitnessError("read-date witness must satisfy 0 < sent_at <= checked_at")
     conn.execute("BEGIN IMMEDIATE")
     try:
         state = cast(
