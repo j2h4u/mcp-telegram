@@ -1520,16 +1520,16 @@ def test_migration_v72_keeps_existing_topic_attribution_unknown(tmp_path: Path) 
     with _sync_db_connection(db_path) as conn:
         row = conn.execute(
             "SELECT topic_attribution_version, topic_attribution_state, "
-            "topic_attribution_observed_at, topic_attribution_completed_at "
+            "topic_attribution_observed_at, topic_attribution_completed_at, topic_attribution_no_topic_count "
             "FROM synced_dialogs WHERE dialog_id=1"
         ).fetchone()
         assert row is None
         conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
         assert conn.execute(
             "SELECT topic_attribution_version, topic_attribution_state, "
-            "topic_attribution_observed_at, topic_attribution_completed_at "
+            "topic_attribution_observed_at, topic_attribution_completed_at, topic_attribution_no_topic_count "
             "FROM synced_dialogs WHERE dialog_id=1"
-        ).fetchone() == (0, "unknown", None, None)
+        ).fetchone() == (0, "unknown", None, None, 0)
 
 
 def test_migration_v70_normalizes_legacy_read_date_rows() -> None:

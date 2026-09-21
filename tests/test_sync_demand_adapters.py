@@ -53,7 +53,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcScope,
     current_rpc_scope,
 )
-from mcp_telegram.topic_attribution_campaign import CAMPAIGN_STATE_KEY, campaign_status, enroll_campaign
+from mcp_telegram.topic_attribution_campaign import CAMPAIGN_STATE_KEY, abort_campaign, campaign_status, enroll_campaign
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -961,3 +961,29 @@ async def test_campaign_expiry_preflight_runs_despite_normal_full_sync_work(conn
         await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
 
     assert campaign_status(conn)["terminal_reason"] == "expiry"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["page", "access_lost"])
+async def test_campaign_operator_abort_supersedes_inflight_page_result(conn: sqlite3.Connection, outcome: str) -> None:
+    _enroll_topic_campaign(conn)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingPort:
+        async def fetch_page(self, _dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            assert before_message_id == 0
+            entered.set()
+            await release.wait()
+            if outcome == "access_lost":
+                raise MessageHistoryAccessLostError("lost", reason_code="ChannelPrivateError")
+            return FullHistoryPage(messages=(), total_messages=0)
+
+    worker = FullSyncWorker(cast(FullHistoryPagePort, BlockingPort()), conn, asyncio.Event())
+    task = asyncio.create_task(worker.process_topic_attribution_campaign_page())
+    await entered.wait()
+    assert abort_campaign(conn)["terminal_reason"] == "operator_abort"
+    release.set()
+    await task
+
+    assert campaign_status(conn)["terminal_reason"] == "operator_abort"

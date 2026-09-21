@@ -2247,8 +2247,10 @@ def test_marked_peer_id_matches_telethon_convention() -> None:
 
 
 @pytest.mark.asyncio
-async def test_full_history_null_topic_keeps_current_receipt_partial(sync_db: _SQLiteConnection) -> None:
-    """A legal NULL topic member cannot produce a false complete receipt."""
+async def test_full_history_null_topic_completes_current_receipt_with_evaluated_count(
+    sync_db: _SQLiteConnection,
+) -> None:
+    """A legal NULL topic member is evaluated no-topic, not incomplete extraction."""
     from mcp_telegram.message_contracts import ExtractedMessage
 
     dialog_id = 405
@@ -2262,5 +2264,7 @@ async def test_full_history_null_topic_keeps_current_receipt_partial(sync_db: _S
     await worker._store_batch_page(dialog_id, 0, 1, (ExtractedMessage(message=_stored(dialog_id, 1), reply_count=0),))
 
     assert sync_db.execute(
-        "SELECT topic_attribution_version,topic_attribution_state FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
-    ).fetchone() == (1, "partial")
+        "SELECT topic_attribution_version,topic_attribution_state,topic_attribution_no_topic_count "
+        "FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone() == (1, "complete", 1)

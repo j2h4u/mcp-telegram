@@ -314,7 +314,7 @@ CAMPAIGN_STATE_KEY = "topic_attribution_campaign_v1"
 CAMPAIGN_VERSION = 1
 CAMPAIGN_DIALOG_COUNT = 2
 CAMPAIGN_MAX_FAILURES_PER_DIALOG = 16
-_COUNTER_KEYS = ("attributed", "no_longer_needed", "unresolved")
+_COUNTER_KEYS = ("attributed", "no_topic", "no_longer_needed", "unresolved")
 _TERMINAL_REASON_PRIORITY = {
     "exhausted": 0,
     "expiry": 1,
@@ -632,17 +632,17 @@ def record_page(
     conn.execute("BEGIN IMMEDIATE")
     try:
         manifest, item = _require_active_dialog(conn, dialog_id, checkpoint)
-        _reconcile_page_messages(conn, dialog_id, messages, cast(dict[str, int], item["counts"]))
+        counts = cast(dict[str, int], item["counts"])
+        previous_no_topic = counts["no_topic"]
+        _reconcile_page_messages(conn, dialog_id, messages, counts)
         _advance_page_checkpoint(item, messages)
-        conn.execute(
-            "UPDATE synced_dialogs SET topic_attribution_version=?, topic_attribution_state='partial', "
-            "topic_attribution_observed_at=?, topic_attribution_completed_at=NULL WHERE dialog_id=?",
-            (TOPIC_ATTRIBUTION_EXTRACTOR_VERSION, observed_at, dialog_id),
-        )
+        no_topic_delta = counts["no_topic"] - previous_no_topic
+        _record_campaign_no_topic_receipt(conn, dialog_id, observed_at, no_topic_delta)
+        if item["state"] == "done":
+            _publish_campaign_dialog_receipt(conn, dialog_id, counts, observed_at)
         terminal = _next_pending(manifest) is None
         if terminal:
             _finish(conn, manifest, "exhausted", observed_at)
-            _publish_campaign_receipt(conn, manifest, observed_at)
         else:
             _save(conn, manifest)
         conn.commit()
@@ -651,8 +651,9 @@ def record_page(
         raise
     counts = cast(dict[str, int], item["counts"])
     logger.info(
-        "topic_attribution_campaign_page_result attributed=%d no_longer_needed=%d unresolved=%d",
+        "topic_attribution_campaign_page_result attributed=%d no_topic=%d no_longer_needed=%d unresolved=%d",
         counts["attributed"],
+        counts["no_topic"],
         counts["no_longer_needed"],
         counts["unresolved"],
     )
@@ -681,7 +682,7 @@ def _reconcile_page_messages(
         elif local[0] is not None or local[1] != 0:
             counts["no_longer_needed"] += 1
         elif message.forum_topic_id is None:
-            counts["unresolved"] += 1
+            counts["no_topic"] += 1
         else:
             updated = conn.execute(
                 "UPDATE messages SET forum_topic_id=? WHERE dialog_id=? AND message_id=? "
@@ -700,26 +701,37 @@ def _advance_page_checkpoint(item: dict[str, object], messages: Sequence[_messag
         item["state"] = "done"
 
 
-def _publish_campaign_receipt(conn: sqlite3.Connection, manifest: dict[str, object], observed_at: int) -> None:
-    """A finite repair can certify only when no live local NULL remains."""
-    totals = _status_from_manifest(manifest)["counts"]
-    total_counts = cast(dict[str, int], totals)
-    if total_counts["unresolved"]:
+def _record_campaign_no_topic_receipt(
+    conn: sqlite3.Connection, dialog_id: int, observed_at: int, no_topic_delta: int
+) -> None:
+    """Publish a partial campaign receipt and its evaluated legal-NULL outcomes."""
+    conn.execute(
+        "UPDATE synced_dialogs SET topic_attribution_version=?, topic_attribution_state='partial', "
+        "topic_attribution_observed_at=?, topic_attribution_completed_at=NULL, "
+        "topic_attribution_no_topic_count=CASE "
+        "WHEN topic_attribution_version=? AND topic_attribution_state='partial' "
+        "THEN topic_attribution_no_topic_count+? ELSE ? END WHERE dialog_id=?",
+        (
+            TOPIC_ATTRIBUTION_EXTRACTOR_VERSION,
+            observed_at,
+            TOPIC_ATTRIBUTION_EXTRACTOR_VERSION,
+            no_topic_delta,
+            no_topic_delta,
+            dialog_id,
+        ),
+    )
+
+
+def _publish_campaign_dialog_receipt(
+    conn: sqlite3.Connection, dialog_id: int, counts: dict[str, int], observed_at: int
+) -> None:
+    """Certify this clean traversal without waiting for the other enrolled dialog."""
+    if counts["unresolved"]:
         return
-    for dialog_id in cast(list[int], manifest["dialog_ids"]):
-        unresolved = cast(
-            tuple[object] | None,
-            conn.execute(
-                "SELECT 1 FROM messages WHERE dialog_id=? AND forum_topic_id IS NULL AND is_deleted=0 LIMIT 1",
-                (dialog_id,),
-            ).fetchone(),
-        )
-        if unresolved is not None:
-            return
     conn.execute(
         "UPDATE synced_dialogs SET topic_attribution_state='complete', topic_attribution_completed_at=? "
-        "WHERE dialog_id IN (?,?) AND topic_attribution_version=? AND topic_attribution_state='partial'",
-        (observed_at, *cast(list[int], manifest["dialog_ids"]), TOPIC_ATTRIBUTION_EXTRACTOR_VERSION),
+        "WHERE dialog_id=? AND topic_attribution_version=? AND topic_attribution_state='partial'",
+        (observed_at, dialog_id, TOPIC_ATTRIBUTION_EXTRACTOR_VERSION),
     )
 
 
@@ -930,29 +942,40 @@ def _status_from_manifest(manifest: dict[str, object]) -> dict[str, object]:
         for key in _COUNTER_KEYS:
             totals[key] += int(cast(int | str, item_counts.get(key, 0)))
     terminal_reason = manifest.get("terminal_reason")
+    failed_dialogs = sum(item.get("terminal_reason") == "failure_limit" for item in dialogs.values())
+    abandoned_dialogs = sum(
+        item.get("terminal_reason") in {"access_lost", "history_disabled", "status_ineligible", "operator_abort"}
+        for item in dialogs.values()
+    )
     return {
         "state": manifest.get("state"),
         "terminal_reason": terminal_reason,
-        "terminal_severity": _TERMINAL_SEVERITY.get(str(terminal_reason), "none"),
+        "terminal_severity": _terminal_severity(terminal_reason, totals, failed_dialogs, abandoned_dialogs),
         "dialog_count": len(dialogs),
         "pending_dialogs": sum(item.get("state") == "pending" for item in dialogs.values()),
-        "failed_dialogs": sum(item.get("terminal_reason") == "failure_limit" for item in dialogs.values()),
-        "abandoned_dialogs": sum(
-            item.get("terminal_reason") in {"access_lost", "history_disabled", "status_ineligible", "operator_abort"}
-            for item in dialogs.values()
-        ),
+        "failed_dialogs": failed_dialogs,
+        "abandoned_dialogs": abandoned_dialogs,
         "counts": totals,
     }
+
+
+def _terminal_severity(
+    terminal_reason: object, totals: dict[str, int], failed_dialogs: int, abandoned_dialogs: int
+) -> str:
+    if terminal_reason == "exhausted" and (totals["unresolved"] or failed_dialogs or abandoned_dialogs):
+        return "degraded"
+    return _TERMINAL_SEVERITY.get(str(terminal_reason), "none")
 
 
 def _log_terminal(manifest: dict[str, object]) -> None:
     status = _status_from_manifest(manifest)
     counts = cast(dict[str, int], status["counts"])
     logger.info(
-        "topic_attribution_campaign_terminal reason=%s severity=%s attributed=%d no_longer_needed=%d unresolved=%d",
+        "topic_attribution_campaign_terminal reason=%s severity=%s attributed=%d no_topic=%d no_longer_needed=%d unresolved=%d",
         status["terminal_reason"],
         status["terminal_severity"],
         counts["attributed"],
+        counts["no_topic"],
         counts["no_longer_needed"],
         counts["unresolved"],
     )
@@ -963,14 +986,3 @@ def _most_severe_terminal_reason(manifest: dict[str, object], requested: str) ->
     reasons = [requested]
     reasons.extend(str(item["terminal_reason"]) for item in dialogs.values() if "terminal_reason" in item)
     return max(reasons, key=lambda reason: _TERMINAL_REASON_PRIORITY.get(reason, 0))
-
-
-def has_live_null_topic_attribution(conn: sqlite3.Connection, dialog_id: int) -> bool:
-    """Whether a live message still has an ambiguous topic projection."""
-    return (
-        conn.execute(
-            "SELECT 1 FROM messages WHERE dialog_id=? AND forum_topic_id IS NULL AND is_deleted=0 LIMIT 1",
-            (dialog_id,),
-        ).fetchone()
-        is not None
-    )

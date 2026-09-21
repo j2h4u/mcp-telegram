@@ -116,11 +116,12 @@ def test_campaign_updates_only_live_null_topic_and_keeps_remote_omission_unresol
     item = dialogs["101"]
     assert isinstance(item, dict)
     counts = item["counts"]
-    assert counts == {"attributed": 1, "no_longer_needed": 2, "unresolved": 2}
+    assert counts == {"attributed": 1, "no_topic": 1, "no_longer_needed": 2, "unresolved": 1}
     assert "success_pages" not in item
     assert conn.execute(
-        "SELECT topic_attribution_state,topic_attribution_completed_at FROM synced_dialogs WHERE dialog_id=101"
-    ).fetchone() == ("partial", None)
+        "SELECT topic_attribution_state,topic_attribution_completed_at,topic_attribution_no_topic_count "
+        "FROM synced_dialogs WHERE dialog_id=101"
+    ).fetchone() == ("partial", None, 1)
     with pytest.raises(TopicAttributionCampaignError, match="checkpoint_changed"):
         record_page(conn, 101, 0, (), observed_at=103)
 
@@ -178,7 +179,7 @@ def test_terminal_status_preserves_access_loss_over_exhausted(conn: sqlite3.Conn
         "pending_dialogs": 0,
         "failed_dialogs": 0,
         "abandoned_dialogs": 1,
-        "counts": {"attributed": 0, "no_longer_needed": 0, "unresolved": 0},
+        "counts": {"attributed": 0, "no_topic": 0, "no_longer_needed": 0, "unresolved": 0},
     }
 
 
@@ -319,3 +320,29 @@ def test_invalid_numeric_manifest_is_quarantined_on_mutation(
     assert campaign_status(conn)["state"] == "invalid"
     assert advance_campaign(conn, now=101) is None
     assert campaign_status(conn)["terminal_reason"] == "invalid_manifest"
+
+
+def test_clean_campaign_dialog_completes_with_legal_no_topic_while_sibling_is_abandoned(
+    conn: sqlite3.Connection,
+) -> None:
+    conn.execute(
+        "INSERT INTO messages(dialog_id,message_id,sent_at,text,forum_topic_id,is_deleted) VALUES (101,1,1,'root',NULL,0)"
+    )
+    conn.commit()
+    enroll_campaign(conn, [101, 102], now=100)
+    record_page(conn, 101, 0, [_extracted(101, 1, None)], observed_at=101)
+    assert conn.execute(
+        "SELECT topic_attribution_state,topic_attribution_no_topic_count FROM synced_dialogs WHERE dialog_id=101"
+    ).fetchone() == ("complete", 1)
+    record_access_lost(conn, 102, 0, observed_at=102)
+    assert campaign_status(conn)["terminal_severity"] == "degraded"
+
+
+def test_exhausted_campaign_with_missing_local_row_is_degraded(conn: sqlite3.Connection) -> None:
+    enroll_campaign(conn, [101, 102], now=100)
+    record_page(conn, 101, 0, [_extracted(101, 99, 7)], observed_at=101)
+    record_page(conn, 102, 0, (), observed_at=102)
+    status = campaign_status(conn)
+    assert status["terminal_reason"] == "exhausted"
+    assert status["terminal_severity"] == "degraded"
+    assert status["counts"]["unresolved"] == 1

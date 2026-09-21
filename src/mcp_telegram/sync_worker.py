@@ -40,7 +40,7 @@ from .message_history.contracts import (
     MessageHistoryUnavailableError,
 )
 from .message_history.ports import FullHistoryPagePort
-from .messages.sqlite_bundle import has_live_null_topic_attribution, insert_messages_with_fts
+from .messages.sqlite_bundle import insert_messages_with_fts
 from .read_state import apply_read_cursor
 from .resolver import latinize
 from .telegram_demand import (
@@ -65,6 +65,7 @@ from .telegram_rpc_scheduler import (
     rpc_scope,
 )
 from .topic_attribution_campaign import (
+    TopicAttributionCampaignError,
     advance_campaign,
     campaign_execution_allowed,
     campaign_release_at,
@@ -341,14 +342,14 @@ class FullSyncWorker:
             return True
         dialog_id, before_message_id = checkpoint
         if not campaign_execution_allowed(self._conn, dialog_id):
-            record_access_lost(self._conn, dialog_id, before_message_id, observed_at=now, reason="history_disabled")
+            self._record_campaign_access_loss(dialog_id, before_message_id, now, "history_disabled")
             return campaign_release_at(self._conn, now=now) is None
         try:
             page = await self._history_port.fetch_page(dialog_id, before_message_id=before_message_id)
         except MessageHistoryAccessLostError as exc:
             set_access_lost(self._conn, dialog_id, int(time.time()), reason=exc.reason_code)
             self._conn.commit()
-            record_access_lost(self._conn, dialog_id, before_message_id, observed_at=now)
+            self._record_campaign_access_loss(dialog_id, before_message_id, now, "access_lost")
         except TelegramRpcAdmissionDeferred as exc:
             record_deferred(self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=now)
             raise
@@ -366,16 +367,30 @@ class FullSyncWorker:
             record_failed_attempt(self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=now)
         else:
             if campaign_execution_allowed(self._conn, dialog_id):
-                record_page(self._conn, dialog_id, before_message_id, page.messages, observed_at=now)
+                self._record_campaign_page(dialog_id, before_message_id, page.messages, now)
             else:
-                record_access_lost(
-                    self._conn,
-                    dialog_id,
-                    before_message_id,
-                    observed_at=now,
-                    reason="history_disabled",
-                )
+                self._record_campaign_access_loss(dialog_id, before_message_id, now, "history_disabled")
         return campaign_release_at(self._conn, now=now) is None
+
+    def _record_campaign_page(
+        self, dialog_id: int, checkpoint: int, messages: Sequence[_ExtractedMessage], observed_at: int
+    ) -> None:
+        try:
+            record_page(self._conn, dialog_id, checkpoint, messages, observed_at=observed_at)
+        except TopicAttributionCampaignError as exc:
+            self._ignore_superseded_campaign_operation(exc)
+
+    def _record_campaign_access_loss(self, dialog_id: int, checkpoint: int, observed_at: int, reason: str) -> None:
+        try:
+            record_access_lost(self._conn, dialog_id, checkpoint, observed_at=observed_at, reason=reason)
+        except TopicAttributionCampaignError as exc:
+            self._ignore_superseded_campaign_operation(exc)
+
+    @staticmethod
+    def _ignore_superseded_campaign_operation(exc: TopicAttributionCampaignError) -> None:
+        if str(exc) not in {"campaign_inactive", "checkpoint_changed"}:
+            raise exc
+        logger.info("topic_attribution_campaign_operation_superseded reason=%s", exc)
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_LOOKUP)
     async def repair_one_total_messages(self) -> bool:  # noqa: PLR0911
@@ -612,6 +627,7 @@ class FullSyncWorker:
                 priority=HydrationPriority.BACKFILL,
                 reaction_observed_at=reaction_observed_at,
             )
+            self._record_no_topic_attribution(dialog_id, rows)
             if is_done:
                 self._conn.execute(
                     _UPDATE_PROGRESS_DONE_SQL,
@@ -640,16 +656,24 @@ class FullSyncWorker:
         del sync_progress
         self._conn.execute(
             "UPDATE synced_dialogs SET topic_attribution_version=?, topic_attribution_state='partial', "
-            "topic_attribution_observed_at=?, topic_attribution_completed_at=NULL "
+            "topic_attribution_observed_at=?, topic_attribution_completed_at=NULL, topic_attribution_no_topic_count=0 "
             "WHERE dialog_id=? AND status IN ('not_synced', 'syncing') "
             "AND (topic_attribution_version<>? OR topic_attribution_state<>'partial')",
             (TOPIC_ATTRIBUTION_EXTRACTOR_VERSION, observed_at, dialog_id, TOPIC_ATTRIBUTION_EXTRACTOR_VERSION),
         )
 
+    def _record_no_topic_attribution(self, dialog_id: int, batch: Sequence[_ExtractedMessage]) -> None:
+        """Record legal extractor NULL outcomes from one current history page."""
+        count = sum(message.message.forum_topic_id is None for message in batch)
+        if count:
+            self._conn.execute(
+                "UPDATE synced_dialogs SET topic_attribution_no_topic_count=topic_attribution_no_topic_count+? "
+                "WHERE dialog_id=? AND topic_attribution_version=? AND topic_attribution_state='partial'",
+                (count, dialog_id, TOPIC_ATTRIBUTION_EXTRACTOR_VERSION),
+            )
+
     def _complete_topic_attribution_pass(self, dialog_id: int, completed_at: int) -> None:
-        """Publish completion only when a current traversal left no ambiguous NULL."""
-        if has_live_null_topic_attribution(self._conn, dialog_id):
-            return
+        """Publish a full current-extractor traversal, including legal NULL outcomes."""
         self._conn.execute(
             "UPDATE synced_dialogs SET topic_attribution_state='complete', topic_attribution_completed_at=? "
             "WHERE dialog_id=? AND topic_attribution_version=? AND topic_attribution_state='partial'",

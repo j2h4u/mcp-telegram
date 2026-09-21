@@ -183,9 +183,10 @@ a fresh two-dialog enrollment; an active campaign can first be terminalized with
 `mcp-telegram topic-attribution abort` when enrollment was wrong. The campaign
 is bounded and restart-safe. PR2 must remove its commands, executor, and the
 `topic_attribution_campaign_v1` daemon-state row after the repair terminates.
-A completed receipt is published only when a current full traversal leaves no
-live message with an ambiguous `NULL` topic marker; legal `NULL` members keep
-that receipt partial.
+A completed receipt means the current extractor traversed the covered full
+history. Legal root or General-topic `NULL` outcomes remain valid and are
+reported as `topic_attribution.no_topic_count`; they do not change an empty
+topic selection from `unknown` to absence.
 
 Review recent important access changes:
 

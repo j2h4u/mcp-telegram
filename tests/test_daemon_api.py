@@ -611,7 +611,8 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             topic_attribution_version INTEGER NOT NULL DEFAULT 0,
             topic_attribution_state TEXT NOT NULL DEFAULT 'unknown',
             topic_attribution_observed_at INTEGER,
-            topic_attribution_completed_at INTEGER
+            topic_attribution_completed_at INTEGER,
+            topic_attribution_no_topic_count INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -4716,6 +4717,7 @@ async def test_list_messages_known_topic_with_no_local_rows_stays_local_and_unkn
     assert _response_messages(result) == []
     assert result["data"]["selection_state"] == "unknown"
     assert result["data"]["topic_attribution"]["state"] == "unknown"
+    assert result["data"]["topic_attribution"]["no_topic_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -4757,7 +4759,7 @@ def test_topic_attribution_campaign_status_route_is_privacy_safe() -> None:
             "pending_dialogs": 0,
             "failed_dialogs": 0,
             "abandoned_dialogs": 0,
-            "counts": {"attributed": 0, "no_longer_needed": 0, "unresolved": 0},
+            "counts": {"attributed": 0, "no_topic": 0, "no_longer_needed": 0, "unresolved": 0},
         },
     }
 

@@ -4168,6 +4168,7 @@ def _apply_migration_72(conn: sqlite3.Connection, current: int) -> int:
             ),
             "ALTER TABLE synced_dialogs ADD COLUMN topic_attribution_observed_at INTEGER",
             "ALTER TABLE synced_dialogs ADD COLUMN topic_attribution_completed_at INTEGER",
+            "ALTER TABLE synced_dialogs ADD COLUMN topic_attribution_no_topic_count INTEGER NOT NULL DEFAULT 0",
         ],
         ignore_duplicate_column=True,
     )

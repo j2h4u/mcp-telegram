@@ -518,19 +518,20 @@ def _topic_attribution_receipt(conn: sqlite3.Connection, dialog_id: int) -> dict
     row = _fetchone_row(
         conn.execute(
             "SELECT topic_attribution_version, topic_attribution_state, "
-            "topic_attribution_observed_at, topic_attribution_completed_at "
+            "topic_attribution_observed_at, topic_attribution_completed_at, topic_attribution_no_topic_count "
             "FROM synced_dialogs WHERE dialog_id = ?",
             (dialog_id,),
         )
     )
     if row is None:
-        return {"version": 0, "state": "unknown", "observed_at": None, "completed_at": None}
+        return {"version": 0, "state": "unknown", "observed_at": None, "completed_at": None, "no_topic_count": 0}
     values = _row_sequence(row)
     return {
         "version": int(cast(int | str, values[0] or 0)),
         "state": str(values[1] or "unknown"),
         "observed_at": values[2],
         "completed_at": values[3],
+        "no_topic_count": int(cast(int | str, values[4] or 0)),
     }
 
 
