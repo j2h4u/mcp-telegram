@@ -83,6 +83,47 @@ async def test_list_messages_draft_is_local_and_has_no_sent_identity() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("message_state", ["draft", "all"])
+async def test_draft_response_budget_keeps_complete_rows_reachable(message_state: str) -> None:
+    server = make_server()
+    server.self_id = 7
+    conn = server._conn
+    _create_draft_projection(conn)
+    for topic_id in range(1, 6):
+        conn.execute(
+            "INSERT INTO draft_current VALUES (7, 1, ?, 0, 'present', ?, '[]', NULL, NULL, NULL, NULL, NULL, "
+            "NULL, NULL, 1, 'realtime_present', 100, 100, 101, ?, 1)",
+            (topic_id, "x" * 65_536, topic_id),
+        )
+    conn.execute("INSERT INTO draft_sync_state VALUES (7, 'ready', 'complete', 100, 101, NULL)")
+    conn.commit()
+
+    first = await server._list_messages({"dialog_id": 1, "message_state": message_state, "limit": 5})
+
+    assert first["data"]["truncation"] == {
+        "is_truncated": True,
+        "shown_count": 3,
+        "hidden_count": 2,
+        "reason": "response_budget",
+    }
+    assert first["data"]["next_navigation"] is not None
+    assert all(len(row["text"]) == 65_536 for row in first["data"]["messages"])
+
+    second = await server._list_messages(
+        {
+            "dialog_id": 1,
+            "message_state": message_state,
+            "limit": 5,
+            "navigation": first["data"]["next_navigation"],
+        }
+    )
+
+    assert second["data"]["truncation"]["is_truncated"] is False
+    assert second["data"]["next_navigation"] is None
+    assert len(first["data"]["messages"] + second["data"]["messages"]) == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_state", ["draft", "all"])
 async def test_natural_draft_dialog_resolution_never_falls_through_to_telegram(message_state: str) -> None:
     get_entity = AsyncMock(side_effect=AssertionError("draft selector must remain local"))
     client = MagicMock()
@@ -93,6 +134,9 @@ async def test_natural_draft_dialog_resolution_never_falls_through_to_telegram(m
 
     assert result["ok"] is False
     assert result["error"] in {"dialog_directory_incomplete", "dialog_not_found", "stale_local_directory"}
+    assert result["required_action"] == (
+        "Use an exact dialog id, or refresh the local dialog directory before retrying this username."
+    )
     get_entity.assert_not_awaited()
 
 

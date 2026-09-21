@@ -343,6 +343,17 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
             ],
             "additionalProperties": False,
         },
+        "truncation": {
+            "type": "object",
+            "properties": {
+                "is_truncated": {"type": "boolean"},
+                "shown_count": {"type": "integer", "minimum": 0},
+                "hidden_count": {"type": "integer", "minimum": 0},
+                "reason": {"type": ["string", "null"]},
+            },
+            "required": ["is_truncated", "shown_count", "hidden_count", "reason"],
+            "additionalProperties": False,
+        },
         "presentation": {
             "type": "object",
             "properties": {
@@ -447,6 +458,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
         "filters",
         "limits",
         "navigation",
+        "truncation",
         "presentation",
         "read_state",
         "scope",
@@ -756,6 +768,10 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
             "direction": _navigation_direction_for_structured(ctx.direction, args.anchor_message_id),
             "anchor_message_id": args.anchor_message_id,
         },
+        "truncation": data.get(
+            "truncation",
+            {"is_truncated": False, "shown_count": len(rows), "hidden_count": 0, "reason": None},
+        ),
         "presentation": {
             "messages_order": "chronological",
             "is_chronological": True,

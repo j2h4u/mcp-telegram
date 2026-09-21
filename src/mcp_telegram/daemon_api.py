@@ -191,6 +191,7 @@ def _served_source(response: Mapping[str, object]) -> str:
         if source in {
             "sync_db",
             "scheduled_messages",
+            "draft_current",
             "sync_db+scheduled_messages",
             "sync_db+scheduled_messages+draft_current",
         }:
@@ -1403,7 +1404,20 @@ class DaemonAPIServer:
             return ResolvedDialogId(result.entity_id, directory_coverage)
         if isinstance(result, Candidates):
             return self._dialog_resolution_candidates_response(selector, result, directory_coverage)
-        return self._dialog_resolution_no_match_response(selector, directory_coverage)
+        return self._local_dialog_resolution_no_match_response(selector, directory_coverage)
+
+    @staticmethod
+    def _local_dialog_resolution_no_match_response(
+        selector: DialogSelector,
+        coverage: DialogDirectoryCoverage,
+    ) -> dict[str, object]:
+        """Describe the actionable local-only recovery for an uncached selector."""
+        response = DaemonAPIServer._dialog_resolution_no_match_response(selector, coverage)
+        if selector.query is not None and selector.query.startswith("@"):
+            response["required_action"] = (
+                "Use an exact dialog id, or refresh the local dialog directory before retrying this username."
+            )
+        return response
 
     def _trace_service(self) -> DaemonAccountTraceService:
         return DaemonAccountTraceService(

@@ -81,6 +81,7 @@ _TRACE_ACRONYM_MIN_LEN = 2
 _TRACE_ACRONYM_MAX_LEN = 4
 _TRACE_FUZZY_MIN_LEN = 4
 _TRACE_FUZZY_SCORE_MIN = 75
+_DRAFT_RESPONSE_BUDGET_BYTES = 256 * 1024
 
 
 class LoggerLike(Protocol):
@@ -1001,7 +1002,7 @@ class ReadingService:
                 direction=direction,
                 direction_enum=direction_enum,
                 anchor_msg_id=anchor_msg_id,
-                anchor_sent_at=self._history_navigation_sent_at(request.navigation),
+                anchor_sent_at=self._local_history_anchor_sent_at(dialog_id, anchor_msg_id, request.navigation),
                 sender_id=request.sender_id,
                 sender_name=request.sender_name,
                 topic_id=request.topic_id,
@@ -1744,10 +1745,11 @@ class ReadingService:
         start = self._draft_cursor_start(navigation, req, coverage.projection_fingerprint, visible)
         if isinstance(start, dict):
             return start
-        page = visible[start : start + req.limit]
-        next_navigation = self._draft_next_navigation(req, coverage.projection_fingerprint, visible, page, start)
+        candidates = visible[start : start + req.limit]
         with timing_phase("response_shape"):
+            page, budget_truncated = self._bounded_draft_page(candidates)
             rows = [self._draft_wire_row(record) for record in page]
+        next_navigation = self._draft_next_navigation(req, coverage.projection_fingerprint, visible, page, start)
         return {
             "ok": True,
             "data": {
@@ -1758,6 +1760,12 @@ class ReadingService:
                 "scope": "own_only",
                 "draft_coverage": coverage.to_wire(),
                 "draft_fingerprint": coverage.projection_fingerprint,
+                "truncation": {
+                    "is_truncated": budget_truncated,
+                    "shown_count": len(page),
+                    "hidden_count": len(visible) - start - len(page) if budget_truncated else 0,
+                    "reason": "response_budget" if budget_truncated else None,
+                },
             },
         }
 
@@ -1834,7 +1842,7 @@ class ReadingService:
         page: list[DraftReadRecord],
         start: int,
     ) -> str | None:
-        if len(visible) <= start + req.limit or not page:
+        if len(visible) <= start + len(page) or not page:
             return None
         return encode_history_navigation(
             None,
@@ -1847,6 +1855,21 @@ class ReadingService:
             draft_key=draft_message_key(page[-1]),
             draft_fingerprint=fingerprint,
         )
+
+    @staticmethod
+    def _bounded_draft_page(candidates: list[DraftReadRecord]) -> tuple[list[DraftReadRecord], bool]:
+        """Keep complete draft rows within the structured response byte budget."""
+        page: list[DraftReadRecord] = []
+        payload_bytes = 0
+        for record in candidates:
+            row_bytes = len(
+                json.dumps(ReadingService._draft_wire_row(record), ensure_ascii=False, separators=(",", ":")).encode()
+            )
+            if page and payload_bytes + row_bytes > _DRAFT_RESPONSE_BUDGET_BYTES:
+                return page, True
+            page.append(record)
+            payload_bytes += row_bytes
+        return page, False
 
     @staticmethod
     def _draft_wire_row(record: DraftReadRecord) -> dict[str, object]:
@@ -1990,7 +2013,7 @@ class ReadingService:
             combined = self._combined_local_rows(
                 state.sent_rows, state.scheduled_rows, state.draft_rows, state.request.direction
             )
-            has_more = len(combined) > request.limit
+            has_more = len(combined) > request.limit or state.draft_result["data"]["next_navigation"] is not None
             page = combined[: request.limit]
             next_nav = self._all_next_navigation(
                 page,
@@ -2008,6 +2031,7 @@ class ReadingService:
                     "dialog_type": dialog_type,
                     "read_state": read_state,
                     "draft_coverage": state.draft_result["data"]["draft_coverage"],
+                    "truncation": state.draft_result["data"]["truncation"],
                     **access_metadata,
                 },
             }
@@ -2073,6 +2097,24 @@ class ReadingService:
         if navigation in (None, "newest", "oldest"):
             return None
         return decode_navigation_token(navigation).sent_at
+
+    def _local_history_anchor_sent_at(
+        self,
+        dialog_id: int,
+        anchor_msg_id: int | None,
+        navigation: str | None,
+    ) -> int | None:
+        sent_at = self._history_navigation_sent_at(navigation)
+        if sent_at is not None or anchor_msg_id is None:
+            return sent_at
+        row = _fetchone_row(
+            self._conn.execute(
+                "SELECT sent_at FROM messages WHERE dialog_id = ? AND message_id = ?",
+                (dialog_id, anchor_msg_id),
+            )
+        )
+        values = _row_sequence(row)
+        return _object_to_int_or_none(values[0] if values else None)
 
     async def _list_messages_non_sent(
         self,
