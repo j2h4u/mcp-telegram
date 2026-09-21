@@ -2242,3 +2242,21 @@ def test_marked_peer_id_matches_telethon_convention() -> None:
     for peer in cases:
         assert _marked_peer_id(peer) == tl_utils.get_peer_id(peer)
     assert _marked_peer_id(SimpleNamespace(channel_id=None, chat_id=None, user_id=None)) is None
+
+
+@pytest.mark.asyncio
+async def test_full_history_null_topic_keeps_current_receipt_partial(sync_db: _SQLiteConnection) -> None:
+    """A legal NULL topic member cannot produce a false complete receipt."""
+    from mcp_telegram.message_contracts import ExtractedMessage
+
+    dialog_id = 405
+    sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (?, 'not_synced', 0)", (dialog_id,))
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
+    sync_db.commit()
+    worker = make_worker(MagicMock(), sync_db, asyncio.Event())
+
+    await worker._store_batch_page(dialog_id, 0, 1, (ExtractedMessage(message=_stored(dialog_id, 1), reply_count=0),))
+
+    assert sync_db.execute(
+        "SELECT topic_attribution_version,topic_attribution_state FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (1, "partial")

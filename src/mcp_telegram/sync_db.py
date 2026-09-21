@@ -4205,6 +4205,28 @@ def _repair_v54_schema_ledger(conn: sqlite3.Connection, current: int) -> int:
     return current
 
 
+
+def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
+    """Apply the conditional current-schema migration tail."""
+    if _CURRENT_SCHEMA_VERSION >= _ENTITY_PROFILE_ACQUISITION_MIGRATION_61:
+        current = _apply_migration_61(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _ENTITY_PROFILE_METADATA_MIGRATION_62:
+        current = _apply_migration_62(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _REALTIME_DM_DIALOG_BACKFILL_MIGRATION_63:
+        current = _apply_migration_63(conn, current)
+    current = _apply_migrations_64_to_67(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _REACTION_DETAIL_LIFECYCLE_MIGRATION_68:
+        current = _apply_migration_68(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _REACTION_DETAIL_PACING_MIGRATION_69:
+        current = _apply_migration_69(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _READ_DATE_OUTCOME_MIGRATION_70:
+        current = _apply_migration_70(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _READ_DATE_EXPIRY_CUTOFF_MIGRATION_71:
+        current = _apply_migration_71(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _TOPIC_ATTRIBUTION_RECEIPT_MIGRATION_72:
+        current = _apply_migration_72(conn, current)
+    return current
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -4266,23 +4288,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_migration_58(conn, current)
     current = _apply_migration_59(conn, current)
     current = _apply_migration_60(conn, current)
-    if _CURRENT_SCHEMA_VERSION >= _ENTITY_PROFILE_ACQUISITION_MIGRATION_61:
-        current = _apply_migration_61(conn, current)
-    if _CURRENT_SCHEMA_VERSION >= _ENTITY_PROFILE_METADATA_MIGRATION_62:
-        current = _apply_migration_62(conn, current)
-    if _CURRENT_SCHEMA_VERSION >= _REALTIME_DM_DIALOG_BACKFILL_MIGRATION_63:
-        current = _apply_migration_63(conn, current)
-    current = _apply_migrations_64_to_67(conn, current)
-    if _CURRENT_SCHEMA_VERSION >= _REACTION_DETAIL_LIFECYCLE_MIGRATION_68:
-        current = _apply_migration_68(conn, current)
-    if _CURRENT_SCHEMA_VERSION >= _REACTION_DETAIL_PACING_MIGRATION_69:
-        current = _apply_migration_69(conn, current)
-    if _CURRENT_SCHEMA_VERSION >= _READ_DATE_OUTCOME_MIGRATION_70:
-        current = _apply_migration_70(conn, current)
-    if _CURRENT_SCHEMA_VERSION >= _READ_DATE_EXPIRY_CUTOFF_MIGRATION_71:
-        current = _apply_migration_71(conn, current)
-    if _CURRENT_SCHEMA_VERSION >= _TOPIC_ATTRIBUTION_RECEIPT_MIGRATION_72:
-        current = _apply_migration_72(conn, current)
+    current = _apply_late_migrations(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

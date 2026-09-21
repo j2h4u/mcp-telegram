@@ -10,6 +10,16 @@ from enum import StrEnum
 from types import MappingProxyType
 
 
+def topic_attribution_failure_delay() -> int:
+    """Return the bounded retry cadence for the temporary FULL_SYNC repair."""
+    return 60
+
+
+def topic_attribution_campaign_lifetime() -> int:
+    """Return the maximum lifetime of the temporary repair manifest."""
+    return 7 * 24 * 60 * 60
+
+
 class RpcServiceClass(StrEnum):
     """Internal service classes for account-wide Telegram RPC admission."""
 

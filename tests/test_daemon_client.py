@@ -816,10 +816,12 @@ async def test_topic_attribution_campaign_status_convenience() -> None:
     conn.request = _mock_request  # type: ignore[method-assign]
 
     await conn.get_topic_attribution_campaign_status()
+    await conn.abort_topic_attribution_campaign()
     await conn.reset_topic_attribution_campaign()
 
     assert captured == [
         {"method": "get_topic_attribution_campaign_status"},
+        {"method": "abort_topic_attribution_campaign"},
         {"method": "reset_topic_attribution_campaign"},
     ]
 

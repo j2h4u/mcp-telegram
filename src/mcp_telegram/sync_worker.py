@@ -33,9 +33,14 @@ from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
 from .history_enrollment import ensure_automatic_dm_enrollment, full_history_enabled
 from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage as _ExtractedMessage
-from .message_history.contracts import HISTORY_PAGE_SIZE, MessageHistoryAccessLostError, MessageHistoryUnavailableError
+from .message_history.contracts import (
+    MESSAGE_HISTORY_PAGE_LIMIT,
+    TOPIC_ATTRIBUTION_EXTRACTOR_VERSION,
+    MessageHistoryAccessLostError,
+    MessageHistoryUnavailableError,
+)
 from .message_history.ports import FullHistoryPagePort
-from .messages.sqlite_bundle import insert_messages_with_fts
+from .messages.sqlite_bundle import has_live_null_topic_attribution, insert_messages_with_fts
 from .read_state import apply_read_cursor
 from .resolver import latinize
 from .telegram_demand import (
@@ -70,11 +75,10 @@ from .topic_attribution_campaign import (
 
 logger = logging.getLogger(__name__)
 
-_BATCH_SIZE = HISTORY_PAGE_SIZE
+_BATCH_SIZE = MESSAGE_HISTORY_PAGE_LIMIT
 _DM_ENROLLMENT_KEY_LAST_PUBLICATION_GENERATION = "full_sync_dm_enrollment_last_publication_generation"
 _TOTAL_MESSAGES_REPAIR_GATE_STATE_KEY = "full_sync_total_messages_repair_retry_at"
 _TOTAL_MESSAGES_REPAIR_FAILURE_DELAY_S = 60
-_TOPIC_ATTRIBUTION_EXTRACTOR_VERSION = 1
 
 
 @contextmanager
@@ -335,6 +339,9 @@ class FullSyncWorker:
         if checkpoint is None:
             return True
         dialog_id, before_message_id = checkpoint
+        if not full_history_enabled(self._conn, dialog_id):
+            record_access_lost(self._conn, dialog_id, before_message_id, observed_at=now, reason="history_disabled")
+            return campaign_release_at(self._conn, now=now) is None
         try:
             page = await self._history_port.fetch_page(dialog_id, before_message_id=before_message_id)
         except MessageHistoryAccessLostError as exc:
@@ -619,26 +626,24 @@ class FullSyncWorker:
         return new_progress, is_done
 
     def _begin_topic_attribution_pass(self, dialog_id: int, sync_progress: int, observed_at: int) -> None:
-        """Mark a newly started current-extractor full-history pass as partial.
-
-        Legacy synced rows never enter ``process_one_batch``.  This guard keeps
-        realtime and delta ingestion from silently upgrading their receipt.
-        """
-        if sync_progress != 0:
-            return
+        """Start or safely resume a current-extractor full-history receipt."""
+        del sync_progress
         self._conn.execute(
             "UPDATE synced_dialogs SET topic_attribution_version=?, topic_attribution_state='partial', "
             "topic_attribution_observed_at=?, topic_attribution_completed_at=NULL "
-            "WHERE dialog_id=? AND status IN ('not_synced', 'syncing')",
-            (_TOPIC_ATTRIBUTION_EXTRACTOR_VERSION, observed_at, dialog_id),
+            "WHERE dialog_id=? AND status IN ('not_synced', 'syncing') "
+            "AND (topic_attribution_version<>? OR topic_attribution_state<>'partial')",
+            (TOPIC_ATTRIBUTION_EXTRACTOR_VERSION, observed_at, dialog_id, TOPIC_ATTRIBUTION_EXTRACTOR_VERSION),
         )
 
     def _complete_topic_attribution_pass(self, dialog_id: int, completed_at: int) -> None:
-        """Publish a complete receipt only at the authoritative full-history terminal."""
+        """Publish completion only when a current traversal left no ambiguous NULL."""
+        if has_live_null_topic_attribution(self._conn, dialog_id):
+            return
         self._conn.execute(
             "UPDATE synced_dialogs SET topic_attribution_state='complete', topic_attribution_completed_at=? "
             "WHERE dialog_id=? AND topic_attribution_version=? AND topic_attribution_state='partial'",
-            (completed_at, dialog_id, _TOPIC_ATTRIBUTION_EXTRACTOR_VERSION),
+            (completed_at, dialog_id, TOPIC_ATTRIBUTION_EXTRACTOR_VERSION),
         )
 
 

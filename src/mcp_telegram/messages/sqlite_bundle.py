@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
 import time
 from collections.abc import Sequence
@@ -10,12 +12,17 @@ from typing import cast
 
 from .. import message_contracts as _message_contracts
 from ..alert_policy import incoming_human_dm_sql
+from ..dialog_classification import is_bot_dialog_type
 from ..fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
 from ..hydration_queue import HydrationPriority, HydrationQueueRepository
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
+from ..message_history.contracts import MESSAGE_HISTORY_PAGE_LIMIT, TOPIC_ATTRIBUTION_EXTRACTOR_VERSION
 from ..reactions.contracts import ReactionAggregate, ReactionAggregateSource
 from ..reactions.persistence import replace_reaction_aggregates
+from ..telegram_rpc_consumers import topic_attribution_campaign_lifetime, topic_attribution_failure_delay
 from .sqlite_hydration_jobs import _FACT_HYDRATION_EMPTY_KINDS, _is_canonical_media_pair, reconcile_fact_hydration_job
+
+SQLiteConnection = sqlite3.Connection
 
 
 def _insert_sql(table: str, dataclass_type: type) -> str:
@@ -297,3 +304,614 @@ def _preserve_transcribed_texts(
         )
         for item in extracted
     ]
+
+
+# Temporary topic-attribution repair state. PR2 removes this section and its daemon_state row.
+
+logger = logging.getLogger("mcp_telegram.topic_attribution_campaign")
+
+CAMPAIGN_STATE_KEY = "topic_attribution_campaign_v1"
+CAMPAIGN_VERSION = 1
+CAMPAIGN_DIALOG_COUNT = 2
+CAMPAIGN_MAX_FAILURES_PER_DIALOG = 16
+_COUNTER_KEYS = ("attributed", "no_longer_needed", "unresolved")
+_TERMINAL_REASON_PRIORITY = {
+    "exhausted": 0,
+    "expiry": 1,
+    "status_ineligible": 2,
+    "access_lost": 3,
+    "history_disabled": 3,
+    "failure_limit": 4,
+    "invalid_manifest": 5,
+    "incompatible_manifest": 5,
+    "operator_abort": 6,
+}
+_TERMINAL_SEVERITY = {
+    "exhausted": "complete",
+    "status_ineligible": "degraded",
+    "access_lost": "degraded",
+    "expiry": "degraded",
+    "failure_limit": "failed",
+    "invalid_manifest": "failed",
+    "incompatible_manifest": "failed",
+    "operator_abort": "abandoned",
+    "history_disabled": "abandoned",
+}
+
+
+class TopicAttributionCampaignError(ValueError):
+    """The explicitly limited campaign cannot continue as requested."""
+
+
+def _empty_counts() -> dict[str, int]:
+    return dict.fromkeys(_COUNTER_KEYS, 0)
+
+
+def _encode(manifest: dict[str, object]) -> str:
+    return json.dumps(manifest, separators=(",", ":"), sort_keys=True)
+
+
+def _load(conn: sqlite3.Connection) -> dict[str, object] | None:
+    try:
+        row = cast(
+            tuple[object] | None,
+            conn.execute("SELECT value FROM daemon_state WHERE key=?", (CAMPAIGN_STATE_KEY,)).fetchone(),
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+        return None
+    if row is None or not isinstance(row[0], str):
+        return None
+    try:
+        raw = cast(object, json.loads(row[0]))
+    except json.JSONDecodeError as exc:
+        raise TopicAttributionCampaignError("invalid_manifest") from exc
+    if not isinstance(raw, dict) or raw.get("version") != CAMPAIGN_VERSION:
+        raise TopicAttributionCampaignError("incompatible_manifest")
+    manifest = cast(dict[str, object], raw)
+    if not _valid_manifest_shape(manifest):
+        raise TopicAttributionCampaignError("invalid_manifest")
+    return manifest
+
+
+
+def _valid_manifest_shape(manifest: dict[str, object]) -> bool:
+    dialog_ids = manifest.get("dialog_ids")
+    dialogs = manifest.get("dialogs")
+    return _valid_manifest_header(manifest, dialog_ids, dialogs) and _valid_manifest_dialogs(dialog_ids, dialogs)
+
+
+def _valid_manifest_header(manifest: dict[str, object], dialog_ids: object, dialogs: object) -> bool:
+    if manifest.get("state") not in {"active", "complete"} or not isinstance(dialog_ids, list) or not isinstance(dialogs, dict):
+        return False
+    return manifest.get("state") != "active" or (len(dialog_ids) == CAMPAIGN_DIALOG_COUNT and "expires_at" in manifest)
+
+
+def _valid_manifest_dialogs(dialog_ids: object, dialogs: object) -> bool:
+    if not isinstance(dialog_ids, list) or not isinstance(dialogs, dict):
+        return False
+    return all(_valid_manifest_dialog(dialog_id, dialogs.get(str(dialog_id))) for dialog_id in dialog_ids)
+
+
+def _valid_manifest_dialog(dialog_id: object, item: object) -> bool:
+    if isinstance(dialog_id, bool) or not isinstance(dialog_id, int) or not isinstance(item, dict):
+        return False
+    counts = item.get("counts")
+    return item.get("state") in {"pending", "done"} and isinstance(counts, dict) and all(
+        isinstance(counts.get(key), int) for key in _COUNTER_KEYS
+    )
+
+def _save(conn: sqlite3.Connection, manifest: dict[str, object]) -> None:
+    conn.execute(
+        "INSERT INTO daemon_state(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (CAMPAIGN_STATE_KEY, _encode(manifest)),
+    )
+
+
+def enroll_campaign(
+    conn: sqlite3.Connection, dialog_ids: Sequence[int], *, now: int | None = None
+) -> dict[str, object]:
+    """Persist the fixed two-dialog manifest after local eligibility checks."""
+    ids = _normalized_campaign_ids(dialog_ids)
+    observed_at = int(time.time()) if now is None else now
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = _load(conn)
+        if existing is not None:
+            if existing.get("state") == "active" and existing.get("dialog_ids") == ids:
+                conn.commit()
+                return existing
+            raise TopicAttributionCampaignError("a topic-attribution campaign already exists")
+        _require_synced_bot_dialogs(conn, ids)
+        manifest = _new_campaign_manifest(ids, observed_at)
+        _save(conn, manifest)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    logger.info("topic_attribution_campaign_enrolled dialog_count=%d", CAMPAIGN_DIALOG_COUNT)
+    return manifest
+
+
+def _normalized_campaign_ids(dialog_ids: Sequence[int]) -> list[int]:
+    if len(dialog_ids) != CAMPAIGN_DIALOG_COUNT or any(isinstance(value, bool) for value in dialog_ids):
+        raise TopicAttributionCampaignError("exactly two dialog ids are required")
+    ids = sorted(set(dialog_ids))
+    if len(ids) != CAMPAIGN_DIALOG_COUNT:
+        raise TopicAttributionCampaignError("the two dialog ids must be distinct")
+    return ids
+
+
+def _require_synced_bot_dialogs(conn: sqlite3.Connection, ids: Sequence[int]) -> None:
+    rows = cast(
+        list[tuple[object, object]],
+        conn.execute(
+            "SELECT sd.dialog_id,d.type FROM synced_dialogs sd JOIN dialogs d USING(dialog_id) "
+            "WHERE sd.dialog_id IN (?,?) AND sd.status='synced'", tuple(ids)
+        ).fetchall(),
+    )
+    if len(rows) != CAMPAIGN_DIALOG_COUNT or any(not is_bot_dialog_type(row[1]) for row in rows):
+        raise TopicAttributionCampaignError("each enrolled dialog must currently be a synced bot dialog")
+
+
+def _new_campaign_manifest(ids: list[int], observed_at: int) -> dict[str, object]:
+    return {
+        "version": CAMPAIGN_VERSION, "state": "active", "created_at": observed_at,
+        "expires_at": observed_at + topic_attribution_campaign_lifetime(),
+        "max_failures_per_dialog": CAMPAIGN_MAX_FAILURES_PER_DIALOG, "dialog_ids": ids,
+        "dialogs": {str(dialog_id): {"cursor": 0, "failure_attempts": 0, "next_retry_at": None,
+                    "state": "pending", "counts": _empty_counts()} for dialog_id in ids},
+    }
+
+def reset_campaign(conn: sqlite3.Connection) -> dict[str, object]:
+    """Remove only a terminal manifest before an explicit fresh enrollment."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        manifest = _load(conn)
+        if manifest is None:
+            raise TopicAttributionCampaignError("campaign_not_found")
+        if manifest.get("state") != "complete":
+            raise TopicAttributionCampaignError("campaign_is_not_terminal")
+        reason = str(manifest.get("terminal_reason") or "exhausted")
+        conn.execute("DELETE FROM daemon_state WHERE key=?", (CAMPAIGN_STATE_KEY,))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    logger.info("topic_attribution_campaign_reset prior_terminal_reason=%s", reason)
+    return {"previous_terminal_reason": reason}
+
+
+def campaign_release_at(conn: sqlite3.Connection, *, now: int) -> float | None:
+    """Pure readiness projection for the durable adapter status method."""
+    try:
+        manifest = _load(conn)
+    except TopicAttributionCampaignError:
+        return 0.0
+    if manifest is None or manifest.get("state") != "active":
+        return None
+    if int(cast(int | str, manifest["expires_at"])) <= now:
+        return 0.0
+    scheduled_at: list[float] = []
+    for _dialog_id, item in _pending_items(manifest):
+        retry_at = item.get("next_retry_at")
+        if retry_at is None or int(cast(int | str, retry_at)) <= now:
+            return 0.0
+        scheduled_at.append(float(cast(int | str, retry_at)))
+    return min(scheduled_at, default=0.0)
+
+
+def advance_campaign(conn: sqlite3.Connection, *, now: int) -> tuple[int, int] | None:
+    """Mutate only to quarantine, terminalize, or select a ready local dialog."""
+    try:
+        manifest = _load(conn)
+    except TopicAttributionCampaignError as exc:
+        _quarantine_invalid(conn, str(exc), now)
+        return None
+    if manifest is None or manifest.get("state") != "active":
+        return None
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        result, terminal_reason = _advance_active_manifest(conn, manifest, now)
+        if terminal_reason is not None:
+            _finish(conn, manifest, terminal_reason, now)
+        elif result is None:
+            _save(conn, manifest)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    if terminal_reason is not None:
+        _log_terminal(manifest)
+    return result
+
+
+def _advance_active_manifest(
+    conn: sqlite3.Connection, manifest: dict[str, object], now: int
+) -> tuple[tuple[int, int] | None, str | None]:
+    if int(cast(int | str, manifest["expires_at"])) <= now:
+        return None, "expiry"
+    candidate = _select_ready_campaign_item(conn, manifest, now)
+    if candidate is not None:
+        return candidate, None
+    return None, "exhausted" if _next_pending(manifest) is None else None
+
+
+def _select_ready_campaign_item(
+    conn: sqlite3.Connection, manifest: dict[str, object], now: int
+) -> tuple[int, int] | None:
+    for dialog_id, item in _pending_items(manifest):
+        if _is_delayed(item, now):
+            continue
+        status = _campaign_dialog_status(conn, dialog_id)
+        if status == "synced":
+            return dialog_id, int(cast(int | str, item["cursor"]))
+        _abandon_ineligible_item(item, status)
+    return None
+
+
+def _is_delayed(item: dict[str, object], now: int) -> bool:
+    retry_at = item.get("next_retry_at")
+    return retry_at is not None and int(cast(int | str, retry_at)) > now
+
+
+def _campaign_dialog_status(conn: sqlite3.Connection, dialog_id: int) -> object:
+    row = cast(tuple[object] | None, conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone())
+    return None if row is None else row[0]
+
+
+def _abandon_ineligible_item(item: dict[str, object], status: object) -> None:
+    reason = "access_lost" if status == "access_lost" else "status_ineligible"
+    item.update(state="done", last_error=reason, terminal_reason=reason)
+
+def record_page(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    checkpoint: int,
+    messages: Sequence[_message_contracts.ExtractedMessage],
+    *,
+    observed_at: int,
+) -> dict[str, object]:
+    """Apply one page through the narrow live-NULL topic projection."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        manifest, item = _require_active_dialog(conn, dialog_id, checkpoint)
+        _reconcile_page_messages(conn, dialog_id, messages, cast(dict[str, int], item["counts"]))
+        _advance_page_checkpoint(item, messages)
+        conn.execute(
+            "UPDATE synced_dialogs SET topic_attribution_version=?, topic_attribution_state='partial', "
+            "topic_attribution_observed_at=?, topic_attribution_completed_at=NULL WHERE dialog_id=?",
+            (TOPIC_ATTRIBUTION_EXTRACTOR_VERSION, observed_at, dialog_id),
+        )
+        terminal = _next_pending(manifest) is None
+        if terminal:
+            _finish(conn, manifest, "exhausted", observed_at)
+            _publish_campaign_receipt(conn, manifest, observed_at)
+        else:
+            _save(conn, manifest)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    counts = cast(dict[str, int], item["counts"])
+    logger.info(
+        "topic_attribution_campaign_page_result attributed=%d no_longer_needed=%d unresolved=%d",
+        counts["attributed"], counts["no_longer_needed"], counts["unresolved"],
+    )
+    if terminal:
+        _log_terminal(manifest)
+    return manifest
+
+
+def _reconcile_page_messages(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    messages: Sequence[_message_contracts.ExtractedMessage],
+    counts: dict[str, int],
+) -> None:
+    for extracted in messages:
+        message = extracted.message
+        local = cast(
+            tuple[object, object] | None,
+            conn.execute(
+                "SELECT forum_topic_id,is_deleted FROM messages WHERE dialog_id=? AND message_id=?",
+                (dialog_id, message.message_id),
+            ).fetchone(),
+        )
+        if local is None:
+            counts["unresolved"] += 1
+        elif local[0] is not None or local[1] != 0:
+            counts["no_longer_needed"] += 1
+        elif message.forum_topic_id is None:
+            counts["unresolved"] += 1
+        else:
+            updated = conn.execute(
+                "UPDATE messages SET forum_topic_id=? WHERE dialog_id=? AND message_id=? "
+                "AND forum_topic_id IS NULL AND is_deleted=0",
+                (message.forum_topic_id, dialog_id, message.message_id),
+            ).rowcount
+            counts["attributed" if updated else "unresolved"] += 1
+
+
+def _advance_page_checkpoint(item: dict[str, object], messages: Sequence[_message_contracts.ExtractedMessage]) -> None:
+    item["failure_attempts"] = 0
+    item["next_retry_at"] = None
+    if messages:
+        item["cursor"] = min(extracted.message.message_id for extracted in messages)
+    if not messages or len(messages) < MESSAGE_HISTORY_PAGE_LIMIT:
+        item["state"] = "done"
+
+
+def _publish_campaign_receipt(conn: sqlite3.Connection, manifest: dict[str, object], observed_at: int) -> None:
+    """A finite repair can certify only when no live local NULL remains."""
+    totals = _status_from_manifest(manifest)["counts"]
+    total_counts = cast(dict[str, int], totals)
+    if total_counts["unresolved"]:
+        return
+    for dialog_id in cast(list[int], manifest["dialog_ids"]):
+        unresolved = cast(
+            tuple[object] | None,
+            conn.execute(
+                "SELECT 1 FROM messages WHERE dialog_id=? AND forum_topic_id IS NULL AND is_deleted=0 LIMIT 1",
+                (dialog_id,),
+            ).fetchone(),
+        )
+        if unresolved is not None:
+            return
+    conn.execute(
+        "UPDATE synced_dialogs SET topic_attribution_state='complete', topic_attribution_completed_at=? "
+        "WHERE dialog_id IN (?,?) AND topic_attribution_version=? AND topic_attribution_state='partial'",
+        (observed_at, *cast(list[int], manifest["dialog_ids"]), TOPIC_ATTRIBUTION_EXTRACTOR_VERSION),
+    )
+
+def record_deferred(
+    conn: sqlite3.Connection, dialog_id: int, checkpoint: int, *, reason: str, observed_at: int
+) -> None:
+    """Keep the checkpoint while recording governed deferral without a failure burn."""
+    _record_error(
+        conn, dialog_id, checkpoint, reason=reason, observed_at=observed_at, retry_at=None, count_failure=False
+    )
+
+
+def record_failed_attempt(
+    conn: sqlite3.Connection, dialog_id: int, checkpoint: int, *, reason: str, observed_at: int
+) -> None:
+    """Bound ordinary transport failures while keeping a resumable cursor."""
+    _record_error(
+        conn,
+        dialog_id,
+        checkpoint,
+        reason=reason,
+        observed_at=observed_at,
+        retry_at=observed_at + topic_attribution_failure_delay(),
+        count_failure=True,
+    )
+
+
+def record_access_lost(
+    conn: sqlite3.Connection, dialog_id: int, checkpoint: int, *, observed_at: int, reason: str = "access_lost"
+) -> None:
+    """Exclude a newly inaccessible dialog before another page can be acquired."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        manifest, item = _require_active_dialog(conn, dialog_id, checkpoint)
+        item["state"] = "done"
+        item["last_error"] = reason
+        item["terminal_reason"] = reason
+        terminal = _next_pending(manifest) is None
+        if terminal:
+            _finish(conn, manifest, "exhausted", observed_at)
+        else:
+            _save(conn, manifest)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    logger.info("topic_attribution_campaign_page_failure reason=%s", reason)
+    if terminal:
+        _log_terminal(manifest)
+
+
+
+def abort_campaign(conn: sqlite3.Connection, *, observed_at: int | None = None) -> dict[str, object]:
+    """Terminalize an active enrollment so an operator can reset it safely."""
+    now = int(time.time()) if observed_at is None else observed_at
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        manifest = _load(conn)
+        if manifest is None:
+            raise TopicAttributionCampaignError("campaign_not_found")
+        if manifest.get("state") != "active":
+            raise TopicAttributionCampaignError("campaign_is_not_active")
+        _finish(conn, manifest, "operator_abort", now)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    logger.warning("topic_attribution_campaign_aborted")
+    _log_terminal(manifest)
+    return {"terminal_reason": "operator_abort"}
+
+def campaign_status(conn: sqlite3.Connection) -> dict[str, object]:
+    """Return privacy-safe operator progress without exposing enrolled ids."""
+    try:
+        manifest = _load(conn)
+    except TopicAttributionCampaignError as exc:
+        return {
+            "state": "invalid",
+            "terminal_reason": str(exc),
+            "terminal_severity": "failed",
+            "dialog_count": 0,
+            "pending_dialogs": 0,
+            "failed_dialogs": 0,
+            "abandoned_dialogs": 0,
+            "counts": _empty_counts(),
+        }
+    if manifest is None:
+        return {
+            "state": "none",
+            "terminal_reason": None,
+            "terminal_severity": "none",
+            "dialog_count": 0,
+            "pending_dialogs": 0,
+            "failed_dialogs": 0,
+            "abandoned_dialogs": 0,
+            "counts": _empty_counts(),
+        }
+    return _status_from_manifest(manifest)
+
+
+def _record_error(  # noqa: PLR0913
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    checkpoint: int,
+    *,
+    reason: str,
+    observed_at: int,
+    retry_at: int | None,
+    count_failure: bool,
+) -> None:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        manifest, item = _require_active_dialog(conn, dialog_id, checkpoint)
+        item["last_error"] = reason
+        item["next_retry_at"] = retry_at
+        if count_failure:
+            item["failure_attempts"] = int(cast(int | str, item["failure_attempts"])) + 1
+            if int(cast(int | str, item["failure_attempts"])) >= int(
+                cast(int | str, manifest["max_failures_per_dialog"])
+            ):
+                item["state"] = "done"
+                item["terminal_reason"] = "failure_limit"
+        terminal = _next_pending(manifest) is None
+        if terminal:
+            _finish(conn, manifest, "failure_limit", observed_at)
+        else:
+            _save(conn, manifest)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    logger.info("topic_attribution_campaign_page_failure reason=%s", reason)
+    if terminal:
+        _log_terminal(manifest)
+
+
+def _require_active_dialog(
+    conn: sqlite3.Connection, dialog_id: int, checkpoint: int
+) -> tuple[dict[str, object], dict[str, object]]:
+    manifest = _load(conn)
+    if manifest is None or manifest.get("state") != "active":
+        raise TopicAttributionCampaignError("campaign_inactive")
+    dialogs = manifest.get("dialogs")
+    if not isinstance(dialogs, dict):
+        raise TopicAttributionCampaignError("invalid_manifest")
+    item = dialogs.get(str(dialog_id))
+    if (
+        not isinstance(item, dict)
+        or item.get("state") != "pending"
+        or int(cast(int | str, item.get("cursor", -1))) != checkpoint
+    ):
+        raise TopicAttributionCampaignError("checkpoint_changed")
+    return manifest, cast(dict[str, object], item)
+
+
+def _pending_items(manifest: dict[str, object]) -> list[tuple[int, dict[str, object]]]:
+    dialogs = manifest.get("dialogs")
+    if not isinstance(dialogs, dict):
+        return []
+    pending: list[tuple[int, dict[str, object]]] = []
+    for dialog_id in cast(list[int], manifest.get("dialog_ids", [])):
+        item = dialogs.get(str(dialog_id))
+        if isinstance(item, dict) and item.get("state") == "pending":
+            pending.append((dialog_id, cast(dict[str, object], item)))
+    return pending
+
+
+def _next_pending(manifest: dict[str, object]) -> tuple[int, dict[str, object]] | None:
+    return next(iter(_pending_items(manifest)), None)
+
+
+def _finish(conn: sqlite3.Connection, manifest: dict[str, object], reason: str, completed_at: int) -> None:
+    for item in cast(dict[str, dict[str, object]], manifest["dialogs"]).values():
+        if item.get("state") == "pending":
+            item["state"] = "done"
+    manifest["state"] = "complete"
+    manifest["terminal_reason"] = _most_severe_terminal_reason(manifest, reason)
+    manifest["completed_at"] = completed_at
+    _save(conn, manifest)
+
+
+def _quarantine_invalid(conn: sqlite3.Connection, reason: str, observed_at: int) -> None:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _save(
+            conn,
+            {
+                "version": CAMPAIGN_VERSION,
+                "state": "complete",
+                "terminal_reason": reason,
+                "completed_at": observed_at,
+                "dialog_ids": [],
+                "dialogs": {},
+            },
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    logger.warning("topic_attribution_campaign_quarantined reason=%s", reason)
+
+
+def _status_from_manifest(manifest: dict[str, object]) -> dict[str, object]:
+    dialogs = cast(dict[str, dict[str, object]], manifest["dialogs"])
+    totals = _empty_counts()
+    for item in dialogs.values():
+        item_counts = cast(dict[str, object], item.get("counts", {}))
+        for key in _COUNTER_KEYS:
+            totals[key] += int(cast(int | str, item_counts.get(key, 0)))
+    terminal_reason = manifest.get("terminal_reason")
+    return {
+        "state": manifest.get("state"),
+        "terminal_reason": terminal_reason,
+        "terminal_severity": _TERMINAL_SEVERITY.get(str(terminal_reason), "none"),
+        "dialog_count": len(dialogs),
+        "pending_dialogs": sum(item.get("state") == "pending" for item in dialogs.values()),
+        "failed_dialogs": sum(item.get("terminal_reason") == "failure_limit" for item in dialogs.values()),
+        "abandoned_dialogs": sum(
+            item.get("terminal_reason") in {"access_lost", "history_disabled", "status_ineligible", "operator_abort"} for item in dialogs.values()
+        ),
+        "counts": totals,
+    }
+
+
+def _log_terminal(manifest: dict[str, object]) -> None:
+    status = _status_from_manifest(manifest)
+    counts = cast(dict[str, int], status["counts"])
+    logger.info(
+        "topic_attribution_campaign_terminal reason=%s severity=%s attributed=%d no_longer_needed=%d unresolved=%d",
+        status["terminal_reason"],
+        status["terminal_severity"],
+        counts["attributed"],
+        counts["no_longer_needed"],
+        counts["unresolved"],
+    )
+
+
+def _most_severe_terminal_reason(manifest: dict[str, object], requested: str) -> str:
+    dialogs = cast(dict[str, dict[str, object]], manifest["dialogs"])
+    reasons = [requested]
+    reasons.extend(str(item["terminal_reason"]) for item in dialogs.values() if "terminal_reason" in item)
+    return max(reasons, key=lambda reason: _TERMINAL_REASON_PRIORITY.get(reason, 0))
+
+
+def has_live_null_topic_attribution(conn: sqlite3.Connection, dialog_id: int) -> bool:
+    """Whether a live message still has an ambiguous topic projection."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM messages WHERE dialog_id=? AND forum_topic_id IS NULL AND is_deleted=0 LIMIT 1",
+            (dialog_id,),
+        ).fetchone()
+        is not None
+    )

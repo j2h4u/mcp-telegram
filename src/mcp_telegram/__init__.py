@@ -5,7 +5,6 @@ from typing import Annotated, cast
 from typer import Argument, BadParameter, Option, Typer
 
 from .config import ConfigError, HttpServerConfig, load_config, resolve_http_server_config, resolve_logging_config
-from .topic_attribution_campaign import CAMPAIGN_DIALOG_COUNT
 
 app = Typer(no_args_is_help=True)
 topic_attribution_app = Typer(help="Temporary operator enrollment for the two-dialog topic repair.")
@@ -119,9 +118,6 @@ def enroll_topic_attribution_campaign(
     """Enroll the deployment-local, finite topic-attribution repair campaign."""
     import sys
 
-    if len(dialog_ids) != CAMPAIGN_DIALOG_COUNT:
-        raise BadParameter("provide exactly two dialog ids")
-
     from .daemon_client import daemon_connection
 
     async def _run() -> None:
@@ -159,6 +155,25 @@ def topic_attribution_campaign_status() -> None:
             f"attributed={counts['attributed']} "
             f"no_longer_needed={counts['no_longer_needed']} unresolved={counts['unresolved']}"
         )
+
+    asyncio.run(_run())
+
+
+@topic_attribution_app.command("abort")
+def abort_topic_attribution_campaign() -> None:
+    """Terminalize an active repair before reset and explicit re-enrollment."""
+    import sys
+
+    from .daemon_client import daemon_connection
+
+    async def _run() -> None:
+        async with daemon_connection() as conn:
+            response = await conn.abort_topic_attribution_campaign()
+        if response.get("ok"):
+            print("Active topic-attribution repair aborted; reset it before re-enrollment.")
+            return
+        print(f"Error: {response.get('message') or response.get('error') or 'unknown error'}")
+        sys.exit(1)
 
     asyncio.run(_run())
 

@@ -11,11 +11,12 @@ from pathlib import Path
 import pytest
 
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
-from mcp_telegram.message_history.contracts import HISTORY_PAGE_SIZE
+from mcp_telegram.message_history.contracts import MESSAGE_HISTORY_PAGE_LIMIT
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.topic_attribution_campaign import (
     CAMPAIGN_STATE_KEY,
     TopicAttributionCampaignError,
+    abort_campaign,
     advance_campaign,
     campaign_release_at,
     campaign_status,
@@ -25,6 +26,7 @@ from mcp_telegram.topic_attribution_campaign import (
     record_page,
     reset_campaign,
 )
+from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
 def _extracted(dialog_id: int, message_id: int, topic_id: int | None) -> ExtractedMessage:
@@ -56,6 +58,8 @@ def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     db = _open_sync_db(path)
     db.executemany("INSERT INTO dialogs(dialog_id, type) VALUES (?, 'bot')", [(101,), (102,)])
     db.executemany("INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, 'synced')", [(101,), (102,)])
+    seed_full_history_enrollment(db, 101, enabled=True)
+    seed_full_history_enrollment(db, 102, enabled=True)
     db.commit()
     yield db
     db.close()
@@ -126,7 +130,7 @@ def test_campaign_expiry_is_pure_until_advance_then_restart_safe(conn: sqlite3.C
     assert campaign_release_at(conn, now=100 + 7 * 24 * 60 * 60) == 0.0
     assert campaign_status(conn)["state"] == "active"
     assert advance_campaign(conn, now=100 + 7 * 24 * 60 * 60) is None
-    assert campaign_status(conn)["terminal_reason"] == "deadline"
+    assert campaign_status(conn)["terminal_reason"] == "expiry"
 
 
 def test_failure_keeps_checkpoint_and_delays_retry(conn: sqlite3.Connection) -> None:
@@ -148,7 +152,7 @@ def test_ready_second_dialog_is_not_blocked_by_delayed_first_dialog(conn: sqlite
 
 def test_successful_full_page_keeps_resumable_cursor_without_page_cap(conn: sqlite3.Connection) -> None:
     enroll_campaign(conn, [101, 102], now=100)
-    page = [_extracted(101, message_id, None) for message_id in range(1, HISTORY_PAGE_SIZE + 1)]
+    page = [_extracted(101, message_id, None) for message_id in range(1, MESSAGE_HISTORY_PAGE_LIMIT + 1)]
     record_page(conn, 101, 0, page, observed_at=101)
     assert advance_campaign(conn, now=102) == (101, 1)
 
@@ -206,9 +210,9 @@ def test_terminal_campaign_can_be_reset_then_explicitly_reenrolled(
     with pytest.raises(TopicAttributionCampaignError, match="not_terminal"):
         reset_campaign(conn)
     assert advance_campaign(conn, now=100 + 7 * 24 * 60 * 60) is None
-    assert reset_campaign(conn) == {"previous_terminal_reason": "deadline"}
+    assert reset_campaign(conn) == {"previous_terminal_reason": "expiry"}
     reset_record = next(record for record in caplog.records if record.message.startswith("topic_attribution_campaign_reset"))
-    assert reset_record.getMessage() == "topic_attribution_campaign_reset prior_terminal_reason=deadline"
+    assert reset_record.getMessage() == "topic_attribution_campaign_reset prior_terminal_reason=expiry"
     assert campaign_status(conn)["state"] == "none"
     assert enroll_campaign(conn, [101, 102], now=200)["state"] == "active"
 
@@ -227,3 +231,37 @@ def test_invalid_manifest_is_purely_visible_then_quarantined_by_advance(conn: sq
     assert advance_campaign(conn, now=100) is None
     assert campaign_status(conn)["state"] == "complete"
     assert campaign_status(conn)["terminal_reason"] == "invalid_manifest"
+
+
+def test_campaign_rejects_disabled_enrollment_and_abandons_midflight(conn: sqlite3.Connection) -> None:
+    conn.execute("UPDATE full_history_enrollment SET enabled=0 WHERE dialog_id=101")
+    conn.commit()
+    with pytest.raises(TopicAttributionCampaignError, match="enabled full-history"):
+        enroll_campaign(conn, [101, 102], now=100)
+    conn.execute("UPDATE full_history_enrollment SET enabled=1 WHERE dialog_id=101")
+    conn.commit()
+    enroll_campaign(conn, [101, 102], now=100)
+    conn.execute("UPDATE full_history_enrollment SET enabled=0 WHERE dialog_id=101")
+    conn.commit()
+    assert advance_campaign(conn, now=101) == (102, 0)
+    assert campaign_status(conn)["abandoned_dialogs"] == 1
+
+
+def test_valid_json_with_incomplete_manifest_is_quarantined_on_mutation(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT INTO daemon_state(key,value) VALUES (?,?)",
+        (CAMPAIGN_STATE_KEY, json.dumps({"version": 1, "state": "active", "dialog_ids": [101, 102], "dialogs": {}})),
+    )
+    conn.commit()
+    assert campaign_status(conn)["state"] == "invalid"
+    assert advance_campaign(conn, now=100) is None
+    assert campaign_status(conn)["terminal_reason"] == "invalid_manifest"
+
+
+def test_active_campaign_can_be_aborted_then_reset_for_reenrollment(conn: sqlite3.Connection) -> None:
+    enroll_campaign(conn, [101, 102], now=100)
+    assert abort_campaign(conn) == {"terminal_reason": "operator_abort"}
+    with pytest.raises(TopicAttributionCampaignError, match="not_active"):
+        abort_campaign(conn)
+    assert reset_campaign(conn) == {"previous_terminal_reason": "operator_abort"}
+    assert enroll_campaign(conn, [101, 102], now=200)["state"] == "active"

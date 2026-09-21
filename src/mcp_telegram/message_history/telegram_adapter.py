@@ -11,7 +11,7 @@ from telethon.errors import RPCError  # type: ignore[import-untyped]
 from ..messages.telegram_adapter import PeerNameClient, extract_message_row, resolve_forward_entity_name_map
 from ..telegram_access import ACCESS_LOST_ERRORS
 from .contracts import (
-    HISTORY_PAGE_SIZE,
+    MESSAGE_HISTORY_PAGE_LIMIT,
     ForwardGapPage,
     FullHistoryPage,
     MessageHistoryAccessLostError,
@@ -44,7 +44,7 @@ class TelethonFullHistoryPageAdapter(FullHistoryPagePort):
         try:
             response = await self._client.get_messages(
                 entity=dialog_id,
-                limit=HISTORY_PAGE_SIZE,
+                limit=MESSAGE_HISTORY_PAGE_LIMIT,
                 offset_id=before_message_id,
             )
             raw_messages = tuple(cast(Sequence[object], response))
@@ -90,7 +90,7 @@ class TelethonForwardGapPageAdapter(ForwardGapPagePort):
                 entity=dialog_id,
                 min_id=after_message_id,
                 reverse=True,
-                limit=HISTORY_PAGE_SIZE,
+                limit=MESSAGE_HISTORY_PAGE_LIMIT,
             ):
                 if should_stop():
                     complete = False
@@ -102,7 +102,7 @@ class TelethonForwardGapPageAdapter(ForwardGapPagePort):
             ) from exc
         except (RPCError, TimeoutError, OSError) as exc:
             raise MessageHistoryUnavailableError(f"message history unavailable for dialog {dialog_id}") from exc
-        if len(messages) == HISTORY_PAGE_SIZE:
+        if len(messages) == MESSAGE_HISTORY_PAGE_LIMIT:
             complete = False
         normalized = tuple(extract_message_row(dialog_id, message) for message in messages)
         return ForwardGapPage(messages=normalized, complete=complete)

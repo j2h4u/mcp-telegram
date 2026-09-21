@@ -113,7 +113,13 @@ from .telegram_rpc_scheduler import (
     UnclassifiedTelegramRpcError,
     rpc_scope,
 )
-from .topic_attribution_campaign import TopicAttributionCampaignError, campaign_status, enroll_campaign, reset_campaign
+from .topic_attribution_campaign import (
+    TopicAttributionCampaignError,
+    abort_campaign,
+    campaign_status,
+    enroll_campaign,
+    reset_campaign,
+)
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
 
@@ -981,6 +987,7 @@ class DaemonAPIServer:
             "get_me": self._get_me,
             "mark_dialog_for_sync": self._mark_dialog_for_sync,
             "enroll_topic_attribution_campaign": self._enroll_topic_attribution_campaign,
+            "abort_topic_attribution_campaign": self._abort_topic_attribution_campaign,
             "reset_topic_attribution_campaign": self._reset_topic_attribution_campaign,
             "get_topic_attribution_campaign_status": self._get_topic_attribution_campaign_status,
             "get_sync_status": self._get_sync_status,
@@ -1729,6 +1736,14 @@ class DaemonAPIServer:
     def _get_topic_attribution_campaign_status(self, _req: dict[str, object]) -> dict[str, object]:
         """Expose the temporary campaign's privacy-safe completion receipt."""
         return {"ok": True, "data": campaign_status(self._conn)}
+
+    def _abort_topic_attribution_campaign(self, _req: dict[str, object]) -> dict[str, object]:
+        """Terminalize an active repair so the operator can reset and re-enroll."""
+        try:
+            result = abort_campaign(self._conn)
+        except TopicAttributionCampaignError as exc:
+            return {"ok": False, "error": "topic_attribution_campaign_not_abortable", "message": str(exc)}
+        return {"ok": True, "data": result}
 
     def _reset_topic_attribution_campaign(self, _req: dict[str, object]) -> dict[str, object]:
         """Clear only a terminal repair manifest before explicit re-enrollment."""

@@ -808,6 +808,8 @@ async def test_dialog_light_adapter_clears_one_durable_dirty_flag(conn: sqlite3.
 def _enroll_topic_campaign(conn: sqlite3.Connection) -> None:
     conn.executemany("INSERT INTO dialogs(dialog_id,type) VALUES (?, 'bot')", [(901,), (902,)])
     conn.executemany("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?, 'synced')", [(901,), (902,)])
+    seed_full_history_enrollment(conn, 901, enabled=True)
+    seed_full_history_enrollment(conn, 902, enabled=True)
     conn.commit()
     enroll_campaign(conn, [901, 902])
 

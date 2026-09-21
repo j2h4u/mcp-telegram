@@ -106,6 +106,11 @@ layer = "application"
 depends_on = ["mcp_telegram.telegram_rpc_consumers"]
 
 [[modules]]
+path = "mcp_telegram.topic_attribution_campaign"
+layer = "application"
+depends_on = ["mcp_telegram.history_enrollment", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_bundle"]
+
+[[modules]]
 path = "mcp_telegram.telegram_demand_coordinator"
 layer = "application"
 depends_on = ["mcp_telegram.flood", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
@@ -130,6 +135,7 @@ depends_on = [
     "mcp_telegram.folders.read_model",
     "mcp_telegram.request_timing",
     "mcp_telegram.runtime_observations",
+    "mcp_telegram.topic_attribution_campaign",
     "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler",
 ]
 cannot_depend_on = [
@@ -321,7 +327,7 @@ depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.dialog_classificati
 [[modules]]
 path = "mcp_telegram.sync_worker"
 layer = "application"
-depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.entity_store", "mcp_telegram.flood", "mcp_telegram.history_enrollment", "mcp_telegram.hydration_queue", "mcp_telegram.message_contracts", "mcp_telegram.message_history.contracts", "mcp_telegram.message_history.ports", "mcp_telegram.messages.sqlite_bundle", "mcp_telegram.read_state", "mcp_telegram.resolver", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.entity_store", "mcp_telegram.flood", "mcp_telegram.history_enrollment", "mcp_telegram.topic_attribution_campaign", "mcp_telegram.hydration_queue", "mcp_telegram.message_contracts", "mcp_telegram.message_history.contracts", "mcp_telegram.message_history.ports", "mcp_telegram.messages.sqlite_bundle", "mcp_telegram.read_state", "mcp_telegram.resolver", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
 [[modules]]
 path = "mcp_telegram.delta_sync"
 layer = "application"
@@ -598,7 +604,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.messages.sqlite_bundle"
 layer = "persistence"
-depends_on = ["mcp_telegram.alert_policy", "mcp_telegram.fts", "mcp_telegram.hydration_queue", "mcp_telegram.media_fact", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_hydration_jobs", "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.persistence"]
+depends_on = ["mcp_telegram.alert_policy", "mcp_telegram.dialog_classification", "mcp_telegram.fts", "mcp_telegram.hydration_queue", "mcp_telegram.media_fact", "mcp_telegram.message_contracts", "mcp_telegram.message_history.contracts", "mcp_telegram.messages.sqlite_hydration_jobs", "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.persistence", "mcp_telegram.telegram_rpc_consumers"]
 
 [[modules]]
 path = "mcp_telegram.messages.sqlite_hydration"

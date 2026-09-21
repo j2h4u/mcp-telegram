@@ -179,9 +179,13 @@ enroll <dialog-id> <dialog-id>`; ids are never stored in the repository. Use
 `mcp-telegram topic-attribution status` to read its reconciled counters and
 terminal severity, including failed or abandoned dialogs. A terminal campaign
 can be explicitly cleared with `mcp-telegram topic-attribution reset` before
-a fresh two-dialog enrollment; an active campaign is never reset. The campaign
-is bounded and restart-safe, and PR2 must remove its commands and executor
-after the repair terminates.
+a fresh two-dialog enrollment; an active campaign can first be terminalized with
+`mcp-telegram topic-attribution abort` when enrollment was wrong. The campaign
+is bounded and restart-safe. PR2 must remove its commands, executor, and the
+`topic_attribution_campaign_v1` daemon-state row after the repair terminates.
+A completed receipt is published only when a current full traversal leaves no
+live message with an ambiguous `NULL` topic marker; legal `NULL` members keep
+that receipt partial.
 
 Review recent important access changes:
 
