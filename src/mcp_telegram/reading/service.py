@@ -71,6 +71,7 @@ from .sqlite_projection import (
     _dialog_type_from_db,
     _read_state_for_dialog,
     count_dialog_rows,
+    message_sent_at,
     read_daemon_state_int,
     read_daemon_state_value,
 )
@@ -2107,14 +2108,7 @@ class ReadingService:
         sent_at = self._history_navigation_sent_at(navigation)
         if sent_at is not None or anchor_msg_id is None:
             return sent_at
-        row = _fetchone_row(
-            self._conn.execute(
-                "SELECT sent_at FROM messages WHERE dialog_id = ? AND message_id = ?",
-                (dialog_id, anchor_msg_id),
-            )
-        )
-        values = _row_sequence(row)
-        return _object_to_int_or_none(values[0] if values else None)
+        return message_sent_at(self._conn, dialog_id, anchor_msg_id)
 
     async def _list_messages_non_sent(
         self,

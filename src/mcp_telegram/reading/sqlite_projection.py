@@ -12,6 +12,7 @@ from ..models import DialogType, ReadMessage, ReadState
 from ..sync_read_model import compute_sync_coverage
 
 _SELECT_SYNC_STATUS_SQL = "SELECT status FROM synced_dialogs WHERE dialog_id = ?"
+_MESSAGE_SENT_AT_SQL = "SELECT sent_at FROM messages WHERE dialog_id = ? AND message_id = ?"
 
 
 class _ListMessagesDbRequest(Protocol):
@@ -64,6 +65,12 @@ def read_daemon_state_int(conn: sqlite3.Connection, key: str) -> int | None:
         return int(value)
     except ValueError:
         return None
+
+
+def message_sent_at(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> int | None:
+    """Return a local history cursor's timestamp when the message remains projected."""
+    row = cast(tuple[object] | None, conn.execute(_MESSAGE_SENT_AT_SQL, (dialog_id, message_id)).fetchone())
+    return None if row is None or row[0] is None else int(cast(int | str, row[0]))
 
 
 def _build_access_metadata(
