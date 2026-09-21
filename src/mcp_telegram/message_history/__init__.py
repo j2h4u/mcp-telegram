@@ -6,8 +6,11 @@ from .contracts import (
     FullHistoryPage,
     MessageHistoryAccessLostError,
     MessageHistoryUnavailableError,
+    TopicAttributionMessage,
+    TopicAttributionPage,
+    TopicAttributionPageProjectionError,
 )
-from .ports import ForwardGapPagePort, FullHistoryPagePort
+from .ports import ForwardGapPagePort, FullHistoryPagePort, TopicAttributionPagePort
 
 __all__ = [
     "MESSAGE_HISTORY_PAGE_LIMIT",
@@ -17,4 +20,8 @@ __all__ = [
     "FullHistoryPagePort",
     "MessageHistoryAccessLostError",
     "MessageHistoryUnavailableError",
+    "TopicAttributionMessage",
+    "TopicAttributionPage",
+    "TopicAttributionPagePort",
+    "TopicAttributionPageProjectionError",
 ]

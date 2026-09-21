@@ -57,6 +57,7 @@ from .telegram_rpc_scheduler import (
     current_rpc_scope,
     rpc_attempt_budget,
     rpc_scope,
+    transient_retries_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -342,13 +343,14 @@ class TelegramRpcGate(TelegramClient):
     async def _call_registered(self, request: object, *, ordered: bool) -> object:
         """Run one logical RPC after its root demand context is established."""
         scope = self._require_rpc_scope()
-        for retry_index, delay in enumerate((0.0, *self._transient_retry_delays)):
+        retry_delays = self._transient_retry_delays if transient_retries_enabled() else ()
+        for retry_index, delay in enumerate((0.0, *retry_delays)):
             if retry_index and delay:
                 await asyncio.sleep(delay)
             try:
                 return await self._call_with_source_policy(request, ordered=ordered, scope=scope)
             except TransientRpcErrors:
-                if retry_index >= len(self._transient_retry_delays):
+                if retry_index >= len(retry_delays):
                     raise
                 self._admission_scheduler.record_retry(scope, reason="server_transient")
         raise AssertionError("unreachable")

@@ -108,7 +108,7 @@ depends_on = ["mcp_telegram.telegram_rpc_consumers"]
 [[modules]]
 path = "mcp_telegram.topic_attribution_campaign"
 layer = "application"
-depends_on = ["mcp_telegram.history_enrollment", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_bundle"]
+depends_on = ["mcp_telegram.history_enrollment", "mcp_telegram.message_history.contracts", "mcp_telegram.messages.sqlite_bundle"]
 
 [[modules]]
 path = "mcp_telegram.telegram_demand_coordinator"

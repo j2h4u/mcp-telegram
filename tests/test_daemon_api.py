@@ -4764,7 +4764,7 @@ def test_topic_attribution_campaign_status_route_is_privacy_safe() -> None:
     }
 
 
-def test_topic_attribution_campaign_daemon_route_enrolls_and_resets_only_terminal(tmp_path: Path) -> None:
+def test_topic_attribution_campaign_daemon_route_resumes_operator_abort_and_resets_terminal(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
@@ -4793,6 +4793,9 @@ def test_topic_attribution_campaign_daemon_route_enrolls_and_resets_only_termina
             "data": {"terminal_reason": "operator_abort"},
         }
         assert server._abort_topic_attribution_campaign({})["error"] == "topic_attribution_campaign_not_abortable"
+        assert server._resume_topic_attribution_campaign({}) == {"ok": True, "data": {"resumed_dialogs": 2}}
+        assert offered == [DemandKind.FULL_SYNC_PAGE, DemandKind.FULL_SYNC_PAGE]
+        assert server._abort_topic_attribution_campaign({})["ok"] is True
         reset_after_abort = server._reset_topic_attribution_campaign({})
         assert reset_after_abort == {"ok": True, "data": {"previous_terminal_reason": "operator_abort"}}
         assert server._enroll_topic_attribution_campaign({"dialog_ids": [701, 702]})["ok"] is True
@@ -4803,7 +4806,12 @@ def test_topic_attribution_campaign_daemon_route_enrolls_and_resets_only_termina
         status = cast(dict[str, object], server._get_topic_attribution_campaign_status({})["data"])
         assert status["state"] == "none"
         assert server._enroll_topic_attribution_campaign({"dialog_ids": [701, 702]})["ok"] is True
-        assert offered == [DemandKind.FULL_SYNC_PAGE, DemandKind.FULL_SYNC_PAGE, DemandKind.FULL_SYNC_PAGE]
+        assert offered == [
+            DemandKind.FULL_SYNC_PAGE,
+            DemandKind.FULL_SYNC_PAGE,
+            DemandKind.FULL_SYNC_PAGE,
+            DemandKind.FULL_SYNC_PAGE,
+        ]
     finally:
         conn.close()
 
