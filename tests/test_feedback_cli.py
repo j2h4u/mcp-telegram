@@ -32,7 +32,9 @@ class _FeedbackRowOptions:
 class _FeedbackStatusConn:
     update_feedback_status: AsyncMock
     recover_dialog_directory: AsyncMock
+    enroll_topic_attribution_campaign: AsyncMock
     get_topic_attribution_campaign_status: AsyncMock
+    reset_topic_attribution_campaign: AsyncMock
 
 
 @pytest.fixture
@@ -245,8 +247,11 @@ def test_topic_attribution_campaign_status_cli_routes_to_daemon() -> None:
         "data": {
             "state": "active",
             "terminal_reason": None,
+            "terminal_severity": "none",
             "pending_dialogs": 1,
-            "counts": {"attributed": 3, "no_topic": 0, "no_longer_needed": 2, "unresolved": 4},
+            "failed_dialogs": 0,
+            "abandoned_dialogs": 0,
+            "counts": {"attributed": 3, "no_longer_needed": 2, "unresolved": 4},
         },
     }
     async_cm = MagicMock()
@@ -260,6 +265,35 @@ def test_topic_attribution_campaign_status_cli_routes_to_daemon() -> None:
     assert "state=active" in result.stdout
     assert "attributed=3" in result.stdout
     mock_conn.get_topic_attribution_campaign_status.assert_called_once_with()
+
+
+def test_topic_attribution_campaign_enroll_cli_routes_to_daemon() -> None:
+    mock_conn = cast(_FeedbackStatusConn, AsyncMock())
+    mock_conn.enroll_topic_attribution_campaign.return_value = {"ok": True, "data": {"state": "active"}}
+    async_cm = MagicMock()
+    async_cm.__aenter__ = AsyncMock(return_value=mock_conn)
+    async_cm.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("mcp_telegram.daemon_client.daemon_connection", return_value=async_cm):
+        result = runner.invoke(app, ["topic-attribution", "enroll", "701", "702"])
+
+    assert result.exit_code == 0, result.stdout
+    mock_conn.enroll_topic_attribution_campaign.assert_called_once_with(dialog_ids=[701, 702])
+
+
+def test_topic_attribution_campaign_reset_cli_routes_to_daemon() -> None:
+    mock_conn = cast(_FeedbackStatusConn, AsyncMock())
+    mock_conn.reset_topic_attribution_campaign.return_value = {"ok": True, "data": {"previous_terminal_reason": "deadline"}}
+    async_cm = MagicMock()
+    async_cm.__aenter__ = AsyncMock(return_value=mock_conn)
+    async_cm.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("mcp_telegram.daemon_client.daemon_connection", return_value=async_cm):
+        result = runner.invoke(app, ["topic-attribution", "reset"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "Terminal topic-attribution repair reset" in result.stdout
+    mock_conn.reset_topic_attribution_campaign.assert_called_once_with()
 
 
 def _set_status_direct(db_path: Path, rid: int, status: str) -> None:

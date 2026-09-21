@@ -218,7 +218,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "last_delta_checked_at": {"type": ["integer", "null"]},
                 "sync_coverage_pct": {"type": ["integer", "null"]},
                 "archived_message_count": {"type": ["integer", "null"]},
-                "selection_state": {"type": "string", "enum": ["present", "absent", "unknown"]},
+                "selection_state": {"type": "string", "enum": ["present", "unknown"]},
                 "topic_attribution": {
                     "type": "object",
                     "properties": {
@@ -467,7 +467,7 @@ def _list_messages_coverage(data: dict) -> dict[str, object]:
         "archived_message_count": data.get("archived_message_count"),
     }
     selection_state = data.get("selection_state")
-    if selection_state in {"present", "absent", "unknown"}:
+    if selection_state in {"present", "unknown"}:
         coverage["selection_state"] = selection_state
     topic_attribution = data.get("topic_attribution")
     if isinstance(topic_attribution, dict):

@@ -816,8 +816,12 @@ async def test_topic_attribution_campaign_status_convenience() -> None:
     conn.request = _mock_request  # type: ignore[method-assign]
 
     await conn.get_topic_attribution_campaign_status()
+    await conn.reset_topic_attribution_campaign()
 
-    assert captured == [{"method": "get_topic_attribution_campaign_status"}]
+    assert captured == [
+        {"method": "get_topic_attribution_campaign_status"},
+        {"method": "reset_topic_attribution_campaign"},
+    ]
 
 
 @pytest.mark.asyncio

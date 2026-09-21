@@ -423,6 +423,10 @@ class DaemonConnection:
         """Read the privacy-safe receipt for the temporary topic repair."""
         return await self.request({"method": "get_topic_attribution_campaign_status"})
 
+    async def reset_topic_attribution_campaign(self) -> dict:
+        """Clear a terminal topic repair before explicit re-enrollment."""
+        return await self.request({"method": "reset_topic_attribution_campaign"})
+
     async def list_conversation_changes(  # noqa: PLR0913
         self,
         *,

@@ -668,21 +668,16 @@ class FullSyncDemandAdapter:
             return
         with demand_context(DemandKind.FULL_SYNC_PAGE):
             with rpc_attempt_budget(budget):
-                try:
-                    if self._worker._next_pending_dialog() is not None:
-                        await self._worker.process_one_batch()
-                        if self._worker._last_page_error is not None:
-                            raise self._worker._last_page_error
-                    elif campaign_release_at(self._worker._conn, now=int(time.time())) == 0.0:
-                        await self._worker.process_topic_attribution_campaign_page()
-                    elif self._worker._next_total_messages_repair_dialog() is not None:
-                        await self._worker.repair_one_total_messages()
-                        if self._worker._last_total_repair_error is not None:
-                            raise self._worker._last_total_repair_error
-                    else:
-                        return
-                except RpcAttemptBudgetExhaustedError:
-                    raise
+                if self._worker._next_pending_dialog() is not None:
+                    await self._worker.process_one_batch()
+                    if self._worker._last_page_error is not None:
+                        raise self._worker._last_page_error
+                elif campaign_release_at(self._worker._conn, now=int(time.time())) == 0.0:
+                    await self._worker.process_topic_attribution_campaign_page()
+                elif self._worker._next_total_messages_repair_dialog() is not None:
+                    await self._worker.repair_one_total_messages()
+                    if self._worker._last_total_repair_error is not None:
+                        raise self._worker._last_total_repair_error
 
 
 class FullSyncDmEnrollmentDemandAdapter:

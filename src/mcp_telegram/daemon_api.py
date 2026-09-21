@@ -113,7 +113,7 @@ from .telegram_rpc_scheduler import (
     UnclassifiedTelegramRpcError,
     rpc_scope,
 )
-from .topic_attribution_campaign import TopicAttributionCampaignError, campaign_status, enroll_campaign
+from .topic_attribution_campaign import TopicAttributionCampaignError, campaign_status, enroll_campaign, reset_campaign
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
 
@@ -981,6 +981,7 @@ class DaemonAPIServer:
             "get_me": self._get_me,
             "mark_dialog_for_sync": self._mark_dialog_for_sync,
             "enroll_topic_attribution_campaign": self._enroll_topic_attribution_campaign,
+            "reset_topic_attribution_campaign": self._reset_topic_attribution_campaign,
             "get_topic_attribution_campaign_status": self._get_topic_attribution_campaign_status,
             "get_sync_status": self._get_sync_status,
             "recover_dialog_directory": self._recover_dialog_directory,
@@ -1728,6 +1729,14 @@ class DaemonAPIServer:
     def _get_topic_attribution_campaign_status(self, _req: dict[str, object]) -> dict[str, object]:
         """Expose the temporary campaign's privacy-safe completion receipt."""
         return {"ok": True, "data": campaign_status(self._conn)}
+
+    def _reset_topic_attribution_campaign(self, _req: dict[str, object]) -> dict[str, object]:
+        """Clear only a terminal repair manifest before explicit re-enrollment."""
+        try:
+            result = reset_campaign(self._conn)
+        except TopicAttributionCampaignError as exc:
+            return {"ok": False, "error": "topic_attribution_campaign_not_resettable", "message": str(exc)}
+        return {"ok": True, "data": result}
 
     # ------------------------------------------------------------------
     # get_sync_status

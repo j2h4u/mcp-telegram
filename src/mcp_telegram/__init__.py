@@ -153,10 +153,31 @@ def topic_attribution_campaign_status() -> None:
         counts = cast(dict[str, object], data["counts"])
         print(
             f"state={data['state']} terminal_reason={data['terminal_reason']} "
+            f"terminal_severity={data.get('terminal_severity', 'none')} "
             f"pending_dialogs={data.get('pending_dialogs', 0)} "
-            f"attributed={counts['attributed']} no_topic={counts['no_topic']} "
+            f"failed_dialogs={data.get('failed_dialogs', 0)} abandoned_dialogs={data.get('abandoned_dialogs', 0)} "
+            f"attributed={counts['attributed']} "
             f"no_longer_needed={counts['no_longer_needed']} unresolved={counts['unresolved']}"
         )
+
+    asyncio.run(_run())
+
+
+@topic_attribution_app.command("reset")
+def reset_topic_attribution_campaign() -> None:
+    """Clear a terminal repair manifest before an explicit fresh enrollment."""
+    import sys
+
+    from .daemon_client import daemon_connection
+
+    async def _run() -> None:
+        async with daemon_connection() as conn:
+            response = await conn.reset_topic_attribution_campaign()
+        if response.get("ok"):
+            print("Terminal topic-attribution repair reset; enroll two bot dialogs to start a new campaign.")
+            return
+        print(f"Error: {response.get('message') or response.get('error') or 'unknown error'}")
+        sys.exit(1)
 
     asyncio.run(_run())
 

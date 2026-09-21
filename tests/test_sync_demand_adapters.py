@@ -24,7 +24,12 @@ from mcp_telegram.delta_sync import (
 )
 from mcp_telegram.dialog_sync import DialogLightReconciliationDemandAdapter, DialogReconciliationWorker
 from mcp_telegram.flood import TelegramRpcThrottled
-from mcp_telegram.message_history.contracts import MessageHistoryAccessLostError, MessageHistoryUnavailableError
+from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
+from mcp_telegram.message_history.contracts import (
+    FullHistoryPage,
+    MessageHistoryAccessLostError,
+    MessageHistoryUnavailableError,
+)
 from mcp_telegram.message_history.ports import ForwardGapPagePort, FullHistoryPagePort
 from mcp_telegram.message_history.telegram_adapter import (
     TelethonForwardGapPageAdapter,
@@ -48,7 +53,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcScope,
     current_rpc_scope,
 )
-from mcp_telegram.topic_attribution_campaign import CAMPAIGN_STATE_KEY, enroll_campaign
+from mcp_telegram.topic_attribution_campaign import CAMPAIGN_STATE_KEY, campaign_status, enroll_campaign
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -805,6 +810,73 @@ def _enroll_topic_campaign(conn: sqlite3.Connection) -> None:
     conn.executemany("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?, 'synced')", [(901,), (902,)])
     conn.commit()
     enroll_campaign(conn, [901, 902])
+
+
+def _campaign_message(dialog_id: int, message_id: int, topic_id: int) -> ExtractedMessage:
+    return ExtractedMessage(
+        message=StoredMessage(
+            dialog_id=dialog_id,
+            message_id=message_id,
+            sent_at=1,
+            text="campaign test",
+            sender_id=None,
+            sender_first_name=None,
+            reply_to_msg_id=None,
+            forum_topic_id=topic_id,
+            edit_date=None,
+            grouped_id=None,
+            reply_to_peer_id=None,
+            out=0,
+            is_service=0,
+            post_author=None,
+        ),
+        reply_count=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_campaign_adapter_projects_a_successful_history_page(conn: sqlite3.Connection) -> None:
+    _enroll_topic_campaign(conn)
+    conn.execute(
+        "INSERT INTO messages(dialog_id,message_id,sent_at,text,forum_topic_id,is_deleted) VALUES (?,?,?,?,?,0)",
+        (901, 11, 1, "preserved", None),
+    )
+    conn.commit()
+    observed_scopes: list[TelegramRpcScope] = []
+
+    class SuccessfulPort:
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            observed_scopes.append(current_rpc_scope())
+            assert (dialog_id, before_message_id) == (901, 0)
+            return FullHistoryPage(messages=(_campaign_message(901, 11, 44),), total_messages=None)
+
+    adapter = FullSyncDemandAdapter(FullSyncWorker(cast(FullHistoryPagePort, SuccessfulPort()), conn, asyncio.Event()))
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute("SELECT forum_topic_id FROM messages WHERE dialog_id=901 AND message_id=11").fetchone() == (44,)
+    assert campaign_status(conn)["pending_dialogs"] == 1
+    assert observed_scopes[0].demand_kind is DemandKind.FULL_SYNC_PAGE
+    assert observed_scopes[0].acquisition_kind is AcquisitionKind.MESSAGE_HISTORY_PAGE
+
+
+@pytest.mark.asyncio
+async def test_campaign_adapter_records_access_lost_without_another_acquisition(conn: sqlite3.Connection) -> None:
+    _enroll_topic_campaign(conn)
+    calls: list[tuple[int, int]] = []
+
+    class AccessLostPort:
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            calls.append((dialog_id, before_message_id))
+            raise MessageHistoryAccessLostError("lost", reason_code="ChannelPrivateError")
+
+    adapter = FullSyncDemandAdapter(FullSyncWorker(cast(FullHistoryPagePort, AccessLostPort()), conn, asyncio.Event()))
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert calls == [(901, 0)]
+    assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=901").fetchone() == ("access_lost",)
+    status = campaign_status(conn)
+    assert status["abandoned_dialogs"] == 1
+    assert status["pending_dialogs"] == 1
 
 
 @pytest.mark.asyncio

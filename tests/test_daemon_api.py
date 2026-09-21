@@ -59,6 +59,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     rpc_scope,
 )
 from mcp_telegram.telethon_dialog import classify_dialog_type
+from mcp_telegram.topic_attribution_campaign import advance_campaign
 from mcp_telegram.topics.contracts import TopicFact
 from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
@@ -4751,10 +4752,48 @@ def test_topic_attribution_campaign_status_route_is_privacy_safe() -> None:
         "data": {
             "state": "none",
             "terminal_reason": None,
+            "terminal_severity": "none",
             "dialog_count": 0,
-            "counts": {"attributed": 0, "no_topic": 0, "no_longer_needed": 0, "unresolved": 0},
+            "pending_dialogs": 0,
+            "failed_dialogs": 0,
+            "abandoned_dialogs": 0,
+            "counts": {"attributed": 0, "no_longer_needed": 0, "unresolved": 0},
         },
     }
+
+
+def test_topic_attribution_campaign_daemon_route_enrolls_and_resets_only_terminal(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executemany("INSERT INTO dialogs(dialog_id,type) VALUES (?, 'bot')", [(701,), (702,)])
+        conn.executemany("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?, 'synced')", [(701,), (702,)])
+        conn.commit()
+        server = make_server(conn)
+        offered: list[DemandKind] = []
+
+        class DemandSink:
+            def offer(self, kind: DemandKind) -> bool:
+                offered.append(kind)
+                return True
+
+        server.bind_demand_sink(DemandSink())
+
+        enrolled = server._enroll_topic_attribution_campaign({"dialog_ids": [701, 702]})
+        assert enrolled == {"ok": True, "data": {"state": "active", "dialog_count": 2}}
+        assert offered == [DemandKind.FULL_SYNC_PAGE]
+        assert server._reset_topic_attribution_campaign({})["error"] == "topic_attribution_campaign_not_resettable"
+
+        assert advance_campaign(conn, now=10**10) is None
+        reset = server._reset_topic_attribution_campaign({})
+        assert reset == {"ok": True, "data": {"previous_terminal_reason": "deadline"}}
+        status = cast(dict[str, object], server._get_topic_attribution_campaign_status({})["data"])
+        assert status["state"] == "none"
+        assert server._enroll_topic_attribution_campaign({"dialog_ids": [701, 702]})["ok"] is True
+        assert offered == [DemandKind.FULL_SYNC_PAGE, DemandKind.FULL_SYNC_PAGE]
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

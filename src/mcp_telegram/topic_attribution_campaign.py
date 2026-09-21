@@ -13,6 +13,7 @@ import time
 from collections.abc import Sequence
 from typing import cast
 
+from .dialog_classification import is_bot_dialog_type
 from .message_contracts import ExtractedMessage
 from .message_history.contracts import HISTORY_PAGE_SIZE
 
@@ -24,7 +25,25 @@ CAMPAIGN_DIALOG_COUNT = 2
 CAMPAIGN_MAX_FAILURES_PER_DIALOG = 16
 CAMPAIGN_FAILURE_RETRY_SECONDS = 60
 CAMPAIGN_DEADLINE_SECONDS = 7 * 24 * 60 * 60
-_COUNTER_KEYS = ("attributed", "no_topic", "no_longer_needed", "unresolved")
+_COUNTER_KEYS = ("attributed", "no_longer_needed", "unresolved")
+_TERMINAL_REASON_PRIORITY = {
+    "exhausted": 0,
+    "deadline": 1,
+    "status_ineligible": 2,
+    "access_lost": 3,
+    "failure_limit": 4,
+    "invalid_manifest": 5,
+    "incompatible_manifest": 5,
+}
+_TERMINAL_SEVERITY = {
+    "exhausted": "complete",
+    "status_ineligible": "degraded",
+    "access_lost": "degraded",
+    "deadline": "degraded",
+    "failure_limit": "failed",
+    "invalid_manifest": "failed",
+    "incompatible_manifest": "failed",
+}
 
 
 class TopicAttributionCampaignError(ValueError):
@@ -93,7 +112,7 @@ def enroll_campaign(
                 tuple(ids),
             ).fetchall(),
         )
-        if len(rows) != CAMPAIGN_DIALOG_COUNT or any(str(row[1]).lower() != "bot" for row in rows):
+        if len(rows) != CAMPAIGN_DIALOG_COUNT or any(not is_bot_dialog_type(row[1]) for row in rows):
             raise TopicAttributionCampaignError("each enrolled dialog must currently be a synced bot dialog")
         manifest: dict[str, object] = {
             "version": CAMPAIGN_VERSION,
@@ -106,7 +125,6 @@ def enroll_campaign(
                 str(dialog_id): {
                     "cursor": 0,
                     "failure_attempts": 0,
-                    "success_pages": 0,
                     "next_retry_at": None,
                     "state": "pending",
                     "counts": _empty_counts(),
@@ -123,6 +141,25 @@ def enroll_campaign(
     return manifest
 
 
+def reset_campaign(conn: sqlite3.Connection) -> dict[str, object]:
+    """Remove only a terminal manifest before an explicit fresh enrollment."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        manifest = _load(conn)
+        if manifest is None:
+            raise TopicAttributionCampaignError("campaign_not_found")
+        if manifest.get("state") != "complete":
+            raise TopicAttributionCampaignError("campaign_is_not_terminal")
+        reason = str(manifest.get("terminal_reason") or "exhausted")
+        conn.execute("DELETE FROM daemon_state WHERE key=?", (CAMPAIGN_STATE_KEY,))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    logger.info("topic_attribution_campaign_reset prior_terminal_reason=%s", reason)
+    return {"previous_terminal_reason": reason}
+
+
 def campaign_release_at(conn: sqlite3.Connection, *, now: int) -> float | None:
     """Pure readiness projection for the durable adapter status method."""
     try:
@@ -133,12 +170,13 @@ def campaign_release_at(conn: sqlite3.Connection, *, now: int) -> float | None:
         return None
     if int(cast(int | str, manifest["deadline_at"])) <= now:
         return 0.0
-    pending = _next_pending(manifest)
-    if pending is None:
-        return 0.0
-    _dialog_id, item = pending
-    retry_at = item.get("next_retry_at")
-    return 0.0 if retry_at is None or int(cast(int | str, retry_at)) <= now else float(cast(int | str, retry_at))
+    retry_times: list[float] = []
+    for _dialog_id, item in _pending_items(manifest):
+        retry_at = item.get("next_retry_at")
+        if retry_at is None or int(cast(int | str, retry_at)) <= now:
+            return 0.0
+        retry_times.append(float(cast(int | str, retry_at)))
+    return min(retry_times, default=0.0)
 
 
 def advance_campaign(conn: sqlite3.Connection, *, now: int) -> tuple[int, int] | None:
@@ -157,25 +195,33 @@ def advance_campaign(conn: sqlite3.Connection, *, now: int) -> tuple[int, int] |
             conn.commit()
             _log_terminal(manifest)
             return None
-        while (pending := _next_pending(manifest)) is not None:
-            dialog_id, item = pending
-            retry_at = item.get("next_retry_at")
-            if retry_at is not None and int(cast(int | str, retry_at)) > now:
+        while True:
+            pending = _pending_items(manifest)
+            if not pending:
+                _finish(conn, manifest, "exhausted", now)
+                conn.commit()
+                _log_terminal(manifest)
+                return None
+            changed = False
+            for dialog_id, item in pending:
+                retry_at = item.get("next_retry_at")
+                if retry_at is not None and int(cast(int | str, retry_at)) > now:
+                    continue
+                status = cast(
+                    tuple[object] | None,
+                    conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone(),
+                )
+                if status is not None and status[0] == "synced":
+                    conn.commit()
+                    return dialog_id, int(cast(int | str, item["cursor"]))
+                reason = "access_lost" if status is not None and status[0] == "access_lost" else "status_ineligible"
+                item["state"] = "done"
+                item["last_error"] = reason
+                item["terminal_reason"] = reason
+                changed = True
+            if not changed:
                 conn.commit()
                 return None
-            status = cast(
-                tuple[object] | None,
-                conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone(),
-            )
-            if status is not None and status[0] == "synced":
-                conn.commit()
-                return dialog_id, int(cast(int | str, item["cursor"]))
-            item["state"] = "done"
-            item["last_error"] = "status_ineligible"
-        _finish(conn, manifest, "exhausted", now)
-        conn.commit()
-        _log_terminal(manifest)
-        return None
     except BaseException:
         conn.rollback()
         raise
@@ -196,24 +242,28 @@ def record_page(
         counts = cast(dict[str, int], item["counts"])
         for extracted in messages:
             message = extracted.message
+            local = cast(
+                tuple[object, object] | None,
+                conn.execute(
+                    "SELECT forum_topic_id,is_deleted FROM messages WHERE dialog_id=? AND message_id=?",
+                    (dialog_id, message.message_id),
+                ).fetchone(),
+            )
+            if local is None:
+                counts["unresolved"] += 1
+                continue
+            if local[0] is not None or local[1] != 0:
+                counts["no_longer_needed"] += 1
+                continue
             if message.forum_topic_id is None:
-                exists = cast(
-                    tuple[object] | None,
-                    conn.execute(
-                        "SELECT 1 FROM messages WHERE dialog_id=? AND message_id=? "
-                        "AND forum_topic_id IS NULL AND is_deleted=0",
-                        (dialog_id, message.message_id),
-                    ).fetchone(),
-                )
-                counts["unresolved" if exists is not None else "no_longer_needed"] += 1
+                counts["unresolved"] += 1
                 continue
             updated = conn.execute(
                 "UPDATE messages SET forum_topic_id=? WHERE dialog_id=? AND message_id=? "
                 "AND forum_topic_id IS NULL AND is_deleted=0",
                 (message.forum_topic_id, dialog_id, message.message_id),
             ).rowcount
-            counts["attributed" if updated else "no_longer_needed"] += 1
-        item["success_pages"] = int(cast(int | str, item["success_pages"])) + 1
+            counts["attributed" if updated else "unresolved"] += 1
         item["failure_attempts"] = 0
         item["next_retry_at"] = None
         if messages:
@@ -235,9 +285,8 @@ def record_page(
         conn.rollback()
         raise
     logger.info(
-        "topic_attribution_campaign_page_result attributed=%d no_topic=%d no_longer_needed=%d unresolved=%d",
+        "topic_attribution_campaign_page_result attributed=%d no_longer_needed=%d unresolved=%d",
         counts["attributed"],
-        counts["no_topic"],
         counts["no_longer_needed"],
         counts["unresolved"],
     )
@@ -277,6 +326,7 @@ def record_access_lost(conn: sqlite3.Connection, dialog_id: int, checkpoint: int
         manifest, item = _require_active_dialog(conn, dialog_id, checkpoint)
         item["state"] = "done"
         item["last_error"] = "access_lost"
+        item["terminal_reason"] = "access_lost"
         terminal = _next_pending(manifest) is None
         if terminal:
             _finish(conn, manifest, "exhausted", observed_at)
@@ -296,9 +346,27 @@ def campaign_status(conn: sqlite3.Connection) -> dict[str, object]:
     try:
         manifest = _load(conn)
     except TopicAttributionCampaignError as exc:
-        return {"state": "invalid", "terminal_reason": str(exc), "dialog_count": 0, "counts": _empty_counts()}
+        return {
+            "state": "invalid",
+            "terminal_reason": str(exc),
+            "terminal_severity": "failed",
+            "dialog_count": 0,
+            "pending_dialogs": 0,
+            "failed_dialogs": 0,
+            "abandoned_dialogs": 0,
+            "counts": _empty_counts(),
+        }
     if manifest is None:
-        return {"state": "none", "terminal_reason": None, "dialog_count": 0, "counts": _empty_counts()}
+        return {
+            "state": "none",
+            "terminal_reason": None,
+            "terminal_severity": "none",
+            "dialog_count": 0,
+            "pending_dialogs": 0,
+            "failed_dialogs": 0,
+            "abandoned_dialogs": 0,
+            "counts": _empty_counts(),
+        }
     return _status_from_manifest(manifest)
 
 
@@ -323,6 +391,7 @@ def _record_error(  # noqa: PLR0913
                 cast(int | str, manifest["max_failures_per_dialog"])
             ):
                 item["state"] = "done"
+                item["terminal_reason"] = "failure_limit"
         terminal = _next_pending(manifest) is None
         if terminal:
             _finish(conn, manifest, "failure_limit", observed_at)
@@ -356,15 +425,20 @@ def _require_active_dialog(
     return manifest, cast(dict[str, object], item)
 
 
-def _next_pending(manifest: dict[str, object]) -> tuple[int, dict[str, object]] | None:
+def _pending_items(manifest: dict[str, object]) -> list[tuple[int, dict[str, object]]]:
     dialogs = manifest.get("dialogs")
     if not isinstance(dialogs, dict):
-        return None
+        return []
+    pending: list[tuple[int, dict[str, object]]] = []
     for dialog_id in cast(list[int], manifest.get("dialog_ids", [])):
         item = dialogs.get(str(dialog_id))
         if isinstance(item, dict) and item.get("state") == "pending":
-            return dialog_id, cast(dict[str, object], item)
-    return None
+            pending.append((dialog_id, cast(dict[str, object], item)))
+    return pending
+
+
+def _next_pending(manifest: dict[str, object]) -> tuple[int, dict[str, object]] | None:
+    return next(iter(_pending_items(manifest)), None)
 
 
 def _finish(conn: sqlite3.Connection, manifest: dict[str, object], reason: str, completed_at: int) -> None:
@@ -372,7 +446,7 @@ def _finish(conn: sqlite3.Connection, manifest: dict[str, object], reason: str, 
         if item.get("state") == "pending":
             item["state"] = "done"
     manifest["state"] = "complete"
-    manifest["terminal_reason"] = reason
+    manifest["terminal_reason"] = _most_severe_terminal_reason(manifest, reason)
     manifest["completed_at"] = completed_at
     _save(conn, manifest)
 
@@ -402,13 +476,20 @@ def _status_from_manifest(manifest: dict[str, object]) -> dict[str, object]:
     dialogs = cast(dict[str, dict[str, object]], manifest["dialogs"])
     totals = _empty_counts()
     for item in dialogs.values():
-        for key, value in cast(dict[str, int], item["counts"]).items():
-            totals[key] += value
+        item_counts = cast(dict[str, object], item.get("counts", {}))
+        for key in _COUNTER_KEYS:
+            totals[key] += int(cast(int | str, item_counts.get(key, 0)))
+    terminal_reason = manifest.get("terminal_reason")
     return {
         "state": manifest.get("state"),
-        "terminal_reason": manifest.get("terminal_reason"),
+        "terminal_reason": terminal_reason,
+        "terminal_severity": _TERMINAL_SEVERITY.get(str(terminal_reason), "none"),
         "dialog_count": len(dialogs),
         "pending_dialogs": sum(item.get("state") == "pending" for item in dialogs.values()),
+        "failed_dialogs": sum(item.get("terminal_reason") == "failure_limit" for item in dialogs.values()),
+        "abandoned_dialogs": sum(
+            item.get("terminal_reason") in {"access_lost", "status_ineligible"} for item in dialogs.values()
+        ),
         "counts": totals,
     }
 
@@ -417,10 +498,17 @@ def _log_terminal(manifest: dict[str, object]) -> None:
     status = _status_from_manifest(manifest)
     counts = cast(dict[str, int], status["counts"])
     logger.info(
-        "topic_attribution_campaign_terminal reason=%s attributed=%d no_topic=%d no_longer_needed=%d unresolved=%d",
+        "topic_attribution_campaign_terminal reason=%s severity=%s attributed=%d no_longer_needed=%d unresolved=%d",
         status["terminal_reason"],
+        status["terminal_severity"],
         counts["attributed"],
-        counts["no_topic"],
         counts["no_longer_needed"],
         counts["unresolved"],
     )
+
+
+def _most_severe_terminal_reason(manifest: dict[str, object], requested: str) -> str:
+    dialogs = cast(dict[str, dict[str, object]], manifest["dialogs"])
+    reasons = [requested]
+    reasons.extend(str(item["terminal_reason"]) for item in dialogs.values() if "terminal_reason" in item)
+    return max(reasons, key=lambda reason: _TERMINAL_REASON_PRIORITY.get(reason, 0))

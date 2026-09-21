@@ -176,9 +176,12 @@ This release also has a temporary, deployment-local
 repair for the two production-confirmed synced bot dialogs. An operator enrolls
 those ids through the running daemon with `mcp-telegram topic-attribution
 enroll <dialog-id> <dialog-id>`; ids are never stored in the repository. Use
-`mcp-telegram topic-attribution status` to read its reconciled counters. The
-campaign is bounded and restart-safe, and PR2 must remove its command and
-executor after the repair terminates.
+`mcp-telegram topic-attribution status` to read its reconciled counters and
+terminal severity, including failed or abandoned dialogs. A terminal campaign
+can be explicitly cleared with `mcp-telegram topic-attribution reset` before
+a fresh two-dialog enrollment; an active campaign is never reset. The campaign
+is bounded and restart-safe, and PR2 must remove its commands and executor
+after the repair terminates.
 
 Review recent important access changes:
 

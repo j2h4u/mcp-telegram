@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
@@ -18,8 +20,10 @@ from mcp_telegram.topic_attribution_campaign import (
     campaign_release_at,
     campaign_status,
     enroll_campaign,
+    record_access_lost,
     record_failed_attempt,
     record_page,
+    reset_campaign,
 )
 
 
@@ -85,7 +89,13 @@ def test_campaign_updates_only_live_null_topic_and_keeps_remote_omission_unresol
         conn,
         101,
         0,
-        [_extracted(101, 11, 7), _extracted(101, 12, 8), _extracted(101, 13, 9), _extracted(101, 14, None)],
+        [
+            _extracted(101, 11, 7),
+            _extracted(101, 12, 8),
+            _extracted(101, 13, 9),
+            _extracted(101, 14, None),
+            _extracted(101, 15, 10),
+        ],
         observed_at=102,
     )
 
@@ -102,7 +112,8 @@ def test_campaign_updates_only_live_null_topic_and_keeps_remote_omission_unresol
     item = dialogs["101"]
     assert isinstance(item, dict)
     counts = item["counts"]
-    assert counts == {"attributed": 1, "no_topic": 0, "no_longer_needed": 2, "unresolved": 1}
+    assert counts == {"attributed": 1, "no_longer_needed": 2, "unresolved": 2}
+    assert "success_pages" not in item
     assert conn.execute(
         "SELECT topic_attribution_state,topic_attribution_completed_at FROM synced_dialogs WHERE dialog_id=101"
     ).fetchone() == ("partial", None)
@@ -121,9 +132,18 @@ def test_campaign_expiry_is_pure_until_advance_then_restart_safe(conn: sqlite3.C
 def test_failure_keeps_checkpoint_and_delays_retry(conn: sqlite3.Connection) -> None:
     enroll_campaign(conn, [101, 102], now=100)
     record_failed_attempt(conn, 101, 0, reason="MessageHistoryUnavailableError", observed_at=110)
+    assert advance_campaign(conn, now=111) == (102, 0)
+    record_page(conn, 102, 0, (), observed_at=111)
     assert campaign_release_at(conn, now=111) == 170.0
     assert advance_campaign(conn, now=111) is None
     assert advance_campaign(conn, now=170) == (101, 0)
+
+
+def test_ready_second_dialog_is_not_blocked_by_delayed_first_dialog(conn: sqlite3.Connection) -> None:
+    enroll_campaign(conn, [101, 102], now=100)
+    record_failed_attempt(conn, 101, 0, reason="MessageHistoryUnavailableError", observed_at=100)
+    assert campaign_release_at(conn, now=101) == 0.0
+    assert advance_campaign(conn, now=101) == (102, 0)
 
 
 def test_successful_full_page_keeps_resumable_cursor_without_page_cap(conn: sqlite3.Connection) -> None:
@@ -138,6 +158,65 @@ def test_access_lost_status_is_skipped_without_history_acquisition(conn: sqlite3
     conn.execute("UPDATE synced_dialogs SET status='access_lost' WHERE dialog_id=101")
     conn.commit()
     assert advance_campaign(conn, now=101) == (102, 0)
+
+
+def test_terminal_status_preserves_access_loss_over_exhausted(conn: sqlite3.Connection) -> None:
+    enroll_campaign(conn, [101, 102], now=100)
+    record_access_lost(conn, 101, 0, observed_at=101)
+    record_page(conn, 102, 0, (), observed_at=102)
+
+    assert campaign_status(conn) == {
+        "state": "complete",
+        "terminal_reason": "access_lost",
+        "terminal_severity": "degraded",
+        "dialog_count": 2,
+        "pending_dialogs": 0,
+        "failed_dialogs": 0,
+        "abandoned_dialogs": 1,
+        "counts": {"attributed": 0, "no_longer_needed": 0, "unresolved": 0},
+    }
+
+
+def test_failure_limit_is_visible_in_terminal_status(conn: sqlite3.Connection) -> None:
+    manifest = enroll_campaign(conn, [101, 102], now=100)
+    manifest["max_failures_per_dialog"] = 1
+    conn.execute(
+        "UPDATE daemon_state SET value=? WHERE key=?",
+        (json.dumps(manifest), CAMPAIGN_STATE_KEY),
+    )
+    conn.commit()
+    record_failed_attempt(conn, 101, 0, reason="MessageHistoryUnavailableError", observed_at=101)
+
+    status = campaign_status(conn)
+    assert status["state"] == "active"
+    assert status["failed_dialogs"] == 1
+    assert advance_campaign(conn, now=102) == (102, 0)
+    record_page(conn, 102, 0, (), observed_at=103)
+    status = campaign_status(conn)
+    assert status["terminal_reason"] == "failure_limit"
+    assert status["terminal_severity"] == "failed"
+    assert status["failed_dialogs"] == 1
+
+
+def test_terminal_campaign_can_be_reset_then_explicitly_reenrolled(
+    conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="mcp_telegram.topic_attribution_campaign")
+    enroll_campaign(conn, [101, 102], now=100)
+    with pytest.raises(TopicAttributionCampaignError, match="not_terminal"):
+        reset_campaign(conn)
+    assert advance_campaign(conn, now=100 + 7 * 24 * 60 * 60) is None
+    assert reset_campaign(conn) == {"previous_terminal_reason": "deadline"}
+    reset_record = next(record for record in caplog.records if record.message.startswith("topic_attribution_campaign_reset"))
+    assert reset_record.getMessage() == "topic_attribution_campaign_reset prior_terminal_reason=deadline"
+    assert campaign_status(conn)["state"] == "none"
+    assert enroll_campaign(conn, [101, 102], now=200)["state"] == "active"
+
+
+def test_campaign_eligibility_uses_canonical_bot_dialog_type(conn: sqlite3.Connection) -> None:
+    conn.execute("UPDATE dialogs SET type='Bot' WHERE dialog_id=102")
+    conn.commit()
+    assert enroll_campaign(conn, [101, 102], now=100)["state"] == "active"
 
 
 def test_invalid_manifest_is_purely_visible_then_quarantined_by_advance(conn: sqlite3.Connection) -> None:
