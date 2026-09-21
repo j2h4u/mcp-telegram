@@ -39,6 +39,7 @@ REQUIRED_POLICY_FIELDS = {
     "user_directory_ttl_seconds",
     "group_directory_ttl_seconds",
     "resolver_enrichment_ttl_seconds",
+    "draft_response_budget_bytes",
     "telemetry",
 }
 REQUIRED_POLICY_SINKS = {

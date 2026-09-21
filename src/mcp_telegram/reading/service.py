@@ -82,7 +82,6 @@ _TRACE_ACRONYM_MIN_LEN = 2
 _TRACE_ACRONYM_MAX_LEN = 4
 _TRACE_FUZZY_MIN_LEN = 4
 _TRACE_FUZZY_SCORE_MIN = 75
-_DRAFT_RESPONSE_BUDGET_BYTES = 256 * 1024
 
 
 class LoggerLike(Protocol):
@@ -190,6 +189,7 @@ class ReadingDeps:
     logger: LoggerLike
     rid: Callable[[], str]
     deleted_message_visibility_seconds: int
+    draft_response_budget_bytes: int
     resolve_dialog_id_local: Callable[[DialogSelector], Awaitable[int | dict]] | None = None
 
 
@@ -1857,8 +1857,7 @@ class ReadingService:
             draft_fingerprint=fingerprint,
         )
 
-    @staticmethod
-    def _bounded_draft_page(candidates: list[DraftReadRecord]) -> tuple[list[DraftReadRecord], bool]:
+    def _bounded_draft_page(self, candidates: list[DraftReadRecord]) -> tuple[list[DraftReadRecord], bool]:
         """Keep complete draft rows within the structured response byte budget."""
         page: list[DraftReadRecord] = []
         payload_bytes = 0
@@ -1866,7 +1865,7 @@ class ReadingService:
             row_bytes = len(
                 json.dumps(ReadingService._draft_wire_row(record), ensure_ascii=False, separators=(",", ":")).encode()
             )
-            if page and payload_bytes + row_bytes > _DRAFT_RESPONSE_BUDGET_BYTES:
+            if page and payload_bytes + row_bytes > self._deps.draft_response_budget_bytes:
                 return page, True
             page.append(record)
             payload_bytes += row_bytes

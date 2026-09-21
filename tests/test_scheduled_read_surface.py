@@ -97,6 +97,8 @@ async def test_draft_response_budget_keeps_complete_rows_reachable(message_state
     conn.execute("INSERT INTO draft_sync_state VALUES (7, 'ready', 'complete', 100, 101, NULL)")
     conn.commit()
 
+    assert server._get_reading_service()._deps.draft_response_budget_bytes == 256 * 1024
+
     first = await server._list_messages({"dialog_id": 1, "message_state": message_state, "limit": 5})
 
     assert first["data"]["truncation"] == {

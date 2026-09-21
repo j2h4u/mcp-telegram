@@ -389,6 +389,13 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ResponseConfig:
+    """Bounded response policy for locally projected MCP reads."""
+
+    draft_response_budget_bytes: int = 256 * 1024
+
+
+@dataclass(frozen=True, slots=True)
 class HttpServerConfig:
     """HTTP transport settings, including safe local-only defaults."""
 
@@ -435,6 +442,7 @@ class McpTelegramConfig:
     telegram_rpc: TelegramRpcConfig = field(default_factory=TelegramRpcConfig)
     entity_profile: EntityProfileConfig = field(default_factory=EntityProfileConfig)
     scheduling: SchedulingConfig = field(default_factory=SchedulingConfig)
+    response: ResponseConfig = field(default_factory=ResponseConfig)
     http: HttpServerConfig = field(default_factory=HttpServerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
@@ -1062,6 +1070,20 @@ def _parse_telemetry(data: dict[str, object], path: Path) -> TelemetryConfig:
     )
 
 
+def _parse_response(data: dict[str, object], path: Path) -> ResponseConfig:
+    response_data = _optional_section(data, "response", {"draft_response_budget_bytes"}, path)
+    defaults = ResponseConfig()
+    return ResponseConfig(
+        draft_response_budget_bytes=_positive_int(
+            response_data,
+            "draft_response_budget_bytes",
+            "response",
+            path,
+            defaults.draft_response_budget_bytes,
+        )
+    )
+
+
 def _parse_flood_wait(data: dict[str, object], path: Path) -> FloodWaitConfig:
     flood_data = _optional_section(
         data,
@@ -1665,6 +1687,7 @@ def load_config(path: Path | None = None) -> McpTelegramConfig:
             "telegram_rpc",
             "entity_profile",
             "scheduling",
+            "response",
             "http",
             "logging",
         },
@@ -1679,6 +1702,7 @@ def load_config(path: Path | None = None) -> McpTelegramConfig:
         telegram_rpc=_parse_telegram_rpc(data, config_path),
         entity_profile=_parse_entity_profile(data, config_path),
         scheduling=_parse_scheduling(data, config_path),
+        response=_parse_response(data, config_path),
         http=_parse_http(data, config_path),
         logging=_parse_logging(data, config_path),
     )

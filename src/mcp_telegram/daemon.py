@@ -1125,6 +1125,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
             folder_snapshot_stale_after_seconds=config.scheduling.folder_projection.stale_threshold_seconds,
             telemetry=config.telemetry,
             slow_request_seconds=config.logging.daemon_api_slow_request_seconds,
+            draft_response_budget_bytes=config.response.draft_response_budget_bytes,
             entity_profile=RefreshLimits(
                 foreground_resolve_seconds=config.entity_profile.foreground_resolve_seconds,
                 foreground_refresh_wait_seconds=config.entity_profile.foreground_refresh_wait_seconds,

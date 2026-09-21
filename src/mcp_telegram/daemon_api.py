@@ -298,6 +298,7 @@ class DaemonApiPolicy:
     folder_snapshot_stale_after_seconds: int
     telemetry: TelemetryPolicy
     slow_request_seconds: float
+    draft_response_budget_bytes: int
     entity_profile: RefreshLimits
     full_user_pair_enabled: bool = False
 
@@ -692,6 +693,7 @@ class DaemonAPIServer:
                     logger=cast(_LoggerLike, logger),
                     rid=_rid,
                     deleted_message_visibility_seconds=self._policy.deleted_message_visibility_seconds,
+                    draft_response_budget_bytes=self._policy.draft_response_budget_bytes,
                 )
             )
         return self._reading_service
