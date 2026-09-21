@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import cast
 
@@ -80,10 +81,11 @@ def test_list_messages_projects_draft_without_sent_identity() -> None:
     }
 
     projected = _list_messages_structured_messages([row])[0]
+    content = cast(Mapping[str, object], projected["content"])
 
     assert projected["message_state"] == "draft"
     assert "msg_id" not in projected and "sent_at" not in projected
-    assert projected["content"]["is_telegram_content"] is True
+    assert content["is_telegram_content"] is True
     validate(instance=projected, schema=DRAFT_MESSAGE_VIEW_SCHEMA)
 
 

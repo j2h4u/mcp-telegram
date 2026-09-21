@@ -84,15 +84,16 @@ async def test_list_messages_draft_is_local_and_has_no_sent_identity() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("message_state", ["draft", "all"])
 async def test_natural_draft_dialog_resolution_never_falls_through_to_telegram(message_state: str) -> None:
+    get_entity = AsyncMock(side_effect=AssertionError("draft selector must remain local"))
     client = MagicMock()
-    client.get_entity = AsyncMock(side_effect=AssertionError("draft selector must remain local"))
+    client.get_entity = get_entity
     server = make_server(client=client)
 
     result = await server._list_messages({"dialog": "@not_cached", "message_state": message_state})
 
     assert result["ok"] is False
     assert result["error"] in {"dialog_directory_incomplete", "dialog_not_found", "stale_local_directory"}
-    client.get_entity.assert_not_awaited()
+    get_entity.assert_not_awaited()
 
 
 @pytest.mark.asyncio
