@@ -82,11 +82,12 @@ def test_list_messages_projects_draft_without_sent_identity() -> None:
 
     projected = _list_messages_structured_messages([row])[0]
     content = cast(Mapping[str, object], projected["content"])
+    composition = cast(Mapping[str, object], projected["composition"])
 
     assert projected["message_state"] == "draft"
     assert "msg_id" not in projected and "sent_at" not in projected
-    assert projected["composition"]["no_webpage"] is None
-    assert projected["composition"]["invert_media"] is None
+    assert composition["no_webpage"] is None
+    assert composition["invert_media"] is None
     assert content["is_telegram_content"] is True
     validate(instance=projected, schema=DRAFT_MESSAGE_VIEW_SCHEMA)
 

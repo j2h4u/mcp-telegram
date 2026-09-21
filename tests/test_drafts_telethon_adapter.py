@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 from telethon.tl import types  # type: ignore[import-untyped]
@@ -62,7 +63,7 @@ def test_oversized_normalized_entity_json_fails_closed() -> None:
         types.DraftMessage(
             "draft",
             datetime(2026, 1, 1, tzinfo=UTC),
-            entities=[types.MessageEntityPre(0, 1, "я" * 80)] * 1024,
+            entities=cast(list[types.TypeMessageEntity], [types.MessageEntityPre(0, 1, "я" * 80)] * 1024),
         ),
     )
 
