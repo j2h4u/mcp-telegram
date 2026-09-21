@@ -10,6 +10,7 @@ from typing import cast
 
 import pytest
 
+from mcp_telegram.config import DraftRecoveryConfig
 from mcp_telegram.drafts.contracts import (
     DraftComposition,
     DraftDisposition,
@@ -27,7 +28,7 @@ def projection(tmp_path: Path) -> Iterator[tuple[sqlite3.Connection, SQLiteDraft
     database = tmp_path / "sync.db"
     ensure_sync_schema(database)
     conn = sqlite3.connect(database)
-    repository = SQLiteDraftProjection(conn)
+    repository = SQLiteDraftProjection(conn, DraftRecoveryConfig())
     repository.bind_account(100)
     try:
         yield conn, repository

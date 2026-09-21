@@ -11,6 +11,7 @@ import pytest
 from mcp_telegram.config import (
     ActivityHotSweepConfig,
     ConfigError,
+    DraftRecoveryConfig,
     EntitiesConfig,
     EntityProfileConfig,
     FactHydrationConfig,
@@ -237,6 +238,9 @@ retry_cap_seconds = 900
 warning_failure_threshold = 3
 stale_after_seconds = 46
 
+[scheduling.draft_recovery]
+retry_delays_seconds = [2, 4, 8]
+
 [telemetry]
 retention_ttl_seconds = 47
 
@@ -362,6 +366,7 @@ daemon_api_slow_request_seconds = 2.5
             circuit_retry_seconds=1801,
             max_attempts=4,
         ),
+        draft_recovery=DraftRecoveryConfig(retry_delays_seconds=(2, 4, 8)),
         folder_projection=FolderProjectionConfig(stale_after_seconds=46),
     )
     assert config.http == HttpServerConfig(host="localhost", port=3200)

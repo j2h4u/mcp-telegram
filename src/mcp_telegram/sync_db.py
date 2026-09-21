@@ -40,7 +40,7 @@ _READ_DATE_EXPIRY_CUTOFF_MIGRATION_71 = 71
 _TOPIC_ATTRIBUTION_RECEIPT_MIGRATION_72 = 72
 _REMOVE_TOPIC_ATTRIBUTION_CAMPAIGN_MIGRATION_73 = 73
 _DRAFT_PROJECTION_CUTOVER_MIGRATION_74 = 74
-_DRAFT_RECOVERY_BACKOFF_MIGRATION_75 = 75
+_DRAFT_RECOVERY_SCHEMA_75 = 75
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
@@ -4378,7 +4378,7 @@ def _apply_migration_75(conn: sqlite3.Connection, current: int) -> int:
     return _apply_migration(
         conn,
         current,
-        _DRAFT_RECOVERY_BACKOFF_MIGRATION_75,
+        _DRAFT_RECOVERY_SCHEMA_75,
         [
             (
                 "ALTER TABLE draft_projection_runtime ADD COLUMN recovery_failure_count INTEGER NOT NULL DEFAULT 0 "
@@ -4456,7 +4456,7 @@ def _apply_migrations_72_to_75(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_73(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _DRAFT_PROJECTION_CUTOVER_MIGRATION_74:
         current = _apply_migration_74(conn, current)
-    if _CURRENT_SCHEMA_VERSION >= _DRAFT_RECOVERY_BACKOFF_MIGRATION_75:
+    if _CURRENT_SCHEMA_VERSION >= _DRAFT_RECOVERY_SCHEMA_75:
         current = _apply_migration_75(conn, current)
     return current
 

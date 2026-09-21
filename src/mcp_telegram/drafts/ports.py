@@ -39,10 +39,17 @@ class DraftProjectionRepository(Protocol):
     def rearm_recovery(self, *, reason: str, now: float) -> None: ...
 
 
+class DraftRecoveryScheduling(Protocol):
+    """Injected retry schedule for durable draft recovery."""
+
+    @property
+    def retry_delays_seconds(self) -> tuple[int, ...]: ...
+
+
 class DraftSnapshotGateway(Protocol):
     """One classified scalar acquisition of all account draft observations."""
 
     async def fetch_all_drafts(self) -> tuple[SnapshotCoverage, tuple[DraftObservation, ...]]: ...
 
 
-__all__ = ["DraftProjectionRepository", "DraftSnapshotGateway"]
+__all__ = ["DraftProjectionRepository", "DraftRecoveryScheduling", "DraftSnapshotGateway"]

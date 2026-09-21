@@ -20,12 +20,10 @@ from mcp_telegram.drafts.contracts import (
     DraftScope,
     SnapshotCoverage,
 )
+from mcp_telegram.drafts.ports import DraftRecoveryScheduling
 
 _NORMALIZATION_VERSION = 1
 _MAX_RECOVERY_REASON_LENGTH = 256
-_RECOVERY_BACKOFF_BASE_SECONDS = 1
-_RECOVERY_BACKOFF_MAX_SECONDS = 60
-_RECOVERY_BACKOFF_MAX_FAILURES = 6
 _CURRENT_VALUE_COLUMNS = (
     "state",
     "text",
@@ -53,8 +51,9 @@ class DraftAccountFenceError(RuntimeError):
 class SQLiteDraftProjection:
     """Persist current drafts with account fencing and snapshot revision fences."""
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, recovery_scheduling: DraftRecoveryScheduling) -> None:
         self._conn = conn
+        self._recovery_scheduling = recovery_scheduling
 
     def bind_account(self, account_id: int) -> None:
         """Bind this writer runtime to one authenticated Telegram account."""
@@ -278,16 +277,15 @@ class SQLiteDraftProjection:
                 raise DraftAccountFenceError("draft recovery requires a bound account")
             if isinstance(row[1], bool) or not isinstance(row[1], int) or row[1] < 0:
                 raise RuntimeError("draft recovery failure count is invalid")
-            failures = row[1]
-            if failures > _RECOVERY_BACKOFF_MAX_FAILURES:
-                failures = _RECOVERY_BACKOFF_MAX_FAILURES
-            delay = _RECOVERY_BACKOFF_BASE_SECONDS * (1 << failures)
-            if delay > _RECOVERY_BACKOFF_MAX_SECONDS:
-                delay = _RECOVERY_BACKOFF_MAX_SECONDS
+            schedule = self._recovery_scheduling.retry_delays_seconds
+            if not schedule:
+                raise RuntimeError("draft recovery retry schedule is empty")
+            schedule_index = min(row[1], len(schedule) - 1)
+            delay = schedule[schedule_index]
             self._set_recovery_needed(
                 reason,
                 now_int + delay,
-                failure_count=failures + 1 if failures < _RECOVERY_BACKOFF_MAX_FAILURES else failures,
+                failure_count=min(row[1] + 1, len(schedule) - 1),
             )
 
     @contextmanager

@@ -1799,7 +1799,7 @@ async def sync_main() -> None:
         update_barrier = UpdateProcessingBarrier(closed=True)
         ctx.draft_owner = DraftMessageOwner(
             ctx.client,
-            SQLiteDraftProjection(ctx.conn),
+            SQLiteDraftProjection(ctx.conn, ctx.scheduling.draft_recovery),
             ctx.shutdown_event,
             update_barrier,
             observe=lambda kind, outcome, reason: _observe_runtime(ctx, kind, outcome, reason),

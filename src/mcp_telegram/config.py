@@ -116,6 +116,19 @@ class EntityProfileConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DraftRecoveryConfig:
+    """Retry cadence for recovery of the account-wide draft projection."""
+
+    retry_delays_seconds: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 60)
+
+    def __post_init__(self) -> None:
+        if not self.retry_delays_seconds or any(
+            isinstance(delay, bool) or not isinstance(delay, int) or delay < 1 for delay in self.retry_delays_seconds
+        ):
+            raise ValueError("draft recovery retry schedule must contain positive integers")
+
+
+@dataclass(frozen=True, slots=True)
 class FolderProjectionConfig:
     """Daemon-owned schedule and health policy for folder projections."""
 
@@ -362,6 +375,7 @@ class SchedulingConfig:
     activity_cold_enroll_seconds: float = 1_800.0
     activity_cold_access_retry_seconds: float = 3_600.0
     fact_hydration: FactHydrationConfig = field(default_factory=FactHydrationConfig)
+    draft_recovery: DraftRecoveryConfig = field(default_factory=DraftRecoveryConfig)
     folder_projection: FolderProjectionConfig = field(default_factory=FolderProjectionConfig)
     activity_hot_sweep: ActivityHotSweepConfig = field(default_factory=ActivityHotSweepConfig)
 
@@ -1342,6 +1356,20 @@ def _parse_folder_projection(data: dict[str, object], path: Path, defaults: Sche
     )
 
 
+def _parse_draft_recovery(data: dict[str, object], path: Path, defaults: DraftRecoveryConfig) -> DraftRecoveryConfig:
+    section = _nested_table(data, "draft_recovery", "scheduling.draft_recovery", path) or {}
+    _reject_unknown_keys(section, {"retry_delays_seconds"}, "scheduling.draft_recovery", path)
+    return DraftRecoveryConfig(
+        retry_delays_seconds=_retry_schedule(
+            section,
+            "retry_delays_seconds",
+            "scheduling.draft_recovery",
+            path,
+            defaults.retry_delays_seconds,
+        )
+    )
+
+
 def _parse_activity_hot_sweep(
     data: dict[str, object], path: Path, defaults: ActivityHotSweepConfig
 ) -> ActivityHotSweepConfig:
@@ -1421,11 +1449,13 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "activity_cold_backfill_batch_pause_seconds",
         "activity_cold_enroll_seconds",
         "activity_cold_access_retry_seconds",
+        "draft_recovery",
         "fact_hydration",
         "folder_projection",
     }
     scheduling_data = _optional_section(data, "scheduling", allowed, path)
     fact_hydration = _parse_fact_hydration(scheduling_data, path, defaults)
+    draft_recovery = _parse_draft_recovery(scheduling_data, path, defaults.draft_recovery)
     folder_projection = _parse_folder_projection(scheduling_data, path, defaults)
     activity_hot_sweep = _parse_activity_hot_sweep(scheduling_data, path, defaults.activity_hot_sweep)
     return SchedulingConfig(
@@ -1591,6 +1621,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             defaults.activity_cold_access_retry_seconds,
         ),
         fact_hydration=fact_hydration,
+        draft_recovery=draft_recovery,
         folder_projection=folder_projection,
         activity_hot_sweep=activity_hot_sweep,
     )
