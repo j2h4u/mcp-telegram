@@ -1232,32 +1232,35 @@ class DaemonAPIServer:
             key=lambda item: (-item["score"], item["display_name"].casefold(), item["entity_id"]),
         )
 
-    async def _resolve_dialog_name(
+    @staticmethod
+    def _natural_username(dialog: str) -> str | None:
+        tme = _parse_tme_link(dialog)
+        return tme[0] if tme is not None else dialog[1:] if dialog.startswith("@") else None
+
+    async def _resolve_username_dialog_name(
         self,
         dialog: str,
+        username: str,
         *,
-        allow_remote: bool = True,
+        allow_remote: bool,
     ) -> Resolved | Candidates | NotFound:
-        """Resolve one normalized natural selector without silent precedence."""
-        tme = _parse_tme_link(dialog)
-        username = tme[0] if tme is not None else dialog[1:] if dialog.startswith("@") else None
-        if username is not None:
-            ineligible_ids = {
-                entity_id
-                for entity_id, (_name, _type, eligible, _username, _complete) in self._local_dialog_metadata().items()
-                if not eligible
-            }
-            if allow_remote:
-                return await self._resolve_dialog_username(dialog, username, ineligible_ids=ineligible_ids)
-            return self._resolve_local_dialog_username(username, dialog)
+        ineligible_ids = {
+            entity_id
+            for entity_id, (_name, _type, eligible, _username, _complete) in self._local_dialog_metadata().items()
+            if not eligible
+        }
+        if allow_remote:
+            return await self._resolve_dialog_username(dialog, username, ineligible_ids=ineligible_ids)
+        return self._resolve_local_dialog_username(username, dialog)
 
+    def _resolve_non_username_dialog_name(self, dialog: str) -> Resolved | Candidates | NotFound:
         (
             local_names,
             local_normalized,
             fuzzy_names,
             fuzzy_normalized,
             entity_types,
-            ineligible_ids,
+            _ineligible_ids,
             _coverage,
         ) = self._local_dialog_directory()
         if not latinize(dialog):
@@ -1267,11 +1270,19 @@ class DaemonAPIServer:
             return exact_result
         local_result = _fuzzy_resolve(dialog, fuzzy_names, normalized_name_map=fuzzy_normalized)
         self._apply_dialog_candidate_types(local_result, entity_types)
-        # A local ambiguity is already a fail-closed selector outcome. It must
-        # not turn an MCP read into Telegram work merely to expand the set.
-        if isinstance(local_result, Candidates) and len(local_result.matches) > 1:
-            return local_result
         return local_result
+
+    async def _resolve_dialog_name(
+        self,
+        dialog: str,
+        *,
+        allow_remote: bool = True,
+    ) -> Resolved | Candidates | NotFound:
+        """Resolve one normalized natural selector without silent precedence."""
+        username = self._natural_username(dialog)
+        if username is not None:
+            return await self._resolve_username_dialog_name(dialog, username, allow_remote=allow_remote)
+        return self._resolve_non_username_dialog_name(dialog)
 
     @staticmethod
     def _dialog_resolution_retryable_response(

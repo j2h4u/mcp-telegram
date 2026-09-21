@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Protocol, cast
 
@@ -12,7 +12,7 @@ from telethon import events  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 
 from mcp_telegram.demand_wiring import DemandOfferSink, offer_durable_demand
-from mcp_telegram.drafts.contracts import DraftObservationSource
+from mcp_telegram.drafts.contracts import DraftObservation, DraftObservationSource, DraftScope, SnapshotCoverage
 from mcp_telegram.drafts.ports import DraftProjectionRepository, DraftSnapshotGateway
 from mcp_telegram.drafts.telethon_adapter import TelethonDraftSnapshotGateway, normalize_update_draft
 from mcp_telegram.event_handlers import UpdateProcessingBarrier
@@ -139,23 +139,41 @@ class DraftMessageOwner:
         """Apply one account-wide snapshot without allowing a stale baseline to win."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
+        snapshot_run = self._prepare_snapshot_run(budget)
+        if snapshot_run is None:
+            return
+        gateway, baselines = snapshot_run
+        with demand_context(self.demand_kind):
+            with rpc_attempt_budget(budget):
+                coverage, observations = await gateway.fetch_all_drafts()
+        self._publish_snapshot(coverage, observations, baselines)
+
+    def _prepare_snapshot_run(
+        self,
+        budget: RpcAttemptBudget,
+    ) -> tuple[DraftSnapshotGateway, Mapping[DraftScope, int]] | None:
         account_id = self._account_id
         gateway = self._snapshot_gateway
         now = time.time()
         if account_id is None or gateway is None or budget.exhausted:
-            return
+            return None
         status = self.status(now)
         if status is None or not status.is_ready(now):
-            return
+            return None
         if not self._repository.claim_recovery(now=now):
-            return
+            return None
         # This fence is intentionally taken before the RPC.  The persistence
         # worker compares it against revisions written by later realtime rows
         # and tombstones, so an older snapshot cannot overwrite either one.
         baselines = self._repository.snapshot_baselines(account_id)
-        with demand_context(self.demand_kind):
-            with rpc_attempt_budget(budget):
-                coverage, observations = await gateway.fetch_all_drafts()
+        return gateway, baselines
+
+    def _publish_snapshot(
+        self,
+        coverage: SnapshotCoverage,
+        observations: tuple[DraftObservation, ...],
+        baselines: Mapping[DraftScope, int],
+    ) -> None:
         if not coverage.authoritative:
             self.request_recovery("snapshot_coverage_incomplete")
             self._record("draft.recovery", "deferred", "snapshot_coverage_incomplete")

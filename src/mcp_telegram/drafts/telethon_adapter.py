@@ -44,7 +44,7 @@ def _peer_id(peer: object | None) -> int | None:
         return None
     try:
         value = get_peer_id(cast(types.TypePeer, peer))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     return int(value) if isinstance(value, int) and value != 0 else None
 
@@ -95,7 +95,9 @@ def _reference(raw: object | None, *, fallback_kind: str) -> tuple[DraftReferenc
     peer_id = _peer_id(getattr(raw, "reply_to_peer_id", None))
     if peer_id is None:
         peer_id = _peer_id(getattr(raw, "peer", None))
-    reference = DraftReference(_bounded_kind(raw) if raw is not None else fallback_kind, identifier, peer_id, message_id)
+    reference = DraftReference(
+        _bounded_kind(raw) if raw is not None else fallback_kind, identifier, peer_id, message_id
+    )
     # Quote text, URLs and other nested data are not bounded primitives.  Keep
     # the structural context and flag that the whole construct was not copied.
     partial = any(hasattr(raw, field) for field in ("quote_text", "url", "entities"))
@@ -117,16 +119,18 @@ def _reply_context(
     story = DraftReference("story", peer_id=peer_id, identifier=story_id) if story_id is not None else None
     monoforum = DraftReference("monoforum", peer_id=monoforum_peer_id) if monoforum_peer_id is not None else None
     has_quote = any(getattr(raw, field, None) is not None for field in ("quote_text", "quote_entities", "quote_offset"))
-    quote = DraftReference("quote", peer_id=peer_id, message_id=reply_id, identifier=quote_offset) if has_quote else None
+    quote = (
+        DraftReference("quote", peer_id=peer_id, message_id=reply_id, identifier=quote_offset) if has_quote else None
+    )
     partial = any(
-        getattr(raw, field, None) is not None for field in ("quote_text", "quote_entities", "todo_item_id", "poll_option")
+        getattr(raw, field, None) is not None
+        for field in ("quote_text", "quote_entities", "todo_item_id", "poll_option")
     )
     return reply, story, quote, monoforum, partial
 
 
-def _composition(draft: object) -> DraftComposition | None:  # noqa: PLR0914 - each TL field is explicit at this boundary
-    if not isinstance(draft, types.DraftMessage):
-        return None
+def _entities(draft: types.DraftMessage) -> tuple[tuple[DraftEntity, ...], bool]:
+    """Normalize bounded entity ranges and record omitted detail."""
     entities: list[DraftEntity] = []
     partial = False
     raw_entities = getattr(draft, "entities", None)
@@ -143,24 +147,58 @@ def _composition(draft: object) -> DraftComposition | None:  # noqa: PLR0914 - e
                     partial = True
             if len(raw_entities) > MAX_DRAFT_ENTITY_COUNT:
                 partial = True
+    return tuple(entities), partial
+
+
+def _composition_references(
+    draft: types.DraftMessage,
+) -> tuple[
+    DraftReference | None,
+    DraftReference | None,
+    DraftReference | None,
+    DraftReference | None,
+    DraftReference | None,
+    DraftReference | None,
+    DraftReference | None,
+    bool,
+]:
+    """Normalize all supported non-text composition references."""
 
     reply, story, quote, monoforum, reply_partial = _reply_context(getattr(draft, "reply_to", None))
     media, media_partial = _reference(getattr(draft, "media", None), fallback_kind="media")
     rich, rich_partial = _reference(getattr(draft, "rich_message", None), fallback_kind="rich")
     suggested, suggested_partial = _reference(getattr(draft, "suggested_post", None), fallback_kind="suggested_post")
-    partial = partial or reply_partial or media_partial or rich_partial or suggested_partial
+    return (
+        reply,
+        story,
+        quote,
+        monoforum,
+        media,
+        rich,
+        suggested,
+        any((reply_partial, media_partial, rich_partial, suggested_partial)),
+    )
+
+
+def _draft_date(draft: types.DraftMessage) -> datetime | None:
     date = getattr(draft, "date", None)
     if not isinstance(date, datetime):
-        date = None
-    elif date.tzinfo is None:
-        date = date.replace(tzinfo=UTC)
+        return None
+    return date.replace(tzinfo=UTC) if date.tzinfo is None else date
+
+
+def _composition(draft: object) -> DraftComposition | None:
+    if not isinstance(draft, types.DraftMessage):
+        return None
     text = getattr(draft, "message", None)
     if not isinstance(text, str):
         return None
+    entities, entity_partial = _entities(draft)
+    reply, story, quote, monoforum, media, rich, suggested, reference_partial = _composition_references(draft)
     return DraftComposition(
         text=text,
-        date=date,
-        entities=tuple(entities),
+        date=_draft_date(draft),
+        entities=entities,
         reply=reply,
         story=story,
         quote=quote,
@@ -171,7 +209,9 @@ def _composition(draft: object) -> DraftComposition | None:  # noqa: PLR0914 - e
         invert_media=getattr(draft, "invert_media", None),
         effect_id=_positive_int(getattr(draft, "effect", None)),
         suggested_post=suggested,
-        completeness=CompositionCompleteness.PARTIAL if partial else CompositionCompleteness.COMPLETE,
+        completeness=CompositionCompleteness.PARTIAL
+        if entity_partial or reference_partial
+        else CompositionCompleteness.COMPLETE,
     )
 
 
