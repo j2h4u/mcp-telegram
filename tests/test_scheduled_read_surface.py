@@ -417,6 +417,96 @@ async def test_list_messages_all_paginates_across_sent_and_scheduled_rows() -> N
 
 
 @pytest.mark.asyncio
+async def test_list_messages_all_paginates_drafts_without_hiding_later_sent_rows() -> None:
+    server = make_server()
+    server.self_id = 7
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    _insert_message(conn, 1, 1, sent_at=FUTURE_BASE - 300, text="sent one")
+    _insert_message(conn, 1, 3, sent_at=FUTURE_BASE - 100, text="sent three")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 2, FUTURE_BASE - 200, "scheduled two")
+    _create_draft_projection(conn)
+    conn.execute(
+        f"INSERT INTO draft_current VALUES (7, 1, 0, 0, 'present', 'draft', '[]', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1, 'realtime_present', {FUTURE_BASE - 150}, {FUTURE_BASE - 150}, {FUTURE_BASE - 150}, 1, 1)"
+    )
+    conn.execute(
+        "INSERT INTO draft_sync_state VALUES (?, 'ready', 'complete', ?, ?, NULL)",
+        (7, FUTURE_BASE - 150, FUTURE_BASE - 150),
+    )
+    conn.commit()
+
+    first = await server._list_messages({"dialog_id": 1, "message_state": "all", "direction": "oldest", "limit": 2})
+    assert [row["text"] for row in first["data"]["messages"]] == ["sent one", "scheduled two"]
+    token = first["data"]["next_navigation"]
+    assert token is not None
+    navigation = decode_navigation_token(token)
+    assert navigation.value == 1
+    assert navigation.scheduled_message_id == 2
+    assert navigation.draft_key is None
+    assert navigation.draft_fingerprint is not None
+
+    second = await server._list_messages(
+        {"dialog_id": 1, "message_state": "all", "direction": "oldest", "limit": 2, "navigation": token}
+    )
+    assert [row["text"] for row in second["data"]["messages"]] == ["draft", "sent three"]
+    assert second["data"]["next_navigation"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_messages_all_invalidates_cursor_when_unseen_draft_changes() -> None:
+    server = make_server()
+    server.self_id = 7
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    _insert_message(conn, 1, 1, sent_at=FUTURE_BASE - 300, text="sent one")
+    _insert_message(conn, 1, 3, sent_at=FUTURE_BASE - 100, text="sent three")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 2, FUTURE_BASE - 200, "scheduled two")
+    _create_draft_projection(conn)
+    conn.execute(
+        f"INSERT INTO draft_current VALUES (7, 1, 0, 0, 'present', 'draft', '[]', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1, 'realtime_present', {FUTURE_BASE - 150}, {FUTURE_BASE - 150}, {FUTURE_BASE - 150}, 1, 1)"
+    )
+    conn.execute(
+        "INSERT INTO draft_sync_state VALUES (?, 'ready', 'complete', ?, ?, NULL)",
+        (7, FUTURE_BASE - 150, FUTURE_BASE - 150),
+    )
+    conn.commit()
+
+    first = await server._list_messages({"dialog_id": 1, "message_state": "all", "direction": "oldest", "limit": 2})
+    conn.execute("UPDATE draft_current SET projection_revision = 2 WHERE dialog_id = 1")
+    conn.commit()
+
+    second = await server._list_messages(
+        {
+            "dialog_id": 1,
+            "message_state": "all",
+            "direction": "oldest",
+            "limit": 2,
+            "navigation": first["data"]["next_navigation"],
+        }
+    )
+    assert second["error"] == "draft_projection_changed"
+
+
+@pytest.mark.asyncio
+async def test_draft_sender_filter_reports_scope_mismatch_without_absence_claim() -> None:
+    server = make_server()
+    server.self_id = 7
+    conn = server._conn
+    _create_draft_projection(conn)
+    conn.execute("INSERT INTO draft_sync_state VALUES (7, 'ready', 'complete', 100, 100, NULL)")
+    conn.commit()
+
+    result = await server._list_messages({"dialog_id": 1, "message_state": "draft", "sender_id": 99})
+
+    coverage = result["data"]["draft_coverage"]
+    assert coverage["presence"] == "unknown"
+    assert coverage["absence_basis"] is None
+    assert coverage["continuity_reason"] == "sender_filter_excludes_author_only_drafts"
+
+
+@pytest.mark.asyncio
 async def test_own_only_cache_fails_closed_for_scheduled_projection() -> None:
     server = make_server()
     conn = server._conn

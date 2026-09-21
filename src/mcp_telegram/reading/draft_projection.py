@@ -74,6 +74,12 @@ def _optional_int(value: object | None) -> int | None:
     return int(cast(int | str, value))
 
 
+def _optional_bool(value: object | None) -> bool | None:
+    if value is None:
+        return None
+    return bool(value)
+
+
 def _normalized_json(
     value: object | None, *, array: bool = False
 ) -> dict[str, object] | tuple[dict[str, object], ...] | None:
@@ -119,8 +125,8 @@ def _record_from_row(row: Mapping[str, object]) -> DraftReadRecord:
         suggested_post=cast(dict[str, object] | None, _normalized_json(row["suggested_post_json"])),
         rich_message=cast(dict[str, object] | None, _normalized_json(row["rich_message_json"])),
         effect_id=_optional_int(row["effect_id"]),
-        no_webpage=bool(row["no_webpage"]),
-        invert_media=bool(row["invert_media"]),
+        no_webpage=_optional_bool(row["no_webpage"]),
+        invert_media=_optional_bool(row["invert_media"]),
         composition_complete=bool(row["composition_complete"]),
         source_kind=str(row["source_kind"]),
         source_observed_at=_optional_int(row["source_observed_at"]),
@@ -185,12 +191,12 @@ def _early_read_result(
         )
     if sender_id is not None and sender_id != account_id:
         return [], DraftCoverage(
-            DraftCoveragePresence.ABSENT,
+            DraftCoveragePresence.UNKNOWN,
             DraftCoverageFreshness.UNKNOWN,
             None,
             None,
-            "sender_is_current_account",
             None,
+            "sender_filter_excludes_author_only_drafts",
             None,
             None,
         )

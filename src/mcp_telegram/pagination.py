@@ -47,6 +47,8 @@ class NavigationToken:
     until_utc: int | None = None
     draft_key: str | None = None
     draft_fingerprint: str | None = None
+    scheduled_message_id: int | None = None
+    scheduled_sent_at: int | None = None
 
 
 @dataclass(frozen=True)
@@ -169,12 +171,14 @@ def _optional_navigation_fields(navigation: NavigationToken) -> dict[str, object
             "until_utc": navigation.until_utc,
             "draft_key": navigation.draft_key,
             "draft_fingerprint": navigation.draft_fingerprint,
+            "scheduled_message_id": navigation.scheduled_message_id,
+            "scheduled_sent_at": navigation.scheduled_sent_at,
         }.items()
         if value is not None
     }
 
 
-def decode_navigation_token(token: str) -> NavigationToken:
+def decode_navigation_token(token: str) -> NavigationToken:  # noqa: PLR0914
     """Decode a base64 token into a NavigationToken.
 
     Raises ``ValueError`` on malformed input, unknown kind, or wrong field types.
@@ -193,9 +197,19 @@ def decode_navigation_token(token: str) -> NavigationToken:
     if not isinstance(dialog_id, int):
         raise ValueError("Invalid navigation token: dialog_id must be an integer")
 
-    topic_id, query, direction, sent_at, message_state, since_utc, until_utc, draft_key, draft_fingerprint = (
-        _decode_optional_navigation_fields(data)
-    )
+    (
+        topic_id,
+        query,
+        direction,
+        sent_at,
+        message_state,
+        since_utc,
+        until_utc,
+        draft_key,
+        draft_fingerprint,
+        scheduled_message_id,
+        scheduled_sent_at,
+    ) = _decode_optional_navigation_fields(data)
     navigation = NavigationToken(
         kind=cast("NavigationKind", kind),
         value=cast(int | None, value),
@@ -209,6 +223,8 @@ def decode_navigation_token(token: str) -> NavigationToken:
         until_utc=until_utc,
         draft_key=draft_key,
         draft_fingerprint=draft_fingerprint,
+        scheduled_message_id=scheduled_message_id,
+        scheduled_sent_at=scheduled_sent_at,
     )
     _validate_navigation_shape(navigation)
     return navigation
@@ -249,6 +265,8 @@ def _validate_search_navigation(navigation: NavigationToken) -> None:
         navigation.sent_at,
         navigation.draft_key,
         navigation.draft_fingerprint,
+        navigation.scheduled_message_id,
+        navigation.scheduled_sent_at,
     )
     if any(value is not None for value in history_fields):
         raise ValueError("Invalid navigation token: search cursor contains history-only state")
@@ -257,6 +275,9 @@ def _validate_search_navigation(navigation: NavigationToken) -> None:
 def _validate_history_navigation(navigation: NavigationToken) -> None:
     if navigation.query is not None:
         raise ValueError("Invalid navigation token: history cursor contains search-only query state")
+    if navigation.message_state == "all":
+        _validate_all_history_cursor(navigation)
+        return
     if _is_draft_cursor(navigation):
         _validate_draft_cursor(navigation)
     elif navigation.value is None:
@@ -268,15 +289,41 @@ def _is_draft_cursor(navigation: NavigationToken) -> bool:
 
 
 def _validate_draft_cursor(navigation: NavigationToken) -> None:
-    if navigation.message_state not in {"draft", "all"}:
-        raise ValueError("Invalid navigation token: draft cursor requires draft or all message_state")
+    if navigation.message_state != "draft":
+        raise ValueError("Invalid navigation token: draft cursor requires draft message_state")
     if navigation.draft_key is None or navigation.draft_fingerprint is None or navigation.value is not None:
         raise ValueError("Invalid navigation token: draft cursor requires key and fingerprint without message id")
+    if navigation.scheduled_message_id is not None or navigation.scheduled_sent_at is not None:
+        raise ValueError("Invalid navigation token: draft cursor contains scheduled state")
+
+
+def _validate_all_history_cursor(navigation: NavigationToken) -> None:
+    """Validate the independent stream positions in an ``all`` continuation."""
+    if (navigation.value is None) != (navigation.sent_at is None):
+        raise ValueError("Invalid navigation token: all cursor sent position requires id and timestamp")
+    if (navigation.scheduled_message_id is None) != (navigation.scheduled_sent_at is None):
+        raise ValueError("Invalid navigation token: all cursor scheduled position requires id and timestamp")
+    if navigation.draft_key is not None and navigation.draft_fingerprint is None:
+        raise ValueError("Invalid navigation token: all cursor draft position requires fingerprint")
+    if navigation.value is None and navigation.scheduled_message_id is None and navigation.draft_key is None:
+        raise ValueError("Invalid navigation token: all cursor requires at least one stream position")
 
 
 def _decode_optional_navigation_fields(
     data: dict[str, object],
-) -> tuple[int | None, str | None, str | None, int | None, str | None, int | None, int | None, str | None, str | None]:
+) -> tuple[
+    int | None,
+    str | None,
+    str | None,
+    int | None,
+    str | None,
+    int | None,
+    int | None,
+    str | None,
+    str | None,
+    int | None,
+    int | None,
+]:
     topic_id = _optional_int(data, "topic_id")
     query = _optional_str(data, "query")
     direction = _optional_direction(data)
@@ -286,6 +333,8 @@ def _decode_optional_navigation_fields(
     until_utc = _optional_int(data, "until_utc")
     draft_key = _optional_str(data, "draft_key")
     draft_fingerprint = _optional_str(data, "draft_fingerprint")
+    scheduled_message_id = _optional_int(data, "scheduled_message_id")
+    scheduled_sent_at = _optional_int(data, "scheduled_sent_at")
 
     return (
         cast(int | None, topic_id),
@@ -297,6 +346,8 @@ def _decode_optional_navigation_fields(
         cast(int | None, until_utc),
         cast(str | None, draft_key),
         cast(str | None, draft_fingerprint),
+        cast(int | None, scheduled_message_id),
+        cast(int | None, scheduled_sent_at),
     )
 
 
@@ -340,6 +391,8 @@ def encode_history_navigation(  # noqa: PLR0913
     until_utc: int | None = None,
     draft_key: str | None = None,
     draft_fingerprint: str | None = None,
+    scheduled_message_id: int | None = None,
+    scheduled_sent_at: int | None = None,
 ) -> str:
     """Encode a history continuation cursor as a base64 token."""
     return encode_navigation_token(
@@ -355,6 +408,8 @@ def encode_history_navigation(  # noqa: PLR0913
             until_utc=until_utc,
             draft_key=draft_key,
             draft_fingerprint=draft_fingerprint,
+            scheduled_message_id=scheduled_message_id,
+            scheduled_sent_at=scheduled_sent_at,
         )
     )
 

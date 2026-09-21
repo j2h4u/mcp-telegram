@@ -234,7 +234,7 @@ class _AllLocalStateRequest:
     direction: str
     status: str | None
     db_request: _ListMessagesDbRequest
-    scheduled_result: dict
+    navigation: NavigationToken | None
 
 
 @dataclass(frozen=True)
@@ -1723,6 +1723,7 @@ class ReadingService:
                 "message_state": "draft",
                 "scope": "own_only",
                 "draft_coverage": coverage.to_wire(),
+                "draft_fingerprint": coverage.projection_fingerprint,
             },
         }
 
@@ -1751,6 +1752,8 @@ class ReadingService:
         error = ReadingService._draft_cursor_error(cursor, req, fingerprint)
         if error is not None:
             return error
+        if cursor.message_state == "all" and cursor.draft_key is None:
+            return 0
         assert cursor.draft_key is not None
         positions = {draft_message_key(record): index for index, record in enumerate(visible)}
         if cursor.draft_key not in positions:
@@ -1761,7 +1764,7 @@ class ReadingService:
     def _draft_cursor_error(
         cursor: NavigationToken, req: _ListMessagesDbRequest, fingerprint: str | None
     ) -> dict | None:
-        if cursor.kind != "history" or cursor.message_state != "draft":
+        if cursor.kind != "history" or cursor.message_state not in {"draft", "all"}:
             return {"ok": False, "error": "invalid_navigation", "message": "Navigation token is not a draft cursor."}
         if cursor.dialog_id != req.dialog_id or cursor.topic_id != req.topic_id:
             return {
@@ -1777,7 +1780,7 @@ class ReadingService:
             }
         if cursor.draft_fingerprint != fingerprint:
             return ReadingService._draft_projection_changed("Draft composition changed since this page.")
-        if cursor.draft_key is None:
+        if cursor.message_state == "draft" and cursor.draft_key is None:
             return {"ok": False, "error": "invalid_navigation", "message": "Draft cursor is missing its scope key."}
         return None
 
@@ -1852,20 +1855,20 @@ class ReadingService:
         status: str | None,
         anchor_msg_id: int | None = None,
         anchor_sent_at: int | None = None,
+        all_navigation: NavigationToken | None = None,
     ) -> dict:
         db_request = self._local_state_db_request(dialog_id, request, direction, anchor_msg_id, anchor_sent_at)
         if request.message_state == "draft":
             return self._list_draft_messages_from_db(db_request, navigation=request.navigation)
-        scheduled_result = self._list_scheduled_messages_from_db(db_request)
         if request.message_state == "scheduled":
-            return self._scheduled_local_state_result(dialog_id, scheduled_result)
+            return self._scheduled_local_state_result(dialog_id, self._list_scheduled_messages_from_db(db_request))
         all_request = _AllLocalStateRequest(
             dialog_id,
             request,
             direction,
             status,
             db_request,
-            scheduled_result,
+            all_navigation,
         )
         return await self._all_local_state_result(all_request)
 
@@ -1902,9 +1905,24 @@ class ReadingService:
         return scheduled_result
 
     async def _all_local_state_result(self, all_request: _AllLocalStateRequest) -> dict:
-        sent_rows = await self._all_sent_rows(all_request.status, all_request.db_request)
-        draft_result = self._list_draft_messages_from_db(all_request.db_request)
-        scheduled_rows = all_request.scheduled_result["data"]["messages"]
+        navigation = all_request.navigation
+        sent_request = dataclasses.replace(
+            all_request.db_request,
+            anchor_msg_id=navigation.value if navigation is not None else None,
+            anchor_sent_at=navigation.sent_at if navigation is not None else None,
+        )
+        scheduled_request = dataclasses.replace(
+            all_request.db_request,
+            anchor_msg_id=navigation.scheduled_message_id if navigation is not None else None,
+            anchor_sent_at=navigation.scheduled_sent_at if navigation is not None else None,
+        )
+        sent_rows = await self._all_sent_rows(all_request.status, sent_request)
+        draft_result = self._list_draft_messages_from_db(
+            all_request.db_request, navigation=all_request.request.navigation
+        )
+        if not draft_result.get("ok"):
+            return draft_result
+        scheduled_rows = self._list_scheduled_messages_from_db(scheduled_request)["data"]["messages"]
         draft_rows = draft_result["data"]["messages"]
         state = _AllLocalState(
             all_request,
@@ -1940,7 +1958,12 @@ class ReadingService:
             )
             has_more = len(combined) > request.limit
             page = combined[: request.limit]
-            next_nav = self._all_next_navigation(page, has_more, state.draft_rows, state.request)
+            next_nav = self._all_next_navigation(
+                page,
+                has_more,
+                state.request,
+                state.draft_result["data"]["draft_fingerprint"],
+            )
             return {
                 "ok": True,
                 "data": {
@@ -1951,7 +1974,6 @@ class ReadingService:
                     "dialog_type": dialog_type,
                     "read_state": read_state,
                     "draft_coverage": state.draft_result["data"]["draft_coverage"],
-                    "pagination_notice": self._all_pagination_notice(has_more, state.draft_rows),
                     **access_metadata,
                 },
             }
@@ -1962,39 +1984,64 @@ class ReadingService:
     ) -> list[dict]:
         combined = [*sent_rows, *scheduled_rows, *draft_rows]
         combined.sort(
-            key=lambda row: (
-                int(row.get("sent_at") or row.get("draft_updated_at") or 0),
-                str(row.get("message_key") or row.get("message_id") or ""),
-            ),
+            key=ReadingService._all_row_sort_key,
             reverse=direction != "oldest",
         )
         return combined
 
     @staticmethod
-    def _all_next_navigation(
-        page: list[dict],
-        has_more: bool,
-        draft_rows: list[dict],
-        all_request: _AllLocalStateRequest,
-    ) -> str | None:
-        if not has_more or not page or draft_rows:
-            return None
-        last = page[-1]
-        return encode_history_navigation(
-            _message_id_from_item(last),
-            all_request.dialog_id,
-            direction=(HistoryDirection.OLDEST if all_request.direction == "oldest" else HistoryDirection.NEWEST),
-            sent_at=_object_to_int(last.get("sent_at")),
-            message_state="all",
-            since_utc=all_request.request.since_utc,
-            until_utc=all_request.request.until_utc,
+    def _all_row_sort_key(row: dict) -> tuple[int, int, int | str]:
+        state = str(row.get("message_state"))
+        state_order = {"sent": 0, "scheduled": 1, "draft": 2}
+        identity: int | str
+        if state == "draft":
+            identity = str(row.get("message_key") or "")
+        else:
+            identity = _object_to_int(row.get("message_id"))
+        return (
+            int(row.get("sent_at") or row.get("draft_updated_at") or 0),
+            state_order.get(state, 3),
+            identity,
         )
 
     @staticmethod
-    def _all_pagination_notice(has_more: bool, draft_rows: list[dict]) -> str | None:
-        if not has_more or not draft_rows:
+    def _all_next_navigation(
+        page: list[dict],
+        has_more: bool,
+        all_request: _AllLocalStateRequest,
+        draft_fingerprint: str | None,
+    ) -> str | None:
+        if not has_more or not page:
             return None
-        return "Draft projections are mutable; this union page has no continuation token. Retry the read from the beginning if more rows are needed."
+        navigation = all_request.navigation
+        sent_message_id = navigation.value if navigation is not None else None
+        sent_at = navigation.sent_at if navigation is not None else None
+        scheduled_message_id = navigation.scheduled_message_id if navigation is not None else None
+        scheduled_sent_at = navigation.scheduled_sent_at if navigation is not None else None
+        draft_key = navigation.draft_key if navigation is not None else None
+        for row in page:
+            state = row.get("message_state")
+            if state == "sent":
+                sent_message_id = _message_id_from_item(row)
+                sent_at = _object_to_int(row.get("sent_at"))
+            elif state == "scheduled":
+                scheduled_message_id = _message_id_from_item(row)
+                scheduled_sent_at = _object_to_int(row.get("sent_at"))
+            elif state == "draft":
+                draft_key = str(row["message_key"])
+        return encode_history_navigation(
+            sent_message_id,
+            all_request.dialog_id,
+            direction=(HistoryDirection.OLDEST if all_request.direction == "oldest" else HistoryDirection.NEWEST),
+            sent_at=sent_at,
+            message_state="all",
+            since_utc=all_request.request.since_utc,
+            until_utc=all_request.request.until_utc,
+            draft_key=draft_key,
+            draft_fingerprint=draft_fingerprint,
+            scheduled_message_id=scheduled_message_id,
+            scheduled_sent_at=scheduled_sent_at,
+        )
 
     async def _list_messages_non_sent(
         self,
@@ -2027,15 +2074,23 @@ class ReadingService:
             return nav_result
         anchor_msg_id, direction = nav_result
         anchor_sent_at = None
+        all_navigation: NavigationToken | None = None
         if request.message_state == "all" and request.navigation not in (None, "newest", "oldest"):
             navigation = request.navigation
             assert navigation is not None
             try:
-                anchor_sent_at = decode_navigation_token(navigation).sent_at
+                all_navigation = decode_navigation_token(navigation)
+                anchor_sent_at = all_navigation.sent_at
             except ValueError as exc:
                 return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
         return await self._list_messages_local_state_result(
-            dialog_id, request, direction, status, anchor_msg_id, anchor_sent_at
+            dialog_id,
+            request,
+            direction,
+            status,
+            anchor_msg_id,
+            anchor_sent_at,
+            all_navigation,
         )
 
     async def _list_messages_for_state(

@@ -232,8 +232,8 @@ class DraftReadRecord:
     suggested_post: dict[str, object] | None
     rich_message: dict[str, object] | None
     effect_id: int | None
-    no_webpage: bool
-    invert_media: bool
+    no_webpage: bool | None
+    invert_media: bool | None
     composition_complete: bool
     source_kind: str
     source_observed_at: int | None

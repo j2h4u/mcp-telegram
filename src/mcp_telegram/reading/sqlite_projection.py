@@ -523,9 +523,9 @@ def _build_list_messages_query(
     sql, params = _apply_list_messages_anchor_filter(sql, params, req)
 
     if direction == "oldest":
-        sql += " ORDER BY m.message_id ASC"
+        sql += " ORDER BY m.sent_at ASC, m.message_id ASC"
     else:
-        sql += " ORDER BY m.message_id DESC"
+        sql += " ORDER BY m.sent_at DESC, m.message_id DESC"
 
     sql += " LIMIT :limit"
 

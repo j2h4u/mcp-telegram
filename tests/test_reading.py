@@ -70,8 +70,8 @@ def test_list_messages_projects_draft_without_sent_identity() -> None:
         "suggested_post": None,
         "rich_message": None,
         "effect_id": None,
-        "no_webpage": False,
-        "invert_media": False,
+        "no_webpage": None,
+        "invert_media": None,
         "composition_complete": True,
         "observation_source": "realtime_present",
         "observed_at": 100,
@@ -85,6 +85,8 @@ def test_list_messages_projects_draft_without_sent_identity() -> None:
 
     assert projected["message_state"] == "draft"
     assert "msg_id" not in projected and "sent_at" not in projected
+    assert projected["composition"]["no_webpage"] is None
+    assert projected["composition"]["invert_media"] is None
     assert content["is_telegram_content"] is True
     validate(instance=projected, schema=DRAFT_MESSAGE_VIEW_SCHEMA)
 
