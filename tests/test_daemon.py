@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import sqlite3
+from collections.abc import Coroutine
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -14,6 +15,7 @@ from mcp_telegram.config import load_config
 from mcp_telegram.daemon import (
     _acquire_startup_identity_before_updates,
     _ensure_demand_runtime,
+    _HistorySyncRuntime,
     _message_fact_refresh_policy_from_config,
     _offer_startup_demands,
     _prime_runtime,
@@ -209,6 +211,240 @@ def test_sync_main_has_one_coordinator_task_and_no_retired_launcher() -> None:
         "initialize_read_positions",
     ):
         assert retired not in source
+
+
+def test_ensure_demand_runtime_wires_all_demand_sinks_once(monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: PLR0914
+    from mcp_telegram import daemon
+
+    events: list[str] = []
+
+    class _Bindable:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def bind_demand_sink(self, sink: object) -> None:
+            events.append(f"{self.name}:{sink!r}")
+
+    class _Coordinator:
+        def run(self) -> object:
+            async def _run() -> None:
+                return None
+
+            return _run()
+
+        def __repr__(self) -> str:
+            return "coordinator"
+
+    coordinator = _Coordinator()
+    runtime = SimpleNamespace(coordinator=coordinator)
+    entity_service = _Bindable("entity")
+    api_server = SimpleNamespace(
+        _get_entity_info_service=lambda: entity_service,
+        bind_demand_sink=lambda sink: events.append(f"api:{sink!r}"),
+    )
+    handler = _Bindable("handler")
+    owner = _Bindable("draft")
+    fact_hydration = _Bindable("fact")
+    folder_projection = _Bindable("folder")
+    ctx = _typed_ctx(
+        api_server=api_server,
+        handler_manager=handler,
+        draft_owner=owner,
+        fact_hydration_worker=fact_hydration,
+        folder_projection_worker=folder_projection,
+    )
+    build_calls: list[tuple[object, object, object, object]] = []
+
+    def build_runtime(ctx_arg: object, history: object, directory: object, startup: object) -> object:
+        build_calls.append((ctx_arg, history, directory, startup))
+        return runtime
+
+    created_tasks: list[dict[str, object]] = []
+
+    def create_task(_ctx: object, coroutine: object, **kwargs: object) -> None:
+        cast(Coroutine[object, object, object], coroutine).close()
+        created_tasks.append(kwargs)
+
+    monkeypatch.setattr(daemon, "_build_demand_runtime", build_runtime)
+    monkeypatch.setattr(daemon, "_create_tracked_task", create_task)
+    history = object()
+    directory = object()
+    startup = object()
+
+    result = _ensure_demand_runtime(
+        ctx,
+        cast(_HistorySyncRuntime, history),
+        cast(CanonicalDialogDirectory, directory),
+        cast(StartupIdentityState, startup),
+    )
+
+    assert result is runtime
+    assert ctx.demand_runtime is runtime
+    assert ctx.coordinator is coordinator
+    assert len(build_calls) == 1
+    assert build_calls[0] == (ctx, history, directory, startup)
+    assert events == [
+        "api:coordinator",
+        "handler:coordinator",
+        "draft:coordinator",
+        "entity:coordinator",
+        "fact:coordinator",
+        "folder:coordinator",
+    ]
+    assert created_tasks == [{"name": "telegram_demand_coordinator", "critical": True}]
+
+
+def test_ensure_demand_runtime_reuses_existing_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    existing = SimpleNamespace(coordinator=object())
+    ctx = _typed_ctx(demand_runtime=existing)
+
+    def fail_build(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("existing demand runtime must be reused")
+
+    from mcp_telegram import daemon
+
+    monkeypatch.setattr(daemon, "_build_demand_runtime", fail_build)
+
+    assert _ensure_demand_runtime(
+        ctx,
+        cast(_HistorySyncRuntime, object()),
+        cast(CanonicalDialogDirectory, object()),
+        cast(StartupIdentityState, object()),
+    ) is existing
+
+
+@pytest.mark.asyncio
+async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mcp_telegram import daemon
+
+    events: list[str] = []
+
+    class _Barrier:
+        def __init__(self, *, closed: bool) -> None:
+            events.append(f"barrier:{closed}")
+
+        def open(self) -> None:
+            events.append("barrier:open")
+
+    class _Owner:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            events.append("owner:init")
+
+        def register(self) -> None:
+            events.append("owner:register")
+
+        def bind_account(self, account_id: int) -> None:
+            events.append(f"owner:bind:{account_id}")
+
+        def request_recovery(self, reason: str) -> None:
+            events.append(f"owner:recovery:{reason}")
+
+    class _Handler:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            events.append("handler:init")
+
+        def register(self) -> None:
+            events.append("handler:register")
+
+        def set_self_id(self, account_id: int) -> None:
+            events.append(f"handler:self:{account_id}")
+
+    class _Directory:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            events.append("directory:init")
+
+    ctx = SimpleNamespace(
+        rpc_observation_sink=None,
+        client=object(),
+        conn=object(),
+        db_path=Path("/tmp/mcp-telegram-sync-main-test.db"),
+        shutdown_event=asyncio.Event(),
+        scheduling=SimpleNamespace(draft_recovery=object(), reconnect_catch_up_interval_seconds=5.0),
+        api_server=SimpleNamespace(self_id=314),
+        draft_owner=None,
+        handler_manager=None,
+    )
+
+    async def build_context() -> object:
+        events.append("context")
+        return ctx
+
+    def create_task(_ctx: object, coroutine: object, **kwargs: object) -> None:
+        cast(Coroutine[object, object, object], coroutine).close()
+        events.append(f"task:{kwargs['name']}")
+
+    async def connect(_ctx: object) -> bool:
+        events.append("connect")
+        return True
+
+    async def acquire(_ctx: object, _directory: object) -> object:
+        events.append("identity")
+        return object()
+
+    async def run_reconnect(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def run_fts(_ctx: object) -> None:
+        events.append("fts")
+
+    async def prime(_ctx: object) -> None:
+        events.append("prime")
+
+    async def lifetime(_ctx: object) -> None:
+        events.append("lifetime")
+
+    async def shutdown(_ctx: object) -> None:
+        events.append("shutdown")
+
+    monkeypatch.setattr(daemon, "_build_sync_main_context", build_context)
+    monkeypatch.setattr(daemon, "_create_tracked_task", create_task)
+    monkeypatch.setattr(daemon, "_run_fts_backfill", run_fts)
+    monkeypatch.setattr(daemon, "UpdateProcessingBarrier", _Barrier)
+    monkeypatch.setattr(daemon, "DraftMessageOwner", _Owner)
+    monkeypatch.setattr(daemon, "SQLiteDraftProjection", lambda *_args: object())
+    monkeypatch.setattr(daemon, "EventHandlerManager", _Handler)
+    monkeypatch.setattr(daemon, "_connect_telegram", connect)
+    monkeypatch.setattr(daemon, "CanonicalDialogDirectory", _Directory)
+    monkeypatch.setattr(daemon, "_acquire_startup_identity_before_updates", acquire)
+    monkeypatch.setattr(daemon, "TelethonFullHistoryPageAdapter", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(daemon, "TelethonForwardGapPageAdapter", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(daemon, "TelethonHistoryAccessProbe", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(daemon, "DeltaSyncWorker", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(daemon, "FullSyncWorker", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(daemon, "_ensure_demand_runtime", lambda *_args: events.append("ensure"))
+    monkeypatch.setattr(daemon, "run_reconnect_catch_up_loop", run_reconnect)
+    monkeypatch.setattr(daemon, "_prime_runtime", prime)
+    monkeypatch.setattr(daemon, "_offer_startup_demands", lambda _ctx: events.append("offers"))
+    monkeypatch.setattr(daemon, "_run_daemon_lifetime", lifetime)
+    monkeypatch.setattr(daemon, "_shutdown_sync_main_context", shutdown)
+
+    await daemon.sync_main()
+
+    assert events == [
+        "context",
+        "task:flood_wait_kill_switch_monitor",
+        "fts",
+        "barrier:True",
+        "owner:init",
+        "owner:register",
+        "handler:init",
+        "handler:register",
+        "connect",
+        "directory:init",
+        "identity",
+        "handler:self:314",
+        "owner:bind:314",
+        "ensure",
+        "owner:recovery:startup",
+        "barrier:open",
+        "task:reconnect_catch_up_loop",
+        "prime",
+        "offers",
+        "lifetime",
+        "shutdown",
+    ]
 
 
 def test_startup_demands_are_offered_to_coordinator() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -10,6 +11,7 @@ from mcp_telegram.drafts.contracts import (
     CompositionCompleteness,
     DraftDisposition,
     DraftObservationSource,
+    DraftReference,
 )
 from mcp_telegram.drafts.telethon_adapter import TelethonDraftSnapshotGateway, normalize_update_draft
 from mcp_telegram.telegram_demand import AcquisitionKind, demand_context
@@ -127,6 +129,82 @@ def test_normalize_retains_bounded_reply_story_quote_and_monoforum_context() -> 
     assert observation.composition.monoforum is not None
     assert observation.composition.completeness is CompositionCompleteness.PARTIAL
     assert "do not persist" not in repr(observation)
+
+
+@pytest.mark.parametrize(
+    ("media", "expected"),
+    (
+        (
+            SimpleNamespace(
+                id=17,
+                reply_to_msg_id=21,
+                reply_to_peer_id=types.InputPeerUser(91, 0),
+            ),
+            DraftReference("SimpleNamespace", identifier=17, peer_id=91, message_id=21),
+        ),
+        (
+            SimpleNamespace(
+                id=SimpleNamespace(id=18),
+                top_msg_id=22,
+                peer=types.InputPeerUser(92, 0),
+            ),
+            DraftReference("SimpleNamespace", identifier=18, peer_id=92, message_id=22),
+        ),
+        (
+            SimpleNamespace(story_id=19, peer=types.InputPeerUser(93, 0)),
+            DraftReference("SimpleNamespace", identifier=19, peer_id=93),
+        ),
+        (
+            SimpleNamespace(document_id=20),
+            DraftReference("SimpleNamespace", identifier=20),
+        ),
+        (
+            SimpleNamespace(document=SimpleNamespace(id=21)),
+            DraftReference("SimpleNamespace", identifier=21),
+        ),
+    ),
+)
+def test_normalize_media_reference_variants(media: object, expected: DraftReference) -> None:
+    update = types.UpdateDraftMessage(
+        types.PeerUser(91),
+        types.DraftMessage("draft", datetime(2026, 1, 1, tzinfo=UTC), media=cast(types.TypeInputMedia, media)),
+    )
+
+    observation = normalize_update_draft(
+        update,
+        account_id=42,
+        source=DraftObservationSource.REALTIME,
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    assert observation is not None and observation.composition is not None
+    assert observation.composition.media == expected
+    assert observation.composition.completeness is CompositionCompleteness.COMPLETE
+
+
+def test_normalize_media_reference_preserves_shape_when_nested_detail_is_opaque() -> None:
+    media = SimpleNamespace(
+        id=22,
+        quote_text="do not persist this media quote",
+        url="https://secret.invalid/media",
+        entities=[SimpleNamespace(offset=0, length=1)],
+    )
+    update = types.UpdateDraftMessage(
+        types.PeerUser(91),
+        types.DraftMessage("draft", datetime(2026, 1, 1, tzinfo=UTC), media=cast(types.TypeInputMedia, media)),
+    )
+
+    observation = normalize_update_draft(
+        update,
+        account_id=42,
+        source=DraftObservationSource.REALTIME,
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    assert observation is not None and observation.composition is not None
+    assert observation.composition.media == DraftReference("SimpleNamespace", identifier=22)
+    assert observation.composition.completeness is CompositionCompleteness.PARTIAL
+    assert "secret.invalid" not in repr(observation)
 
 
 @pytest.mark.asyncio
