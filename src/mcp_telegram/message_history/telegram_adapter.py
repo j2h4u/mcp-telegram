@@ -7,28 +7,17 @@ from contextlib import AbstractContextManager, nullcontext
 from typing import Protocol, cast
 
 from telethon.errors import RPCError  # type: ignore[import-untyped]
-from telethon.tl import types  # type: ignore[import-untyped]
-from telethon.tl.functions.messages import GetHistoryRequest  # type: ignore[import-untyped]
-from telethon.tl.types import TypeInputPeer  # type: ignore[import-untyped]
 
-from ..messages.telegram_adapter import (
-    PeerNameClient,
-    extract_message_row,
-    extract_reply_and_topic,
-    resolve_forward_entity_name_map,
-)
+from ..messages.telegram_adapter import PeerNameClient, extract_message_row, resolve_forward_entity_name_map
 from ..telegram_access import ACCESS_LOST_ERRORS
 from .contracts import (
-    MESSAGE_HISTORY_PAGE_LIMIT,
+    MESSAGE_HISTORY_PAGE_SIZE,
     ForwardGapPage,
     FullHistoryPage,
     MessageHistoryAccessLostError,
     MessageHistoryUnavailableError,
-    TopicAttributionMessage,
-    TopicAttributionPage,
-    TopicAttributionPageProjectionError,
 )
-from .ports import ForwardGapPagePort, FullHistoryPagePort, TopicAttributionPagePort
+from .ports import ForwardGapPagePort, FullHistoryPagePort
 
 
 class _TelegramHistoryClient(Protocol):
@@ -37,12 +26,6 @@ class _TelegramHistoryClient(Protocol):
     def iter_messages(self, **kwargs: object) -> AsyncIterator[object]: ...
 
     async def get_entity(self, peer: object) -> object: ...
-
-    async def __call__(self, request: object, **kwargs: object) -> object: ...
-
-
-class _TopicAttributionMessageLike(Protocol):
-    id: int | str
 
 
 class TelethonFullHistoryPageAdapter(FullHistoryPagePort):
@@ -61,7 +44,7 @@ class TelethonFullHistoryPageAdapter(FullHistoryPagePort):
         try:
             response = await self._client.get_messages(
                 entity=dialog_id,
-                limit=MESSAGE_HISTORY_PAGE_LIMIT,
+                limit=MESSAGE_HISTORY_PAGE_SIZE,
                 offset_id=before_message_id,
             )
             raw_messages = tuple(cast(Sequence[object], response))
@@ -81,71 +64,6 @@ class TelethonFullHistoryPageAdapter(FullHistoryPagePort):
             raise MessageHistoryUnavailableError(f"message history unavailable for dialog {dialog_id}") from exc
         total_messages = _optional_nonnegative_int(getattr(response, "total", None))
         return FullHistoryPage(messages=messages, total_messages=total_messages)
-
-
-class TelethonTopicAttributionPageAdapter(TopicAttributionPagePort):
-    """Fetch one campaign page without normalizing messages or resolving entities."""
-
-    def __init__(self, client: object) -> None:
-        self._client = cast(_TelegramHistoryClient, client)
-
-    async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> TopicAttributionPage:
-        try:
-            peer = _session_input_peer(self._client, dialog_id)
-            response = await self._client(
-                GetHistoryRequest(
-                    peer=peer,
-                    limit=MESSAGE_HISTORY_PAGE_LIMIT,
-                    offset_date=None,
-                    offset_id=before_message_id,
-                    add_offset=0,
-                    max_id=0,
-                    min_id=0,
-                    hash=0,
-                )
-            )
-            raw_messages = tuple(cast(Sequence[object], getattr(response, "messages", ()) or ()))
-        except ACCESS_LOST_ERRORS as exc:
-            raise MessageHistoryAccessLostError(
-                f"message history access lost for dialog {dialog_id}", reason_code=type(exc).__name__
-            ) from exc
-        except (RPCError, TimeoutError, OSError) as exc:
-            raise MessageHistoryUnavailableError(f"message history unavailable for dialog {dialog_id}") from exc
-        try:
-            messages = tuple(
-                TopicAttributionMessage(
-                    message_id=int(cast(_TopicAttributionMessageLike, message).id),
-                    forum_topic_id=extract_reply_and_topic(message)[1],
-                )
-                for message in raw_messages
-            )
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise TopicAttributionPageProjectionError("invalid topic-attribution page projection") from exc
-        return TopicAttributionPage(
-            messages=messages,
-            next_cursor=min((message.message_id for message in messages), default=None),
-            complete=len(raw_messages) < MESSAGE_HISTORY_PAGE_LIMIT,
-        )
-
-
-def _session_input_peer(client: object, dialog_id: int) -> TypeInputPeer:
-    """Resolve an already-known peer from Telethon's local session only."""
-    session = getattr(client, "session", None)
-    getter = getattr(session, "get_input_entity", None)
-    if not callable(getter):
-        raise MessageHistoryUnavailableError(f"message history unavailable for dialog {dialog_id}")
-    try:
-        peer = getter(dialog_id)
-    except (AttributeError, KeyError, TypeError, ValueError) as exc:
-        raise MessageHistoryUnavailableError(f"message history unavailable for dialog {dialog_id}") from exc
-    if hasattr(peer, "__await__"):
-        close = getattr(peer, "close", None)
-        if callable(close):
-            close()
-        raise MessageHistoryUnavailableError(f"message history unavailable for dialog {dialog_id}")
-    if not isinstance(peer, (types.InputPeerUser, types.InputPeerChat, types.InputPeerChannel, types.InputPeerSelf)):
-        raise MessageHistoryUnavailableError(f"message history unavailable for dialog {dialog_id}")
-    return cast(TypeInputPeer, peer)
 
 
 def _empty_context() -> AbstractContextManager[object]:
@@ -172,7 +90,7 @@ class TelethonForwardGapPageAdapter(ForwardGapPagePort):
                 entity=dialog_id,
                 min_id=after_message_id,
                 reverse=True,
-                limit=MESSAGE_HISTORY_PAGE_LIMIT,
+                limit=MESSAGE_HISTORY_PAGE_SIZE,
             ):
                 if should_stop():
                     complete = False
@@ -184,7 +102,7 @@ class TelethonForwardGapPageAdapter(ForwardGapPagePort):
             ) from exc
         except (RPCError, TimeoutError, OSError) as exc:
             raise MessageHistoryUnavailableError(f"message history unavailable for dialog {dialog_id}") from exc
-        if len(messages) == MESSAGE_HISTORY_PAGE_LIMIT:
+        if len(messages) == MESSAGE_HISTORY_PAGE_SIZE:
             complete = False
         normalized = tuple(extract_message_row(dialog_id, message) for message in messages)
         return ForwardGapPage(messages=normalized, complete=complete)
@@ -220,5 +138,4 @@ __all__ = [
     "TelethonForwardGapPageAdapter",
     "TelethonFullHistoryPageAdapter",
     "TelethonHistoryAccessProbe",
-    "TelethonTopicAttributionPageAdapter",
 ]

@@ -57,7 +57,6 @@ from .telegram_rpc_scheduler import (
     current_rpc_scope,
     rpc_attempt_budget,
     rpc_scope,
-    transient_retries_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -343,7 +342,7 @@ class TelegramRpcGate(TelegramClient):
     async def _call_registered(self, request: object, *, ordered: bool) -> object:
         """Run one logical RPC after its root demand context is established."""
         scope = self._require_rpc_scope()
-        retry_delays = self._transient_retry_delays if transient_retries_enabled() else ()
+        retry_delays = self._transient_retry_delays
         for retry_index, delay in enumerate((0.0, *retry_delays)):
             if retry_index and delay:
                 await asyncio.sleep(delay)

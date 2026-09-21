@@ -421,8 +421,3 @@ rationale = "This is the injected reaction-detail retry policy; configuration ow
 category = "policy_assignments"
 key = "src/mcp_telegram/reactions/detail.py:ReactionDetailPolicy:page_size"
 rationale = "GetMessageReactionsList page size is a fixed Telegram adapter protocol bound."
-
-[[entry]]
-category = "policy_assignments"
-key = "src/mcp_telegram/message_history/contracts.py:<module>:MESSAGE_HISTORY_PAGE_LIMIT"
-rationale = "This is the canonical Telegram history-page protocol bound shared by acquisition and repair."
