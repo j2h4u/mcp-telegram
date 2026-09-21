@@ -722,7 +722,7 @@ def test_schema_version_records_current(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-    assert _CURRENT_SCHEMA_VERSION == 73
+    assert _CURRENT_SCHEMA_VERSION == 74
 
 
 def test_genuine_v61_fixture_upgrades_to_v62_and_reopens_idempotently(
@@ -1511,7 +1511,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-    assert _CURRENT_SCHEMA_VERSION == 73
+    assert _CURRENT_SCHEMA_VERSION == 74
 
 
 def test_migration_v72_keeps_existing_topic_attribution_unknown(tmp_path: Path) -> None:
@@ -1921,8 +1921,8 @@ def test_migration_v63_repairs_positive_synced_dialog_orphans(tmp_path: Path) ->
             (12348,),
         )
         conn.execute(
-            "INSERT INTO dialogs(dialog_id, name, type, hidden, archived, pinned, needs_refresh, draft_text) "
-            "VALUES (?, 'Keep', 'user', 1, 1, 1, 0, 'draft')",
+            "INSERT INTO dialogs(dialog_id, name, type, hidden, archived, pinned, needs_refresh) "
+            "VALUES (?, 'Keep', 'user', 1, 1, 1, 0)",
             (12347,),
         )
         conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, 'synced')", (12347,))
@@ -1937,9 +1937,9 @@ def test_migration_v63_repairs_positive_synced_dialog_orphans(tmp_path: Path) ->
         assert conn.execute("SELECT dialog_id FROM dialogs WHERE dialog_id=?", (12346,)).fetchone() is None
         assert conn.execute("SELECT dialog_id FROM dialogs WHERE dialog_id=?", (12348,)).fetchone() is None
         assert conn.execute(
-            "SELECT name, type, hidden, archived, pinned, needs_refresh, draft_text FROM dialogs WHERE dialog_id=?",
+            "SELECT name, type, hidden, archived, pinned, needs_refresh FROM dialogs WHERE dialog_id=?",
             (12347,),
-        ).fetchone() == ("Keep", "user", 1, 1, 1, 0, "draft")
+        ).fetchone() == ("Keep", "user", 1, 1, 1, 0)
 
 
 def test_startup_repair_reclassifies_persisted_replies_rows(tmp_path: Path) -> None:

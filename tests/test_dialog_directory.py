@@ -249,6 +249,37 @@ async def test_imperfect_slice_advances_and_retains_every_identifiable_row(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_directory_traversal_never_mutates_current_drafts(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO draft_current(account_id,dialog_id,state,text,composition_complete,source_kind,"
+            "source_observed_at,observation_started_at,observation_completed_at,projection_revision,normalization_version) "
+            "VALUES (100,1,'present','draft body',1,'realtime_present',1,1,1,1,1)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    directory = CanonicalDialogDirectory(
+        _FakeClient([_pinned_response(), _pinned_response(), _response([_dialog(1, 8)]), _response([])]),
+        db_path,
+        asyncio.Event(),
+    )
+    await _run_slices(directory, 4)
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT state,text,projection_revision FROM draft_current WHERE account_id=100 AND dialog_id=1").fetchone() == (
+            "present",
+            "draft body",
+            1,
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
 async def test_wholly_unpageable_slice_stages_then_retries_from_committed_cursor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
