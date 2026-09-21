@@ -34,7 +34,6 @@ from mcp_telegram.telegram_rpc_scheduler import (
     current_rpc_scope,
     rpc_attempt_budget,
     rpc_scope,
-    without_transient_retries,
 )
 
 
@@ -262,37 +261,4 @@ async def test_sender_debits_actual_attempts_and_stops_transport_retry_at_slice_
     assert len(exhausted) == 1
     assert exhausted[0].demand_kind is DemandKind.FULL_SYNC_PAGE
     assert exhausted[0].acquisition_kind is AcquisitionKind.MESSAGE_HISTORY_PAGE
-    await gate.close_rpc_scheduler()
-
-
-@pytest.mark.asyncio
-async def test_no_transient_retry_operation_returns_first_server_failure_without_second_send() -> None:
-    limiter = _ImmediateLimiter()
-    events: list[RpcAdmissionEvent] = []
-    gate = _make_gate(limiter, TelegramRpcSchedulerConfig(), events)
-    gate._transient_retry_delays = (0.0,)
-    attempts = 0
-
-    class _FailingSender:
-        def send(self, _request: object, *, ordered: bool = False) -> asyncio.Future[object]:
-            nonlocal attempts
-            del ordered
-            attempts += 1
-            result = asyncio.get_running_loop().create_future()
-            result.set_exception(ServerError(None, "temporary"))
-            return result
-
-    gate._sender = _FailingSender()
-    budget = RpcAttemptBudget(limit=1)
-    with demand_context(DemandKind.FULL_SYNC_PAGE):
-        with acquisition_context(AcquisitionKind.MESSAGE_HISTORY_PAGE):
-            with rpc_attempt_budget(budget):
-                with without_transient_retries():
-                    with pytest.raises(ServerError):
-                        await gate(_ScalarRequest("campaign-page"))
-
-    assert attempts == 1
-    assert budget.attempts == 1
-    assert [event.kind for event in events].count(RpcAdmissionEventKind.DISPATCHED) == 1
-    assert not any(event.kind is RpcAdmissionEventKind.RESUBMITTED for event in events)
     await gate.close_rpc_scheduler()

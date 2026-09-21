@@ -27,6 +27,7 @@ from mcp_telegram.sync_db import (
     _apply_migration_66,
     _apply_migration_70,
     _apply_migration_71,
+    _apply_migration_73,
     _open_sync_db,
     ensure_sync_schema,
 )
@@ -721,7 +722,7 @@ def test_schema_version_records_current(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-    assert _CURRENT_SCHEMA_VERSION == 72
+    assert _CURRENT_SCHEMA_VERSION == 73
 
 
 def test_genuine_v61_fixture_upgrades_to_v62_and_reopens_idempotently(
@@ -1510,7 +1511,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-    assert _CURRENT_SCHEMA_VERSION == 72
+    assert _CURRENT_SCHEMA_VERSION == 73
 
 
 def test_migration_v72_keeps_existing_topic_attribution_unknown(tmp_path: Path) -> None:
@@ -1533,6 +1534,21 @@ def test_migration_v72_keeps_existing_topic_attribution_unknown(tmp_path: Path) 
             "topic_attribution_observed_at, topic_attribution_completed_at, topic_attribution_no_topic_count "
             "FROM synced_dialogs WHERE dialog_id=1"
         ).fetchone() == (0, "unknown", None, None, 0)
+
+
+def test_migration_v73_removes_persisted_campaign_state(tmp_path: Path) -> None:
+    db_path = _make_v24_db(tmp_path)
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute(
+            "INSERT INTO daemon_state(key, value) VALUES ('topic_attribution_campaign_v1', '{\"state\":\"complete\"}')"
+        )
+        conn.execute("DELETE FROM schema_version WHERE version = 73")
+        conn.commit()
+
+        assert _apply_migration_73(conn, 72) == 73
+        assert _fetchone_row(conn, "SELECT value FROM daemon_state WHERE key = 'topic_attribution_campaign_v1'") is None
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version = 73") == (73,)
 
 
 def test_migration_v70_normalizes_legacy_read_date_rows() -> None:

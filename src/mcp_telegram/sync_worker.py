@@ -34,14 +34,12 @@ from .history_enrollment import ensure_automatic_dm_enrollment, full_history_ena
 from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage as _ExtractedMessage
 from .message_history.contracts import (
-    MESSAGE_HISTORY_PAGE_LIMIT,
+    MESSAGE_HISTORY_PAGE_SIZE,
     TOPIC_ATTRIBUTION_EXTRACTOR_VERSION,
     MessageHistoryAccessLostError,
     MessageHistoryUnavailableError,
-    TopicAttributionPage,
-    TopicAttributionPageProjectionError,
 )
-from .message_history.ports import FullHistoryPagePort, TopicAttributionPagePort
+from .message_history.ports import FullHistoryPagePort
 from .messages.sqlite_bundle import insert_messages_with_fts
 from .read_state import apply_read_cursor
 from .resolver import latinize
@@ -65,23 +63,11 @@ from .telegram_rpc_scheduler import (
     current_rpc_scope,
     rpc_attempt_budget,
     rpc_scope,
-    without_transient_retries,
-)
-from .topic_attribution_campaign import (
-    TopicAttributionCampaignError,
-    advance_campaign,
-    campaign_execution_allowed,
-    campaign_release_at,
-    record_access_lost,
-    record_deferred,
-    record_failed_attempt,
-    record_page,
-    record_terminal_failure,
 )
 
 logger = logging.getLogger(__name__)
 
-_BATCH_SIZE = MESSAGE_HISTORY_PAGE_LIMIT
+_BATCH_SIZE = MESSAGE_HISTORY_PAGE_SIZE
 _DM_ENROLLMENT_KEY_LAST_PUBLICATION_GENERATION = "full_sync_dm_enrollment_last_publication_generation"
 _TOTAL_MESSAGES_REPAIR_GATE_STATE_KEY = "full_sync_total_messages_repair_retry_at"
 _TOTAL_MESSAGES_REPAIR_FAILURE_DELAY_S = 60
@@ -221,11 +207,9 @@ class FullSyncWorker:
         shutdown_event: asyncio.Event,
         *,
         total_messages_probe: TotalMessagesProbe | None = None,
-        topic_attribution_port: TopicAttributionPagePort | None = None,
     ) -> None:
         self._history_port = history_port
         self._total_messages_probe = total_messages_probe
-        self._topic_attribution_port = topic_attribution_port
         self._conn = conn
         self._shutdown_event = shutdown_event
         self._last_page_error: BaseException | None = None
@@ -333,105 +317,6 @@ class FullSyncWorker:
             return False  # more batches needed for this dialog
         # Dialog done — check if more pending dialogs remain
         return self._next_pending_dialog() is None
-
-    @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
-    async def process_topic_attribution_campaign_page(self) -> bool:
-        """Run one removable campaign page through the dedicated topic-attribution history port.
-
-        The campaign never inserts or replaces a message bundle.  Its only
-        persistence mutation is the constrained topic-id update owned by the
-        campaign module, so tombstones and satellite message facts survive.
-        """
-        now = int(time.time())
-        checkpoint = advance_campaign(self._conn, now=now)
-        if checkpoint is None:
-            return True
-        dialog_id, before_message_id = checkpoint
-        if not campaign_execution_allowed(self._conn, dialog_id):
-            self._record_campaign_access_loss(dialog_id, before_message_id, now, "history_disabled")
-            return campaign_release_at(self._conn, now=now) is None
-        if self._topic_attribution_port is None:
-            self._record_campaign_terminal_failure(dialog_id, before_message_id, now, "campaign_adapter_unavailable")
-            return True
-        page = await self._fetch_topic_attribution_page(dialog_id, before_message_id, now)
-        if page is not None:
-            if campaign_execution_allowed(self._conn, dialog_id):
-                self._record_campaign_page(dialog_id, before_message_id, page, now)
-            else:
-                self._record_campaign_access_loss(dialog_id, before_message_id, now, "history_disabled")
-        return campaign_release_at(self._conn, now=now) is None
-
-    async def _fetch_topic_attribution_page(
-        self, dialog_id: int, before_message_id: int, observed_at: int
-    ) -> TopicAttributionPage | None:
-        assert self._topic_attribution_port is not None
-        try:
-            with without_transient_retries():
-                return await self._topic_attribution_port.fetch_page(dialog_id, before_message_id=before_message_id)
-        except MessageHistoryAccessLostError as exc:
-            set_access_lost(self._conn, dialog_id, int(time.time()), reason=exc.reason_code)
-            self._conn.commit()
-            self._record_campaign_access_loss(dialog_id, before_message_id, observed_at, "access_lost")
-        except TelegramRpcAdmissionDeferred as exc:
-            record_deferred(
-                self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=observed_at
-            )
-            raise
-        except (
-            RpcAdmissionSaturatedError,
-            RpcAdmissionExpiredError,
-        ) as exc:
-            record_deferred(
-                self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=observed_at
-            )
-            raise
-        except TelegramRpcThrottled as exc:
-            record_deferred(
-                self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=observed_at
-            )
-            _raise_if_latched(exc)
-            raise
-        except MessageHistoryUnavailableError as exc:
-            record_failed_attempt(
-                self._conn,
-                dialog_id,
-                before_message_id,
-                reason=type(exc).__name__,
-                observed_at=observed_at,
-            )
-        except TopicAttributionPageProjectionError:
-            self._record_campaign_terminal_failure(dialog_id, before_message_id, observed_at, "invalid_page_projection")
-        except RpcAttemptBudgetExhaustedError:
-            self._record_campaign_terminal_failure(
-                dialog_id, before_message_id, observed_at, "rpc_attempt_budget_exhausted"
-            )
-        return None
-
-    def _record_campaign_page(
-        self, dialog_id: int, checkpoint: int, page: TopicAttributionPage, observed_at: int
-    ) -> None:
-        try:
-            record_page(self._conn, dialog_id, checkpoint, page, observed_at=observed_at)
-        except TopicAttributionCampaignError as exc:
-            self._ignore_superseded_campaign_operation(exc)
-
-    def _record_campaign_access_loss(self, dialog_id: int, checkpoint: int, observed_at: int, reason: str) -> None:
-        try:
-            record_access_lost(self._conn, dialog_id, checkpoint, observed_at=observed_at, reason=reason)
-        except TopicAttributionCampaignError as exc:
-            self._ignore_superseded_campaign_operation(exc)
-
-    def _record_campaign_terminal_failure(self, dialog_id: int, checkpoint: int, observed_at: int, reason: str) -> None:
-        try:
-            record_terminal_failure(self._conn, dialog_id, checkpoint, reason=reason, observed_at=observed_at)
-        except TopicAttributionCampaignError as exc:
-            self._ignore_superseded_campaign_operation(exc)
-
-    @staticmethod
-    def _ignore_superseded_campaign_operation(exc: TopicAttributionCampaignError) -> None:
-        if str(exc) not in {"campaign_inactive", "checkpoint_changed"}:
-            raise exc
-        logger.info("topic_attribution_campaign_operation_superseded reason=%s", exc)
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_LOOKUP)
     async def repair_one_total_messages(self) -> bool:  # noqa: PLR0911
@@ -735,19 +620,13 @@ class FullSyncDemandAdapter:
         if self._worker._next_pending_dialog() is not None:
             return DemandStatus(release_at=0.0)
         repair_release_at = self._worker._total_messages_repair_release_at(now)
-        campaign_release = campaign_release_at(self._worker._conn, now=int(now))
-        releases = [release for release in (repair_release_at, campaign_release) if release is not None]
-        return None if not releases else DemandStatus(release_at=min(releases))
+        return None if repair_release_at is None else DemandStatus(release_at=repair_release_at)
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
         """Fetch at most one history page under the transport attempt budget."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
         now = time.time()
-        with demand_context(DemandKind.FULL_SYNC_PAGE):
-            # This mutating preflight keeps the finite campaign's terminal receipt
-            # independent from ordinary full-sync queue starvation. status() stays pure.
-            advance_campaign(self._worker._conn, now=int(now))
         status = self.status(now)
         if status is None or not status.is_ready(now):
             return
@@ -757,8 +636,6 @@ class FullSyncDemandAdapter:
                     await self._worker.process_one_batch()
                     if self._worker._last_page_error is not None:
                         raise self._worker._last_page_error
-                elif campaign_release_at(self._worker._conn, now=int(time.time())) == 0.0:
-                    await self._worker.process_topic_attribution_campaign_page()
                 elif self._worker._next_total_messages_repair_dialog() is not None:
                     await self._worker.repair_one_total_messages()
                     if self._worker._last_total_repair_error is not None:
@@ -794,7 +671,6 @@ _EXPORTED_SYMBOLS = (
     FullSyncDemandAdapter,
     FullSyncWorker,
     FullSyncWorker.process_one_batch,
-    FullSyncWorker.process_topic_attribution_campaign_page,
     FullSyncWorker.repair_one_total_messages,
 )
 

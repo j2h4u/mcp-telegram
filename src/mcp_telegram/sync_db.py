@@ -14,7 +14,7 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 72
+_CURRENT_SCHEMA_VERSION = 73
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -38,6 +38,7 @@ _REACTION_DETAIL_PACING_MIGRATION_69 = 69
 _READ_DATE_OUTCOME_MIGRATION_70 = 70
 _READ_DATE_EXPIRY_CUTOFF_MIGRATION_71 = 71
 _TOPIC_ATTRIBUTION_RECEIPT_MIGRATION_72 = 72
+_REMOVE_TOPIC_ATTRIBUTION_CAMPAIGN_MIGRATION_73 = 73
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
@@ -4174,6 +4175,16 @@ def _apply_migration_72(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_73(conn: sqlite3.Connection, current: int) -> int:
+    """Remove the durable state key left by the completed repair campaign."""
+    return _apply_migration(
+        conn,
+        current,
+        _REMOVE_TOPIC_ATTRIBUTION_CAMPAIGN_MIGRATION_73,
+        ["DELETE FROM daemon_state WHERE key = 'topic_attribution_campaign_v1'"],
+    )
+
+
 def _apply_migrations_64_to_67(conn: sqlite3.Connection, current: int) -> int:
     """Apply the ordered canonical-directory and folder migrations."""
     if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64:
@@ -4225,6 +4236,8 @@ def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_71(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _TOPIC_ATTRIBUTION_RECEIPT_MIGRATION_72:
         current = _apply_migration_72(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _REMOVE_TOPIC_ATTRIBUTION_CAMPAIGN_MIGRATION_73:
+        current = _apply_migration_73(conn, current)
     return current
 
 

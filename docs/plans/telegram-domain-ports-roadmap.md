@@ -129,6 +129,10 @@ Telethon method and not an MCP tool.
 
 ## Current state after the completed program
 
+The temporary topic-attribution campaign is removed from the codebase. Migration
+v73 performs the finite cleanup of its persisted daemon-state key. This records
+code state only and makes no claim about the production campaign outcome.
+
 The MCP delivery boundary already satisfies the target: production modules
 under `tools/` have no direct Telethon imports and communicate with the daemon
 API.

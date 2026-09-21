@@ -1,27 +1,20 @@
 """Transport-neutral message-history contracts and Telegram adapters."""
 
 from .contracts import (
-    MESSAGE_HISTORY_PAGE_LIMIT,
+    MESSAGE_HISTORY_PAGE_SIZE,
     ForwardGapPage,
     FullHistoryPage,
     MessageHistoryAccessLostError,
     MessageHistoryUnavailableError,
-    TopicAttributionMessage,
-    TopicAttributionPage,
-    TopicAttributionPageProjectionError,
 )
-from .ports import ForwardGapPagePort, FullHistoryPagePort, TopicAttributionPagePort
+from .ports import ForwardGapPagePort, FullHistoryPagePort
 
 __all__ = [
-    "MESSAGE_HISTORY_PAGE_LIMIT",
+    "MESSAGE_HISTORY_PAGE_SIZE",
     "ForwardGapPage",
     "ForwardGapPagePort",
     "FullHistoryPage",
     "FullHistoryPagePort",
     "MessageHistoryAccessLostError",
     "MessageHistoryUnavailableError",
-    "TopicAttributionMessage",
-    "TopicAttributionPage",
-    "TopicAttributionPagePort",
-    "TopicAttributionPageProjectionError",
 ]

@@ -7,8 +7,6 @@ from typer import Argument, BadParameter, Option, Typer
 from .config import ConfigError, HttpServerConfig, load_config, resolve_http_server_config, resolve_logging_config
 
 app = Typer(no_args_is_help=True)
-topic_attribution_app = Typer(help="Temporary operator enrollment for the two-dialog topic repair.")
-app.add_typer(topic_attribution_app, name="topic-attribution")
 
 
 def _resolve_http_host(host: str | None, *, base: HttpServerConfig | None = None) -> str:
@@ -106,111 +104,6 @@ def recover_dialog_directory() -> None:
             return
         message = response.get("message") or response.get("error") or "unknown error"
         print(f"Error: {message}")
-        sys.exit(1)
-
-    asyncio.run(_run())
-
-
-@topic_attribution_app.command("enroll")
-def enroll_topic_attribution_campaign(
-    dialog_ids: Annotated[list[int], Argument(help="Exactly two currently synced bot dialog ids.")],
-) -> None:
-    """Enroll the deployment-local, finite topic-attribution repair campaign."""
-    import sys
-
-    from .daemon_client import daemon_connection
-
-    async def _run() -> None:
-        async with daemon_connection() as conn:
-            response = await conn.enroll_topic_attribution_campaign(dialog_ids=dialog_ids)
-        if response.get("ok"):
-            print("Topic-attribution repair enrolled for two bot dialogs.")
-            return
-        print(f"Error: {response.get('message') or response.get('error') or 'unknown error'}")
-        sys.exit(1)
-
-    asyncio.run(_run())
-
-
-@topic_attribution_app.command("status")
-def topic_attribution_campaign_status() -> None:
-    """Print the temporary repair's state, terminal reason, and reconciled counts."""
-    import sys
-
-    from .daemon_client import daemon_connection
-
-    async def _run() -> None:
-        async with daemon_connection() as conn:
-            response = await conn.get_topic_attribution_campaign_status()
-        if not response.get("ok"):
-            print(f"Error: {response.get('message') or response.get('error') or 'unknown error'}")
-            sys.exit(1)
-        data = cast(dict[str, object], response["data"])
-        counts = cast(dict[str, object], data["counts"])
-        print(
-            f"state={data['state']} terminal_reason={data['terminal_reason']} "
-            f"terminal_severity={data.get('terminal_severity', 'none')} "
-            f"pending_dialogs={data.get('pending_dialogs', 0)} "
-            f"failed_dialogs={data.get('failed_dialogs', 0)} abandoned_dialogs={data.get('abandoned_dialogs', 0)} "
-            f"attributed={counts['attributed']} "
-            f"no_longer_needed={counts['no_longer_needed']} unresolved={counts['unresolved']}"
-        )
-
-    asyncio.run(_run())
-
-
-@topic_attribution_app.command("abort")
-def abort_topic_attribution_campaign() -> None:
-    """Terminalize an active repair before explicit resume or reset."""
-    import sys
-
-    from .daemon_client import daemon_connection
-
-    async def _run() -> None:
-        async with daemon_connection() as conn:
-            response = await conn.abort_topic_attribution_campaign()
-        if response.get("ok"):
-            print("Active topic-attribution repair aborted; resume preserves its committed progress.")
-            return
-        print(f"Error: {response.get('message') or response.get('error') or 'unknown error'}")
-        sys.exit(1)
-
-    asyncio.run(_run())
-
-
-@topic_attribution_app.command("resume")
-def resume_topic_attribution_campaign() -> None:
-    """Resume an operator-aborted repair without resetting its manifest."""
-    import sys
-
-    from .daemon_client import daemon_connection
-
-    async def _run() -> None:
-        async with daemon_connection() as conn:
-            response = await conn.resume_topic_attribution_campaign()
-        if response.get("ok"):
-            print("Operator-aborted topic-attribution repair resumed from committed progress.")
-            return
-        print(f"Error: {response.get('message') or response.get('error') or 'unknown error'}")
-        sys.exit(1)
-
-    asyncio.run(_run())
-
-
-@topic_attribution_app.command("reset")
-def reset_topic_attribution_campaign() -> None:
-    """Clear a terminal repair manifest before an explicit fresh enrollment."""
-    import sys
-
-    from .daemon_client import daemon_connection
-
-    async def _run() -> None:
-        async with daemon_connection() as conn:
-            response = await conn.reset_topic_attribution_campaign()
-        if response.get("ok"):
-            print("Terminal topic-attribution repair reset; enroll two bot dialogs to start a new campaign.")
-            return
-        print(f"Error: {response.get('message') or response.get('error') or 'unknown error'}")
         sys.exit(1)
 
     asyncio.run(_run())

@@ -148,7 +148,6 @@ class _DeadlineOverride:
 
 _RPC_DEADLINE: ContextVar[_DeadlineOverride | None] = ContextVar("telegram_rpc_deadline", default=None)
 _RPC_ATTEMPT_BUDGET: ContextVar[RpcAttemptBudget | None] = ContextVar("telegram_rpc_attempt_budget", default=None)
-_TRANSIENT_RETRIES_DISABLED: ContextVar[bool] = ContextVar("telegram_rpc_transient_retries_disabled", default=False)
 _LEGACY_DEMAND_TOKEN: ContextVar[DemandToken | None] = ContextVar("telegram_legacy_demand_token", default=None)
 
 
@@ -283,21 +282,6 @@ def rpc_attempt_budget(budget: RpcAttemptBudget) -> Iterator[RpcAttemptBudget]:
         yield budget
     finally:
         _RPC_ATTEMPT_BUDGET.reset(reset_token)
-
-
-@contextmanager
-def without_transient_retries() -> Iterator[None]:
-    """Forbid gate-level retries for one operation without changing global policy."""
-    reset_token = _TRANSIENT_RETRIES_DISABLED.set(True)
-    try:
-        yield
-    finally:
-        _TRANSIENT_RETRIES_DISABLED.reset(reset_token)
-
-
-def transient_retries_enabled() -> bool:
-    """Return whether the current operation permits configured transient retries."""
-    return not _TRANSIENT_RETRIES_DISABLED.get()
 
 
 @contextmanager
@@ -1144,6 +1128,4 @@ __all__ = [
     "preserve_or_rpc_scope",
     "rpc_attempt_budget",
     "rpc_scope",
-    "transient_retries_enabled",
-    "without_transient_retries",
 ]

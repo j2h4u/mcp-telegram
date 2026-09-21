@@ -803,32 +803,6 @@ async def test_recover_dialog_directory_convenience() -> None:
 
 
 @pytest.mark.asyncio
-async def test_topic_attribution_campaign_status_convenience() -> None:
-    reader = MagicMock(spec=asyncio.StreamReader)
-    writer = MagicMock(spec=asyncio.StreamWriter)
-    conn = DaemonConnection(reader, writer)
-    captured: list[dict] = []
-
-    async def _mock_request(payload: dict) -> dict:
-        captured.append(payload)
-        return {"ok": True, "data": {"state": "active"}}
-
-    conn.request = _mock_request  # type: ignore[method-assign]
-
-    await conn.get_topic_attribution_campaign_status()
-    await conn.abort_topic_attribution_campaign()
-    await conn.resume_topic_attribution_campaign()
-    await conn.reset_topic_attribution_campaign()
-
-    assert captured == [
-        {"method": "get_topic_attribution_campaign_status"},
-        {"method": "abort_topic_attribution_campaign"},
-        {"method": "resume_topic_attribution_campaign"},
-        {"method": "reset_topic_attribution_campaign"},
-    ]
-
-
-@pytest.mark.asyncio
 async def test_submit_feedback_convenience_with_optional_fields() -> None:
     """submit_feedback forwards optional context and status metadata."""
     reader = MagicMock(spec=asyncio.StreamReader)

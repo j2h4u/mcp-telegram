@@ -113,14 +113,6 @@ from .telegram_rpc_scheduler import (
     UnclassifiedTelegramRpcError,
     rpc_scope,
 )
-from .topic_attribution_campaign import (
-    TopicAttributionCampaignError,
-    abort_campaign,
-    campaign_status,
-    enroll_campaign,
-    reset_campaign,
-    resume_campaign,
-)
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
 
@@ -987,11 +979,6 @@ class DaemonAPIServer:
             "list_topics": self._list_topics,
             "get_me": self._get_me,
             "mark_dialog_for_sync": self._mark_dialog_for_sync,
-            "enroll_topic_attribution_campaign": self._enroll_topic_attribution_campaign,
-            "abort_topic_attribution_campaign": self._abort_topic_attribution_campaign,
-            "resume_topic_attribution_campaign": self._resume_topic_attribution_campaign,
-            "reset_topic_attribution_campaign": self._reset_topic_attribution_campaign,
-            "get_topic_attribution_campaign_status": self._get_topic_attribution_campaign_status,
             "get_sync_status": self._get_sync_status,
             "recover_dialog_directory": self._recover_dialog_directory,
             "list_conversation_changes": self._list_conversation_changes,
@@ -1720,49 +1707,6 @@ class DaemonAPIServer:
                 "full_history_will_be_fetched": outcome.full_history_will_be_fetched,
             },
         }
-
-    def _enroll_topic_attribution_campaign(self, req: dict[str, object]) -> dict[str, object]:
-        """Accept the explicit two-bot deployment enrollment and wake its page slice."""
-        raw_ids = req.get("dialog_ids")
-        if not isinstance(raw_ids, list) or any(
-            isinstance(value, bool) or not isinstance(value, int) for value in raw_ids
-        ):
-            return {"ok": False, "error": "invalid_input", "message": "dialog_ids must be two integer ids"}
-        try:
-            manifest = enroll_campaign(self._conn, cast(list[int], raw_ids))
-        except TopicAttributionCampaignError as exc:
-            return {"ok": False, "error": "topic_attribution_campaign_ineligible", "message": str(exc)}
-        offer_durable_demand(self._require_demand_sink(), DemandKind.FULL_SYNC_PAGE)
-        return {"ok": True, "data": {"state": manifest["state"], "dialog_count": len(raw_ids)}}
-
-    def _get_topic_attribution_campaign_status(self, _req: dict[str, object]) -> dict[str, object]:
-        """Expose the temporary campaign's privacy-safe completion receipt."""
-        return {"ok": True, "data": campaign_status(self._conn)}
-
-    def _abort_topic_attribution_campaign(self, _req: dict[str, object]) -> dict[str, object]:
-        """Terminalize an active repair for an explicit later resume or reset."""
-        try:
-            result = abort_campaign(self._conn)
-        except TopicAttributionCampaignError as exc:
-            return {"ok": False, "error": "topic_attribution_campaign_not_abortable", "message": str(exc)}
-        return {"ok": True, "data": result}
-
-    def _resume_topic_attribution_campaign(self, _req: dict[str, object]) -> dict[str, object]:
-        """Resume only an operator-aborted repair from durable committed progress."""
-        try:
-            result = resume_campaign(self._conn)
-        except TopicAttributionCampaignError as exc:
-            return {"ok": False, "error": "topic_attribution_campaign_not_resumable", "message": str(exc)}
-        offer_durable_demand(self._require_demand_sink(), DemandKind.FULL_SYNC_PAGE)
-        return {"ok": True, "data": result}
-
-    def _reset_topic_attribution_campaign(self, _req: dict[str, object]) -> dict[str, object]:
-        """Clear only a terminal repair manifest before explicit re-enrollment."""
-        try:
-            result = reset_campaign(self._conn)
-        except TopicAttributionCampaignError as exc:
-            return {"ok": False, "error": "topic_attribution_campaign_not_resettable", "message": str(exc)}
-        return {"ok": True, "data": result}
 
     # ------------------------------------------------------------------
     # get_sync_status
