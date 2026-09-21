@@ -4,6 +4,7 @@ import sqlite3
 import time
 from collections.abc import Mapping
 from typing import Literal
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -36,6 +37,86 @@ LIFECYCLE_FIELDS = {
     "published_at",
     "inclusion_basis",
 }
+
+
+def _create_draft_projection(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE draft_current (
+            account_id INTEGER, dialog_id INTEGER, top_message_id INTEGER, subdialog_peer_id INTEGER,
+            state TEXT, text TEXT, entities_json TEXT, reply_to_json TEXT, media_json TEXT,
+            suggested_post_json TEXT, rich_message_json TEXT, effect_id INTEGER, no_webpage INTEGER,
+            invert_media INTEGER, composition_complete INTEGER, source_kind TEXT, source_observed_at INTEGER,
+            observation_started_at INTEGER, observation_completed_at INTEGER, projection_revision INTEGER,
+            normalization_version INTEGER
+        );
+        CREATE TABLE draft_sync_state (
+            account_id INTEGER PRIMARY KEY, status TEXT, coverage_status TEXT,
+            observation_started_at INTEGER, observation_completed_at INTEGER, reason TEXT
+        );
+        """
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_messages_draft_is_local_and_has_no_sent_identity() -> None:
+    server = make_server()
+    server.self_id = 7
+    conn = server._conn
+    _create_draft_projection(conn)
+    conn.execute(
+        "INSERT INTO draft_current VALUES (7, 1, 0, 0, 'present', ?, '[]', NULL, NULL, NULL, NULL, NULL, 0, 0, 1, 'realtime_present', 100, 100, 101, 2, 1)",
+        ("a composition longer than the obsolete eighty character dialog preview limit, without truncation",),
+    )
+    conn.execute("INSERT INTO draft_sync_state VALUES (7, 'ready', 'complete', 100, 101, NULL)")
+    conn.commit()
+
+    result = await server._list_messages({"dialog_id": 1, "message_state": "draft"})
+
+    assert result["ok"] is True
+    row = result["data"]["messages"][0]
+    assert row["message_state"] == "draft"
+    assert "message_id" not in row and "sent_at" not in row
+    assert row["text"].startswith("a composition longer")
+    assert result["data"]["draft_coverage"]["freshness"] == "current"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_state", ["draft", "all"])
+async def test_natural_draft_dialog_resolution_never_falls_through_to_telegram(message_state: str) -> None:
+    client = MagicMock()
+    client.get_entity = AsyncMock(side_effect=AssertionError("draft selector must remain local"))
+    server = make_server(client=client)
+
+    result = await server._list_messages({"dialog": "@not_cached", "message_state": message_state})
+
+    assert result["ok"] is False
+    assert result["error"] in {"dialog_directory_incomplete", "dialog_not_found", "stale_local_directory"}
+    client.get_entity.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_draft_cursor_rejects_changed_projection() -> None:
+    server = make_server()
+    server.self_id = 7
+    conn = server._conn
+    _create_draft_projection(conn)
+    for topic_id, revision in ((1, 1), (2, 2)):
+        conn.execute(
+            "INSERT INTO draft_current VALUES (7, 1, ?, 0, 'present', 'draft', '[]', NULL, NULL, NULL, NULL, NULL, 0, 0, 1, 'realtime_present', 100, 100, 101, ?, 1)",
+            (topic_id, revision),
+        )
+    conn.execute("INSERT INTO draft_sync_state VALUES (7, 'ready', 'complete', 100, 101, NULL)")
+    conn.commit()
+    first = await server._list_messages({"dialog_id": 1, "message_state": "draft", "limit": 1})
+    conn.execute("UPDATE draft_current SET projection_revision = 3 WHERE top_message_id = 2")
+    conn.commit()
+
+    second = await server._list_messages(
+        {"dialog_id": 1, "message_state": "draft", "limit": 1, "navigation": first["data"]["next_navigation"]}
+    )
+
+    assert second["error"] == "draft_projection_changed"
 
 
 @pytest.mark.parametrize(
@@ -301,7 +382,7 @@ async def test_list_messages_all_uses_one_unified_envelope() -> None:
 
     rows = result["data"]["messages"]
     assert [row["text"] for row in rows] == ["published", "future"]
-    assert "message_state" not in rows[0]
+    assert rows[0]["message_state"] == "sent"
     assert rows[1]["message_state"] == "scheduled"
     assert rows[1]["unpublished"] is True
     assert rows[1]["unseen"] is True

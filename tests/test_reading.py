@@ -10,6 +10,7 @@ from jsonschema import validate
 from pydantic import ValidationError
 
 from mcp_telegram.models import ReadReactionEvent
+from mcp_telegram.tools.message_view import DRAFT_MESSAGE_VIEW_SCHEMA
 from mcp_telegram.tools.reading import (
     LIST_MESSAGES_OUTPUT_SCHEMA,
     SEARCH_MESSAGES_OUTPUT_SCHEMA,
@@ -52,6 +53,38 @@ def test_list_messages_contact_has_one_explicit_attachment() -> None:
     assert "content" not in message
     assert message["media"] == {"type": "contact", "description": "Ada, +123"}
     validate(instance=message["media"], schema=MEDIA_OUTPUT_SCHEMA)
+
+
+def test_list_messages_projects_draft_without_sent_identity() -> None:
+    row = {
+        "message_state": "draft",
+        "message_key": "draft_opaque_scope_key",
+        "dialog_id": 1,
+        "draft_scope": {"dialog_id": 1, "topic_id": None, "subdialog_peer_id": None},
+        "draft_status": "present",
+        "text": "current composition",
+        "entities": [],
+        "reply_to": None,
+        "media": None,
+        "suggested_post": None,
+        "rich_message": None,
+        "effect_id": None,
+        "no_webpage": False,
+        "invert_media": False,
+        "composition_complete": True,
+        "observation_source": "realtime_present",
+        "observed_at": 100,
+        "draft_updated_at": 101,
+        "projection_revision": 2,
+        "normalization_version": "1",
+    }
+
+    projected = _list_messages_structured_messages([row])[0]
+
+    assert projected["message_state"] == "draft"
+    assert "msg_id" not in projected and "sent_at" not in projected
+    assert projected["content"]["is_telegram_content"] is True
+    validate(instance=projected, schema=DRAFT_MESSAGE_VIEW_SCHEMA)
 
 
 def test_search_messages_contact_uses_same_attachment_projection() -> None:

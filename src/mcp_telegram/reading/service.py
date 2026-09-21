@@ -42,6 +42,7 @@ from ..telegram_reading import (
     TelegramHistoryGateway,
 )
 from ..temporal import parse_utc_boundary
+from .draft_projection import draft_message_key, read_drafts
 from .query_records import read_message_from_row
 from .scheduled_projection import (
     build_scheduled_list_query,
@@ -187,6 +188,7 @@ class ReadingDeps:
     logger: LoggerLike
     rid: Callable[[], str]
     deleted_message_visibility_seconds: int
+    resolve_dialog_id_local: Callable[[DialogSelector], Awaitable[int | dict]] | None = None
 
 
 @dataclass(frozen=True)
@@ -1343,7 +1345,6 @@ class ReadingService:
         inclusion_basis: tuple[str, ...] | None,
     ) -> dict[str, object]:
         return {
-            "draft_text": row["draft_text"],
             "scheduled_count": scheduled_summary[0],
             "next_scheduled_at": scheduled_summary[1],
             "inclusion_basis": list(inclusion_basis) if inclusion_basis is not None else None,
@@ -1667,6 +1668,119 @@ class ReadingService:
                 },
             }
 
+    def _list_draft_messages_from_db(  # noqa: PLR0911
+        self, req: _ListMessagesDbRequest, *, navigation: str | None = None
+    ) -> dict:
+        """Read mutable author-only composition from the dedicated local projection.
+
+        This path has no gateway dependency.  Empty local rows and unavailable
+        receipts remain visible through ``draft_coverage`` instead of being
+        misrepresented as an empty sent-history page.
+        """
+        with timing_phase("local_projection"):
+            records, coverage = read_drafts(
+                self._conn,
+                account_id=self._deps.self_id,
+                dialog_id=req.dialog_id,
+                topic_id=req.topic_id,
+                sender_id=req.sender_id,
+                sender_name=req.sender_name,
+                since_utc=req.since_utc,
+                until_utc=req.until_utc,
+            )
+        visible = [record for record in records if record.state == "present"]
+        visible.sort(
+            key=lambda record: (record.observation_completed_at, draft_message_key(record)),
+            reverse=req.direction != "oldest",
+        )
+        start = 0
+        if navigation not in (None, "newest", "oldest"):
+            try:
+                cursor = decode_navigation_token(navigation)
+            except ValueError as exc:
+                return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
+            if cursor.kind != "history" or cursor.message_state != "draft":
+                return {"ok": False, "error": "invalid_navigation", "message": "Navigation token is not a draft cursor."}
+            if cursor.dialog_id != req.dialog_id or cursor.topic_id != req.topic_id:
+                return {"ok": False, "error": "invalid_navigation", "message": "Navigation token belongs to a different draft scope."}
+            if cursor.since_utc != req.since_utc or cursor.until_utc != req.until_utc:
+                return {"ok": False, "error": "invalid_navigation", "message": "Navigation token belongs to a different time range."}
+            if cursor.draft_fingerprint != coverage.projection_fingerprint:
+                return {
+                    "ok": False,
+                    "error": "draft_projection_changed",
+                    "message": "Draft composition changed since this page. Action: restart the draft read from the beginning.",
+                }
+            if cursor.draft_key is None:
+                return {"ok": False, "error": "invalid_navigation", "message": "Draft cursor is missing its scope key."}
+            positions = {draft_message_key(record): index for index, record in enumerate(visible)}
+            if cursor.draft_key not in positions:
+                return {
+                    "ok": False,
+                    "error": "draft_projection_changed",
+                    "message": "Draft scope changed since this page. Action: restart the draft read from the beginning.",
+                }
+            start = positions[cursor.draft_key] + 1
+        next_navigation = None
+        page = visible[start : start + req.limit]
+        if len(visible) > start + req.limit and page:
+            next_navigation = encode_history_navigation(
+                None,
+                req.dialog_id,
+                topic_id=req.topic_id,
+                direction=req.direction_enum,
+                message_state="draft",
+                since_utc=req.since_utc,
+                until_utc=req.until_utc,
+                draft_key=draft_message_key(page[-1]),
+                draft_fingerprint=coverage.projection_fingerprint,
+            )
+        with timing_phase("response_shape"):
+            rows = [
+                {
+                    "message_state": "draft",
+                    "message_key": draft_message_key(record),
+                    "dialog_id": record.dialog_id,
+                    "draft_scope": {
+                        "dialog_id": record.dialog_id,
+                        "topic_id": record.topic_id,
+                        "subdialog_peer_id": record.subdialog_peer_id,
+                    },
+                    "draft_status": record.state,
+                    "text": record.text,
+                    "entities": list(record.entities),
+                    "reply_to": record.reply_to,
+                    "media": record.media,
+                    "suggested_post": record.suggested_post,
+                    "rich_message": record.rich_message,
+                    "effect_id": record.effect_id,
+                    "no_webpage": record.no_webpage,
+                    "invert_media": record.invert_media,
+                    "composition_complete": record.composition_complete,
+                    "observation_source": record.source_kind,
+                    "observed_at": record.source_observed_at,
+                    "draft_updated_at": record.observation_completed_at,
+                    "projection_revision": record.projection_revision,
+                    "normalization_version": record.normalization_version,
+                    "visibility": "author_only",
+                    "unpublished": True,
+                    "published": False,
+                    "unseen": True,
+                }
+                for record in page
+            ]
+        return {
+            "ok": True,
+            "data": {
+                "messages": rows,
+                "source": "draft_current",
+                "next_navigation": next_navigation,
+                "message_state": "draft",
+                "scope": "own_only",
+                "draft_coverage": coverage.to_wire(),
+            },
+        }
+
     async def _list_messages_local_state_result(  # noqa: PLR0913, PLR0917
         self,
         dialog_id: int,
@@ -1692,6 +1806,9 @@ class ReadingService:
             since_utc=request.since_utc,
             until_utc=request.until_utc,
         )
+        if request.message_state == "draft":
+            return self._list_draft_messages_from_db(db_request, navigation=request.navigation)
+
         scheduled_result = self._list_scheduled_messages_from_db(db_request)
         if request.message_state == "scheduled":
             with timing_phase("local_projection"):
@@ -1703,24 +1820,32 @@ class ReadingService:
 
         if status in ("synced", "syncing", "access_lost"):
             sent_result = await self._list_messages_from_db(db_request)
-            sent_rows = sent_result["data"]["messages"]
+            sent_rows = [
+                {**row, "message_state": "sent"}
+                for row in sent_result["data"]["messages"]
+            ]
         else:
             sent_rows = []
+        draft_result = self._list_draft_messages_from_db(db_request)
         scheduled_rows = scheduled_result["data"]["messages"]
+        draft_rows = draft_result["data"]["messages"]
         with timing_phase("local_projection"):
             dialog_type = _dialog_type_from_db(self._conn, dialog_id)
             read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
             access_metadata = _build_access_metadata(self._conn, dialog_id, status or "not_synced")
         with timing_phase("response_shape"):
-            combined = [*sent_rows, *scheduled_rows]
+            combined = [*sent_rows, *scheduled_rows, *draft_rows]
             combined.sort(
-                key=lambda row: (int(row.get("sent_at") or 0), int(row.get("message_id") or 0)),
+                key=lambda row: (
+                    int(row.get("sent_at") or row.get("draft_updated_at") or 0),
+                    str(row.get("message_key") or row.get("message_id") or ""),
+                ),
                 reverse=direction != "oldest",
             )
             has_more = len(combined) > request.limit
             combined = combined[: request.limit]
             next_nav = None
-            if has_more and combined:
+            if has_more and combined and not draft_rows:
                 last = combined[-1]
                 next_nav = encode_history_navigation(
                     _message_id_from_item(last),
@@ -1740,6 +1865,13 @@ class ReadingService:
                     "message_state": "all",
                     "dialog_type": dialog_type,
                     "read_state": read_state,
+                    "draft_coverage": draft_result["data"]["draft_coverage"],
+                    "pagination_notice": (
+                        "Draft projections are mutable; this union page has no continuation token. Retry the read "
+                        "from the beginning if more rows are needed."
+                        if has_more and draft_rows
+                        else None
+                    ),
                     **access_metadata,
                 },
             }
@@ -1757,8 +1889,8 @@ class ReadingService:
         if request.context_message_id is not None:
             return {
                 "ok": False,
-                "error": "scheduled_context_unsupported",
-                "message": "Scheduled messages do not support sent-history context windows.",
+                "error": "non_sent_context_unsupported",
+                "message": "Draft and scheduled messages do not support sent-history context windows.",
             }
         nav_result = self._decode_history_navigation(
             request.navigation,
@@ -1792,11 +1924,11 @@ class ReadingService:
         request: _ListMessagesRequest,
         direction: str,
     ) -> dict:
-        if request.message_state not in {"sent", "scheduled", "all"}:
+        if request.message_state not in {"sent", "scheduled", "draft", "all"}:
             return {
                 "ok": False,
                 "error": "invalid_message_state",
-                "message": "message_state must be sent, scheduled, or all",
+                "message": "message_state must be sent, scheduled, draft, or all",
             }
         if request.message_state != "sent":
             return await self._list_messages_non_sent(dialog_id, request, direction)
@@ -1821,8 +1953,11 @@ class ReadingService:
         if direction not in ("newest", "oldest"):
             direction = "newest"
 
+        resolver = self._deps.resolve_dialog_id
+        if request.message_state in {"draft", "all"} and self._deps.resolve_dialog_id_local is not None:
+            resolver = self._deps.resolve_dialog_id_local
         with timing_phase("resolution"):
-            resolved = await self._deps.resolve_dialog_id(selector)
+            resolved = await resolver(selector)
         if isinstance(resolved, dict):
             return resolved
         dialog_id = resolved

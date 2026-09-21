@@ -144,7 +144,6 @@ class _SeedDialogRowKwargs(TypedDict, total=False):
     needs_refresh: int
     unread_mentions_count: int
     unread_reactions_count: int
-    draft_text: str | None
 
 
 class _InsertMessageVersionKwargs(TypedDict, total=False):
@@ -1026,11 +1025,10 @@ def _seed_dialog_row(
     needs_refresh = kwargs.get("needs_refresh", 0)
     unread_mentions_count = kwargs.get("unread_mentions_count", 0)
     unread_reactions_count = kwargs.get("unread_reactions_count", 0)
-    draft_text = kwargs.get("draft_text")
     conn.execute(
         "INSERT INTO dialogs (dialog_id, name, type, archived, pinned, members, created, "
         "last_message_at, snapshot_at, hidden, needs_refresh, unread_mentions_count, "
-        "unread_reactions_count, draft_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "unread_reactions_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             dialog_id,
             name,
@@ -1045,7 +1043,6 @@ def _seed_dialog_row(
             needs_refresh,
             unread_mentions_count,
             unread_reactions_count,
-            draft_text,
         ),
     )
     conn.commit()
@@ -1402,6 +1399,27 @@ async def test_list_messages_name_resolution() -> None:
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
     cast(AsyncMock, client.get_entity).assert_not_awaited()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_state", ["draft", "all"])
+async def test_draft_bearing_natural_reads_stay_local(message_state: str) -> None:
+    """Draft-bearing reads must not resolve a local selector through Telegram."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 123, name="Alice", type_="user")
+    _publish_test_dialog_directory(conn)
+    client = _TestClient()
+    client.get_entity = AsyncMock(side_effect=AssertionError("draft selector must stay local"))
+    client.iter_messages = AsyncMock(side_effect=AssertionError("draft-bearing read must not fetch history"))
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("draft selector must stay local"))
+    server = make_server(conn, client)
+
+    result = await server._list_messages({"dialog": "Alice", "message_state": message_state})
+
+    assert result["ok"] is True
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
+    cast(AsyncMock, client.iter_messages).assert_not_awaited()
     cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
@@ -2192,8 +2210,8 @@ async def test_list_dialogs_includes_orphan_access_lost_archive() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_dialogs_diff04_fields_present_in_data() -> None:
-    """Test G: per-row unread_mentions_count, unread_reactions_count, draft_text fields."""
+async def test_list_dialogs_diff04_fields_present_without_draft_preview() -> None:
+    """Dialog rows retain unread facts but do not expose a draft preview."""
     conn = _make_db_with_dialogs()
     _seed_dialog_row(
         conn,
@@ -2202,7 +2220,6 @@ async def test_list_dialogs_diff04_fields_present_in_data() -> None:
         type_="Chat",
         unread_mentions_count=2,
         unread_reactions_count=1,
-        draft_text="WIP",
     )
     _seed_dialog_row(
         conn,
@@ -2211,7 +2228,6 @@ async def test_list_dialogs_diff04_fields_present_in_data() -> None:
         type_="Chat",
         unread_mentions_count=0,
         unread_reactions_count=0,
-        draft_text=None,
     )
 
     client = _TestClient()
@@ -2223,10 +2239,10 @@ async def test_list_dialogs_diff04_fields_present_in_data() -> None:
     by_id = {d["id"]: d for d in result["data"]["dialogs"]}
     assert by_id[1]["unread_mentions_count"] == 2
     assert by_id[1]["unread_reactions_count"] == 1
-    assert by_id[1]["draft_text"] == "WIP"
+    assert "draft_text" not in by_id[1]
     assert by_id[2]["unread_mentions_count"] == 0
     assert by_id[2]["unread_reactions_count"] == 0
-    assert by_id[2]["draft_text"] is None
+    assert "draft_text" not in by_id[2]
     cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 

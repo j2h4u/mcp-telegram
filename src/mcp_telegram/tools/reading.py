@@ -39,7 +39,14 @@ from ._base import (
     structured_result,
 )
 from .dialog_resolution import project_dialog_resolution_error
-from .message_view import MESSAGE_VIEW_SCHEMA, ReadMarker, project_message_view, project_read_markers
+from .message_view import (
+    DRAFT_MESSAGE_VIEW_SCHEMA,
+    MESSAGE_VIEW_SCHEMA,
+    ReadMarker,
+    project_draft_message_view,
+    project_message_view,
+    project_read_markers,
+)
 from .search_hit import SEARCH_HIT_SCHEMA, extract_search_snippet, project_search_hit
 from .structured import (
     StructuredWarning,
@@ -276,8 +283,8 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "anchor_message_id": {"type": ["integer", "null"]},
                 "message_state": {
                     "type": "string",
-                    "enum": ["sent", "scheduled", "all"],
-                    "description": "Lifecycle filter: published history, pending author-only outbox, or both.",
+                    "enum": ["sent", "scheduled", "draft", "all"],
+                    "description": "Lifecycle filter: published history, pending author-only state, current draft composition, or all local states.",
                 },
                 "since_utc": {"type": ["string", "null"]},
                 "until_utc": {"type": ["string", "null"]},
@@ -359,9 +366,24 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
             "required": ["dialog_type", "state", "header_lines"],
             "additionalProperties": False,
         },
+        "draft_coverage": {
+            "type": ["object", "null"],
+            "properties": {
+                "presence": {"type": "string", "enum": ["present", "absent", "unknown"]},
+                "freshness": {"type": "string", "enum": ["current", "stale", "unknown"]},
+                "observed_at": {"type": ["integer", "null"]},
+                "observation_source": {"type": ["string", "null"]},
+                "absence_basis": {"type": ["string", "null"]},
+                "continuity_reason": {"type": ["string", "null"]},
+                "composition_complete": {"type": ["boolean", "null"]},
+            },
+            "required": ["presence", "freshness", "observed_at", "observation_source", "absence_basis", "continuity_reason", "composition_complete"],
+            "additionalProperties": False,
+        },
         "messages": {
             "type": "array",
-            "items": {
+            "items": {"oneOf": [
+                {
                 "type": "object",
                 "properties": {
                     **cast(dict[str, object], MESSAGE_VIEW_SCHEMA["properties"]),
@@ -394,7 +416,9 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "reaction_events_status",
                 ],
                 "additionalProperties": False,
-            },
+                },
+                DRAFT_MESSAGE_VIEW_SCHEMA,
+            ]},
         },
         "count": {"type": "integer"},
         "result_count_semantics": {"type": "string"},
@@ -412,6 +436,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
         "presentation",
         "read_state",
         "scope",
+        "draft_coverage",
         "messages",
         "count",
         "result_count_semantics",
@@ -618,23 +643,28 @@ def _list_messages_structured_messages(
 ) -> list[dict[str, object]]:
     if not rows:
         return []
-    messages = _read_messages_from_rows(rows)
+    sent_rows = [row for row in rows if row.get("message_state") != "draft"]
+    messages = _read_messages_from_rows(sent_rows)
     reply_map: dict[int, ReadMessage] = {message.id: message for message in messages}
     marker_by_message = project_read_markers(messages, read_state=read_state, dialog_type=dialog_type)
 
     structured: list[dict[str, object]] = []
-    for row, message in zip(rows, messages, strict=True):
+    structured_by_identity: dict[int, dict[str, object]] = {}
+    for row, message in zip(sent_rows, messages, strict=True):
         marker_label, lifecycle = _list_message_render_metadata(row, message, marker_by_message)
         reply_parent = reply_map.get(message.reply_to_msg_id or -1)
         parent_in_page = reply_parent is not None
-        structured.append(
-            _list_message_structured_item(
-                message,
-                parent_in_page=parent_in_page,
-                read_marker=marker_label,
-                lifecycle=lifecycle,
-            )
+        structured_by_identity[id(row)] = _list_message_structured_item(
+            message,
+            parent_in_page=parent_in_page,
+            read_marker=marker_label,
+            lifecycle=lifecycle,
         )
+    for row in rows:
+        if row.get("message_state") == "draft":
+            structured.append(project_draft_message_view(row))
+        else:
+            structured.append(structured_by_identity[id(row)])
     return structured
 
 
@@ -642,8 +672,8 @@ def _chronological_message_rows(rows: list[dict]) -> list[dict]:
     return sorted(
         rows,
         key=lambda row: (
-            int(row.get("sent_at") or 0),
-            int(row.get("message_id") or 0),
+            int(row.get("sent_at") or row.get("draft_updated_at") or 0),
+            str(row.get("message_key") or row.get("message_id") or ""),
         ),
     )
 
@@ -722,6 +752,7 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
         },
         "read_state": structured_read_state,
         "scope": str(data.get("scope", "all")),
+        "draft_coverage": data.get("draft_coverage"),
         "messages": _list_messages_structured_messages(
             ordered_rows,
             read_state=read_state,
@@ -922,6 +953,11 @@ def _search_messages_request_context(args: SearchMessages) -> _SearchMessagesReq
             if error_message is not None:
                 return error_result(
                     invalid_navigation_text(error_message, retry_tool="SearchMessages"),
+                    has_cursor=True,
+                )
+            if nav.value is None:
+                return error_result(
+                    invalid_navigation_text("Search navigation token is missing its offset", retry_tool="SearchMessages"),
                     has_cursor=True,
                 )
             offset = nav.value
@@ -1160,11 +1196,11 @@ class ListMessages(ToolArgs):
         default=None,
         description="Exclusive RFC3339 UTC upper bound (Z or +00:00). Results use [since_utc, until_utc).",
     )
-    message_state: Literal["sent", "scheduled", "all"] = Field(
+    message_state: Literal["sent", "scheduled", "draft", "all"] = Field(
         default="sent",
         description=(
             "Lifecycle filter. sent returns published chat history (default), scheduled returns "
-            "pending future outbox rows, and all combines both in chronological order."
+            "pending future outbox rows, draft returns current local author composition, and all combines them."
         ),
     )
 
@@ -1193,6 +1229,8 @@ def _validate_topic_selectors(args: ListMessages) -> None:
 def _validate_message_state_selector(args: ListMessages) -> None:
     if args.message_state != "sent" and args.anchor_message_id is not None:
         raise ValueError("anchor_message_id is only supported for published sent history.")
+    if args.message_state in {"draft", "all"} and args.topic is not None:
+        raise ValueError("draft and all reads require exact_topic_id; natural topic resolution may use Telegram.")
 
 
 def _validate_utc_range(args: ListMessages) -> None:

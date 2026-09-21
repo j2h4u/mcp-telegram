@@ -112,6 +112,94 @@ MESSAGE_VIEW_SCHEMA: dict[str, object] = {
     "additionalProperties": False,
 }
 
+DRAFT_MESSAGE_VIEW_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "message_state": {"type": "string", "enum": ["draft"]},
+        "message_key": {"type": "string"},
+        "dialog_id": {"type": "integer"},
+        "draft_scope": {
+            "type": "object",
+            "properties": {
+                "dialog_id": {"type": "integer"},
+                "topic_id": {"type": ["integer", "null"]},
+                "subdialog_peer_id": {"type": ["integer", "null"]},
+            },
+            "required": ["dialog_id", "topic_id", "subdialog_peer_id"],
+            "additionalProperties": False,
+        },
+        "draft_status": {"type": "string", "enum": ["present"]},
+        "content": TELEGRAM_CONTENT_OUTPUT_SCHEMA,
+        "composition": {
+            "type": "object",
+            "properties": {
+                "entities": {"type": "array", "items": {"type": "object"}},
+                "reply_to": {"type": ["object", "null"]},
+                "media": {"type": ["object", "null"]},
+                "suggested_post": {"type": ["object", "null"]},
+                "rich_message": {"type": ["object", "null"]},
+                "effect_id": {"type": ["integer", "null"]},
+                "no_webpage": {"type": "boolean"},
+                "invert_media": {"type": "boolean"},
+                "complete": {"type": "boolean"},
+                "normalization_version": {"type": "string"},
+            },
+            "required": [
+                "entities", "reply_to", "media", "suggested_post", "rich_message", "effect_id", "no_webpage",
+                "invert_media", "complete", "normalization_version",
+            ],
+            "additionalProperties": False,
+        },
+        "draft_updated_at": {"type": "integer"},
+        "observed_at": {"type": ["integer", "null"]},
+        "observation_source": {"type": "string"},
+        "projection_revision": {"type": "integer"},
+        "visibility": {"type": "string", "enum": ["author_only"]},
+        "unpublished": {"type": "boolean", "enum": [True]},
+        "published": {"type": "boolean", "enum": [False]},
+        "unseen": {"type": "boolean", "enum": [True]},
+    },
+    "required": [
+        "message_state", "message_key", "dialog_id", "draft_scope", "draft_status", "content", "composition",
+        "draft_updated_at", "observed_at", "observation_source", "projection_revision", "visibility", "unpublished",
+        "published", "unseen",
+    ],
+    "additionalProperties": False,
+}
+
+
+def project_draft_message_view(row: Mapping[str, object]) -> dict[str, object]:
+    """Project one local draft row without manufacturing sent-message facts."""
+    text = row.get("text")
+    return {
+        "message_state": "draft",
+        "message_key": row["message_key"],
+        "dialog_id": row["dialog_id"],
+        "draft_scope": row["draft_scope"],
+        "draft_status": row["draft_status"],
+        "content": telegram_content(text if isinstance(text, str) else "", "message_text"),
+        "composition": {
+            "entities": row["entities"],
+            "reply_to": row["reply_to"],
+            "media": row["media"],
+            "suggested_post": row["suggested_post"],
+            "rich_message": row["rich_message"],
+            "effect_id": row["effect_id"],
+            "no_webpage": row["no_webpage"],
+            "invert_media": row["invert_media"],
+            "complete": row["composition_complete"],
+            "normalization_version": row["normalization_version"],
+        },
+        "draft_updated_at": row["draft_updated_at"],
+        "observed_at": row["observed_at"],
+        "observation_source": row["observation_source"],
+        "projection_revision": row["projection_revision"],
+        "visibility": "author_only",
+        "unpublished": True,
+        "published": False,
+        "unseen": True,
+    }
+
 _READ_MARKER_METADATA = {
     "[I read up to here]": {"kind": "i_read_up_to_here", "side": "inbox"},
     "[unread by me]": {"kind": "unread_by_me", "side": "inbox"},

@@ -1040,6 +1040,8 @@ def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
             dict[str, object],
             cast(dict[str, object], cast(dict[str, object], schema["properties"])[collection_name])["items"],
         )
+        if "oneOf" in items:
+            items = cast(dict[str, object], cast(list[object], items["oneOf"])[0])
         item_required = cast(list[str], items["required"])
         item_properties = cast(dict[str, object], items["properties"])
         for field in required_fields:
@@ -1060,12 +1062,11 @@ def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
 
     list_dialogs_schema = server.tool_by_name["list_dialogs"].output_schema
     assert list_dialogs_schema is not None
-    assert_nested_item_fields(
-        list_dialogs_schema,
-        collection_name="dialogs",
-        required_fields=(),
-        property_fields=("draft_content",),
+    list_dialogs_items = cast(
+        dict[str, object],
+        cast(dict[str, object], cast(dict[str, object], list_dialogs_schema["properties"])["dialogs"])["items"],
     )
+    assert "draft_content" not in cast(dict[str, object], list_dialogs_items["properties"])
 
     list_topics_schema = server.tool_by_name["list_topics"].output_schema
     assert list_topics_schema is not None

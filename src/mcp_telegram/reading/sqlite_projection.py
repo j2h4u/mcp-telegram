@@ -117,7 +117,6 @@ WITH agent_visible_dialogs AS (
         d.unread_mentions_count,
         d.unread_reactions_count,
         d.unread_count,
-        d.draft_text,
         sd.status AS sync_status,
         sd.total_messages,
         sd.last_synced_at,
@@ -143,7 +142,6 @@ WITH agent_visible_dialogs AS (
         0 AS unread_mentions_count,
         0 AS unread_reactions_count,
         NULL AS unread_count,
-        NULL AS draft_text,
         sd.status AS sync_status,
         sd.total_messages,
         sd.last_synced_at,
@@ -157,7 +155,7 @@ WITH agent_visible_dialogs AS (
 SELECT
     dialog_id, name, type, archived, pinned,
     members, created, last_message_at, snapshot_at,
-    unread_mentions_count, unread_reactions_count, unread_count, draft_text,
+    unread_mentions_count, unread_reactions_count, unread_count,
     sync_status, total_messages, last_synced_at, last_event_at, last_delta_checked_at, access_lost_at
 FROM agent_visible_dialogs
 WHERE (:archived_filter IS NULL OR archived = :archived_filter)
