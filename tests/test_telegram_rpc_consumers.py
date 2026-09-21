@@ -48,6 +48,7 @@ EXPECTED_DURABLE_DEMAND_ORDER = (
     DemandKind.READ_RECEIPT_BATCH,
     DemandKind.SCHEDULED_REPAIR,
     DemandKind.SCHEDULED_DISCOVERY,
+    DemandKind.DRAFT_SNAPSHOT,
 )
 
 
@@ -98,6 +99,7 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
             DemandKind.SCHEDULED_REPAIR,
             DemandKind.SCHEDULED_DISCOVERY,
         },
+        TelegramRpcSource.DRAFT_SNAPSHOT: {DemandKind.DRAFT_SNAPSHOT},
         TelegramRpcSource.MAINTENANCE: {DemandKind.SELF_PROFILE_MAINTENANCE},
     }
     actual_by_source = {
@@ -163,7 +165,7 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
 
 def test_durable_demand_order_is_a_literal_complete_contract() -> None:
     assert DURABLE_DEMAND_ORDER == EXPECTED_DURABLE_DEMAND_ORDER
-    assert len(DURABLE_DEMAND_ORDER) == 19
+    assert len(DURABLE_DEMAND_ORDER) == 20
     assert {
         kind for kind, contract in TELEGRAM_DEMAND_CONTRACTS.items() if contract.execution_mode is ExecutionMode.DURABLE
     } == set(EXPECTED_DURABLE_DEMAND_ORDER)

@@ -222,6 +222,7 @@ def test_startup_demands_are_offered_to_coordinator() -> None:
         DemandKind.DIALOG_BOOTSTRAP,
         DemandKind.FULL_SYNC_PAGE,
         DemandKind.READ_RECEIPT_BATCH,
+        DemandKind.DRAFT_SNAPSHOT,
     ]
 
 

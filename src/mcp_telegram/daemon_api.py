@@ -677,6 +677,7 @@ class DaemonAPIServer:
                     sync_db_path=self._sync_db_path,
                     self_id=self.self_id,
                     resolve_dialog_id=self._resolve_dialog_id,
+                    resolve_dialog_id_local=self._resolve_dialog_id_local,
                     fragment_context=FragmentContextService(
                         self._conn,
                         TelethonTelegramFragmentGateway(self._client),
@@ -1234,6 +1235,8 @@ class DaemonAPIServer:
     async def _resolve_dialog_name(
         self,
         dialog: str,
+        *,
+        allow_remote: bool = True,
     ) -> Resolved | Candidates | NotFound:
         """Resolve one normalized natural selector without silent precedence."""
         tme = _parse_tme_link(dialog)
@@ -1244,7 +1247,9 @@ class DaemonAPIServer:
                 for entity_id, (_name, _type, eligible, _username, _complete) in self._local_dialog_metadata().items()
                 if not eligible
             }
-            return await self._resolve_dialog_username(dialog, username, ineligible_ids=ineligible_ids)
+            if allow_remote:
+                return await self._resolve_dialog_username(dialog, username, ineligible_ids=ineligible_ids)
+            return self._resolve_local_dialog_username(username, dialog)
 
         (
             local_names,
@@ -1357,6 +1362,27 @@ class DaemonAPIServer:
         except RPCError, TimeoutError:
             retry_after = None
             return self._dialog_resolution_retryable_response(retry_after=retry_after)
+        if isinstance(result, Resolved):
+            return ResolvedDialogId(result.entity_id, directory_coverage)
+        if isinstance(result, Candidates):
+            return self._dialog_resolution_candidates_response(selector, result, directory_coverage)
+        return self._dialog_resolution_no_match_response(selector, directory_coverage)
+
+    async def _resolve_dialog_id_local(
+        self,
+        selector: DialogSelector,
+    ) -> int | dict:
+        """Resolve a draft-bearing read entirely from the local dialog directory.
+
+        The draft projection is local state.  A missing natural selector must
+        return the ordinary local resolution response, never trigger peer
+        lookup before the draft/all routing decision is known.
+        """
+        if selector.exact_id is not None:
+            return ResolvedDialogId(selector.exact_id, read_dialog_directory_coverage(self._conn))
+        assert selector.query is not None
+        directory_coverage = read_dialog_directory_coverage(self._conn)
+        result = await self._resolve_dialog_name(selector.query, allow_remote=False)
         if isinstance(result, Resolved):
             return ResolvedDialogId(result.entity_id, directory_coverage)
         if isinstance(result, Candidates):

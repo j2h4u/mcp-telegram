@@ -32,7 +32,9 @@ from mcp_telegram.dialog_directory import (
 from mcp_telegram.dialog_sync import (
     DialogLightReconciliationDemandAdapter,
 )
+from mcp_telegram.drafts.owner import DraftMessageOwner
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, EntityRefreshCoordinator
+from mcp_telegram.event_handlers import UpdateProcessingBarrier
 from mcp_telegram.fact_hydration import FactHydrationDemandAdapter
 from mcp_telegram.folders.contracts import FolderRuleObservation
 from mcp_telegram.folders.ports import FolderSnapshotRepository
@@ -158,6 +160,9 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
             history=ColdBackfillHistoryPacing(batch_s=1.0, enroll_s=60.0, access_retry_s=60.0),
         ),
         "cadence": SQLiteSelfProfileCadence(conn, 60.0),
+        "draft_owner": DraftMessageOwner(
+            MagicMock(), MagicMock(), asyncio.Event(), UpdateProcessingBarrier(closed=True)
+        ),
     }
 
     async def read_receipt_batch() -> object:
@@ -196,6 +201,7 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         get_self_input_entity=get_self_input_entity,
         user_profile_port=LoudUserProfilePort(),
         publish_startup_identity=publish_startup_identity,
+        draft_owner=cast(DraftMessageOwner, objects["draft_owner"]),
     )
     objects["read_receipt_batch"] = read_receipt_batch
     objects["update_profile"] = update_profile
@@ -239,9 +245,10 @@ def test_adapter_map_is_exact_against_literal_20_kind_class_map(
         DemandKind.READ_RECEIPT_BATCH: ReadReceiptDemandAdapter,
         DemandKind.SCHEDULED_REPAIR: ScheduledRepairDemandAdapter,
         DemandKind.SCHEDULED_DISCOVERY: ScheduledDiscoveryDemandAdapter,
+        DemandKind.DRAFT_SNAPSHOT: DraftMessageOwner,
         DemandKind.SELF_PROFILE_MAINTENANCE: SelfProfileMaintenanceDemandAdapter,
     }
-    assert len(expected) == 19
+    assert len(expected) == 20
     assert set(adapters) == set(expected)
     assert {kind: type(adapter) for kind, adapter in adapters.items()} == expected
     assert all(getattr(adapter, "demand_kind", None) is kind for kind, adapter in adapters.items())
@@ -261,6 +268,7 @@ def test_adapter_map_is_exact_against_literal_20_kind_class_map(
     assert adapters[DemandKind.FOLDER_SNAPSHOT]._worker is objects["folder"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.SCHEDULED_REPAIR]._reconciler is objects["scheduled"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.SCHEDULED_DISCOVERY]._reconciler is objects["scheduled"]  # type: ignore[attr-defined]
+    assert adapters[DemandKind.DRAFT_SNAPSHOT] is objects["draft_owner"]
     assert adapters[DemandKind.MESSAGE_FACT_REFRESH]._shutdown_event is objects["shutdown"]  # type: ignore[attr-defined]
     with pytest.raises(TypeError):
         adapters[DemandKind.SCHEDULED_REPAIR] = adapters[DemandKind.SCHEDULED_DISCOVERY]  # type: ignore[index]
