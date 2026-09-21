@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -21,7 +23,7 @@ from mcp_telegram.sync_db import _apply_migration_74, ensure_sync_schema
 
 
 @pytest.fixture()
-def projection(tmp_path: Path) -> tuple[sqlite3.Connection, SQLiteDraftProjection]:
+def projection(tmp_path: Path) -> Iterator[tuple[sqlite3.Connection, SQLiteDraftProjection]]:
     database = tmp_path / "sync.db"
     ensure_sync_schema(database)
     conn = sqlite3.connect(database)
@@ -57,13 +59,25 @@ def _empty(scope: DraftScope, second: int, *, source: DraftObservationSource) ->
 
 
 def _current(conn: sqlite3.Connection, scope: DraftScope) -> tuple[object, ...]:
-    row = conn.execute(
+    row = _fetchone(
+        conn,
         "SELECT state,text,source_kind,source_observed_at,projection_revision,entities_json "
         "FROM draft_current WHERE account_id=? AND dialog_id=? AND top_message_id=? AND subdialog_peer_id=?",
         (scope.account_id, scope.dialog_id, scope.top_message_id or 0, scope.subdialog_peer_id or 0),
-    ).fetchone()
+    )
     assert row is not None
     return row
+
+
+def _fetchone(
+    conn: sqlite3.Connection, statement: str, parameters: tuple[object, ...] = ()
+) -> tuple[object, ...] | None:
+    return cast(tuple[object, ...] | None, conn.execute(statement, parameters).fetchone())
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    rows = cast(list[tuple[object, ...]], conn.execute(f"PRAGMA table_info({table})").fetchall())
+    return {str(row[1]) for row in rows}
 
 
 def test_realtime_orders_duplicates_and_equal_conflicts(
@@ -183,8 +197,8 @@ def test_v74_upgrade_removes_previews_without_promoting_them(tmp_path: Path) -> 
         conn.execute("DELETE FROM schema_version WHERE version=74")
         conn.commit()
         assert _apply_migration_74(conn, 73) == 74
-        assert "draft_text" not in {column[1] for column in conn.execute("PRAGMA table_info(dialogs)")}
-        assert "draft_text" not in {column[1] for column in conn.execute("PRAGMA table_info(dialog_directory_staging)")}
+        assert "draft_text" not in _table_columns(conn, "dialogs")
+        assert "draft_text" not in _table_columns(conn, "dialog_directory_staging")
         assert conn.execute("SELECT COUNT(*) FROM draft_current").fetchone() == (0,)
         assert _apply_migration_74(conn, 74) == 74
     finally:
