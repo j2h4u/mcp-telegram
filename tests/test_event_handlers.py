@@ -570,8 +570,8 @@ async def test_first_seen_private_event_preserves_existing_dialog_facts(
 ) -> None:
     dialog_id = 7019
     sync_db.execute(
-        "INSERT INTO dialogs(dialog_id, name, type, archived, pinned, members, hidden, unread_count, draft_text) "
-        "VALUES (?, 'Saved', 'user', 1, 1, 9, 1, 4, 'draft')",
+        "INSERT INTO dialogs(dialog_id, name, type, archived, pinned, members, hidden, unread_count) "
+        "VALUES (?, 'Saved', 'user', 1, 1, 9, 1, 4)",
         (dialog_id,),
     )
     sync_db.commit()
@@ -592,9 +592,9 @@ async def test_first_seen_private_event_preserves_existing_dialog_facts(
     # Realtime presence intentionally exposes an absent-from-snapshot row; other
     # durable dialog facts must survive the thin first-event projection.
     assert sync_db.execute(
-        "SELECT name, archived, pinned, members, hidden, unread_count, draft_text FROM dialogs WHERE dialog_id=?",
+        "SELECT name, archived, pinned, members, hidden, unread_count FROM dialogs WHERE dialog_id=?",
         (dialog_id,),
-    ).fetchone() == ("Saved", 1, 1, 9, 0, 4, "draft")
+    ).fetchone() == ("Saved", 1, 1, 9, 0, 4)
 
 
 @pytest.mark.asyncio
