@@ -16,7 +16,11 @@ from ..dialog_classification import is_bot_dialog_type
 from ..fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
 from ..hydration_queue import HydrationPriority, HydrationQueueRepository
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
-from ..message_history.contracts import MESSAGE_HISTORY_PAGE_LIMIT, TOPIC_ATTRIBUTION_EXTRACTOR_VERSION
+from ..message_history.contracts import (
+    TOPIC_ATTRIBUTION_EXTRACTOR_VERSION,
+    TopicAttributionMessage,
+    TopicAttributionPage,
+)
 from ..reactions.contracts import ReactionAggregate, ReactionAggregateSource
 from ..reactions.persistence import replace_reaction_aggregates
 from ..telegram_rpc_consumers import topic_attribution_campaign_lifetime, topic_attribution_failure_delay
@@ -325,6 +329,11 @@ _TERMINAL_REASON_PRIORITY = {
     "invalid_manifest": 5,
     "incompatible_manifest": 5,
     "operator_abort": 6,
+    "non_advancing_cursor": 7,
+    "empty_incomplete_page": 7,
+    "invalid_page_projection": 7,
+    "rpc_attempt_budget_exhausted": 7,
+    "campaign_adapter_unavailable": 7,
 }
 _TERMINAL_SEVERITY = {
     "exhausted": "complete",
@@ -336,6 +345,11 @@ _TERMINAL_SEVERITY = {
     "incompatible_manifest": "failed",
     "operator_abort": "abandoned",
     "history_disabled": "abandoned",
+    "non_advancing_cursor": "failed",
+    "empty_incomplete_page": "failed",
+    "invalid_page_projection": "failed",
+    "rpc_attempt_budget_exhausted": "failed",
+    "campaign_adapter_unavailable": "failed",
 }
 
 
@@ -624,7 +638,7 @@ def record_page(
     conn: sqlite3.Connection,
     dialog_id: int,
     checkpoint: int,
-    messages: Sequence[_message_contracts.ExtractedMessage],
+    page: TopicAttributionPage,
     *,
     observed_at: int,
 ) -> dict[str, object]:
@@ -632,10 +646,16 @@ def record_page(
     conn.execute("BEGIN IMMEDIATE")
     try:
         manifest, item = _require_active_dialog(conn, dialog_id, checkpoint)
+        cursor_failure = _page_cursor_failure(checkpoint, page)
+        if cursor_failure is not None:
+            _finish(conn, manifest, cursor_failure, observed_at)
+            conn.commit()
+            _log_terminal(manifest)
+            return manifest
         counts = cast(dict[str, int], item["counts"])
         previous_no_topic = counts["no_topic"]
-        _reconcile_page_messages(conn, dialog_id, messages, counts)
-        _advance_page_checkpoint(item, messages)
+        _reconcile_page_messages(conn, dialog_id, page.messages, counts)
+        _advance_page_checkpoint(item, page)
         no_topic_delta = counts["no_topic"] - previous_no_topic
         _record_campaign_no_topic_receipt(conn, dialog_id, observed_at, no_topic_delta)
         if item["state"] == "done":
@@ -662,42 +682,49 @@ def record_page(
     return manifest
 
 
+def _page_cursor_failure(checkpoint: int, page: TopicAttributionPage) -> str | None:
+    if not page.complete and page.next_cursor is None:
+        return "empty_incomplete_page"
+    if page.next_cursor is not None and checkpoint != 0 and page.next_cursor >= checkpoint:
+        return "non_advancing_cursor"
+    return None
+
+
 def _reconcile_page_messages(
     conn: sqlite3.Connection,
     dialog_id: int,
-    messages: Sequence[_message_contracts.ExtractedMessage],
+    messages: Sequence[TopicAttributionMessage],
     counts: dict[str, int],
 ) -> None:
     for extracted in messages:
-        message = extracted.message
         local = cast(
             tuple[object, object] | None,
             conn.execute(
                 "SELECT forum_topic_id,is_deleted FROM messages WHERE dialog_id=? AND message_id=?",
-                (dialog_id, message.message_id),
+                (dialog_id, extracted.message_id),
             ).fetchone(),
         )
         if local is None:
             counts["unresolved"] += 1
         elif local[0] is not None or local[1] != 0:
             counts["no_longer_needed"] += 1
-        elif message.forum_topic_id is None:
+        elif extracted.forum_topic_id is None:
             counts["no_topic"] += 1
         else:
             updated = conn.execute(
                 "UPDATE messages SET forum_topic_id=? WHERE dialog_id=? AND message_id=? "
                 "AND forum_topic_id IS NULL AND is_deleted=0",
-                (message.forum_topic_id, dialog_id, message.message_id),
+                (extracted.forum_topic_id, dialog_id, extracted.message_id),
             ).rowcount
             counts["attributed" if updated else "unresolved"] += 1
 
 
-def _advance_page_checkpoint(item: dict[str, object], messages: Sequence[_message_contracts.ExtractedMessage]) -> None:
+def _advance_page_checkpoint(item: dict[str, object], page: TopicAttributionPage) -> None:
     item["failure_attempts"] = 0
     item["next_retry_at"] = None
-    if messages:
-        item["cursor"] = min(extracted.message.message_id for extracted in messages)
-    if not messages or len(messages) < MESSAGE_HISTORY_PAGE_LIMIT:
+    if page.next_cursor is not None:
+        item["cursor"] = page.next_cursor
+    if page.complete:
         item["state"] = "done"
 
 
@@ -759,6 +786,22 @@ def record_failed_attempt(
     )
 
 
+def record_terminal_failure(
+    conn: sqlite3.Connection, dialog_id: int, checkpoint: int, *, reason: str, observed_at: int
+) -> None:
+    """Terminalize a violated one-page campaign contract without retrying it."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        manifest, _item = _require_active_dialog(conn, dialog_id, checkpoint)
+        _finish(conn, manifest, reason, observed_at)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    logger.warning("topic_attribution_campaign_contract_failure reason=%s", reason)
+    _log_terminal(manifest)
+
+
 def record_access_lost(
     conn: sqlite3.Connection, dialog_id: int, checkpoint: int, *, observed_at: int, reason: str = "access_lost"
 ) -> None:
@@ -801,6 +844,85 @@ def abort_campaign(conn: sqlite3.Connection, *, observed_at: int | None = None) 
     logger.warning("topic_attribution_campaign_aborted")
     _log_terminal(manifest)
     return {"terminal_reason": "operator_abort"}
+
+
+def resume_campaign(conn: sqlite3.Connection, *, observed_at: int | None = None) -> dict[str, object]:
+    """Reactivate only an operator-aborted campaign without resetting progress."""
+    now = int(time.time()) if observed_at is None else observed_at
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        manifest = _load(conn)
+        if manifest is None:
+            raise TopicAttributionCampaignError("campaign_not_found")
+        if manifest.get("state") != "complete" or manifest.get("terminal_reason") != "operator_abort":
+            raise TopicAttributionCampaignError("campaign_is_not_operator_aborted")
+        expires_at = manifest.get("expires_at")
+        if not _nonnegative_int(expires_at):
+            raise TopicAttributionCampaignError("invalid_manifest")
+        if cast(int, expires_at) <= now:
+            raise TopicAttributionCampaignError("campaign_expired")
+        resumed = _resume_aborted_items(conn, manifest)
+        if resumed == 0:
+            raise TopicAttributionCampaignError("campaign_has_no_aborted_dialogs")
+        manifest["state"] = "active"
+        manifest.pop("terminal_reason", None)
+        manifest.pop("completed_at", None)
+        manifest["resumed_at"] = now
+        _save(conn, manifest)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    logger.info("topic_attribution_campaign_resumed dialog_count=%d", resumed)
+    return {"resumed_dialogs": resumed}
+
+
+def _resume_aborted_items(conn: sqlite3.Connection, manifest: dict[str, object]) -> int:
+    dialogs = cast(dict[str, dict[str, object]], manifest["dialogs"])
+    marked = [item for item in dialogs.values() if item.get("terminal_reason") == "operator_abort"]
+    candidates = marked or _legacy_aborted_items(conn, manifest, dialogs)
+    for item in candidates:
+        item["state"] = "pending"
+        item["next_retry_at"] = None
+        item.pop("terminal_reason", None)
+        item.pop("last_error", None)
+    return len(candidates)
+
+
+def _legacy_aborted_items(
+    conn: sqlite3.Connection,
+    manifest: dict[str, object],
+    dialogs: dict[str, dict[str, object]],
+) -> list[dict[str, object]]:
+    """Recover only pre-marker items whose missing page commit is certain."""
+    candidates: list[dict[str, object]] = []
+    for dialog_id in cast(list[int], manifest["dialog_ids"]):
+        item = dialogs[str(dialog_id)]
+        if "terminal_reason" in item:
+            continue
+        receipt = cast(
+            tuple[object] | None,
+            conn.execute(
+                "SELECT topic_attribution_state FROM synced_dialogs WHERE dialog_id=?",
+                (dialog_id,),
+            ).fetchone(),
+        )
+        if receipt is not None and receipt[0] == "complete":
+            continue
+        if _legacy_item_has_no_committed_page(item, receipt):
+            candidates.append(item)
+            continue
+        raise TopicAttributionCampaignError("legacy_resume_ambiguous")
+    return candidates
+
+
+def _legacy_item_has_no_committed_page(item: dict[str, object], receipt: tuple[object] | None) -> bool:
+    return (
+        receipt is not None
+        and receipt[0] == "unknown"
+        and item.get("cursor") == 0
+        and item.get("counts") == _empty_counts()
+    )
 
 
 def campaign_status(conn: sqlite3.Connection) -> dict[str, object]:
@@ -907,6 +1029,8 @@ def _finish(conn: sqlite3.Connection, manifest: dict[str, object], reason: str, 
     for item in cast(dict[str, dict[str, object]], manifest["dialogs"]).values():
         if item.get("state") == "pending":
             item["state"] = "done"
+            if reason == "operator_abort":
+                item["terminal_reason"] = "operator_abort"
     manifest["state"] = "complete"
     manifest["terminal_reason"] = _most_severe_terminal_reason(manifest, reason)
     manifest["completed_at"] = completed_at

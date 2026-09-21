@@ -38,8 +38,10 @@ from .message_history.contracts import (
     TOPIC_ATTRIBUTION_EXTRACTOR_VERSION,
     MessageHistoryAccessLostError,
     MessageHistoryUnavailableError,
+    TopicAttributionPage,
+    TopicAttributionPageProjectionError,
 )
-from .message_history.ports import FullHistoryPagePort
+from .message_history.ports import FullHistoryPagePort, TopicAttributionPagePort
 from .messages.sqlite_bundle import insert_messages_with_fts
 from .read_state import apply_read_cursor
 from .resolver import latinize
@@ -63,6 +65,7 @@ from .telegram_rpc_scheduler import (
     current_rpc_scope,
     rpc_attempt_budget,
     rpc_scope,
+    without_transient_retries,
 )
 from .topic_attribution_campaign import (
     TopicAttributionCampaignError,
@@ -73,6 +76,7 @@ from .topic_attribution_campaign import (
     record_deferred,
     record_failed_attempt,
     record_page,
+    record_terminal_failure,
 )
 
 logger = logging.getLogger(__name__)
@@ -217,9 +221,11 @@ class FullSyncWorker:
         shutdown_event: asyncio.Event,
         *,
         total_messages_probe: TotalMessagesProbe | None = None,
+        topic_attribution_port: TopicAttributionPagePort | None = None,
     ) -> None:
         self._history_port = history_port
         self._total_messages_probe = total_messages_probe
+        self._topic_attribution_port = topic_attribution_port
         self._conn = conn
         self._shutdown_event = shutdown_event
         self._last_page_error: BaseException | None = None
@@ -330,7 +336,7 @@ class FullSyncWorker:
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def process_topic_attribution_campaign_page(self) -> bool:
-        """Run one removable campaign page through the normal history port.
+        """Run one removable campaign page through the dedicated topic-attribution history port.
 
         The campaign never inserts or replaces a message bundle.  Its only
         persistence mutation is the constrained topic-id update owned by the
@@ -344,45 +350,80 @@ class FullSyncWorker:
         if not campaign_execution_allowed(self._conn, dialog_id):
             self._record_campaign_access_loss(dialog_id, before_message_id, now, "history_disabled")
             return campaign_release_at(self._conn, now=now) is None
+        if self._topic_attribution_port is None:
+            self._record_campaign_terminal_failure(dialog_id, before_message_id, now, "campaign_adapter_unavailable")
+            return True
+        page = await self._fetch_topic_attribution_page(dialog_id, before_message_id, now)
+        if page is not None:
+            if campaign_execution_allowed(self._conn, dialog_id):
+                self._record_campaign_page(dialog_id, before_message_id, page, now)
+            else:
+                self._record_campaign_access_loss(dialog_id, before_message_id, now, "history_disabled")
+        return campaign_release_at(self._conn, now=now) is None
+
+    async def _fetch_topic_attribution_page(
+        self, dialog_id: int, before_message_id: int, observed_at: int
+    ) -> TopicAttributionPage | None:
+        assert self._topic_attribution_port is not None
         try:
-            page = await self._history_port.fetch_page(dialog_id, before_message_id=before_message_id)
+            with without_transient_retries():
+                return await self._topic_attribution_port.fetch_page(dialog_id, before_message_id=before_message_id)
         except MessageHistoryAccessLostError as exc:
             set_access_lost(self._conn, dialog_id, int(time.time()), reason=exc.reason_code)
             self._conn.commit()
-            self._record_campaign_access_loss(dialog_id, before_message_id, now, "access_lost")
+            self._record_campaign_access_loss(dialog_id, before_message_id, observed_at, "access_lost")
         except TelegramRpcAdmissionDeferred as exc:
-            record_deferred(self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=now)
+            record_deferred(
+                self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=observed_at
+            )
             raise
         except (
             RpcAdmissionSaturatedError,
             RpcAdmissionExpiredError,
         ) as exc:
-            record_deferred(self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=now)
+            record_deferred(
+                self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=observed_at
+            )
             raise
         except TelegramRpcThrottled as exc:
-            record_deferred(self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=now)
+            record_deferred(
+                self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=observed_at
+            )
             _raise_if_latched(exc)
             raise
         except MessageHistoryUnavailableError as exc:
-            record_failed_attempt(self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=now)
-        else:
-            if campaign_execution_allowed(self._conn, dialog_id):
-                self._record_campaign_page(dialog_id, before_message_id, page.messages, now)
-            else:
-                self._record_campaign_access_loss(dialog_id, before_message_id, now, "history_disabled")
-        return campaign_release_at(self._conn, now=now) is None
+            record_failed_attempt(
+                self._conn,
+                dialog_id,
+                before_message_id,
+                reason=type(exc).__name__,
+                observed_at=observed_at,
+            )
+        except TopicAttributionPageProjectionError:
+            self._record_campaign_terminal_failure(dialog_id, before_message_id, observed_at, "invalid_page_projection")
+        except RpcAttemptBudgetExhaustedError:
+            self._record_campaign_terminal_failure(
+                dialog_id, before_message_id, observed_at, "rpc_attempt_budget_exhausted"
+            )
+        return None
 
     def _record_campaign_page(
-        self, dialog_id: int, checkpoint: int, messages: Sequence[_ExtractedMessage], observed_at: int
+        self, dialog_id: int, checkpoint: int, page: TopicAttributionPage, observed_at: int
     ) -> None:
         try:
-            record_page(self._conn, dialog_id, checkpoint, messages, observed_at=observed_at)
+            record_page(self._conn, dialog_id, checkpoint, page, observed_at=observed_at)
         except TopicAttributionCampaignError as exc:
             self._ignore_superseded_campaign_operation(exc)
 
     def _record_campaign_access_loss(self, dialog_id: int, checkpoint: int, observed_at: int, reason: str) -> None:
         try:
             record_access_lost(self._conn, dialog_id, checkpoint, observed_at=observed_at, reason=reason)
+        except TopicAttributionCampaignError as exc:
+            self._ignore_superseded_campaign_operation(exc)
+
+    def _record_campaign_terminal_failure(self, dialog_id: int, checkpoint: int, observed_at: int, reason: str) -> None:
+        try:
+            record_terminal_failure(self._conn, dialog_id, checkpoint, reason=reason, observed_at=observed_at)
         except TopicAttributionCampaignError as exc:
             self._ignore_superseded_campaign_operation(exc)
 

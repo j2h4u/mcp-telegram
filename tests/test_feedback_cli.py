@@ -35,6 +35,7 @@ class _FeedbackStatusConn:
     enroll_topic_attribution_campaign: AsyncMock
     get_topic_attribution_campaign_status: AsyncMock
     abort_topic_attribution_campaign: AsyncMock
+    resume_topic_attribution_campaign: AsyncMock
     reset_topic_attribution_campaign: AsyncMock
 
 
@@ -298,6 +299,21 @@ def test_topic_attribution_campaign_abort_cli_routes_to_daemon() -> None:
     assert result.exit_code == 0, result.stdout
     assert "aborted" in result.stdout
     mock_conn.abort_topic_attribution_campaign.assert_called_once_with()
+
+
+def test_topic_attribution_campaign_resume_cli_routes_to_daemon() -> None:
+    mock_conn = cast(_FeedbackStatusConn, AsyncMock())
+    mock_conn.resume_topic_attribution_campaign.return_value = {"ok": True, "data": {"resumed_dialogs": 2}}
+    async_cm = MagicMock()
+    async_cm.__aenter__ = AsyncMock(return_value=mock_conn)
+    async_cm.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("mcp_telegram.daemon_client.daemon_connection", return_value=async_cm):
+        result = runner.invoke(app, ["topic-attribution", "resume"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "resumed" in result.stdout
+    mock_conn.resume_topic_attribution_campaign.assert_called_once_with()
 
 
 def test_topic_attribution_campaign_reset_cli_routes_to_daemon() -> None:

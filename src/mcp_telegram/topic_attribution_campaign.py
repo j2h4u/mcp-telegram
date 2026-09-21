@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from .history_enrollment import full_history_enabled
-from .message_contracts import ExtractedMessage
+from .message_history.contracts import TopicAttributionPage
 from .messages.sqlite_bundle import (
     CAMPAIGN_DIALOG_COUNT,
     CAMPAIGN_STATE_KEY,
@@ -48,7 +48,13 @@ from .messages.sqlite_bundle import (
     record_page as _record_page,
 )
 from .messages.sqlite_bundle import (
+    record_terminal_failure as _record_terminal_failure,
+)
+from .messages.sqlite_bundle import (
     reset_campaign as _reset_campaign,
+)
+from .messages.sqlite_bundle import (
+    resume_campaign as _resume_campaign,
 )
 
 
@@ -94,10 +100,15 @@ def abort_campaign(conn: SQLiteConnection) -> dict[str, object]:
     return _abort_campaign(conn)
 
 
+def resume_campaign(conn: SQLiteConnection, *, now: int | None = None) -> dict[str, object]:
+    """Resume a stopped operator-aborted campaign from its durable checkpoints."""
+    return _resume_campaign(conn, observed_at=now)
+
+
 def record_page(
-    conn: SQLiteConnection, dialog_id: int, checkpoint: int, messages: Sequence[ExtractedMessage], *, observed_at: int
+    conn: SQLiteConnection, dialog_id: int, checkpoint: int, page: TopicAttributionPage, *, observed_at: int
 ) -> dict[str, object]:
-    return _record_page(conn, dialog_id, checkpoint, messages, observed_at=observed_at)
+    return _record_page(conn, dialog_id, checkpoint, page, observed_at=observed_at)
 
 
 def record_deferred(conn: SQLiteConnection, dialog_id: int, checkpoint: int, *, reason: str, observed_at: int) -> None:
@@ -108,6 +119,12 @@ def record_failed_attempt(
     conn: SQLiteConnection, dialog_id: int, checkpoint: int, *, reason: str, observed_at: int
 ) -> None:
     _record_failed_attempt(conn, dialog_id, checkpoint, reason=reason, observed_at=observed_at)
+
+
+def record_terminal_failure(
+    conn: SQLiteConnection, dialog_id: int, checkpoint: int, *, reason: str, observed_at: int
+) -> None:
+    _record_terminal_failure(conn, dialog_id, checkpoint, reason=reason, observed_at=observed_at)
 
 
 def record_access_lost(
@@ -130,5 +147,7 @@ __all__ = [
     "record_deferred",
     "record_failed_attempt",
     "record_page",
+    "record_terminal_failure",
     "reset_campaign",
+    "resume_campaign",
 ]

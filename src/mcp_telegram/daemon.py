@@ -100,6 +100,7 @@ from .message_history.telegram_adapter import (
     TelethonForwardGapPageAdapter,
     TelethonFullHistoryPageAdapter,
     TelethonHistoryAccessProbe,
+    TelethonTopicAttributionPageAdapter,
 )
 from .messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
 from .own_only import ensure_own_only_schema
@@ -1810,6 +1811,7 @@ async def sync_main() -> None:
             entity_lookup_context=lambda: acquisition_context(AcquisitionKind.ENTITY_LOOKUP),
         )
         forward_gap_port = TelethonForwardGapPageAdapter(ctx.client)
+        topic_attribution_port = TelethonTopicAttributionPageAdapter(ctx.client)
         history_access_probe = TelethonHistoryAccessProbe(ctx.client)
         delta_worker = DeltaSyncWorker(forward_gap_port, ctx.conn, ctx.shutdown_event)
         worker = FullSyncWorker(
@@ -1817,6 +1819,7 @@ async def sync_main() -> None:
             ctx.conn,
             ctx.shutdown_event,
             total_messages_probe=history_access_probe,
+            topic_attribution_port=topic_attribution_port,
         )
         history_runtime = _HistorySyncRuntime(worker, delta_worker, history_access_probe)
         _ensure_demand_runtime(

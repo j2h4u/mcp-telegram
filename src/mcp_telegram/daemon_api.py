@@ -119,6 +119,7 @@ from .topic_attribution_campaign import (
     campaign_status,
     enroll_campaign,
     reset_campaign,
+    resume_campaign,
 )
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
@@ -988,6 +989,7 @@ class DaemonAPIServer:
             "mark_dialog_for_sync": self._mark_dialog_for_sync,
             "enroll_topic_attribution_campaign": self._enroll_topic_attribution_campaign,
             "abort_topic_attribution_campaign": self._abort_topic_attribution_campaign,
+            "resume_topic_attribution_campaign": self._resume_topic_attribution_campaign,
             "reset_topic_attribution_campaign": self._reset_topic_attribution_campaign,
             "get_topic_attribution_campaign_status": self._get_topic_attribution_campaign_status,
             "get_sync_status": self._get_sync_status,
@@ -1738,11 +1740,20 @@ class DaemonAPIServer:
         return {"ok": True, "data": campaign_status(self._conn)}
 
     def _abort_topic_attribution_campaign(self, _req: dict[str, object]) -> dict[str, object]:
-        """Terminalize an active repair so the operator can reset and re-enroll."""
+        """Terminalize an active repair for an explicit later resume or reset."""
         try:
             result = abort_campaign(self._conn)
         except TopicAttributionCampaignError as exc:
             return {"ok": False, "error": "topic_attribution_campaign_not_abortable", "message": str(exc)}
+        return {"ok": True, "data": result}
+
+    def _resume_topic_attribution_campaign(self, _req: dict[str, object]) -> dict[str, object]:
+        """Resume only an operator-aborted repair from durable committed progress."""
+        try:
+            result = resume_campaign(self._conn)
+        except TopicAttributionCampaignError as exc:
+            return {"ok": False, "error": "topic_attribution_campaign_not_resumable", "message": str(exc)}
+        offer_durable_demand(self._require_demand_sink(), DemandKind.FULL_SYNC_PAGE)
         return {"ok": True, "data": result}
 
     def _reset_topic_attribution_campaign(self, _req: dict[str, object]) -> dict[str, object]:

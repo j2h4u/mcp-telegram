@@ -161,7 +161,7 @@ def topic_attribution_campaign_status() -> None:
 
 @topic_attribution_app.command("abort")
 def abort_topic_attribution_campaign() -> None:
-    """Terminalize an active repair before reset and explicit re-enrollment."""
+    """Terminalize an active repair before explicit resume or reset."""
     import sys
 
     from .daemon_client import daemon_connection
@@ -170,7 +170,26 @@ def abort_topic_attribution_campaign() -> None:
         async with daemon_connection() as conn:
             response = await conn.abort_topic_attribution_campaign()
         if response.get("ok"):
-            print("Active topic-attribution repair aborted; reset it before re-enrollment.")
+            print("Active topic-attribution repair aborted; resume preserves its committed progress.")
+            return
+        print(f"Error: {response.get('message') or response.get('error') or 'unknown error'}")
+        sys.exit(1)
+
+    asyncio.run(_run())
+
+
+@topic_attribution_app.command("resume")
+def resume_topic_attribution_campaign() -> None:
+    """Resume an operator-aborted repair without resetting its manifest."""
+    import sys
+
+    from .daemon_client import daemon_connection
+
+    async def _run() -> None:
+        async with daemon_connection() as conn:
+            response = await conn.resume_topic_attribution_campaign()
+        if response.get("ok"):
+            print("Operator-aborted topic-attribution repair resumed from committed progress.")
             return
         print(f"Error: {response.get('message') or response.get('error') or 'unknown error'}")
         sys.exit(1)
