@@ -66,7 +66,9 @@ def _current(conn: sqlite3.Connection, scope: DraftScope) -> tuple[object, ...]:
     return row
 
 
-def test_realtime_orders_duplicates_and_equal_conflicts(projection: tuple[sqlite3.Connection, SQLiteDraftProjection]) -> None:
+def test_realtime_orders_duplicates_and_equal_conflicts(
+    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
+) -> None:
     conn, repository = projection
     scope = DraftScope(100, 200)
     first = _present(scope, 1, "first", source=DraftObservationSource.REALTIME)
@@ -116,7 +118,9 @@ def test_authoritative_absence_creates_bodyless_cleared_tombstone(
     assert (state, text, source_kind, entities) == ("cleared", None, "snapshot_absence", None)
 
 
-def test_failed_snapshot_never_establishes_absence(projection: tuple[sqlite3.Connection, SQLiteDraftProjection]) -> None:
+def test_failed_snapshot_never_establishes_absence(
+    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
+) -> None:
     conn, repository = projection
     scope = DraftScope(100, 200)
     repository.apply_realtime(_present(scope, 1, "body", source=DraftObservationSource.REALTIME))
@@ -130,13 +134,17 @@ def test_failed_snapshot_never_establishes_absence(projection: tuple[sqlite3.Con
     assert conn.execute("SELECT coverage_status FROM draft_sync_state WHERE account_id=100").fetchone() == ("unknown",)
 
 
-def test_account_fence_rejects_unbound_observation(projection: tuple[sqlite3.Connection, SQLiteDraftProjection]) -> None:
+def test_account_fence_rejects_unbound_observation(
+    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
+) -> None:
     _, repository = projection
     with pytest.raises(DraftAccountFenceError):
         repository.apply_realtime(_present(DraftScope(101, 200), 1, "body", source=DraftObservationSource.REALTIME))
 
 
-def test_optional_scope_zero_sentinel_and_constraints(projection: tuple[sqlite3.Connection, SQLiteDraftProjection]) -> None:
+def test_optional_scope_zero_sentinel_and_constraints(
+    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
+) -> None:
     conn, repository = projection
     scope = DraftScope(100, -200, subdialog_peer_id=-300)
     repository.apply_realtime(_present(scope, 1, "body", source=DraftObservationSource.REALTIME))
@@ -151,12 +159,16 @@ def test_optional_scope_zero_sentinel_and_constraints(projection: tuple[sqlite3.
         )
 
 
-def test_read_transaction_is_local_stable_snapshot(projection: tuple[sqlite3.Connection, SQLiteDraftProjection]) -> None:
+def test_read_transaction_is_local_stable_snapshot(
+    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
+) -> None:
     conn, repository = projection
     scope = DraftScope(100, 200)
     repository.apply_realtime(_present(scope, 1, "body", source=DraftObservationSource.REALTIME))
     with repository.read_transaction() as reader:
-        assert reader.execute("SELECT text FROM draft_current WHERE account_id=100 AND dialog_id=200").fetchone() == ("body",)
+        assert reader.execute("SELECT text FROM draft_current WHERE account_id=100 AND dialog_id=200").fetchone() == (
+            "body",
+        )
     assert not conn.in_transaction
 
 

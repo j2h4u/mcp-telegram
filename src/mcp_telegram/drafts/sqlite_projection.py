@@ -112,7 +112,9 @@ class SQLiteDraftProjection:
                 ).fetchall(),
             )
             baselines = {
-                DraftScope(account_id, dialog_id, _none_for_zero(top_message_id), _none_for_zero(subdialog_peer_id)): revision
+                DraftScope(
+                    account_id, dialog_id, _none_for_zero(top_message_id), _none_for_zero(subdialog_peer_id)
+                ): revision
                 for dialog_id, top_message_id, subdialog_peer_id, revision in rows
             }
             self._conn.executemany(
@@ -153,51 +155,69 @@ class SQLiteDraftProjection:
             if deduplicated is None:
                 self._set_recovery_needed("conflicting_snapshot_observations", completed_at)
                 return DraftApplyResult(accepted=False, ambiguous=True)
-            changed_revision: int | None = None
-            for observation in deduplicated:
-                current = self._row_for_scope(observation.scope)
-                baseline = baselines.get(observation.scope)
-                if current is not None and (baseline is None or _database_int(current["projection_revision"]) != baseline):
-                    continue
-                candidate = _row_values(observation, source_kind=_source_kind(observation), completed_at=completed_at)
-                if current is not None and _row_matches(current, candidate):
-                    continue
-                changed_revision = self._next_revision()
-                self._upsert_current(observation.scope, candidate, changed_revision)
+            changed_revision = self._apply_snapshot_observations(deduplicated, baselines, completed_at)
             if coverage.authoritative:
-                known = cast(
-                    list[tuple[int, int, int, int]],
-                    self._conn.execute(
-                        "SELECT dialog_id,top_message_id,subdialog_peer_id,projection_revision "
-                        "FROM draft_current WHERE account_id=?",
-                        (coverage.account_id,),
-                    ).fetchall(),
+                changed_revision = self._infer_snapshot_absences(
+                    coverage.account_id, deduplicated, baselines, completed_at, changed_revision
                 )
-                observed_scopes = {observation.scope for observation in deduplicated}
-                for dialog_id, top_message_id, subdialog_peer_id, revision in known:
-                    scope = DraftScope(
-                        coverage.account_id,
-                        dialog_id,
-                        _none_for_zero(top_message_id),
-                        _none_for_zero(subdialog_peer_id),
-                    )
-                    if scope in observed_scopes or baselines.get(scope) != revision:
-                        continue
-                    cleared = _cleared_row(completed_at)
-                    changed_revision = self._next_revision()
-                    self._upsert_current(scope, cleared, changed_revision)
-                self._conn.execute(
-                    "UPDATE draft_sync_state SET status='ready',coverage_status='complete',"
-                    "observation_completed_at=?,reason=NULL WHERE account_id=?",
-                    (completed_at, coverage.account_id),
-                )
-                self._conn.execute(
-                    "UPDATE draft_projection_runtime SET recovery_due_at=NULL,recovery_claimed_at=NULL WHERE singleton=1"
-                )
+                self._mark_snapshot_complete(coverage.account_id, completed_at)
             else:
                 self._set_recovery_needed("snapshot_not_authoritative", completed_at)
             self._conn.execute("DELETE FROM draft_snapshot_baseline WHERE account_id=?", (coverage.account_id,))
             return DraftApplyResult(accepted=coverage.authoritative, revision=changed_revision)
+
+    def _apply_snapshot_observations(
+        self,
+        observations: Sequence[DraftObservation],
+        baselines: Mapping[DraftScope, int],
+        completed_at: int,
+    ) -> int | None:
+        changed_revision: int | None = None
+        for observation in observations:
+            current = self._row_for_scope(observation.scope)
+            baseline = baselines.get(observation.scope)
+            if current is not None and (baseline is None or _database_int(current["projection_revision"]) != baseline):
+                continue
+            candidate = _row_values(observation, source_kind=_source_kind(observation), completed_at=completed_at)
+            if current is not None and _row_matches(current, candidate):
+                continue
+            changed_revision = self._next_revision()
+            self._upsert_current(observation.scope, candidate, changed_revision)
+        return changed_revision
+
+    def _infer_snapshot_absences(
+        self,
+        account_id: int,
+        observations: Sequence[DraftObservation],
+        baselines: Mapping[DraftScope, int],
+        completed_at: int,
+        changed_revision: int | None,
+    ) -> int | None:
+        known = cast(
+            list[tuple[int, int, int, int]],
+            self._conn.execute(
+                "SELECT dialog_id,top_message_id,subdialog_peer_id,projection_revision FROM draft_current WHERE account_id=?",
+                (account_id,),
+            ).fetchall(),
+        )
+        observed_scopes = {observation.scope for observation in observations}
+        for dialog_id, top_message_id, subdialog_peer_id, revision in known:
+            scope = DraftScope(account_id, dialog_id, _none_for_zero(top_message_id), _none_for_zero(subdialog_peer_id))
+            if scope in observed_scopes or baselines.get(scope) != revision:
+                continue
+            changed_revision = self._next_revision()
+            self._upsert_current(scope, _cleared_row(completed_at), changed_revision)
+        return changed_revision
+
+    def _mark_snapshot_complete(self, account_id: int, completed_at: int) -> None:
+        self._conn.execute(
+            "UPDATE draft_sync_state SET status='ready',coverage_status='complete',"
+            "observation_completed_at=?,reason=NULL WHERE account_id=?",
+            (completed_at, account_id),
+        )
+        self._conn.execute(
+            "UPDATE draft_projection_runtime SET recovery_due_at=NULL,recovery_claimed_at=NULL WHERE singleton=1"
+        )
 
     def mark_recovery_needed(self, *, reason: str, observed_at: datetime) -> None:
         """Persist a retryable recovery requirement without inventing draft absence."""
@@ -342,7 +362,9 @@ class SQLiteDraftProjection:
         )
 
 
-def _row_values(observation: DraftObservation, *, source_kind: str, completed_at: int | None = None) -> dict[str, object]:
+def _row_values(
+    observation: DraftObservation, *, source_kind: str, completed_at: int | None = None
+) -> dict[str, object]:
     observed_at = _as_unix(observation.observed_at)
     completed = observed_at if completed_at is None else completed_at
     if observation.disposition is DraftDisposition.TOMBSTONE:
@@ -370,7 +392,9 @@ def _row_values(observation: DraftObservation, *, source_kind: str, completed_at
     return _present_row(composition, source_kind, observed_at, completed)
 
 
-def _present_row(composition: DraftComposition, source_kind: str, observed_at: int, completed_at: int) -> dict[str, object]:
+def _present_row(
+    composition: DraftComposition, source_kind: str, observed_at: int, completed_at: int
+) -> dict[str, object]:
     return {
         "state": "present",
         "text": composition.text,
@@ -478,10 +502,18 @@ def _validate_snapshot_inputs(
     observations: Sequence[DraftObservation], coverage: SnapshotCoverage, baselines: Mapping[DraftScope, int]
 ) -> None:
     for scope, revision in baselines.items():
-        if scope.account_id != coverage.account_id or isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        if (
+            scope.account_id != coverage.account_id
+            or isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 0
+        ):
             raise ValueError("snapshot baselines must contain non-negative revisions for the covered account")
     for observation in observations:
-        if observation.scope.account_id != coverage.account_id or observation.source is not DraftObservationSource.SNAPSHOT:
+        if (
+            observation.scope.account_id != coverage.account_id
+            or observation.source is not DraftObservationSource.SNAPSHOT
+        ):
             raise ValueError("snapshot observations must belong to the covered account and snapshot source")
 
 

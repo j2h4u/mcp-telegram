@@ -4413,6 +4413,12 @@ def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
     if _CURRENT_SCHEMA_VERSION >= _REALTIME_DM_DIALOG_BACKFILL_MIGRATION_63:
         current = _apply_migration_63(conn, current)
     current = _apply_migrations_64_to_67(conn, current)
+    current = _apply_migrations_68_to_71(conn, current)
+    return _apply_migrations_72_to_74(conn, current)
+
+
+def _apply_migrations_68_to_71(conn: sqlite3.Connection, current: int) -> int:
+    """Apply reaction and read-date migrations after the directory cutover."""
     if _CURRENT_SCHEMA_VERSION >= _REACTION_DETAIL_LIFECYCLE_MIGRATION_68:
         current = _apply_migration_68(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _REACTION_DETAIL_PACING_MIGRATION_69:
@@ -4421,6 +4427,11 @@ def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_70(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _READ_DATE_EXPIRY_CUTOFF_MIGRATION_71:
         current = _apply_migration_71(conn, current)
+    return current
+
+
+def _apply_migrations_72_to_74(conn: sqlite3.Connection, current: int) -> int:
+    """Apply topic-receipt cleanup and the finite draft ownership cutover."""
     if _CURRENT_SCHEMA_VERSION >= _TOPIC_ATTRIBUTION_RECEIPT_MIGRATION_72:
         current = _apply_migration_72(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _REMOVE_TOPIC_ATTRIBUTION_CAMPAIGN_MIGRATION_73:

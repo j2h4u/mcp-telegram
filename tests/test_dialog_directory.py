@@ -270,7 +270,9 @@ async def test_directory_traversal_never_mutates_current_drafts(tmp_path: Path) 
     await _run_slices(directory, 4)
     conn = _open_sync_db(db_path)
     try:
-        assert conn.execute("SELECT state,text,projection_revision FROM draft_current WHERE account_id=100 AND dialog_id=1").fetchone() == (
+        assert conn.execute(
+            "SELECT state,text,projection_revision FROM draft_current WHERE account_id=100 AND dialog_id=1"
+        ).fetchone() == (
             "present",
             "draft body",
             1,
