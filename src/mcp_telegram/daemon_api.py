@@ -188,7 +188,12 @@ def _served_source(response: Mapping[str, object]) -> str:
     data = response.get("data")
     if isinstance(data, Mapping):
         source = data.get("source")
-        if source in {"sync_db", "scheduled_messages", "sync_db+scheduled_messages"}:
+        if source in {
+            "sync_db",
+            "scheduled_messages",
+            "sync_db+scheduled_messages",
+            "sync_db+scheduled_messages+draft_current",
+        }:
             return "local"
         if source == "telegram":
             return "telegram"

@@ -209,6 +209,7 @@ def test_unknown_route_does_not_claim_phases_not_applicable() -> None:
 
 
 def test_unknown_served_source_remains_unknown() -> None:
+    assert _served_source({"ok": True, "data": {"source": "sync_db+scheduled_messages+draft_current"}}) == "local"
     assert _served_source({"ok": True, "data": {"source": "future"}}) == "unknown"
     assert _served_source({"ok": False, "error": "failed"}) == "error"
 

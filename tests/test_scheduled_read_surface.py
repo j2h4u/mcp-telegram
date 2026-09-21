@@ -387,6 +387,52 @@ async def test_list_messages_all_uses_one_unified_envelope() -> None:
     assert rows[1]["message_state"] == "scheduled"
     assert rows[1]["unpublished"] is True
     assert rows[1]["unseen"] is True
+    assert result["data"]["source"] == "sync_db+scheduled_messages+draft_current"
+
+
+@pytest.mark.asyncio
+async def test_list_messages_all_uses_numeric_tie_break_for_sent_and_scheduled_rows() -> None:
+    server = make_server()
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    shared_timestamp = FUTURE_BASE + 100
+    _insert_message(conn, 1, 10, sent_at=shared_timestamp, text="sent ten")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 2, shared_timestamp, "scheduled two")
+
+    result = await server._list_messages({"dialog_id": 1, "message_state": "all", "direction": "oldest"})
+
+    assert [row["message_id"] for row in result["data"]["messages"]] == [2, 10]
+
+
+@pytest.mark.asyncio
+async def test_list_messages_all_topic_cursor_preserves_topic_scope() -> None:
+    server = make_server()
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    _insert_message(conn, 1, 1, sent_at=100, text="topic first", forum_topic_id=7)
+    _insert_message(conn, 1, 2, sent_at=200, text="topic second", forum_topic_id=7)
+    _insert_message(conn, 1, 3, sent_at=300, text="other topic", forum_topic_id=8)
+
+    first = await server._list_messages(
+        {"dialog_id": 1, "message_state": "all", "direction": "oldest", "limit": 1, "topic_id": 7}
+    )
+    token = first["data"]["next_navigation"]
+    assert token is not None
+    assert decode_navigation_token(token).topic_id == 7
+
+    second = await server._list_messages(
+        {
+            "dialog_id": 1,
+            "message_state": "all",
+            "direction": "oldest",
+            "limit": 1,
+            "topic_id": 7,
+            "navigation": token,
+        }
+    )
+
+    assert [row["message_id"] for row in first["data"]["messages"] + second["data"]["messages"]] == [1, 2]
 
 
 @pytest.mark.asyncio

@@ -1001,7 +1001,7 @@ class ReadingService:
                 direction=direction,
                 direction_enum=direction_enum,
                 anchor_msg_id=anchor_msg_id,
-                anchor_sent_at=None,
+                anchor_sent_at=self._history_navigation_sent_at(request.navigation),
                 sender_id=request.sender_id,
                 sender_name=request.sender_name,
                 topic_id=request.topic_id,
@@ -2002,7 +2002,7 @@ class ReadingService:
                 "ok": True,
                 "data": {
                     "messages": page,
-                    "source": "sync_db+scheduled_messages",
+                    "source": "sync_db+scheduled_messages+draft_current",
                     "next_navigation": next_nav,
                     "message_state": "all",
                     "dialog_type": dialog_type,
@@ -2024,18 +2024,21 @@ class ReadingService:
         return combined
 
     @staticmethod
-    def _all_row_sort_key(row: dict) -> tuple[int, int, int | str]:
+    def _all_row_sort_key(row: dict) -> tuple[int, int, int | str, int]:
         state = str(row.get("message_state"))
         state_order = {"sent": 0, "scheduled": 1, "draft": 2}
-        identity: int | str
         if state == "draft":
-            identity = str(row.get("message_key") or "")
-        else:
-            identity = _object_to_int(row.get("message_id"))
+            return (
+                int(row.get("sent_at") or row.get("draft_updated_at") or 0),
+                1,
+                str(row.get("message_key") or ""),
+                state_order["draft"],
+            )
         return (
             int(row.get("sent_at") or row.get("draft_updated_at") or 0),
+            0,
+            _object_to_int(row.get("message_id")),
             state_order.get(state, 3),
-            identity,
         )
 
     @staticmethod
@@ -2053,6 +2056,7 @@ class ReadingService:
         return encode_history_navigation(
             position.sent_message_id,
             all_request.dialog_id,
+            topic_id=all_request.request.topic_id,
             direction=(HistoryDirection.OLDEST if all_request.direction == "oldest" else HistoryDirection.NEWEST),
             sent_at=position.sent_at,
             message_state="all",
@@ -2063,6 +2067,12 @@ class ReadingService:
             scheduled_message_id=position.scheduled_message_id,
             scheduled_sent_at=position.scheduled_sent_at,
         )
+
+    @staticmethod
+    def _history_navigation_sent_at(navigation: str | None) -> int | None:
+        if navigation in (None, "newest", "oldest"):
+            return None
+        return decode_navigation_token(navigation).sent_at
 
     async def _list_messages_non_sent(
         self,

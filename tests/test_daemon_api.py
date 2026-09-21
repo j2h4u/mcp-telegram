@@ -4471,6 +4471,39 @@ async def test_list_messages_pagination_cursor_continues() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("direction", "expected_ids", "expected_anchor_sent_at"),
+    [
+        ("oldest", [100, 50], 100),
+        ("newest", [50, 100], 200),
+    ],
+)
+async def test_list_messages_pagination_uses_composite_sent_anchor(
+    direction: str, expected_ids: list[int], expected_anchor_sent_at: int
+) -> None:
+    """The sent-time cursor survives message-id/date inversions between pages."""
+    from mcp_telegram.pagination import decode_navigation_token
+
+    dialog_id = 9012
+    conn = _make_db()
+    _insert_synced_dialog(conn, dialog_id, status="synced")
+    _insert_message(conn, dialog_id, 100, sent_at=100, text="older date, larger id")
+    _insert_message(conn, dialog_id, 50, sent_at=200, text="newer date, smaller id")
+
+    server = make_server(conn)
+    first = await server._list_messages({"dialog_id": dialog_id, "direction": direction, "limit": 1})
+    token = first["data"]["next_navigation"]
+    assert token is not None
+    assert decode_navigation_token(token).sent_at == expected_anchor_sent_at
+
+    second = await server._list_messages(
+        {"dialog_id": dialog_id, "direction": direction, "limit": 1, "navigation": token}
+    )
+
+    assert [row["message_id"] for row in first["data"]["messages"] + second["data"]["messages"]] == expected_ids
+
+
+@pytest.mark.asyncio
 async def test_list_messages_pagination_wrong_dialog_error() -> None:
     """list_messages with navigation token for wrong dialog returns error."""
     from mcp_telegram.pagination import HistoryDirection, encode_history_navigation
