@@ -247,6 +247,40 @@ class _AllLocalState:
     metadata: tuple[str, ReadState | None, dict[str, object]]
 
 
+@dataclass
+class _AllNavigationPosition:
+    """Independent positions for the three streams in an ``all`` cursor."""
+
+    sent_message_id: int | None = None
+    sent_at: int | None = None
+    scheduled_message_id: int | None = None
+    scheduled_sent_at: int | None = None
+    draft_key: str | None = None
+
+    @classmethod
+    def from_navigation(cls, navigation: NavigationToken | None) -> _AllNavigationPosition:
+        if navigation is None:
+            return cls()
+        return cls(
+            sent_message_id=navigation.value,
+            sent_at=navigation.sent_at,
+            scheduled_message_id=navigation.scheduled_message_id,
+            scheduled_sent_at=navigation.scheduled_sent_at,
+            draft_key=navigation.draft_key,
+        )
+
+    def advance(self, row: dict) -> None:
+        state = row.get("message_state")
+        if state == "sent":
+            self.sent_message_id = _message_id_from_item(row)
+            self.sent_at = _object_to_int(row.get("sent_at"))
+        elif state == "scheduled":
+            self.scheduled_message_id = _message_id_from_item(row)
+            self.scheduled_sent_at = _object_to_int(row.get("sent_at"))
+        elif state == "draft":
+            self.draft_key = str(row["message_key"])
+
+
 _MAX_TELEGRAM_BOUNDARY_BATCHES = 16
 
 
@@ -2013,34 +2047,21 @@ class ReadingService:
     ) -> str | None:
         if not has_more or not page:
             return None
-        navigation = all_request.navigation
-        sent_message_id = navigation.value if navigation is not None else None
-        sent_at = navigation.sent_at if navigation is not None else None
-        scheduled_message_id = navigation.scheduled_message_id if navigation is not None else None
-        scheduled_sent_at = navigation.scheduled_sent_at if navigation is not None else None
-        draft_key = navigation.draft_key if navigation is not None else None
+        position = _AllNavigationPosition.from_navigation(all_request.navigation)
         for row in page:
-            state = row.get("message_state")
-            if state == "sent":
-                sent_message_id = _message_id_from_item(row)
-                sent_at = _object_to_int(row.get("sent_at"))
-            elif state == "scheduled":
-                scheduled_message_id = _message_id_from_item(row)
-                scheduled_sent_at = _object_to_int(row.get("sent_at"))
-            elif state == "draft":
-                draft_key = str(row["message_key"])
+            position.advance(row)
         return encode_history_navigation(
-            sent_message_id,
+            position.sent_message_id,
             all_request.dialog_id,
             direction=(HistoryDirection.OLDEST if all_request.direction == "oldest" else HistoryDirection.NEWEST),
-            sent_at=sent_at,
+            sent_at=position.sent_at,
             message_state="all",
             since_utc=all_request.request.since_utc,
             until_utc=all_request.request.until_utc,
-            draft_key=draft_key,
+            draft_key=position.draft_key,
             draft_fingerprint=draft_fingerprint,
-            scheduled_message_id=scheduled_message_id,
-            scheduled_sent_at=scheduled_sent_at,
+            scheduled_message_id=position.scheduled_message_id,
+            scheduled_sent_at=position.scheduled_sent_at,
         )
 
     async def _list_messages_non_sent(
