@@ -375,7 +375,6 @@ def _load(conn: sqlite3.Connection) -> dict[str, object] | None:
     return manifest
 
 
-
 def _valid_manifest_shape(manifest: dict[str, object]) -> bool:
     dialog_ids = manifest.get("dialog_ids")
     dialogs = manifest.get("dialogs")
@@ -383,9 +382,19 @@ def _valid_manifest_shape(manifest: dict[str, object]) -> bool:
 
 
 def _valid_manifest_header(manifest: dict[str, object], dialog_ids: object, dialogs: object) -> bool:
-    if manifest.get("state") not in {"active", "complete"} or not isinstance(dialog_ids, list) or not isinstance(dialogs, dict):
+    if (
+        manifest.get("state") not in {"active", "complete"}
+        or not isinstance(dialog_ids, list)
+        or not isinstance(dialogs, dict)
+    ):
         return False
-    return manifest.get("state") != "active" or (len(dialog_ids) == CAMPAIGN_DIALOG_COUNT and "expires_at" in manifest)
+    if manifest.get("state") != "active":
+        return True
+    return len(dialog_ids) == CAMPAIGN_DIALOG_COUNT and _nonnegative_int(manifest.get("expires_at"))
+
+
+def _nonnegative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _valid_manifest_dialogs(dialog_ids: object, dialogs: object) -> bool:
@@ -395,12 +404,31 @@ def _valid_manifest_dialogs(dialog_ids: object, dialogs: object) -> bool:
 
 
 def _valid_manifest_dialog(dialog_id: object, item: object) -> bool:
-    if isinstance(dialog_id, bool) or not isinstance(dialog_id, int) or not isinstance(item, dict):
+    return _valid_dialog_identity(dialog_id, item) and _valid_dialog_progress(item) and _valid_dialog_counts(item)
+
+
+def _valid_dialog_identity(dialog_id: object, item: object) -> bool:
+    return not isinstance(dialog_id, bool) and isinstance(dialog_id, int) and isinstance(item, dict)
+
+
+def _valid_dialog_progress(item: object) -> bool:
+    if not isinstance(item, dict):
+        return False
+    retry_at = item.get("next_retry_at")
+    return (
+        item.get("state") in {"pending", "done"}
+        and _nonnegative_int(item.get("cursor"))
+        and _nonnegative_int(item.get("failure_attempts"))
+        and (retry_at is None or _nonnegative_int(retry_at))
+    )
+
+
+def _valid_dialog_counts(item: object) -> bool:
+    if not isinstance(item, dict):
         return False
     counts = item.get("counts")
-    return item.get("state") in {"pending", "done"} and isinstance(counts, dict) and all(
-        isinstance(counts.get(key), int) for key in _COUNTER_KEYS
-    )
+    return isinstance(counts, dict) and all(_nonnegative_int(counts.get(key)) for key in _COUNTER_KEYS)
+
 
 def _save(conn: sqlite3.Connection, manifest: dict[str, object]) -> None:
     conn.execute(
@@ -448,7 +476,8 @@ def _require_synced_bot_dialogs(conn: sqlite3.Connection, ids: Sequence[int]) ->
         list[tuple[object, object]],
         conn.execute(
             "SELECT sd.dialog_id,d.type FROM synced_dialogs sd JOIN dialogs d USING(dialog_id) "
-            "WHERE sd.dialog_id IN (?,?) AND sd.status='synced'", tuple(ids)
+            "WHERE sd.dialog_id IN (?,?) AND sd.status='synced' AND d.hidden=0",
+            tuple(ids),
         ).fetchall(),
     )
     if len(rows) != CAMPAIGN_DIALOG_COUNT or any(not is_bot_dialog_type(row[1]) for row in rows):
@@ -457,12 +486,24 @@ def _require_synced_bot_dialogs(conn: sqlite3.Connection, ids: Sequence[int]) ->
 
 def _new_campaign_manifest(ids: list[int], observed_at: int) -> dict[str, object]:
     return {
-        "version": CAMPAIGN_VERSION, "state": "active", "created_at": observed_at,
+        "version": CAMPAIGN_VERSION,
+        "state": "active",
+        "created_at": observed_at,
         "expires_at": observed_at + topic_attribution_campaign_lifetime(),
-        "max_failures_per_dialog": CAMPAIGN_MAX_FAILURES_PER_DIALOG, "dialog_ids": ids,
-        "dialogs": {str(dialog_id): {"cursor": 0, "failure_attempts": 0, "next_retry_at": None,
-                    "state": "pending", "counts": _empty_counts()} for dialog_id in ids},
+        "max_failures_per_dialog": CAMPAIGN_MAX_FAILURES_PER_DIALOG,
+        "dialog_ids": ids,
+        "dialogs": {
+            str(dialog_id): {
+                "cursor": 0,
+                "failure_attempts": 0,
+                "next_retry_at": None,
+                "state": "pending",
+                "counts": _empty_counts(),
+            }
+            for dialog_id in ids
+        },
     }
+
 
 def reset_campaign(conn: sqlite3.Connection) -> dict[str, object]:
     """Remove only a terminal manifest before an explicit fresh enrollment."""
@@ -516,7 +557,7 @@ def advance_campaign(conn: sqlite3.Connection, *, now: int) -> tuple[int, int] |
         result, terminal_reason = _advance_active_manifest(conn, manifest, now)
         if terminal_reason is not None:
             _finish(conn, manifest, terminal_reason, now)
-        elif result is None:
+        else:
             _save(conn, manifest)
         conn.commit()
     except BaseException:
@@ -557,13 +598,27 @@ def _is_delayed(item: dict[str, object], now: int) -> bool:
 
 
 def _campaign_dialog_status(conn: sqlite3.Connection, dialog_id: int) -> object:
-    row = cast(tuple[object] | None, conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone())
-    return None if row is None else row[0]
+    row = cast(
+        tuple[object, object] | None,
+        conn.execute(
+            "SELECT sd.status,d.hidden FROM synced_dialogs sd JOIN dialogs d USING(dialog_id) WHERE sd.dialog_id=?",
+            (dialog_id,),
+        ).fetchone(),
+    )
+    if row is None or row[1] != 0:
+        return None
+    return row[0]
+
+
+def campaign_dialog_visible(conn: sqlite3.Connection, dialog_id: int) -> bool:
+    """Return whether canonical full-history eligibility still permits execution."""
+    return _campaign_dialog_status(conn, dialog_id) == "synced"
 
 
 def _abandon_ineligible_item(item: dict[str, object], status: object) -> None:
     reason = "access_lost" if status == "access_lost" else "status_ineligible"
     item.update(state="done", last_error=reason, terminal_reason=reason)
+
 
 def record_page(
     conn: sqlite3.Connection,
@@ -597,7 +652,9 @@ def record_page(
     counts = cast(dict[str, int], item["counts"])
     logger.info(
         "topic_attribution_campaign_page_result attributed=%d no_longer_needed=%d unresolved=%d",
-        counts["attributed"], counts["no_longer_needed"], counts["unresolved"],
+        counts["attributed"],
+        counts["no_longer_needed"],
+        counts["unresolved"],
     )
     if terminal:
         _log_terminal(manifest)
@@ -665,6 +722,7 @@ def _publish_campaign_receipt(conn: sqlite3.Connection, manifest: dict[str, obje
         (observed_at, *cast(list[int], manifest["dialog_ids"]), TOPIC_ATTRIBUTION_EXTRACTOR_VERSION),
     )
 
+
 def record_deferred(
     conn: sqlite3.Connection, dialog_id: int, checkpoint: int, *, reason: str, observed_at: int
 ) -> None:
@@ -713,7 +771,6 @@ def record_access_lost(
         _log_terminal(manifest)
 
 
-
 def abort_campaign(conn: sqlite3.Connection, *, observed_at: int | None = None) -> dict[str, object]:
     """Terminalize an active enrollment so an operator can reset it safely."""
     now = int(time.time()) if observed_at is None else observed_at
@@ -732,6 +789,7 @@ def abort_campaign(conn: sqlite3.Connection, *, observed_at: int | None = None) 
     logger.warning("topic_attribution_campaign_aborted")
     _log_terminal(manifest)
     return {"terminal_reason": "operator_abort"}
+
 
 def campaign_status(conn: sqlite3.Connection) -> dict[str, object]:
     """Return privacy-safe operator progress without exposing enrolled ids."""
@@ -880,7 +938,8 @@ def _status_from_manifest(manifest: dict[str, object]) -> dict[str, object]:
         "pending_dialogs": sum(item.get("state") == "pending" for item in dialogs.values()),
         "failed_dialogs": sum(item.get("terminal_reason") == "failure_limit" for item in dialogs.values()),
         "abandoned_dialogs": sum(
-            item.get("terminal_reason") in {"access_lost", "history_disabled", "status_ineligible", "operator_abort"} for item in dialogs.values()
+            item.get("terminal_reason") in {"access_lost", "history_disabled", "status_ineligible", "operator_abort"}
+            for item in dialogs.values()
         ),
         "counts": totals,
     }

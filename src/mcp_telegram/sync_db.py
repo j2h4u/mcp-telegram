@@ -4205,7 +4205,6 @@ def _repair_v54_schema_ledger(conn: sqlite3.Connection, current: int) -> int:
     return current
 
 
-
 def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
     """Apply the conditional current-schema migration tail."""
     if _CURRENT_SCHEMA_VERSION >= _ENTITY_PROFILE_ACQUISITION_MIGRATION_61:
@@ -4226,6 +4225,7 @@ def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
     if _CURRENT_SCHEMA_VERSION >= _TOPIC_ATTRIBUTION_RECEIPT_MIGRATION_72:
         current = _apply_migration_72(conn, current)
     return current
+
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     """Apply WAL mode and all pending schema migrations in version order."""

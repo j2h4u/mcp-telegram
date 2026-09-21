@@ -284,7 +284,10 @@ def test_topic_attribution_campaign_enroll_cli_routes_to_daemon() -> None:
 
 def test_topic_attribution_campaign_abort_cli_routes_to_daemon() -> None:
     mock_conn = cast(_FeedbackStatusConn, AsyncMock())
-    mock_conn.abort_topic_attribution_campaign.return_value = {"ok": True, "data": {"terminal_reason": "operator_abort"}}
+    mock_conn.abort_topic_attribution_campaign.return_value = {
+        "ok": True,
+        "data": {"terminal_reason": "operator_abort"},
+    }
     async_cm = MagicMock()
     async_cm.__aenter__ = AsyncMock(return_value=mock_conn)
     async_cm.__aexit__ = AsyncMock(return_value=False)
@@ -299,7 +302,10 @@ def test_topic_attribution_campaign_abort_cli_routes_to_daemon() -> None:
 
 def test_topic_attribution_campaign_reset_cli_routes_to_daemon() -> None:
     mock_conn = cast(_FeedbackStatusConn, AsyncMock())
-    mock_conn.reset_topic_attribution_campaign.return_value = {"ok": True, "data": {"previous_terminal_reason": "expiry"}}
+    mock_conn.reset_topic_attribution_campaign.return_value = {
+        "ok": True,
+        "data": {"previous_terminal_reason": "expiry"},
+    }
     async_cm = MagicMock()
     async_cm.__aenter__ = AsyncMock(return_value=mock_conn)
     async_cm.__aexit__ = AsyncMock(return_value=False)

@@ -66,6 +66,7 @@ from .telegram_rpc_scheduler import (
 )
 from .topic_attribution_campaign import (
     advance_campaign,
+    campaign_execution_allowed,
     campaign_release_at,
     record_access_lost,
     record_deferred,
@@ -339,7 +340,7 @@ class FullSyncWorker:
         if checkpoint is None:
             return True
         dialog_id, before_message_id = checkpoint
-        if not full_history_enabled(self._conn, dialog_id):
+        if not campaign_execution_allowed(self._conn, dialog_id):
             record_access_lost(self._conn, dialog_id, before_message_id, observed_at=now, reason="history_disabled")
             return campaign_release_at(self._conn, now=now) is None
         try:
@@ -364,7 +365,16 @@ class FullSyncWorker:
         except MessageHistoryUnavailableError as exc:
             record_failed_attempt(self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=now)
         else:
-            record_page(self._conn, dialog_id, before_message_id, page.messages, observed_at=now)
+            if campaign_execution_allowed(self._conn, dialog_id):
+                record_page(self._conn, dialog_id, before_message_id, page.messages, observed_at=now)
+            else:
+                record_access_lost(
+                    self._conn,
+                    dialog_id,
+                    before_message_id,
+                    observed_at=now,
+                    reason="history_disabled",
+                )
         return campaign_release_at(self._conn, now=now) is None
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_LOOKUP)
@@ -668,8 +678,13 @@ class FullSyncDemandAdapter:
         """Fetch at most one history page under the transport attempt budget."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
-        status = self.status(time.time())
-        if status is None or not status.is_ready(time.time()):
+        now = time.time()
+        with demand_context(DemandKind.FULL_SYNC_PAGE):
+            # This mutating preflight keeps the finite campaign's terminal receipt
+            # independent from ordinary full-sync queue starvation. status() stays pure.
+            advance_campaign(self._worker._conn, now=int(now))
+        status = self.status(now)
+        if status is None or not status.is_ready(now):
             return
         with demand_context(DemandKind.FULL_SYNC_PAGE):
             with rpc_attempt_budget(budget):

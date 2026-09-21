@@ -914,3 +914,50 @@ async def test_campaign_propagates_governed_deferrals_without_failure_budget(
     assert item["cursor"] == 0
     assert item["failure_attempts"] == 0
     assert item["last_error"] in {"TelegramRpcThrottled", "RpcAdmissionSaturatedError"}
+
+
+@pytest.mark.asyncio
+async def test_campaign_skips_midflight_hidden_dialog_without_telegram_read(conn: sqlite3.Connection) -> None:
+    _enroll_topic_campaign(conn)
+    conn.execute("UPDATE dialogs SET hidden=1 WHERE dialog_id=901")
+    conn.commit()
+    calls: list[int] = []
+
+    class Port:
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            assert before_message_id == 0
+            calls.append(dialog_id)
+            return FullHistoryPage(messages=(), total_messages=0)
+
+    await FullSyncDemandAdapter(FullSyncWorker(cast(FullHistoryPagePort, Port()), conn, asyncio.Event())).run_slice(
+        RpcAttemptBudget(limit=1)
+    )
+
+    assert calls == [902]
+    assert campaign_status(conn)["abandoned_dialogs"] == 1
+
+
+@pytest.mark.asyncio
+async def test_campaign_expiry_preflight_runs_despite_normal_full_sync_work(conn: sqlite3.Connection) -> None:
+    _enroll_topic_campaign(conn)
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (903,'syncing',0)")
+    seed_full_history_enrollment(conn, 903, enabled=True)
+    conn.commit()
+    # Make the durable manifest old without relying on the live clock.
+    manifest_row = conn.execute("SELECT value FROM daemon_state WHERE key=?", (CAMPAIGN_STATE_KEY,)).fetchone()
+    assert manifest_row is not None
+    manifest = json.loads(cast(tuple[str], manifest_row)[0])
+    manifest["expires_at"] = 1
+    conn.execute("UPDATE daemon_state SET value=? WHERE key=?", (json.dumps(manifest), CAMPAIGN_STATE_KEY))
+    conn.commit()
+
+    class NormalPort:
+        async def fetch_page(self, _dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            assert before_message_id == 0
+            return FullHistoryPage(messages=(), total_messages=0)
+
+    worker = FullSyncWorker(cast(FullHistoryPagePort, NormalPort()), conn, asyncio.Event())
+    with patch("mcp_telegram.sync_worker.time.time", return_value=100.0):
+        await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+
+    assert campaign_status(conn)["terminal_reason"] == "expiry"

@@ -24,6 +24,9 @@ from .messages.sqlite_bundle import (
     advance_campaign as _advance_campaign,
 )
 from .messages.sqlite_bundle import (
+    campaign_dialog_visible as _campaign_dialog_visible,
+)
+from .messages.sqlite_bundle import (
     campaign_release_at as _campaign_release_at,
 )
 from .messages.sqlite_bundle import (
@@ -69,6 +72,11 @@ def advance_campaign(conn: SQLiteConnection, *, now: int) -> tuple[int, int] | N
     return None
 
 
+def campaign_execution_allowed(conn: SQLiteConnection, dialog_id: int) -> bool:
+    """Require current enabled intent and canonical visible synced eligibility."""
+    return full_history_enabled(conn, dialog_id) and _campaign_dialog_visible(conn, dialog_id)
+
+
 def campaign_release_at(conn: SQLiteConnection, *, now: int) -> float | None:
     return _campaign_release_at(conn, now=now)
 
@@ -86,7 +94,9 @@ def abort_campaign(conn: SQLiteConnection) -> dict[str, object]:
     return _abort_campaign(conn)
 
 
-def record_page(conn: SQLiteConnection, dialog_id: int, checkpoint: int, messages: Sequence[ExtractedMessage], *, observed_at: int) -> dict[str, object]:
+def record_page(
+    conn: SQLiteConnection, dialog_id: int, checkpoint: int, messages: Sequence[ExtractedMessage], *, observed_at: int
+) -> dict[str, object]:
     return _record_page(conn, dialog_id, checkpoint, messages, observed_at=observed_at)
 
 
@@ -94,16 +104,31 @@ def record_deferred(conn: SQLiteConnection, dialog_id: int, checkpoint: int, *, 
     _record_deferred(conn, dialog_id, checkpoint, reason=reason, observed_at=observed_at)
 
 
-def record_failed_attempt(conn: SQLiteConnection, dialog_id: int, checkpoint: int, *, reason: str, observed_at: int) -> None:
+def record_failed_attempt(
+    conn: SQLiteConnection, dialog_id: int, checkpoint: int, *, reason: str, observed_at: int
+) -> None:
     _record_failed_attempt(conn, dialog_id, checkpoint, reason=reason, observed_at=observed_at)
 
 
-def record_access_lost(conn: SQLiteConnection, dialog_id: int, checkpoint: int, *, observed_at: int, reason: str = "access_lost") -> None:
+def record_access_lost(
+    conn: SQLiteConnection, dialog_id: int, checkpoint: int, *, observed_at: int, reason: str = "access_lost"
+) -> None:
     _record_access_lost(conn, dialog_id, checkpoint, observed_at=observed_at, reason=reason)
 
 
 __all__ = [
-    "CAMPAIGN_DIALOG_COUNT", "CAMPAIGN_STATE_KEY", "TopicAttributionCampaignError",
-    "abort_campaign", "advance_campaign", "campaign_release_at", "campaign_status", "enroll_campaign",
-    "record_access_lost", "record_deferred", "record_failed_attempt", "record_page", "reset_campaign",
+    "CAMPAIGN_DIALOG_COUNT",
+    "CAMPAIGN_STATE_KEY",
+    "TopicAttributionCampaignError",
+    "abort_campaign",
+    "advance_campaign",
+    "campaign_execution_allowed",
+    "campaign_release_at",
+    "campaign_status",
+    "enroll_campaign",
+    "record_access_lost",
+    "record_deferred",
+    "record_failed_attempt",
+    "record_page",
+    "reset_campaign",
 ]

@@ -35,6 +35,8 @@ class FullHistoryPage:
     def __post_init__(self) -> None:
         if not isinstance(self.messages, tuple):
             raise TypeError("messages must be a tuple")
+        if len(self.messages) > MESSAGE_HISTORY_PAGE_LIMIT:
+            raise ValueError("full history pages must contain at most 100 messages")
         if any(not isinstance(message, ExtractedMessage) for message in self.messages):
             raise TypeError("messages must contain ExtractedMessage values")
         if self.total_messages is not None and (

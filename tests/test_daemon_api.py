@@ -4786,7 +4786,10 @@ def test_topic_attribution_campaign_daemon_route_enrolls_and_resets_only_termina
         assert enrolled == {"ok": True, "data": {"state": "active", "dialog_count": 2}}
         assert offered == [DemandKind.FULL_SYNC_PAGE]
         assert server._reset_topic_attribution_campaign({})["error"] == "topic_attribution_campaign_not_resettable"
-        assert server._abort_topic_attribution_campaign({}) == {"ok": True, "data": {"terminal_reason": "operator_abort"}}
+        assert server._abort_topic_attribution_campaign({}) == {
+            "ok": True,
+            "data": {"terminal_reason": "operator_abort"},
+        }
         assert server._abort_topic_attribution_campaign({})["error"] == "topic_attribution_campaign_not_abortable"
         reset_after_abort = server._reset_topic_attribution_campaign({})
         assert reset_after_abort == {"ok": True, "data": {"previous_terminal_reason": "operator_abort"}}

@@ -173,7 +173,9 @@ async def test_new_full_history_terminal_publishes_complete_topic_attribution_re
 ) -> None:
     """Only a current full-history terminal can turn the receipt complete."""
     dialog_id = 404
-    sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (?, 'not_synced', 0)", (dialog_id,))
+    sync_db.execute(
+        "INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (?, 'not_synced', 0)", (dialog_id,)
+    )
     seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
     worker = make_worker(MagicMock(), sync_db, asyncio.Event())
@@ -2250,7 +2252,9 @@ async def test_full_history_null_topic_keeps_current_receipt_partial(sync_db: _S
     from mcp_telegram.message_contracts import ExtractedMessage
 
     dialog_id = 405
-    sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (?, 'not_synced', 0)", (dialog_id,))
+    sync_db.execute(
+        "INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (?, 'not_synced', 0)", (dialog_id,)
+    )
     seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
     worker = make_worker(MagicMock(), sync_db, asyncio.Event())
