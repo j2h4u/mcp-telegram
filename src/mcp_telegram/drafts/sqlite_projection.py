@@ -158,7 +158,9 @@ class SQLiteDraftProjection:
             self._require_active_account(coverage.account_id)
             deduplicated = _deduplicate_snapshot(observations)
             if deduplicated is None:
-                self._set_recovery_needed("conflicting_snapshot_observations", completed_at)
+                # The owner still holds the recovery claim and will rearm it
+                # with its token-fenced backoff.  Clearing it here would make
+                # that rearm a no-op and turn the conflict into a hot retry.
                 return DraftApplyResult(accepted=False, ambiguous=True)
             changed_revision = self._apply_snapshot_observations(deduplicated, baselines, completed_at)
             if coverage.authoritative:
@@ -210,8 +212,12 @@ class SQLiteDraftProjection:
             scope = DraftScope(account_id, dialog_id, _none_for_zero(top_message_id), _none_for_zero(subdialog_peer_id))
             if scope in observed_scopes or baselines.get(scope) != revision:
                 continue
+            current = self._row_for_scope(scope)
+            cleared = _cleared_row(completed_at)
+            if current is not None and _row_matches(current, cleared):
+                continue
             changed_revision = self._next_revision()
-            self._upsert_current(scope, _cleared_row(completed_at), changed_revision)
+            self._upsert_current(scope, cleared, changed_revision)
         return changed_revision
 
     def _mark_snapshot_complete(self, account_id: int, completed_at: int, claim_token: int) -> None:

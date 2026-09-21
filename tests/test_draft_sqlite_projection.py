@@ -77,6 +77,16 @@ def _current(conn: sqlite3.Connection, scope: DraftScope) -> tuple[object, ...]:
     return row
 
 
+def _current_row(conn: sqlite3.Connection, scope: DraftScope) -> tuple[object, ...]:
+    row = _fetchone(
+        conn,
+        "SELECT * FROM draft_current WHERE account_id=? AND dialog_id=? AND top_message_id=? AND subdialog_peer_id=?",
+        (scope.account_id, scope.dialog_id, scope.top_message_id or 0, scope.subdialog_peer_id or 0),
+    )
+    assert row is not None
+    return row
+
+
 def _fetchone(
     conn: sqlite3.Connection, statement: str, parameters: tuple[object, ...] = ()
 ) -> tuple[object, ...] | None:
@@ -144,6 +154,65 @@ def test_authoritative_absence_creates_bodyless_cleared_tombstone(
     assert result.accepted
     state, text, source_kind, _, _, entities = _current(conn, scope)
     assert (state, text, source_kind, entities) == ("cleared", None, "snapshot_absence", None)
+
+
+def test_authoritative_absence_is_revision_idempotent(
+    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
+) -> None:
+    conn, repository = projection
+    scope = DraftScope(100, 200)
+    repository.apply_realtime(_present(scope, 1, "body", source=DraftObservationSource.REALTIME))
+    first_claim_token = _claim(repository, 2)
+    first = repository.apply_snapshot(
+        [],
+        SnapshotCoverage(account_id=100, response_complete=True, update_count=0),
+        repository.snapshot_baselines(100),
+        claim_token=first_claim_token,
+    )
+    assert first.revision is not None
+    first_current = _current_row(conn, scope)
+
+    second_claim_token = _claim(repository, 3)
+    second = repository.apply_snapshot(
+        [],
+        SnapshotCoverage(account_id=100, response_complete=True, update_count=0),
+        repository.snapshot_baselines(100),
+        claim_token=second_claim_token,
+    )
+
+    assert second.revision is None
+    assert _current_row(conn, scope) == first_current
+
+
+def test_conflicting_snapshot_observations_preserve_claim_for_fenced_rearm(
+    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
+) -> None:
+    conn, repository = projection
+    scope = DraftScope(100, 200)
+    claim_token = _claim(repository, 1)
+    baselines = repository.snapshot_baselines(100)
+
+    result = repository.apply_snapshot(
+        [
+            _present(scope, 2, "first", source=DraftObservationSource.SNAPSHOT),
+            _present(scope, 2, "second", source=DraftObservationSource.SNAPSHOT),
+        ],
+        SnapshotCoverage(account_id=100, response_complete=True, update_count=2),
+        baselines,
+        claim_token=claim_token,
+    )
+
+    assert not result.accepted and result.ambiguous
+    assert conn.execute(
+        "SELECT recovery_due_at,recovery_claimed_at,recovery_failure_count "
+        "FROM draft_projection_runtime WHERE singleton=1"
+    ).fetchone() == (None, claim_token, 0)
+    rearm_at = int(_at(2).timestamp())
+    assert repository.rearm_recovery(reason="ambiguous_snapshot", now=rearm_at, claim_token=claim_token)
+    assert conn.execute(
+        "SELECT recovery_due_at,recovery_claimed_at,recovery_failure_count "
+        "FROM draft_projection_runtime WHERE singleton=1"
+    ).fetchone() == (rearm_at + 1, None, 1)
 
 
 def test_identical_authoritative_snapshots_do_not_bump_revision_for_observation_time(
