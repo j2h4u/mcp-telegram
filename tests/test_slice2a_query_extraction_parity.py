@@ -52,7 +52,7 @@ def _req(**overrides: object) -> _ListMessagesDbRequest:
 def test_build_list_messages_query_golden_baseline() -> None:
     """No filters: base SQL + newest ORDER/LIMIT, canonical params."""
     sql, params = _build_list_messages_query(_req())
-    assert sql == _LIST_MESSAGES_BASE_SQL + " ORDER BY m.message_id DESC LIMIT :limit"
+    assert sql == _LIST_MESSAGES_BASE_SQL + " ORDER BY m.sent_at DESC, m.message_id DESC LIMIT :limit"
     assert params == {"dialog_id": 100, "limit": 20, "self_id": None}
 
 
@@ -63,7 +63,7 @@ def test_build_list_messages_query_golden_stacked_filters() -> None:
         _LIST_MESSAGES_BASE_SQL
         + f" AND {_EFFECTIVE_SENDER_ID_EXPR} = :filter_sender_id"
         + " AND m.forum_topic_id = :topic_id"
-        + " ORDER BY m.message_id ASC LIMIT :limit"
+        + " ORDER BY m.sent_at ASC, m.message_id ASC LIMIT :limit"
     )
     assert params == {
         "dialog_id": 100,

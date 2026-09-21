@@ -79,7 +79,7 @@ def _build_list_messages_query_req(**overrides: object) -> _ListMessagesDbReques
 def test_baseline_newest() -> None:
     """Default direction=newest produces DESC order and dialog_id + limit + self_id params."""
     sql, params = _build_list_messages_query(_build_list_messages_query_req())
-    assert "ORDER BY m.message_id DESC" in sql
+    assert "ORDER BY m.sent_at DESC, m.message_id DESC" in sql
     assert "m.is_deleted = 0" in sql
     assert params["dialog_id"] == 100
     assert params["limit"] == 20
@@ -89,7 +89,7 @@ def test_baseline_newest() -> None:
 def test_baseline_oldest() -> None:
     """direction=oldest produces ASC order."""
     sql, params = _build_list_messages_query(_build_list_messages_query_req(direction="oldest"))
-    assert "ORDER BY m.message_id ASC" in sql
+    assert "ORDER BY m.sent_at ASC, m.message_id ASC" in sql
     assert params["dialog_id"] == 100
     assert params["limit"] == 20
 
@@ -215,7 +215,7 @@ def test_all_filters_combined() -> None:
     assert params["topic_id"] == 7
     assert params["unread_after_id"] == 300
     assert params["anchor_msg_id"] == 500
-    assert "ORDER BY m.message_id ASC" in sql
+    assert "ORDER BY m.sent_at ASC, m.message_id ASC" in sql
 
 
 def test_topic_and_sender_name_combined() -> None:
