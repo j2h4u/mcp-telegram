@@ -241,6 +241,8 @@ def _validate_navigation_state(navigation: NavigationToken) -> None:
 def _validate_search_navigation(navigation: NavigationToken) -> None:
     if navigation.query is None:
         raise ValueError("Invalid navigation token: search cursor requires query")
+    if navigation.value is None:
+        raise ValueError("Invalid navigation token: search cursor requires offset")
     history_fields = (
         navigation.topic_id,
         navigation.direction,

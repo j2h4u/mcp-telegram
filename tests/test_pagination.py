@@ -151,6 +151,7 @@ class TestDecodeValidation:
         [
             ({"kind": "history", "value": 1, "dialog_id": 1}, "message_state"),
             ({"kind": "search", "value": 1, "dialog_id": 1, "message_state": "sent"}, "requires query"),
+            ({"kind": "search", "dialog_id": 1, "query": "needle", "message_state": "sent"}, "requires offset"),
         ],
     )
     def test_unbound_signed_token_is_rejected(self, payload: dict[str, object], error: str) -> None:

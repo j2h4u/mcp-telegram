@@ -2191,22 +2191,37 @@ class ReadingService:
         except ValueError as exc:
             return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
 
-        error_message: str | None = None
-        if navigation.kind != "search":
-            error_message = f"Navigation token is for {navigation.kind}, not search"
-        elif navigation.query != request.query:
-            error_message = "Navigation token belongs to a different search query"
-        elif navigation.message_state != request.message_state:
-            error_message = (
-                f"Navigation token belongs to message_state {navigation.message_state!r}, not {request.message_state!r}"
-            )
-        elif navigation.dialog_id != dialog_id:
-            error_message = f"Navigation token belongs to dialog {navigation.dialog_id}, not {dialog_id}"
-        elif navigation.since_utc != request.since_utc or navigation.until_utc != request.until_utc:
-            error_message = "Navigation token belongs to a different time range"
+        error_message = ReadingService._search_navigation_context_error(navigation, request, dialog_id)
         if error_message is not None:
             return {"ok": False, "error": "invalid_navigation", "message": error_message}
-        return dataclasses.replace(request, offset=navigation.value)
+        offset = navigation.value
+        if offset is None:
+            return {
+                "ok": False,
+                "error": "invalid_navigation",
+                "message": "Search navigation token is missing its offset.",
+            }
+        return dataclasses.replace(request, offset=offset)
+
+    @staticmethod
+    def _search_navigation_context_error(
+        navigation: NavigationToken,
+        request: _SearchMessagesRequest,
+        dialog_id: int,
+    ) -> str | None:
+        if navigation.kind != "search":
+            return f"Navigation token is for {navigation.kind}, not search"
+        if navigation.query != request.query:
+            return "Navigation token belongs to a different search query"
+        if navigation.message_state != request.message_state:
+            return (
+                f"Navigation token belongs to message_state {navigation.message_state!r}, not {request.message_state!r}"
+            )
+        if navigation.dialog_id != dialog_id:
+            return f"Navigation token belongs to dialog {navigation.dialog_id}, not {dialog_id}"
+        if navigation.since_utc != request.since_utc or navigation.until_utc != request.until_utc:
+            return "Navigation token belongs to a different time range"
+        return None
 
     async def _search_messages(self, req: dict) -> dict:
         """FTS5 stemmed full-text search against messages_fts."""
