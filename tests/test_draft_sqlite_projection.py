@@ -59,6 +59,13 @@ def _empty(scope: DraftScope, second: int, *, source: DraftObservationSource) ->
     )
 
 
+def _claim(repository: SQLiteDraftProjection, second: int) -> int:
+    repository.mark_recovery_needed(reason="test_recovery", observed_at=_at(second))
+    claim_token = repository.claim_recovery(now=_at(second).timestamp())
+    assert claim_token is not None
+    return claim_token
+
+
 def _current(conn: sqlite3.Connection, scope: DraftScope) -> tuple[object, ...]:
     row = _fetchone(
         conn,
@@ -107,12 +114,14 @@ def test_delayed_snapshot_cannot_overwrite_newer_realtime_clear(
     conn, repository = projection
     scope = DraftScope(100, 200, top_message_id=7)
     repository.apply_realtime(_present(scope, 1, "old", source=DraftObservationSource.REALTIME))
+    claim_token = _claim(repository, 2)
     baselines = repository.snapshot_baselines(100)
     repository.apply_realtime(_empty(scope, 2, source=DraftObservationSource.REALTIME))
     result = repository.apply_snapshot(
         [_present(scope, 1, "snapshot-old", source=DraftObservationSource.SNAPSHOT)],
         SnapshotCoverage(account_id=100, response_complete=True, update_count=1),
         baselines,
+        claim_token=claim_token,
     )
     assert result.accepted
     state, text, source_kind, *_ = _current(conn, scope)
@@ -125,8 +134,12 @@ def test_authoritative_absence_creates_bodyless_cleared_tombstone(
     conn, repository = projection
     scope = DraftScope(100, 200)
     repository.apply_realtime(_present(scope, 1, "body", source=DraftObservationSource.REALTIME))
+    claim_token = _claim(repository, 2)
     result = repository.apply_snapshot(
-        [], SnapshotCoverage(account_id=100, response_complete=True, update_count=0), repository.snapshot_baselines(100)
+        [],
+        SnapshotCoverage(account_id=100, response_complete=True, update_count=0),
+        repository.snapshot_baselines(100),
+        claim_token=claim_token,
     )
     assert result.accepted
     state, text, source_kind, _, _, entities = _current(conn, scope)
@@ -138,16 +151,20 @@ def test_identical_authoritative_snapshots_do_not_bump_revision_for_observation_
 ) -> None:
     conn, repository = projection
     scope = DraftScope(100, 200)
+    first_claim_token = _claim(repository, 1)
     first = repository.apply_snapshot(
         [_present(scope, 1, "body", source=DraftObservationSource.SNAPSHOT)],
         SnapshotCoverage(account_id=100, response_complete=True, update_count=1),
         repository.snapshot_baselines(100),
+        claim_token=first_claim_token,
     )
     assert first.revision is not None
+    second_claim_token = _claim(repository, 2)
     second = repository.apply_snapshot(
         [_present(scope, 2, "body", source=DraftObservationSource.SNAPSHOT)],
         SnapshotCoverage(account_id=100, response_complete=True, update_count=1),
         repository.snapshot_baselines(100),
+        claim_token=second_claim_token,
     )
 
     assert second.revision is None
@@ -167,16 +184,65 @@ def test_realtime_empty_tombstone_uses_observation_ordering(
     assert _current(conn, scope)[0] == "empty"
 
 
+def test_snapshot_does_not_clear_a_later_recovery_signal(
+    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
+) -> None:
+    conn, repository = projection
+    scope = DraftScope(100, 200)
+    repository.apply_realtime(_present(scope, 1, "body", source=DraftObservationSource.REALTIME))
+    claim_token = _claim(repository, 2)
+    baselines = repository.snapshot_baselines(100)
+    repository.mark_recovery_needed(reason="reconnect_observed", observed_at=_at(3))
+
+    result = repository.apply_snapshot(
+        [_present(scope, 1, "body", source=DraftObservationSource.SNAPSHOT)],
+        SnapshotCoverage(account_id=100, response_complete=True, update_count=1),
+        baselines,
+        claim_token=claim_token,
+    )
+
+    assert result.accepted
+    assert conn.execute(
+        "SELECT recovery_due_at,recovery_claimed_at FROM draft_projection_runtime WHERE singleton=1"
+    ).fetchone() == (int(_at(3).timestamp()), None)
+    assert conn.execute(
+        "SELECT status,coverage_status,reason,observation_completed_at FROM draft_sync_state WHERE account_id=100"
+    ).fetchone() == ("recovery_needed", "unknown", "reconnect_observed", int(_at(3).timestamp()))
+
+
+def test_snapshot_with_identical_realtime_content_does_not_bump_revision_for_source_kind(
+    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
+) -> None:
+    conn, repository = projection
+    scope = DraftScope(100, 200)
+    realtime = repository.apply_realtime(_present(scope, 1, "body", source=DraftObservationSource.REALTIME))
+    assert realtime.revision is not None
+    claim_token = _claim(repository, 2)
+
+    snapshot = repository.apply_snapshot(
+        [_present(scope, 2, "body", source=DraftObservationSource.SNAPSHOT)],
+        SnapshotCoverage(account_id=100, response_complete=True, update_count=1),
+        repository.snapshot_baselines(100),
+        claim_token=claim_token,
+    )
+
+    assert snapshot.revision is None
+    assert _current(conn, scope)[4] == realtime.revision
+    assert _current(conn, scope)[2] == "realtime_present"
+
+
 def test_failed_snapshot_never_establishes_absence(
     projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
 ) -> None:
     conn, repository = projection
     scope = DraftScope(100, 200)
     repository.apply_realtime(_present(scope, 1, "body", source=DraftObservationSource.REALTIME))
+    claim_token = _claim(repository, 2)
     result = repository.apply_snapshot(
         [],
         SnapshotCoverage(account_id=100, response_complete=False, update_count=0),
         repository.snapshot_baselines(100),
+        claim_token=claim_token,
     )
     assert not result.accepted
     assert _current(conn, scope)[0] == "present"
@@ -254,16 +320,26 @@ def test_recovery_rearm_uses_bounded_durable_backoff(
 ) -> None:
     conn, repository = projection
 
-    repository.rearm_recovery(reason="snapshot_fetch_failed", now=100)
+    repository.mark_recovery_needed(reason="test_recovery", observed_at=datetime.fromtimestamp(100, UTC))
+    claim_token = repository.claim_recovery(now=100)
+    assert claim_token == 100
+    assert repository.rearm_recovery(reason="snapshot_fetch_failed", now=100, claim_token=claim_token)
     assert conn.execute(
         "SELECT recovery_due_at,recovery_failure_count FROM draft_projection_runtime WHERE singleton=1"
     ).fetchone() == (101, 1)
-    repository.rearm_recovery(reason="snapshot_fetch_failed", now=101)
+    assert conn.execute("SELECT observation_completed_at FROM draft_sync_state WHERE account_id=100").fetchone() == (
+        100,
+    )
+    claim_token = repository.claim_recovery(now=101)
+    assert claim_token == 101
+    assert repository.rearm_recovery(reason="snapshot_fetch_failed", now=101, claim_token=claim_token)
     assert conn.execute(
         "SELECT recovery_due_at,recovery_failure_count FROM draft_projection_runtime WHERE singleton=1"
     ).fetchone() == (103, 2)
     for now in (103, 107, 115, 131, 163):
-        repository.rearm_recovery(reason="snapshot_fetch_failed", now=now)
+        claim_token = repository.claim_recovery(now=now)
+        assert claim_token == now
+        assert repository.rearm_recovery(reason="snapshot_fetch_failed", now=now, claim_token=claim_token)
     assert conn.execute(
         "SELECT recovery_due_at,recovery_failure_count FROM draft_projection_runtime WHERE singleton=1"
     ).fetchone() == (223, 6)

@@ -147,6 +147,8 @@ class SQLiteDraftProjection:
         observations: Sequence[DraftObservation],
         coverage: SnapshotCoverage,
         baselines: Mapping[DraftScope, int],
+        *,
+        claim_token: int,
     ) -> DraftApplyResult:
         """Publish one fenced snapshot and only then infer its durable absences."""
         _validate_account_id(coverage.account_id)
@@ -163,7 +165,7 @@ class SQLiteDraftProjection:
                 changed_revision = self._infer_snapshot_absences(
                     coverage.account_id, deduplicated, baselines, completed_at, changed_revision
                 )
-                self._mark_snapshot_complete(coverage.account_id, completed_at)
+                self._mark_snapshot_complete(coverage.account_id, completed_at, claim_token)
             else:
                 self._set_recovery_needed("snapshot_not_authoritative", completed_at)
             self._conn.execute("DELETE FROM draft_snapshot_baseline WHERE account_id=?", (coverage.account_id,))
@@ -212,15 +214,19 @@ class SQLiteDraftProjection:
             self._upsert_current(scope, _cleared_row(completed_at), changed_revision)
         return changed_revision
 
-    def _mark_snapshot_complete(self, account_id: int, completed_at: int) -> None:
+    def _mark_snapshot_complete(self, account_id: int, completed_at: int, claim_token: int) -> None:
+        """Clear only the recovery request claimed by this snapshot run."""
+        cursor = self._conn.execute(
+            "UPDATE draft_projection_runtime SET recovery_due_at=NULL,recovery_claimed_at=NULL,"
+            "recovery_failure_count=0 WHERE singleton=1 AND recovery_claimed_at=?",
+            (claim_token,),
+        )
+        if cursor.rowcount != 1:
+            return
         self._conn.execute(
             "UPDATE draft_sync_state SET status='ready',coverage_status='complete',"
             "observation_completed_at=?,reason=NULL WHERE account_id=?",
             (completed_at, account_id),
-        )
-        self._conn.execute(
-            "UPDATE draft_projection_runtime SET recovery_due_at=NULL,recovery_claimed_at=NULL,"
-            "recovery_failure_count=0 WHERE singleton=1"
         )
 
     def mark_recovery_needed(self, *, reason: str, observed_at: datetime) -> None:
@@ -240,7 +246,7 @@ class SQLiteDraftProjection:
             return None
         return float(cast(int, row[1]))
 
-    def claim_recovery(self, *, now: float) -> bool:
+    def claim_recovery(self, *, now: float) -> int | None:
         """Claim a due recovery run exactly once for the active account."""
         now_int = _finite_non_negative_unix(now)
         with self._write_transaction():
@@ -251,7 +257,7 @@ class SQLiteDraftProjection:
                 ).fetchone(),
             )
             if row is None or row[0] is None or row[1] is None or int(cast(int, row[1])) > now_int:
-                return False
+                return None
             account_id = int(cast(int, row[0]))
             self._conn.execute(
                 "UPDATE draft_projection_runtime SET recovery_due_at=NULL,recovery_claimed_at=? WHERE singleton=1",
@@ -261,9 +267,9 @@ class SQLiteDraftProjection:
                 "UPDATE draft_sync_state SET status='recovering',coverage_status='incomplete' WHERE account_id=?",
                 (account_id,),
             )
-            return True
+            return now_int
 
-    def rearm_recovery(self, *, reason: str, now: float) -> None:
+    def rearm_recovery(self, *, reason: str, now: float, claim_token: int) -> bool:
         """Requeue a claimed recovery with durable exponential backoff."""
         now_int = _finite_non_negative_unix(now)
         with self._write_transaction():
@@ -282,10 +288,12 @@ class SQLiteDraftProjection:
                 raise RuntimeError("draft recovery retry schedule is empty")
             schedule_index = min(row[1], len(schedule) - 1)
             delay = schedule[schedule_index]
-            self._set_recovery_needed(
+            return self._set_recovery_needed(
                 reason,
-                now_int + delay,
+                now_int,
+                recovery_due_at=now_int + delay,
                 failure_count=min(row[1] + 1, len(schedule) - 1),
+                expected_claim_token=claim_token,
             )
 
     @contextmanager
@@ -323,7 +331,15 @@ class SQLiteDraftProjection:
             raise RuntimeError("draft projection runtime row is missing")
         return int(cast(int, row[0]))
 
-    def _set_recovery_needed(self, reason: str, observed_at: int, *, failure_count: int = 0) -> None:
+    def _set_recovery_needed(
+        self,
+        reason: str,
+        observed_at: int,
+        *,
+        recovery_due_at: int | None = None,
+        failure_count: int = 0,
+        expected_claim_token: int | None = None,
+    ) -> bool:
         if not reason or len(reason) > _MAX_RECOVERY_REASON_LENGTH:
             raise ValueError("draft recovery reason must be a non-empty string of at most 256 characters")
         row = cast(
@@ -333,16 +349,20 @@ class SQLiteDraftProjection:
         if row is None or row[0] is None:
             raise DraftAccountFenceError("draft recovery requires a bound account")
         account_id = int(cast(int, row[0]))
-        self._conn.execute(
+        due_at = observed_at if recovery_due_at is None else recovery_due_at
+        cursor = self._conn.execute(
             "UPDATE draft_projection_runtime SET recovery_due_at=?,recovery_claimed_at=NULL,recovery_failure_count=? "
-            "WHERE singleton=1",
-            (observed_at, failure_count),
+            "WHERE singleton=1 AND (? IS NULL OR recovery_claimed_at=?)",
+            (due_at, failure_count, expected_claim_token, expected_claim_token),
         )
+        if cursor.rowcount != 1:
+            return False
         self._conn.execute(
             "UPDATE draft_sync_state SET status='recovery_needed',coverage_status='unknown',reason=?,"
             "observation_completed_at=? WHERE account_id=?",
             (reason, observed_at, account_id),
         )
+        return True
 
     def _row_for_scope(self, scope: DraftScope) -> dict[str, object] | None:
         cursor = self._conn.execute(
@@ -499,7 +519,7 @@ def _row_matches(existing: Mapping[str, object], candidate: Mapping[str, object]
     return all(
         existing[column] == value
         for column, value in candidate.items()
-        if column not in {"source_observed_at", "observation_started_at", "observation_completed_at"}
+        if column not in {"source_kind", "source_observed_at", "observation_started_at", "observation_completed_at"}
     )
 
 

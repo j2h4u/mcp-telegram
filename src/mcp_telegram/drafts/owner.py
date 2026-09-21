@@ -148,24 +148,24 @@ class DraftMessageOwner:
         snapshot_run = self._prepare_snapshot_run(budget)
         if snapshot_run is None:
             return
-        gateway, baselines = snapshot_run
+        gateway, baselines, claim_token = snapshot_run
         try:
             with demand_context(self.demand_kind):
                 with rpc_attempt_budget(budget):
                     coverage, observations = await gateway.fetch_all_drafts()
         except BaseException:
-            self._rearm_claimed_recovery("snapshot_fetch_failed")
+            self._rearm_claimed_recovery("snapshot_fetch_failed", claim_token)
             raise
         try:
-            self._publish_snapshot(coverage, observations, baselines)
+            self._publish_snapshot(coverage, observations, baselines, claim_token)
         except BaseException:
-            self._rearm_claimed_recovery("snapshot_publish_failed")
+            self._rearm_claimed_recovery("snapshot_publish_failed", claim_token)
             raise
 
     def _prepare_snapshot_run(
         self,
         budget: RpcAttemptBudget,
-    ) -> tuple[DraftSnapshotGateway, Mapping[DraftScope, int]] | None:
+    ) -> tuple[DraftSnapshotGateway, Mapping[DraftScope, int], int] | None:
         account_id = self._account_id
         gateway = self._snapshot_gateway
         now = time.time()
@@ -174,32 +174,39 @@ class DraftMessageOwner:
         status = self.status(now)
         if status is None or not status.is_ready(now):
             return None
-        if not self._repository.claim_recovery(now=now):
+        claim_token = self._repository.claim_recovery(now=now)
+        if claim_token is None:
             return None
         # This fence is intentionally taken before the RPC.  The persistence
         # worker compares it against revisions written by later realtime rows
         # and tombstones, so an older snapshot cannot overwrite either one.
-        baselines = self._repository.snapshot_baselines(account_id)
-        return gateway, baselines
+        try:
+            baselines = self._repository.snapshot_baselines(account_id)
+        except BaseException:
+            self._rearm_claimed_recovery("snapshot_baselines_failed", claim_token)
+            raise
+        return gateway, baselines, claim_token
 
     def _publish_snapshot(
         self,
         coverage: SnapshotCoverage,
         observations: tuple[DraftObservation, ...],
         baselines: Mapping[DraftScope, int],
+        claim_token: int,
     ) -> None:
         if not coverage.authoritative:
-            self._rearm_claimed_recovery("snapshot_coverage_incomplete")
+            self._rearm_claimed_recovery("snapshot_coverage_incomplete", claim_token)
             self._record("draft.recovery", "deferred", "snapshot_coverage_incomplete")
             return
-        result = self._repository.apply_snapshot(observations, coverage, baselines)
+        result = self._repository.apply_snapshot(observations, coverage, baselines, claim_token=claim_token)
         if result.ambiguous:
-            self._rearm_claimed_recovery("ambiguous_snapshot")
+            self._rearm_claimed_recovery("ambiguous_snapshot", claim_token)
         self._record("draft.recovery", "applied" if result.accepted else "ignored", None)
 
-    def _rearm_claimed_recovery(self, reason: str) -> None:
+    def _rearm_claimed_recovery(self, reason: str, claim_token: int) -> None:
         """Return a claimed recovery to durable, bounded retry cadence."""
-        self._repository.rearm_recovery(reason=reason, now=time.time())
+        if not self._repository.rearm_recovery(reason=reason, now=time.time(), claim_token=claim_token):
+            return
         sink = self._demand_sink
         if sink is not None:
             offer_durable_demand(sink, self.demand_kind)

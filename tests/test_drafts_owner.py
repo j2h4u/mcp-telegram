@@ -29,6 +29,7 @@ class _Repository:
         self.rearmed: list[tuple[str, float]] = []
         self.due_at: float | None = None
         self.baselines: dict[DraftScope, int] = {}
+        self.baselines_error: Exception | None = None
         self.realtime_error: Exception | None = None
         self.snapshot_error: Exception | None = None
 
@@ -43,6 +44,8 @@ class _Repository:
 
     def snapshot_baselines(self, account_id: int) -> Mapping[DraftScope, int]:
         assert account_id == self.account_id
+        if self.baselines_error is not None:
+            raise self.baselines_error
         return dict(self.baselines)
 
     def apply_snapshot(
@@ -50,7 +53,10 @@ class _Repository:
         observations: Sequence[DraftObservation],
         coverage: SnapshotCoverage,
         baselines: Mapping[DraftScope, int],
+        *,
+        claim_token: int,
     ) -> DraftApplyResult:
+        assert claim_token >= 0
         if self.snapshot_error is not None:
             raise self.snapshot_error
         self.snapshot_calls.append((observations, coverage, baselines))
@@ -64,15 +70,17 @@ class _Repository:
     def recovery_due_at(self) -> float | None:
         return self.due_at
 
-    def claim_recovery(self, *, now: float) -> bool:
+    def claim_recovery(self, *, now: float) -> int | None:
         if self.due_at is None or self.due_at > now:
-            return False
+            return None
         self.due_at = None
-        return True
+        return int(now)
 
-    def rearm_recovery(self, *, reason: str, now: float) -> None:
+    def rearm_recovery(self, *, reason: str, now: float, claim_token: int) -> bool:
+        assert claim_token >= 0
         self.rearmed.append((reason, now))
         self.due_at = now + 1
+        return True
 
 
 class _Gateway(DraftSnapshotGateway):
@@ -208,6 +216,21 @@ async def test_claimed_recovery_is_rearmed_when_snapshot_fetch_fails() -> None:
 
     assert [reason for reason, _now in repository.rearmed] == ["snapshot_fetch_failed"]
     assert repository.due_at is not None
+
+
+@pytest.mark.asyncio
+async def test_claimed_recovery_is_rearmed_when_snapshot_baselines_fail() -> None:
+    repository = _Repository()
+    repository.baselines_error = RuntimeError("baseline write failed")
+    gateway = _Gateway(SnapshotCoverage(42, True, 0), ())
+    owner, _client = _owner(repository, gateway)
+    repository.due_at = 0.0
+
+    with pytest.raises(RuntimeError, match="baseline write failed"):
+        await owner.run_slice(RpcAttemptBudget(1))
+
+    assert gateway.calls == 0
+    assert [reason for reason, _now in repository.rearmed] == ["snapshot_baselines_failed"]
 
 
 @pytest.mark.asyncio
