@@ -120,7 +120,12 @@ class DraftMessageOwner:
         if observation is None:
             self.request_recovery("normalization_incomplete")
             return
-        result = self._repository.apply_realtime(observation)
+        try:
+            result = self._repository.apply_realtime(observation)
+        except Exception:  # noqa: BLE001 - recovery preserves the next authoritative path
+            self.request_recovery("realtime_persistence_failed")
+            self._record("draft.observed", "deferred", "persistence_failed")
+            return
         if observation.ambiguity or result.ambiguous:
             self.request_recovery("ambiguous_realtime")
         self._record(
@@ -144,10 +149,18 @@ class DraftMessageOwner:
         if snapshot_run is None:
             return
         gateway, baselines = snapshot_run
-        with demand_context(self.demand_kind):
-            with rpc_attempt_budget(budget):
-                coverage, observations = await gateway.fetch_all_drafts()
-        self._publish_snapshot(coverage, observations, baselines)
+        try:
+            with demand_context(self.demand_kind):
+                with rpc_attempt_budget(budget):
+                    coverage, observations = await gateway.fetch_all_drafts()
+        except BaseException:
+            self._rearm_claimed_recovery("snapshot_fetch_failed")
+            raise
+        try:
+            self._publish_snapshot(coverage, observations, baselines)
+        except BaseException:
+            self._rearm_claimed_recovery("snapshot_publish_failed")
+            raise
 
     def _prepare_snapshot_run(
         self,
@@ -176,13 +189,21 @@ class DraftMessageOwner:
         baselines: Mapping[DraftScope, int],
     ) -> None:
         if not coverage.authoritative:
-            self.request_recovery("snapshot_coverage_incomplete")
+            self._rearm_claimed_recovery("snapshot_coverage_incomplete")
             self._record("draft.recovery", "deferred", "snapshot_coverage_incomplete")
             return
         result = self._repository.apply_snapshot(observations, coverage, baselines)
         if result.ambiguous:
-            self.request_recovery("ambiguous_snapshot")
+            self._rearm_claimed_recovery("ambiguous_snapshot")
         self._record("draft.recovery", "applied" if result.accepted else "ignored", None)
+
+    def _rearm_claimed_recovery(self, reason: str) -> None:
+        """Return a claimed recovery to durable, bounded retry cadence."""
+        self._repository.rearm_recovery(reason=reason, now=time.time())
+        sink = self._demand_sink
+        if sink is not None:
+            offer_durable_demand(sink, self.demand_kind)
+        self._record("draft.recovery", "deferred", reason)
 
     def _record(self, kind: str, outcome: str, reason: str | None) -> None:
         observer = self._observe

@@ -14,7 +14,7 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 74
+_CURRENT_SCHEMA_VERSION = 75
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -40,6 +40,7 @@ _READ_DATE_EXPIRY_CUTOFF_MIGRATION_71 = 71
 _TOPIC_ATTRIBUTION_RECEIPT_MIGRATION_72 = 72
 _REMOVE_TOPIC_ATTRIBUTION_CAMPAIGN_MIGRATION_73 = 73
 _DRAFT_PROJECTION_CUTOVER_MIGRATION_74 = 74
+_DRAFT_RECOVERY_BACKOFF_MIGRATION_75 = 75
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
@@ -846,11 +847,6 @@ CREATE TABLE IF NOT EXISTS draft_current (
 ) WITHOUT ROWID
 """
 
-_DRAFT_CURRENT_ACCOUNT_DIALOG_INDEX_DDL = """
-CREATE INDEX IF NOT EXISTS idx_draft_current_account_dialog
-ON draft_current(account_id, dialog_id, top_message_id, subdialog_peer_id)
-"""
-
 _DRAFT_SYNC_STATE_DDL = """
 CREATE TABLE IF NOT EXISTS draft_sync_state (
     account_id                INTEGER PRIMARY KEY CHECK(account_id != 0),
@@ -872,6 +868,7 @@ CREATE TABLE IF NOT EXISTS draft_projection_runtime (
     projection_revision   INTEGER NOT NULL DEFAULT 0 CHECK(projection_revision >= 0),
     recovery_due_at       INTEGER,
     recovery_claimed_at   INTEGER,
+    recovery_failure_count INTEGER NOT NULL DEFAULT 0 CHECK(recovery_failure_count >= 0),
     CHECK(recovery_due_at IS NULL OR recovery_due_at >= 0),
     CHECK(recovery_claimed_at IS NULL OR recovery_claimed_at >= 0)
 )
@@ -4318,7 +4315,7 @@ def _apply_migration_74(conn: sqlite3.Connection, current: int) -> int:
             triggers = cast(
                 list[tuple[str, str]],
                 conn.execute(
-                    "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND sql LIKE '%dialogs%' AND sql IS NOT NULL"
+                    "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='dialogs' AND sql IS NOT NULL"
                 ).fetchall(),
             )
             for name, _ in triggers:
@@ -4335,8 +4332,13 @@ def _apply_migration_74(conn: sqlite3.Connection, current: int) -> int:
                 "unread_mark_observed_at,linked_chat_id,linked_chat_resolved_at,revision,read_inbox_max_id,"
                 "read_outbox_max_id,username,identity_observed_at,identity_complete,identity_source FROM dialogs"
             )
+            # Triggers on other tables may read ``dialogs`` in their body.  Do
+            # not collect and recreate those unrelated triggers: legacy rename
+            # mode keeps their SQL valid while the replacement is installed.
+            conn.execute("PRAGMA legacy_alter_table=ON")
             conn.execute("DROP TABLE dialogs")
             conn.execute("ALTER TABLE dialogs_v74 RENAME TO dialogs")
+            conn.execute("PRAGMA legacy_alter_table=OFF")
             for _, statement in triggers:
                 conn.execute(statement)
             conn.execute(_DIALOGS_HIDDEN_PINNED_INDEX_DDL)
@@ -4356,7 +4358,6 @@ def _apply_migration_74(conn: sqlite3.Connection, current: int) -> int:
                 "reason='draft_projection_cutover',retry_at=NULL WHERE singleton=1"
             )
         conn.execute(_DRAFT_CURRENT_DDL)
-        conn.execute(_DRAFT_CURRENT_ACCOUNT_DIALOG_INDEX_DDL)
         conn.execute(_DRAFT_SYNC_STATE_DDL)
         conn.execute(_DRAFT_PROJECTION_RUNTIME_DDL)
         conn.execute(_DRAFT_SNAPSHOT_BASELINE_DDL)
@@ -4370,6 +4371,23 @@ def _apply_migration_74(conn: sqlite3.Connection, current: int) -> int:
     except BaseException:
         conn.rollback()
         raise
+
+
+def _apply_migration_75(conn: sqlite3.Connection, current: int) -> int:
+    """Add durable draft recovery backoff and remove the redundant key-prefix index."""
+    return _apply_migration(
+        conn,
+        current,
+        _DRAFT_RECOVERY_BACKOFF_MIGRATION_75,
+        [
+            (
+                "ALTER TABLE draft_projection_runtime ADD COLUMN recovery_failure_count INTEGER NOT NULL DEFAULT 0 "
+                "CHECK(recovery_failure_count >= 0)"
+            ),
+            "DROP INDEX IF EXISTS idx_draft_current_account_dialog",
+        ],
+        ignore_duplicate_column=True,
+    )
 
 
 def _apply_migrations_64_to_67(conn: sqlite3.Connection, current: int) -> int:
@@ -4414,7 +4432,7 @@ def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_63(conn, current)
     current = _apply_migrations_64_to_67(conn, current)
     current = _apply_migrations_68_to_71(conn, current)
-    return _apply_migrations_72_to_74(conn, current)
+    return _apply_migrations_72_to_75(conn, current)
 
 
 def _apply_migrations_68_to_71(conn: sqlite3.Connection, current: int) -> int:
@@ -4430,7 +4448,7 @@ def _apply_migrations_68_to_71(conn: sqlite3.Connection, current: int) -> int:
     return current
 
 
-def _apply_migrations_72_to_74(conn: sqlite3.Connection, current: int) -> int:
+def _apply_migrations_72_to_75(conn: sqlite3.Connection, current: int) -> int:
     """Apply topic-receipt cleanup and the finite draft ownership cutover."""
     if _CURRENT_SCHEMA_VERSION >= _TOPIC_ATTRIBUTION_RECEIPT_MIGRATION_72:
         current = _apply_migration_72(conn, current)
@@ -4438,6 +4456,8 @@ def _apply_migrations_72_to_74(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_73(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _DRAFT_PROJECTION_CUTOVER_MIGRATION_74:
         current = _apply_migration_74(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _DRAFT_RECOVERY_BACKOFF_MIGRATION_75:
+        current = _apply_migration_75(conn, current)
     return current
 
 

@@ -23,6 +23,9 @@ from mcp_telegram.drafts.contracts import (
 
 _NORMALIZATION_VERSION = 1
 _MAX_RECOVERY_REASON_LENGTH = 256
+_RECOVERY_BACKOFF_BASE_SECONDS = 1
+_RECOVERY_BACKOFF_MAX_SECONDS = 60
+_RECOVERY_BACKOFF_MAX_FAILURES = 6
 _CURRENT_VALUE_COLUMNS = (
     "state",
     "text",
@@ -59,7 +62,8 @@ class SQLiteDraftProjection:
         with self._write_transaction():
             self._conn.execute("INSERT OR IGNORE INTO draft_projection_runtime(singleton) VALUES (1)")
             self._conn.execute(
-                "UPDATE draft_projection_runtime SET account_id=?,recovery_due_at=NULL,recovery_claimed_at=NULL WHERE singleton=1",
+                "UPDATE draft_projection_runtime SET account_id=?,recovery_due_at=NULL,recovery_claimed_at=NULL,"
+                "recovery_failure_count=0 WHERE singleton=1",
                 (account_id,),
             )
             self._conn.execute(
@@ -216,7 +220,8 @@ class SQLiteDraftProjection:
             (completed_at, account_id),
         )
         self._conn.execute(
-            "UPDATE draft_projection_runtime SET recovery_due_at=NULL,recovery_claimed_at=NULL WHERE singleton=1"
+            "UPDATE draft_projection_runtime SET recovery_due_at=NULL,recovery_claimed_at=NULL,"
+            "recovery_failure_count=0 WHERE singleton=1"
         )
 
     def mark_recovery_needed(self, *, reason: str, observed_at: datetime) -> None:
@@ -259,6 +264,32 @@ class SQLiteDraftProjection:
             )
             return True
 
+    def rearm_recovery(self, *, reason: str, now: float) -> None:
+        """Requeue a claimed recovery with durable exponential backoff."""
+        now_int = _finite_non_negative_unix(now)
+        with self._write_transaction():
+            row = cast(
+                tuple[object | None, object | None] | None,
+                self._conn.execute(
+                    "SELECT account_id,recovery_failure_count FROM draft_projection_runtime WHERE singleton=1"
+                ).fetchone(),
+            )
+            if row is None or row[0] is None:
+                raise DraftAccountFenceError("draft recovery requires a bound account")
+            if isinstance(row[1], bool) or not isinstance(row[1], int) or row[1] < 0:
+                raise RuntimeError("draft recovery failure count is invalid")
+            failures = row[1]
+            if failures > _RECOVERY_BACKOFF_MAX_FAILURES:
+                failures = _RECOVERY_BACKOFF_MAX_FAILURES
+            delay = _RECOVERY_BACKOFF_BASE_SECONDS * (1 << failures)
+            if delay > _RECOVERY_BACKOFF_MAX_SECONDS:
+                delay = _RECOVERY_BACKOFF_MAX_SECONDS
+            self._set_recovery_needed(
+                reason,
+                now_int + delay,
+                failure_count=failures + 1 if failures < _RECOVERY_BACKOFF_MAX_FAILURES else failures,
+            )
+
     @contextmanager
     def _write_transaction(self) -> Iterator[None]:
         owns_transaction = not self._conn.in_transaction
@@ -294,7 +325,7 @@ class SQLiteDraftProjection:
             raise RuntimeError("draft projection runtime row is missing")
         return int(cast(int, row[0]))
 
-    def _set_recovery_needed(self, reason: str, observed_at: int) -> None:
+    def _set_recovery_needed(self, reason: str, observed_at: int, *, failure_count: int = 0) -> None:
         if not reason or len(reason) > _MAX_RECOVERY_REASON_LENGTH:
             raise ValueError("draft recovery reason must be a non-empty string of at most 256 characters")
         row = cast(
@@ -305,8 +336,9 @@ class SQLiteDraftProjection:
             raise DraftAccountFenceError("draft recovery requires a bound account")
         account_id = int(cast(int, row[0]))
         self._conn.execute(
-            "UPDATE draft_projection_runtime SET recovery_due_at=?,recovery_claimed_at=NULL WHERE singleton=1",
-            (observed_at,),
+            "UPDATE draft_projection_runtime SET recovery_due_at=?,recovery_claimed_at=NULL,recovery_failure_count=? "
+            "WHERE singleton=1",
+            (observed_at, failure_count),
         )
         self._conn.execute(
             "UPDATE draft_sync_state SET status='recovery_needed',coverage_status='unknown',reason=?,"
@@ -469,7 +501,7 @@ def _row_matches(existing: Mapping[str, object], candidate: Mapping[str, object]
     return all(
         existing[column] == value
         for column, value in candidate.items()
-        if column not in {"observation_started_at", "observation_completed_at"}
+        if column not in {"source_observed_at", "observation_started_at", "observation_completed_at"}
     )
 
 

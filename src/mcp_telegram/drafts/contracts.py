@@ -13,6 +13,7 @@ from enum import StrEnum
 
 MAX_DRAFT_ENTITY_COUNT = 1_024
 MAX_DRAFT_TEXT_LENGTH = 65_536
+MAX_DRAFT_ENTITIES_JSON_BYTES = 65_536
 MAX_REFERENCE_KIND_LENGTH = 80
 
 
@@ -188,6 +189,7 @@ class DraftApplyResult:
 
 
 __all__ = [
+    "MAX_DRAFT_ENTITIES_JSON_BYTES",
     "CompositionCompleteness",
     "DraftApplyResult",
     "DraftComposition",

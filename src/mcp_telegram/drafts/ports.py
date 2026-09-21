@@ -36,6 +36,8 @@ class DraftProjectionRepository(Protocol):
 
     def claim_recovery(self, *, now: float) -> bool: ...
 
+    def rearm_recovery(self, *, reason: str, now: float) -> None: ...
+
 
 class DraftSnapshotGateway(Protocol):
     """One classified scalar acquisition of all account draft observations."""

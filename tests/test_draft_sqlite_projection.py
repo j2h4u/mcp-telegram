@@ -19,7 +19,7 @@ from mcp_telegram.drafts.contracts import (
     SnapshotCoverage,
 )
 from mcp_telegram.drafts.sqlite_projection import DraftAccountFenceError, SQLiteDraftProjection
-from mcp_telegram.sync_db import _apply_migration_74, ensure_sync_schema
+from mcp_telegram.sync_db import _apply_migration_74, _apply_migration_75, ensure_sync_schema
 
 
 @pytest.fixture()
@@ -132,6 +132,40 @@ def test_authoritative_absence_creates_bodyless_cleared_tombstone(
     assert (state, text, source_kind, entities) == ("cleared", None, "snapshot_absence", None)
 
 
+def test_identical_authoritative_snapshots_do_not_bump_revision_for_observation_time(
+    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
+) -> None:
+    conn, repository = projection
+    scope = DraftScope(100, 200)
+    first = repository.apply_snapshot(
+        [_present(scope, 1, "body", source=DraftObservationSource.SNAPSHOT)],
+        SnapshotCoverage(account_id=100, response_complete=True, update_count=1),
+        repository.snapshot_baselines(100),
+    )
+    assert first.revision is not None
+    second = repository.apply_snapshot(
+        [_present(scope, 2, "body", source=DraftObservationSource.SNAPSHOT)],
+        SnapshotCoverage(account_id=100, response_complete=True, update_count=1),
+        repository.snapshot_baselines(100),
+    )
+
+    assert second.revision is None
+    assert _current(conn, scope)[4] == first.revision
+
+
+def test_realtime_empty_tombstone_uses_observation_ordering(
+    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
+) -> None:
+    conn, repository = projection
+    scope = DraftScope(100, 200)
+    repository.apply_realtime(_present(scope, 1, "body", source=DraftObservationSource.REALTIME))
+
+    result = repository.apply_realtime(_empty(scope, 2, source=DraftObservationSource.REALTIME))
+
+    assert result.accepted
+    assert _current(conn, scope)[0] == "empty"
+
+
 def test_failed_snapshot_never_establishes_absence(
     projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
 ) -> None:
@@ -190,3 +224,45 @@ def test_v74_upgrade_removes_previews_without_promoting_them(tmp_path: Path) -> 
         assert _apply_migration_74(conn, 74) == 74
     finally:
         conn.close()
+
+
+def test_v75_adds_durable_recovery_backoff_and_removes_key_prefix_index(tmp_path: Path) -> None:
+    database = tmp_path / "sync.db"
+    ensure_sync_schema(database)
+    conn = sqlite3.connect(database)
+    try:
+        conn.execute("ALTER TABLE draft_projection_runtime DROP COLUMN recovery_failure_count")
+        conn.execute(
+            "CREATE INDEX idx_draft_current_account_dialog "
+            "ON draft_current(account_id,dialog_id,top_message_id,subdialog_peer_id)"
+        )
+        conn.execute("DELETE FROM schema_version WHERE version=75")
+        conn.commit()
+
+        assert _apply_migration_75(conn, 74) == 75
+        assert "recovery_failure_count" in _table_columns(conn, "draft_projection_runtime")
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_draft_current_account_dialog'"
+        ).fetchone() == (0,)
+    finally:
+        conn.close()
+
+
+def test_recovery_rearm_uses_bounded_durable_backoff(
+    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
+) -> None:
+    conn, repository = projection
+
+    repository.rearm_recovery(reason="snapshot_fetch_failed", now=100)
+    assert conn.execute(
+        "SELECT recovery_due_at,recovery_failure_count FROM draft_projection_runtime WHERE singleton=1"
+    ).fetchone() == (101, 1)
+    repository.rearm_recovery(reason="snapshot_fetch_failed", now=101)
+    assert conn.execute(
+        "SELECT recovery_due_at,recovery_failure_count FROM draft_projection_runtime WHERE singleton=1"
+    ).fetchone() == (103, 2)
+    for now in (103, 107, 115, 131, 163):
+        repository.rearm_recovery(reason="snapshot_fetch_failed", now=now)
+    assert conn.execute(
+        "SELECT recovery_due_at,recovery_failure_count FROM draft_projection_runtime WHERE singleton=1"
+    ).fetchone() == (223, 6)

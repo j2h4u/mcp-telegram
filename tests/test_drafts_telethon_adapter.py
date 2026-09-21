@@ -41,6 +41,41 @@ def test_normalize_present_empty_draft_is_not_an_absent_draft() -> None:
     assert observation.composition.text == ""
 
 
+def test_normalize_realtime_empty_draft_is_an_ordered_tombstone() -> None:
+    update = types.UpdateDraftMessage(types.PeerUser(91), types.DraftMessageEmpty(datetime(2026, 1, 1, tzinfo=UTC)))
+
+    observation = normalize_update_draft(
+        update,
+        account_id=42,
+        source=DraftObservationSource.REALTIME,
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    assert observation is not None
+    assert observation.disposition is DraftDisposition.TOMBSTONE
+    assert observation.ambiguity is False
+
+
+def test_oversized_normalized_entity_json_fails_closed() -> None:
+    update = types.UpdateDraftMessage(
+        types.PeerUser(91),
+        types.DraftMessage(
+            "draft",
+            datetime(2026, 1, 1, tzinfo=UTC),
+            entities=[types.MessageEntityPre(0, 1, "я" * 80)] * 1024,
+        ),
+    )
+
+    observation = normalize_update_draft(
+        update,
+        account_id=42,
+        source=DraftObservationSource.REALTIME,
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    assert observation is None
+
+
 def test_normalize_copies_utf16_entity_metadata_but_not_url_target() -> None:
     update = types.UpdateDraftMessage(
         types.PeerUser(91),

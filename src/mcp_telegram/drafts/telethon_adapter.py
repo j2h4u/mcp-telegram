@@ -7,6 +7,7 @@ copied into :mod:`mcp_telegram.drafts.contracts`.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Protocol, cast
@@ -17,6 +18,7 @@ from telethon.tl.functions.messages import GetAllDraftsRequest  # type: ignore[i
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from mcp_telegram.drafts.contracts import (
+    MAX_DRAFT_ENTITIES_JSON_BYTES,
     MAX_DRAFT_ENTITY_COUNT,
     MAX_REFERENCE_KIND_LENGTH,
     CompositionCompleteness,
@@ -135,7 +137,7 @@ def _reply_context(
     return reply, story, quote, monoforum, partial
 
 
-def _entities(draft: types.DraftMessage) -> tuple[tuple[DraftEntity, ...], bool]:
+def _entities(draft: types.DraftMessage) -> tuple[tuple[DraftEntity, ...], bool, bool]:
     """Normalize bounded entity ranges and record omitted detail."""
     entities: list[DraftEntity] = []
     partial = False
@@ -153,7 +155,29 @@ def _entities(draft: types.DraftMessage) -> tuple[tuple[DraftEntity, ...], bool]
                     partial = True
             if len(raw_entities) > MAX_DRAFT_ENTITY_COUNT:
                 partial = True
-    return tuple(entities), partial
+    normalized = tuple(entities)
+    if (
+        len(
+            json.dumps(
+                [
+                    {
+                        "kind": entity.kind,
+                        "language": entity.language,
+                        "length_utf16": entity.length_utf16,
+                        "offset_utf16": entity.offset_utf16,
+                        "reference_id": entity.reference_id,
+                    }
+                    for entity in normalized
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        )
+        > MAX_DRAFT_ENTITIES_JSON_BYTES
+    ):
+        return (), True, True
+    return normalized, partial, False
 
 
 def _composition_references(
@@ -199,7 +223,9 @@ def _composition(draft: object) -> DraftComposition | None:
     text = getattr(draft, "message", None)
     if not isinstance(text, str):
         return None
-    entities, entity_partial = _entities(draft)
+    entities, entity_partial, entities_too_large = _entities(draft)
+    if entities_too_large:
+        return None
     reply, story, quote, monoforum, media, rich, suggested, reference_partial = _composition_references(draft)
     return DraftComposition(
         text=text,
@@ -251,7 +277,10 @@ def normalize_update_draft(
             ambiguity=composition.date is None,
         )
     if isinstance(update.draft, types.DraftMessageEmpty):
-        return DraftObservation(scope, DraftDisposition.TOMBSTONE, source, observed_at, ambiguity=True)
+        # Telegram supplies no draft revision or pts here.  Arrival observation
+        # time is the only ordering evidence, and the projection's snapshot
+        # baseline fence still prevents an earlier snapshot from restoring it.
+        return DraftObservation(scope, DraftDisposition.TOMBSTONE, source, observed_at)
     return None
 
 
