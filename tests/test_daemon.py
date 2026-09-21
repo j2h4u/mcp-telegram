@@ -305,12 +305,15 @@ def test_ensure_demand_runtime_reuses_existing_runtime(monkeypatch: pytest.Monke
 
     monkeypatch.setattr(daemon, "_build_demand_runtime", fail_build)
 
-    assert _ensure_demand_runtime(
-        ctx,
-        cast(_HistorySyncRuntime, object()),
-        cast(CanonicalDialogDirectory, object()),
-        cast(StartupIdentityState, object()),
-    ) is existing
+    assert (
+        _ensure_demand_runtime(
+            ctx,
+            cast(_HistorySyncRuntime, object()),
+            cast(CanonicalDialogDirectory, object()),
+            cast(StartupIdentityState, object()),
+        )
+        is existing
+    )
 
 
 @pytest.mark.asyncio
