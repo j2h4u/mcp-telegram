@@ -339,6 +339,7 @@ def test_recovery_rearm_uses_bounded_durable_backoff(
     for now in (103, 107, 115, 131, 163):
         claim_token = repository.claim_recovery(now=now)
         assert claim_token == now
+        assert claim_token is not None
         assert repository.rearm_recovery(reason="snapshot_fetch_failed", now=now, claim_token=claim_token)
     assert conn.execute(
         "SELECT recovery_due_at,recovery_failure_count FROM draft_projection_runtime WHERE singleton=1"
