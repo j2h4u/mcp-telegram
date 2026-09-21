@@ -14,8 +14,6 @@ from mcp_telegram.drafts.contracts import (
     DraftScope,
     SnapshotCoverage,
 )
-from mcp_telegram.drafts.owner import DraftMessageOwner
-from mcp_telegram.drafts.ports import DraftProjectionRepository, DraftSnapshotGateway
 
 __all__ = [
     "CompositionCompleteness",
@@ -25,12 +23,9 @@ __all__ = [
     "DraftCoveragePresence",
     "DraftDisposition",
     "DraftEntity",
-    "DraftMessageOwner",
     "DraftObservation",
     "DraftObservationSource",
-    "DraftProjectionRepository",
     "DraftReference",
     "DraftScope",
-    "DraftSnapshotGateway",
     "SnapshotCoverage",
 ]

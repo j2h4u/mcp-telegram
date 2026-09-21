@@ -239,7 +239,7 @@ depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.activity_peer_resol
 [[modules]]
 path = "mcp_telegram.drafts"
 layer = "application"
-depends_on = ["mcp_telegram.drafts.contracts", "mcp_telegram.drafts.owner", "mcp_telegram.drafts.ports"]
+depends_on = ["mcp_telegram.drafts.contracts"]
 
 [[modules]]
 path = "mcp_telegram.drafts.owner"
