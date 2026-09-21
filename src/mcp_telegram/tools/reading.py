@@ -23,6 +23,7 @@ from ..formatter import (
 )
 from ..models import DialogType, ReadMessage
 from ..pagination import NavigationToken
+from ..reading.draft_projection import DraftCoverageFreshness, DraftCoveragePresence
 from ..search_contracts import SEARCHABLE_QUERY_TOKEN_PATTERN
 from ..temporal import parse_utc_boundary
 from ._base import (
@@ -369,8 +370,8 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
         "draft_coverage": {
             "type": ["object", "null"],
             "properties": {
-                "presence": {"type": "string", "enum": ["present", "absent", "unknown"]},
-                "freshness": {"type": "string", "enum": ["current", "stale", "unknown"]},
+                "presence": {"type": "string", "enum": [item.value for item in DraftCoveragePresence]},
+                "freshness": {"type": "string", "enum": [item.value for item in DraftCoverageFreshness]},
                 "observed_at": {"type": ["integer", "null"]},
                 "observation_source": {"type": ["string", "null"]},
                 "absence_basis": {"type": ["string", "null"]},

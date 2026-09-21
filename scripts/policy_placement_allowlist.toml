@@ -421,3 +421,8 @@ rationale = "This is the injected reaction-detail retry policy; configuration ow
 category = "policy_assignments"
 key = "src/mcp_telegram/reactions/detail.py:ReactionDetailPolicy:page_size"
 rationale = "GetMessageReactionsList page size is a fixed Telegram adapter protocol bound."
+
+[[entry]]
+category = "policy_dict_values"
+key = "src/mcp_telegram/tools/reading.py:<module>:freshness"
+rationale = "The draft coverage response field derives its fixed vocabulary from DraftCoverageFreshness, not an operator freshness policy."

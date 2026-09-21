@@ -7,12 +7,29 @@ import json
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Literal, cast
 
 from ..models import DraftReadRecord
 
 _DRAFT_TABLE = "draft_current"
 _DRAFT_STATE_TABLE = "draft_sync_state"
+
+
+class DraftCoveragePresence(StrEnum):
+    """Domain vocabulary for whether a draft is locally observed."""
+
+    PRESENT = "present"
+    ABSENT = "absent"
+    UNKNOWN = "unknown"
+
+
+class DraftCoverageFreshness(StrEnum):
+    """Domain vocabulary for the reliability of a draft observation."""
+
+    CURRENT = "current"
+    STALE = "stale"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,8 +40,8 @@ class DraftCoverage:
     intentionally distinct from a confirmed absent draft.
     """
 
-    presence: Literal["present", "absent", "unknown"]
-    freshness: Literal["current", "stale", "unknown"]
+    presence: DraftCoveragePresence
+    freshness: DraftCoverageFreshness
     observed_at: int | None
     observation_source: str | None
     absence_basis: str | None
@@ -34,8 +51,8 @@ class DraftCoverage:
 
     def to_wire(self) -> dict[str, object]:
         return {
-            "presence": self.presence,
-            "freshness": self.freshness,
+            "presence": self.presence.value,
+            "freshness": self.freshness.value,
             "observed_at": self.observed_at,
             "observation_source": self.observation_source,
             "absence_basis": self.absence_basis,
@@ -172,12 +189,37 @@ def _early_read_result(
     sender_name: str | None,
 ) -> tuple[list[DraftReadRecord], DraftCoverage] | None:
     if account_id is None or not draft_projection_available(conn):
-        return [], DraftCoverage("unknown", "unknown", None, None, None, "projection_unavailable", None, None)
+        return [], DraftCoverage(
+            DraftCoveragePresence.UNKNOWN,
+            DraftCoverageFreshness.UNKNOWN,
+            None,
+            None,
+            None,
+            "projection_unavailable",
+            None,
+            None,
+        )
     if sender_id is not None and sender_id != account_id:
-        return [], DraftCoverage("absent", "unknown", None, None, "sender_is_current_account", None, None, None)
+        return [], DraftCoverage(
+            DraftCoveragePresence.ABSENT,
+            DraftCoverageFreshness.UNKNOWN,
+            None,
+            None,
+            "sender_is_current_account",
+            None,
+            None,
+            None,
+        )
     if sender_name is not None:
         return [], DraftCoverage(
-            "unknown", "unknown", None, None, None, "sender_name_not_locally_resolvable", None, None
+            DraftCoveragePresence.UNKNOWN,
+            DraftCoverageFreshness.UNKNOWN,
+            None,
+            None,
+            None,
+            "sender_name_not_locally_resolvable",
+            None,
+            None,
         )
     return None
 
@@ -235,8 +277,10 @@ def _draft_sync_state(conn: sqlite3.Connection, account_id: int) -> Mapping[str,
 def _unfenced_draft_coverage(records: list[DraftReadRecord]) -> DraftCoverage:
     latest = _latest_record(records)
     return DraftCoverage(
-        "present" if any(record.state == "present" for record in records) else "unknown",
-        "unknown",
+        DraftCoveragePresence.PRESENT
+        if any(record.state == "present" for record in records)
+        else DraftCoveragePresence.UNKNOWN,
+        DraftCoverageFreshness.UNKNOWN,
         latest.observation_completed_at if latest is not None else None,
         latest.source_kind if latest is not None else None,
         None,
@@ -287,17 +331,17 @@ def _draft_is_fresh(state_row: Mapping[str, object]) -> bool:
 
 def _draft_presence(
     present: list[DraftReadRecord], absence: list[DraftReadRecord], fresh: bool
-) -> Literal["present", "absent", "unknown"]:
+) -> DraftCoveragePresence:
     if present:
-        return "present"
+        return DraftCoveragePresence.PRESENT
     if absence and fresh:
-        return "absent"
-    return "unknown"
+        return DraftCoveragePresence.ABSENT
+    return DraftCoveragePresence.UNKNOWN
 
 
-def _draft_freshness(state_row: Mapping[str, object], fresh: bool) -> Literal["current", "stale", "unknown"]:
+def _draft_freshness(state_row: Mapping[str, object], fresh: bool) -> DraftCoverageFreshness:
     if fresh:
-        return "current"
+        return DraftCoverageFreshness.CURRENT
     if str(state_row["status"]) in {"unknown", "recovery_needed", "recovering", "failed"}:
-        return "stale"
-    return "unknown"
+        return DraftCoverageFreshness.STALE
+    return DraftCoverageFreshness.UNKNOWN
