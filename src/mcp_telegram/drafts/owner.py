@@ -8,13 +8,14 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Protocol, cast
 
-from telethon import events  # type: ignore[import-untyped]
-from telethon.tl import types  # type: ignore[import-untyped]
-
 from mcp_telegram.demand_wiring import DemandOfferSink, offer_durable_demand
 from mcp_telegram.drafts.contracts import DraftObservation, DraftObservationSource, DraftScope, SnapshotCoverage
 from mcp_telegram.drafts.ports import DraftProjectionRepository, DraftSnapshotGateway
-from mcp_telegram.drafts.telethon_adapter import TelethonDraftSnapshotGateway, normalize_update_draft
+from mcp_telegram.drafts.telethon_adapter import (
+    TelethonDraftSnapshotGateway,
+    draft_update_event,
+    normalize_update_draft,
+)
 from mcp_telegram.event_handlers import UpdateProcessingBarrier
 from mcp_telegram.telegram_demand import DemandStatus, RpcAttemptBudget, demand_context
 from mcp_telegram.telegram_rpc_consumers import DemandKind
@@ -66,7 +67,7 @@ class DraftMessageOwner:
         """Register the barrier-gated raw callback before the client connects."""
         if self._registered:
             return
-        self._event_client.add_event_handler(self.on_raw_draft_update, events.Raw(types=[types.UpdateDraftMessage]))
+        self._event_client.add_event_handler(self.on_raw_draft_update, draft_update_event())
         self._registered = True
 
     def unregister(self) -> None:

@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Protocol, cast
 
+from telethon import events  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetAllDraftsRequest  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
@@ -36,6 +37,11 @@ from mcp_telegram.telegram_rpc_scheduler import rpc_scope
 
 class _DraftClient(Protocol):
     async def __call__(self, request: object) -> object: ...
+
+
+def draft_update_event() -> object:
+    """Build the raw event filter at the Telethon adapter boundary."""
+    return events.Raw(types=[types.UpdateDraftMessage])
 
 
 def _peer_id(peer: object | None) -> int | None:
@@ -281,4 +287,4 @@ class TelethonDraftSnapshotGateway(DraftSnapshotGateway):
         return SnapshotCoverage(self._account_id, complete, len(raw_updates), too_long), tuple(observations)
 
 
-__all__ = ["TelethonDraftSnapshotGateway", "normalize_update_draft"]
+__all__ = ["TelethonDraftSnapshotGateway", "draft_update_event", "normalize_update_draft"]
