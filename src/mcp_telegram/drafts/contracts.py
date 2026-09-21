@@ -37,6 +37,22 @@ class CompositionCompleteness(StrEnum):
     PARTIAL = "partial"
 
 
+class DraftCoveragePresence(StrEnum):
+    """Whether a read receipt locally observes a draft composition."""
+
+    PRESENT = "present"
+    ABSENT = "absent"
+    UNKNOWN = "unknown"
+
+
+class DraftCoverageFreshness(StrEnum):
+    """Whether the draft projection receipt can be treated as current."""
+
+    CURRENT = "current"
+    STALE = "stale"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class DraftScope:
     """One account-fenced draft key in the canonical dialog namespace."""
@@ -175,6 +191,8 @@ __all__ = [
     "CompositionCompleteness",
     "DraftApplyResult",
     "DraftComposition",
+    "DraftCoverageFreshness",
+    "DraftCoveragePresence",
     "DraftDisposition",
     "DraftEntity",
     "DraftObservation",

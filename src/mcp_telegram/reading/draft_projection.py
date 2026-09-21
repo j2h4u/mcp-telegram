@@ -7,29 +7,13 @@ import json
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Literal, cast
 
+from ..drafts.contracts import DraftCoverageFreshness, DraftCoveragePresence
 from ..models import DraftReadRecord
 
 _DRAFT_TABLE = "draft_current"
 _DRAFT_STATE_TABLE = "draft_sync_state"
-
-
-class DraftCoveragePresence(StrEnum):
-    """Domain vocabulary for whether a draft is locally observed."""
-
-    PRESENT = "present"
-    ABSENT = "absent"
-    UNKNOWN = "unknown"
-
-
-class DraftCoverageFreshness(StrEnum):
-    """Domain vocabulary for the reliability of a draft observation."""
-
-    CURRENT = "current"
-    STALE = "stale"
-    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True, slots=True)

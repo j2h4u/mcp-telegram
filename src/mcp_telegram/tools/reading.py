@@ -14,6 +14,7 @@ from ..dialog_selector import (
     optional_dialog_selector,
     required_dialog_selector,
 )
+from ..drafts.contracts import DraftCoverageFreshness, DraftCoveragePresence
 from ..errors import dialog_not_found_text, invalid_navigation_text
 from ..formatter import (
     _render_read_state_header,
@@ -23,7 +24,6 @@ from ..formatter import (
 )
 from ..models import DialogType, ReadMessage
 from ..pagination import NavigationToken
-from ..reading.draft_projection import DraftCoverageFreshness, DraftCoveragePresence
 from ..search_contracts import SEARCHABLE_QUERY_TOKEN_PATTERN
 from ..temporal import parse_utc_boundary
 from ._base import (
