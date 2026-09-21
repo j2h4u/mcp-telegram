@@ -7,6 +7,7 @@ import logging
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -302,7 +303,8 @@ def test_invalid_numeric_manifest_is_quarantined_on_mutation(
     assert isinstance(dialogs, dict)
     for key, value in manifest_patch.items():
         if key == "dialogs":
-            for dialog_id, changes in value.items():
+            dialog_changes = cast(dict[str, dict[str, object]], value)
+            for dialog_id, changes in dialog_changes.items():
                 assert isinstance(changes, dict)
                 item = dialogs[dialog_id]
                 assert isinstance(item, dict)
@@ -310,7 +312,7 @@ def test_invalid_numeric_manifest_is_quarantined_on_mutation(
                     if field == "counts":
                         counts = item["counts"]
                         assert isinstance(counts, dict)
-                        counts.update(replacement)
+                        counts.update(cast(dict[str, object], replacement))
                     else:
                         item[field] = replacement
         else:
@@ -345,4 +347,5 @@ def test_exhausted_campaign_with_missing_local_row_is_degraded(conn: sqlite3.Con
     status = campaign_status(conn)
     assert status["terminal_reason"] == "exhausted"
     assert status["terminal_severity"] == "degraded"
-    assert status["counts"]["unresolved"] == 1
+    counts = cast(dict[str, int], status["counts"])
+    assert counts["unresolved"] == 1

@@ -182,12 +182,14 @@ async def test_new_full_history_terminal_publishes_complete_topic_attribution_re
 
     await worker._store_batch_page(dialog_id, 0, 0, ())
 
-    assert sync_db.execute(
+    row = sync_db.execute(
         "SELECT status,topic_attribution_version,topic_attribution_state,"
         "topic_attribution_observed_at,topic_attribution_completed_at "
         "FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
-    ).fetchone()[0:3] == ("synced", 1, "complete")
+    ).fetchone()
+    assert row is not None
+    assert row[0:3] == ("synced", 1, "complete")
 
 
 @pytest.mark.asyncio

@@ -944,9 +944,12 @@ async def test_campaign_expiry_preflight_runs_despite_normal_full_sync_work(conn
     seed_full_history_enrollment(conn, 903, enabled=True)
     conn.commit()
     # Make the durable manifest old without relying on the live clock.
-    manifest_row = conn.execute("SELECT value FROM daemon_state WHERE key=?", (CAMPAIGN_STATE_KEY,)).fetchone()
+    manifest_row = cast(
+        tuple[str] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key=?", (CAMPAIGN_STATE_KEY,)).fetchone(),
+    )
     assert manifest_row is not None
-    manifest = json.loads(cast(tuple[str], manifest_row)[0])
+    manifest = cast(dict[str, object], json.loads(manifest_row[0]))
     manifest["expires_at"] = 1
     conn.execute("UPDATE daemon_state SET value=? WHERE key=?", (json.dumps(manifest), CAMPAIGN_STATE_KEY))
     conn.commit()
@@ -980,7 +983,11 @@ async def test_campaign_operator_abort_supersedes_inflight_page_result(conn: sql
             return FullHistoryPage(messages=(), total_messages=0)
 
     worker = FullSyncWorker(cast(FullHistoryPagePort, BlockingPort()), conn, asyncio.Event())
-    task = asyncio.create_task(worker.process_topic_attribution_campaign_page())
+
+    async def process_campaign_page() -> bool:
+        return await worker.process_topic_attribution_campaign_page()
+
+    task = asyncio.create_task(process_campaign_page())
     await entered.wait()
     assert abort_campaign(conn)["terminal_reason"] == "operator_abort"
     release.set()

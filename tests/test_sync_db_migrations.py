@@ -1518,11 +1518,14 @@ def test_migration_v72_keeps_existing_topic_attribution_unknown(tmp_path: Path) 
     db_path = _make_v24_db(tmp_path)
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
-        row = conn.execute(
-            "SELECT topic_attribution_version, topic_attribution_state, "
-            "topic_attribution_observed_at, topic_attribution_completed_at, topic_attribution_no_topic_count "
-            "FROM synced_dialogs WHERE dialog_id=1"
-        ).fetchone()
+        row = cast(
+            Row | None,
+            conn.execute(
+                "SELECT topic_attribution_version, topic_attribution_state, "
+                "topic_attribution_observed_at, topic_attribution_completed_at, topic_attribution_no_topic_count "
+                "FROM synced_dialogs WHERE dialog_id=1"
+            ).fetchone(),
+        )
         assert row is None
         conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
         assert conn.execute(
