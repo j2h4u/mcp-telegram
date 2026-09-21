@@ -362,7 +362,13 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
                 "last_event_at": 1_699_999_000,
                 "sync_coverage_pct": 80,
                 "selection_state": "unknown",
-                "topic_attribution": {"version": 0, "state": "unknown", "observed_at": None, "completed_at": None},
+                "topic_attribution": {
+                    "version": 0,
+                    "state": "unknown",
+                    "observed_at": None,
+                    "completed_at": None,
+                    "no_topic_count": 0,
+                },
                 "dialog_type": "User",
                 "read_state": {
                     "inbox_unread_count": 0,
@@ -395,6 +401,7 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
         "state": "unknown",
         "observed_at": None,
         "completed_at": None,
+        "no_topic_count": 0,
     }
     validate(instance=payload, schema=LIST_MESSAGES_OUTPUT_SCHEMA)
     assert warnings[0]["kind"] == "archived_dialog"
