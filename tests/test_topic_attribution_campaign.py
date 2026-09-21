@@ -284,8 +284,14 @@ def test_legacy_operator_abort_resumes_only_the_uncommitted_item(conn: sqlite3.C
 
 
 def test_legacy_operator_abort_rejects_ambiguous_partial_item(conn: sqlite3.Connection) -> None:
+    conn.executemany(
+        "INSERT INTO messages(dialog_id,message_id,sent_at,text,forum_topic_id,is_deleted) VALUES (?,?,?,?,?,?)",
+        [(101, 11, 1, "first", None, 0), (102, 12, 1, "second", None, 0)],
+    )
+    conn.commit()
     enroll_campaign(conn, [101, 102], now=100)
     record_page(conn, 101, 0, _page([_message(101, 11, 4)], complete=False), observed_at=101)
+    record_page(conn, 102, 0, _page([_message(102, 12, 5)], complete=False), observed_at=102)
     assert abort_campaign(conn) == {"terminal_reason": "operator_abort"}
     manifest = cast(
         dict[str, object],
@@ -296,6 +302,89 @@ def test_legacy_operator_abort_rejects_ambiguous_partial_item(conn: sqlite3.Conn
     dialogs = cast(dict[str, dict[str, object]], manifest["dialogs"])
     dialogs["101"].pop("terminal_reason", None)
     dialogs["102"].pop("terminal_reason", None)
+    conn.execute("UPDATE daemon_state SET value=? WHERE key=?", (json.dumps(manifest), CAMPAIGN_STATE_KEY))
+    conn.commit()
+
+    with pytest.raises(TopicAttributionCampaignError, match="legacy_resume_ambiguous"):
+        resume_campaign(conn, now=102)
+
+
+def test_legacy_operator_abort_resumes_unique_partial_receipt_with_preserved_progress(
+    conn: sqlite3.Connection,
+) -> None:
+    conn.executemany(
+        "INSERT INTO messages(dialog_id,message_id,sent_at,text,forum_topic_id,is_deleted) VALUES (?,?,?,?,?,?)",
+        [(101, 500, 1, "complete", None, 0), (102, 304584, 1, "interrupted", None, 0)],
+    )
+    conn.commit()
+    enroll_campaign(conn, [101, 102], now=100)
+    record_page(conn, 101, 0, _page([_message(101, 500, 4)]), observed_at=101)
+    record_page(conn, 102, 0, _page([_message(102, 304584, 5)], complete=False), observed_at=102)
+    assert abort_campaign(conn) == {"terminal_reason": "operator_abort"}
+    manifest = cast(
+        dict[str, object],
+        json.loads(
+            cast(str, conn.execute("SELECT value FROM daemon_state WHERE key=?", (CAMPAIGN_STATE_KEY,)).fetchone()[0])
+        ),
+    )
+    dialogs = cast(dict[str, dict[str, object]], manifest["dialogs"])
+    dialogs["102"].pop("terminal_reason")
+    conn.execute("UPDATE daemon_state SET value=? WHERE key=?", (json.dumps(manifest), CAMPAIGN_STATE_KEY))
+    conn.commit()
+
+    assert resume_campaign(conn, now=103) == {"resumed_dialogs": 1}
+
+    resumed = cast(
+        dict[str, object],
+        json.loads(
+            cast(str, conn.execute("SELECT value FROM daemon_state WHERE key=?", (CAMPAIGN_STATE_KEY,)).fetchone()[0])
+        ),
+    )
+    resumed_dialogs = cast(dict[str, dict[str, object]], resumed["dialogs"])
+    assert resumed_dialogs["101"] == dialogs["101"]
+    assert resumed_dialogs["102"]["state"] == "pending"
+    assert resumed_dialogs["102"]["cursor"] == 304584
+    assert resumed_dialogs["102"]["counts"] == {
+        "attributed": 1,
+        "no_topic": 0,
+        "no_longer_needed": 0,
+        "unresolved": 0,
+    }
+    assert conn.execute("SELECT topic_attribution_state FROM synced_dialogs WHERE dialog_id=101").fetchone() == (
+        "complete",
+    )
+    assert conn.execute("SELECT topic_attribution_state FROM synced_dialogs WHERE dialog_id=102").fetchone() == (
+        "partial",
+    )
+
+
+@pytest.mark.parametrize("corruption", ["partial_without_progress", "unknown_committed", "other_terminal"])
+def test_legacy_operator_abort_rejects_nonunique_or_untrusted_resume_state(
+    conn: sqlite3.Connection, corruption: str
+) -> None:
+    conn.execute(
+        "INSERT INTO messages(dialog_id,message_id,sent_at,text,forum_topic_id,is_deleted) VALUES (101,11,1,'keep',NULL,0)"
+    )
+    conn.commit()
+    enroll_campaign(conn, [101, 102], now=100)
+    record_page(conn, 101, 0, _page([_message(101, 11, 4)], complete=False), observed_at=101)
+    assert abort_campaign(conn) == {"terminal_reason": "operator_abort"}
+    manifest = cast(
+        dict[str, object],
+        json.loads(
+            cast(str, conn.execute("SELECT value FROM daemon_state WHERE key=?", (CAMPAIGN_STATE_KEY,)).fetchone()[0])
+        ),
+    )
+    dialogs = cast(dict[str, dict[str, object]], manifest["dialogs"])
+    dialogs["101"].pop("terminal_reason")
+    dialogs["102"].pop("terminal_reason")
+    if corruption == "partial_without_progress":
+        dialogs["101"]["cursor"] = 0
+        dialogs["101"]["counts"] = {"attributed": 0, "no_topic": 0, "no_longer_needed": 0, "unresolved": 0}
+    elif corruption == "unknown_committed":
+        conn.execute("UPDATE synced_dialogs SET topic_attribution_state='unknown' WHERE dialog_id=101")
+    else:
+        dialogs["101"]["terminal_reason"] = "access_lost"
     conn.execute("UPDATE daemon_state SET value=? WHERE key=?", (json.dumps(manifest), CAMPAIGN_STATE_KEY))
     conn.commit()
 

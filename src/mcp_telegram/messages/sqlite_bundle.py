@@ -894,35 +894,65 @@ def _legacy_aborted_items(
     manifest: dict[str, object],
     dialogs: dict[str, dict[str, object]],
 ) -> list[dict[str, object]]:
-    """Recover only pre-marker items whose missing page commit is certain."""
-    candidates: list[dict[str, object]] = []
+    """Recover only a uniquely identifiable pre-marker interrupted item."""
+    uncommitted: list[dict[str, object]] = []
+    partial: list[dict[str, object]] = []
     for dialog_id in cast(list[int], manifest["dialog_ids"]):
         item = dialogs[str(dialog_id)]
-        if "terminal_reason" in item:
+        receipt_state = _legacy_receipt_state(conn, dialog_id)
+        if _legacy_item_has_other_terminal_evidence(item):
+            raise TopicAttributionCampaignError("legacy_resume_ambiguous")
+        if receipt_state == "complete":
+            if item.get("state") != "done":
+                raise TopicAttributionCampaignError("legacy_resume_ambiguous")
             continue
-        receipt = cast(
-            tuple[object] | None,
-            conn.execute(
-                "SELECT topic_attribution_state FROM synced_dialogs WHERE dialog_id=?",
-                (dialog_id,),
-            ).fetchone(),
-        )
-        if receipt is not None and receipt[0] == "complete":
+        if receipt_state == "unknown" and _legacy_item_has_no_committed_page(item):
+            uncommitted.append(item)
             continue
-        if _legacy_item_has_no_committed_page(item, receipt):
-            candidates.append(item)
+        if receipt_state == "partial" and _legacy_item_has_committed_partial(item):
+            partial.append(item)
             continue
         raise TopicAttributionCampaignError("legacy_resume_ambiguous")
-    return candidates
+    return _select_legacy_resume_candidate(uncommitted, partial)
 
 
-def _legacy_item_has_no_committed_page(item: dict[str, object], receipt: tuple[object] | None) -> bool:
-    return (
-        receipt is not None
-        and receipt[0] == "unknown"
-        and item.get("cursor") == 0
-        and item.get("counts") == _empty_counts()
+def _legacy_receipt_state(conn: sqlite3.Connection, dialog_id: int) -> str | None:
+    receipt = cast(
+        tuple[object] | None,
+        conn.execute(
+            "SELECT topic_attribution_state FROM synced_dialogs WHERE dialog_id=?",
+            (dialog_id,),
+        ).fetchone(),
     )
+    return receipt[0] if receipt is not None and isinstance(receipt[0], str) else None
+
+
+def _legacy_item_has_other_terminal_evidence(item: dict[str, object]) -> bool:
+    return "terminal_reason" in item or item.get("state") != "done"
+
+
+def _legacy_item_has_committed_partial(item: dict[str, object]) -> bool:
+    cursor = item.get("cursor")
+    counts = cast(dict[str, object], item["counts"])
+    return (
+        _nonnegative_int(cursor) and cast(int, cursor) > 0 and any(cast(int, counts[key]) > 0 for key in _COUNTER_KEYS)
+    )
+
+
+def _select_legacy_resume_candidate(
+    uncommitted: list[dict[str, object]], partial: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    if len(partial) == 1 and not uncommitted:
+        return partial
+    if not partial and len(uncommitted) == 1:
+        return uncommitted
+    if partial or uncommitted:
+        raise TopicAttributionCampaignError("legacy_resume_ambiguous")
+    return []
+
+
+def _legacy_item_has_no_committed_page(item: dict[str, object]) -> bool:
+    return item.get("cursor") == 0 and item.get("counts") == _empty_counts()
 
 
 def campaign_status(conn: sqlite3.Connection) -> dict[str, object]:
