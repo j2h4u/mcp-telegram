@@ -377,48 +377,61 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "continuity_reason": {"type": ["string", "null"]},
                 "composition_complete": {"type": ["boolean", "null"]},
             },
-            "required": ["presence", "freshness", "observed_at", "observation_source", "absence_basis", "continuity_reason", "composition_complete"],
+            "required": [
+                "presence",
+                "freshness",
+                "observed_at",
+                "observation_source",
+                "absence_basis",
+                "continuity_reason",
+                "composition_complete",
+            ],
             "additionalProperties": False,
         },
         "messages": {
             "type": "array",
-            "items": {"oneOf": [
-                {
-                "type": "object",
-                "properties": {
-                    **cast(dict[str, object], MESSAGE_VIEW_SCHEMA["properties"]),
-                    "message_state": {"type": "string", "enum": ["sent", "scheduled"]},
-                    "visibility": {
-                        "type": "string",
-                        "description": "author_only before publication, chat_visible after publication.",
+            "items": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            **cast(dict[str, object], MESSAGE_VIEW_SCHEMA["properties"]),
+                            "message_state": {"type": "string", "enum": ["sent", "scheduled"]},
+                            "visibility": {
+                                "type": "string",
+                                "description": "author_only before publication, chat_visible after publication.",
+                            },
+                            "unpublished": {"type": "boolean"},
+                            "published": {
+                                "type": "boolean",
+                                "description": "Whether this message is visible in chat history.",
+                            },
+                            "unseen": {"type": "boolean"},
+                            "scheduled_at": {"type": ["integer", "null"]},
+                            "published_at": {"type": ["integer", "null"]},
+                            "inclusion_basis": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": [
+                            "dialog_id",
+                            "msg_id",
+                            "sent_at",
+                            "out",
+                            "message_state",
+                            "visibility",
+                            "unpublished",
+                            "published",
+                            "unseen",
+                            "scheduled_at",
+                            "published_at",
+                            "inclusion_basis",
+                            "reaction_events",
+                            "reaction_events_status",
+                        ],
+                        "additionalProperties": False,
                     },
-                    "unpublished": {"type": "boolean"},
-                    "published": {"type": "boolean", "description": "Whether this message is visible in chat history."},
-                    "unseen": {"type": "boolean"},
-                    "scheduled_at": {"type": ["integer", "null"]},
-                    "published_at": {"type": ["integer", "null"]},
-                    "inclusion_basis": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": [
-                    "dialog_id",
-                    "msg_id",
-                    "sent_at",
-                    "out",
-                    "message_state",
-                    "visibility",
-                    "unpublished",
-                    "published",
-                    "unseen",
-                    "scheduled_at",
-                    "published_at",
-                    "inclusion_basis",
-                    "reaction_events",
-                    "reaction_events_status",
-                ],
-                "additionalProperties": False,
-                },
-                DRAFT_MESSAGE_VIEW_SCHEMA,
-            ]},
+                    DRAFT_MESSAGE_VIEW_SCHEMA,
+                ]
+            },
         },
         "count": {"type": "integer"},
         "result_count_semantics": {"type": "string"},
@@ -957,7 +970,9 @@ def _search_messages_request_context(args: SearchMessages) -> _SearchMessagesReq
                 )
             if nav.value is None:
                 return error_result(
-                    invalid_navigation_text("Search navigation token is missing its offset", retry_tool="SearchMessages"),
+                    invalid_navigation_text(
+                        "Search navigation token is missing its offset", retry_tool="SearchMessages"
+                    ),
                     has_cursor=True,
                 )
             offset = nav.value

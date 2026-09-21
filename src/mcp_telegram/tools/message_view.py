@@ -145,8 +145,16 @@ DRAFT_MESSAGE_VIEW_SCHEMA: dict[str, object] = {
                 "normalization_version": {"type": "string"},
             },
             "required": [
-                "entities", "reply_to", "media", "suggested_post", "rich_message", "effect_id", "no_webpage",
-                "invert_media", "complete", "normalization_version",
+                "entities",
+                "reply_to",
+                "media",
+                "suggested_post",
+                "rich_message",
+                "effect_id",
+                "no_webpage",
+                "invert_media",
+                "complete",
+                "normalization_version",
             ],
             "additionalProperties": False,
         },
@@ -160,9 +168,21 @@ DRAFT_MESSAGE_VIEW_SCHEMA: dict[str, object] = {
         "unseen": {"type": "boolean", "enum": [True]},
     },
     "required": [
-        "message_state", "message_key", "dialog_id", "draft_scope", "draft_status", "content", "composition",
-        "draft_updated_at", "observed_at", "observation_source", "projection_revision", "visibility", "unpublished",
-        "published", "unseen",
+        "message_state",
+        "message_key",
+        "dialog_id",
+        "draft_scope",
+        "draft_status",
+        "content",
+        "composition",
+        "draft_updated_at",
+        "observed_at",
+        "observation_source",
+        "projection_revision",
+        "visibility",
+        "unpublished",
+        "published",
+        "unseen",
     ],
     "additionalProperties": False,
 }
@@ -199,6 +219,7 @@ def project_draft_message_view(row: Mapping[str, object]) -> dict[str, object]:
         "published": False,
         "unseen": True,
     }
+
 
 _READ_MARKER_METADATA = {
     "[I read up to here]": {"kind": "i_read_up_to_here", "side": "inbox"},

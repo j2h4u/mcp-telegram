@@ -193,7 +193,9 @@ def decode_navigation_token(token: str) -> NavigationToken:
     if not isinstance(dialog_id, int):
         raise ValueError("Invalid navigation token: dialog_id must be an integer")
 
-    topic_id, query, direction, sent_at, message_state, since_utc, until_utc, draft_key, draft_fingerprint = _decode_optional_navigation_fields(data)
+    topic_id, query, direction, sent_at, message_state, since_utc, until_utc, draft_key, draft_fingerprint = (
+        _decode_optional_navigation_fields(data)
+    )
     navigation = NavigationToken(
         kind=cast("NavigationKind", kind),
         value=cast(int | None, value),
@@ -214,69 +216,74 @@ def decode_navigation_token(token: str) -> NavigationToken:
 
 def _validate_navigation_shape(navigation: NavigationToken) -> None:
     """Reject signed cursors that are not fully bound to their request state."""
+    _validate_navigation_time_range(navigation)
+    _validate_navigation_state(navigation)
+    if navigation.kind == "search":
+        _validate_search_navigation(navigation)
+        return
+    _validate_history_navigation(navigation)
+
+
+def _validate_navigation_time_range(navigation: NavigationToken) -> None:
     if (
         navigation.since_utc is not None
         and navigation.until_utc is not None
         and navigation.since_utc >= navigation.until_utc
     ):
         raise ValueError("Invalid navigation token: since_utc must be earlier than until_utc")
+
+
+def _validate_navigation_state(navigation: NavigationToken) -> None:
     if navigation.message_state not in {"sent", "scheduled", "draft", "all"}:
         raise ValueError("Invalid navigation token: message_state must be sent, scheduled, draft, or all")
-    if navigation.kind == "search":
-        if navigation.query is None:
-            raise ValueError("Invalid navigation token: search cursor requires query")
-        if any(value is not None for value in (navigation.topic_id, navigation.direction, navigation.sent_at, navigation.draft_key, navigation.draft_fingerprint)):
-            raise ValueError("Invalid navigation token: search cursor contains history-only state")
-        return
+
+
+def _validate_search_navigation(navigation: NavigationToken) -> None:
+    if navigation.query is None:
+        raise ValueError("Invalid navigation token: search cursor requires query")
+    history_fields = (
+        navigation.topic_id,
+        navigation.direction,
+        navigation.sent_at,
+        navigation.draft_key,
+        navigation.draft_fingerprint,
+    )
+    if any(value is not None for value in history_fields):
+        raise ValueError("Invalid navigation token: search cursor contains history-only state")
+
+
+def _validate_history_navigation(navigation: NavigationToken) -> None:
     if navigation.query is not None:
         raise ValueError("Invalid navigation token: history cursor contains search-only query state")
-    is_draft_cursor = navigation.draft_key is not None or navigation.draft_fingerprint is not None
-    if is_draft_cursor:
-        if navigation.message_state not in {"draft", "all"}:
-            raise ValueError("Invalid navigation token: draft cursor requires draft or all message_state")
-        if navigation.draft_key is None or navigation.draft_fingerprint is None or navigation.value is not None:
-            raise ValueError("Invalid navigation token: draft cursor requires key and fingerprint without message id")
+    if _is_draft_cursor(navigation):
+        _validate_draft_cursor(navigation)
     elif navigation.value is None:
         raise ValueError("Invalid navigation token: history cursor requires message id")
+
+
+def _is_draft_cursor(navigation: NavigationToken) -> bool:
+    return navigation.draft_key is not None or navigation.draft_fingerprint is not None
+
+
+def _validate_draft_cursor(navigation: NavigationToken) -> None:
+    if navigation.message_state not in {"draft", "all"}:
+        raise ValueError("Invalid navigation token: draft cursor requires draft or all message_state")
+    if navigation.draft_key is None or navigation.draft_fingerprint is None or navigation.value is not None:
+        raise ValueError("Invalid navigation token: draft cursor requires key and fingerprint without message id")
 
 
 def _decode_optional_navigation_fields(
     data: dict[str, object],
 ) -> tuple[int | None, str | None, str | None, int | None, str | None, int | None, int | None, str | None, str | None]:
-    topic_id = data.get("topic_id")
-    if topic_id is not None and not isinstance(topic_id, int):
-        raise ValueError("Invalid navigation token: topic_id must be an integer when present")
-
-    query = data.get("query")
-    if query is not None and not isinstance(query, str):
-        raise ValueError("Invalid navigation token: query must be a string when present")
-
-    direction = data.get("direction")
-    if direction is not None and direction not in {"newest", "oldest"}:
-        raise ValueError("Invalid navigation token: direction must be newest or oldest when present")
-
-    sent_at = data.get("sent_at")
-    if sent_at is not None and not isinstance(sent_at, int):
-        raise ValueError("Invalid navigation token: sent_at must be an integer when present")
-
-    message_state = data.get("message_state")
-    if message_state is not None and message_state not in {"sent", "scheduled", "draft", "all"}:
-        raise ValueError("Invalid navigation token: message_state must be sent, scheduled, draft, or all when present")
-
-    since_utc = data.get("since_utc")
-    if since_utc is not None and not isinstance(since_utc, int):
-        raise ValueError("Invalid navigation token: since_utc must be an integer when present")
-
-    until_utc = data.get("until_utc")
-    if until_utc is not None and not isinstance(until_utc, int):
-        raise ValueError("Invalid navigation token: until_utc must be an integer when present")
-
-    draft_key = data.get("draft_key")
-    if draft_key is not None and not isinstance(draft_key, str):
-        raise ValueError("Invalid navigation token: draft_key must be a string when present")
-    draft_fingerprint = data.get("draft_fingerprint")
-    if draft_fingerprint is not None and not isinstance(draft_fingerprint, str):
-        raise ValueError("Invalid navigation token: draft_fingerprint must be a string when present")
+    topic_id = _optional_int(data, "topic_id")
+    query = _optional_str(data, "query")
+    direction = _optional_direction(data)
+    sent_at = _optional_int(data, "sent_at")
+    message_state = _optional_message_state(data)
+    since_utc = _optional_int(data, "since_utc")
+    until_utc = _optional_int(data, "until_utc")
+    draft_key = _optional_str(data, "draft_key")
+    draft_fingerprint = _optional_str(data, "draft_fingerprint")
 
     return (
         cast(int | None, topic_id),
@@ -289,6 +296,34 @@ def _decode_optional_navigation_fields(
         cast(str | None, draft_key),
         cast(str | None, draft_fingerprint),
     )
+
+
+def _optional_int(data: dict[str, object], name: str) -> int | None:
+    value = data.get(name)
+    if value is not None and not isinstance(value, int):
+        raise ValueError(f"Invalid navigation token: {name} must be an integer when present")
+    return cast(int | None, value)
+
+
+def _optional_str(data: dict[str, object], name: str) -> str | None:
+    value = data.get(name)
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"Invalid navigation token: {name} must be a string when present")
+    return cast(str | None, value)
+
+
+def _optional_direction(data: dict[str, object]) -> str | None:
+    value = _optional_str(data, "direction")
+    if value is not None and value not in {"newest", "oldest"}:
+        raise ValueError("Invalid navigation token: direction must be newest or oldest when present")
+    return value
+
+
+def _optional_message_state(data: dict[str, object]) -> str | None:
+    value = _optional_str(data, "message_state")
+    if value is not None and value not in {"sent", "scheduled", "draft", "all"}:
+        raise ValueError("Invalid navigation token: message_state must be sent, scheduled, draft, or all when present")
+    return value
 
 
 def encode_history_navigation(  # noqa: PLR0913

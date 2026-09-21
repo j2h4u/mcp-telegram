@@ -22,7 +22,7 @@ from ..daemon_message import (
 from ..dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
 from ..dialog_selector import DialogSelector, DialogSelectorError, optional_dialog_selector, required_dialog_selector
 from ..fts import stem_query
-from ..models import DialogType, ReadMessage, ReadState
+from ..models import DialogType, DraftReadRecord, ReadMessage, ReadState
 from ..own_only import own_only_basis_by_dialog
 from ..pagination import (
     HistoryDirection,
@@ -225,6 +225,26 @@ class _ListMessagesDbRequest:
     unread_after_id: int | None
     since_utc: int | None = None
     until_utc: int | None = None
+
+
+@dataclass(frozen=True)
+class _AllLocalStateRequest:
+    dialog_id: int
+    request: _ListMessagesRequest
+    direction: str
+    status: str | None
+    db_request: _ListMessagesDbRequest
+    scheduled_result: dict
+
+
+@dataclass(frozen=True)
+class _AllLocalState:
+    request: _AllLocalStateRequest
+    sent_rows: list[dict]
+    scheduled_rows: list[dict]
+    draft_rows: list[dict]
+    draft_result: dict
+    metadata: tuple[str, ReadState | None, dict[str, object]]
 
 
 _MAX_TELEGRAM_BOUNDARY_BATCHES = 16
@@ -1668,9 +1688,7 @@ class ReadingService:
                 },
             }
 
-    def _list_draft_messages_from_db(  # noqa: PLR0911
-        self, req: _ListMessagesDbRequest, *, navigation: str | None = None
-    ) -> dict:
+    def _list_draft_messages_from_db(self, req: _ListMessagesDbRequest, *, navigation: str | None = None) -> dict:
         """Read mutable author-only composition from the dedicated local projection.
 
         This path has no gateway dependency.  Empty local rows and unavailable
@@ -1688,87 +1706,14 @@ class ReadingService:
                 since_utc=req.since_utc,
                 until_utc=req.until_utc,
             )
-        visible = [record for record in records if record.state == "present"]
-        visible.sort(
-            key=lambda record: (record.observation_completed_at, draft_message_key(record)),
-            reverse=req.direction != "oldest",
-        )
-        start = 0
-        if navigation not in (None, "newest", "oldest"):
-            try:
-                cursor = decode_navigation_token(navigation)
-            except ValueError as exc:
-                return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
-            if cursor.kind != "history" or cursor.message_state != "draft":
-                return {"ok": False, "error": "invalid_navigation", "message": "Navigation token is not a draft cursor."}
-            if cursor.dialog_id != req.dialog_id or cursor.topic_id != req.topic_id:
-                return {"ok": False, "error": "invalid_navigation", "message": "Navigation token belongs to a different draft scope."}
-            if cursor.since_utc != req.since_utc or cursor.until_utc != req.until_utc:
-                return {"ok": False, "error": "invalid_navigation", "message": "Navigation token belongs to a different time range."}
-            if cursor.draft_fingerprint != coverage.projection_fingerprint:
-                return {
-                    "ok": False,
-                    "error": "draft_projection_changed",
-                    "message": "Draft composition changed since this page. Action: restart the draft read from the beginning.",
-                }
-            if cursor.draft_key is None:
-                return {"ok": False, "error": "invalid_navigation", "message": "Draft cursor is missing its scope key."}
-            positions = {draft_message_key(record): index for index, record in enumerate(visible)}
-            if cursor.draft_key not in positions:
-                return {
-                    "ok": False,
-                    "error": "draft_projection_changed",
-                    "message": "Draft scope changed since this page. Action: restart the draft read from the beginning.",
-                }
-            start = positions[cursor.draft_key] + 1
-        next_navigation = None
+        visible = self._visible_drafts(records, req.direction)
+        start = self._draft_cursor_start(navigation, req, coverage.projection_fingerprint, visible)
+        if isinstance(start, dict):
+            return start
         page = visible[start : start + req.limit]
-        if len(visible) > start + req.limit and page:
-            next_navigation = encode_history_navigation(
-                None,
-                req.dialog_id,
-                topic_id=req.topic_id,
-                direction=req.direction_enum,
-                message_state="draft",
-                since_utc=req.since_utc,
-                until_utc=req.until_utc,
-                draft_key=draft_message_key(page[-1]),
-                draft_fingerprint=coverage.projection_fingerprint,
-            )
+        next_navigation = self._draft_next_navigation(req, coverage.projection_fingerprint, visible, page, start)
         with timing_phase("response_shape"):
-            rows = [
-                {
-                    "message_state": "draft",
-                    "message_key": draft_message_key(record),
-                    "dialog_id": record.dialog_id,
-                    "draft_scope": {
-                        "dialog_id": record.dialog_id,
-                        "topic_id": record.topic_id,
-                        "subdialog_peer_id": record.subdialog_peer_id,
-                    },
-                    "draft_status": record.state,
-                    "text": record.text,
-                    "entities": list(record.entities),
-                    "reply_to": record.reply_to,
-                    "media": record.media,
-                    "suggested_post": record.suggested_post,
-                    "rich_message": record.rich_message,
-                    "effect_id": record.effect_id,
-                    "no_webpage": record.no_webpage,
-                    "invert_media": record.invert_media,
-                    "composition_complete": record.composition_complete,
-                    "observation_source": record.source_kind,
-                    "observed_at": record.source_observed_at,
-                    "draft_updated_at": record.observation_completed_at,
-                    "projection_revision": record.projection_revision,
-                    "normalization_version": record.normalization_version,
-                    "visibility": "author_only",
-                    "unpublished": True,
-                    "published": False,
-                    "unseen": True,
-                }
-                for record in page
-            ]
+            rows = [self._draft_wire_row(record) for record in page]
         return {
             "ok": True,
             "data": {
@@ -1781,6 +1726,124 @@ class ReadingService:
             },
         }
 
+    @staticmethod
+    def _visible_drafts(records: list[DraftReadRecord], direction: str) -> list[DraftReadRecord]:
+        visible = [record for record in records if record.state == "present"]
+        visible.sort(
+            key=lambda record: (record.observation_completed_at, draft_message_key(record)),
+            reverse=direction != "oldest",
+        )
+        return visible
+
+    @staticmethod
+    def _draft_cursor_start(
+        navigation: str | None,
+        req: _ListMessagesDbRequest,
+        fingerprint: str | None,
+        visible: list[DraftReadRecord],
+    ) -> int | dict:
+        if navigation in (None, "newest", "oldest"):
+            return 0
+        try:
+            cursor = decode_navigation_token(navigation)
+        except ValueError as exc:
+            return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
+        error = ReadingService._draft_cursor_error(cursor, req, fingerprint)
+        if error is not None:
+            return error
+        assert cursor.draft_key is not None
+        positions = {draft_message_key(record): index for index, record in enumerate(visible)}
+        if cursor.draft_key not in positions:
+            return ReadingService._draft_projection_changed("Draft scope changed since this page.")
+        return positions[cursor.draft_key] + 1
+
+    @staticmethod
+    def _draft_cursor_error(
+        cursor: NavigationToken, req: _ListMessagesDbRequest, fingerprint: str | None
+    ) -> dict | None:
+        if cursor.kind != "history" or cursor.message_state != "draft":
+            return {"ok": False, "error": "invalid_navigation", "message": "Navigation token is not a draft cursor."}
+        if cursor.dialog_id != req.dialog_id or cursor.topic_id != req.topic_id:
+            return {
+                "ok": False,
+                "error": "invalid_navigation",
+                "message": "Navigation token belongs to a different draft scope.",
+            }
+        if cursor.since_utc != req.since_utc or cursor.until_utc != req.until_utc:
+            return {
+                "ok": False,
+                "error": "invalid_navigation",
+                "message": "Navigation token belongs to a different time range.",
+            }
+        if cursor.draft_fingerprint != fingerprint:
+            return ReadingService._draft_projection_changed("Draft composition changed since this page.")
+        if cursor.draft_key is None:
+            return {"ok": False, "error": "invalid_navigation", "message": "Draft cursor is missing its scope key."}
+        return None
+
+    @staticmethod
+    def _draft_projection_changed(detail: str) -> dict:
+        return {
+            "ok": False,
+            "error": "draft_projection_changed",
+            "message": f"{detail} Action: restart the draft read from the beginning.",
+        }
+
+    @staticmethod
+    def _draft_next_navigation(
+        req: _ListMessagesDbRequest,
+        fingerprint: str | None,
+        visible: list[DraftReadRecord],
+        page: list[DraftReadRecord],
+        start: int,
+    ) -> str | None:
+        if len(visible) <= start + req.limit or not page:
+            return None
+        return encode_history_navigation(
+            None,
+            req.dialog_id,
+            topic_id=req.topic_id,
+            direction=req.direction_enum,
+            message_state="draft",
+            since_utc=req.since_utc,
+            until_utc=req.until_utc,
+            draft_key=draft_message_key(page[-1]),
+            draft_fingerprint=fingerprint,
+        )
+
+    @staticmethod
+    def _draft_wire_row(record: DraftReadRecord) -> dict[str, object]:
+        return {
+            "message_state": "draft",
+            "message_key": draft_message_key(record),
+            "dialog_id": record.dialog_id,
+            "draft_scope": {
+                "dialog_id": record.dialog_id,
+                "topic_id": record.topic_id,
+                "subdialog_peer_id": record.subdialog_peer_id,
+            },
+            "draft_status": record.state,
+            "text": record.text,
+            "entities": list(record.entities),
+            "reply_to": record.reply_to,
+            "media": record.media,
+            "suggested_post": record.suggested_post,
+            "rich_message": record.rich_message,
+            "effect_id": record.effect_id,
+            "no_webpage": record.no_webpage,
+            "invert_media": record.invert_media,
+            "composition_complete": record.composition_complete,
+            "observation_source": record.source_kind,
+            "observed_at": record.source_observed_at,
+            "draft_updated_at": record.observation_completed_at,
+            "projection_revision": record.projection_revision,
+            "normalization_version": record.normalization_version,
+            "visibility": "author_only",
+            "unpublished": True,
+            "published": False,
+            "unseen": True,
+        }
+
     async def _list_messages_local_state_result(  # noqa: PLR0913, PLR0917
         self,
         dialog_id: int,
@@ -1790,13 +1853,36 @@ class ReadingService:
         anchor_msg_id: int | None = None,
         anchor_sent_at: int | None = None,
     ) -> dict:
-        direction_enum = HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST
-        db_request = _ListMessagesDbRequest(
+        db_request = self._local_state_db_request(dialog_id, request, direction, anchor_msg_id, anchor_sent_at)
+        if request.message_state == "draft":
+            return self._list_draft_messages_from_db(db_request, navigation=request.navigation)
+        scheduled_result = self._list_scheduled_messages_from_db(db_request)
+        if request.message_state == "scheduled":
+            return self._scheduled_local_state_result(dialog_id, scheduled_result)
+        all_request = _AllLocalStateRequest(
+            dialog_id,
+            request,
+            direction,
+            status,
+            db_request,
+            scheduled_result,
+        )
+        return await self._all_local_state_result(all_request)
+
+    def _local_state_db_request(
+        self,
+        dialog_id: int,
+        request: _ListMessagesRequest,
+        direction: str,
+        anchor_msg_id: int | None,
+        anchor_sent_at: int | None,
+    ) -> _ListMessagesDbRequest:
+        return _ListMessagesDbRequest(
             dialog_id=dialog_id,
             limit=request.limit + 1 if request.message_state == "all" else request.limit,
             self_id=self._deps.self_id,
             direction=direction,
-            direction_enum=direction_enum,
+            direction_enum=HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST,
             anchor_msg_id=anchor_msg_id,
             anchor_sent_at=anchor_sent_at,
             sender_id=request.sender_id,
@@ -1806,75 +1892,109 @@ class ReadingService:
             since_utc=request.since_utc,
             until_utc=request.until_utc,
         )
-        if request.message_state == "draft":
-            return self._list_draft_messages_from_db(db_request, navigation=request.navigation)
 
-        scheduled_result = self._list_scheduled_messages_from_db(db_request)
-        if request.message_state == "scheduled":
-            with timing_phase("local_projection"):
-                dialog_type = _dialog_type_from_db(self._conn, dialog_id)
-            with timing_phase("response_shape"):
-                scheduled_result["data"]["dialog_type"] = dialog_type
-                scheduled_result["data"]["read_state"] = None
-                return scheduled_result
+    def _scheduled_local_state_result(self, dialog_id: int, scheduled_result: dict) -> dict:
+        with timing_phase("local_projection"):
+            dialog_type = _dialog_type_from_db(self._conn, dialog_id)
+        with timing_phase("response_shape"):
+            scheduled_result["data"]["dialog_type"] = dialog_type
+            scheduled_result["data"]["read_state"] = None
+        return scheduled_result
 
-        if status in ("synced", "syncing", "access_lost"):
-            sent_result = await self._list_messages_from_db(db_request)
-            sent_rows = [
-                {**row, "message_state": "sent"}
-                for row in sent_result["data"]["messages"]
-            ]
-        else:
-            sent_rows = []
-        draft_result = self._list_draft_messages_from_db(db_request)
-        scheduled_rows = scheduled_result["data"]["messages"]
+    async def _all_local_state_result(self, all_request: _AllLocalStateRequest) -> dict:
+        sent_rows = await self._all_sent_rows(all_request.status, all_request.db_request)
+        draft_result = self._list_draft_messages_from_db(all_request.db_request)
+        scheduled_rows = all_request.scheduled_result["data"]["messages"]
         draft_rows = draft_result["data"]["messages"]
+        state = _AllLocalState(
+            all_request,
+            sent_rows,
+            scheduled_rows,
+            draft_rows,
+            draft_result,
+            self._all_local_metadata(all_request.dialog_id, all_request.status),
+        )
+        return self._all_local_response(state)
+
+    async def _all_sent_rows(self, status: str | None, db_request: _ListMessagesDbRequest) -> list[dict]:
+        if status not in {"synced", "syncing", "access_lost"}:
+            return []
+        sent_result = await self._list_messages_from_db(db_request)
+        return [{**row, "message_state": "sent"} for row in sent_result["data"]["messages"]]
+
+    def _all_local_metadata(
+        self, dialog_id: int, status: str | None
+    ) -> tuple[str, ReadState | None, dict[str, object]]:
         with timing_phase("local_projection"):
             dialog_type = _dialog_type_from_db(self._conn, dialog_id)
             read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
             access_metadata = _build_access_metadata(self._conn, dialog_id, status or "not_synced")
+        return dialog_type, read_state, access_metadata
+
+    def _all_local_response(self, state: _AllLocalState) -> dict:
+        dialog_type, read_state, access_metadata = state.metadata
+        request = state.request.request
         with timing_phase("response_shape"):
-            combined = [*sent_rows, *scheduled_rows, *draft_rows]
-            combined.sort(
-                key=lambda row: (
-                    int(row.get("sent_at") or row.get("draft_updated_at") or 0),
-                    str(row.get("message_key") or row.get("message_id") or ""),
-                ),
-                reverse=direction != "oldest",
+            combined = self._combined_local_rows(
+                state.sent_rows, state.scheduled_rows, state.draft_rows, state.request.direction
             )
             has_more = len(combined) > request.limit
-            combined = combined[: request.limit]
-            next_nav = None
-            if has_more and combined and not draft_rows:
-                last = combined[-1]
-                next_nav = encode_history_navigation(
-                    _message_id_from_item(last),
-                    dialog_id,
-                    direction=HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST,
-                    sent_at=_object_to_int(last.get("sent_at")),
-                    message_state="all",
-                    since_utc=request.since_utc,
-                    until_utc=request.until_utc,
-                )
+            page = combined[: request.limit]
+            next_nav = self._all_next_navigation(page, has_more, state.draft_rows, state.request)
             return {
                 "ok": True,
                 "data": {
-                    "messages": combined,
+                    "messages": page,
                     "source": "sync_db+scheduled_messages",
                     "next_navigation": next_nav,
                     "message_state": "all",
                     "dialog_type": dialog_type,
                     "read_state": read_state,
-                    "draft_coverage": draft_result["data"]["draft_coverage"],
-                    "pagination_notice": (
-                        "Draft projections are mutable; this union page has no continuation token. Retry the read "
-                        "from the beginning if more rows are needed."
-                        if has_more and draft_rows
-                        else None
-                    ),
+                    "draft_coverage": state.draft_result["data"]["draft_coverage"],
+                    "pagination_notice": self._all_pagination_notice(has_more, state.draft_rows),
                     **access_metadata,
                 },
             }
+
+    @staticmethod
+    def _combined_local_rows(
+        sent_rows: list[dict], scheduled_rows: list[dict], draft_rows: list[dict], direction: str
+    ) -> list[dict]:
+        combined = [*sent_rows, *scheduled_rows, *draft_rows]
+        combined.sort(
+            key=lambda row: (
+                int(row.get("sent_at") or row.get("draft_updated_at") or 0),
+                str(row.get("message_key") or row.get("message_id") or ""),
+            ),
+            reverse=direction != "oldest",
+        )
+        return combined
+
+    @staticmethod
+    def _all_next_navigation(
+        page: list[dict],
+        has_more: bool,
+        draft_rows: list[dict],
+        all_request: _AllLocalStateRequest,
+    ) -> str | None:
+        if not has_more or not page or draft_rows:
+            return None
+        last = page[-1]
+        return encode_history_navigation(
+            _message_id_from_item(last),
+            all_request.dialog_id,
+            direction=(HistoryDirection.OLDEST if all_request.direction == "oldest" else HistoryDirection.NEWEST),
+            sent_at=_object_to_int(last.get("sent_at")),
+            message_state="all",
+            since_utc=all_request.request.since_utc,
+            until_utc=all_request.request.until_utc,
+        )
+
+    @staticmethod
+    def _all_pagination_notice(has_more: bool, draft_rows: list[dict]) -> str | None:
+        if not has_more or not draft_rows:
+            return None
+        return "Draft projections are mutable; this union page has no continuation token. Retry the read from the beginning if more rows are needed."
 
     async def _list_messages_non_sent(
         self,
