@@ -643,7 +643,7 @@ depends_on = ["mcp_telegram.topics.contracts", "mcp_telegram.topics.ports"]
 [[modules]]
 path = "mcp_telegram.drafts.sqlite_projection"
 layer = "persistence"
-depends_on = ["mcp_telegram.drafts.contracts"]
+depends_on = ["mcp_telegram.drafts.contracts", "mcp_telegram.drafts.ports"]
 
 # foundation — small neutral contracts, IPC, configuration, and primitives.
 [[modules]]
