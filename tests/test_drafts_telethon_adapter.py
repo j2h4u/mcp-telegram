@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock
 
 import pytest
 from telethon.tl import types  # type: ignore[import-untyped]
@@ -14,6 +13,16 @@ from mcp_telegram.drafts.contracts import (
 from mcp_telegram.drafts.telethon_adapter import TelethonDraftSnapshotGateway, normalize_update_draft
 from mcp_telegram.telegram_demand import AcquisitionKind, demand_context
 from mcp_telegram.telegram_rpc_consumers import DemandKind
+
+
+class _SnapshotClient:
+    def __init__(self, result: object) -> None:
+        self.result = result
+        self.requests: list[object] = []
+
+    async def __call__(self, request: object) -> object:
+        self.requests.append(request)
+        return self.result
 
 
 def test_normalize_present_empty_draft_is_not_an_absent_draft() -> None:
@@ -86,8 +95,7 @@ def test_normalize_retains_bounded_reply_story_quote_and_monoforum_context() -> 
 
 @pytest.mark.asyncio
 async def test_snapshot_requires_updates_vector_before_absence_can_be_inferred() -> None:
-    client = AsyncMock()
-    client.return_value = object()
+    client = _SnapshotClient(object())
     gateway = TelethonDraftSnapshotGateway(client, 42)
 
     with demand_context(DemandKind.DRAFT_SNAPSHOT):
@@ -99,8 +107,7 @@ async def test_snapshot_requires_updates_vector_before_absence_can_be_inferred()
 
 @pytest.mark.asyncio
 async def test_snapshot_is_one_classified_unpaged_rpc() -> None:
-    client = AsyncMock()
-    client.return_value = types.Updates([], [], [], datetime(2026, 1, 1, tzinfo=UTC), 1)
+    client = _SnapshotClient(types.Updates([], [], [], datetime(2026, 1, 1, tzinfo=UTC), 1))
     gateway = TelethonDraftSnapshotGateway(client, 42)
 
     with demand_context(DemandKind.DRAFT_SNAPSHOT):
@@ -108,6 +115,7 @@ async def test_snapshot_is_one_classified_unpaged_rpc() -> None:
 
     assert coverage.authoritative is True
     assert observations == ()
-    request = client.await_args.args[0]
+    assert len(client.requests) == 1
+    request = client.requests[0]
     assert type(request).__name__ == "GetAllDraftsRequest"
     assert AcquisitionKind.DRAFT_SNAPSHOT.value == "draft_snapshot"

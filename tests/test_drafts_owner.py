@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
 
 import pytest
 from telethon.tl import types  # type: ignore[import-untyped]
@@ -76,8 +75,28 @@ class _Gateway(DraftSnapshotGateway):
         return self.coverage, self.observations
 
 
-def _owner(repository: _Repository, gateway: _Gateway) -> tuple[DraftMessageOwner, MagicMock]:
-    client = MagicMock()
+class _EventClient:
+    def __init__(self) -> None:
+        self.event_handlers: list[tuple[object, object]] = []
+
+    def add_event_handler(self, callback: object, event: object) -> None:
+        self.event_handlers.append((callback, event))
+
+    def remove_event_handler(self, callback: object) -> None:
+        self.event_handlers = [registered for registered in self.event_handlers if registered[0] is not callback]
+
+
+class _DemandSink:
+    def __init__(self) -> None:
+        self.offered: list[DemandKind] = []
+
+    def offer(self, kind: DemandKind) -> bool:
+        self.offered.append(kind)
+        return True
+
+
+def _owner(repository: _Repository, gateway: _Gateway) -> tuple[DraftMessageOwner, _EventClient]:
+    client = _EventClient()
     barrier = UpdateProcessingBarrier(closed=True)
     owner = DraftMessageOwner(
         client,
@@ -101,10 +120,9 @@ async def test_raw_callback_registers_before_connect_and_never_enriches_peer() -
     update = types.UpdateDraftMessage(types.PeerUser(91), types.DraftMessage("draft", datetime(2026, 1, 1, tzinfo=UTC)))
     await owner.on_raw_draft_update(update)
 
-    assert client.add_event_handler.call_count == 1
+    assert len(client.event_handlers) == 1
     assert len(repository.realtime) == 1
     assert repository.realtime[0].scope.dialog_id == 91
-    assert client.mock_calls[1:] == []
 
 
 @pytest.mark.asyncio
@@ -112,14 +130,14 @@ async def test_undated_realtime_is_coalesced_for_snapshot_instead_of_arrival_ord
     repository = _Repository()
     gateway = _Gateway(SnapshotCoverage(42, True, 0), ())
     owner, _client = _owner(repository, gateway)
-    sink = MagicMock()
+    sink = _DemandSink()
     owner.bind_demand_sink(sink)
 
     await owner.on_raw_draft_update(types.UpdateDraftMessage(types.PeerUser(91), types.DraftMessage("draft", None)))
 
     assert repository.realtime[0].ambiguity is True
     assert repository.reasons == ["ambiguous_realtime"]
-    assert sink.offer.call_args.args == (DemandKind.DRAFT_SNAPSHOT,)
+    assert sink.offered == [DemandKind.DRAFT_SNAPSHOT]
 
 
 @pytest.mark.asyncio
