@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
+from mcp_telegram.message_history.contracts import HISTORY_PAGE_SIZE
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.topic_attribution_campaign import (
+    CAMPAIGN_STATE_KEY,
     TopicAttributionCampaignError,
+    advance_campaign,
+    campaign_release_at,
+    campaign_status,
     enroll_campaign,
-    next_checkpoint,
+    record_failed_attempt,
     record_page,
 )
 
@@ -40,7 +46,7 @@ def _extracted(dialog_id: int, message_id: int, topic_id: int | None) -> Extract
 
 
 @pytest.fixture()
-def conn(tmp_path: Path) -> sqlite3.Connection:
+def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     db = _open_sync_db(path)
@@ -72,7 +78,8 @@ def test_campaign_updates_only_live_null_topic_and_keeps_remote_omission_unresol
     )
     conn.commit()
     enroll_campaign(conn, [101, 102], now=100)
-    assert next_checkpoint(conn, now=101) == (101, 0)
+    assert campaign_release_at(conn, now=101) == 0.0
+    assert advance_campaign(conn, now=101) == (101, 0)
 
     manifest = record_page(
         conn,
@@ -90,10 +97,54 @@ def test_campaign_updates_only_live_null_topic_and_keeps_remote_omission_unresol
         (13, "existing topic", 3, 0),
         (14, "unknown omission", None, 0),
     ]
-    counts = manifest["dialogs"]["101"]["counts"]
+    dialogs = manifest["dialogs"]
+    assert isinstance(dialogs, dict)
+    item = dialogs["101"]
+    assert isinstance(item, dict)
+    counts = item["counts"]
     assert counts == {"attributed": 1, "no_topic": 0, "no_longer_needed": 2, "unresolved": 1}
     assert conn.execute(
         "SELECT topic_attribution_state,topic_attribution_completed_at FROM synced_dialogs WHERE dialog_id=101"
     ).fetchone() == ("partial", None)
-    with pytest.raises(TopicAttributionCampaignError, match="checkpoint changed"):
-        record_page(conn, 101, 0, ())
+    with pytest.raises(TopicAttributionCampaignError, match="checkpoint_changed"):
+        record_page(conn, 101, 0, (), observed_at=103)
+
+
+def test_campaign_expiry_is_pure_until_advance_then_restart_safe(conn: sqlite3.Connection) -> None:
+    enroll_campaign(conn, [101, 102], now=100)
+    assert campaign_release_at(conn, now=100 + 7 * 24 * 60 * 60) == 0.0
+    assert campaign_status(conn)["state"] == "active"
+    assert advance_campaign(conn, now=100 + 7 * 24 * 60 * 60) is None
+    assert campaign_status(conn)["terminal_reason"] == "deadline"
+
+
+def test_failure_keeps_checkpoint_and_delays_retry(conn: sqlite3.Connection) -> None:
+    enroll_campaign(conn, [101, 102], now=100)
+    record_failed_attempt(conn, 101, 0, reason="MessageHistoryUnavailableError", observed_at=110)
+    assert campaign_release_at(conn, now=111) == 170.0
+    assert advance_campaign(conn, now=111) is None
+    assert advance_campaign(conn, now=170) == (101, 0)
+
+
+def test_successful_full_page_keeps_resumable_cursor_without_page_cap(conn: sqlite3.Connection) -> None:
+    enroll_campaign(conn, [101, 102], now=100)
+    page = [_extracted(101, message_id, None) for message_id in range(1, HISTORY_PAGE_SIZE + 1)]
+    record_page(conn, 101, 0, page, observed_at=101)
+    assert advance_campaign(conn, now=102) == (101, 1)
+
+
+def test_access_lost_status_is_skipped_without_history_acquisition(conn: sqlite3.Connection) -> None:
+    enroll_campaign(conn, [101, 102], now=100)
+    conn.execute("UPDATE synced_dialogs SET status='access_lost' WHERE dialog_id=101")
+    conn.commit()
+    assert advance_campaign(conn, now=101) == (102, 0)
+
+
+def test_invalid_manifest_is_purely_visible_then_quarantined_by_advance(conn: sqlite3.Connection) -> None:
+    conn.execute("INSERT INTO daemon_state(key,value) VALUES (?,?)", (CAMPAIGN_STATE_KEY, "not-json"))
+    conn.commit()
+    assert campaign_release_at(conn, now=100) == 0.0
+    assert campaign_status(conn)["state"] == "invalid"
+    assert advance_campaign(conn, now=100) is None
+    assert campaign_status(conn)["state"] == "complete"
+    assert campaign_status(conn)["terminal_reason"] == "invalid_manifest"

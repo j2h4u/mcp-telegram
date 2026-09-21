@@ -489,7 +489,9 @@ def _list_messages_warnings(data: dict) -> list[StructuredWarning]:
     ]
 
 
-def _empty_exact_topic_warning(args: ListMessages, rows: list[dict]) -> StructuredWarning | None:
+def _empty_exact_topic_warning(
+    args: ListMessages, rows: list[dict], selection_state: object
+) -> StructuredWarning | None:
     if args.exact_topic_id is None or rows:
         return None
     has_other_filter = any(
@@ -504,6 +506,12 @@ def _empty_exact_topic_warning(args: ListMessages, rows: list[dict]) -> Structur
     )
     if has_other_filter:
         return None
+    if selection_state == "unknown":
+        return structured_warning(
+            "topic_selection_unknown",
+            f"No locally attributed messages matched topic {args.exact_topic_id}; topic membership remains unknown.",
+            severity="warning",
+        )
     return structured_warning(
         "dialog_identifier_mismatch",
         (
@@ -660,7 +668,7 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
         }
     ordered_rows = _chronological_message_rows(rows)
     warnings = _list_messages_warnings(data)
-    if topic_warning := _empty_exact_topic_warning(args, rows):
+    if topic_warning := _empty_exact_topic_warning(args, rows, data.get("selection_state")):
         warnings.append(topic_warning)
     return {
         "dialog_id": resolved_dialog_id,

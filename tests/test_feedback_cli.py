@@ -32,6 +32,7 @@ class _FeedbackRowOptions:
 class _FeedbackStatusConn:
     update_feedback_status: AsyncMock
     recover_dialog_directory: AsyncMock
+    get_topic_attribution_campaign_status: AsyncMock
 
 
 @pytest.fixture
@@ -235,6 +236,30 @@ def test_recover_dialog_directory_cli_routes_to_daemon() -> None:
     assert result.exit_code == 0, result.stdout
     assert "Directory recovery started" in result.stdout
     mock_conn.recover_dialog_directory.assert_called_once_with()
+
+
+def test_topic_attribution_campaign_status_cli_routes_to_daemon() -> None:
+    mock_conn = cast(_FeedbackStatusConn, AsyncMock())
+    mock_conn.get_topic_attribution_campaign_status.return_value = {
+        "ok": True,
+        "data": {
+            "state": "active",
+            "terminal_reason": None,
+            "pending_dialogs": 1,
+            "counts": {"attributed": 3, "no_topic": 0, "no_longer_needed": 2, "unresolved": 4},
+        },
+    }
+    async_cm = MagicMock()
+    async_cm.__aenter__ = AsyncMock(return_value=mock_conn)
+    async_cm.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("mcp_telegram.daemon_client.daemon_connection", return_value=async_cm):
+        result = runner.invoke(app, ["topic-attribution", "status"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "state=active" in result.stdout
+    assert "attributed=3" in result.stdout
+    mock_conn.get_topic_attribution_campaign_status.assert_called_once_with()
 
 
 def _set_status_direct(db_path: Path, rid: int, status: str) -> None:

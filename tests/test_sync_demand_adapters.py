@@ -48,6 +48,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcScope,
     current_rpc_scope,
 )
+from mcp_telegram.topic_attribution_campaign import CAMPAIGN_STATE_KEY, enroll_campaign
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -797,3 +798,45 @@ async def test_dialog_light_adapter_clears_one_durable_dirty_flag(conn: sqlite3.
     assert observed_scopes[0].demand_kind is DemandKind.DIALOG_LIGHT_RECONCILIATION
     assert observed_scopes[0].acquisition_kind is AcquisitionKind.ENTITY_LOOKUP
     assert observed_scopes[0].attempt_budget is budget
+
+
+def _enroll_topic_campaign(conn: sqlite3.Connection) -> None:
+    conn.executemany("INSERT INTO dialogs(dialog_id,type) VALUES (?, 'bot')", [(901,), (902,)])
+    conn.executemany("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?, 'synced')", [(901,), (902,)])
+    conn.commit()
+    enroll_campaign(conn, [901, 902])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["throttled", "saturated"])
+async def test_campaign_propagates_governed_deferrals_without_failure_budget(
+    conn: sqlite3.Connection, failure: str
+) -> None:
+    _enroll_topic_campaign(conn)
+
+    class FailingPort:
+        async def fetch_page(self, _dialog_id: int, *, before_message_id: int) -> object:
+            del before_message_id
+            if failure == "throttled":
+                raise TelegramRpcThrottled(retry_after_seconds=30)
+            raise RpcAdmissionSaturatedError(current_rpc_scope(), "capacity full")
+
+    worker = FullSyncWorker(cast(FullHistoryPagePort, FailingPort()), conn, asyncio.Event())
+    adapter = FullSyncDemandAdapter(worker)
+    expected = TelegramRpcThrottled if failure == "throttled" else RpcAdmissionSaturatedError
+    with pytest.raises(expected):
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key=?", (CAMPAIGN_STATE_KEY,)).fetchone(),
+    )
+    assert row is not None
+    raw_manifest = row[0]
+    assert isinstance(raw_manifest, str)
+    manifest = cast(dict[str, object], json.loads(raw_manifest))
+    dialogs = cast(dict[str, object], manifest["dialogs"])
+    item = cast(dict[str, object], dialogs["901"])
+    assert item["cursor"] == 0
+    assert item["failure_attempts"] == 0
+    assert item["last_error"] in {"TelegramRpcThrottled", "RpcAdmissionSaturatedError"}

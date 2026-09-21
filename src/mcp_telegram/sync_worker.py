@@ -33,7 +33,7 @@ from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
 from .history_enrollment import ensure_automatic_dm_enrollment, full_history_enabled
 from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage as _ExtractedMessage
-from .message_history.contracts import MessageHistoryAccessLostError, MessageHistoryUnavailableError
+from .message_history.contracts import HISTORY_PAGE_SIZE, MessageHistoryAccessLostError, MessageHistoryUnavailableError
 from .message_history.ports import FullHistoryPagePort
 from .messages.sqlite_bundle import insert_messages_with_fts
 from .read_state import apply_read_cursor
@@ -59,10 +59,18 @@ from .telegram_rpc_scheduler import (
     rpc_attempt_budget,
     rpc_scope,
 )
-from .topic_attribution_campaign import campaign_pending, next_checkpoint, record_failed_attempt, record_page
+from .topic_attribution_campaign import (
+    advance_campaign,
+    campaign_release_at,
+    record_access_lost,
+    record_deferred,
+    record_failed_attempt,
+    record_page,
+)
 
 logger = logging.getLogger(__name__)
-_BATCH_SIZE = 100
+
+_BATCH_SIZE = HISTORY_PAGE_SIZE
 _DM_ENROLLMENT_KEY_LAST_PUBLICATION_GENERATION = "full_sync_dm_enrollment_last_publication_generation"
 _TOTAL_MESSAGES_REPAIR_GATE_STATE_KEY = "full_sync_total_messages_repair_retry_at"
 _TOTAL_MESSAGES_REPAIR_FAILURE_DELAY_S = 60
@@ -322,7 +330,8 @@ class FullSyncWorker:
         persistence mutation is the constrained topic-id update owned by the
         campaign module, so tombstones and satellite message facts survive.
         """
-        checkpoint = next_checkpoint(self._conn)
+        now = int(time.time())
+        checkpoint = advance_campaign(self._conn, now=now)
         if checkpoint is None:
             return True
         dialog_id, before_message_id = checkpoint
@@ -331,18 +340,25 @@ class FullSyncWorker:
         except MessageHistoryAccessLostError as exc:
             set_access_lost(self._conn, dialog_id, int(time.time()), reason=exc.reason_code)
             self._conn.commit()
-            record_page(self._conn, dialog_id, before_message_id, ())
+            record_access_lost(self._conn, dialog_id, before_message_id, observed_at=now)
+        except TelegramRpcAdmissionDeferred as exc:
+            record_deferred(self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=now)
+            raise
         except (
-            TelegramRpcThrottled,
             RpcAdmissionSaturatedError,
             RpcAdmissionExpiredError,
-            MessageHistoryUnavailableError,
         ) as exc:
-            record_failed_attempt(self._conn, dialog_id, before_message_id, reason=type(exc).__name__)
-            self._last_page_error = exc
+            record_deferred(self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=now)
+            raise
+        except TelegramRpcThrottled as exc:
+            record_deferred(self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=now)
+            _raise_if_latched(exc)
+            raise
+        except MessageHistoryUnavailableError as exc:
+            record_failed_attempt(self._conn, dialog_id, before_message_id, reason=type(exc).__name__, observed_at=now)
         else:
-            record_page(self._conn, dialog_id, before_message_id, page.messages)
-        return not campaign_pending(self._conn)
+            record_page(self._conn, dialog_id, before_message_id, page.messages, observed_at=now)
+        return campaign_release_at(self._conn, now=now) is None
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_LOOKUP)
     async def repair_one_total_messages(self) -> bool:  # noqa: PLR0911
@@ -639,9 +655,9 @@ class FullSyncDemandAdapter:
         if self._worker._next_pending_dialog() is not None:
             return DemandStatus(release_at=0.0)
         repair_release_at = self._worker._total_messages_repair_release_at(now)
-        if repair_release_at is not None:
-            return DemandStatus(release_at=repair_release_at)
-        return DemandStatus(release_at=0.0) if campaign_pending(self._worker._conn, now=int(now)) else None
+        campaign_release = campaign_release_at(self._worker._conn, now=int(now))
+        releases = [release for release in (repair_release_at, campaign_release) if release is not None]
+        return None if not releases else DemandStatus(release_at=min(releases))
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
         """Fetch at most one history page under the transport attempt budget."""
@@ -657,16 +673,16 @@ class FullSyncDemandAdapter:
                         await self._worker.process_one_batch()
                         if self._worker._last_page_error is not None:
                             raise self._worker._last_page_error
+                    elif campaign_release_at(self._worker._conn, now=int(time.time())) == 0.0:
+                        await self._worker.process_topic_attribution_campaign_page()
                     elif self._worker._next_total_messages_repair_dialog() is not None:
                         await self._worker.repair_one_total_messages()
                         if self._worker._last_total_repair_error is not None:
                             raise self._worker._last_total_repair_error
                     else:
-                        await self._worker.process_topic_attribution_campaign_page()
-                        # Campaign failures are persisted and bounded by its
-                        # own terminal policy; they must not abandon its state.
+                        return
                 except RpcAttemptBudgetExhaustedError:
-                    return
+                    raise
 
 
 class FullSyncDmEnrollmentDemandAdapter:
@@ -698,6 +714,7 @@ _EXPORTED_SYMBOLS = (
     FullSyncDemandAdapter,
     FullSyncWorker,
     FullSyncWorker.process_one_batch,
+    FullSyncWorker.process_topic_attribution_campaign_page,
     FullSyncWorker.repair_one_total_messages,
 )
 

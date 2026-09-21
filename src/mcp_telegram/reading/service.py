@@ -503,21 +503,6 @@ def _telegram_history_kwargs(req: _ListMessagesTelegramRequest) -> dict[str, obj
     }
 
 
-def _telegram_request_from_db_request(req: _ListMessagesDbRequest) -> _ListMessagesTelegramRequest:
-    return _ListMessagesTelegramRequest(
-        dialog_id=req.dialog_id,
-        limit=req.limit,
-        direction=req.direction,
-        direction_enum=req.direction_enum,
-        anchor_msg_id=req.anchor_msg_id,
-        sender_id=req.sender_id,
-        topic_id=req.topic_id,
-        unread_after_id=req.unread_after_id,
-        since_utc=req.since_utc,
-        until_utc=req.until_utc,
-    )
-
-
 def _status_from_row(row: object | None) -> str | None:
     if row is None:
         return None
@@ -557,11 +542,11 @@ def _topic_selection_state(
         return None
     if messages:
         return "present"
-    # A local empty selection is absent only after a complete local full-history
-    # pass with the matching complete attribution receipt.  Archived and
-    # in-progress histories remain unknown even when they currently have rows.
-    if status == "synced" and receipt.get("state") == "complete":
-        return "absent"
+    # Topic roots and legal General-topic members can retain NULL attribution
+    # even after a complete current extraction pass. A local empty filter
+    # therefore cannot prove remote topic absence without a separate
+    # topic-member receipt, which this release deliberately does not invent.
+    del status, receipt
     return "unknown"
 
 

@@ -169,13 +169,14 @@ list_topics(exact_dialog_id=<dialog_id>)
 list_messages(exact_dialog_id=<dialog_id>, exact_topic_id=<topic_id>)
 ```
 
-For a topic-filtered local result, `coverage.selection_state` is `present`,
-`absent`, or `unknown`. Empty remains `unknown` unless the local full-history
-and topic-attribution receipts are both complete; topic catalog metadata alone
-does not establish absence. This release also has a temporary, deployment-local
+For a topic-filtered local result, `coverage.selection_state` is `present` or
+`unknown`. Empty remains `unknown`: topic roots and General-topic members may
+legally have no persisted marker, so local history cannot establish absence.
+This release also has a temporary, deployment-local
 repair for the two production-confirmed synced bot dialogs. An operator enrolls
 those ids through the running daemon with `mcp-telegram topic-attribution
-enroll <dialog-id> <dialog-id>`; ids are never stored in the repository. The
+enroll <dialog-id> <dialog-id>`; ids are never stored in the repository. Use
+`mcp-telegram topic-attribution status` to read its reconciled counters. The
 campaign is bounded and restart-safe, and PR2 must remove its command and
 executor after the repair terminates.
 

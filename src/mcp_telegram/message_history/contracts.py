@@ -7,7 +7,7 @@ from typing import Final
 
 from ..message_contracts import ExtractedMessage
 
-_MAX_HISTORY_PAGE_SIZE: Final = 100
+HISTORY_PAGE_SIZE: Final = 100
 
 
 class MessageHistoryAccessLostError(RuntimeError):
@@ -52,7 +52,7 @@ class ForwardGapPage:
     def __post_init__(self) -> None:
         if not isinstance(self.messages, tuple):
             raise TypeError("messages must be a tuple")
-        if len(self.messages) > _MAX_HISTORY_PAGE_SIZE:
+        if len(self.messages) > HISTORY_PAGE_SIZE:
             raise ValueError("forward gap pages must contain at most 100 messages")
         if any(not isinstance(message, ExtractedMessage) for message in self.messages):
             raise TypeError("messages must contain ExtractedMessage values")
@@ -61,6 +61,7 @@ class ForwardGapPage:
 
 
 __all__ = [
+    "HISTORY_PAGE_SIZE",
     "ForwardGapPage",
     "FullHistoryPage",
     "MessageHistoryAccessLostError",

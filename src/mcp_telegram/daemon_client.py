@@ -419,6 +419,10 @@ class DaemonConnection:
         """Enroll exactly two currently synced bot dialogs in the temporary repair."""
         return await self.request({"method": "enroll_topic_attribution_campaign", "dialog_ids": dialog_ids})
 
+    async def get_topic_attribution_campaign_status(self) -> dict:
+        """Read the privacy-safe receipt for the temporary topic repair."""
+        return await self.request({"method": "get_topic_attribution_campaign_status"})
+
     async def list_conversation_changes(  # noqa: PLR0913
         self,
         *,

@@ -113,7 +113,7 @@ from .telegram_rpc_scheduler import (
     UnclassifiedTelegramRpcError,
     rpc_scope,
 )
-from .topic_attribution_campaign import TopicAttributionCampaignError, enroll_campaign
+from .topic_attribution_campaign import TopicAttributionCampaignError, campaign_status, enroll_campaign
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
 
@@ -981,6 +981,7 @@ class DaemonAPIServer:
             "get_me": self._get_me,
             "mark_dialog_for_sync": self._mark_dialog_for_sync,
             "enroll_topic_attribution_campaign": self._enroll_topic_attribution_campaign,
+            "get_topic_attribution_campaign_status": self._get_topic_attribution_campaign_status,
             "get_sync_status": self._get_sync_status,
             "recover_dialog_directory": self._recover_dialog_directory,
             "list_conversation_changes": self._list_conversation_changes,
@@ -1723,6 +1724,10 @@ class DaemonAPIServer:
             return {"ok": False, "error": "topic_attribution_campaign_ineligible", "message": str(exc)}
         offer_durable_demand(self._require_demand_sink(), DemandKind.FULL_SYNC_PAGE)
         return {"ok": True, "data": {"state": manifest["state"], "dialog_count": len(raw_ids)}}
+
+    def _get_topic_attribution_campaign_status(self, _req: dict[str, object]) -> dict[str, object]:
+        """Expose the temporary campaign's privacy-safe completion receipt."""
+        return {"ok": True, "data": campaign_status(self._conn)}
 
     # ------------------------------------------------------------------
     # get_sync_status

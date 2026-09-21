@@ -5,11 +5,11 @@ from typing import Annotated, cast
 from typer import Argument, BadParameter, Option, Typer
 
 from .config import ConfigError, HttpServerConfig, load_config, resolve_http_server_config, resolve_logging_config
+from .topic_attribution_campaign import CAMPAIGN_DIALOG_COUNT
 
 app = Typer(no_args_is_help=True)
 topic_attribution_app = Typer(help="Temporary operator enrollment for the two-dialog topic repair.")
 app.add_typer(topic_attribution_app, name="topic-attribution")
-_TOPIC_ATTRIBUTION_CAMPAIGN_DIALOG_COUNT = 2
 
 
 def _resolve_http_host(host: str | None, *, base: HttpServerConfig | None = None) -> str:
@@ -119,7 +119,7 @@ def enroll_topic_attribution_campaign(
     """Enroll the deployment-local, finite topic-attribution repair campaign."""
     import sys
 
-    if len(dialog_ids) != _TOPIC_ATTRIBUTION_CAMPAIGN_DIALOG_COUNT:
+    if len(dialog_ids) != CAMPAIGN_DIALOG_COUNT:
         raise BadParameter("provide exactly two dialog ids")
 
     from .daemon_client import daemon_connection
@@ -132,6 +132,31 @@ def enroll_topic_attribution_campaign(
             return
         print(f"Error: {response.get('message') or response.get('error') or 'unknown error'}")
         sys.exit(1)
+
+    asyncio.run(_run())
+
+
+@topic_attribution_app.command("status")
+def topic_attribution_campaign_status() -> None:
+    """Print the temporary repair's state, terminal reason, and reconciled counts."""
+    import sys
+
+    from .daemon_client import daemon_connection
+
+    async def _run() -> None:
+        async with daemon_connection() as conn:
+            response = await conn.get_topic_attribution_campaign_status()
+        if not response.get("ok"):
+            print(f"Error: {response.get('message') or response.get('error') or 'unknown error'}")
+            sys.exit(1)
+        data = cast(dict[str, object], response["data"])
+        counts = cast(dict[str, object], data["counts"])
+        print(
+            f"state={data['state']} terminal_reason={data['terminal_reason']} "
+            f"pending_dialogs={data.get('pending_dialogs', 0)} "
+            f"attributed={counts['attributed']} no_topic={counts['no_topic']} "
+            f"no_longer_needed={counts['no_longer_needed']} unresolved={counts['unresolved']}"
+        )
 
     asyncio.run(_run())
 

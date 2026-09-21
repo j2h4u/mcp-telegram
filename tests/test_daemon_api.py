@@ -4740,6 +4740,23 @@ async def test_list_messages_unknown_topic_for_synced_dialog_does_not_call_teleg
     assert result["data"]["selection_state"] == "unknown"
 
 
+def test_topic_attribution_campaign_status_route_is_privacy_safe() -> None:
+    conn = _make_db()
+    server = make_server(conn)
+
+    result = server._get_topic_attribution_campaign_status({})
+
+    assert result == {
+        "ok": True,
+        "data": {
+            "state": "none",
+            "terminal_reason": None,
+            "dialog_count": 0,
+            "counts": {"attributed": 0, "no_topic": 0, "no_longer_needed": 0, "unresolved": 0},
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Phase 35-01: list_messages — unread filter (sync.db)
 # ---------------------------------------------------------------------------

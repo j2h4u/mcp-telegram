@@ -416,11 +416,16 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
     assert cast(dict[str, object], read_state)["header_lines"] == ["[read-state: all caught up]"]
 
 
-def test_list_messages_warns_when_exact_topic_is_empty_in_selected_dialog() -> None:
+def test_list_messages_warns_honestly_when_exact_topic_selection_is_unknown() -> None:
     payload = _list_messages_structured_content(
         _ListMessagesStructuredContentContext(
             args=ListMessages(exact_dialog_id=591994976, exact_topic_id=306001, limit=10),
-            data={"messages": [], "source": "sync_db", "dialog_access": "live"},
+            data={
+                "messages": [],
+                "source": "sync_db",
+                "dialog_access": "live",
+                "selection_state": "unknown",
+            },
             rows=[],
             dialog_id=591994976,
             sender_id=None,
@@ -431,10 +436,10 @@ def test_list_messages_warns_when_exact_topic_is_empty_in_selected_dialog() -> N
         )
     )
     warnings = cast(list[dict[str, object]], payload["warnings"])
-    assert warnings[0]["kind"] == "dialog_identifier_mismatch"
-    assert warnings[0]["severity"] == "action_required"
-    assert "dialog set to" in cast(str, warnings[0]["action"])
-    assert "previously returned by mcp-telegram" in cast(str, warnings[0]["action"])
+    assert warnings[0]["kind"] == "topic_selection_unknown"
+    assert warnings[0]["severity"] == "warning"
+    assert "action" not in warnings[0]
+    assert "membership remains unknown" in cast(str, warnings[0]["message"])
     assert payload["limits"] == {
         "requested_limit": 10,
         "applied_limit": 10,
