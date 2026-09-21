@@ -721,7 +721,7 @@ def test_schema_version_records_current(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-    assert _CURRENT_SCHEMA_VERSION == 71
+    assert _CURRENT_SCHEMA_VERSION == 72
 
 
 def test_genuine_v61_fixture_upgrades_to_v62_and_reopens_idempotently(
@@ -1510,7 +1510,26 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 71
+    assert _CURRENT_SCHEMA_VERSION == 72
+
+
+def test_migration_v72_keeps_existing_topic_attribution_unknown(tmp_path: Path) -> None:
+    """A NULL legacy projection is not a topic-absence receipt."""
+    db_path = _make_v24_db(tmp_path)
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT topic_attribution_version, topic_attribution_state, "
+            "topic_attribution_observed_at, topic_attribution_completed_at "
+            "FROM synced_dialogs WHERE dialog_id=1"
+        ).fetchone()
+        assert row is None
+        conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (1, 'synced')")
+        assert conn.execute(
+            "SELECT topic_attribution_version, topic_attribution_state, "
+            "topic_attribution_observed_at, topic_attribution_completed_at "
+            "FROM synced_dialogs WHERE dialog_id=1"
+        ).fetchone() == (0, "unknown", None, None)
 
 
 def test_migration_v70_normalizes_legacy_read_date_rows() -> None:

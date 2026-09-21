@@ -415,6 +415,10 @@ class DaemonConnection:
         """Ask the daemon writer to replace an explicitly latched invalid attempt."""
         return await self.request({"method": "recover_dialog_directory"})
 
+    async def enroll_topic_attribution_campaign(self, *, dialog_ids: list[int]) -> dict:
+        """Enroll exactly two currently synced bot dialogs in the temporary repair."""
+        return await self.request({"method": "enroll_topic_attribution_campaign", "dialog_ids": dialog_ids})
+
     async def list_conversation_changes(  # noqa: PLR0913
         self,
         *,

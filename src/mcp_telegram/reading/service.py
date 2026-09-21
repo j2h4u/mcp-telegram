@@ -528,23 +528,41 @@ def _status_from_row(row: object | None) -> str | None:
     return None if value is None else str(value)
 
 
-def _topic_known_for_dialog(conn: sqlite3.Connection, dialog_id: int, topic_id: int) -> bool:
-    return (
+def _topic_attribution_receipt(conn: sqlite3.Connection, dialog_id: int) -> dict[str, object]:
+    """Read the local projection receipt without inferring history completeness."""
+    row = _fetchone_row(
         conn.execute(
-            "SELECT 1 FROM topic_metadata WHERE dialog_id = ? AND topic_id = ? LIMIT 1",
-            (dialog_id, topic_id),
-        ).fetchone()
-        is not None
+            "SELECT topic_attribution_version, topic_attribution_state, "
+            "topic_attribution_observed_at, topic_attribution_completed_at "
+            "FROM synced_dialogs WHERE dialog_id = ?",
+            (dialog_id,),
+        )
     )
+    if row is None:
+        return {"version": 0, "state": "unknown", "observed_at": None, "completed_at": None}
+    values = _row_sequence(row)
+    return {
+        "version": int(cast(int | str, values[0] or 0)),
+        "state": str(values[1] or "unknown"),
+        "observed_at": values[2],
+        "completed_at": values[3],
+    }
 
 
-def _should_fetch_topic_from_telegram(
-    conn: sqlite3.Connection,
-    dialog_id: int,
-    topic_id: int | None,
-    messages: Sequence[object],
-) -> bool:
-    return topic_id is not None and not messages and _topic_known_for_dialog(conn, dialog_id, topic_id)
+def _topic_selection_state(
+    *, topic_id: object, messages: Sequence[object], status: str | None, receipt: Mapping[str, object]
+) -> str | None:
+    """Classify a topic-filtered page without treating NULL as Telegram absence."""
+    if topic_id is None:
+        return None
+    if messages:
+        return "present"
+    # A local empty selection is absent only after a complete local full-history
+    # pass with the matching complete attribution receipt.  Archived and
+    # in-progress histories remain unknown even when they currently have rows.
+    if status == "synced" and receipt.get("state") == "complete":
+        return "absent"
+    return "unknown"
 
 
 class ReadingService:
@@ -956,20 +974,16 @@ class ReadingService:
             result["data"]["dialog_type"] = dialog_type
             result["data"]["read_state"] = read_state
             with timing_phase("local_projection"):
-                fetch_topic = _should_fetch_topic_from_telegram(
-                    self._conn, dialog_id, request.topic_id, result["data"]["messages"]
+                receipt = _topic_attribution_receipt(self._conn, dialog_id)
+                result["data"]["topic_attribution"] = receipt
+                selection_state = _topic_selection_state(
+                    topic_id=request.topic_id,
+                    messages=result["data"]["messages"],
+                    status=status,
+                    receipt=receipt,
                 )
-            if fetch_topic:
-                _set_timing_route("telegram_topic_fallback", fallback=True)
-                telegram_result = await self._list_messages_from_telegram(_telegram_request_from_db_request(db_request))
-                if telegram_result.get("ok") and telegram_result["data"]["messages"]:
-                    telegram_result["data"]["source"] = "telegram_topic_fallback"
-                    with timing_phase("local_projection"):
-                        telegram_access_metadata = _build_access_metadata(self._conn, dialog_id, status)
-                    telegram_result["data"].update(telegram_access_metadata)
-                    telegram_result["data"]["dialog_type"] = dialog_type
-                    telegram_result["data"]["read_state"] = read_state
-                    return telegram_result
+                if selection_state is not None:
+                    result["data"]["selection_state"] = selection_state
             return result
 
         _set_timing_route("telegram_fallback", fallback=True)

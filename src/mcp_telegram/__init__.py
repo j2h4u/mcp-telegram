@@ -7,6 +7,9 @@ from typer import Argument, BadParameter, Option, Typer
 from .config import ConfigError, HttpServerConfig, load_config, resolve_http_server_config, resolve_logging_config
 
 app = Typer(no_args_is_help=True)
+topic_attribution_app = Typer(help="Temporary operator enrollment for the two-dialog topic repair.")
+app.add_typer(topic_attribution_app, name="topic-attribution")
+_TOPIC_ATTRIBUTION_CAMPAIGN_DIALOG_COUNT = 2
 
 
 def _resolve_http_host(host: str | None, *, base: HttpServerConfig | None = None) -> str:
@@ -104,6 +107,30 @@ def recover_dialog_directory() -> None:
             return
         message = response.get("message") or response.get("error") or "unknown error"
         print(f"Error: {message}")
+        sys.exit(1)
+
+    asyncio.run(_run())
+
+
+@topic_attribution_app.command("enroll")
+def enroll_topic_attribution_campaign(
+    dialog_ids: Annotated[list[int], Argument(help="Exactly two currently synced bot dialog ids.")],
+) -> None:
+    """Enroll the deployment-local, finite topic-attribution repair campaign."""
+    import sys
+
+    if len(dialog_ids) != _TOPIC_ATTRIBUTION_CAMPAIGN_DIALOG_COUNT:
+        raise BadParameter("provide exactly two dialog ids")
+
+    from .daemon_client import daemon_connection
+
+    async def _run() -> None:
+        async with daemon_connection() as conn:
+            response = await conn.enroll_topic_attribution_campaign(dialog_ids=dialog_ids)
+        if response.get("ok"):
+            print("Topic-attribution repair enrolled for two bot dialogs.")
+            return
+        print(f"Error: {response.get('message') or response.get('error') or 'unknown error'}")
         sys.exit(1)
 
     asyncio.run(_run())

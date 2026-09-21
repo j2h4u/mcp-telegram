@@ -59,12 +59,14 @@ from .telegram_rpc_scheduler import (
     rpc_attempt_budget,
     rpc_scope,
 )
+from .topic_attribution_campaign import campaign_pending, next_checkpoint, record_failed_attempt, record_page
 
 logger = logging.getLogger(__name__)
 _BATCH_SIZE = 100
 _DM_ENROLLMENT_KEY_LAST_PUBLICATION_GENERATION = "full_sync_dm_enrollment_last_publication_generation"
 _TOTAL_MESSAGES_REPAIR_GATE_STATE_KEY = "full_sync_total_messages_repair_retry_at"
 _TOTAL_MESSAGES_REPAIR_FAILURE_DELAY_S = 60
+_TOPIC_ATTRIBUTION_EXTRACTOR_VERSION = 1
 
 
 @contextmanager
@@ -312,6 +314,36 @@ class FullSyncWorker:
         # Dialog done — check if more pending dialogs remain
         return self._next_pending_dialog() is None
 
+    @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
+    async def process_topic_attribution_campaign_page(self) -> bool:
+        """Run one removable campaign page through the normal history port.
+
+        The campaign never inserts or replaces a message bundle.  Its only
+        persistence mutation is the constrained topic-id update owned by the
+        campaign module, so tombstones and satellite message facts survive.
+        """
+        checkpoint = next_checkpoint(self._conn)
+        if checkpoint is None:
+            return True
+        dialog_id, before_message_id = checkpoint
+        try:
+            page = await self._history_port.fetch_page(dialog_id, before_message_id=before_message_id)
+        except MessageHistoryAccessLostError as exc:
+            set_access_lost(self._conn, dialog_id, int(time.time()), reason=exc.reason_code)
+            self._conn.commit()
+            record_page(self._conn, dialog_id, before_message_id, ())
+        except (
+            TelegramRpcThrottled,
+            RpcAdmissionSaturatedError,
+            RpcAdmissionExpiredError,
+            MessageHistoryUnavailableError,
+        ) as exc:
+            record_failed_attempt(self._conn, dialog_id, before_message_id, reason=type(exc).__name__)
+            self._last_page_error = exc
+        else:
+            record_page(self._conn, dialog_id, before_message_id, page.messages)
+        return not campaign_pending(self._conn)
+
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_LOOKUP)
     async def repair_one_total_messages(self) -> bool:  # noqa: PLR0911
         """Repair one missing Telegram history total under a single RPC budget."""
@@ -520,10 +552,12 @@ class FullSyncWorker:
         if not batch:
             now = int(time.time())
             with self._conn:
+                self._begin_topic_attribution_pass(dialog_id, sync_progress, now)
                 self._conn.execute(
                     _UPDATE_PROGRESS_DONE_SQL,
                     (sync_progress, "synced", total_messages, now, dialog_id, dialog_id),
                 )
+                self._complete_topic_attribution_pass(dialog_id, now)
             logger.info("sync_done dialog_id=%d status=synced (empty batch)", dialog_id)
             return sync_progress, True
 
@@ -537,6 +571,8 @@ class FullSyncWorker:
             if not full_history_enabled(self._conn, dialog_id):
                 logger.info("sync_batch_discarded_disabled dialog_id=%d fetched=%d", dialog_id, len(rows))
                 return sync_progress, True
+            now = int(time.time())
+            self._begin_topic_attribution_pass(dialog_id, sync_progress, now)
             insert_messages_with_fts(
                 self._conn,
                 rows,
@@ -544,11 +580,11 @@ class FullSyncWorker:
                 reaction_observed_at=reaction_observed_at,
             )
             if is_done:
-                now = int(time.time())
                 self._conn.execute(
                     _UPDATE_PROGRESS_DONE_SQL,
                     (new_progress, new_status, total_messages, now, dialog_id, dialog_id),
                 )
+                self._complete_topic_attribution_pass(dialog_id, now)
             else:
                 self._conn.execute(
                     _UPDATE_PROGRESS_SQL,
@@ -566,6 +602,29 @@ class FullSyncWorker:
             logger.info("sync_done dialog_id=%d status=synced total_messages=%s", dialog_id, total_messages)
         return new_progress, is_done
 
+    def _begin_topic_attribution_pass(self, dialog_id: int, sync_progress: int, observed_at: int) -> None:
+        """Mark a newly started current-extractor full-history pass as partial.
+
+        Legacy synced rows never enter ``process_one_batch``.  This guard keeps
+        realtime and delta ingestion from silently upgrading their receipt.
+        """
+        if sync_progress != 0:
+            return
+        self._conn.execute(
+            "UPDATE synced_dialogs SET topic_attribution_version=?, topic_attribution_state='partial', "
+            "topic_attribution_observed_at=?, topic_attribution_completed_at=NULL "
+            "WHERE dialog_id=? AND status IN ('not_synced', 'syncing')",
+            (_TOPIC_ATTRIBUTION_EXTRACTOR_VERSION, observed_at, dialog_id),
+        )
+
+    def _complete_topic_attribution_pass(self, dialog_id: int, completed_at: int) -> None:
+        """Publish a complete receipt only at the authoritative full-history terminal."""
+        self._conn.execute(
+            "UPDATE synced_dialogs SET topic_attribution_state='complete', topic_attribution_completed_at=? "
+            "WHERE dialog_id=? AND topic_attribution_version=? AND topic_attribution_state='partial'",
+            (completed_at, dialog_id, _TOPIC_ATTRIBUTION_EXTRACTOR_VERSION),
+        )
+
 
 class FullSyncDemandAdapter:
     """Bounded durable adapter over ``synced_dialogs.sync_progress``."""
@@ -580,9 +639,9 @@ class FullSyncDemandAdapter:
         if self._worker._next_pending_dialog() is not None:
             return DemandStatus(release_at=0.0)
         repair_release_at = self._worker._total_messages_repair_release_at(now)
-        if repair_release_at is None:
-            return None
-        return DemandStatus(release_at=repair_release_at)
+        if repair_release_at is not None:
+            return DemandStatus(release_at=repair_release_at)
+        return DemandStatus(release_at=0.0) if campaign_pending(self._worker._conn, now=int(now)) else None
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
         """Fetch at most one history page under the transport attempt budget."""
@@ -598,10 +657,14 @@ class FullSyncDemandAdapter:
                         await self._worker.process_one_batch()
                         if self._worker._last_page_error is not None:
                             raise self._worker._last_page_error
-                    else:
+                    elif self._worker._next_total_messages_repair_dialog() is not None:
                         await self._worker.repair_one_total_messages()
                         if self._worker._last_total_repair_error is not None:
                             raise self._worker._last_total_repair_error
+                    else:
+                        await self._worker.process_topic_attribution_campaign_page()
+                        # Campaign failures are persisted and bounded by its
+                        # own terminal policy; they must not abandon its state.
                 except RpcAttemptBudgetExhaustedError:
                     return
 

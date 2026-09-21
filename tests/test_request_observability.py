@@ -606,7 +606,7 @@ async def test_scheduled_inner_shape_is_measured_independently(
 
 
 @pytest.mark.asyncio
-async def test_empty_topic_fallback_observes_attempted_route_and_local_result() -> None:
+async def test_empty_topic_selection_records_local_route_without_acquisition() -> None:
     class Sink:
         def __init__(self) -> None:
             self.events: list[dict[str, object]] = []
@@ -622,36 +622,27 @@ async def test_empty_topic_fallback_observes_attempted_route_and_local_result() 
     _insert_message(conn, dialog_id, 100, text="without topic")
     client = _TestClient()
 
-    async def empty_iter(*_args: object, **_kwargs: object):
-        if False:
-            yield None
-
-    async def failed_iter(*_args: object, **_kwargs: object):
-        raise RuntimeError("telegram unavailable")
-        yield None
-
-    for index, iterator in enumerate((empty_iter, failed_iter), start=1):
-        client.iter_messages = iterator
-        sink = Sink()
-        server = make_server(conn, client)
-        server._runtime_observation_sink = cast(RuntimeObservationSink, sink)
-        response, _, _ = await server._handle_client_line(
-            json.dumps(
-                {
-                    "method": "list_messages",
-                    "operation_id": f"{index + 7:032x}",
-                    "dialog_id": dialog_id,
-                    "topic_id": topic_id,
-                }
-            ).encode(),
-            "",
-            None,
-        )
-        assert response["ok"] is True
-        assert response["data"]["source"] == "sync_db"
-        payload = cast(dict[str, object], sink.events[0]["payload"])
-        assert payload["route_attempted"] == "telegram_topic_fallback"
-        assert payload["served_source"] == "local"
+    client.iter_messages = AsyncMock(side_effect=AssertionError("no topic fallback acquisition"))
+    sink = Sink()
+    server = make_server(conn, client)
+    server._runtime_observation_sink = cast(RuntimeObservationSink, sink)
+    response, _, _ = await server._handle_client_line(
+        json.dumps(
+            {
+                "method": "list_messages",
+                "operation_id": f"{8:032x}",
+                "dialog_id": dialog_id,
+                "topic_id": topic_id,
+            }
+        ).encode(),
+        "",
+        None,
+    )
+    assert response["ok"] is True
+    assert response["data"]["source"] == "sync_db"
+    payload = cast(dict[str, object], sink.events[0]["payload"])
+    assert payload["route_attempted"] == "local_history"
+    assert payload["served_source"] == "local"
 
 
 @pytest.mark.asyncio

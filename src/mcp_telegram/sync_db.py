@@ -14,7 +14,7 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 71
+_CURRENT_SCHEMA_VERSION = 72
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -37,6 +37,7 @@ _REACTION_DETAIL_LIFECYCLE_MIGRATION_68 = 68
 _REACTION_DETAIL_PACING_MIGRATION_69 = 69
 _READ_DATE_OUTCOME_MIGRATION_70 = 70
 _READ_DATE_EXPIRY_CUTOFF_MIGRATION_71 = 71
+_TOPIC_ATTRIBUTION_RECEIPT_MIGRATION_72 = 72
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
@@ -4148,6 +4149,30 @@ def _apply_migration_71(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
+def _apply_migration_72(conn: sqlite3.Connection, current: int) -> int:
+    """Add per-dialog receipts for persisted message topic attribution.
+
+    These fields describe only the quality of the local message projection.
+    Existing history is deliberately left ``unknown``: a schema upgrade did
+    not observe Telegram and therefore cannot establish topic absence.
+    """
+    return _apply_migration(
+        conn,
+        current,
+        _TOPIC_ATTRIBUTION_RECEIPT_MIGRATION_72,
+        [
+            "ALTER TABLE synced_dialogs ADD COLUMN topic_attribution_version INTEGER NOT NULL DEFAULT 0",
+            (
+                "ALTER TABLE synced_dialogs ADD COLUMN topic_attribution_state TEXT NOT NULL DEFAULT 'unknown' "
+                "CHECK (topic_attribution_state IN ('unknown', 'partial', 'complete'))"
+            ),
+            "ALTER TABLE synced_dialogs ADD COLUMN topic_attribution_observed_at INTEGER",
+            "ALTER TABLE synced_dialogs ADD COLUMN topic_attribution_completed_at INTEGER",
+        ],
+        ignore_duplicate_column=True,
+    )
+
+
 def _apply_migrations_64_to_67(conn: sqlite3.Connection, current: int) -> int:
     """Apply the ordered canonical-directory and folder migrations."""
     if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64:
@@ -4256,6 +4281,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_70(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _READ_DATE_EXPIRY_CUTOFF_MIGRATION_71:
         current = _apply_migration_71(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _TOPIC_ATTRIBUTION_RECEIPT_MIGRATION_72:
+        current = _apply_migration_72(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

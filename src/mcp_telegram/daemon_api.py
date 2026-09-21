@@ -113,6 +113,7 @@ from .telegram_rpc_scheduler import (
     UnclassifiedTelegramRpcError,
     rpc_scope,
 )
+from .topic_attribution_campaign import TopicAttributionCampaignError, enroll_campaign
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
 
@@ -190,7 +191,7 @@ def _served_source(response: Mapping[str, object]) -> str:
         source = data.get("source")
         if source in {"sync_db", "scheduled_messages", "sync_db+scheduled_messages"}:
             return "local"
-        if source in {"telegram", "telegram_topic_fallback"}:
+        if source == "telegram":
             return "telegram"
     return "unknown" if response.get("ok") else "error"
 
@@ -979,6 +980,7 @@ class DaemonAPIServer:
             "list_topics": self._list_topics,
             "get_me": self._get_me,
             "mark_dialog_for_sync": self._mark_dialog_for_sync,
+            "enroll_topic_attribution_campaign": self._enroll_topic_attribution_campaign,
             "get_sync_status": self._get_sync_status,
             "recover_dialog_directory": self._recover_dialog_directory,
             "list_conversation_changes": self._list_conversation_changes,
@@ -1707,6 +1709,20 @@ class DaemonAPIServer:
                 "full_history_will_be_fetched": outcome.full_history_will_be_fetched,
             },
         }
+
+    def _enroll_topic_attribution_campaign(self, req: dict[str, object]) -> dict[str, object]:
+        """Accept the explicit two-bot deployment enrollment and wake its page slice."""
+        raw_ids = req.get("dialog_ids")
+        if not isinstance(raw_ids, list) or any(
+            isinstance(value, bool) or not isinstance(value, int) for value in raw_ids
+        ):
+            return {"ok": False, "error": "invalid_input", "message": "dialog_ids must be two integer ids"}
+        try:
+            manifest = enroll_campaign(self._conn, cast(list[int], raw_ids))
+        except TopicAttributionCampaignError as exc:
+            return {"ok": False, "error": "topic_attribution_campaign_ineligible", "message": str(exc)}
+        offer_durable_demand(self._require_demand_sink(), DemandKind.FULL_SYNC_PAGE)
+        return {"ok": True, "data": {"state": manifest["state"], "dialog_count": len(raw_ids)}}
 
     # ------------------------------------------------------------------
     # get_sync_status

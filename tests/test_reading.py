@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from mcp_telegram.models import ReadReactionEvent
 from mcp_telegram.tools.reading import (
+    LIST_MESSAGES_OUTPUT_SCHEMA,
     SEARCH_MESSAGES_OUTPUT_SCHEMA,
     ListMessages,
     SearchMessages,
@@ -348,7 +349,9 @@ def test_search_messages_structured_payload_includes_dialog_anchor_read_state_wa
 def test_list_messages_structured_page_metadata_preserves_navigation_warning_coverage_and_limits():
     payload = _list_messages_structured_content(
         _ListMessagesStructuredContentContext(
-            args=ListMessages(exact_dialog_id=123, limit=10, navigation="start", anchor_message_id=50),
+            args=ListMessages(
+                exact_dialog_id=123, exact_topic_id=7, limit=10, navigation="start", anchor_message_id=50
+            ),
             data={
                 "messages": [],
                 "source": "sync_db",
@@ -358,6 +361,8 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
                 "last_synced_at": 1_699_990_000,
                 "last_event_at": 1_699_999_000,
                 "sync_coverage_pct": 80,
+                "selection_state": "unknown",
+                "topic_attribution": {"version": 0, "state": "unknown", "observed_at": None, "completed_at": None},
                 "dialog_type": "User",
                 "read_state": {
                     "inbox_unread_count": 0,
@@ -370,7 +375,7 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
             dialog_id=123,
             sender_id=None,
             sender_name=None,
-            topic_id=None,
+            topic_id=7,
             direction="oldest",
             next_navigation="history-token",
         )
@@ -384,6 +389,14 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
     assert payload["dialog_id"] == 123
     assert coverage["kind"] == "fragment"
     assert coverage["fragment_coverage"] is True
+    assert coverage["selection_state"] == "unknown"
+    assert coverage["topic_attribution"] == {
+        "version": 0,
+        "state": "unknown",
+        "observed_at": None,
+        "completed_at": None,
+    }
+    validate(instance=payload, schema=LIST_MESSAGES_OUTPUT_SCHEMA)
     assert warnings[0]["kind"] == "archived_dialog"
     assert "No current access" in cast(str, warnings[0]["message"])
     assert navigation["next_navigation"] == "history-token"

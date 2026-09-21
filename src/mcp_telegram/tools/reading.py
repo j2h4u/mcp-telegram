@@ -218,6 +218,18 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "last_delta_checked_at": {"type": ["integer", "null"]},
                 "sync_coverage_pct": {"type": ["integer", "null"]},
                 "archived_message_count": {"type": ["integer", "null"]},
+                "selection_state": {"type": "string", "enum": ["present", "absent", "unknown"]},
+                "topic_attribution": {
+                    "type": "object",
+                    "properties": {
+                        "version": {"type": "integer"},
+                        "state": {"type": "string", "enum": ["unknown", "partial", "complete"]},
+                        "observed_at": {"type": ["integer", "null"]},
+                        "completed_at": {"type": ["integer", "null"]},
+                    },
+                    "required": ["version", "state", "observed_at", "completed_at"],
+                    "additionalProperties": False,
+                },
             },
             "required": [
                 "kind",
@@ -442,7 +454,7 @@ def _list_messages_coverage(data: dict) -> dict[str, object]:
         kind = "live"
     else:
         kind = str(data.get("source") or "unknown")
-    return {
+    coverage: dict[str, object] = {
         "kind": kind,
         "state": kind,
         "fragment_coverage": raw_coverage == "fragment",
@@ -454,6 +466,13 @@ def _list_messages_coverage(data: dict) -> dict[str, object]:
         "sync_coverage_pct": data.get("sync_coverage_pct"),
         "archived_message_count": data.get("archived_message_count"),
     }
+    selection_state = data.get("selection_state")
+    if selection_state in {"present", "absent", "unknown"}:
+        coverage["selection_state"] = selection_state
+    topic_attribution = data.get("topic_attribution")
+    if isinstance(topic_attribution, dict):
+        coverage["topic_attribution"] = topic_attribution
+    return coverage
 
 
 def _list_messages_warnings(data: dict) -> list[StructuredWarning]:
