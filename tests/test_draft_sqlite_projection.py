@@ -173,19 +173,6 @@ def test_optional_scope_zero_sentinel_and_constraints(
         )
 
 
-def test_read_transaction_is_local_stable_snapshot(
-    projection: tuple[sqlite3.Connection, SQLiteDraftProjection],
-) -> None:
-    conn, repository = projection
-    scope = DraftScope(100, 200)
-    repository.apply_realtime(_present(scope, 1, "body", source=DraftObservationSource.REALTIME))
-    with repository.read_transaction() as reader:
-        assert reader.execute("SELECT text FROM draft_current WHERE account_id=100 AND dialog_id=200").fetchone() == (
-            "body",
-        )
-    assert not conn.in_transaction
-
-
 def test_v74_upgrade_removes_previews_without_promoting_them(tmp_path: Path) -> None:
     database = tmp_path / "sync.db"
     ensure_sync_schema(database)

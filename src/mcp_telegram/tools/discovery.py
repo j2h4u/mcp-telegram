@@ -55,13 +55,6 @@ TELEGRAM_CONTENT_OUTPUT_SCHEMA = {
     "additionalProperties": False,
 }
 
-NULLABLE_TELEGRAM_CONTENT_OUTPUT_SCHEMA = {
-    "type": ["object", "null"],
-    "properties": TELEGRAM_CONTENT_OUTPUT_SCHEMA["properties"],
-    "required": TELEGRAM_CONTENT_OUTPUT_SCHEMA["required"],
-    "additionalProperties": False,
-}
-
 LIST_DIALOGS_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {

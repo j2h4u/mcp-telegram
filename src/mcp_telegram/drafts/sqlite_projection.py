@@ -260,18 +260,6 @@ class SQLiteDraftProjection:
             return True
 
     @contextmanager
-    def read_transaction(self) -> Iterator[sqlite3.Connection]:
-        """Yield a stable local read snapshot without opening a second database."""
-        if self._conn.in_transaction:
-            yield self._conn
-            return
-        self._conn.execute("BEGIN")
-        try:
-            yield self._conn
-        finally:
-            self._conn.rollback()
-
-    @contextmanager
     def _write_transaction(self) -> Iterator[None]:
         owns_transaction = not self._conn.in_transaction
         if owns_transaction:
