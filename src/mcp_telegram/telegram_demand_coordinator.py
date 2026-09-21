@@ -18,6 +18,7 @@ from mcp_telegram.telegram_demand import (
     DemandToken,
     DurableDemandAdapter,
     RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
     demand_context,
 )
 from mcp_telegram.telegram_rpc_consumers import (
@@ -28,12 +29,23 @@ from mcp_telegram.telegram_rpc_consumers import (
     ExecutionMode,
     demand_contract,
 )
-from mcp_telegram.telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcAdmissionDeferred
+from mcp_telegram.telegram_rpc_scheduler import (
+    RpcAdmissionClosedError,
+    RpcAdmissionExpiredError,
+    RpcAdmissionSaturatedError,
+    TelegramRpcAdmissionDeferred,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_SAFETY_SCAN_SECONDS = 60.0
 MIN_WAIT_SECONDS = 0.001
+_DEFERRED_ERRORS = (
+    TelegramRpcAdmissionDeferred,
+    RpcAttemptBudgetExhaustedError,
+    RpcAdmissionSaturatedError,
+    RpcAdmissionExpiredError,
+)
 
 
 class CoordinatorState(StrEnum):
@@ -275,8 +287,8 @@ class TelegramDemandCoordinator:
             if self._handle_closed_admission(kind, budget):
                 return
             raise
-        except TelegramRpcAdmissionDeferred as exc:
-            self._handle_admission_deferred(kind, budget, exc)
+        except _DEFERRED_ERRORS as exc:
+            self._handle_deferred(kind, budget, exc)
         except TelegramRpcThrottled as exc:
             if self._handle_throttle(kind, budget, exc):
                 raise
@@ -293,11 +305,12 @@ class TelegramDemandCoordinator:
         self._wake.set()
         return False
 
-    def _handle_admission_deferred(
-        self, kind: DemandKind, budget: RpcAttemptBudget, exc: TelegramRpcAdmissionDeferred
-    ) -> None:
-        self._suppress(kind, exc.retry_after_seconds)
-        self._observe("deferred", kind, actual_attempts=budget.attempts, reason="admission_deferred")
+    def _handle_deferred(self, kind: DemandKind, budget: RpcAttemptBudget, exc: Exception) -> None:
+        if isinstance(exc, TelegramRpcAdmissionDeferred):
+            self._suppress(kind, exc.retry_after_seconds)
+            self._observe("deferred", kind, actual_attempts=budget.attempts, reason="admission_deferred")
+            return
+        self._handle_pacing_deferred(kind, budget, exc)
 
     def _handle_throttle(self, kind: DemandKind, budget: RpcAttemptBudget, exc: TelegramRpcThrottled) -> bool:
         if exc.latched:
@@ -307,6 +320,16 @@ class TelegramDemandCoordinator:
         self._global_release_at = max(self._global_release_at or 0.0, self._now() + (exc.retry_after_seconds or 0))
         self._observe("deferred", kind, actual_attempts=budget.attempts, reason="flood_wait")
         return False
+
+    def _handle_pacing_deferred(self, kind: DemandKind, budget: RpcAttemptBudget, exc: Exception) -> None:
+        if isinstance(exc, RpcAttemptBudgetExhaustedError):
+            reason = "attempt_budget_exhausted"
+        elif isinstance(exc, RpcAdmissionSaturatedError):
+            reason = "admission_saturated"
+        else:
+            reason = "admission_expired"
+        self._suppress(kind, self._safety_scan_seconds)
+        self._observe("deferred", kind, actual_attempts=budget.attempts, reason=reason)
 
     def _handle_slice_failure(self, kind: DemandKind, budget: RpcAttemptBudget, exc: Exception) -> None:
         self._suppress(kind, self._safety_scan_seconds)

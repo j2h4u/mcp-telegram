@@ -33,7 +33,12 @@ from mcp_telegram.message_history.telegram_adapter import (
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter, FullSyncWorker
-from mcp_telegram.telegram_demand import AcquisitionKind, RpcAttemptBudget, acquisition_context
+from mcp_telegram.telegram_demand import (
+    AcquisitionKind,
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+    acquisition_context,
+)
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
@@ -427,7 +432,13 @@ async def test_delta_gap_tombstone_cursor_does_not_skip_after_earlier_dialog_is_
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure_type",
-    [TelegramRpcAdmissionDeferred, TelegramRpcThrottled, RpcAdmissionClosedError, RPCError],
+    [
+        TelegramRpcAdmissionDeferred,
+        TelegramRpcThrottled,
+        RpcAdmissionClosedError,
+        RpcAttemptBudgetExhaustedError,
+        RPCError,
+    ],
 )
 async def test_delta_gap_adapter_propagates_coordinator_outcomes_without_checkpoint(
     conn: sqlite3.Connection,
@@ -447,6 +458,8 @@ async def test_delta_gap_adapter_propagates_coordinator_outcomes_without_checkpo
             raise TelegramRpcThrottled(retry_after_seconds=11)
         if failure_type is RpcAdmissionClosedError:
             raise RpcAdmissionClosedError(current_rpc_scope(), "scheduler closed")
+        if failure_type is RpcAttemptBudgetExhaustedError:
+            raise RpcAttemptBudgetExhaustedError("slice attempt budget exhausted")
         raise RPCError(None, "delta failed")
         yield  # pragma: no cover
 
@@ -649,8 +662,6 @@ async def test_access_probe_adapter_persists_probe_to_gap_fill_handoff(conn: sql
     ("error_kind", "expected_retry"),
     [
         ("deferred", 1007),
-        ("saturated", None),
-        ("expired", None),
         ("access", 1100),
         ("flood", 1200),
         ("network", 1100),
@@ -696,6 +707,56 @@ async def test_access_probe_slice_records_retry_policy_for_probe_outcomes(
     assert conn.execute(
         "SELECT access_next_revalidate_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
     ).fetchone() == (expected_retry,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_kind", ["saturated", "expired"])
+async def test_access_probe_propagates_admission_failure_without_retry_boundary(
+    conn: sqlite3.Connection,
+    error_kind: str,
+) -> None:
+    dialog_id = 304
+    _seed_history_dialog(conn, dialog_id, status="access_lost")
+
+    class AdmissionFailureProbe:
+        async def probe_total_messages(self, dialog_id: int) -> int | None:
+            del dialog_id
+            if error_kind == "saturated":
+                raise RpcAdmissionSaturatedError(current_rpc_scope(), "probe capacity is full")
+            raise RpcAdmissionExpiredError(current_rpc_scope(), "probe deadline elapsed")
+
+    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event())
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), AdmissionFailureProbe())
+
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
+        with pytest.raises((RpcAdmissionSaturatedError, RpcAdmissionExpiredError)):
+            await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute(
+        "SELECT access_next_revalidate_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (None,)
+
+
+@pytest.mark.asyncio
+async def test_access_probe_propagates_exhausted_slice_budget(conn: sqlite3.Connection) -> None:
+    dialog_id = 304
+    _seed_history_dialog(conn, dialog_id, status="access_lost")
+
+    class ExhaustedProbe:
+        async def probe_total_messages(self, dialog_id: int) -> int | None:
+            del dialog_id
+            raise RpcAttemptBudgetExhaustedError("slice attempt budget exhausted")
+
+    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event())
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), ExhaustedProbe())
+
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
+        with pytest.raises(RpcAttemptBudgetExhaustedError):
+            await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute(
+        "SELECT access_next_revalidate_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (None,)
     assert conn.execute("SELECT 1 FROM delta_access_recovery_state WHERE dialog_id=?", (dialog_id,)).fetchone() is None
 
 

@@ -41,7 +41,6 @@ from .telegram_demand import (
     AcquisitionKind,
     DemandStatus,
     RpcAttemptBudget,
-    RpcAttemptBudgetExhaustedError,
     UnclassifiedTelegramDemandError,
     acquisition_context,
     current_demand_token,
@@ -49,7 +48,6 @@ from .telegram_demand import (
 )
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
-    RpcAdmissionClosedError,
     RpcAdmissionExpiredError,
     RpcAdmissionSaturatedError,
     TelegramRpcAdmissionDeferred,
@@ -569,16 +567,13 @@ class DeltaGapFillDemandAdapter:
             return
         with demand_context(DemandKind.DELTA_GAP_FILL):
             with rpc_attempt_budget(budget):
-                try:
-                    if candidate[1] == 1:
-                        await self._run_dm_gap_slice(now)
-                    else:
-                        assert candidate[2] is not None
-                        await self._worker.fetch_delta_slice_for_dialog(candidate[2])
-                        if self._worker._last_delta_slice_error is not None:
-                            raise self._worker._last_delta_slice_error
-                except RpcAttemptBudgetExhaustedError:
-                    return
+                if candidate[1] == 1:
+                    await self._run_dm_gap_slice(now)
+                else:
+                    assert candidate[2] is not None
+                    await self._worker.fetch_delta_slice_for_dialog(candidate[2])
+                    if self._worker._last_delta_slice_error is not None:
+                        raise self._worker._last_delta_slice_error
 
 
 def _restore_revalidated_access(
@@ -738,14 +733,8 @@ class DeltaAccessProbeDemandAdapter:
     async def _probe_dialog_for_recovery(self, dialog_id: int, now: int) -> None:
         try:
             result = await self._request_probe(dialog_id)
-        except RpcAttemptBudgetExhaustedError:
-            return
-        except RpcAdmissionClosedError:
-            raise
         except (
             TelegramRpcAdmissionDeferred,
-            RpcAdmissionSaturatedError,
-            RpcAdmissionExpiredError,
             TelegramRpcThrottled,
         ) as exc:
             self._handle_probe_error(dialog_id, now, exc)
@@ -761,16 +750,15 @@ class DeltaAccessProbeDemandAdapter:
 
     def _handle_probe_error(self, dialog_id: int, now: int, exc: BaseException) -> None:
         conn = self._worker._conn
-        if isinstance(exc, (TelegramRpcAdmissionDeferred, RpcAdmissionSaturatedError, RpcAdmissionExpiredError)):
+        if isinstance(exc, TelegramRpcAdmissionDeferred):
             logger.info(
                 "access_probe admission_deferred dialog_id=%d error_type=%s — preserving revalidation budget",
                 dialog_id,
                 type(exc).__name__,
             )
-            if isinstance(exc, TelegramRpcAdmissionDeferred):
-                retry = max(1, int(exc.retry_after_seconds or 1))
-                stamp_access_revalidation(conn, dialog_id, now, retry)
-                conn.commit()
+            retry = max(1, int(exc.retry_after_seconds or 1))
+            stamp_access_revalidation(conn, dialog_id, now, retry)
+            conn.commit()
             return
         if isinstance(exc, MessageHistoryAccessLostError):
             logger.debug("access_still_lost dialog_id=%d", dialog_id)
@@ -814,10 +802,7 @@ class DeltaAccessProbeDemandAdapter:
         if not full_history_enabled(self._worker._conn, recovery.dialog_id):
             _finish_durable_access_recovery(self._worker._conn, recovery)
             return
-        try:
-            await self._worker.fetch_delta_slice_for_dialog(recovery.dialog_id)
-        except RpcAttemptBudgetExhaustedError:
-            return
+        await self._worker.fetch_delta_slice_for_dialog(recovery.dialog_id)
         if self._worker._last_delta_slice_completed:
             _finish_durable_access_recovery(self._worker._conn, recovery)
             return

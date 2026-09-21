@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable, Mapping
 import pytest
 
 from mcp_telegram.flood import TelegramRpcThrottled
-from mcp_telegram.telegram_demand import DemandStatus, RpcAttemptBudget
+from mcp_telegram.telegram_demand import DemandStatus, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
 from mcp_telegram.telegram_demand_coordinator import (
     CoordinatorState,
     TelegramDemandCoordinator,
@@ -175,6 +175,33 @@ async def test_unexpected_failure_is_suppressed_and_other_kind_runs() -> None:
 
     assert len(adapters[first].run_calls) == 1
     assert len(adapters[second].run_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_attempt_budget_exhaustion_is_deferred_and_suppressed() -> None:
+    clock = _Clock()
+    target = DemandKind.DELTA_GAP_FILL
+    adapters = _adapters({target: DemandStatus(0)})
+    adapters[target].run_error = RpcAttemptBudgetExhaustedError("slice attempt budget exhausted")
+    observations: list[dict[str, object]] = []
+
+    coordinator = TelegramDemandCoordinator(
+        adapters,
+        clock=clock,
+        safety_scan_seconds=10,
+        observer=lambda **fields: observations.append(fields),
+    )
+    await coordinator._execute_slice(target)
+    coordinator._active_kind = None
+    coordinator.scan(now=clock.value)
+
+    assert coordinator.ready_kinds == ()
+    assert observations[-1]["outcome"] == "deferred"
+    assert observations[-1]["reason"] == "attempt_budget_exhausted"
+
+    clock.value += 10
+    coordinator.scan(now=clock.value)
+    assert coordinator.ready_kinds == (target,)
 
 
 @pytest.mark.asyncio
