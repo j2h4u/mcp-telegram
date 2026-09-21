@@ -80,6 +80,7 @@ async def run_reconnect_catch_up_loop(
     *,
     interval_seconds: float,
     observe: Callable[[str, str, str | None], None] | None = None,
+    on_reconnect: Callable[[], None] | None = None,
 ) -> None:
     """Recover missed updates once for each observed reconnect transition.
 
@@ -108,6 +109,8 @@ async def run_reconnect_catch_up_loop(
             recovery_needed = False
         elif not was_connected:
             recovery_needed = True
+            if on_reconnect is not None:
+                on_reconnect()
         if connected and recovery_needed and await _request_catch_up(client, observe):
             recovery_needed = False
         was_connected = connected

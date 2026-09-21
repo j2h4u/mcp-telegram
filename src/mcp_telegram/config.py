@@ -116,6 +116,19 @@ class EntityProfileConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DraftRecoveryConfig:
+    """Retry cadence for recovery of the account-wide draft projection."""
+
+    retry_delays_seconds: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 60)
+
+    def __post_init__(self) -> None:
+        if not self.retry_delays_seconds or any(
+            isinstance(delay, bool) or not isinstance(delay, int) or delay < 1 for delay in self.retry_delays_seconds
+        ):
+            raise ValueError("draft recovery retry schedule must contain positive integers")
+
+
+@dataclass(frozen=True, slots=True)
 class FolderProjectionConfig:
     """Daemon-owned schedule and health policy for folder projections."""
 
@@ -362,6 +375,7 @@ class SchedulingConfig:
     activity_cold_enroll_seconds: float = 1_800.0
     activity_cold_access_retry_seconds: float = 3_600.0
     fact_hydration: FactHydrationConfig = field(default_factory=FactHydrationConfig)
+    draft_recovery: DraftRecoveryConfig = field(default_factory=DraftRecoveryConfig)
     folder_projection: FolderProjectionConfig = field(default_factory=FolderProjectionConfig)
     activity_hot_sweep: ActivityHotSweepConfig = field(default_factory=ActivityHotSweepConfig)
 
@@ -372,6 +386,13 @@ class LoggingConfig:
 
     level: str = "INFO"
     daemon_api_slow_request_seconds: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class ResponseConfig:
+    """Bounded response policy for locally projected MCP reads."""
+
+    draft_response_budget_bytes: int = 256 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,6 +442,7 @@ class McpTelegramConfig:
     telegram_rpc: TelegramRpcConfig = field(default_factory=TelegramRpcConfig)
     entity_profile: EntityProfileConfig = field(default_factory=EntityProfileConfig)
     scheduling: SchedulingConfig = field(default_factory=SchedulingConfig)
+    response: ResponseConfig = field(default_factory=ResponseConfig)
     http: HttpServerConfig = field(default_factory=HttpServerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
@@ -1048,6 +1070,20 @@ def _parse_telemetry(data: dict[str, object], path: Path) -> TelemetryConfig:
     )
 
 
+def _parse_response(data: dict[str, object], path: Path) -> ResponseConfig:
+    response_data = _optional_section(data, "response", {"draft_response_budget_bytes"}, path)
+    defaults = ResponseConfig()
+    return ResponseConfig(
+        draft_response_budget_bytes=_positive_int(
+            response_data,
+            "draft_response_budget_bytes",
+            "response",
+            path,
+            defaults.draft_response_budget_bytes,
+        )
+    )
+
+
 def _parse_flood_wait(data: dict[str, object], path: Path) -> FloodWaitConfig:
     flood_data = _optional_section(
         data,
@@ -1342,6 +1378,20 @@ def _parse_folder_projection(data: dict[str, object], path: Path, defaults: Sche
     )
 
 
+def _parse_draft_recovery(data: dict[str, object], path: Path, defaults: DraftRecoveryConfig) -> DraftRecoveryConfig:
+    section = _nested_table(data, "draft_recovery", "scheduling.draft_recovery", path) or {}
+    _reject_unknown_keys(section, {"retry_delays_seconds"}, "scheduling.draft_recovery", path)
+    return DraftRecoveryConfig(
+        retry_delays_seconds=_retry_schedule(
+            section,
+            "retry_delays_seconds",
+            "scheduling.draft_recovery",
+            path,
+            defaults.retry_delays_seconds,
+        )
+    )
+
+
 def _parse_activity_hot_sweep(
     data: dict[str, object], path: Path, defaults: ActivityHotSweepConfig
 ) -> ActivityHotSweepConfig:
@@ -1421,11 +1471,13 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "activity_cold_backfill_batch_pause_seconds",
         "activity_cold_enroll_seconds",
         "activity_cold_access_retry_seconds",
+        "draft_recovery",
         "fact_hydration",
         "folder_projection",
     }
     scheduling_data = _optional_section(data, "scheduling", allowed, path)
     fact_hydration = _parse_fact_hydration(scheduling_data, path, defaults)
+    draft_recovery = _parse_draft_recovery(scheduling_data, path, defaults.draft_recovery)
     folder_projection = _parse_folder_projection(scheduling_data, path, defaults)
     activity_hot_sweep = _parse_activity_hot_sweep(scheduling_data, path, defaults.activity_hot_sweep)
     return SchedulingConfig(
@@ -1591,6 +1643,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             defaults.activity_cold_access_retry_seconds,
         ),
         fact_hydration=fact_hydration,
+        draft_recovery=draft_recovery,
         folder_projection=folder_projection,
         activity_hot_sweep=activity_hot_sweep,
     )
@@ -1634,6 +1687,7 @@ def load_config(path: Path | None = None) -> McpTelegramConfig:
             "telegram_rpc",
             "entity_profile",
             "scheduling",
+            "response",
             "http",
             "logging",
         },
@@ -1648,6 +1702,7 @@ def load_config(path: Path | None = None) -> McpTelegramConfig:
         telegram_rpc=_parse_telegram_rpc(data, config_path),
         entity_profile=_parse_entity_profile(data, config_path),
         scheduling=_parse_scheduling(data, config_path),
+        response=_parse_response(data, config_path),
         http=_parse_http(data, config_path),
         logging=_parse_logging(data, config_path),
     )

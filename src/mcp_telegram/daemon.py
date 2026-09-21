@@ -71,6 +71,8 @@ from .demand_composition import (
 )
 from .dialog_directory import CanonicalDialogDirectory
 from .dialog_sync import DialogReconciliationWorker
+from .drafts.owner import DraftMessageOwner
+from .drafts.sqlite_projection import SQLiteDraftProjection
 from .entity_profile.ports import UserProfilePort
 from .entity_profile.refresh import RefreshLimits
 from .event_handlers import EventHandlerManager, UpdateProcessingBarrier
@@ -329,6 +331,7 @@ class _SyncMainContext:
     demand_runtime: _DemandRuntime | None = None
     unix_server: asyncio.AbstractServer | None = None
     handler_manager: EventHandlerManager | None = None
+    draft_owner: DraftMessageOwner | None = None
     own_only_context: OwnOnlyContext | None = None
     scheduling: SchedulingConfig = field(default_factory=SchedulingConfig)
     background_tasks: set[asyncio.Task[object]] = field(default_factory=set)
@@ -346,6 +349,7 @@ class _DemandRuntime:
     message_fact_refresh_deps: MessageFactRefreshDeps
     read_receipt_batch: Callable[[], Awaitable[object]]
     startup_identity: StartupIdentityState
+    draft_owner: DraftMessageOwner
 
 
 @dataclass(frozen=True, slots=True)
@@ -1121,6 +1125,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
             folder_snapshot_stale_after_seconds=config.scheduling.folder_projection.stale_threshold_seconds,
             telemetry=config.telemetry,
             slow_request_seconds=config.logging.daemon_api_slow_request_seconds,
+            draft_response_budget_bytes=config.response.draft_response_budget_bytes,
             entity_profile=RefreshLimits(
                 foreground_resolve_seconds=config.entity_profile.foreground_resolve_seconds,
                 foreground_refresh_wait_seconds=config.entity_profile.foreground_refresh_wait_seconds,
@@ -1399,6 +1404,7 @@ def _offer_startup_demands(ctx: _SyncMainContext) -> None:
         DemandKind.DIALOG_BOOTSTRAP,
         DemandKind.FULL_SYNC_PAGE,
         DemandKind.READ_RECEIPT_BATCH,
+        DemandKind.DRAFT_SNAPSHOT,
     ):
         ctx.coordinator.offer(kind)
 
@@ -1538,6 +1544,10 @@ def _build_demand_runtime(
         scheduled_reconciler._own_only_context = own_only_context
         scheduled_reconciler._resolved_context = own_only_context
 
+    draft_owner = ctx.draft_owner
+    if draft_owner is None:
+        raise RuntimeError("draft owner must be registered before demand composition")
+
     try:
         dependencies = DemandCompositionDependencies(
             client=cast(DemandCompositionClient, ctx.client),
@@ -1567,6 +1577,7 @@ def _build_demand_runtime(
             get_self_input_entity=get_self_input_entity,
             user_profile_port=ctx.user_profile_port,
             publish_startup_identity=publish_startup_identity,
+            draft_owner=draft_owner,
             startup_detail_setter=lambda detail: setattr(ctx.api_server, "startup_detail", detail),
         )
         coordinator = build_durable_coordinator(dependencies, observer=ctx.rpc_admission_observer)
@@ -1581,6 +1592,7 @@ def _build_demand_runtime(
         message_fact_refresh_deps=message_fact_refresh_deps,
         read_receipt_batch=read_receipt_batch,
         startup_identity=startup_identity,
+        draft_owner=draft_owner,
     )
 
 
@@ -1604,6 +1616,8 @@ def _ensure_demand_runtime(
     ctx.api_server.bind_demand_sink(demand_runtime.coordinator)
     if ctx.handler_manager is not None:
         ctx.handler_manager.bind_demand_sink(demand_runtime.coordinator)
+    if ctx.draft_owner is not None:
+        ctx.draft_owner.bind_demand_sink(demand_runtime.coordinator)
     entity_service = ctx.api_server._get_entity_info_service()
     entity_service.bind_demand_sink(demand_runtime.coordinator)
     for producer in (ctx.fact_hydration_worker, ctx.folder_projection_worker):
@@ -1630,6 +1644,9 @@ async def _stop_daemon_api(ctx: _SyncMainContext) -> None:
 
 
 async def _cancel_background_tasks(ctx: _SyncMainContext) -> None:
+    draft_owner = cast(DraftMessageOwner | None, getattr(ctx, "draft_owner", None))
+    if draft_owner is not None:
+        draft_owner.unregister()
     if ctx.handler_manager is not None:
         ctx.handler_manager.unregister()
     if ctx.coordinator is not None:
@@ -1781,6 +1798,14 @@ async def sync_main() -> None:
         await _run_fts_backfill(ctx)
 
         update_barrier = UpdateProcessingBarrier(closed=True)
+        ctx.draft_owner = DraftMessageOwner(
+            ctx.client,
+            SQLiteDraftProjection(ctx.conn, ctx.scheduling.draft_recovery),
+            ctx.shutdown_event,
+            update_barrier,
+            observe=lambda kind, outcome, reason: _observe_runtime(ctx, kind, outcome, reason),
+        )
+        ctx.draft_owner.register()
         input_peer_resolver = cast(InputPeerResolver, partial(resolve_input_peer, cast(ActivityClient, ctx.client)))
         ctx.handler_manager = EventHandlerManager(
             ctx.client,
@@ -1804,6 +1829,9 @@ async def sync_main() -> None:
         startup_identity = await _acquire_startup_identity_before_updates(ctx, dialog_directory)
         assert ctx.api_server.self_id is not None
         ctx.handler_manager.set_self_id(ctx.api_server.self_id)
+        ctx.draft_owner.bind_account(ctx.api_server.self_id)
+        draft_owner = ctx.draft_owner
+        assert draft_owner is not None
 
         full_history_port = TelethonFullHistoryPageAdapter(
             ctx.client,
@@ -1825,6 +1853,7 @@ async def sync_main() -> None:
             dialog_directory,
             startup_identity,
         )
+        draft_owner.request_recovery("startup")
         update_barrier.open()
 
         # Keep the transition watcher live for later reconnects. Initial
@@ -1836,6 +1865,7 @@ async def sync_main() -> None:
                 ctx.shutdown_event,
                 interval_seconds=ctx.scheduling.reconnect_catch_up_interval_seconds,
                 observe=lambda kind, outcome, reason: _observe_runtime(ctx, kind, outcome, reason),
+                on_reconnect=lambda: draft_owner.request_recovery("reconnect_observed"),
             ),
             name="reconnect_catch_up_loop",
         )

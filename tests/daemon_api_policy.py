@@ -19,6 +19,7 @@ def make_daemon_api_policy() -> DaemonApiPolicy:
         folder_snapshot_stale_after_seconds=scheduling.folder_projection.stale_threshold_seconds,
         telemetry=TelemetryConfig(),
         slow_request_seconds=LoggingConfig().daemon_api_slow_request_seconds,
+        draft_response_budget_bytes=256 * 1024,
         entity_profile=RefreshLimits(
             foreground_resolve_seconds=entity_profile.foreground_resolve_seconds,
             foreground_refresh_wait_seconds=entity_profile.foreground_refresh_wait_seconds,

@@ -201,19 +201,15 @@ async def test_list_dialogs_renders_reactions_token() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_dialogs_renders_draft_token() -> None:
+async def test_list_dialogs_omits_legacy_draft_preview() -> None:
     response = _canonical_catalog(dialogs=[_make_dialog_dict(draft_text="Hi all")])
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
     structured = cast(dict[str, object], result.structured_content)
     dialog = cast(dict[str, object], cast(list[dict[str, object]], structured["dialogs"])[0])
-    assert dialog["draft_text"] == "Hi all"
-    assert dialog["draft_content"] == {
-        "text": "Hi all",
-        "is_telegram_content": True,
-        "content_kind": "message_text",
-    }
+    assert "draft_text" not in dialog
+    assert "draft_content" not in dialog
 
 
 @pytest.mark.asyncio
@@ -232,13 +228,14 @@ async def test_list_dialogs_omits_zero_diff_tokens() -> None:
     assert result.content == ()
     structured = cast(dict[str, object], result.structured_content)
     dialogs = cast(list[dict[str, object]], structured["dialogs"])
-    assert dialogs[0]["draft_content"] is None
+    assert "draft_text" not in dialogs[0]
+    assert "draft_content" not in dialogs[0]
     assert dialogs[0]["unread_mentions_count"] == 0
     assert dialogs[0]["unread_reactions_count"] == 0
 
 
 @pytest.mark.asyncio
-async def test_list_dialogs_renders_all_three_diff_tokens_together() -> None:
+async def test_list_dialogs_keeps_unread_tokens_without_draft_preview() -> None:
     response = _canonical_catalog(
         dialogs=[
             _make_dialog_dict(
@@ -255,7 +252,7 @@ async def test_list_dialogs_renders_all_three_diff_tokens_together() -> None:
     dialog = cast(dict[str, object], cast(list[dict[str, object]], structured["dialogs"])[0])
     assert dialog["unread_mentions_count"] == 1
     assert dialog["unread_reactions_count"] == 2
-    assert dialog["draft_text"] == "WIP"
+    assert "draft_text" not in dialog
 
 
 @pytest.mark.asyncio
@@ -311,17 +308,12 @@ async def test_list_dialogs_renders_no_dialogs_when_empty_and_not_bootstrap() ->
 
 
 @pytest.mark.asyncio
-async def test_list_dialogs_renders_draft_with_double_quotes() -> None:
-    """Draft text with embedded double quotes renders as-is (cosmetic acceptance T-44-07).
-
-    The inner double quotes are NOT escaped — this is accepted cosmetic behavior.
-    The renderer output is text-only for an LLM; no parser interprets the format.
-    """
+async def test_list_dialogs_never_returns_draft_text_with_quotes() -> None:
     response = _canonical_catalog(dialogs=[_make_dialog_dict(draft_text='Say "hi" to Bob')])
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
     structured = cast(dict[str, object], result.structured_content)
     dialog = cast(dict[str, object], cast(list[dict[str, object]], structured["dialogs"])[0])
-    assert dialog["draft_text"] == 'Say "hi" to Bob'
-    assert cast(dict[str, object], dialog["draft_content"])["text"] == 'Say "hi" to Bob'
+    assert "draft_text" not in dialog
+    assert "draft_content" not in dialog

@@ -69,6 +69,14 @@ def test_sqlite_import_owners_name_split_persistence_modules() -> None:
     assert "messages/sqlite_repository.py" not in gate.ALLOWED_IMPORTER_PATHS["sqlite3"]
 
 
+def test_draft_import_owners_are_limited_to_projection_and_telethon_adapter() -> None:
+    gate = _load_gate()
+
+    assert {"drafts/sqlite_projection.py", "reading/draft_projection.py"} <= gate.ALLOWED_IMPORTER_PATHS["sqlite3"]
+    assert "drafts/telethon_adapter.py" in gate.ALLOWED_IMPORTER_PATHS["telethon"]
+    assert "drafts/owner.py" not in gate.ALLOWED_IMPORTER_PATHS["telethon"]
+
+
 def test_forbidden_import_owner_is_rejected() -> None:
     gate = _load_gate()
     path = gate.SOURCE_ROOT / "not_an_owner.py"

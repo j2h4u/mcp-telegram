@@ -9,6 +9,8 @@ and optional filter keys). SQL uses :name placeholders.
 
 from __future__ import annotations
 
+import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from typing import cast
 
@@ -17,6 +19,7 @@ from mcp_telegram.reading.sqlite_projection import (
     _SENDER_NAME_FILTER_SQL,
     _build_list_messages_query,
     _ListMessagesDbRequest,
+    message_sent_at,
 )
 
 
@@ -79,7 +82,7 @@ def _build_list_messages_query_req(**overrides: object) -> _ListMessagesDbReques
 def test_baseline_newest() -> None:
     """Default direction=newest produces DESC order and dialog_id + limit + self_id params."""
     sql, params = _build_list_messages_query(_build_list_messages_query_req())
-    assert "ORDER BY m.message_id DESC" in sql
+    assert "ORDER BY m.sent_at DESC, m.message_id DESC" in sql
     assert "m.is_deleted = 0" in sql
     assert params["dialog_id"] == 100
     assert params["limit"] == 20
@@ -89,9 +92,18 @@ def test_baseline_newest() -> None:
 def test_baseline_oldest() -> None:
     """direction=oldest produces ASC order."""
     sql, params = _build_list_messages_query(_build_list_messages_query_req(direction="oldest"))
-    assert "ORDER BY m.message_id ASC" in sql
+    assert "ORDER BY m.sent_at ASC, m.message_id ASC" in sql
     assert params["dialog_id"] == 100
     assert params["limit"] == 20
+
+
+def test_message_sent_at_reads_the_local_cursor_timestamp() -> None:
+    with closing(sqlite3.connect(":memory:")) as conn:
+        conn.execute("CREATE TABLE messages (dialog_id INTEGER, message_id INTEGER, sent_at INTEGER)")
+        conn.execute("INSERT INTO messages VALUES (7, 11, 1234)")
+
+        assert message_sent_at(conn, 7, 11) == 1234
+        assert message_sent_at(conn, 7, 12) is None
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +227,7 @@ def test_all_filters_combined() -> None:
     assert params["topic_id"] == 7
     assert params["unread_after_id"] == 300
     assert params["anchor_msg_id"] == 500
-    assert "ORDER BY m.message_id ASC" in sql
+    assert "ORDER BY m.sent_at ASC, m.message_id ASC" in sql
 
 
 def test_topic_and_sender_name_combined() -> None:

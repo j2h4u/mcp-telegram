@@ -12,6 +12,7 @@ from ..models import DialogType, ReadMessage, ReadState
 from ..sync_read_model import compute_sync_coverage
 
 _SELECT_SYNC_STATUS_SQL = "SELECT status FROM synced_dialogs WHERE dialog_id = ?"
+_MESSAGE_SENT_AT_SQL = "SELECT sent_at FROM messages WHERE dialog_id = ? AND message_id = ?"
 
 
 class _ListMessagesDbRequest(Protocol):
@@ -66,6 +67,12 @@ def read_daemon_state_int(conn: sqlite3.Connection, key: str) -> int | None:
         return None
 
 
+def message_sent_at(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> int | None:
+    """Return a local history cursor's timestamp when the message remains projected."""
+    row = cast(tuple[object] | None, conn.execute(_MESSAGE_SENT_AT_SQL, (dialog_id, message_id)).fetchone())
+    return None if row is None or row[0] is None else int(cast(int | str, row[0]))
+
+
 def _build_access_metadata(
     conn: sqlite3.Connection,
     dialog_id: int,
@@ -117,7 +124,6 @@ WITH agent_visible_dialogs AS (
         d.unread_mentions_count,
         d.unread_reactions_count,
         d.unread_count,
-        d.draft_text,
         sd.status AS sync_status,
         sd.total_messages,
         sd.last_synced_at,
@@ -143,7 +149,6 @@ WITH agent_visible_dialogs AS (
         0 AS unread_mentions_count,
         0 AS unread_reactions_count,
         NULL AS unread_count,
-        NULL AS draft_text,
         sd.status AS sync_status,
         sd.total_messages,
         sd.last_synced_at,
@@ -157,7 +162,7 @@ WITH agent_visible_dialogs AS (
 SELECT
     dialog_id, name, type, archived, pinned,
     members, created, last_message_at, snapshot_at,
-    unread_mentions_count, unread_reactions_count, unread_count, draft_text,
+    unread_mentions_count, unread_reactions_count, unread_count,
     sync_status, total_messages, last_synced_at, last_event_at, last_delta_checked_at, access_lost_at
 FROM agent_visible_dialogs
 WHERE (:archived_filter IS NULL OR archived = :archived_filter)
@@ -525,9 +530,9 @@ def _build_list_messages_query(
     sql, params = _apply_list_messages_anchor_filter(sql, params, req)
 
     if direction == "oldest":
-        sql += " ORDER BY m.message_id ASC"
+        sql += " ORDER BY m.sent_at ASC, m.message_id ASC"
     else:
-        sql += " ORDER BY m.message_id DESC"
+        sql += " ORDER BY m.sent_at DESC, m.message_id DESC"
 
     sql += " LIMIT :limit"
 

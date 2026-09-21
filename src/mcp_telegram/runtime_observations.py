@@ -40,6 +40,8 @@ ALLOWED_KINDS = frozenset(
         "reaction.detail",
         "reaction.invalidation",
         "runtime.telemetry_loss",
+        "draft.observed",
+        "draft.recovery",
     }
 )
 

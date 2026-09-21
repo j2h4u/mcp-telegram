@@ -55,13 +55,6 @@ TELEGRAM_CONTENT_OUTPUT_SCHEMA = {
     "additionalProperties": False,
 }
 
-NULLABLE_TELEGRAM_CONTENT_OUTPUT_SCHEMA = {
-    "type": ["object", "null"],
-    "properties": TELEGRAM_CONTENT_OUTPUT_SCHEMA["properties"],
-    "required": TELEGRAM_CONTENT_OUTPUT_SCHEMA["required"],
-    "additionalProperties": False,
-}
-
 LIST_DIALOGS_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -101,8 +94,6 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "unread_out": {"type": ["integer", "null"]},
                     "unread_mentions_count": {"type": "integer"},
                     "unread_reactions_count": {"type": "integer"},
-                    "draft_text": {"type": ["string", "null"]},
-                    "draft_content": NULLABLE_TELEGRAM_CONTENT_OUTPUT_SCHEMA,
                     "scheduled_count": {
                         "type": "integer",
                         "description": "Count of pending author-only scheduled messages in this dialog.",
@@ -156,8 +147,6 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "unread_out",
                     "unread_mentions_count",
                     "unread_reactions_count",
-                    "draft_text",
-                    "draft_content",
                     "scheduled_count",
                     "next_scheduled_at",
                     "inclusion_basis",
@@ -317,7 +306,6 @@ class _DialogSurface:
     unread_out: int | None
     unread_mentions_count: int
     unread_reactions_count: int
-    draft_text: str | None
     scheduled_count: int
     next_scheduled_at: int | None
     inclusion_basis: list[str] | None
@@ -496,7 +484,6 @@ def _strict_dialog(value: object, index: int) -> _DialogSurface:
         unread_out=_strict_optional_int(value, "unread_out", context=context),
         unread_mentions_count=_strict_int(value, "unread_mentions_count", context=context),
         unread_reactions_count=_strict_int(value, "unread_reactions_count", context=context),
-        draft_text=_strict_optional_string(value, "draft_text", context=context),
         scheduled_count=_strict_int(value, "scheduled_count", context=context),
         next_scheduled_at=_strict_optional_int(value, "next_scheduled_at", context=context),
         inclusion_basis=_strict_string_list_or_none(value, "inclusion_basis", context=context),
@@ -839,10 +826,6 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 "unread_out": dialog.unread_out,
                 "unread_mentions_count": dialog.unread_mentions_count,
                 "unread_reactions_count": dialog.unread_reactions_count,
-                "draft_text": dialog.draft_text,
-                "draft_content": (
-                    telegram_content(dialog.draft_text, "message_text") if dialog.draft_text is not None else None
-                ),
                 "scheduled_count": dialog.scheduled_count,
                 "next_scheduled_at": dialog.next_scheduled_at,
                 "inclusion_basis": dialog.inclusion_basis,

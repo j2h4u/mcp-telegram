@@ -14,7 +14,7 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 73
+_CURRENT_SCHEMA_VERSION = 75
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -39,6 +39,8 @@ _READ_DATE_OUTCOME_MIGRATION_70 = 70
 _READ_DATE_EXPIRY_CUTOFF_MIGRATION_71 = 71
 _TOPIC_ATTRIBUTION_RECEIPT_MIGRATION_72 = 72
 _REMOVE_TOPIC_ATTRIBUTION_CAMPAIGN_MIGRATION_73 = 73
+_DRAFT_PROJECTION_CUTOVER_MIGRATION_74 = 74
+_DRAFT_RECOVERY_SCHEMA_75 = 75
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
@@ -559,7 +561,6 @@ CREATE TABLE IF NOT EXISTS dialogs (
     unread_mark             INTEGER,
     unread_count_observed_at INTEGER,
     unread_mark_observed_at INTEGER,
-    draft_text              TEXT,
     read_inbox_max_id       INTEGER,
     read_outbox_max_id      INTEGER,
     username                TEXT,
@@ -790,7 +791,6 @@ CREATE TABLE IF NOT EXISTS dialog_directory_staging (
     unread_reactions_count INTEGER,
     unread_count        INTEGER,
     unread_mark         INTEGER,
-    draft_text          TEXT,
     snapshot_at         INTEGER NOT NULL,
     baseline_revision   INTEGER,
     username            TEXT,
@@ -803,6 +803,86 @@ CREATE TABLE IF NOT EXISTS dialog_directory_staging (
     eligibility_mute_until INTEGER,
     eligibility_observed_at INTEGER,
     PRIMARY KEY(generation, dialog_id)
+) WITHOUT ROWID
+"""
+
+# v74: account-owned current draft projection.  Zero is reserved exclusively
+# for the two optional Telegram scope dimensions; dialog and account ids remain
+# non-zero canonical ids.  Tombstones retain no composition payload.
+_DRAFT_CURRENT_DDL = """
+CREATE TABLE IF NOT EXISTS draft_current (
+    account_id                INTEGER NOT NULL CHECK(account_id != 0),
+    dialog_id                 INTEGER NOT NULL CHECK(dialog_id != 0),
+    top_message_id            INTEGER NOT NULL DEFAULT 0,
+    subdialog_peer_id         INTEGER NOT NULL DEFAULT 0,
+    state                     TEXT NOT NULL CHECK(state IN ('present', 'empty', 'cleared')),
+    text                      TEXT,
+    entities_json             TEXT,
+    reply_to_json             TEXT,
+    media_json                TEXT,
+    suggested_post_json       TEXT,
+    rich_message_json         TEXT,
+    effect_id                 INTEGER,
+    no_webpage                INTEGER CHECK(no_webpage IN (0, 1) OR no_webpage IS NULL),
+    invert_media              INTEGER CHECK(invert_media IN (0, 1) OR invert_media IS NULL),
+    composition_complete      INTEGER NOT NULL CHECK(composition_complete IN (0, 1)),
+    source_kind               TEXT NOT NULL CHECK(source_kind IN ('realtime_present', 'realtime_empty', 'snapshot_present', 'snapshot_empty', 'snapshot_absence')),
+    source_observed_at        INTEGER NOT NULL CHECK(source_observed_at >= 0),
+    observation_started_at    INTEGER NOT NULL CHECK(observation_started_at >= 0),
+    observation_completed_at  INTEGER NOT NULL CHECK(observation_completed_at >= 0),
+    projection_revision       INTEGER NOT NULL CHECK(projection_revision >= 0),
+    normalization_version     INTEGER NOT NULL CHECK(normalization_version >= 1),
+    CHECK(text IS NULL OR length(text) <= 65536),
+    CHECK(entities_json IS NULL OR (length(entities_json) <= 65536 AND json_valid(entities_json))),
+    CHECK(reply_to_json IS NULL OR (length(reply_to_json) <= 4096 AND json_valid(reply_to_json))),
+    CHECK(media_json IS NULL OR (length(media_json) <= 4096 AND json_valid(media_json))),
+    CHECK(suggested_post_json IS NULL OR (length(suggested_post_json) <= 4096 AND json_valid(suggested_post_json))),
+    CHECK(rich_message_json IS NULL OR (length(rich_message_json) <= 4096 AND json_valid(rich_message_json))),
+    CHECK(state = 'present' OR (
+        text IS NULL AND entities_json IS NULL AND reply_to_json IS NULL AND media_json IS NULL
+        AND suggested_post_json IS NULL AND rich_message_json IS NULL AND effect_id IS NULL
+        AND no_webpage IS NULL AND invert_media IS NULL
+    )),
+    PRIMARY KEY(account_id, dialog_id, top_message_id, subdialog_peer_id)
+) WITHOUT ROWID
+"""
+
+_DRAFT_SYNC_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS draft_sync_state (
+    account_id                INTEGER PRIMARY KEY CHECK(account_id != 0),
+    status                    TEXT NOT NULL CHECK(status IN ('unknown', 'recovery_needed', 'recovering', 'ready', 'failed')),
+    coverage_status           TEXT NOT NULL CHECK(coverage_status IN ('unknown', 'incomplete', 'complete')),
+    observation_started_at    INTEGER,
+    observation_completed_at  INTEGER,
+    reason                    TEXT,
+    CHECK(observation_started_at IS NULL OR observation_started_at >= 0),
+    CHECK(observation_completed_at IS NULL OR observation_completed_at >= 0),
+    CHECK(reason IS NULL OR length(reason) <= 256)
+) WITHOUT ROWID
+"""
+
+_DRAFT_PROJECTION_RUNTIME_DDL = """
+CREATE TABLE IF NOT EXISTS draft_projection_runtime (
+    singleton             INTEGER PRIMARY KEY CHECK(singleton = 1),
+    account_id            INTEGER CHECK(account_id IS NULL OR account_id != 0),
+    projection_revision   INTEGER NOT NULL DEFAULT 0 CHECK(projection_revision >= 0),
+    recovery_due_at       INTEGER,
+    recovery_claimed_at   INTEGER,
+    recovery_failure_count INTEGER NOT NULL DEFAULT 0 CHECK(recovery_failure_count >= 0),
+    CHECK(recovery_due_at IS NULL OR recovery_due_at >= 0),
+    CHECK(recovery_claimed_at IS NULL OR recovery_claimed_at >= 0)
+)
+"""
+
+_DRAFT_SNAPSHOT_BASELINE_DDL = """
+CREATE TABLE IF NOT EXISTS draft_snapshot_baseline (
+    account_id            INTEGER NOT NULL CHECK(account_id != 0),
+    dialog_id             INTEGER NOT NULL CHECK(dialog_id != 0),
+    top_message_id        INTEGER NOT NULL DEFAULT 0,
+    subdialog_peer_id     INTEGER NOT NULL DEFAULT 0,
+    baseline_revision     INTEGER NOT NULL CHECK(baseline_revision >= 0),
+    captured_at           INTEGER NOT NULL CHECK(captured_at >= 0),
+    PRIMARY KEY(account_id, dialog_id, top_message_id, subdialog_peer_id)
 ) WITHOUT ROWID
 """
 
@@ -4185,6 +4265,131 @@ def _apply_migration_73(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+_DIALOGS_V74_DDL = """
+CREATE TABLE dialogs_v74 (
+    dialog_id               INTEGER PRIMARY KEY,
+    name                    TEXT,
+    type                    TEXT,
+    archived                INTEGER NOT NULL DEFAULT 0,
+    pinned                  INTEGER NOT NULL DEFAULT 0,
+    members                 INTEGER,
+    created                 INTEGER,
+    last_message_at         INTEGER,
+    snapshot_at             INTEGER,
+    hidden                  INTEGER NOT NULL DEFAULT 0,
+    needs_refresh           INTEGER NOT NULL DEFAULT 0,
+    unread_mentions_count   INTEGER NOT NULL DEFAULT 0,
+    unread_reactions_count  INTEGER NOT NULL DEFAULT 0,
+    unread_count            INTEGER,
+    unread_mark             INTEGER,
+    unread_count_observed_at INTEGER,
+    unread_mark_observed_at INTEGER,
+    linked_chat_id          INTEGER,
+    linked_chat_resolved_at INTEGER,
+    revision                INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+    read_inbox_max_id       INTEGER,
+    read_outbox_max_id      INTEGER,
+    username                TEXT,
+    identity_observed_at    INTEGER,
+    identity_complete       INTEGER NOT NULL DEFAULT 0 CHECK(identity_complete IN (0, 1)),
+    identity_source         TEXT CHECK(identity_source IN ('directory', 'realtime', 'mixed', 'legacy') OR identity_source IS NULL)
+)
+"""
+
+
+def _apply_migration_74(conn: sqlite3.Connection, current: int) -> int:
+    """Cut drafts over to their account-owned current projection.
+
+    Existing dialog previews were a lossy, directory-owned side effect.  They
+    are deliberately discarded instead of being promoted into draft authority.
+    Rebuilding the two finite directory tables removes the column from both
+    fresh and upgraded databases and restarts any interrupted directory pass.
+    """
+    if current >= _DRAFT_PROJECTION_CUTOVER_MIGRATION_74:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        dialog_columns = _table_column_names(conn, "dialogs")
+        staging_columns = _table_column_names(conn, "dialog_directory_staging")
+        if "draft_text" in dialog_columns:
+            triggers = cast(
+                list[tuple[str, str]],
+                conn.execute(
+                    "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='dialogs' AND sql IS NOT NULL"
+                ).fetchall(),
+            )
+            for name, _ in triggers:
+                conn.execute(f"DROP TRIGGER {name}")
+            conn.execute(_DIALOGS_V74_DDL)
+            conn.execute(
+                "INSERT INTO dialogs_v74("
+                "dialog_id,name,type,archived,pinned,members,created,last_message_at,snapshot_at,hidden,needs_refresh,"
+                "unread_mentions_count,unread_reactions_count,unread_count,unread_mark,unread_count_observed_at,"
+                "unread_mark_observed_at,linked_chat_id,linked_chat_resolved_at,revision,read_inbox_max_id,"
+                "read_outbox_max_id,username,identity_observed_at,identity_complete,identity_source) "
+                "SELECT dialog_id,name,type,archived,pinned,members,created,last_message_at,snapshot_at,hidden,needs_refresh,"
+                "unread_mentions_count,unread_reactions_count,unread_count,unread_mark,unread_count_observed_at,"
+                "unread_mark_observed_at,linked_chat_id,linked_chat_resolved_at,revision,read_inbox_max_id,"
+                "read_outbox_max_id,username,identity_observed_at,identity_complete,identity_source FROM dialogs"
+            )
+            # Triggers on other tables may read ``dialogs`` in their body.  Do
+            # not collect and recreate those unrelated triggers: legacy rename
+            # mode keeps their SQL valid while the replacement is installed.
+            conn.execute("PRAGMA legacy_alter_table=ON")
+            conn.execute("DROP TABLE dialogs")
+            conn.execute("ALTER TABLE dialogs_v74 RENAME TO dialogs")
+            conn.execute("PRAGMA legacy_alter_table=OFF")
+            for _, statement in triggers:
+                conn.execute(statement)
+            conn.execute(_DIALOGS_HIDDEN_PINNED_INDEX_DDL)
+            conn.execute(_DIALOGS_TYPE_INDEX_DDL)
+            conn.execute(_DIALOGS_SNAPSHOT_AT_INDEX_DDL)
+            conn.execute(_DIALOGS_NEEDS_REFRESH_INDEX_DDL)
+            conn.execute(_DIALOGS_REVISION_TRIGGER_DDL)
+        if "draft_text" in staging_columns:
+            conn.execute("DROP TABLE dialog_directory_staging")
+            conn.execute(_DIALOG_DIRECTORY_STAGING_DDL)
+            conn.execute("DELETE FROM dialog_directory_baseline")
+            conn.execute("DELETE FROM dialog_directory_pins")
+            conn.execute(
+                "UPDATE dialog_directory_state SET status='pending',ordinary_status='pending',"
+                "pinned_main_status='pending',pinned_archive_status='pending',offset_date=NULL,offset_id=0,"
+                "offset_peer=NULL,observation_started_at=NULL,observation_completed_at=NULL,observed_count=0,"
+                "reason='draft_projection_cutover',retry_at=NULL WHERE singleton=1"
+            )
+        conn.execute(_DRAFT_CURRENT_DDL)
+        conn.execute(_DRAFT_SYNC_STATE_DDL)
+        conn.execute(_DRAFT_PROJECTION_RUNTIME_DDL)
+        conn.execute(_DRAFT_SNAPSHOT_BASELINE_DDL)
+        conn.execute("INSERT OR IGNORE INTO draft_projection_runtime(singleton) VALUES (1)")
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
+            (_DRAFT_PROJECTION_CUTOVER_MIGRATION_74,),
+        )
+        conn.commit()
+        return _DRAFT_PROJECTION_CUTOVER_MIGRATION_74
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _apply_migration_75(conn: sqlite3.Connection, current: int) -> int:
+    """Add durable draft recovery backoff and remove the redundant key-prefix index."""
+    return _apply_migration(
+        conn,
+        current,
+        _DRAFT_RECOVERY_SCHEMA_75,
+        [
+            (
+                "ALTER TABLE draft_projection_runtime ADD COLUMN recovery_failure_count INTEGER NOT NULL DEFAULT 0 "
+                "CHECK(recovery_failure_count >= 0)"
+            ),
+            "DROP INDEX IF EXISTS idx_draft_current_account_dialog",
+        ],
+        ignore_duplicate_column=True,
+    )
+
+
 def _apply_migrations_64_to_67(conn: sqlite3.Connection, current: int) -> int:
     """Apply the ordered canonical-directory and folder migrations."""
     if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64:
@@ -4226,6 +4431,12 @@ def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
     if _CURRENT_SCHEMA_VERSION >= _REALTIME_DM_DIALOG_BACKFILL_MIGRATION_63:
         current = _apply_migration_63(conn, current)
     current = _apply_migrations_64_to_67(conn, current)
+    current = _apply_migrations_68_to_71(conn, current)
+    return _apply_migrations_72_to_75(conn, current)
+
+
+def _apply_migrations_68_to_71(conn: sqlite3.Connection, current: int) -> int:
+    """Apply reaction and read-date migrations after the directory cutover."""
     if _CURRENT_SCHEMA_VERSION >= _REACTION_DETAIL_LIFECYCLE_MIGRATION_68:
         current = _apply_migration_68(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _REACTION_DETAIL_PACING_MIGRATION_69:
@@ -4234,10 +4445,19 @@ def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_70(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _READ_DATE_EXPIRY_CUTOFF_MIGRATION_71:
         current = _apply_migration_71(conn, current)
+    return current
+
+
+def _apply_migrations_72_to_75(conn: sqlite3.Connection, current: int) -> int:
+    """Apply topic-receipt cleanup and the finite draft ownership cutover."""
     if _CURRENT_SCHEMA_VERSION >= _TOPIC_ATTRIBUTION_RECEIPT_MIGRATION_72:
         current = _apply_migration_72(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _REMOVE_TOPIC_ATTRIBUTION_CAMPAIGN_MIGRATION_73:
         current = _apply_migration_73(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _DRAFT_PROJECTION_CUTOVER_MIGRATION_74:
+        current = _apply_migration_74(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _DRAFT_RECOVERY_SCHEMA_75:
+        current = _apply_migration_75(conn, current)
     return current
 
 

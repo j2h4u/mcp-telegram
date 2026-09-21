@@ -35,6 +35,7 @@ class AcquisitionKind(StrEnum):
     REACTION_SNAPSHOT = "reaction_snapshot"
     READ_RECEIPT_SNAPSHOT = "read_receipt_snapshot"
     SCHEDULED_MESSAGES_SNAPSHOT = "scheduled_messages_snapshot"
+    DRAFT_SNAPSHOT = "draft_snapshot"
     TOPIC_LOOKUP = "topic_lookup"
     TOPIC_SNAPSHOT = "topic_snapshot"
     UPDATE_DIFFERENCE = "update_difference"

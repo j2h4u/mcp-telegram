@@ -136,8 +136,8 @@ def _insert_dialog(
         "INSERT OR REPLACE INTO dialogs "
         "(dialog_id, name, type, archived, pinned, members, created, "
         " last_message_at, snapshot_at, hidden, needs_refresh, "
-        " unread_mentions_count, unread_reactions_count, draft_text) "
-        "VALUES (?, 'X', 'channel', 0, ?, NULL, NULL, ?, ?, 0, ?, 0, 0, NULL)",
+        " unread_mentions_count, unread_reactions_count) "
+        "VALUES (?, 'X', 'channel', 0, ?, NULL, NULL, ?, ?, 0, ?, 0, 0)",
         (dialog_id, opts.pinned, opts.last_message_at, opts.snapshot_at, opts.needs_refresh),
     )
     conn.commit()

@@ -74,7 +74,7 @@ def test_build_list_messages_query_params() -> None:
         "topic_id": 3,
         "unread_after_id": 50,
     }
-    assert "ORDER BY m.message_id ASC" in sql
+    assert "ORDER BY m.sent_at ASC, m.message_id ASC" in sql
     assert ":filter_sender_id" in sql and ":topic_id" in sql and ":unread_after_id" in sql
 
 

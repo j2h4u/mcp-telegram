@@ -152,7 +152,7 @@ def test_list_and_inbox_schemas_embed_the_same_canonical_message_contract() -> N
 
     list_properties = cast(dict[str, object], LIST_MESSAGES_OUTPUT_SCHEMA["properties"])
     list_messages = cast(dict[str, object], list_properties["messages"])
-    list_item = cast(dict[str, object], list_messages["items"])
+    list_item = cast(dict[str, object], cast(list[object], cast(dict[str, object], list_messages["items"])["oneOf"])[0])
 
     inbox_properties = cast(dict[str, object], GET_INBOX_OUTPUT_SCHEMA["properties"])
     dialogs = cast(dict[str, object], inbox_properties["dialogs"])

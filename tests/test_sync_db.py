@@ -1605,7 +1605,6 @@ def test_dialogs_columns_match_current_schema(tmp_sync_db_path: Path) -> None:
             "unread_mark",
             "unread_count_observed_at",
             "unread_mark_observed_at",
-            "draft_text",
             # v24 (Phase 54): linked-chat resolution columns
             "linked_chat_id",
             "linked_chat_resolved_at",
@@ -1643,7 +1642,6 @@ def test_dialogs_columns_match_current_schema(tmp_sync_db_path: Path) -> None:
             "created",
             "last_message_at",
             "snapshot_at",
-            "draft_text",
             "linked_chat_id",
             "linked_chat_resolved_at",
             "unread_count",
@@ -1721,7 +1719,7 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 73, f"_CURRENT_SCHEMA_VERSION must be 73, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 75, f"_CURRENT_SCHEMA_VERSION must be 75, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
 

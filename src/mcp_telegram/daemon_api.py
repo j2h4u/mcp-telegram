@@ -188,7 +188,13 @@ def _served_source(response: Mapping[str, object]) -> str:
     data = response.get("data")
     if isinstance(data, Mapping):
         source = data.get("source")
-        if source in {"sync_db", "scheduled_messages", "sync_db+scheduled_messages"}:
+        if source in {
+            "sync_db",
+            "scheduled_messages",
+            "draft_current",
+            "sync_db+scheduled_messages",
+            "sync_db+scheduled_messages+draft_current",
+        }:
             return "local"
         if source == "telegram":
             return "telegram"
@@ -292,6 +298,7 @@ class DaemonApiPolicy:
     folder_snapshot_stale_after_seconds: int
     telemetry: TelemetryPolicy
     slow_request_seconds: float
+    draft_response_budget_bytes: int
     entity_profile: RefreshLimits
     full_user_pair_enabled: bool = False
 
@@ -677,6 +684,7 @@ class DaemonAPIServer:
                     sync_db_path=self._sync_db_path,
                     self_id=self.self_id,
                     resolve_dialog_id=self._resolve_dialog_id,
+                    resolve_dialog_id_local=self._resolve_dialog_id_local,
                     fragment_context=FragmentContextService(
                         self._conn,
                         TelethonTelegramFragmentGateway(self._client),
@@ -685,6 +693,7 @@ class DaemonAPIServer:
                     logger=cast(_LoggerLike, logger),
                     rid=_rid,
                     deleted_message_visibility_seconds=self._policy.deleted_message_visibility_seconds,
+                    draft_response_budget_bytes=self._policy.draft_response_budget_bytes,
                 )
             )
         return self._reading_service
@@ -1231,28 +1240,35 @@ class DaemonAPIServer:
             key=lambda item: (-item["score"], item["display_name"].casefold(), item["entity_id"]),
         )
 
-    async def _resolve_dialog_name(
+    @staticmethod
+    def _natural_username(dialog: str) -> str | None:
+        tme = _parse_tme_link(dialog)
+        return tme[0] if tme is not None else dialog[1:] if dialog.startswith("@") else None
+
+    async def _resolve_username_dialog_name(
         self,
         dialog: str,
+        username: str,
+        *,
+        allow_remote: bool,
     ) -> Resolved | Candidates | NotFound:
-        """Resolve one normalized natural selector without silent precedence."""
-        tme = _parse_tme_link(dialog)
-        username = tme[0] if tme is not None else dialog[1:] if dialog.startswith("@") else None
-        if username is not None:
-            ineligible_ids = {
-                entity_id
-                for entity_id, (_name, _type, eligible, _username, _complete) in self._local_dialog_metadata().items()
-                if not eligible
-            }
+        ineligible_ids = {
+            entity_id
+            for entity_id, (_name, _type, eligible, _username, _complete) in self._local_dialog_metadata().items()
+            if not eligible
+        }
+        if allow_remote:
             return await self._resolve_dialog_username(dialog, username, ineligible_ids=ineligible_ids)
+        return self._resolve_local_dialog_username(username, dialog)
 
+    def _resolve_non_username_dialog_name(self, dialog: str) -> Resolved | Candidates | NotFound:
         (
             local_names,
             local_normalized,
             fuzzy_names,
             fuzzy_normalized,
             entity_types,
-            ineligible_ids,
+            _ineligible_ids,
             _coverage,
         ) = self._local_dialog_directory()
         if not latinize(dialog):
@@ -1262,11 +1278,19 @@ class DaemonAPIServer:
             return exact_result
         local_result = _fuzzy_resolve(dialog, fuzzy_names, normalized_name_map=fuzzy_normalized)
         self._apply_dialog_candidate_types(local_result, entity_types)
-        # A local ambiguity is already a fail-closed selector outcome. It must
-        # not turn an MCP read into Telegram work merely to expand the set.
-        if isinstance(local_result, Candidates) and len(local_result.matches) > 1:
-            return local_result
         return local_result
+
+    async def _resolve_dialog_name(
+        self,
+        dialog: str,
+        *,
+        allow_remote: bool = True,
+    ) -> Resolved | Candidates | NotFound:
+        """Resolve one normalized natural selector without silent precedence."""
+        username = self._natural_username(dialog)
+        if username is not None:
+            return await self._resolve_username_dialog_name(dialog, username, allow_remote=allow_remote)
+        return self._resolve_non_username_dialog_name(dialog)
 
     @staticmethod
     def _dialog_resolution_retryable_response(
@@ -1362,6 +1386,40 @@ class DaemonAPIServer:
         if isinstance(result, Candidates):
             return self._dialog_resolution_candidates_response(selector, result, directory_coverage)
         return self._dialog_resolution_no_match_response(selector, directory_coverage)
+
+    async def _resolve_dialog_id_local(
+        self,
+        selector: DialogSelector,
+    ) -> int | dict:
+        """Resolve a draft-bearing read entirely from the local dialog directory.
+
+        The draft projection is local state.  A missing natural selector must
+        return the ordinary local resolution response, never trigger peer
+        lookup before the draft/all routing decision is known.
+        """
+        if selector.exact_id is not None:
+            return ResolvedDialogId(selector.exact_id, read_dialog_directory_coverage(self._conn))
+        assert selector.query is not None
+        directory_coverage = read_dialog_directory_coverage(self._conn)
+        result = await self._resolve_dialog_name(selector.query, allow_remote=False)
+        if isinstance(result, Resolved):
+            return ResolvedDialogId(result.entity_id, directory_coverage)
+        if isinstance(result, Candidates):
+            return self._dialog_resolution_candidates_response(selector, result, directory_coverage)
+        return self._local_dialog_resolution_no_match_response(selector, directory_coverage)
+
+    @staticmethod
+    def _local_dialog_resolution_no_match_response(
+        selector: DialogSelector,
+        coverage: DialogDirectoryCoverage,
+    ) -> dict[str, object]:
+        """Describe the actionable local-only recovery for an uncached selector."""
+        response = DaemonAPIServer._dialog_resolution_no_match_response(selector, coverage)
+        if selector.query is not None and selector.query.startswith("@"):
+            response["required_action"] = (
+                "Use an exact dialog id, or refresh the local dialog directory before retrying this username."
+            )
+        return response
 
     def _trace_service(self) -> DaemonAccountTraceService:
         return DaemonAccountTraceService(

@@ -210,6 +210,39 @@ class ReadMessage:
         return datetime.fromtimestamp(self.sent_at, tz=UTC)
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DraftReadRecord:
+    """Transport-neutral current-composition projection for one draft scope.
+
+    A draft deliberately is not a :class:`ReadMessage`: it has no Telegram
+    message id or sent time and its composition can change in place.  The
+    persistence adapter owns conversion from normalized SQLite values to this
+    local read record; no Telethon object may cross this boundary.
+    """
+
+    account_id: int
+    dialog_id: int
+    topic_id: int | None
+    subdialog_peer_id: int | None
+    state: Literal["present", "empty", "cleared"]
+    text: str | None
+    entities: tuple[dict[str, object], ...]
+    reply_to: dict[str, object] | None
+    media: dict[str, object] | None
+    suggested_post: dict[str, object] | None
+    rich_message: dict[str, object] | None
+    effect_id: int | None
+    no_webpage: bool | None
+    invert_media: bool | None
+    composition_complete: bool
+    source_kind: str
+    source_observed_at: int | None
+    observation_started_at: int
+    observation_completed_at: int
+    projection_revision: int
+    normalization_version: str
+
+
 TopicNameGetter = Callable[[ReadMessage], str | None]
 LinePrefixGetter = Callable[[ReadMessage], str | None]
 

@@ -4,6 +4,7 @@ import sqlite3
 import time
 from collections.abc import Mapping
 from typing import Literal
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -36,6 +37,133 @@ LIFECYCLE_FIELDS = {
     "published_at",
     "inclusion_basis",
 }
+
+
+def _create_draft_projection(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE draft_current (
+            account_id INTEGER, dialog_id INTEGER, top_message_id INTEGER, subdialog_peer_id INTEGER,
+            state TEXT, text TEXT, entities_json TEXT, reply_to_json TEXT, media_json TEXT,
+            suggested_post_json TEXT, rich_message_json TEXT, effect_id INTEGER, no_webpage INTEGER,
+            invert_media INTEGER, composition_complete INTEGER, source_kind TEXT, source_observed_at INTEGER,
+            observation_started_at INTEGER, observation_completed_at INTEGER, projection_revision INTEGER,
+            normalization_version INTEGER
+        );
+        CREATE TABLE draft_sync_state (
+            account_id INTEGER PRIMARY KEY, status TEXT, coverage_status TEXT,
+            observation_started_at INTEGER, observation_completed_at INTEGER, reason TEXT
+        );
+        """
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_messages_draft_is_local_and_has_no_sent_identity() -> None:
+    server = make_server()
+    server.self_id = 7
+    conn = server._conn
+    _create_draft_projection(conn)
+    conn.execute(
+        "INSERT INTO draft_current VALUES (7, 1, 0, 0, 'present', ?, '[]', NULL, NULL, NULL, NULL, NULL, 0, 0, 1, 'realtime_present', 100, 100, 101, 2, 1)",
+        ("a composition longer than the obsolete eighty character dialog preview limit, without truncation",),
+    )
+    conn.execute("INSERT INTO draft_sync_state VALUES (7, 'ready', 'complete', 100, 101, NULL)")
+    conn.commit()
+
+    result = await server._list_messages({"dialog_id": 1, "message_state": "draft"})
+
+    assert result["ok"] is True
+    row = result["data"]["messages"][0]
+    assert row["message_state"] == "draft"
+    assert "message_id" not in row and "sent_at" not in row
+    assert row["text"].startswith("a composition longer")
+    assert result["data"]["draft_coverage"]["freshness"] == "current"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_state", ["draft", "all"])
+async def test_draft_response_budget_keeps_complete_rows_reachable(message_state: str) -> None:
+    server = make_server()
+    server.self_id = 7
+    conn = server._conn
+    _create_draft_projection(conn)
+    for topic_id in range(1, 6):
+        conn.execute(
+            "INSERT INTO draft_current VALUES (7, 1, ?, 0, 'present', ?, '[]', NULL, NULL, NULL, NULL, NULL, "
+            "NULL, NULL, 1, 'realtime_present', 100, 100, 101, ?, 1)",
+            (topic_id, "x" * 65_536, topic_id),
+        )
+    conn.execute("INSERT INTO draft_sync_state VALUES (7, 'ready', 'complete', 100, 101, NULL)")
+    conn.commit()
+
+    assert server._get_reading_service()._deps.draft_response_budget_bytes == 256 * 1024
+
+    first = await server._list_messages({"dialog_id": 1, "message_state": message_state, "limit": 5})
+
+    assert first["data"]["truncation"] == {
+        "is_truncated": True,
+        "shown_count": 3,
+        "hidden_count": 2,
+        "reason": "response_budget",
+    }
+    assert first["data"]["next_navigation"] is not None
+    assert all(len(row["text"]) == 65_536 for row in first["data"]["messages"])
+
+    second = await server._list_messages(
+        {
+            "dialog_id": 1,
+            "message_state": message_state,
+            "limit": 5,
+            "navigation": first["data"]["next_navigation"],
+        }
+    )
+
+    assert second["data"]["truncation"]["is_truncated"] is False
+    assert second["data"]["next_navigation"] is None
+    assert len(first["data"]["messages"] + second["data"]["messages"]) == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_state", ["draft", "all"])
+async def test_natural_draft_dialog_resolution_never_falls_through_to_telegram(message_state: str) -> None:
+    get_entity = AsyncMock(side_effect=AssertionError("draft selector must remain local"))
+    client = MagicMock()
+    client.get_entity = get_entity
+    server = make_server(client=client)
+
+    result = await server._list_messages({"dialog": "@not_cached", "message_state": message_state})
+
+    assert result["ok"] is False
+    assert result["error"] in {"dialog_directory_incomplete", "dialog_not_found", "stale_local_directory"}
+    assert result["required_action"] == (
+        "Use an exact dialog id, or refresh the local dialog directory before retrying this username."
+    )
+    get_entity.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_draft_cursor_rejects_changed_projection() -> None:
+    server = make_server()
+    server.self_id = 7
+    conn = server._conn
+    _create_draft_projection(conn)
+    for topic_id, revision in ((1, 1), (2, 2)):
+        conn.execute(
+            "INSERT INTO draft_current VALUES (7, 1, ?, 0, 'present', 'draft', '[]', NULL, NULL, NULL, NULL, NULL, 0, 0, 1, 'realtime_present', 100, 100, 101, ?, 1)",
+            (topic_id, revision),
+        )
+    conn.execute("INSERT INTO draft_sync_state VALUES (7, 'ready', 'complete', 100, 101, NULL)")
+    conn.commit()
+    first = await server._list_messages({"dialog_id": 1, "message_state": "draft", "limit": 1})
+    conn.execute("UPDATE draft_current SET projection_revision = 3 WHERE top_message_id = 2")
+    conn.commit()
+
+    second = await server._list_messages(
+        {"dialog_id": 1, "message_state": "draft", "limit": 1, "navigation": first["data"]["next_navigation"]}
+    )
+
+    assert second["error"] == "draft_projection_changed"
 
 
 @pytest.mark.parametrize(
@@ -301,10 +429,56 @@ async def test_list_messages_all_uses_one_unified_envelope() -> None:
 
     rows = result["data"]["messages"]
     assert [row["text"] for row in rows] == ["published", "future"]
-    assert "message_state" not in rows[0]
+    assert rows[0]["message_state"] == "sent"
     assert rows[1]["message_state"] == "scheduled"
     assert rows[1]["unpublished"] is True
     assert rows[1]["unseen"] is True
+    assert result["data"]["source"] == "sync_db+scheduled_messages+draft_current"
+
+
+@pytest.mark.asyncio
+async def test_list_messages_all_uses_numeric_tie_break_for_sent_and_scheduled_rows() -> None:
+    server = make_server()
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    shared_timestamp = FUTURE_BASE + 100
+    _insert_message(conn, 1, 10, sent_at=shared_timestamp, text="sent ten")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 2, shared_timestamp, "scheduled two")
+
+    result = await server._list_messages({"dialog_id": 1, "message_state": "all", "direction": "oldest"})
+
+    assert [row["message_id"] for row in result["data"]["messages"]] == [2, 10]
+
+
+@pytest.mark.asyncio
+async def test_list_messages_all_topic_cursor_preserves_topic_scope() -> None:
+    server = make_server()
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    _insert_message(conn, 1, 1, sent_at=100, text="topic first", forum_topic_id=7)
+    _insert_message(conn, 1, 2, sent_at=200, text="topic second", forum_topic_id=7)
+    _insert_message(conn, 1, 3, sent_at=300, text="other topic", forum_topic_id=8)
+
+    first = await server._list_messages(
+        {"dialog_id": 1, "message_state": "all", "direction": "oldest", "limit": 1, "topic_id": 7}
+    )
+    token = first["data"]["next_navigation"]
+    assert token is not None
+    assert decode_navigation_token(token).topic_id == 7
+
+    second = await server._list_messages(
+        {
+            "dialog_id": 1,
+            "message_state": "all",
+            "direction": "oldest",
+            "limit": 1,
+            "topic_id": 7,
+            "navigation": token,
+        }
+    )
+
+    assert [row["message_id"] for row in first["data"]["messages"] + second["data"]["messages"]] == [1, 2]
 
 
 @pytest.mark.asyncio
@@ -332,6 +506,96 @@ async def test_list_messages_all_paginates_across_sent_and_scheduled_rows() -> N
         }
     )
     assert [row["text"] for row in second["data"]["messages"]] == ["sent three", "scheduled four"]
+
+
+@pytest.mark.asyncio
+async def test_list_messages_all_paginates_drafts_without_hiding_later_sent_rows() -> None:
+    server = make_server()
+    server.self_id = 7
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    _insert_message(conn, 1, 1, sent_at=FUTURE_BASE - 300, text="sent one")
+    _insert_message(conn, 1, 3, sent_at=FUTURE_BASE - 100, text="sent three")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 2, FUTURE_BASE - 200, "scheduled two")
+    _create_draft_projection(conn)
+    conn.execute(
+        f"INSERT INTO draft_current VALUES (7, 1, 0, 0, 'present', 'draft', '[]', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1, 'realtime_present', {FUTURE_BASE - 150}, {FUTURE_BASE - 150}, {FUTURE_BASE - 150}, 1, 1)"
+    )
+    conn.execute(
+        "INSERT INTO draft_sync_state VALUES (?, 'ready', 'complete', ?, ?, NULL)",
+        (7, FUTURE_BASE - 150, FUTURE_BASE - 150),
+    )
+    conn.commit()
+
+    first = await server._list_messages({"dialog_id": 1, "message_state": "all", "direction": "oldest", "limit": 2})
+    assert [row["text"] for row in first["data"]["messages"]] == ["sent one", "scheduled two"]
+    token = first["data"]["next_navigation"]
+    assert token is not None
+    navigation = decode_navigation_token(token)
+    assert navigation.value == 1
+    assert navigation.scheduled_message_id == 2
+    assert navigation.draft_key is None
+    assert navigation.draft_fingerprint is not None
+
+    second = await server._list_messages(
+        {"dialog_id": 1, "message_state": "all", "direction": "oldest", "limit": 2, "navigation": token}
+    )
+    assert [row["text"] for row in second["data"]["messages"]] == ["draft", "sent three"]
+    assert second["data"]["next_navigation"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_messages_all_invalidates_cursor_when_unseen_draft_changes() -> None:
+    server = make_server()
+    server.self_id = 7
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    _insert_message(conn, 1, 1, sent_at=FUTURE_BASE - 300, text="sent one")
+    _insert_message(conn, 1, 3, sent_at=FUTURE_BASE - 100, text="sent three")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 2, FUTURE_BASE - 200, "scheduled two")
+    _create_draft_projection(conn)
+    conn.execute(
+        f"INSERT INTO draft_current VALUES (7, 1, 0, 0, 'present', 'draft', '[]', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1, 'realtime_present', {FUTURE_BASE - 150}, {FUTURE_BASE - 150}, {FUTURE_BASE - 150}, 1, 1)"
+    )
+    conn.execute(
+        "INSERT INTO draft_sync_state VALUES (?, 'ready', 'complete', ?, ?, NULL)",
+        (7, FUTURE_BASE - 150, FUTURE_BASE - 150),
+    )
+    conn.commit()
+
+    first = await server._list_messages({"dialog_id": 1, "message_state": "all", "direction": "oldest", "limit": 2})
+    conn.execute("UPDATE draft_current SET projection_revision = 2 WHERE dialog_id = 1")
+    conn.commit()
+
+    second = await server._list_messages(
+        {
+            "dialog_id": 1,
+            "message_state": "all",
+            "direction": "oldest",
+            "limit": 2,
+            "navigation": first["data"]["next_navigation"],
+        }
+    )
+    assert second["error"] == "draft_projection_changed"
+
+
+@pytest.mark.asyncio
+async def test_draft_sender_filter_reports_scope_mismatch_without_absence_claim() -> None:
+    server = make_server()
+    server.self_id = 7
+    conn = server._conn
+    _create_draft_projection(conn)
+    conn.execute("INSERT INTO draft_sync_state VALUES (7, 'ready', 'complete', 100, 100, NULL)")
+    conn.commit()
+
+    result = await server._list_messages({"dialog_id": 1, "message_state": "draft", "sender_id": 99})
+
+    coverage = result["data"]["draft_coverage"]
+    assert coverage["presence"] == "unknown"
+    assert coverage["absence_basis"] is None
+    assert coverage["continuity_reason"] == "sender_filter_excludes_author_only_drafts"
 
 
 @pytest.mark.asyncio

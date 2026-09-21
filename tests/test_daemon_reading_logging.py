@@ -153,6 +153,7 @@ def test_read_state_per_dialog_skips_non_dm_and_zero_dialogs() -> None:
             logger=_TestLogger(),
             rid=lambda: "",
             deleted_message_visibility_seconds=86_400,
+            draft_response_budget_bytes=256 * 1024,
         )
     )
     try:
@@ -263,6 +264,7 @@ def _telegram_service(gateway: _PagedHistoryGateway, conn: sqlite3.Connection | 
             logger=_TestLogger(),
             rid=lambda: "",
             deleted_message_visibility_seconds=86_400,
+            draft_response_budget_bytes=256 * 1024,
         )
     )
 
@@ -434,6 +436,7 @@ async def test_list_messages_telegram_entity_miss_logs_structured_warning_withou
             logger=logger,
             rid=lambda: " request_id=test-rid",
             deleted_message_visibility_seconds=86_400,
+            draft_response_budget_bytes=256 * 1024,
         )
     )
 
@@ -549,6 +552,7 @@ async def test_build_read_messages_projects_persisted_reaction_events() -> None:
             logger=logger,
             rid=lambda: "",
             deleted_message_visibility_seconds=86_400,
+            draft_response_budget_bytes=256 * 1024,
         )
     )
     try:

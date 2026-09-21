@@ -97,7 +97,6 @@ class _StagedFact:
     unread_reactions_count: int
     unread_count: int | None
     unread_mark: int | None
-    draft_text: str | None
     snapshot_at: int
     username: str | None
     identity_complete: int
@@ -132,7 +131,6 @@ class _StagedDialogProjection:
     unread_reactions_count: int
     unread_count: int | None
     unread_mark: int | None
-    draft_text: str | None
     snapshot_at: int
     unread: int | None
     mute_until: int | None
@@ -201,7 +199,6 @@ def _staged_dialog_projection(fact: RawDialogFact, observed_at: int, folder_id: 
         unread_mark=(
             int(bool(getattr(raw, "unread_mark", False))) if getattr(raw, "unread_mark", None) is not None else None
         ),
-        draft_text=_draft_text(getattr(raw, "draft", None)),
         snapshot_at=observed_at,
         unread=_three_valued_unread(raw),
         mute_until=_mute_until(getattr(raw, "notify_settings", None)),
@@ -597,15 +594,15 @@ class CanonicalDialogDirectory:
             baseline_revision = _required_int(baseline[0], "baseline revision") if baseline is not None else None
             conn.execute(
                 "INSERT INTO dialog_directory_staging("
-                "generation,dialog_id,source,peer_kind,top_message,name,type,archived,pinned,members,created,last_message_at,read_inbox_max_id,read_outbox_max_id,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,draft_text,snapshot_at,baseline_revision,username,identity_observed_at,identity_complete,identity_source,eligibility_category,eligibility_archived,eligibility_unread,eligibility_mute_until,eligibility_observed_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "generation,dialog_id,source,peer_kind,top_message,name,type,archived,pinned,members,created,last_message_at,read_inbox_max_id,read_outbox_max_id,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,snapshot_at,baseline_revision,username,identity_observed_at,identity_complete,identity_source,eligibility_category,eligibility_archived,eligibility_unread,eligibility_mute_until,eligibility_observed_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(generation,dialog_id) DO UPDATE SET "
                 "source=excluded.source,peer_kind=excluded.peer_kind,top_message=excluded.top_message,"
                 "name=excluded.name,type=excluded.type,archived=excluded.archived,pinned=excluded.pinned,members=excluded.members,"
                 "created=excluded.created,last_message_at=excluded.last_message_at,read_inbox_max_id=excluded.read_inbox_max_id,"
                 "read_outbox_max_id=excluded.read_outbox_max_id,unread_mentions_count=excluded.unread_mentions_count,"
                 "unread_reactions_count=excluded.unread_reactions_count,unread_count=excluded.unread_count,"
-                "unread_mark=excluded.unread_mark,draft_text=excluded.draft_text,snapshot_at=excluded.snapshot_at,"
+                "unread_mark=excluded.unread_mark,snapshot_at=excluded.snapshot_at,"
                 "baseline_revision=excluded.baseline_revision,username=excluded.username,"
                 "identity_observed_at=excluded.identity_observed_at,identity_complete=excluded.identity_complete,"
                 "identity_source=excluded.identity_source,eligibility_category=excluded.eligibility_category,"
@@ -630,7 +627,6 @@ class CanonicalDialogDirectory:
                     row.unread_reactions_count,
                     row.unread_count,
                     row.unread_mark,
-                    row.draft_text,
                     row.snapshot_at,
                     baseline_revision,
                     row.username,
@@ -684,7 +680,6 @@ class CanonicalDialogDirectory:
             dialog.unread_reactions_count,
             dialog.unread_count,
             dialog.unread_mark,
-            dialog.draft_text,
             dialog.snapshot_at,
             entity.username,
             entity.identity_complete,
@@ -755,7 +750,7 @@ class CanonicalDialogDirectory:
             "pinned=CASE WHEN EXISTS (SELECT 1 FROM dialog_directory_pins pin WHERE pin.generation=staged.generation AND pin.folder_id=0 AND pin.dialog_id=staged.dialog_id) THEN 1 ELSE 0 END, "
             "members=staged.members, created=staged.created, last_message_at=staged.last_message_at, "
             "snapshot_at=staged.snapshot_at, unread_mentions_count=staged.unread_mentions_count, "
-            "unread_reactions_count=staged.unread_reactions_count, draft_text=staged.draft_text, "
+            "unread_reactions_count=staged.unread_reactions_count, "
             "read_inbox_max_id=CASE WHEN staged.read_inbox_max_id IS NULL THEN current.read_inbox_max_id "
             "WHEN current.read_inbox_max_id IS NULL THEN staged.read_inbox_max_id "
             "ELSE MAX(current.read_inbox_max_id, staged.read_inbox_max_id) END, "
@@ -772,13 +767,13 @@ class CanonicalDialogDirectory:
             (generation,),
         )
         conn.execute(
-            "INSERT INTO dialogs(dialog_id,name,type,username,identity_observed_at,identity_complete,identity_source,archived,pinned,members,created,last_message_at,snapshot_at,hidden,needs_refresh,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,unread_count_observed_at,unread_mark_observed_at,draft_text,read_inbox_max_id,read_outbox_max_id) "
+            "INSERT INTO dialogs(dialog_id,name,type,username,identity_observed_at,identity_complete,identity_source,archived,pinned,members,created,last_message_at,snapshot_at,hidden,needs_refresh,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,unread_count_observed_at,unread_mark_observed_at,read_inbox_max_id,read_outbox_max_id) "
             "SELECT staged.dialog_id,staged.name,staged.type,staged.username,staged.identity_observed_at,staged.identity_complete,staged.identity_source,staged.archived,"
             "CASE WHEN EXISTS (SELECT 1 FROM dialog_directory_pins pin WHERE pin.generation=staged.generation AND pin.folder_id=0 AND pin.dialog_id=staged.dialog_id) THEN 1 ELSE 0 END,"
             "staged.members,staged.created,staged.last_message_at,"
             "staged.snapshot_at,0,0,staged.unread_mentions_count,staged.unread_reactions_count,staged.unread_count,staged.unread_mark,"
             "CASE WHEN staged.unread_count IS NULL THEN NULL ELSE staged.snapshot_at END,"
-            "CASE WHEN staged.unread_mark IS NULL THEN NULL ELSE staged.snapshot_at END,staged.draft_text,"
+            "CASE WHEN staged.unread_mark IS NULL THEN NULL ELSE staged.snapshot_at END,"
             "staged.read_inbox_max_id,staged.read_outbox_max_id FROM dialog_directory_staging AS staged "
             "WHERE staged.generation=? AND staged.baseline_revision IS NULL "
             "AND NOT EXISTS (SELECT 1 FROM dialogs current WHERE current.dialog_id=staged.dialog_id) "
@@ -968,14 +963,6 @@ def _entity_name(entity: object | None) -> str | None:
     last = getattr(entity, "last_name", None)
     pieces = [part for part in (first, last) if isinstance(part, str) and part]
     return " ".join(pieces) or None
-
-
-def _draft_text(draft: object) -> str | None:
-    for name in ("message", "text"):
-        value = getattr(draft, name, None)
-        if isinstance(value, str):
-            return value[:80] or None
-    return None
 
 
 def _nullable_int(value: object) -> int | None:

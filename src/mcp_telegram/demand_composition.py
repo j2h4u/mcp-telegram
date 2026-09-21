@@ -29,6 +29,7 @@ from mcp_telegram.dialog_sync import (
     DialogLightReconciliationDemandAdapter,
     DialogReconciliationWorker,
 )
+from mcp_telegram.drafts.owner import DraftMessageOwner
 from mcp_telegram.entity_profile.ports import UserProfilePort
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, EntityRefreshCoordinator
 from mcp_telegram.fact_hydration import FactHydrationDemandAdapter, MessageFactHydrationWorker
@@ -96,6 +97,7 @@ class DemandCompositionDependencies:
     get_self_input_entity: Callable[[int], Awaitable[object]]
     user_profile_port: UserProfilePort
     publish_startup_identity: Callable[[object, OwnOnlyContext], None]
+    draft_owner: DraftMessageOwner
     startup_detail_setter: Callable[[str], None] | None = None
 
 
@@ -168,6 +170,7 @@ def build_durable_adapter_map(dependencies: DemandCompositionDependencies) -> Ma
         ),
         DemandKind.SCHEDULED_REPAIR: ScheduledRepairDemandAdapter(dependencies.scheduled_reconciler),
         DemandKind.SCHEDULED_DISCOVERY: ScheduledDiscoveryDemandAdapter(dependencies.scheduled_reconciler),
+        DemandKind.DRAFT_SNAPSHOT: dependencies.draft_owner,
         DemandKind.SELF_PROFILE_MAINTENANCE: SelfProfileMaintenanceDemandAdapter(
             SelfProfileMaintenanceDependencies(
                 cadence=dependencies.self_profile_cadence,
