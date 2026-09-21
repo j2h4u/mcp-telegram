@@ -1617,3 +1617,13 @@ async def test_list_messages_tool_uses_last_synced_at_not_access_lost_at(
     message = cast(str, warning["message"])
     assert "2023-11-14" in message
     assert "2024-01-01" not in message
+
+
+def test_list_messages_schema_exposes_evaluated_no_topic_count() -> None:
+    schema = server.tool_by_name["list_messages"].output_schema
+    assert schema is not None
+    coverage = cast(dict[str, object], cast(dict[str, object], schema["properties"])["coverage"])
+    coverage_properties = cast(dict[str, object], coverage["properties"])
+    receipt = cast(dict[str, object], coverage_properties["topic_attribution"])
+    receipt_properties = cast(dict[str, object], receipt["properties"])
+    assert receipt_properties["no_topic_count"] == {"type": "integer", "minimum": 0}

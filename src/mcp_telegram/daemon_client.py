@@ -415,6 +415,22 @@ class DaemonConnection:
         """Ask the daemon writer to replace an explicitly latched invalid attempt."""
         return await self.request({"method": "recover_dialog_directory"})
 
+    async def enroll_topic_attribution_campaign(self, *, dialog_ids: list[int]) -> dict:
+        """Enroll exactly two currently synced bot dialogs in the temporary repair."""
+        return await self.request({"method": "enroll_topic_attribution_campaign", "dialog_ids": dialog_ids})
+
+    async def get_topic_attribution_campaign_status(self) -> dict:
+        """Read the privacy-safe receipt for the temporary topic repair."""
+        return await self.request({"method": "get_topic_attribution_campaign_status"})
+
+    async def abort_topic_attribution_campaign(self) -> dict:
+        """Terminalize an active temporary repair before reset and re-enrollment."""
+        return await self.request({"method": "abort_topic_attribution_campaign"})
+
+    async def reset_topic_attribution_campaign(self) -> dict:
+        """Clear a terminal topic repair before explicit re-enrollment."""
+        return await self.request({"method": "reset_topic_attribution_campaign"})
+
     async def list_conversation_changes(  # noqa: PLR0913
         self,
         *,

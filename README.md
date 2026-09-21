@@ -169,6 +169,25 @@ list_topics(exact_dialog_id=<dialog_id>)
 list_messages(exact_dialog_id=<dialog_id>, exact_topic_id=<topic_id>)
 ```
 
+For a topic-filtered local result, `coverage.selection_state` is `present` or
+`unknown`. Empty remains `unknown`: topic roots and General-topic members may
+legally have no persisted marker, so local history cannot establish absence.
+This release also has a temporary, deployment-local
+repair for the two production-confirmed synced bot dialogs. An operator enrolls
+those ids through the running daemon with `mcp-telegram topic-attribution
+enroll <dialog-id> <dialog-id>`; ids are never stored in the repository. Use
+`mcp-telegram topic-attribution status` to read its reconciled counters and
+terminal severity, including failed or abandoned dialogs. A terminal campaign
+can be explicitly cleared with `mcp-telegram topic-attribution reset` before
+a fresh two-dialog enrollment; an active campaign can first be terminalized with
+`mcp-telegram topic-attribution abort` when enrollment was wrong. The campaign
+is bounded and restart-safe. PR2 must remove its commands, executor, and the
+`topic_attribution_campaign_v1` daemon-state row after the repair terminates.
+A completed receipt means the current extractor traversed the covered full
+history. Legal root or General-topic `NULL` outcomes remain valid and are
+reported as `topic_attribution.no_topic_count`; they do not change an empty
+topic selection from `unknown` to absence.
+
 Review recent important access changes:
 
 ```text

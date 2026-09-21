@@ -168,6 +168,31 @@ async def test_dm_bootstrap_is_idempotent_for_consumed_publication(sync_db: _SQL
 
 
 @pytest.mark.asyncio
+async def test_new_full_history_terminal_publishes_complete_topic_attribution_receipt(
+    sync_db: _SQLiteConnection,
+) -> None:
+    """Only a current full-history terminal can turn the receipt complete."""
+    dialog_id = 404
+    sync_db.execute(
+        "INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (?, 'not_synced', 0)", (dialog_id,)
+    )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
+    sync_db.commit()
+    worker = make_worker(MagicMock(), sync_db, asyncio.Event())
+
+    await worker._store_batch_page(dialog_id, 0, 0, ())
+
+    row = sync_db.execute(
+        "SELECT status,topic_attribution_version,topic_attribution_state,"
+        "topic_attribution_observed_at,topic_attribution_completed_at "
+        "FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0:3] == ("synced", 1, "complete")
+
+
+@pytest.mark.asyncio
 async def test_dm_bootstrap_excludes_hidden_rows_and_preserves_richer_entity_type(sync_db: _SQLiteConnection) -> None:
     publish_local_dialogs(sync_db, [(101, "user", "Visible", None, None), (102, "user", "Hidden", None, None)])
     sync_db.execute("UPDATE dialogs SET hidden=1 WHERE dialog_id=102")
@@ -2221,3 +2246,27 @@ def test_marked_peer_id_matches_telethon_convention() -> None:
     for peer in cases:
         assert _marked_peer_id(peer) == tl_utils.get_peer_id(peer)
     assert _marked_peer_id(SimpleNamespace(channel_id=None, chat_id=None, user_id=None)) is None
+
+
+@pytest.mark.asyncio
+async def test_full_history_null_topic_completes_current_receipt_with_evaluated_count(
+    sync_db: _SQLiteConnection,
+) -> None:
+    """A legal NULL topic member is evaluated no-topic, not incomplete extraction."""
+    from mcp_telegram.message_contracts import ExtractedMessage
+
+    dialog_id = 405
+    sync_db.execute(
+        "INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (?, 'not_synced', 0)", (dialog_id,)
+    )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
+    sync_db.commit()
+    worker = make_worker(MagicMock(), sync_db, asyncio.Event())
+
+    await worker._store_batch_page(dialog_id, 0, 1, (ExtractedMessage(message=_stored(dialog_id, 1), reply_count=0),))
+
+    assert sync_db.execute(
+        "SELECT topic_attribution_version,topic_attribution_state,topic_attribution_no_topic_count "
+        "FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone() == (1, "complete", 1)

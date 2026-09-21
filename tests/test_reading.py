@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from mcp_telegram.models import ReadReactionEvent
 from mcp_telegram.tools.reading import (
+    LIST_MESSAGES_OUTPUT_SCHEMA,
     SEARCH_MESSAGES_OUTPUT_SCHEMA,
     ListMessages,
     SearchMessages,
@@ -348,7 +349,9 @@ def test_search_messages_structured_payload_includes_dialog_anchor_read_state_wa
 def test_list_messages_structured_page_metadata_preserves_navigation_warning_coverage_and_limits():
     payload = _list_messages_structured_content(
         _ListMessagesStructuredContentContext(
-            args=ListMessages(exact_dialog_id=123, limit=10, navigation="start", anchor_message_id=50),
+            args=ListMessages(
+                exact_dialog_id=123, exact_topic_id=7, limit=10, navigation="start", anchor_message_id=50
+            ),
             data={
                 "messages": [],
                 "source": "sync_db",
@@ -358,6 +361,14 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
                 "last_synced_at": 1_699_990_000,
                 "last_event_at": 1_699_999_000,
                 "sync_coverage_pct": 80,
+                "selection_state": "unknown",
+                "topic_attribution": {
+                    "version": 0,
+                    "state": "unknown",
+                    "observed_at": None,
+                    "completed_at": None,
+                    "no_topic_count": 0,
+                },
                 "dialog_type": "User",
                 "read_state": {
                     "inbox_unread_count": 0,
@@ -370,7 +381,7 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
             dialog_id=123,
             sender_id=None,
             sender_name=None,
-            topic_id=None,
+            topic_id=7,
             direction="oldest",
             next_navigation="history-token",
         )
@@ -384,6 +395,15 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
     assert payload["dialog_id"] == 123
     assert coverage["kind"] == "fragment"
     assert coverage["fragment_coverage"] is True
+    assert coverage["selection_state"] == "unknown"
+    assert coverage["topic_attribution"] == {
+        "version": 0,
+        "state": "unknown",
+        "observed_at": None,
+        "completed_at": None,
+        "no_topic_count": 0,
+    }
+    validate(instance=payload, schema=LIST_MESSAGES_OUTPUT_SCHEMA)
     assert warnings[0]["kind"] == "archived_dialog"
     assert "No current access" in cast(str, warnings[0]["message"])
     assert navigation["next_navigation"] == "history-token"
@@ -403,11 +423,16 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
     assert cast(dict[str, object], read_state)["header_lines"] == ["[read-state: all caught up]"]
 
 
-def test_list_messages_warns_when_exact_topic_is_empty_in_selected_dialog() -> None:
+def test_list_messages_warns_honestly_when_exact_topic_selection_is_unknown() -> None:
     payload = _list_messages_structured_content(
         _ListMessagesStructuredContentContext(
             args=ListMessages(exact_dialog_id=591994976, exact_topic_id=306001, limit=10),
-            data={"messages": [], "source": "sync_db", "dialog_access": "live"},
+            data={
+                "messages": [],
+                "source": "sync_db",
+                "dialog_access": "live",
+                "selection_state": "unknown",
+            },
             rows=[],
             dialog_id=591994976,
             sender_id=None,
@@ -418,10 +443,10 @@ def test_list_messages_warns_when_exact_topic_is_empty_in_selected_dialog() -> N
         )
     )
     warnings = cast(list[dict[str, object]], payload["warnings"])
-    assert warnings[0]["kind"] == "dialog_identifier_mismatch"
-    assert warnings[0]["severity"] == "action_required"
-    assert "dialog set to" in cast(str, warnings[0]["action"])
-    assert "previously returned by mcp-telegram" in cast(str, warnings[0]["action"])
+    assert warnings[0]["kind"] == "topic_selection_unknown"
+    assert warnings[0]["severity"] == "warning"
+    assert "action" not in warnings[0]
+    assert "membership remains unknown" in cast(str, warnings[0]["message"])
     assert payload["limits"] == {
         "requested_limit": 10,
         "applied_limit": 10,

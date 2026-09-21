@@ -10,7 +10,9 @@ from telethon.errors import ChannelPrivateError, RPCError  # type: ignore[import
 
 from helpers import MockTotalList, build_mock_message
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.message_history.contracts import (
+    FullHistoryPage,
     MessageHistoryAccessLostError,
     MessageHistoryUnavailableError,
 )
@@ -192,3 +194,27 @@ async def test_ordinary_rpc_failure_is_translated_at_telegram_boundary(adapter_k
             await TelethonForwardGapPageAdapter(client).fetch_page(7, after_message_id=0, should_stop=lambda: False)
         else:
             await TelethonHistoryAccessProbe(client).probe_total_messages(7)
+
+
+def test_full_history_page_rejects_more_than_protocol_limit() -> None:
+    message = ExtractedMessage(
+        message=StoredMessage(
+            dialog_id=1,
+            message_id=1,
+            sent_at=1,
+            text=None,
+            sender_id=None,
+            sender_first_name=None,
+            reply_to_msg_id=None,
+            forum_topic_id=None,
+            edit_date=None,
+            grouped_id=None,
+            reply_to_peer_id=None,
+            out=0,
+            is_service=0,
+            post_author=None,
+        ),
+        reply_count=0,
+    )
+    with pytest.raises(ValueError, match="at most 100"):
+        FullHistoryPage(messages=(message,) * 101, total_messages=None)

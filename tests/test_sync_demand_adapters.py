@@ -24,7 +24,12 @@ from mcp_telegram.delta_sync import (
 )
 from mcp_telegram.dialog_sync import DialogLightReconciliationDemandAdapter, DialogReconciliationWorker
 from mcp_telegram.flood import TelegramRpcThrottled
-from mcp_telegram.message_history.contracts import MessageHistoryAccessLostError, MessageHistoryUnavailableError
+from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
+from mcp_telegram.message_history.contracts import (
+    FullHistoryPage,
+    MessageHistoryAccessLostError,
+    MessageHistoryUnavailableError,
+)
 from mcp_telegram.message_history.ports import ForwardGapPagePort, FullHistoryPagePort
 from mcp_telegram.message_history.telegram_adapter import (
     TelethonForwardGapPageAdapter,
@@ -48,6 +53,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcScope,
     current_rpc_scope,
 )
+from mcp_telegram.topic_attribution_campaign import CAMPAIGN_STATE_KEY, abort_campaign, campaign_status, enroll_campaign
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
@@ -797,3 +803,194 @@ async def test_dialog_light_adapter_clears_one_durable_dirty_flag(conn: sqlite3.
     assert observed_scopes[0].demand_kind is DemandKind.DIALOG_LIGHT_RECONCILIATION
     assert observed_scopes[0].acquisition_kind is AcquisitionKind.ENTITY_LOOKUP
     assert observed_scopes[0].attempt_budget is budget
+
+
+def _enroll_topic_campaign(conn: sqlite3.Connection) -> None:
+    conn.executemany("INSERT INTO dialogs(dialog_id,type) VALUES (?, 'bot')", [(901,), (902,)])
+    conn.executemany("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?, 'synced')", [(901,), (902,)])
+    seed_full_history_enrollment(conn, 901, enabled=True)
+    seed_full_history_enrollment(conn, 902, enabled=True)
+    conn.commit()
+    enroll_campaign(conn, [901, 902])
+
+
+def _campaign_message(dialog_id: int, message_id: int, topic_id: int) -> ExtractedMessage:
+    return ExtractedMessage(
+        message=StoredMessage(
+            dialog_id=dialog_id,
+            message_id=message_id,
+            sent_at=1,
+            text="campaign test",
+            sender_id=None,
+            sender_first_name=None,
+            reply_to_msg_id=None,
+            forum_topic_id=topic_id,
+            edit_date=None,
+            grouped_id=None,
+            reply_to_peer_id=None,
+            out=0,
+            is_service=0,
+            post_author=None,
+        ),
+        reply_count=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_campaign_adapter_projects_a_successful_history_page(conn: sqlite3.Connection) -> None:
+    _enroll_topic_campaign(conn)
+    conn.execute(
+        "INSERT INTO messages(dialog_id,message_id,sent_at,text,forum_topic_id,is_deleted) VALUES (?,?,?,?,?,0)",
+        (901, 11, 1, "preserved", None),
+    )
+    conn.commit()
+    observed_scopes: list[TelegramRpcScope] = []
+
+    class SuccessfulPort:
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            observed_scopes.append(current_rpc_scope())
+            assert (dialog_id, before_message_id) == (901, 0)
+            return FullHistoryPage(messages=(_campaign_message(901, 11, 44),), total_messages=None)
+
+    adapter = FullSyncDemandAdapter(FullSyncWorker(cast(FullHistoryPagePort, SuccessfulPort()), conn, asyncio.Event()))
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute("SELECT forum_topic_id FROM messages WHERE dialog_id=901 AND message_id=11").fetchone() == (44,)
+    assert campaign_status(conn)["pending_dialogs"] == 1
+    assert observed_scopes[0].demand_kind is DemandKind.FULL_SYNC_PAGE
+    assert observed_scopes[0].acquisition_kind is AcquisitionKind.MESSAGE_HISTORY_PAGE
+
+
+@pytest.mark.asyncio
+async def test_campaign_adapter_records_access_lost_without_another_acquisition(conn: sqlite3.Connection) -> None:
+    _enroll_topic_campaign(conn)
+    calls: list[tuple[int, int]] = []
+
+    class AccessLostPort:
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            calls.append((dialog_id, before_message_id))
+            raise MessageHistoryAccessLostError("lost", reason_code="ChannelPrivateError")
+
+    adapter = FullSyncDemandAdapter(FullSyncWorker(cast(FullHistoryPagePort, AccessLostPort()), conn, asyncio.Event()))
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert calls == [(901, 0)]
+    assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=901").fetchone() == ("access_lost",)
+    status = campaign_status(conn)
+    assert status["abandoned_dialogs"] == 1
+    assert status["pending_dialogs"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["throttled", "saturated"])
+async def test_campaign_propagates_governed_deferrals_without_failure_budget(
+    conn: sqlite3.Connection, failure: str
+) -> None:
+    _enroll_topic_campaign(conn)
+
+    class FailingPort:
+        async def fetch_page(self, _dialog_id: int, *, before_message_id: int) -> object:
+            del before_message_id
+            if failure == "throttled":
+                raise TelegramRpcThrottled(retry_after_seconds=30)
+            raise RpcAdmissionSaturatedError(current_rpc_scope(), "capacity full")
+
+    worker = FullSyncWorker(cast(FullHistoryPagePort, FailingPort()), conn, asyncio.Event())
+    adapter = FullSyncDemandAdapter(worker)
+    expected = TelegramRpcThrottled if failure == "throttled" else RpcAdmissionSaturatedError
+    with pytest.raises(expected):
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key=?", (CAMPAIGN_STATE_KEY,)).fetchone(),
+    )
+    assert row is not None
+    raw_manifest = row[0]
+    assert isinstance(raw_manifest, str)
+    manifest = cast(dict[str, object], json.loads(raw_manifest))
+    dialogs = cast(dict[str, object], manifest["dialogs"])
+    item = cast(dict[str, object], dialogs["901"])
+    assert item["cursor"] == 0
+    assert item["failure_attempts"] == 0
+    assert item["last_error"] in {"TelegramRpcThrottled", "RpcAdmissionSaturatedError"}
+
+
+@pytest.mark.asyncio
+async def test_campaign_skips_midflight_hidden_dialog_without_telegram_read(conn: sqlite3.Connection) -> None:
+    _enroll_topic_campaign(conn)
+    conn.execute("UPDATE dialogs SET hidden=1 WHERE dialog_id=901")
+    conn.commit()
+    calls: list[int] = []
+
+    class Port:
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            assert before_message_id == 0
+            calls.append(dialog_id)
+            return FullHistoryPage(messages=(), total_messages=0)
+
+    await FullSyncDemandAdapter(FullSyncWorker(cast(FullHistoryPagePort, Port()), conn, asyncio.Event())).run_slice(
+        RpcAttemptBudget(limit=1)
+    )
+
+    assert calls == [902]
+    assert campaign_status(conn)["abandoned_dialogs"] == 1
+
+
+@pytest.mark.asyncio
+async def test_campaign_expiry_preflight_runs_despite_normal_full_sync_work(conn: sqlite3.Connection) -> None:
+    _enroll_topic_campaign(conn)
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (903,'syncing',0)")
+    seed_full_history_enrollment(conn, 903, enabled=True)
+    conn.commit()
+    # Make the durable manifest old without relying on the live clock.
+    manifest_row = cast(
+        tuple[str] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key=?", (CAMPAIGN_STATE_KEY,)).fetchone(),
+    )
+    assert manifest_row is not None
+    manifest = cast(dict[str, object], json.loads(manifest_row[0]))
+    manifest["expires_at"] = 1
+    conn.execute("UPDATE daemon_state SET value=? WHERE key=?", (json.dumps(manifest), CAMPAIGN_STATE_KEY))
+    conn.commit()
+
+    class NormalPort:
+        async def fetch_page(self, _dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            assert before_message_id == 0
+            return FullHistoryPage(messages=(), total_messages=0)
+
+    worker = FullSyncWorker(cast(FullHistoryPagePort, NormalPort()), conn, asyncio.Event())
+    with patch("mcp_telegram.sync_worker.time.time", return_value=100.0):
+        await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+
+    assert campaign_status(conn)["terminal_reason"] == "expiry"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["page", "access_lost"])
+async def test_campaign_operator_abort_supersedes_inflight_page_result(conn: sqlite3.Connection, outcome: str) -> None:
+    _enroll_topic_campaign(conn)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingPort:
+        async def fetch_page(self, _dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            assert before_message_id == 0
+            entered.set()
+            await release.wait()
+            if outcome == "access_lost":
+                raise MessageHistoryAccessLostError("lost", reason_code="ChannelPrivateError")
+            return FullHistoryPage(messages=(), total_messages=0)
+
+    worker = FullSyncWorker(cast(FullHistoryPagePort, BlockingPort()), conn, asyncio.Event())
+
+    async def process_campaign_page() -> bool:
+        return await worker.process_topic_attribution_campaign_page()
+
+    task = asyncio.create_task(process_campaign_page())
+    await entered.wait()
+    assert abort_campaign(conn)["terminal_reason"] == "operator_abort"
+    release.set()
+    await task
+
+    assert campaign_status(conn)["terminal_reason"] == "operator_abort"

@@ -83,7 +83,12 @@ def _make_db() -> Iterator[sqlite3.Connection]:
             total_messages      INTEGER,
             access_lost_at      INTEGER,
             read_inbox_max_id   INTEGER,
-            read_outbox_max_id  INTEGER
+            read_outbox_max_id  INTEGER,
+            topic_attribution_version INTEGER NOT NULL DEFAULT 0,
+            topic_attribution_state TEXT NOT NULL DEFAULT 'unknown',
+            topic_attribution_observed_at INTEGER,
+            topic_attribution_completed_at INTEGER,
+            topic_attribution_no_topic_count INTEGER NOT NULL DEFAULT 0
         )
         """
     )

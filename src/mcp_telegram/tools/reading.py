@@ -218,6 +218,19 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "last_delta_checked_at": {"type": ["integer", "null"]},
                 "sync_coverage_pct": {"type": ["integer", "null"]},
                 "archived_message_count": {"type": ["integer", "null"]},
+                "selection_state": {"type": "string", "enum": ["present", "unknown"]},
+                "topic_attribution": {
+                    "type": "object",
+                    "properties": {
+                        "version": {"type": "integer"},
+                        "state": {"type": "string", "enum": ["unknown", "partial", "complete"]},
+                        "observed_at": {"type": ["integer", "null"]},
+                        "completed_at": {"type": ["integer", "null"]},
+                        "no_topic_count": {"type": "integer", "minimum": 0},
+                    },
+                    "required": ["version", "state", "observed_at", "completed_at", "no_topic_count"],
+                    "additionalProperties": False,
+                },
             },
             "required": [
                 "kind",
@@ -442,7 +455,7 @@ def _list_messages_coverage(data: dict) -> dict[str, object]:
         kind = "live"
     else:
         kind = str(data.get("source") or "unknown")
-    return {
+    coverage: dict[str, object] = {
         "kind": kind,
         "state": kind,
         "fragment_coverage": raw_coverage == "fragment",
@@ -454,6 +467,13 @@ def _list_messages_coverage(data: dict) -> dict[str, object]:
         "sync_coverage_pct": data.get("sync_coverage_pct"),
         "archived_message_count": data.get("archived_message_count"),
     }
+    selection_state = data.get("selection_state")
+    if selection_state in {"present", "unknown"}:
+        coverage["selection_state"] = selection_state
+    topic_attribution = data.get("topic_attribution")
+    if isinstance(topic_attribution, dict):
+        coverage["topic_attribution"] = topic_attribution
+    return coverage
 
 
 def _list_messages_warnings(data: dict) -> list[StructuredWarning]:
@@ -470,7 +490,9 @@ def _list_messages_warnings(data: dict) -> list[StructuredWarning]:
     ]
 
 
-def _empty_exact_topic_warning(args: ListMessages, rows: list[dict]) -> StructuredWarning | None:
+def _empty_exact_topic_warning(
+    args: ListMessages, rows: list[dict], selection_state: object
+) -> StructuredWarning | None:
     if args.exact_topic_id is None or rows:
         return None
     has_other_filter = any(
@@ -485,6 +507,12 @@ def _empty_exact_topic_warning(args: ListMessages, rows: list[dict]) -> Structur
     )
     if has_other_filter:
         return None
+    if selection_state == "unknown":
+        return structured_warning(
+            "topic_selection_unknown",
+            f"No locally attributed messages matched topic {args.exact_topic_id}; topic membership remains unknown.",
+            severity="warning",
+        )
     return structured_warning(
         "dialog_identifier_mismatch",
         (
@@ -641,7 +669,7 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
         }
     ordered_rows = _chronological_message_rows(rows)
     warnings = _list_messages_warnings(data)
-    if topic_warning := _empty_exact_topic_warning(args, rows):
+    if topic_warning := _empty_exact_topic_warning(args, rows, data.get("selection_state")):
         warnings.append(topic_warning)
     return {
         "dialog_id": resolved_dialog_id,

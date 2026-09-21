@@ -40,7 +40,6 @@ TIMING_REQUIRED_PHASES_BY_ROUTE = MappingProxyType(
         "local_non_sent_state": ("resolution", "local_projection", "response_shape"),
         "telegram_fallback": ("resolution", "telegram_fallback", "response_shape"),
         "telegram_context_fallback": TIMING_TOP_LEVEL_PHASES,
-        "telegram_topic_fallback": TIMING_TOP_LEVEL_PHASES,
     }
 )
 TIMING_ROUTES = frozenset(
@@ -50,7 +49,6 @@ TIMING_ROUTES = frozenset(
         "local_non_sent_state",
         "telegram_fallback",
         "telegram_context_fallback",
-        "telegram_topic_fallback",
     }
 )
 TIMING_SERVED_SOURCES = frozenset({"local", "telegram", "error", "unknown"})
