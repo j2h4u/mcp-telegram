@@ -1555,6 +1555,64 @@ def _make_mock_conn(list_messages_response: dict):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("message_state", ["draft", "all"])
+async def test_list_messages_draft_structured_result_matches_exported_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    message_state: str,
+) -> None:
+    """The MCP boundary accepts ISO timestamps for draft and lifecycle-union rows."""
+    mock_conn = _make_mock_conn(
+        {
+            "ok": True,
+            "data": {
+                "messages": [
+                    {
+                        "message_state": "draft",
+                        "message_key": "draft_opaque_scope_key",
+                        "dialog_id": 123,
+                        "draft_scope": {"dialog_id": 123, "topic_id": None, "subdialog_peer_id": None},
+                        "draft_status": "present",
+                        "text": "current composition",
+                        "entities": [],
+                        "reply_to": None,
+                        "media": None,
+                        "suggested_post": None,
+                        "rich_message": None,
+                        "effect_id": None,
+                        "no_webpage": None,
+                        "invert_media": None,
+                        "composition_complete": True,
+                        "observation_source": "realtime_present",
+                        "observed_at": 100,
+                        "draft_updated_at": 101,
+                        "projection_revision": 2,
+                        "normalization_version": "1",
+                    }
+                ],
+                "source": "draft_projection",
+                "next_navigation": None,
+                "dialog_access": "live",
+            },
+        }
+    )
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
+
+    result = _call_tool_result(
+        await server.call_tool("list_messages", {"exact_dialog_id": 123, "message_state": message_state})
+    )
+
+    assert result.is_error is False
+    assert result.content == []
+    payload = cast(dict[str, object], result.structured_content)
+    schema = server.tool_by_name["list_messages"].output_schema
+    assert schema is not None
+    validate(instance=payload, schema=schema)
+    row = cast(list[dict[str, object]], payload["messages"])[0]
+    assert row["draft_updated_at"] == "1970-01-01T00:01:41+00:00"
+    assert row["observed_at"] == "1970-01-01T00:01:40+00:00"
+
+
+@pytest.mark.asyncio
 async def test_list_messages_tool_archived_warning_with_coverage(monkeypatch: pytest.MonkeyPatch):
     """list_messages tool output includes archived warning with coverage pct."""
     mock_conn = _make_mock_conn(

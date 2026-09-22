@@ -132,10 +132,19 @@ def _rendered_timestamp_type(schema: object) -> object:
     return schema_map
 
 
+def _normalize_schema_sequence(nodes: list[object]) -> bool:
+    """Normalize every schema branch and report whether any timestamp was found."""
+    found_temporal = False
+    for item in nodes:
+        if _normalize_schema_node(item):
+            found_temporal = True
+    return found_temporal
+
+
 def _normalize_schema_node(node: object) -> bool:
     """Normalize timestamp fields in a JSON schema node in place."""
     if isinstance(node, list):
-        return any(_normalize_schema_node(item) for item in node)
+        return _normalize_schema_sequence(node)
     if not isinstance(node, dict):
         return False
 
