@@ -19,6 +19,7 @@ from typing import cast
 
 from ..entity_store import EntitySnapshot, ensure_entity_stub, upsert_entity_snapshots
 from ..models import DialogType
+from ..resolver import latinize
 from .contracts import (
     FULL_PROFILE_OWNED_FIELDS,
     FULL_USER_ENDPOINT,
@@ -69,6 +70,7 @@ class EntitySectionCommit:
     observation_owner_account_id: int | None = None
     observation_auth_scope: Mapping[str, object] | None = None
     ownership_observed: bool = False
+    identity_patch: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,10 +406,32 @@ class EntityProfileRepository:
         self, entity_id: int
     ) -> tuple[dict[str, object], int | None, int | None, dict[str, object] | None]:
         detail, observed_at, owner_account_id, observation_scope = self._read_profile_blob(entity_id)
+        detail = self._merge_canonical_identity(entity_id, detail)
         if detail:
             return detail, observed_at, owner_account_id, observation_scope
-        detail = self._read_entity_stub(entity_id)
         return (detail, None, None, None) if detail else ({}, None, None, None)
+
+    def _merge_canonical_identity(self, entity_id: int, detail: Mapping[str, object]) -> dict[str, object]:
+        """Overlay canonical identity, using the blob only for unknown stubs."""
+        canonical = self._read_entity_stub(entity_id)
+        if not canonical:
+            return dict(detail)
+        merged = dict(detail)
+        merged["id"] = canonical["id"]
+        canonical_raw_type = canonical.get("type")
+        detail_raw_type = detail.get("type")
+        canonical_type = DialogType.parse(canonical_raw_type if isinstance(canonical_raw_type, str) else None)
+        detail_type = DialogType.parse(detail_raw_type if isinstance(detail_raw_type, str) else None)
+        merged["type"] = canonical_type.value if canonical_type is not DialogType.UNKNOWN else detail_type.value
+        if canonical_type is not DialogType.UNKNOWN:
+            merged["name"] = canonical.get("name")
+            merged["username"] = canonical.get("username")
+            return merged
+        for field in ("name", "username"):
+            canonical_value = canonical.get(field)
+            if (isinstance(canonical_value, str) and canonical_value.strip()) or field not in merged:
+                merged[field] = canonical_value
+        return merged
 
     def _read_profile_blob(
         self, entity_id: int
@@ -428,50 +452,144 @@ class EntityProfileRepository:
         return f"SELECT {', '.join(columns)} FROM entity_details WHERE entity_id = ?"
 
     def _read_entity_stub(self, entity_id: int) -> dict[str, object]:
+        has_normalized_name = "name_normalized" in self._columns("entities")
+        selected = "type, name, username" + (", name_normalized" if has_normalized_name else "")
         entity_row = cast(
-            tuple[str, str | None, str | None] | None,
-            self._conn.execute("SELECT type, name, username FROM entities WHERE id = ?", (entity_id,)).fetchone(),
+            tuple[object, ...] | None,
+            self._conn.execute(f"SELECT {selected} FROM entities WHERE id = ?", (entity_id,)).fetchone(),
         )
         if entity_row is None:
             return {}
-        entity_type, name, username = entity_row
-        return {
+        entity_type, name, username = entity_row[:3]
+        result: dict[str, object] = {
             "id": entity_id,
-            "type": _normalise_entity_type(entity_type),
+            "type": _normalise_entity_type(str(entity_type)),
             "name": name,
             "username": username,
         }
+        if has_normalized_name:
+            result["name_normalized"] = entity_row[3]
+        return result
+
+    def _update_canonical_identity(
+        self,
+        entity_id: int,
+        detail: Mapping[str, object],
+        *,
+        now: int,
+        canonical: Mapping[str, object] | None = None,
+    ) -> None:
+        """Materialize fresh identity observations in the canonical entity row."""
+        if canonical is None:
+            canonical = self._read_entity_stub(entity_id)
+        if not canonical:
+            return
+        updated = _apply_identity_patch(canonical, detail)
+        if all(updated[field] == canonical[field] for field in ("type", "name", "username")):
+            return
+        upsert_entity_snapshots(
+            self._conn,
+            [
+                EntitySnapshot(
+                    entity_id=entity_id,
+                    entity_type=str(updated["type"]),
+                    name=_optional_text(updated["name"]),
+                    username=_optional_text(updated["username"]),
+                    name_normalized=_identity_name_normalized(canonical, updated),
+                    updated_at=now,
+                )
+            ],
+        )
 
     def save_core(self, detail: Mapping[str, object], *, now: int) -> None:
         """Persist the mandatory core in the existing entities projection."""
         entity_id = detail.get("id")
         if not isinstance(entity_id, int):
             return
-        try:
+        with self._conn:
+            canonical = self._read_entity_stub(entity_id)
+            identity = _apply_identity_patch(canonical or {"id": entity_id}, detail, allow_deletions=False)
             upsert_entity_snapshots(
                 self._conn,
                 [
                     EntitySnapshot(
                         entity_id=entity_id,
-                        entity_type=str(detail.get("type", "unknown")),
-                        name=_optional_text(detail.get("name")),
-                        username=_optional_text(detail.get("username")),
-                        name_normalized=None,
+                        entity_type=str(identity.get("type", "unknown")),
+                        name=_optional_text(identity.get("name")),
+                        username=_optional_text(identity.get("username")),
+                        name_normalized=_identity_name_normalized(canonical, identity),
                         updated_at=now,
                     )
                 ],
             )
+            # Identity writes are canonical profile writes for fencing, but
+            # they do not renew the detail blob's observation age.
+            self._bump_identity_fence(entity_id)
+
+    def commit_core_acquisition(
+        self,
+        cursor: EntityRefreshCursor,
+        core: Mapping[str, object],
+        *,
+        next_acquisition_cursor: int,
+        now: int,
+    ) -> bool:
+        """Atomically commit canonical core identity and durable progress."""
+        if next_acquisition_cursor <= cursor.acquisition_cursor:
+            raise ValueError("next_acquisition_cursor must advance")
+        entity_id = core.get("id")
+        if not isinstance(entity_id, int) or entity_id != cursor.entity_id:
+            return False
+        with self._conn:
+            if not self._cursor_matches(cursor):
+                return False
+            canonical = self._read_entity_stub(entity_id)
+            identity = _apply_identity_patch(canonical or {"id": entity_id}, core, allow_deletions=False)
+            upsert_entity_snapshots(
+                self._conn,
+                [
+                    EntitySnapshot(
+                        entity_id=entity_id,
+                        entity_type=str(identity.get("type", "unknown")),
+                        name=_optional_text(identity.get("name")),
+                        username=_optional_text(identity.get("username")),
+                        name_normalized=_identity_name_normalized(canonical, identity),
+                        updated_at=now,
+                    )
+                ],
+            )
+            detail_revision = cursor.profile_revision
             if self._detail_has("profile_revision"):
-                # Identity writes are canonical profile writes for fencing,
-                # but they do not renew the detail blob's observation age.
-                self._conn.execute(
-                    "UPDATE entity_details SET profile_revision=profile_revision+1 WHERE entity_id=?",
-                    (entity_id,),
-                )
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            # Compatibility fixtures can expose only entity_details.
-            return
+                detail_exists = self._conn.execute(
+                    "SELECT 1 FROM entity_details WHERE entity_id=?", (entity_id,)
+                ).fetchone()
+                if detail_exists is not None:
+                    self._conn.execute(
+                        "UPDATE entity_details SET profile_revision=profile_revision+1 WHERE entity_id=?",
+                        (entity_id,),
+                    )
+                    detail_revision = self._profile_revision(entity_id)
+                else:
+                    # The core RPC establishes canonical identity while the
+                    # next section owns the first detail insert.  Advance the
+                    # refresh fence through the cursor CAS below.
+                    detail_revision = cursor.profile_revision + 1
+            predicate, parameters = self._cursor_predicate(cursor)
+            assignments = (
+                "status='pending', retry_at=NULL, reason='refresh_in_progress', updated_at=?, acquisition_cursor=?"
+            )
+            values: tuple[object, ...] = (now, next_acquisition_cursor)
+            if self._refresh_has("profile_revision"):
+                assignments += ", profile_revision=?"
+                values += (detail_revision,)
+            changed = self._conn.execute(
+                "UPDATE entity_profile_refresh_state SET " + assignments + " WHERE " + predicate,
+                (*values, *parameters),
+            ).rowcount
+            if changed != 1:
+                self._conn.rollback()
+                return False
+            return True
 
     def ensure_unknown_refresh_parent(self, entity_id: int, *, now: int) -> bool:
         """Create an unknown entity parent before FK-protected refresh rows."""
@@ -726,12 +844,47 @@ class EntityProfileRepository:
         )
 
     def _profile_revision(self, entity_id: int) -> int:
-        if not self._detail_has("profile_revision"):
-            return 0
-        row = self._conn.execute(
-            "SELECT profile_revision FROM entity_details WHERE entity_id=?", (entity_id,)
-        ).fetchone()
-        return int(row[0]) if row is not None and row[0] is not None else 0
+        if self._detail_has("profile_revision"):
+            row = self._conn.execute(
+                "SELECT profile_revision FROM entity_details WHERE entity_id=?", (entity_id,)
+            ).fetchone()
+            if row is not None and row[0] is not None:
+                return int(row[0])
+        if self._refresh_has("profile_revision"):
+            row = self._conn.execute(
+                "SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=?", (entity_id,)
+            ).fetchone()
+            if row is not None and row[0] is not None:
+                return int(row[0])
+        return 0
+
+    def _bump_identity_fence(self, entity_id: int) -> int | None:
+        if self._detail_has("profile_revision"):
+            changed = self._conn.execute(
+                "UPDATE entity_details SET profile_revision=profile_revision+1 WHERE entity_id=?",
+                (entity_id,),
+            ).rowcount
+            if changed == 1:
+                revision = self._profile_revision(entity_id)
+                self._carry_active_refresh_revision(entity_id, revision)
+                return revision
+        if self._refresh_has("profile_revision"):
+            changed = self._conn.execute(
+                "UPDATE entity_profile_refresh_state SET profile_revision=profile_revision+1 "
+                "WHERE entity_id=? AND status IN ('pending', 'failed')",
+                (entity_id,),
+            ).rowcount
+            if changed == 1:
+                return self._profile_revision(entity_id)
+        return None
+
+    def _carry_active_refresh_revision(self, entity_id: int, revision: int) -> None:
+        if self._refresh_has("profile_revision"):
+            self._conn.execute(
+                "UPDATE entity_profile_refresh_state SET profile_revision=? "
+                "WHERE entity_id=? AND status IN ('pending', 'failed')",
+                (revision, entity_id),
+            )
 
     def _pair_is_eligible(self, entity_id: int, *, now: int) -> bool:
         detail, observed_at, _owner, _scope = self._read_primary_detail(entity_id)
@@ -1036,32 +1189,6 @@ class EntityProfileRepository:
             return None
         return _pair_summary_payload(mode, current, readiness_latency_ms=readiness_latency_ms, ready=True)
 
-    def advance_acquisition_cursor(
-        self,
-        cursor: EntityRefreshCursor,
-        *,
-        next_acquisition_cursor: int,
-        now: int,
-    ) -> bool:
-        """Commit acquisition progress that has no section payload of its own."""
-        if next_acquisition_cursor <= cursor.acquisition_cursor:
-            raise ValueError("next_acquisition_cursor must advance")
-        with self._conn:
-            predicate, parameters = self._cursor_predicate(cursor)
-            assignments = (
-                "status='pending', retry_at=NULL, reason='refresh_in_progress', updated_at=?, acquisition_cursor=?"
-            )
-            if self._refresh_has("profile_revision"):
-                assignments += ", profile_revision=?"
-                values: tuple[object, ...] = (now, next_acquisition_cursor, cursor.profile_revision)
-            else:
-                values = (now, next_acquisition_cursor)
-            changed = self._conn.execute(
-                f"UPDATE entity_profile_refresh_state SET {assignments} WHERE {predicate}",
-                (*values, *parameters),
-            ).rowcount
-        return changed == 1
-
     def commit_section(
         self,
         cursor: EntityRefreshCursor,
@@ -1135,6 +1262,7 @@ class EntityProfileRepository:
             owner_account_id=commit.observation_owner_account_id,
             observation_scope=commit.observation_auth_scope,
             ownership_observed=commit.ownership_observed,
+            identity_patch=commit.identity_patch,
         ):
             return False
         section_payload = _section_payload(detail, cursor.next_section) if commit.payload is None else commit.payload
@@ -1219,7 +1347,9 @@ class EntityProfileRepository:
         owner_account_id: int | None = None,
         observation_scope: Mapping[str, object] | None = None,
         ownership_observed: bool = False,
+        identity_patch: Mapping[str, object] | None = None,
     ) -> bool:
+        canonical = self._read_entity_stub(entity_id)
         encoded_detail = json.dumps({"schema": _DETAIL_SCHEMA, **detail}, separators=(",", ":"))
         metadata_columns, metadata_values = self._detail_metadata(
             owner_account_id=owner_account_id,
@@ -1228,12 +1358,16 @@ class EntityProfileRepository:
         )
         encoded = _EncodedDetail(entity_id, encoded_detail, metadata_columns, metadata_values)
         if self._detail_has("profile_revision"):
-            return self._write_fenced_detail(
+            changed = self._write_fenced_detail(
                 encoded,
                 now=now,
                 expected_revision=expected_revision,
             )
-        return self._write_legacy_detail(entity_id, encoded_detail, metadata_columns, metadata_values, now=now)
+        else:
+            changed = self._write_legacy_detail(entity_id, encoded_detail, metadata_columns, metadata_values, now=now)
+        if changed and identity_patch:
+            self._update_canonical_identity(entity_id, identity_patch, now=now, canonical=canonical)
+        return changed
 
     def _detail_metadata(
         self,
@@ -1273,12 +1407,22 @@ class EntityProfileRepository:
         if exists is not None:
             return False
         columns = ("entity_id", "detail_json", "fetched_at", "profile_revision", *metadata_columns)
-        values: tuple[object, ...] = (entity_id, encoded_detail, now, 1, *metadata_values)
-        self._conn.execute(
-            f"INSERT INTO entity_details({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
-            values,
-        )
-        return True
+        if not self._refresh_has("profile_revision"):
+            return False
+        refresh_columns = self._columns("entity_profile_refresh_state")
+        if "status" not in refresh_columns:
+            return False
+        select_values = (entity_id, encoded_detail, now, *metadata_values)
+        metadata_select = ", " + ", ".join("?" for _ in metadata_columns) if metadata_columns else ""
+        changed = self._conn.execute(
+            f"INSERT INTO entity_details({', '.join(columns)}) "
+            f"SELECT ?, ?, ?, profile_revision + 1{metadata_select} "
+            "FROM entity_profile_refresh_state "
+            "WHERE entity_id=? AND status IN ('pending', 'failed') AND profile_revision=? "
+            "AND NOT EXISTS (SELECT 1 FROM entity_details WHERE entity_id=?)",
+            (*select_values, entity_id, expected_revision, entity_id),
+        ).rowcount
+        return changed == 1
 
     def _write_legacy_detail(
         self,
@@ -1404,7 +1548,9 @@ class EntityProfileRepository:
             if detail is None:
                 return False
             self._record_full_pair_measurement(cursor, full_profile, personal_channel, now=now)
-            return self._advance_full_pair_cursor(cursor, now=now)
+            if not self._advance_full_pair_cursor(cursor, now=now):
+                raise sqlite3.OperationalError("full user pair cursor advance was rejected")
+            return True
 
     def commit_group_full_chat_pair(
         self,
@@ -1452,6 +1598,7 @@ class EntityProfileRepository:
             owner_account_id=owner_account_id,
             observation_scope=observation_scope,
             ownership_observed=ownership_observed,
+            identity_patch=_combine_identity_patches(full_profile.identity_patch, contact_overlap.identity_patch),
         ):
             return None
         return detail
@@ -1568,6 +1715,7 @@ class EntityProfileRepository:
             owner_account_id=owner_account_id,
             observation_scope=observation_scope,
             ownership_observed=ownership_observed,
+            identity_patch=_combine_identity_patches(full_profile.identity_patch, personal_channel.identity_patch),
         ):
             return None
         self._write_pair_section(cursor.entity_id, "full_profile", full_profile, detail, now=now)
@@ -2098,7 +2246,7 @@ class EntityProfileRepository:
             value = cast(object, json.loads(str(row[0])))
         except TypeError, json.JSONDecodeError:
             return {}
-        return value if isinstance(value, dict) else {}
+        return self._merge_canonical_identity(entity_id, value) if isinstance(value, dict) else {}
 
 
 def _observation_bounds(evidence: Mapping[str, object]) -> tuple[int | None, int | None]:
@@ -2309,6 +2457,54 @@ def _is_sparse_full_profile_evidence(
 
 def _normalise_entity_type(value: str) -> str:
     return DialogType.parse(value).value
+
+
+def _apply_identity_patch(
+    canonical: Mapping[str, object],
+    patch: Mapping[str, object],
+    *,
+    allow_deletions: bool = True,
+) -> dict[str, object]:
+    """Apply validated identity observations while preserving canonical ids."""
+    updated = dict(canonical)
+    for field in ("name", "username"):
+        if field not in patch:
+            continue
+        value = patch[field]
+        if value is None:
+            if allow_deletions:
+                updated[field] = None
+        elif isinstance(value, str) and value.strip():
+            updated[field] = value.strip()
+    if "type" in patch:
+        parsed = DialogType.parse(patch["type"] if isinstance(patch["type"], (str, DialogType)) else None)
+        if parsed is not DialogType.UNKNOWN:
+            updated["type"] = parsed.value
+    return updated
+
+
+def _identity_name_normalized(
+    canonical: Mapping[str, object],
+    identity: Mapping[str, object],
+) -> str | None:
+    name = identity.get("name")
+    if name == canonical.get("name") and isinstance(canonical.get("name_normalized"), str):
+        return cast(str, canonical["name_normalized"])
+    return latinize(name) if isinstance(name, str) else None
+
+
+def _combine_identity_patches(
+    first: Mapping[str, object] | None,
+    second: Mapping[str, object] | None,
+) -> Mapping[str, object] | None:
+    if not first and not second:
+        return None
+    combined: dict[str, object] = {}
+    if first:
+        combined.update(first)
+    if second:
+        combined.update(second)
+    return combined
 
 
 def _next_profile_section(section: str) -> str | None:

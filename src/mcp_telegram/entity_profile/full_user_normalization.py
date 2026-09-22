@@ -14,6 +14,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime
 from typing import TypedDict, cast
 
+from ..identity_observation import USERNAME_UNOBSERVED, observe_username
 from .contracts import (
     FULL_PROFILE_OWNED_FIELDS,
     FULL_USER_ENDPOINT,
@@ -380,7 +381,40 @@ def _add_membership(facts: dict[str, object]) -> None:
         }
 
 
-def _normalize_full_profile(full_user: object, user: object) -> tuple[dict[str, object], bool]:
+def _normalize_identity_patch(user: object, *, target_id: int, target_kind: TargetKind) -> dict[str, object]:
+    """Return only identity fields explicitly materialized by Telegram."""
+    patch: dict[str, object] = {"id": target_id, "type": target_kind.value}
+    username = _normalized_username_observation(user)
+    if username is not USERNAME_UNOBSERVED:
+        patch["username"] = username
+    name = _normalized_name_observation(user)
+    if name is not USERNAME_UNOBSERVED:
+        patch["name"] = name
+    return patch
+
+
+def _normalized_username_observation(user: object) -> object:
+    raw_username = _attr(user, "username")
+    primary_username = USERNAME_UNOBSERVED if raw_username is _MISSING else raw_username
+    raw_usernames = _attr(user, "usernames")
+    alternates = USERNAME_UNOBSERVED if raw_usernames is _MISSING else raw_usernames
+    return observe_username(primary_username, alternates)
+
+
+def _normalized_name_observation(user: object) -> object:
+    first_raw = _attr(user, "first_name")
+    last_raw = _attr(user, "last_name")
+    if first_raw is _MISSING and last_raw is _MISSING:
+        return USERNAME_UNOBSERVED
+    first_name, _ = _normalize_name_value(first_raw)
+    last_name, _ = _normalize_name_value(last_raw)
+    name = " ".join(part for part in (first_name, last_name) if part)
+    return name or None if first_raw is None and last_raw is None else name or USERNAME_UNOBSERVED
+
+
+def _normalize_full_profile(
+    full_user: object, user: object, *, target_id: int, target_kind: TargetKind
+) -> tuple[dict[str, object], bool, dict[str, object]]:
     full_scalars, full_scalars_complete = _normalize_scalar_fields(full_user, _FULL_USER_SCALAR_FIELDS)
     nested, nested_complete = _normalize_nested_fields(full_user)
     names, names_complete = _normalize_names(user)
@@ -391,7 +425,7 @@ def _normalize_full_profile(full_user: object, user: object) -> tuple[dict[str, 
     facts = full_scalars | nested | names | user_scalars | optional
     _add_membership(facts)
     complete = all((full_scalars_complete, nested_complete, names_complete, user_scalars_complete, optional_complete))
-    return facts, complete
+    return facts, complete, _normalize_identity_patch(user, target_id=target_id, target_kind=target_kind)
 
 
 def _entity_id(value: object) -> int | None:
@@ -555,7 +589,9 @@ def normalize_full_user_response(
             personal_channel=_unavailable(failure_reason),
         )
 
-    profile, complete = _normalize_full_profile(full_user, user)
+    profile, complete, identity_patch = _normalize_full_profile(
+        full_user, user, target_id=target_id, target_kind=normalized_kind
+    )
     profile_provenance = _projection_provenance(FULL_PROFILE_OWNED_FIELDS, profile, boundary, authoritative=complete)
     return UserProfileObservation(
         target_id=target_id,
@@ -565,6 +601,7 @@ def normalize_full_user_response(
             payload=profile,
             reason=None if complete else "full_profile_fields_unknown",
             provenance=profile_provenance,
+            identity_patch=identity_patch,
         ),
         personal_channel=_normalize_personal_channel(full_user, _attr(response, "chats"), boundary),
     )

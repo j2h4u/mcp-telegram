@@ -69,10 +69,18 @@ def _fenced_schema(conn: sqlite3.Connection) -> None:
 
 
 class _PairClient:
-    def __init__(self, *, channel_id: int | None = 123, bot: bool = False, omit_channel_id: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        channel_id: int | None = 123,
+        bot: bool = False,
+        omit_channel_id: bool = False,
+        username: str | None = "target",
+    ) -> None:
         self.channel_id = channel_id
         self.bot = bot
         self.omit_channel_id = omit_channel_id
+        self.username = username
         self.full_user_calls = 0
 
     def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference:
@@ -83,7 +91,7 @@ class _PairClient:
         assert scope.attempt_budget is not None
         scope.attempt_budget.debit()
         self.full_user_calls += 1
-        user = User(id=42, first_name="Target", username="target", bot=self.bot)
+        user = User(id=42, first_name="Target", username=self.username, bot=self.bot)
         full_user_data = {"about": "about", "personal_channel_message": 9}
         if not self.omit_channel_id:
             full_user_data["personal_channel_id"] = self.channel_id
@@ -301,6 +309,28 @@ async def test_disabled_switch_keeps_legacy_two_full_user_acquisitions(tmp_path:
     conn.commit()
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
     assert client.full_user_calls == 2
+    await service.shutdown()  # type: ignore[attr-defined]
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_pair_disabled_full_profile_applies_identity_patch_to_canonical_entity(tmp_path: Path) -> None:
+    conn, service = _prepare(tmp_path / "pair-disabled-identity.sqlite")
+    service._deps = replace(service._deps, enable_full_user_pair=False)  # type: ignore[attr-defined]
+    client = cast(_PairClient, service._deps.client)  # type: ignore[attr-defined]
+    client.username = None
+    conn.execute("UPDATE entities SET name='Stale Name', username='stale' WHERE id=42")
+    conn.commit()
+    coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
+    assert coordinator is not None
+
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute("SELECT name, username FROM entities WHERE id=42").fetchone() == ("Target", None)
+    stored = service._profiles.read(42, now=100)  # type: ignore[attr-defined]
+    assert stored is not None
+    assert stored.detail["name"] == "Target"
+    assert stored.detail["username"] is None
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()
 

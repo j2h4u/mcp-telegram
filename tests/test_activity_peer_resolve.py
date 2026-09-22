@@ -25,12 +25,15 @@ import sqlite3
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TypedDict, cast
 
 import pytest
 
+import mcp_telegram.activity_peer_resolve as activity_peer_resolve_module
 from mcp_telegram.activity_peer_resolve import LinkedChatResolution, resolve_input_peer, resolve_linked_chat_id
-from mcp_telegram.sync_db import _apply_migrations
+from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
+from mcp_telegram.sync_db import _apply_migrations, ensure_sync_schema
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -331,6 +334,122 @@ async def test_resolve_linked_chat_id_cache_miss_calls_once_and_merges() -> None
         assert dialogs_row is not None
         assert dialogs_row["linked_chat_id"] is not None
         assert str(dialogs_row["linked_chat_id"]).startswith("-100")
+
+
+@pytest.mark.asyncio
+async def test_linked_chat_write_advances_profile_revision_and_fences_inflight_cursor() -> None:
+    channel_id = -100200000004
+    with _make_db() as conn:
+        _write_entity_details(conn, channel_id, {"about": "old"}, fetched_at=0)
+        conn.execute(
+            "UPDATE entity_details SET profile_owner_account_id=?, profile_observation_scope_json=? WHERE entity_id=?",
+            (7, '{"account_id":7,"dc_id":2}', channel_id),
+        )
+        conn.commit()
+        repo = EntityProfileRepository(conn, section_ttl_seconds=10)
+        repo.mark_pending(channel_id, now=100)
+        old_cursor = repo.next_due_refresh(now=100)
+        assert old_cursor is not None
+        client = _FakeClient(
+            input_entity=object(),
+            full_channel_result=_fake_full_channel_result(linked_chat_id=None, about="fresh"),
+        )
+        await resolve_linked_chat_id(client, conn, channel_id)
+        assert conn.execute(
+            "SELECT profile_revision FROM entity_details WHERE entity_id=?", (channel_id,)
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=?", (channel_id,)
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT profile_owner_account_id, profile_observation_scope_json FROM entity_details WHERE entity_id=?",
+            (channel_id,),
+        ).fetchone() == (7, '{"account_id":7,"dc_id":2}')
+        assert not repo.commit_section(old_cursor, EntitySectionCommit({"about": "stale"}), now=101)
+        next_cursor = repo.next_due_refresh(now=101)
+        assert next_cursor is not None and next_cursor.profile_revision == 1
+        assert repo.commit_section(next_cursor, EntitySectionCommit({"about": "fresh"}), now=101)
+
+
+@pytest.mark.asyncio
+async def test_linked_chat_cas_preserves_newer_detail_written_during_rpc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel_id = -100200000005
+    with _make_db() as conn:
+        _write_entity_details(conn, channel_id, {"about": "old"}, fetched_at=0)
+        repo = EntityProfileRepository(conn, section_ttl_seconds=10)
+        repo.mark_pending(channel_id, now=100)
+        original_load = activity_peer_resolve_module._load_existing_detail_blob
+
+        def load_then_mutate(connection: sqlite3.Connection, entity_id: int):
+            loaded = original_load(connection, entity_id)
+            connection.execute(
+                "UPDATE entity_details SET detail_json=?, profile_revision=profile_revision+1 WHERE entity_id=?",
+                ('{"schema":1,"about":"newer section"}', entity_id),
+            )
+            connection.execute(
+                "UPDATE entity_profile_refresh_state SET profile_revision=profile_revision+1 WHERE entity_id=?",
+                (entity_id,),
+            )
+            connection.commit()
+            return loaded
+
+        monkeypatch.setattr(activity_peer_resolve_module, "_load_existing_detail_blob", load_then_mutate)
+        client = _FakeClient(
+            input_entity=object(),
+            full_channel_result=_fake_full_channel_result(linked_chat_id=None, about="stale rpc payload"),
+        )
+        await resolve_linked_chat_id(client, conn, channel_id)
+        assert _read_entity_details(conn, channel_id) == {"schema": 1, "about": "newer section"}
+        assert conn.execute(
+            "SELECT profile_revision FROM entity_details WHERE entity_id=?", (channel_id,)
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=?", (channel_id,)
+        ).fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained_revision", (3, 8))
+async def test_linked_chat_first_insert_advances_retained_refresh_fence_and_reopens(
+    tmp_path: Path, retained_revision: int
+) -> None:
+    path = tmp_path / f"linked-first-{retained_revision}.sqlite"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    channel_id = -100200000006 - retained_revision
+    _insert_entity(conn, channel_id)
+    repo = EntityProfileRepository(conn, section_ttl_seconds=10)
+    repo.mark_pending(channel_id, now=100)
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET profile_revision=? WHERE entity_id=?",
+        (retained_revision, channel_id),
+    )
+    conn.commit()
+    old_cursor = repo.next_due_refresh(now=100)
+    assert old_cursor is not None and old_cursor.profile_revision == retained_revision
+
+    client = _FakeClient(
+        input_entity=object(),
+        full_channel_result=_fake_full_channel_result(linked_chat_id=None, about="fresh linked detail"),
+    )
+    await resolve_linked_chat_id(client, conn, channel_id)
+    assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=?", (channel_id,)).fetchone() == (
+        retained_revision + 1,
+    )
+    assert conn.execute(
+        "SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=?", (channel_id,)
+    ).fetchone() == (retained_revision + 1,)
+    assert not repo.commit_section(old_cursor, EntitySectionCommit({"about": "stale"}), now=101)
+    conn.close()
+
+    reopened = sqlite3.connect(path)
+    reopened_repo = EntityProfileRepository(reopened, section_ttl_seconds=10)
+    next_cursor = reopened_repo.next_due_refresh(now=101)
+    assert next_cursor is not None and next_cursor.profile_revision == retained_revision + 1
+    assert reopened_repo.commit_section(next_cursor, EntitySectionCommit({"about": "new section"}), now=101)
+    reopened.close()
 
 
 @pytest.mark.asyncio

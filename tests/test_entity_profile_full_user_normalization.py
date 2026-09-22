@@ -86,6 +86,126 @@ def test_telethon_user_with_unspecified_bot_flag_is_a_user() -> None:
     assert result.full_profile.payload["bot"] is False
 
 
+def test_full_profile_identity_patch_distinguishes_absent_empty_and_deleted_username() -> None:
+    deleted = normalize_full_user_response(
+        SimpleNamespace(
+            full_user=SimpleNamespace(),
+            users=[
+                SimpleNamespace(id=42, bot=False, first_name="Ada", last_name="Lovelace", username=None, usernames=None)
+            ],
+            chats=[],
+        ),
+        target_id=42,
+        target_kind=TargetKind.USER,
+    )
+    assert deleted.full_profile.identity_patch == {
+        "id": 42,
+        "type": "user",
+        "username": None,
+        "name": "Ada Lovelace",
+    }
+
+    absent_user = SimpleNamespace(id=42, bot=False, first_name="Ada", last_name="Lovelace", contact=True)
+    absent = normalize_full_user_response(
+        SimpleNamespace(full_user=SimpleNamespace(), users=[absent_user], chats=[]),
+        target_id=42,
+        target_kind=TargetKind.USER,
+    )
+    assert absent.full_profile.identity_patch == {"id": 42, "type": "user", "name": "Ada Lovelace"}
+
+    empty = normalize_full_user_response(
+        SimpleNamespace(
+            full_user=SimpleNamespace(),
+            users=[SimpleNamespace(id=42, bot=False, first_name="Ada", last_name="Lovelace", username="")],
+            chats=[],
+        ),
+        target_id=42,
+        target_kind=TargetKind.USER,
+    )
+    assert "username" not in (empty.full_profile.identity_patch or {})
+
+
+@pytest.mark.parametrize("usernames", (None, []))
+def test_primary_username_none_deletes_only_with_explicit_empty_alternates(usernames: object) -> None:
+    result = normalize_full_user_response(
+        SimpleNamespace(
+            full_user=SimpleNamespace(),
+            users=[
+                SimpleNamespace(id=42, bot=False, first_name="Ada", last_name=None, username=None, usernames=usernames)
+            ],
+            chats=[],
+        ),
+        target_id=42,
+        target_kind=TargetKind.USER,
+    )
+    assert result.full_profile.identity_patch is not None
+    assert result.full_profile.identity_patch["username"] is None
+
+
+def test_primary_username_uses_first_active_collectible_alternate() -> None:
+    result = normalize_full_user_response(
+        SimpleNamespace(
+            full_user=SimpleNamespace(),
+            users=[
+                SimpleNamespace(
+                    id=42,
+                    bot=False,
+                    first_name="Ada",
+                    last_name=None,
+                    username=None,
+                    usernames=[
+                        SimpleNamespace(username="inactive", active=False),
+                        SimpleNamespace(username="@collectible", active=True),
+                        SimpleNamespace(username="later", active=True),
+                    ],
+                )
+            ],
+            chats=[],
+        ),
+        target_id=42,
+        target_kind=TargetKind.USER,
+    )
+    assert result.full_profile.identity_patch is not None
+    assert result.full_profile.identity_patch["username"] == "collectible"
+
+
+def test_primary_username_with_only_inactive_alternates_is_explicit_deletion() -> None:
+    result = normalize_full_user_response(
+        SimpleNamespace(
+            full_user=SimpleNamespace(),
+            users=[
+                SimpleNamespace(
+                    id=42,
+                    bot=False,
+                    first_name="Ada",
+                    last_name=None,
+                    username=None,
+                    usernames=[SimpleNamespace(username="inactive", active=False)],
+                )
+            ],
+            chats=[],
+        ),
+        target_id=42,
+        target_kind=TargetKind.USER,
+    )
+    assert result.full_profile.identity_patch is not None
+    assert result.full_profile.identity_patch["username"] is None
+
+
+def test_primary_username_none_with_absent_alternates_preserves_existing_identity() -> None:
+    result = normalize_full_user_response(
+        SimpleNamespace(
+            full_user=SimpleNamespace(),
+            users=[SimpleNamespace(id=42, bot=False, first_name="Ada", last_name=None, username=None)],
+            chats=[],
+        ),
+        target_id=42,
+        target_kind=TargetKind.USER,
+    )
+    assert result.full_profile.identity_patch is not None
+    assert "username" not in result.full_profile.identity_patch
+
+
 def test_malformed_bot_flag_rejects_both_projections() -> None:
     result = normalize_full_user_response(
         _response(bot="yes"),  # type: ignore[arg-type]

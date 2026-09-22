@@ -1531,6 +1531,7 @@ class DaemonEntityInfoService:
         }
         return EntitySectionCommit(
             payload,
+            identity_patch=outcome.identity_patch,
             status="fresh",
             payload=private_payload,
             evidence=self._projection_evidence(outcome, cursor=cursor, identity=identity),
@@ -1735,12 +1736,16 @@ class DaemonEntityInfoService:
                 retry_at=retry_at,
             )
             return self._persisted_failure(cursor.entity_id, now=now)
-        self._profiles.save_core(self._core_from_entity(entity), now=now)
-        self._profiles.advance_acquisition_cursor(
+        core = self._core_from_entity(entity)
+        core["id"] = cursor.entity_id
+        committed = self._profiles.commit_core_acquisition(
             cursor,
+            core,
             next_acquisition_cursor=cursor.acquisition_cursor + 1,
             now=now,
         )
+        if not committed:
+            return None
         return None
 
     @staticmethod
@@ -1849,7 +1854,9 @@ class DaemonEntityInfoService:
                 else None
             )
         }
-        return EntitySectionCommit(patch, payload=private_payload)
+        identity_patch = dict(outcome.identity_patch or {})
+        identity_patch["type"] = entity_type.value
+        return EntitySectionCommit(patch, payload=private_payload, identity_patch=identity_patch)
 
     async def _acquire_channel_full_profile(self, entity_id: int, entity_type: DialogType) -> EntitySectionCommit:
         port = self._deps.channel_profile_port

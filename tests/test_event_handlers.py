@@ -658,6 +658,58 @@ async def test_auto_enroll_writes_entity_when_sender_available(
     assert row[4] == "fixture person"
 
 
+def test_dm_entity_collectible_username_and_partial_sender_preserve_canonical_facts(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 7016
+    sync_db.execute(
+        "INSERT INTO entities(id,type,name,username,name_normalized,updated_at) VALUES (?,?,?,?,?,?)",
+        (dialog_id, "user", "Known Person", "known", "known person", 1),
+    )
+    sync_db.commit()
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+
+    assert manager._auto_enroll_dm(
+        dialog_id,
+        sender=SimpleNamespace(usernames=[SimpleNamespace(username="@collectible", active=True)]),
+        observed_at=100,
+    )
+    assert sync_db.execute("SELECT name,username,type FROM entities WHERE id=?", (dialog_id,)).fetchone() == (
+        "Known Person",
+        "collectible",
+        "user",
+    )
+
+    dialog_id += 1
+    sync_db.execute(
+        "INSERT INTO entities(id,type,name,username,name_normalized,updated_at) VALUES (?,?,?,?,?,?)",
+        (dialog_id, "service", "Known Service", "service_name", "known service", 1),
+    )
+    sync_db.commit()
+    assert manager._auto_enroll_dm(dialog_id, sender=SimpleNamespace(), observed_at=101)
+    assert sync_db.execute("SELECT name,username,type FROM entities WHERE id=?", (dialog_id,)).fetchone() == (
+        "Known Service",
+        "service_name",
+        "service",
+    )
+
+    for offset, stored_type in enumerate(("unknown", ""), start=2):
+        unknown_id = dialog_id + offset
+        sync_db.execute(
+            "INSERT INTO entities(id,type,name,username,name_normalized,updated_at) VALUES (?,?,?,?,?,?)",
+            (unknown_id, stored_type, None, None, None, 1),
+        )
+        identity = manager._dm_identity(SimpleNamespace(first_name=None, last_name=None, username="observed"))
+        assert identity is not None
+        manager._persist_dm_entity(unknown_id, identity, observed_at=102)
+        assert sync_db.execute("SELECT type,username FROM entities WHERE id=?", (unknown_id,)).fetchone() == (
+            "user",
+            "observed",
+        )
+
+
 @pytest.mark.asyncio
 async def test_auto_enroll_entity_write_fails_gracefully(
     mock_client: MagicMock,

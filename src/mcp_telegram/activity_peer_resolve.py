@@ -20,14 +20,16 @@ from typing import Protocol, cast
 from telethon.tl.types import TypeInputChannel, TypeInputPeer
 
 from .activity_substrate import ActivityClient, call_with_timeout
-from .entity_store import EntitySnapshot, ensure_entity_stub
+from .entity_store import EntitySnapshot, ensure_entity_stub, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled, _raise_if_latched
+from .resolver import latinize
 from .telegram_demand import RpcAttemptBudgetExhaustedError
 from .telegram_rpc_scheduler import RpcAdmissionClosedError
 
 logger = logging.getLogger(__name__)
 
 _MIN_LINKED_CHAT_SCHEMA_VERSION = 24
+_PROFILE_REVISION_INDEX = 2
 
 
 @dataclass
@@ -57,6 +59,8 @@ class _LinkedChatCacheWrite:
     linked_chat_id: int | None
     existing_blob: dict[str, object]
     existing_detail_row: tuple[str] | None
+    observed_profile_revision: int | None
+    observed_fetched_at: int | None
     channel_name: str | None
     channel_username: str | None
     now: int
@@ -145,22 +149,32 @@ def _normalize_linked_chat_id(linked_chat_id_raw: int | None) -> int | None:
 
 def _load_existing_detail_blob(
     conn: sqlite3.Connection, channel_id: int
-) -> tuple[dict[str, object], tuple[str] | None]:
+) -> tuple[dict[str, object], tuple[str] | None, int | None, int | None]:
     """Load the current entity_details JSON payload, if any."""
-    existing_detail_row = cast(
-        tuple[str] | None,
-        conn.execute(
-            "SELECT detail_json FROM entity_details WHERE entity_id = ?",
-            (channel_id,),
-        ).fetchone(),
+    detail_rows = cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(entity_details)").fetchall())
+    detail_columns = {str(row[1]) for row in detail_rows}
+    selected = ["detail_json", "fetched_at"]
+    if "profile_revision" in detail_columns:
+        selected.append("profile_revision")
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute(f"SELECT {', '.join(selected)} FROM entity_details WHERE entity_id = ?", (channel_id,)).fetchone(),
     )
-    if existing_detail_row is None:
-        return {}, None
+    if row is None or not isinstance(row[0], str):
+        return {}, None, None, None
+    existing_detail_row = (row[0],)
+    fetched_at = _optional_int(row[1])
+    observed_revision = _optional_int(row[2]) if len(row) > _PROFILE_REVISION_INDEX else None
     try:
-        detail_row = cast(tuple[str], existing_detail_row)
-        return cast(dict[str, object], json.loads(detail_row[0])), detail_row
+        decoded = cast(object, json.loads(row[0]))
+        detail = cast(dict[str, object], decoded) if isinstance(decoded, dict) else {}
+        return detail, existing_detail_row, observed_revision, fetched_at
     except json.JSONDecodeError:
-        return {}, cast(tuple[str], existing_detail_row)
+        return {}, existing_detail_row, observed_revision, fetched_at
+
+
+def _optional_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 class _FullChatLike(Protocol):
@@ -208,22 +222,150 @@ def _extract_channel_identity(full_result: _FullResultLike, channel_id: int) -> 
     return None, None
 
 
+def _write_linked_entity_identity(payload: _LinkedChatCacheWrite) -> None:
+    ensure_entity_stub(
+        payload.conn,
+        EntitySnapshot(
+            entity_id=payload.channel_id,
+            entity_type="channel",
+            name=payload.channel_name,
+            username=payload.channel_username,
+            name_normalized=latinize(payload.channel_name) if isinstance(payload.channel_name, str) else None,
+            updated_at=payload.now,
+        ),
+    )
+    current = cast(
+        tuple[object, ...] | None,
+        payload.conn.execute(
+            "SELECT name, username, name_normalized FROM entities WHERE id=?", (payload.channel_id,)
+        ).fetchone(),
+    )
+    current_name, current_username, current_normalized = (current or (None, None, None))[:3]
+    current_name = current_name if isinstance(current_name, str) else None
+    current_username = current_username if isinstance(current_username, str) else None
+    observed_name = _clean_linked_name(payload.channel_name)
+    observed_username = _clean_linked_name(payload.channel_username)
+    upsert_entity_snapshots(
+        payload.conn,
+        [
+            EntitySnapshot(
+                entity_id=payload.channel_id,
+                entity_type="channel",
+                name=observed_name or current_name,
+                username=observed_username or current_username,
+                name_normalized=_linked_name_normalized(observed_name, current_name, current_normalized),
+                updated_at=payload.now,
+            )
+        ],
+    )
+
+
+def _clean_linked_name(value: str | None) -> str | None:
+    return value.strip() if isinstance(value, str) else None
+
+
+def _linked_name_normalized(observed_name: str | None, current_name: object, current_normalized: object) -> str | None:
+    if observed_name is None and isinstance(current_normalized, str):
+        return current_normalized
+    next_name = observed_name or current_name
+    return latinize(next_name) if isinstance(next_name, str) else None
+
+
+def _linked_detail_columns(conn: sqlite3.Connection) -> set[str]:
+    rows = cast(list[tuple[object, ...]], conn.execute("PRAGMA table_info(entity_details)").fetchall())
+    return {str(row[1]) for row in rows}
+
+
+def _write_linked_detail(payload: _LinkedChatCacheWrite, detail_columns: set[str]) -> int | None:
+    if payload.existing_detail_row is None and not _has_linked_sibling_fields(payload.existing_blob):
+        return None
+    if payload.existing_detail_row is None:
+        if not _insert_linked_detail(payload, detail_columns):
+            return None
+    elif not _update_linked_detail(payload, detail_columns):
+        return None
+    return _linked_detail_revision(payload, detail_columns)
+
+
+def _has_linked_sibling_fields(blob: dict[str, object]) -> bool:
+    return any(key in blob for key in ("subscribers_count", "pinned_msg_id", "about"))
+
+
+def _update_linked_detail(payload: _LinkedChatCacheWrite, detail_columns: set[str]) -> bool:
+    encoded = json.dumps(payload.existing_blob)
+    assignments = "detail_json=?, fetched_at=?"
+    if "profile_revision" in detail_columns:
+        assignments += ", profile_revision=profile_revision+1"
+        cas = " AND profile_revision=?"
+        cas_value: tuple[object, ...] = (payload.observed_profile_revision or 0,)
+    else:
+        cas = " AND fetched_at=?"
+        cas_value = (payload.observed_fetched_at,)
+    changed = payload.conn.execute(
+        "UPDATE entity_details SET " + assignments + " WHERE entity_id=?" + cas,
+        (encoded, payload.now, payload.channel_id, *cas_value),
+    ).rowcount
+    return changed == 1
+
+
+def _insert_linked_detail(payload: _LinkedChatCacheWrite, detail_columns: set[str]) -> bool:
+    columns = ["entity_id", "detail_json", "fetched_at"]
+    values: list[object] = [payload.channel_id, json.dumps(payload.existing_blob), payload.now]
+    if "profile_revision" in detail_columns:
+        columns.append("profile_revision")
+        refresh_columns = _table_columns(payload.conn, "entity_profile_refresh_state")
+        if {"profile_revision", "status"} <= refresh_columns:
+            changed = payload.conn.execute(
+                f"INSERT OR IGNORE INTO entity_details({', '.join(columns)}) "
+                "SELECT ?, ?, ?, COALESCE((SELECT profile_revision + 1 "
+                "FROM entity_profile_refresh_state WHERE entity_id=? "
+                "AND status IN ('pending', 'failed')), 1)",
+                (payload.channel_id, json.dumps(payload.existing_blob), payload.now, payload.channel_id),
+            ).rowcount
+            return changed == 1
+        values.append(1)
+    changed = payload.conn.execute(
+        f"INSERT INTO entity_details({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)}) "
+        "ON CONFLICT(entity_id) DO NOTHING",
+        values,
+    ).rowcount
+    return changed == 1
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    rows = cast(list[tuple[object, ...]], conn.execute(f"PRAGMA table_info({table})").fetchall())
+    return {str(row[1]) for row in rows}
+
+
+def _linked_detail_revision(payload: _LinkedChatCacheWrite, detail_columns: set[str]) -> int | None:
+    if "profile_revision" not in detail_columns:
+        return None
+    row = cast(
+        tuple[object, ...] | None,
+        payload.conn.execute(
+            "SELECT profile_revision FROM entity_details WHERE entity_id=?", (payload.channel_id,)
+        ).fetchone(),
+    )
+    return _optional_int(row[0]) if row is not None else None
+
+
+def _carry_linked_refresh_revision(conn: sqlite3.Connection, channel_id: int, revision: int | None) -> None:
+    if revision is None:
+        return
+    refresh_columns = _table_columns(conn, "entity_profile_refresh_state")
+    if "profile_revision" in refresh_columns:
+        conn.execute(
+            "UPDATE entity_profile_refresh_state SET profile_revision=? "
+            "WHERE entity_id=? AND status IN ('pending', 'failed') AND profile_revision<=?",
+            (revision, channel_id, revision),
+        )
+
+
 def _write_linked_chat_resolution(payload: _LinkedChatCacheWrite) -> None:
     """Persist the live linked-chat answer and sibling fields."""
-    has_sibling_fields = any(k in payload.existing_blob for k in ("subscribers_count", "pinned_msg_id", "about"))
     try:
         with payload.conn:
-            ensure_entity_stub(
-                payload.conn,
-                EntitySnapshot(
-                    entity_id=payload.channel_id,
-                    entity_type="channel",
-                    name=payload.channel_name,
-                    username=payload.channel_username,
-                    name_normalized=None,
-                    updated_at=payload.now,
-                ),
-            )
+            _write_linked_entity_identity(payload)
             payload.conn.execute(
                 "INSERT INTO dialogs (dialog_id, linked_chat_id, linked_chat_resolved_at) "
                 "VALUES (?, ?, ?) "
@@ -232,11 +374,8 @@ def _write_linked_chat_resolution(payload: _LinkedChatCacheWrite) -> None:
                 "    linked_chat_resolved_at = excluded.linked_chat_resolved_at",
                 (payload.channel_id, payload.linked_chat_id, payload.now),
             )
-            if payload.existing_detail_row is not None or has_sibling_fields:
-                payload.conn.execute(
-                    "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
-                    (payload.channel_id, json.dumps(payload.existing_blob), payload.now),
-                )
+            revision = _write_linked_detail(payload, _linked_detail_columns(payload.conn))
+            _carry_linked_refresh_revision(payload.conn, payload.channel_id, revision)
     except sqlite3.Error:
         logger.debug(
             "activity_peer_resolve_linked_cache_write_error channel_id=%r",
@@ -266,7 +405,9 @@ async def _resolve_linked_chat_live(
         full_result = cast(_FullResultLike, await call_with_timeout(client, request, timeout_s=timeout_s))
     full_chat = full_result.full_chat
     linked_chat_id = _normalize_linked_chat_id(full_chat.linked_chat_id)
-    existing_blob, existing_detail_row = _load_existing_detail_blob(conn, channel_id)
+    existing_blob, existing_detail_row, observed_profile_revision, observed_fetched_at = _load_existing_detail_blob(
+        conn, channel_id
+    )
     merged_blob = _merge_sibling_linked_chat_fields(full_chat, existing_blob)
     channel_name, channel_username = _extract_channel_identity(full_result, channel_id)
     _write_linked_chat_resolution(
@@ -276,6 +417,8 @@ async def _resolve_linked_chat_live(
             linked_chat_id=linked_chat_id,
             existing_blob=merged_blob,
             existing_detail_row=existing_detail_row,
+            observed_profile_revision=observed_profile_revision,
+            observed_fetched_at=observed_fetched_at,
             channel_name=channel_name,
             channel_username=channel_username,
             now=now,
