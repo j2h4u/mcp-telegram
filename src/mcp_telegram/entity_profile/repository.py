@@ -1804,12 +1804,25 @@ class EntityProfileRepository:
                 return True
             # A completed state is retained by v61 so the next demand can
             # start a fresh, never-reused generation immediately.
+            revision_assignment = ""
+            revision_value: tuple[object, ...] = ()
+            if self._refresh_has("profile_revision") and self._detail_has("profile_revision"):
+                revision_assignment = ", profile_revision=?"
+                revision_value = (self._profile_revision(entity_id),)
             changed = self._conn.execute(
                 "UPDATE entity_profile_refresh_state SET status='pending', retry_at=NULL, "
                 "reason='refresh_follow_up', updated_at=?, follow_up_required=0, "
-                "generation=generation+1, started_at=?, pair_eligible=?, next_section=?, acquisition_cursor=0 "
-                "WHERE entity_id=? AND status='complete'",
-                (now, now, int(self._pair_is_eligible(entity_id, now=now)), PROFILE_SECTIONS[0], entity_id),
+                "generation=generation+1, started_at=?, pair_eligible=?, next_section=?, acquisition_cursor=0"
+                + revision_assignment
+                + " WHERE entity_id=? AND status='complete'",
+                (
+                    now,
+                    now,
+                    int(self._pair_is_eligible(entity_id, now=now)),
+                    PROFILE_SECTIONS[0],
+                    *revision_value,
+                    entity_id,
+                ),
             ).rowcount
             if changed == 1:
                 self._reset_pair_measurement(entity_id)

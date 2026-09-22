@@ -332,6 +332,10 @@ def test_core_acquisition_is_atomic_and_reopens_at_next_section(tmp_path: Path) 
     assert resumed.acquisition_cursor == 1
     assert resumed.profile_revision == 1
     assert reopened_repo.commit_section(resumed, EntitySectionCommit({"about": "new"}), now=102)
+    assert reopened.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (2,)
+    assert reopened.execute(
+        "SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == (2,)
     reopened.close()
 
 
@@ -432,6 +436,79 @@ def test_save_core_carries_active_refresh_revision_before_section_progress(tmp_p
     conn.close()
 
 
+def test_refresh_readmission_paths_preserve_detail_revision_fence(tmp_path: Path) -> None:
+    path = tmp_path / "readmission-fence.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    conn.execute(
+        "INSERT INTO entity_details(entity_id, detail_json, fetched_at, profile_revision) VALUES (42, ?, 90, 0)",
+        ('{"schema":1,"about":"old"}',),
+    )
+    repo.mark_pending(42, now=100)
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET status='complete', retry_at=NULL, reason='refresh_complete' "
+        "WHERE entity_id=42"
+    )
+    conn.commit()
+    # A realtime identity write can arrive after completion. It advances the
+    # detail fence while no refresh generation is active.
+    repo.save_core({"id": 42, "type": "user", "name": "Fresh"}, now=101)
+    assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (1,)
+    assert conn.execute("SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+        0,
+    )
+    repo.mark_pending(42, now=102)
+    assert (
+        conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone()
+        == conn.execute("SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=42").fetchone()
+        == (1,)
+    )
+    cursor = repo.next_due_refresh(now=102)
+    assert cursor is not None
+    assert repo.commit_section(cursor, EntitySectionCommit({"about": "readmitted"}), now=103)
+
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET status='complete', retry_at=NULL, reason='refresh_complete' "
+        "WHERE entity_id=42"
+    )
+    conn.commit()
+    assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (2,)
+    assert conn.execute("SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+        2,
+    )
+    # Repeat the same drift against a completed generation and enter through
+    # request_follow_up, which must carry the detail fence into generation 3.
+    repo.save_core({"id": 42, "type": "user", "name": "Fresher"}, now=104)
+    assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (3,)
+    assert conn.execute("SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+        2,
+    )
+    assert repo.request_follow_up(42, now=105)
+    assert (
+        conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone()
+        == conn.execute("SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=42").fetchone()
+        == (3,)
+    )
+    cursor = repo.next_due_refresh(now=105)
+    assert cursor is not None
+    assert repo.commit_section(cursor, EntitySectionCommit({"about": "follow-up"}), now=106)
+
+    conn.execute(
+        "UPDATE entity_profile_refresh_state SET status='failed', retry_at=777, reason='flood_wait' WHERE entity_id=42"
+    )
+    conn.commit()
+    # Active failed generations already carry the detail fence; re-admission
+    # must preserve it without advancing generation or resetting the cursor.
+    repo.save_core({"id": 42, "type": "user", "name": "Newest"}, now=107)
+    repo.mark_pending(42, now=108)
+    assert (
+        conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone()
+        == conn.execute("SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=42").fetchone()
+        == (5,)
+    )
+    conn.close()
+
+
 def test_pre_detail_identity_writes_advance_only_the_active_refresh_fence(tmp_path: Path) -> None:
     path = tmp_path / "pre-detail-fence.sqlite"
     ensure_sync_schema(path)
@@ -456,6 +533,9 @@ def test_pre_detail_identity_writes_advance_only_the_active_refresh_fence(tmp_pa
     assert cursor is not None and cursor.profile_revision == 2
     assert repo.commit_section(cursor, EntitySectionCommit({"about": "first detail"}), now=103)
     assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (3,)
+    assert conn.execute("SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+        3,
+    )
     conn.close()
 
 
@@ -481,6 +561,9 @@ def test_pre_detail_core_acquisition_advances_cursor_fence_then_first_section_in
     assert next_cursor is not None and next_cursor.profile_revision == 1
     assert repo.commit_section(next_cursor, EntitySectionCommit({"about": "section"}), now=102)
     assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (2,)
+    assert conn.execute("SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+        2,
+    )
     conn.close()
 
 
