@@ -142,6 +142,7 @@ class ProjectionOutcome:
     payload: Mapping[str, object] | None
     reason: str | None
     provenance: ProjectionProvenance | None
+    identity_patch: Mapping[str, object] | None = None
 
     @property
     def authoritative_absence(self) -> bool:

@@ -134,6 +134,16 @@ def _sections_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _advance_fixture_cursor(repo: EntityProfileRepository, entity_id: int, next_cursor: int, now: int) -> None:
+    """Move a hand-built fixture past core acquisition without testing a writer API."""
+    with repo._conn:
+        repo._conn.execute(
+            "UPDATE entity_profile_refresh_state SET status='pending', retry_at=NULL, "
+            "reason='refresh_in_progress', updated_at=?, acquisition_cursor=? WHERE entity_id=?",
+            (now, next_cursor, entity_id),
+        )
+
+
 def test_local_core_has_pending_sections_without_rpc() -> None:
     conn = sqlite3.connect(":memory:")
     conn.execute(
@@ -628,7 +638,7 @@ async def test_channel_profile_commit_advances_once_and_overlays_canonical_link_
     try:
         cursor = service._profiles.next_due_refresh(now=100)
         assert cursor is not None
-        assert service._profiles.advance_acquisition_cursor(cursor, next_acquisition_cursor=1, now=100)
+        _advance_fixture_cursor(service._profiles, -10042, 1, 100)
         cursor = service._profiles.next_due_refresh(now=100)
         assert cursor is not None and cursor.next_section == "full_profile"
 
@@ -669,7 +679,7 @@ async def test_channel_profile_unavailable_commits_adapter_reason() -> None:
         _port.profile = replace(_port.profile, status=ProjectionStatus.UNAVAILABLE, reason="access_lost")
         cursor = service._profiles.next_due_refresh(now=100)
         assert cursor is not None
-        assert service._profiles.advance_acquisition_cursor(cursor, next_acquisition_cursor=1, now=100)
+        _advance_fixture_cursor(service._profiles, -10045, 1, 100)
         cursor = service._profiles.next_due_refresh(now=100)
         assert cursor is not None
         commit = await service._acquire_channel_full_profile(-10045, DialogType.CHANNEL)
@@ -726,7 +736,7 @@ async def test_supergroup_profile_persists_reverse_link_fact_only() -> None:
     try:
         cursor = service._profiles.next_due_refresh(now=100)
         assert cursor is not None
-        assert service._profiles.advance_acquisition_cursor(cursor, next_acquisition_cursor=1, now=100)
+        _advance_fixture_cursor(service._profiles, -10044, 1, 100)
         cursor = service._profiles.next_due_refresh(now=100)
         assert cursor is not None
         commit = await service._acquire_channel_full_profile(-10044, DialogType.SUPERGROUP)
@@ -1166,6 +1176,221 @@ async def test_cached_core_path_is_local_and_fast() -> None:
     assert data["name"] == "Cached"
     assert data["completeness"] == "partial"
     conn.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_detail_uses_canonical_identity_and_skips_core_resolution() -> None:  # noqa: PLR0915
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+    )
+    _sections_schema(conn)
+    conn.execute("INSERT INTO entities VALUES (42, 'user', 'Canonical', 'canonical', NULL, 100)")
+    conn.execute(
+        "INSERT INTO entity_details VALUES (42, ?, 90)",
+        (json.dumps({"schema": 1, "id": 999, "type": "unknown", "name": "Enrichment", "about": "legacy"}),),
+    )
+    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    _advance_fixture_cursor(repo, 42, 7, 100)
+    service = _test_service(conn, limits=RefreshLimits())
+    resolved_calls: list[int] = []
+
+    async def resolve_entity(entity_id: int) -> tuple[object | None, dict[str, object] | None]:
+        resolved_calls.append(entity_id)
+        raise AssertionError("known canonical entities must not resolve their core again")
+
+    async def acquire_section(_cursor: object, _entity_type: DialogType) -> EntitySectionCommit:
+        return EntitySectionCommit({"about": "fresh"}, payload={"about": "fresh"})
+
+    service._resolve_entity = resolve_entity  # type: ignore[method-assign]
+    service._acquire_profile_section = acquire_section  # type: ignore[method-assign]
+    try:
+        stored = repo.read(42, now=100)
+        assert stored is not None
+        assert stored.detail["id"] == 42
+        assert stored.detail["type"] == "user"
+        assert stored.detail["name"] == "Canonical"
+        assert stored.detail["username"] == "canonical"
+
+        coordinator = service.refresh_coordinator
+        assert coordinator is not None
+        assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
+        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+
+        assert resolved_calls == []
+        cursor = repo.next_due_refresh(now=100)
+        assert cursor is not None
+        assert cursor.next_section == "common_chats"
+        assert cursor.acquisition_cursor == 0
+        stored = repo.read(42, now=100)
+        assert stored is not None
+        assert stored.detail["type"] == "user"
+        assert stored.detail["name"] == "Canonical"
+        assert stored.detail["about"] == "fresh"
+        written_value = cast(
+            object,
+            json.loads(
+                cast(str, conn.execute("SELECT detail_json FROM entity_details WHERE entity_id=42").fetchone()[0])
+            ),
+        )
+        assert isinstance(written_value, dict)
+        written = cast(dict[str, object], written_value)
+        assert written["type"] == "user"
+        assert written["name"] == "Canonical"
+    finally:
+        await service.shutdown()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_core_acquisition_becomes_known_across_reopen_without_cursor_retry(tmp_path: Path) -> None:
+    path = tmp_path / "partial-core.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, "
+        "name_normalized TEXT, updated_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+    )
+    _sections_schema(conn)
+    conn.execute("INSERT INTO entities VALUES (42, 'unknown', 'Legacy', NULL, NULL, 90)")
+    conn.execute(
+        "INSERT INTO entity_details VALUES (42, ?, 90)",
+        (json.dumps({"schema": 1, "about": "legacy"}),),
+    )
+    repo = EntityProfileRepository(conn, section_ttl_seconds=300)
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    _advance_fixture_cursor(repo, 42, 7, 100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None and cursor.acquisition_cursor == 7
+
+    service = _test_service(conn, limits=RefreshLimits())
+
+    async def resolve_entity(_entity_id: int) -> tuple[object, None]:
+        return SimpleNamespace(id=42), None
+
+    service._resolve_entity = resolve_entity  # type: ignore[method-assign]
+    service._core_from_entity = lambda _entity: {
+        "id": 42,
+        "type": "user",
+        "name": "Resolved",
+        "username": "resolved",
+    }  # type: ignore[method-assign]
+    try:
+        assert await service._acquire_durable_refresh_core(cursor, now=100) is None
+        assert conn.execute(
+            "SELECT acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone() == (8,)
+    finally:
+        await service.shutdown()
+        conn.close()
+
+    reopened = sqlite3.connect(path)
+    try:
+        reopened_repo = EntityProfileRepository(reopened, section_ttl_seconds=300)
+        stored = reopened_repo.read(42, now=100)
+        assert stored is not None
+        assert stored.detail["type"] == "user"
+        assert stored.detail["name"] == "Resolved"
+        cursor = reopened_repo.next_due_refresh(now=100)
+        assert cursor is not None
+        assert cursor.acquisition_cursor == 8
+        assert cursor.next_section == "full_profile"
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_production_schema_core_write_syncs_revision_before_next_section_and_reopen(tmp_path: Path) -> None:  # noqa: PLR0915
+    path = tmp_path / "production-core.sqlite"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO entities(id, type, name, updated_at) VALUES (42, 'unknown', 'Legacy', 90)")
+    conn.execute(
+        "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
+        (json.dumps({"schema": 1, "about": "legacy"}),),
+    )
+    conn.commit()
+    service = _test_service(conn, limits=RefreshLimits())
+    service._profiles.mark_pending(42, now=100)
+    core_calls = 0
+
+    async def resolve_entity(_entity_id: int) -> tuple[object, None]:
+        nonlocal core_calls
+        core_calls += 1
+        scope = current_rpc_scope()
+        assert scope.attempt_budget is not None
+        scope.attempt_budget.debit()
+        return SimpleNamespace(id=42), None
+
+    async def acquire_section(_cursor: object, _entity_type: DialogType) -> EntitySectionCommit:
+        return EntitySectionCommit({"about": "fresh"}, payload={"about": "fresh"})
+
+    service._resolve_entity = resolve_entity  # type: ignore[method-assign]
+    service._core_from_entity = lambda _entity: {
+        "id": 42,
+        "type": "user",
+        "name": "Resolved",
+        "username": "resolved",
+    }  # type: ignore[method-assign]
+    service._acquire_profile_section = acquire_section  # type: ignore[method-assign]
+    try:
+        coordinator = service.refresh_coordinator
+        assert coordinator is not None
+        assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
+        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        assert core_calls == 1
+        assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (1,)
+        assert conn.execute(
+            "SELECT acquisition_cursor, profile_revision FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone() == (1, 1)
+        coordinator.signal_terminal(DurableRefreshSliceResult(42, DurableRefreshTerminal.SUCCESS))
+
+        assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
+        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        assert core_calls == 1
+        cursor = service._profiles.next_due_refresh(now=100)
+        assert cursor is not None
+        assert cursor.next_section == "common_chats"
+        assert cursor.profile_revision == 2
+        conn.close()
+    finally:
+        await service.shutdown()
+
+    reopened = sqlite3.connect(path)
+    reopened_service = _test_service(reopened, limits=RefreshLimits())
+
+    async def forbidden_resolve(_entity_id: int) -> tuple[object, None]:
+        raise AssertionError("reopened known entity must not resolve core again")
+
+    reopened_service._resolve_entity = forbidden_resolve  # type: ignore[method-assign]
+    reopened_service._acquire_profile_section = acquire_section  # type: ignore[method-assign]
+    try:
+        cursor = reopened_service._profiles.next_due_refresh(now=100)
+        assert cursor is not None
+        assert cursor.next_section == "common_chats"
+        assert cursor.profile_revision == 2
+        coordinator = reopened_service.refresh_coordinator
+        assert coordinator is not None
+        assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
+        await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+        cursor = reopened_service._profiles.next_due_refresh(now=100)
+        assert cursor is not None
+        assert cursor.next_section == "contact_overlap"
+        assert cursor.profile_revision == 3
+    finally:
+        await reopened_service.shutdown()
+        reopened.close()
 
 
 @pytest.mark.asyncio

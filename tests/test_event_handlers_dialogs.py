@@ -50,6 +50,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from helpers import build_mock_message
+from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
 from mcp_telegram.event_handlers import (
     EventHandlerManager,
     _ChannelChatUpdateLike,
@@ -718,6 +719,10 @@ async def test_realtime_identity_and_mute_update_only_their_canonical_bundles(
         "identity_source='directory',identity_observed_at=10 WHERE dialog_id=?",
         (dialog_id,),
     )
+    sync_db.execute(
+        "INSERT INTO entities(id,type,name,username,name_normalized,updated_at) VALUES (?,?,?,?,?,?)",
+        (dialog_id, "user", "Old", "old", "old", 10),
+    )
     sync_db.commit()
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
 
@@ -736,6 +741,106 @@ async def test_realtime_identity_and_mute_update_only_their_canonical_bundles(
     assert sync_db.execute(
         "SELECT mute_until FROM dialog_directory_facts WHERE dialog_id=?", (dialog_id,)
     ).fetchone() == (1_767_225_600,)
+    assert sync_db.execute("SELECT name,username,type FROM entities WHERE id=?", (dialog_id,)).fetchone() == (
+        "New Name",
+        "new",
+        "user",
+    )
+
+
+@pytest.mark.asyncio
+async def test_username_only_realtime_update_preserves_canonical_name_and_type(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 67892
+    _insert_dialog(sync_db, dialog_id, snapshot_at=1)
+    sync_db.execute(
+        "INSERT INTO entities(id,type,name,username,name_normalized,updated_at) VALUES (?,?,?,?,?,?)",
+        (dialog_id, "service", "Known Name", "old", "known name", 10),
+    )
+    sync_db.commit()
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    manager._update_realtime_username(
+        SimpleNamespace(user_id=dialog_id, usernames=[Username("new", active=True)]), now=100
+    )
+    assert sync_db.execute("SELECT name,username,type FROM entities WHERE id=?", (dialog_id,)).fetchone() == (
+        "Known Name",
+        "new",
+        "service",
+    )
+
+
+@pytest.mark.asyncio
+async def test_realtime_identity_write_carries_profile_revision_past_old_cursor(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 67893
+    repo = EntityProfileRepository(sync_db, section_ttl_seconds=300)
+    repo.save_core({"id": dialog_id, "type": "user", "name": "Old", "username": "old"}, now=1)
+    sync_db.execute(
+        "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_revision) VALUES (?,?,?,?)",
+        (dialog_id, '{"id": 67893, "type": "user"}', 1, 0),
+    )
+    repo.mark_pending(dialog_id, now=1)
+    old_cursor = repo.next_due_refresh(now=1)
+    assert old_cursor is not None
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+
+    manager._update_realtime_username(
+        SimpleNamespace(user_id=dialog_id, usernames=[Username("new", active=True)]), now=2
+    )
+
+    assert sync_db.execute(
+        "SELECT profile_revision FROM entity_details WHERE entity_id=?", (dialog_id,)
+    ).fetchone() == (1,)
+    assert sync_db.execute(
+        "SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=?", (dialog_id,)
+    ).fetchone() == (1,)
+    assert not repo.commit_section(old_cursor, EntitySectionCommit({"about": "stale"}), now=2)
+    current = repo.next_due_refresh(now=2)
+    assert current is not None and current.profile_revision == 1
+    assert repo.commit_section(current, EntitySectionCommit({"about": "fresh"}), now=2)
+
+
+@pytest.mark.asyncio
+async def test_dm_identity_write_carries_profile_revision_past_old_cursor(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 67894
+    repo = EntityProfileRepository(sync_db, section_ttl_seconds=300)
+    repo.save_core({"id": dialog_id, "type": "user", "name": "Old", "username": "old"}, now=1)
+    sync_db.execute(
+        "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_revision) VALUES (?,?,?,?)",
+        (dialog_id, '{"id": 67894, "type": "user"}', 1, 0),
+    )
+    repo.mark_pending(dialog_id, now=1)
+    old_cursor = repo.next_due_refresh(now=1)
+    assert old_cursor is not None
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    manager.bind_demand_sink(MagicMock())
+
+    assert manager._auto_enroll_dm(
+        dialog_id,
+        sender=SimpleNamespace(first_name="Fresh", last_name="Person", username="fresh"),
+        observed_at=2,
+    )
+
+    assert sync_db.execute(
+        "SELECT profile_revision FROM entity_details WHERE entity_id=?", (dialog_id,)
+    ).fetchone() == (1,)
+    assert sync_db.execute(
+        "SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=?", (dialog_id,)
+    ).fetchone() == (1,)
+    assert not repo.commit_section(old_cursor, EntitySectionCommit({"about": "stale"}), now=2)
+    current = repo.next_due_refresh(now=2)
+    assert current is not None and current.profile_revision == 1
+    assert repo.commit_section(current, EntitySectionCommit({"about": "fresh"}), now=2)
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import mcp_telegram.entity_profile.repository as repository_module
 import mcp_telegram.sync_db as sync_db_module
 from mcp_telegram.entity_profile.contracts import FULL_PROFILE_OWNED_FIELDS, ProfileAcquisitionEvidence
 from mcp_telegram.entity_profile.refresh import failure_retry_at, scope_changed_retry_at, throttled_retry_at
@@ -106,6 +107,36 @@ def test_pair_commit_rolls_back_all_projections_on_failure(tmp_path: Path) -> No
     conn.close()
 
 
+def test_pair_commit_rolls_back_when_final_cursor_cas_returns_false(tmp_path: Path) -> None:
+    path = tmp_path / "pair-cursor-reject.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    original_advance = repo._advance_full_pair_cursor
+    repo._advance_full_pair_cursor = lambda *_args, **_kwargs: False  # type: ignore[method-assign]
+    with pytest.raises(sqlite3.OperationalError, match="full user pair cursor advance"):
+        repo.commit_full_user_pair(
+            cursor,
+            EntitySectionCommit({"about": "new"}, evidence=_evidence(cursor.generation)),
+            EntitySectionCommit(
+                {"personal_channel": None},
+                status="unavailable",
+                reason="absent",
+                evidence=_evidence(cursor.generation, outcome="absent"),
+            ),
+            now=101,
+        )
+    repo._advance_full_pair_cursor = original_advance  # type: ignore[method-assign]
+    assert conn.execute("SELECT COUNT(*) FROM entity_details WHERE entity_id=42").fetchone() == (0,)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM entity_detail_sections WHERE entity_id=42 AND acquisition_generation IS NOT NULL"
+    ).fetchone() == (0,)
+    assert repo.next_due_refresh(now=101) == cursor
+    conn.close()
+
+
 def test_pair_measurement_survives_reopen_after_projection_commit(tmp_path: Path) -> None:
     path = tmp_path / "pair-measurement.sqlite"
     ensure_sync_schema(path)
@@ -190,6 +221,8 @@ def test_generation_and_revision_fences_reject_stale_writers(tmp_path: Path) -> 
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)
     conn, repo = _repository(path)
+    conn.execute("UPDATE entities SET username='canonical' WHERE id=42")
+    conn.commit()
     repo.mark_pending(42, now=100)
     cursor = repo.next_due_refresh(now=100)
     assert cursor is not None
@@ -200,15 +233,374 @@ def test_generation_and_revision_fences_reject_stale_writers(tmp_path: Path) -> 
         ('{"schema":1,"id":42,"type":"user","name":"newer"}',),
     )
     conn.commit()
-    assert not repo.commit_section(cursor, EntitySectionCommit({"name": "older"}), now=102)
+    assert not repo.commit_section(
+        cursor, EntitySectionCommit({"name": "older"}, identity_patch={"username": None}), now=102
+    )
     assert conn.execute("SELECT detail_json FROM entity_details WHERE entity_id=42").fetchone() == (
         '{"schema":1,"id":42,"type":"user","name":"newer"}',
+    )
+    assert conn.execute("SELECT type, name, username FROM entities WHERE id=42").fetchone() == (
+        "user",
+        "User",
+        "canonical",
     )
     conn.execute(
         "UPDATE entity_profile_refresh_state SET generation=generation+1, profile_revision=1 WHERE entity_id=42"
     )
     conn.commit()
     assert not repo.commit_section(cursor, EntitySectionCommit({"name": "aba"}), now=103)
+    conn.close()
+
+
+def test_canonical_identity_merge_preserves_richer_placeholders_and_materializes_fresh_patch(tmp_path: Path) -> None:
+    path = tmp_path / "identity-merge.sqlite"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO entities(id, type, name, username, updated_at) VALUES (42, 'unknown', NULL, NULL, 1)")
+    conn.execute(
+        "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
+        ('{"schema":1,"id":999,"type":"user","name":"Blob User","username":"blob"}',),
+    )
+    conn.commit()
+    repo = EntityProfileRepository(conn, section_ttl_seconds=10)
+
+    stored = repo.read(42, now=90)
+    assert stored is not None
+    assert stored.detail["id"] == 42
+    assert stored.detail["type"] == "user"
+    assert stored.detail["name"] == "Blob User"
+    assert stored.detail["username"] == "blob"
+
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    assert repo.commit_section(
+        cursor,
+        EntitySectionCommit(
+            {"about": "enrichment"},
+            identity_patch={"id": 999, "type": "User", "name": "Fresh User", "username": "fresh"},
+        ),
+        now=101,
+    )
+    assert conn.execute("SELECT id, type, name, username FROM entities WHERE id=42").fetchone() == (
+        42,
+        "user",
+        "Fresh User",
+        "fresh",
+    )
+    stored = repo.read(42, now=101)
+    assert stored is not None
+    assert stored.detail["id"] == 42
+    assert stored.detail["type"] == "user"
+    assert stored.detail["name"] == "Fresh User"
+    assert stored.detail["username"] == "fresh"
+    conn.close()
+
+
+def test_core_acquisition_is_atomic_and_reopens_at_next_section(tmp_path: Path) -> None:
+    path = tmp_path / "core-acquisition.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    conn.execute(
+        "INSERT INTO entity_details(entity_id, detail_json, fetched_at, profile_revision) VALUES (42, ?, 90, 0)",
+        ('{"schema":1,"about":"old"}',),
+    )
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    assert repo.commit_core_acquisition(
+        cursor,
+        {"id": 42, "type": "user", "name": "Fresh", "username": "fresh"},
+        next_acquisition_cursor=1,
+        now=101,
+    )
+    assert conn.execute("SELECT type, name, username FROM entities WHERE id=42").fetchone() == (
+        "user",
+        "Fresh",
+        "fresh",
+    )
+    assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (1,)
+    assert conn.execute(
+        "SELECT acquisition_cursor, profile_revision FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == (1, 1)
+    conn.close()
+
+    reopened = sqlite3.connect(path)
+    reopened_repo = EntityProfileRepository(reopened, section_ttl_seconds=10)
+    resumed = reopened_repo.next_due_refresh(now=102)
+    assert resumed is not None
+    assert resumed.acquisition_cursor == 1
+    assert resumed.profile_revision == 1
+    assert reopened_repo.commit_section(resumed, EntitySectionCommit({"about": "new"}), now=102)
+    reopened.close()
+
+
+def test_core_acquisition_stale_cursor_and_exception_leave_all_rows_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "core-rollback.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    conn.execute(
+        "INSERT INTO entity_details(entity_id, detail_json, fetched_at, profile_revision) VALUES (42, ?, 90, 0)",
+        ('{"schema":1,"about":"old"}',),
+    )
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    conn.execute("UPDATE entity_profile_refresh_state SET acquisition_cursor=1 WHERE entity_id=42")
+    conn.commit()
+    before = (
+        conn.execute("SELECT type, name, username FROM entities WHERE id=42").fetchone(),
+        conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone(),
+    )
+    assert not repo.commit_core_acquisition(
+        cursor,
+        {"id": 42, "type": "user", "name": "stale", "username": "stale"},
+        next_acquisition_cursor=1,
+        now=101,
+    )
+    assert before == (
+        conn.execute("SELECT type, name, username FROM entities WHERE id=42").fetchone(),
+        conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone(),
+    )
+    conn.execute("UPDATE entity_profile_refresh_state SET acquisition_cursor=0 WHERE entity_id=42")
+    conn.commit()
+    original_matches = repo._cursor_matches
+
+    def stale_after_match(candidate: object) -> bool:
+        matched = original_matches(candidate)  # type: ignore[arg-type]
+        conn.execute("UPDATE entity_profile_refresh_state SET acquisition_cursor=1 WHERE entity_id=42")
+        return matched
+
+    monkeypatch.setattr(repo, "_cursor_matches", stale_after_match)
+    assert not repo.commit_core_acquisition(
+        cursor,
+        {"id": 42, "type": "user", "name": "rowcount", "username": "rowcount"},
+        next_acquisition_cursor=1,
+        now=101,
+    )
+    assert conn.execute(
+        "SELECT acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == (0,)
+    assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (0,)
+    monkeypatch.setattr(repo, "_cursor_matches", original_matches)
+    original = repository_module.upsert_entity_snapshots
+
+    def fail_after_write(connection: sqlite3.Connection, snapshots: object) -> None:
+        original(connection, snapshots)  # type: ignore[arg-type]
+        raise RuntimeError("injected core failure")
+
+    monkeypatch.setattr(repository_module, "upsert_entity_snapshots", fail_after_write)
+    with pytest.raises(RuntimeError, match="injected core failure"):
+        repo.commit_core_acquisition(
+            cursor,
+            {"id": 42, "type": "user", "name": "new", "username": "new"},
+            next_acquisition_cursor=1,
+            now=101,
+        )
+    assert conn.execute("SELECT type, name, username FROM entities WHERE id=42").fetchone() == (
+        "user",
+        "User",
+        None,
+    )
+    assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (0,)
+    assert conn.execute(
+        "SELECT acquisition_cursor FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == (0,)
+    conn.close()
+
+
+def test_save_core_carries_active_refresh_revision_before_section_progress(tmp_path: Path) -> None:
+    path = tmp_path / "save-core-active.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    conn.execute(
+        "INSERT INTO entity_details(entity_id, detail_json, fetched_at, profile_revision) VALUES (42, ?, 90, 0)",
+        ('{"schema":1,"about":"old"}',),
+    )
+    repo.mark_pending(42, now=100)
+    repo.save_core({"id": 42, "type": "user", "name": "Fresh Name", "username": "fresh"}, now=101)
+    assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (1,)
+    assert conn.execute("SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
+        1,
+    )
+    assert conn.execute("SELECT name_normalized FROM entities WHERE id=42").fetchone() == ("fresh name",)
+    cursor = repo.next_due_refresh(now=101)
+    assert cursor is not None and cursor.profile_revision == 1
+    assert repo.commit_section(cursor, EntitySectionCommit({"about": "new"}), now=102)
+    conn.close()
+
+
+def test_pre_detail_identity_writes_advance_only_the_active_refresh_fence(tmp_path: Path) -> None:
+    path = tmp_path / "pre-detail-fence.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    repo.mark_pending(42, now=100)
+    before = conn.execute(
+        "SELECT status, retry_at, reason, next_section, acquisition_cursor, generation, started_at "
+        "FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone()
+
+    repo.save_core({"id": 42, "type": "user", "name": "First", "username": "first"}, now=101)
+    repo.save_core({"id": 42, "type": "user", "name": "Second", "username": "second"}, now=102)
+
+    assert conn.execute("SELECT COUNT(*) FROM entity_details WHERE entity_id=42").fetchone() == (0,)
+    state = conn.execute(
+        "SELECT status, retry_at, reason, next_section, acquisition_cursor, generation, started_at, profile_revision "
+        "FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone()
+    assert state == (*before, 2)
+    assert conn.execute("SELECT name, username FROM entities WHERE id=42").fetchone() == ("Second", "second")
+    cursor = repo.next_due_refresh(now=102)
+    assert cursor is not None and cursor.profile_revision == 2
+    assert repo.commit_section(cursor, EntitySectionCommit({"about": "first detail"}), now=103)
+    assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (3,)
+    conn.close()
+
+
+def test_pre_detail_core_acquisition_advances_cursor_fence_then_first_section_inserts(tmp_path: Path) -> None:
+    path = tmp_path / "pre-detail-core.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None and cursor.profile_revision == 0
+
+    assert repo.commit_core_acquisition(
+        cursor,
+        {"id": 42, "type": "user", "name": "Core", "username": "core"},
+        next_acquisition_cursor=1,
+        now=101,
+    )
+    assert conn.execute("SELECT COUNT(*) FROM entity_details WHERE entity_id=42").fetchone() == (0,)
+    assert conn.execute(
+        "SELECT acquisition_cursor, profile_revision FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == (1, 1)
+    next_cursor = repo.next_due_refresh(now=101)
+    assert next_cursor is not None and next_cursor.profile_revision == 1
+    assert repo.commit_section(next_cursor, EntitySectionCommit({"about": "section"}), now=102)
+    assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (2,)
+    conn.close()
+
+
+def test_pre_detail_pair_first_insert_uses_retained_refresh_revision(tmp_path: Path) -> None:
+    path = tmp_path / "pre-detail-pair.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    repo.mark_pending(42, now=100, pair_mode_override="enabled")
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    assert repo.save_core({"id": 42, "type": "user", "name": "Core"}, now=101) is None
+    cursor = repo.next_due_refresh(now=101)
+    assert cursor is not None and cursor.profile_revision == 1
+
+    assert repo.commit_full_user_pair(
+        cursor,
+        EntitySectionCommit({"about": "full"}, evidence=_evidence(cursor.generation)),
+        EntitySectionCommit(
+            {"personal_channel": None},
+            status="unavailable",
+            reason="absent",
+            evidence=_evidence(cursor.generation, outcome="absent"),
+        ),
+        now=102,
+    )
+    assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=42").fetchone() == (2,)
+    assert conn.execute(
+        "SELECT next_section, profile_revision FROM entity_profile_refresh_state WHERE entity_id=42"
+    ).fetchone() == ("common_chats", 2)
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("identity_patch", "expected"),
+    [
+        ({"username": None}, None),
+        ({}, "known"),
+        ({"username": ""}, "known"),
+    ],
+)
+def test_identity_patch_deletion_absence_and_empty_semantics(
+    tmp_path: Path, identity_patch: dict[str, object], expected: str | None
+) -> None:
+    path = tmp_path / "identity-patch.sqlite"
+    ensure_sync_schema(path)
+    conn, repo = _repository(path)
+    conn.execute("UPDATE entities SET username='known' WHERE id=42")
+    conn.commit()
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    assert repo.commit_section(
+        cursor, EntitySectionCommit({"about": "observed"}, identity_patch=identity_patch), now=101
+    )
+    assert conn.execute("SELECT username FROM entities WHERE id=42").fetchone() == (expected,)
+    conn.close()
+    reopened = sqlite3.connect(path)
+    stored = EntityProfileRepository(reopened, section_ttl_seconds=10).read(42, now=102)
+    assert stored is not None
+    assert stored.detail["username"] == expected
+    reopened.close()
+
+
+def test_known_canonical_null_identity_overrides_legacy_blob_after_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "canonical-null.sqlite"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO entities(id, type, name, username, updated_at) VALUES (42, 'user', 'Known', NULL, 1)")
+    conn.execute(
+        "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
+        ('{"schema":1,"id":999,"type":"user","name":"Old","username":"old"}',),
+    )
+    conn.commit()
+    repo = EntityProfileRepository(conn, section_ttl_seconds=10)
+    stored = repo.read(42, now=100)
+    assert stored is not None and stored.detail["id"] == 42
+    assert stored.detail["name"] == "Known"
+    assert stored.detail["username"] is None
+    conn.close()
+    reopened = sqlite3.connect(path)
+    stored = EntityProfileRepository(reopened, section_ttl_seconds=10).read(42, now=101)
+    assert stored is not None and stored.detail["username"] is None
+    reopened.close()
+
+
+def test_known_canonical_identity_is_not_erased_by_placeholder_section_values(tmp_path: Path) -> None:
+    path = tmp_path / "identity-placeholder.sqlite"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO entities(id, type, name, username, updated_at) VALUES (42, 'user', 'Known', 'known', 1)")
+    conn.execute(
+        "INSERT INTO entity_details(entity_id, detail_json, fetched_at) VALUES (42, ?, 90)",
+        ('{"schema":1,"id":42,"type":"unknown","name":"Old","username":"old"}',),
+    )
+    conn.commit()
+    repo = EntityProfileRepository(conn, section_ttl_seconds=10)
+    repo.save_core({"id": 42, "type": "unknown", "name": None, "username": None}, now=95)
+    assert conn.execute("SELECT type, name, username FROM entities WHERE id=42").fetchone() == (
+        "user",
+        "Known",
+        "known",
+    )
+    repo.mark_pending(42, now=100)
+    cursor = repo.next_due_refresh(now=100)
+    assert cursor is not None
+    assert repo.commit_section(
+        cursor,
+        EntitySectionCommit({"type": "unknown", "name": None, "username": ""}),
+        now=101,
+    )
+    assert conn.execute("SELECT type, name, username FROM entities WHERE id=42").fetchone() == (
+        "user",
+        "Known",
+        "known",
+    )
+    stored = repo.read(42, now=101)
+    assert stored is not None
+    assert stored.detail["type"] == "user"
+    assert stored.detail["name"] == "Known"
+    assert stored.detail["username"] == "known"
     conn.close()
 
 

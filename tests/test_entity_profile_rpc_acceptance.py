@@ -265,6 +265,29 @@ async def test_service_full_profile_uses_bot_target_and_keeps_personal_channel_i
 
 
 @pytest.mark.asyncio
+async def test_service_refresh_keeps_canonical_service_type_when_full_user_uses_bot_target(tmp_path: Path) -> None:
+    conn, service = _prepare(tmp_path / "service-refresh.sqlite", entity_type="service")
+    client = cast(_PairClient, service._deps.client)  # type: ignore[attr-defined]
+    client.bot = True
+    coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
+    assert coordinator is not None
+
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute("SELECT type FROM entities WHERE id=42").fetchone() == ("service",)
+    state = cast(
+        tuple[str, int] | None,
+        conn.execute(
+            "SELECT next_section, pair_eligible FROM entity_profile_refresh_state WHERE entity_id=42"
+        ).fetchone(),
+    )
+    assert state == ("common_chats", 0)
+    assert not DaemonEntityInfoService._section_applies(DialogType.SERVICE, "personal_channel")  # type: ignore[attr-defined]
+    await service.shutdown()  # type: ignore[attr-defined]
+    conn.close()
+
+
+@pytest.mark.asyncio
 async def test_partial_personal_channel_keeps_id_reason_and_no_local_card(tmp_path: Path) -> None:
     conn, service = _prepare(tmp_path / "partial-channel.sqlite")
     raw = _RawUserProfileClient(

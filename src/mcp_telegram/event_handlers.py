@@ -77,11 +77,12 @@ from .dialog_directory import (
     record_realtime_pin_fence,
     sync_active_generation_pins_from_publication,
 )
-from .entity_store import EntitySnapshot, upsert_entity_snapshots
+from .entity_store import PartialEntityIdentity, apply_partial_entity_identity
 from .flood import TelegramRpcThrottled
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .history_enrollment import EnrollmentOutcome, ensure_automatic_dm_enrollment
 from .hydration_queue import HydrationPriority
+from .identity_observation import USERNAME_UNOBSERVED, observe_username
 from .messages.sqlite_bundle import (
     find_unique_incoming_human_dm_dialogs,
     insert_messages_with_fts,
@@ -116,7 +117,6 @@ from .realtime_history_policy import (
     allows_new_message,
     realtime_history_coverage,
 )
-from .resolver import latinize
 from .runtime_observations import record_runtime_observation
 from .scheduled_messages import (
     mark_scheduled_messages_removed,
@@ -252,6 +252,8 @@ class _DmIdentity:
     name: str | None
     username: str | None
     entity_type: str
+    name_observed: bool
+    username_observed: bool
 
 
 class _MessageLike(Protocol):
@@ -813,12 +815,19 @@ class EventHandlerManager:
     def _dm_identity(sender: _SenderLike | None) -> _DmIdentity | None:
         if sender is None:
             return None
-        first = _first_non_empty_str(getattr(sender, "first_name", None)) or ""
-        last = _first_non_empty_str(getattr(sender, "last_name", None)) or ""
+        first_raw = getattr(sender, "first_name", USERNAME_UNOBSERVED)
+        last_raw = getattr(sender, "last_name", USERNAME_UNOBSERVED)
+        first = _first_non_empty_str(first_raw) or ""
+        last = _first_non_empty_str(last_raw) or ""
+        raw_username = getattr(sender, "username", USERNAME_UNOBSERVED)
+        raw_usernames = getattr(sender, "usernames", USERNAME_UNOBSERVED)
+        observed_username = observe_username(raw_username, raw_usernames)
         return _DmIdentity(
             name=f"{first} {last}".strip() or None,
-            username=_first_non_empty_str(getattr(sender, "username", None)),
+            username=None if observed_username is USERNAME_UNOBSERVED else cast(str | None, observed_username),
             entity_type=classify_dialog_type(sender).value,
+            name_observed=first_raw is not USERNAME_UNOBSERVED or last_raw is not USERNAME_UNOBSERVED,
+            username_observed=observed_username is not USERNAME_UNOBSERVED,
         )
 
     def _persist_dm_enrollment(
@@ -855,17 +864,16 @@ class EventHandlerManager:
     def _persist_dm_entity(self, dialog_id: int, identity: _DmIdentity, observed_at: int) -> None:
         try:
             with self._conn:
-                upsert_entity_snapshots(
+                apply_partial_entity_identity(
                     self._conn,
-                    (
-                        EntitySnapshot(
-                            entity_id=dialog_id,
-                            entity_type=identity.entity_type,
-                            name=identity.name,
-                            username=identity.username,
-                            name_normalized=latinize(identity.name) if identity.name else None,
-                            updated_at=observed_at,
-                        ),
+                    dialog_id,
+                    PartialEntityIdentity(
+                        observed_at=observed_at,
+                        observed_type=identity.entity_type,
+                        name_observed=identity.name_observed,
+                        name=identity.name,
+                        username_observed=identity.username_observed,
+                        username=identity.username,
                     ),
                 )
         except Exception:
@@ -1973,27 +1981,34 @@ class EventHandlerManager:
     def _username_update_alias(update: UpdateUserName) -> str | _IdentityOmitted | None:
         if not hasattr(update, "usernames"):
             return IDENTITY_OMITTED
-        return next(
-            (
-                username.removeprefix("@")
-                for candidate in (update.usernames or ())
-                if getattr(candidate, "active", False)
-                and isinstance(username := getattr(candidate, "username", None), str)
-            ),
-            None,
-        )
+        observed = observe_username(USERNAME_UNOBSERVED, update.usernames)
+        return IDENTITY_OMITTED if observed is USERNAME_UNOBSERVED else cast(str | None, observed)
 
     def _update_realtime_username(self, update: UpdateUserName, now: int) -> None:
         with self._conn:
+            name = self._username_update_name(update)
+            username = self._username_update_alias(update)
             apply_realtime_identity(
                 self._conn,
                 int(update.user_id),
-                name=self._username_update_name(update),
-                username=self._username_update_alias(update),
+                name=name,
+                username=username,
                 dialog_type=None,
                 observed_at=now,
                 complete=False,
             )
+            if name is not IDENTITY_OMITTED or username is not IDENTITY_OMITTED:
+                apply_partial_entity_identity(
+                    self._conn,
+                    int(update.user_id),
+                    PartialEntityIdentity(
+                        observed_at=now,
+                        name_observed=name is not IDENTITY_OMITTED,
+                        name=cast(str | None, name) if name is not IDENTITY_OMITTED else None,
+                        username_observed=username is not IDENTITY_OMITTED,
+                        username=cast(str | None, username) if username is not IDENTITY_OMITTED else None,
+                    ),
+                )
 
     def _update_realtime_notify(self, update: UpdateNotifySettings, now: int) -> None:
         peer = getattr(getattr(update, "peer", None), "peer", None)
