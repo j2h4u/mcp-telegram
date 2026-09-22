@@ -1193,7 +1193,7 @@ async def test_list_messages_from_db() -> None:
     client.iter_messages = AsyncMock()
     server = make_server(conn, client)
 
-    result = await server._list_messages({"dialog_id": 1, "limit": 10})
+    result = await server._list_messages({"dialog_id": 1, "limit": 10, "message_state": "sent"})
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
     assert result["data"]["source"] == "sync_db"
@@ -1236,7 +1236,7 @@ async def test_list_messages_on_demand() -> None:
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
 
-    result = await server._list_messages({"dialog_id": 2, "limit": 10})
+    result = await server._list_messages({"dialog_id": 2, "limit": 10, "message_state": "sent"})
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
     assert result["data"]["source"] == "telegram"
@@ -1269,7 +1269,7 @@ async def test_dispatch_uncached_list_messages_binds_interactive_rpc_source() ->
     client.iter_messages = iter_messages
     server = make_server(conn, client)
 
-    result = await server._dispatch({"method": "list_messages", "dialog_id": 2, "limit": 10})
+    result = await server._dispatch({"method": "list_messages", "dialog_id": 2, "limit": 10, "message_state": "sent"})
 
     assert result["ok"] is True
     assert seen_sources == [TelegramRpcSource.MCP_INTERACTIVE]
@@ -1361,7 +1361,9 @@ async def test_list_messages_context_window_own_only_uses_fragment_fetch() -> No
     )
     server = make_server(conn, client)
 
-    result = await server._list_messages({"dialog_id": DIALOG_ID, "context_message_id": 10, "context_size": 4})
+    result = await server._list_messages(
+        {"dialog_id": DIALOG_ID, "context_message_id": 10, "context_size": 4, "message_state": "sent"}
+    )
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     assert result["data"]["coverage"] == "fragment"
@@ -4460,7 +4462,9 @@ async def test_list_messages_pagination_cursor_continues() -> None:
     token = encode_history_navigation(103, DIALOG_ID, direction=HistoryDirection.NEWEST, message_state="sent")
 
     server = make_server(conn)
-    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 2, "navigation": token})
+    result = await server._list_messages(
+        {"dialog_id": DIALOG_ID, "limit": 2, "navigation": token, "message_state": "sent"}
+    )
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     messages = _response_messages(result)
@@ -4491,13 +4495,15 @@ async def test_list_messages_pagination_uses_composite_sent_anchor(
     _insert_message(conn, dialog_id, 50, sent_at=200, text="newer date, smaller id")
 
     server = make_server(conn)
-    first = await server._list_messages({"dialog_id": dialog_id, "direction": direction, "limit": 1})
+    first = await server._list_messages(
+        {"dialog_id": dialog_id, "direction": direction, "limit": 1, "message_state": "sent"}
+    )
     token = first["data"]["next_navigation"]
     assert token is not None
     assert decode_navigation_token(token).sent_at == expected_anchor_sent_at
 
     second = await server._list_messages(
-        {"dialog_id": dialog_id, "direction": direction, "limit": 1, "navigation": token}
+        {"dialog_id": dialog_id, "direction": direction, "limit": 1, "navigation": token, "message_state": "sent"}
     )
 
     assert [row["message_id"] for row in first["data"]["messages"] + second["data"]["messages"]] == expected_ids
@@ -4530,7 +4536,7 @@ async def test_list_messages_legacy_cursor_looks_up_local_composite_anchor(
     )
 
     result = await make_server(conn)._list_messages(
-        {"dialog_id": dialog_id, "direction": direction, "limit": 1, "navigation": token}
+        {"dialog_id": dialog_id, "direction": direction, "limit": 1, "navigation": token, "message_state": "sent"}
     )
 
     assert [row["message_id"] for row in result["data"]["messages"]] == expected_ids
@@ -4791,7 +4797,9 @@ async def test_list_messages_known_topic_with_no_local_rows_stays_local_and_unkn
     client.iter_messages = AsyncMock(side_effect=AssertionError("synced topic reads must not acquire Telegram history"))
     server = make_server(conn, client)
 
-    result = await server._list_messages({"dialog_id": dialog_id, "limit": 10, "topic_id": topic_id})
+    result = await server._list_messages(
+        {"dialog_id": dialog_id, "limit": 10, "topic_id": topic_id, "message_state": "sent"}
+    )
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     assert result["data"]["source"] == "sync_db"
@@ -4816,7 +4824,9 @@ async def test_list_messages_unknown_topic_for_synced_dialog_does_not_call_teleg
     client.iter_messages = _unexpected_iter_messages
     server = make_server(conn, client)
 
-    result = await server._list_messages({"dialog_id": dialog_id, "limit": 10, "topic_id": topic_id})
+    result = await server._list_messages(
+        {"dialog_id": dialog_id, "limit": 10, "topic_id": topic_id, "message_state": "sent"}
+    )
 
     assert result["ok"] is True
     assert result["data"]["source"] == "sync_db"
@@ -4836,7 +4846,9 @@ async def test_list_messages_unread_filter() -> None:
     _insert_message(conn, DIALOG_ID, 102, text="newer msg", sent_at=1700000004)
 
     server = make_server(conn)
-    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "unread_after_id": 100})
+    result = await server._list_messages(
+        {"dialog_id": DIALOG_ID, "limit": 10, "unread_after_id": 100, "message_state": "sent"}
+    )
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     messages = _response_messages(result)
@@ -4964,7 +4976,9 @@ async def test_list_messages_on_demand_navigation_offset_id() -> None:
     server = make_server(conn, client)
 
     token = encode_history_navigation(200, DIALOG_ID, direction=HistoryDirection.NEWEST, message_state="sent")
-    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "navigation": token})
+    result = await server._list_messages(
+        {"dialog_id": DIALOG_ID, "limit": 10, "navigation": token, "message_state": "sent"}
+    )
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     assert captured_kwargs.get("offset_id") == 200, (
@@ -4989,7 +5003,9 @@ async def test_list_messages_on_demand_direction_oldest_reverse() -> None:
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
 
-    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "direction": "oldest"})
+    result = await server._list_messages(
+        {"dialog_id": DIALOG_ID, "limit": 10, "direction": "oldest", "message_state": "sent"}
+    )
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     assert captured_kwargs.get("reverse") is True, (
@@ -5019,7 +5035,9 @@ async def test_list_messages_on_demand_sender_id_from_user() -> None:
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
 
-    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "sender_id": 42})
+    result = await server._list_messages(
+        {"dialog_id": DIALOG_ID, "limit": 10, "sender_id": 42, "message_state": "sent"}
+    )
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     assert captured_kwargs.get("from_user") == 42, (
@@ -5044,7 +5062,7 @@ async def test_list_messages_on_demand_topic_id_reply_to() -> None:
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
 
-    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "topic_id": 5})
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "topic_id": 5, "message_state": "sent"})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     assert captured_kwargs.get("reply_to") == 5, f"Expected reply_to=5 in iter_messages kwargs, got: {captured_kwargs}"
@@ -5067,7 +5085,9 @@ async def test_list_messages_on_demand_unread_after_id_min_id() -> None:
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
 
-    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "unread_after_id": 100})
+    result = await server._list_messages(
+        {"dialog_id": DIALOG_ID, "limit": 10, "unread_after_id": 100, "message_state": "sent"}
+    )
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     assert captured_kwargs.get("min_id") == 100, f"Expected min_id=100 in iter_messages kwargs, got: {captured_kwargs}"
@@ -5089,7 +5109,9 @@ async def test_list_messages_context_window_centred() -> None:
         _insert_message(conn, DIALOG_ID, mid, text=f"msg {mid}", sent_at=1700000000 + mid)
     server = make_server(conn)
 
-    result = await server._list_messages({"dialog_id": DIALOG_ID, "context_message_id": 5, "context_size": 4})
+    result = await server._list_messages(
+        {"dialog_id": DIALOG_ID, "context_message_id": 5, "context_size": 4, "message_state": "sent"}
+    )
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     messages = _response_messages(result)
@@ -5111,7 +5133,9 @@ async def test_list_messages_context_window_near_start() -> None:
         _insert_message(conn, DIALOG_ID, mid, text=f"msg {mid}", sent_at=1700000000 + mid)
     server = make_server(conn)
 
-    result = await server._list_messages({"dialog_id": DIALOG_ID, "context_message_id": 2, "context_size": 6})
+    result = await server._list_messages(
+        {"dialog_id": DIALOG_ID, "context_message_id": 2, "context_size": 6, "message_state": "sent"}
+    )
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     messages = _response_messages(result)
@@ -5135,7 +5159,9 @@ async def test_list_messages_context_window_not_synced_error() -> None:
     _insert_synced_dialog(conn, DIALOG_ID, status="access_lost")
     server = make_server(conn)
 
-    result = await server._list_messages({"dialog_id": DIALOG_ID, "context_message_id": 10, "context_size": 4})
+    result = await server._list_messages(
+        {"dialog_id": DIALOG_ID, "context_message_id": 10, "context_size": 4, "message_state": "sent"}
+    )
 
     assert result["ok"] is False
     assert result["error"] == "not_synced"
@@ -5157,7 +5183,9 @@ async def test_list_messages_context_window_reactions_injected() -> None:
     conn.commit()
     server = make_server(conn)
 
-    result = await server._list_messages({"dialog_id": DIALOG_ID, "context_message_id": 20, "context_size": 4})
+    result = await server._list_messages(
+        {"dialog_id": DIALOG_ID, "context_message_id": 20, "context_size": 4, "message_state": "sent"}
+    )
 
     assert result["ok"] is True
     by_id = {cast(int, m["message_id"]): m for m in _response_messages(result)}
@@ -5608,7 +5636,7 @@ async def test_list_messages_access_lost_returns_archived():
     conn.commit()
 
     server = make_server(conn)
-    result = await server._list_messages({"dialog_id": 6001, "limit": 10})
+    result = await server._list_messages({"dialog_id": 6001, "limit": 10, "message_state": "sent"})
     assert result["ok"] is True
     assert result["data"]["dialog_access"] == "archived"
     assert result["data"]["source"] == "sync_db"
@@ -6857,15 +6885,19 @@ async def test_fallback_path_does_not_emit_counter(caplog: pytest.LogCaptureFixt
     server = make_server(conn)
 
     # Mock telegram client to return empty list (avoid real API call)
+    iter_calls: list[object] = []
+
     async def _empty_iter_messages(*args: object, **kwargs: object):  # type: ignore[misc]
+        iter_calls.append(args)
         return
         yield  # make it an async generator
 
     server._client.iter_messages = _empty_iter_messages
     caplog.clear()
     with caplog.at_level("INFO", logger="mcp_telegram.daemon_api"):
-        await server._list_messages({"dialog_id": 999_999_999, "limit": 10})
+        await server._list_messages({"dialog_id": 999_999_999, "limit": 10, "message_state": "sent"})
     records = [r for r in caplog.records if r.message == "list_messages rendered"]
+    assert len(iter_calls) == 1
     assert len(records) == 0, "Fallback/non-sync.db path must NOT emit the counter log"
 
 

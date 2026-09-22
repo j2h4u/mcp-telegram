@@ -79,7 +79,7 @@ Core contract:
 - Use get_inbox for personal body-rich unread notifications; use get_unread_summary for a compact unread overview from persisted dialog facts.
 
 Workflows:
-- SEARCH THEN READ: Use search_messages to find hits. Omit dialog for global search; add dialog or exact_dialog_id to scope. Use list_messages(exact_dialog_id=N, anchor_message_id=M) to read context around a hit.
+- SEARCH THEN READ: Use search_messages to find hits. Omit dialog for global search; add dialog or exact_dialog_id to scope. Use list_messages(exact_dialog_id=N, anchor_message_id=M, message_state="sent") to read context around a hit.
 - BROWSE CHAT: Use list_messages with navigation="latest" or "start". Continue with next_navigation until it is absent. Pages are chronological, oldest-to-newest.
 - FOLDERS: Use list_dialogs(view="folders") to review folder structure and discover ids. Use list_dialogs(folder_id=N) to inspect the chats, groups, channels, sync state, membership, and freshness within one folder.
 - PERSON OR ENTITY: Use get_entity_info for a user, bot, group, supergroup, or channel profile. Read dialog_placement.folders to see folder membership for that entity.

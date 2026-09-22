@@ -74,8 +74,9 @@ GET_MY_RECENT_ACTIVITY_OUTPUT_SCHEMA = {
                                 "properties": {
                                     "exact_dialog_id": {"type": "integer"},
                                     "anchor_message_id": {"type": "integer"},
+                                    "message_state": {"type": "string", "enum": ["sent"]},
                                 },
-                                "required": ["exact_dialog_id", "anchor_message_id"],
+                                "required": ["exact_dialog_id", "anchor_message_id", "message_state"],
                                 "additionalProperties": False,
                             },
                         },
@@ -265,6 +266,7 @@ def _structured_comment(comment: Mapping[str, object]) -> dict[str, object]:
             "arguments": {
                 "exact_dialog_id": dialog_id,
                 "anchor_message_id": message_id,
+                "message_state": "sent",
             },
         },
     }

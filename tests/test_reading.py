@@ -20,6 +20,7 @@ from mcp_telegram.tools.reading import (
     _format_search_results,
     _list_messages_structured_content,
     _list_messages_structured_messages,
+    _list_messages_warnings,
     _ListMessagesStructuredContentContext,
     _search_result_structured_rows,
     _search_structured_content,
@@ -30,9 +31,20 @@ from mcp_telegram.tools.structured import MEDIA_OUTPUT_SCHEMA
 
 @pytest.mark.parametrize("anchor_message_id", [1, 2_147_483_647])
 def test_list_messages_accepts_telegram_signed_32_bit_anchor_boundaries(anchor_message_id: int) -> None:
-    args = ListMessages(exact_dialog_id=1, anchor_message_id=anchor_message_id)
+    args = ListMessages(exact_dialog_id=1, anchor_message_id=anchor_message_id, message_state="sent")
 
     assert args.anchor_message_id == anchor_message_id
+
+
+def test_list_messages_default_lifecycle_is_all_and_schema_exposes_it() -> None:
+    args = ListMessages(exact_dialog_id=1)
+    schema = cast(dict[str, object], ListMessages.model_json_schema())
+    properties = cast(dict[str, object], schema["properties"])
+    message_state_schema = cast(dict[str, object], properties["message_state"])
+
+    assert args.message_state == "all"
+    assert message_state_schema["default"] == "all"
+    assert "default" not in LIST_MESSAGES_OUTPUT_SCHEMA["properties"]["filters"]["properties"]["message_state"]
 
 
 def test_list_messages_contact_has_one_explicit_attachment() -> None:
@@ -371,6 +383,7 @@ def test_search_messages_structured_payload_includes_dialog_anchor_read_state_wa
     }
     assert limits == {"requested_limit": 5, "applied_limit": 5, "returned_count": 1, "offset": 20}
     assert cast(dict[str, object], anchor_call["arguments_template"])["anchor_message_id"] == "<result.msg_id>"
+    assert cast(dict[str, object], anchor_call["arguments_template"])["message_state"] == "sent"
     assert result["dialog_name"] == "Alice"
     assert result["content"] == {
         "text": "needle in Telegram text",
@@ -379,7 +392,7 @@ def test_search_messages_structured_payload_includes_dialog_anchor_read_state_wa
     }
     assert result["anchor_call"] == {
         "tool": "list_messages",
-        "arguments": {"exact_dialog_id": 123, "anchor_message_id": 9},
+        "arguments": {"exact_dialog_id": 123, "anchor_message_id": 9, "message_state": "sent"},
     }
     assert payload["result_count_semantics"] == "count is the number of search hits returned in this response page"
 
@@ -388,7 +401,12 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
     payload = _list_messages_structured_content(
         _ListMessagesStructuredContentContext(
             args=ListMessages(
-                exact_dialog_id=123, exact_topic_id=7, limit=10, navigation="start", anchor_message_id=50
+                exact_dialog_id=123,
+                exact_topic_id=7,
+                limit=10,
+                navigation="start",
+                anchor_message_id=50,
+                message_state="sent",
             ),
             data={
                 "messages": [],
@@ -492,6 +510,34 @@ def test_list_messages_warns_honestly_when_exact_topic_selection_is_unknown() ->
         "requested_context_size": 10,
         "applied_context_size": None,
     }
+
+
+def test_list_messages_preserves_empty_topic_warning_for_explicit_sent_reads() -> None:
+    payload = _list_messages_structured_content(
+        _ListMessagesStructuredContentContext(
+            args=ListMessages(exact_dialog_id=591994976, exact_topic_id=306001, message_state="sent"),
+            data={"messages": [], "source": "sync_db", "dialog_access": "live", "selection_state": "unknown"},
+            rows=[],
+            dialog_id=591994976,
+            sender_id=None,
+            sender_name=None,
+            topic_id=306001,
+            direction="newest",
+            next_navigation=None,
+        )
+    )
+
+    assert cast(list[dict[str, object]], payload["warnings"])[0]["kind"] == "topic_selection_unknown"
+
+
+def test_list_messages_warns_when_default_all_has_no_local_published_history() -> None:
+    warnings = _list_messages_warnings({"coverage": "local_only"})
+
+    assert [warning["kind"] for warning in warnings] == ["local_history_unavailable"]
+    assert warnings[0].get("action") == (
+        "Mark the dialog for sync to make a complete local history available, or retry with "
+        'message_state="sent" for an on-demand live page.'
+    )
 
 
 def test_list_messages_does_not_diagnose_dialog_id_when_another_filter_makes_topic_empty() -> None:
@@ -779,7 +825,23 @@ def test_structured_read_surfaces_preserve_nullable_reaction_events_and_read_at(
         ),
         (
             {"exact_dialog_id": 17, "message_state": "scheduled", "anchor_message_id": 10},
-            "anchor_message_id is only supported for published sent history",
+            'anchor_message_id requires message_state="sent"',
+        ),
+        (
+            {"exact_dialog_id": 17, "topic": "general"},
+            'natural topic resolution requires message_state="sent"',
+        ),
+        (
+            {"exact_dialog_id": 17, "topic": "general", "message_state": "scheduled"},
+            'natural topic resolution requires message_state="sent"',
+        ),
+        (
+            {"exact_dialog_id": 17, "unread": True, "message_state": "scheduled"},
+            'unread requires message_state="sent" or "all"',
+        ),
+        (
+            {"exact_dialog_id": 17, "unread": True, "message_state": "draft"},
+            'unread requires message_state="sent" or "all"',
         ),
         (
             {
@@ -803,7 +865,7 @@ def test_list_messages_rejects_invalid_selector_and_temporal_combinations(
     [
         {"exact_dialog_id": 17},
         {"dialog": "alice"},
-        {"exact_dialog_id": 17, "topic": "general"},
+        {"exact_dialog_id": 17, "topic": "general", "message_state": "sent"},
         {"exact_dialog_id": 17, "exact_topic_id": 3},
         {"exact_dialog_id": 17, "since_utc": "2026-01-01T00:00:00Z"},
         {"exact_dialog_id": 17, "until_utc": "2026-01-02T00:00:00Z"},
@@ -813,3 +875,7 @@ def test_list_messages_accepts_non_conflicting_selector_and_boundary_combination
     kwargs: dict[str, object],
 ) -> None:
     assert ListMessages.model_validate(kwargs)
+
+
+def test_search_messages_documents_sent_anchor_calls() -> None:
+    assert 'message_state="sent"' in (SearchMessages.__doc__ or "")

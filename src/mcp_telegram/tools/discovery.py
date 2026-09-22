@@ -652,7 +652,7 @@ class ListDialogs(ToolArgs):
       - 'own_only'    — only own-message-related history is stored
       - 'access_lost' — account no longer has access; read-only snapshot
       - 'fragment'    — no full sync; only point-fetched snippets from targeted
-                        list_messages(anchor_message_id=...) calls (Phase 999.1)
+                        list_messages(anchor_message_id=..., message_state="sent") calls (Phase 999.1)
 
     Call `get_sync_status` and inspect `realtime_history` when active realtime coverage matters.
     """

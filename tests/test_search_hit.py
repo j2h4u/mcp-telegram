@@ -115,7 +115,7 @@ def test_sent_search_hit_is_a_bounded_query_centered_discovery_result() -> None:
     assert hit["sender"] == "Ada"
     assert hit["anchor_call"] == {
         "tool": "list_messages",
-        "arguments": {"exact_dialog_id": -100, "anchor_message_id": 42},
+        "arguments": {"exact_dialog_id": -100, "anchor_message_id": 42, "message_state": "sent"},
     }
 
 
@@ -261,4 +261,5 @@ def test_sent_search_hit_anchor_coordinates_open_the_exact_result_message() -> N
     assert anchor["arguments"] == {
         "exact_dialog_id": hit["dialog_id"],
         "anchor_message_id": hit["msg_id"],
+        "message_state": "sent",
     }

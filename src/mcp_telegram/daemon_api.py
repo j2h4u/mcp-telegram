@@ -1485,7 +1485,7 @@ class DaemonAPIServer:
         self,
         dialog_id: int,
         unread_after_id: int | None,
-    ) -> int | None:
+    ) -> int | dict:
         """Delegate unread-position resolution to the reading service."""
         return await self._get_reading_service().resolve_unread_position(dialog_id, unread_after_id)
 

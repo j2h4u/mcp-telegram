@@ -83,7 +83,7 @@ and Telegram-originated content.
 | --- | --- |
 | `list_dialogs` | List dialogs or summarize the custom-folder structure, with unread, activity, sync, draft, and cached metadata. |
 | `list_topics` | List threads for a topic-capable dialog, including forum topics and bot-DM topics. |
-| `list_messages` | Read one dialog in chronological order within each page, with pagination, topic/sender/unread filters, UTC time bounds, reply refs, reactions, read-state markers, and archive coverage. |
+| `list_messages` | Read one dialog in chronological order within each page. By default it combines local sent, scheduled, and draft rows; set `message_state="sent"` for published history only. Supports pagination, topic/sender/unread filters, UTC time bounds, reply refs, reactions, read-state markers, and archive coverage. |
 | `search_messages` | Full-text search across synced dialogs or within one dialog, with optional UTC time bounds; results include anchors for `list_messages`. |
 | `get_inbox` | Fetch unread messages from personal chats and small groups with budgeted per-dialog output. |
 | `get_unread_summary` | Show a compact unread overview from persisted dialog facts, without message bodies. |
@@ -103,7 +103,7 @@ Search, then read context:
 
 ```text
 search_messages(query="contract")
-list_messages(exact_dialog_id=<hit.dialog_id>, anchor_message_id=<hit.msg_id>)
+list_messages(exact_dialog_id=<hit.dialog_id>, anchor_message_id=<hit.msg_id>, message_state="sent")
 ```
 
 Search includes normalized message text and available Telegram transcriptions
@@ -166,7 +166,7 @@ bot-DM topics:
 
 ```text
 list_topics(exact_dialog_id=<dialog_id>)
-list_messages(exact_dialog_id=<dialog_id>, exact_topic_id=<topic_id>)
+list_messages(exact_dialog_id=<dialog_id>, exact_topic_id=<topic_id>, message_state="sent")
 ```
 
 For a topic-filtered local result, `coverage.selection_state` is `present` or

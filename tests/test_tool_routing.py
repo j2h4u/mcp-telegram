@@ -1613,7 +1613,7 @@ async def test_search_messages_via_daemon():
     }
     assert first_result["anchor_call"] == {
         "tool": "list_messages",
-        "arguments": {"exact_dialog_id": 123, "anchor_message_id": 5},
+        "arguments": {"exact_dialog_id": 123, "anchor_message_id": 5, "message_state": "sent"},
     }
     conn.search_messages.assert_called_once()
 
@@ -1666,7 +1666,7 @@ async def test_search_messages_structured_plain_snippet_around_hidden_link_bound
     assert first_result["msg_id"] == 42
     assert first_result["anchor_call"] == {
         "tool": "list_messages",
-        "arguments": {"exact_dialog_id": 123, "anchor_message_id": 42},
+        "arguments": {"exact_dialog_id": 123, "anchor_message_id": 42, "message_state": "sent"},
     }
 
 
@@ -3531,7 +3531,7 @@ async def test_list_messages_topic_fuzzy_resolves_via_list_topics():
     conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
     conn.list_topics = _AsyncMethodMock(return_value=list_topics_response)
     with _patch_daemon(conn):
-        await list_messages(ListMessages(exact_dialog_id=1, topic="General"))
+        await list_messages(ListMessages(exact_dialog_id=1, topic="General", message_state="sent"))
 
     call_kwargs = _call_kwargs(conn.list_messages)
     assert call_kwargs.get("topic_id") == 7
@@ -3552,7 +3552,7 @@ async def test_list_messages_topic_fuzzy_ambiguous_returns_error():
     conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
     conn.list_topics = _AsyncMethodMock(return_value=list_topics_response)
     with _patch_daemon(conn):
-        result = await list_messages(ListMessages(exact_dialog_id=1, topic="General"))
+        result = await list_messages(ListMessages(exact_dialog_id=1, topic="General", message_state="sent"))
 
     text = _result_text(result)
     assert result.is_error is True
@@ -3589,7 +3589,7 @@ async def test_list_messages_topic_not_found_returns_error():
     conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
     conn.list_topics = _AsyncMethodMock(return_value=list_topics_response)
     with _patch_daemon(conn):
-        result = await list_messages(ListMessages(exact_dialog_id=1, topic="nonexistent"))
+        result = await list_messages(ListMessages(exact_dialog_id=1, topic="nonexistent", message_state="sent"))
 
     text = _result_text(result)
     assert "not found" in text.lower() or "nonexistent" in text.lower()
@@ -3605,6 +3605,7 @@ async def test_list_messages_no_optional_params_not_sent():
     assert call_kwargs.get("sender_name") is None
     assert call_kwargs.get("topic_id") is None
     assert call_kwargs.get("unread") is None
+    assert call_kwargs.get("message_state") == "all"
 
 
 # ---------------------------------------------------------------------------
@@ -3684,7 +3685,7 @@ async def test_get_my_recent_activity_routes_primary():
     assert first_comment["navigation"] == {
         "text": "nav: dialog_id=42 message_id=100",
         "tool": "list_messages",
-        "arguments": {"exact_dialog_id": 42, "anchor_message_id": 100},
+        "arguments": {"exact_dialog_id": 42, "anchor_message_id": 100, "message_state": "sent"},
     }
     conn.get_my_recent_activity.assert_awaited_once_with(
         since_hours=168,
@@ -3857,7 +3858,7 @@ async def test_get_my_recent_activity_frames_adversarial_text():
         "content_kind": "message_text",
     }
     navigation = _json_dict(comment["navigation"])
-    assert navigation["arguments"] == {"exact_dialog_id": 42, "anchor_message_id": 100}
+    assert navigation["arguments"] == {"exact_dialog_id": 42, "anchor_message_id": 100, "message_state": "sent"}
 
 
 async def test_get_my_recent_activity_never_run_header():
@@ -3931,7 +3932,7 @@ async def test_get_my_recent_activity_formats_comment_block():
     assert comment["dialog_name"] == "X"
     assert comment["text"] == "hi"
     navigation = _json_dict(comment["navigation"])
-    assert navigation["arguments"] == {"exact_dialog_id": 42, "anchor_message_id": 100}
+    assert navigation["arguments"] == {"exact_dialog_id": 42, "anchor_message_id": 100, "message_state": "sent"}
     assert comment["reactions"] == []
 
 
@@ -4008,7 +4009,9 @@ async def test_list_messages_fragment_fetch_failure_exposes_context_metadata():
         }
     )
     with _patch_daemon(conn):
-        result = await list_messages(ListMessages(exact_dialog_id=42, anchor_message_id=100, context_size=4))
+        result = await list_messages(
+            ListMessages(exact_dialog_id=42, anchor_message_id=100, context_size=4, message_state="sent")
+        )
     assert result.content
     assert result.is_error is True
     payload = _json_dict(result.structured_content)
