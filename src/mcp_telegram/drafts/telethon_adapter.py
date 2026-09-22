@@ -210,11 +210,8 @@ def _composition_references(
     )
 
 
-def _draft_date(draft: types.DraftMessage) -> datetime | None:
-    date = getattr(draft, "date", None)
-    if not isinstance(date, datetime):
-        return None
-    return date.replace(tzinfo=UTC) if date.tzinfo is None else date
+def _draft_date(draft: object) -> datetime | None:
+    return _source_datetime(getattr(draft, "date", None))
 
 
 def _composition(draft: object) -> DraftComposition | None:
@@ -275,12 +272,16 @@ def normalize_update_draft(
             observed_at,
             composition,
             ambiguity=composition.date is None,
+            source_order_at=composition.date,
         )
     if isinstance(update.draft, types.DraftMessageEmpty):
-        # Telegram supplies no draft revision or pts here.  Arrival observation
-        # time is the only ordering evidence, and the projection's snapshot
-        # baseline fence still prevents an earlier snapshot from restoring it.
-        return DraftObservation(scope, DraftDisposition.TOMBSTONE, source, observed_at)
+        return DraftObservation(
+            scope,
+            DraftDisposition.TOMBSTONE,
+            source,
+            observed_at,
+            source_order_at=_draft_date(update.draft),
+        )
     return None
 
 
@@ -298,22 +299,43 @@ class TelethonDraftSnapshotGateway(DraftSnapshotGateway):
                 result = await self._client(GetAllDraftsRequest())
         raw_updates = getattr(result, "updates", None)
         too_long = isinstance(result, types.UpdatesTooLong)
+        envelope_date = _source_datetime(getattr(result, "date", None))
         if not isinstance(raw_updates, Sequence) or isinstance(raw_updates, (str, bytes)):
-            return SnapshotCoverage(self._account_id, False, 0, too_long), ()
+            return SnapshotCoverage(self._account_id, False, 0, too_long, envelope_date), ()
         observations: list[DraftObservation] = []
         complete = not too_long
+        unexpected_updates = 0
         for update in raw_updates:
+            if not isinstance(update, types.UpdateDraftMessage):
+                complete = False
+                unexpected_updates += 1
+                continue
             observation = normalize_update_draft(
                 update,
                 account_id=self._account_id,
                 source=DraftObservationSource.SNAPSHOT,
                 observed_at=observed_at,
             )
-            if isinstance(update, types.UpdateDraftMessage) and observation is None:
+            if observation is None:
                 complete = False
             if observation is not None:
                 observations.append(observation)
-        return SnapshotCoverage(self._account_id, complete, len(raw_updates), too_long), tuple(observations)
+        return SnapshotCoverage(
+            self._account_id,
+            complete,
+            len(raw_updates),
+            too_long,
+            envelope_date,
+            unexpected_updates,
+        ), tuple(observations)
+
+
+def _source_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return datetime.fromtimestamp(value, UTC)
+    return None
 
 
 __all__ = ["TelethonDraftSnapshotGateway", "draft_update_event", "normalize_update_draft"]

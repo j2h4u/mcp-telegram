@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from typing import Protocol, cast
 
 from mcp_telegram.demand_wiring import DemandOfferSink, offer_durable_demand
-from mcp_telegram.drafts.contracts import DraftObservation, DraftObservationSource, DraftScope, SnapshotCoverage
+from mcp_telegram.drafts.contracts import DraftObservation, DraftObservationSource, SnapshotCoverage
 from mcp_telegram.drafts.ports import DraftProjectionRepository, DraftSnapshotGateway
 from mcp_telegram.drafts.telethon_adapter import (
     TelethonDraftSnapshotGateway,
@@ -176,7 +176,7 @@ class DraftMessageOwner:
         self._record(
             "draft.observed",
             "applied" if result.accepted else "ignored",
-            observation.disposition.value,
+            result.decision or observation.disposition.value,
             duration_ms=duration_ms,
             payload=payload,
             observed_at_ms=commit_utc_ms,
@@ -196,7 +196,7 @@ class DraftMessageOwner:
         snapshot_run = self._prepare_snapshot_run(budget)
         if snapshot_run is None:
             return
-        gateway, baselines, claim_token = snapshot_run
+        gateway, claim_token = snapshot_run
         try:
             with demand_context(self.demand_kind):
                 with rpc_attempt_budget(budget):
@@ -205,7 +205,7 @@ class DraftMessageOwner:
             self._rearm_claimed_recovery("snapshot_fetch_failed", claim_token)
             raise
         try:
-            self._publish_snapshot(coverage, observations, baselines, claim_token)
+            self._publish_snapshot(coverage, observations, claim_token)
         except BaseException:
             self._rearm_claimed_recovery("snapshot_publish_failed", claim_token)
             raise
@@ -213,7 +213,7 @@ class DraftMessageOwner:
     def _prepare_snapshot_run(
         self,
         budget: RpcAttemptBudget,
-    ) -> tuple[DraftSnapshotGateway, Mapping[DraftScope, int], int] | None:
+    ) -> tuple[DraftSnapshotGateway, int] | None:
         account_id = self._account_id
         gateway = self._snapshot_gateway
         now = time.time()
@@ -225,31 +225,23 @@ class DraftMessageOwner:
         claim_token = self._repository.claim_recovery(now=now)
         if claim_token is None:
             return None
-        # This fence is intentionally taken before the RPC.  The persistence
-        # worker compares it against revisions written by later realtime rows
-        # and tombstones, so an older snapshot cannot overwrite either one.
-        try:
-            baselines = self._repository.snapshot_baselines(account_id)
-        except BaseException:
-            self._rearm_claimed_recovery("snapshot_baselines_failed", claim_token)
-            raise
-        return gateway, baselines, claim_token
+        return gateway, claim_token
 
     def _publish_snapshot(
         self,
         coverage: SnapshotCoverage,
         observations: tuple[DraftObservation, ...],
-        baselines: Mapping[DraftScope, int],
         claim_token: int,
     ) -> None:
         if not coverage.authoritative:
-            self._rearm_claimed_recovery("snapshot_coverage_incomplete", claim_token)
-            self._record("draft.recovery", "deferred", "snapshot_coverage_incomplete")
+            reason = _snapshot_recovery_reason(coverage)
+            self._rearm_claimed_recovery(reason, claim_token)
+            self._record("draft.recovery", "deferred", reason)
             return
-        result = self._repository.apply_snapshot(observations, coverage, baselines, claim_token=claim_token)
-        if result.ambiguous:
-            self._rearm_claimed_recovery("ambiguous_snapshot", claim_token)
-        self._record("draft.recovery", "applied" if result.accepted else "ignored", None)
+        result = self._repository.apply_snapshot(observations, coverage, claim_token=claim_token)
+        if result.ambiguous or not result.accepted:
+            self._rearm_claimed_recovery(result.decision or "snapshot_failure", claim_token)
+        self._record("draft.recovery", "applied" if result.accepted else "ignored", result.decision)
 
     def _rearm_claimed_recovery(self, reason: str, claim_token: int) -> None:
         """Return a claimed recovery to durable, bounded retry cadence."""
@@ -283,3 +275,13 @@ class DraftMessageOwner:
 
 
 __all__ = ["DraftMessageOwner", "RuntimeObserver"]
+
+
+def _snapshot_recovery_reason(coverage: SnapshotCoverage) -> str:
+    if coverage.unexpected_update_count:
+        return "snapshot_unexpected_update"
+    if not coverage.response_complete or coverage.has_updates_too_long:
+        return "snapshot_coverage_incomplete"
+    if coverage.source_order_at is None:
+        return "snapshot_source_order_missing"
+    return "snapshot_invalid"

@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol
 
 from mcp_telegram.drafts.contracts import (
     DraftApplyResult,
     DraftObservation,
-    DraftScope,
     SnapshotCoverage,
 )
 
@@ -21,13 +20,10 @@ class DraftProjectionRepository(Protocol):
 
     def apply_realtime(self, observation: DraftObservation) -> DraftApplyResult: ...
 
-    def snapshot_baselines(self, account_id: int) -> Mapping[DraftScope, int]: ...
-
     def apply_snapshot(
         self,
         observations: Sequence[DraftObservation],
         coverage: SnapshotCoverage,
-        baselines: Mapping[DraftScope, int],
         *,
         claim_token: int,
     ) -> DraftApplyResult: ...

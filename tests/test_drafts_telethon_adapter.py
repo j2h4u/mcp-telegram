@@ -42,6 +42,7 @@ def test_normalize_present_empty_draft_is_not_an_absent_draft() -> None:
     assert observation.disposition is DraftDisposition.PRESENT
     assert observation.composition is not None
     assert observation.composition.text == ""
+    assert observation.source_order_at == datetime(2026, 1, 1, tzinfo=UTC)
 
 
 def test_normalize_realtime_empty_draft_is_an_ordered_tombstone() -> None:
@@ -57,6 +58,22 @@ def test_normalize_realtime_empty_draft_is_an_ordered_tombstone() -> None:
     assert observation is not None
     assert observation.disposition is DraftDisposition.TOMBSTONE
     assert observation.ambiguity is False
+    assert observation.source_order_at == datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def test_normalize_realtime_empty_draft_without_date_is_unordered_tombstone() -> None:
+    update = types.UpdateDraftMessage(types.PeerUser(91), types.DraftMessageEmpty())
+
+    observation = normalize_update_draft(
+        update,
+        account_id=42,
+        source=DraftObservationSource.REALTIME,
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    assert observation is not None
+    assert observation.disposition is DraftDisposition.TOMBSTONE
+    assert observation.source_order_at is None
 
 
 def test_oversized_normalized_entity_json_fails_closed() -> None:
@@ -228,8 +245,32 @@ async def test_snapshot_is_one_classified_unpaged_rpc() -> None:
         coverage, observations = await gateway.fetch_all_drafts()
 
     assert coverage.authoritative is True
+    assert coverage.source_order_at == datetime(2026, 1, 1, tzinfo=UTC)
     assert observations == ()
     assert len(client.requests) == 1
     request = client.requests[0]
     assert type(request).__name__ == "GetAllDraftsRequest"
     assert AcquisitionKind.DRAFT_SNAPSHOT.value == "draft_snapshot"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_marks_unexpected_updates_non_authoritative() -> None:
+    updates: list[types.TypeUpdate] = [
+        types.UpdateDraftMessage(types.PeerUser(91), types.DraftMessage("draft", datetime(2026, 1, 1, tzinfo=UTC))),
+        types.UpdateUserStatus(92, types.UserStatusOffline(datetime(2026, 1, 1, tzinfo=UTC))),
+    ]
+    result = types.Updates(
+        updates,
+        [],
+        [],
+        datetime(2026, 1, 1, tzinfo=UTC),
+        1,
+    )
+    client = _SnapshotClient(result)
+    gateway = TelethonDraftSnapshotGateway(client, 42)
+
+    with demand_context(DemandKind.DRAFT_SNAPSHOT):
+        coverage, _ = await gateway.fetch_all_drafts()
+
+    assert coverage.authoritative is False
+    assert coverage.unexpected_update_count == 1

@@ -14,7 +14,7 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 75
+_CURRENT_SCHEMA_VERSION = 76
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -41,6 +41,7 @@ _TOPIC_ATTRIBUTION_RECEIPT_MIGRATION_72 = 72
 _REMOVE_TOPIC_ATTRIBUTION_CAMPAIGN_MIGRATION_73 = 73
 _DRAFT_PROJECTION_CUTOVER_MIGRATION_74 = 74
 _DRAFT_RECOVERY_SCHEMA_75 = 75
+_DRAFT_SOURCE_ORDER_SCHEMA_76 = 76
 
 _ACCOUNT_COOLDOWN_UNTIL_UTC_KEY = "telegram_account_cooldown_until_utc"
 _SELF_PROFILE_LAST_SUCCESS_AT_KEY = "self_profile_last_success_at"
@@ -828,6 +829,7 @@ CREATE TABLE IF NOT EXISTS draft_current (
     composition_complete      INTEGER NOT NULL CHECK(composition_complete IN (0, 1)),
     source_kind               TEXT NOT NULL CHECK(source_kind IN ('realtime_present', 'realtime_empty', 'snapshot_present', 'snapshot_empty', 'snapshot_absence')),
     source_observed_at        INTEGER NOT NULL CHECK(source_observed_at >= 0),
+    source_order_at           INTEGER CHECK(source_order_at IS NULL OR source_order_at >= 0),
     observation_started_at    INTEGER NOT NULL CHECK(observation_started_at >= 0),
     observation_completed_at  INTEGER NOT NULL CHECK(observation_completed_at >= 0),
     projection_revision       INTEGER NOT NULL CHECK(projection_revision >= 0),
@@ -855,6 +857,7 @@ CREATE TABLE IF NOT EXISTS draft_sync_state (
     observation_started_at    INTEGER,
     observation_completed_at  INTEGER,
     reason                    TEXT,
+    source_order_floor        INTEGER CHECK(source_order_floor IS NULL OR source_order_floor >= 0),
     CHECK(observation_started_at IS NULL OR observation_started_at >= 0),
     CHECK(observation_completed_at IS NULL OR observation_completed_at >= 0),
     CHECK(reason IS NULL OR length(reason) <= 256)
@@ -874,14 +877,13 @@ CREATE TABLE IF NOT EXISTS draft_projection_runtime (
 )
 """
 
-_DRAFT_SNAPSHOT_BASELINE_DDL = """
-CREATE TABLE IF NOT EXISTS draft_snapshot_baseline (
-    account_id            INTEGER NOT NULL CHECK(account_id != 0),
-    dialog_id             INTEGER NOT NULL CHECK(dialog_id != 0),
-    top_message_id        INTEGER NOT NULL DEFAULT 0,
-    subdialog_peer_id     INTEGER NOT NULL DEFAULT 0,
-    baseline_revision     INTEGER NOT NULL CHECK(baseline_revision >= 0),
-    captured_at           INTEGER NOT NULL CHECK(captured_at >= 0),
+_DRAFT_ORDER_UNCERTAINTY_DDL = """
+CREATE TABLE IF NOT EXISTS draft_order_uncertainty (
+    account_id          INTEGER NOT NULL CHECK(account_id != 0),
+    dialog_id           INTEGER NOT NULL CHECK(dialog_id != 0),
+    top_message_id     INTEGER NOT NULL DEFAULT 0,
+    subdialog_peer_id  INTEGER NOT NULL DEFAULT 0,
+    observed_at        INTEGER NOT NULL CHECK(observed_at >= 0),
     PRIMARY KEY(account_id, dialog_id, top_message_id, subdialog_peer_id)
 ) WITHOUT ROWID
 """
@@ -4360,7 +4362,6 @@ def _apply_migration_74(conn: sqlite3.Connection, current: int) -> int:
         conn.execute(_DRAFT_CURRENT_DDL)
         conn.execute(_DRAFT_SYNC_STATE_DDL)
         conn.execute(_DRAFT_PROJECTION_RUNTIME_DDL)
-        conn.execute(_DRAFT_SNAPSHOT_BASELINE_DDL)
         conn.execute("INSERT OR IGNORE INTO draft_projection_runtime(singleton) VALUES (1)")
         conn.execute(
             "INSERT OR IGNORE INTO schema_version VALUES (?, strftime('%s', 'now'))",
@@ -4385,6 +4386,28 @@ def _apply_migration_75(conn: sqlite3.Connection, current: int) -> int:
                 "CHECK(recovery_failure_count >= 0)"
             ),
             "DROP INDEX IF EXISTS idx_draft_current_account_dialog",
+        ],
+        ignore_duplicate_column=True,
+    )
+
+
+def _apply_migration_76(conn: sqlite3.Connection, current: int) -> int:
+    """Persist Telegram source ordering and remove revision baselines."""
+    return _apply_migration(
+        conn,
+        current,
+        _DRAFT_SOURCE_ORDER_SCHEMA_76,
+        [
+            (
+                "ALTER TABLE draft_current ADD COLUMN source_order_at INTEGER "
+                "CHECK(source_order_at IS NULL OR source_order_at >= 0)"
+            ),
+            (
+                "ALTER TABLE draft_sync_state ADD COLUMN source_order_floor INTEGER "
+                "CHECK(source_order_floor IS NULL OR source_order_floor >= 0)"
+            ),
+            _DRAFT_ORDER_UNCERTAINTY_DDL,
+            "DROP TABLE IF EXISTS draft_snapshot_baseline",
         ],
         ignore_duplicate_column=True,
     )
@@ -4432,7 +4455,7 @@ def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_63(conn, current)
     current = _apply_migrations_64_to_67(conn, current)
     current = _apply_migrations_68_to_71(conn, current)
-    return _apply_migrations_72_to_75(conn, current)
+    return _apply_migrations_72_to_76(conn, current)
 
 
 def _apply_migrations_68_to_71(conn: sqlite3.Connection, current: int) -> int:
@@ -4448,7 +4471,7 @@ def _apply_migrations_68_to_71(conn: sqlite3.Connection, current: int) -> int:
     return current
 
 
-def _apply_migrations_72_to_75(conn: sqlite3.Connection, current: int) -> int:
+def _apply_migrations_72_to_76(conn: sqlite3.Connection, current: int) -> int:
     """Apply topic-receipt cleanup and the finite draft ownership cutover."""
     if _CURRENT_SCHEMA_VERSION >= _TOPIC_ATTRIBUTION_RECEIPT_MIGRATION_72:
         current = _apply_migration_72(conn, current)
@@ -4458,6 +4481,8 @@ def _apply_migrations_72_to_75(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_74(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _DRAFT_RECOVERY_SCHEMA_75:
         current = _apply_migration_75(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _DRAFT_SOURCE_ORDER_SCHEMA_76:
+        current = _apply_migration_76(conn, current)
     return current
 
 
