@@ -181,11 +181,19 @@ class SnapshotCoverage:
 
 @dataclass(frozen=True, slots=True)
 class DraftApplyResult:
-    """Persistence result that keeps owner policy independent from SQLite details."""
+    """Persistence result that keeps owner policy independent from SQLite details.
+
+    For ``apply_realtime``, ``publication_changed`` is true if and only if the
+    repository committed a new projection revision. A byte-identical
+    observation with a newer source observation time may still create a
+    revision; an exact duplicate does not. Snapshot application does not use
+    this flag.
+    """
 
     accepted: bool
     ambiguous: bool = False
     revision: int | None = None
+    publication_changed: bool = False
 
 
 __all__ = [

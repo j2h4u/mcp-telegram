@@ -196,6 +196,11 @@ class UpdateProcessingBarrier:
         self._cancelled = True
         self._opened.set()
 
+    @property
+    def is_open(self) -> bool:
+        """Return whether callbacks pass the startup barrier immediately."""
+        return self._opened.is_set()
+
     async def wait(self, shutdown_event: asyncio.Event) -> None:
         if self._cancelled or shutdown_event.is_set():
             raise asyncio.CancelledError

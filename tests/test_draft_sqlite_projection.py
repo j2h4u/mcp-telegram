@@ -106,8 +106,10 @@ def test_realtime_orders_duplicates_and_equal_conflicts(
     first = _present(scope, 1, "first", source=DraftObservationSource.REALTIME)
     applied = repository.apply_realtime(first)
     assert applied.accepted and applied.revision is not None
+    assert applied.publication_changed
     duplicate = repository.apply_realtime(first)
     assert duplicate.accepted and duplicate.revision == applied.revision
+    assert not duplicate.publication_changed
     assert _current(conn, scope)[4] == applied.revision
     older = repository.apply_realtime(_present(scope, 0, "older", source=DraftObservationSource.REALTIME))
     assert not older.accepted

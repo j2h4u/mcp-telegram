@@ -28,7 +28,32 @@ class _DraftEventClient(Protocol):
     def remove_event_handler(self, callback: object) -> None: ...
 
 
-RuntimeObserver = Callable[[str, str, str | None], None]
+class RuntimeObserver(Protocol):
+    """Receive content-free lifecycle observations from draft ownership."""
+
+    def __call__(  # noqa: PLR0913 - mirrors the bounded runtime-observation contract
+        self,
+        kind: str,
+        outcome: str,
+        reason_code: str | None,
+        *,
+        duration_ms: float | None = None,
+        payload: Mapping[str, object] | None = None,
+        observed_at_ms: int | None = None,
+    ) -> None: ...
+
+
+def _utc_now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+# Canonical retrospective p95 predicate: kind="draft.observed", outcome="applied",
+# duration_ms IS NOT NULL, payload.publication_changed=true, and
+# payload.barrier_gated=false.  duration_ms is the only latency source; UTC
+# fields only delimit the retrospective window. barrier_gated=false deliberately
+# measures steady-state callback-to-commit; startup-gated updates remain
+# queryable separately with barrier_gated=true.
+_REALTIME_LATENCY_BASIS = "callback_to_commit_monotonic"
 
 
 class DraftMessageOwner:
@@ -50,6 +75,8 @@ class DraftMessageOwner:
         *,
         observe: RuntimeObserver | None = None,
         snapshot_gateway_factory: Callable[[object, int], DraftSnapshotGateway] = TelethonDraftSnapshotGateway,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+        utc_now_ms: Callable[[], int] = _utc_now_ms,
     ) -> None:
         self._client = client
         self._event_client = cast(_DraftEventClient, client)
@@ -58,6 +85,8 @@ class DraftMessageOwner:
         self._update_barrier = update_barrier
         self._observe = observe
         self._snapshot_gateway_factory = snapshot_gateway_factory
+        self._monotonic_clock = monotonic_clock
+        self._utc_now_ms = utc_now_ms
         self._account_id: int | None = None
         self._snapshot_gateway: DraftSnapshotGateway | None = None
         self._demand_sink: DemandOfferSink | None = None
@@ -106,6 +135,9 @@ class DraftMessageOwner:
 
         This callback deliberately performs no Telegram RPC and no peer lookup.
         """
+        barrier_gated = not self._update_barrier.is_open
+        receipt_monotonic = self._monotonic_clock()
+        receipt_utc_ms = self._utc_now_ms()
         await self._update_barrier.wait(self._shutdown_event)
         account_id = self._account_id
         if account_id is None:
@@ -128,10 +160,26 @@ class DraftMessageOwner:
             return
         if observation.ambiguity or result.ambiguous:
             self.request_recovery("ambiguous_realtime")
+        duration_ms: float | None = None
+        payload: Mapping[str, object] | None = None
+        commit_utc_ms: int | None = None
+        if result.accepted:
+            commit_utc_ms = self._utc_now_ms()
+            duration_ms = max(0.0, (self._monotonic_clock() - receipt_monotonic) * 1000)
+            payload = {
+                "barrier_gated": barrier_gated,
+                "commit_utc_ms": commit_utc_ms,
+                "latency_basis": _REALTIME_LATENCY_BASIS,
+                "publication_changed": result.publication_changed,
+                "receipt_utc_ms": receipt_utc_ms,
+            }
         self._record(
             "draft.observed",
             "applied" if result.accepted else "ignored",
             observation.disposition.value,
+            duration_ms=duration_ms,
+            payload=payload,
+            observed_at_ms=commit_utc_ms,
         )
 
     def status(self, now: float) -> DemandStatus | None:
@@ -212,10 +260,26 @@ class DraftMessageOwner:
             offer_durable_demand(sink, self.demand_kind)
         self._record("draft.recovery", "deferred", reason)
 
-    def _record(self, kind: str, outcome: str, reason: str | None) -> None:
+    def _record(  # noqa: PLR0913 - mirrors the bounded runtime-observation contract
+        self,
+        kind: str,
+        outcome: str,
+        reason_code: str | None,
+        *,
+        duration_ms: float | None = None,
+        payload: Mapping[str, object] | None = None,
+        observed_at_ms: int | None = None,
+    ) -> None:
         observer = self._observe
         if observer is not None:
-            observer(kind, outcome, reason)
+            observer(
+                kind,
+                outcome,
+                reason_code,
+                duration_ms=duration_ms,
+                payload=payload,
+                observed_at_ms=observed_at_ms,
+            )
 
 
 __all__ = ["DraftMessageOwner", "RuntimeObserver"]
