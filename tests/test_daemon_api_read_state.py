@@ -539,7 +539,9 @@ async def test_list_messages_context_window_response_includes_read_state() -> No
 
         server = make_server(conn)
         server.self_id = 999
-        result = await server._list_messages({"dialog_id": 1, "context_message_id": 3, "context_size": 4})
+        result = await server._list_messages(
+            {"dialog_id": 1, "context_message_id": 3, "context_size": 4, "message_state": "sent"}
+        )
         assert result["ok"] is True
         data = result["data"]
         assert data["dialog_type"] == "User"

@@ -212,6 +212,29 @@ class _ListMessagesRequest:
     until_utc: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _UnreadPosition:
+    """A known inbox read cursor for an unread filter."""
+
+    value: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadPositionPending:
+    """The daemon has not yet reconciled an inbox read cursor."""
+
+    def response(self) -> dict[str, str | bool]:
+        return {
+            "ok": False,
+            "error": "read_position_pending",
+            "message": "The inbox read position is not available for this dialog, so unread results are unknown.",
+            "required_action": "Retry shortly while the sync daemon reconciles read positions.",
+        }
+
+
+_UnreadPositionResult = _UnreadPosition | _ReadPositionPending
+
+
 @dataclass
 class _ListMessagesDbRequest:
     dialog_id: int
@@ -225,6 +248,7 @@ class _ListMessagesDbRequest:
     sender_name: str | None
     topic_id: int | None
     unread_after_id: int | None
+    unread: bool = False
     since_utc: int | None = None
     until_utc: int | None = None
 
@@ -245,7 +269,7 @@ class _AllLocalState:
     sent_rows: list[dict]
     scheduled_rows: list[dict]
     draft_rows: list[dict]
-    draft_result: dict
+    draft_result: dict | None
     metadata: tuple[str, ReadState | None, dict[str, object]]
 
 
@@ -296,6 +320,7 @@ class _ListMessagesTelegramRequest:
     sender_id: int | None
     topic_id: int | None
     unread_after_id: int | None
+    unread: bool = False
     since_utc: int | None = None
     until_utc: int | None = None
 
@@ -319,6 +344,7 @@ class _HistoryNavigationContext:
     direction: str
     message_state: str
     topic_id: int | None
+    unread: bool = False
     since_utc: int | None = None
     until_utc: int | None = None
 
@@ -341,7 +367,7 @@ def _coerce_history_navigation_context(
         if field_name not in context_kwargs:
             raise TypeError(f"missing history navigation field: {field_name}")
         fields.append(context_kwargs.pop(field_name))
-    unknown = set(context_kwargs) - {"since_utc", "until_utc"}
+    unknown = set(context_kwargs) - {"unread", "since_utc", "until_utc"}
     if unknown:
         raise TypeError(f"unexpected history navigation fields: {', '.join(sorted(unknown))}")
     return _HistoryNavigationContext(
@@ -349,6 +375,7 @@ def _coerce_history_navigation_context(
         direction=cast(str, fields[0]),
         message_state=cast(str, fields[1]),
         topic_id=cast(int | None, fields[2]),
+        unread=cast(bool, context_kwargs.get("unread", False)),
         since_utc=cast(int | None, context_kwargs.get("since_utc")),
         until_utc=cast(int | None, context_kwargs.get("until_utc")),
     )
@@ -402,6 +429,7 @@ class _NextNavContext:
     request_id: Callable[[], str]
     topic_id: int | None = None
     message_state: str = "sent"
+    unread: bool = False
     since_utc: int | None = None
     until_utc: int | None = None
 
@@ -641,7 +669,7 @@ class ReadingService:
             unread=bool(req.get("unread")),
             context_message_id=req.get("context_message_id"),
             context_size=_clamp(req.get("context_size", 10), 2, 50),
-            message_state=req.get("message_state", "sent"),
+            message_state=req.get("message_state", "all"),
             since_utc=since_utc,
             until_utc=until_utc,
         )
@@ -715,6 +743,7 @@ class ReadingService:
                 direction=context.direction_enum,
                 sent_at=ReadingService._navigation_sent_at(last),
                 message_state=context.message_state,
+                unread=context.unread,
                 since_utc=context.since_utc,
                 until_utc=context.until_utc,
             )
@@ -766,6 +795,7 @@ class ReadingService:
             direction=req.direction_enum,
             sent_at=ReadingService._navigation_sent_at(last_raw_message),
             message_state="sent",
+            unread=req.unread,
             since_utc=req.since_utc,
             until_utc=req.until_utc,
         )
@@ -790,6 +820,7 @@ class ReadingService:
                 logger=self._logger,
                 request_id=self._deps.rid,
                 message_state="sent",
+                unread=req.unread,
                 since_utc=req.since_utc,
                 until_utc=req.until_utc,
             ),
@@ -825,7 +856,7 @@ class ReadingService:
         return anchor_msg_id, direction
 
     @staticmethod
-    def _history_navigation_error(
+    def _history_navigation_error(  # noqa: PLR0911
         navigation: NavigationToken,
         context: _HistoryNavigationContext,
     ) -> str | None:
@@ -837,6 +868,8 @@ class ReadingService:
             return (
                 f"Navigation token belongs to message_state {navigation.message_state!r}, not {context.message_state!r}"
             )
+        if navigation.unread != context.unread:
+            return f"Navigation token belongs to unread={navigation.unread!r}, not {context.unread!r}"
         if navigation.topic_id != context.topic_id:
             return f"Navigation token belongs to topic {navigation.topic_id!r}, not {context.topic_id!r}"
         if navigation.since_utc != context.since_utc or navigation.until_utc != context.until_utc:
@@ -975,6 +1008,7 @@ class ReadingService:
                 direction=direction,
                 message_state=request.message_state,
                 topic_id=request.topic_id,
+                unread=request.unread,
                 since_utc=request.since_utc,
                 until_utc=request.until_utc,
             ),
@@ -983,10 +1017,11 @@ class ReadingService:
             return nav_result
         anchor_msg_id, direction = nav_result
 
-        direction_enum = HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST
-        unread_after_id = request.unread_after_id
         if request.unread:
-            unread_after_id = await self._resolve_unread_position(dialog_id, request.unread_after_id)
+            unread_position = await self._resolve_unread_position(dialog_id, request.unread_after_id)
+            if isinstance(unread_position, _ReadPositionPending):
+                return unread_position.response()
+            request = dataclasses.replace(request, unread_after_id=unread_position.value)
 
         with timing_phase("local_projection"):
             row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)))
@@ -1001,13 +1036,14 @@ class ReadingService:
                 limit=request.limit,
                 self_id=self._deps.self_id,
                 direction=direction,
-                direction_enum=direction_enum,
+                direction_enum=HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST,
                 anchor_msg_id=anchor_msg_id,
                 anchor_sent_at=self._local_history_anchor_sent_at(dialog_id, anchor_msg_id, request.navigation),
                 sender_id=request.sender_id,
                 sender_name=request.sender_name,
                 topic_id=request.topic_id,
-                unread_after_id=unread_after_id,
+                unread_after_id=request.unread_after_id,
+                unread=request.unread,
                 since_utc=request.since_utc,
                 until_utc=request.until_utc,
             )
@@ -1036,11 +1072,12 @@ class ReadingService:
                 dialog_id=dialog_id,
                 limit=request.limit,
                 direction=direction,
-                direction_enum=direction_enum,
+                direction_enum=HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST,
                 anchor_msg_id=anchor_msg_id,
                 sender_id=request.sender_id,
                 topic_id=request.topic_id,
-                unread_after_id=unread_after_id,
+                unread_after_id=request.unread_after_id,
+                unread=request.unread,
                 since_utc=request.since_utc,
                 until_utc=request.until_utc,
             )
@@ -1410,17 +1447,17 @@ class ReadingService:
         self,
         dialog_id: int,
         unread_after_id: int | None,
-    ) -> int | None:
+    ) -> _UnreadPositionResult:
         """Resolve unread cutoff from synced_dialogs."""
         if unread_after_id is not None:
-            return unread_after_id
+            return _UnreadPosition(unread_after_id)
         with timing_phase("local_projection"):
             row = _fetchone_row(self._conn.execute(_GET_READ_POSITION_SQL, (dialog_id,)))
         if row is not None:
             values = _row_sequence(row)
             if values and values[0] is not None:
-                return _object_to_int(values[0])
-        return None
+                return _UnreadPosition(_object_to_int(values[0]))
+        return _ReadPositionPending()
 
     async def _list_messages_context_window(
         self,
@@ -1643,6 +1680,7 @@ class ReadingService:
                     logger=self._logger,
                     request_id=self._deps.rid,
                     message_state="sent",
+                    unread=req.unread,
                     since_utc=req.since_utc,
                     until_utc=req.until_utc,
                 ),
@@ -1821,6 +1859,8 @@ class ReadingService:
                 "error": "invalid_navigation",
                 "message": "Navigation token belongs to a different time range.",
             }
+        # all+unread never reaches draft validation: the history token binds
+        # unread before this path, and that mode selects published rows only.
         if cursor.draft_fingerprint != fingerprint:
             return ReadingService._draft_projection_changed("Draft composition changed since this page.")
         if cursor.message_state == "draft" and cursor.draft_key is None:
@@ -1948,7 +1988,7 @@ class ReadingService:
             sender_id=request.sender_id,
             sender_name=request.sender_name,
             topic_id=request.topic_id,
-            unread_after_id=None,
+            unread_after_id=request.unread_after_id if request.message_state == "all" else None,
             since_utc=request.since_utc,
             until_utc=request.until_utc,
         )
@@ -1968,12 +2008,28 @@ class ReadingService:
             anchor_msg_id=navigation.value if navigation is not None else None,
             anchor_sent_at=navigation.sent_at if navigation is not None else None,
         )
+        sent_rows = await self._all_sent_rows(all_request.status, sent_request)
+        # Telegram read cursors only describe published incoming history.
+        # Scheduled and draft projections are author-only state and cannot be
+        # truthfully classified as unread, so do not query or validate either
+        # mutable projection for this sent-only page.
+        if all_request.request.unread:
+            state = _AllLocalState(
+                all_request,
+                sent_rows,
+                [],
+                [],
+                None,
+                self._all_local_metadata(all_request.dialog_id, all_request.status),
+            )
+            return self._all_local_response(state)
+
         scheduled_request = dataclasses.replace(
             all_request.db_request,
             anchor_msg_id=navigation.scheduled_message_id if navigation is not None else None,
             anchor_sent_at=navigation.scheduled_sent_at if navigation is not None else None,
+            unread_after_id=None,
         )
-        sent_rows = await self._all_sent_rows(all_request.status, sent_request)
         draft_result = self._list_draft_messages_from_db(
             all_request.db_request, navigation=all_request.request.navigation
         )
@@ -2004,6 +2060,17 @@ class ReadingService:
             dialog_type = _dialog_type_from_db(self._conn, dialog_id)
             read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
             access_metadata = _build_access_metadata(self._conn, dialog_id, status or "not_synced")
+            if status not in {"synced", "syncing", "access_lost"}:
+                access_metadata.update(
+                    {
+                        "dialog_access": "local_only",
+                        "coverage": "local_only",
+                        "required_action": (
+                            "Mark the dialog for sync to make a complete local history available, or retry with "
+                            'message_state="sent" for an on-demand live page.'
+                        ),
+                    }
+                )
         return dialog_type, read_state, access_metadata
 
     def _all_local_response(self, state: _AllLocalState) -> dict:
@@ -2013,25 +2080,47 @@ class ReadingService:
             combined = self._combined_local_rows(
                 state.sent_rows, state.scheduled_rows, state.draft_rows, state.request.direction
             )
-            has_more = len(combined) > request.limit or state.draft_result["data"]["next_navigation"] is not None
+            draft_result = state.draft_result
+            has_more = len(combined) > request.limit or (
+                draft_result is not None and draft_result["data"]["next_navigation"] is not None
+            )
             page = combined[: request.limit]
             next_nav = self._all_next_navigation(
                 page,
                 has_more,
                 state.request,
-                state.draft_result["data"]["draft_fingerprint"],
+                draft_result["data"]["draft_fingerprint"] if draft_result is not None else None,
             )
+            topic_metadata: dict[str, object] = {}
+            if request.topic_id is not None:
+                with timing_phase("local_projection"):
+                    receipt = _topic_attribution_receipt(self._conn, state.request.dialog_id)
+                topic_metadata = {
+                    "topic_attribution": receipt,
+                    "selection_state": _topic_selection_state(
+                        topic_id=request.topic_id,
+                        messages=page,
+                        status=state.request.status,
+                        receipt=receipt,
+                    ),
+                }
+            projection_metadata: dict[str, object] = {}
+            if draft_result is not None:
+                projection_metadata = {
+                    "draft_coverage": draft_result["data"]["draft_coverage"],
+                    "truncation": draft_result["data"]["truncation"],
+                }
             return {
                 "ok": True,
                 "data": {
                     "messages": page,
-                    "source": "sync_db+scheduled_messages+draft_current",
+                    "source": "sync_db" if request.unread else "sync_db+scheduled_messages+draft_current",
                     "next_navigation": next_nav,
                     "message_state": "all",
                     "dialog_type": dialog_type,
                     "read_state": read_state,
-                    "draft_coverage": state.draft_result["data"]["draft_coverage"],
-                    "truncation": state.draft_result["data"]["truncation"],
+                    **projection_metadata,
+                    **topic_metadata,
                     **access_metadata,
                 },
             }
@@ -2084,6 +2173,7 @@ class ReadingService:
             direction=(HistoryDirection.OLDEST if all_request.direction == "oldest" else HistoryDirection.NEWEST),
             sent_at=position.sent_at,
             message_state="all",
+            unread=all_request.request.unread,
             since_utc=all_request.request.since_utc,
             until_utc=all_request.request.until_utc,
             draft_key=position.draft_key,
@@ -2122,8 +2212,11 @@ class ReadingService:
         if request.context_message_id is not None:
             return {
                 "ok": False,
-                "error": "non_sent_context_unsupported",
-                "message": "Draft and scheduled messages do not support sent-history context windows.",
+                "error": f"{request.message_state}_context_unsupported",
+                "message": (
+                    f'message_state="{request.message_state}" does not support sent-history context windows. '
+                    'Action: retry with message_state="sent".'
+                ),
             }
         nav_result = self._decode_history_navigation(
             request.navigation,
@@ -2132,6 +2225,7 @@ class ReadingService:
                 direction=direction,
                 message_state=request.message_state,
                 topic_id=request.topic_id,
+                unread=request.unread,
                 since_utc=request.since_utc,
                 until_utc=request.until_utc,
             ),
@@ -2149,6 +2243,11 @@ class ReadingService:
                 anchor_sent_at = all_navigation.sent_at
             except ValueError as exc:
                 return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
+        if request.message_state == "all" and request.unread:
+            unread_position = await self._resolve_unread_position(dialog_id, request.unread_after_id)
+            if isinstance(unread_position, _ReadPositionPending):
+                return unread_position.response()
+            request = dataclasses.replace(request, unread_after_id=unread_position.value)
         return await self._list_messages_local_state_result(
             dialog_id,
             request,
@@ -2170,6 +2269,15 @@ class ReadingService:
                 "ok": False,
                 "error": "invalid_message_state",
                 "message": "message_state must be sent, scheduled, draft, or all",
+            }
+        if request.unread and request.message_state in {"scheduled", "draft"}:
+            return {
+                "ok": False,
+                "error": "unread_state_unsupported",
+                "message": (
+                    f'message_state="{request.message_state}" has no unread semantics. '
+                    'Action: retry with message_state="sent" or message_state="all".'
+                ),
             }
         if request.message_state != "sent":
             return await self._list_messages_non_sent(dialog_id, request, direction)
@@ -2601,8 +2709,12 @@ class ReadingService:
     async def list_messages_from_db(self, req: object) -> dict:
         return await self._list_messages_from_db(cast(_ListMessagesDbRequest, req))
 
-    async def resolve_unread_position(self, dialog_id: int, unread_after_id: int | None) -> int | None:
-        return await self._resolve_unread_position(dialog_id, unread_after_id)
+    async def resolve_unread_position(self, dialog_id: int, unread_after_id: int | None) -> int | dict[str, str | bool]:
+        """Expose the legacy daemon response shape for read-position lookup."""
+        result = await self._resolve_unread_position(dialog_id, unread_after_id)
+        if isinstance(result, _ReadPositionPending):
+            return result.response()
+        return result.value
 
     async def _list_dialogs(self, req: dict) -> dict:
         """Return dialog list from the local dialogs snapshot.

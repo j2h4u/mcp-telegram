@@ -112,6 +112,7 @@ def _anchor_call(dialog_id: int, msg_id: int, message_state: str) -> dict[str, o
         arguments["message_state"] = "scheduled"
     else:
         arguments["anchor_message_id"] = msg_id
+        arguments["message_state"] = "sent"
     return {"tool": "list_messages", "arguments": arguments}
 
 

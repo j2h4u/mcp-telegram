@@ -33,6 +33,13 @@ class TestNavigationTokenRoundTrip:
         nav = decode_navigation_token(token)
         assert nav.topic_id == 42
 
+    def test_history_token_roundtrip_preserves_unread_binding(self):
+        token = encode_history_navigation(50, dialog_id=300, message_state="sent", unread=True)
+
+        nav = decode_navigation_token(token)
+
+        assert nav.unread is True
+
     def test_search_token_roundtrip(self):
         token = encode_search_navigation(offset=20, dialog_id=100, query="hello world", message_state="scheduled")
         nav = decode_navigation_token(token)
@@ -150,6 +157,10 @@ class TestDecodeValidation:
         "payload, error",
         [
             ({"kind": "history", "value": 1, "dialog_id": 1}, "message_state"),
+            (
+                {"kind": "history", "value": 1, "dialog_id": 1, "message_state": "sent"},
+                "unread binding",
+            ),
             ({"kind": "search", "value": 1, "dialog_id": 1, "message_state": "sent"}, "requires query"),
             ({"kind": "search", "dialog_id": 1, "query": "needle", "message_state": "sent"}, "requires offset"),
         ],

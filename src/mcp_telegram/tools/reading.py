@@ -285,7 +285,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "message_state": {
                     "type": "string",
                     "enum": ["sent", "scheduled", "draft", "all"],
-                    "description": "Lifecycle filter: published history, pending author-only state, current draft composition, or all local states.",
+                    "description": "Lifecycle selection used by the request: all local states by default, or published history, pending author-only state, or current draft composition.",
                 },
                 "since_utc": {"type": ["string", "null"]},
                 "until_utc": {"type": ["string", "null"]},
@@ -498,8 +498,10 @@ def _list_messages_dialog_name(data: dict, rows: list[dict], fallback_dialog: st
 def _list_messages_coverage(data: dict) -> dict[str, object]:
     raw_coverage = data.get("coverage")
     dialog_access = data.get("dialog_access")
-    if raw_coverage == "fragment":
+    if raw_coverage in {"fragment", "local_only"}:
         kind = "fragment"
+        if raw_coverage == "local_only":
+            kind = "local_only"
     elif dialog_access == "archived":
         kind = "archived"
     elif dialog_access == "live":
@@ -528,17 +530,30 @@ def _list_messages_coverage(data: dict) -> dict[str, object]:
 
 
 def _list_messages_warnings(data: dict) -> list[StructuredWarning]:
+    warnings: list[StructuredWarning] = []
     archived_warning = _format_archived_warning(data).strip()
-    if not archived_warning:
-        return []
-    return [
-        structured_warning(
-            "archived_dialog",
-            archived_warning,
-            severity="warning",
-            action="Treat results as local archive content; sync cannot fetch current messages until access is restored.",
+    if archived_warning:
+        warnings.append(
+            structured_warning(
+                "archived_dialog",
+                archived_warning,
+                severity="warning",
+                action="Treat results as local archive content; sync cannot fetch current messages until access is restored.",
+            )
         )
-    ]
+    if data.get("coverage") == "local_only":
+        warnings.append(
+            structured_warning(
+                "local_history_unavailable",
+                "This local read cannot establish complete published history; results contain only records available in this projection.",
+                severity="warning",
+                action=(
+                    "Mark the dialog for sync to make a complete local history available, or retry with "
+                    'message_state="sent" for an on-demand live page.'
+                ),
+            )
+        )
+    return warnings
 
 
 def _empty_exact_topic_warning(
@@ -551,7 +566,7 @@ def _empty_exact_topic_warning(
             args.sender is not None,
             args.unread,
             args.anchor_message_id is not None,
-            args.message_state != "sent",
+            args.message_state not in {"all", "sent"},
             args.since_utc is not None,
             args.until_utc is not None,
         )
@@ -1076,6 +1091,7 @@ def _search_structured_content(ctx: _SearchStructuredContentContext) -> dict[str
             "arguments_template": {
                 "exact_dialog_id": "<result.dialog_id>",
                 "anchor_message_id": "<result.msg_id>",
+                "message_state": "sent",
             },
         },
         "results": structured_results,
@@ -1145,26 +1161,29 @@ class ListMessages(ToolArgs):
     Provide dialog= for fuzzy/name/link resolution or exact_dialog_id= when known.
     This is not a global latest-across-all-dialogs tool.
 
-    Omit navigation or use navigation="latest" for the recent tail; use
-    navigation="start" for the beginning; pass next_navigation to continue.
-    Every page is chronological (oldest-to-newest). Use anchor_message_id from
-    search_messages to read context around a hit. For a dialog without local history,
-    the daemon may fetch and retain a bounded fragment around the anchor; an access-lost
-    dialog cannot be fetched. Use exact_dialog_id with an anchor.
+    Pages are chronological. Omit navigation or use navigation="latest" for the
+    recent tail; use navigation="start" for the beginning. Reuse the exact
+    next_navigation token with the same filters, including message_state and unread.
 
-    Supports sender, topic/exact_topic_id, unread, and absolute UTC time-bound
-    filters. ``since_utc`` is inclusive and ``until_utc`` is exclusive; both
-    require RFC3339 timestamps with a UTC offset (``Z`` or ``+00:00``). DM rows include
-    read_state plus inline read markers. Fragment coverage means a targeted
-    snippet, not full chat history. Use message_state="scheduled" for pending
-    future outbox rows or "all" to combine them with published history. Scheduled
-    rows are author_only, unpublished, and unseen by chat participants.
+    The default message_state="all" returns the local combined stream. Use
+    message_state="sent" for published history, search-hit anchors, and natural
+    topic resolution. Scheduled rows are author_only and unpublished.
+
+    Use anchor_message_id with exact_dialog_id to read context around a search hit.
+    When local history is absent, the daemon may retain a bounded fragment around
+    that anchor; access-lost dialogs cannot be fetched. Supports sender, topic,
+    unread, and UTC time bounds. DM rows include read_state; inline read markers
+    show boundaries. Fragment coverage is a targeted snippet, not complete history.
     """
 
     dialog: str | None = Field(
         default=None,
         max_length=500,
-        description=f"{NATURAL_DIALOG_SELECTOR_DESCRIPTION} Mutually exclusive with exact_dialog_id.",
+        description=(
+            f"{NATURAL_DIALOG_SELECTOR_DESCRIPTION} Mutually exclusive with exact_dialog_id. "
+            "For message_state=all or draft, names and @usernames resolve from the local dialog directory only; "
+            "use a previously returned exact_dialog_id when that directory lacks the selector."
+        ),
     )
     exact_dialog_id: StrictInt | None = Field(
         default=None,
@@ -1177,7 +1196,7 @@ class ListMessages(ToolArgs):
         description=(
             'Optional shared navigation state. Omit or set to "latest" to start from the latest '
             'message page. Set to "start" to start from the beginning. Reuse the exact '
-            "next_navigation token from the previous ListMessages response to continue."
+            "next_navigation token from the previous ListMessages response to continue with the same message_state."
         ),
     )
     sender: str | None = Field(
@@ -1189,7 +1208,8 @@ class ListMessages(ToolArgs):
         default=None,
         max_length=500,
         description=(
-            "Optional natural topic title resolved within the selected dialog. Mutually exclusive with exact_topic_id."
+            "Optional natural topic title resolved within the selected dialog. Available only with message_state=sent; "
+            "otherwise use exact_topic_id. Mutually exclusive with exact_topic_id."
         ),
     )
     exact_topic_id: int | None = Field(
@@ -1200,7 +1220,10 @@ class ListMessages(ToolArgs):
             "default. Mutually exclusive with topic."
         ),
     )
-    unread: bool = False
+    unread: bool = Field(
+        default=False,
+        description='Filter unread published rows. Supported with message_state="sent" or "all" only.',
+    )
     anchor_message_id: int | None = Field(
         default=None,
         ge=1,
@@ -1211,7 +1234,7 @@ class ListMessages(ToolArgs):
             "history is unavailable, the daemon may fetch and retain that bounded fragment "
             "from Telegram. Access-lost dialogs cannot be fetched. When set, navigation and "
             "direction are ignored. "
-            "Obtain from msg_id: values in SearchMessages results."
+            'Obtain from msg_id: values in SearchMessages results. Requires message_state="sent".'
         ),
     )
     context_size: int = Field(
@@ -1229,10 +1252,11 @@ class ListMessages(ToolArgs):
         description="Exclusive RFC3339 UTC upper bound (Z or +00:00). Results use [since_utc, until_utc).",
     )
     message_state: Literal["sent", "scheduled", "draft", "all"] = Field(
-        default="sent",
+        default="all",
         description=(
-            "Lifecycle filter. sent returns published chat history (default), scheduled returns "
-            "pending future outbox rows, draft returns current local author composition, and all combines them."
+            "Lifecycle filter. all returns the local combined stream (default); sent returns "
+            "published chat history only, scheduled returns pending future outbox rows, and "
+            "draft returns current local author composition. unread is supported only for sent and all."
         ),
     )
 
@@ -1260,9 +1284,13 @@ def _validate_topic_selectors(args: ListMessages) -> None:
 
 def _validate_message_state_selector(args: ListMessages) -> None:
     if args.message_state != "sent" and args.anchor_message_id is not None:
-        raise ValueError("anchor_message_id is only supported for published sent history.")
-    if args.message_state in {"draft", "all"} and args.topic is not None:
-        raise ValueError("draft and all reads require exact_topic_id; natural topic resolution may use Telegram.")
+        raise ValueError('anchor_message_id requires message_state="sent"; retry with message_state="sent".')
+    if args.unread and args.message_state in {"scheduled", "draft"}:
+        raise ValueError('unread requires message_state="sent" or "all".')
+    if args.message_state != "sent" and args.topic is not None:
+        raise ValueError(
+            'natural topic resolution requires message_state="sent"; retry with message_state="sent" or use exact_topic_id.'
+        )
 
 
 def _validate_utc_range(args: ListMessages) -> None:
@@ -1377,7 +1405,7 @@ def _list_messages_has_filter(args: ListMessages) -> bool:
         or args.topic
         or args.exact_topic_id is not None
         or args.unread
-        or args.message_state != "sent"
+        or args.message_state != "all"
         or args.since_utc is not None
         or args.until_utc is not None
     )
@@ -1571,7 +1599,8 @@ class SearchMessages(ToolArgs):
     Each result is a compact one-liner with a msg_id: anchor:
       [Dialog] 2024-01-15 14:32 Ivan (msg_id:42): "...snippet..."
 
-    To read context around a hit, call ListMessages with exact_dialog_id and anchor_message_id=42.
+    To read context around a hit, call ListMessages with exact_dialog_id, anchor_message_id=42,
+    and message_state="sent".
 
     Omit navigation to start a new search.
     Pass the next_navigation token from a previous response to continue paging.

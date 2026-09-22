@@ -43,6 +43,7 @@ class NavigationToken:
     direction: HistoryDirection | None = None
     sent_at: int | None = None
     message_state: str | None = None
+    unread: bool = False
     since_utc: int | None = None
     until_utc: int | None = None
     draft_key: str | None = None
@@ -159,7 +160,7 @@ def encode_navigation_token(navigation: NavigationToken) -> str:
 
 
 def _optional_navigation_fields(navigation: NavigationToken) -> dict[str, object]:
-    return {
+    fields: dict[str, object] = {
         key: value
         for key, value in {
             "topic_id": navigation.topic_id,
@@ -176,6 +177,9 @@ def _optional_navigation_fields(navigation: NavigationToken) -> dict[str, object
         }.items()
         if value is not None
     }
+    if navigation.kind == "history":
+        fields["unread"] = navigation.unread
+    return fields
 
 
 def decode_navigation_token(token: str) -> NavigationToken:  # noqa: PLR0914
@@ -210,6 +214,8 @@ def decode_navigation_token(token: str) -> NavigationToken:  # noqa: PLR0914
         scheduled_message_id,
         scheduled_sent_at,
     ) = _decode_optional_navigation_fields(data)
+    raw_unread = data.get("unread")
+    unread = raw_unread if isinstance(raw_unread, bool) else False
     navigation = NavigationToken(
         kind=cast("NavigationKind", kind),
         value=cast(int | None, value),
@@ -219,6 +225,7 @@ def decode_navigation_token(token: str) -> NavigationToken:  # noqa: PLR0914
         direction=cast("HistoryDirection | None", direction),
         sent_at=sent_at,
         message_state=cast("str | None", message_state),
+        unread=unread,
         since_utc=since_utc,
         until_utc=until_utc,
         draft_key=draft_key,
@@ -227,6 +234,10 @@ def decode_navigation_token(token: str) -> NavigationToken:  # noqa: PLR0914
         scheduled_sent_at=scheduled_sent_at,
     )
     _validate_navigation_shape(navigation)
+    if kind == "history" and not isinstance(raw_unread, bool):
+        raise ValueError("Invalid navigation token: history cursor requires boolean unread binding")
+    if kind == "search" and "unread" in data:
+        raise ValueError("Invalid navigation token: search cursor contains history-only unread binding")
     return navigation
 
 
@@ -252,9 +263,13 @@ def _validate_navigation_time_range(navigation: NavigationToken) -> None:
 def _validate_navigation_state(navigation: NavigationToken) -> None:
     if navigation.message_state not in {"sent", "scheduled", "draft", "all"}:
         raise ValueError("Invalid navigation token: message_state must be sent, scheduled, draft, or all")
+    if not isinstance(navigation.unread, bool):
+        raise ValueError("Invalid navigation token: unread must be a boolean")
 
 
 def _validate_search_navigation(navigation: NavigationToken) -> None:
+    if navigation.unread:
+        raise ValueError("Invalid navigation token: search cursor cannot bind unread mode")
     if navigation.query is None:
         raise ValueError("Invalid navigation token: search cursor requires query")
     if navigation.value is None:
@@ -387,6 +402,7 @@ def encode_history_navigation(  # noqa: PLR0913
     direction: HistoryDirection = HistoryDirection.NEWEST,
     sent_at: int | None = None,
     message_state: str,
+    unread: bool = False,
     since_utc: int | None = None,
     until_utc: int | None = None,
     draft_key: str | None = None,
@@ -404,6 +420,7 @@ def encode_history_navigation(  # noqa: PLR0913
             direction=direction,
             sent_at=sent_at,
             message_state=message_state,
+            unread=unread,
             since_utc=since_utc,
             until_utc=until_utc,
             draft_key=draft_key,

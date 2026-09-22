@@ -437,6 +437,219 @@ async def test_list_messages_all_uses_one_unified_envelope() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_messages_defaults_to_all_and_sent_remains_explicit() -> None:
+    server = make_server()
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    _insert_message(conn, 1, 1, sent_at=1700000000, text="published")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 2, FUTURE_BASE + 100, "future")
+
+    default_result = await server._list_messages({"dialog_id": 1, "direction": "oldest"})
+    all_result = await server._list_messages({"dialog_id": 1, "message_state": "all", "direction": "oldest"})
+    sent_result = await server._list_messages({"dialog_id": 1, "message_state": "sent", "direction": "oldest"})
+
+    assert default_result["data"] == all_result["data"]
+    assert [row["message_state"] for row in default_result["data"]["messages"]] == ["sent", "scheduled"]
+    assert [row["text"] for row in sent_result["data"]["messages"]] == ["published"]
+
+
+@pytest.mark.asyncio
+async def test_default_all_unread_uses_only_the_published_unread_cursor() -> None:
+    server = make_server()
+    server.self_id = 7
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    conn.execute("UPDATE synced_dialogs SET read_inbox_max_id = 100 WHERE dialog_id = 1")
+    _insert_message(conn, 1, 99, sent_at=FUTURE_BASE - 300, text="read")
+    _insert_message(conn, 1, 101, sent_at=FUTURE_BASE - 100, text="unread")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 102, FUTURE_BASE + 100, "scheduled")
+    _create_draft_projection(conn)
+    conn.execute(
+        f"INSERT INTO draft_current VALUES (7, 1, 0, 0, 'present', 'draft', '[]', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1, 'realtime_present', {FUTURE_BASE}, {FUTURE_BASE}, {FUTURE_BASE}, 1, 1)"
+    )
+    conn.execute("INSERT INTO draft_sync_state VALUES (7, 'ready', 'complete', ?, ?, NULL)", (FUTURE_BASE, FUTURE_BASE))
+    conn.commit()
+
+    result = await server._list_messages({"dialog_id": 1, "unread": True, "direction": "oldest"})
+
+    assert [row["text"] for row in result["data"]["messages"]] == ["unread"]
+    assert [row["message_state"] for row in result["data"]["messages"]] == ["sent"]
+    assert result["data"]["source"] == "sync_db"
+    assert "draft_coverage" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_all_unread_pagination_skips_mutable_local_projections(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = make_server()
+    server.self_id = 7
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    conn.execute("UPDATE synced_dialogs SET read_inbox_max_id = 0 WHERE dialog_id = 1")
+    _insert_message(conn, 1, 1, sent_at=100, text="first unread")
+    _insert_message(conn, 1, 2, sent_at=200, text="second unread")
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 3, FUTURE_BASE + 100, "scheduled")
+    _create_draft_projection(conn)
+    conn.execute(
+        "INSERT INTO draft_current VALUES (7, 1, 0, 0, 'present', 'draft', '[]', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1, 'realtime_present', 100, 100, 100, 1, 1)"
+    )
+    conn.execute("INSERT INTO draft_sync_state VALUES (7, 'ready', 'complete', 100, 100, NULL)")
+    conn.commit()
+
+    reading = server._get_reading_service()
+
+    def _unexpected_projection(*_args: object, **_kwargs: object) -> dict:
+        raise AssertionError("all+unread must not query a mutable local projection")
+
+    monkeypatch.setattr(reading, "_list_scheduled_messages_from_db", _unexpected_projection)
+    monkeypatch.setattr(reading, "_list_draft_messages_from_db", _unexpected_projection)
+
+    first = await server._list_messages({"dialog_id": 1, "unread": True, "direction": "oldest", "limit": 1})
+    token = first["data"]["next_navigation"]
+    assert token is not None
+    assert decode_navigation_token(token).unread is True
+
+    conn.execute("UPDATE draft_current SET projection_revision = 2 WHERE dialog_id = 1")
+    conn.commit()
+    second = await server._list_messages(
+        {"dialog_id": 1, "unread": True, "direction": "oldest", "limit": 1, "navigation": token}
+    )
+
+    assert [row["text"] for row in first["data"]["messages"] + second["data"]["messages"]] == [
+        "first unread",
+        "second unread",
+    ]
+    assert second["data"]["source"] == "sync_db"
+
+
+@pytest.mark.asyncio
+async def test_all_unread_cursor_rejects_continuation_without_unread() -> None:
+    server = make_server()
+    server.self_id = 7
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    conn.execute("UPDATE synced_dialogs SET read_inbox_max_id = 0 WHERE dialog_id = 1")
+    _insert_message(conn, 1, 1, sent_at=100, text="first unread")
+    _insert_message(conn, 1, 2, sent_at=200, text="second unread")
+    _create_draft_projection(conn)
+    conn.execute(
+        "INSERT INTO draft_current VALUES (7, 1, 0, 0, 'present', 'draft', '[]', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1, 'realtime_present', 150, 150, 150, 1, 1)"
+    )
+    conn.execute("INSERT INTO draft_sync_state VALUES (7, 'ready', 'complete', 150, 150, NULL)")
+    conn.commit()
+
+    first = await server._list_messages({"dialog_id": 1, "unread": True, "direction": "oldest", "limit": 1})
+    token = first["data"]["next_navigation"]
+    assert token is not None
+    assert decode_navigation_token(token).draft_fingerprint is None
+
+    second = await server._list_messages(
+        {"dialog_id": 1, "message_state": "all", "direction": "oldest", "limit": 2, "navigation": token}
+    )
+
+    assert second["ok"] is False
+    assert second["error"] == "invalid_navigation"
+    assert "unread" in second["message"]
+
+
+@pytest.mark.asyncio
+async def test_all_cursor_rejects_continuation_with_unread() -> None:
+    server = make_server()
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    conn.execute("UPDATE synced_dialogs SET read_inbox_max_id = 0 WHERE dialog_id = 1")
+    _insert_message(conn, 1, 1, sent_at=100, text="first")
+    _insert_message(conn, 1, 2, sent_at=200, text="second")
+
+    first = await server._list_messages({"dialog_id": 1, "direction": "oldest", "limit": 1})
+    token = first["data"]["next_navigation"]
+    assert token is not None
+    assert decode_navigation_token(token).unread is False
+
+    second = await server._list_messages(
+        {"dialog_id": 1, "direction": "oldest", "limit": 1, "unread": True, "navigation": token}
+    )
+
+    assert second["ok"] is False
+    assert second["error"] == "invalid_navigation"
+    assert "unread" in second["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_state", [None, "sent"])
+async def test_unread_requires_a_known_read_position(message_state: str | None) -> None:
+    server = make_server()
+    _insert_synced_dialog(server._conn, 1, status="synced")
+    _insert_message(server._conn, 1, 1, sent_at=100, text="unclassified")
+    request: dict[str, object] = {"dialog_id": 1, "unread": True}
+    if message_state is not None:
+        request["message_state"] = message_state
+
+    result = await server._list_messages(request)
+
+    assert result["ok"] is False
+    assert result["error"] == "read_position_pending"
+    assert result["required_action"] == "Retry shortly while the sync daemon reconciles read positions."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_state", ["scheduled", "draft"])
+async def test_non_sent_states_reject_unread(message_state: str) -> None:
+    result = await make_server()._list_messages({"dialog_id": 1, "message_state": message_state, "unread": True})
+
+    assert result["ok"] is False
+    assert result["error"] == "unread_state_unsupported"
+    assert 'message_state="sent" or message_state="all"' in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_omitted_state_rejects_context_with_actionable_sent_retry() -> None:
+    result = await make_server()._list_messages({"dialog_id": 1, "context_message_id": 1})
+
+    assert result["ok"] is False
+    assert result["error"] == "all_context_unsupported"
+    assert 'retry with message_state="sent"' in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_default_all_empty_exact_topic_has_truthful_local_attribution() -> None:
+    server = make_server()
+    conn = server._conn
+    _insert_synced_dialog(conn, 1, status="synced")
+    _insert_message(conn, 1, 1, sent_at=100, text="another topic", forum_topic_id=8)
+
+    result = await server._list_messages({"dialog_id": 1, "topic_id": 7})
+
+    assert result["ok"] is True
+    assert result["data"]["messages"] == []
+    assert result["data"]["selection_state"] == "unknown"
+    assert result["data"]["topic_attribution"]["state"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_default_all_marks_not_synced_empty_history_as_local_only() -> None:
+    iter_messages = MagicMock(side_effect=AssertionError("all reads must not call Telegram"))
+    client = MagicMock()
+    client.iter_messages = iter_messages
+    server = make_server(client=client)
+    _insert_synced_dialog(server._conn, 1, status="not_synced")
+
+    result = await server._list_messages({"dialog_id": 1})
+
+    assert result["ok"] is True
+    assert result["data"]["messages"] == []
+    assert result["data"]["coverage"] == "local_only"
+    assert result["data"]["dialog_access"] == "local_only"
+    assert result["data"]["required_action"] == (
+        "Mark the dialog for sync to make a complete local history available, or retry with "
+        'message_state="sent" for an on-demand live page.'
+    )
+    iter_messages.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_list_messages_all_uses_numeric_tie_break_for_sent_and_scheduled_rows() -> None:
     server = make_server()
     conn = server._conn

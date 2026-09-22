@@ -119,17 +119,22 @@ def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
     assert "response_order" not in properties
     assert "reply_context_mode" not in properties
     navigation = cast(dict[str, object], properties["navigation"])
+    dialog = cast(dict[str, object], properties["dialog"])
     exact_dialog_id = cast(dict[str, object], properties["exact_dialog_id"])
     exact_topic_id = cast(dict[str, object], properties["exact_topic_id"])
     anchor_message_id = cast(dict[str, object], properties["anchor_message_id"])
+    message_state = cast(dict[str, object], properties["message_state"])
     assert navigation["type"] == "string"
     assert exact_dialog_id["type"] == "integer"
     assert exact_topic_id["type"] == "integer"
     assert anchor_message_id["type"] == "integer"
     assert anchor_message_id["minimum"] == 1
     assert anchor_message_id["maximum"] == 2_147_483_647
+    assert message_state["default"] == "all"
     assert '"latest"' in cast(str, navigation["description"])
     assert '"start"' in cast(str, navigation["description"])
+    assert "same message_state" in cast(str, navigation["description"])
+    assert "local dialog directory only" in cast(str, dialog["description"])
     assert "previously returned by mcp-telegram" in cast(str, exact_dialog_id["description"])
     assert "another API" in cast(str, exact_dialog_id["description"])
     assert "Mutually exclusive with dialog" in cast(str, exact_dialog_id["description"])
@@ -854,6 +859,7 @@ async def test_get_prompt_returns_telegram_workflows_guide() -> None:
     assert isinstance(message.content, TextContent)
     text = message.content.text
     assert "SEARCH THEN READ" in text
+    assert 'anchor_message_id=M, message_state="sent"' in text
     assert "FOLDERS" in text
     assert 'list_dialogs(view="folders")' in text
     assert "get_entity_info" in text

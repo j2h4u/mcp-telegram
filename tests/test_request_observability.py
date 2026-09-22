@@ -465,7 +465,13 @@ async def test_real_list_messages_seams_record_local_shape_and_fallback_attempt(
     local_server._runtime_observation_sink = cast(RuntimeObservationSink, local_sink)
     local_response, _, _ = await local_server._handle_client_line(
         json.dumps(
-            {"method": "list_messages", "operation_id": "e" * 32, "request_id": "abcdef12", "dialog_id": 1}
+            {
+                "method": "list_messages",
+                "operation_id": "e" * 32,
+                "request_id": "abcdef12",
+                "dialog_id": 1,
+                "message_state": "sent",
+            }
         ).encode(),
         "",
         None,
@@ -490,7 +496,9 @@ async def test_real_list_messages_seams_record_local_shape_and_fallback_attempt(
     fallback_server = make_server(_make_db(), fallback_client)
     fallback_server._runtime_observation_sink = cast(RuntimeObservationSink, fallback_sink)
     fallback_response, _, _ = await fallback_server._handle_client_line(
-        json.dumps({"method": "list_messages", "operation_id": "f" * 32, "dialog_id": 2}).encode(),
+        json.dumps(
+            {"method": "list_messages", "operation_id": "f" * 32, "dialog_id": 2, "message_state": "sent"}
+        ).encode(),
         "",
         None,
     )
@@ -510,7 +518,9 @@ async def test_real_list_messages_seams_record_local_shape_and_fallback_attempt(
     failed_server = make_server(_make_db(), failed_client)
     failed_server._runtime_observation_sink = cast(RuntimeObservationSink, failed_sink)
     failed_response, _, _ = await failed_server._handle_client_line(
-        json.dumps({"method": "list_messages", "operation_id": "1" * 32, "dialog_id": 2}).encode(),
+        json.dumps(
+            {"method": "list_messages", "operation_id": "1" * 32, "dialog_id": 2, "message_state": "sent"}
+        ).encode(),
         "",
         None,
     )
@@ -635,6 +645,7 @@ async def test_empty_topic_selection_records_local_route_without_acquisition() -
                 "operation_id": f"{8:032x}",
                 "dialog_id": dialog_id,
                 "topic_id": topic_id,
+                "message_state": "sent",
             }
         ).encode(),
         "",
