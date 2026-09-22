@@ -38,6 +38,7 @@ _CURRENT_VALUE_COLUMNS = (
     "composition_complete",
     "source_kind",
     "source_observed_at",
+    "source_order_at",
     "observation_started_at",
     "observation_completed_at",
     "normalization_version",
@@ -69,134 +70,264 @@ class SQLiteDraftProjection:
                 "INSERT OR IGNORE INTO draft_sync_state(account_id,status,coverage_status) VALUES (?,'unknown','unknown')",
                 (account_id,),
             )
+            legacy_pending = self._legacy_order_pending(account_id)
+            scope_uncertain = self._has_scope_uncertainty(account_id)
+            if legacy_pending or scope_uncertain:
+                now = int(time.time())
+                reason = "legacy_order_pending" if legacy_pending else "scope_order_uncertain"
+                self._conn.execute(
+                    "UPDATE draft_projection_runtime SET recovery_due_at=?,recovery_claimed_at=NULL WHERE singleton=1",
+                    (now,),
+                )
+                self._conn.execute(
+                    "UPDATE draft_sync_state SET status='recovery_needed',coverage_status='unknown',"
+                    "reason=?,observation_completed_at=? WHERE account_id=?",
+                    (reason, now, account_id),
+                )
 
     def apply_realtime(self, observation: DraftObservation) -> DraftApplyResult:
-        """Atomically apply one delivered observation or request recovery on ambiguity."""
+        """Apply a realtime observation using Telegram source order only."""
         if observation.source is not DraftObservationSource.REALTIME:
             raise ValueError("apply_realtime requires a realtime observation")
         with self._write_transaction():
             self._require_active_account(observation.scope.account_id)
-            if observation.ambiguity:
-                self._set_recovery_needed("ambiguous_realtime_observation", _as_unix(observation.observed_at))
-                return DraftApplyResult(accepted=False, ambiguous=True)
             existing = self._row_for_scope(observation.scope)
             candidate = _row_values(observation, source_kind=_source_kind(observation))
-            if existing is not None:
-                source_observed_at = _database_int(existing["source_observed_at"])
-                incoming_observed_at = _database_int(candidate["source_observed_at"])
-                if incoming_observed_at < source_observed_at:
-                    return DraftApplyResult(accepted=False, revision=_database_int(existing["projection_revision"]))
-                if incoming_observed_at == source_observed_at:
-                    if _row_matches(existing, candidate):
-                        return DraftApplyResult(accepted=True, revision=_database_int(existing["projection_revision"]))
-                    self._set_recovery_needed("equal_realtime_observation_conflict", incoming_observed_at)
-                    return DraftApplyResult(accepted=False, ambiguous=True)
-            revision = self._next_revision()
-            self._upsert_current(observation.scope, candidate, revision)
-            self._conn.execute(
-                "UPDATE draft_sync_state SET status='ready' WHERE account_id=?",
-                (observation.scope.account_id,),
-            )
-            return DraftApplyResult(accepted=True, revision=revision, publication_changed=True)
+            if self._scope_order_uncertain(observation.scope):
+                self._invalidate_recovery_claim("scope_order_uncertain", _as_unix(observation.observed_at))
+                return DraftApplyResult(accepted=False, ambiguous=True, decision="scope_order_uncertain")
+            ordered = self._classify_realtime_order(existing, candidate, observation)
+            if ordered is not None:
+                return ordered
+            if observation.ambiguity:
+                self._invalidate_recovery_claim("ambiguous_realtime", _as_unix(observation.observed_at))
+                return DraftApplyResult(accepted=False, ambiguous=True, decision="ambiguous_realtime")
+            if self._legacy_order_pending(observation.scope.account_id):
+                self._invalidate_recovery_claim("legacy_order_pending", _as_unix(observation.observed_at))
+                return DraftApplyResult(accepted=False, ambiguous=True, decision="legacy_order_pending")
+            if self._recovery_claim_active():
+                self._invalidate_recovery_claim("snapshot_in_flight", _as_unix(observation.observed_at))
+            if existing is not None and _row_matches(existing, candidate):
+                self._refresh_source_order(observation.scope, candidate)
+                return DraftApplyResult(
+                    accepted=True,
+                    revision=_database_int(existing["projection_revision"]),
+                    decision="advanced",
+                )
+            return self._publish_realtime(observation.scope, candidate)
 
-    def snapshot_baselines(self, account_id: int) -> Mapping[DraftScope, int]:
-        """Capture durable per-scope revisions before one GetAllDrafts request."""
-        _validate_account_id(account_id)
-        captured_at = int(time.time())
-        with self._write_transaction():
-            self._require_active_account(account_id)
-            self._conn.execute("DELETE FROM draft_snapshot_baseline WHERE account_id=?", (account_id,))
-            rows = cast(
-                list[tuple[int, int, int, int]],
-                self._conn.execute(
-                    "SELECT dialog_id,top_message_id,subdialog_peer_id,projection_revision "
-                    "FROM draft_current WHERE account_id=?",
-                    (account_id,),
-                ).fetchall(),
+    def _classify_realtime_order(
+        self,
+        existing: dict[str, object] | None,
+        candidate: dict[str, object],
+        observation: DraftObservation,
+    ) -> DraftApplyResult | None:
+        incoming_order = cast(int | None, candidate["source_order_at"])
+        content_equal = existing is not None and _row_matches(existing, candidate)
+        if incoming_order is None:
+            return self._classify_missing_order(existing, content_equal, observation)
+
+        effective_order = self._effective_order(existing, observation.scope.account_id)
+        if effective_order is None or incoming_order > effective_order:
+            return None
+        return self._classify_non_advancing_order(
+            existing, content_equal, incoming_order, effective_order, observation.observed_at
+        )
+
+    def _classify_missing_order(
+        self,
+        existing: dict[str, object] | None,
+        content_equal: bool,
+        observation: DraftObservation,
+    ) -> DraftApplyResult:
+        if content_equal and existing is not None:
+            if observation.disposition is DraftDisposition.TOMBSTONE:
+                self._mark_scope_uncertain(observation.scope, _as_unix(observation.observed_at))
+                self._invalidate_recovery_claim("missing_source_order", _as_unix(observation.observed_at))
+            return DraftApplyResult(
+                accepted=True,
+                ambiguous=observation.disposition is DraftDisposition.TOMBSTONE,
+                revision=_database_int(existing["projection_revision"]),
+                decision="missing_source_order",
             )
-            baselines = {
-                DraftScope(
-                    account_id, dialog_id, _none_for_zero(top_message_id), _none_for_zero(subdialog_peer_id)
-                ): revision
-                for dialog_id, top_message_id, subdialog_peer_id, revision in rows
-            }
-            self._conn.executemany(
-                "INSERT INTO draft_snapshot_baseline("
-                "account_id,dialog_id,top_message_id,subdialog_peer_id,baseline_revision,captured_at) VALUES (?,?,?,?,?,?)",
-                [
-                    (
-                        scope.account_id,
-                        scope.dialog_id,
-                        _zero_for_none(scope.top_message_id),
-                        _zero_for_none(scope.subdialog_peer_id),
-                        revision,
-                        captured_at,
-                    )
-                    for scope, revision in baselines.items()
-                ],
+        if observation.disposition is DraftDisposition.TOMBSTONE:
+            self._mark_scope_uncertain(observation.scope, _as_unix(observation.observed_at))
+        self._invalidate_recovery_claim("missing_source_order", _as_unix(observation.observed_at))
+        return DraftApplyResult(accepted=False, ambiguous=True, decision="missing_source_order")
+
+    def _classify_non_advancing_order(
+        self,
+        existing: dict[str, object] | None,
+        content_equal: bool,
+        incoming_order: int,
+        effective_order: int,
+        observed_at: datetime,
+    ) -> DraftApplyResult:
+        if incoming_order < effective_order:
+            revision = None if existing is None else _database_int(existing["projection_revision"])
+            return DraftApplyResult(accepted=False, revision=revision, decision="stale")
+        if content_equal and existing is not None:
+            return DraftApplyResult(
+                accepted=True,
+                revision=_database_int(existing["projection_revision"]),
+                decision="duplicate",
             )
+        self._invalidate_recovery_claim("equal_order_conflict", _as_unix(observed_at))
+        return DraftApplyResult(accepted=False, ambiguous=True, decision="equal_order_conflict")
+
+    def _effective_order(self, existing: dict[str, object] | None, account_id: int) -> int | None:
+        floor = self._source_order_floor(account_id)
+        current = None if existing is None else cast(int | None, existing["source_order_at"])
+        orders = tuple(value for value in (floor, current) if value is not None)
+        return max(orders) if orders else None
+
+    def _legacy_order_pending(self, account_id: int) -> bool:
+        if self._source_order_floor(account_id) is not None:
+            return False
+        row = cast(
+            tuple[object] | None,
             self._conn.execute(
-                "UPDATE draft_sync_state SET status='recovering',coverage_status='incomplete',"
-                "observation_started_at=?,observation_completed_at=NULL WHERE account_id=?",
-                (captured_at, account_id),
-            )
-            return baselines
+                "SELECT 1 FROM draft_current WHERE account_id=? AND source_order_at IS NULL LIMIT 1", (account_id,)
+            ).fetchone(),
+        )
+        return row is not None
+
+    def _scope_order_uncertain(self, scope: DraftScope) -> bool:
+        row = cast(
+            tuple[object] | None,
+            self._conn.execute(
+                "SELECT 1 FROM draft_order_uncertainty WHERE account_id=? AND dialog_id=? AND top_message_id=? "
+                "AND subdialog_peer_id=?",
+                (
+                    scope.account_id,
+                    scope.dialog_id,
+                    _zero_for_none(scope.top_message_id),
+                    _zero_for_none(scope.subdialog_peer_id),
+                ),
+            ).fetchone(),
+        )
+        return row is not None
+
+    def _mark_scope_uncertain(self, scope: DraftScope, observed_at: int) -> None:
+        self._conn.execute(
+            "INSERT INTO draft_order_uncertainty(account_id,dialog_id,top_message_id,subdialog_peer_id,observed_at) "
+            "VALUES (?,?,?,?,?) ON CONFLICT(account_id,dialog_id,top_message_id,subdialog_peer_id) DO UPDATE SET "
+            "observed_at=excluded.observed_at",
+            (
+                scope.account_id,
+                scope.dialog_id,
+                _zero_for_none(scope.top_message_id),
+                _zero_for_none(scope.subdialog_peer_id),
+                observed_at,
+            ),
+        )
+
+    def _clear_scope_uncertainty(self, scope: DraftScope) -> None:
+        self._conn.execute(
+            "DELETE FROM draft_order_uncertainty WHERE account_id=? AND dialog_id=? AND top_message_id=? "
+            "AND subdialog_peer_id=?",
+            (
+                scope.account_id,
+                scope.dialog_id,
+                _zero_for_none(scope.top_message_id),
+                _zero_for_none(scope.subdialog_peer_id),
+            ),
+        )
+
+    def _has_scope_uncertainty(self, account_id: int) -> bool:
+        row = cast(
+            tuple[object] | None,
+            self._conn.execute(
+                "SELECT 1 FROM draft_order_uncertainty WHERE account_id=? LIMIT 1", (account_id,)
+            ).fetchone(),
+        )
+        return row is not None
+
+    def _publish_realtime(self, scope: DraftScope, candidate: dict[str, object]) -> DraftApplyResult:
+        revision = self._next_revision()
+        self._upsert_current(scope, candidate, revision)
+        if not self._recovery_pending():
+            self._conn.execute("UPDATE draft_sync_state SET status='ready' WHERE account_id=?", (scope.account_id,))
+        return DraftApplyResult(accepted=True, revision=revision, publication_changed=True, decision="advanced")
+
+    def _recovery_pending(self) -> bool:
+        row = cast(
+            tuple[object | None, object | None] | None,
+            self._conn.execute(
+                "SELECT recovery_due_at,recovery_claimed_at FROM draft_projection_runtime WHERE singleton=1"
+            ).fetchone(),
+        )
+        return row is not None and (row[0] is not None or row[1] is not None)
 
     def apply_snapshot(
         self,
         observations: Sequence[DraftObservation],
         coverage: SnapshotCoverage,
-        baselines: Mapping[DraftScope, int],
         *,
         claim_token: int,
     ) -> DraftApplyResult:
-        """Publish one fenced snapshot and only then infer its durable absences."""
+        """Atomically publish an uncontested, envelope-dated full snapshot."""
         _validate_account_id(coverage.account_id)
-        _validate_snapshot_inputs(observations, coverage, baselines)
+        _validate_snapshot_inputs(observations, coverage)
         completed_at = int(time.time())
         with self._write_transaction():
             self._require_active_account(coverage.account_id)
+            if not self._claim_matches(claim_token):
+                return DraftApplyResult(accepted=False, decision="snapshot_superseded")
+            source_order_at = coverage.source_order_at
+            if not coverage.authoritative or source_order_at is None:
+                return DraftApplyResult(accepted=False, ambiguous=True, decision="snapshot_invalid")
+            floor = self._source_order_floor(coverage.account_id)
+            if floor is not None and _as_unix(source_order_at) < floor:
+                return DraftApplyResult(accepted=False, ambiguous=True, decision="snapshot_stale")
             deduplicated = _deduplicate_snapshot(observations)
             if deduplicated is None:
-                # The owner still holds the recovery claim and will rearm it
-                # with its token-fenced backoff.  Clearing it here would make
-                # that rearm a no-op and turn the conflict into a hot retry.
-                return DraftApplyResult(accepted=False, ambiguous=True)
-            changed_revision = self._apply_snapshot_observations(deduplicated, baselines, completed_at)
-            if coverage.authoritative:
-                changed_revision = self._infer_snapshot_absences(
-                    coverage.account_id, deduplicated, baselines, completed_at, changed_revision
+                return DraftApplyResult(accepted=False, ambiguous=True, decision="snapshot_conflict")
+            changed_revision = self._apply_snapshot_observations(deduplicated, source_order_at, completed_at)
+            changed_revision = self._infer_snapshot_absences(
+                coverage.account_id, deduplicated, source_order_at, completed_at, changed_revision
+            )
+            complete = self._mark_snapshot_complete(coverage.account_id, completed_at, claim_token, source_order_at)
+            if not complete:
+                return DraftApplyResult(
+                    accepted=False,
+                    ambiguous=True,
+                    revision=changed_revision,
+                    decision="snapshot_scope_uncertain",
                 )
-                self._mark_snapshot_complete(coverage.account_id, completed_at, claim_token)
-            else:
-                self._set_recovery_needed("snapshot_not_authoritative", completed_at)
-            self._conn.execute("DELETE FROM draft_snapshot_baseline WHERE account_id=?", (coverage.account_id,))
-            return DraftApplyResult(accepted=coverage.authoritative, revision=changed_revision)
+            return DraftApplyResult(accepted=True, revision=changed_revision, decision="authoritative")
 
     def _apply_snapshot_observations(
         self,
         observations: Sequence[DraftObservation],
-        baselines: Mapping[DraftScope, int],
+        source_order_at: datetime,
         completed_at: int,
     ) -> int | None:
         changed_revision: int | None = None
         for observation in observations:
             current = self._row_for_scope(observation.scope)
-            baseline = baselines.get(observation.scope)
-            if current is not None and (baseline is None or _database_int(current["projection_revision"]) != baseline):
+            candidate = _row_values(
+                observation,
+                source_kind=_source_kind(observation),
+                completed_at=completed_at,
+                source_order_override=_authoritative_order(observation, source_order_at),
+            )
+            if current is not None and _newer_than(current, candidate) is False:
                 continue
-            candidate = _row_values(observation, source_kind=_source_kind(observation), completed_at=completed_at)
             if current is not None and _row_matches(current, candidate):
+                self._refresh_source_order(observation.scope, candidate)
+                self._clear_scope_uncertainty(observation.scope)
                 continue
             changed_revision = self._next_revision()
             self._upsert_current(observation.scope, candidate, changed_revision)
+            self._clear_scope_uncertainty(observation.scope)
         return changed_revision
 
     def _infer_snapshot_absences(
         self,
         account_id: int,
         observations: Sequence[DraftObservation],
-        baselines: Mapping[DraftScope, int],
+        source_order_at: datetime,
         completed_at: int,
         changed_revision: int | None,
     ) -> int | None:
@@ -208,37 +339,141 @@ class SQLiteDraftProjection:
             ).fetchall(),
         )
         observed_scopes = {observation.scope for observation in observations}
-        for dialog_id, top_message_id, subdialog_peer_id, revision in known:
+        for dialog_id, top_message_id, subdialog_peer_id, _revision in known:
             scope = DraftScope(account_id, dialog_id, _none_for_zero(top_message_id), _none_for_zero(subdialog_peer_id))
-            if scope in observed_scopes or baselines.get(scope) != revision:
+            if scope in observed_scopes:
                 continue
             current = self._row_for_scope(scope)
-            cleared = _cleared_row(completed_at)
+            cleared = _cleared_row(completed_at, _as_unix(source_order_at))
+            if _newer_than(current, cleared) is False:
+                continue
             if current is not None and _row_matches(current, cleared):
+                self._refresh_source_order(scope, cleared)
+                self._clear_scope_uncertainty(scope)
                 continue
             changed_revision = self._next_revision()
             self._upsert_current(scope, cleared, changed_revision)
+            self._clear_scope_uncertainty(scope)
+        uncertain_scopes = cast(
+            list[tuple[int, int, int, int]],
+            self._conn.execute(
+                "SELECT dialog_id,top_message_id,subdialog_peer_id,account_id FROM draft_order_uncertainty "
+                "WHERE account_id=?",
+                (account_id,),
+            ).fetchall(),
+        )
+        for dialog_id, top_message_id, subdialog_peer_id, _account_id in uncertain_scopes:
+            scope = DraftScope(account_id, dialog_id, _none_for_zero(top_message_id), _none_for_zero(subdialog_peer_id))
+            if scope not in observed_scopes and self._row_for_scope(scope) is None:
+                changed_revision = self._next_revision()
+                self._upsert_current(
+                    scope,
+                    _cleared_row(completed_at, _as_unix(source_order_at)),
+                    changed_revision,
+                )
+                self._clear_scope_uncertainty(scope)
         return changed_revision
 
-    def _mark_snapshot_complete(self, account_id: int, completed_at: int, claim_token: int) -> None:
+    def _mark_snapshot_complete(
+        self, account_id: int, completed_at: int, claim_token: int, source_order_at: datetime
+    ) -> bool:
         """Clear only the recovery request claimed by this snapshot run."""
+        if self._has_scope_uncertainty(account_id):
+            self._conn.execute(
+                "UPDATE draft_sync_state SET observation_completed_at=?,source_order_floor="
+                "MAX(COALESCE(source_order_floor,0),?) WHERE account_id=?",
+                (completed_at, _as_unix(source_order_at), account_id),
+            )
+            return False
         cursor = self._conn.execute(
             "UPDATE draft_projection_runtime SET recovery_due_at=NULL,recovery_claimed_at=NULL,"
             "recovery_failure_count=0 WHERE singleton=1 AND recovery_claimed_at=?",
             (claim_token,),
         )
         if cursor.rowcount != 1:
-            return
+            return False
         self._conn.execute(
             "UPDATE draft_sync_state SET status='ready',coverage_status='complete',"
-            "observation_completed_at=?,reason=NULL WHERE account_id=?",
-            (completed_at, account_id),
+            "observation_completed_at=?,source_order_floor=MAX(COALESCE(source_order_floor,0),?),reason=NULL "
+            "WHERE account_id=?",
+            (completed_at, _as_unix(source_order_at), account_id),
+        )
+        return True
+
+    def _source_order_floor(self, account_id: int) -> int | None:
+        row = cast(
+            tuple[object | None] | None,
+            self._conn.execute(
+                "SELECT source_order_floor FROM draft_sync_state WHERE account_id=?", (account_id,)
+            ).fetchone(),
+        )
+        if row is None or row[0] is None:
+            return None
+        return _database_int(row[0])
+
+    def _recovery_claim_active(self) -> bool:
+        row = cast(
+            tuple[object | None] | None,
+            self._conn.execute("SELECT recovery_claimed_at FROM draft_projection_runtime WHERE singleton=1").fetchone(),
+        )
+        return bool(row is not None and row[0] is not None)
+
+    def _claim_matches(self, claim_token: int) -> bool:
+        row = cast(
+            tuple[object | None] | None,
+            self._conn.execute("SELECT recovery_claimed_at FROM draft_projection_runtime WHERE singleton=1").fetchone(),
+        )
+        return row is not None and row[0] == claim_token
+
+    def _refresh_source_order(self, scope: DraftScope, candidate: Mapping[str, object]) -> None:
+        self._conn.execute(
+            "UPDATE draft_current SET source_observed_at=?,source_order_at=? WHERE account_id=? AND dialog_id=? "
+            "AND top_message_id=? AND subdialog_peer_id=?",
+            (
+                candidate["source_observed_at"],
+                candidate["source_order_at"],
+                scope.account_id,
+                scope.dialog_id,
+                _zero_for_none(scope.top_message_id),
+                _zero_for_none(scope.subdialog_peer_id),
+            ),
+        )
+
+    def _invalidate_recovery_claim(self, reason: str, observed_at: int) -> None:
+        """Invalidate an active claim while retaining its bounded retry cadence."""
+        row = cast(
+            tuple[object | None, object | None, object | None] | None,
+            self._conn.execute(
+                "SELECT recovery_claimed_at,recovery_due_at,recovery_failure_count FROM draft_projection_runtime "
+                "WHERE singleton=1"
+            ).fetchone(),
+        )
+        if row is None:
+            raise DraftAccountFenceError("draft recovery requires a bound account")
+        claim, due_at, failure_count = row
+        claim_int = None if claim is None else _database_int(claim)
+        failure_count_int = _database_int(failure_count)
+        if claim is not None:
+            schedule = self._recovery_scheduling.retry_delays_seconds
+            if not schedule:
+                raise RuntimeError("draft recovery retry schedule is empty")
+            failure_count_int = min(failure_count_int + 1, len(schedule) - 1)
+            due_at = observed_at + schedule[failure_count_int]
+        elif due_at is None:
+            due_at = observed_at
+        due_at_int = observed_at if due_at is None else _database_int(due_at)
+        self._set_recovery_needed(
+            reason,
+            observed_at,
+            recovery_due_at=due_at_int,
+            failure_count=failure_count_int,
+            expected_claim_token=claim_int,
         )
 
     def mark_recovery_needed(self, *, reason: str, observed_at: datetime) -> None:
         """Persist a retryable recovery requirement without inventing draft absence."""
         with self._write_transaction():
-            self._set_recovery_needed(reason, _as_unix(observed_at))
+            self._invalidate_recovery_claim(reason, _as_unix(observed_at))
 
     def recovery_due_at(self) -> float | None:
         """Return the active account's recovery due time, if recovery is pending."""
@@ -407,7 +642,11 @@ class SQLiteDraftProjection:
 
 
 def _row_values(
-    observation: DraftObservation, *, source_kind: str, completed_at: int | None = None
+    observation: DraftObservation,
+    *,
+    source_kind: str,
+    completed_at: int | None = None,
+    source_order_override: datetime | None = None,
 ) -> dict[str, object]:
     observed_at = _as_unix(observation.observed_at)
     completed = observed_at if completed_at is None else completed_at
@@ -426,6 +665,7 @@ def _row_values(
             "composition_complete": 1,
             "source_kind": source_kind,
             "source_observed_at": observed_at,
+            "source_order_at": _source_order(observation, source_order_override),
             "observation_started_at": observed_at,
             "observation_completed_at": completed,
             "normalization_version": _NORMALIZATION_VERSION,
@@ -433,11 +673,17 @@ def _row_values(
     composition = observation.composition
     if composition is None:
         raise ValueError("present draft observation is missing its composition")
-    return _present_row(composition, source_kind, observed_at, completed)
+    return _present_row(
+        composition, source_kind, observed_at, completed, _source_order(observation, source_order_override)
+    )
 
 
 def _present_row(
-    composition: DraftComposition, source_kind: str, observed_at: int, completed_at: int
+    composition: DraftComposition,
+    source_kind: str,
+    observed_at: int,
+    completed_at: int,
+    source_order_at: int | None,
 ) -> dict[str, object]:
     return {
         "state": "present",
@@ -471,13 +717,14 @@ def _present_row(
         "composition_complete": int(composition.completeness.value == "complete"),
         "source_kind": source_kind,
         "source_observed_at": observed_at,
+        "source_order_at": source_order_at,
         "observation_started_at": observed_at,
         "observation_completed_at": completed_at,
         "normalization_version": _NORMALIZATION_VERSION,
     }
 
 
-def _cleared_row(observed_at: int) -> dict[str, object]:
+def _cleared_row(observed_at: int, source_order_at: int | None = None) -> dict[str, object]:
     return {
         "state": "cleared",
         "text": None,
@@ -492,6 +739,7 @@ def _cleared_row(observed_at: int) -> dict[str, object]:
         "composition_complete": 1,
         "source_kind": "snapshot_absence",
         "source_observed_at": observed_at,
+        "source_order_at": source_order_at,
         "observation_started_at": observed_at,
         "observation_completed_at": observed_at,
         "normalization_version": _NORMALIZATION_VERSION,
@@ -525,7 +773,14 @@ def _row_matches(existing: Mapping[str, object], candidate: Mapping[str, object]
     return all(
         existing[column] == value
         for column, value in candidate.items()
-        if column not in {"source_kind", "source_observed_at", "observation_started_at", "observation_completed_at"}
+        if column
+        not in {
+            "source_kind",
+            "source_observed_at",
+            "source_order_at",
+            "observation_started_at",
+            "observation_completed_at",
+        }
     )
 
 
@@ -535,30 +790,43 @@ def _deduplicate_snapshot(observations: Sequence[DraftObservation]) -> tuple[Dra
         existing = result.get(observation.scope)
         if existing is None:
             result[observation.scope] = observation
-        elif _row_values(existing, source_kind=_source_kind(existing)) != _row_values(
-            observation, source_kind=_source_kind(observation)
+        elif not _row_matches(
+            _row_values(existing, source_kind=_source_kind(existing)),
+            _row_values(observation, source_kind=_source_kind(observation)),
         ):
             return None
     return tuple(result.values())
 
 
-def _validate_snapshot_inputs(
-    observations: Sequence[DraftObservation], coverage: SnapshotCoverage, baselines: Mapping[DraftScope, int]
-) -> None:
-    for scope, revision in baselines.items():
-        if (
-            scope.account_id != coverage.account_id
-            or isinstance(revision, bool)
-            or not isinstance(revision, int)
-            or revision < 0
-        ):
-            raise ValueError("snapshot baselines must contain non-negative revisions for the covered account")
+def _validate_snapshot_inputs(observations: Sequence[DraftObservation], coverage: SnapshotCoverage) -> None:
     for observation in observations:
         if (
             observation.scope.account_id != coverage.account_id
             or observation.source is not DraftObservationSource.SNAPSHOT
         ):
             raise ValueError("snapshot observations must belong to the covered account and snapshot source")
+
+
+def _source_order(observation: DraftObservation, override: datetime | None = None) -> int | None:
+    value = override or observation.telegram_source_order_at()
+    return None if value is None else _as_unix(value)
+
+
+def _authoritative_order(observation: DraftObservation, snapshot_order: datetime) -> datetime:
+    row_order = observation.telegram_source_order_at()
+    if row_order is None or _as_unix(row_order) < _as_unix(snapshot_order):
+        return snapshot_order
+    return row_order
+
+
+def _newer_than(existing: Mapping[str, object] | None, candidate: Mapping[str, object]) -> bool:
+    if existing is None:
+        return True
+    old = cast(int | None, existing.get("source_order_at"))
+    new = cast(int | None, candidate.get("source_order_at"))
+    if old is None or new is None:
+        return True
+    return new >= old
 
 
 def _validate_account_id(account_id: int) -> None:

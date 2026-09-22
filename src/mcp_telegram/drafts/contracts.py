@@ -150,12 +150,20 @@ class DraftObservation:
     observed_at: datetime
     composition: DraftComposition | None = None
     ambiguity: bool = False
+    source_order_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.disposition is DraftDisposition.PRESENT and self.composition is None:
             raise ValueError("a present draft observation requires composition")
         if self.disposition is DraftDisposition.TOMBSTONE and self.composition is not None:
             raise ValueError("a tombstone draft observation cannot carry composition")
+
+        if self.source_order_at is not None and not isinstance(self.source_order_at, datetime):
+            raise ValueError("source_order_at must be a datetime or None")
+
+    def telegram_source_order_at(self) -> datetime | None:
+        """Return Telegram's source timestamp, separate from local receipt time."""
+        return self.source_order_at or (None if self.composition is None else self.composition.date)
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,17 +174,26 @@ class SnapshotCoverage:
     response_complete: bool
     update_count: int
     has_updates_too_long: bool = False
+    source_order_at: datetime | None = None
+    unexpected_update_count: int = 0
 
     def __post_init__(self) -> None:
         if isinstance(self.account_id, bool) or not isinstance(self.account_id, int) or self.account_id <= 0:
             raise ValueError("account_id must be positive")
         if self.update_count < 0:
             raise ValueError("update_count must be non-negative")
+        if self.unexpected_update_count < 0:
+            raise ValueError("unexpected_update_count must be non-negative")
 
     @property
     def authoritative(self) -> bool:
         """Return whether absence inference is safe for this response."""
-        return self.response_complete and not self.has_updates_too_long
+        return (
+            self.response_complete
+            and not self.has_updates_too_long
+            and self.unexpected_update_count == 0
+            and self.source_order_at is not None
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,16 +201,16 @@ class DraftApplyResult:
     """Persistence result that keeps owner policy independent from SQLite details.
 
     For ``apply_realtime``, ``publication_changed`` is true if and only if the
-    repository committed a new projection revision. A byte-identical
-    observation with a newer source observation time may still create a
-    revision; an exact duplicate does not. Snapshot application does not use
-    this flag.
+    repository committed a new projection revision. Content equality ignores
+    local observation metadata and source-order advancement alone does not
+    create a revision. Snapshot application does not use this flag.
     """
 
     accepted: bool
     ambiguous: bool = False
     revision: int | None = None
     publication_changed: bool = False
+    decision: str | None = None
 
 
 __all__ = [

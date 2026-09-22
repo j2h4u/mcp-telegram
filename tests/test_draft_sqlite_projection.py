@@ -41,12 +41,14 @@ def _at(second: int) -> datetime:
 
 
 def _present(scope: DraftScope, second: int, text: str, *, source: DraftObservationSource) -> DraftObservation:
+    source_order = _at(second)
     return DraftObservation(
         scope=scope,
         disposition=DraftDisposition.PRESENT,
         source=source,
         observed_at=_at(second),
-        composition=DraftComposition(text=text, date=None),
+        composition=DraftComposition(text=text, date=source_order),
+        source_order_at=source_order,
     )
 
 
@@ -56,6 +58,16 @@ def _empty(scope: DraftScope, second: int, *, source: DraftObservationSource) ->
         disposition=DraftDisposition.TOMBSTONE,
         source=source,
         observed_at=_at(second),
+        source_order_at=_at(second),
+    )
+
+
+def _coverage(update_count: int, *, complete: bool = True, second: int = 10) -> SnapshotCoverage:
+    return SnapshotCoverage(
+        account_id=100,
+        response_complete=complete,
+        update_count=update_count,
+        source_order_at=_at(second),
     )
 
 
@@ -127,17 +139,18 @@ def test_delayed_snapshot_cannot_overwrite_newer_realtime_clear(
     scope = DraftScope(100, 200, top_message_id=7)
     repository.apply_realtime(_present(scope, 1, "old", source=DraftObservationSource.REALTIME))
     claim_token = _claim(repository, 2)
-    baselines = repository.snapshot_baselines(100)
-    repository.apply_realtime(_empty(scope, 2, source=DraftObservationSource.REALTIME))
+    before = _current_row(conn, scope)
+    realtime = repository.apply_realtime(_empty(scope, 3, source=DraftObservationSource.REALTIME))
+    assert realtime.publication_changed
+    after_realtime = _current_row(conn, scope)
     result = repository.apply_snapshot(
         [_present(scope, 1, "snapshot-old", source=DraftObservationSource.SNAPSHOT)],
-        SnapshotCoverage(account_id=100, response_complete=True, update_count=1),
-        baselines,
+        _coverage(1, second=2),
         claim_token=claim_token,
     )
-    assert result.accepted
-    state, text, source_kind, *_ = _current(conn, scope)
-    assert (state, text, source_kind) == ("empty", None, "realtime_empty")
+    assert result.decision == "snapshot_superseded"
+    assert after_realtime != before
+    assert _current_row(conn, scope) == after_realtime
 
 
 def test_authoritative_absence_creates_bodyless_cleared_tombstone(
@@ -149,8 +162,7 @@ def test_authoritative_absence_creates_bodyless_cleared_tombstone(
     claim_token = _claim(repository, 2)
     result = repository.apply_snapshot(
         [],
-        SnapshotCoverage(account_id=100, response_complete=True, update_count=0),
-        repository.snapshot_baselines(100),
+        _coverage(0),
         claim_token=claim_token,
     )
     assert result.accepted
@@ -167,8 +179,7 @@ def test_authoritative_absence_is_revision_idempotent(
     first_claim_token = _claim(repository, 2)
     first = repository.apply_snapshot(
         [],
-        SnapshotCoverage(account_id=100, response_complete=True, update_count=0),
-        repository.snapshot_baselines(100),
+        _coverage(0),
         claim_token=first_claim_token,
     )
     assert first.revision is not None
@@ -177,8 +188,7 @@ def test_authoritative_absence_is_revision_idempotent(
     second_claim_token = _claim(repository, 3)
     second = repository.apply_snapshot(
         [],
-        SnapshotCoverage(account_id=100, response_complete=True, update_count=0),
-        repository.snapshot_baselines(100),
+        _coverage(0),
         claim_token=second_claim_token,
     )
 
@@ -192,15 +202,13 @@ def test_conflicting_snapshot_observations_preserve_claim_for_fenced_rearm(
     conn, repository = projection
     scope = DraftScope(100, 200)
     claim_token = _claim(repository, 1)
-    baselines = repository.snapshot_baselines(100)
 
     result = repository.apply_snapshot(
         [
             _present(scope, 2, "first", source=DraftObservationSource.SNAPSHOT),
             _present(scope, 2, "second", source=DraftObservationSource.SNAPSHOT),
         ],
-        SnapshotCoverage(account_id=100, response_complete=True, update_count=2),
-        baselines,
+        _coverage(2),
         claim_token=claim_token,
     )
 
@@ -225,16 +233,14 @@ def test_identical_authoritative_snapshots_do_not_bump_revision_for_observation_
     first_claim_token = _claim(repository, 1)
     first = repository.apply_snapshot(
         [_present(scope, 1, "body", source=DraftObservationSource.SNAPSHOT)],
-        SnapshotCoverage(account_id=100, response_complete=True, update_count=1),
-        repository.snapshot_baselines(100),
+        _coverage(1),
         claim_token=first_claim_token,
     )
     assert first.revision is not None
     second_claim_token = _claim(repository, 2)
     second = repository.apply_snapshot(
         [_present(scope, 2, "body", source=DraftObservationSource.SNAPSHOT)],
-        SnapshotCoverage(account_id=100, response_complete=True, update_count=1),
-        repository.snapshot_baselines(100),
+        _coverage(1),
         claim_token=second_claim_token,
     )
 
@@ -262,20 +268,21 @@ def test_snapshot_does_not_clear_a_later_recovery_signal(
     scope = DraftScope(100, 200)
     repository.apply_realtime(_present(scope, 1, "body", source=DraftObservationSource.REALTIME))
     claim_token = _claim(repository, 2)
-    baselines = repository.snapshot_baselines(100)
     repository.mark_recovery_needed(reason="reconnect_observed", observed_at=_at(3))
 
     result = repository.apply_snapshot(
         [_present(scope, 1, "body", source=DraftObservationSource.SNAPSHOT)],
-        SnapshotCoverage(account_id=100, response_complete=True, update_count=1),
-        baselines,
+        _coverage(1),
         claim_token=claim_token,
     )
 
-    assert result.accepted
-    assert conn.execute(
-        "SELECT recovery_due_at,recovery_claimed_at FROM draft_projection_runtime WHERE singleton=1"
-    ).fetchone() == (int(_at(3).timestamp()), None)
+    assert result.decision == "snapshot_superseded"
+    assert (
+        conn.execute(
+            "SELECT recovery_due_at,recovery_claimed_at FROM draft_projection_runtime WHERE singleton=1"
+        ).fetchone()[0]
+        is not None
+    )
     assert conn.execute(
         "SELECT status,coverage_status,reason,observation_completed_at FROM draft_sync_state WHERE account_id=100"
     ).fetchone() == ("recovery_needed", "unknown", "reconnect_observed", int(_at(3).timestamp()))
@@ -292,8 +299,7 @@ def test_snapshot_with_identical_realtime_content_does_not_bump_revision_for_sou
 
     snapshot = repository.apply_snapshot(
         [_present(scope, 2, "body", source=DraftObservationSource.SNAPSHOT)],
-        SnapshotCoverage(account_id=100, response_complete=True, update_count=1),
-        repository.snapshot_baselines(100),
+        _coverage(1),
         claim_token=claim_token,
     )
 
@@ -311,13 +317,14 @@ def test_failed_snapshot_never_establishes_absence(
     claim_token = _claim(repository, 2)
     result = repository.apply_snapshot(
         [],
-        SnapshotCoverage(account_id=100, response_complete=False, update_count=0),
-        repository.snapshot_baselines(100),
+        _coverage(0, complete=False),
         claim_token=claim_token,
     )
     assert not result.accepted
     assert _current(conn, scope)[0] == "present"
-    assert conn.execute("SELECT coverage_status FROM draft_sync_state WHERE account_id=100").fetchone() == ("unknown",)
+    assert conn.execute("SELECT coverage_status FROM draft_sync_state WHERE account_id=100").fetchone() == (
+        "incomplete",
+    )
 
 
 def test_account_fence_rejects_unbound_observation(
