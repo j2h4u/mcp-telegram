@@ -89,6 +89,11 @@ from .telethon_dialog import classify_dialog_type
 
 _ENTITY_DETAIL_SCHEMA_VERSION = 1
 _CHANNEL_DIALOG_ID_OFFSET = 1_000_000_000_000
+_SQLITE_INT64_MIN = -(2**63)
+_SQLITE_INT64_MAX = 2**63 - 1
+# Telethon's integer lookup also binds ``-(offset + peer_id)`` for a channel;
+# the signed range includes one more negative value than positive values.
+_TELETHON_PEER_ID_MAX = _SQLITE_INT64_MAX - _CHANNEL_DIALOG_ID_OFFSET + 1
 _PERSONAL_CHANNEL_PREVIEW_CHARS = 100
 _PAIR_SECTION_COUNT = 2
 _ENTITY_NOT_FOUND_ERRORS = (
@@ -98,6 +103,11 @@ _ENTITY_NOT_FOUND_ERRORS = (
     UsernameInvalidError,
     UsernameNotOccupiedError,
 )
+
+
+def _is_valid_telethon_peer_id(value: int) -> bool:
+    """Return whether an exact ID is safe for Telethon's SQLite peer lookup."""
+    return value != 0 and _SQLITE_INT64_MIN <= value <= _TELETHON_PEER_ID_MAX
 
 
 class _AuthScopeUnavailableError(RuntimeError):
@@ -417,8 +427,8 @@ class DaemonEntityInfoService:
         """Type-tagged entity inspector covering 5 Telegram entity kinds."""
         started_at = self._deps.now_provider()
         entity_id = self._extract_entity_id(req)
-        if entity_id is None:
-            return self._error("telegram_api_error", "entity_id missing or not an integer")
+        if isinstance(entity_id, dict):
+            return entity_id
 
         now = int(self._deps.now_provider())
         if self._progressive_enabled():
@@ -2456,10 +2466,15 @@ class DaemonEntityInfoService:
                 self._deps.rid(),
             )
 
-    def _extract_entity_id(self, req: Mapping[str, object]) -> int | None:
+    def _extract_entity_id(self, req: Mapping[str, object]) -> int | dict[str, object]:
         entity_id = req.get("entity_id")
-        if not isinstance(entity_id, int):
-            return None
+        if type(entity_id) is not int:
+            return self._error("telegram_api_error", "entity_id missing or not an integer")
+        if not _is_valid_telethon_peer_id(entity_id):
+            return self._error(
+                "entity_not_found",
+                "Entity id is outside the valid Telegram peer-id range. Action: retry with an exact entity id from ListDialogs.",
+            )
         return entity_id
 
     def _load_cached_detail(self, entity_id: int, now: int) -> dict[str, object] | None:
