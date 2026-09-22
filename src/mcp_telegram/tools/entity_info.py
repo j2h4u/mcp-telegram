@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import phonenumbers
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field, StrictInt, model_validator
 
 from ..daemon_client import ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS
 from ..errors import (
@@ -779,7 +779,7 @@ class GetEntityInfo(ToolArgs):
         max_length=500,
         description="Natural name or handle for fuzzy resolution. Mutually exclusive with exact_entity_id.",
     )
-    exact_entity_id: int | None = Field(
+    exact_entity_id: StrictInt | None = Field(
         default=None,
         description="Exact numeric Telegram entity id for direct lookup. Mutually exclusive with entity.",
     )

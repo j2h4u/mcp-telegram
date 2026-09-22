@@ -18,7 +18,12 @@ from jsonschema import validate
 from telethon.errors import PeerIdInvalidError  # type: ignore[import-untyped]
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
-from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
+from mcp_telegram.daemon_entity_info import (
+    _SQLITE_INT64_MAX,
+    _SQLITE_INT64_MIN,
+    DaemonEntityInfoService,
+    EntityInfoDeps,
+)
 from mcp_telegram.entity_profile.contracts import (
     PROFILE_SECTIONS,
     ChannelContactOverlapObservation,
@@ -1577,6 +1582,51 @@ async def test_resolve_entity_not_found_is_terminal_and_positive_id_is_valid() -
     entity, error = await service._resolve_entity(42)
     assert entity is not None and getattr(entity, "id", None) == 42
     assert error is None
+    await service.shutdown()
+    conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entity_id", "should_reach_client"),
+    [
+        (_SQLITE_INT64_MIN, True),
+        (_SQLITE_INT64_MIN - 1, False),
+        (_SQLITE_INT64_MAX - 1_000_000_000_000 + 1, True),
+        (_SQLITE_INT64_MAX - 1_000_000_000_000 + 2, False),
+        (9_223_372_036_854_775_000, False),
+        (0, False),
+    ],
+)
+async def test_entity_info_rejects_ids_outside_telethon_peer_domain_before_rpc(
+    entity_id: int,
+    should_reach_client: bool,
+) -> None:
+    class CountingClient(_UnusedClient):
+        def __init__(self) -> None:
+            self.entity_ids: list[int] = []
+
+        async def get_entity(self, entity_id: int) -> object:
+            self.entity_ids.append(entity_id)
+            raise ValueError("unknown entity")
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
+    )
+    client = CountingClient()
+    service = _test_service(conn, limits=RefreshLimits())
+    demand_sink = MagicMock()
+    service.bind_demand_sink(demand_sink)
+    service._deps = replace(service._deps, client=client)
+
+    result = await service.get_entity_info({"entity_id": entity_id})
+
+    assert result["ok"] is False
+    assert result["error"] == "entity_not_found"
+    assert client.entity_ids == ([entity_id] if should_reach_client else [])
+    assert demand_sink.call_count == 0
+    assert conn.total_changes == 0
     await service.shutdown()
     conn.close()
 

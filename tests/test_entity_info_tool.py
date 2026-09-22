@@ -758,6 +758,14 @@ def test_get_entity_info_validation_requires_exactly_one_selector() -> None:
         GetEntityInfo(entity="Alice", exact_entity_id=123)
 
 
+@pytest.mark.parametrize("exact_entity_id", [True, False])
+def test_get_entity_info_rejects_boolean_exact_entity_id(exact_entity_id: bool) -> None:
+    with pytest.raises(ValidationError, match="exact_entity_id"):
+        GetEntityInfo(exact_entity_id=exact_entity_id)
+
+    assert GetEntityInfo(exact_entity_id=42).exact_entity_id == 42
+
+
 def test_numeric_entity_lookup_parses_numeric_string() -> None:
     lookup = _numeric_entity_lookup("-1001079568001")
     assert lookup is not None

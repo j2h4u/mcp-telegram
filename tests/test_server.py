@@ -190,6 +190,25 @@ async def test_public_tools_reject_invalid_boundary_arguments(
     assert expected_fragment in _call_tool_text(result)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exact_entity_id", [True, False])
+async def test_call_tool_rejects_boolean_entity_id_before_runner_or_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+    exact_entity_id: bool,
+) -> None:
+    runner = AsyncMock()
+    daemon_connection = AsyncMock()
+    monkeypatch.setattr(server.tools, "tool_runner", runner)
+    monkeypatch.setattr("mcp_telegram.tools.entity_info.daemon_connection", daemon_connection)
+
+    result = _call_tool_result(await server.call_tool("get_entity_info", {"exact_entity_id": exact_entity_id}))
+
+    assert result.is_error is True
+    assert "exact_entity_id" in _call_tool_text(result)
+    runner.assert_not_awaited()
+    daemon_connection.assert_not_called()
+
+
 def test_search_messages_reflection_exposes_shared_navigation_schema() -> None:
     tool = server.tool_by_name["search_messages"]
     properties = cast(dict[str, object], _tool_input_schema(tool)["properties"])
