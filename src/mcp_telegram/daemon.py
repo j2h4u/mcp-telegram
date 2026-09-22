@@ -922,10 +922,27 @@ def _handle_tracked_task_completion(ctx: _SyncMainContext, task: asyncio.Task[ob
         logger.error("background_task_failed name=%s error=%s", task.get_name(), exc, exc_info=exc)
 
 
-def _observe_runtime(ctx: _SyncMainContext, kind: str, outcome: str, reason_code: str | None) -> None:
+def _observe_runtime(  # noqa: PLR0913 - mirrors the bounded runtime-observation contract
+    ctx: _SyncMainContext,
+    kind: str,
+    outcome: str,
+    reason_code: str | None,
+    *,
+    duration_ms: float | None = None,
+    payload: Mapping[str, object] | None = None,
+    observed_at_ms: int | None = None,
+) -> None:
     try:
         with ctx.conn:
-            record_runtime_observation(ctx.conn, kind=kind, outcome=outcome, reason_code=reason_code)
+            record_runtime_observation(
+                ctx.conn,
+                kind=kind,
+                outcome=outcome,
+                reason_code=reason_code,
+                duration_ms=duration_ms,
+                payload=payload,
+                observed_at_ms=observed_at_ms,
+            )
     except Exception:
         logger.exception("runtime_event_record_failed kind=%s", kind)
 
@@ -1803,7 +1820,7 @@ async def sync_main() -> None:
             SQLiteDraftProjection(ctx.conn, ctx.scheduling.draft_recovery),
             ctx.shutdown_event,
             update_barrier,
-            observe=lambda kind, outcome, reason: _observe_runtime(ctx, kind, outcome, reason),
+            observe=partial(_observe_runtime, ctx),
         )
         ctx.draft_owner.register()
         input_peer_resolver = cast(InputPeerResolver, partial(resolve_input_peer, cast(ActivityClient, ctx.client)))

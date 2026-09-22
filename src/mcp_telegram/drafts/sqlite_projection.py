@@ -97,7 +97,7 @@ class SQLiteDraftProjection:
                 "UPDATE draft_sync_state SET status='ready' WHERE account_id=?",
                 (observation.scope.account_id,),
             )
-            return DraftApplyResult(accepted=True, revision=revision)
+            return DraftApplyResult(accepted=True, revision=revision, publication_changed=True)
 
     def snapshot_baselines(self, account_id: int) -> Mapping[DraftScope, int]:
         """Capture durable per-scope revisions before one GetAllDrafts request."""
