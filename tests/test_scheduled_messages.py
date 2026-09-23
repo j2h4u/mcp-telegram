@@ -16,12 +16,13 @@ import pytest
 from telethon.errors import ChannelPrivateError
 from telethon.tl.types import PeerUser
 
-from mcp_telegram.activity_peer_resolve import LinkedChatResolution
 from mcp_telegram.event_handlers import EventHandlerManager, _NewMessageEvent
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.linked_chat_fact import LinkedChatFact, LinkedChatState, linked_chat_fact_owner
 from mcp_telegram.own_only import OwnOnlyContext, query_own_only_candidates
 from mcp_telegram.scheduled_messages import (
     ScheduledDiscoveryDemandAdapter,
+    ScheduledDiscoveryPending,
     ScheduledMessageReconciler,
     ScheduledReconciliationPolicy,
     ScheduledRepairDemandAdapter,
@@ -262,10 +263,10 @@ async def test_reconciliation_classifies_and_enrolls_own_only_candidates(
 
     async def fake_resolve_linked_chat_id(
         client: object, conn: sqlite3.Connection, channel_id: int, *, timeout_s: float | None
-    ) -> LinkedChatResolution:
+    ) -> LinkedChatFact:
         del client, conn, channel_id
         captured["timeout_s"] = timeout_s
-        return LinkedChatResolution(linked_chat_id=discussion_id, flood_wait_seconds=None)
+        return LinkedChatFact(LinkedChatState.KNOWN_LINK, discussion_id, 100, False, None, None)
 
     monkeypatch.setattr("mcp_telegram.scheduled_messages.resolve_linked_chat_id", fake_resolve_linked_chat_id)
     worker = ScheduledMessageReconciler(
@@ -302,6 +303,177 @@ async def test_reconciliation_classifies_and_enrolls_own_only_candidates(
 
 
 @pytest.mark.asyncio
+async def test_scheduled_context_retries_unknown_and_rereads_newer_link(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mcp_telegram.scheduled_messages import ScheduledMessageReconciler
+
+    worker = ScheduledMessageReconciler(
+        _ScheduledSnapshotClient({}),
+        conn,
+        asyncio.Event(),
+        OwnOnlyContext(account_id=42, personal_channel_id=9001),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=1.0),
+    )
+    current = LinkedChatFact(LinkedChatState.UNKNOWN, None, None, True, None, 200)
+
+    async def fake_resolve(*_args: object, **_kwargs: object) -> LinkedChatFact:
+        return current
+
+    monkeypatch.setattr("mcp_telegram.scheduled_messages.resolve_linked_chat_id", fake_resolve)
+    pending = await worker._context()
+    assert pending == ScheduledDiscoveryPending(retry_at=200)
+    assert worker._own_only_context is not None
+    assert worker._own_only_context.personal_channel_linked_chat_id is None
+
+    current = LinkedChatFact(LinkedChatState.KNOWN_LINK, -10077, 300, True, None, 400)
+    context = await worker._context()
+    assert not isinstance(context, ScheduledDiscoveryPending)
+    assert context is not None and context.personal_channel_linked_chat_id == -10077
+
+    current = LinkedChatFact(LinkedChatState.KNOWN_LINK, -10088, 500, False, None, None)
+    updated = await worker._context()
+    assert not isinstance(updated, ScheduledDiscoveryPending)
+    assert updated is not None and updated.personal_channel_linked_chat_id == -10088
+
+
+@pytest.mark.asyncio
+async def test_pending_linked_chat_gates_discovery_without_account_retry_and_allows_repair(
+    conn: sqlite3.Connection,
+) -> None:
+    now = int(time.time())
+    retry_at = now + 86_400
+    personal_channel_id = -1_000_000_000_900
+    conn.execute(
+        "INSERT INTO linked_chat_fact_state(channel_id,generation,pending_generation,requested_at,retry_at) "
+        "VALUES (?,0,0,?,?)",
+        (personal_channel_id, now, retry_at),
+    )
+    conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id,repair_due_at,discovery_due_at,updated_at) "
+        "VALUES (42,NULL,?,?)",
+        (now, now),
+    )
+    conn.commit()
+    client = _ScheduledSnapshotClient({42: []})
+    worker = ScheduledMessageReconciler(
+        client,
+        conn,
+        asyncio.Event(),
+        OwnOnlyContext(account_id=42, personal_channel_id=personal_channel_id),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+    )
+
+    assert worker.discovery_retry_at(now) == retry_at
+    discovery_status = ScheduledDiscoveryDemandAdapter(worker).status(now)
+    assert discovery_status == DemandStatus(release_at=float(retry_at), freshness_deadline=float(now))
+    assert await worker._prepare_discovery(42, now) == (0, True)
+    assert client.requests == []
+    assert conn.execute("SELECT next_retry_at,last_error FROM scheduled_sync_state WHERE key='account'").fetchone() == (
+        None,
+        None,
+    )
+
+    upsert_scheduled_message(conn, 42, _message(90), now=now)
+    repair_status = ScheduledRepairDemandAdapter(worker).status(now)
+    assert repair_status is not None and repair_status.release_at <= now
+    assert await worker.run_demand_slice(DemandKind.SCHEDULED_REPAIR) == 1
+    assert len(client.requests) == 1
+    assert conn.execute("SELECT next_retry_at,last_error FROM scheduled_sync_state WHERE key='account'").fetchone() == (
+        None,
+        None,
+    )
+
+
+@pytest.mark.parametrize("linked_chat_id", [None, -1_000_000_000_777])
+def test_known_linked_chat_facts_do_not_gate_discovery(conn: sqlite3.Connection, linked_chat_id: int | None) -> None:
+    now = int(time.time())
+    personal_channel_id = -1_000_000_000_900
+    conn.execute(
+        "INSERT INTO dialogs(dialog_id,type,linked_chat_id,linked_chat_resolved_at) VALUES (?,'channel',?,?)",
+        (personal_channel_id, linked_chat_id, now),
+    )
+    conn.execute(
+        "INSERT INTO linked_chat_fact_state(channel_id,generation,pending_generation,requested_at,retry_at) "
+        "VALUES (?,0,0,?,?)",
+        (personal_channel_id, now, now + 86_400),
+    )
+    conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id,repair_due_at,discovery_due_at,updated_at) "
+        "VALUES (42,NULL,0,0)"
+    )
+    conn.commit()
+    worker = ScheduledMessageReconciler(
+        _ScheduledSnapshotClient(),
+        conn,
+        asyncio.Event(),
+        OwnOnlyContext(account_id=42, personal_channel_id=personal_channel_id),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+    )
+
+    assert worker.discovery_retry_at(now) is None
+    assert ScheduledDiscoveryDemandAdapter(worker).status(now) == DemandStatus(release_at=0.0, freshness_deadline=0.0)
+
+
+@pytest.mark.asyncio
+async def test_suspended_pending_fact_suppresses_only_discovery_and_restore_releases_it(
+    conn: sqlite3.Connection,
+) -> None:
+    now = int(time.time())
+    personal_channel_id = -1_000_000_000_900
+    conn.execute(
+        "INSERT INTO dialogs(dialog_id,type,hidden) VALUES(?,'channel',0)",
+        (personal_channel_id,),
+    )
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(?,'access_lost')", (personal_channel_id,))
+    conn.execute(
+        "INSERT INTO linked_chat_fact_state(channel_id,generation,pending_generation,requested_at,retry_at) "
+        "VALUES (?,0,0,?,?)",
+        (personal_channel_id, now, now + 86_400),
+    )
+    conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id,repair_due_at,discovery_due_at,updated_at) "
+        "VALUES (42,?,?,?)",
+        (now, now, now),
+    )
+    conn.commit()
+    client = _ScheduledSnapshotClient({42: []})
+    worker = ScheduledMessageReconciler(
+        client,
+        conn,
+        asyncio.Event(),
+        OwnOnlyContext(account_id=42, personal_channel_id=personal_channel_id),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+    )
+    discovery_adapter = ScheduledDiscoveryDemandAdapter(worker)
+    repair_adapter = ScheduledRepairDemandAdapter(worker)
+
+    assert worker.discovery_suspended()
+    assert discovery_adapter.status(now) is None
+    repair_status = repair_adapter.status(now)
+    assert repair_status is not None and repair_status.release_at == now
+    await worker.run_demand_slice(DemandKind.SCHEDULED_DISCOVERY)
+    assert client.requests == []
+    assert conn.execute("SELECT next_retry_at,last_error FROM scheduled_sync_state WHERE key='account'").fetchone() == (
+        None,
+        None,
+    )
+
+    upsert_scheduled_message(conn, 42, _message(90), now=now)
+    conn.commit()
+    assert await worker.run_demand_slice(DemandKind.SCHEDULED_REPAIR) == 1
+    assert len(client.requests) == 1
+
+    with conn:
+        conn.execute("UPDATE synced_dialogs SET status='synced' WHERE dialog_id=?", (personal_channel_id,))
+        linked_chat_fact_owner.invalidate_from_update(conn, personal_channel_id, now + 1)
+    assert not worker.discovery_suspended()
+    restored_status = discovery_adapter.status(now + 1)
+    assert restored_status is not None and restored_status.release_at <= now + 1
+
+
+@pytest.mark.asyncio
 async def test_reconciliation_access_lost_candidate_log_has_dialog_context(
     conn: sqlite3.Connection,
     caplog: pytest.LogCaptureFixture,
@@ -312,6 +484,12 @@ async def test_reconciliation_access_lost_candidate_log_has_dialog_context(
         "INSERT INTO dialogs (dialog_id, name, type, hidden, archived) VALUES (?, ?, ?, ?, ?)",
         (private_channel_id, channel_name, "channel", 1, 1),
     )
+    from mcp_telegram.linked_chat_fact import linked_chat_fact_owner
+
+    with conn:
+        personal_channel_id = -1_000_000_009_001
+        generation = linked_chat_fact_owner.capture_generation(conn, personal_channel_id)
+        assert linked_chat_fact_owner.publish(conn, personal_channel_id, generation, None, int(time.time()))
     conn.commit()
     client = _ScheduledSnapshotClient(
         entities={
@@ -359,7 +537,7 @@ async def test_reconciliation_access_lost_candidate_log_has_dialog_context(
 @pytest.mark.asyncio
 async def test_raw_scheduled_updates_ingest_without_messages_row(conn: sqlite3.Connection) -> None:
     client = MagicMock()
-    manager = EventHandlerManager(client, conn, asyncio.Event(), client.get_input_entity)
+    manager = EventHandlerManager(client, conn, asyncio.Event())
     offered: list[DemandKind] = []
     sink = MagicMock()
 
@@ -393,7 +571,7 @@ async def test_publication_reconciliation_runs_before_sync_enrollment(conn: sqli
     upsert_scheduled_message(conn, 42, _message(21), now=100)
     mark_scheduled_messages_removed(conn, 42, [21], [901], now=200)
     client = MagicMock()
-    manager = EventHandlerManager(client, conn, asyncio.Event(), client.get_input_entity)
+    manager = EventHandlerManager(client, conn, asyncio.Event())
     manager.bind_demand_sink(MagicMock())
     message = _message(901, "published")
     message.from_scheduled = True

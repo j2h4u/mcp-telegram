@@ -129,6 +129,7 @@ class _ClientStub:
         self.disconnect_calls = 0
         self.close_scheduler_calls = 0
         self.observer_detached = False
+        self.request_observer_detached = False
 
     def is_connected(self) -> bool:
         return True
@@ -141,6 +142,9 @@ class _ClientStub:
 
     def set_rpc_admission_observer(self, observer: object | None) -> None:
         self.observer_detached = observer is None
+
+    def set_rpc_request_observer(self, observer: object | None) -> None:
+        self.request_observer_detached = observer is None
 
     async def get_me(self) -> object:
         return SimpleNamespace(id=1)
@@ -604,4 +608,5 @@ async def test_shutdown_requests_coordinator_stop_before_connections_close() -> 
     assert client.disconnect_calls == 1
     assert client.close_scheduler_calls == 1
     assert client.observer_detached
+    assert client.request_observer_detached
     assert cast(_ConnectionStub, ctx.conn).close_calls == 1

@@ -22,6 +22,7 @@ from mcp_telegram.delta_sync import DeltaAccessProbeDemandAdapter, DeltaGapFillD
 from mcp_telegram.demand_composition import (
     DemandCompositionClient,
     DemandCompositionDependencies,
+    LinkedChatFactDemandAdapter,
     build_durable_adapter_map,
     build_durable_coordinator,
 )
@@ -46,7 +47,12 @@ from mcp_telegram.message_fact_refresh import (
     ReadReceiptDemandAdapter,
 )
 from mcp_telegram.own_only_contracts import OwnOnlyContext
-from mcp_telegram.scheduled_messages import ScheduledDiscoveryDemandAdapter, ScheduledRepairDemandAdapter
+from mcp_telegram.scheduled_messages import (
+    ScheduledDiscoveryDemandAdapter,
+    ScheduledMessageReconciler,
+    ScheduledReconciliationPolicy,
+    ScheduledRepairDemandAdapter,
+)
 from mcp_telegram.self_profile_maintenance import (
     SelfProfileCadenceState,
     SelfProfileMaintenanceDemandAdapter,
@@ -54,10 +60,17 @@ from mcp_telegram.self_profile_maintenance import (
 from mcp_telegram.startup_identity import StartupIdentityState
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter
+from mcp_telegram.telegram_demand import (
+    AcquisitionKind,
+    RpcAttemptBudget,
+    current_demand_token,
+)
 from mcp_telegram.telegram_rpc_consumers import (
     DemandKind,
+    TelegramRpcSource,
     demand_freshness_seconds,
 )
+from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 from tests.helpers import LoudUserProfilePort
 
 
@@ -126,6 +139,26 @@ class _HotPolicy:
     initial_spread_seconds: float = 0.0
 
 
+class _LinkedChatRefresher:
+    def __init__(self) -> None:
+        self.budgets: list[RpcAttemptBudget] = []
+        self.contexts: list[tuple[DemandKind, str | None, str]] = []
+
+    async def retry_one_pending_linked_chat_fact(self, budget: RpcAttemptBudget) -> bool:
+        self.budgets.append(budget)
+        token = current_demand_token()
+        scope = current_rpc_scope()
+        assert scope.attempt_budget is budget
+        self.contexts.append(
+            (
+                token.kind,
+                token.acquisition_kind.value if token.acquisition_kind else None,
+                scope.source.value,
+            )
+        )
+        return True
+
+
 def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[str, object]]:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
@@ -163,6 +196,7 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         "draft_owner": DraftMessageOwner(
             MagicMock(), MagicMock(), asyncio.Event(), UpdateProcessingBarrier(closed=True)
         ),
+        "linked_chat_refresh": _LinkedChatRefresher(),
     }
 
     async def read_receipt_batch() -> object:
@@ -202,6 +236,7 @@ def _dependencies(tmp_path: Path) -> tuple[DemandCompositionDependencies, dict[s
         user_profile_port=LoudUserProfilePort(),
         publish_startup_identity=publish_startup_identity,
         draft_owner=cast(DraftMessageOwner, objects["draft_owner"]),
+        linked_chat_fact_refresh_port=cast(object, objects["linked_chat_refresh"]),  # type: ignore[arg-type]
     )
     objects["read_receipt_batch"] = read_receipt_batch
     objects["update_profile"] = update_profile
@@ -219,7 +254,7 @@ def composition_dependencies(
         cast(sqlite3.Connection, objects["conn"]).close()
 
 
-def test_adapter_map_is_exact_against_literal_20_kind_class_map(
+def test_adapter_map_is_exact_against_literal_21_kind_class_map(
     composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
 ) -> None:
     dependencies, objects = composition_dependencies
@@ -247,8 +282,9 @@ def test_adapter_map_is_exact_against_literal_20_kind_class_map(
         DemandKind.SCHEDULED_DISCOVERY: ScheduledDiscoveryDemandAdapter,
         DemandKind.DRAFT_SNAPSHOT: DraftMessageOwner,
         DemandKind.SELF_PROFILE_MAINTENANCE: SelfProfileMaintenanceDemandAdapter,
+        DemandKind.LINKED_CHAT_REFRESH: LinkedChatFactDemandAdapter,
     }
-    assert len(expected) == 20
+    assert len(expected) == 21
     assert set(adapters) == set(expected)
     assert {kind: type(adapter) for kind, adapter in adapters.items()} == expected
     assert all(getattr(adapter, "demand_kind", None) is kind for kind, adapter in adapters.items())
@@ -272,6 +308,139 @@ def test_adapter_map_is_exact_against_literal_20_kind_class_map(
     assert adapters[DemandKind.MESSAGE_FACT_REFRESH]._shutdown_event is objects["shutdown"]  # type: ignore[attr-defined]
     with pytest.raises(TypeError):
         adapters[DemandKind.SCHEDULED_REPAIR] = adapters[DemandKind.SCHEDULED_DISCOVERY]  # type: ignore[index]
+
+
+def test_linked_chat_adapter_selects_due_demand_and_passes_one_attempt_budget(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+) -> None:
+    dependencies, objects = composition_dependencies
+    refresher = cast(_LinkedChatRefresher, objects["linked_chat_refresh"])
+    adapter = build_durable_adapter_map(dependencies)[DemandKind.LINKED_CHAT_REFRESH]
+    assert isinstance(adapter, LinkedChatFactDemandAdapter)
+    assert adapter.status(10**12) is None
+    with dependencies.conn:
+        dependencies.conn.execute(
+            "INSERT INTO linked_chat_fact_state "
+            "(channel_id,generation,pending_generation,requested_at,retry_at) VALUES(?,?,?,?,?)",
+            (123, 1, 1, 100, 400),
+        )
+    status = adapter.status(100)
+    assert status is not None and status.release_at == 400
+
+    budget = RpcAttemptBudget(limit=1)
+    asyncio.run(adapter.run_slice(budget))
+
+    assert refresher.budgets == [budget]
+    assert refresher.contexts == [(DemandKind.LINKED_CHAT_REFRESH, "linked_chat_resolution", "linked_chat_refresh")]
+
+
+def test_scheduled_repair_remains_due_during_day_long_local_link_wait(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+) -> None:
+    from mcp_telegram.linked_chat_fact import linked_chat_fact_owner
+
+    dependencies, _objects = composition_dependencies
+    now = 1_800_000_000
+    channel_id = -1000000000123
+    due_dialog_id = -1000000000456
+    with dependencies.conn:
+        linked_chat_fact_owner.ensure_cold_demand(dependencies.conn, channel_id, now)
+        work = linked_chat_fact_owner.next_due(dependencies.conn, now)
+        assert work is not None
+        assert linked_chat_fact_owner.defer(dependencies.conn, work, now + 86_400)
+        dependencies.conn.execute(
+            "INSERT INTO scheduled_reconciliation_state "
+            "(dialog_id,repair_due_at,discovery_due_at,updated_at) VALUES (?,?,?,?)",
+            (due_dialog_id, now, now, now),
+        )
+
+    reconciler = ScheduledMessageReconciler(
+        cast(object, dependencies.client),  # type: ignore[arg-type]
+        dependencies.conn,
+        dependencies.shutdown_event,
+        OwnOnlyContext(account_id=1, personal_channel_id=channel_id),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=30.0),
+    )
+    repair = ScheduledRepairDemandAdapter(reconciler).status(now)
+    discovery = ScheduledDiscoveryDemandAdapter(reconciler).status(now)
+
+    assert repair is not None and repair.release_at == now
+    assert discovery is not None and discovery.release_at == now + 86_400
+
+
+@pytest.mark.asyncio
+async def test_linked_chat_adapter_real_gate_cannot_retry_physical_send(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+) -> None:
+    from telethon.errors import ServerError  # type: ignore[import-untyped]
+    from telethon.tl.types import InputPeerChannel, UpdateChannel  # type: ignore[import-untyped]
+
+    from mcp_telegram.event_handlers import EventHandlerManager
+    from tests.test_telegram_rpc import _gate, _set_sender
+
+    dependencies, _objects = composition_dependencies
+    gate = _gate(retry_delays=(0.0,))
+    physical_scopes = []
+    physical_attempts = 0
+    gate.set_rpc_request_observer(
+        lambda **kwargs: physical_scopes.append((kwargs["source"], kwargs["demand_kind"], kwargs["acquisition_kind"]))
+    )
+
+    def send(_request: object) -> object:
+        nonlocal physical_attempts
+        physical_attempts += 1
+        raise ServerError(None, "transient")
+
+    _set_sender(gate, send)
+
+    dialog_id = -1000000000123
+    dependencies.conn.execute(
+        "INSERT INTO dialogs (dialog_id,type,linked_chat_id,linked_chat_resolved_at) VALUES (?,'channel',NULL,100)",
+        (dialog_id,),
+    )
+    dependencies.conn.execute("INSERT INTO synced_dialogs (dialog_id,status) VALUES (?,'synced')", (dialog_id,))
+    dependencies.conn.commit()
+
+    class _GateClient:
+        session = type(
+            "Session",
+            (),
+            {"get_input_entity": lambda _self, _peer: InputPeerChannel(channel_id=123, access_hash=1)},
+        )()
+
+        async def __call__(self, request: object) -> object:
+            return await gate(request)
+
+    client = _GateClient()
+    manager = EventHandlerManager(client, dependencies.conn, dependencies.shutdown_event)  # type: ignore[arg-type]
+    manager._synced_dialog_ids.add(dialog_id)
+
+    class _RecordingSink:
+        def __init__(self) -> None:
+            self.offered: list[DemandKind] = []
+
+        def offer(self, kind: DemandKind) -> bool:
+            self.offered.append(kind)
+            return True
+
+    sink = _RecordingSink()
+    manager.bind_demand_sink(sink)
+    await manager.on_raw_channel_chat_update(UpdateChannel(channel_id=123))
+    assert DemandKind.LINKED_CHAT_REFRESH in sink.offered
+
+    adapter = LinkedChatFactDemandAdapter(manager, dependencies.conn)
+    budget = RpcAttemptBudget(limit=1)
+    await adapter.run_slice(budget)
+
+    assert physical_attempts == 1
+    assert budget.attempts == 1
+    assert physical_scopes == [
+        (
+            TelegramRpcSource.LINKED_CHAT_REFRESH,
+            DemandKind.LINKED_CHAT_REFRESH,
+            AcquisitionKind.LINKED_CHAT_RESOLUTION,
+        )
+    ]
 
 
 @pytest.mark.asyncio

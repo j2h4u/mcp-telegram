@@ -24,6 +24,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
     ServerError,
     TimedOutError,
 )
+from telethon.tl.functions.channels import GetFullChannelRequest  # type: ignore[import-untyped]
 from telethon.tl.functions.updates import (  # type: ignore[import-untyped]
     GetChannelDifferenceRequest,
     GetDifferenceRequest,
@@ -125,6 +126,8 @@ class _AdmissionAwareSender:
                         self._gate._admission_scheduler.record_attempt_budget_exhausted(self._scope)
                     budget.debit()
                 self._gate._admission_scheduler.record_dispatch(admission)
+                if isinstance(request, GetFullChannelRequest):
+                    self._gate._observe_rpc_request(self._scope)
                 if (timing := current_timing()) is not None:
                     timing.record_rpc_attempt()
                 future = self._send_attempt(request, ordered=ordered)
@@ -216,6 +219,7 @@ class TelegramRpcGate(TelegramClient):
         transient_retry_delays_seconds: tuple[float, ...],
         scheduler_policy: TelegramRpcSchedulerPolicy,
         admission_observer: AdmissionObserver | None = None,
+        rpc_request_observer: Callable[..., None] | None = None,
         flood_observer: Callable[..., None] | None = None,
         cooldown_persistence: TelegramRpcCooldownPersistence | None = None,
         **kwargs: object,
@@ -236,6 +240,7 @@ class TelegramRpcGate(TelegramClient):
         self._cooldown_buffer_seconds = cooldown_buffer_seconds
         self._transient_retry_delays = transient_retry_delays_seconds
         self._flood_observer = flood_observer
+        self._rpc_request_observer = rpc_request_observer
         self._cooldown_persistence = cooldown_persistence
         self._restore_account_cooldown()
         self._scheduler_policy = scheduler_policy
@@ -275,6 +280,25 @@ class TelegramRpcGate(TelegramClient):
     def set_rpc_admission_observer(self, observer: AdmissionObserver | None) -> None:
         """Attach the daemon-owned operational telemetry sink."""
         self._admission_scheduler.set_observer(observer)
+
+    def set_rpc_request_observer(self, observer: Callable[..., None] | None) -> None:
+        """Attach bounded per-request-class attempt telemetry."""
+        self._rpc_request_observer = observer
+
+    def _observe_rpc_request(self, scope: TelegramRpcScope) -> None:
+        observer = self._rpc_request_observer
+        if observer is None:
+            return
+        try:
+            observer(
+                request_class="get_full_channel",
+                source=scope.source,
+                service_class=scope.service_class,
+                demand_kind=scope.demand_kind,
+                acquisition_kind=scope.acquisition_kind,
+            )
+        except Exception:
+            logger.debug("telegram_rpc_request_observation_failed", exc_info=True)
 
     def check_circuit(self) -> None:
         status = self._rpc_circuit_status()

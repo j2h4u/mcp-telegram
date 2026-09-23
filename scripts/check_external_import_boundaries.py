@@ -32,6 +32,8 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "activity_cold_backfill.py",
             "activity_hot_sweep.py",
             "activity_peer_resolve.py",
+            "channel_full_siblings.py",
+            "linked_chat_fact.py",
             "activity_peer_sweep.py",
             "activity_sync.py",
             "account_trace_sqlite.py",
@@ -89,6 +91,8 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
     "telethon": frozenset(
         {
             "activity_peer_resolve.py",
+            "channel_full_siblings.py",
+            "linked_chat_fact.py",
             "activity_peer_sweep.py",
             "activity_sync.py",
             "daemon.py",

@@ -475,6 +475,36 @@ def _rpc_lines(summary_count: int, cancelled: int, sources: dict[str, RpcSourceS
     return lines
 
 
+def _linked_chat_rpc_lines(observations: list[Observation]) -> list[str]:
+    attempts: dict[tuple[str, str, str | None], int] = defaultdict(int)
+    for row in _rows_for_outcome(_rows_for_kind(observations, "telegram.rpc_request"), "summary"):
+        parsed = _get_full_channel_attempt(row)
+        if parsed is not None:
+            key, count = parsed
+            attempts[key] += count
+    if not attempts:
+        return []
+    total = sum(attempts.values())
+    dimensions = ", ".join(
+        f"{source}/{demand_kind}{f'/{acquisition}' if acquisition else ''}={count}"
+        for (source, demand_kind, acquisition), count in sorted(attempts.items())
+    )
+    return [f"GetFullChannel RPC attempts: {total} ({dimensions})"]
+
+
+def _get_full_channel_attempt(
+    row: Observation,
+) -> tuple[tuple[str, str, str | None], int] | None:
+    payload = json.loads(str(row["payload_json"] or "{}"))
+    if payload.get("request_class") != "get_full_channel":
+        return None
+    source = str(payload.get("source") or "unknown")
+    demand_kind = str(payload.get("demand_kind") or "unknown")
+    acquisition_kind = payload.get("acquisition_kind")
+    acquisition = None if acquisition_kind is None else str(acquisition_kind)
+    return (source, demand_kind, acquisition), _as_int(payload.get("actual_attempts") or 0)
+
+
 def _demand_lines(summary: DemandSummary) -> list[str]:
     if not summary.counts and summary.actual_attempts == 0:
         return []
@@ -574,6 +604,7 @@ def build_operator_summary(  # noqa: PLR0914
         f"Dialog state: {status_text}",
         *_mcp_lines(_mcp_summary(observations, slow_mcp_ms=slow_mcp_ms)),
         *_rpc_lines(rpc_count, rpc_cancelled, rpc_sources),
+        *_linked_chat_rpc_lines(observations),
         *_demand_lines(demand_summary),
     ]
     sync_counts = _sync_counts(observations)

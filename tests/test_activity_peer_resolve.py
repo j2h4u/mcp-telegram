@@ -1,59 +1,17 @@
-"""Unit tests for activity_peer_resolve.py.
-
-Covers:
-  (a) resolve_input_peer returns the input entity for a known dialog_id.
-  (b) resolve_input_peer returns None (not raises) when get_input_entity
-      raises an access-loss error.
-  (c) resolve_linked_chat_id reads from dialogs.linked_chat_resolved_at
-      WITHOUT calling GetFullChannel (dialogs cache hit).
-  (d) On cold path (no dialogs row or NULL resolved_at) it calls
-      GetFullChannel exactly once, UPSERTs result into dialogs, preserves
-      sibling fields (about, subscribers_count) in entity_details but does
-      NOT write linked_chat_id into detail_json, normalizes to -100… form.
-  (e) A channel with no linked chat returns
-      LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None).
-  (f) When GetFullChannel raises TelegramRpcThrottled(seconds=N), the resolver
-      returns LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=N)
-      WITHOUT sleeping, WITHOUT raising, and WITHOUT touching dialogs.
-"""
+"""Local-only activity linked-chat fact resolution tests."""
 
 from __future__ import annotations
 
 import contextlib
-import json
 import sqlite3
-import time
 from collections.abc import Iterator
-from dataclasses import dataclass
-from pathlib import Path
-from typing import TypedDict, cast
+from typing import cast
 
 import pytest
 
-import mcp_telegram.activity_peer_resolve as activity_peer_resolve_module
-from mcp_telegram.activity_peer_resolve import LinkedChatResolution, resolve_input_peer, resolve_linked_chat_id
-from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
-from mcp_telegram.sync_db import _apply_migrations, ensure_sync_schema
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-class _DialogRow(TypedDict):
-    dialog_id: int
-    linked_chat_id: int | None
-    linked_chat_resolved_at: int | None
-    name: str | None
-    type: str | None
-    hidden: int | None
-
-
-class _DialogRowSeed(TypedDict, total=False):
-    linked_chat_id: int | None
-    linked_chat_resolved_at: int | None
-    name: str | None
-    type_: str | None
+from mcp_telegram.activity_peer_resolve import linked_chat_retry_at, resolve_input_peer, resolve_linked_chat_id
+from mcp_telegram.linked_chat_fact import LinkedChatFact, LinkedChatState, linked_chat_fact_owner
+from mcp_telegram.sync_db import _apply_migrations
 
 
 @contextlib.contextmanager
@@ -66,729 +24,85 @@ def _make_db() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-def _insert_entity(conn: sqlite3.Connection, entity_id: int) -> None:
-    """Insert a minimal entities row so entity_details FK is satisfied."""
-    conn.execute(
-        "INSERT OR IGNORE INTO entities (id, type, name, updated_at) VALUES (?, 'channel', 'test', ?)",
-        (entity_id, int(time.time())),
-    )
-    conn.commit()
-
-
-def _write_entity_details(
-    conn: sqlite3.Connection,
-    entity_id: int,
-    blob: dict[str, object],
-    fetched_at: int | None = None,
-) -> None:
-    """Write a row to entity_details for the given entity_id."""
-    _insert_entity(conn, entity_id)
-    if fetched_at is None:
-        fetched_at = int(time.time())
-    conn.execute(
-        "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
-        (entity_id, json.dumps(blob), fetched_at),
-    )
-    conn.commit()
-
-
-def _read_entity_details(conn: sqlite3.Connection, entity_id: int) -> dict[str, object] | None:
-    row = cast(
-        tuple[str] | None,
-        conn.execute("SELECT detail_json FROM entity_details WHERE entity_id = ?", (entity_id,)).fetchone(),
-    )
-    if row is None:
-        return None
-    blob = cast(object, json.loads(row[0]))
-    assert isinstance(blob, dict), f"Expected JSON object, got {type(blob)}"
-    return cast(dict[str, object], blob)
-
-
-def _write_dialogs_row(
-    conn: sqlite3.Connection,
-    dialog_id: int,
-    row: _DialogRowSeed,
-) -> None:
-    """Insert a minimal dialogs row for resolver tests."""
-    linked_chat_id = row.get("linked_chat_id")
-    linked_chat_resolved_at = row.get("linked_chat_resolved_at")
-    name = row.get("name")
-    type_ = row.get("type_")
-    conn.execute(
-        "INSERT OR REPLACE INTO dialogs "
-        "(dialog_id, name, type, linked_chat_id, linked_chat_resolved_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (dialog_id, name, type_, linked_chat_id, linked_chat_resolved_at),
-    )
-    conn.commit()
-
-
-def _read_dialogs_row(conn: sqlite3.Connection, dialog_id: int) -> _DialogRow | None:
-    """Read a dialogs row as a dict, or None if absent."""
-    row = cast(
-        tuple[int, int | None, int | None, str | None, str | None, int | None] | None,
-        conn.execute(
-            "SELECT dialog_id, linked_chat_id, linked_chat_resolved_at, name, type, hidden "
-            "FROM dialogs WHERE dialog_id = ?",
-            (dialog_id,),
-        ).fetchone(),
-    )
-    if row is None:
-        return None
-    return cast(
-        _DialogRow,
-        {
-            "dialog_id": row[0],
-            "linked_chat_id": row[1],
-            "linked_chat_resolved_at": row[2],
-            "name": row[3],
-            "type": row[4],
-            "hidden": row[5],
-        },
-    )
-
-
-# ---------------------------------------------------------------------------
-# Fake client
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class _FakeFullChat:
-    linked_chat_id: int | None
-    participants_count: int | None = None
-    pinned_msg_id: int | None = None
-    about: str | None = None
-
-
-@dataclass
-class _FakeChat:
-    id: int
-    title: str | None = None
-    username: str | None = None
-
-
-@dataclass
-class _FakeFullResult:
-    full_chat: _FakeFullChat
-    chats: list[_FakeChat] | None = None
-
-
-class _FakeClient:
-    """Minimal fake TelegramClient."""
-
-    def __init__(
-        self,
-        *,
-        input_entity: object = object(),
-        input_entity_error: Exception | None = None,
-        full_channel_result: _FakeFullResult | None = None,
-        full_channel_error: Exception | None = None,
-    ) -> None:
-        self._input_entity = input_entity
-        self._input_entity_error = input_entity_error
-        self._full_channel_result = full_channel_result
-        self._full_channel_error = full_channel_error
-        self.get_input_entity_calls: list[int] = []
-        self.call_calls: list[object] = []
+class _Client:
+    def __init__(self, input_peer: object = object()) -> None:
+        self.input_peer = input_peer
+        self.input_calls: list[int] = []
+        self.rpc_calls: list[object] = []
 
     async def get_input_entity(self, dialog_id: int) -> object:
-        self.get_input_entity_calls.append(dialog_id)
-        if self._input_entity_error is not None:
-            raise self._input_entity_error
-        return self._input_entity
+        self.input_calls.append(dialog_id)
+        return self.input_peer
 
     async def __call__(self, request: object) -> object:
-        self.call_calls.append(request)
-        if self._full_channel_error is not None:
-            raise self._full_channel_error
-        assert self._full_channel_result is not None
-        return self._full_channel_result
-
-
-def _fake_full_channel_result(linked_chat_id: int | None, **kwargs: object) -> _FakeFullResult:
-    """Build a fake GetFullChannelRequest result."""
-    full_chat = _FakeFullChat(
-        linked_chat_id=linked_chat_id,
-        participants_count=cast(int | None, kwargs.get("participants_count")),
-        pinned_msg_id=cast(int | None, kwargs.get("pinned_msg_id")),
-        about=cast(str | None, kwargs.get("about")),
-    )
-    return _FakeFullResult(full_chat=full_chat)
-
-
-# ---------------------------------------------------------------------------
-# (a) resolve_input_peer: returns input entity for a known dialog_id
-# ---------------------------------------------------------------------------
+        self.rpc_calls.append(request)
+        raise AssertionError("activity linked-chat resolution must not send RPC")
 
 
 @pytest.mark.asyncio
-async def test_resolve_input_peer_returns_entity() -> None:
-    fake_peer = object()
-    client = _FakeClient(input_entity=fake_peer)
-    result = await resolve_input_peer(client, -100123456789)
-    assert result is fake_peer
-    assert len(client.get_input_entity_calls) == 1
-
-
-# ---------------------------------------------------------------------------
-# (b) resolve_input_peer: returns None on access-loss, never raises
-# ---------------------------------------------------------------------------
+async def test_resolve_input_peer_uses_client_session_lookup() -> None:
+    peer = object()
+    client = _Client(peer)
+    assert await resolve_input_peer(client, -10042) is peer
+    assert client.input_calls == [-10042]
 
 
 @pytest.mark.asyncio
-async def test_resolve_input_peer_returns_none_on_access_loss() -> None:
-    client = _FakeClient(input_entity_error=ValueError("No user has id=-100123"))
-    result = await resolve_input_peer(client, -100123456789)
-    assert result is None, "Expected None on access-loss, got a value"
-
-
-@pytest.mark.asyncio
-async def test_resolve_input_peer_returns_none_on_key_error() -> None:
-    """Any exception from get_input_entity must return None, not propagate."""
-    client = _FakeClient(input_entity_error=KeyError("session miss"))
-    result = await resolve_input_peer(client, -100111111111)
-    assert result is None
-
-
-# ---------------------------------------------------------------------------
-# (c) resolve_linked_chat_id: dialogs cache hit — no GetFullChannel call
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_resolve_linked_chat_id_cache_hit_no_live_call() -> None:
-    """A dialogs row with non-NULL linked_chat_resolved_at serves the answer
-    without calling GetFullChannel (Phase 54: dialogs-first cache substrate)."""
-    channel_id = -100200000001
-    linked_id = -100300000001
-
+async def test_unknown_fact_is_pending_and_cold_demand_is_idempotent() -> None:
     with _make_db() as conn:
-        # Seed the authoritative answer into dialogs (not entity_details).
-        # Any non-NULL linked_chat_resolved_at is the authority signal.
-        _write_dialogs_row(
-            conn,
-            channel_id,
-            {"linked_chat_id": linked_id, "linked_chat_resolved_at": int(time.time()) - 99999},
+        client = _Client()
+        fact = await resolve_linked_chat_id(client, conn, -10042)  # type: ignore[arg-type]
+        assert fact.state is LinkedChatState.UNKNOWN
+        assert fact.refresh_pending
+        generation = cast(
+            tuple[int, int | None] | None,
+            conn.execute(
+                "SELECT generation, pending_generation FROM linked_chat_fact_state WHERE channel_id=?", (-10042,)
+            ).fetchone(),
         )
+        assert generation is not None and generation[0] == generation[1]
 
-        client = _FakeClient(input_entity=object())
-        result = await resolve_linked_chat_id(client, conn, channel_id)
-
-    assert result.linked_chat_id == linked_id
-    assert result.flood_wait_seconds is None
-    # GetFullChannel was NOT called
-    assert len(client.call_calls) == 0, f"Cache hit must not call GetFullChannel, got {len(client.call_calls)} calls"
-
-
-# ---------------------------------------------------------------------------
-# (d) resolve_linked_chat_id: cache miss — calls GetFullChannel once, merges blob
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_resolve_linked_chat_id_cache_miss_calls_once_and_merges() -> None:
-    """On cache miss: GetFullChannel called once, result merged into existing blob."""
-    channel_id = -100200000002
-    raw_linked = 555666777  # positive bare id
-    expected_linked = -1002555666777  # -100{raw}
-
-    with _make_db() as conn:
-        # Pre-existing blob with an 'about' key that must survive the merge
-        _write_entity_details(
-            conn,
-            channel_id,
-            {"about": "original about text", "subscribers_count": 9999},
-            fetched_at=0,  # expired (age = now - 0 >> TTL)
-        )
-
-        full_result = _fake_full_channel_result(
-            linked_chat_id=raw_linked,
-            about="updated about",
-            participants_count=10000,
-        )
-        client = _FakeClient(input_entity=object(), full_channel_result=full_result)
-
-        result = await resolve_linked_chat_id(client, conn, channel_id)
-
-        # GetFullChannel called exactly once
-        assert len(client.call_calls) == 1
-
-        # Normalized to -100… form
-        assert result.linked_chat_id is not None
-        assert str(result.linked_chat_id).startswith("-100"), f"Expected -100… form, got {result.linked_chat_id}"
-        assert result.flood_wait_seconds is None
-
-        # entity_details blob was written back with sibling fields preserved.
-        # Phase 54: linked_chat_id is now owned by dialogs — it must NOT appear
-        # in entity_details.detail_json.
-        written = _read_entity_details(conn, channel_id)
-        assert written is not None
-        assert "linked_chat_id" not in written, (
-            "linked_chat_id must NOT be written into entity_details (Phase 54 contract)"
-        )
-        # The merge preserved the about field (updated from the fresh result)
-        assert "about" in written
-        # The live result wrote its row into dialogs instead
-        dialogs_row = _read_dialogs_row(conn, channel_id)
-        assert dialogs_row is not None
-        assert dialogs_row["linked_chat_id"] is not None
-        assert str(dialogs_row["linked_chat_id"]).startswith("-100")
-
-
-@pytest.mark.asyncio
-async def test_linked_chat_write_advances_profile_revision_and_fences_inflight_cursor() -> None:
-    channel_id = -100200000004
-    with _make_db() as conn:
-        _write_entity_details(conn, channel_id, {"about": "old"}, fetched_at=0)
-        conn.execute(
-            "UPDATE entity_details SET profile_owner_account_id=?, profile_observation_scope_json=? WHERE entity_id=?",
-            (7, '{"account_id":7,"dc_id":2}', channel_id),
-        )
-        conn.commit()
-        repo = EntityProfileRepository(conn, section_ttl_seconds=10)
-        repo.mark_pending(channel_id, now=100)
-        old_cursor = repo.next_due_refresh(now=100)
-        assert old_cursor is not None
-        client = _FakeClient(
-            input_entity=object(),
-            full_channel_result=_fake_full_channel_result(linked_chat_id=None, about="fresh"),
-        )
-        await resolve_linked_chat_id(client, conn, channel_id)
-        assert conn.execute(
-            "SELECT profile_revision FROM entity_details WHERE entity_id=?", (channel_id,)
-        ).fetchone() == (1,)
-        assert conn.execute(
-            "SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=?", (channel_id,)
-        ).fetchone() == (1,)
-        assert conn.execute(
-            "SELECT profile_owner_account_id, profile_observation_scope_json FROM entity_details WHERE entity_id=?",
-            (channel_id,),
-        ).fetchone() == (7, '{"account_id":7,"dc_id":2}')
-        assert not repo.commit_section(old_cursor, EntitySectionCommit({"about": "stale"}), now=101)
-        next_cursor = repo.next_due_refresh(now=101)
-        assert next_cursor is not None and next_cursor.profile_revision == 1
-        assert repo.commit_section(next_cursor, EntitySectionCommit({"about": "fresh"}), now=101)
-
-
-@pytest.mark.asyncio
-async def test_linked_chat_cas_preserves_newer_detail_written_during_rpc(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    channel_id = -100200000005
-    with _make_db() as conn:
-        _write_entity_details(conn, channel_id, {"about": "old"}, fetched_at=0)
-        repo = EntityProfileRepository(conn, section_ttl_seconds=10)
-        repo.mark_pending(channel_id, now=100)
-        original_load = activity_peer_resolve_module._load_existing_detail_blob
-
-        def load_then_mutate(connection: sqlite3.Connection, entity_id: int):
-            loaded = original_load(connection, entity_id)
-            connection.execute(
-                "UPDATE entity_details SET detail_json=?, profile_revision=profile_revision+1 WHERE entity_id=?",
-                ('{"schema":1,"about":"newer section"}', entity_id),
+        repeated = await resolve_linked_chat_id(client, conn, -10042)  # type: ignore[arg-type]
+        assert repeated.state is LinkedChatState.UNKNOWN and repeated.refresh_pending
+        assert (
+            cast(
+                tuple[int, int | None] | None,
+                conn.execute(
+                    "SELECT generation, pending_generation FROM linked_chat_fact_state WHERE channel_id=?", (-10042,)
+                ).fetchone(),
             )
-            connection.execute(
-                "UPDATE entity_profile_refresh_state SET profile_revision=profile_revision+1 WHERE entity_id=?",
-                (entity_id,),
+            == generation
+        )
+        assert client.input_calls == []
+        assert client.rpc_calls == []
+
+
+@pytest.mark.asyncio
+async def test_confirmed_no_link_and_stale_known_link_remain_distinct_from_unknown() -> None:
+    with _make_db() as conn:
+        with conn:
+            linked_chat_fact_owner.capture_generation(conn, -10043)
+            assert linked_chat_fact_owner.publish(conn, -10043, 0, None, 100)
+            conn.execute("INSERT INTO linked_chat_fact_state(channel_id,generation) VALUES(-10044,0)")
+            conn.execute(
+                "INSERT INTO dialogs(dialog_id,linked_chat_id,linked_chat_resolved_at) VALUES(-10044,-10099,90)"
             )
-            connection.commit()
-            return loaded
+            conn.execute("UPDATE linked_chat_fact_state SET pending_generation=0,retry_at=200 WHERE channel_id=-10044")
 
-        monkeypatch.setattr(activity_peer_resolve_module, "_load_existing_detail_blob", load_then_mutate)
-        client = _FakeClient(
-            input_entity=object(),
-            full_channel_result=_fake_full_channel_result(linked_chat_id=None, about="stale rpc payload"),
-        )
-        await resolve_linked_chat_id(client, conn, channel_id)
-        assert _read_entity_details(conn, channel_id) == {"schema": 1, "about": "newer section"}
-        assert conn.execute(
-            "SELECT profile_revision FROM entity_details WHERE entity_id=?", (channel_id,)
-        ).fetchone() == (1,)
-        assert conn.execute(
-            "SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=?", (channel_id,)
-        ).fetchone() == (1,)
+        no_link = await resolve_linked_chat_id(_Client(), conn, -10043)  # type: ignore[arg-type]
+        stale_link = await resolve_linked_chat_id(_Client(), conn, -10044)  # type: ignore[arg-type]
+        assert no_link.state is LinkedChatState.KNOWN_NONE and no_link.linked_chat_id is None
+        assert stale_link.state is LinkedChatState.KNOWN_LINK and stale_link.linked_chat_id == -10099
+        assert stale_link.refresh_pending and stale_link.retry_at == 200
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("retained_revision", (3, 8))
-async def test_linked_chat_first_insert_advances_retained_refresh_fence_and_reopens(
-    tmp_path: Path, retained_revision: int
-) -> None:
-    path = tmp_path / f"linked-first-{retained_revision}.sqlite"
-    ensure_sync_schema(path)
-    conn = sqlite3.connect(path)
-    channel_id = -100200000006 - retained_revision
-    _insert_entity(conn, channel_id)
-    repo = EntityProfileRepository(conn, section_ttl_seconds=10)
-    repo.mark_pending(channel_id, now=100)
-    conn.execute(
-        "UPDATE entity_profile_refresh_state SET profile_revision=? WHERE entity_id=?",
-        (retained_revision, channel_id),
+def test_missing_pending_retry_uses_one_bounded_fallback() -> None:
+    fact = LinkedChatFact(LinkedChatState.UNKNOWN, None, None, True, 50, None)
+    assert linked_chat_retry_at(fact, now=100) == linked_chat_fact_owner.retry_policy.effective_retry_at(None, 50, 100)
+
+
+def test_missing_retry_and_request_use_owner_bounded_fallback() -> None:
+    fact = LinkedChatFact(LinkedChatState.UNKNOWN, None, None, True, None, None)
+    assert linked_chat_retry_at(fact, now=100) == linked_chat_fact_owner.retry_policy.effective_retry_at(
+        None, None, 100
     )
-    conn.commit()
-    old_cursor = repo.next_due_refresh(now=100)
-    assert old_cursor is not None and old_cursor.profile_revision == retained_revision
-
-    client = _FakeClient(
-        input_entity=object(),
-        full_channel_result=_fake_full_channel_result(linked_chat_id=None, about="fresh linked detail"),
-    )
-    await resolve_linked_chat_id(client, conn, channel_id)
-    assert conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=?", (channel_id,)).fetchone() == (
-        retained_revision + 1,
-    )
-    assert conn.execute(
-        "SELECT profile_revision FROM entity_profile_refresh_state WHERE entity_id=?", (channel_id,)
-    ).fetchone() == (retained_revision + 1,)
-    assert not repo.commit_section(old_cursor, EntitySectionCommit({"about": "stale"}), now=101)
-    conn.close()
-
-    reopened = sqlite3.connect(path)
-    reopened_repo = EntityProfileRepository(reopened, section_ttl_seconds=10)
-    next_cursor = reopened_repo.next_due_refresh(now=101)
-    assert next_cursor is not None and next_cursor.profile_revision == retained_revision + 1
-    assert reopened_repo.commit_section(next_cursor, EntitySectionCommit({"about": "new section"}), now=101)
-    reopened.close()
-
-
-@pytest.mark.asyncio
-async def test_resolve_linked_chat_id_forwards_timeout_to_live_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
-    channel_id = -100200000009
-    captured: dict[str, float] = {}
-
-    async def fake_call_with_timeout(client: object, request: object, *, timeout_s: float) -> object:
-        captured["timeout_s"] = timeout_s
-        return await client(request)  # type: ignore[operator]
-
-    monkeypatch.setattr("mcp_telegram.activity_peer_resolve.call_with_timeout", fake_call_with_timeout)
-    with _make_db() as conn:
-        client = _FakeClient(input_entity=object(), full_channel_result=_fake_full_channel_result(linked_chat_id=None))
-        await resolve_linked_chat_id(client, conn, channel_id, timeout_s=37.0)
-
-    assert captured == {"timeout_s": 37.0}
-
-
-@pytest.mark.asyncio
-async def test_resolve_linked_chat_id_preserves_existing_keys():
-    """Blob merge must not clobber keys NOT returned by GetFullChannel."""
-    channel_id = -100200000003
-
-    with _make_db() as conn:
-        # Pre-existing blob with a custom key
-        _write_entity_details(
-            conn,
-            channel_id,
-            {"subscribers_count": 1234, "some_extra_key": "preserved"},
-            fetched_at=0,  # expired
-        )
-
-        full_result = _fake_full_channel_result(linked_chat_id=None)
-        client = _FakeClient(input_entity=object(), full_channel_result=full_result)
-        await resolve_linked_chat_id(client, conn, channel_id)
-
-        written = _read_entity_details(conn, channel_id)
-    assert written is not None
-    assert "some_extra_key" in written, "Pre-existing key must survive blob merge"
-    assert written["some_extra_key"] == "preserved"
-
-
-# ---------------------------------------------------------------------------
-# (e) Channel with no discussion group → linked_chat_id=None, flood_wait=None
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_resolve_linked_chat_id_no_discussion_group():
-    """Channel with no linked chat returns linked_chat_id=None, flood_wait_seconds=None."""
-    channel_id = -100200000004
-
-    with _make_db() as conn:
-        full_result = _fake_full_channel_result(linked_chat_id=None)
-        client = _FakeClient(input_entity=object(), full_channel_result=full_result)
-
-        result = await resolve_linked_chat_id(client, conn, channel_id)
-
-    assert result.linked_chat_id is None
-    assert result.flood_wait_seconds is None
-
-
-# ---------------------------------------------------------------------------
-# (f) TelegramRpcThrottled → returns flood_wait_seconds, no sleep, no raise
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_resolve_linked_chat_id_flood_wait_no_sleep():
-    """TelegramRpcThrottled returns flood_wait_seconds set, does NOT sleep, does NOT raise."""
-    from mcp_telegram.flood import TelegramRpcThrottled
-
-    channel_id = -100200000005
-
-    with _make_db() as conn:
-        flood_error = TelegramRpcThrottled(retry_after_seconds=120)
-        client = _FakeClient(
-            input_entity=object(),
-            full_channel_error=flood_error,
-        )
-
-        # Should not raise, and should not sleep (asyncio.sleep not patched —
-        # if it's called, the test will block or fail in CI timeout)
-        result = await resolve_linked_chat_id(client, conn, channel_id)
-
-    assert result.linked_chat_id is None
-    assert result.flood_wait_seconds == 120, f"Expected flood_wait_seconds=120, got {result.flood_wait_seconds}"
-
-
-@pytest.mark.asyncio
-async def test_resolve_linked_chat_id_flood_wait_distinct_from_no_group():
-    """FloodWait is distinguishable from 'no discussion group' by flood_wait_seconds field."""
-    from mcp_telegram.flood import TelegramRpcThrottled
-
-    with _make_db() as conn:
-        channel_id = -100200000006
-        flood_error = TelegramRpcThrottled(retry_after_seconds=60)
-        client = _FakeClient(input_entity=object(), full_channel_error=flood_error)
-
-        flood_result = await resolve_linked_chat_id(client, conn, channel_id)
-
-        # No-discussion-group result
-        channel_id2 = -100200000007
-        full_result = _fake_full_channel_result(linked_chat_id=None)
-        client2 = _FakeClient(input_entity=object(), full_channel_result=full_result)
-        no_group_result = await resolve_linked_chat_id(client2, conn, channel_id2)
-
-    assert flood_result.flood_wait_seconds is not None
-    assert no_group_result.flood_wait_seconds is None
-    # Both have linked_chat_id=None
-    assert flood_result.linked_chat_id is None
-    assert no_group_result.linked_chat_id is None
-
-
-# ---------------------------------------------------------------------------
-# LinkedChatResolution dataclass
-# ---------------------------------------------------------------------------
-
-
-def test_linked_chat_resolution_fields():
-    r = LinkedChatResolution(linked_chat_id=-100123, flood_wait_seconds=None)
-    assert r.linked_chat_id == -100123
-    assert r.flood_wait_seconds is None
-
-    r2 = LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=30)
-    assert r2.linked_chat_id is None
-    assert r2.flood_wait_seconds == 30
-
-
-# ---------------------------------------------------------------------------
-# Phase 54 TDD tests: dialogs cache substrate
-# ---------------------------------------------------------------------------
-
-# Task 4: dialogs cache hit does NOT call GetFullChannelRequest
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_resolve_linked_chat_id_dialogs_cache_hit_returns_without_telethon_call():
-    """Pre-resolved channel: resolver returns the dialogs row without any Telethon call."""
-    channel_id = -1001234567890
-    expected_linked = -1009876543210
-
-    with _make_db() as conn:
-        _write_dialogs_row(
-            conn,
-            channel_id,
-            {"linked_chat_id": expected_linked, "linked_chat_resolved_at": int(time.time()) - 99999},
-        )
-
-        # _FakeClient records all calls; on a cache hit, none should be made
-        client = _FakeClient(input_entity=object())
-
-        result = await resolve_linked_chat_id(client, conn, channel_id)
-
-    assert result == LinkedChatResolution(linked_chat_id=expected_linked, flood_wait_seconds=None)
-    assert len(client.get_input_entity_calls) == 0, "get_input_entity must not be called on a dialogs cache hit"
-    assert len(client.call_calls) == 0, "GetFullChannelRequest must not be called on a dialogs cache hit"
-
-
-@pytest.mark.asyncio
-async def test_resolve_linked_chat_id_dialogs_cache_hit_null_linked_chat():
-    """dialogs row with linked_chat_id=NULL and non-NULL resolved_at = definitively no
-    discussion group. Returns linked_chat_id=None, flood_wait_seconds=None with zero
-    Telethon calls."""
-    channel_id = -1001234567891
-
-    with _make_db() as conn:
-        # NULL linked_chat_id + NOT-NULL resolved_at = "we asked, no linked chat exists"
-        _write_dialogs_row(
-            conn,
-            channel_id,
-            {"linked_chat_id": None, "linked_chat_resolved_at": int(time.time()) - 50},
-        )
-
-        client = _FakeClient(input_entity=object())
-
-        result = await resolve_linked_chat_id(client, conn, channel_id)
-
-    assert result == LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None)
-    assert len(client.get_input_entity_calls) == 0, "get_input_entity must not be called on a dialogs cache hit"
-    assert len(client.call_calls) == 0, "GetFullChannelRequest must not be called on a dialogs cache hit"
-
-
-# Task 5: cold path UPSERTs into dialogs and does not pollute detail_json
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_resolve_linked_chat_id_cold_path_upserts_dialogs():
-    """Cold path (no dialogs row): live fetch UPSERTs into dialogs; linked_chat_id
-    absent from entity_details.detail_json; sibling fields present in detail_json."""
-    channel_id = -1001111111111
-    raw_linked = 2222222222  # positive bare id → resolver normalises to -1002222222222
-
-    with _make_db() as conn:
-        full_result = _fake_full_channel_result(
-            linked_chat_id=raw_linked,
-            participants_count=5000,
-            about="Test channel about",
-            pinned_msg_id=42,
-        )
-        # No chats list → no title/username lookup for entities row
-        full_result.chats = []
-
-        client = _FakeClient(input_entity=object(), full_channel_result=full_result)
-
-        before_call = int(time.time())
-        result = await resolve_linked_chat_id(client, conn, channel_id)
-        after_call = int(time.time())
-
-        # Return value
-        assert result.linked_chat_id == -1002222222222
-        assert result.flood_wait_seconds is None
-
-        # dialogs row was UPSERTed
-        dr = _read_dialogs_row(conn, channel_id)
-        assert dr is not None, "dialogs row must be created by cold-path UPSERT"
-        assert dr["linked_chat_id"] == -1002222222222
-        assert dr["linked_chat_resolved_at"] is not None
-        assert before_call <= dr["linked_chat_resolved_at"] <= after_call + 1, (
-            f"resolved_at={dr['linked_chat_resolved_at']} not within 5s of now"
-        )
-
-        # Resolver only owns the two linked-chat columns — other columns at defaults
-        assert dr["name"] is None, "resolver must not write name into dialogs"
-        assert dr["type"] is None, "resolver must not write type into dialogs"
-        assert dr["hidden"] == 0, "resolver must not write hidden into dialogs"
-
-        # entity_details: sibling fields present, linked_chat_id absent
-        ed = _read_entity_details(conn, channel_id)
-        assert ed is not None
-        assert "linked_chat_id" not in ed, "linked_chat_id must NOT appear in entity_details (Phase 54 contract)"
-        assert "subscribers_count" in ed
-        assert "about" in ed
-        assert "pinned_msg_id" in ed
-
-        # Second call: dialogs cache now hot — zero further GetFullChannelRequest calls
-        call_count_before = len(client.call_calls)
-        result2 = await resolve_linked_chat_id(client, conn, channel_id)
-        assert result2 == result
-        assert len(client.call_calls) == call_count_before, (
-            "Second call must use dialogs cache — no further GetFullChannelRequest"
-        )
-
-
-# Task 6: schema-floor assertion raises RuntimeError on sub-v24 connections
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_resolve_linked_chat_id_schema_floor_raises_on_v23():
-    """A connection with schema_version < 24 raises RuntimeError with a greppable message."""
-    import sqlite3 as _sqlite3
-
-    with contextlib.closing(_sqlite3.connect(":memory:")) as raw_conn:
-        # Create schema_version table and insert a sub-v24 version
-        raw_conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
-        raw_conn.execute("INSERT INTO schema_version VALUES (23, 1000000)")
-        raw_conn.commit()
-
-        # The assertion fires before any Telethon call — client is never touched
-        client = _FakeClient(input_entity=object())
-
-        with pytest.raises(RuntimeError, match=r"requires schema v24\+"):
-            await resolve_linked_chat_id(client, raw_conn, -1004444444444)
-
-    # Confirm client was never touched
-    assert len(client.get_input_entity_calls) == 0
-    assert len(client.call_calls) == 0
-
-
-@pytest.mark.asyncio
-async def test_resolve_linked_chat_id_schema_floor_passes_on_v24():
-    """A connection migrated to v24 via _apply_migrations does NOT raise RuntimeError."""
-    channel_id = -1005555555555
-    # _apply_migrations → schema_version includes v24
-    with _make_db() as conn:
-        # Seed a resolved dialogs row so the resolver returns without a Telethon call
-        _write_dialogs_row(
-            conn,
-            channel_id,
-            {"linked_chat_id": -1006666666666, "linked_chat_resolved_at": int(time.time())},
-        )
-
-        client = _FakeClient(input_entity=object())
-
-        # Must not raise
-        result = await resolve_linked_chat_id(client, conn, channel_id)
-        assert result.linked_chat_id == -1006666666666
-        assert result.flood_wait_seconds is None
-
-
-# Task 7: FloodWait leaves dialogs untouched (retry signal preserved)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_resolve_linked_chat_id_flood_wait_leaves_dialogs_untouched():
-    """TelegramRpcThrottled must NOT touch dialogs; resolved_at stays NULL so the next
-    sweep pass retries naturally (D-08 contract)."""
-    from mcp_telegram.flood import TelegramRpcThrottled
-
-    channel_id = -1003333333333
-
-    with _make_db() as conn:
-        # Seed a dialogs row in "never asked" state (NULL, NULL)
-        _write_dialogs_row(
-            conn,
-            channel_id,
-            {"linked_chat_id": None, "linked_chat_resolved_at": None},
-        )
-
-        flood_error = TelegramRpcThrottled(retry_after_seconds=42)
-        client = _FakeClient(
-            input_entity=object(),
-            full_channel_error=flood_error,
-        )
-
-        result = await resolve_linked_chat_id(client, conn, channel_id)
-
-        # Return value
-        assert result.linked_chat_id is None
-        assert result.flood_wait_seconds == 42
-
-        # dialogs row UNCHANGED — resolved_at still NULL (the retry signal)
-        dr = _read_dialogs_row(conn, channel_id)
-        assert dr is not None
-        assert dr["linked_chat_id"] is None, "FloodWait must NOT write linked_chat_id into dialogs"
-        assert dr["linked_chat_resolved_at"] is None, (
-            "FloodWait must NOT set resolved_at — NULL IS the retry signal (D-08)"
-        )
-
-        # No additional rows inserted
-        row_count_row = cast(
-            tuple[int] | None,
-            conn.execute("SELECT COUNT(*) FROM dialogs WHERE dialog_id = ?", (channel_id,)).fetchone(),
-        )
-        assert row_count_row is not None
-        row_count = row_count_row[0]
-        assert row_count == 1, "exactly one dialogs row for this channel"

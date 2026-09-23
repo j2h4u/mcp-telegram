@@ -12,6 +12,16 @@ rationale = "No exclusions use this grouping; every entry below has its own rati
 
 [[entry]]
 category = "policy_assignments"
+key = "src/mcp_telegram/linked_chat_fact.py:LinkedChatRetryPolicy:base_delay_seconds"
+rationale = "This retry delay is a code-owned recovery invariant for retained linked-chat demand."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/linked_chat_fact.py:LinkedChatRetryPolicy:max_delay_seconds"
+rationale = "This retry ceiling bounds automatic recovery without exposing operator configuration."
+
+[[entry]]
+category = "policy_assignments"
 key = "src/mcp_telegram/__init__.py:_feedback_list_select_rows:order_limit"
 rationale = "The feedback CLI's SQLite query ordering bound is a local presentation contract."
 

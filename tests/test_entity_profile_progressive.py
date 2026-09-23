@@ -28,6 +28,7 @@ from mcp_telegram.entity_profile.contracts import (
     PROFILE_SECTIONS,
     ChannelContactOverlapObservation,
     ChannelProfileObservation,
+    ChannelReference,
     ChatAvatarHistoryObservation,
     CommonChatsObservation,
     GroupReference,
@@ -595,17 +596,22 @@ def _channel_profile_service(
         "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
     )
     conn.execute(
-        "CREATE TABLE dialogs (dialog_id INTEGER PRIMARY KEY, linked_chat_id INTEGER, linked_chat_resolved_at INTEGER)"
+        "CREATE TABLE dialogs (dialog_id INTEGER PRIMARY KEY, linked_chat_id INTEGER, linked_chat_resolved_at INTEGER, "
+        "revision INTEGER NOT NULL DEFAULT 0)"
     )
     conn.execute(
-        "INSERT INTO dialogs VALUES (?, ?, ?)",
+        "CREATE TABLE linked_chat_fact_state (channel_id INTEGER PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 0, "
+        "pending_generation INTEGER, requested_at INTEGER, retry_at INTEGER, failure_count INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute(
+        "INSERT INTO dialogs(dialog_id, linked_chat_id, linked_chat_resolved_at) VALUES (?, ?, ?)",
         (channel_id, linked_chat_id, 100 if linked_chat_id is not None else None),
     )
     profile = ChannelProfileObservation(
         channel_id=channel_id,
         about="profile",
         participants_count=participants_count,
-        linked_chat_id=-100777,
+        linked_chat_id=-1000000000777,
         pinned_msg_id=None,
         slow_mode_seconds=None,
         available_reactions={"kind": "none", "emojis": []},
@@ -638,24 +644,74 @@ def _channel_profile_service(
 
 
 @pytest.mark.asyncio
-async def test_channel_profile_commit_advances_once_and_overlays_canonical_link_without_persisting_it() -> None:
+async def test_channel_profile_commit_publishes_linked_chat_fact_and_overlays_canonical_link() -> None:
+    from mcp_telegram.activity_peer_resolve import resolve_linked_chat_id
+    from mcp_telegram.linked_chat_fact import (
+        LinkedChatState,
+        linked_chat_fact_owner,
+    )
+
     service, conn, port = _channel_profile_service(channel_id=-10042, linked_chat_id=-10099)
     try:
+        offered: list[DemandKind] = []
+
+        class RecordingSink:
+            def offer(self, kind: DemandKind) -> bool:
+                assert not conn.in_transaction
+                offered.append(kind)
+                return True
+
+        service.bind_demand_sink(RecordingSink())
+        fetch_profile = port.fetch_channel_profile
+
+        async def check_committed_capture(reference: ChannelReference) -> ChannelProfileObservation:
+            assert not conn.in_transaction
+            return await fetch_profile(reference)
+
+        port.fetch_channel_profile = check_committed_capture  # type: ignore[method-assign]
+        linked_chat_fact_owner.invalidate_from_update(conn, -10042, 100)
         cursor = service._profiles.next_due_refresh(now=100)
         assert cursor is not None
         _advance_fixture_cursor(service._profiles, -10042, 1, 100)
         cursor = service._profiles.next_due_refresh(now=100)
         assert cursor is not None and cursor.next_section == "full_profile"
 
-        commit = await service._acquire_channel_full_profile(-10042, DialogType.CHANNEL)
-        assert service._profiles.commit_section(cursor, commit, now=100)
+        from mcp_telegram.daemon_entity_info import _ProfileSectionContext
+
+        context = _ProfileSectionContext(None, 0, False, "disabled", False)
+        commit = await service._acquire_channel_full_profile(-10042, DialogType.CHANNEL, context=context)
+        conn.execute(
+            "INSERT INTO dialogs(dialog_id, linked_chat_id, linked_chat_resolved_at) VALUES(-1004201, NULL, 99)"
+        )
+        committed = service._profiles.commit_section(cursor, commit, now=100)
+        service._publish_profile_linked_chat_fact(cursor, DialogType.CHANNEL, context, committed, now=100)
+        assert committed
+        assert offered == [DemandKind.SCHEDULED_DISCOVERY, DemandKind.COLD_PEER_PAGE]
         assert port.profile_calls == [-1000000010042]
+        assert conn.execute(
+            "SELECT linked_chat_id, linked_chat_resolved_at FROM dialogs WHERE dialog_id=?", (-10042,)
+        ).fetchone() == (-1000000000777, 100)
+        assert not linked_chat_fact_owner.read_fact(conn, -10042).refresh_pending
         stored = service._profiles.read(-10042, now=100)
         assert stored is not None
         assert "linked_chat_id" not in stored.detail
         result = service._progressive_result(-10042, stored.detail, stored.sections, now=100, admit_refresh=False)
         data = cast(dict[str, object], result["data"])
-        assert data["linked_chat_id"] == -10099
+        assert data["linked_chat_id"] == -1000000000777
+        fact = linked_chat_fact_owner.read_fact(conn, -10042)
+        assert fact.state is LinkedChatState.KNOWN_LINK and fact.linked_chat_id == -1000000000777
+
+        class NoRpcClient:
+            calls = 0
+
+            async def __call__(self, _request: object) -> object:
+                self.calls += 1
+                raise AssertionError("linked-chat fact hit must stay local")
+
+        no_rpc = NoRpcClient()
+        local_read = await resolve_linked_chat_id(no_rpc, conn, -10042)  # type: ignore[arg-type]
+        assert local_read.state is LinkedChatState.KNOWN_LINK
+        assert no_rpc.calls == 0
     finally:
         await service.shutdown()
         conn.close()
@@ -669,6 +725,200 @@ async def test_channel_progressive_link_overlay_replaces_stale_and_unresolved_wi
         sections: dict[str, dict[str, object]] = {section: {"status": "fresh"} for section in PROFILE_SECTIONS}
         result = service._progressive_result(-10043, stale, sections, now=100, admit_refresh=False)
         assert cast(dict[str, object], result["data"])["linked_chat_id"] is None
+    finally:
+        await service.shutdown()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_channel_profile_fact_publish_is_fenced_by_newer_dialog_revision() -> None:
+    from mcp_telegram.linked_chat_fact import linked_chat_fact_owner
+
+    service, conn, _port = _channel_profile_service(channel_id=-10047, linked_chat_id=-10099)
+    try:
+        offered: list[DemandKind] = []
+
+        class RecordingSink:
+            def offer(self, kind: DemandKind) -> bool:
+                offered.append(kind)
+                return True
+
+        service.bind_demand_sink(RecordingSink())
+        cursor = service._profiles.next_due_refresh(now=100)
+        assert cursor is not None
+        _advance_fixture_cursor(service._profiles, -10047, 1, 100)
+        cursor = service._profiles.next_due_refresh(now=100)
+        assert cursor is not None and cursor.next_section == "full_profile"
+
+        from mcp_telegram.daemon_entity_info import _ProfileSectionContext
+
+        context = _ProfileSectionContext(None, 0, False, "disabled", False)
+        commit = await service._acquire_channel_full_profile(-10047, DialogType.CHANNEL, context=context)
+        linked_chat_fact_owner.invalidate_from_update(conn, -10047, 100)
+        assert service._profiles.commit_section(cursor, commit, now=100)
+        service._publish_profile_linked_chat_fact(cursor, DialogType.CHANNEL, context, True, now=100)
+        assert conn.execute("SELECT linked_chat_id FROM dialogs WHERE dialog_id=?", (-10047,)).fetchone() == (-10099,)
+        assert linked_chat_fact_owner.read_fact(conn, -10047).refresh_pending
+        assert offered == []
+    finally:
+        await service.shutdown()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_channel_detail_publishes_linked_chat_fact() -> None:
+    from types import SimpleNamespace
+
+    service, conn, port = _channel_profile_service(channel_id=-10048, linked_chat_id=None)
+    service._deps = replace(service._deps, get_peer_id=lambda entity: cast(int, entity.id))
+    offered: list[DemandKind] = []
+
+    class RecordingSink:
+        def offer(self, kind: DemandKind) -> bool:
+            assert not conn.in_transaction
+            offered.append(kind)
+            return True
+
+    service.bind_demand_sink(RecordingSink())
+
+    fetch_profile = port.fetch_channel_profile
+
+    async def check_committed_capture(reference: ChannelReference) -> ChannelProfileObservation:
+        assert not conn.in_transaction
+        return await fetch_profile(reference)
+
+    port.fetch_channel_profile = check_committed_capture  # type: ignore[method-assign]
+
+    async def no_avatar_history(_reference: object, *, current_photo: object = None) -> tuple[list[object], int]:
+        del _reference, current_photo
+        return [], 0
+
+    service._search_chat_photo_history = no_avatar_history  # type: ignore[method-assign]
+    try:
+        detail = await service._fetch_channel_detail(
+            SimpleNamespace(
+                id=-10048, title="Channel", username="channel", creator=False, admin_rights=None, left=False
+            )
+        )
+        assert detail["linked_chat_id"] == -1000000000777
+        assert conn.execute(
+            "SELECT linked_chat_id, linked_chat_resolved_at FROM dialogs WHERE dialog_id=?", (-10048,)
+        ).fetchone() == (-1000000000777, 100)
+        assert offered == [DemandKind.SCHEDULED_DISCOVERY, DemandKind.COLD_PEER_PAGE]
+    finally:
+        await service.shutdown()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_profile_publication_wakes_cold_adapter_for_local_link_enrollment() -> None:
+    from time import time
+    from types import SimpleNamespace
+
+    from mcp_telegram.activity_cold_backfill import (
+        ColdBackfillHistoryPacing,
+        ColdBackfillPacing,
+        ColdPeerPageDemandAdapter,
+    )
+
+    conn = sqlite3.connect(":memory:")
+    _apply_migrations(conn)
+    channel_id = -10042
+    linked_chat_id = -1000000000777
+    conn.execute(
+        "INSERT INTO dialogs(dialog_id, type, hidden, last_message_at) VALUES (?, 'channel', 0, 100)",
+        (channel_id,),
+    )
+    conn.execute("INSERT INTO activity_sync_state(key, value) VALUES ('activity_working_set_completed_at', '50')")
+    conn.commit()
+
+    profile = ChannelProfileObservation(
+        channel_id=channel_id,
+        about="profile",
+        participants_count=10,
+        linked_chat_id=linked_chat_id,
+        pinned_msg_id=None,
+        slow_mode_seconds=None,
+        available_reactions={"kind": "none", "emojis": []},
+        current_photo=None,
+        observation_started_at=100,
+        observation_completed_at=100,
+    )
+    overlap = ChannelContactOverlapObservation(
+        channel_id=channel_id,
+        contact_ids=(),
+        status=ProjectionStatus.PARTIAL,
+        reason="bounded_contacts_page",
+        observation_started_at=100,
+        observation_completed_at=100,
+    )
+    port = FakeChannelProfilePort(profile, overlap)
+    service = _test_service(conn, limits=RefreshLimits())
+    service._deps = replace(
+        service._deps,
+        channel_profile_port=port,
+        channel_reference_provider=port,
+        get_peer_id=lambda _entity: channel_id,
+    )
+    offered: list[DemandKind] = []
+
+    class RecordingSink:
+        def offer(self, kind: DemandKind) -> bool:
+            assert not conn.in_transaction
+            offered.append(kind)
+            return True
+
+    service.bind_demand_sink(RecordingSink())
+
+    async def no_avatar_history(_reference: object, *, current_photo: object = None) -> tuple[list[object], int]:
+        del _reference, current_photo
+        return [], 0
+
+    service._search_chat_photo_history = no_avatar_history  # type: ignore[method-assign]
+
+    class NoRpcClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_input_entity(self, dialog_id: int) -> object:
+            del dialog_id
+            self.calls += 1
+            raise AssertionError("known linked-chat fact must not resolve an input peer")
+
+        async def __call__(self, request: object) -> object:
+            del request
+            self.calls += 1
+            raise AssertionError("known linked-chat fact must not send Telegram RPC")
+
+    client = NoRpcClient()
+    try:
+        await service._fetch_channel_detail(
+            SimpleNamespace(
+                id=channel_id,
+                title="Channel",
+                username="channel",
+                creator=False,
+                admin_rights=None,
+                left=False,
+            )
+        )
+        assert offered == [DemandKind.SCHEDULED_DISCOVERY, DemandKind.COLD_PEER_PAGE]
+
+        adapter = ColdPeerPageDemandAdapter(
+            client,
+            conn,
+            asyncio.Event(),
+            ColdBackfillPacing(ColdBackfillHistoryPacing(batch_s=0.0, enroll_s=1.0, access_retry_s=1.0)),
+            timeout_s=1.0,
+        )
+        status = adapter.status(time())
+        assert status is not None and status.is_ready(time())
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+        assert conn.execute(
+            "SELECT source FROM activity_dialog_state WHERE dialog_id=?", (linked_chat_id,)
+        ).fetchone() == ("linked_chat",)
+        assert client.calls == 0
     finally:
         await service.shutdown()
         conn.close()
@@ -746,12 +996,12 @@ async def test_supergroup_profile_persists_reverse_link_fact_only() -> None:
         assert cursor is not None
         commit = await service._acquire_channel_full_profile(-10044, DialogType.SUPERGROUP)
         assert port.profile_calls == [-1000000010044]
-        assert commit.detail_patch["linked_broadcast_id"] == -100777
+        assert commit.detail_patch["linked_broadcast_id"] == -1000000000777
         assert "linked_chat_id" not in commit.detail_patch
         assert service._profiles.commit_section(cursor, commit, now=100)
         stored = service._profiles.read(-10044, now=100)
         assert stored is not None
-        assert stored.detail["linked_broadcast_id"] == -100777
+        assert stored.detail["linked_broadcast_id"] == -1000000000777
         assert "linked_chat_id" not in stored.detail
     finally:
         await service.shutdown()

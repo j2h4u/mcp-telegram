@@ -52,7 +52,7 @@ def _manager(client: MagicMock, db: sqlite3.Connection) -> EventHandlerManager:
     db.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, 'synced')", (dialog_id,))
     seed_full_history_enrollment(db, dialog_id, enabled=True)
     db.commit()
-    manager = EventHandlerManager(client, db, asyncio.Event(), client.get_input_entity)
+    manager = EventHandlerManager(client, db, asyncio.Event())
     manager.register()
     return manager
 
@@ -116,7 +116,7 @@ async def test_raw_service_create_and_edit_use_peer_id_and_prefer_top_target(
 async def test_raw_topic_events_ignore_nonservice_unknown_and_coverage_denied(
     client: MagicMock, db: sqlite3.Connection
 ) -> None:
-    manager = EventHandlerManager(client, db, asyncio.Event(), client.get_input_entity)
+    manager = EventHandlerManager(client, db, asyncio.Event())
     manager.register()
     peer = PeerChannel(123)
     regular = Message(id=1, peer_id=peer, message="hello", date=datetime.now(UTC), out=False)
@@ -128,7 +128,7 @@ async def test_raw_topic_events_ignore_nonservice_unknown_and_coverage_denied(
 
 
 def test_raw_topic_handler_registration_is_symmetric(client: MagicMock, db: sqlite3.Connection) -> None:
-    manager = EventHandlerManager(client, db, asyncio.Event(), client.get_input_entity)
+    manager = EventHandlerManager(client, db, asyncio.Event())
     manager.register()
     raw_calls = [
         call for call in client.add_event_handler.call_args_list if call.args[0].__name__ == "on_raw_topic_message"

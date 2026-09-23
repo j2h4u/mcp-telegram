@@ -21,11 +21,12 @@ from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .access_lifecycle import set_access_lost
-from .activity_peer_resolve import resolve_linked_chat_id
+from .activity_peer_resolve import linked_chat_retry_at, resolve_linked_chat_id
 from .activity_substrate import ActivityClient
 from .daemon_log_context import dialog_log_context
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .fts import stem_text
+from .linked_chat_fact import LinkedChatState, linked_chat_fact_owner
 from .message_contracts import ExtractedMessage
 from .messages.telegram_adapter import extract_message_row
 from .own_only import (
@@ -69,6 +70,13 @@ class ScheduledReconciliationPolicy:
     state_scan_seconds: float = 60.0
     failure_retry_seconds: int = 300
     max_dialogs_per_slice: int = 8
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduledDiscoveryPending:
+    """Linked-chat ownership is unresolved; discovery may resume at retry_at."""
+
+    retry_at: int
 
 
 def _as_int(value: object) -> int:
@@ -460,7 +468,6 @@ class ScheduledMessageReconciler:
         self._shutdown_event = shutdown_event
         self._own_only_context = own_only_context
         self._policy = policy
-        self._resolved_context = own_only_context
         self._next_candidate_seed_at = 0
 
     def _seed_candidates(self, now: int) -> None:
@@ -530,13 +537,9 @@ class ScheduledMessageReconciler:
         if now >= self._next_candidate_seed_at:
             self._seed_candidates(now)
 
-    async def _context(self) -> OwnOnlyContext | None:
-        context = self._resolved_context
-        if (
-            context is None
-            or context.personal_channel_id is None
-            or context.personal_channel_linked_chat_id is not None
-        ):
+    async def _context(self) -> OwnOnlyContext | ScheduledDiscoveryPending | None:
+        context = self._own_only_context
+        if context is None or context.personal_channel_id is None:
             return context
         resolution = await resolve_linked_chat_id(
             cast(ActivityClient, self._client),
@@ -544,18 +547,36 @@ class ScheduledMessageReconciler:
             context.personal_channel_id,
             timeout_s=self._policy.activity_rpc_timeout_seconds,
         )
-        if resolution.flood_wait_seconds is not None:
-            raise TelegramRpcThrottled(
-                retry_after_seconds=max(1, resolution.flood_wait_seconds),
-                latched=False,
-                detail="Scheduled ownership discovery was throttled",
+        if resolution.state is LinkedChatState.UNKNOWN:
+            now = int(time.time())
+            return ScheduledDiscoveryPending(
+                retry_at=linked_chat_retry_at(resolution, now=now),
             )
-        self._resolved_context = replace(context, personal_channel_linked_chat_id=resolution.linked_chat_id)
-        return self._resolved_context
+        return replace(context, personal_channel_linked_chat_id=resolution.linked_chat_id)
 
-    async def _discover_eligibility(self, dialog_id: int) -> bool | None:
+    def discovery_retry_at(self, now: int) -> int | None:
+        """Return the linked-chat release time that gates discovery only."""
+        context = self._own_only_context
+        if context is None or context.personal_channel_id is None:
+            return None
+        fact = linked_chat_fact_owner.read_fact(self._conn, context.personal_channel_id)
+        if fact.state is not LinkedChatState.UNKNOWN or not fact.refresh_pending:
+            return None
+        return linked_chat_retry_at(fact, now=now)
+
+    def discovery_suspended(self) -> bool:
+        """Report whether discovery is blocked by a suspended channel fact."""
+        context = self._own_only_context
+        if context is None or context.personal_channel_id is None:
+            return False
+        fact = linked_chat_fact_owner.read_fact(self._conn, context.personal_channel_id)
+        return fact.state is LinkedChatState.UNKNOWN and fact.refresh_pending and fact.suspended
+
+    async def _discover_eligibility(self, dialog_id: int) -> bool | ScheduledDiscoveryPending | None:
         """Classify one dialog; None means preserve prior knowledge and retry."""
         context = await self._context()
+        if isinstance(context, ScheduledDiscoveryPending):
+            return context
         if context is None:
             active = cast(
                 tuple[object] | None,
@@ -732,6 +753,8 @@ class ScheduledMessageReconciler:
             assert exc.retry_after_seconds is not None
             _record_retry(self._conn, int(time.time()) + exc.retry_after_seconds, "TelegramRpcThrottled")
             return 0, True
+        if isinstance(eligible, ScheduledDiscoveryPending):
+            return 0, True
         if eligible is None:
             self._record_dialog_failure(dialog_id, "discovery", "classification_unavailable", now)
             return 0, False
@@ -829,9 +852,7 @@ class _ScheduledDemandAdapter(DurableDemandAdapter):
     def __init__(self, reconciler: ScheduledMessageReconciler) -> None:
         self._reconciler = reconciler
 
-    def status(self, now: float) -> DemandStatus | None:
-        """Read the earliest due row without claiming or changing state."""
-        del now
+    def _queue_status(self) -> tuple[float, float | None] | None:
         column = "repair_due_at" if self.demand_kind is DemandKind.SCHEDULED_REPAIR else "discovery_due_at"
         row = cast(
             tuple[object] | None,
@@ -840,20 +861,37 @@ class _ScheduledDemandAdapter(DurableDemandAdapter):
             ).fetchone(),
         )
         unseeded = self.demand_kind is DemandKind.SCHEDULED_DISCOVERY and self._reconciler._has_unseeded_candidate()
-        original_release_at: float | None = None
         if row is None or row[0] is None:
-            if not unseeded:
-                return None
-            queue_release_at = 0.0
-        else:
-            queue_release_at = float(cast(int | float, row[0]))
-            original_release_at = queue_release_at
-            if unseeded:
-                queue_release_at = 0.0
-        release_at = queue_release_at
+            return (0.0, None) if unseeded else None
+
+        original_release_at = float(cast(int | float, row[0]))
+        release_at = 0.0 if unseeded else original_release_at
+        return release_at, original_release_at
+
+    def _apply_fact_and_account_retries(
+        self,
+        release_at: float,
+        *,
+        now: float,
+    ) -> float:
+        if self.demand_kind is DemandKind.SCHEDULED_DISCOVERY:
+            linked_chat_retry_at = self._reconciler.discovery_retry_at(int(now))
+            if linked_chat_retry_at is not None:
+                release_at = max(release_at, float(linked_chat_retry_at))
         account_retry_at = _retry_at(self._reconciler._conn)
         if account_retry_at is not None:
             release_at = max(release_at, float(account_retry_at))
+        return release_at
+
+    def status(self, now: float) -> DemandStatus | None:
+        """Read the earliest due row without claiming or changing state."""
+        if self.demand_kind is DemandKind.SCHEDULED_DISCOVERY and self._reconciler.discovery_suspended():
+            return None
+        queue_status = self._queue_status()
+        if queue_status is None:
+            return None
+        queue_release_at, original_release_at = queue_status
+        release_at = self._apply_fact_and_account_retries(queue_release_at, now=now)
         return DemandStatus(release_at, original_release_at)
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
