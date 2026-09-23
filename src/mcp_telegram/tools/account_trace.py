@@ -452,23 +452,26 @@ def _normalize_trace_group_order(data: dict) -> None:
     groups = data.get("groups")
     if not isinstance(groups, list):
         return
-    for group in groups:
-        if not isinstance(group, dict):
-            continue
-        evidence = group.get("evidence")
-        if isinstance(evidence, list):
-            group["evidence"] = sorted(
-                [item for item in evidence if isinstance(item, dict)],
-                key=_trace_evidence_key,
-            )
-    data["groups"] = sorted(
-        [group for group in groups if isinstance(group, dict)],
-        key=lambda group: (
-            _trace_evidence_key(group["evidence"][0])
-            if isinstance(group.get("evidence"), list) and group["evidence"]
-            else (0, 0, 0)
-        ),
-    )
+    valid_groups = [group for group in groups if isinstance(group, dict)]
+    for group in valid_groups:
+        _normalize_trace_group_evidence(group)
+    data["groups"] = sorted(valid_groups, key=_trace_group_order_key)
+
+
+def _normalize_trace_group_evidence(group: dict) -> None:
+    evidence = group.get("evidence")
+    if isinstance(evidence, list):
+        group["evidence"] = sorted(
+            [item for item in evidence if isinstance(item, dict)],
+            key=_trace_evidence_key,
+        )
+
+
+def _trace_group_order_key(group: dict) -> tuple[int, int, int]:
+    evidence = group.get("evidence")
+    if isinstance(evidence, list) and evidence:
+        return _trace_evidence_key(evidence[0])
+    return (0, 0, 0)
 
 
 def _trace_structured_content(data: dict, args: TraceAccountMessages) -> dict[str, object]:

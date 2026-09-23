@@ -61,23 +61,35 @@ def allocate_message_budget_proportional(
     if total_unread <= limit:
         return unread_counts.copy()
 
-    allocation = {}
     num_chats = len(unread_counts)
     reserved = min_per_chat * num_chats
 
     if reserved >= limit:
-        per_chat = limit // num_chats
-        remainder = limit % num_chats
-        for i, chat_id in enumerate(sorted(unread_counts.keys())):
-            allocation[chat_id] = per_chat + (1 if i < remainder else 0)
-        return allocation
+        return _allocate_evenly(unread_counts, limit)
 
     remaining_budget = limit - reserved
+    allocation = _allocate_proportionally(unread_counts, total_unread, remaining_budget, min_per_chat)
+    return _trim_allocation(allocation, limit, min_per_chat)
+
+
+def _allocate_evenly(unread_counts: dict[int, int], limit: int) -> dict[int, int]:
+    num_chats = len(unread_counts)
+    per_chat, remainder = divmod(limit, num_chats)
+    return {chat_id: per_chat + (1 if index < remainder else 0) for index, chat_id in enumerate(sorted(unread_counts))}
+
+
+def _allocate_proportionally(
+    unread_counts: dict[int, int], total_unread: int, remaining_budget: int, min_per_chat: int
+) -> dict[int, int]:
+    allocation = {}
     for chat_id, unread_count in unread_counts.items():
         proportion = unread_count / total_unread if total_unread > 0 else 0
         extra = int(proportion * remaining_budget)
         allocation[chat_id] = min_per_chat + min(extra, unread_count - min_per_chat)
+    return allocation
 
+
+def _trim_allocation(allocation: dict[int, int], limit: int, min_per_chat: int) -> dict[int, int]:
     total_allocated = sum(allocation.values())
     if total_allocated > limit:
         overage = total_allocated - limit

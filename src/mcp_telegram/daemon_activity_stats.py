@@ -485,6 +485,33 @@ def _activity_text_links(
     return links_by_msg
 
 
+def _activity_reactions_by_message(
+    conn: sqlite3.Connection,
+    rows: Sequence[tuple[object, ...]],
+) -> dict[tuple[int, int], list[dict]]:
+    reactions_by_msg: dict[tuple[int, int], list[dict]] = {}
+    if not rows:
+        return reactions_by_msg
+
+    rx_params: list[int] = []
+    for row in rows:
+        rx_params.extend([int(cast(int | str, row[0])), int(cast(int | str, row[1]))])
+    rx_placeholders = ",".join("(?,?)" for _ in rows)
+    reaction_rows = cast(
+        list[tuple[object, object, object, object]],
+        conn.execute(
+            f"SELECT dialog_id, message_id, emoji, count FROM message_reactions "
+            f"WHERE (dialog_id, message_id) IN (VALUES {rx_placeholders}) "
+            "ORDER BY count DESC",
+            rx_params,
+        ).fetchall(),
+    )
+    for reaction in reaction_rows:
+        key = (int(cast(int | str, reaction[0])), int(cast(int | str, reaction[1])))
+        reactions_by_msg.setdefault(key, []).append({"emoji": reaction[2], "count": int(cast(int | str, reaction[3]))})
+    return reactions_by_msg
+
+
 def _project_activity_comments(
     rows: Sequence[tuple[object, ...]],
     links_by_msg: dict[tuple[int, int], list[tuple[int, int, str]]],
@@ -633,24 +660,7 @@ class DaemonActivityStatsService:
 
         links_by_msg = _activity_text_links(self._deps.conn, rows)
 
-        reactions_by_msg: dict[tuple[int, int], list[dict]] = {}
-        if rows:
-            rx_params: list[int] = []
-            for row in rows:
-                rx_params.extend([int(cast(int | str, row[0])), int(cast(int | str, row[1]))])
-            rx_placeholders = ",".join("(?,?)" for _ in rows)
-            for rx in cast(
-                list[tuple[object, object, object, object]],
-                self._deps.conn.execute(
-                    f"SELECT dialog_id, message_id, emoji, count FROM message_reactions "
-                    f"WHERE (dialog_id, message_id) IN (VALUES {rx_placeholders}) "
-                    f"ORDER BY count DESC",
-                    rx_params,
-                ).fetchall(),
-            ):
-                reactions_by_msg.setdefault((int(cast(int | str, rx[0])), int(cast(int | str, rx[1]))), []).append(
-                    {"emoji": rx[2], "count": int(cast(int | str, rx[3]))}
-                )
+        reactions_by_msg = _activity_reactions_by_message(self._deps.conn, rows)
 
         comments = _project_activity_comments(rows, links_by_msg, reactions_by_msg)
 

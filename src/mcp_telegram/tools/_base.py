@@ -502,29 +502,38 @@ def _sanitize_tool_schema(value: object) -> object:
     """
     if isinstance(value, dict):
         sanitized = {key: _sanitize_tool_schema(item) for key, item in value.items()}
-
-        any_of = sanitized.get("anyOf")
-        if isinstance(any_of, list):
-            non_null_variants = [item for item in any_of if not (isinstance(item, dict) and item.get("type") == "null")]
-            has_null_variant = len(non_null_variants) != len(any_of)
-            if has_null_variant and len(non_null_variants) == 1:
-                replacement = non_null_variants[0]
-                if not isinstance(replacement, dict):
-                    return replacement
-
-                merged = {key: item for key, item in sanitized.items() if key not in {"anyOf", "default"}}
-                return {**replacement, **merged}
-
-        schema_type = sanitized.get("type")
-        if sanitized.get("default") is None and schema_type != "null":
-            sanitized.pop("default", None)
-
-        return sanitized
+        return _sanitize_schema_dict(sanitized)
 
     if isinstance(value, list):
         return [_sanitize_tool_schema(item) for item in value]
 
     return value
+
+
+def _sanitize_schema_dict(sanitized: dict[object, object]) -> object:
+    has_replacement, replacement = _nullable_schema_replacement(sanitized.get("anyOf"))
+    if has_replacement:
+        if not isinstance(replacement, dict):
+            return replacement
+        merged = {key: item for key, item in sanitized.items() if key not in {"anyOf", "default"}}
+        return {**replacement, **merged}
+    if sanitized.get("default") is None and sanitized.get("type") != "null":
+        sanitized.pop("default", None)
+    return sanitized
+
+
+def _nullable_schema_replacement(any_of: object) -> tuple[bool, object]:
+    if not isinstance(any_of, list):
+        return False, None
+    non_null_variants = [item for item in any_of if not _is_null_schema_variant(item)]
+    has_null_variant = len(non_null_variants) != len(any_of)
+    if has_null_variant and len(non_null_variants) == 1:
+        return True, non_null_variants[0]
+    return False, None
+
+
+def _is_null_schema_variant(item: object) -> bool:
+    return isinstance(item, dict) and item.get("type") == "null"
 
 
 def tool_args(tool: Tool, *args: object, **kwargs: object) -> ToolArgs:

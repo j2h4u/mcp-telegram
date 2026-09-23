@@ -339,30 +339,34 @@ def _decode_optional_navigation_fields(
     int | None,
     int | None,
 ]:
-    topic_id = _optional_int(data, "topic_id")
-    query = _optional_str(data, "query")
-    direction = _optional_direction(data)
-    sent_at = _optional_int(data, "sent_at")
-    message_state = _optional_message_state(data)
-    since_utc = _optional_int(data, "since_utc")
-    until_utc = _optional_int(data, "until_utc")
-    draft_key = _optional_str(data, "draft_key")
-    draft_fingerprint = _optional_str(data, "draft_fingerprint")
-    scheduled_message_id = _optional_int(data, "scheduled_message_id")
-    scheduled_sent_at = _optional_int(data, "scheduled_sent_at")
-
     return (
-        cast(int | None, topic_id),
-        cast(str | None, query),
-        cast(str | None, direction),
-        cast(int | None, sent_at),
-        cast(str | None, message_state),
-        cast(int | None, since_utc),
-        cast(int | None, until_utc),
-        cast(str | None, draft_key),
-        cast(str | None, draft_fingerprint),
-        cast(int | None, scheduled_message_id),
-        cast(int | None, scheduled_sent_at),
+        *_decode_navigation_identity_fields(data),
+        *_decode_navigation_local_fields(data),
+    )
+
+
+def _decode_navigation_identity_fields(
+    data: dict[str, object],
+) -> tuple[int | None, str | None, str | None, int | None, str | None]:
+    return (
+        _optional_int(data, "topic_id"),
+        _optional_str(data, "query"),
+        _optional_direction(data),
+        _optional_int(data, "sent_at"),
+        _optional_message_state(data),
+    )
+
+
+def _decode_navigation_local_fields(
+    data: dict[str, object],
+) -> tuple[int | None, int | None, str | None, str | None, int | None, int | None]:
+    return (
+        _optional_int(data, "since_utc"),
+        _optional_int(data, "until_utc"),
+        _optional_str(data, "draft_key"),
+        _optional_str(data, "draft_fingerprint"),
+        _optional_int(data, "scheduled_message_id"),
+        _optional_int(data, "scheduled_sent_at"),
     )
 
 

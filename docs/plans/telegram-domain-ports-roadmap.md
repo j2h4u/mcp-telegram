@@ -123,9 +123,9 @@ Telethon method and not an MCP tool.
   suspected overlap or prove an acceptance criterion.
 - A refactor removes the superseded path. It does not retain rollback paths,
   compatibility healing, or shadow execution without a current product need.
-- Each slice reduces the legacy complexity it touches. The Radon and CRAP
-  baselines are temporary debt ceilings, not complexity budgets that new code
-  may consume.
+- Each slice reduces the legacy complexity it touches and keeps every function
+  within the fixed Radon CC <= 10 and CRAP <= 30 limits. Coverage informs CRAP;
+  there is no aggregate coverage floor.
 
 ## Current state after the completed program
 
@@ -192,8 +192,8 @@ requests. It delivered these product and architecture outcomes:
   access-loss, and restart behavior for the migrated capabilities.
 - [x] Removed superseded direct paths, including the unused unbounded delta
   implementation and its inert configuration.
-- [x] Tightened structural and complexity ratchets when migrated ownership made
-  old exceptions and debt entries obsolete.
+- [x] Tightened structural gates and kept complexity within policy as migrated
+  ownership made old exceptions obsolete.
 - [x] At acceptance time, each slice passed its release gate, was merged and
   deployed, and received a live MCP runtime smoke. This is the recorded
   completion status through 2026-09-18, not fresh runtime evidence for a
@@ -219,9 +219,9 @@ These are current facts for the panel to evaluate, not a predetermined backlog:
   inbound Telegram events are expected to remain in infrastructure/runtime
   modules; moving them behind application-domain ports may add ceremony
   without product value.
-- The remaining Radon and CRAP baselines include code both inside and outside
-  likely migration candidates. Complexity cleanup remains attached to code
-  that a chosen slice materially changes; it is not a separate cleanup phase.
+- Some functions exceed the fixed Radon and CRAP limits. Complexity cleanup
+  remains attached to code that a chosen slice materially changes; it is not a
+  separate cleanup phase.
 - A service-wide proof that no consumers reacquire the same facts through
   different paths has not been completed. Existing observability should be
   used only for intersections that source and tests cannot resolve.
@@ -251,8 +251,8 @@ runtime evidence, product demand, and remaining complexity.
 - [ ] Decide which current local projections need explicit bundle-level
   observation time and completeness before consumers can safely drop remote
   fallbacks.
-- [ ] Attach each selected slice to the Radon and CRAP entries it will remove
-  or reduce, and reject designs that merely move complexity into wrappers.
+- [ ] Keep each selected slice within the fixed Radon CC <= 10 and CRAP <= 30
+  limits, and reject designs that merely move complexity into wrappers.
 - [ ] Tighten the Telethon-import gate toward the final boundary as a result of
   accepted migrations, rather than as an isolated mass-rewrite objective.
 
@@ -303,8 +303,8 @@ questions, not additional implementation PRs and not cumulative progress boxes.
   domain contract.
 - [ ] The old direct path and obsolete recovery machinery are removed.
 - [ ] The Telethon-import ratchet is unchanged or smaller, never broader.
-- [ ] Touched Radon and CRAP debt is lower, or the unchanged debt has a concrete
-  documented reason; neither ratchet ceiling increases.
+- [ ] Touched Radon and CRAP metrics meet the fixed limits, and complexity is
+  reduced where the selected slice changes an over-limit function.
 - [ ] Complexity was removed rather than displaced into adapters, wrappers, or
   additional orchestration layers.
 - [ ] Targeted contract tests and a real scenario smoke prove the intended
@@ -333,9 +333,8 @@ as constraints when choosing what is valuable now and may leave them open.
   fallback traversal.
 - [ ] Structural checks enforce the final boundary without a brownfield
   application-layer allowlist.
-- [ ] The legacy Radon and CRAP baselines contain no remaining debt entries;
-  the architectural slices removed them without a separate cleanup project or
-  replacement compatibility complexity.
+- [ ] Every production function meets the fixed Radon CC <= 10 and CRAP <= 30
+  limits; architectural slices do not displace complexity into wrappers.
 - [ ] Production telemetry shows no unexplained duplicate acquisition for the
   same fact bundle and observation window.
 - [ ] Slow instrumented MCP calls can be attributed to a measured local,

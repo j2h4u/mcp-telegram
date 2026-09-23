@@ -8,7 +8,7 @@ default:
     @just --list
 
 # Run all local source checks.
-check: fmt-check lint complexity-ratchet lock-check typecheck typecheck-pyright typecheck-tests import-contracts module-boundaries semantic-boundaries message-boundaries telegram-rpc-boundaries config-imports policy-placement demand-cutover runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
+check: fmt-check lint radon-threshold lock-check typecheck typecheck-pyright typecheck-tests import-contracts module-boundaries semantic-boundaries message-boundaries telegram-rpc-boundaries config-imports policy-placement demand-cutover runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
 
 # Verify uv.lock is synchronized with pyproject.toml.
 lock-check:
@@ -18,9 +18,9 @@ lock-check:
 lint:
     uv run ruff check --preview src tests deploy scripts
 
-# Canonical complexity gate: Radon CC with policy cutoff A/B=10.
-complexity-ratchet:
-    uv run python -m devtools.radon_ratchet --src src/mcp_telegram --baseline reports/radon-baseline.json
+# Enforce the repository-wide Radon CC limit of 10.
+radon-threshold:
+    uv run python -m devtools.radon_threshold --src src/mcp_telegram
 
 # Check formatting without writing.
 fmt-check:
@@ -118,9 +118,6 @@ unit:
 deadcode:
     uv run vulture
 
-# CI/regression CRAP gate that checks the tracked baseline.
-crap-check: crap-ratchet
-
 # Build cumulative coverage in two bounded processes.  The full instrumented
 # suite can exhaust memory on GitHub runners even though the uninstrumented
 # suite and both halves pass independently.
@@ -131,32 +128,13 @@ coverage-data:
     uv run pytest "${test_files[@]:0:split}" --cov=src/mcp_telegram --cov-report=; \
     uv run pytest "${test_files[@]:split}" --cov=src/mcp_telegram --cov-append --cov-report=
 
-# Keep JSON serialization out of pytest's memory-heavy processes. The coverage
-# CLI reads the same .coverage data and preserves function regions.
-# Migrate/tighten the tracked CRAP baseline from the current coverage state.
-crap-baseline:
+# Enforce the repository-wide CRAP limit of 30 using per-function coverage.
+crap-threshold:
     coverage_file="$(mktemp /tmp/mcp-telegram-crap-coverage.XXXXXX.json)"; \
     trap 'rm -f "$coverage_file"' EXIT; \
     just coverage-data; \
     uv run coverage json -o "$coverage_file"; \
-    uv run python -m devtools.crap_ratchet --coverage "$coverage_file" --baseline reports/crap-baseline.json --src src/mcp_telegram --threshold 30 --tighten-baseline
-
-# Tighten the tracked CRAP baseline by clamping existing entries downward and adding
-# only new entries that are at/below threshold.
-crap-tighten:
-    coverage_file="$(mktemp /tmp/mcp-telegram-crap-coverage.XXXXXX.json)"; \
-    trap 'rm -f "$coverage_file"' EXIT; \
-    just coverage-data; \
-    uv run coverage json -o "$coverage_file"; \
-    uv run python -m devtools.crap_ratchet --coverage "$coverage_file" --baseline reports/crap-baseline.json --src src/mcp_telegram --threshold 30 --tighten-baseline
-
-# Enforce the CRAP ratchet against the tracked baseline.
-crap-ratchet:
-    coverage_file="$(mktemp /tmp/mcp-telegram-crap-coverage.XXXXXX.json)"; \
-    trap 'rm -f "$coverage_file"' EXIT; \
-    just coverage-data; \
-    uv run coverage json -o "$coverage_file"; \
-    uv run python -m devtools.crap_ratchet --coverage "$coverage_file" --baseline reports/crap-baseline.json --src src/mcp_telegram --threshold 30
+    uv run python -m devtools.crap_threshold --coverage "$coverage_file" --src src/mcp_telegram
 
 # Rebuild and restart the live Docker container.
 runtime-build:
@@ -197,8 +175,8 @@ clean:
       -exec rm -rf {} +
     rm -rf .coverage htmlcov build dist
 
-# Run local checks, CRAP ratchet, rebuild the runtime, and smoke-test live MCP behavior.
-verify: check crap-ratchet runtime-verify
+# Run local checks, CRAP threshold, rebuild the runtime, and smoke-test live MCP behavior.
+verify: check crap-threshold runtime-verify
 
 # Show live Docker container state.
 runtime-status:

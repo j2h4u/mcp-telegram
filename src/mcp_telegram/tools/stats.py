@@ -176,43 +176,67 @@ def format_usage_summary(stats: dict) -> str:
 
     Output: natural-language string, target 60-80 tokens, < 100 hard limit.
     """
-    parts = []
-
-    if stats.get("tool_distribution"):
-        most_used = sorted(stats["tool_distribution"].items(), key=lambda x: x[1], reverse=True)[:2]
-        if most_used:
-            most_used_name, most_used_count = most_used[0]
-            most_used_pct = int(most_used_count * 100 / stats["total_calls"]) if stats["total_calls"] > 0 else 0
-            parts.append(f"Most active: {most_used_name} ({most_used_pct}% of calls)")
-
-    if stats.get("max_page_depth", 0) >= _DEEP_PAGE_DEPTH_THRESHOLD:
-        parts.append(f"Deep scrolling detected: max page depth {stats['max_page_depth']}")
-
-    if stats.get("error_distribution"):
-        errors_str = ", ".join(
-            [
-                f"{err} ({cnt})"
-                for err, cnt in sorted(stats["error_distribution"].items(), key=lambda x: x[1], reverse=True)[:3]
-            ]
+    parts = [
+        summary
+        for summary in (
+            _usage_tool_summary(stats),
+            _usage_depth_summary(stats),
+            _usage_error_summary(stats),
+            _usage_filter_summary(stats),
+            _usage_latency_summary(stats),
         )
-        parts.append(f"Errors: {errors_str}")
+        if summary
+    ]
+    return _truncate_usage_summary(" ".join(parts))
 
-    if stats.get("total_calls", 0) > 0 and stats.get("filter_count", 0) > 0:
-        filter_pct = int(stats["filter_count"] * 100 / stats["total_calls"])
-        parts.append(f"Filtered queries: {filter_pct}%")
 
+def _usage_tool_summary(stats: dict) -> str:
+    distribution = stats.get("tool_distribution")
+    if not distribution:
+        return ""
+    most_used = sorted(distribution.items(), key=lambda item: item[1], reverse=True)[:2]
+    if not most_used:
+        return ""
+    name, count = most_used[0]
+    total_calls = stats["total_calls"]
+    percentage = int(count * 100 / total_calls) if total_calls > 0 else 0
+    return f"Most active: {name} ({percentage}% of calls)"
+
+
+def _usage_depth_summary(stats: dict) -> str:
+    depth = stats.get("max_page_depth", 0)
+    return f"Deep scrolling detected: max page depth {depth}" if depth >= _DEEP_PAGE_DEPTH_THRESHOLD else ""
+
+
+def _usage_error_summary(stats: dict) -> str:
+    distribution = stats.get("error_distribution")
+    if not distribution:
+        return ""
+    errors = ", ".join(
+        f"{error} ({count})"
+        for error, count in sorted(distribution.items(), key=lambda item: item[1], reverse=True)[:3]
+    )
+    return f"Errors: {errors}"
+
+
+def _usage_filter_summary(stats: dict) -> str:
+    total_calls = stats.get("total_calls", 0)
+    filter_count = stats.get("filter_count", 0)
+    if total_calls <= 0 or filter_count <= 0:
+        return ""
+    return f"Filtered queries: {int(filter_count * 100 / total_calls)}%"
+
+
+def _usage_latency_summary(stats: dict) -> str:
     median = stats.get("latency_median_ms", 0)
     p95 = stats.get("latency_p95_ms", 0)
-    if median or p95:
-        parts.append(f"Response time: {median:.0f}ms median, {p95:.0f}ms p95")
+    return f"Response time: {median:.0f}ms median, {p95:.0f}ms p95" if median or p95 else ""
 
-    summary = " ".join(parts)
 
-    # Safety: if summary exceeds 100 tokens, truncate gracefully
+def _truncate_usage_summary(summary: str) -> str:
     tokens = summary.split()
     if len(tokens) > _USAGE_SUMMARY_TOKEN_LIMIT:
-        summary = " ".join(tokens[:_USAGE_SUMMARY_TOKEN_LIMIT]) + "..."
-
+        return " ".join(tokens[:_USAGE_SUMMARY_TOKEN_LIMIT]) + "..."
     return summary
 
 

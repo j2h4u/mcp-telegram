@@ -45,28 +45,31 @@ def test_aggregate_coverage_is_informational_only() -> None:
     assert "just coverage-check" not in workflow
 
 
-def test_crap_remains_the_coverage_informed_gate() -> None:
+def test_fixed_metric_thresholds_and_coverage_informed_crap_gate() -> None:
     pyproject_text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
-    assert re.search(r"(?m)^  crap:\s*$", workflow) is not None
-    assert "run: python3 scripts/ci_pytest_runner.py run -- just crap-check" in workflow
+    assert re.search(r"(?m)^  crap-threshold:\s*$", workflow) is not None
+    assert "run: python3 scripts/ci_pytest_runner.py run -- just crap-threshold" in workflow
     assert workflow.count("needs: changes") == 4
     assert workflow.count("if: needs.changes.outputs.run_heavy == 'true'") == 4
-    assert "needs: [changes, quality, unit, crap, docker-build]" in workflow
-    assert re.search(r"(?m)^crap-ratchet:\s*$", justfile) is not None
-    assert re.search(r"(?m)^crap:\s*$", justfile) is None
+    assert "needs: [changes, quality, unit, crap-threshold, docker-build]" in workflow
+    assert re.search(r"(?m)^radon-threshold:\s*$", justfile) is not None
+    assert re.search(r"(?m)^crap-threshold:\s*$", justfile) is not None
     assert "pytest-crap" not in pyproject_text
     assert "pytest-crap" not in justfile
     assert "--crap" not in justfile
     assert re.search(r"(?m)^coverage-data:\s*$", justfile) is not None
     assert "--cov-append --cov-report=" in justfile
-    assert justfile.count("just coverage-data;") == 3
-    assert justfile.count('uv run coverage json -o "$coverage_file";') == 3
+    assert justfile.count("just coverage-data;") == 1
+    assert justfile.count('uv run coverage json -o "$coverage_file";') == 1
     assert "--cov-report=json:" not in justfile
-    assert "python -m devtools.crap_ratchet" in justfile
-    assert "verify: check crap-ratchet runtime-verify" in justfile
+    assert "python -m devtools.crap_threshold" in justfile
+    assert "python -m devtools.radon_threshold" in justfile
+    assert "verify: check crap-threshold runtime-verify" in justfile
+    assert "--baseline" not in justfile
+    assert "tighten-baseline" not in justfile
 
 
 def test_import_linter_and_tach_are_both_required_static_gates() -> None:

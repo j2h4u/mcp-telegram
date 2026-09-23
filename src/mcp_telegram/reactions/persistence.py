@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import cast
 
 from .contracts import (
@@ -17,6 +18,13 @@ _DELETE_REACTIONS_SQL = "DELETE FROM message_reactions WHERE dialog_id = ? AND m
 _INSERT_REACTION_SQL = (
     "INSERT OR REPLACE INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _AggregateStateKey:
+    dialog_id: int
+    message_id: int
+    generation: int
 
 
 def replace_reaction_aggregates(  # noqa: PLR0913
@@ -103,56 +111,81 @@ def apply_aggregate_observation(  # noqa: PLR0913
     observation_sequence: int | None = None,
 ) -> bool:
     """Persist an aggregate and invalidate detail only for a newer boundary."""
-    if (
-        conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_reaction_aggregate_state'"
-        ).fetchone()
-        is None
-    ):
-        conn.execute(_DELETE_REACTIONS_SQL, (dialog_id, message_id))
-        if aggregates:
-            conn.executemany(
-                _INSERT_REACTION_SQL,
-                [(dialog_id, message_id, aggregate.emoji, aggregate.count) for aggregate in aggregates],
-            )
+    if not _has_aggregate_state_table(conn):
+        _replace_projection(conn, dialog_id, message_id, aggregates)
         return True
     boundary = _boundary_from_values(source, observed_at, observation_sequence, conn)
     try:
-        existing = cast(
-            tuple[object, ...] | None,
-            conn.execute(
-                "SELECT generation, observed_at, source_rank, observation_sequence, source "
-                "FROM message_reaction_aggregate_state WHERE dialog_id = ? AND message_id = ?",
-                (dialog_id, message_id),
-            ).fetchone(),
-        )
+        existing = _load_aggregate_state(conn, dialog_id, message_id)
     except sqlite3.OperationalError as exc:
         if "no such table" not in str(exc).lower():
             raise
         # Small isolated unit fixtures may intentionally model only the legacy
         # projection. Production connections always run migration 68.
-        conn.execute(_DELETE_REACTIONS_SQL, (dialog_id, message_id))
-        if aggregates:
-            conn.executemany(
-                _INSERT_REACTION_SQL,
-                [(dialog_id, message_id, aggregate.emoji, aggregate.count) for aggregate in aggregates],
-            )
+        _replace_projection(conn, dialog_id, message_id, aggregates)
         return True
-    previous_generation = 0
-    if existing is not None:
-        previous_generation = int(cast(int | str, existing[0]))
-        old_boundary = ReactionObservationBoundary(
-            int(cast(int | str, existing[1])),
-            int(cast(int | str, existing[2])),
-            int(cast(int | str, existing[3])),
-            str(existing[4]),
+    generation_info = _accepted_generation(existing, boundary)
+    if generation_info is None:
+        return False
+    previous_generation, generation = generation_info
+    state_key = _AggregateStateKey(dialog_id, message_id, generation)
+    if existing is not None and _projection_matches(conn, dialog_id, message_id, aggregates):
+        _update_identical_observation(
+            conn,
+            _AggregateStateKey(dialog_id, message_id, previous_generation),
+            boundary,
+            aggregates,
         )
-        if boundary <= old_boundary:
-            return False
-        generation = previous_generation + 1
-    else:
-        generation = 1
+        return True
+    _replace_projection(conn, dialog_id, message_id, aggregates)
+    _store_aggregate_state(conn, state_key, boundary, len(aggregates))
+    _finish_detail_for_aggregate(conn, dialog_id, message_id, generation, boundary.observed_at, aggregates)
+    return True
 
+
+def _has_aggregate_state_table(conn: sqlite3.Connection) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_reaction_aggregate_state'"
+        ).fetchone()
+        is not None
+    )
+
+
+def _load_aggregate_state(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> tuple[object, ...] | None:
+    return cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT generation, observed_at, source_rank, observation_sequence, source "
+            "FROM message_reaction_aggregate_state WHERE dialog_id = ? AND message_id = ?",
+            (dialog_id, message_id),
+        ).fetchone(),
+    )
+
+
+def _accepted_generation(
+    existing: tuple[object, ...] | None, boundary: ReactionObservationBoundary
+) -> tuple[int, int] | None:
+    if existing is None:
+        return 0, 1
+    previous_generation = int(cast(int | str, existing[0]))
+    old_boundary = ReactionObservationBoundary(
+        int(cast(int | str, existing[1])),
+        int(cast(int | str, existing[2])),
+        int(cast(int | str, existing[3])),
+        str(existing[4]),
+    )
+    if boundary <= old_boundary:
+        return None
+    return previous_generation, previous_generation + 1
+
+
+def _projection_matches(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    aggregates: Sequence[ReactionAggregate],
+) -> bool:
     current_rows = cast(
         list[tuple[object, ...]],
         conn.execute(
@@ -160,29 +193,57 @@ def apply_aggregate_observation(  # noqa: PLR0913
             (dialog_id, message_id),
         ).fetchall(),
     )
-    observed_rows = sorted((aggregate.emoji, aggregate.count) for aggregate in aggregates)
-    if existing is not None and current_rows == observed_rows:
-        conn.execute(
-            "UPDATE message_reaction_aggregate_state SET observed_at=?, observation_sequence=?, source=?, source_rank=? "
-            "WHERE dialog_id=? AND message_id=?",
-            (
-                boundary.observed_at,
-                boundary.sequence,
-                boundary.source,
-                boundary.source_rank,
-                dialog_id,
-                message_id,
-            ),
-        )
-        _finish_identical_detail(conn, dialog_id, message_id, previous_generation, boundary.observed_at, aggregates)
-        return True
+    return current_rows == sorted((aggregate.emoji, aggregate.count) for aggregate in aggregates)
 
+
+def _update_identical_observation(
+    conn: sqlite3.Connection,
+    state_key: _AggregateStateKey,
+    boundary: ReactionObservationBoundary,
+    aggregates: Sequence[ReactionAggregate],
+) -> None:
+    conn.execute(
+        "UPDATE message_reaction_aggregate_state SET observed_at=?, observation_sequence=?, source=?, source_rank=? "
+        "WHERE dialog_id=? AND message_id=?",
+        (
+            boundary.observed_at,
+            boundary.sequence,
+            boundary.source,
+            boundary.source_rank,
+            state_key.dialog_id,
+            state_key.message_id,
+        ),
+    )
+    _finish_identical_detail(
+        conn,
+        state_key.dialog_id,
+        state_key.message_id,
+        state_key.generation,
+        boundary.observed_at,
+        aggregates,
+    )
+
+
+def _replace_projection(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    aggregates: Sequence[ReactionAggregate],
+) -> None:
     conn.execute(_DELETE_REACTIONS_SQL, (dialog_id, message_id))
     if aggregates:
         conn.executemany(
             _INSERT_REACTION_SQL,
             [(dialog_id, message_id, aggregate.emoji, aggregate.count) for aggregate in aggregates],
         )
+
+
+def _store_aggregate_state(
+    conn: sqlite3.Connection,
+    state_key: _AggregateStateKey,
+    boundary: ReactionObservationBoundary,
+    aggregate_count: int,
+) -> None:
     conn.execute(
         "INSERT INTO message_reaction_aggregate_state "
         "(dialog_id, message_id, generation, observed_at, observation_sequence, source, source_rank, aggregate_row_count) "
@@ -191,18 +252,16 @@ def apply_aggregate_observation(  # noqa: PLR0913
         "observed_at=excluded.observed_at, observation_sequence=excluded.observation_sequence, "
         "source=excluded.source, source_rank=excluded.source_rank, aggregate_row_count=excluded.aggregate_row_count",
         (
-            dialog_id,
-            message_id,
-            generation,
+            state_key.dialog_id,
+            state_key.message_id,
+            state_key.generation,
             boundary.observed_at,
             boundary.sequence,
             boundary.source,
             boundary.source_rank,
-            len(aggregates),
+            aggregate_count,
         ),
     )
-    _finish_detail_for_aggregate(conn, dialog_id, message_id, generation, boundary.observed_at, aggregates)
-    return True
 
 
 def _finish_detail_for_aggregate(  # noqa: PLR0913, PLR0917
