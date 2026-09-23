@@ -39,6 +39,7 @@ class AcquisitionKind(StrEnum):
     TOPIC_LOOKUP = "topic_lookup"
     TOPIC_SNAPSHOT = "topic_snapshot"
     UPDATE_DIFFERENCE = "update_difference"
+    LINKED_CHAT_RESOLUTION = "linked_chat_resolution"
 
 
 @dataclass(slots=True, eq=False)

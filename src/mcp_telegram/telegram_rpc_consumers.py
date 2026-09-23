@@ -46,6 +46,7 @@ class TelegramRpcSource(StrEnum):
     SCHEDULED_MESSAGES = "scheduled_messages"
     DRAFT_SNAPSHOT = "draft_snapshot"
     MAINTENANCE = "maintenance"
+    LINKED_CHAT_REFRESH = "linked_chat_refresh"
 
 
 class DemandKind(StrEnum):
@@ -81,6 +82,7 @@ class DemandKind(StrEnum):
     SCHEDULED_DISCOVERY = "scheduled_discovery"
     DRAFT_SNAPSHOT = "draft_snapshot"
     SELF_PROFILE_MAINTENANCE = "self_profile_maintenance"
+    LINKED_CHAT_REFRESH = "linked_chat_refresh"
 
 
 # Scheduler order is an independent product contract.  Keep this literal: deriving
@@ -107,8 +109,9 @@ DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
     DemandKind.SCHEDULED_REPAIR,
     DemandKind.SCHEDULED_DISCOVERY,
     DemandKind.DRAFT_SNAPSHOT,
+    DemandKind.LINKED_CHAT_REFRESH,
 )
-_EXPECTED_DURABLE_DEMAND_COUNT = 20
+_EXPECTED_DURABLE_DEMAND_COUNT = 21
 
 
 class ExecutionMode(StrEnum):
@@ -552,6 +555,18 @@ _REGISTRY: dict[TelegramRpcSource, TelegramRpcConsumerSpec] = {
         _PRODUCER,
         demand_bound=DemandBound.PRODUCER_BOUNDED,
     ),
+    TelegramRpcSource.LINKED_CHAT_REFRESH: _consumer(
+        "Linked-chat fact refresh",
+        "Refresh one durable discussion-group link fact",
+        _B,
+        TelegramFactDomain.DIALOGS,
+        AcquisitionRole.RECONCILIATION,
+        AcquisitionTrigger.DURABLE_BACKLOG,
+        FanoutScope.DIALOG,
+        _PRODUCER,
+        demand_bound=DemandBound.PRODUCER_BOUNDED,
+        repairs=(TelegramRpcSource.REALTIME_EVENT,),
+    ),
     TelegramRpcSource.DRAFT_SNAPSHOT: _consumer(
         "Draft snapshot",
         "Recover the account-wide current draft projection after an explicit signal",
@@ -761,6 +776,12 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         # is local; GetFullUser is the second and final possible network send.
         max_rpc_attempts_per_slice=2,
     ),
+    DemandKind.LINKED_CHAT_REFRESH: _contract(
+        DemandKind.LINKED_CHAT_REFRESH,
+        TelegramRpcSource.LINKED_CHAT_REFRESH,
+        _DURABLE,
+        max_rpc_attempts_per_slice=1,
+    ),
 }
 
 
@@ -849,13 +870,13 @@ def _validate_contract_coverage(contracts: Mapping[DemandKind, DemandContract]) 
 
 def _validate_durable_order() -> None:
     if not isinstance(DURABLE_DEMAND_ORDER, tuple):
-        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+        raise RuntimeError(f"Durable demand order must contain exactly {_EXPECTED_DURABLE_DEMAND_COUNT} unique kinds")
     if len(DURABLE_DEMAND_ORDER) != _EXPECTED_DURABLE_DEMAND_COUNT:
-        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+        raise RuntimeError(f"Durable demand order must contain exactly {_EXPECTED_DURABLE_DEMAND_COUNT} unique kinds")
     if any(not isinstance(kind, DemandKind) for kind in DURABLE_DEMAND_ORDER):
-        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+        raise RuntimeError(f"Durable demand order must contain exactly {_EXPECTED_DURABLE_DEMAND_COUNT} unique kinds")
     if len(set(DURABLE_DEMAND_ORDER)) != _EXPECTED_DURABLE_DEMAND_COUNT:
-        raise RuntimeError("Durable demand order must contain exactly 20 unique kinds")
+        raise RuntimeError(f"Durable demand order must contain exactly {_EXPECTED_DURABLE_DEMAND_COUNT} unique kinds")
 
 
 def _validate_durable_modes(contracts: Mapping[DemandKind, DemandContract]) -> None:

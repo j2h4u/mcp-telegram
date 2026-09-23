@@ -14,7 +14,8 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 76
+_CURRENT_SCHEMA_VERSION = 77
+_LINKED_CHAT_FACT_DEMAND_MIGRATION = 77
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -4413,6 +4414,32 @@ def _apply_migration_76(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_77(conn: sqlite3.Connection, current: int) -> int:
+    """Retain per-channel linked-chat generations and retry state."""
+    if current >= _LINKED_CHAT_FACT_DEMAND_MIGRATION:
+        return current
+    return _apply_migration(
+        conn,
+        current,
+        _LINKED_CHAT_FACT_DEMAND_MIGRATION,
+        [
+            """CREATE TABLE IF NOT EXISTS linked_chat_fact_state (
+                channel_id INTEGER PRIMARY KEY,
+                generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+                pending_generation INTEGER,
+                requested_at INTEGER,
+                retry_at INTEGER,
+                failure_count INTEGER NOT NULL DEFAULT 0 CHECK(failure_count >= 0),
+                CHECK(pending_generation IS NULL OR pending_generation = generation)
+            ) WITHOUT ROWID""",
+            (
+                "CREATE INDEX IF NOT EXISTS idx_linked_chat_fact_state_due "
+                "ON linked_chat_fact_state(retry_at, channel_id) WHERE pending_generation IS NOT NULL"
+            ),
+        ],
+    )
+
+
 def _apply_migrations_64_to_67(conn: sqlite3.Connection, current: int) -> int:
     """Apply the ordered canonical-directory and folder migrations."""
     if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64:
@@ -4455,7 +4482,10 @@ def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_63(conn, current)
     current = _apply_migrations_64_to_67(conn, current)
     current = _apply_migrations_68_to_71(conn, current)
-    return _apply_migrations_72_to_76(conn, current)
+    current = _apply_migrations_72_to_76(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _LINKED_CHAT_FACT_DEMAND_MIGRATION:
+        current = _apply_migration_77(conn, current)
+    return current
 
 
 def _apply_migrations_68_to_71(conn: sqlite3.Connection, current: int) -> int:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import sqlite3
 import time
@@ -11,6 +12,7 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from telethon.tl.functions.channels import GetFullChannelRequest  # type: ignore[import-untyped]
 
 from account_trace_fixtures import (
     make_channel_signature_evidence,
@@ -877,8 +879,10 @@ async def test_unscoped_trace_paginates_across_excluded_direct_chat(
 
     first = _dict(await trace_service._trace_account_messages({"exact_account_id": 101, "limit": 1}))
     first_data = _dict(first["data"])
-    first_groups = cast(list[dict[str, object]], first_data["groups"])
-    first_evidence = cast(list[dict[str, object]], first_groups[0]["evidence"])
+    first_evidence = cast(
+        list[dict[str, object]],
+        cast(list[dict[str, object]], first_data["groups"])[0]["evidence"],
+    )
     navigation = first_data["next_navigation"]
 
     assert [(item["dialog_id"], item["message_id"]) for item in first_evidence] == [(-100123, 1)]
@@ -888,8 +892,10 @@ async def test_unscoped_trace_paginates_across_excluded_direct_chat(
         await trace_service._trace_account_messages({"exact_account_id": 101, "limit": 1, "navigation": navigation})
     )
     second_data = _dict(second["data"])
-    second_groups = cast(list[dict[str, object]], second_data["groups"])
-    second_evidence = cast(list[dict[str, object]], second_groups[0]["evidence"])
+    second_evidence = cast(
+        list[dict[str, object]],
+        cast(list[dict[str, object]], second_data["groups"])[0]["evidence"],
+    )
 
     assert [(item["dialog_id"], item["message_id"]) for item in second_evidence] == [(-100124, 3)]
     assert second_data["next_navigation"] is None
@@ -1102,6 +1108,29 @@ async def test_trace_zero_hit_resolved_account_returns_observed_zero_gap(
 
 
 @pytest.mark.asyncio
+async def test_trace_defers_unknown_channel_scope_before_pagination(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
+    _server, conn, client = trace_server
+    seed_entity(conn, entity_id=101, name="Me", username="me")
+    seed_dialog(conn, dialog_id=-100123, name="Channel", dialog_type="channel")
+    seed_synced_dialog(conn, dialog_id=-100123)
+    conn.commit()
+
+    result = _dict(
+        await trace_service._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": -100123, "limit": 10})
+    )
+    assert result["error"] == "linked_chat_pending"
+    assert result["retry_at"] is not None
+    assert not [call for call in client.mock_calls if call[0] == "iter_messages"]
+    assert (
+        conn.execute("SELECT pending_generation FROM linked_chat_fact_state WHERE channel_id=-100123").fetchone()[0]
+        is not None
+    )
+
+
+@pytest.mark.asyncio
 async def test_trace_provenance_includes_basis_counts_and_coverage_bounds(
     trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
     trace_service: DaemonAccountTraceService,
@@ -1162,6 +1191,108 @@ async def test_trace_exact_topic_scope_filters_rows(
     assert [item["message_id"] for item in evidence] == [50]
     assert evidence[0]["topic_id"] == 5
     assert evidence[0]["topic_title"] == "Five"
+
+
+@pytest.mark.asyncio
+async def test_trace_linked_topic_pagination_reuses_canonical_scope_without_rpc(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
+    class CountingRpcClient:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        async def __call__(self, request: object) -> object:
+            self.requests.append(request)
+            return SimpleNamespace()
+
+    conn = trace_server[1]
+    rpc_client = CountingRpcClient()
+    service = DaemonAccountTraceService(dataclasses.replace(trace_service._deps, client=rpc_client))
+
+    channel_id = -100123
+    linked_chat_id = -100456
+    seed_entity(conn, entity_id=101, name="Me", username="me")
+    seed_dialog(conn, dialog_id=channel_id, name="Channel", dialog_type="Channel")
+    seed_dialog(conn, dialog_id=linked_chat_id, name="Discussion", dialog_type="Forum")
+    conn.execute(
+        "UPDATE dialogs SET linked_chat_id=?, linked_chat_resolved_at=? WHERE dialog_id=?",
+        (linked_chat_id, 1_700_000_000, channel_id),
+    )
+    seed_synced_dialog(conn, dialog_id=channel_id)
+    seed_synced_dialog(conn, dialog_id=linked_chat_id)
+    seed_topic(conn, dialog_id=linked_chat_id, topic_id=7, title="Reports")
+    seed_message(
+        conn,
+        dialog_id=linked_chat_id,
+        message_id=2,
+        sent_at=1_700_000_002,
+        sender_id=101,
+        forum_topic_id=7,
+    )
+    seed_message(
+        conn,
+        dialog_id=linked_chat_id,
+        message_id=1,
+        sent_at=1_700_000_001,
+        sender_id=101,
+        forum_topic_id=7,
+    )
+    conn.commit()
+
+    first = _dict(
+        await service._trace_account_messages(
+            {
+                "exact_account_id": 101,
+                "exact_dialog_id": channel_id,
+                "exact_topic_id": 7,
+                "limit": 1,
+            }
+        )
+    )
+    first_data = _dict(first["data"])
+    first_evidence = cast(
+        list[dict[str, object]],
+        cast(list[dict[str, object]], first_data["groups"])[0]["evidence"],
+    )
+    navigation = first_data["next_navigation"]
+    assert [item["message_id"] for item in first_evidence] == [2]
+    assert first_evidence[0]["dialog_id"] == linked_chat_id
+    assert first_evidence[0]["topic_id"] == 7
+    assert isinstance(navigation, str)
+    decoded = decode_account_trace_navigation(
+        navigation,
+        AccountTraceNavigationContext(
+            expected_target_user_id=101,
+            expected_group_by="timeline",
+            expected_view="messages",
+            expected_exact_dialog_id=channel_id,
+            expected_exact_topic_id=7,
+        ),
+    )
+    assert decoded.scope_dialog_ids == [channel_id, linked_chat_id]
+
+    second = _dict(
+        await service._trace_account_messages(
+            {
+                "exact_account_id": 101,
+                "exact_dialog_id": channel_id,
+                "exact_topic_id": 7,
+                "limit": 1,
+                "navigation": navigation,
+            }
+        )
+    )
+    second_data = _dict(second["data"])
+    second_evidence = cast(
+        list[dict[str, object]],
+        cast(list[dict[str, object]], second_data["groups"])[0]["evidence"],
+    )
+    assert [item["message_id"] for item in second_evidence] == [1]
+    assert second_evidence[0]["dialog_id"] == linked_chat_id
+    assert second_evidence[0]["topic_id"] == 7
+    assert second_data["next_navigation"] is None
+    assert [request for request in rpc_client.requests if isinstance(request, GetFullChannelRequest)] == []
 
 
 @pytest.mark.asyncio

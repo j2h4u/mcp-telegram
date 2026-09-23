@@ -262,6 +262,7 @@ async def test_get_entity_info_channel_type() -> None:
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001})
     assert r["ok"] is True, f"got {r}"
     assert _dict(r["data"])["type"] == "channel"
+    assert _dict(r["data"])["linked_chat_id"] is None
 
 
 @pytest.mark.asyncio

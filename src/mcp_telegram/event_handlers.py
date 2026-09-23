@@ -23,7 +23,7 @@ import logging
 import sqlite3
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import wraps
@@ -65,7 +65,11 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .access_lifecycle import AccessLossEvidence, set_access_lost, unhide_after_realtime_presence
-from .activity_contracts import InputPeerResolver
+from .channel_full_siblings import (
+    ChannelFullSiblingsToken,
+    capture_channel_full_siblings_token,
+    write_channel_full_siblings,
+)
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import (
     IDENTITY_OMITTED,
@@ -83,6 +87,7 @@ from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .history_enrollment import EnrollmentOutcome, ensure_automatic_dm_enrollment
 from .hydration_queue import HydrationPriority
 from .identity_observation import USERNAME_UNOBSERVED, observe_username
+from .linked_chat_fact import LinkedChatWork, linked_chat_fact_owner
 from .messages.sqlite_bundle import (
     find_unique_incoming_human_dm_dialogs,
     insert_messages_with_fts,
@@ -125,8 +130,10 @@ from .scheduled_messages import (
     upsert_scheduled_message,
     verify_scheduled_publication,
 )
+from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import (
     AcquisitionKind,
+    RpcAttemptBudget,
     UnclassifiedTelegramDemandError,
     acquisition_context,
     current_demand_token,
@@ -510,7 +517,7 @@ class _EventHandlerClient(Protocol):
 
     async def get_me(self) -> object: ...
 
-    async def __call__(self, _request: object) -> object: ...
+    def __call__(self, _request: object) -> Coroutine[object, object, object]: ...
 
 
 class _RealtimeHistoryStatusReader(Protocol):
@@ -636,14 +643,12 @@ class EventHandlerManager:
         client: _EventHandlerClient,
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
-        input_peer_resolver: InputPeerResolver,
         update_barrier: UpdateProcessingBarrier | None = None,
     ) -> None:
         self._client = client
         self._conn = conn
         self._shutdown_event = shutdown_event
         self._update_barrier = update_barrier
-        self._input_peer_resolver = input_peer_resolver
         self._shutdown_event.is_set()
         self._synced_dialog_ids: set[int] = set()
         self._realtime_history_status: _RealtimeHistoryStatusReader = _SQLiteRealtimeHistoryStatusReader(conn)
@@ -2128,9 +2133,8 @@ class EventHandlerManager:
     async def on_raw_channel_chat_update(self, update: _ChannelChatUpdateLike | _ChatUpdateLike) -> None:
         """Phase 42 EVENTS-03: UpdateChannel / UpdateChat → dialogs.needs_refresh=1.
 
-        Phase 54 EVENTS-03 extension: UpdateChannel for a broadcast channel with
-        linked_chat_resolved_at IS NOT NULL also triggers one GetFullChannelRequest
-        to refresh dialogs.linked_chat_id (D-10, D-11, D-12).
+        UpdateChannel for an already-resolved broadcast channel records durable
+        linked-chat refresh demand; the shared owner performs the bounded RPC.
 
         Gated on _synced_dialog_ids; UPDATE-only.
         """
@@ -2141,7 +2145,11 @@ class EventHandlerManager:
             if dialog_id not in self._synced_dialog_ids:
                 return
             now = int(time.time())
-            changed, row = self._mark_channel_chat_update(dialog_id, now=now)
+            changed, row = self._mark_channel_chat_update(
+                dialog_id,
+                now=now,
+                invalidate_linked_chat=isinstance(update, UpdateChannel),
+            )
             if changed:
                 self._offer(DemandKind.DIALOG_LIGHT_RECONCILIATION)
             logger.info("event_channel_chat_dirty dialog_id=%d", dialog_id)
@@ -2154,19 +2162,16 @@ class EventHandlerManager:
             )
             return
 
-        # D-10 / D-11: refresh linked_chat_id ONLY for UpdateChannel on a channel
-        # that has been resolved at least once. Never-resolved channels belong to the
-        # sweep's cold path (D-11) — we must not amplify bursts into resolution storms.
-        # This await is deliberately OUTSIDE the with self._conn: block above to avoid
-        # holding a write transaction open across an async round-trip.
+        # Only previously resolved broadcast channels enter the refresh queue.
         if _should_refresh_linked_chat_id(update, row):
-            await self._refresh_linked_chat_id(dialog_id)
+            self._offer(DemandKind.LINKED_CHAT_REFRESH)
 
     def _mark_channel_chat_update(
         self,
         dialog_id: int,
         *,
         now: int,
+        invalidate_linked_chat: bool = False,
     ) -> tuple[int, tuple[str | None, int | None] | None]:
         with self._conn:
             changed = self._conn.execute(_UPDATE_DIALOG_NEEDS_REFRESH_SQL, (now, dialog_id)).rowcount
@@ -2177,67 +2182,142 @@ class EventHandlerManager:
                     (dialog_id,),
                 ).fetchone(),
             )
+            if invalidate_linked_chat and row is not None and row[0] == "channel" and row[1] is not None:
+                linked_chat_fact_owner.invalidate_from_update(self._conn, dialog_id, now)
         return changed, row
 
-    async def _refresh_linked_chat_id(self, dialog_id: int) -> None:
-        """Phase 54: event-driven linked_chat_id refresh for a previously-resolved channel.
+    async def retry_one_pending_linked_chat_fact(self, budget: RpcAttemptBudget) -> bool:
+        """Acquire and publish one due linked-chat fact in this adapter task."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        now = int(time.time())
+        # next_due performs a bounded self-heal UPDATE. End its write transaction
+        # before peer resolution or the first asynchronous Telegram RPC.
+        with self._conn:
+            work = linked_chat_fact_owner.next_due(self._conn, now)
+        if work is None:
+            return False
+        with self._conn:
+            generation = linked_chat_fact_owner.capture_generation(self._conn, work.channel_id)
+            siblings_token = capture_channel_full_siblings_token(self._conn, work.channel_id)
+        return await self._acquire_linked_chat_work(work, generation, siblings_token, now)
 
-        Issues exactly one GetFullChannelRequest and UPSERTs linked_chat_id +
-        linked_chat_resolved_at into dialogs. FloodWait is swallowed without
-        writing — the unchanged resolved_at acts as the retry signal for the
-        next sweep cycle or UpdateChannel event.
-        """
-        from telethon.tl.functions.channels import GetFullChannelRequest  # type: ignore[import-untyped]
-        from telethon.tl.types import PeerChannel as _PeerChannel  # type: ignore[import-untyped]
-        from telethon.utils import get_peer_id as _get_peer_id  # type: ignore[import-untyped]
-
-        input_channel = cast(
-            TypeInputChannel | None,
-            await self._input_peer_resolver(dialog_id),
-        )
+    async def _acquire_linked_chat_work(
+        self,
+        work: LinkedChatWork,
+        generation: int,
+        siblings_token: ChannelFullSiblingsToken,
+        now: int,
+    ) -> bool:
+        """Run local peer resolution, one RPC, then publish the accepted observation."""
+        channel_id = work.channel_id
+        input_channel = linked_chat_fact_owner.resolve_cached_input_peer(self._client, channel_id)
         if input_channel is None:
-            logger.debug("event_linked_chat_refresh_no_input_peer dialog_id=%d", dialog_id)
-            return
+            self._defer_linked_chat_work(work, now)
+            logger.debug("linked_chat_refresh_no_input_peer dialog_id=%d", channel_id)
+            return True
 
+        full_result = await self._request_linked_chat_full(work, input_channel, now)
+        if full_result is None:
+            return True
+        return self._publish_linked_chat_observation(work, generation, siblings_token, full_result, now)
+
+    async def _request_linked_chat_full(
+        self,
+        work: LinkedChatWork,
+        input_channel: TypeInputChannel,
+        now: int,
+    ) -> object | None:
+        """Acquire one full-channel result and persist recoverable failure state."""
+        channel_id = work.channel_id
         try:
-            full_result = await self._client(GetFullChannelRequest(channel=input_channel))
+            return await linked_chat_fact_owner.acquire(self._client, input_channel)
         except TelegramRpcThrottled as exc:
             logger.warning(
-                "event_linked_chat_refresh_flood dialog_id=%d flood_wait_seconds=%s",
-                dialog_id,
+                "linked_chat_refresh_flood dialog_id=%d flood_wait_seconds=%s",
+                channel_id,
                 exc.retry_after_seconds,
             )
-            return
+            self._defer_linked_chat_work(work, now, flood_wait_seconds=exc.retry_after_seconds)
+            if exc.latched:
+                raise
+            return None
         except RpcAdmissionClosedError:
+            self._defer_linked_chat_work(work, now)
             raise
+        except ACCESS_LOST_ERRORS as exc:
+            self._mark_linked_chat_access_lost(channel_id, now, exc)
+            return None
         except Exception:
-            logger.debug("event_linked_chat_refresh_failed dialog_id=%d", dialog_id, exc_info=True)
-            return
+            logger.debug("linked_chat_refresh_failed dialog_id=%d", channel_id, exc_info=True)
+            self._defer_linked_chat_work(work, now)
+            return None
 
-        full_chat = getattr(full_result, "full_chat", None)
-        raw = cast(int | None, getattr(full_chat, "linked_chat_id", None))
-        normalised: int | None = None
-        if raw is not None:
-            if raw > 0:
-                normalised = int(cast(int, _get_peer_id(_PeerChannel(raw))))
-            else:
-                normalised = int(raw)
-
-        now = int(time.time())
+    def _publish_linked_chat_observation(
+        self,
+        work: LinkedChatWork,
+        generation: int,
+        siblings_token: ChannelFullSiblingsToken,
+        full_result: object,
+        now: int,
+    ) -> bool:
+        """Validate and atomically publish canonical and sibling facts."""
+        channel_id = work.channel_id
+        try:
+            validated_link = linked_chat_fact_owner.validate_observation(full_result, channel_id)
+        except ValueError:
+            self._defer_linked_chat_work(work, now)
+            logger.debug("linked_chat_refresh_invalid_observation dialog_id=%d", channel_id)
+            return True
         with self._conn:
-            self._conn.execute(
-                "INSERT INTO dialogs (dialog_id, linked_chat_id, linked_chat_resolved_at) "
-                "VALUES (?, ?, ?) "
-                "ON CONFLICT(dialog_id) DO UPDATE SET "
-                "    linked_chat_id = excluded.linked_chat_id, "
-                "    linked_chat_resolved_at = excluded.linked_chat_resolved_at",
-                (dialog_id, normalised, now),
+            published = linked_chat_fact_owner.publish(
+                self._conn,
+                channel_id,
+                generation,
+                validated_link,
+                now,
             )
+            if published:
+                write_channel_full_siblings(
+                    self._conn,
+                    channel_id,
+                    full_result,
+                    siblings_token,
+                    observed_at=now,
+                )
+        if published:
+            self._offer(DemandKind.SCHEDULED_DISCOVERY)
+            if validated_link is not None and validated_link != 0:
+                self._offer(DemandKind.COLD_PEER_PAGE)
         logger.info(
-            "event_linked_chat_refresh dialog_id=%d linked_chat_id=%r",
-            dialog_id,
-            normalised,
+            "linked_chat_refresh dialog_id=%d published=%s",
+            channel_id,
+            published,
         )
+        return True
+
+    def _defer_linked_chat_work(
+        self,
+        work: LinkedChatWork,
+        now: int,
+        *,
+        flood_wait_seconds: int | None = None,
+    ) -> None:
+        with self._conn:
+            retry_at = linked_chat_fact_owner.retry_at_for_failure(
+                self._conn,
+                work,
+                now,
+                flood_wait_seconds=flood_wait_seconds,
+            )
+            linked_chat_fact_owner.defer(self._conn, work, retry_at)
+
+    def _mark_linked_chat_access_lost(self, channel_id: int, now: int, error: Exception) -> None:
+        with self._conn:
+            changed = set_access_lost(self._conn, channel_id, now, reason=type(error).__name__)
+        if changed:
+            self._synced_dialog_ids.discard(channel_id)
+            self._offer(DemandKind.DELTA_ACCESS_PROBE)
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_inbox_read(self, update: _InboxReadUpdateLike | _ChannelInboxReadUpdateLike) -> None:

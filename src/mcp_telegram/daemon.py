@@ -57,9 +57,6 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 
 from . import daemon_shutdown
 from .activity_cold_backfill import ColdBackfillPacing
-from .activity_contracts import InputPeerResolver
-from .activity_peer_resolve import resolve_input_peer
-from .activity_substrate import ActivityClient
 from .auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from .config import McpTelegramConfig, SchedulingConfig, load_config, resolve_scheduling_config
 from .daemon_api import DaemonApiPolicy, DaemonAPIServer, DaemonClientLike, DaemonHealthStatus
@@ -245,9 +242,11 @@ class _DaemonClient(Protocol):
 
     def set_rpc_admission_observer(self, observer: AdmissionObserver | None) -> None: ...
 
+    def set_rpc_request_observer(self, observer: Callable[..., None] | None) -> None: ...
+
     async def get_me(self) -> object: ...
 
-    async def get_input_entity(self, _dialog_id: int) -> object: ...
+    async def get_input_entity(self, dialog_id: int, /) -> object: ...
 
     async def get_entity(self, _dialog_id: int) -> object: ...
 
@@ -1242,6 +1241,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
                 fatal_callback=partial(_mark_rpc_scheduler_failed, ctx, rpc_scheduler_failure),
             )
         )
+        client.set_rpc_request_observer(rpc_admission_observer.observe_request_attempt)
     return ctx
 
 
@@ -1559,7 +1559,6 @@ def _build_demand_runtime(
     def publish_startup_identity(profile: object, own_only_context: OwnOnlyContext) -> None:
         _publish_startup_identity(ctx, profile, own_only_context)
         scheduled_reconciler._own_only_context = own_only_context
-        scheduled_reconciler._resolved_context = own_only_context
 
     draft_owner = ctx.draft_owner
     if draft_owner is None:
@@ -1595,6 +1594,7 @@ def _build_demand_runtime(
             user_profile_port=ctx.user_profile_port,
             publish_startup_identity=publish_startup_identity,
             draft_owner=draft_owner,
+            linked_chat_fact_refresh_port=ctx.handler_manager,
             startup_detail_setter=lambda detail: setattr(ctx.api_server, "startup_detail", detail),
         )
         coordinator = build_durable_coordinator(dependencies, observer=ctx.rpc_admission_observer)
@@ -1762,6 +1762,7 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
 
     async def detach_observer() -> None:
         ctx.client.set_rpc_admission_observer(None)
+        ctx.client.set_rpc_request_observer(None)
 
     async def drain_telemetry() -> None:
         if ctx.rpc_admission_observer is not None:
@@ -1823,12 +1824,10 @@ async def sync_main() -> None:
             observe=partial(_observe_runtime, ctx),
         )
         ctx.draft_owner.register()
-        input_peer_resolver = cast(InputPeerResolver, partial(resolve_input_peer, cast(ActivityClient, ctx.client)))
         ctx.handler_manager = EventHandlerManager(
             ctx.client,
             ctx.conn,
             ctx.shutdown_event,
-            input_peer_resolver,
             update_barrier=update_barrier,
         )
         ctx.handler_manager.register()

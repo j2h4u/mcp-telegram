@@ -12,8 +12,9 @@ This module provides:
     coordinator-owned execution.
   - _load_dialog_state / _save_dialog_state: per-tier cursor helpers.
 
-Phase 54: linked_chat_id resolution is dialogs-cache-trust; no per-channel
-backoff helpers — see activity_peer_resolve.resolve_linked_chat_id.
+Broadcast-channel discussion links are read from the canonical fact owner.
+Unknown facts advance the scan cursor while durable refresh demand runs; known
+links missing from the activity projection are enrolled before the next scan.
 
 No scheduling loops live here — those are plans 03 and 04.
 """
@@ -35,13 +36,14 @@ from .activity_peer_resolve import resolve_input_peer, resolve_linked_chat_id
 from .activity_substrate import ActivityClient, call_with_timeout
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
+from .linked_chat_fact import LinkedChatState
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_bundle import insert_messages_with_fts, message_exists
 from .messages.telegram_adapter import extract_dialog_id, extract_message_row
 from .own_only import enroll_own_only_sync_dialog
 from .telegram_access import ACCESS_LOST_ERRORS
-from .telegram_demand import AcquisitionKind, RpcAttemptBudgetExhaustedError, acquisition_context
-from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
+from .telegram_demand import RpcAttemptBudgetExhaustedError
+from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource
 
 logger = logging.getLogger(__name__)
 
@@ -679,6 +681,20 @@ def _has_working_set_enrollment_candidate(conn: sqlite3.Connection) -> bool:
     return candidate is not None
 
 
+def _next_linked_chat_projection_lag(conn: sqlite3.Connection) -> tuple[int, int, int | None] | None:
+    return cast(
+        tuple[int, int, int | None] | None,
+        conn.execute(
+            "SELECT channel.dialog_id, channel.linked_chat_id, channel.last_message_at "
+            "FROM dialogs AS channel "
+            "WHERE channel.type='channel' AND channel.hidden=0 AND channel.linked_chat_id IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM activity_dialog_state AS activity "
+            "WHERE activity.dialog_id=channel.linked_chat_id) "
+            "ORDER BY channel.dialog_id LIMIT 1"
+        ).fetchone(),
+    )
+
+
 def working_set_enrollment_release_at(
     conn: sqlite3.Connection,
     *,
@@ -687,6 +703,8 @@ def working_set_enrollment_release_at(
 ) -> float | None:
     """Return the restart-safe release for the next enrollment unit."""
     _validate_working_set_enrollment_timing(now, cadence_s)
+    if _next_linked_chat_projection_lag(conn) is not None:
+        return 0.0
     state = _load_working_set_enrollment_state(conn)
     if state.get(_ENROLLMENT_PHASE_KEY) is not None:
         return float(int(state.get(_ENROLLMENT_NEXT_ATTEMPT_AT_KEY) or 0))
@@ -717,24 +735,35 @@ def _set_working_set_enrollment_position(
     retry_at: int | None = None,
 ) -> None:
     with conn:
+        _write_working_set_enrollment_position(conn, phase=phase, cursor=cursor, retry_at=retry_at)
+
+
+def _write_working_set_enrollment_position(
+    conn: sqlite3.Connection,
+    *,
+    phase: str,
+    cursor: int | None,
+    retry_at: int | None = None,
+) -> None:
+    """Write enrollment state without acquiring or committing a transaction."""
+    conn.execute(
+        "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
+        (_ENROLLMENT_PHASE_KEY, phase),
+    )
+    if cursor is None:
+        conn.execute("DELETE FROM activity_sync_state WHERE key = ?", (_ENROLLMENT_CURSOR_KEY,))
+    else:
         conn.execute(
             "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
-            (_ENROLLMENT_PHASE_KEY, phase),
+            (_ENROLLMENT_CURSOR_KEY, str(cursor)),
         )
-        if cursor is None:
-            conn.execute("DELETE FROM activity_sync_state WHERE key = ?", (_ENROLLMENT_CURSOR_KEY,))
-        else:
-            conn.execute(
-                "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
-                (_ENROLLMENT_CURSOR_KEY, str(cursor)),
-            )
-        if retry_at is None:
-            conn.execute("DELETE FROM activity_sync_state WHERE key = ?", (_ENROLLMENT_NEXT_ATTEMPT_AT_KEY,))
-        else:
-            conn.execute(
-                "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
-                (_ENROLLMENT_NEXT_ATTEMPT_AT_KEY, str(retry_at)),
-            )
+    if retry_at is None:
+        conn.execute("DELETE FROM activity_sync_state WHERE key = ?", (_ENROLLMENT_NEXT_ATTEMPT_AT_KEY,))
+    else:
+        conn.execute(
+            "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
+            (_ENROLLMENT_NEXT_ATTEMPT_AT_KEY, str(retry_at)),
+        )
 
 
 def _finish_working_set_enrollment(conn: sqlite3.Connection, *, completed_at: int) -> None:
@@ -819,38 +848,39 @@ async def _enroll_channel_slice(
         return WorkingSetEnrollmentSliceResult(completed=True, consumed=True)
 
     channel_id, last_activity_at = row
-    try:
-        with acquisition_context(AcquisitionKind.DIALOG_TRAVERSAL):
-            with rpc_scope(request.source, timeout_seconds=request.timeout_s):
-                resolution = await resolve_linked_chat_id(
-                    request.client,
-                    request.conn,
-                    channel_id,
-                    timeout_s=request.timeout_s,
-                )
-    except RpcAttemptBudgetExhaustedError:
-        return WorkingSetEnrollmentSliceResult(consumed=True)
+    resolution = await resolve_linked_chat_id(
+        request.client,
+        request.conn,
+        channel_id,
+        timeout_s=request.timeout_s,
+    )
 
-    if resolution.flood_wait_seconds is not None:
+    if resolution.state is LinkedChatState.UNKNOWN:
         _set_working_set_enrollment_position(
             request.conn,
             phase=_ENROLLMENT_CHANNELS,
-            cursor=request.cursor,
-            retry_at=request.now + resolution.flood_wait_seconds,
+            cursor=channel_id,
         )
-        return WorkingSetEnrollmentSliceResult(flood_wait_seconds=resolution.flood_wait_seconds, consumed=True)
-    if resolution.linked_chat_id is not None:
+        return WorkingSetEnrollmentSliceResult(consumed=True)
+    if resolution.state is LinkedChatState.KNOWN_LINK:
+        assert resolution.linked_chat_id is not None
+        _set_working_set_enrollment_position(
+            request.conn,
+            phase=_ENROLLMENT_CHANNELS,
+            cursor=channel_id,
+        )
         enroll_activity_dialog(
             request.conn,
             resolution.linked_chat_id,
             "linked_chat",
             last_activity_at=last_activity_at,
         )
-    _set_working_set_enrollment_position(
-        request.conn,
-        phase=_ENROLLMENT_CHANNELS,
-        cursor=channel_id,
-    )
+    else:
+        _set_working_set_enrollment_position(
+            request.conn,
+            phase=_ENROLLMENT_CHANNELS,
+            cursor=channel_id,
+        )
     return WorkingSetEnrollmentSliceResult(consumed=True)
 
 
@@ -868,6 +898,12 @@ async def run_working_set_enrollment_slice(  # noqa: PLR0913 - explicit bounded 
     release_at = working_set_enrollment_release_at(conn, now=float(at), cadence_s=cadence_s)
     if release_at is None or release_at > at:
         return WorkingSetEnrollmentSliceResult()
+
+    linked_chat_lag = _next_linked_chat_projection_lag(conn)
+    if linked_chat_lag is not None:
+        _channel_id, linked_chat_id, last_activity_at = linked_chat_lag
+        enroll_activity_dialog(conn, linked_chat_id, "linked_chat", last_activity_at=last_activity_at)
+        return WorkingSetEnrollmentSliceResult(consumed=True)
 
     position = _load_or_start_working_set_enrollment(conn)
     if position.phase == _ENROLLMENT_SUPERGROUPS:

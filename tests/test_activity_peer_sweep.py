@@ -27,9 +27,13 @@ from mcp_telegram.activity_peer_sweep import (
     _load_dialog_state,
     _save_dialog_state,
     enroll_activity_dialog,
+    run_working_set_enrollment_slice,
     sweep_peer_once,
+    working_set_enrollment_release_at,
 )
+from mcp_telegram.linked_chat_fact import LinkedChatState, linked_chat_fact_owner
 from mcp_telegram.sync_db import _apply_migrations
+from mcp_telegram.telegram_rpc_scheduler import TelegramRpcSource
 
 _TEST_TIMEOUT_S = 120.0
 
@@ -65,6 +69,154 @@ class _FakeSweepMessage:
 class _FakeSweepResult:
     def __init__(self, messages: object) -> None:
         self.messages = messages
+
+
+@pytest.mark.asyncio
+async def test_channel_enrollment_holds_cursor_for_unknown_then_resumes_after_publication() -> None:
+    with closing(_make_db()) as conn:
+        now = int(time.time())
+        first, pending = -100200, -100100
+        conn.executemany(
+            "INSERT INTO dialogs(dialog_id,type,hidden,last_message_at) VALUES(?, 'channel', 0, 100)",
+            [(first,), (pending,)],
+        )
+        with conn:
+            generation = linked_chat_fact_owner.capture_generation(conn, first)
+            assert linked_chat_fact_owner.publish(conn, first, generation, None, now)
+
+        client = _FakeClient()
+        first_result = await run_working_set_enrollment_slice(
+            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now
+        )
+        assert first_result.consumed
+        assert conn.execute(
+            "SELECT value FROM activity_sync_state WHERE key='activity_working_set_cursor'"
+        ).fetchone() == (str(first),)
+
+        pending_result = await run_working_set_enrollment_slice(
+            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now
+        )
+        assert pending_result.consumed
+        state = dict(conn.execute("SELECT key,value FROM activity_sync_state"))
+        assert state["activity_working_set_cursor"] == str(pending)
+        assert "activity_working_set_retry_at" not in state
+        assert linked_chat_fact_owner.read_fact(conn, pending).state is LinkedChatState.UNKNOWN
+
+        with conn:
+            generation = linked_chat_fact_owner.capture_generation(conn, pending)
+            assert linked_chat_fact_owner.publish(conn, pending, generation, 300, now + 1)
+        resumed = await run_working_set_enrollment_slice(
+            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now + 2
+        )
+        assert resumed.consumed
+        assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=-1000000000300").fetchone() is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("access_lost", [False, True])
+async def test_projection_lag_enrolls_published_link_after_completed_scan(access_lost: bool) -> None:
+    with closing(_make_db()) as conn:
+        now = int(time.time())
+        channel_a, channel_b = -100300, -100200
+        conn.executemany(
+            "INSERT INTO dialogs(dialog_id,type,hidden,last_message_at) VALUES(?, 'channel', 0, 100)",
+            [(channel_a,), (channel_b,)],
+        )
+        if access_lost:
+            conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(?,'access_lost')", (channel_a,))
+        client = _FakeClient()
+        unresolved = await run_working_set_enrollment_slice(
+            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now
+        )
+        assert unresolved.consumed
+        assert conn.execute(
+            "SELECT value FROM activity_sync_state WHERE key='activity_working_set_cursor'"
+        ).fetchone() == (str(channel_a),)
+        assert "activity_working_set_retry_at" not in dict(conn.execute("SELECT key,value FROM activity_sync_state"))
+        fact_a = linked_chat_fact_owner.read_fact(conn, channel_a)
+        assert fact_a.state is LinkedChatState.UNKNOWN
+        assert fact_a.suspended is access_lost
+
+        with conn:
+            generation_b = linked_chat_fact_owner.capture_generation(conn, channel_b)
+            assert linked_chat_fact_owner.publish(conn, channel_b, generation_b, 300, now)
+        linked_b = await run_working_set_enrollment_slice(
+            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now
+        )
+        assert linked_b.consumed
+        assert conn.execute("SELECT source FROM activity_dialog_state WHERE dialog_id=-1000000000300").fetchone() == (
+            "linked_chat",
+        )
+        scanned_b = await run_working_set_enrollment_slice(
+            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now
+        )
+        assert scanned_b.consumed
+        completed = await run_working_set_enrollment_slice(
+            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now
+        )
+        assert completed.completed
+        assert conn.execute(
+            "SELECT value FROM activity_sync_state WHERE key='activity_working_set_completed_at'"
+        ).fetchone() == (str(now),)
+
+        with conn:
+            conn.execute("UPDATE synced_dialogs SET status='synced' WHERE dialog_id=?", (channel_a,))
+            generation_a = linked_chat_fact_owner.capture_generation(conn, channel_a)
+            assert linked_chat_fact_owner.publish(conn, channel_a, generation_a, 400, now + 1)
+        assert working_set_enrollment_release_at(conn, now=now + 1, cadence_s=60) == 0
+
+        linked_a = await run_working_set_enrollment_slice(
+            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now + 2
+        )
+        assert linked_a.consumed
+        assert conn.execute("SELECT source FROM activity_dialog_state WHERE dialog_id=-1000000000400").fetchone() == (
+            "linked_chat",
+        )
+        await run_working_set_enrollment_slice(
+            client, conn, source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL, cadence_s=60, timeout_s=1, now=now + 3
+        )
+        completed_at_row = cast(
+            tuple[str] | None,
+            conn.execute(
+                "SELECT value FROM activity_sync_state WHERE key='activity_working_set_completed_at'"
+            ).fetchone(),
+        )
+        assert completed_at_row is not None
+        completed_at = float(completed_at_row[0])
+        assert working_set_enrollment_release_at(conn, now=now + 4, cadence_s=60) == completed_at + 60
+        with conn:
+            generation_a = linked_chat_fact_owner.capture_generation(conn, channel_a)
+            assert linked_chat_fact_owner.publish(conn, channel_a, generation_a, 400, now + 4)
+
+
+@pytest.mark.asyncio
+async def test_existing_activity_projection_prevents_linked_chat_lag_and_preserves_source() -> None:
+    with closing(_make_db()) as conn:
+        now = int(time.time())
+        channel_id, peer_id = -100500, -1000000000500
+        conn.execute(
+            "INSERT INTO dialogs(dialog_id,type,hidden,last_message_at,linked_chat_id) VALUES(?, 'channel', 0, 100, ?)",
+            (channel_id, peer_id),
+        )
+        enroll_activity_dialog(conn, peer_id, "supergroup", last_activity_at=100)
+        conn.execute(
+            "INSERT INTO activity_sync_state(key,value) VALUES('activity_working_set_completed_at',?)",
+            (str(now),),
+        )
+
+        assert working_set_enrollment_release_at(conn, now=now, cadence_s=60) == now + 60
+        result = await run_working_set_enrollment_slice(
+            _FakeClient(),
+            conn,
+            source=TelegramRpcSource.ACTIVITY_COLD_BACKFILL,
+            cadence_s=60,
+            timeout_s=1,
+            now=now,
+        )
+        assert not result.consumed
+        assert conn.execute("SELECT source FROM activity_dialog_state WHERE dialog_id=?", (peer_id,)).fetchone() == (
+            "supergroup",
+        )
 
 
 # ---------------------------------------------------------------------------

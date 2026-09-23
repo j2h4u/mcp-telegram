@@ -22,7 +22,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from telethon.tl.types import PeerUser, UpdateReadHistoryInbox
 
-from mcp_telegram.activity_contracts import InputPeerResolver
 from mcp_telegram.config import RuntimeObservationConfig, TelemetryConfig
 from mcp_telegram.daemon_api import (
     DaemonAPIServer,
@@ -3135,7 +3134,7 @@ async def test_raw_inbox_read_updates_cursor_before_get_inbox_projection() -> No
     _seed_message(conn, dialog_id, message_id=11, text="new")
 
     client = _TestClient()
-    manager = EventHandlerManager(client, conn, asyncio.Event(), cast(InputPeerResolver, client.get_input_entity))
+    manager = EventHandlerManager(client, conn, asyncio.Event())
     manager._synced_dialog_ids.add(dialog_id)
     await manager.on_raw_inbox_read(
         cast(

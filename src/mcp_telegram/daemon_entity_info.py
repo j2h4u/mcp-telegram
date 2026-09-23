@@ -73,6 +73,7 @@ from .entity_profile.repository import EntityProfileRepository, EntityRefreshCur
 from .entity_store import EntitySnapshot, ensure_entity_stub
 from .flood import TelegramRpcThrottled
 from .folders.read_model import dialog_placement
+from .linked_chat_fact import linked_chat_fact_owner
 from .models import DialogType
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_demand import (
@@ -88,6 +89,25 @@ from .telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_sc
 from .telethon_dialog import classify_dialog_type
 
 _ENTITY_DETAIL_SCHEMA_VERSION = 1
+
+
+class _LinkedChatFactCaptureUnavailable:
+    pass
+
+
+_LINKED_CHAT_FACT_CAPTURE_UNAVAILABLE = _LinkedChatFactCaptureUnavailable()
+
+
+def _raw_linked_chat_channel_id(canonical_id: int | None) -> int | None:
+    """Convert Telethon's canonical -100… peer ID back to the raw channel ID."""
+    if canonical_id is None:
+        return None
+    raw_id = -int(canonical_id) - 1_000_000_000_000
+    if raw_id <= 0:
+        raise ValueError("linked chat observation is not a canonical channel peer ID")
+    return raw_id
+
+
 _CHANNEL_DIALOG_ID_OFFSET = 1_000_000_000_000
 _SQLITE_INT64_MIN = -(2**63)
 _SQLITE_INT64_MAX = 2**63 - 1
@@ -159,6 +179,39 @@ def _opt_int_attr(obj: object, name: str) -> int | None:
 def _opt_str_attr(obj: object, name: str) -> str | None:
     value = _attr(obj, name)
     return value if isinstance(value, str) else None
+
+
+def _channel_profile_unavailable_commit(
+    reference: ChannelReference,
+    observation: ChannelProfileObservation,
+) -> EntitySectionCommit | None:
+    if observation.channel_id != reference.channel_id:
+        raise ValueError("channel profile observation target does not match")
+    if observation.status is ProjectionStatus.UNAVAILABLE:
+        return EntitySectionCommit({}, status="unavailable", reason=observation.reason)
+    if observation.status is not ProjectionStatus.USABLE:
+        raise ValueError(observation.reason or "channel profile is unavailable")
+    return None
+
+
+def _channel_profile_kind_patch(
+    entity_type: DialogType,
+    observation: ChannelProfileObservation,
+) -> dict[str, object]:
+    if entity_type is DialogType.CHANNEL:
+        return {
+            "subscribers_count": observation.participants_count,
+            "available_reactions": dict(observation.available_reactions),
+        }
+    return {
+        "members_count": observation.participants_count,
+        "linked_broadcast_id": observation.linked_chat_id,
+    }
+
+
+def _channel_profile_payload(observation: ChannelProfileObservation) -> dict[str, object]:
+    current = observation.current_photo
+    return {"current_photo": {"photo_id": current.photo_id, "date": current.date} if current is not None else None}
 
 
 def _positive_personal_channel_id(payload: Mapping[str, object]) -> int | None:
@@ -285,13 +338,17 @@ class EntityInfoDeps:
     profile_observer: ProfilePairObservationHook | None = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _ProfileSectionContext:
     captured_scope: TelegramAuthScope | None
     attempt_start: int
     pair_section: bool
     pair_mode: str
     eligible_pair: bool
+    linked_chat_fact_generation: int | None = None
+    linked_chat_id: int | None = None
+    linked_chat_fact_captured: bool = False
+    linked_chat_observation_usable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -944,7 +1001,10 @@ class DaemonEntityInfoService:
     ) -> DurableRefreshTerminal | None:
         context = self._profile_section_context(cursor, entity_type)
         try:
-            result = await self._acquire_profile_section(cursor, entity_type)
+            if entity_type is DialogType.CHANNEL and cursor.next_section == "full_profile":
+                result = await self._acquire_profile_section(cursor, entity_type, context=context)
+            else:
+                result = await self._acquire_profile_section(cursor, entity_type)
         except RpcAttemptBudgetExhaustedError:
             self._observe_profile_section_failure(cursor, entity_type, actual_attempts=0)
             raise
@@ -1037,8 +1097,10 @@ class DaemonEntityInfoService:
             )
             if summary is not None:
                 self._emit_pair_summary(summary)
+            self._publish_profile_linked_chat_fact(cursor, entity_type, context, committed, now=now)
             return committed
         committed = self._profiles.commit_section(cursor, result, now=now)
+        self._publish_profile_linked_chat_fact(cursor, entity_type, context, committed, now=now)
         self._observe_profile_section_commit(
             cursor,
             entity_type,
@@ -1047,6 +1109,44 @@ class DaemonEntityInfoService:
             actual_attempts=actual_attempts,
         )
         return committed
+
+    def _publish_profile_linked_chat_fact(
+        self,
+        cursor: EntityRefreshCursor,
+        entity_type: DialogType,
+        context: _ProfileSectionContext,
+        committed: bool,
+        *,
+        now: int,
+    ) -> None:
+        if (
+            committed
+            and entity_type is DialogType.CHANNEL
+            and cursor.next_section == "full_profile"
+            and context.linked_chat_fact_captured
+            and context.linked_chat_observation_usable
+        ):
+            with self._deps.conn:
+                published = linked_chat_fact_owner.publish(
+                    self._deps.conn,
+                    cursor.entity_id,
+                    cast(int, context.linked_chat_fact_generation),
+                    _raw_linked_chat_channel_id(context.linked_chat_id),
+                    now,
+                )
+            self._offer_linked_chat_followups(published, context.linked_chat_id is not None)
+
+    def _offer_linked_chat_followups(self, published: bool, has_link: bool) -> None:
+        if not published or self._demand_sink is None:
+            return
+        if has_link:
+            offer_durable_demand(
+                self._demand_sink,
+                DemandKind.SCHEDULED_DISCOVERY,
+                DemandKind.COLD_PEER_PAGE,
+            )
+        else:
+            offer_durable_demand(self._demand_sink, DemandKind.SCHEDULED_DISCOVERY)
 
     async def _acquire_and_commit_full_user_pair(
         self,
@@ -1783,10 +1883,14 @@ class DaemonEntityInfoService:
         self,
         cursor: EntityRefreshCursor,
         entity_type: DialogType,
+        *,
+        context: _ProfileSectionContext | None = None,
     ) -> EntitySectionCommit:
         section = cursor.next_section
         if section == "full_profile":
-            return await self._acquire_full_profile(cursor.entity_id, entity_type)
+            if context is None:
+                return await self._acquire_full_profile(cursor.entity_id, entity_type)
+            return await self._acquire_full_profile(cursor.entity_id, entity_type, context=context)
         if section == "common_chats":
             return await self._acquire_common_chats(cursor.entity_id)
         if section == "contact_overlap":
@@ -1838,12 +1942,14 @@ class DaemonEntityInfoService:
         self,
         entity_id: int,
         entity_type: DialogType,
+        *,
+        context: _ProfileSectionContext | None = None,
     ) -> EntitySectionCommit:
         if entity_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}:
             return await self._acquire_user_full_profile(entity_id, entity_type)
 
         if entity_type in {DialogType.CHANNEL, DialogType.SUPERGROUP, DialogType.FORUM}:
-            return await self._acquire_channel_full_profile(entity_id, entity_type)
+            return await self._acquire_channel_full_profile(entity_id, entity_type, context=context)
 
         return EntitySectionCommit({}, status="unavailable", reason="unsupported_entity_type")
 
@@ -1868,36 +1974,54 @@ class DaemonEntityInfoService:
         identity_patch["type"] = entity_type.value
         return EntitySectionCommit(patch, payload=private_payload, identity_patch=identity_patch)
 
-    async def _acquire_channel_full_profile(self, entity_id: int, entity_type: DialogType) -> EntitySectionCommit:
+    async def _acquire_channel_full_profile(
+        self,
+        entity_id: int,
+        entity_type: DialogType,
+        *,
+        context: _ProfileSectionContext | None = None,
+    ) -> EntitySectionCommit:
         port = self._deps.channel_profile_port
         reference = self._deps.channel_reference_provider.get_channel_reference(entity_id)
         if reference is None:
             return EntitySectionCommit({}, status="unavailable", reason="channel_reference_unavailable")
+        is_broadcast_channel = entity_type is DialogType.CHANNEL
+        self._capture_linked_chat_fact_generation(entity_id, is_broadcast_channel, context)
         observation = await port.fetch_channel_profile(reference)
-        if observation.channel_id != reference.channel_id:
-            raise ValueError("channel profile observation target does not match")
-        if observation.status is ProjectionStatus.UNAVAILABLE:
-            return EntitySectionCommit({}, status="unavailable", reason=observation.reason)
-        if observation.status is not ProjectionStatus.USABLE:
-            raise ValueError(observation.reason or "channel profile is unavailable")
+        unavailable = _channel_profile_unavailable_commit(reference, observation)
+        if unavailable is not None:
+            return unavailable
+        self._record_linked_chat_profile_observation(is_broadcast_channel, context, observation.linked_chat_id)
         patch: dict[str, object] = {
             "about": observation.about,
             "pinned_msg_id": observation.pinned_msg_id,
             "slow_mode_seconds": observation.slow_mode_seconds,
         }
-        member_count = observation.participants_count
-        if entity_type is DialogType.CHANNEL:
-            patch.update(
-                subscribers_count=member_count,
-                available_reactions=dict(observation.available_reactions),
-            )
-        else:
-            patch.update(members_count=member_count, linked_broadcast_id=observation.linked_chat_id)
-        current = observation.current_photo
-        payload = {
-            "current_photo": {"photo_id": current.photo_id, "date": current.date} if current is not None else None
-        }
-        return EntitySectionCommit(patch, payload=payload)
+        patch.update(_channel_profile_kind_patch(entity_type, observation))
+        return EntitySectionCommit(patch, payload=_channel_profile_payload(observation))
+
+    def _capture_linked_chat_fact_generation(
+        self,
+        entity_id: int,
+        is_broadcast_channel: bool,
+        context: _ProfileSectionContext | None,
+    ) -> None:
+        if is_broadcast_channel and context is not None:
+            with self._deps.conn:
+                context.linked_chat_fact_generation = linked_chat_fact_owner.capture_generation(
+                    self._deps.conn, entity_id
+                )
+            context.linked_chat_fact_captured = True
+
+    @staticmethod
+    def _record_linked_chat_profile_observation(
+        is_broadcast_channel: bool,
+        context: _ProfileSectionContext | None,
+        linked_chat_id: int | None,
+    ) -> None:
+        if is_broadcast_channel and context is not None:
+            context.linked_chat_id = linked_chat_id
+            context.linked_chat_observation_usable = True
 
     async def _acquire_group_full_chat_pair(
         self,
@@ -3154,7 +3278,18 @@ class DaemonEntityInfoService:
     async def _fetch_channel_detail(self, channel: object) -> dict[str, object]:
         channel_id = int(self._deps.get_peer_id(channel))
         reference = self._channel_reference_from_entity(channel)
+        fact_generation = self._capture_legacy_linked_chat_fact_generation(channel_id)
         profile = await self._fetch_channel_profile_observation(reference)
+        if profile is not None and fact_generation is not _LINKED_CHAT_FACT_CAPTURE_UNAVAILABLE:
+            with self._deps.conn:
+                published = linked_chat_fact_owner.publish(
+                    self._deps.conn,
+                    channel_id,
+                    cast(int, fact_generation),
+                    _raw_linked_chat_channel_id(profile.linked_chat_id),
+                    int(profile.observation_completed_at),
+                )
+            self._offer_linked_chat_followups(published, profile.linked_chat_id is not None)
         memberships = self._build_chat_membership(channel)
         contacts_subscribed, contacts_subscribed_partial, contacts_reason = await self._fetch_channel_contacts(
             reference,
@@ -3187,6 +3322,29 @@ class DaemonEntityInfoService:
             "contacts_reason": contacts_reason,
             "_full_fetch_ok": profile is not None,
         }
+
+    def _capture_legacy_linked_chat_fact_generation(
+        self, channel_id: int
+    ) -> int | _LinkedChatFactCaptureUnavailable | None:
+        try:
+            ledger_exists = cast(
+                tuple[int] | None,
+                self._deps.conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='linked_chat_fact_state'"
+                ).fetchone(),
+            )
+            if ledger_exists is None:
+                return _LINKED_CHAT_FACT_CAPTURE_UNAVAILABLE
+            with self._deps.conn:
+                return linked_chat_fact_owner.capture_generation(self._deps.conn, channel_id)
+        except sqlite3.Error as exc:
+            self._deps.logger.warning(
+                "entity_info linked_chat_fact_capture_failed channel_id=%r error=%s%s",
+                channel_id,
+                exc,
+                self._deps.rid(),
+            )
+            return _LINKED_CHAT_FACT_CAPTURE_UNAVAILABLE
 
     def _channel_reference_from_entity(self, channel: object) -> ChannelReference | None:
         channel_id = self._deps.get_peer_id(channel)

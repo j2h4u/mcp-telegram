@@ -1,12 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from mcp_telegram.flood import TelegramRpcThrottled
-from mcp_telegram.telegram_demand import DemandStatus, RpcAttemptBudget, RpcAttemptBudgetExhaustedError
+from mcp_telegram.linked_chat_fact import linked_chat_fact_owner
+from mcp_telegram.own_only import OwnOnlyContext
+from mcp_telegram.scheduled_messages import (
+    ScheduledDiscoveryDemandAdapter,
+    ScheduledMessageReconciler,
+    ScheduledReconciliationPolicy,
+)
+from mcp_telegram.sync_db import _apply_migrations
+from mcp_telegram.telegram_demand import (
+    DemandStatus,
+    DurableDemandAdapter,
+    RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
+)
 from mcp_telegram.telegram_demand_coordinator import (
     CoordinatorState,
     TelegramDemandCoordinator,
@@ -304,3 +320,100 @@ async def test_recoverable_transport_outcomes_do_not_kill_siblings() -> None:
     coordinator = TelegramDemandCoordinator(second_adapters, second_shutdown, clock=_Clock())
     await coordinator.run()
     assert coordinator.next_release_at == 102.0
+
+
+@pytest.mark.asyncio
+async def test_suspended_discovery_does_not_spin_coordinator_and_restore_reoffers_due_work() -> None:
+    now = 1_800_000_000
+    clock = _Clock(float(now))
+    conn, client, discovery = _suspended_discovery(now)
+    callback_kind = DURABLE_DEMAND_ORDER[0]
+    shutdown = asyncio.Event()
+    initial = _adapters({callback_kind: DemandStatus(release_at=float(now))})
+    adapters: dict[DemandKind, object] = dict(initial)
+    adapters[DemandKind.SCHEDULED_DISCOVERY] = discovery
+    coordinator = TelegramDemandCoordinator(
+        cast(Mapping[DemandKind, DurableDemandAdapter], adapters), shutdown, clock=clock
+    )
+    callback_adapter = initial[callback_kind]
+    callback_offers: list[bool] = []
+    callback_adapter.on_run = _restore_link_callback(conn, clock, coordinator, shutdown, callback_offers)
+
+    for _ in range(20):
+        coordinator.scan(now=clock.value)
+        assert DemandKind.SCHEDULED_DISCOVERY not in coordinator.ready_kinds
+    assert callback_adapter.run_calls == []
+    assert client.requests == []
+
+    await coordinator.run()
+
+    assert len(callback_adapter.run_calls) == 1
+    assert callback_offers == [True]
+    assert client.requests == []
+    assert DemandKind.SCHEDULED_DISCOVERY in coordinator.ready_kinds
+    assert discovery.status(clock.value + 1) == DemandStatus(release_at=0.0, freshness_deadline=float(now))
+    conn.close()
+
+
+class _CoordinatorScheduledClient:
+    def __init__(self) -> None:
+        self.requests: list[object] = []
+
+    async def get_input_entity(self, _dialog_id: int, /) -> object:
+        return object()
+
+    async def get_entity(self, _dialog_id: int) -> object:
+        return object()
+
+    async def __call__(self, _request: object, **_kwargs: object) -> object:
+        self.requests.append(_request)
+        return SimpleNamespace(scheduled_messages=[])
+
+
+def _suspended_discovery(
+    now: int,
+) -> tuple[sqlite3.Connection, _CoordinatorScheduledClient, ScheduledDiscoveryDemandAdapter]:
+    conn = sqlite3.connect(":memory:")
+    _apply_migrations(conn)
+    channel_id = -1_000_000_000_900
+    conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES(?,'channel',0)", (channel_id,))
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(?,'access_lost')", (channel_id,))
+    conn.execute(
+        "INSERT INTO linked_chat_fact_state(channel_id,generation,pending_generation,requested_at,retry_at) "
+        "VALUES (?,0,0,?,?)",
+        (channel_id, now, now + 86_400),
+    )
+    conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id,repair_due_at,discovery_due_at,updated_at) "
+        "VALUES (42,NULL,?,?)",
+        (now, now),
+    )
+    conn.commit()
+    client = _CoordinatorScheduledClient()
+    reconciler = ScheduledMessageReconciler(
+        client,
+        conn,
+        asyncio.Event(),
+        OwnOnlyContext(account_id=42, personal_channel_id=channel_id),
+        policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=1),
+    )
+    return conn, client, ScheduledDiscoveryDemandAdapter(reconciler)
+
+
+def _restore_link_callback(
+    conn: sqlite3.Connection,
+    clock: _Clock,
+    coordinator: TelegramDemandCoordinator,
+    shutdown: asyncio.Event,
+    offers: list[bool],
+) -> Callable[[], Awaitable[None]]:
+    async def restore_link() -> None:
+        channel_id = -1_000_000_000_900
+        with conn:
+            conn.execute("UPDATE synced_dialogs SET status='synced' WHERE dialog_id=?", (channel_id,))
+            generation = linked_chat_fact_owner.capture_generation(conn, channel_id)
+            assert linked_chat_fact_owner.publish(conn, channel_id, generation, 400, int(clock.value) + 1)
+        offers.append(coordinator.offer(DemandKind.SCHEDULED_DISCOVERY))
+        shutdown.set()
+
+    return restore_link

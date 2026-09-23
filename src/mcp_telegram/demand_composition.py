@@ -35,6 +35,7 @@ from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, Enti
 from mcp_telegram.fact_hydration import FactHydrationDemandAdapter, MessageFactHydrationWorker
 from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker
 from mcp_telegram.hydration_queue import HydrationPriority
+from mcp_telegram.linked_chat_fact import linked_chat_fact_owner
 from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshDemandAdapter,
     MessageFactRefreshDeps,
@@ -56,14 +57,24 @@ from mcp_telegram.startup_identity import StartupIdentityState
 from mcp_telegram.sync_db import SyncDatabaseConnection
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter, FullSyncWorker
 from mcp_telegram.telegram_demand import (
+    AcquisitionKind,
+    DemandStatus,
     DurableDemandAdapter,
+    RpcAttemptBudget,
+    acquisition_context,
+    demand_context,
 )
 from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator, validate_durable_adapters
 from mcp_telegram.telegram_rpc_consumers import DemandKind, demand_freshness_seconds
+from mcp_telegram.telegram_rpc_scheduler import rpc_attempt_budget
 
 
 class DemandCompositionClient(ActivityClient, Protocol):
     async def get_me(self) -> object: ...
+
+
+class LinkedChatFactRefreshPort(Protocol):
+    async def retry_one_pending_linked_chat_fact(self, budget: RpcAttemptBudget) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +109,32 @@ class DemandCompositionDependencies:
     user_profile_port: UserProfilePort
     publish_startup_identity: Callable[[object, OwnOnlyContext], None]
     draft_owner: DraftMessageOwner
+    linked_chat_fact_refresh_port: LinkedChatFactRefreshPort
     startup_detail_setter: Callable[[str], None] | None = None
+
+
+class LinkedChatFactDemandAdapter(DurableDemandAdapter):
+    """Retry one durable linked-chat fact demand with the coordinator's RPC budget."""
+
+    demand_kind = DemandKind.LINKED_CHAT_REFRESH
+
+    def __init__(self, port: LinkedChatFactRefreshPort, conn: SyncDatabaseConnection) -> None:
+        self._port = port
+        self._conn = conn
+
+    def status(self, now: float) -> DemandStatus | None:
+        release_at = linked_chat_fact_owner.next_release_at(self._conn)
+        if release_at is None:
+            return None
+        return DemandStatus(release_at=float(release_at))
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        with demand_context(self.demand_kind):
+            with acquisition_context(AcquisitionKind.LINKED_CHAT_RESOLUTION):
+                with rpc_attempt_budget(budget):
+                    await self._port.retry_one_pending_linked_chat_fact(budget)
 
 
 def build_durable_adapter_map(dependencies: DemandCompositionDependencies) -> Mapping[DemandKind, DurableDemandAdapter]:
@@ -181,6 +217,10 @@ def build_durable_adapter_map(dependencies: DemandCompositionDependencies) -> Ma
                 user_profile_port=dependencies.user_profile_port,
                 publish_startup_identity=dependencies.publish_startup_identity,
             )
+        ),
+        DemandKind.LINKED_CHAT_REFRESH: LinkedChatFactDemandAdapter(
+            dependencies.linked_chat_fact_refresh_port,
+            dependencies.conn,
         ),
     }
     validate_durable_adapters(adapters)

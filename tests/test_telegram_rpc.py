@@ -479,6 +479,36 @@ async def test_telethon_retry_sleep_holds_no_slot_and_each_sender_attempt_readmi
 
 
 @pytest.mark.asyncio
+async def test_request_specific_observation_counts_each_actual_retry_attempt_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mcp_telegram.telegram_rpc as telegram_rpc_module
+
+    monkeypatch.setattr(telegram_rpc_module, "GetFullChannelRequest", _TestRequest)
+    gate = _gate(retry_delays=(0,))
+    observed: list[dict[str, object]] = []
+    gate.set_rpc_request_observer(lambda **values: observed.append(values))
+    send_attempts = 0
+
+    def send(_request: object) -> object:
+        nonlocal send_attempts
+        send_attempts += 1
+        if send_attempts == 1:
+            raise ServerError(None, "temporary")
+        return "ok"
+
+    _set_sender(gate, send)
+
+    assert await _call(gate, _TestRequest("private channel identity")) == "ok"
+
+    assert send_attempts == 2
+    assert len(observed) == 2
+    assert all(item["request_class"] == "get_full_channel" for item in observed)
+    assert all(item["source"] is TelegramRpcSource.MCP_INTERACTIVE for item in observed)
+    assert all("private channel identity" not in repr(item) for item in observed)
+
+
+@pytest.mark.asyncio
 async def test_sender_proxy_rejects_unexpected_future_batch_and_releases_slot() -> None:
     gate = _gate()
     returned_future: asyncio.Future[object] | None = None

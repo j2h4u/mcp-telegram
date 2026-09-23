@@ -109,6 +109,72 @@ def test_summary_is_one_coherent_content_free_report(tmp_path: Path) -> None:
     assert "get_entity_info: tool_error" in report.text
 
 
+def test_summary_reconciles_get_full_channel_attempts_by_source_and_demand(tmp_path: Path) -> None:
+    now = 2_000_000_000.0
+    db_path = tmp_path / "sync.db"
+    _database(db_path, now_ms=int(now * 1000))
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.executemany(
+            "INSERT INTO runtime_observations("
+            "observed_at_ms,kind,runtime_instance_id,outcome,payload_json"
+            ") VALUES (?,?,?,?,?)",
+            [
+                (
+                    int(now * 1000) - 4_000,
+                    "telegram.rpc_request",
+                    "current",
+                    "summary",
+                    json.dumps(
+                        {
+                            "request_class": "get_full_channel",
+                            "source": "dialog_resolution",
+                            "demand_kind": "entity_lookup",
+                            "acquisition_kind": "entity_lookup",
+                            "actual_attempts": 2,
+                        }
+                    ),
+                ),
+                (
+                    int(now * 1000) - 3_000,
+                    "telegram.rpc_request",
+                    "current",
+                    "summary",
+                    json.dumps(
+                        {
+                            "request_class": "get_full_channel",
+                            "source": "realtime_event",
+                            "demand_kind": "realtime_event_acquisition",
+                            "actual_attempts": 1,
+                        }
+                    ),
+                ),
+                (
+                    int(now * 1000) - 2_000,
+                    "telegram.rpc_request",
+                    "current",
+                    "summary",
+                    json.dumps(
+                        {
+                            "request_class": "get_full_user",
+                            "source": "dialog_resolution",
+                            "demand_kind": "entity_lookup",
+                            "actual_attempts": 100,
+                        }
+                    ),
+                ),
+            ],
+        )
+        conn.commit()
+
+    report = build_operator_summary(db_path, since_seconds=15 * 3600, now=now)
+
+    assert (
+        "GetFullChannel RPC attempts: 3 "
+        "(dialog_resolution/entity_lookup/entity_lookup=2, "
+        "realtime_event/realtime_event_acquisition=1)" in report.text
+    )
+
+
 def test_summary_reports_final_demand_outcomes_and_freshness_reason(tmp_path: Path) -> None:
     now = 2_000_000_000.0
     db_path = tmp_path / "sync.db"

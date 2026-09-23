@@ -40,6 +40,7 @@ from .dialog_selector import DialogSelector, DialogSelectorError, optional_dialo
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
+from .linked_chat_fact import LinkedChatState
 from .message_content import MessageSnapshot, project_message_content
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_bundle import insert_messages_with_fts
@@ -1300,10 +1301,13 @@ async def _resolve_trace_account_scope(
     if validation_error is not None:
         return None, validation_error
 
-    signature_scope = await _resolve_trace_account_signature_scope(
-        request.deps,
-        exact_dialog_id,
-    )
+    # A continuation token carries the scope captured by its first page. Do
+    # not recompute channel linkage and silently change that pagination scope.
+    signature_scope = None
+    if request.req.get("navigation") is None:
+        signature_scope = await _resolve_trace_account_signature_scope(request.deps, exact_dialog_id)
+    if isinstance(signature_scope, dict):
+        return None, signature_scope
     if signature_scope is not None:
         scope_dialog_ids, linked_chat_map = signature_scope
 
@@ -1400,7 +1404,7 @@ def _validate_trace_account_scope_exact_topic(
 async def _resolve_trace_account_signature_scope(
     deps: DaemonAccountTraceDeps,
     exact_dialog_id: int | None,
-) -> tuple[list[int] | None, dict[int, int]] | None:
+) -> tuple[list[int] | None, dict[int, int]] | dict[str, object] | None:
     if exact_dialog_id is None:
         return None
 
@@ -1412,10 +1416,17 @@ async def _resolve_trace_account_signature_scope(
         return None
 
     resolution = await resolve_linked_chat_id(deps.client, deps.conn, exact_dialog_id)
-    if resolution.flood_wait_seconds is not None:
+    if resolution.state is LinkedChatState.UNKNOWN:
+        return {
+            "ok": False,
+            "error": "linked_chat_pending",
+            "message": "The channel discussion scope is still being resolved. Retry this request shortly.",
+            "retry_at": resolution.retry_at,
+            "Action": "Retry this request after the linked-chat refresh completes.",
+        }
+    if resolution.state is LinkedChatState.KNOWN_NONE:
         return None
-    if resolution.linked_chat_id is None:
-        return None
+    assert resolution.linked_chat_id is not None
 
     linked_chat_map: dict[int, int] = {exact_dialog_id: resolution.linked_chat_id}
     scope_dialog_ids = [exact_dialog_id, resolution.linked_chat_id]

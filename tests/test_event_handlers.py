@@ -119,7 +119,7 @@ def make_manager(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> EventHandlerManager:
-    manager = EventHandlerManager(mock_client, sync_db, shutdown_event, mock_client.get_input_entity)
+    manager = EventHandlerManager(mock_client, sync_db, shutdown_event)
     manager.bind_demand_sink(MagicMock())
     return manager
 
@@ -132,6 +132,15 @@ def insert_synced_dialog(conn: _SQLiteConnection, dialog_id: int) -> None:
     )
     seed_full_history_enrollment(conn, dialog_id, enabled=True)
     conn.commit()
+
+
+class _RecordingDemandSink:
+    def __init__(self) -> None:
+        self.offered: list[DemandKind] = []
+
+    def offer(self, kind: DemandKind) -> bool:
+        self.offered.append(kind)
+        return True
 
 
 def test_auto_enrollment_offers_full_sync_only_after_commit(
@@ -1721,294 +1730,276 @@ async def test_on_message_edited_updates_fts(
 
 
 # ---------------------------------------------------------------------------
-# Phase 54 Plan 03: event-driven linked_chat_id refresh
+# TG-4: realtime linked-chat updates only enqueue durable work
 # ---------------------------------------------------------------------------
 
 
-class _LinkedChatFakeClient:
-    """Minimal fake TelegramClient for linked_chat_id refresh tests.
-
-    Mirrors the _FakeClient pattern from test_activity_peer_resolve.py.
-    Supports async __call__ (for GetFullChannelRequest) and async get_input_entity.
-    """
-
-    def __init__(
-        self,
-        *,
-        input_entity: object | None = None,
-        full_channel_result: object | None = None,
-        full_channel_error: Exception | None = None,
-        forbid_call: bool = False,
-    ):
-        self._input_entity = input_entity
-        self._full_channel_result = full_channel_result
-        self._full_channel_error = full_channel_error
-        self._forbid_call = forbid_call
-        # Attributes expected by EventHandlerManager constructor
-        self.add_event_handler = MagicMock()
-        self.remove_event_handler = MagicMock()
-        self.input_entity_calls: list[int] = []
-        self.call_args_list: list[object] = []
-
-    async def get_input_entity(self, dialog_id: object) -> object:
-        if self._forbid_call:
-            raise AssertionError("get_input_entity must not be called")
-        self.input_entity_calls.append(int(dialog_id))
-        return self._input_entity
-
-    async def __call__(self, request: object) -> object:
-        if self._forbid_call:
-            raise AssertionError("client() must not be called")
-        self.call_args_list.append(request)
-        if self._full_channel_error is not None:
-            raise self._full_channel_error
-        return self._full_channel_result
-
-
 @pytest.mark.asyncio
-async def test_linked_chat_refresh_updates_dialogs(
+async def test_updatechannel_offers_linked_chat_refresh_without_rpc(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """UpdateChannel for a previously-resolved broadcast channel refreshes linked_chat_id.
-
-    Asserts:
-    - Exactly one GetFullChannelRequest was issued.
-    - dialogs.linked_chat_id is updated to the normalised new value.
-    - dialogs.linked_chat_resolved_at is bumped to approximately now.
-    - Unrelated columns (type, hidden) are unchanged.
-    - needs_refresh = 1 was also written (original branch still runs).
-    """
-    import time
-    from types import SimpleNamespace
-
-    from telethon.tl.functions.channels import GetFullChannelRequest  # type: ignore[import-untyped]
     from telethon.tl.types import UpdateChannel  # type: ignore[import-untyped]
 
     dialog_id = -1004444444444
-    channel_id = 4444444444  # positive form Telegram sends
-
-    # Seed dialogs row: already resolved, has a linked chat
+    channel_id = 4444444444
     sync_db.execute(
-        "INSERT INTO dialogs (dialog_id, type, linked_chat_id, linked_chat_resolved_at, hidden) "
-        "VALUES (?, 'channel', -1005555555555, 1700000000, 0)",
+        "INSERT INTO dialogs (dialog_id, type, linked_chat_id, linked_chat_resolved_at) "
+        "VALUES (?, 'channel', -1005555555555, 1700000000)",
         (dialog_id,),
     )
     sync_db.commit()
-
-    # Seed synced_dialogs so the gate passes
     insert_synced_dialog(sync_db, dialog_id)
 
-    # Build fake full_result with a NEW linked_chat_id (positive raw form)
-    fake_full_chat = SimpleNamespace(linked_chat_id=6666666666)
-    fake_full_result = SimpleNamespace(full_chat=fake_full_chat, chats=[])
-    fake_input = SimpleNamespace(channel_id=channel_id)
-
-    client = _LinkedChatFakeClient(
-        input_entity=fake_input,
-        full_channel_result=fake_full_result,
-    )
-
+    client = MagicMock()
     manager = make_manager(client, sync_db, shutdown_event)
+    sink = _RecordingDemandSink()
+    manager.bind_demand_sink(sink)
     manager.register()
 
-    update = UpdateChannel(channel_id=channel_id)
-    before = int(time.time())
-    await manager.on_raw_channel_chat_update(update)
-    after = int(time.time())
+    await manager.on_raw_channel_chat_update(UpdateChannel(channel_id=channel_id))
 
-    # Exactly one GetFullChannelRequest was issued
-    assert client.input_entity_calls == [dialog_id]
-    assert len(client.call_args_list) == 1
-    assert isinstance(client.call_args_list[0], GetFullChannelRequest)
-
-    # Row reflects the new linked_chat_id (6666666666 normalised to -1006666666666)
-    row = sync_db.execute(
-        "SELECT linked_chat_id, linked_chat_resolved_at, type, hidden, needs_refresh FROM dialogs WHERE dialog_id = ?",
+    assert client.call_count == 0
+    assert sink.offered == [
+        DemandKind.DIALOG_LIGHT_RECONCILIATION,
+        DemandKind.LINKED_CHAT_REFRESH,
+    ]
+    assert sync_db.execute(
+        "SELECT linked_chat_id, linked_chat_resolved_at, needs_refresh FROM dialogs WHERE dialog_id=?",
         (dialog_id,),
+    ).fetchone() == (-1005555555555, 1700000000, 1)
+    pending = sync_db.execute(
+        "SELECT generation, pending_generation FROM linked_chat_fact_state WHERE channel_id=?", (dialog_id,)
     ).fetchone()
-    assert row is not None
-    assert row[0] == -1006666666666, f"Expected -1006666666666, got {row[0]}"
-    assert before <= row[1] <= after + 1, f"resolved_at={row[1]} not within [{before}, {after + 1}]"
-    # Unrelated columns unchanged
-    assert row[2] == "channel"
-    assert row[3] == 0
-    # needs_refresh set by original branch
-    assert row[4] == 1
+    assert pending is not None and pending[0] == pending[1]
 
 
 @pytest.mark.asyncio
-async def test_linked_chat_refresh_skips_never_resolved(
+async def test_updatechannel_does_not_enqueue_never_resolved_channel(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """UpdateChannel for a never-resolved channel does NOT call GetFullChannelRequest (D-11).
-
-    Asserts:
-    - No GetFullChannelRequest is issued.
-    - linked_chat_id and linked_chat_resolved_at remain NULL.
-    - needs_refresh = 1 is still set (original branch runs for all channels).
-    """
     from telethon.tl.types import UpdateChannel  # type: ignore[import-untyped]
 
     dialog_id = -1007777777777
-    channel_id = 7777777777
-
-    # Seed dialogs row: type=channel, never resolved (linked_chat_resolved_at IS NULL)
+    insert_synced_dialog(sync_db, dialog_id)
     sync_db.execute(
-        "INSERT INTO dialogs (dialog_id, type, linked_chat_id, linked_chat_resolved_at, hidden) "
-        "VALUES (?, 'channel', NULL, NULL, 0)",
+        "INSERT INTO dialogs (dialog_id, type, linked_chat_id, linked_chat_resolved_at) "
+        "VALUES (?, 'channel', NULL, NULL)",
         (dialog_id,),
     )
     sync_db.commit()
-
-    insert_synced_dialog(sync_db, dialog_id)
-
-    # Client raises on any call — the refresh branch must NOT fire
-    client = _LinkedChatFakeClient(forbid_call=True)
-
+    client = MagicMock()
     manager = make_manager(client, sync_db, shutdown_event)
+    sink = _RecordingDemandSink()
+    manager.bind_demand_sink(sink)
     manager.register()
 
-    update = UpdateChannel(channel_id=channel_id)
-    await manager.on_raw_channel_chat_update(update)  # must not raise
+    await manager.on_raw_channel_chat_update(UpdateChannel(channel_id=7777777777))
 
-    row = sync_db.execute(
-        "SELECT linked_chat_id, linked_chat_resolved_at, needs_refresh FROM dialogs WHERE dialog_id = ?",
-        (dialog_id,),
-    ).fetchone()
-    assert row is not None
-    assert row[0] is None, "linked_chat_id must remain NULL for never-resolved channel"
-    assert row[1] is None, "linked_chat_resolved_at must remain NULL for never-resolved channel"
-    assert row[2] == 1, "needs_refresh must be set by the original branch"
+    assert client.call_count == 0
+    assert sync_db.execute("SELECT 1 FROM linked_chat_fact_state WHERE channel_id=?", (dialog_id,)).fetchone() is None
+    assert DemandKind.LINKED_CHAT_REFRESH not in sink.offered
 
 
+@pytest.mark.parametrize(("flood_wait_seconds", "expected_delay"), [(20, 300), (200_000, 86_400)])
 @pytest.mark.asyncio
-async def test_linked_chat_refresh_skips_input_peer_cache_miss(
+async def test_linked_chat_retry_respects_owner_flood_wait_policy(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
+    flood_wait_seconds: int,
+    expected_delay: int,
 ) -> None:
-    """An injected resolver miss leaves the previously cached dialog unchanged."""
-    from telethon.tl.types import UpdateChannel  # type: ignore[import-untyped]
+    import time
 
-    dialog_id = -1008887776665
-    channel_id = 8887776665
-    sync_db.execute(
-        "INSERT INTO dialogs (dialog_id, type, linked_chat_id, linked_chat_resolved_at, hidden) "
-        "VALUES (?, 'channel', -1001234567890, 1700000000, 0)",
-        (dialog_id,),
-    )
-    sync_db.commit()
-    insert_synced_dialog(sync_db, dialog_id)
-
-    client = _LinkedChatFakeClient(forbid_call=True)
-    resolver = AsyncMock(return_value=None)
-    manager = EventHandlerManager(
-        client,
-        sync_db,
-        shutdown_event,
-        resolver,
-    )
-    manager.bind_demand_sink(MagicMock())
-    manager.register()
-
-    await manager.on_raw_channel_chat_update(UpdateChannel(channel_id=channel_id))
-
-    row = sync_db.execute(
-        "SELECT linked_chat_id, linked_chat_resolved_at, needs_refresh FROM dialogs WHERE dialog_id = ?",
-        (dialog_id,),
-    ).fetchone()
-    assert row == (-1001234567890, 1700000000, 1)
-    assert client.call_args_list == []
-    resolver.assert_awaited_once_with(dialog_id)
-
-
-@pytest.mark.asyncio
-async def test_linked_chat_refresh_exception_leaves_dialogs_unchanged(
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """A non-FloodWait RPC error is logged and leaves linked-chat state unchanged."""
-    from types import SimpleNamespace
-
-    from telethon.tl.types import UpdateChannel  # type: ignore[import-untyped]
-
-    dialog_id = -1002223334445
-    channel_id = 2223334445
-    sync_db.execute(
-        "INSERT INTO dialogs (dialog_id, type, linked_chat_id, linked_chat_resolved_at, hidden) "
-        "VALUES (?, 'channel', -1001111111111, 1700000000, 0)",
-        (dialog_id,),
-    )
-    sync_db.commit()
-    insert_synced_dialog(sync_db, dialog_id)
-
-    client = _LinkedChatFakeClient(
-        input_entity=SimpleNamespace(channel_id=channel_id),
-        full_channel_error=RuntimeError("temporary RPC failure"),
-    )
-    manager = make_manager(client, sync_db, shutdown_event)
-    manager.register()
-
-    await manager.on_raw_channel_chat_update(UpdateChannel(channel_id=channel_id))
-
-    row = sync_db.execute(
-        "SELECT linked_chat_id, linked_chat_resolved_at, needs_refresh FROM dialogs WHERE dialog_id = ?",
-        (dialog_id,),
-    ).fetchone()
-    assert row == (-1001111111111, 1700000000, 1)
-
-
-@pytest.mark.asyncio
-async def test_linked_chat_refresh_flood_no_op(
-    sync_db: _SQLiteConnection,
-    shutdown_event: asyncio.Event,
-) -> None:
-    """FloodWait inside _refresh_linked_chat_id leaves dialogs unchanged.
-
-    Asserts:
-    - Handler returns without raising.
-    - linked_chat_id and linked_chat_resolved_at are unchanged (no write on FloodWait).
-    - needs_refresh = 1 was still written by the original branch.
-    """
-    from types import SimpleNamespace
-
-    from telethon.tl.types import UpdateChannel  # type: ignore[import-untyped]
+    from telethon.tl.types import InputPeerChannel
 
     from mcp_telegram.flood import TelegramRpcThrottled
+    from mcp_telegram.linked_chat_fact import linked_chat_fact_owner
+    from mcp_telegram.telegram_demand import RpcAttemptBudget
 
-    dialog_id = -1009999999999
-    channel_id = 9999999999
-
-    # Seed dialogs row: already resolved
+    dialog_id = -1000000000123
     sync_db.execute(
-        "INSERT INTO dialogs (dialog_id, type, linked_chat_id, linked_chat_resolved_at, hidden) "
-        "VALUES (?, 'channel', -1008888888888, 1700000000, 0)",
+        "INSERT INTO dialogs (dialog_id, type, linked_chat_id, linked_chat_resolved_at) "
+        "VALUES (?, 'channel', NULL, 100)",
         (dialog_id,),
     )
-    sync_db.commit()
+    with sync_db:
+        linked_chat_fact_owner.invalidate_from_update(sync_db, dialog_id, int(time.time()))
 
-    insert_synced_dialog(sync_db, dialog_id)
+    class _Session:
+        def get_input_entity(self, _peer: object) -> InputPeerChannel:
+            return InputPeerChannel(channel_id=123, access_hash=1)
 
-    # TelegramRpcThrottled carries the finite retry duration.
-    flood_error = TelegramRpcThrottled(retry_after_seconds=120)
-    fake_input = SimpleNamespace(channel_id=channel_id)
-    client = _LinkedChatFakeClient(
-        input_entity=fake_input,
-        full_channel_error=flood_error,
-    )
+    class _FloodingClient:
+        session = _Session()
+        transaction_open_during_rpc: bool | None = None
 
-    manager = make_manager(client, sync_db, shutdown_event)
-    manager.register()
+        async def __call__(self, _request: object) -> object:
+            self.transaction_open_during_rpc = sync_db.in_transaction
+            raise TelegramRpcThrottled(retry_after_seconds=flood_wait_seconds)
 
-    update = UpdateChannel(channel_id=channel_id)
-    await manager.on_raw_channel_chat_update(update)  # must not raise
+    client = _FloodingClient()
+    manager = EventHandlerManager(client, sync_db, shutdown_event)  # type: ignore[arg-type]
+    before = int(time.time())
+    await manager.retry_one_pending_linked_chat_fact(RpcAttemptBudget(limit=1))
+    after = int(time.time())
 
     row = sync_db.execute(
-        "SELECT linked_chat_id, linked_chat_resolved_at, needs_refresh FROM dialogs WHERE dialog_id = ?",
-        (dialog_id,),
+        "SELECT retry_at, failure_count FROM linked_chat_fact_state WHERE channel_id=?", (dialog_id,)
     ).fetchone()
     assert row is not None
-    assert row[0] == -1008888888888, "linked_chat_id must be unchanged after FloodWait"
-    assert row[1] == 1700000000, "linked_chat_resolved_at must be unchanged after FloodWait"
-    assert row[2] == 1, "needs_refresh must be set by the original branch"
+    assert before + expected_delay <= row[0] <= after + expected_delay
+    assert row[1] == 1
+    assert client.transaction_open_during_rpc is False
+
+
+@pytest.mark.asyncio
+async def test_linked_chat_no_due_self_heal_commits_before_return(
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    import time
+
+    from mcp_telegram.linked_chat_fact import linked_chat_fact_owner
+    from mcp_telegram.telegram_demand import RpcAttemptBudget
+
+    dialog_id = -1000000000123
+    sync_db.execute(
+        "INSERT INTO dialogs (dialog_id, type, linked_chat_id, linked_chat_resolved_at) "
+        "VALUES (?, 'channel', NULL, 100)",
+        (dialog_id,),
+    )
+    with sync_db:
+        linked_chat_fact_owner.invalidate_from_update(sync_db, dialog_id, int(time.time()))
+        sync_db.execute("UPDATE linked_chat_fact_state SET retry_at=NULL WHERE channel_id=?", (dialog_id,))
+
+    manager = EventHandlerManager(MagicMock(), sync_db, shutdown_event)  # type: ignore[arg-type]
+    assert await manager.retry_one_pending_linked_chat_fact(RpcAttemptBudget(limit=1)) is False
+    assert sync_db.in_transaction is False
+    repaired_retry = sync_db.execute(
+        "SELECT retry_at FROM linked_chat_fact_state WHERE channel_id=?", (dialog_id,)
+    ).fetchone()
+    assert repaired_retry is not None and repaired_retry[0] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("linked_chat_id", "expected_offers"),
+    [
+        (456, [DemandKind.SCHEDULED_DISCOVERY, DemandKind.COLD_PEER_PAGE]),
+        (None, [DemandKind.SCHEDULED_DISCOVERY]),
+    ],
+)
+async def test_accepted_linked_chat_publication_offers_scheduled_discovery_after_commit(
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+    linked_chat_id: int | None,
+    expected_offers: list[DemandKind],
+) -> None:
+    import time
+    from contextlib import closing
+    from types import SimpleNamespace
+
+    from telethon.tl.types import Channel, InputPeerChannel
+
+    from mcp_telegram.linked_chat_fact import linked_chat_fact_owner
+    from mcp_telegram.telegram_demand import RpcAttemptBudget
+
+    dialog_id = -1000000000123
+    channel_id = 123
+    sync_db.execute(
+        "INSERT INTO dialogs (dialog_id, type, linked_chat_id, linked_chat_resolved_at) "
+        "VALUES (?, 'channel', NULL, 100)",
+        (dialog_id,),
+    )
+    with sync_db:
+        linked_chat_fact_owner.invalidate_from_update(sync_db, dialog_id, int(time.time()))
+
+    full_result = SimpleNamespace(
+        full_chat=SimpleNamespace(id=channel_id, linked_chat_id=linked_chat_id),
+        chats=[Channel(id=channel_id, access_hash=0, title="channel", photo=None, date=None)],
+    )
+
+    class _Session:
+        def get_input_entity(self, _peer: object) -> InputPeerChannel:
+            return InputPeerChannel(channel_id=channel_id, access_hash=1)
+
+    class _Client:
+        session = _Session()
+
+        async def __call__(self, _request: object) -> object:
+            return full_result
+
+    database_path = str(sync_db.execute("PRAGMA database_list").fetchone()[2])
+
+    class _CommitObservingSink:
+        def __init__(self) -> None:
+            self.offered: list[DemandKind] = []
+            self.published_at_offer: list[bool] = []
+
+        def offer(self, kind: DemandKind) -> bool:
+            self.offered.append(kind)
+            with closing(sqlite3.connect(database_path)) as reader:
+                fact = reader.execute(
+                    "SELECT linked_chat_id, linked_chat_resolved_at FROM dialogs WHERE dialog_id=?", (dialog_id,)
+                ).fetchone()
+                pending = reader.execute(
+                    "SELECT pending_generation FROM linked_chat_fact_state WHERE channel_id=?", (dialog_id,)
+                ).fetchone()
+            self.published_at_offer.append(
+                fact is not None
+                and fact[0] == (None if linked_chat_id is None else -1000000000456)
+                and fact[1] is not None
+                and pending == (None,)
+            )
+            return True
+
+    manager = EventHandlerManager(_Client(), sync_db, shutdown_event)  # type: ignore[arg-type]
+    sink = _CommitObservingSink()
+    manager.bind_demand_sink(sink)
+
+    await manager.retry_one_pending_linked_chat_fact(RpcAttemptBudget(limit=1))
+
+    assert sink.offered == expected_offers
+    assert sink.published_at_offer == [True] * len(expected_offers)
+
+
+def test_stale_linked_chat_publication_offers_no_followup_work(
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    import time
+    from types import SimpleNamespace
+
+    from telethon.tl.types import Channel
+
+    from mcp_telegram.channel_full_siblings import capture_channel_full_siblings_token
+    from mcp_telegram.linked_chat_fact import linked_chat_fact_owner
+
+    dialog_id = -1000000000123
+    channel_id = 123
+    now = int(time.time())
+    sync_db.execute(
+        "INSERT INTO dialogs (dialog_id, type, linked_chat_id, linked_chat_resolved_at) "
+        "VALUES (?, 'channel', NULL, 100)",
+        (dialog_id,),
+    )
+    with sync_db:
+        linked_chat_fact_owner.invalidate_from_update(sync_db, dialog_id, now)
+        work = linked_chat_fact_owner.next_due(sync_db, now + 1000)
+        assert work is not None
+        siblings_token = capture_channel_full_siblings_token(sync_db, dialog_id)
+        linked_chat_fact_owner.invalidate_from_update(sync_db, dialog_id, now + 1)
+
+    full_result = SimpleNamespace(
+        full_chat=SimpleNamespace(id=channel_id, linked_chat_id=456),
+        chats=[Channel(id=channel_id, access_hash=0, title="channel", photo=None, date=None)],
+    )
+    manager = EventHandlerManager(MagicMock(), sync_db, shutdown_event)  # type: ignore[arg-type]
+    sink = _RecordingDemandSink()
+    manager.bind_demand_sink(sink)
+
+    manager._publish_linked_chat_observation(work, work.generation, siblings_token, full_result, now)
+
+    assert sink.offered == []

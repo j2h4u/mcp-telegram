@@ -299,3 +299,32 @@ def test_transport_summary_carries_root_and_acquisition_dimensions() -> None:
     assert payload["demand_kind"] == "mcp_remote_acquisition"
     assert payload["acquisition_kind"] == "message_lookup"
     assert payload["actual_attempts"] == 1
+
+
+def test_get_full_channel_attempts_aggregate_by_source_and_demand_without_ids() -> None:
+    recorder = _Recorder()
+    aggregator = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), clock=lambda: 0.0)
+    dimensions = {
+        "request_class": "get_full_channel",
+        "source": TelegramRpcSource.DIALOG_RESOLUTION,
+        "service_class": RPC_SOURCE_SERVICE_CLASS[TelegramRpcSource.DIALOG_RESOLUTION],
+        "demand_kind": DemandKind.ENTITY_LOOKUP,
+        "acquisition_kind": AcquisitionKind.ENTITY_LOOKUP,
+    }
+
+    aggregator.observe_request_attempt(**dimensions)
+    aggregator.observe_request_attempt(**dimensions)
+    aggregator.flush(now=300.0)
+
+    assert len(recorder.rows) == 1
+    assert recorder.rows[0]["kind"] == "telegram.rpc_request"
+    assert recorder.rows[0]["result_count"] == 2
+    assert recorder.rows[0]["payload"] == {
+        "request_class": "get_full_channel",
+        "source": "dialog_resolution",
+        "service_class": "interactive",
+        "demand_kind": "entity_lookup",
+        "acquisition_kind": "entity_lookup",
+        "actual_attempts": 2,
+        "window_seconds": 300,
+    }

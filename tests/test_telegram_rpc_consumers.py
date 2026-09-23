@@ -49,6 +49,7 @@ EXPECTED_DURABLE_DEMAND_ORDER = (
     DemandKind.SCHEDULED_REPAIR,
     DemandKind.SCHEDULED_DISCOVERY,
     DemandKind.DRAFT_SNAPSHOT,
+    DemandKind.LINKED_CHAT_REFRESH,
 )
 
 
@@ -101,12 +102,29 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
         },
         TelegramRpcSource.DRAFT_SNAPSHOT: {DemandKind.DRAFT_SNAPSHOT},
         TelegramRpcSource.MAINTENANCE: {DemandKind.SELF_PROFILE_MAINTENANCE},
+        TelegramRpcSource.LINKED_CHAT_REFRESH: {DemandKind.LINKED_CHAT_REFRESH},
     }
     actual_by_source = {
         source: {kind for kind, contract in TELEGRAM_DEMAND_CONTRACTS.items() if contract.source is source}
         for source in TelegramRpcSource
     }
     assert actual_by_source == expected_by_source
+
+
+def test_linked_chat_refresh_has_its_own_bounded_durable_contract() -> None:
+    consumer = TELEGRAM_RPC_CONSUMERS[TelegramRpcSource.LINKED_CHAT_REFRESH]
+    contract = demand_contract(DemandKind.LINKED_CHAT_REFRESH)
+
+    assert consumer.admission.service_class.value == "background"
+    assert consumer.acquisition.domains == frozenset({TelegramFactDomain.DIALOGS})
+    assert consumer.acquisition.role is AcquisitionRole.RECONCILIATION
+    assert consumer.acquisition.trigger is AcquisitionTrigger.DURABLE_BACKLOG
+    assert consumer.acquisition.fanout is FanoutScope.DIALOG
+    assert consumer.demand.owner is DemandPolicyOwner.PRODUCER
+    assert consumer.demand.bound is DemandBound.PRODUCER_BOUNDED
+    assert consumer.acquisition.repairs == (TelegramRpcSource.REALTIME_EVENT,)
+    assert contract.execution_mode is ExecutionMode.DURABLE
+    assert contract.max_rpc_attempts_per_slice == 1
 
 
 def test_scheduler_classification_is_derived_from_consumer_registry() -> None:
@@ -165,7 +183,7 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
 
 def test_durable_demand_order_is_a_literal_complete_contract() -> None:
     assert DURABLE_DEMAND_ORDER == EXPECTED_DURABLE_DEMAND_ORDER
-    assert len(DURABLE_DEMAND_ORDER) == 20
+    assert len(DURABLE_DEMAND_ORDER) == 21
     assert {
         kind for kind, contract in TELEGRAM_DEMAND_CONTRACTS.items() if contract.execution_mode is ExecutionMode.DURABLE
     } == set(EXPECTED_DURABLE_DEMAND_ORDER)

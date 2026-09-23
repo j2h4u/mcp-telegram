@@ -111,6 +111,7 @@ _ProfileKey = tuple[
     bool,
     bool,
 ]
+_RequestKey = tuple[TelegramRpcSource, RpcServiceClass, DemandKind | None, AcquisitionKind | None]
 
 
 @dataclass(slots=True)
@@ -169,6 +170,7 @@ class RpcAdmissionObservationAggregator:
         self._aggregates: dict[_AdmissionKey, _AdmissionAggregate] = {}
         self._demand_aggregates: dict[_DemandKey, _DemandAggregate] = {}
         self._profile_aggregates: dict[_ProfileKey, _ProfilePairAggregate] = {}
+        self._request_attempts: dict[_RequestKey, int] = {}
         self._state_lock = threading.Lock()
         self._flush_lock = threading.Lock()
 
@@ -182,6 +184,32 @@ class RpcAdmissionObservationAggregator:
             self.flush_if_due()
         except Exception:  # noqa: BLE001 - telemetry cannot break scheduler admission
             # Operational telemetry remains best effort at the scheduler callback boundary.
+            return
+
+    def observe_request_attempt(
+        self,
+        *,
+        request_class: str,
+        source: TelegramRpcSource,
+        service_class: RpcServiceClass,
+        demand_kind: DemandKind | None = None,
+        acquisition_kind: AcquisitionKind | None = None,
+    ) -> None:
+        """Count physical dispatches for the one bounded request class in TG-4."""
+        try:
+            if request_class != "get_full_channel":
+                raise ValueError("unsupported request class")
+            if not isinstance(source, TelegramRpcSource) or not isinstance(service_class, RpcServiceClass):
+                raise TypeError("source and service_class must be bounded enums")
+            if demand_kind is not None and not isinstance(demand_kind, DemandKind):
+                raise TypeError("demand_kind must be a DemandKind")
+            if acquisition_kind is not None and not isinstance(acquisition_kind, AcquisitionKind):
+                raise TypeError("acquisition_kind must be an AcquisitionKind")
+            key = (source, service_class, demand_kind, acquisition_kind)
+            with self._state_lock:
+                self._request_attempts[key] = self._request_attempts.get(key, 0) + 1
+            self.flush_if_due()
+        except Exception:  # noqa: BLE001 - telemetry cannot affect RPC dispatch
             return
 
     def observe_demand(  # noqa: PLR0913 - explicit bounded evidence dimensions
@@ -325,7 +353,35 @@ class RpcAdmissionObservationAggregator:
         self._flush_demand_aggregates(demand_aggregates)
         with self._state_lock:
             profile_aggregates, self._profile_aggregates = self._profile_aggregates, {}
+            request_attempts, self._request_attempts = self._request_attempts, {}
         self._flush_profile_aggregates(profile_aggregates)
+        self._flush_request_attempts(request_attempts)
+
+    def _flush_request_attempts(self, attempts: dict[_RequestKey, int]) -> None:
+        for (source, service_class, demand_kind, acquisition_kind), count in attempts.items():
+            payload: dict[str, object] = {
+                "request_class": "get_full_channel",
+                "source": source.value,
+                "service_class": service_class.value,
+                "actual_attempts": count,
+                "window_seconds": self._summary_interval_seconds,
+            }
+            if demand_kind is not None:
+                payload["demand_kind"] = demand_kind.value
+            if acquisition_kind is not None:
+                payload["acquisition_kind"] = acquisition_kind.value
+            try:
+                self._recorder.record(
+                    kind="telegram.rpc_request", outcome="summary", result_count=count, payload=payload
+                )
+            except Exception:
+                with self._state_lock:
+                    self._request_attempts[(source, service_class, demand_kind, acquisition_kind)] = (
+                        self._request_attempts.get((source, service_class, demand_kind, acquisition_kind), 0) + count
+                    )
+                logger.exception(
+                    "rpc_request_summary_flush_failed request_class=get_full_channel source=%s", source.value
+                )
 
     def _flush_admission_aggregates(self, aggregates: dict[_AdmissionKey, _AdmissionAggregate]) -> None:
         for (source, service_class, demand_kind, acquisition_kind), aggregate in aggregates.items():

@@ -12,7 +12,6 @@ from typing import cast
 
 import pytest
 
-from mcp_telegram.activity_peer_resolve import LinkedChatResolution
 from mcp_telegram.activity_peer_sweep import WorkingSetEnrollmentSliceResult, run_working_set_enrollment_slice
 from mcp_telegram.activity_substrate import ActivityClient
 from mcp_telegram.activity_sync import _SearchResultLike, _upsert_entities_from_search
@@ -22,6 +21,7 @@ from mcp_telegram.daemon import (
     _SyncMainContext,
 )
 from mcp_telegram.daemon_api import DaemonAPIServer
+from mcp_telegram.linked_chat_fact import LinkedChatFact, LinkedChatState
 from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
 from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
 from mcp_telegram.messages.sqlite_hydration import apply_message_transcription_if_absent
@@ -189,8 +189,8 @@ async def test_working_set_enrollment_slice_preserves_phase_and_finishes(
 
     _seed_dialog(sync_conn, 12, "channel")
 
-    async def resolve(*_args: object, **_kwargs: object) -> LinkedChatResolution:
-        return LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None)
+    async def resolve(*_args: object, **_kwargs: object) -> LinkedChatFact:
+        return LinkedChatFact(LinkedChatState.KNOWN_NONE, None, 100, False, None, None)
 
     monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_linked_chat_id", resolve)
     with demand_context(DemandKind.COLD_PEER_PAGE):

@@ -140,7 +140,7 @@ async def test_edit_disable_after_precheck_skips_body_fts_and_version(
         tmp_path / "edit-race.db", dialog_id=dialog_id, message_id=message_id, text="before"
     )
     try:
-        manager = EventHandlerManager(mock_client, handler_conn, shutdown_event, mock_client.get_input_entity)
+        manager = EventHandlerManager(mock_client, handler_conn, shutdown_event)
         # EDIT has a second precheck after async extraction. Flip authorization
         # after that allowed result and before the handler's write transaction.
         _install_disable_hook(manager, disable_conn, dialog_id=dialog_id, trigger_call=2)
@@ -174,7 +174,7 @@ async def test_edit_enabled_path_still_updates_body_fts_and_version(
         tmp_path / "edit-enabled.db", dialog_id=dialog_id, message_id=message_id, text="before"
     )
     try:
-        manager = EventHandlerManager(mock_client, handler_conn, shutdown_event, mock_client.get_input_entity)
+        manager = EventHandlerManager(mock_client, handler_conn, shutdown_event)
         msg = build_mock_message(
             id=message_id,
             text="after",
@@ -206,7 +206,7 @@ async def test_transcription_disable_after_precheck_skips_body_fts_and_version(
             (dialog_id, message_id),
         )
         handler_conn.commit()
-        manager = EventHandlerManager(mock_client, handler_conn, shutdown_event, mock_client.get_input_entity)
+        manager = EventHandlerManager(mock_client, handler_conn, shutdown_event)
         # TRANSCRIPTION's initial precheck is immediately followed by reads;
         # flip authorization before its guarded write transaction starts.
         _install_disable_hook(manager, disable_conn, dialog_id=dialog_id, trigger_call=1)
@@ -242,7 +242,7 @@ async def test_transcription_enabled_path_updates_body_fts_without_version(
             (dialog_id, message_id),
         )
         handler_conn.commit()
-        manager = EventHandlerManager(mock_client, handler_conn, shutdown_event, mock_client.get_input_entity)
+        manager = EventHandlerManager(mock_client, handler_conn, shutdown_event)
         update = SimpleNamespace(
             peer=PeerUser(user_id=dialog_id), msg_id=message_id, text="voice after", pending=False, transcription_id=2
         )
