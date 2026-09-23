@@ -7,11 +7,13 @@ import time
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 import mcp_telegram.runtime_observations as runtime_observations
 from mcp_telegram.config import RuntimeObservationConfig
+from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.runtime_observations import (
     ALLOWED_KINDS,
     RuntimeObservationSink,
@@ -241,6 +243,62 @@ def test_runtime_observation_sink_logs_aggregate_queue_overflow(
     assert caplog.text.count("runtime_observation_sink_summary") == 1
 
 
+def test_delta_gap_fill_summary_requeues_after_production_sink_queue_saturation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    sink = RuntimeObservationSink(
+        path,
+        retention_ttl_seconds=5,
+        policy=replace(RuntimeObservationConfig(), queue_capacity=1),
+    )
+    writer_started = threading.Event()
+    release_writer = threading.Event()
+    original_write = sink._write_job
+    first_write = True
+
+    def block_first_write(
+        conn: sqlite3.Connection,
+        job: runtime_observations._ObservationJob,
+        writes_since_prune: int,
+    ) -> bool | None:
+        nonlocal first_write
+        if first_write:
+            first_write = False
+            writer_started.set()
+            release_writer.wait(timeout=2)
+        return original_write(conn, job, writes_since_prune)
+
+    monkeypatch.setattr(sink, "_write_job", block_first_write)
+    assert sink.record(kind="telegram.rpc_admission", outcome="head") is True
+    assert writer_started.wait(timeout=0.5)
+    assert sink.record(kind="telegram.rpc_admission", outcome="fills-queue") is True
+
+    aggregator = RpcAdmissionObservationAggregator(
+        sink,
+        policy=RuntimeObservationConfig(),
+        clock=lambda: 0.0,
+    )
+    aggregator.observe_delta_gap_fill({"slice_count": 1, "completed": 1}, reason="completed")
+    aggregator.flush(now=300)
+    assert sink.queue_full_drops == 1
+
+    release_writer.set()
+    sink._jobs.join()
+    aggregator.flush(now=600)
+    sink.close()
+
+    with closing(sqlite3.connect(path)) as conn:
+        payload = cast(
+            tuple[str] | None,
+            conn.execute("SELECT payload_json FROM runtime_observations WHERE kind='sync.delta_gap_fill'").fetchone(),
+        )
+    assert payload is not None
+    assert '"slice_count":1' in payload[0]
+
+
 @pytest.mark.asyncio
 async def test_runtime_observation_sink_survives_a_permanent_job_failure(
     tmp_path: Path,
@@ -466,7 +524,7 @@ def test_runtime_observation_sink_drops_bounded_lock_contention_and_rejects_afte
 
     conn.execute("BEGIN IMMEDIATE")
     conn.execute("INSERT INTO app_work VALUES ('writer-lock')")
-    assert sink.record(kind="telegram.rpc_admission", outcome="queued") is None
+    assert sink.record(kind="telegram.rpc_admission", outcome="queued") is True
     assert conn.in_transaction
     conn.rollback()
     sink.close()

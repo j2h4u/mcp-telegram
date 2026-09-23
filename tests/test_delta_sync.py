@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol, cast
+from unittest.mock import patch
 
 import pytest
 
@@ -22,7 +23,7 @@ from mcp_telegram.message_history.contracts import (
 )
 from mcp_telegram.messages.telegram_adapter import extract_message_row
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-from mcp_telegram.telegram_demand import RpcAttemptBudget
+from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcAttemptBudgetExhaustedError
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionExpiredError,
     RpcAdmissionSaturatedError,
@@ -91,6 +92,8 @@ class _ForwardPort:
                 raise RpcAdmissionSaturatedError(current_rpc_scope(), "full")
             if page == "expired":
                 raise RpcAdmissionExpiredError(current_rpc_scope(), "expired")
+            if page == "budget":
+                raise RpcAttemptBudgetExhaustedError("budget exhausted")
             if page == "flood":
                 raise TelegramRpcThrottled(retry_after_seconds=3)
             raise MessageHistoryUnavailableError("ordinary failure")
@@ -99,6 +102,14 @@ class _ForwardPort:
         if self.disable_after_fetch and self.conn is not None:
             disable_history(cast(sqlite3.Connection, self.conn), dialog_id, now=2)
         return page
+
+
+class _DeltaObserver:
+    def __init__(self) -> None:
+        self.rows: list[tuple[Mapping[str, int], str]] = []
+
+    def observe_delta_gap_fill(self, metrics: Mapping[str, int], *, reason: str) -> None:
+        self.rows.append((metrics, reason))
 
 
 @pytest.mark.asyncio
@@ -232,6 +243,9 @@ async def test_access_loss_marks_dialog_without_publishing(sync_db: _SQLiteConne
         "expired",
         "flood",
         "ordinary",
+        "cancelled",
+        "error",
+        "budget",
     ],
 )
 async def test_page_failures_preserve_checkpoint_and_reach_demand_coordinator(
@@ -246,7 +260,8 @@ async def test_page_failures_preserve_checkpoint_and_reach_demand_coordinator(
         cast(sqlite3.Connection, sync_db),
         asyncio.Event(),
     )
-    adapter = DeltaGapFillDemandAdapter(worker)
+    observer = _DeltaObserver()
+    adapter = DeltaGapFillDemandAdapter(worker, observer=observer)
 
     expected_error = {
         "deferred": TelegramRpcAdmissionDeferred,
@@ -254,10 +269,153 @@ async def test_page_failures_preserve_checkpoint_and_reach_demand_coordinator(
         "expired": RpcAdmissionExpiredError,
         "flood": TelegramRpcThrottled,
         "ordinary": MessageHistoryUnavailableError,
+        "cancelled": asyncio.CancelledError,
+        "error": RuntimeError,
+        "budget": RpcAttemptBudgetExhaustedError,
     }[error_kind]
+    page_error: BaseException | str = {
+        "cancelled": asyncio.CancelledError(),
+        "error": RuntimeError("private exception detail"),
+    }.get(error_kind, error_kind)
+    worker._history_port = _ForwardPort([page_error])
     with pytest.raises(expected_error):
         await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert len(observer.rows) == 1
+    observed, reason = observer.rows[0]
+    assert observed["slice_count"] == observed["deferred"] + observed["failed"] == 1
+    assert observed["completed"] == 0
+    expected_reason = {
+        "deferred": "admission_deferred",
+        "saturated": "admission_saturated",
+        "expired": "admission_expired",
+        "flood": "flood_wait",
+        "ordinary": "history_unavailable",
+        "cancelled": "cancelled",
+        "error": "error",
+        "budget": "budget_exhausted",
+    }[error_kind]
+    assert reason == expected_reason
     assert sync_db.execute(
         "SELECT delta_refresh_requested_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone() == (1, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rows", "complete", "existing", "expected"),
+    [
+        (
+            (11, 12),
+            True,
+            (),
+            {
+                "new_key_count": 2,
+                "preexisting_key_count": 0,
+                "uncommitted_unique_count": 0,
+                "duplicate_count": 0,
+                "terminal_count": 1,
+            },
+        ),
+        (
+            (11,),
+            True,
+            (11,),
+            {
+                "new_key_count": 0,
+                "preexisting_key_count": 1,
+                "uncommitted_unique_count": 0,
+                "duplicate_count": 0,
+                "terminal_count": 1,
+            },
+        ),
+        (
+            (11, 11),
+            True,
+            (),
+            {
+                "new_key_count": 1,
+                "preexisting_key_count": 0,
+                "uncommitted_unique_count": 0,
+                "duplicate_count": 1,
+                "terminal_count": 1,
+            },
+        ),
+        (
+            (),
+            True,
+            (),
+            {
+                "new_key_count": 0,
+                "preexisting_key_count": 0,
+                "uncommitted_unique_count": 0,
+                "duplicate_count": 0,
+                "empty_page_count": 1,
+                "terminal_count": 1,
+            },
+        ),
+        ((11,), False, (), {"new_key_count": 1, "continuation_count": 1, "terminal_count": 0}),
+    ],
+)
+async def test_forward_slice_observes_page_and_message_key_outcomes(
+    sync_db: _SQLiteConnection,
+    rows: tuple[int, ...],
+    complete: bool,
+    existing: tuple[int, ...],
+    expected: dict[str, int],
+) -> None:
+    dialog_id = 107
+    _seed_dialog(sync_db, dialog_id, refresh_requested_at=1)
+    sync_db.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, ?, 1)", (dialog_id, 10))
+    for message_id in existing:
+        sync_db.execute(
+            "INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, ?, 1)", (dialog_id, message_id)
+        )
+    sync_db.commit()
+    page = ForwardGapPage(tuple(_message(dialog_id, message_id) for message_id in rows), complete=complete)
+    observer = _DeltaObserver()
+    worker = DeltaSyncWorker(_ForwardPort([page]), cast(sqlite3.Connection, sync_db), asyncio.Event())
+    adapter = DeltaGapFillDemandAdapter(worker, observer=observer)
+
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert len(observer.rows) == 1
+    metrics, reason = observer.rows[0]
+    assert metrics["slice_count"] == metrics["completed"] + metrics["deferred"] + metrics["failed"] == 1
+    assert metrics["fetched_count"] == sum(
+        metrics[key]
+        for key in ("new_key_count", "preexisting_key_count", "uncommitted_unique_count", "duplicate_count")
+    )
+    assert metrics["page_count"] >= metrics["empty_page_count"]
+    for key, value in expected.items():
+        assert metrics[key] == value
+    if not rows:
+        assert reason == "empty_page"
+
+
+@pytest.mark.asyncio
+async def test_delta_sync_without_observer_skips_telemetry_lookup_and_still_commits(
+    sync_db: _SQLiteConnection,
+) -> None:
+    dialog_id = 108
+    _seed_dialog(sync_db, dialog_id, refresh_requested_at=1)
+    sync_db.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, ?, 1)", (dialog_id, 10))
+    sync_db.commit()
+    statements: list[str] = []
+    cast(sqlite3.Connection, sync_db).set_trace_callback(statements.append)
+    worker = DeltaSyncWorker(
+        _ForwardPort([ForwardGapPage((_message(dialog_id, 11),), complete=True)]),
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+    )
+
+    await worker.fetch_delta_slice_for_dialog(dialog_id)
+
+    assert sync_db.execute(
+        "SELECT COUNT(*) FROM messages WHERE dialog_id=? AND message_id=11", (dialog_id,)
+    ).fetchone() == (1,)
+    assert not any(
+        "SELECT message_id FROM messages WHERE dialog_id" in statement and " IN (" in statement
+        for statement in statements
+    )

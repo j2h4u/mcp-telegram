@@ -39,8 +39,10 @@ from .messages.sqlite_bundle import insert_messages_with_fts
 from .reactions.contracts import ReactionAggregateSource
 from .telegram_demand import (
     AcquisitionKind,
+    DeltaGapFillObservationHook,
     DemandStatus,
     RpcAttemptBudget,
+    RpcAttemptBudgetExhaustedError,
     UnclassifiedTelegramDemandError,
     acquisition_context,
     current_demand_token,
@@ -179,6 +181,21 @@ class DmGapScanPage(Protocol):
     async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int: ...
 
 
+def _delta_gap_fill_error_result(exc: BaseException) -> tuple[str, str]:
+    for error_type, result in (
+        (TelegramRpcAdmissionDeferred, ("deferred", "admission_deferred")),
+        (RpcAdmissionSaturatedError, ("deferred", "admission_saturated")),
+        (RpcAdmissionExpiredError, ("deferred", "admission_expired")),
+        (RpcAttemptBudgetExhaustedError, ("deferred", "budget_exhausted")),
+        (TelegramRpcThrottled, ("deferred", "flood_wait")),
+        (asyncio.CancelledError, ("failed", "cancelled")),
+        (MessageHistoryUnavailableError, ("failed", "history_unavailable")),
+    ):
+        if isinstance(exc, error_type):
+            return result
+    return "failed", "error"
+
+
 def _load_dm_gap_scan_state(conn: sqlite3.Connection) -> _DmGapScanState | None:
     row = cast(
         tuple[str | None] | None,
@@ -285,6 +302,13 @@ class _DeltaFetchOutcome:
     reaction_observed_at: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _DeltaGapFillSliceOutcome:
+    outcome: str
+    attempts_before: int
+    recovery_completed: bool | None = None
+
+
 def _row_first_int(row: tuple[object | None, ...] | None) -> int:
     if row is None:
         return 0
@@ -336,6 +360,10 @@ class DeltaSyncWorker:
         self._last_delta_slice_completed = False
         self._last_delta_slice_succeeded = False
         self._last_delta_slice_error: BaseException | None = None
+        self._last_delta_slice_access_lost = False
+        self._last_delta_slice_skipped = False
+        self._last_delta_page_metrics: dict[str, int] = {}
+        self._delta_gap_fill_observation_enabled = False
 
     def _stamp_delta_checkpoint(self, dialog_id: int, checked_at: int) -> None:
         self._conn.execute(_UPDATE_DELTA_CHECKPOINT_SQL, (checked_at, checked_at, dialog_id, dialog_id))
@@ -363,6 +391,9 @@ class DeltaSyncWorker:
         self._last_delta_slice_completed = False
         self._last_delta_slice_succeeded = False
         self._last_delta_slice_error = None
+        self._last_delta_slice_access_lost = False
+        self._last_delta_slice_skipped = False
+        self._last_delta_page_metrics = {}
 
     def _max_known_message_id(self, dialog_id: int) -> int:
         row = cast(
@@ -396,6 +427,7 @@ class DeltaSyncWorker:
             self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
         except MessageHistoryAccessLostError as exc:
+            self._last_delta_slice_access_lost = True
             set_access_lost(self._conn, dialog_id, int(time.time()), reason=exc.reason_code)
             self._conn.commit()
             return _DeltaFetchOutcome([], 0)
@@ -403,31 +435,136 @@ class DeltaSyncWorker:
             logger.warning("delta_slice_rpc_error dialog_id=%d error=%s", dialog_id, exc)
             self._last_delta_slice_error = exc
             return _DeltaFetchOutcome([], 0)
-        return _DeltaFetchOutcome(
-            list(page.messages), completed=page.complete, reaction_observed_at=reaction_observed_at
-        )
+        rows = list(page.messages)
+        if self._delta_gap_fill_observation_enabled:
+            unique_keys = {(row.message.dialog_id, row.message.message_id) for row in rows}
+            self._last_delta_page_metrics = {
+                "page_count": 1,
+                "empty_page_count": int(not rows),
+                "fetched_count": len(rows),
+                "duplicate_count": len(rows) - len(unique_keys),
+                "preexisting_key_count": 0,
+                "new_key_count": 0,
+                "uncommitted_unique_count": len(unique_keys),
+            }
+        return _DeltaFetchOutcome(rows, completed=page.complete, reaction_observed_at=reaction_observed_at)
 
     def _commit_delta_slice(self, dialog_id: int, outcome: _DeltaFetchOutcome) -> int:
         continuation_required = not outcome.completed or len(outcome.rows) == _DELTA_SLICE_MESSAGE_LIMIT
         now = int(time.time())
+        result = self._commit_delta_transaction(dialog_id, outcome, continuation_required, now)
+        if result is None:
+            return 0
+        unique_message_ids, existing_ids, committed_new_count = result
+        self._last_delta_slice_completed = not continuation_required
+        self._last_delta_slice_succeeded = True
+        if self._delta_gap_fill_observation_enabled and outcome.rows:
+            self._last_delta_page_metrics.update(
+                new_key_count=committed_new_count,
+                uncommitted_unique_count=len(unique_message_ids) - len(existing_ids) - committed_new_count,
+            )
+        return len(outcome.rows)
+
+    def _commit_delta_transaction(
+        self, dialog_id: int, outcome: _DeltaFetchOutcome, continuation_required: bool, now: int
+    ) -> tuple[list[int], set[int], int] | None:
         with self._conn:
+            unique_message_ids, existing_ids = self._existing_delta_message_ids(dialog_id, outcome.rows)
             if not full_history_enabled(self._conn, dialog_id):
-                return 0
-            if outcome.rows:
-                insert_messages_with_fts(
-                    self._conn,
-                    outcome.rows,
-                    priority=HydrationPriority.BACKFILL,
-                    reaction_source=ReactionAggregateSource.DELTA,
-                    reaction_observed_at=outcome.reaction_observed_at or now,
-                )
+                self._record_uncommitted_delta_counts(unique_message_ids, existing_ids)
+                return None
+            committed_new_count = self._insert_delta_messages(dialog_id, outcome, unique_message_ids, existing_ids, now)
             if continuation_required:
                 self._conn.execute(_REQUEST_DELTA_CONTINUATION_SQL, (now, dialog_id, dialog_id))
             else:
                 self._stamp_delta_checkpoint(dialog_id, now)
-        self._last_delta_slice_completed = not continuation_required
-        self._last_delta_slice_succeeded = True
-        return len(outcome.rows)
+        return unique_message_ids, existing_ids, committed_new_count
+
+    def _existing_delta_message_ids(
+        self, dialog_id: int, rows: Sequence[ExtractedMessage]
+    ) -> tuple[list[int], set[int]]:
+        if not self._delta_gap_fill_observation_enabled:
+            return [], set()
+        unique_message_ids = sorted({row.message.message_id for row in rows})
+        if not unique_message_ids:
+            return unique_message_ids, set()
+        placeholders = ",".join("?" for _ in unique_message_ids)
+        rows_found = cast(
+            Sequence[tuple[int]],
+            self._conn.execute(
+                f"SELECT message_id FROM messages WHERE dialog_id=? AND message_id IN ({placeholders})",
+                (dialog_id, *unique_message_ids),
+            ).fetchall(),
+        )
+        existing_ids = {message_id for (message_id,) in rows_found}
+        self._record_uncommitted_delta_counts(unique_message_ids, existing_ids)
+        return unique_message_ids, existing_ids
+
+    def _record_uncommitted_delta_counts(self, unique_message_ids: Sequence[int], existing_ids: set[int]) -> None:
+        if not self._delta_gap_fill_observation_enabled:
+            return
+        self._last_delta_page_metrics.update(
+            preexisting_key_count=len(existing_ids),
+            new_key_count=0,
+            uncommitted_unique_count=len(unique_message_ids) - len(existing_ids),
+        )
+
+    def _insert_delta_messages(
+        self,
+        dialog_id: int,
+        outcome: _DeltaFetchOutcome,
+        unique_message_ids: Sequence[int],
+        existing_ids: set[int],
+        now: int,
+    ) -> int:
+        if not outcome.rows:
+            return 0
+        insert_messages_with_fts(
+            self._conn,
+            outcome.rows,
+            priority=HydrationPriority.BACKFILL,
+            reaction_source=ReactionAggregateSource.DELTA,
+            reaction_observed_at=outcome.reaction_observed_at or now,
+        )
+        if not self._delta_gap_fill_observation_enabled:
+            return 0
+        # INSERT OR REPLACE publishes every unique fetched key; only absent keys count.
+        return len(unique_message_ids) - len(existing_ids)
+
+
+def _delta_gap_fill_slice_metrics(
+    worker: DeltaSyncWorker,
+    budget: RpcAttemptBudget,
+    slice_outcome: _DeltaGapFillSliceOutcome,
+) -> dict[str, int]:
+    page = worker._last_delta_page_metrics
+    attempts = max(0, budget.attempts - slice_outcome.attempts_before)
+    recovery = slice_outcome.recovery_completed is not None
+    terminal = (
+        worker._last_delta_slice_completed
+        if slice_outcome.recovery_completed is None
+        else slice_outcome.recovery_completed
+    ) and not worker._last_delta_slice_skipped
+    return {
+        "slice_count": 1,
+        "completed": int(slice_outcome.outcome == "completed"),
+        "deferred": int(slice_outcome.outcome == "deferred"),
+        "failed": int(slice_outcome.outcome == "failed"),
+        "scheduled": int(not recovery),
+        "recovery": int(recovery),
+        "actual_attempts": attempts,
+        "attempted_slices": int(attempts > 0),
+        "page_count": page.get("page_count", 0),
+        "empty_page_count": page.get("empty_page_count", 0),
+        "fetched_count": page.get("fetched_count", 0),
+        "new_key_count": page.get("new_key_count", 0),
+        "preexisting_key_count": page.get("preexisting_key_count", 0),
+        "uncommitted_unique_count": page.get("uncommitted_unique_count", 0),
+        "duplicate_count": page.get("duplicate_count", 0),
+        "continuation_count": int(worker._last_delta_slice_succeeded and not terminal),
+        "terminal_count": int(terminal),
+        "recovery_completion_count": int(slice_outcome.recovery_completed is True),
+    }
 
 
 class DeltaGapFillDemandAdapter:
@@ -435,9 +572,54 @@ class DeltaGapFillDemandAdapter:
 
     demand_kind = DemandKind.DELTA_GAP_FILL
 
-    def __init__(self, worker: DeltaSyncWorker, dm_gap_scanner: DmGapScanPage | None = None) -> None:
+    def __init__(
+        self,
+        worker: DeltaSyncWorker,
+        dm_gap_scanner: DmGapScanPage | None = None,
+        observer: DeltaGapFillObservationHook | None = None,
+    ) -> None:
         self._worker = worker
         self._dm_gap_scanner = dm_gap_scanner
+        self._observer = observer
+        if observer is not None:
+            self._worker._delta_gap_fill_observation_enabled = True
+
+    def _observe_forward_slice(
+        self, budget: RpcAttemptBudget, attempts_before: int, *, outcome: str, reason: str, recovery: bool = False
+    ) -> None:
+        if self._observer is None:
+            return
+        metrics = _delta_gap_fill_slice_metrics(
+            self._worker,
+            budget,
+            _DeltaGapFillSliceOutcome(outcome, attempts_before, True if recovery else None),
+        )
+        try:
+            self._observer.observe_delta_gap_fill(metrics, reason=reason)
+        except Exception:  # noqa: BLE001 - telemetry cannot change sync behavior
+            logger.debug("delta_gap_fill_observation_failed")
+
+    async def _run_forward_slice(self, budget: RpcAttemptBudget, dialog_id: int) -> None:
+        attempts_before = budget.attempts
+        outcome, reason = "completed", "completed"
+        try:
+            await self._worker.fetch_delta_slice_for_dialog(dialog_id)
+            if self._worker._last_delta_slice_error is not None:
+                raise self._worker._last_delta_slice_error
+            if self._worker._last_delta_slice_access_lost:
+                outcome, reason = "failed", "access_lost"
+            elif self._worker._last_delta_slice_completed:
+                if self._worker._last_delta_page_metrics.get("empty_page_count", 0):
+                    reason = "empty_page"
+                else:
+                    reason = "terminal" if self._worker._last_delta_page_metrics.get("page_count", 0) else "completed"
+            elif self._worker._last_delta_slice_succeeded:
+                reason = "continuation"
+        except BaseException as exc:
+            outcome, reason = _delta_gap_fill_error_result(exc)
+            raise
+        finally:
+            self._observe_forward_slice(budget, attempts_before, outcome=outcome, reason=reason)
 
     def _ordinary_candidate(self, now: float) -> tuple[float, int] | None:
         rows = cast(
@@ -571,9 +753,7 @@ class DeltaGapFillDemandAdapter:
                     await self._run_dm_gap_slice(now)
                 else:
                     assert candidate[2] is not None
-                    await self._worker.fetch_delta_slice_for_dialog(candidate[2])
-                    if self._worker._last_delta_slice_error is not None:
-                        raise self._worker._last_delta_slice_error
+                    await self._run_forward_slice(budget, candidate[2])
 
 
 def _restore_revalidated_access(
@@ -644,10 +824,19 @@ class DeltaAccessProbeDemandAdapter:
 
     demand_kind = DemandKind.DELTA_ACCESS_PROBE
 
-    def __init__(self, worker: DeltaSyncWorker, policy: AccessProbePolicy, probe: AccessProbe) -> None:
+    def __init__(
+        self,
+        worker: DeltaSyncWorker,
+        policy: AccessProbePolicy,
+        probe: AccessProbe,
+        observer: DeltaGapFillObservationHook | None = None,
+    ) -> None:
         self._worker = worker
         self._policy = policy
         self._probe = probe
+        self._observer = observer
+        if observer is not None:
+            self._worker._delta_gap_fill_observation_enabled = True
 
     def status(self, now: float) -> DemandStatus | None:
         """Report the earliest access revalidation boundary without writes."""
@@ -690,9 +879,39 @@ class DeltaAccessProbeDemandAdapter:
             with rpc_attempt_budget(budget):
                 recovery = _due_access_recovery(self._worker._conn, now=int(time.time()))
                 if recovery is not None:
-                    await self._run_gap_fill_slice(recovery)
+                    await self._run_observed_recovery_slice(budget, recovery)
                     return
                 await self._run_probe_slice()
+
+    async def _run_observed_recovery_slice(self, budget: RpcAttemptBudget, recovery: _DurableAccessRecovery) -> None:
+        attempts_before = budget.attempts
+        self._worker._reset_delta_slice_state()
+        outcome, reason = "completed", "completed"
+        recovery_completed = False
+        try:
+            recovery_completed = await self._run_gap_fill_slice(recovery)
+            if self._worker._last_delta_slice_error is not None:
+                outcome, reason = _delta_gap_fill_error_result(self._worker._last_delta_slice_error)
+            elif self._worker._last_delta_slice_access_lost:
+                outcome, reason = "failed", "access_lost"
+            elif recovery_completed:
+                reason = "skipped" if self._worker._last_delta_slice_skipped else "terminal"
+            elif self._worker._last_delta_slice_succeeded:
+                reason = "continuation"
+        except BaseException as exc:
+            outcome, reason = _delta_gap_fill_error_result(exc)
+            raise
+        finally:
+            if self._observer is not None:
+                metrics = _delta_gap_fill_slice_metrics(
+                    self._worker,
+                    budget,
+                    _DeltaGapFillSliceOutcome(outcome, attempts_before, recovery_completed),
+                )
+                try:
+                    self._observer.observe_delta_gap_fill(metrics, reason=reason)
+                except Exception:  # noqa: BLE001 - telemetry cannot change sync behavior
+                    logger.debug("delta_gap_fill_observation_failed")
 
     async def _run_probe_slice(self) -> None:
         now = int(time.time())
@@ -798,17 +1017,19 @@ class DeltaAccessProbeDemandAdapter:
             )
             complete_access_revalidation(self._worker._conn, dialog_id, now)
 
-    async def _run_gap_fill_slice(self, recovery: _DurableAccessRecovery) -> None:
+    async def _run_gap_fill_slice(self, recovery: _DurableAccessRecovery) -> bool:
         if not full_history_enabled(self._worker._conn, recovery.dialog_id):
+            self._worker._reset_delta_slice_state()
+            self._worker._last_delta_slice_skipped = True
             _finish_durable_access_recovery(self._worker._conn, recovery)
-            return
+            return True
         await self._worker.fetch_delta_slice_for_dialog(recovery.dialog_id)
         if self._worker._last_delta_slice_completed:
             _finish_durable_access_recovery(self._worker._conn, recovery)
-            return
+            return True
         if self._worker._last_delta_slice_succeeded:
             _set_access_recovery_retry(self._worker._conn, recovery.dialog_id, None)
-            return
+            return False
         if (
             self._worker._conn.execute(
                 "SELECT 1 FROM delta_access_recovery_state WHERE dialog_id=?", (recovery.dialog_id,)
@@ -820,6 +1041,7 @@ class DeltaAccessProbeDemandAdapter:
                 recovery.dialog_id,
                 int(time.time()) + self._policy.cooldown_seconds,
             )
+        return False
 
 
 _EXPORTED_SYMBOLS = (

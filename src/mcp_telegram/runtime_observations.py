@@ -36,6 +36,7 @@ ALLOWED_KINDS = frozenset(
         "telegram.demand",
         "daemon.request_timing",
         "entity_profile.pair",
+        "sync.delta_gap_fill",
         "message_fact.read_at",
         "reaction.aggregate",
         "reaction.detail",
@@ -284,8 +285,8 @@ class RuntimeObservationSink:
         error_type: str | None = None,
         payload: Mapping[str, object] | None = None,
         observed_at_ms: int | None = None,
-    ) -> None:
-        """Encode and enqueue one observation without waiting for the writer."""
+    ) -> bool:
+        """Enqueue one observation without waiting; return whether the queue accepted it."""
         if kind not in ALLOWED_KINDS:
             raise ValueError(f"unsupported runtime event kind: {kind}")
         tool_capability, contract_version = _normalize_tool_identity(
@@ -322,6 +323,8 @@ class RuntimeObservationSink:
                 self._jobs.put_nowait(job)
             except queue.Full:
                 self._increment("queue_full_drops")
+                return False
+        return True
 
     def close(self) -> None:
         """Synchronously close the sink for non-async callers."""

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field, replace
 
 from mcp_telegram.config import RuntimeObservationConfig
 from mcp_telegram.rpc_admission_observations import DemandEvidenceOutcome, RpcAdmissionObservationAggregator
+from mcp_telegram.runtime_observations import MAX_PAYLOAD_BYTES, encode_payload
 from mcp_telegram.telegram_demand import AcquisitionKind
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
@@ -19,7 +20,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
 class _Recorder:
     rows: list[dict[str, object]] = field(default_factory=list)
 
-    def record(self, **values: object) -> None:
+    def record(self, **values: object) -> bool | None:
         self.rows.append(values)
 
 
@@ -328,3 +329,155 @@ def test_get_full_channel_attempts_aggregate_by_source_and_demand_without_ids() 
         "actual_attempts": 2,
         "window_seconds": 300,
     }
+
+
+def test_delta_gap_fill_summary_reconciles_and_stays_private_and_bounded() -> None:
+    recorder = _Recorder()
+    aggregator = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), clock=lambda: 0.0)
+    aggregator.observe_delta_gap_fill(
+        {
+            "slice_count": 1,
+            "completed": 1,
+            "scheduled": 1,
+            "actual_attempts": 2,
+            "attempted_slices": 1,
+            "page_count": 1,
+            "fetched_count": 3,
+            "new_key_count": 1,
+            "preexisting_key_count": 1,
+            "uncommitted_unique_count": 0,
+            "duplicate_count": 1,
+            "terminal_count": 1,
+        },
+        reason="terminal",
+    )
+    aggregator.flush(now=300)
+
+    assert len(recorder.rows) == 1
+    row = recorder.rows[0]
+    assert row["kind"] == "sync.delta_gap_fill"
+    assert row["outcome"] == "summary"
+    payload = row["payload"]
+    assert isinstance(payload, dict)
+    assert payload["slice_count"] == payload["completed"] + payload["deferred"] + payload["failed"] == 1
+    assert payload["slice_outcome_scope"] == "forward_slice"
+    assert payload["fetched_count"] == sum(
+        payload[key]
+        for key in ("new_key_count", "preexisting_key_count", "uncommitted_unique_count", "duplicate_count")
+    )
+    assert len(encode_payload(payload).encode()) <= MAX_PAYLOAD_BYTES
+    assert "dialog_id" not in payload and "message_id" not in payload and "content" not in payload
+    assert payload["reason_counts"] == {"terminal": 1}
+
+
+def test_empty_delta_gap_fill_window_advances_before_next_active_window() -> None:
+    now = 0.0
+    recorder = _Recorder()
+    aggregator = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), clock=lambda: now)
+
+    aggregator.flush(now=300.0)
+    now = 600.0
+    aggregator.observe_delta_gap_fill({"slice_count": 1, "completed": 1}, reason="completed")
+
+    assert len(recorder.rows) == 1
+    payload = recorder.rows[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["window_seconds"] == 300.0
+
+
+def test_failed_delta_gap_fill_flush_is_requeued() -> None:
+    class _FlakyRecorder(_Recorder):
+        failures = 1
+
+        def record(self, **values: object) -> None:
+            if values.get("kind") == "sync.delta_gap_fill" and self.failures:
+                self.failures -= 1
+                raise RuntimeError("offline")
+            super().record(**values)
+
+    recorder = _FlakyRecorder()
+    aggregator = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), clock=lambda: 0.0)
+    aggregator.observe_delta_gap_fill({"slice_count": 1, "completed": 1}, reason="completed")
+
+    aggregator.flush(now=300)
+    assert recorder.rows == []
+    aggregator.flush()  # the daemon's shutdown drain uses an unconditional flush
+    assert len(recorder.rows) == 1
+    assert recorder.rows[0]["payload"]["slice_count"] == 1  # type: ignore[index]
+
+
+def test_queue_rejected_delta_gap_fill_retries_with_actual_merged_window() -> None:
+    now = 0.0
+
+    class _QueueFullRecorder(_Recorder):
+        reject_once = True
+
+        def record(self, **values: object) -> bool | None:
+            if values.get("kind") == "sync.delta_gap_fill" and self.reject_once:
+                self.reject_once = False
+                return False
+            super().record(**values)
+            return True
+
+    recorder = _QueueFullRecorder()
+    aggregator = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), clock=lambda: now)
+
+    aggregator.observe_delta_gap_fill({"slice_count": 1, "completed": 1}, reason="completed")
+    aggregator.flush(now=300.0)
+    assert recorder.rows == []
+
+    now = 600.0
+    aggregator.observe_delta_gap_fill({"slice_count": 1, "completed": 1}, reason="completed")
+
+    assert len(recorder.rows) == 1
+    payload = recorder.rows[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["slice_count"] == 2
+    assert payload["window_seconds"] == 600.0
+    assert payload["slice_outcome_scope"] == "forward_slice"
+
+
+def test_delta_gap_fill_reason_cardinality_is_fixed_and_payload_remains_bounded() -> None:
+    recorder = _Recorder()
+    aggregator = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), clock=lambda: 0.0)
+    reasons = (
+        "admission_deferred",
+        "admission_saturated",
+        "admission_expired",
+        "flood_wait",
+        "access_lost",
+        "history_unavailable",
+        "cancelled",
+        "error",
+        "skipped",
+        "empty_page",
+        "continuation",
+        "terminal",
+        "completed",
+        "private dialog 123",
+    )
+    for reason in reasons:
+        aggregator.observe_delta_gap_fill({"slice_count": 1, "completed": 1}, reason=reason)
+    aggregator.flush(now=300)
+
+    payload = recorder.rows[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["slice_count"] == len(reasons)
+    assert payload["reason_counts"]["error"] == 2  # type: ignore[index]
+    assert len(payload["reason_counts"]) <= 13  # type: ignore[arg-type]
+    assert len(encode_payload(payload).encode()) <= MAX_PAYLOAD_BYTES
+
+
+def test_invalid_delta_gap_fill_slice_is_reported_without_corrupting_valid_totals() -> None:
+    recorder = _Recorder()
+    aggregator = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), clock=lambda: 0.0)
+    aggregator.observe_delta_gap_fill({"slice_count": 1, "completed": 0}, reason="private dialog 123")
+    aggregator.flush(now=300)
+
+    assert len(recorder.rows) == 1
+    payload = recorder.rows[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["slice_count"] == payload["completed"] + payload["deferred"] + payload["failed"] == 0
+    assert payload["rejected_slice_count"] == 1
+    assert recorder.rows[0]["result_count"] == 1
+    assert "private dialog 123" not in encode_payload(payload)
