@@ -29,6 +29,7 @@ class TelegramRpcSource(StrEnum):
     ENTITY_INFO_REFRESH = "entity_info_refresh"
     ACCOUNT_TRACE = "account_trace"
     TELETHON_UPDATE_DIFFERENCE = "telethon_update_difference"
+    TELETHON_RECONNECT_PROBE = "telethon_reconnect_probe"
     RECONNECT_DIFFERENCE = "reconnect_difference"
     REALTIME_EVENT = "realtime_event"
     DELTA_SYNC = "delta_sync"
@@ -60,6 +61,7 @@ class DemandKind(StrEnum):
     ENTITY_PROFILE_REFRESH = "entity_profile_refresh"
     ACCOUNT_TRACE_PAGE = "account_trace_page"
     TELETHON_UPDATE_DIFFERENCE = "telethon_update_difference"
+    TELETHON_RECONNECT_PROBE = "telethon_reconnect_probe"
     RECONNECT_DIFFERENCE = "reconnect_difference"
     REALTIME_EVENT_ACQUISITION = "realtime_event_acquisition"
     DELTA_GAP_FILL = "delta_gap_fill"
@@ -365,6 +367,16 @@ _REGISTRY: dict[TelegramRpcSource, TelegramRpcConsumerSpec] = {
         DemandPolicyOwner.TELETHON,
         repairs=(TelegramRpcSource.REALTIME_EVENT,),
     ),
+    TelegramRpcSource.TELETHON_RECONNECT_PROBE: _consumer(
+        "Telethon reconnect probe",
+        "Let Telethon verify the account after an internal reconnect",
+        _L,
+        TelegramFactDomain.ACCOUNT,
+        AcquisitionRole.DIRECT,
+        AcquisitionTrigger.TELETHON_INTERNAL,
+        FanoutScope.ACCOUNT,
+        DemandPolicyOwner.TELETHON,
+    ),
     TelegramRpcSource.RECONNECT_DIFFERENCE: _consumer(
         "Reconnect difference",
         "Request missed updates after a reconnect transition",
@@ -641,6 +653,11 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
     DemandKind.TELETHON_UPDATE_DIFFERENCE: _contract(
         DemandKind.TELETHON_UPDATE_DIFFERENCE,
         TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE,
+        _PROTOCOL,
+    ),
+    DemandKind.TELETHON_RECONNECT_PROBE: _contract(
+        DemandKind.TELETHON_RECONNECT_PROBE,
+        TelegramRpcSource.TELETHON_RECONNECT_PROBE,
         _PROTOCOL,
     ),
     DemandKind.RECONNECT_DIFFERENCE: _contract(

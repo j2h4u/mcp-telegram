@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 class ReconnectClient(Protocol):
     """Public client surface required for reconnect update recovery."""
 
-    def is_connected(self) -> bool: ...
+    @property
+    def reconnect_event(self) -> asyncio.Event: ...
 
     async def catch_up(self) -> None: ...
 
@@ -64,14 +65,23 @@ async def _request_catch_up_in_context(
         return True
 
 
-def _observe_connection_transition(
-    observe: Callable[[str, str, str | None], None] | None,
-    *,
-    connected: bool,
-    was_connected: bool,
-) -> None:
-    if connected != was_connected and observe is not None:
-        observe("runtime.connection_observed", "connected" if connected else "disconnected", None)
+async def _wait_for_reconnect_signal(client: ReconnectClient, shutdown_event: asyncio.Event) -> bool:
+    reconnect_task = asyncio.create_task(client.reconnect_event.wait())
+    shutdown_task = asyncio.create_task(shutdown_event.wait())
+    try:
+        done, _ = await asyncio.wait(
+            (reconnect_task, shutdown_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if shutdown_task in done:
+            return False
+        client.reconnect_event.clear()
+        return True
+    finally:
+        for task in (reconnect_task, shutdown_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(reconnect_task, shutdown_task, return_exceptions=True)
 
 
 async def run_reconnect_catch_up_loop(
@@ -82,38 +92,36 @@ async def run_reconnect_catch_up_loop(
     observe: Callable[[str, str, str | None], None] | None = None,
     on_reconnect: Callable[[], None] | None = None,
 ) -> None:
-    """Recover missed updates once for each observed reconnect transition.
+    """Recover missed updates once for each Telethon reconnect signal.
 
     Telethon owns initial startup catch-up through ``TelegramClient``'s
-    ``catch_up=True`` option. This loop only invokes the public ``catch_up``
-    method after observing a disconnected to connected transition. A failed
-    recovery remains pending and retries at the configured poll cadence until
-    the public connection state changes back to disconnected or recovery
-    succeeds.
+    ``catch_up=True`` option. This loop consumes the event signalled by
+    Telethon's internal reconnect handler. A failed recovery remains pending
+    and retries at the configured cadence; repeated signals stay coalesced by
+    ``asyncio.Event`` until the current recovery succeeds.
     """
     if interval_seconds <= 0:
         raise ValueError("interval_seconds must be positive")
 
-    was_connected = bool(client.is_connected())
     recovery_needed = False
     while not shutdown_event.is_set():
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=interval_seconds)
-            break
-        except TimeoutError:
-            pass
-
-        connected = bool(client.is_connected())
-        _observe_connection_transition(observe, connected=connected, was_connected=was_connected)
-        if not connected:
-            recovery_needed = False
-        elif not was_connected:
+        if not recovery_needed:
+            if not await _wait_for_reconnect_signal(client, shutdown_event):
+                break
             recovery_needed = True
+            if observe is not None:
+                observe("runtime.connection_observed", "reconnected", None)
             if on_reconnect is not None:
                 on_reconnect()
-        if connected and recovery_needed and await _request_catch_up(client, observe):
+
+        if await _request_catch_up(client, observe):
             recovery_needed = False
-        was_connected = connected
+            continue
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=interval_seconds)
+        except TimeoutError:
+            continue
+        break
 
 
 __all__ = ["ReconnectClient", "run_reconnect_catch_up_loop"]
