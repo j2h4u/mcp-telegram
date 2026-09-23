@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import time
+from dataclasses import dataclass
 from typing import Literal, Protocol, cast
 
 from ..alert_policy import incoming_human_dm_sql
@@ -501,32 +502,9 @@ def _build_list_messages_query(
         "self_id": self_id,
     }
     sql = _LIST_MESSAGES_BASE_SQL
-
-    if since_utc is not None:
-        sql += " AND m.sent_at >= :since_utc"
-        params["since_utc"] = since_utc
-    if until_utc is not None:
-        sql += " AND m.sent_at < :until_utc"
-        params["until_utc"] = until_utc
-
-    if sender_id is not None:
-        sql += f" AND {_EFFECTIVE_SENDER_ID_EXPR} = :filter_sender_id"
-        params["filter_sender_id"] = sender_id
-    elif sender_name is not None:
-        # Prefer the stored historical name, but fall back to resolved sender entities for DM rows
-        # whose raw sender fields are intentionally NULL.
-        sql += f" AND {_SENDER_NAME_FILTER_SQL} LIKE :sender_name_pattern ESCAPE '\\' COLLATE NOCASE"
-        escaped = sender_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        params["sender_name_pattern"] = f"%{escaped}%"
-
-    if topic_id is not None:
-        sql += " AND m.forum_topic_id = :topic_id"
-        params["topic_id"] = topic_id
-
-    if unread_after_id is not None:
-        sql += " AND m.message_id > :unread_after_id"
-        params["unread_after_id"] = unread_after_id
-
+    sql, params = _apply_list_messages_time_filters(sql, params, since_utc, until_utc)
+    sql, params = _apply_list_messages_sender_filter(sql, params, sender_id, sender_name)
+    sql, params = _apply_list_messages_topic_and_unread_filters(sql, params, topic_id, unread_after_id)
     sql, params = _apply_list_messages_anchor_filter(sql, params, req)
 
     if direction == "oldest":
@@ -537,26 +515,82 @@ def _build_list_messages_query(
     sql += " LIMIT :limit"
 
     if query_logger is not None:
-        query_logger.debug(
-            "list_messages_query filters=%s param_count=%d direction=%s",
-            "+".join(
-                f
-                for f, v in [
-                    ("sender_id", sender_id),
-                    ("sender_name", sender_name),
-                    ("topic_id", topic_id),
-                    ("unread_after_id", unread_after_id),
-                    ("anchor", anchor_msg_id),
-                    ("since_utc", since_utc),
-                    ("until_utc", until_utc),
-                ]
-                if v is not None
-            )
-            or "none",
-            len(params),
+        _log_list_messages_query(
+            query_logger,
+            params,
             direction,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            topic_id=topic_id,
+            unread_after_id=unread_after_id,
+            anchor=anchor_msg_id,
+            since_utc=since_utc,
+            until_utc=until_utc,
         )
     return sql, params
+
+
+def _apply_list_messages_time_filters(
+    sql: str,
+    params: dict[str, object],
+    since_utc: int | None,
+    until_utc: int | None,
+) -> tuple[str, dict[str, object]]:
+    if since_utc is not None:
+        sql += " AND m.sent_at >= :since_utc"
+        params["since_utc"] = since_utc
+    if until_utc is not None:
+        sql += " AND m.sent_at < :until_utc"
+        params["until_utc"] = until_utc
+    return sql, params
+
+
+def _apply_list_messages_sender_filter(
+    sql: str,
+    params: dict[str, object],
+    sender_id: int | None,
+    sender_name: str | None,
+) -> tuple[str, dict[str, object]]:
+    if sender_id is not None:
+        sql += f" AND {_EFFECTIVE_SENDER_ID_EXPR} = :filter_sender_id"
+        params["filter_sender_id"] = sender_id
+    elif sender_name is not None:
+        # Prefer the stored historical name, but fall back to resolved sender entities for DM rows
+        # whose raw sender fields are intentionally NULL.
+        sql += f" AND {_SENDER_NAME_FILTER_SQL} LIKE :sender_name_pattern ESCAPE '\\' COLLATE NOCASE"
+        escaped = sender_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        params["sender_name_pattern"] = f"%{escaped}%"
+    return sql, params
+
+
+def _apply_list_messages_topic_and_unread_filters(
+    sql: str,
+    params: dict[str, object],
+    topic_id: int | None,
+    unread_after_id: int | None,
+) -> tuple[str, dict[str, object]]:
+    if topic_id is not None:
+        sql += " AND m.forum_topic_id = :topic_id"
+        params["topic_id"] = topic_id
+    if unread_after_id is not None:
+        sql += " AND m.message_id > :unread_after_id"
+        params["unread_after_id"] = unread_after_id
+    return sql, params
+
+
+def _log_list_messages_query(
+    query_logger: _QueryLogger,
+    params: dict[str, object],
+    direction: str,
+    **filters: int | str | None,
+) -> None:
+    active_filters = "+".join(name for name, value in filters.items() if value is not None) or "none"
+    query_logger.debug(
+        "list_messages_query filters=%s param_count=%d direction=%s",
+        active_filters,
+        len(params),
+        direction,
+    )
 
 
 _DIALOG_TYPE_SQL = "SELECT type FROM entities WHERE id = ?"
@@ -577,6 +611,16 @@ WHERE m.dialog_id = :dialog_id AND m.is_deleted = 0 AND m.is_service = 0
 """
 
 
+@dataclass(frozen=True, slots=True)
+class _ReadStateValues:
+    inbox_cursor: int | None
+    outbox_cursor: int | None
+    inbox_count: int
+    outbox_count: int
+    inbox_oldest: int | None
+    outbox_oldest: int | None
+
+
 def _dialog_type_from_db(conn: sqlite3.Connection, dialog_id: int) -> str:
     """Return the cached entity type for a dialog, or ``Unknown``."""
     row = cast(tuple[object] | None, conn.execute(_DIALOG_TYPE_SQL, (dialog_id,)).fetchone())
@@ -594,38 +638,47 @@ def _read_state_for_dialog(conn: sqlite3.Connection, dialog_id: int, dialog_type
         tuple[object, object, object, object, object, object] | None,
         conn.execute(_READ_STATE_SQL, {"dialog_id": dialog_id}).fetchone(),
     )
-    # Aggregate functions return one row even when no messages match.
-    read_inbox_max_id = cast(int | None, row[0]) if row is not None else None
-    read_outbox_max_id = cast(int | None, row[1]) if row is not None else None
-    agg_row = (
-        cast(tuple[int | None, int | None, int | None, int | None], (row[2], row[3], row[4], row[5]))
-        if row is not None
-        else (None, None, None, None)
-    )
-    in_cnt = int(agg_row[0] or 0)
-    out_cnt = int(agg_row[1] or 0)
-    in_min = cast(int | None, agg_row[2])
-    out_min = cast(int | None, agg_row[3])
-
-    def _state(cursor: int | None, unread_count: int) -> Literal["populated", "null", "all_read"]:
-        if cursor is None:
-            return "null"
-        if unread_count == 0:
-            return "all_read"
-        return "populated"
-
+    values = _read_state_values(row)
     rs: ReadState = {
-        "inbox_unread_count": in_cnt,
-        "inbox_cursor_state": _state(read_inbox_max_id, in_cnt),
-        "outbox_unread_count": out_cnt,
-        "outbox_cursor_state": _state(read_outbox_max_id, out_cnt),
+        "inbox_unread_count": values.inbox_count,
+        "inbox_cursor_state": _read_cursor_state(values.inbox_cursor, values.inbox_count),
+        "outbox_unread_count": values.outbox_count,
+        "outbox_cursor_state": _read_cursor_state(values.outbox_cursor, values.outbox_count),
     }
-    if read_inbox_max_id is not None:
-        rs["inbox_max_id_anchor"] = int(read_inbox_max_id)
-    if read_outbox_max_id is not None:
-        rs["outbox_max_id_anchor"] = int(read_outbox_max_id)
-    if in_cnt > 0 and in_min is not None:
-        rs["inbox_oldest_unread_date"] = int(in_min)
-    if out_cnt > 0 and out_min is not None:
-        rs["outbox_oldest_unread_date"] = int(out_min)
+    _add_read_state_positions(rs, values)
     return rs
+
+
+def _read_state_values(
+    row: tuple[object, object, object, object, object, object] | None,
+) -> _ReadStateValues:
+    # Aggregate functions return one row even when no messages match.
+    if row is None:
+        return _ReadStateValues(None, None, 0, 0, None, None)
+    return _ReadStateValues(
+        inbox_cursor=cast(int | None, row[0]),
+        outbox_cursor=cast(int | None, row[1]),
+        inbox_count=int(cast(int | None, row[2]) or 0),
+        outbox_count=int(cast(int | None, row[3]) or 0),
+        inbox_oldest=cast(int | None, row[4]),
+        outbox_oldest=cast(int | None, row[5]),
+    )
+
+
+def _read_cursor_state(cursor: int | None, unread_count: int) -> Literal["populated", "null", "all_read"]:
+    if cursor is None:
+        return "null"
+    if unread_count == 0:
+        return "all_read"
+    return "populated"
+
+
+def _add_read_state_positions(state: ReadState, values: _ReadStateValues) -> None:
+    if values.inbox_cursor is not None:
+        state["inbox_max_id_anchor"] = int(values.inbox_cursor)
+    if values.outbox_cursor is not None:
+        state["outbox_max_id_anchor"] = int(values.outbox_cursor)
+    if values.inbox_count > 0 and values.inbox_oldest is not None:
+        state["inbox_oldest_unread_date"] = int(values.inbox_oldest)
+    if values.outbox_count > 0 and values.outbox_oldest is not None:
+        state["outbox_oldest_unread_date"] = int(values.outbox_oldest)

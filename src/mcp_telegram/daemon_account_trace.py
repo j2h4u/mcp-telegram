@@ -452,48 +452,7 @@ class DaemonAccountTraceService:
                 resolution_source="telegram_username_lookup_failed",
             )
 
-        users = list(cast(Sequence[object], _attr(result, "users", []) or []))
-        if not users:
-            return _unresolved_trace_account(
-                query=f"@{username}",
-                resolution_source="telegram_username_lookup_empty",
-            )
-
-        user = users[0]
-        user_id = _row_int(cast(Mapping[str, object], {"id": _attr(user, "id")}), "id")
-        first_name = _attr(user, "first_name", None)
-        last_name = _attr(user, "last_name", None)
-        first_name_text = first_name if isinstance(first_name, str) else None
-        last_name_text = last_name if isinstance(last_name, str) else None
-        display_name = " ".join(part for part in (first_name_text, last_name_text) if part) or username
-        resolved_username = _attr(user, "username", None)
-        if not isinstance(resolved_username, str) or not resolved_username:
-            resolved_username = username
-        entity_type = classify_dialog_type(user).value
-        now = int(time.time())
-        upsert_entity_snapshots(
-            self._deps.conn,
-            (
-                EntitySnapshot(
-                    entity_id=user_id,
-                    entity_type=entity_type,
-                    name=display_name,
-                    username=resolved_username,
-                    name_normalized=latinize(display_name),
-                    updated_at=now,
-                ),
-            ),
-        )
-        self._deps.conn.commit()
-        row = account_by_id(self._deps.conn, user_id)
-        if row is None:
-            return _unresolved_trace_account(
-                query=f"@{username}",
-                resolution_source="telegram_username_lookup_write_failed",
-            )
-        return _trace_account_from_entity_row(
-            cast(Mapping[str, object], row), resolution_source="telegram_username_lookup"
-        )
+        return _persist_trace_username_result(self._deps, username, result)
 
     @staticmethod
     def _build_trace_account_unresolved_payload(
@@ -1816,6 +1775,58 @@ def _unresolved_trace_account(
     }
 
 
+def _persist_trace_username_result(
+    deps: DaemonAccountTraceDeps,
+    username: str,
+    result: object,
+) -> dict:
+    users = list(cast(Sequence[object], _attr(result, "users", []) or []))
+    if not users:
+        return _unresolved_trace_account(
+            query=f"@{username}",
+            resolution_source="telegram_username_lookup_empty",
+        )
+
+    user = users[0]
+    user_id = _row_int(cast(Mapping[str, object], {"id": _attr(user, "id")}), "id")
+    entity_type = classify_dialog_type(user).value
+    display_name = _trace_username_display_name(user, username)
+    resolved_username = _trace_username_value(user, username)
+    upsert_entity_snapshots(
+        deps.conn,
+        (
+            EntitySnapshot(
+                entity_id=user_id,
+                entity_type=entity_type,
+                name=display_name,
+                username=resolved_username,
+                name_normalized=latinize(display_name),
+                updated_at=int(time.time()),
+            ),
+        ),
+    )
+    deps.conn.commit()
+    row = account_by_id(deps.conn, user_id)
+    if row is None:
+        return _unresolved_trace_account(
+            query=f"@{username}",
+            resolution_source="telegram_username_lookup_write_failed",
+        )
+    return _trace_account_from_entity_row(cast(Mapping[str, object], row), resolution_source="telegram_username_lookup")
+
+
+def _trace_username_display_name(user: object, username: str) -> str:
+    first_name = _attr(user, "first_name", None)
+    last_name = _attr(user, "last_name", None)
+    parts = (part for part in (first_name, last_name) if isinstance(part, str) and part)
+    return " ".join(parts) or username
+
+
+def _trace_username_value(user: object, username: str) -> str:
+    resolved_username = _attr(user, "username", None)
+    return resolved_username if isinstance(resolved_username, str) and resolved_username else username
+
+
 def _parse_trace_time_bound(value: object) -> int | None:
     """Parse a trace time bound as unix seconds or ISO datetime string."""
     if value is None:
@@ -2403,22 +2414,24 @@ def _messages_row_equal(existing: dict | None, candidate: ExtractedMessage) -> b
     if existing_message.get("is_deleted") != 0:
         return False
 
+    return _trace_message_fields_equal(existing_message, candidate) and _trace_message_children_equal(
+        existing, candidate
+    )
+
+
+def _trace_message_fields_equal(existing: Mapping[str, object], candidate: ExtractedMessage) -> bool:
     candidate_message = dataclasses.asdict(candidate.message)
     candidate_message["is_deleted"] = 0
-    for field in TRACE_MESSAGE_COMPARE_FIELDS:
-        existing_value = existing_message.get(field, 0 if field == "reply_count" else None)
-        candidate_value = candidate.reply_count if field == "reply_count" else candidate_message.get(field)
-        if existing_value != candidate_value:
-            return False
+    return all(
+        existing.get(field, 0 if field == "reply_count" else None)
+        == (candidate.reply_count if field == "reply_count" else candidate_message.get(field))
+        for field in TRACE_MESSAGE_COMPARE_FIELDS
+    )
 
+
+def _trace_message_children_equal(existing: Mapping[str, object], candidate: ExtractedMessage) -> bool:
     candidate_reactions = sorted((item.emoji, item.count) for item in candidate.reactions)
-    if existing.get("reactions", []) != candidate_reactions:
-        return False
-
     candidate_entities = sorted((item.offset, item.length, item.type, item.value) for item in candidate.entities)
-    if existing.get("entities", []) != candidate_entities:
-        return False
-
     candidate_forward = (
         None
         if candidate.forward is None
@@ -2429,7 +2442,11 @@ def _messages_row_equal(existing: dict | None, candidate: ExtractedMessage) -> b
             candidate.forward.fwd_channel_post,
         )
     )
-    return existing.get("forward") == candidate_forward
+    return (
+        existing.get("reactions", []) == candidate_reactions
+        and existing.get("entities", []) == candidate_entities
+        and existing.get("forward") == candidate_forward
+    )
 
 
 def _trace_enrichment_result(

@@ -242,6 +242,32 @@ def test_format_relative_ymd_future_does_not_return_today() -> None:
     assert _format_relative_ymd("2026-04-26", now=now) == "future date"
 
 
+@pytest.mark.parametrize(
+    ("iso_date", "expected"),
+    [
+        ("not-a-date", "not-a-date"),
+        ("2026-04-24", "1d ago"),
+        ("2026-03-26", "1mo ago"),
+        ("2025-04-25", "1y ago"),
+        ("2025-03-25", "1y 1mo ago"),
+        ("2025-04-24", "1y ago"),
+    ],
+)
+def test_format_relative_ymd_date_boundaries(iso_date: str, expected: str) -> None:
+    now = datetime(2026, 4, 25, 12, 0, 0, tzinfo=UTC)
+    assert _format_relative_ymd(iso_date, now=now) == expected
+
+
+def test_format_relative_ymd_uses_calendar_date_for_timezone_offsets() -> None:
+    now = datetime(2026, 4, 25, 0, 30, tzinfo=UTC)
+    assert _format_relative_ymd("2026-04-25T23:30:00-05:00", now=now) == "today"
+
+
+def test_format_relative_ymd_naive_now_and_date_are_compared_as_dates() -> None:
+    now = datetime(2026, 4, 25, tzinfo=UTC)
+    assert _format_relative_ymd("2026-04-24T23:59:59", now=now) == "1d ago"
+
+
 def test_entity_input_label_prefers_entity_string() -> None:
     from mcp_telegram.tools.entity_info import GetEntityInfo
 

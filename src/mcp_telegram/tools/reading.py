@@ -1111,42 +1111,46 @@ def _format_search_results(
     """Format search result rows as compact snippet lines with msg_id anchors."""
     if not rows:
         return ""
-
-    header_lines: list[str] = []
-    if read_state_per_dialog:
-        seen: dict[int, str | None] = {}
-        for row in rows:
-            did = row.get("dialog_id")
-            if did is None or did in seen:
-                continue
-            seen[did] = row.get("dialog_name")
-        now_unix = int(datetime.now(tz=UTC).timestamp())
-        for did, dname in seen.items():
-            rs = read_state_per_dialog.get(did)
-            if rs is None:
-                continue
-            rs_lines = _render_read_state_header(rs, DialogType.USER.value, now_unix)
-            if not rs_lines:
-                continue
-            label = dname or str(did)
-            header_lines.append(f"# {label}:")
-            header_lines.extend(rs_lines)
-
-    lines: list[str] = []
-    for row in rows:
-        msg_id = row["message_id"]
-        sent_at = row.get("sent_at") or 0
-        sender = resolve_sender_label(row)
-        dt = datetime.fromtimestamp(int(sent_at), tz=UTC)
-        time_str = dt.strftime("%Y-%m-%d %H:%M")
-        snippet = frame_telegram_snippet(extract_search_snippet(row.get("text"), query))
-
-        dialog_prefix = f"[{row.get('dialog_name') or '?'}] " if global_mode else ""
-        lines.append(f"{dialog_prefix}{time_str} {sender} (msg_id:{msg_id}): {snippet}")
-
+    header_lines = _search_read_state_header_lines(rows, read_state_per_dialog)
+    lines = [_format_search_result_row(row, query, global_mode=global_mode) for row in rows]
     if header_lines:
         return "\n".join(header_lines + lines)
     return "\n".join(lines)
+
+
+def _search_read_state_header_lines(
+    rows: list[dict],
+    read_state_per_dialog: dict[int, dict] | None,
+) -> list[str]:
+    if not read_state_per_dialog:
+        return []
+    seen: dict[int, str | None] = {}
+    for row in rows:
+        dialog_id = row.get("dialog_id")
+        if dialog_id is None or dialog_id in seen:
+            continue
+        seen[dialog_id] = row.get("dialog_name")
+    now_unix = int(datetime.now(tz=UTC).timestamp())
+    lines: list[str] = []
+    for dialog_id, dialog_name in seen.items():
+        read_state = read_state_per_dialog.get(dialog_id)
+        if read_state is None:
+            continue
+        state_lines = _render_read_state_header(read_state, DialogType.USER.value, now_unix)
+        if state_lines:
+            lines.append(f"# {dialog_name or dialog_id}:")
+            lines.extend(state_lines)
+    return lines
+
+
+def _format_search_result_row(row: dict, query: str, *, global_mode: bool) -> str:
+    message_id = row["message_id"]
+    sent_at = row.get("sent_at") or 0
+    timestamp = datetime.fromtimestamp(int(sent_at), tz=UTC).strftime("%Y-%m-%d %H:%M")
+    sender = resolve_sender_label(row)
+    snippet = frame_telegram_snippet(extract_search_snippet(row.get("text"), query))
+    dialog_prefix = f"[{row.get('dialog_name') or '?'}] " if global_mode else ""
+    return f"{dialog_prefix}{timestamp} {sender} (msg_id:{message_id}): {snippet}"
 
 
 # ---------------------------------------------------------------------------
@@ -1321,40 +1325,51 @@ async def _resolve_topic_id(
         return error_result(_daemon_not_running_text(exc))
 
     if not response.get("ok"):
-        error = response.get("error", "unknown")
-        error_detail = response.get("message", "Request failed.")
-        return error_result(
-            f"Topic lookup failed: {error}: {error_detail}\n"
-            "Action: Call list_topics for this dialog, then retry list_messages with a numeric exact_topic_id.",
-        )
+        return _topic_lookup_error(response)
+    return _resolve_topic_matches(response.get("data", {}).get("topics", []), topic_name)
 
-    topics = response.get("data", {}).get("topics", [])
+
+def _topic_lookup_error(response: dict) -> ToolResult:
+    error = response.get("error", "unknown")
+    error_detail = response.get("message", "Request failed.")
+    return error_result(
+        f"Topic lookup failed: {error}: {error_detail}\n"
+        "Action: Call list_topics for this dialog, then retry list_messages with a numeric exact_topic_id."
+    )
+
+
+def _resolve_topic_matches(topics: list[dict], topic_name: str) -> int | ToolResult:
     query = topic_name.lower()
-    fuzzy_matches = [t for t in topics if query in (t.get("title") or "").lower()]
-
+    fuzzy_matches = [topic for topic in topics if query in (topic.get("title") or "").lower()]
     if len(fuzzy_matches) == 1:
         return fuzzy_matches[0]["id"]
+    if not fuzzy_matches:
+        return _topic_not_found_result()
+    return _resolve_multiple_topic_matches(fuzzy_matches, query)
 
-    if len(fuzzy_matches) > 1:
-        exact_matches = [t for t in fuzzy_matches if (t.get("title") or "").lower() == query]
-        if len(exact_matches) == 1:
-            return exact_matches[0]["id"]
-        err = error_result(
-            "Multiple topics matched.\n"
-            "Action: Retry list_messages with one numeric exact_topic_id from structuredContent.candidates.",
-        )
-        return ToolResult(
-            content=err.content,
-            is_error=True,
-            structured_content={
-                "error": "ambiguous_topic",
-                "candidates": [_topic_candidate_payload(topic) for topic in fuzzy_matches[:5]],
-            },
-        )
 
+def _topic_not_found_result() -> ToolResult:
     return error_result(
         "Topic was not found in this dialog.\n"
-        "Action: Call list_topics for this dialog, then retry list_messages with a numeric exact_topic_id.",
+        "Action: Call list_topics for this dialog, then retry list_messages with a numeric exact_topic_id."
+    )
+
+
+def _resolve_multiple_topic_matches(fuzzy_matches: list[dict], query: str) -> int | ToolResult:
+    exact_matches = [topic for topic in fuzzy_matches if (topic.get("title") or "").lower() == query]
+    if len(exact_matches) == 1:
+        return exact_matches[0]["id"]
+    err = error_result(
+        "Multiple topics matched.\n"
+        "Action: Retry list_messages with one numeric exact_topic_id from structuredContent.candidates."
+    )
+    return ToolResult(
+        content=err.content,
+        is_error=True,
+        structured_content={
+            "error": "ambiguous_topic",
+            "candidates": [_topic_candidate_payload(topic) for topic in fuzzy_matches[:5]],
+        },
     )
 
 

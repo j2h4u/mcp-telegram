@@ -25,6 +25,7 @@ from mcp_telegram.sync_db import (
     _apply_migration_60,
     _apply_migration_64,
     _apply_migration_66,
+    _apply_migration_68,
     _apply_migration_70,
     _apply_migration_71,
     _apply_migration_73,
@@ -168,6 +169,101 @@ def test_reaction_state_projection_is_current(db_path: Path) -> None:
             )
             == []
         )
+
+
+def test_migration_v68_preserves_legacy_reaction_evidence(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (1, ?, 1700000000)",
+            [(10,), (11,), (12,), (13,)],
+        )
+        conn.execute("DROP TABLE message_reaction_aggregate_state")
+        conn.execute("DROP TABLE message_reaction_observation_counter")
+        conn.execute("DROP TABLE message_reaction_event_status")
+        conn.execute("DROP TABLE message_reaction_events")
+        conn.execute("DROP TABLE IF EXISTS message_reactions_freshness")
+        conn.execute(
+            "CREATE TABLE message_reactions_freshness ("
+            "dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL, checked_at INTEGER NOT NULL, "
+            "PRIMARY KEY (dialog_id, message_id)) WITHOUT ROWID"
+        )
+        conn.execute(
+            "CREATE TABLE message_reaction_events ("
+            "event_id INTEGER PRIMARY KEY AUTOINCREMENT, dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL, "
+            "reactor_id INTEGER, emoji TEXT NOT NULL, reacted_at INTEGER, fetched_at INTEGER NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE message_reaction_event_status ("
+            "dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL, checked_at INTEGER NOT NULL, "
+            "status TEXT NOT NULL, returned_count INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (dialog_id, message_id)) WITHOUT ROWID"
+        )
+        conn.execute(
+            "CREATE INDEX idx_message_reaction_events_message "
+            "ON message_reaction_events(dialog_id, message_id, fetched_at)"
+        )
+        conn.execute("INSERT INTO message_reactions_freshness VALUES (1, 10, 100)")
+        conn.executemany(
+            "INSERT INTO message_reactions VALUES (1, 11, ?, ?)",
+            [("👍", 2), ("❤", 1)],
+        )
+        conn.execute("INSERT INTO message_reaction_event_status VALUES (1, 12, 120, 'complete', 1)")
+        conn.execute("INSERT INTO message_reaction_event_status VALUES (1, 97, 970, 'partial', 1)")
+        conn.execute(
+            "INSERT INTO message_reaction_events(dialog_id, message_id, reactor_id, emoji, reacted_at, fetched_at) "
+            "VALUES (1, 13, 7, '👍', 130, 131)"
+        )
+        conn.execute(
+            "INSERT INTO message_reaction_events(dialog_id, message_id, reactor_id, emoji, reacted_at, fetched_at) "
+            "VALUES (2, 96, 7, '❤', 960, 961)"
+        )
+        conn.commit()
+
+        assert _apply_migration_68(conn, 67) == 68
+
+        aggregate_rows = _fetchall_rows(
+            conn,
+            "SELECT dialog_id, message_id, observed_at, observation_sequence, aggregate_row_count "
+            "FROM message_reaction_aggregate_state ORDER BY message_id",
+        )
+        assert [(row[0], row[1], row[2], row[4]) for row in aggregate_rows] == [
+            (1, 10, 100, 0),
+            (1, 11, 0, 2),
+            (1, 12, 120, 0),
+            (1, 13, 131, 0),
+        ]
+        sequences = [int(cast(int, row[3])) for row in aggregate_rows]
+        assert len(set(sequences)) == 4
+        assert _fetchone_int(
+            conn, "SELECT next_sequence FROM message_reaction_observation_counter WHERE singleton=1"
+        ) == max(sequences)
+        statuses = _fetchall_rows(
+            conn,
+            "SELECT message_id, status, detail_generation, published_generation FROM "
+            "message_reaction_event_status ORDER BY message_id",
+        )
+        assert statuses == [
+            (10, "stale", 0, 0),
+            (11, "stale", 0, 0),
+            (12, "complete", 1, 1),
+            (13, "stale", 0, 0),
+        ]
+        assert _fetchall_rows(
+            conn,
+            "SELECT message_id, detail_generation, display_generation FROM message_reaction_events",
+        ) == [(13, 0, 1)]
+        assert (
+            _fetchone_row(
+                conn,
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='message_reactions_freshness'",
+            )
+            is None
+        )
+        assert _fetchone_row(
+            conn,
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_message_reaction_detail_due'",
+        ) == ("idx_message_reaction_detail_due",)
 
 
 def test_migration_v37_rebuilds_media_tables_without_legacy_description(db_path: Path) -> None:

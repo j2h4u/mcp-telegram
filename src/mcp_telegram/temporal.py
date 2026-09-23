@@ -141,6 +141,42 @@ def _normalize_schema_sequence(nodes: list[object]) -> bool:
     return found_temporal
 
 
+def _normalize_schema_property(key: str, child: object) -> bool:
+    found_temporal = False
+    if _is_temporal_key(key) and _has_integer_type(child):
+        _rendered_timestamp_type(child)
+        found_temporal = True
+    nested_temporal = _normalize_schema_node(child)
+    return found_temporal or nested_temporal
+
+
+def _normalize_schema_properties(node_map: dict[str, object]) -> bool:
+    properties = node_map.get("properties")
+    if not isinstance(properties, dict):
+        return False
+
+    found_temporal = False
+    sent_at_numeric = _has_integer_type(properties.get("sent_at"))
+    for key, child in properties.items():
+        if _normalize_schema_property(key, child):
+            found_temporal = True
+
+    # Message rows historically required both sent_at and a duplicate date.
+    # The response projection retains only sent_at, so date must be optional.
+    required = node_map.get("required")
+    if isinstance(required, list) and "date" in required and "sent_at" in properties and sent_at_numeric:
+        node_map["required"] = [field for field in required if field != "date"]
+    return found_temporal
+
+
+def _normalize_schema_children(node_map: dict[str, object]) -> bool:
+    found_temporal = False
+    for key, child in node_map.items():
+        if key != "properties" and _normalize_schema_node(child):
+            found_temporal = True
+    return found_temporal
+
+
 def _normalize_schema_node(node: object) -> bool:
     """Normalize timestamp fields in a JSON schema node in place."""
     if isinstance(node, list):
@@ -148,28 +184,9 @@ def _normalize_schema_node(node: object) -> bool:
     if not isinstance(node, dict):
         return False
 
-    found_temporal = False
     node_map = cast(dict[str, object], node)
-    properties = node_map.get("properties")
-    if isinstance(properties, dict):
-        sent_at_numeric = _has_integer_type(properties.get("sent_at"))
-        for key, child in properties.items():
-            if _is_temporal_key(key) and _has_integer_type(child):
-                _rendered_timestamp_type(child)
-                found_temporal = True
-            if _normalize_schema_node(child):
-                found_temporal = True
-
-        # Message rows historically required both sent_at and a duplicate date.
-        # The response projection retains only sent_at, so date must be optional.
-        required = node_map.get("required")
-        if isinstance(required, list) and "date" in required and "sent_at" in properties and sent_at_numeric:
-            node_map["required"] = [field for field in required if field != "date"]
-
-    for key, child in node_map.items():
-        if key != "properties" and _normalize_schema_node(child):
-            found_temporal = True
-    return found_temporal
+    found_temporal = _normalize_schema_properties(node_map)
+    return _normalize_schema_children(node_map) or found_temporal
 
 
 def normalize_temporal_output_schema(schema: dict[str, object] | None) -> dict[str, object] | None:
@@ -190,34 +207,41 @@ def normalize_temporal_output_schema(schema: dict[str, object] | None) -> dict[s
     return normalized
 
 
+def _project_mapping_item(
+    key: str,
+    item: object,
+    value_map: dict[str, object],
+    timezone: str,
+) -> tuple[object, bool] | None:
+    """Project one mapping item; None indicates a legacy duplicate date."""
+    sent_at = value_map.get("sent_at")
+    if key == "date" and isinstance(sent_at, (int, float)) and not isinstance(sent_at, bool):
+        return None
+    if _is_temporal_key(key) and isinstance(item, (int, float)) and not isinstance(item, bool):
+        return format_timestamp(item, timezone), True
+    return _project(item, timezone)
+
+
+def _project_mapping(value_map: dict[str, object], timezone: str) -> tuple[dict[str, object], bool]:
+    output: dict[str, object] = {}
+    found_temporal = False
+    for key, item in value_map.items():
+        projected = _project_mapping_item(key, item, value_map, timezone)
+        if projected is None:
+            found_temporal = True
+            continue
+        output[key], child_found = projected
+        found_temporal = found_temporal or child_found
+    return output, found_temporal
+
+
 def _project(value: object, timezone: str) -> tuple[object, bool]:
     if isinstance(value, list):
         projected = [_project(item, timezone) for item in cast(list[object], value)]
         return [item for item, _ in projected], any(found for _, found in projected)
     if not isinstance(value, dict):
         return value, False
-
-    value_map = cast(dict[str, object], value)
-    output: dict[str, object] = {}
-    found_temporal = False
-    for key, item in value_map.items():
-        # Older message contracts duplicated the same Telegram moment as sent_at
-        # (Unix seconds) and date (UTC text). Keep the canonical semantic field once.
-        if (
-            key == "date"
-            and isinstance(value_map.get("sent_at"), (int, float))
-            and not isinstance(value_map.get("sent_at"), bool)
-        ):
-            found_temporal = True
-            continue
-        if _is_temporal_key(key) and isinstance(item, (int, float)) and not isinstance(item, bool):
-            output[key] = format_timestamp(item, timezone)
-            found_temporal = True
-            continue
-        child, child_found = _project(item, timezone)
-        output[key] = child
-        found_temporal = found_temporal or child_found
-    return output, found_temporal
+    return _project_mapping(cast(dict[str, object], value), timezone)
 
 
 def project_temporal_response(content: dict[str, object], timezone: str) -> dict[str, object]:

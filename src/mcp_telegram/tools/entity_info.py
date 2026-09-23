@@ -129,14 +129,24 @@ GET_ENTITY_INFO_OUTPUT_SCHEMA = {
 
 def _format_relative_ymd(iso_date: str, now: datetime | None = None) -> str:
     """Render an ISO date as a coarse relative string (year/month/day granularity)."""
-    try:
-        then = datetime.fromisoformat(iso_date)
-    except ValueError:
+    then = _parse_iso_datetime(iso_date)
+    if then is None:
         return iso_date
     if then.tzinfo is None:
         then = then.replace(tzinfo=UTC)
     reference = now or datetime.now(tz=UTC)
     delta_days = (reference.date() - then.date()).days
+    return _format_ymd_delta(delta_days)
+
+
+def _parse_iso_datetime(iso_date: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(iso_date)
+    except ValueError:
+        return None
+
+
+def _format_ymd_delta(delta_days: int) -> str:
     if delta_days < 0:
         return "future date"
     if delta_days == 0:
@@ -306,48 +316,60 @@ def _personal_channel_warnings(data: dict) -> list[StructuredWarning]:
 
 
 def _content_fields(data: dict) -> list[dict[str, object]]:
-    maybe_fields = [
+    maybe_fields = _base_content_fields(data)
+    maybe_fields.extend(_bot_content_fields(data))
+    maybe_fields.extend(_business_content_fields(data))
+    maybe_fields.extend(_personal_channel_content_fields(data))
+    maybe_fields.extend(_restriction_content_fields(data))
+    return [field for field in maybe_fields if field is not None]
+
+
+def _base_content_fields(data: dict) -> list[dict[str, object] | None]:
+    return [
         _content_field("common.about", data.get("about"), "about"),
         _content_field("type_specific.note", data.get("note"), "note"),
         _content_field("type_specific.private_forward_name", data.get("private_forward_name"), "private_forward_name"),
     ]
+
+
+def _bot_content_fields(data: dict) -> list[dict[str, object] | None]:
     bot_info = data.get("bot_info") or {}
-    maybe_fields.append(
-        _content_field("type_specific.bot_info.description", bot_info.get("description"), "bot_description")
-    )
-    for idx, command in enumerate(bot_info.get("commands") or []):
-        maybe_fields.append(
-            _content_field(
-                f"type_specific.bot_info.commands.{idx}.description",
-                command.get("description"),
-                "bot_command_description",
-            )
+    fields = [_content_field("type_specific.bot_info.description", bot_info.get("description"), "bot_description")]
+    fields.extend(
+        _content_field(
+            f"type_specific.bot_info.commands.{idx}.description",
+            command.get("description"),
+            "bot_command_description",
         )
+        for idx, command in enumerate(bot_info.get("commands") or [])
+    )
+    return fields
+
+
+def _business_content_fields(data: dict) -> list[dict[str, object] | None]:
     business_intro = data.get("business_intro") or {}
-    maybe_fields.extend(
-        [
-            _content_field("type_specific.business.intro.title", business_intro.get("title"), "business_intro"),
-            _content_field(
-                "type_specific.business.intro.description",
-                business_intro.get("description"),
-                "business_intro",
-            ),
-        ]
-    )
     business_location = data.get("business_location") or {}
-    maybe_fields.append(
-        _content_field("type_specific.business.location.address", business_location.get("address"), "business_location")
-    )
-    maybe_fields.extend(_personal_channel_content_fields(data))
-    for idx, restriction in enumerate(data.get("restriction_reason") or data.get("restrictions") or []):
-        maybe_fields.append(
-            _content_field(
-                f"type_specific.restrictions.{idx}.text",
-                restriction.get("text"),
-                "restriction_reason",
-            )
+    return [
+        _content_field("type_specific.business.intro.title", business_intro.get("title"), "business_intro"),
+        _content_field("type_specific.business.intro.description", business_intro.get("description"), "business_intro"),
+        _content_field(
+            "type_specific.business.location.address",
+            business_location.get("address"),
+            "business_location",
+        ),
+    ]
+
+
+def _restriction_content_fields(data: dict) -> list[dict[str, object] | None]:
+    restrictions = data.get("restriction_reason") or data.get("restrictions") or []
+    return [
+        _content_field(
+            f"type_specific.restrictions.{idx}.text",
+            restriction.get("text"),
+            "restriction_reason",
         )
-    return [field for field in maybe_fields if field is not None]
+        for idx, restriction in enumerate(restrictions)
+    ]
 
 
 def _personal_channel_content_fields(data: dict) -> list[dict[str, object]]:

@@ -73,7 +73,7 @@ or public schema is required.
 ### Definition of done
 
 - Targeted state-transition and stale-writer tests pass.
-- The release-candidate full gate and CRAP ratchet pass.
+- The release-candidate full gate and fixed CRAP threshold pass.
 - The deployed runtime remains healthy.
 - A live local-only smoke confirms a stored date survives restart and a later
   coordinator cycle.
@@ -139,7 +139,7 @@ projections; aggregate receipts and detail lifecycle state remain local facts.
 
 - Contract, ordering, race, retry, and restart tests pass.
 - Superseded realtime lookup and combined-freshness paths are removed.
-- The release-candidate full gate and CRAP ratchet pass.
+- The release-candidate full gate and fixed CRAP threshold pass.
 - A live reaction-update smoke shows zero reaction message lookups and truthful
   detail status while the service remains healthy.
 - Repeat attempts for complete, non-invalidated detail disappear after the
@@ -201,12 +201,10 @@ alone should be prioritized by measured cost.
 
 ## Complexity policy
 
-The Radon baseline contains stale entries: 53 recorded entries versus 31
-currently above the threshold. Tighten the baseline in the first implementation
-PR as release hygiene, not as a standalone cleanup slice. Neither selected
-slice owns a current CRAP-baseline entry, so unrelated CRAP cleanup is outside
-scope. Any complexity touched by the selected paths must decrease or remain
-below the ratchet; wrappers that merely relocate branching are not acceptable.
+Enforce repository-wide Radon CC <= 10 and CRAP <= 30 limits without historical
+per-function baselines. Coverage is an input to CRAP only; there is no aggregate
+coverage floor. Any complexity touched by the selected paths must stay within
+the fixed limits; wrappers that merely relocate branching are not acceptable.
 
 ## Panel conflicts and resolution
 

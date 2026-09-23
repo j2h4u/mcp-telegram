@@ -35,6 +35,7 @@ from mcp_telegram.daemon_account_trace import (
     DaemonAccountTraceService,
     _build_trace_coverage,
     _LoggerLike,
+    _parse_trace_time_bound_from_string,
     _TraceCoverageBuildRequest,
     _TraceCoverageFragmentUpsertRequest,
     _upsert_trace_coverage_fragment,
@@ -179,7 +180,6 @@ def test_account_trace_navigation_roundtrip() -> None:
             sent_before="2024-02-01T00:00:00Z",
         )
     )
-
     decoded = decode_account_trace_navigation(
         token,
         AccountTraceNavigationContext(
@@ -203,6 +203,21 @@ def test_account_trace_navigation_roundtrip() -> None:
         sent_after="2024-01-01T00:00:00Z",
         sent_before="2024-02-01T00:00:00Z",
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (" 1700000000 ", 1_700_000_000),
+        ("2023-11-14T22:13:20Z", 1_700_000_000),
+        ("2023-11-14T22:13:20", 1_700_000_000),
+        ("", None),
+        ("   ", None),
+        ("not-a-time", None),
+    ],
+)
+def test_parse_trace_time_bound_from_string(value: str, expected: int | None) -> None:
+    assert _parse_trace_time_bound_from_string(value) == expected
 
 
 def test_account_trace_navigation_rejects_target_mismatch() -> None:

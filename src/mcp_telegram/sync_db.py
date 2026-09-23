@@ -3925,7 +3925,160 @@ def _apply_migration_67(conn: sqlite3.Connection, current: int) -> int:
         raise
 
 
-def _apply_migration_68(conn: sqlite3.Connection, current: int) -> int:  # noqa: PLR0912, PLR0915
+def _add_reaction_lifecycle_columns(conn: sqlite3.Connection) -> None:
+    event_columns = _table_column_names(conn, "message_reaction_events")
+    event_alters = {
+        "detail_generation": "ALTER TABLE message_reaction_events ADD COLUMN detail_generation INTEGER NOT NULL DEFAULT 0",
+        "page_ordinal": "ALTER TABLE message_reaction_events ADD COLUMN page_ordinal INTEGER NOT NULL DEFAULT 0",
+        "display_generation": "ALTER TABLE message_reaction_events ADD COLUMN display_generation INTEGER NOT NULL DEFAULT 0",
+    }
+    for column, statement in event_alters.items():
+        if event_columns and column not in event_columns:
+            conn.execute(statement)
+
+    status_columns = _table_column_names(conn, "message_reaction_event_status")
+    status_alters = {
+        "aggregate_generation": "ALTER TABLE message_reaction_event_status ADD COLUMN aggregate_generation INTEGER NOT NULL DEFAULT 1",
+        "detail_generation": "ALTER TABLE message_reaction_event_status ADD COLUMN detail_generation INTEGER NOT NULL DEFAULT 0",
+        "display_generation": "ALTER TABLE message_reaction_event_status ADD COLUMN display_generation INTEGER NOT NULL DEFAULT 0",
+        "published_generation": "ALTER TABLE message_reaction_event_status ADD COLUMN published_generation INTEGER NOT NULL DEFAULT 0",
+        "staged_count": "ALTER TABLE message_reaction_event_status ADD COLUMN staged_count INTEGER NOT NULL DEFAULT 0",
+        "next_offset": "ALTER TABLE message_reaction_event_status ADD COLUMN next_offset TEXT",
+        "next_attempt_at": "ALTER TABLE message_reaction_event_status ADD COLUMN next_attempt_at INTEGER",
+        "failure_kind": "ALTER TABLE message_reaction_event_status ADD COLUMN failure_kind TEXT",
+    }
+    for column, statement in status_alters.items():
+        if status_columns and column not in status_columns:
+            conn.execute(statement)
+
+
+def _legacy_reaction_tables(conn: sqlite3.Connection) -> set[str]:
+    rows = cast(
+        list[tuple[object, ...]],
+        conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('messages','message_reactions_freshness','message_reaction_event_status','message_reaction_events','message_reactions')"
+        ).fetchall(),
+    )
+    return {str(row[0]) for row in rows}
+
+
+def _legacy_reaction_observation_queries(existing_tables: set[str]) -> list[str]:
+    """Return legacy aggregate evidence queries in migration order."""
+    sources = (
+        (
+            "SELECT dialog_id, message_id, checked_at FROM message_reactions_freshness",
+            "message_reactions_freshness",
+        ),
+        (
+            "SELECT dialog_id, message_id, checked_at FROM message_reaction_event_status",
+            "message_reaction_event_status",
+        ),
+        (
+            "SELECT dialog_id, message_id, fetched_at FROM message_reaction_events",
+            "message_reaction_events",
+        ),
+        ("SELECT dialog_id, message_id, 0 FROM message_reactions", "message_reactions"),
+    )
+    return [query for query, table in sources if table in existing_tables]
+
+
+def _backfill_legacy_reaction_aggregates(
+    conn: sqlite3.Connection,
+    existing_tables: set[str],
+) -> None:
+    """Create one aggregate receipt for each legacy source row key."""
+    observation_queries = _legacy_reaction_observation_queries(existing_tables)
+    keys = cast(
+        list[tuple[int, int, int]],
+        conn.execute(" UNION ALL ".join(observation_queries)).fetchall() if observation_queries else [],
+    )
+    seen: set[tuple[int, int]] = set()
+    sequence = 0
+    for dialog_id, message_id, observed_at in keys:
+        key = (int(dialog_id), int(message_id))
+        if key in seen:
+            continue
+        seen.add(key)
+        sequence += 1
+        row_count = 0
+        if "message_reactions" in existing_tables:
+            row_count = int(
+                cast(
+                    int,
+                    conn.execute(
+                        "SELECT COUNT(*) FROM message_reactions WHERE dialog_id = ? AND message_id = ?",
+                        key,
+                    ).fetchone()[0],
+                )
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO message_reaction_aggregate_state "
+            "(dialog_id, message_id, generation, observed_at, observation_sequence, source, source_rank, aggregate_row_count) "
+            "VALUES (?, ?, 1, ?, ?, 'legacy', 0, ?)",
+            (*key, int(observed_at or 0), sequence, row_count),
+        )
+
+    conn.execute("INSERT OR IGNORE INTO message_reaction_observation_counter(singleton, next_sequence) VALUES (1, 0)")
+    conn.execute(
+        "UPDATE message_reaction_observation_counter SET next_sequence=MAX(next_sequence, "
+        "COALESCE((SELECT MAX(observation_sequence) FROM message_reaction_aggregate_state), 0)) "
+        "WHERE singleton=1"
+    )
+
+
+def _initialize_reaction_event_status(conn: sqlite3.Connection, now: int) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO message_reaction_event_status "
+        "(dialog_id, message_id, aggregate_generation, detail_generation, display_generation, "
+        "published_generation, checked_at, status, returned_count, staged_count, next_offset, next_attempt_at, failure_kind) "
+        "SELECT dialog_id, message_id, generation, 0, 0, 0, ?, 'stale', 0, 0, NULL, ?, NULL "
+        "FROM message_reaction_aggregate_state "
+        "WHERE NOT EXISTS (SELECT 1 FROM message_reaction_event_status s "
+        "WHERE s.dialog_id=message_reaction_aggregate_state.dialog_id "
+        "AND s.message_id=message_reaction_aggregate_state.message_id)",
+        (now, now),
+    )
+    conn.execute(
+        "UPDATE message_reaction_event_status SET "
+        "aggregate_generation=COALESCE(aggregate_generation, 1), "
+        "staged_count=0, "
+        "display_generation=CASE WHEN status IN ('complete','partial','unavailable') "
+        "OR EXISTS (SELECT 1 FROM message_reaction_events e "
+        "WHERE e.dialog_id=message_reaction_event_status.dialog_id "
+        "AND e.message_id=message_reaction_event_status.message_id) THEN 1 ELSE 0 END, "
+        "detail_generation=CASE WHEN status='complete' THEN aggregate_generation ELSE 0 END, "
+        "published_generation=CASE WHEN status='complete' THEN aggregate_generation ELSE 0 END, "
+        "next_attempt_at=CASE WHEN status IN ('partial','unavailable') THEN COALESCE(next_attempt_at, ?) ELSE next_attempt_at END",
+        (now,),
+    )
+    conn.execute(
+        "UPDATE message_reaction_events SET detail_generation=CASE WHEN EXISTS ("
+        "SELECT 1 FROM message_reaction_event_status s WHERE s.dialog_id=message_reaction_events.dialog_id "
+        "AND s.message_id=message_reaction_events.message_id AND s.status='complete') "
+        "THEN 1 ELSE 0 END, display_generation=1"
+    )
+
+
+def _prune_orphaned_reaction_rows(conn: sqlite3.Connection, existing_tables: set[str]) -> None:
+    if "messages" not in existing_tables:
+        return
+    for table in (
+        "message_reactions",
+        "message_reaction_events",
+        "message_reaction_event_status",
+        "message_reaction_aggregate_state",
+    ):
+        if table not in existing_tables and table != "message_reaction_aggregate_state":
+            continue
+        conn.execute(
+            f"DELETE FROM {table} WHERE NOT EXISTS ("
+            f"SELECT 1 FROM messages m WHERE m.dialog_id={table}.dialog_id "
+            f"AND m.message_id={table}.message_id)"
+        )
+
+
+def _apply_migration_68(conn: sqlite3.Connection, current: int) -> int:
     """Split reaction aggregate observations from reactor-detail lifecycle."""
     if current >= _REACTION_DETAIL_LIFECYCLE_MIGRATION_68:
         return current
@@ -3935,146 +4088,12 @@ def _apply_migration_68(conn: sqlite3.Connection, current: int) -> int:  # noqa:
         conn.execute(_MESSAGE_REACTION_OBSERVATION_COUNTER_DDL)
         conn.execute(_MESSAGE_REACTION_EVENTS_DDL)
         conn.execute(_MESSAGE_REACTION_EVENT_STATUS_DDL)
-        event_columns = _table_column_names(conn, "message_reaction_events")
-        event_alters = {
-            "detail_generation": "ALTER TABLE message_reaction_events ADD COLUMN detail_generation INTEGER NOT NULL DEFAULT 0",
-            "page_ordinal": "ALTER TABLE message_reaction_events ADD COLUMN page_ordinal INTEGER NOT NULL DEFAULT 0",
-            "display_generation": "ALTER TABLE message_reaction_events ADD COLUMN display_generation INTEGER NOT NULL DEFAULT 0",
-        }
-        for column, statement in event_alters.items():
-            if event_columns and column not in event_columns:
-                conn.execute(statement)
-
-        status_columns = _table_column_names(conn, "message_reaction_event_status")
-        status_alters = {
-            "aggregate_generation": "ALTER TABLE message_reaction_event_status ADD COLUMN aggregate_generation INTEGER NOT NULL DEFAULT 1",
-            "detail_generation": "ALTER TABLE message_reaction_event_status ADD COLUMN detail_generation INTEGER NOT NULL DEFAULT 0",
-            "display_generation": "ALTER TABLE message_reaction_event_status ADD COLUMN display_generation INTEGER NOT NULL DEFAULT 0",
-            "published_generation": "ALTER TABLE message_reaction_event_status ADD COLUMN published_generation INTEGER NOT NULL DEFAULT 0",
-            "staged_count": "ALTER TABLE message_reaction_event_status ADD COLUMN staged_count INTEGER NOT NULL DEFAULT 0",
-            "next_offset": "ALTER TABLE message_reaction_event_status ADD COLUMN next_offset TEXT",
-            "next_attempt_at": "ALTER TABLE message_reaction_event_status ADD COLUMN next_attempt_at INTEGER",
-            "failure_kind": "ALTER TABLE message_reaction_event_status ADD COLUMN failure_kind TEXT",
-        }
-        for column, statement in status_alters.items():
-            if status_columns and column not in status_columns:
-                conn.execute(statement)
-
-        # Build one legacy observation for every aggregate, freshness receipt,
-        # event status, or event row. A receipt is evidence even when the
-        # aggregate projection is empty.
-        existing_tables = {
-            str(row[0])
-            for row in cast(
-                list[tuple[object, ...]],
-                conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
-                    "('messages','message_reactions_freshness','message_reaction_event_status','message_reaction_events','message_reactions')"
-                ).fetchall(),
-            )
-        }
-        observation_queries = [
-            query
-            for query, table in (
-                (
-                    "SELECT dialog_id, message_id, checked_at FROM message_reactions_freshness",
-                    "message_reactions_freshness",
-                ),
-                (
-                    "SELECT dialog_id, message_id, checked_at FROM message_reaction_event_status",
-                    "message_reaction_event_status",
-                ),
-                (
-                    "SELECT dialog_id, message_id, fetched_at FROM message_reaction_events",
-                    "message_reaction_events",
-                ),
-                ("SELECT dialog_id, message_id, 0 FROM message_reactions", "message_reactions"),
-            )
-            if table in existing_tables
-        ]
-        keys = cast(
-            list[tuple[int, int, int]],
-            conn.execute(" UNION ALL ".join(observation_queries)).fetchall() if observation_queries else [],
-        )
-        seen: set[tuple[int, int]] = set()
-        sequence = 0
-        for dialog_id, message_id, observed_at in keys:
-            key = (int(dialog_id), int(message_id))
-            if key in seen:
-                continue
-            seen.add(key)
-            sequence += 1
-            row_count = 0
-            if "message_reactions" in existing_tables:
-                row_count = int(
-                    cast(
-                        int,
-                        conn.execute(
-                            "SELECT COUNT(*) FROM message_reactions WHERE dialog_id = ? AND message_id = ?",
-                            key,
-                        ).fetchone()[0],
-                    )
-                )
-            conn.execute(
-                "INSERT OR IGNORE INTO message_reaction_aggregate_state "
-                "(dialog_id, message_id, generation, observed_at, observation_sequence, source, source_rank, aggregate_row_count) "
-                "VALUES (?, ?, 1, ?, ?, 'legacy', 0, ?)",
-                (*key, int(observed_at or 0), sequence, row_count),
-            )
-
-        conn.execute(
-            "INSERT OR IGNORE INTO message_reaction_observation_counter(singleton, next_sequence) VALUES (1, 0)"
-        )
-        conn.execute(
-            "UPDATE message_reaction_observation_counter SET next_sequence=MAX(next_sequence, "
-            "COALESCE((SELECT MAX(observation_sequence) FROM message_reaction_aggregate_state), 0)) "
-            "WHERE singleton=1"
-        )
+        _add_reaction_lifecycle_columns(conn)
+        existing_tables = _legacy_reaction_tables(conn)
+        _backfill_legacy_reaction_aggregates(conn, existing_tables)
         now = int(time.time())
-        conn.execute(
-            "INSERT OR IGNORE INTO message_reaction_event_status "
-            "(dialog_id, message_id, aggregate_generation, detail_generation, display_generation, "
-            "published_generation, checked_at, status, returned_count, staged_count, next_offset, next_attempt_at, failure_kind) "
-            "SELECT dialog_id, message_id, generation, 0, 0, 0, ?, 'stale', 0, 0, NULL, ?, NULL "
-            "FROM message_reaction_aggregate_state "
-            "WHERE NOT EXISTS (SELECT 1 FROM message_reaction_event_status s "
-            "WHERE s.dialog_id=message_reaction_aggregate_state.dialog_id "
-            "AND s.message_id=message_reaction_aggregate_state.message_id)",
-            (now, now),
-        )
-        conn.execute(
-            "UPDATE message_reaction_event_status SET "
-            "aggregate_generation=COALESCE(aggregate_generation, 1), "
-            "staged_count=0, "
-            "display_generation=CASE WHEN status IN ('complete','partial','unavailable') "
-            "OR EXISTS (SELECT 1 FROM message_reaction_events e "
-            "WHERE e.dialog_id=message_reaction_event_status.dialog_id "
-            "AND e.message_id=message_reaction_event_status.message_id) THEN 1 ELSE 0 END, "
-            "detail_generation=CASE WHEN status='complete' THEN aggregate_generation ELSE 0 END, "
-            "published_generation=CASE WHEN status='complete' THEN aggregate_generation ELSE 0 END, "
-            "next_attempt_at=CASE WHEN status IN ('partial','unavailable') THEN COALESCE(next_attempt_at, ?) ELSE next_attempt_at END",
-            (now,),
-        )
-        conn.execute(
-            "UPDATE message_reaction_events SET detail_generation=CASE WHEN EXISTS ("
-            "SELECT 1 FROM message_reaction_event_status s WHERE s.dialog_id=message_reaction_events.dialog_id "
-            "AND s.message_id=message_reaction_events.message_id AND s.status='complete') "
-            "THEN 1 ELSE 0 END, display_generation=1"
-        )
-        if "messages" in existing_tables:
-            for table in (
-                "message_reactions",
-                "message_reaction_events",
-                "message_reaction_event_status",
-                "message_reaction_aggregate_state",
-            ):
-                if table not in existing_tables and table != "message_reaction_aggregate_state":
-                    continue
-                conn.execute(
-                    f"DELETE FROM {table} WHERE NOT EXISTS ("
-                    f"SELECT 1 FROM messages m WHERE m.dialog_id={table}.dialog_id "
-                    f"AND m.message_id={table}.message_id)"
-                )
+        _initialize_reaction_event_status(conn, now)
+        _prune_orphaned_reaction_rows(conn, existing_tables)
         conn.execute(_MESSAGE_REACTION_DETAIL_DUE_INDEX_DDL)
         conn.execute("DROP TABLE IF EXISTS message_reactions_freshness")
         conn.execute(

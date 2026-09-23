@@ -529,9 +529,7 @@ def _select_telegram_batch(request: _TelegramBatchRequest) -> _TelegramBatchSele
             continue
         updated_seen.add(message_id)
         sent_at = _message_sent_at(message)
-        if sent_at is None or (request.since_utc is not None and sent_at < request.since_utc):
-            continue
-        if request.until_utc is not None and sent_at >= request.until_utc:
+        if not _telegram_message_in_time_range(sent_at, request):
             continue
         selected.append(message)
         if request.current_count + len(selected) >= request.limit:
@@ -542,6 +540,14 @@ def _select_telegram_batch(request: _TelegramBatchRequest) -> _TelegramBatchSele
         last_message_id=_message_id_from_item(request.batch[-1]) if request.batch else 0,
         last_raw_message=request.batch[-1] if request.batch else None,
     )
+
+
+def _telegram_message_in_time_range(sent_at: int | None, request: _TelegramBatchRequest) -> bool:
+    if sent_at is None:
+        return False
+    if request.since_utc is not None and sent_at < request.since_utc:
+        return False
+    return request.until_utc is None or sent_at < request.until_utc
 
 
 def _next_telegram_offset(last_message_id: int, current_offset: int | None) -> int | None:
@@ -587,6 +593,18 @@ def _telegram_history_kwargs(req: _ListMessagesTelegramRequest) -> dict[str, obj
         }.items()
         if value is not None
     }
+
+
+def _context_uses_fragment_fallback(status: str | None) -> bool:
+    return status in (None, "not_synced", "fragment", "own_only")
+
+
+def _mark_fragment_coverage(result: dict) -> None:
+    data = result.get("data")
+    if isinstance(data, dict):
+        data["coverage"] = "fragment"
+    else:
+        result["coverage"] = "fragment"
 
 
 def _status_from_row(row: object | None) -> str | None:
@@ -635,6 +653,19 @@ def _topic_selection_state(
     # topic-member receipt, which this release deliberately does not invent.
     del status, receipt
     return "unknown"
+
+
+def _dialog_filter_matches_acronym(filter_raw: str, name: str) -> bool:
+    if not _TRACE_ACRONYM_MIN_LEN <= len(filter_raw) <= _TRACE_ACRONYM_MAX_LEN:
+        return False
+    initials = "".join(word[0] for word in name.split() if word).lower()
+    return filter_raw in initials
+
+
+def _dialog_filter_matches_fuzzy(filter_normalized: str, name_normalized: str) -> bool:
+    if len(filter_normalized) < _TRACE_FUZZY_MIN_LEN or len(name_normalized) < _TRACE_FUZZY_MIN_LEN:
+        return False
+    return _fuzz.partial_ratio(filter_normalized, name_normalized) >= _TRACE_FUZZY_SCORE_MIN
 
 
 class ReadingService:
@@ -944,39 +975,8 @@ class ReadingService:
         with timing_phase("local_projection"):
             row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)))
             current_status = _status_from_row(row)
-        if current_status in (None, "not_synced", "fragment", "own_only"):
-            _set_timing_route("telegram_context_fallback", fallback=True)
-            with timing_phase("telegram_fallback"):
-                fragment_result = await self._deps.fragment_context.fetch(
-                    dialog_id,
-                    request.context_message_id or 0,
-                    request.context_size,
-                )
-            if not fragment_result.ok:
-                failure = fragment_result.failure
-                detail = failure.as_dict() if failure is not None else None
-                return {
-                    "ok": False,
-                    "error": "fragment_fetch_failed",
-                    "message": "Could not fetch bounded context from Telegram.",
-                    "required_action": "Retry with a valid anchor_message_id, or mark the dialog for sync if broader history is needed.",
-                    "context_availability": "fragment_unavailable",
-                    "dialog_status": current_status or "not_synced",
-                    "fragment_failure": detail,
-                }
-            result = await self._list_messages_context_window(
-                dialog_id=dialog_id,
-                anchor_message_id=request.context_message_id or 0,
-                context_size=request.context_size,
-                since_utc=request.since_utc,
-                until_utc=request.until_utc,
-            )
-            data = result.get("data") if isinstance(result.get("data"), dict) else None
-            if data is not None:
-                data["coverage"] = "fragment"
-            else:
-                result["coverage"] = "fragment"
-            return result
+        if _context_uses_fragment_fallback(current_status):
+            return await self._list_fragment_context_result(dialog_id, request, current_status)
         if current_status not in ("synced", "syncing"):
             return {
                 "ok": False,
@@ -994,6 +994,41 @@ class ReadingService:
             since_utc=request.since_utc,
             until_utc=request.until_utc,
         )
+
+    async def _list_fragment_context_result(
+        self,
+        dialog_id: int,
+        request: _ListMessagesRequest,
+        current_status: str | None,
+    ) -> dict:
+        _set_timing_route("telegram_context_fallback", fallback=True)
+        with timing_phase("telegram_fallback"):
+            fragment_result = await self._deps.fragment_context.fetch(
+                dialog_id,
+                request.context_message_id or 0,
+                request.context_size,
+            )
+        if not fragment_result.ok:
+            failure = fragment_result.failure
+            detail = failure.as_dict() if failure is not None else None
+            return {
+                "ok": False,
+                "error": "fragment_fetch_failed",
+                "message": "Could not fetch bounded context from Telegram.",
+                "required_action": "Retry with a valid anchor_message_id, or mark the dialog for sync if broader history is needed.",
+                "context_availability": "fragment_unavailable",
+                "dialog_status": current_status or "not_synced",
+                "fragment_failure": detail,
+            }
+        result = await self._list_messages_context_window(
+            dialog_id=dialog_id,
+            anchor_message_id=request.context_message_id or 0,
+            context_size=request.context_size,
+            since_utc=request.since_utc,
+            until_utc=request.until_utc,
+        )
+        _mark_fragment_coverage(result)
+        return result
 
     async def _list_messages_history_result(
         self,
@@ -1373,17 +1408,104 @@ class ReadingService:
         if name_norm in (None, ""):
             return False
         filter_raw_lc = dialog_filter.raw_lower or ""
-        name_initials_raw = "".join(w[0] for w in raw_name.split() if w).lower()
-        matches_acronym = (
-            _TRACE_ACRONYM_MIN_LEN <= len(filter_raw_lc) <= _TRACE_ACRONYM_MAX_LEN
-            and filter_raw_lc in name_initials_raw
+        return (
+            dialog_filter.normalized in name_norm
+            or _dialog_filter_matches_acronym(filter_raw_lc, raw_name)
+            or _dialog_filter_matches_fuzzy(dialog_filter.normalized, name_norm)
         )
-        matches_fuzzy = (
-            len(dialog_filter.normalized) >= _TRACE_FUZZY_MIN_LEN
-            and len(name_norm) >= _TRACE_FUZZY_MIN_LEN
-            and _fuzz.partial_ratio(dialog_filter.normalized, name_norm) >= _TRACE_FUZZY_SCORE_MIN
-        )
-        return dialog_filter.normalized in name_norm or matches_acronym or matches_fuzzy
+
+    def _list_dialogs_request_error(self, request: _ListDialogsRequest) -> dict | None:
+        if request.message_state not in {"sent", "scheduled", "all"}:
+            return {
+                "ok": False,
+                "error": "invalid_message_state",
+                "message": "message_state must be sent, scheduled, or all",
+            }
+        if request.scope not in {"all", "own_only"}:
+            return {
+                "ok": False,
+                "error": "invalid_scope",
+                "message": "scope must be all or own_only",
+            }
+        return None
+
+    def _select_list_dialog_rows(
+        self,
+        sql_rows: Sequence[Mapping[str, object]],
+        request: _ListDialogsRequest,
+        dialog_filter: _ListDialogsFilter,
+        scheduled_summary: Mapping[int, tuple[int, int | None]],
+        own_basis: Mapping[int, tuple[str, ...]],
+    ) -> list[tuple[Mapping[str, object], tuple[int, int | None], tuple[str, ...] | None]]:
+        selected_rows: list[tuple[Mapping[str, object], tuple[int, int | None], tuple[str, ...] | None]] = []
+        for row in sql_rows:
+            dialog_id = _object_to_int(row["dialog_id"])
+            if request.scope == "own_only" and dialog_id not in own_basis:
+                continue
+            summary = scheduled_summary.get(dialog_id, (0, None))
+            if dialog_id not in own_basis:
+                summary = (0, None)
+            if request.message_state == "scheduled" and summary[0] == 0:
+                continue
+            if not self._dialog_row_matches_filter(dialog_filter, _object_to_str_or_none(row["name"])):
+                continue
+            selected_rows.append((row, summary, own_basis.get(dialog_id)))
+        return selected_rows
+
+    def _project_list_dialog_rows(
+        self,
+        conn: sqlite3.Connection,
+        selected_rows: Sequence[tuple[Mapping[str, object], tuple[int, int | None], tuple[str, ...] | None]],
+        request: _ListDialogsRequest,
+        directory_coverage: dict,
+    ) -> dict:
+        dialog_ids = [_object_to_int(row["dialog_id"]) for row, _, _ in selected_rows]
+        aggregates = self._fetch_list_dialog_aggregates(conn, dialog_ids)
+        enrollment_by_dialog = self._fetch_history_enrollment(conn, dialog_ids)
+        read_model_now = int(time.time())
+        dialogs: list[dict] = []
+        max_snapshot: int | None = None
+        for row, summary, inclusion_basis in selected_rows:
+            dialog_id = _object_to_int(row["dialog_id"])
+            row_data, snapshot_at = self._shape_dialog_row(
+                row,
+                aggregates.get(dialog_id, _DialogMessageAggregate()),
+                enrollment_by_dialog.get(dialog_id),
+                read_model_now,
+                summary,
+                inclusion_basis,
+            )
+            if snapshot_at is not None and (max_snapshot is None or snapshot_at > max_snapshot):
+                max_snapshot = snapshot_at
+            dialogs.append(row_data)
+        return {
+            "ok": True,
+            "data": {
+                "dialogs": dialogs,
+                "snapshot_age_h": _compute_snapshot_age_h(max_snapshot),
+                "bootstrap_pending": False,
+                "scope": request.scope,
+                "directory_coverage": directory_coverage,
+            },
+        }
+
+    @staticmethod
+    def _empty_list_dialogs_response(
+        scope: str,
+        directory_coverage: dict,
+        *,
+        bootstrap_pending: bool,
+    ) -> dict:
+        return {
+            "ok": True,
+            "data": {
+                "dialogs": [],
+                "snapshot_age_h": None,
+                "bootstrap_pending": bootstrap_pending,
+                "scope": scope,
+                "directory_coverage": directory_coverage,
+            },
+        }
 
     def _shape_dialog_row(  # noqa: PLR0913, PLR0917
         self,
@@ -2825,99 +2947,35 @@ class ReadingService:
         finally:
             conn.close()
 
-    def _list_dialogs_sync(self, conn: sqlite3.Connection, req: dict) -> dict:  # noqa: PLR0914
+    def _list_dialogs_sync(self, conn: sqlite3.Connection, req: dict) -> dict:
         """Return dialog list from the local dialogs snapshot (pure SQL)."""
         directory_coverage = read_dialog_directory_coverage(conn).to_wire()
         request = self._parse_list_dialogs_request(req)
-        if request.message_state not in {"sent", "scheduled", "all"}:
-            return {
-                "ok": False,
-                "error": "invalid_message_state",
-                "message": "message_state must be sent, scheduled, or all",
-            }
-        if request.scope not in {"all", "own_only"}:
-            return {
-                "ok": False,
-                "error": "invalid_scope",
-                "message": "scope must be all or own_only",
-            }
+        request_error = self._list_dialogs_request_error(request)
+        if request_error is not None:
+            return request_error
         dialog_filter = self._prepare_list_dialogs_filter(request.filter_raw)
         scheduled_summary = scheduled_summary_by_dialog(conn, scheduled_now=int(time.time()))
         own_basis: dict[int, tuple[str, ...]] = self._own_only_basis_by_dialog(conn)
         sql_rows = self._fetch_list_dialog_rows(conn, request, dialog_filter)
         if not sql_rows:
             count_total = count_dialog_rows(conn)
-            return {
-                "ok": True,
-                "data": {
-                    "dialogs": [],
-                    "snapshot_age_h": None,
-                    "bootstrap_pending": count_total == 0,
-                    "scope": request.scope,
-                    "directory_coverage": directory_coverage,
-                },
-            }
-
-        selected_rows: list[tuple[Mapping[str, object], tuple[int, int | None], tuple[str, ...] | None]] = []
-        for row in sql_rows:
-            dialog_id = _object_to_int(row["dialog_id"])
-            if request.scope == "own_only" and dialog_id not in own_basis:
-                continue
-            summary = scheduled_summary.get(dialog_id, (0, None))
-            if dialog_id not in own_basis:
-                summary = (0, None)
-            if request.message_state == "scheduled" and summary[0] == 0:
-                continue
-            if not self._dialog_row_matches_filter(dialog_filter, _object_to_str_or_none(row["name"])):
-                continue
-            selected_rows.append(
-                (
-                    row,
-                    summary,
-                    own_basis.get(dialog_id),
-                )
+            return self._empty_list_dialogs_response(
+                request.scope,
+                directory_coverage,
+                bootstrap_pending=count_total == 0,
             )
-
+        selected_rows = self._select_list_dialog_rows(
+            sql_rows,
+            request,
+            dialog_filter,
+            scheduled_summary,
+            own_basis,
+        )
         if not selected_rows:
-            return {
-                "ok": True,
-                "data": {
-                    "dialogs": [],
-                    "snapshot_age_h": None,
-                    "bootstrap_pending": False,
-                    "scope": request.scope,
-                    "directory_coverage": directory_coverage,
-                },
-            }
-
-        dialog_ids = [_object_to_int(row["dialog_id"]) for row, _, _ in selected_rows]
-        aggregates = self._fetch_list_dialog_aggregates(conn, dialog_ids)
-        enrollment_by_dialog = self._fetch_history_enrollment(conn, dialog_ids)
-        read_model_now = int(time.time())
-        dialogs: list[dict] = []
-        max_snapshot: int | None = None
-        for row, summary, inclusion_basis in selected_rows:
-            dialog_id = _object_to_int(row["dialog_id"])
-            row_data, snapshot_at = self._shape_dialog_row(
-                row,
-                aggregates.get(dialog_id, _DialogMessageAggregate()),
-                enrollment_by_dialog.get(dialog_id),
-                read_model_now,
-                summary,
-                inclusion_basis,
+            return self._empty_list_dialogs_response(
+                request.scope,
+                directory_coverage,
+                bootstrap_pending=False,
             )
-            if snapshot_at is not None and (max_snapshot is None or snapshot_at > max_snapshot):
-                max_snapshot = snapshot_at
-            dialogs.append(row_data)
-
-        snapshot_age_h = _compute_snapshot_age_h(max_snapshot)
-        return {
-            "ok": True,
-            "data": {
-                "dialogs": dialogs,
-                "snapshot_age_h": snapshot_age_h,
-                "bootstrap_pending": False,
-                "scope": request.scope,
-                "directory_coverage": directory_coverage,
-            },
-        }
+        return self._project_list_dialog_rows(conn, selected_rows, request, directory_coverage)

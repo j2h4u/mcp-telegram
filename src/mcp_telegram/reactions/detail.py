@@ -11,7 +11,7 @@ from typing import cast
 
 from ..telegram_demand import AcquisitionKind, acquisition_context
 from ..telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
-from .contracts import GatewayFailure, GatewayFailureKind, ReactionEvent
+from .contracts import GatewayFailure, GatewayFailureKind, ReactionDetailFetchResult, ReactionEvent
 from .ports import TelegramReactionGateway
 
 
@@ -37,6 +37,17 @@ class ReactionDetailResult:
     def stop_cycle(self) -> bool:
         """Stop this cycle after a FloodWait while leaving later cycles eligible."""
         return self.failure_kind == "flood_wait"
+
+
+@dataclass(frozen=True, slots=True)
+class _ExpectedDetailState:
+    dialog_id: int
+    message_id: int
+    requested_generation: int
+    aggregate_generation: int | None
+    status: str
+    offset: str | None
+    staged_count: int
 
 
 class ReactionDetailRefresher:
@@ -65,7 +76,7 @@ class ReactionDetailRefresher:
         except Exception:  # noqa: BLE001 - telemetry must not affect acquisition
             return
 
-    async def refresh_one(  # noqa: PLR0913, PLR0911
+    async def refresh_one(  # noqa: PLR0913
         self,
         dialog_id: int,
         message_id: int,
@@ -79,6 +90,22 @@ class ReactionDetailRefresher:
         when = int(self._now() if now is None else now)
         if cancellation_event is not None and cancellation_event.is_set():
             return ReactionDetailResult("cancelled")
+        state = self._expected_state(dialog_id, message_id, generation)
+        if state.aggregate_generation is not None and state.aggregate_generation != generation:
+            return ReactionDetailResult("stale_writer")
+        if state.offset != offset:
+            return ReactionDetailResult("stale_writer")
+        self._observe("reaction.detail", "attempt")
+        fetched = await self._fetch_page(entity, message_id, offset)
+        if cancellation_event is not None and cancellation_event.is_set():
+            return ReactionDetailResult("cancelled")
+        return self._persist_fetch_result(
+            state=state,
+            fetched=fetched,
+            when=when,
+        )
+
+    def _expected_state(self, dialog_id: int, message_id: int, generation: int) -> _ExpectedDetailState:
         existing = cast(
             tuple[object, ...] | None,
             self._conn.execute(
@@ -87,46 +114,58 @@ class ReactionDetailRefresher:
                 (dialog_id, message_id),
             ).fetchone(),
         )
-        expected_status = "stale" if existing is None else str(existing[1])
-        expected_offset = None if existing is None or existing[2] is None else str(existing[2])
-        staged_count = 0 if existing is None else int(cast(int | str, existing[3]))
-        if existing is not None and int(cast(int | str, existing[0])) != generation:
-            return ReactionDetailResult("stale_writer")
-        if expected_offset != offset:
-            return ReactionDetailResult("stale_writer")
-        self._observe("reaction.detail", "attempt")
+        return _ExpectedDetailState(
+            dialog_id=dialog_id,
+            message_id=message_id,
+            requested_generation=generation,
+            aggregate_generation=None if existing is None else int(cast(int | str, existing[0])),
+            status="stale" if existing is None else str(existing[1]),
+            offset=None if existing is None or existing[2] is None else str(existing[2]),
+            staged_count=0 if existing is None else int(cast(int | str, existing[3])),
+        )
+
+    async def _fetch_page(self, entity: object, message_id: int, offset: str | None) -> ReactionDetailFetchResult:
         try:
             with rpc_scope(TelegramRpcSource.MESSAGE_FACT_REFRESH):
                 with acquisition_context(AcquisitionKind.REACTION_SNAPSHOT):
-                    fetched = await self._gateway.fetch_reaction_page(
+                    return await self._gateway.fetch_reaction_page(
                         entity, message_id, offset=offset, limit=self._policy.page_size
                     )
         except asyncio.CancelledError:
             raise
-        if cancellation_event is not None and cancellation_event.is_set():
-            return ReactionDetailResult("cancelled")
+
+    def _persist_fetch_result(
+        self,
+        *,
+        state: _ExpectedDetailState,
+        fetched: ReactionDetailFetchResult,
+        when: int,
+    ) -> ReactionDetailResult:
+        dialog_id = state.dialog_id
+        message_id = state.message_id
+        generation = state.requested_generation
         if not fetched.ok:
             assert fetched.failure is not None
             return self._persist_failure(
                 dialog_id,
                 message_id,
                 generation,
-                expected_status=expected_status,
-                expected_offset=expected_offset,
-                staged_count=staged_count,
+                expected_status=state.status,
+                expected_offset=state.offset,
+                staged_count=state.staged_count,
                 failure=fetched.failure,
                 when=when,
             )
         assert fetched.page is not None
         next_offset = fetched.page.next_offset
-        if next_offset is not None and next_offset == offset:
+        if next_offset is not None and next_offset == state.offset:
             return self._persist_failure(
                 dialog_id,
                 message_id,
                 generation,
-                expected_status=expected_status,
-                expected_offset=expected_offset,
-                staged_count=staged_count,
+                expected_status=state.status,
+                expected_offset=state.offset,
+                staged_count=state.staged_count,
                 failure=None,
                 when=when,
                 failure_kind="non_advancing_offset",
@@ -135,8 +174,8 @@ class ReactionDetailRefresher:
             dialog_id,
             message_id,
             generation,
-            expected_status=expected_status,
-            expected_offset=expected_offset,
+            expected_status=state.status,
+            expected_offset=state.offset,
             events=fetched.page.events,
             next_offset=next_offset,
             when=when,

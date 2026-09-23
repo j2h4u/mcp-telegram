@@ -1,7 +1,8 @@
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TypedDict, Unpack
+from typing import SupportsIndex, SupportsInt, TypedDict, Unpack, cast
 from zoneinfo import ZoneInfo
 
 from .message_content import project_message_text
@@ -24,6 +25,7 @@ DAYS_PER_WEEK = 7
 SELF_SENDER_LABEL = "[me]"
 TELEGRAM_CONTENT_OPEN = "[Telegram content]"
 TELEGRAM_CONTENT_CLOSE = "[/Telegram content]"
+_IntConvertible = int | str | bytes | bytearray | SupportsInt | SupportsIndex
 
 
 class _FormatMessagesKwargs(TypedDict, total=False):
@@ -55,6 +57,25 @@ class _ReadStateSide:
     state: str | None
     count: int
     oldest: int | None
+
+
+@dataclass(slots=True)
+class _InlineMarkerSide:
+    out_flag: int
+    cursor_state: str | None
+    anchor: int | None
+    boundary_label: str
+    tail_label: str
+
+
+@dataclass(slots=True)
+class _SenderLabelFields:
+    is_service: int
+    out_flag: int
+    dialog_id: int
+    first_name: object
+    effective_sender_id: object
+    sender_id: object
 
 
 @dataclass(slots=True)
@@ -210,42 +231,58 @@ def _compute_inline_markers(
 
     markers: dict[int, str] = {}
 
-    def _side(
-        out_flag: int, cursor_state: str | None, anchor: int | None, boundary_label: str, tail_label: str
-    ) -> None:
-        ids = [m.id for m in messages if m.out == out_flag]
-        if not ids:
-            return
-        if cursor_state == "null":
-            # Entire side is unread; tail-start on lowest id; no boundary.
-            markers[min(ids)] = tail_label
-            return
-        if anchor is None:
-            # Populated state but no anchor provided (e.g. all_read with count 0):
-            # no markers — nothing unread here.
-            return
-        seen_ids = [i for i in ids if i <= anchor]
-        unseen_ids = [i for i in ids if i > anchor]
-        if seen_ids:
-            markers[max(seen_ids)] = boundary_label
-        if unseen_ids:
-            markers[min(unseen_ids)] = tail_label
-
-    _side(
-        out_flag=0,
-        cursor_state=read_state.get("inbox_cursor_state"),
-        anchor=read_state.get("inbox_max_id_anchor"),
-        boundary_label="[I read up to here]",
-        tail_label="[unread by me]",
+    _add_inline_side_markers(
+        messages,
+        markers,
+        _InlineMarkerSide(
+            out_flag=0,
+            cursor_state=read_state.get("inbox_cursor_state"),
+            anchor=read_state.get("inbox_max_id_anchor"),
+            boundary_label="[I read up to here]",
+            tail_label="[unread by me]",
+        ),
     )
-    _side(
-        out_flag=1,
-        cursor_state=read_state.get("outbox_cursor_state"),
-        anchor=read_state.get("outbox_max_id_anchor"),
-        boundary_label="[peer read up to here]",
-        tail_label="[unread by peer]",
+    _add_inline_side_markers(
+        messages,
+        markers,
+        _InlineMarkerSide(
+            out_flag=1,
+            cursor_state=read_state.get("outbox_cursor_state"),
+            anchor=read_state.get("outbox_max_id_anchor"),
+            boundary_label="[peer read up to here]",
+            tail_label="[unread by peer]",
+        ),
     )
     return markers
+
+
+def _add_inline_side_markers(
+    messages: list[ReadMessage],
+    markers: dict[int, str],
+    side: _InlineMarkerSide,
+) -> None:
+    ids = [message.id for message in messages if message.out == side.out_flag]
+    if not ids:
+        return
+    if side.cursor_state == "null":
+        # Entire side is unread; tail-start on lowest id; no boundary.
+        markers[min(ids)] = side.tail_label
+        return
+    if side.anchor is None:
+        # Populated state but no anchor provided (e.g. all_read with count 0).
+        return
+    _add_cursor_markers(ids, markers, side.anchor, side.boundary_label, side.tail_label)
+
+
+def _add_cursor_markers(
+    ids: list[int], markers: dict[int, str], anchor: int, boundary_label: str, tail_label: str
+) -> None:
+    seen_ids = [message_id for message_id in ids if message_id <= anchor]
+    unseen_ids = [message_id for message_id in ids if message_id > anchor]
+    if seen_ids:
+        markers[max(seen_ids)] = boundary_label
+    if unseen_ids:
+        markers[min(unseen_ids)] = tail_label
 
 
 def _resolve_message_format_options(kwargs: _FormatMessagesKwargs) -> _MessageFormatOptions:
@@ -458,6 +495,27 @@ def format_search_message_groups(
     return "\n\n".join(parts)
 
 
+def _sender_label_fields(msg_or_row: object) -> _SenderLabelFields:
+    if isinstance(msg_or_row, dict):
+        get = cast(Callable[[str], object], msg_or_row.get)
+        return _SenderLabelFields(
+            is_service=int(cast(_IntConvertible, get("is_service") or 0)),
+            out_flag=int(cast(_IntConvertible, get("out") or 0)),
+            dialog_id=cast(int, get("dialog_id") or 0),
+            first_name=get("sender_first_name"),
+            effective_sender_id=get("effective_sender_id"),
+            sender_id=get("sender_id"),
+        )
+    return _SenderLabelFields(
+        is_service=int(cast(_IntConvertible, cast(object, getattr(msg_or_row, "is_service", 0)) or 0)),
+        out_flag=int(cast(_IntConvertible, cast(object, getattr(msg_or_row, "out", 0)) or 0)),
+        dialog_id=cast(int, cast(object, getattr(msg_or_row, "dialog_id", 0)) or 0),
+        first_name=cast(object, getattr(msg_or_row, "sender_first_name", None)),
+        effective_sender_id=cast(object, getattr(msg_or_row, "effective_sender_id", None)),
+        sender_id=cast(object, getattr(msg_or_row, "sender_id", None)),
+    )
+
+
 def resolve_sender_label(msg_or_row: object) -> str:
     """Return the sender label for a ReadMessage or a raw row dict.
 
@@ -471,33 +529,19 @@ def resolve_sender_label(msg_or_row: object) -> str:
     Accepts ReadMessage objects and plain row dicts (used by search snippet
     formatting in reading.py which works with raw daemon response dicts).
     """
-    if isinstance(msg_or_row, dict):
-        get = msg_or_row.get
-        is_service = int(get("is_service") or 0)
-        out_flag = int(get("out") or 0)
-        dialog_id = get("dialog_id") or 0
-        first_name = get("sender_first_name")
-        effective_sender_id = get("effective_sender_id")
-        sender_id = get("sender_id")
-    else:
-        is_service = int(getattr(msg_or_row, "is_service", 0) or 0)
-        out_flag = int(getattr(msg_or_row, "out", 0) or 0)
-        dialog_id = getattr(msg_or_row, "dialog_id", 0) or 0
-        first_name = getattr(msg_or_row, "sender_first_name", None)
-        effective_sender_id = getattr(msg_or_row, "effective_sender_id", None)
-        sender_id = getattr(msg_or_row, "sender_id", None)
+    fields = _sender_label_fields(msg_or_row)
 
     # Branch 1: service message wins regardless of other fields
-    if is_service == 1:
+    if fields.is_service == 1:
         return "System"
     # Branch 2: DM outgoing → SELF_SENDER_LABEL (no self_id comparison needed at render)
-    if out_flag == 1 and (dialog_id or 0) > 0:
+    if fields.out_flag == 1 and (fields.dialog_id or 0) > 0:
         return SELF_SENDER_LABEL
     # Branch 3: known first_name
-    if isinstance(first_name, str) and first_name:
-        return first_name
+    if isinstance(fields.first_name, str) and fields.first_name:
+        return fields.first_name
     # Branch 4: id is known but name unresolved
-    resolved_id = effective_sender_id if effective_sender_id is not None else sender_id
+    resolved_id = fields.effective_sender_id if fields.effective_sender_id is not None else fields.sender_id
     if resolved_id is not None:
         return f"(unknown user {resolved_id})"
     # Branch 5: nothing to work with
@@ -578,51 +622,49 @@ def format_unread_messages_grouped(
     if not chats:
         return ""
 
-    # WR-01: Resolve tz once so header and message lines agree by construction,
-    # not by coincidence — guards against future drift if format_messages'
-    # default changes.
     effective_tz = tz if tz is not None else ZoneInfo("UTC")
     resolved_now = now_unix if now_unix is not None else int(datetime.now(tz=UTC).timestamp())
+    read_states = read_state_per_dialog or {}
+    dialog_types = dialog_type_per_dialog or {}
+    return "\n".join(_format_unread_chat(chat, effective_tz, resolved_now, read_states, dialog_types) for chat in chats)
 
-    parts: list[str] = []
 
-    for chat in chats:
-        header_parts: list[str] = []
-        if chat.is_bot:
-            header_parts.append("бот")
-        header_parts.append(f"{chat.unread_count} непрочитанных")
-        if chat.unread_mentions_count > 0:
-            n = chat.unread_mentions_count
-            word = "упоминание" if n == 1 else "упоминания" if n % 10 in (2, 3, 4) else "упоминаний"
-            header_parts.append(f"{n} {word}")
-        header_parts.append(f"id={chat.chat_id}")
-        parts.append(f"--- {chat.display_name} ({', '.join(header_parts)}) ---")
-
-        # Phase 39.3: per-chat read-state header (AC-5/6/7, D-03).
-        chat_read_state = read_state_per_dialog.get(chat.chat_id) if read_state_per_dialog else None
-        chat_dialog_type = dialog_type_per_dialog.get(chat.chat_id) if dialog_type_per_dialog else None
-        read_state_header = _render_read_state_header(chat_read_state, chat_dialog_type, resolved_now, effective_tz)
-        if read_state_header:
-            parts.extend(read_state_header)
-
-        if chat.is_channel:
-            continue
-
+def _format_unread_chat(
+    chat: UnreadChatData,
+    effective_tz: ZoneInfo,
+    now_unix: int,
+    read_state_per_dialog: dict[int, ReadState | dict],
+    dialog_type_per_dialog: dict[int, str],
+) -> str:
+    parts = [_unread_chat_heading(chat)]
+    read_state = read_state_per_dialog.get(chat.chat_id)
+    dialog_type = dialog_type_per_dialog.get(chat.chat_id)
+    parts.extend(_render_read_state_header(read_state, dialog_type, now_unix, effective_tz))
+    if not chat.is_channel:
         if chat.messages:
             formatted = format_messages(
                 chat.messages,
                 {},
                 tz=effective_tz,
-                read_state=chat_read_state,
-                dialog_type=chat_dialog_type,
-                now_unix=resolved_now,
+                read_state=read_state,
+                dialog_type=dialog_type,
+                now_unix=now_unix,
                 suppress_header=True,
             )
             if formatted:
                 parts.append(formatted)
-
         shown = len(chat.messages)
         if shown < chat.total_in_chat:
             parts.append(f"[и ещё {chat.total_in_chat - shown}]")
-
     return "\n".join(parts)
+
+
+def _unread_chat_heading(chat: UnreadChatData) -> str:
+    header_parts: list[str] = ["бот"] if chat.is_bot else []
+    header_parts.append(f"{chat.unread_count} непрочитанных")
+    if chat.unread_mentions_count > 0:
+        count = chat.unread_mentions_count
+        word = "упоминание" if count == 1 else "упоминания" if count % 10 in (2, 3, 4) else "упоминаний"
+        header_parts.append(f"{count} {word}")
+    header_parts.append(f"id={chat.chat_id}")
+    return f"--- {chat.display_name} ({', '.join(header_parts)}) ---"
