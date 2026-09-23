@@ -280,18 +280,61 @@ async def test_dm_enrollment_restarts_after_interruption_without_replaying_teleg
     ).fetchone() == ("7",)
 
 
-def test_delta_gap_status_uses_refresh_or_recency_boundary_without_writes(conn: sqlite3.Connection) -> None:
+def test_delta_gap_status_uses_two_hour_fallback_and_immediate_explicit_refresh(conn: sqlite3.Connection) -> None:
     _seed_history_dialog(conn, 201, status="synced", last_delta_checked_at=100)
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event())
     adapter = DeltaGapFillDemandAdapter(worker)
     changes_before = conn.total_changes
 
-    assert adapter.status(50.0).release_at == 3700.0  # type: ignore[union-attr]
+    assert adapter.status(7299.0).release_at == 7300.0  # type: ignore[union-attr]
+    assert not adapter.status(7299.0).is_ready(7299.0)  # type: ignore[union-attr]
+    assert adapter.status(7300.0).is_ready(7300.0)  # type: ignore[union-attr]
     assert conn.total_changes == changes_before
 
     conn.execute("UPDATE synced_dialogs SET delta_refresh_requested_at = 75 WHERE dialog_id = 201")
     conn.commit()
-    assert adapter.status(50.0).release_at == 75.0  # type: ignore[union-attr]
+    assert adapter.status(200.0).release_at == 75.0  # type: ignore[union-attr]
+    assert adapter.status(200.0).is_ready(200.0)  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_empty_delta_completion_persists_two_hour_cadence_across_restart(
+    conn: sqlite3.Connection,
+    db_path: Path,
+) -> None:
+    dialog_id = 207
+    _seed_history_dialog(conn, dialog_id, status="synced", refresh_requested_at=1)
+    conn.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, text) VALUES (?, 10, 1, 'baseline')", (dialog_id,)
+    )
+    conn.commit()
+
+    async def iter_messages(**_kwargs: object) -> AsyncIterator[object]:
+        if False:
+            yield None
+
+    worker = DeltaSyncWorker(
+        TelethonForwardGapPageAdapter(SimpleNamespace(iter_messages=iter_messages)), conn, asyncio.Event()
+    )
+    adapter = DeltaGapFillDemandAdapter(worker)
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute(
+        "SELECT delta_refresh_requested_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone() == (None, 1000)
+
+    restarted_conn = _open_sync_db(db_path)
+    try:
+        restarted = DeltaGapFillDemandAdapter(
+            DeltaSyncWorker(cast(ForwardGapPagePort, object()), restarted_conn, asyncio.Event())
+        )
+        assert restarted.status(8199.0).release_at == 8200.0  # type: ignore[union-attr]
+        assert not restarted.status(8199.0).is_ready(8199.0)  # type: ignore[union-attr]
+        assert restarted.status(8200.0).is_ready(8200.0)  # type: ignore[union-attr]
+    finally:
+        restarted_conn.close()
 
 
 @pytest.mark.asyncio
@@ -479,6 +522,7 @@ async def test_delta_gap_adapter_propagates_coordinator_outcomes_without_checkpo
         "SELECT delta_refresh_requested_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone() == (1, None)
+    assert adapter.status(1000.0).is_ready(1000.0)  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio
