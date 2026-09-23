@@ -10,12 +10,70 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, TypedDict, cast
 
-from .telegram_demand import AcquisitionKind
+from .telegram_demand import AcquisitionKind, DemandObservationHook
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import RpcAdmissionEvent, RpcAdmissionEventKind, RpcServiceClass, TelegramRpcSource
 
 logger = logging.getLogger(__name__)
 _MILLISECONDS_PER_SECOND = 1_000
+_DELTA_GAP_FILL_COUNTERS = (
+    "slice_count",
+    "completed",
+    "deferred",
+    "failed",
+    "scheduled",
+    "recovery",
+    "actual_attempts",
+    "attempted_slices",
+    "page_count",
+    "empty_page_count",
+    "fetched_count",
+    "new_key_count",
+    "preexisting_key_count",
+    "uncommitted_unique_count",
+    "duplicate_count",
+    "continuation_count",
+    "terminal_count",
+    "recovery_completion_count",
+)
+_DELTA_GAP_FILL_REASONS = frozenset(
+    {
+        "admission_deferred",
+        "admission_saturated",
+        "admission_expired",
+        "budget_exhausted",
+        "flood_wait",
+        "access_lost",
+        "history_unavailable",
+        "cancelled",
+        "error",
+        "skipped",
+        "empty_page",
+        "continuation",
+        "terminal",
+        "completed",
+    }
+)
+
+
+def _validated_delta_gap_fill_metrics(metrics: Mapping[str, int]) -> dict[str, int] | None:
+    values = {key: metrics.get(key, 0) for key in _DELTA_GAP_FILL_COUNTERS}
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values.values()):
+        return None
+    return values if _delta_gap_fill_metrics_reconcile(values) else None
+
+
+def _delta_gap_fill_metrics_reconcile(values: Mapping[str, int]) -> bool:
+    fetched_categories = ("new_key_count", "preexisting_key_count", "uncommitted_unique_count", "duplicate_count")
+    return all(
+        (
+            values["slice_count"] == 1,
+            values["slice_count"] == values["completed"] + values["deferred"] + values["failed"],
+            values["fetched_count"] == sum(values[key] for key in fetched_categories),
+            values["page_count"] >= values["empty_page_count"],
+            values["recovery_completion_count"] <= values["recovery"],
+        )
+    )
 
 
 class ObservationRecorder(Protocol):
@@ -30,7 +88,7 @@ class ObservationRecorder(Protocol):
         duration_ms: float | None = None,
         result_count: int | None = None,
         payload: Mapping[str, object] | None = None,
-    ) -> None: ...
+    ) -> bool | None: ...
 
 
 class RpcAdmissionObservationPolicy(Protocol):
@@ -49,27 +107,7 @@ class DemandEvidenceOutcome(StrEnum):
     FAILED = "failed"
 
 
-class DemandObservationHook(Protocol):
-    """Narrow observer seam the durable coordinator may call after a slice."""
-
-    def observe_demand(  # noqa: PLR0913 - this is the stable telemetry boundary
-        self,
-        *,
-        outcome: DemandEvidenceOutcome | str,
-        demand_kind: DemandKind,
-        acquisition_kind: AcquisitionKind | None = None,
-        demand_units: int = 1,
-        actual_attempts: int = 0,
-        queue_age_seconds: float | None = None,
-        freshness_debt_seconds: float | None = None,
-        reason: str | None = None,
-    ) -> None: ...
-
-
 # Compatibility name for composition code that still refers to demand evidence.
-DemandEvidenceObserver = DemandObservationHook
-
-
 class _ProfileObservationValues(TypedDict):
     mode: str
     eligible_pair: bool
@@ -171,6 +209,10 @@ class RpcAdmissionObservationAggregator:
         self._demand_aggregates: dict[_DemandKey, _DemandAggregate] = {}
         self._profile_aggregates: dict[_ProfileKey, _ProfilePairAggregate] = {}
         self._request_attempts: dict[_RequestKey, int] = {}
+        self._delta_gap_fill: dict[str, int] = dict.fromkeys(_DELTA_GAP_FILL_COUNTERS, 0)
+        self._delta_gap_fill_reasons: dict[str, int] = {}
+        self._delta_gap_fill_rejected = 0
+        self._delta_gap_fill_window_started_at = self._last_flush_at
         self._state_lock = threading.Lock()
         self._flush_lock = threading.Lock()
 
@@ -321,6 +363,27 @@ class RpcAdmissionObservationAggregator:
         except Exception:  # noqa: BLE001 - telemetry cannot affect profile correctness
             return
 
+    def observe_delta_gap_fill(self, metrics: Mapping[str, int], *, reason: str) -> None:
+        """Aggregate one content-free forward gap-fill slice into a bounded window."""
+        try:
+            values = _validated_delta_gap_fill_metrics(metrics)
+            if values is None:
+                with self._state_lock:
+                    self._delta_gap_fill_rejected += 1
+                self.flush_if_due()
+                return
+            self._aggregate_delta_gap_fill(values, reason)
+        except Exception:  # noqa: BLE001 - telemetry cannot affect the sync slice
+            return
+
+    def _aggregate_delta_gap_fill(self, values: Mapping[str, int], reason: str) -> None:
+        normalized_reason = reason if reason in _DELTA_GAP_FILL_REASONS else "error"
+        with self._state_lock:
+            for key, value in values.items():
+                self._delta_gap_fill[key] += value
+            self._delta_gap_fill_reasons[normalized_reason] = self._delta_gap_fill_reasons.get(normalized_reason, 0) + 1
+        self.flush_if_due()
+
     def flush_if_due(self) -> None:
         now = self._clock()
         with self._state_lock:
@@ -354,8 +417,62 @@ class RpcAdmissionObservationAggregator:
         with self._state_lock:
             profile_aggregates, self._profile_aggregates = self._profile_aggregates, {}
             request_attempts, self._request_attempts = self._request_attempts, {}
+            delta_gap_fill, self._delta_gap_fill = (
+                self._delta_gap_fill,
+                cast(dict[str, int], dict.fromkeys(_DELTA_GAP_FILL_COUNTERS, 0)),
+            )
+            delta_reasons, self._delta_gap_fill_reasons = self._delta_gap_fill_reasons, {}
+            delta_rejected, self._delta_gap_fill_rejected = self._delta_gap_fill_rejected, 0
+            delta_window_started_at = self._delta_gap_fill_window_started_at
         self._flush_profile_aggregates(profile_aggregates)
         self._flush_request_attempts(request_attempts)
+        self._flush_delta_gap_fill(delta_gap_fill, delta_reasons, delta_rejected, delta_window_started_at, flush_at)
+
+    def _flush_delta_gap_fill(
+        self,
+        counters: dict[str, int],
+        reasons: dict[str, int],
+        rejected: int,
+        window_started_at: float,
+        flush_at: float,
+    ) -> None:
+        if not counters["slice_count"] and not rejected:
+            with self._state_lock:
+                self._delta_gap_fill_window_started_at = flush_at
+            return
+        payload: dict[str, object] = {
+            **counters,
+            "rejected_slice_count": rejected,
+            "slice_outcome_scope": "forward_slice",
+            "window_seconds": max(0.0, flush_at - window_started_at),
+        }
+        if reasons:
+            payload["reason_counts"] = reasons
+        try:
+            accepted = self._recorder.record(
+                kind="sync.delta_gap_fill",
+                outcome="summary",
+                result_count=counters["slice_count"] + rejected,
+                payload=payload,
+            )
+            if accepted is False:
+                with self._state_lock:
+                    self._merge_delta_gap_fill(counters, reasons, rejected)
+                logger.warning("delta_gap_fill_summary_queue_full")
+                return
+            with self._state_lock:
+                self._delta_gap_fill_window_started_at = flush_at
+        except Exception:
+            with self._state_lock:
+                self._merge_delta_gap_fill(counters, reasons, rejected)
+            logger.exception("delta_gap_fill_summary_flush_failed")
+
+    def _merge_delta_gap_fill(self, counters: Mapping[str, int], reasons: Mapping[str, int], rejected: int) -> None:
+        for key, value in counters.items():
+            self._delta_gap_fill[key] += value
+        for key, value in reasons.items():
+            self._delta_gap_fill_reasons[key] = self._delta_gap_fill_reasons.get(key, 0) + value
+        self._delta_gap_fill_rejected += rejected
 
     def _flush_request_attempts(self, attempts: dict[_RequestKey, int]) -> None:
         for (source, service_class, demand_kind, acquisition_kind), count in attempts.items():
@@ -811,7 +928,6 @@ def _normalize_reason(reason: str | None) -> str | None:
 
 
 __all__ = [
-    "DemandEvidenceObserver",
     "DemandEvidenceOutcome",
     "DemandObservationHook",
     "ObservationRecorder",

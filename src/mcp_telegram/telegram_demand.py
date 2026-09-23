@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -40,6 +40,29 @@ class AcquisitionKind(StrEnum):
     TOPIC_SNAPSHOT = "topic_snapshot"
     UPDATE_DIFFERENCE = "update_difference"
     LINKED_CHAT_RESOLUTION = "linked_chat_resolution"
+
+
+class DemandObservationHook(Protocol):
+    """Narrow observer seam the durable coordinator may call after a slice."""
+
+    def observe_demand(  # noqa: PLR0913 - this is the stable telemetry boundary
+        self,
+        *,
+        outcome: str,
+        demand_kind: DemandKind,
+        acquisition_kind: AcquisitionKind | None = None,
+        demand_units: int = 1,
+        actual_attempts: int = 0,
+        queue_age_seconds: float | None = None,
+        freshness_debt_seconds: float | None = None,
+        reason: str | None = None,
+    ) -> None: ...
+
+
+class DeltaGapFillObservationHook(Protocol):
+    """Content-free per-slice evidence consumed by the bounded aggregator."""
+
+    def observe_delta_gap_fill(self, metrics: Mapping[str, int], *, reason: str) -> None: ...
 
 
 @dataclass(slots=True, eq=False)

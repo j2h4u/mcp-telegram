@@ -58,6 +58,8 @@ from mcp_telegram.sync_db import SyncDatabaseConnection
 from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncDmEnrollmentDemandAdapter, FullSyncWorker
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
+    DeltaGapFillObservationHook,
+    DemandObservationHook,
     DemandStatus,
     DurableDemandAdapter,
     RpcAttemptBudget,
@@ -71,6 +73,10 @@ from mcp_telegram.telegram_rpc_scheduler import rpc_attempt_budget
 
 class DemandCompositionClient(ActivityClient, Protocol):
     async def get_me(self) -> object: ...
+
+
+class DemandCompositionObserver(DemandObservationHook, DeltaGapFillObservationHook, Protocol):
+    """Observer hooks consumed by coordinator and delta gap-fill adapters."""
 
 
 class LinkedChatFactRefreshPort(Protocol):
@@ -137,18 +143,24 @@ class LinkedChatFactDemandAdapter(DurableDemandAdapter):
                     await self._port.retry_one_pending_linked_chat_fact(budget)
 
 
-def build_durable_adapter_map(dependencies: DemandCompositionDependencies) -> Mapping[DemandKind, DurableDemandAdapter]:
+def build_durable_adapter_map(
+    dependencies: DemandCompositionDependencies,
+    *,
+    observer: DeltaGapFillObservationHook | None = None,
+) -> Mapping[DemandKind, DurableDemandAdapter]:
     """Build and validate the exhaustive durable adapter map."""
     adapters: dict[DemandKind, DurableDemandAdapter] = {
         DemandKind.ENTITY_PROFILE_REFRESH: EntityProfileDemandAdapter(dependencies.entity_refresh_coordinator),
         DemandKind.DELTA_GAP_FILL: DeltaGapFillDemandAdapter(
             dependencies.delta_sync_worker,
             dependencies.dm_gap_scanner,
+            observer=observer,
         ),
         DemandKind.DELTA_ACCESS_PROBE: DeltaAccessProbeDemandAdapter(
             dependencies.delta_sync_worker,
             dependencies.access_probe_policy,
             dependencies.access_probe,
+            observer=observer,
         ),
         DemandKind.HOT_ACTIVITY_PAGE: HotActivityDemandAdapter(
             dependencies.client,
@@ -233,11 +245,11 @@ def build_durable_adapter_map(dependencies: DemandCompositionDependencies) -> Ma
 def build_durable_coordinator(
     dependencies: DemandCompositionDependencies,
     *,
-    observer: object | None = None,
+    observer: DemandCompositionObserver | None = None,
 ) -> TelegramDemandCoordinator:
     """Construct the sole durable executor over the exhaustive adapter map."""
     return TelegramDemandCoordinator(
-        build_durable_adapter_map(dependencies),
+        build_durable_adapter_map(dependencies, observer=observer),
         dependencies.shutdown_event,
         observer=observer,
     )

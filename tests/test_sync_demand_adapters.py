@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -653,11 +653,191 @@ async def test_access_probe_adapter_persists_probe_to_gap_fill_handoff(conn: sql
         "access_lost",
     )
 
-    restarted = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), TelethonHistoryAccessProbe(client))
+    class Observer:
+        def __init__(self) -> None:
+            self.rows: list[tuple[Mapping[str, int], str]] = []
+
+        def observe_delta_gap_fill(self, metrics: Mapping[str, int], *, reason: str) -> None:
+            self.rows.append((metrics, reason))
+
+    observer = Observer()
+    restarted = DeltaAccessProbeDemandAdapter(
+        worker, _delta_policy(), TelethonHistoryAccessProbe(client), observer=observer
+    )
     await restarted.run_slice(RpcAttemptBudget(limit=1))
 
+    assert len(observer.rows) == 1
+    recovery_metrics, _ = observer.rows[0]
+    assert recovery_metrics["recovery"] == recovery_metrics["recovery_completion_count"] == 1
+    assert recovery_metrics["completed"] == 1
+    assert (
+        recovery_metrics["slice_count"]
+        == recovery_metrics["completed"] + recovery_metrics["deferred"] + recovery_metrics["failed"]
+    )
+    assert recovery_metrics["fetched_count"] == sum(
+        recovery_metrics[key]
+        for key in ("new_key_count", "preexisting_key_count", "uncommitted_unique_count", "duplicate_count")
+    )
     assert conn.execute("SELECT 1 FROM delta_access_recovery_state WHERE dialog_id=?", (dialog_id,)).fetchone() is None
     assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == ("syncing",)
+
+
+@pytest.mark.asyncio
+async def test_recovery_query_failure_does_not_reuse_prior_slice_metrics(conn: sqlite3.Connection) -> None:
+    dialog_id = 304
+    _seed_history_dialog(conn, dialog_id, status="synced", refresh_requested_at=1)
+    conn.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, ?, 1)", (dialog_id, 10))
+    conn.commit()
+
+    async def iter_messages(**_kwargs: object) -> AsyncIterator[object]:
+        for message_id in range(11, 18):
+            yield build_mock_message(id=message_id, text=f"message {message_id}")
+
+    client = SimpleNamespace(iter_messages=iter_messages)
+    worker = DeltaSyncWorker(
+        TelethonForwardGapPageAdapter(client),
+        conn,
+        asyncio.Event(),
+    )
+
+    class Observer:
+        def __init__(self) -> None:
+            self.rows: list[tuple[Mapping[str, int], str]] = []
+
+        def observe_delta_gap_fill(self, metrics: Mapping[str, int], *, reason: str) -> None:
+            self.rows.append((metrics, reason))
+
+    observer = Observer()
+    scheduled = DeltaGapFillDemandAdapter(worker, observer=observer)
+    await scheduled.run_slice(RpcAttemptBudget(limit=1))
+    assert observer.rows[-1][0]["new_key_count"] == 7
+
+    conn.execute("UPDATE synced_dialogs SET status='access_lost' WHERE dialog_id=?", (dialog_id,))
+    conn.execute(
+        "INSERT INTO delta_access_recovery_state(dialog_id,stage,total_messages,probe_succeeded_at,retry_at,updated_at) "
+        "VALUES (?, 'gap_fill', 20, 1, NULL, 1)",
+        (dialog_id,),
+    )
+    conn.commit()
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), TelethonHistoryAccessProbe(client), observer)
+
+    with patch("mcp_telegram.delta_sync.full_history_enabled", side_effect=RuntimeError("lookup failed")):
+        with pytest.raises(RuntimeError, match="lookup failed"):
+            await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    metrics, reason = observer.rows[-1]
+    assert reason == "error"
+    assert metrics["recovery"] == 1
+    assert metrics["failed"] == 1
+    assert metrics["fetched_count"] == metrics["new_key_count"] == 0
+    assert metrics["page_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_non_enrolled_recovery_is_observed_as_skipped_not_terminal(conn: sqlite3.Connection) -> None:
+    dialog_id = 306
+    _seed_history_dialog(conn, dialog_id, status="access_lost")
+    conn.execute("UPDATE full_history_enrollment SET enabled=0 WHERE dialog_id=?", (dialog_id,))
+    conn.execute(
+        "INSERT INTO delta_access_recovery_state(dialog_id,stage,total_messages,probe_succeeded_at,retry_at,updated_at) "
+        "VALUES (?, 'gap_fill', 20, 1, NULL, 1)",
+        (dialog_id,),
+    )
+    conn.commit()
+
+    class Probe:
+        async def probe_total_messages(self, dialog_id: int) -> int | None:
+            raise AssertionError(f"unexpected probe for {dialog_id}")
+
+    class Observer:
+        def __init__(self) -> None:
+            self.rows: list[tuple[Mapping[str, int], str]] = []
+
+        def observe_delta_gap_fill(self, metrics: Mapping[str, int], *, reason: str) -> None:
+            self.rows.append((metrics, reason))
+
+    observer = Observer()
+    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event())
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), Probe(), observer)
+
+    await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert len(observer.rows) == 1
+    metrics, reason = observer.rows[0]
+    assert reason == "skipped"
+    assert metrics["completed"] == metrics["recovery_completion_count"] == 1
+    assert metrics["terminal_count"] == metrics["page_count"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_kind", "raises", "retry_at", "reason"),
+    [
+        ("flood", False, 1100, "flood_wait"),
+        ("budget", True, None, "budget_exhausted"),
+    ],
+)
+async def test_access_recovery_retains_local_flood_retry_and_observes_budget_deferral(
+    conn: sqlite3.Connection,
+    error_kind: str,
+    raises: bool,
+    retry_at: int | None,
+    reason: str,
+) -> None:
+    dialog_id = 305
+    _seed_history_dialog(conn, dialog_id, status="access_lost")
+    conn.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (?, ?, 1)", (dialog_id, 10))
+    conn.execute(
+        "INSERT INTO delta_access_recovery_state(dialog_id,stage,total_messages,probe_succeeded_at,retry_at,updated_at) "
+        "VALUES (?, 'gap_fill', 10, 1, NULL, 1)",
+        (dialog_id,),
+    )
+    conn.commit()
+
+    class HistoryPort:
+        async def fetch_page(
+            self,
+            _dialog_id: int,
+            *,
+            after_message_id: int,
+            should_stop: object,
+        ) -> object:
+            del after_message_id, should_stop
+            if error_kind == "flood":
+                raise TelegramRpcThrottled(retry_after_seconds=600)
+            raise RpcAttemptBudgetExhaustedError("budget exhausted")
+
+    class Probe:
+        async def probe_total_messages(self, dialog_id: int) -> int | None:
+            del dialog_id
+            return 10
+
+    class Observer:
+        def __init__(self) -> None:
+            self.rows: list[tuple[Mapping[str, int], str]] = []
+
+        def observe_delta_gap_fill(self, metrics: Mapping[str, int], *, reason: str) -> None:
+            self.rows.append((metrics, reason))
+
+    observer = Observer()
+    worker = DeltaSyncWorker(cast(ForwardGapPagePort, HistoryPort()), conn, asyncio.Event())
+    adapter = DeltaAccessProbeDemandAdapter(worker, _delta_policy(), Probe(), observer=observer)
+
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
+        if raises:
+            with pytest.raises(RpcAttemptBudgetExhaustedError):
+                await adapter.run_slice(RpcAttemptBudget(limit=1))
+        else:
+            await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute(
+        "SELECT retry_at FROM delta_access_recovery_state WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (retry_at,)
+    assert len(observer.rows) == 1
+    metrics, observed_reason = observer.rows[0]
+    assert observed_reason == reason
+    assert metrics["deferred"] == 1
+    assert metrics["completed"] == metrics["failed"] == 0
 
 
 @pytest.mark.asyncio
