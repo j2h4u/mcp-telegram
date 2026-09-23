@@ -36,7 +36,7 @@ from mcp_telegram.config import (
 from mcp_telegram.flood import FloodWaitAccumulator, FloodWaitKillSwitchPolicy, TelegramRpcThrottled
 from mcp_telegram.sync_db import ensure_sync_schema, load_account_cooldown_until_utc, save_account_cooldown_until_utc
 from mcp_telegram.telegram import create_client
-from mcp_telegram.telegram_demand import AcquisitionKind
+from mcp_telegram.telegram_demand import AcquisitionKind, current_demand_token, demand_contract
 from mcp_telegram.telegram_rpc import (
     TelegramRpcAdmissionDeferred,
     TelegramRpcBudget,
@@ -49,7 +49,7 @@ from mcp_telegram.telegram_rpc import (
     reset_account_cooldown,
     rpc_scope,
 )
-from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_consumers import DemandKind, ExecutionMode
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmission,
     RpcAdmissionClosedError,
@@ -160,6 +160,7 @@ def _gate(status: _CircuitStatus | None = None, *, retry_delays: tuple[float, ..
     gate._raise_last_call_error = True
     gate._flood_waited_requests = {}
     gate._no_updates = False
+    gate._reconnect_event = asyncio.Event()
     gate._log = {"telethon.client.users": logging.getLogger(__name__)}
     gate.flood_sleep_threshold = 0
     gate.session = SimpleNamespace(process_entities=lambda _result: None)
@@ -856,6 +857,89 @@ def test_gate_factory_invariants_without_connecting() -> None:
     assert gate.flood_sleep_threshold == 0
     assert gate._raise_last_call_error is True
     assert gate._auto_reconnect is True
+
+
+@pytest.mark.asyncio
+async def test_internal_reconnect_probe_signals_before_vendor_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = _gate()
+    observed: list[tuple[DemandKind, ExecutionMode, AcquisitionKind | None]] = []
+    vendor_calls = 0
+
+    async def vendor_handler(_client: TelegramClient) -> None:
+        nonlocal vendor_calls
+        vendor_calls += 1
+        token = current_demand_token()
+        observed.append((token.kind, demand_contract(token.kind).execution_mode, token.acquisition_kind))
+        assert gate.reconnect_event.is_set()
+
+    monkeypatch.setattr(TelegramClient, "_handle_auto_reconnect", vendor_handler)
+
+    await gate._handle_auto_reconnect()
+
+    assert vendor_calls == 1
+    assert observed == [
+        (DemandKind.TELETHON_RECONNECT_PROBE, ExecutionMode.PROTOCOL, AcquisitionKind.ACCOUNT_SELF_PROFILE)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_internal_reconnect_probe_runs_vendor_get_users_request_under_scope() -> None:
+    assert "get_me" in inspect.getsource(TelegramClient._handle_auto_reconnect)
+    gate = _gate()
+    sent: list[object] = []
+    gate._mb_entity_cache = SimpleNamespace(
+        self_id=None,
+        set_self_user=lambda *_args: None,
+    )
+
+    def send(request: object) -> list[object]:
+        sent.append(request)
+        return [SimpleNamespace(id=7, bot=False, access_hash=11)]
+
+    _set_sender(gate, send)
+
+    await gate._handle_auto_reconnect()
+
+    assert len(sent) == 1
+    assert isinstance(sent[0], functions.users.GetUsersRequest)
+    assert sent[0].id[0].__class__ is types.InputUserSelf
+
+
+def test_telethon_sender_keeps_internal_reconnect_callback_wiring() -> None:
+    source = inspect.getsource(TelegramClient.__init__).replace(" ", "")
+
+    assert "auto_reconnect_callback=self._handle_auto_reconnect" in source
+
+
+@pytest.mark.asyncio
+async def test_internal_reconnect_probe_rejects_same_task_nested_root() -> None:
+    gate = _gate()
+
+    with rpc_scope(TelegramRpcSource.MCP_INTERACTIVE):
+        with pytest.raises(RuntimeError, match="nested root demand"):
+            await gate._handle_auto_reconnect()
+
+
+@pytest.mark.asyncio
+async def test_internal_reconnect_probe_refreshes_inherited_parent_scope() -> None:
+    gate = _gate()
+    sent: list[object] = []
+    gate._mb_entity_cache = SimpleNamespace(self_id=None, set_self_user=lambda *_args: None)
+
+    def send(request: object) -> list[object]:
+        sent.append(request)
+        return [SimpleNamespace(id=7, bot=False, access_hash=11)]
+
+    _set_sender(gate, send)
+
+    async def parent_rpc() -> None:
+        with rpc_scope(TelegramRpcSource.MCP_INTERACTIVE):
+            await asyncio.create_task(gate._handle_auto_reconnect())
+
+    await parent_rpc()
+
+    assert len(sent) == 1
+    assert isinstance(sent[0], functions.users.GetUsersRequest)
 
 
 @pytest.mark.asyncio

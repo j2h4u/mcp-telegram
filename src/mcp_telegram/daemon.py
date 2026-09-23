@@ -21,8 +21,8 @@ Event handlers:
 Delta catch-up:
 - connect() retains Telethon's catch_up=True persisted update recovery; the
   reconnect loop invokes public catch_up() after later reconnects.
-- reconnect_catch_up_loop polls public connection state and invokes public
-  catch_up() once per observed disconnected→connected transition.
+- reconnect_catch_up_loop consumes a persistent event signalled by Telethon's
+  internal reconnect handler and invokes public catch_up().
 - Delta gap and access recovery are durable demand slices selected by the
   process-wide coordinator.
 
@@ -231,6 +231,9 @@ class _DaemonClient(Protocol):
     def remove_event_handler(self, _callback: object) -> None: ...
 
     def is_connected(self) -> bool: ...
+
+    @property
+    def reconnect_event(self) -> asyncio.Event: ...
 
     async def catch_up(self) -> None: ...
 
@@ -1872,8 +1875,9 @@ async def sync_main() -> None:
         draft_owner.request_recovery("startup")
         update_barrier.open()
 
-        # Keep the transition watcher live for later reconnects. Initial
-        # catch-up is already retained by Telethon behind the startup barrier.
+        # Keep the reconnect signal consumer live. Initial catch-up is already
+        # retained by Telethon behind the startup barrier; an early signal
+        # remains pending on the client's event until this task starts.
         _create_tracked_task(
             ctx,
             run_reconnect_catch_up_loop(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -18,28 +19,80 @@ from mcp_telegram.telegram_rpc_scheduler import RpcAdmissionClosedError, current
 
 
 class _Client:
-    def __init__(self, states: list[bool], shutdown: asyncio.Event) -> None:
-        self._states = iter(states)
+    def __init__(self, shutdown: asyncio.Event) -> None:
         self._shutdown = shutdown
+        self.reconnect_event = asyncio.Event()
         self.catch_up_calls = 0
-
-    def is_connected(self) -> bool:
-        return next(self._states)
 
     async def catch_up(self) -> None:
         self.catch_up_calls += 1
-        if self.catch_up_calls == 2:
+        if self.catch_up_calls == 1:
+            self.reconnect_event.set()
+        else:
             self._shutdown.set()
 
 
 @pytest.mark.asyncio
-async def test_reconnect_loop_catches_up_once_per_observed_transition() -> None:
+async def test_reconnect_loop_catches_up_once_per_signal() -> None:
     shutdown = asyncio.Event()
-    client = _Client([False, False, True, True, False, True], shutdown)
+    client = _Client(shutdown)
+    client.reconnect_event.set()
+    assert client.reconnect_event.is_set()
+    recoveries: list[str] = []
+    observations: list[tuple[str, str]] = []
+
+    await run_reconnect_catch_up_loop(
+        client,
+        shutdown,
+        interval_seconds=0.001,
+        observe=lambda kind, outcome, _reason: observations.append((kind, outcome)),
+        on_reconnect=lambda: recoveries.append("reconnect"),
+    )
+
+    assert client.catch_up_calls == 2
+    assert recoveries == ["reconnect", "reconnect"]
+    assert observations == [
+        ("runtime.connection_observed", "reconnected"),
+        ("runtime.catch_up_requested", "requested"),
+        ("runtime.connection_observed", "reconnected"),
+        ("runtime.catch_up_requested", "requested"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_signal_is_consumed_without_poll_interval() -> None:
+    shutdown = asyncio.Event()
+    client = _Client(shutdown)
+    client.catch_up = lambda: _stop_after(shutdown, 0)  # type: ignore[method-assign]
+    loop = asyncio.create_task(run_reconnect_catch_up_loop(client, shutdown, interval_seconds=5.0))
+    await asyncio.sleep(0)
+
+    started = time.monotonic()
+    client.reconnect_event.set()
+    await asyncio.wait_for(loop, timeout=0.1)
+
+    assert time.monotonic() - started < 0.1
+
+
+@pytest.mark.asyncio
+async def test_reconnect_event_coalesces_repeated_pending_signals() -> None:
+    shutdown = asyncio.Event()
+
+    class Client:
+        reconnect_event = asyncio.Event()
+        catch_up_calls = 0
+
+        async def catch_up(self) -> None:
+            self.catch_up_calls += 1
+            shutdown.set()
+
+    client = Client()
+    client.reconnect_event.set()
+    client.reconnect_event.set()
 
     await run_reconnect_catch_up_loop(client, shutdown, interval_seconds=0.001)
 
-    assert client.catch_up_calls == 2
+    assert client.catch_up_calls == 1
 
 
 @pytest.mark.asyncio
@@ -49,9 +102,7 @@ async def test_reconnect_loop_does_not_catch_up_while_steady_connected() -> None
     class ConnectedClient:
         def __init__(self) -> None:
             self.catch_up_calls = 0
-
-        def is_connected(self) -> bool:
-            return True
+            self.reconnect_event = asyncio.Event()
 
         async def catch_up(self) -> None:
             self.catch_up_calls += 1
@@ -75,11 +126,9 @@ async def test_reconnect_loop_retries_failure_while_connected(caplog: pytest.Log
 
     class FailingClient:
         def __init__(self) -> None:
-            self._states = iter((False, True, True, True))
+            self.reconnect_event = asyncio.Event()
+            self.reconnect_event.set()
             self.catch_up_calls = 0
-
-        def is_connected(self) -> bool:
-            return next(self._states)
 
         async def catch_up(self) -> None:
             self.catch_up_calls += 1
@@ -100,16 +149,13 @@ async def test_reconnect_scheduler_closure_propagates() -> None:
     shutdown = asyncio.Event()
 
     class ClosedClient:
-        def is_connected(self) -> bool:
-            return False
+        reconnect_event = asyncio.Event()
 
         async def catch_up(self) -> None:
             raise RpcAdmissionClosedError(current_rpc_scope(), "scheduler closed")
 
     client = ClosedClient()
-    # A reconnect transition is observed on the second poll.
-    states = iter((False, True))
-    client.is_connected = lambda: next(states)  # type: ignore[method-assign]
+    client.reconnect_event.set()
 
     with pytest.raises(RpcAdmissionClosedError, match="scheduler closed"):
         await run_reconnect_catch_up_loop(client, shutdown, interval_seconds=0.001)
@@ -122,10 +168,8 @@ async def test_reconnect_catch_up_creates_inline_root_and_refines_acquisition() 
 
     class InspectingClient:
         def __init__(self) -> None:
-            self._states = iter((False, True))
-
-        def is_connected(self) -> bool:
-            return next(self._states)
+            self.reconnect_event = asyncio.Event()
+            self.reconnect_event.set()
 
         async def catch_up(self) -> None:
             token = current_demand_token()
@@ -142,7 +186,8 @@ async def test_reconnect_catch_up_creates_inline_root_and_refines_acquisition() 
 @pytest.mark.asyncio
 async def test_reconnect_attempt_rejects_wrong_outer_root() -> None:
     shutdown = asyncio.Event()
-    client = _Client([False, True], shutdown)
+    client = _Client(shutdown)
+    client.reconnect_event.set()
 
     with demand_context(DemandKind.REALTIME_EVENT_ACQUISITION):
         with pytest.raises(RuntimeError, match="requires reconnect_difference demand"):
@@ -157,10 +202,8 @@ async def test_reconnect_catch_up_cancellation_propagates() -> None:
 
     class CancelledClient:
         def __init__(self) -> None:
-            self._states = iter((False, True))
-
-        def is_connected(self) -> bool:
-            return next(self._states)
+            self.reconnect_event = asyncio.Event()
+            self.reconnect_event.set()
 
         async def catch_up(self) -> None:
             raise asyncio.CancelledError
@@ -176,10 +219,8 @@ async def test_reconnect_retries_use_fresh_root_contexts() -> None:
 
     class RetryClient:
         def __init__(self) -> None:
-            self._states = iter((False, True, True))
-
-        def is_connected(self) -> bool:
-            return next(self._states)
+            self.reconnect_event = asyncio.Event()
+            self.reconnect_event.set()
 
         async def catch_up(self) -> None:
             observed_tokens.append(current_demand_token())
@@ -200,10 +241,8 @@ async def test_reconnect_attempt_preserves_valid_outer_reconnect_root() -> None:
 
     class InspectingClient:
         def __init__(self) -> None:
-            self._states = iter((False, True))
-
-        def is_connected(self) -> bool:
-            return next(self._states)
+            self.reconnect_event = asyncio.Event()
+            self.reconnect_event.set()
 
         async def catch_up(self) -> None:
             observed_deadlines.append(current_demand_token().admission_deadline)

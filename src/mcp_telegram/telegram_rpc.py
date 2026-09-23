@@ -55,6 +55,7 @@ from .telegram_rpc_scheduler import (
     TelegramRpcScope,
     TelegramRpcSource,
     UnclassifiedTelegramRpcError,
+    create_scoped_rpc_task,
     current_rpc_scope,
     rpc_attempt_budget,
     rpc_scope,
@@ -229,6 +230,7 @@ class TelegramRpcGate(TelegramClient):
         kwargs["raise_last_call_error"] = True
         kwargs.setdefault("auto_reconnect", True)
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self._reconnect_event = asyncio.Event()
         if fallback_wait_seconds < 1:
             raise ValueError("fallback_wait_seconds must be >= 1")
         if cooldown_buffer_seconds < 0:
@@ -284,6 +286,11 @@ class TelegramRpcGate(TelegramClient):
     def set_rpc_request_observer(self, observer: Callable[..., None] | None) -> None:
         """Attach bounded per-request-class attempt telemetry."""
         self._rpc_request_observer = observer
+
+    @property
+    def reconnect_event(self) -> asyncio.Event:
+        """Signal Telethon's internal reconnect handler to daemon recovery."""
+        return self._reconnect_event
 
     def _observe_rpc_request(self, scope: TelegramRpcScope) -> None:
         observer = self._rpc_request_observer
@@ -464,6 +471,28 @@ class TelegramRpcGate(TelegramClient):
     async def _update_loop(self) -> None:
         """Let each difference RPC and dispatched update establish its own root."""
         await super()._update_loop()  # type: ignore[misc]
+
+    async def _handle_auto_reconnect(self) -> None:
+        """Classify and signal Telethon's vendor reconnect probe."""
+        try:
+            current_demand_token()
+        except UnclassifiedTelegramDemandError:
+            pass
+        else:
+            raise RuntimeError("nested root demand is invalid; use acquisition_context for nested helpers")
+        self.reconnect_event.set()
+
+        async def run_vendor_probe() -> None:
+            require_execution_mode(ExecutionMode.PROTOCOL)
+            with acquisition_context(AcquisitionKind.ACCOUNT_SELF_PROFILE):
+                await super(TelegramRpcGate, self)._handle_auto_reconnect()  # type: ignore[misc]
+
+        task = create_scoped_rpc_task(
+            run_vendor_probe(),
+            source=TelegramRpcSource.TELETHON_RECONNECT_PROBE,
+            name="telethon_reconnect_probe",
+        )
+        await task
 
     async def _dispatch_update(self, update: object) -> None:
         """Give one ordinary or replayed update its event-owned demand root."""
