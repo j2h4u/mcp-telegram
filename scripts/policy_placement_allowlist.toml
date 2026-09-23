@@ -297,8 +297,8 @@ rationale = "This existing dialog-query staleness semantic predates the injected
 
 [[entry]]
 category = "policy_assignments"
-key = "src/mcp_telegram/delta_sync.py:<module>:RECENT_SYNC_SKIP_THRESHOLD_S"
-rationale = "This is inherited delta-sync skip behavior, not a newly introduced policy value."
+key = "src/mcp_telegram/delta_sync.py:<module>:DELTA_AUTOMATIC_REFRESH_INTERVAL_S"
+rationale = "TG-8 sets the automatic forward-delta fallback to a deliberate two-hour policy trial, anchored to the durable delta checkpoint."
 
 [[entry]]
 category = "policy_assignments"

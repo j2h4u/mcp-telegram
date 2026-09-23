@@ -111,11 +111,9 @@ class AccessProbePolicy:
         return self.max_dialogs_per_cycle > 0
 
 
-# Skip delta probe for dialogs fully synced within this window — prevents
-# GetHistoryRequest storm on quick restarts (D-01 expert panel).
-# 1h covers typical dev iteration cycles (rebuild + edit + rebuild) where
-# the user's account hasn't received meaningful new traffic worth probing.
-RECENT_SYNC_SKIP_THRESHOLD_S: int = 3600
+# Automatic forward-delta fallback cadence, measured from the durable
+# last_delta_checked_at (or last_synced_at when no delta checkpoint exists).
+DELTA_AUTOMATIC_REFRESH_INTERVAL_S: int = 2 * 60 * 60
 _DELTA_SLICE_MESSAGE_LIMIT = 100
 _DM_GAP_SCAN_RPC_CHUNK = 100
 _DM_GAP_SCAN_PERIOD_S = 7 * 24 * 60 * 60
@@ -321,7 +319,7 @@ def _row_first_int(row: tuple[object | None, ...] | None) -> int:
 
 
 def _delta_skip_anchor(last_synced_at: int | None, last_delta_checked_at: int | None) -> int | None:
-    """Return the local recency anchor used by the delta quick-restart guard."""
+    """Return the durable checkpoint anchoring the automatic refresh cadence."""
     if last_delta_checked_at is not None:
         return last_delta_checked_at
     return last_synced_at
@@ -337,7 +335,7 @@ def _delta_release_at(
     anchor = _delta_skip_anchor(last_synced_at, last_delta_checked_at)
     if anchor is None:
         return 0.0
-    return float(anchor + RECENT_SYNC_SKIP_THRESHOLD_S)
+    return float(anchor + DELTA_AUTOMATIC_REFRESH_INTERVAL_S)
 
 
 # ---------------------------------------------------------------------------
