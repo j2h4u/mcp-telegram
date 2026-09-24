@@ -29,7 +29,8 @@ from mcp_telegram.message_history.telegram_adapter import TelethonFullHistoryPag
 from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
 from mcp_telegram.messages.telegram_adapter import _PeerLike, extract_message_row
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-from mcp_telegram.sync_worker import FullSyncWorker
+from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncWorker
+from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
     RpcAdmissionSaturatedError,
@@ -144,15 +145,18 @@ async def test_automatic_group_history_uses_fresh_total_and_persists_decision(
     )
     sync_db.commit()
     worker = FullSyncWorker(
-        Port(), cast(sqlite3.Connection, sync_db), asyncio.Event(),
+        Port(),
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
         automatic_group_history=AutomaticGroupHistoryConfig(),
     )
     await worker._process_one_automatic_group()
+    if total is None:
+        assert sync_db.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id=501").fetchone() is None
+        return
     assert sync_db.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id=501").fetchone() == (enabled,)
     if total is not None:
-        assert sync_db.execute("SELECT total_messages FROM synced_dialogs WHERE dialog_id=501").fetchone() == (
-            total,
-        )
+        assert sync_db.execute("SELECT total_messages FROM synced_dialogs WHERE dialog_id=501").fetchone() == (total,)
 
 
 @pytest.mark.asyncio
@@ -164,10 +168,15 @@ async def test_automatic_group_first_page_is_saved_once(sync_db: _SQLiteConnecti
             self.calls += 1
             return FullHistoryPage((extract_message_row(dialog_id, build_mock_message(id=9, text="one")),), 1)
 
-    sync_db.execute("INSERT INTO dialogs(dialog_id,type,members,created) VALUES (502,'forum',1,?)", (int(datetime.now(UTC).timestamp()),))
+    sync_db.execute(
+        "INSERT INTO dialogs(dialog_id,type,members,created) VALUES (502,'forum',1,?)",
+        (int(datetime.now(UTC).timestamp()),),
+    )
     sync_db.commit()
     port = Port()
-    worker = FullSyncWorker(port, cast(sqlite3.Connection, sync_db), asyncio.Event())
+    worker = FullSyncWorker(
+        port, cast(sqlite3.Connection, sync_db), asyncio.Event(), automatic_group_history=AutomaticGroupHistoryConfig()
+    )
     await worker._process_one_automatic_group()
     await worker._process_one_automatic_group()
     assert port.calls == 1
@@ -183,11 +192,166 @@ async def test_automatic_group_rechecks_explicit_race(sync_db: _SQLiteConnection
             sync_db.commit()
             return FullHistoryPage((extract_message_row(dialog_id, build_mock_message(id=10, text="race")),), 9_999)
 
-    sync_db.execute("INSERT INTO dialogs(dialog_id,type,members,created) VALUES (503,'group',1,?)", (int(datetime.now(UTC).timestamp()),))
+    sync_db.execute(
+        "INSERT INTO dialogs(dialog_id,type,members,created) VALUES (503,'group',1,?)",
+        (int(datetime.now(UTC).timestamp()),),
+    )
     sync_db.commit()
-    worker = FullSyncWorker(Port(), cast(sqlite3.Connection, sync_db), asyncio.Event())
+    worker = FullSyncWorker(
+        Port(),
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        automatic_group_history=AutomaticGroupHistoryConfig(),
+    )
     await worker._process_one_automatic_group()
     assert sync_db.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=503").fetchone() == ((1 if enabled else 0),)
+
+
+@pytest.mark.asyncio
+async def test_full_sync_adapter_runs_one_automatic_first_page_under_budget(
+    sync_db: _SQLiteConnection,
+) -> None:
+    sync_db.execute(
+        "INSERT INTO dialogs(dialog_id,type,members,created) VALUES (504,'group',1,?)",
+        (int(datetime.now(UTC).timestamp()),),
+    )
+    sync_db.commit()
+    client = _MockClient()
+    observed_scopes: list[object] = []
+
+    async def get_messages(**_kwargs: object) -> MockTotalList:
+        observed_scopes.append(current_rpc_scope())
+        return MockTotalList([], total=3)
+
+    client.get_messages.side_effect = get_messages
+    worker = FullSyncWorker(
+        TelethonFullHistoryPageAdapter(client),
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        automatic_group_history=AutomaticGroupHistoryConfig(),
+    )
+    adapter = FullSyncDemandAdapter(worker)
+
+    assert adapter.status(1_000.0) is not None
+    budget = RpcAttemptBudget(limit=1)
+    await adapter.run_slice(budget)
+
+    assert observed_scopes and observed_scopes[0].attempt_budget is budget  # type: ignore[union-attr]
+    client.get_messages.assert_awaited_once()
+    assert sync_db.execute("SELECT enabled,source FROM full_history_enrollment WHERE dialog_id=504").fetchone() == (
+        1,
+        "automatic",
+    )
+
+
+@pytest.mark.asyncio
+async def test_automatic_group_storage_failure_rolls_back_receipt_and_enrollment(
+    sync_db: _SQLiteConnection,
+) -> None:
+    sync_db.execute(
+        "INSERT INTO dialogs(dialog_id,type,members,created) VALUES (505,'group',1,?)",
+        (int(datetime.now(UTC).timestamp()),),
+    )
+    sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status,sync_progress) VALUES (505,'own_only',7)")
+    sync_db.execute(
+        "CREATE TRIGGER fail_full_sync_message AFTER INSERT ON messages "
+        "BEGIN SELECT RAISE(ABORT, 'test storage failure'); END"
+    )
+    sync_db.commit()
+    client = _MockClient()
+    client.get_messages.return_value = MockTotalList([build_mock_message(id=8, text="new")], total=1)
+    worker = FullSyncWorker(
+        TelethonFullHistoryPageAdapter(client),
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        automatic_group_history=AutomaticGroupHistoryConfig(),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="test storage failure"):
+        await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+
+    assert sync_db.execute("SELECT * FROM full_history_enrollment WHERE dialog_id=505").fetchone() is None
+    assert sync_db.execute("SELECT status,sync_progress FROM synced_dialogs WHERE dialog_id=505").fetchone() == (
+        "own_only",
+        7,
+    )
+    assert sync_db.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=505").fetchone() == (0,)
+    assert sync_db.execute(
+        "SELECT topic_attribution_version,topic_attribution_state,topic_attribution_no_topic_count "
+        "FROM synced_dialogs WHERE dialog_id=505"
+    ).fetchone() == (0, "unknown", 0)
+
+
+@pytest.mark.asyncio
+async def test_automatic_group_retry_skips_failed_candidate_and_reports_release(
+    sync_db: _SQLiteConnection,
+) -> None:
+    sync_db.executemany(
+        "INSERT INTO dialogs(dialog_id,type,members,created) VALUES (?, 'group', 1, 1)",
+        [(506,), (507,)],
+    )
+    sync_db.commit()
+    client = _MockClient()
+
+    class MissingTotalList(list[object]):
+        total: int | None = None
+
+    missing_total = MissingTotalList()
+    client.get_messages.side_effect = [missing_total, MockTotalList([], total=1)]
+    policy = AutomaticGroupHistoryConfig(probe_retry_seconds=60)
+    worker = FullSyncWorker(
+        TelethonFullHistoryPageAdapter(client),
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        automatic_group_history=policy,
+    )
+    adapter = FullSyncDemandAdapter(worker)
+
+    with patch("mcp_telegram.sync_worker.time.time", return_value=1_000):
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        release = adapter.status(1_000.0)
+
+    assert client.get_messages.await_count == 2
+    assert sync_db.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id=507").fetchone() == (1,)
+    assert sync_db.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id=506").fetchone() is None
+    assert release is not None and release.release_at == 1_060.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_status", ["own_only", "fragment"])
+async def test_automatic_group_acceptance_resumes_partial_history_and_counts_topics(
+    sync_db: _SQLiteConnection, initial_status: str
+) -> None:
+    dialog_id = 508 if initial_status == "own_only" else 509
+    sync_db.execute(
+        "INSERT INTO dialogs(dialog_id,type,members,created) VALUES (?, 'forum', 1, ?)",
+        (dialog_id, int(datetime.now(UTC).timestamp())),
+    )
+    sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?, ?)", (dialog_id, initial_status))
+    sync_db.commit()
+    messages = [build_mock_message(id=1, forum_topic=True, reply_to_top_id=77)] + [
+        build_mock_message(id=message_id) for message_id in range(2, 101)
+    ]
+    client = _MockClient()
+    client.get_messages.return_value = MockTotalList(messages, total=101)
+    worker = FullSyncWorker(
+        TelethonFullHistoryPageAdapter(client),
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        automatic_group_history=AutomaticGroupHistoryConfig(),
+    )
+
+    await FullSyncDemandAdapter(worker).run_slice(RpcAttemptBudget(limit=1))
+
+    assert sync_db.execute(
+        "SELECT enabled,source FROM full_history_enrollment WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (1, "automatic")
+    assert sync_db.execute(
+        "SELECT status,total_messages,sync_progress,topic_attribution_state,topic_attribution_no_topic_count "
+        "FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone() == ("syncing", 101, 1, "partial", 99)
 
 
 def publish_local_dialogs(

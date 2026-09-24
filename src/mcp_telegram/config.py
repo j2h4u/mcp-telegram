@@ -354,6 +354,7 @@ class AutomaticGroupHistoryConfig:
     max_members: int = 100
     recent_days: int = 365
     max_messages: int = 5_000
+    probe_retry_seconds: int = 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -1453,7 +1454,7 @@ def _parse_automatic_group_history(
     section = _nested_table(data, "automatic_group_history", "scheduling.automatic_group_history", path) or {}
     _reject_unknown_keys(
         section,
-        {"max_members", "recent_days", "max_messages"},
+        {"max_members", "recent_days", "max_messages", "probe_retry_seconds"},
         "scheduling.automatic_group_history",
         path,
     )
@@ -1466,6 +1467,13 @@ def _parse_automatic_group_history(
         ),
         max_messages=_positive_int(
             section, "max_messages", "scheduling.automatic_group_history", path, defaults.max_messages
+        ),
+        probe_retry_seconds=_positive_int(
+            section,
+            "probe_retry_seconds",
+            "scheduling.automatic_group_history",
+            path,
+            defaults.probe_retry_seconds,
         ),
     )
 
@@ -1514,9 +1522,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
     draft_recovery = _parse_draft_recovery(scheduling_data, path, defaults.draft_recovery)
     folder_projection = _parse_folder_projection(scheduling_data, path, defaults)
     activity_hot_sweep = _parse_activity_hot_sweep(scheduling_data, path, defaults.activity_hot_sweep)
-    automatic_group_history = _parse_automatic_group_history(
-        scheduling_data, path, defaults.automatic_group_history
-    )
+    automatic_group_history = _parse_automatic_group_history(scheduling_data, path, defaults.automatic_group_history)
     return SchedulingConfig(
         scheduled_reconciliation_seconds=_positive_float(
             scheduling_data,

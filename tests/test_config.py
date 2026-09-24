@@ -155,15 +155,16 @@ dir = "/state"
 max_members = 12
 recent_days = 90
 max_messages = 2500
+probe_retry_seconds = 30
 """,
     )
 
     assert load_config(path).scheduling.automatic_group_history == AutomaticGroupHistoryConfig(
-        max_members=12, recent_days=90, max_messages=2500
+        max_members=12, recent_days=90, max_messages=2500, probe_retry_seconds=30
     )
 
 
-@pytest.mark.parametrize("key", ["max_members", "recent_days", "max_messages"])
+@pytest.mark.parametrize("key", ["max_members", "recent_days", "max_messages", "probe_retry_seconds"])
 def test_load_config_rejects_non_positive_automatic_group_history_values(tmp_path: Path, key: str) -> None:
     path = _write_config(
         tmp_path,

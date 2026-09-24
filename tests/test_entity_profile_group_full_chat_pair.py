@@ -255,7 +255,9 @@ async def test_group_pair_sections_share_the_observation_boundary() -> None:
 @pytest.mark.asyncio
 async def test_group_profile_refresh_fills_missing_hidden_dialog_created_once() -> None:
     conn, service, client = _service()
-    conn.execute("CREATE TABLE dialogs (dialog_id INTEGER PRIMARY KEY, created INTEGER, hidden INTEGER NOT NULL DEFAULT 0)")
+    conn.execute(
+        "CREATE TABLE dialogs (dialog_id INTEGER PRIMARY KEY, created INTEGER, hidden INTEGER NOT NULL DEFAULT 0)"
+    )
     conn.execute("INSERT INTO dialogs(dialog_id, created, hidden) VALUES (-123, NULL, 1)")
     client.created = 1_700_000_000
     conn.commit()
@@ -274,7 +276,9 @@ async def test_group_profile_refresh_fills_missing_hidden_dialog_created_once() 
 
 def test_rejected_group_profile_cursor_cannot_mutate_dialog_created() -> None:
     conn, service, _client = _service()
-    conn.execute("CREATE TABLE dialogs (dialog_id INTEGER PRIMARY KEY, created INTEGER, hidden INTEGER NOT NULL DEFAULT 0)")
+    conn.execute(
+        "CREATE TABLE dialogs (dialog_id INTEGER PRIMARY KEY, created INTEGER, hidden INTEGER NOT NULL DEFAULT 0)"
+    )
     conn.execute("INSERT INTO dialogs(dialog_id, created, hidden) VALUES (-123, NULL, 1)")
     cursor = service._profiles.next_due_refresh(now=100)  # type: ignore[attr-defined]
     assert cursor is not None

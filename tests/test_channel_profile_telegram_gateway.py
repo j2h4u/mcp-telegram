@@ -175,9 +175,9 @@ async def test_profile_gateway_normalizes_one_full_channel_rpc() -> None:
 @pytest.mark.asyncio
 async def test_profile_gateway_captures_channel_creation_date() -> None:
     created = datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC)
-    observation = await TelethonChannelProfileGateway(_Client(_full_channel(channel_date=created))).fetch_channel_profile(
-        _reference(access_hash=7)
-    )
+    observation = await TelethonChannelProfileGateway(
+        _Client(_full_channel(channel_date=created))
+    ).fetch_channel_profile(_reference(access_hash=7))
 
     assert observation.created == int(created.timestamp())
 

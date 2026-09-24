@@ -91,6 +91,7 @@ activity_cold_access_retry_seconds = 3600
 max_members = 100
 recent_days = 365
 max_messages = 5000
+probe_retry_seconds = 60
 
 [scheduling.activity_hot_sweep]
 loop_interval_seconds = 3600

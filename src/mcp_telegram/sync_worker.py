@@ -28,7 +28,6 @@ from functools import wraps
 from typing import Protocol, cast
 
 from .access_lifecycle import set_access_lost
-from .config import AutomaticGroupHistoryConfig
 from .entity_store import EntitySnapshot, upsert_entity_stub
 from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
 from .history_enrollment import (
@@ -77,6 +76,17 @@ _BATCH_SIZE = MESSAGE_HISTORY_PAGE_SIZE
 _DM_ENROLLMENT_KEY_LAST_PUBLICATION_GENERATION = "full_sync_dm_enrollment_last_publication_generation"
 _TOTAL_MESSAGES_REPAIR_GATE_STATE_KEY = "full_sync_total_messages_repair_retry_at"
 _TOTAL_MESSAGES_REPAIR_FAILURE_DELAY_S = 60
+
+
+class AutomaticGroupHistoryPolicy(Protocol):
+    @property
+    def max_members(self) -> int: ...
+    @property
+    def recent_days(self) -> int: ...
+    @property
+    def max_messages(self) -> int: ...
+    @property
+    def probe_retry_seconds(self) -> int: ...
 
 
 @contextmanager
@@ -213,11 +223,11 @@ class FullSyncWorker:
         shutdown_event: asyncio.Event,
         *,
         total_messages_probe: TotalMessagesProbe | None = None,
-        automatic_group_history: AutomaticGroupHistoryConfig | None = None,
+        automatic_group_history: AutomaticGroupHistoryPolicy | None = None,
     ) -> None:
         self._history_port = history_port
         self._total_messages_probe = total_messages_probe
-        self._automatic_group_history = automatic_group_history or AutomaticGroupHistoryConfig()
+        self._automatic_group_history = automatic_group_history
         self._conn = conn
         self._shutdown_event = shutdown_event
         self._last_page_error: BaseException | None = None
@@ -410,43 +420,117 @@ class FullSyncWorker:
         return int(row[0]), int(row[1]) if row[1] is not None else 0
 
     def _next_automatic_group(self) -> int | None:
+        if self._automatic_group_history is None:
+            return None
         cutoff = int(time.time()) - self._automatic_group_history.recent_days * 86_400
         return self._eligible_automatic_group(cutoff=cutoff)
 
+    def _automatic_group_earliest_retry(self) -> float | None:
+        if self._automatic_group_history is None:
+            return None
+        row = cast(
+            tuple[int | None] | None,
+            self._conn.execute(
+                "SELECT MIN(CAST(ds.value AS INTEGER)) FROM daemon_state ds JOIN dialogs d "
+                "ON ds.key='automatic_group_history_retry:' || d.dialog_id "
+                "LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=d.dialog_id "
+                "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
+                "WHERE fhe.dialog_id IS NULL AND d.hidden=0 AND d.type IN ('group','supergroup','forum') "
+                "AND d.members BETWEEN ? AND ? AND d.created >= ? "
+                "AND (sd.status IS NULL OR sd.status NOT IN ('access_lost','synced')) "
+                "AND CAST(ds.value AS INTEGER) > ?",
+                (
+                    1,
+                    self._automatic_group_history.max_members,
+                    int(time.time()) - self._automatic_group_history.recent_days * 86_400,
+                    int(time.time()),
+                ),
+            ).fetchone(),
+        )
+        return None if row is None or row[0] is None else float(row[0])
+
+    def _set_automatic_group_retry(self, dialog_id: int) -> None:
+        assert self._automatic_group_history is not None
+        self._conn.execute(
+            "INSERT OR REPLACE INTO daemon_state(key,value) VALUES (?,?)",
+            (
+                f"automatic_group_history_retry:{dialog_id}",
+                str(int(time.time()) + self._automatic_group_history.probe_retry_seconds),
+            ),
+        )
+
     def _eligible_automatic_group(self, *, cutoff: int) -> int | None:
-        row = cast(tuple[int] | None, self._conn.execute(
-            "SELECT d.dialog_id FROM dialogs d "
-            "LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=d.dialog_id "
-            "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
-            "WHERE fhe.dialog_id IS NULL AND d.hidden=0 AND d.type IN ('group','supergroup','forum') "
-            "AND d.members BETWEEN 1 AND ? AND d.created >= ? "
-            "AND (sd.status IS NULL OR sd.status NOT IN ('access_lost', 'synced')) "
-            "ORDER BY d.dialog_id LIMIT 1",
-            (self._automatic_group_history.max_members, cutoff),
-        ).fetchone())
+        policy = self._automatic_group_history
+        if policy is None:
+            return None
+        row = cast(
+            tuple[int] | None,
+            self._conn.execute(
+                "SELECT d.dialog_id FROM dialogs d "
+                "LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=d.dialog_id "
+                "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
+                "WHERE fhe.dialog_id IS NULL AND d.hidden=0 AND d.type IN ('group','supergroup','forum') "
+                "AND d.members BETWEEN 1 AND ? AND d.created >= ? "
+                "AND (sd.status IS NULL OR sd.status NOT IN ('access_lost', 'synced')) "
+                "AND NOT EXISTS (SELECT 1 FROM daemon_state ds WHERE ds.key='automatic_group_history_retry:' || d.dialog_id AND CAST(ds.value AS INTEGER) > ?) "
+                "ORDER BY d.dialog_id LIMIT 1",
+                (policy.max_members, cutoff, int(time.time())),
+            ).fetchone(),
+        )
         return None if row is None else int(row[0])
 
     def _is_eligible_automatic_group(self, dialog_id: int, *, cutoff: int) -> bool:
-        return self._conn.execute(
-            "SELECT 1 FROM dialogs d LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=d.dialog_id "
-            "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
-            "WHERE d.dialog_id=? AND fhe.dialog_id IS NULL AND d.hidden=0 "
-            "AND d.type IN ('group','supergroup','forum') AND d.members BETWEEN 1 AND ? AND d.created >= ? "
-            "AND (sd.status IS NULL OR sd.status NOT IN ('access_lost', 'synced'))",
-            (dialog_id, self._automatic_group_history.max_members, cutoff),
-        ).fetchone() is not None
+        policy = self._automatic_group_history
+        if policy is None:
+            return False
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM dialogs d LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=d.dialog_id "
+                "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
+                "WHERE d.dialog_id=? AND fhe.dialog_id IS NULL AND d.hidden=0 "
+                "AND d.type IN ('group','supergroup','forum') AND d.members BETWEEN 1 AND ? AND d.created >= ? "
+                "AND (sd.status IS NULL OR sd.status NOT IN ('access_lost', 'synced'))",
+                (dialog_id, policy.max_members, cutoff),
+            ).fetchone()
+            is not None
+        )
 
     async def _process_one_automatic_group(self) -> bool:
+        if self._automatic_group_history is None:
+            return False
         dialog_id = self._next_automatic_group()
         if dialog_id is None:
             return False
-        page = await self._fetch_batch_page(dialog_id, 0)
+        try:
+            page = await self._fetch_batch_page(dialog_id, 0)
+        except Exception:
+            self._set_automatic_group_retry(dialog_id)
+            self._conn.commit()
+            raise
         if page.retry is not None:
+            self._set_automatic_group_retry(dialog_id)
+            self._conn.commit()
             return True
+        if page.total_messages is None:
+            self._set_automatic_group_retry(dialog_id)
+            self._conn.commit()
+            return True
+        return self._finalize_automatic_group_page(dialog_id, page)
+
+    def _finalize_automatic_group_page(self, dialog_id: int, page: _FetchedBatchPage) -> bool:
+        assert self._automatic_group_history is not None
+        self._conn.execute("BEGIN IMMEDIATE")
         with self._conn:
             intent = read_intent(self._conn, dialog_id)
             if intent.source is not None:
+                self._conn.execute(
+                    "DELETE FROM daemon_state WHERE key=?", (f"automatic_group_history_retry:{dialog_id}",)
+                )
                 if intent.enabled:
+                    self._conn.execute(
+                        "UPDATE synced_dialogs SET status='syncing' WHERE dialog_id=? AND status IN ('own_only', 'fragment')",
+                        (dialog_id,),
+                    )
                     self._store_batch_page_locked(
                         dialog_id, 0, page.total_messages, page.batch, reaction_observed_at=page.reaction_observed_at
                     )
@@ -456,11 +540,18 @@ class FullSyncWorker:
                 cutoff=int(time.time()) - self._automatic_group_history.recent_days * 86_400,
             ):
                 return True
-            accepted = page.total_messages is not None and page.total_messages <= self._automatic_group_history.max_messages
+            accepted = (
+                page.total_messages is not None and page.total_messages <= self._automatic_group_history.max_messages
+            )
             intent = record_automatic_group_decision(
                 self._conn, dialog_id, enabled=accepted, total_messages=page.total_messages
             )
+            self._conn.execute("DELETE FROM daemon_state WHERE key=?", (f"automatic_group_history_retry:{dialog_id}",))
             if accepted and intent.enabled:
+                self._conn.execute(
+                    "UPDATE synced_dialogs SET status='syncing' WHERE dialog_id=? AND status IN ('own_only', 'fragment')",
+                    (dialog_id,),
+                )
                 self._store_batch_page_locked(
                     dialog_id, 0, page.total_messages, page.batch, reaction_observed_at=page.reaction_observed_at
                 )
@@ -701,6 +792,9 @@ class FullSyncDemandAdapter:
             return DemandStatus(release_at=0.0)
         if self._worker._next_automatic_group() is not None:
             return DemandStatus(release_at=0.0)
+        retry_at = self._worker._automatic_group_earliest_retry()
+        if retry_at is not None and retry_at > now:
+            return DemandStatus(release_at=retry_at)
         repair_release_at = self._worker._total_messages_repair_release_at(now)
         return None if repair_release_at is None else DemandStatus(release_at=repair_release_at)
 
@@ -714,7 +808,7 @@ class FullSyncDemandAdapter:
             return
         with demand_context(DemandKind.FULL_SYNC_PAGE):
             with rpc_attempt_budget(budget):
-                if self._worker._next_pending_dialog() is not None:
+                if self._worker._next_pending_dialog() is not None or self._worker._next_automatic_group() is not None:
                     await self._worker.process_one_batch()
                     if self._worker._last_page_error is not None:
                         raise self._worker._last_page_error
