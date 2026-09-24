@@ -2212,6 +2212,30 @@ async def test_resolve_peer_name_uncacheable_logs_marked_id_without_raising(
 
 
 @pytest.mark.asyncio
+async def test_resolve_peer_name_budget_exhaustion_is_silent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An exhausted slice budget skips optional enrichment without a warning."""
+    import logging
+
+    from mcp_telegram.messages.telegram_adapter import _resolve_peer_name
+    from mcp_telegram.telegram_demand import RpcAttemptBudgetExhaustedError
+
+    class _BudgetExhaustedClient:
+        async def get_entity(self, peer: object) -> object:
+            raise RpcAttemptBudgetExhaustedError("slice budget exhausted")
+
+    peer = cast(_PeerLike, _PeerChannel(channel_id=1579759981))
+
+    with caplog.at_level(logging.WARNING):
+        name = await _resolve_peer_name(_BudgetExhaustedClient(), peer)
+
+    assert name is None
+    assert not any("resolve_peer_name_unexpected" in record.message for record in caplog.records)
+    assert not any(record.exc_info for record in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_build_fwd_entity_map_resolves_channel_keyed_by_marked_id() -> None:
     """End-to-end: channel forward resolves via typed Peer; map keyed by marked id."""
     from telethon.tl import types
