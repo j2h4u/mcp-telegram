@@ -85,7 +85,7 @@ def _extract_reactions_display(msg: MessageLike) -> str:
     counts: list[tuple[str, int]] = []
     for item in results_list:
         reaction = item.reaction
-        emoticon = reaction.emoticon if reaction is not None else None
+        emoticon = getattr(reaction, "emoticon", None) if reaction is not None else None
         if emoticon is not None:
             counts.append((emoticon, int(item.count)))
 
