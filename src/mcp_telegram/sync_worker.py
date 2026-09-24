@@ -510,6 +510,8 @@ class FullSyncWorker:
         if page.retry is not None:
             self._set_automatic_group_retry(dialog_id)
             self._conn.commit()
+            if isinstance(self._last_page_error, MessageHistoryUnavailableError):
+                self._last_page_error = None
             return True
         if page.total_messages is None:
             self._set_automatic_group_retry(dialog_id)
@@ -793,10 +795,9 @@ class FullSyncDemandAdapter:
         if self._worker._next_automatic_group() is not None:
             return DemandStatus(release_at=0.0)
         retry_at = self._worker._automatic_group_earliest_retry()
-        if retry_at is not None and retry_at > now:
-            return DemandStatus(release_at=retry_at)
         repair_release_at = self._worker._total_messages_repair_release_at(now)
-        return None if repair_release_at is None else DemandStatus(release_at=repair_release_at)
+        releases = [release for release in (retry_at, repair_release_at) if release is not None]
+        return None if not releases else DemandStatus(release_at=min(releases))
 
     async def run_slice(self, budget: RpcAttemptBudget) -> None:
         """Fetch at most one history page under the transport attempt budget."""

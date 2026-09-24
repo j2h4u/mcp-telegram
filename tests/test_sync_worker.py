@@ -24,7 +24,7 @@ from mcp_telegram.config import AutomaticGroupHistoryConfig
 from mcp_telegram.fts import stem_text
 from mcp_telegram.history_enrollment import disable_history, enable_history
 from mcp_telegram.message_contracts import StoredMessage
-from mcp_telegram.message_history.contracts import FullHistoryPage
+from mcp_telegram.message_history.contracts import FullHistoryPage, MessageHistoryUnavailableError
 from mcp_telegram.message_history.telegram_adapter import TelethonFullHistoryPageAdapter, TelethonHistoryAccessProbe
 from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
 from mcp_telegram.messages.telegram_adapter import _PeerLike, extract_message_row
@@ -316,6 +316,76 @@ async def test_automatic_group_retry_skips_failed_candidate_and_reports_release(
     assert sync_db.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id=507").fetchone() == (1,)
     assert sync_db.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id=506").fetchone() is None
     assert release is not None and release.release_at == 1_060.0
+
+
+@pytest.mark.asyncio
+async def test_automatic_group_ordinary_error_does_not_block_next_candidate(sync_db: _SQLiteConnection) -> None:
+    sync_db.executemany(
+        "INSERT INTO dialogs(dialog_id,type,members,created) VALUES (?, 'group', 1, 1)", [(510,), (511,)]
+    )
+    sync_db.commit()
+
+    class Port:
+        def __init__(self) -> None:
+            self.attempted: list[int] = []
+
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            self.attempted.append(dialog_id)
+            if dialog_id == 510:
+                raise MessageHistoryUnavailableError("temporary Telegram failure")
+            return FullHistoryPage((), 1)
+
+    port = Port()
+    worker = FullSyncWorker(
+        port,
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        automatic_group_history=AutomaticGroupHistoryConfig(probe_retry_seconds=60),
+    )
+    adapter = FullSyncDemandAdapter(worker)
+    with patch("mcp_telegram.sync_worker.time.time", return_value=1_000):
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert port.attempted == [510, 511]
+    assert sync_db.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id=511").fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_ready_total_repair_runs_during_automatic_candidate_backoff(sync_db: _SQLiteConnection) -> None:
+    sync_db.execute("INSERT INTO dialogs(dialog_id,type,members,created) VALUES (512,'group',1,1)")
+    sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (513,'synced')")
+    seed_full_history_enrollment(sync_db, 513, enabled=True)
+    sync_db.execute("INSERT INTO daemon_state(key,value) VALUES ('automatic_group_history_retry:512','1060')")
+    sync_db.commit()
+
+    class Port:
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            raise AssertionError("candidate is in backoff")
+
+    class Probe:
+        def __init__(self) -> None:
+            self.attempted: list[int] = []
+
+        async def probe_total_messages(self, dialog_id: int) -> int:
+            self.attempted.append(dialog_id)
+            return 42
+
+    probe = Probe()
+    worker = FullSyncWorker(
+        Port(),
+        cast(sqlite3.Connection, sync_db),
+        asyncio.Event(),
+        total_messages_probe=probe,
+        automatic_group_history=AutomaticGroupHistoryConfig(probe_retry_seconds=60),
+    )
+    adapter = FullSyncDemandAdapter(worker)
+    with patch("mcp_telegram.sync_worker.time.time", return_value=1_000):
+        assert adapter.status(1_000.0) is not None
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+
+    assert probe.attempted == [513]
+    assert sync_db.execute("SELECT total_messages FROM synced_dialogs WHERE dialog_id=513").fetchone() == (42,)
 
 
 @pytest.mark.asyncio
