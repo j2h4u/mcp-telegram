@@ -6,7 +6,7 @@ from typing import cast
 
 import pytest
 from jsonschema import validate
-from telethon.tl.types import MessageEntityTextUrl
+from telethon.tl.types import MessageEntityTextUrl, ReactionCustomEmoji, ReactionEmoji
 
 from mcp_telegram.daemon_message import project_cached_message_facts, project_cached_message_facts_by_dialog
 from mcp_telegram.message_content import MessageSnapshot, project_message_content
@@ -322,8 +322,8 @@ def test_uncached_telegram_projection_derives_sender_and_reaction_display() -> N
         sender=None,
         reactions=SimpleNamespace(
             results=[
-                SimpleNamespace(reaction=SimpleNamespace(emoticon="👍"), count=2),
-                SimpleNamespace(reaction=SimpleNamespace(emoticon=None, document_id=123), count=1),
+                SimpleNamespace(reaction=ReactionEmoji(emoticon="👍"), count=2),
+                SimpleNamespace(reaction=ReactionCustomEmoji(document_id=123), count=1),
                 SimpleNamespace(reaction=None, count=9),
             ]
         ),
