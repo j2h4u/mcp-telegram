@@ -162,6 +162,7 @@ class TotalMessagesProbe(Protocol):
 class _FetchedBatchPage:
     total_messages: int | None
     batch: tuple[_ExtractedMessage, ...]
+    next_before_message_id: int | None
     retry: tuple[int, bool] | None = None
     reaction_observed_at: int | None = None
 
@@ -533,9 +534,7 @@ class FullSyncWorker:
                         "UPDATE synced_dialogs SET status='syncing' WHERE dialog_id=? AND status IN ('own_only', 'fragment')",
                         (dialog_id,),
                     )
-                    self._store_batch_page_locked(
-                        dialog_id, 0, page.total_messages, page.batch, reaction_observed_at=page.reaction_observed_at
-                    )
+                    self._store_batch_page_locked(dialog_id, 0, page)
                 return True
             if not self._is_eligible_automatic_group(
                 dialog_id,
@@ -554,9 +553,7 @@ class FullSyncWorker:
                     "UPDATE synced_dialogs SET status='syncing' WHERE dialog_id=? AND status IN ('own_only', 'fragment')",
                     (dialog_id,),
                 )
-                self._store_batch_page_locked(
-                    dialog_id, 0, page.total_messages, page.batch, reaction_observed_at=page.reaction_observed_at
-                )
+                self._store_batch_page_locked(dialog_id, 0, page)
         return True
 
     def _next_total_messages_repair_dialog(self) -> int | None:
@@ -594,7 +591,7 @@ class FullSyncWorker:
                 type(exc).__name__,
             )
         self._last_page_error = exc
-        return _FetchedBatchPage(None, (), (sync_progress, False))
+        return _FetchedBatchPage(None, (), None, (sync_progress, False))
 
     async def _handle_batch_page_error(
         self,
@@ -611,12 +608,12 @@ class FullSyncWorker:
             logger.warning("Telegram RPC throttled dialog_id=%d — retry_after=%s", dialog_id, exc.retry_after_seconds)
             await self._sleep_for_batch_retry(exc.retry_after_seconds)
             self._last_page_error = exc
-            return _FetchedBatchPage(None, (), (sync_progress, False))
+            return _FetchedBatchPage(None, (), None, (sync_progress, False))
         if isinstance(exc, MessageHistoryAccessLostError):
             now = int(time.time())
             set_access_lost(self._conn, dialog_id, now, reason=exc.reason_code)
             self._conn.commit()
-            return _FetchedBatchPage(None, (), (sync_progress, True))
+            return _FetchedBatchPage(None, (), None, (sync_progress, True))
         raise exc
 
     async def _fetch_batch_page(self, dialog_id: int, sync_progress: int) -> _FetchedBatchPage:
@@ -635,9 +632,21 @@ class FullSyncWorker:
                 exc,
             )
             self._last_page_error = exc
-            return _FetchedBatchPage(None, (), (sync_progress, False))
+            return _FetchedBatchPage(None, (), None, (sync_progress, False))
         total_messages = page.total_messages if sync_progress == 0 else None
-        return _FetchedBatchPage(total_messages, page.messages, reaction_observed_at=reaction_observed_at)
+        if (
+            page.next_before_message_id is not None
+            and sync_progress > 0
+            and page.next_before_message_id >= sync_progress
+        ):
+            self._last_page_error = MessageHistoryUnavailableError("history cursor did not move backwards")
+            return _FetchedBatchPage(None, (), None, (sync_progress, False))
+        return _FetchedBatchPage(
+            total_messages,
+            page.messages,
+            page.next_before_message_id,
+            reaction_observed_at=reaction_observed_at,
+        )
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
     async def _fetch_batch(self, dialog_id: int, sync_progress: int) -> tuple[int, bool]:
@@ -665,9 +674,7 @@ class FullSyncWorker:
         return await self._store_batch_page(
             dialog_id,
             sync_progress,
-            page.total_messages,
-            page.batch,
-            reaction_observed_at=page.reaction_observed_at,
+            page,
         )
 
     @_full_sync_rpc_scope(DemandKind.FULL_SYNC_PAGE, AcquisitionKind.MESSAGE_HISTORY_PAGE)
@@ -675,27 +682,19 @@ class FullSyncWorker:
         self,
         dialog_id: int,
         sync_progress: int,
-        total_messages: int | None,
-        batch: Sequence[_ExtractedMessage],
-        *,
-        reaction_observed_at: int | None = None,
+        page: _FetchedBatchPage,
     ) -> tuple[int, bool]:
         """Persist one fetched batch and update sync progress."""
         with self._conn:
-            return self._store_batch_page_locked(
-                dialog_id, sync_progress, total_messages, batch, reaction_observed_at=reaction_observed_at
-            )
+            return self._store_batch_page_locked(dialog_id, sync_progress, page)
 
     def _store_batch_page_locked(
         self,
         dialog_id: int,
         sync_progress: int,
-        total_messages: int | None,
-        batch: Sequence[_ExtractedMessage],
-        *,
-        reaction_observed_at: int | None = None,
+        page: _FetchedBatchPage,
     ) -> tuple[int, bool]:
-        if not batch:
+        if page.next_before_message_id is None:
             if not full_history_enabled(self._conn, dialog_id):
                 logger.info("sync_batch_discarded_disabled dialog_id=%d fetched=0", dialog_id)
                 return sync_progress, True
@@ -703,16 +702,14 @@ class FullSyncWorker:
             self._begin_topic_attribution_pass(dialog_id, sync_progress, now)
             self._conn.execute(
                 _UPDATE_PROGRESS_DONE_SQL,
-                (sync_progress, "synced", total_messages, now, dialog_id, dialog_id),
+                (sync_progress, "synced", page.total_messages, now, dialog_id, dialog_id),
             )
             self._complete_topic_attribution_pass(dialog_id, now)
             logger.info("sync_done dialog_id=%d status=synced (empty batch)", dialog_id)
             return sync_progress, True
 
-        rows = list(batch)
-        new_progress = min(item.message.message_id for item in batch)
-        is_done = len(batch) < _BATCH_SIZE
-        new_status = "synced" if is_done else "syncing"
+        rows = list(page.batch)
+        new_progress = page.next_before_message_id
 
         # Single atomic transaction: messages + FTS + progress update
         if not full_history_enabled(self._conn, dialog_id):
@@ -724,31 +721,22 @@ class FullSyncWorker:
             self._conn,
             rows,
             priority=HydrationPriority.BACKFILL,
-            reaction_observed_at=reaction_observed_at,
+            reaction_observed_at=page.reaction_observed_at,
         )
         self._record_no_topic_attribution(dialog_id, rows)
-        if is_done:
-            self._conn.execute(
-                _UPDATE_PROGRESS_DONE_SQL,
-                (new_progress, new_status, total_messages, now, dialog_id, dialog_id),
-            )
-            self._complete_topic_attribution_pass(dialog_id, now)
-        else:
-            self._conn.execute(
-                _UPDATE_PROGRESS_SQL,
-                (new_progress, new_status, total_messages, dialog_id, dialog_id),
-            )
+        self._conn.execute(
+            _UPDATE_PROGRESS_SQL,
+            (new_progress, "syncing", page.total_messages, dialog_id, dialog_id),
+        )
 
         logger.debug(
             "sync_batch dialog_id=%d fetched=%d progress=%d done=%s",
             dialog_id,
-            len(batch),
+            len(page.batch),
             new_progress,
-            is_done,
+            False,
         )
-        if is_done:
-            logger.info("sync_done dialog_id=%d status=synced total_messages=%s", dialog_id, total_messages)
-        return new_progress, is_done
+        return new_progress, False
 
     def _begin_topic_attribution_pass(self, dialog_id: int, sync_progress: int, observed_at: int) -> None:
         """Start or safely resume a current-extractor full-history receipt."""
