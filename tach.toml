@@ -532,7 +532,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.messages.telegram_adapter"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.media_fact", "mcp_telegram.message_contracts", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message", "mcp_telegram.flood"]
+depends_on = ["mcp_telegram.flood", "mcp_telegram.media_fact", "mcp_telegram.message_contracts", "mcp_telegram.telegram_demand", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message"]
 
 [[modules]]
 path = "mcp_telegram.message_history.telegram_adapter"

@@ -22,6 +22,7 @@ from telethon.tl.types import TypePeer  # type: ignore[import-untyped]
 from .. import message_contracts as _message_contracts
 from ..flood import TelegramRpcThrottled, _raise_if_latched
 from ..media_fact import encode_media_payload
+from ..telegram_demand import RpcAttemptBudgetExhaustedError
 from ..telethon_media import extract_media_fact
 from ..telethon_message import is_service_message
 
@@ -427,6 +428,9 @@ async def _resolve_peer_name(client: PeerNameClient, peer: _PeerLike) -> str | N
         return name or None
     except PeerFloodError:
         logger.warning("resolve_peer_name_peer_flood peer_id=%d", log_id)
+        return None
+    except RpcAttemptBudgetExhaustedError:
+        logger.debug("resolve_peer_name_budget_exhausted peer_id=%d", log_id)
         return None
     except (
         ChannelPrivateError,
