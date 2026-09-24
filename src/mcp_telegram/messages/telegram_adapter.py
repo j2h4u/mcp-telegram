@@ -429,11 +429,13 @@ async def _resolve_peer_name(client: PeerNameClient, peer: _PeerLike) -> str | N
     except PeerFloodError:
         logger.warning("resolve_peer_name_peer_flood peer_id=%d", log_id)
         return None
+    except RpcAttemptBudgetExhaustedError:
+        logger.debug("resolve_peer_name_budget_exhausted peer_id=%d", log_id)
+        return None
     except (
         ChannelPrivateError,
         InputUserDeactivatedError,
         PeerIdInvalidError,
-        RpcAttemptBudgetExhaustedError,
         TelegramRpcThrottled,
         UserDeactivatedBanError,
         UserDeactivatedError,

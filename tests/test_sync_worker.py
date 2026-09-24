@@ -2227,10 +2227,11 @@ async def test_resolve_peer_name_budget_exhaustion_is_silent(
 
     peer = cast(_PeerLike, _PeerChannel(channel_id=1579759981))
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.DEBUG):
         name = await _resolve_peer_name(_BudgetExhaustedClient(), peer)
 
     assert name is None
+    assert "resolve_peer_name_budget_exhausted" in caplog.text
     assert not any("resolve_peer_name_unexpected" in record.message for record in caplog.records)
     assert not any(record.exc_info for record in caplog.records)
 
