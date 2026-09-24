@@ -341,7 +341,7 @@ depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.dialog_classificati
 [[modules]]
 path = "mcp_telegram.sync_worker"
 layer = "application"
-depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.entity_store", "mcp_telegram.flood", "mcp_telegram.history_enrollment", "mcp_telegram.hydration_queue", "mcp_telegram.message_contracts", "mcp_telegram.message_history.contracts", "mcp_telegram.message_history.ports", "mcp_telegram.messages.sqlite_bundle", "mcp_telegram.read_state", "mcp_telegram.resolver", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.config", "mcp_telegram.entity_store", "mcp_telegram.flood", "mcp_telegram.history_enrollment", "mcp_telegram.hydration_queue", "mcp_telegram.message_contracts", "mcp_telegram.message_history.contracts", "mcp_telegram.message_history.ports", "mcp_telegram.messages.sqlite_bundle", "mcp_telegram.read_state", "mcp_telegram.resolver", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
 [[modules]]
 path = "mcp_telegram.delta_sync"
 layer = "application"
@@ -909,7 +909,7 @@ expose = ["DaemonConnection", "DaemonNotRunningError", "ENTITY_PROFILE_ENDPOINT_
 
 [[interfaces]]
 from = ["mcp_telegram.history_enrollment"]
-expose = ["EnrollmentIntent", "EnrollmentOutcome", "EnrollmentSource", "disable_history", "enable_history", "ensure_automatic_dm_enrollment", "full_history_enabled", "read_intent", "reset_read_position_retry", "restore_access_status"]
+expose = ["EnrollmentIntent", "EnrollmentOutcome", "EnrollmentSource", "disable_history", "enable_history", "ensure_automatic_dm_enrollment", "full_history_enabled", "read_intent", "record_automatic_group_decision", "reset_read_position_retry", "restore_access_status"]
 
 [[interfaces]]
 from = ["mcp_telegram.reading"]

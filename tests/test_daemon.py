@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from mcp_telegram.config import load_config
+from mcp_telegram.config import AutomaticGroupHistoryConfig, load_config
 from mcp_telegram.daemon import (
     _acquire_startup_identity_before_updates,
     _ensure_demand_runtime,
@@ -368,7 +368,11 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         conn=object(),
         db_path=Path("/tmp/mcp-telegram-sync-main-test.db"),
         shutdown_event=asyncio.Event(),
-        scheduling=SimpleNamespace(draft_recovery=object(), reconnect_catch_up_interval_seconds=5.0),
+        scheduling=SimpleNamespace(
+            draft_recovery=object(),
+            reconnect_catch_up_interval_seconds=5.0,
+            automatic_group_history=AutomaticGroupHistoryConfig(),
+        ),
         api_server=SimpleNamespace(self_id=314),
         draft_owner=None,
         handler_manager=None,

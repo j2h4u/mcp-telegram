@@ -103,7 +103,7 @@ def _attr[T](obj: object, name: str, default: T) -> T:
 
 _SELECT_DIRTY_DIALOGS_SQL = "SELECT dialog_id FROM dialogs WHERE needs_refresh = 1 AND hidden = 0"
 _SELECT_DIRTY_DIALOG_EXISTS_SQL = "SELECT 1 FROM dialogs WHERE needs_refresh = 1 AND hidden = 0 LIMIT 1"
-_UPDATE_DIALOG_ENTITY_SQL = "UPDATE dialogs SET members=?, created=?, needs_refresh=0, snapshot_at=? WHERE dialog_id=?"
+_UPDATE_DIALOG_ENTITY_SQL = "UPDATE dialogs SET members=?, created=COALESCE(?,created), needs_refresh=0, snapshot_at=? WHERE dialog_id=?"
 
 
 def _extract_entity_fields(entity: _EntityLike) -> _EntityFields:
@@ -115,7 +115,7 @@ def _extract_entity_fields(entity: _EntityLike) -> _EntityFields:
     elif isinstance(entity, types.Chat):
         dialog_type = classify_dialog_type(entity, entity_kind=EntityKind.CHAT).value
         members = entity.participants_count
-        created = None
+        created = int(entity.date.timestamp()) if entity.date else None
     elif isinstance(entity, types.Channel):
         dialog_type = classify_dialog_type(entity, entity_kind=EntityKind.CHANNEL).value
         members = entity.participants_count

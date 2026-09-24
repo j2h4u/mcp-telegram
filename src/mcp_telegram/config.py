@@ -348,6 +348,15 @@ class ActivityHotSweepConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class AutomaticGroupHistoryConfig:
+    """Bounded history policy for automatic full sync of small recent groups."""
+
+    max_members: int = 100
+    recent_days: int = 365
+    max_messages: int = 5_000
+
+
+@dataclass(frozen=True, slots=True)
 class SchedulingConfig:
     """Intervals for local daemon maintenance loops."""
 
@@ -378,6 +387,7 @@ class SchedulingConfig:
     draft_recovery: DraftRecoveryConfig = field(default_factory=DraftRecoveryConfig)
     folder_projection: FolderProjectionConfig = field(default_factory=FolderProjectionConfig)
     activity_hot_sweep: ActivityHotSweepConfig = field(default_factory=ActivityHotSweepConfig)
+    automatic_group_history: AutomaticGroupHistoryConfig = field(default_factory=AutomaticGroupHistoryConfig)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1437,6 +1447,29 @@ def _parse_activity_hot_sweep(
     )
 
 
+def _parse_automatic_group_history(
+    data: dict[str, object], path: Path, defaults: AutomaticGroupHistoryConfig
+) -> AutomaticGroupHistoryConfig:
+    section = _nested_table(data, "automatic_group_history", "scheduling.automatic_group_history", path) or {}
+    _reject_unknown_keys(
+        section,
+        {"max_members", "recent_days", "max_messages"},
+        "scheduling.automatic_group_history",
+        path,
+    )
+    return AutomaticGroupHistoryConfig(
+        max_members=_positive_int(
+            section, "max_members", "scheduling.automatic_group_history", path, defaults.max_members
+        ),
+        recent_days=_positive_int(
+            section, "recent_days", "scheduling.automatic_group_history", path, defaults.recent_days
+        ),
+        max_messages=_positive_int(
+            section, "max_messages", "scheduling.automatic_group_history", path, defaults.max_messages
+        ),
+    )
+
+
 def _non_negative_float(data: dict[str, object], key: str, section: str, path: Path, default: float) -> float:
     value = data.get(key, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
@@ -1474,12 +1507,16 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "draft_recovery",
         "fact_hydration",
         "folder_projection",
+        "automatic_group_history",
     }
     scheduling_data = _optional_section(data, "scheduling", allowed, path)
     fact_hydration = _parse_fact_hydration(scheduling_data, path, defaults)
     draft_recovery = _parse_draft_recovery(scheduling_data, path, defaults.draft_recovery)
     folder_projection = _parse_folder_projection(scheduling_data, path, defaults)
     activity_hot_sweep = _parse_activity_hot_sweep(scheduling_data, path, defaults.activity_hot_sweep)
+    automatic_group_history = _parse_automatic_group_history(
+        scheduling_data, path, defaults.automatic_group_history
+    )
     return SchedulingConfig(
         scheduled_reconciliation_seconds=_positive_float(
             scheduling_data,
@@ -1646,6 +1683,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         draft_recovery=draft_recovery,
         folder_projection=folder_projection,
         activity_hot_sweep=activity_hot_sweep,
+        automatic_group_history=automatic_group_history,
     )
 
 

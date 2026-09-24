@@ -28,9 +28,15 @@ from functools import wraps
 from typing import Protocol, cast
 
 from .access_lifecycle import set_access_lost
+from .config import AutomaticGroupHistoryConfig
 from .entity_store import EntitySnapshot, upsert_entity_stub
 from .flood import TelegramRpcThrottled, _raise_if_latched, sleep_through_flood
-from .history_enrollment import ensure_automatic_dm_enrollment, full_history_enabled
+from .history_enrollment import (
+    ensure_automatic_dm_enrollment,
+    full_history_enabled,
+    read_intent,
+    record_automatic_group_decision,
+)
 from .hydration_queue import HydrationPriority
 from .message_contracts import ExtractedMessage as _ExtractedMessage
 from .message_history.contracts import (
@@ -207,9 +213,11 @@ class FullSyncWorker:
         shutdown_event: asyncio.Event,
         *,
         total_messages_probe: TotalMessagesProbe | None = None,
+        automatic_group_history: AutomaticGroupHistoryConfig | None = None,
     ) -> None:
         self._history_port = history_port
         self._total_messages_probe = total_messages_probe
+        self._automatic_group_history = automatic_group_history or AutomaticGroupHistoryConfig()
         self._conn = conn
         self._shutdown_event = shutdown_event
         self._last_page_error: BaseException | None = None
@@ -309,7 +317,7 @@ class FullSyncWorker:
         """
         pending = self._next_pending_dialog()
         if pending is None:
-            return True  # nothing to do — all synced
+            return not await self._process_one_automatic_group()
 
         dialog_id, sync_progress = pending
         _, is_done = await self._fetch_batch(dialog_id, sync_progress)
@@ -400,6 +408,63 @@ class FullSyncWorker:
         if row is None:
             return None
         return int(row[0]), int(row[1]) if row[1] is not None else 0
+
+    def _next_automatic_group(self) -> int | None:
+        cutoff = int(time.time()) - self._automatic_group_history.recent_days * 86_400
+        return self._eligible_automatic_group(cutoff=cutoff)
+
+    def _eligible_automatic_group(self, *, cutoff: int) -> int | None:
+        row = cast(tuple[int] | None, self._conn.execute(
+            "SELECT d.dialog_id FROM dialogs d "
+            "LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=d.dialog_id "
+            "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
+            "WHERE fhe.dialog_id IS NULL AND d.hidden=0 AND d.type IN ('group','supergroup','forum') "
+            "AND d.members BETWEEN 1 AND ? AND d.created >= ? "
+            "AND (sd.status IS NULL OR sd.status NOT IN ('access_lost', 'synced')) "
+            "ORDER BY d.dialog_id LIMIT 1",
+            (self._automatic_group_history.max_members, cutoff),
+        ).fetchone())
+        return None if row is None else int(row[0])
+
+    def _is_eligible_automatic_group(self, dialog_id: int, *, cutoff: int) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM dialogs d LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=d.dialog_id "
+            "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
+            "WHERE d.dialog_id=? AND fhe.dialog_id IS NULL AND d.hidden=0 "
+            "AND d.type IN ('group','supergroup','forum') AND d.members BETWEEN 1 AND ? AND d.created >= ? "
+            "AND (sd.status IS NULL OR sd.status NOT IN ('access_lost', 'synced'))",
+            (dialog_id, self._automatic_group_history.max_members, cutoff),
+        ).fetchone() is not None
+
+    async def _process_one_automatic_group(self) -> bool:
+        dialog_id = self._next_automatic_group()
+        if dialog_id is None:
+            return False
+        page = await self._fetch_batch_page(dialog_id, 0)
+        if page.retry is not None:
+            return True
+        with self._conn:
+            intent = read_intent(self._conn, dialog_id)
+            if intent.source is not None:
+                if intent.enabled:
+                    self._store_batch_page_locked(
+                        dialog_id, 0, page.total_messages, page.batch, reaction_observed_at=page.reaction_observed_at
+                    )
+                return True
+            if not self._is_eligible_automatic_group(
+                dialog_id,
+                cutoff=int(time.time()) - self._automatic_group_history.recent_days * 86_400,
+            ):
+                return True
+            accepted = page.total_messages is not None and page.total_messages <= self._automatic_group_history.max_messages
+            intent = record_automatic_group_decision(
+                self._conn, dialog_id, enabled=accepted, total_messages=page.total_messages
+            )
+            if accepted and intent.enabled:
+                self._store_batch_page_locked(
+                    dialog_id, 0, page.total_messages, page.batch, reaction_observed_at=page.reaction_observed_at
+                )
+        return True
 
     def _next_total_messages_repair_dialog(self) -> int | None:
         """Return the next enrolled accessible dialog missing its Telegram total."""
@@ -523,15 +588,31 @@ class FullSyncWorker:
         reaction_observed_at: int | None = None,
     ) -> tuple[int, bool]:
         """Persist one fetched batch and update sync progress."""
+        with self._conn:
+            return self._store_batch_page_locked(
+                dialog_id, sync_progress, total_messages, batch, reaction_observed_at=reaction_observed_at
+            )
+
+    def _store_batch_page_locked(
+        self,
+        dialog_id: int,
+        sync_progress: int,
+        total_messages: int | None,
+        batch: Sequence[_ExtractedMessage],
+        *,
+        reaction_observed_at: int | None = None,
+    ) -> tuple[int, bool]:
         if not batch:
+            if not full_history_enabled(self._conn, dialog_id):
+                logger.info("sync_batch_discarded_disabled dialog_id=%d fetched=0", dialog_id)
+                return sync_progress, True
             now = int(time.time())
-            with self._conn:
-                self._begin_topic_attribution_pass(dialog_id, sync_progress, now)
-                self._conn.execute(
-                    _UPDATE_PROGRESS_DONE_SQL,
-                    (sync_progress, "synced", total_messages, now, dialog_id, dialog_id),
-                )
-                self._complete_topic_attribution_pass(dialog_id, now)
+            self._begin_topic_attribution_pass(dialog_id, sync_progress, now)
+            self._conn.execute(
+                _UPDATE_PROGRESS_DONE_SQL,
+                (sync_progress, "synced", total_messages, now, dialog_id, dialog_id),
+            )
+            self._complete_topic_attribution_pass(dialog_id, now)
             logger.info("sync_done dialog_id=%d status=synced (empty batch)", dialog_id)
             return sync_progress, True
 
@@ -541,30 +622,29 @@ class FullSyncWorker:
         new_status = "synced" if is_done else "syncing"
 
         # Single atomic transaction: messages + FTS + progress update
-        with self._conn:
-            if not full_history_enabled(self._conn, dialog_id):
-                logger.info("sync_batch_discarded_disabled dialog_id=%d fetched=%d", dialog_id, len(rows))
-                return sync_progress, True
-            now = int(time.time())
-            self._begin_topic_attribution_pass(dialog_id, sync_progress, now)
-            insert_messages_with_fts(
-                self._conn,
-                rows,
-                priority=HydrationPriority.BACKFILL,
-                reaction_observed_at=reaction_observed_at,
+        if not full_history_enabled(self._conn, dialog_id):
+            logger.info("sync_batch_discarded_disabled dialog_id=%d fetched=%d", dialog_id, len(rows))
+            return sync_progress, True
+        now = int(time.time())
+        self._begin_topic_attribution_pass(dialog_id, sync_progress, now)
+        insert_messages_with_fts(
+            self._conn,
+            rows,
+            priority=HydrationPriority.BACKFILL,
+            reaction_observed_at=reaction_observed_at,
+        )
+        self._record_no_topic_attribution(dialog_id, rows)
+        if is_done:
+            self._conn.execute(
+                _UPDATE_PROGRESS_DONE_SQL,
+                (new_progress, new_status, total_messages, now, dialog_id, dialog_id),
             )
-            self._record_no_topic_attribution(dialog_id, rows)
-            if is_done:
-                self._conn.execute(
-                    _UPDATE_PROGRESS_DONE_SQL,
-                    (new_progress, new_status, total_messages, now, dialog_id, dialog_id),
-                )
-                self._complete_topic_attribution_pass(dialog_id, now)
-            else:
-                self._conn.execute(
-                    _UPDATE_PROGRESS_SQL,
-                    (new_progress, new_status, total_messages, dialog_id, dialog_id),
-                )
+            self._complete_topic_attribution_pass(dialog_id, now)
+        else:
+            self._conn.execute(
+                _UPDATE_PROGRESS_SQL,
+                (new_progress, new_status, total_messages, dialog_id, dialog_id),
+            )
 
         logger.debug(
             "sync_batch dialog_id=%d fetched=%d progress=%d done=%s",
@@ -618,6 +698,8 @@ class FullSyncDemandAdapter:
     def status(self, now: float) -> DemandStatus | None:
         """Report pending history without changing local or Telegram state."""
         if self._worker._next_pending_dialog() is not None:
+            return DemandStatus(release_at=0.0)
+        if self._worker._next_automatic_group() is not None:
             return DemandStatus(release_at=0.0)
         repair_release_at = self._worker._total_messages_repair_release_at(now)
         return None if repair_release_at is None else DemandStatus(release_at=repair_release_at)

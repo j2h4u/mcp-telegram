@@ -1998,7 +1998,11 @@ class DaemonEntityInfoService:
             "slow_mode_seconds": observation.slow_mode_seconds,
         }
         patch.update(_channel_profile_kind_patch(entity_type, observation))
-        return EntitySectionCommit(patch, payload=_channel_profile_payload(observation))
+        return EntitySectionCommit(
+            patch,
+            payload=_channel_profile_payload(observation),
+            dialog_created=observation.created,
+        )
 
     def _capture_linked_chat_fact_generation(
         self,
@@ -2099,6 +2103,7 @@ class DaemonEntityInfoService:
                 "invite_link": observation.invite_link,
                 "members_count": len(participants) if participants is not None else None,
             },
+            dialog_created=observation.created,
             payload={
                 "current_photo": (
                     {"photo_id": observation.current_photo.photo_id, "date": observation.current_photo.date}
@@ -3376,6 +3381,8 @@ class DaemonEntityInfoService:
             return None
         if observation.channel_id != channel_id:
             raise ValueError("channel profile observation target does not match")
+        with self._deps.conn:
+            self._profiles.persist_group_created(observation.channel_id, observation.created)
         if observation.status is ProjectionStatus.UNAVAILABLE:
             reason = observation.reason or "channel_profile_unavailable"
             self._record_section_failure("full_profile", reason)
@@ -3524,6 +3531,8 @@ class DaemonEntityInfoService:
             observation = await self._deps.group_profile_port.fetch_group_profile(chat_id)
             if observation.group_id != chat_id:
                 raise ValueError("group profile observation target does not match")
+            with self._deps.conn:
+                self._profiles.persist_group_created(observation.group_id, observation.created)
             return observation
         except TelegramRpcThrottled:
             raise

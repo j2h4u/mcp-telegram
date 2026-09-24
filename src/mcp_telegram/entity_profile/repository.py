@@ -71,6 +71,7 @@ class EntitySectionCommit:
     observation_auth_scope: Mapping[str, object] | None = None
     ownership_observed: bool = False
     identity_patch: Mapping[str, object] | None = None
+    dialog_created: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -525,6 +526,15 @@ class EntityProfileRepository:
             # Identity writes are canonical profile writes for fencing, but
             # they do not renew the detail blob's observation age.
             self._bump_identity_fence(entity_id)
+
+    def persist_group_created(self, entity_id: int, created: int | None) -> None:
+        """Ratchet a legacy group's canonical creation time when the table exists."""
+        if created is None or not {"dialog_id", "created"} <= self._columns("dialogs"):
+            return
+        self._conn.execute(
+            "UPDATE dialogs SET created=? WHERE dialog_id=? AND created IS NULL",
+            (created, entity_id),
+        )
 
     def commit_core_acquisition(
         self,
@@ -1283,6 +1293,7 @@ class EntityProfileRepository:
         changed = self._advance_after_section_write(cursor, now=now, detail_revision=detail_revision)
         if changed != 1:
             raise sqlite3.OperationalError("entity profile cursor advance was rejected")
+        self.persist_group_created(cursor.entity_id, commit.dialog_created)
         return True
 
     def _advance_after_section_write(
@@ -1571,6 +1582,7 @@ class EntityProfileRepository:
             if detail is None:
                 return False
             self._write_group_pair_sections(cursor, detail, full_profile, contact_overlap, now=now)
+            self.persist_group_created(cursor.entity_id, full_profile.dialog_created)
             advanced = self._advance_group_full_chat_cursor(cursor, now=now)
             if not advanced:
                 raise sqlite3.OperationalError("legacy group cursor advance was rejected")

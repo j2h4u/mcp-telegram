@@ -118,6 +118,7 @@ class TelethonChannelProfileGateway(ChannelProfilePort):
         try:
             result = await self._client(GetFullChannelRequest(channel=_input_channel(reference)))
             full_chat = _validated_full_channel(result, channel_id)
+            created = _channel_created(result, channel_id)
             completed_at = self._now_provider()
         except ACCESS_LOST_ERRORS:
             completed_at = self._now_provider()
@@ -136,6 +137,7 @@ class TelethonChannelProfileGateway(ChannelProfilePort):
             current_photo=_normalize_channel_photo(getattr(full_chat, "chat_photo", None)),
             observation_started_at=started_at,
             observation_completed_at=completed_at,
+            created=created,
         )
 
     async def fetch_channel_contact_overlap(self, reference: ChannelReference) -> ChannelContactOverlapObservation:
@@ -197,6 +199,7 @@ class TelethonGroupProfileGateway(GroupProfilePort):
         result = await self._client(GetFullChatRequest(chat_id=raw_group_id))
         completed_at = int(self._now_provider())
         full_chat = _validated_full_chat(result, raw_group_id)
+        created = _group_created(result, raw_group_id)
         participant_ids, participants_reason = _normalize_participants(
             getattr(full_chat, "participants", None), raw_group_id
         )
@@ -208,6 +211,7 @@ class TelethonGroupProfileGateway(GroupProfilePort):
             participant_ids=participant_ids,
             participants_unavailable_reason=participants_reason,
             current_photo=current_photo,
+            created=created,
             observation_started_at=started_at,
             observation_completed_at=completed_at,
         )
@@ -450,6 +454,19 @@ def _validated_full_channel(result: object, channel_id: int) -> types.ChannelFul
     if not _channel_target_matches(channel_id, getattr(full_chat, "id", None)):
         raise ValueError("channel full target does not match")
     return full_chat
+
+
+def _channel_created(result: object, channel_id: int) -> int | None:
+    chats = getattr(result, "chats", None)
+    if not isinstance(chats, Sequence):
+        return None
+    for chat in chats:
+        if not _channel_target_matches(channel_id, getattr(chat, "id", None)):
+            continue
+        date = getattr(chat, "date", None)
+        if isinstance(date, datetime):
+            return int(date.timestamp())
+    return None
 
 
 def _unavailable_channel_profile(
@@ -790,6 +807,19 @@ def _validated_full_chat(result: object, raw_group_id: int) -> types.ChatFull:
     if _positive_id(getattr(full_chat, "id", None)) != raw_group_id:
         raise ValueError("legacy chat full target does not match")
     return full_chat
+
+
+def _group_created(result: object, raw_group_id: int) -> int | None:
+    chats = getattr(result, "chats", None)
+    if not isinstance(chats, Sequence):
+        return None
+    for chat in chats:
+        if _positive_id(getattr(chat, "id", None)) != raw_group_id:
+            continue
+        date = getattr(chat, "date", None)
+        if isinstance(date, datetime):
+            return int(date.timestamp())
+    return None
 
 
 def _normalize_invite_link(invite: object) -> str | None:

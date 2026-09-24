@@ -333,6 +333,7 @@ class ChannelProfileObservation:
     observation_completed_at: float
     status: ProjectionStatus = ProjectionStatus.USABLE
     reason: str | None = None
+    created: int | None = None
     endpoint: str = CHANNEL_PROFILE_ENDPOINT
     normalization_version: str = CHANNEL_PROFILE_NORMALIZATION_VERSION
 
@@ -383,6 +384,7 @@ class GroupProfileObservation:
     current_photo: ChatCurrentPhoto | None
     observation_started_at: int
     observation_completed_at: int
+    created: int | None = None
     endpoint: str = GROUP_PROFILE_ENDPOINT
     normalization_version: str = GROUP_PROFILE_NORMALIZATION_VERSION
 

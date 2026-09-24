@@ -18,6 +18,7 @@ from mcp_telegram.dialog_directory import (
     _eligibility_category,
     _encode_input_peer,
     _mute_until,
+    _staged_entity_projection,
     _three_valued_unread,
     apply_active_generation_pin_delta,
     apply_realtime_eligibility,
@@ -637,7 +638,9 @@ async def test_publication_is_atomic_and_preserves_realtime_revision(tmp_path: P
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
     try:
-        conn.execute("INSERT INTO dialogs(dialog_id,name,type,snapshot_at,hidden) VALUES (1,'Realtime','user',1,0)")
+        conn.execute(
+            "INSERT INTO dialogs(dialog_id,name,type,created,snapshot_at,hidden) VALUES (1,'Realtime','user',123456789,1,0)"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -663,7 +666,11 @@ async def test_publication_is_atomic_and_preserves_realtime_revision(tmp_path: P
 
     conn = _open_sync_db(db_path)
     try:
-        assert conn.execute("SELECT name, hidden FROM dialogs WHERE dialog_id=1").fetchone() == ("New realtime fact", 0)
+        assert conn.execute("SELECT name, created, hidden FROM dialogs WHERE dialog_id=1").fetchone() == (
+            "New realtime fact",
+            123456789,
+            0,
+        )
         assert conn.execute("SELECT status FROM dialog_directory_state").fetchone() == ("complete",)
         assert conn.execute("SELECT COUNT(*) FROM dialog_directory_staging").fetchone() == (0,)
     finally:
@@ -1388,6 +1395,25 @@ def test_identity_and_eligibility_extract_only_authoritative_facts() -> None:
     assert _mute_until(None) is None
     assert _mute_until(types.PeerNotifySettings(mute_until=datetime(2026, 1, 1, tzinfo=UTC))) == 1_767_225_600
     assert _mute_until(type("Settings", (), {"mute_until": 0})()) == 0
+
+
+def test_entity_projection_persists_chat_and_channel_creation_dates() -> None:
+    chat_date = datetime(2019, 2, 3, 4, 5, 6, tzinfo=UTC)
+    channel_date = datetime(2020, 3, 4, 5, 6, 7, tzinfo=UTC)
+
+    assert _staged_entity_projection(
+        types.Chat(
+            id=5,
+            title="group",
+            photo=types.ChatPhotoEmpty(),
+            participants_count=1,
+            date=chat_date,
+            version=1,
+        )
+    ).created == int(chat_date.timestamp())
+    assert _staged_entity_projection(
+        types.Channel(id=6, title="supergroup", photo=types.ChatPhotoEmpty(), date=channel_date, megagroup=True)
+    ).created == int(channel_date.timestamp())
 
 
 def test_realtime_bundles_preserve_oldest_boundary_and_complete_identity_replaces(tmp_path: Path) -> None:

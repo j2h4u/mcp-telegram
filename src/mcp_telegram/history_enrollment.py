@@ -303,6 +303,34 @@ def ensure_automatic_dm_enrollment(
     return enable_history(conn, dialog_id, source=EnrollmentSource.AUTOMATIC, now=now)
 
 
+def record_automatic_group_decision(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    enabled: bool,
+    total_messages: int | None = None,
+    now: int | None = None,
+) -> EnrollmentIntent:
+    """Persist a first-page group decision while preserving explicit intent."""
+    timestamp = int(time.time()) if now is None else now
+    with _savepoint(conn):
+        previous = read_intent(conn, dialog_id)
+        if previous.source is not None:
+            return previous
+        _store_intent(conn, dialog_id, enabled, EnrollmentSource.AUTOMATIC, timestamp)
+        if enabled:
+            reset_read_position_retry(conn, dialog_id)
+            if _coverage_status(conn, dialog_id) is None:
+                conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (?, 'syncing')", (dialog_id,))
+        elif total_messages is not None:
+            conn.execute(
+                "INSERT INTO synced_dialogs(dialog_id, status, total_messages) VALUES (?, 'not_synced', ?) "
+                "ON CONFLICT(dialog_id) DO UPDATE SET total_messages=excluded.total_messages",
+                (dialog_id, total_messages),
+            )
+        return read_intent(conn, dialog_id)
+
+
 def restore_access_status(conn: sqlite3.Connection, dialog_id: int) -> bool:
     """Restore coverage according to intent; return whether sync is authorized."""
     enabled = full_history_enabled(conn, dialog_id)
@@ -323,6 +351,7 @@ __all__ = [
     "ensure_automatic_dm_enrollment",
     "full_history_enabled",
     "read_intent",
+    "record_automatic_group_decision",
     "reset_read_position_retry",
     "restore_access_status",
 ]

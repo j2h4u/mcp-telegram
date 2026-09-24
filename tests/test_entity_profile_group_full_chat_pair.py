@@ -48,6 +48,7 @@ class _GroupClient:
         self.calls: list[str] = []
         self.search_response: object = SimpleNamespace(count=0, messages=[])
         self.after_call: Callable[[], None] | None = None
+        self.created: int | None = None
 
     async def __call__(self, request: object) -> object:
         scope = current_rpc_scope()
@@ -137,6 +138,7 @@ class _GroupProfilePort:
             current_photo=None,
             observation_started_at=100,
             observation_completed_at=100,
+            created=self._client.created,
         )
 
 
@@ -247,6 +249,45 @@ async def test_group_pair_sections_share_the_observation_boundary() -> None:
         "WHERE entity_id=-123 AND section IN ('full_profile','contact_overlap') ORDER BY section"
     ).fetchall() == [(100, 100), (100, 100)]
     await service.shutdown()  # type: ignore[attr-defined]
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_group_profile_refresh_fills_missing_hidden_dialog_created_once() -> None:
+    conn, service, client = _service()
+    conn.execute("CREATE TABLE dialogs (dialog_id INTEGER PRIMARY KEY, created INTEGER, hidden INTEGER NOT NULL DEFAULT 0)")
+    conn.execute("INSERT INTO dialogs(dialog_id, created, hidden) VALUES (-123, NULL, 1)")
+    client.created = 1_700_000_000
+    conn.commit()
+
+    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+
+    assert conn.execute("SELECT created FROM dialogs WHERE dialog_id=-123").fetchone() == (1_700_000_000,)
+    client.created = None
+    conn.execute("UPDATE entity_profile_refresh_state SET next_section='full_profile' WHERE entity_id=-123")
+    conn.commit()
+    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+    assert conn.execute("SELECT created FROM dialogs WHERE dialog_id=-123").fetchone() == (1_700_000_000,)
+    await service.shutdown()  # type: ignore[attr-defined]
+    conn.close()
+
+
+def test_rejected_group_profile_cursor_cannot_mutate_dialog_created() -> None:
+    conn, service, _client = _service()
+    conn.execute("CREATE TABLE dialogs (dialog_id INTEGER PRIMARY KEY, created INTEGER, hidden INTEGER NOT NULL DEFAULT 0)")
+    conn.execute("INSERT INTO dialogs(dialog_id, created, hidden) VALUES (-123, NULL, 1)")
+    cursor = service._profiles.next_due_refresh(now=100)  # type: ignore[attr-defined]
+    assert cursor is not None
+    conn.execute("UPDATE entity_profile_refresh_state SET generation=generation+1 WHERE entity_id=-123")
+    conn.commit()
+
+    assert not service._profiles.commit_group_full_chat_pair(  # type: ignore[attr-defined]
+        cursor,
+        EntitySectionCommit({"about": "stale"}, dialog_created=1_700_000_000),
+        EntitySectionCommit({"contacts_subscribed": []}),
+        now=100,
+    )
+    assert conn.execute("SELECT created FROM dialogs WHERE dialog_id=-123").fetchone() == (None,)
     conn.close()
 
 

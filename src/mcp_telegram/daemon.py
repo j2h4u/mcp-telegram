@@ -1864,6 +1864,7 @@ async def sync_main() -> None:
             ctx.conn,
             ctx.shutdown_event,
             total_messages_probe=history_access_probe,
+            automatic_group_history=ctx.scheduling.automatic_group_history,
         )
         history_runtime = _HistorySyncRuntime(worker, delta_worker, history_access_probe)
         _ensure_demand_runtime(
