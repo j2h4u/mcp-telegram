@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import cast
 
 import pytest
 from telethon.errors import ChannelPrivateError, RPCError  # type: ignore[import-untyped]
+from telethon.tl import types  # type: ignore[import-untyped]
+from telethon.tl.functions.messages import GetHistoryRequest  # type: ignore[import-untyped]
 
 from helpers import MockTotalList, build_mock_message
 from mcp_telegram.flood import TelegramRpcThrottled
@@ -32,6 +35,16 @@ class _Client:
         self.messages: list[object] = [build_mock_message(id=2), build_mock_message(id=1)]
         self.total = 42
         self.error: BaseException | None = None
+        self.requests: list[object] = []
+
+    async def get_input_entity(self, peer: object) -> object:
+        return peer
+
+    async def __call__(self, request: object) -> object:
+        self.requests.append(request)
+        raw_request = cast(GetHistoryRequest, request)
+        response = await self.get_messages(entity=7, limit=100, offset_id=raw_request.offset_id)
+        return type("History", (), {"messages": list(response), "count": response.total, "users": [], "chats": []})()
 
     async def get_messages(self, **kwargs: object) -> MockTotalList:
         self.get_messages_calls.append(kwargs)
@@ -57,9 +70,48 @@ async def test_full_history_maps_one_backward_page_and_reads_total() -> None:
     with demand_context(DemandKind.FULL_SYNC_PAGE):
         page = await TelethonFullHistoryPageAdapter(client).fetch_page(7, before_message_id=13)
 
-    assert client.get_messages_calls == [{"entity": 7, "limit": 100, "offset_id": 13}]
+    assert len(client.requests) == 1
+    request = cast(GetHistoryRequest, client.requests[0])
+    assert request.limit == 100
+    assert request.offset_id == 13
     assert [row.message.message_id for row in page.messages] == [2, 1]
     assert page.total_messages == 42
+    assert page.next_before_message_id == 1
+
+
+@pytest.mark.asyncio
+async def test_full_history_cursor_includes_message_empty_and_filters_it_from_rows() -> None:
+    client = _Client()
+    client.messages = [
+        build_mock_message(id=900),
+        types.MessageEmpty(id=800, peer_id=types.PeerUser(user_id=7)),
+        build_mock_message(id=700),
+    ]
+
+    page = await TelethonFullHistoryPageAdapter(client).fetch_page(7, before_message_id=0)
+
+    assert [row.message.message_id for row in page.messages] == [900, 700]
+    assert page.next_before_message_id == 700
+
+
+@pytest.mark.asyncio
+async def test_all_message_empty_page_advances_cursor_without_rows() -> None:
+    client = _Client()
+    client.messages = [types.MessageEmpty(id=800, peer_id=types.PeerUser(user_id=7))]
+
+    page = await TelethonFullHistoryPageAdapter(client).fetch_page(7, before_message_id=900)
+
+    assert page.messages == ()
+    assert page.next_before_message_id == 800
+
+
+@pytest.mark.asyncio
+async def test_nonempty_raw_page_without_positive_ids_is_unavailable() -> None:
+    client = _Client()
+    client.messages = [object()]
+
+    with pytest.raises(MessageHistoryUnavailableError, match="no usable message IDs"):
+        await TelethonFullHistoryPageAdapter(client).fetch_page(7, before_message_id=0)
 
 
 @pytest.mark.asyncio
@@ -213,4 +265,6 @@ def test_full_history_page_rejects_more_than_protocol_limit() -> None:
         reply_count=0,
     )
     with pytest.raises(ValueError, match="at most 100"):
-        FullHistoryPage(messages=(message,) * 101, total_messages=None)
+        FullHistoryPage(messages=(message,) * 101, total_messages=None, next_before_message_id=1)
+    with pytest.raises(ValueError, match="require a next cursor"):
+        FullHistoryPage(messages=(message,), total_messages=1, next_before_message_id=None)

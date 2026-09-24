@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from telethon.errors import ChannelPrivateError  # type: ignore[import-untyped]
+from telethon.tl.functions.messages import GetHistoryRequest  # type: ignore[import-untyped]
 
 from helpers import MockTotalList, build_mock_message, build_mock_reactions
 from mcp_telegram.config import AutomaticGroupHistoryConfig
@@ -29,7 +30,7 @@ from mcp_telegram.message_history.telegram_adapter import TelethonFullHistoryPag
 from mcp_telegram.messages.sqlite_bundle import insert_messages_with_fts
 from mcp_telegram.messages.telegram_adapter import _PeerLike, extract_message_row
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncWorker
+from mcp_telegram.sync_worker import FullSyncDemandAdapter, FullSyncWorker, _FetchedBatchPage
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_scheduler import (
     RpcAdmissionClosedError,
@@ -76,6 +77,19 @@ class _MockClient:
         self.get_entity: AsyncMock = AsyncMock()
         self.iter_messages = _empty_async_iter
         self.is_connected = MagicMock(return_value=True)
+        self.raw_history_requests: list[object] = []
+
+    async def get_input_entity(self, peer: object) -> object:
+        return peer
+
+    async def __call__(self, request: object) -> object:
+        self.raw_history_requests.append(request)
+        raw_request = cast(GetHistoryRequest, request)
+        response = cast(
+            MockTotalList,
+            await self.get_messages(entity=raw_request.peer, limit=raw_request.limit, offset_id=raw_request.offset_id),
+        )
+        return SimpleNamespace(messages=list(response), count=response.total, users=(), chats=())
 
 
 class _PeerLookupClient:
@@ -137,7 +151,7 @@ async def test_automatic_group_history_uses_fresh_total_and_persists_decision(
 ) -> None:
     class Port:
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
-            return FullHistoryPage((), total)
+            return FullHistoryPage((), total, None)
 
     sync_db.execute(
         "INSERT INTO dialogs(dialog_id,type,members,created) VALUES (501,'group',1,?)",
@@ -166,7 +180,7 @@ async def test_automatic_group_first_page_is_saved_once(sync_db: _SQLiteConnecti
 
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
             self.calls += 1
-            return FullHistoryPage((extract_message_row(dialog_id, build_mock_message(id=9, text="one")),), 1)
+            return FullHistoryPage((extract_message_row(dialog_id, build_mock_message(id=9, text="one")),), 1, 9)
 
     sync_db.execute(
         "INSERT INTO dialogs(dialog_id,type,members,created) VALUES (502,'forum',1,?)",
@@ -190,7 +204,7 @@ async def test_automatic_group_rechecks_explicit_race(sync_db: _SQLiteConnection
         async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
             (enable_history if enabled else disable_history)(sync_db, dialog_id, now=2)
             sync_db.commit()
-            return FullHistoryPage((extract_message_row(dialog_id, build_mock_message(id=10, text="race")),), 9_999)
+            return FullHistoryPage((extract_message_row(dialog_id, build_mock_message(id=10, text="race")),), 9_999, 10)
 
     sync_db.execute(
         "INSERT INTO dialogs(dialog_id,type,members,created) VALUES (503,'group',1,?)",
@@ -238,6 +252,7 @@ async def test_full_sync_adapter_runs_one_automatic_first_page_under_budget(
 
     assert observed_scopes and observed_scopes[0].attempt_budget is budget  # type: ignore[union-attr]
     client.get_messages.assert_awaited_once()
+    assert len(client.raw_history_requests) == 1
     assert sync_db.execute("SELECT enabled,source FROM full_history_enrollment WHERE dialog_id=504").fetchone() == (
         1,
         "automatic",
@@ -291,16 +306,18 @@ async def test_automatic_group_retry_skips_failed_candidate_and_reports_release(
         [(506,), (507,)],
     )
     sync_db.commit()
-    client = _MockClient()
 
-    class MissingTotalList(list[object]):
-        total: int | None = None
+    class Port:
+        calls = 0
 
-    missing_total = MissingTotalList()
-    client.get_messages.side_effect = [missing_total, MockTotalList([], total=1)]
+        async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
+            self.calls += 1
+            return FullHistoryPage((), None if self.calls == 1 else 1, None)
+
+    port = Port()
     policy = AutomaticGroupHistoryConfig(probe_retry_seconds=60)
     worker = FullSyncWorker(
-        TelethonFullHistoryPageAdapter(client),
+        port,
         cast(sqlite3.Connection, sync_db),
         asyncio.Event(),
         automatic_group_history=policy,
@@ -312,7 +329,7 @@ async def test_automatic_group_retry_skips_failed_candidate_and_reports_release(
         await adapter.run_slice(RpcAttemptBudget(limit=1))
         release = adapter.status(1_000.0)
 
-    assert client.get_messages.await_count == 2
+    assert port.calls == 2
     assert sync_db.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id=507").fetchone() == (1,)
     assert sync_db.execute("SELECT enabled FROM full_history_enrollment WHERE dialog_id=506").fetchone() is None
     assert release is not None and release.release_at == 1_060.0
@@ -333,7 +350,7 @@ async def test_automatic_group_ordinary_error_does_not_block_next_candidate(sync
             self.attempted.append(dialog_id)
             if dialog_id == 510:
                 raise MessageHistoryUnavailableError("temporary Telegram failure")
-            return FullHistoryPage((), 1)
+            return FullHistoryPage((), 1, None)
 
     port = Port()
     worker = FullSyncWorker(
@@ -477,7 +494,7 @@ async def test_new_full_history_terminal_publishes_complete_topic_attribution_re
     sync_db.commit()
     worker = make_worker(MagicMock(), sync_db, asyncio.Event())
 
-    await worker._store_batch_page(dialog_id, 0, 0, ())
+    await worker._store_batch_page(dialog_id, 0, _FetchedBatchPage(0, (), None))
 
     row = sync_db.execute(
         "SELECT status,topic_attribution_version,topic_attribution_state,"
@@ -1072,12 +1089,12 @@ async def test_empty_batch_marks_synced(
 
 
 @pytest.mark.asyncio
-async def test_partial_batch_marks_synced(
+async def test_sparse_batch_advances_cursor_without_marking_synced(
     mock_client: _MockClient,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """Batch of 50 messages (< 100) marks dialog as 'synced' after commit."""
+    """A short raw page with messages advances its cursor and remains in progress."""
     dialog_id = 4002
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
@@ -1093,14 +1110,53 @@ async def test_partial_batch_marks_synced(
     worker = make_worker(mock_client, sync_db, shutdown_event)
     result = await worker.process_one_batch()
 
-    assert result is True
+    assert result is False
 
     row = sync_db.execute(
         "SELECT status FROM synced_dialogs WHERE dialog_id = ?",
         (dialog_id,),
     ).fetchone()
     assert row is not None
-    assert row[0] == "synced"
+    assert row[0] == "syncing"
+    assert sync_db.execute("SELECT sync_progress FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_sparse_raw_pages_resume_from_cursor_until_empty_page(
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 4004
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)", (dialog_id,)
+    )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
+    sync_db.commit()
+    mock_client.get_messages = AsyncMock(
+        side_effect=[
+            MockTotalList([build_mock_message(id=900), build_mock_message(id=700)], total=189),
+            MockTotalList([build_mock_message(id=400), build_mock_message(id=250)], total=189),
+            MockTotalList([], total=189),
+        ]
+    )
+
+    await make_worker(mock_client, sync_db, shutdown_event).process_one_batch()
+    assert sync_db.execute("SELECT sync_progress FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        700,
+    )
+    await make_worker(mock_client, sync_db, shutdown_event).process_one_batch()
+    assert sync_db.execute("SELECT sync_progress FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        250,
+    )
+    await make_worker(mock_client, sync_db, shutdown_event).process_one_batch()
+
+    assert [cast(GetHistoryRequest, request).offset_id for request in mock_client.raw_history_requests] == [0, 700, 250]
+    assert sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        "synced",
+    )
 
 
 @pytest.mark.asyncio
@@ -1564,7 +1620,7 @@ async def test_last_synced_at_set_on_partial_batch(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """When _fetch_batch gets partial batch (< 100 msgs), last_synced_at is set."""
+    """Completion metadata is written when an empty raw page arrives after a sparse page."""
     dialog_id = 8003
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
@@ -1573,8 +1629,9 @@ async def test_last_synced_at_set_on_partial_batch(
     seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
     msgs = [build_mock_message(id=50), build_mock_message(id=40)]  # < 100 = partial
-    mock_client.get_messages = AsyncMock(return_value=MockTotalList(msgs, total=200))
+    mock_client.get_messages = AsyncMock(side_effect=[MockTotalList(msgs, total=200), MockTotalList([], total=200)])
     worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.process_one_batch()
     await worker.process_one_batch()
     row = sync_db.execute(
         "SELECT last_synced_at, status FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)
@@ -2585,7 +2642,12 @@ async def test_full_history_null_topic_completes_current_receipt_with_evaluated_
     sync_db.commit()
     worker = make_worker(MagicMock(), sync_db, asyncio.Event())
 
-    await worker._store_batch_page(dialog_id, 0, 1, (ExtractedMessage(message=_stored(dialog_id, 1), reply_count=0),))
+    await worker._store_batch_page(
+        dialog_id,
+        0,
+        _FetchedBatchPage(1, (ExtractedMessage(message=_stored(dialog_id, 1), reply_count=0),), 1),
+    )
+    await worker._store_batch_page(dialog_id, 1, _FetchedBatchPage(None, (), None))
 
     assert sync_db.execute(
         "SELECT topic_attribution_version,topic_attribution_state,topic_attribution_no_topic_count "

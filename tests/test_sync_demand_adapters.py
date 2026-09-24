@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from telethon.errors import ChannelPrivateError, RPCError  # type: ignore[import-untyped]
+from telethon.tl.functions.messages import GetHistoryRequest  # type: ignore[import-untyped]
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
 from helpers import MockTotalList, build_mock_message
@@ -97,18 +98,50 @@ def _delta_policy() -> AccessProbePolicy:
     )
 
 
+class _RawHistoryClient:
+    def __init__(
+        self,
+        get_messages: Callable[..., Awaitable[MockTotalList]],
+        *,
+        get_entity: Callable[[object], Awaitable[object]] | None = None,
+    ) -> None:
+        self._get_messages = get_messages
+        self._get_entity = get_entity
+
+    async def get_input_entity(self, peer: object) -> object:
+        return peer
+
+    async def get_messages(self, **kwargs: object) -> MockTotalList:
+        return await self._get_messages(**kwargs)
+
+    async def __call__(self, request: object, **_kwargs: object) -> object:
+        history_request = cast(GetHistoryRequest, request)
+        response = await self.get_messages(
+            entity=history_request.peer, limit=history_request.limit, offset_id=history_request.offset_id
+        )
+        return SimpleNamespace(messages=list(response), count=response.total, users=(), chats=())
+
+    async def get_entity(self, peer: object) -> object:
+        if self._get_entity is None:
+            raise AssertionError("unexpected entity lookup")
+        return await self._get_entity(peer)
+
+
 @pytest.mark.asyncio
 async def test_full_sync_adapter_status_is_read_only_and_slice_has_precise_scope(conn: sqlite3.Connection) -> None:
     dialog_id = 101
     _seed_history_dialog(conn, dialog_id, status="syncing")
     observed_scopes: list[TelegramRpcScope] = []
 
-    async def get_messages(**_kwargs: object) -> MockTotalList:
-        observed_scopes.append(current_rpc_scope())
-        return MockTotalList([], total=0)
+    class Client:
+        async def get_input_entity(self, peer: object) -> object:
+            return peer
 
-    client = SimpleNamespace(get_messages=get_messages)
-    worker = FullSyncWorker(TelethonFullHistoryPageAdapter(client), conn, asyncio.Event())
+        async def __call__(self, _request: object, **_kwargs: object) -> object:
+            observed_scopes.append(current_rpc_scope())
+            return SimpleNamespace(messages=(), count=0, users=(), chats=())
+
+    worker = FullSyncWorker(TelethonFullHistoryPageAdapter(Client()), conn, asyncio.Event())
     adapter = FullSyncDemandAdapter(worker)
     changes_before = conn.total_changes
 
@@ -148,7 +181,7 @@ async def test_full_history_forward_name_enrichment_keeps_entity_lookup_attribut
 
     worker = FullSyncWorker(
         TelethonFullHistoryPageAdapter(
-            SimpleNamespace(get_messages=get_messages, get_entity=get_entity),
+            _RawHistoryClient(get_messages, get_entity=get_entity),
             entity_lookup_context=lambda: acquisition_context(AcquisitionKind.ENTITY_LOOKUP),
         ),
         conn,
@@ -541,7 +574,7 @@ async def test_full_sync_total_repair_uses_durable_retry_boundary(conn: sqlite3.
             raise OSError("temporary Telegram failure")
         return MockTotalList([], total=17)
 
-    client = SimpleNamespace(get_messages=get_messages)
+    client = _RawHistoryClient(get_messages)
     worker = FullSyncWorker(
         TelethonFullHistoryPageAdapter(client),
         conn,
@@ -605,7 +638,7 @@ async def test_full_sync_page_adapter_propagates_rpc_failure_and_preserves_progr
     async def get_messages(**_kwargs: object) -> MockTotalList:
         raise RPCError(None, "history failed")
 
-    client = SimpleNamespace(get_messages=get_messages)
+    client = _RawHistoryClient(get_messages)
     adapter = FullSyncDemandAdapter(FullSyncWorker(TelethonFullHistoryPageAdapter(client), conn, asyncio.Event()))
     with pytest.raises(MessageHistoryUnavailableError):
         await adapter.run_slice(RpcAttemptBudget(limit=1))
@@ -625,7 +658,7 @@ async def test_full_sync_page_adapter_defers_to_coordinator_without_local_sleep(
     async def get_messages(**_kwargs: object) -> MockTotalList:
         raise TelegramRpcAdmissionDeferred(retry_after_seconds=9)
 
-    client = SimpleNamespace(get_messages=get_messages)
+    client = _RawHistoryClient(get_messages)
     adapter = FullSyncDemandAdapter(FullSyncWorker(TelethonFullHistoryPageAdapter(client), conn, asyncio.Event()))
     with (
         patch("mcp_telegram.sync_worker.sleep_through_flood", new=AsyncMock()) as sleep,
