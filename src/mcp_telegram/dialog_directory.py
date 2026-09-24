@@ -175,7 +175,11 @@ def _staged_entity_projection(entity: object | None) -> _StagedEntityProjection:
         name=_entity_name(entity),
         dialog_type=classify_dialog_type(entity, entity_kind=kind).value if identity_complete else "unknown",
         members=_nullable_int(getattr(entity, "participants_count", None)),
-        created=int(entity.date.timestamp()) if isinstance(entity, types.Channel) and entity.date is not None else None,
+        created=(
+            int(entity.date.timestamp())
+            if isinstance(entity, (types.Chat, types.Channel)) and entity.date is not None
+            else None
+        ),
         username=_primary_username(entity),
         identity_complete=identity_complete,
         eligibility_category=_eligibility_category(entity),
@@ -599,7 +603,7 @@ class CanonicalDialogDirectory:
                 "ON CONFLICT(generation,dialog_id) DO UPDATE SET "
                 "source=excluded.source,peer_kind=excluded.peer_kind,top_message=excluded.top_message,"
                 "name=excluded.name,type=excluded.type,archived=excluded.archived,pinned=excluded.pinned,members=excluded.members,"
-                "created=excluded.created,last_message_at=excluded.last_message_at,read_inbox_max_id=excluded.read_inbox_max_id,"
+                "created=COALESCE(excluded.created,dialog_directory_staging.created),last_message_at=excluded.last_message_at,read_inbox_max_id=excluded.read_inbox_max_id,"
                 "read_outbox_max_id=excluded.read_outbox_max_id,unread_mentions_count=excluded.unread_mentions_count,"
                 "unread_reactions_count=excluded.unread_reactions_count,unread_count=excluded.unread_count,"
                 "unread_mark=excluded.unread_mark,snapshot_at=excluded.snapshot_at,"
@@ -748,7 +752,7 @@ class CanonicalDialogDirectory:
             "ELSE MIN(current.identity_observed_at,staged.identity_observed_at) END, "
             "archived=staged.archived, "
             "pinned=CASE WHEN EXISTS (SELECT 1 FROM dialog_directory_pins pin WHERE pin.generation=staged.generation AND pin.folder_id=0 AND pin.dialog_id=staged.dialog_id) THEN 1 ELSE 0 END, "
-            "members=staged.members, created=staged.created, last_message_at=staged.last_message_at, "
+            "members=staged.members, created=COALESCE(staged.created,current.created), last_message_at=staged.last_message_at, "
             "snapshot_at=staged.snapshot_at, unread_mentions_count=staged.unread_mentions_count, "
             "unread_reactions_count=staged.unread_reactions_count, "
             "read_inbox_max_id=CASE WHEN staged.read_inbox_max_id IS NULL THEN current.read_inbox_max_id "

@@ -6,12 +6,14 @@ import asyncio
 import logging
 import sqlite3
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from telethon.errors import ChannelPrivateError, PeerIdInvalidError
+from telethon.tl import types  # type: ignore[import-untyped]
 
 from mcp_telegram.dialog_sync import DialogReconciliationWorker
 from mcp_telegram.flood import TelegramRpcThrottled
@@ -72,6 +74,47 @@ async def test_recon_light_pass_resets_needs_refresh_without_owning_identity(
 
     assert count == 1
     assert sync_db.execute("SELECT name, needs_refresh FROM dialogs WHERE dialog_id=100").fetchone() == ("Old", 0)
+
+
+@pytest.mark.asyncio
+async def test_recon_light_pass_persists_chat_creation_date(
+    sync_db: sqlite3.Connection, mock_client: _MockClient, shutdown_event: asyncio.Event
+) -> None:
+    _seed_dialog(sync_db, 100, needs_refresh=1)
+    sync_db.execute("UPDATE dialogs SET created=? WHERE dialog_id=100", (123456789,))
+    sync_db.commit()
+    created = datetime(2019, 2, 3, 4, 5, 6, tzinfo=UTC)
+    mock_client.get_entity.return_value = types.Chat(
+        id=100,
+        title="Group",
+        photo=types.ChatPhotoEmpty(),
+        participants_count=3,
+        date=created,
+        version=1,
+    )
+
+    assert await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass() == 1
+    assert sync_db.execute("SELECT created FROM dialogs WHERE dialog_id=100").fetchone() == (int(created.timestamp()),)
+
+
+@pytest.mark.asyncio
+async def test_recon_light_pass_preserves_known_creation_date_when_entity_omits_it(
+    sync_db: sqlite3.Connection, mock_client: _MockClient, shutdown_event: asyncio.Event
+) -> None:
+    _seed_dialog(sync_db, 100, needs_refresh=1)
+    sync_db.execute("UPDATE dialogs SET created=? WHERE dialog_id=100", (123456789,))
+    sync_db.commit()
+    mock_client.get_entity.return_value = types.Chat(
+        id=100,
+        title="Group",
+        photo=types.ChatPhotoEmpty(),
+        participants_count=3,
+        date=None,
+        version=1,
+    )
+
+    assert await DialogReconciliationWorker(mock_client, sync_db, shutdown_event).run_light_pass() == 1
+    assert sync_db.execute("SELECT created FROM dialogs WHERE dialog_id=100").fetchone() == (123456789,)
 
 
 @pytest.mark.asyncio

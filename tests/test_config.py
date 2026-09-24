@@ -10,6 +10,7 @@ import pytest
 
 from mcp_telegram.config import (
     ActivityHotSweepConfig,
+    AutomaticGroupHistoryConfig,
     ConfigError,
     DraftRecoveryConfig,
     EntitiesConfig,
@@ -57,6 +58,7 @@ def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
     assert config.scheduling.fact_hydration.interval_seconds == 300.0
     assert config.scheduling.fact_hydration.max_requests_per_cycle == 4
     assert config.scheduling.fact_hydration.pause_between_requests_seconds == 5.0
+    assert config.scheduling.automatic_group_history == AutomaticGroupHistoryConfig()
     assert config.http == HttpServerConfig()
     assert config.logging.daemon_api_slow_request_seconds == 1.0
     with pytest.raises(FrozenInstanceError):
@@ -141,6 +143,46 @@ def test_load_config_accepts_positive_fact_hydration_capacity(tmp_path: Path) ->
     )
 
     assert load_config(path).scheduling.fact_hydration.max_requests_per_cycle == 1
+
+
+def test_load_config_reads_automatic_group_history_policy(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        """[state]
+dir = "/state"
+
+[scheduling.automatic_group_history]
+max_members = 12
+recent_days = 90
+max_messages = 2500
+probe_retry_seconds = 30
+""",
+    )
+
+    assert load_config(path).scheduling.automatic_group_history == AutomaticGroupHistoryConfig(
+        max_members=12, recent_days=90, max_messages=2500, probe_retry_seconds=30
+    )
+
+
+@pytest.mark.parametrize("key", ["max_members", "recent_days", "max_messages", "probe_retry_seconds"])
+def test_load_config_rejects_non_positive_automatic_group_history_values(tmp_path: Path, key: str) -> None:
+    path = _write_config(
+        tmp_path,
+        f'[state]\ndir = "/state"\n\n[scheduling.automatic_group_history]\n{key} = 0\n',
+    )
+
+    with pytest.raises(ConfigError, match=f"automatic_group_history.{key}"):
+        load_config(path)
+
+
+def test_load_config_rejects_unknown_automatic_group_history_key(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        '[state]\ndir = "/state"\n\n[scheduling.automatic_group_history]\nunknown = 1\n',
+    )
+
+    with pytest.raises(ConfigError, match="scheduling.automatic_group_history"):
+        load_config(path)
 
 
 def test_load_config_reads_scheduler_and_worker_fairness_bounds(tmp_path: Path) -> None:

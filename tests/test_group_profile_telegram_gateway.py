@@ -27,6 +27,7 @@ def _full_chat(
     chat_id: int = 123,
     participants: object | None = None,
     photo: object | None = None,
+    chat_date: datetime | None = None,
 ) -> types.messages.ChatFull:
     if participants is None:
         participants = types.ChatParticipants(chat_id=chat_id, participants=[], version=1)
@@ -38,7 +39,15 @@ def _full_chat(
         exported_invite=types.ChatInviteExported(link="https://t.me/+group", admin_id=1, date=None),
         chat_photo=cast(types.TypePhoto | None, photo),
     )
-    return types.messages.ChatFull(full_chat=full, chats=[], users=[])
+    chat = types.Chat(
+        id=chat_id,
+        title="Group",
+        photo=types.ChatPhotoEmpty(),
+        participants_count=1,
+        date=chat_date,
+        version=1,
+    )
+    return types.messages.ChatFull(full_chat=full, chats=[chat], users=[])
 
 
 @pytest.mark.asyncio
@@ -65,7 +74,18 @@ async def test_group_gateway_builds_request_and_normalizes_all_primitives() -> N
     assert observation.current_photo.photo_id == 55
     assert observation.observation_started_at == 100
     assert observation.observation_completed_at == 101
+    assert observation.created is None
     assert not hasattr(observation, "full_chat")
+
+
+@pytest.mark.asyncio
+async def test_group_gateway_captures_legacy_chat_creation_date() -> None:
+    created = datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC)
+    observation = await TelethonGroupProfileGateway(
+        _Client(_full_chat(chat_date=created)), now_provider=lambda: 100
+    ).fetch_group_profile(-123)
+
+    assert observation.created == int(created.timestamp())
 
 
 @pytest.mark.asyncio

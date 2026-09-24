@@ -100,7 +100,7 @@ def test_channel_reference_provider_rejects_noncanonical_id_and_async_session_ge
     assert session.calls == 0
 
 
-def _full_channel(*, channel_id: int = 123) -> types.messages.ChatFull:
+def _full_channel(*, channel_id: int = 123, channel_date: datetime | None = None) -> types.messages.ChatFull:
     full = types.ChannelFull(
         id=channel_id,
         about="channel about",
@@ -117,7 +117,14 @@ def _full_channel(*, channel_id: int = 123) -> types.messages.ChatFull:
         slowmode_seconds=60,
         available_reactions=types.ChatReactionsSome([types.ReactionEmoji("👍")]),
     )
-    return types.messages.ChatFull(full_chat=full, chats=[], users=[])
+    channel = types.Channel(
+        id=channel_id,
+        title="Channel",
+        photo=types.ChatPhotoEmpty(),
+        date=channel_date,
+        megagroup=True,
+    )
+    return types.messages.ChatFull(full_chat=full, chats=[channel], users=[])
 
 
 def _reference(*, channel_id: int = -1000000000123, access_hash: int = 0) -> ChannelReference:
@@ -161,7 +168,18 @@ async def test_profile_gateway_normalizes_one_full_channel_rpc() -> None:
     assert observation.current_photo is not None
     assert observation.current_photo.photo_id == 55
     assert (observation.observation_started_at, observation.observation_completed_at) == (100.25, 101.5)
+    assert observation.created is None
     assert not hasattr(observation, "full_chat")
+
+
+@pytest.mark.asyncio
+async def test_profile_gateway_captures_channel_creation_date() -> None:
+    created = datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC)
+    observation = await TelethonChannelProfileGateway(
+        _Client(_full_channel(channel_date=created))
+    ).fetch_channel_profile(_reference(access_hash=7))
+
+    assert observation.created == int(created.timestamp())
 
 
 @pytest.mark.asyncio

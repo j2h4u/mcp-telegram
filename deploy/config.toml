@@ -86,6 +86,13 @@ activity_cold_backfill_batch_pause_seconds = 5
 activity_cold_enroll_seconds = 1800
 activity_cold_access_retry_seconds = 3600
 
+[scheduling.automatic_group_history]
+# Automatically full-sync only small groups with recent bounded history.
+max_members = 100
+recent_days = 365
+max_messages = 5000
+probe_retry_seconds = 60
+
 [scheduling.activity_hot_sweep]
 loop_interval_seconds = 3600
 max_peers_per_pass = 16
