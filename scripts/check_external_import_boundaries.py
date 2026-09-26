@@ -49,6 +49,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "reading/scheduled_projection.py",
             "reading/draft_projection.py",
             "delta_sync.py",
+            "dialog_identity.py",
             "drafts/sqlite_projection.py",
             "dialog_sync.py",
             "dialog_directory.py",

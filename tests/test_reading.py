@@ -397,6 +397,28 @@ def test_search_messages_structured_payload_includes_dialog_anchor_read_state_wa
     assert payload["result_count_semantics"] == "count is the number of search hits returned in this response page"
 
 
+def test_empty_scoped_search_keeps_daemon_canonical_dialog_header() -> None:
+    payload = _search_structured_content(
+        _SearchStructuredContentContext(
+            args=SearchMessages(dialog="123", query="needle"),
+            data={
+                "messages": [],
+                "dialog_name": "Known peer",
+                "dialog_name_source": "name",
+            },
+            rows=[],
+            dialog_id=123,
+            dialog_label="123",
+            global_mode=False,
+            offset=0,
+            next_navigation=None,
+        )
+    )
+
+    assert payload["dialog_name"] == "Known peer"
+    assert payload["dialog_name_source"] == "name"
+
+
 def test_list_messages_structured_page_metadata_preserves_navigation_warning_coverage_and_limits():
     payload = _list_messages_structured_content(
         _ListMessagesStructuredContentContext(

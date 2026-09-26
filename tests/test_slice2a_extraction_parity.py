@@ -15,12 +15,12 @@ from typing import cast
 
 import pytest
 
+from mcp_telegram.dialog_identity import read_dialog_identities
 from mcp_telegram.models import DialogType
 from mcp_telegram.reading.query_records import read_message_from_row
 from mcp_telegram.reading.sqlite_projection import (
     _build_access_metadata,
     _build_list_messages_query,
-    _dialog_type_from_db,
     _ListMessagesDbRequest,
     _read_state_for_dialog,
 )
@@ -149,15 +149,17 @@ def test_build_access_metadata_archived(make_synced_db: Callable[[], sqlite3.Con
     assert meta["sync_coverage_pct"] == 62
 
 
-def test_dialog_type_from_db(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
+def test_dialog_identity_reads_canonical_owner_bundle(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
     conn = make_synced_db()
     conn.execute(
-        "INSERT INTO entities (id, type, name, updated_at) VALUES (?, 'User', 'Alice', 0)",
-        (100,),
+        "INSERT INTO dialogs (dialog_id, name, type, identity_source) VALUES (100, 'Alice', 'user', 'directory')"
     )
     conn.commit()
-    assert _dialog_type_from_db(conn, 100) == "User"
-    assert _dialog_type_from_db(conn, 999) == "Unknown"
+    identity = read_dialog_identities(conn, [100, 999])
+    assert identity[100].dialog_type is DialogType.USER
+    assert identity[100].display_name == "Alice"
+    assert identity[999].dialog_type is DialogType.UNKNOWN
+    assert identity[999].display_name_source == "numeric"
 
 
 def test_read_state_for_dialog_dm(make_synced_db: Callable[[], sqlite3.Connection]) -> None:

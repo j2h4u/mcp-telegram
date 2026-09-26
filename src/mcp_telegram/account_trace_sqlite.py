@@ -12,6 +12,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TypedDict, cast
 
+from .dialog_identity import read_dialog_identities
+
 _ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE username = ? COLLATE NOCASE"
 _TRACE_ACCOUNT_BY_ID_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE id = ?"
 _TRACE_ACCOUNT_NAMES_SQL = (
@@ -142,14 +144,10 @@ def build_dialog_summary_query(request: TraceMessageQueryRequest) -> tuple[str, 
     filtered = _apply_trace_query_scope(filtered, params, request)
     filtered = _apply_trace_query_bounds(filtered, params, request, include_navigation=False) + ") "
     sql = (
-        filtered + "SELECT mm.dialog_id, "
-        "COALESCE(d.name, e.name, CAST(mm.dialog_id AS TEXT)) AS dialog_title, "
-        "COALESCE(d.type, e.type) AS dialog_type, "
+        filtered + "SELECT mm.dialog_id, CAST(mm.dialog_id AS TEXT) AS dialog_title, 'unknown' AS dialog_type, "
         "COUNT(*) AS message_count, MIN(mm.sent_at) AS first_message_at, MAX(mm.sent_at) AS last_message_at, "
         "SUM(CASE WHEN mm.post_author IS NOT NULL THEN 1 ELSE 0 END) AS signature_message_count "
         "FROM matching_messages mm "
-        "LEFT JOIN dialogs d ON d.dialog_id = mm.dialog_id "
-        "LEFT JOIN entities e ON e.id = mm.dialog_id "
         "GROUP BY mm.dialog_id"
     )
     if request.navigation is not None:
@@ -171,8 +169,7 @@ def build_evidence_query(request: TraceMessageQueryRequest) -> tuple[str, dict[s
         f"WITH candidate_messages AS ({' UNION '.join(candidate_queries)}) "
         "SELECT m.dialog_id, m.message_id, m.sent_at, m.text, m.sender_id, "
         "m.media_kind, m.media_payload, m.forum_topic_id AS topic_id, "
-        "COALESCE(d.name, e_dialog.name, CAST(m.dialog_id AS TEXT)) AS dialog_title, "
-        "COALESCE(d.type, e_dialog.type) AS dialog_type, "
+        "CAST(m.dialog_id AS TEXT) AS dialog_title, 'unknown' AS dialog_type, "
         "COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
         "m.post_author AS author_signature, "
         f"{EFFECTIVE_SENDER_ID_SQL}, "
@@ -181,8 +178,6 @@ def build_evidence_query(request: TraceMessageQueryRequest) -> tuple[str, dict[s
         "ELSE 'post_author_signature' END AS authorship_basis "
         "FROM candidate_messages candidate "
         "JOIN messages m ON m.dialog_id = candidate.dialog_id AND m.message_id = candidate.message_id "
-        "LEFT JOIN dialogs d ON d.dialog_id = m.dialog_id "
-        "LEFT JOIN entities e_dialog ON e_dialog.id = m.dialog_id "
         "LEFT JOIN topic_metadata tm ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
         "WHERE 1 = 1"
     )
@@ -351,14 +346,43 @@ def hidden_dialog_ids(conn: sqlite3.Connection) -> set[int]:
 
 
 def dialog_metadata(conn: sqlite3.Connection, dialog_id: int) -> TraceDialogMetadata:
+    result = dialog_presence_metadata(conn, dialog_id)
+    identity = read_dialog_identities(conn, [dialog_id])[dialog_id]
+    return {
+        "dialog_type": identity.dialog_type.value,
+        "status": result["status"],
+        "hidden": result["hidden"],
+    }
+
+
+def dialog_presence_metadata(conn: sqlite3.Connection, dialog_id: int) -> TraceDialogMetadata:
     row = _one(
         conn.execute(
-            "SELECT COALESCE(d.type, e.type, 'Unknown'), COALESCE(sd.status, 'not_synced'), COALESCE(d.hidden, 0) FROM (SELECT ? AS dialog_id) x LEFT JOIN dialogs d ON d.dialog_id = x.dialog_id LEFT JOIN entities e ON e.id = x.dialog_id LEFT JOIN synced_dialogs sd ON sd.dialog_id = x.dialog_id",
+            "SELECT COALESCE(sd.status, 'not_synced'), COALESCE(d.hidden, 0) "
+            "FROM (SELECT ? AS dialog_id) x LEFT JOIN dialogs d ON d.dialog_id=x.dialog_id "
+            "LEFT JOIN synced_dialogs sd ON sd.dialog_id=x.dialog_id",
             (dialog_id,),
         )
     )
-    values = _sequence(row) if row is not None else ("Unknown", "not_synced", 0)
-    return {"dialog_type": str(values[0]), "status": str(values[1]), "hidden": bool(values[2])}
+    values = _sequence(row) if row is not None else ("not_synced", 0)
+    return {"dialog_type": "unknown", "status": str(values[0]), "hidden": bool(values[1])}
+
+
+def apply_trace_dialog_identities(
+    conn: sqlite3.Connection,
+    rows: Sequence[Mapping[str, object]],
+) -> list[Mapping[str, object]]:
+    ids = [_int(row["dialog_id"]) for row in rows]
+    identities = read_dialog_identities(conn, ids)
+    projected = [
+        {
+            **row,
+            "dialog_title": identities[dialog_id].display_name,
+            "dialog_type": identities[dialog_id].dialog_type.value,
+        }
+        for row, dialog_id in zip(rows, ids, strict=True)
+    ]
+    return cast(list[Mapping[str, object]], projected)
 
 
 def common_chat_ids(conn: sqlite3.Connection, target_user_id: int) -> list[int]:

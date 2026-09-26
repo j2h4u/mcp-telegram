@@ -22,6 +22,8 @@ from telethon.tl.functions.messages import GetHistoryRequest  # type: ignore[imp
 
 from helpers import MockTotalList, build_mock_message, build_mock_reactions
 from mcp_telegram.config import AutomaticGroupHistoryConfig
+from mcp_telegram.dialog_identity import capture_identity_baseline, publish_dialog_identity
+from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
 from mcp_telegram.fts import stem_text
 from mcp_telegram.history_enrollment import disable_history, enable_history
 from mcp_telegram.message_contracts import StoredMessage
@@ -517,6 +519,57 @@ async def test_dm_bootstrap_excludes_hidden_rows_and_preserves_richer_entity_typ
     assert worker.consume_canonical_dm_publication() == 1
     assert sync_db.execute("SELECT dialog_id FROM synced_dialogs ORDER BY dialog_id").fetchall() == [(101,)]
     assert sync_db.execute("SELECT type FROM entities WHERE id=101").fetchone() == ("channel",)
+
+
+def test_dm_enrollment_uses_canonical_type_after_partial_realtime_identity(sync_db: _SQLiteConnection) -> None:
+    sync_db.executemany("INSERT INTO dialogs(dialog_id) VALUES (?)", [(201,), (202,), (203,)])
+    for dialog_id, dialog_type, name, username in (
+        (201, "user", "Alice", "alice"),
+        (202, "user", "Hidden", None),
+        (203, "unknown", "Unknown", None),
+    ):
+        baseline = capture_identity_baseline(sync_db, dialog_id)
+        assert publish_dialog_identity(
+            sync_db,
+            dialog_id,
+            DialogIdentityObservation(
+                dialog_id,
+                name,
+                username,
+                dialog_type,
+                dialog_type != "unknown",
+                "directory",
+                10,
+            ),
+            baseline,
+        )
+    sync_db.execute("UPDATE dialogs SET hidden=1 WHERE dialog_id=202")
+    sync_db.execute("UPDATE dialog_directory_publication SET generation=77")
+    sync_db.commit()
+
+    baseline = capture_identity_baseline(sync_db, 201)
+    assert publish_dialog_identity(
+        sync_db,
+        201,
+        DialogIdentityObservation(
+            201,
+            username="alice_new",
+            dialog_type=IDENTITY_OMITTED,
+            complete=False,
+            source="realtime",
+            observed_at=11,
+        ),
+        baseline,
+    )
+    identity = sync_db.execute(
+        "SELECT name,username,type,identity_complete FROM dialogs WHERE dialog_id=201"
+    ).fetchone()
+    assert identity == ("Alice", "alice_new", "user", 0)
+    sync_db.commit()
+
+    worker = make_worker(MagicMock(), sync_db, asyncio.Event())
+    assert worker.consume_canonical_dm_publication() == 1
+    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs ORDER BY dialog_id").fetchall() == [(201,)]
 
 
 @pytest.mark.asyncio

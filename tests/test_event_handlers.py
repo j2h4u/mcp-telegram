@@ -21,8 +21,11 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from telethon.tl import types  # type: ignore[import-untyped]
 
 from helpers import build_mock_message
+from mcp_telegram.dialog_identity import capture_identity_baseline, publish_dialog_identity
+from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
 from mcp_telegram.event_handlers import (
     EventHandlerManager,
     UpdateProcessingBarrier,
@@ -452,7 +455,7 @@ async def test_first_seen_private_message_projects_visible_dialog_and_entity(
     shutdown_event: asyncio.Event,
 ) -> None:
     dialog_id = 7016
-    sender = SimpleNamespace(first_name="Алиса", last_name="Иванова", username="alice")
+    sender = types.User(id=dialog_id, first_name="Алиса", last_name="Иванова", username="alice")
     msg = build_mock_message(id=17, text="hello")
     event = cast(
         _NewMessageEvent,
@@ -483,13 +486,74 @@ async def test_first_seen_private_message_projects_visible_dialog_and_entity(
 
 
 @pytest.mark.asyncio
+async def test_dm_enrollment_does_not_overwrite_identity_published_during_sender_lookup(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 7017
+    sync_db.execute("INSERT INTO dialogs(dialog_id) VALUES (?)", (dialog_id,))
+    baseline = capture_identity_baseline(sync_db, dialog_id)
+    assert publish_dialog_identity(
+        sync_db,
+        dialog_id,
+        DialogIdentityObservation(dialog_id, "Known", "old_handle", "user", True, "directory", 10),
+        baseline,
+    )
+    sync_db.commit()
+
+    lookup_started = asyncio.Event()
+    lookup_release = asyncio.Event()
+
+    async def delayed_sender() -> types.User:
+        lookup_started.set()
+        await lookup_release.wait()
+        return types.User(id=dialog_id, first_name="Stale", last_name="Sender", username="old_handle")
+
+    msg = build_mock_message(id=19, text="hello")
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(chat_id=dialog_id, message=msg, is_private=True, get_sender=delayed_sender),
+    )
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    handling = asyncio.create_task(manager.on_new_message(event))
+    await lookup_started.wait()
+
+    baseline = capture_identity_baseline(sync_db, dialog_id)
+    assert publish_dialog_identity(
+        sync_db,
+        dialog_id,
+        DialogIdentityObservation(
+            dialog_id,
+            name=IDENTITY_OMITTED,
+            username=None,
+            dialog_type=IDENTITY_OMITTED,
+            complete=False,
+            source="realtime",
+            observed_at=20,
+        ),
+        baseline,
+    )
+    sync_db.commit()
+    lookup_release.set()
+    await handling
+
+    assert sync_db.execute(
+        "SELECT name,username,type,identity_complete FROM dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == ("Known", None, "user", 0)
+    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        dialog_id,
+    )
+
+
+@pytest.mark.asyncio
 async def test_first_seen_outgoing_private_message_uses_chat_peer(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     dialog_id = 7017
-    peer = SimpleNamespace(first_name="Target", last_name="Bot", username="target_bot", bot=True)
+    peer = types.User(id=dialog_id, first_name="Target", last_name="Bot", username="target_bot", bot=True)
     msg = build_mock_message(id=18, text="outgoing")
     msg.out = True
     get_sender = AsyncMock(side_effect=AssertionError("operator sender must not be used"))
@@ -514,6 +578,34 @@ async def test_first_seen_outgoing_private_message_uses_chat_peer(
     )
     get_chat.assert_awaited_once_with()
     get_sender.assert_not_awaited()
+
+
+def test_min_user_defaults_do_not_replace_known_canonical_bot_identity(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 7021
+    sync_db.execute("INSERT INTO dialogs(dialog_id) VALUES (?)", (dialog_id,))
+    baseline = capture_identity_baseline(sync_db, dialog_id)
+    assert publish_dialog_identity(
+        sync_db,
+        dialog_id,
+        DialogIdentityObservation(dialog_id, "Known Bot", "known_bot", "bot", True, "directory", 10),
+        baseline,
+    )
+    sync_db.commit()
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+
+    assert manager._auto_enroll_dm(
+        dialog_id,
+        sender=types.User(id=dialog_id, min=True, access_hash=42),
+        observed_at=20,
+    )
+
+    assert sync_db.execute(
+        "SELECT name,username,type,identity_complete FROM dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == ("Known Bot", "known_bot", "bot", 1)
 
 
 @pytest.mark.asyncio
@@ -541,6 +633,7 @@ async def test_first_seen_outgoing_private_lookup_failure_keeps_message_discover
     assert sync_db.execute(
         "SELECT name, type, hidden, needs_refresh FROM dialogs WHERE dialog_id=?", (dialog_id,)
     ).fetchone() == (None, None, 0, 1)
+    assert sync_db.execute("SELECT identity_revision FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (0,)
     assert sync_db.execute("SELECT message_id, out FROM messages WHERE dialog_id=?", (dialog_id,)).fetchone() == (19, 1)
 
 
@@ -584,7 +677,7 @@ async def test_first_seen_private_event_preserves_existing_dialog_facts(
         (dialog_id,),
     )
     sync_db.commit()
-    sender = SimpleNamespace(first_name="New", last_name="Name", username="new_name")
+    sender = types.User(id=dialog_id, first_name="New", last_name="Name", username="new_name")
     msg = build_mock_message(id=20, text="new")
     event = cast(
         _NewMessageEvent,
@@ -601,9 +694,13 @@ async def test_first_seen_private_event_preserves_existing_dialog_facts(
     # Realtime presence intentionally exposes an absent-from-snapshot row; other
     # durable dialog facts must survive the thin first-event projection.
     assert sync_db.execute(
-        "SELECT name, archived, pinned, members, hidden, unread_count FROM dialogs WHERE dialog_id=?",
+        "SELECT archived, pinned, members, hidden, unread_count FROM dialogs WHERE dialog_id=?",
         (dialog_id,),
-    ).fetchone() == ("Saved", 1, 1, 9, 0, 4)
+    ).fetchone() == (1, 1, 9, 0, 4)
+    assert sync_db.execute(
+        "SELECT name,username,type,identity_complete,identity_source,identity_revision FROM dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone() == ("New Name", "new_name", "user", 1, "realtime", 1)
 
 
 @pytest.mark.asyncio
@@ -710,7 +807,11 @@ def test_dm_entity_collectible_username_and_partial_sender_preserve_canonical_fa
             "INSERT INTO entities(id,type,name,username,name_normalized,updated_at) VALUES (?,?,?,?,?,?)",
             (unknown_id, stored_type, None, None, None, 1),
         )
-        identity = manager._dm_identity(SimpleNamespace(first_name=None, last_name=None, username="observed"))
+        identity = manager._dm_identity(
+            SimpleNamespace(first_name=None, last_name=None, username="observed"),
+            dialog_id=unknown_id,
+            observed_at=102,
+        )
         assert identity is not None
         manager._persist_dm_entity(unknown_id, identity, observed_at=102)
         assert sync_db.execute("SELECT type,username FROM entities WHERE id=?", (unknown_id,)).fetchone() == (
@@ -805,7 +906,7 @@ def test_auto_enroll_entity_failure_does_not_rollback_committed_dialog_projectio
 
     assert manager._auto_enroll_dm(
         dialog_id,
-        sender=SimpleNamespace(first_name="Committed", last_name="Peer", username="committed"),
+        sender=types.User(id=dialog_id, first_name="Committed", last_name="Peer", username="committed"),
         message_date=build_mock_message(id=23).date,
         observed_at=100,
     )

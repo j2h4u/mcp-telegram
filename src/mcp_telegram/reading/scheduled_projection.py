@@ -36,19 +36,17 @@ SELECT
     sm.dialog_id,
     NULL AS fwd_from_name,
     sm.post_author,
-    d.name AS dialog_name,
+    NULL AS dialog_name,
     sm.scheduled_at AS scheduled_at,
     sm.published_at AS published_at
 """
 _SCHEDULED_MESSAGE_LIST_FROM_SQL = """
 FROM scheduled_messages sm
-LEFT JOIN dialogs d ON d.dialog_id = sm.dialog_id
 """
 _SCHEDULED_MESSAGE_SEARCH_FROM_SQL = """
 FROM scheduled_messages sm
 JOIN scheduled_messages_fts sf
   ON sf.dialog_id = sm.dialog_id AND sf.message_id = sm.message_id
-LEFT JOIN dialogs d ON d.dialog_id = sm.dialog_id
 """
 
 

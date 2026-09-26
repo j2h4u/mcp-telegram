@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TextIO, cast
 
 _CAPACITY_MARKERS = ("no space left on device", "disk quota exceeded", "errno 28")
+_SQLITE_SHARED_MEMORY_MARKERS = ("sqlite_errorname=sqlite_ioerr_shmmap",)
 _SQLITE_IO_MARKERS = ("sqlite_errorname=SQLITE_IOERR", "sqlite3.operationalerror: disk i/o error")
 _SQLITE_APPLICATION_MARKERS = (
     "sqlite_error",
@@ -19,9 +20,11 @@ _SQLITE_APPLICATION_MARKERS = (
     "cannot start a transaction",
     "cannot commit",
 )
+_NATIVE_EXTENSION_LOAD_MARKERS = ("failed to map segment from shared object",)
 _MIN_FREE_BYTES = 512 * 1024 * 1024
 _MIN_FREE_INODES = 4_096
 _MAX_ATTEMPTS = 2
+_RETRYABLE_OUTCOMES = frozenset({"runner_capacity_exhausted", "runner_filesystem_io_failure"})
 
 
 def _runner_temp() -> Path:
@@ -45,7 +48,7 @@ def report_filesystem_state() -> None:
 
 
 def classify_failure(log_text: str, runner_temp: Path) -> str:
-    """Classify SQLite-related CI failures using log and live capacity evidence."""
+    """Classify CI failures using log markers and live filesystem capacity."""
     lowered = log_text.lower()
     usage = shutil.disk_usage(runner_temp)
     stat = os.statvfs(runner_temp)
@@ -55,11 +58,15 @@ def classify_failure(log_text: str, runner_temp: Path) -> str:
         or stat.f_favail < _MIN_FREE_INODES
     ):
         return "runner_capacity_exhausted"
+    if any(marker in lowered for marker in _SQLITE_SHARED_MEMORY_MARKERS):
+        return "sqlite_shared_memory_mapping_failure"
     if any(marker.lower() in lowered for marker in _SQLITE_IO_MARKERS):
         return "runner_filesystem_io_failure"
     if any(marker in lowered for marker in _SQLITE_APPLICATION_MARKERS):
         return "sqlite_application_failure"
-    return "sqlite_application_failure"
+    if any(marker in lowered for marker in _NATIVE_EXTENSION_LOAD_MARKERS):
+        return "native_extension_load_failure"
+    return "unknown_failure"
 
 
 def _run_once(command: list[str], work_dir: Path, attempt: int) -> tuple[int, str]:
@@ -106,7 +113,7 @@ def run_with_diagnostics(command: list[str]) -> int:
         report_filesystem_state()
         outcome = classify_failure(log_text, runner_temp)
         print(f"ci_failure_outcome={outcome}", flush=True)
-        if attempt == _MAX_ATTEMPTS or outcome == "sqlite_application_failure":
+        if attempt == _MAX_ATTEMPTS or outcome not in _RETRYABLE_OUTCOMES:
             return return_code
         print(f"retrying_after={outcome}", flush=True)
         shutil.rmtree(work_dir / f"a{attempt}")

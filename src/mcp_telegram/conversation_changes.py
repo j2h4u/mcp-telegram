@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import cast
 
 from .conversation_change_contracts import CHANGE_KINDS
+from .dialog_identity import read_dialog_identities
 
 _TOKEN_VERSION = 1
 _MIN_PAGE_DEPTH = 2
@@ -221,11 +222,10 @@ def _query_rows(
     after_seq: int | None,
 ) -> list[tuple[object, ...]]:
     placeholders = ",".join("?" for _ in request.kinds)
-    query = f"""SELECT e.seq,e.kind,e.occurred_at,e.time_basis,e.dialog_id,d.name,
+    query = f"""SELECT e.seq,e.kind,e.occurred_at,e.time_basis,e.dialog_id,
                        e.message_id,e.version,e.reason_code,e.access_change_cause,e.actor_id,
                        m.text,mv.old_text,next_mv.old_text
                   FROM conversation_history_events e
-                  LEFT JOIN dialogs d ON d.dialog_id=e.dialog_id
                   LEFT JOIN messages m ON m.dialog_id=e.dialog_id AND m.message_id=e.message_id
                   LEFT JOIN message_versions mv
                     ON mv.dialog_id=e.dialog_id AND mv.message_id=e.message_id AND mv.version=e.version
@@ -252,7 +252,7 @@ def _query_rows(
 
 
 def _text_evidence(row: tuple[object, ...]) -> dict[str, object] | None:
-    kind, current_text, before_text, next_before_text = row[1], row[11], row[12], row[13]
+    kind, current_text, before_text, next_before_text = row[1], row[10], row[11], row[12]
     if kind == "deleted_message":
         return {
             "untrusted_content": True,
@@ -288,20 +288,20 @@ def _summary(kind: object) -> str:
     }[cast(str, kind)]
 
 
-def _event(row: tuple[object, ...]) -> dict[str, object]:
+def _event(row: tuple[object, ...], dialog_title: str) -> dict[str, object]:
     return {
         "event_id": row[0],
         "kind": row[1],
         "occurred_at": row[2],
         "time_basis": row[3],
         "dialog_id": row[4],
-        "dialog_title": row[5],
-        "message_id": row[6],
-        "version": row[7],
+        "dialog_title": dialog_title,
+        "message_id": row[5],
+        "version": row[6],
         "summary": _summary(row[1]),
-        "reason_code": row[8],
-        "access_change_cause": row[9],
-        "actor_id": row[10],
+        "reason_code": row[7],
+        "access_change_cause": row[8],
+        "actor_id": row[9],
         "text_evidence": _text_evidence(row),
     }
 
@@ -321,6 +321,8 @@ def query_conversation_changes(
             )[0]
         )
         rows = _query_rows(conn, request, snapshot_seq=snapshot_seq, after_seq=cursor.after_seq if cursor else None)
+        page_rows = rows[: request.page_limit]
+        identities = read_dialog_identities(conn, (_strict_int(row[4], "dialog_id") for row in page_rows))
     except sqlite3.OperationalError:
         return {"ok": False, "error": "backend_error", "message": "conversation changes unavailable"}
     except ValueError as exc:
@@ -331,10 +333,9 @@ def query_conversation_changes(
             "message": message,
         }
     has_more = len(rows) > request.page_limit
-    page_rows = rows[: request.page_limit]
     page_depth = cursor.page_depth if cursor is not None else 1
     next_navigation = None
-    if has_more and page_rows:
+    if has_more:
         next_navigation = codec.encode(
             ConversationChangesCursor(
                 request.since_utc,
@@ -350,7 +351,7 @@ def query_conversation_changes(
     return {
         "ok": True,
         "data": {
-            "events": [_event(row) for row in page_rows],
+            "events": [_event(row, identities[_strict_int(row[4], "dialog_id")].display_name) for row in page_rows],
             "count": len(page_rows),
             "has_more": has_more,
             "next_navigation": next_navigation,

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
+from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED
 from mcp_telegram.entity_profile.contracts import (
     NORMALIZATION_VERSION,
     ObservationBoundary,
@@ -84,6 +85,27 @@ def test_telethon_user_with_unspecified_bot_flag_is_a_user() -> None:
     assert result.full_profile.status is ProjectionStatus.USABLE
     assert result.full_profile.payload is not None
     assert result.full_profile.payload["bot"] is False
+    assert result.full_profile.dialog_identity_observation is None
+
+
+def test_min_telethon_user_emits_only_positive_partial_identity_on_fresh_boundary() -> None:
+    user = User(id=42, first_name="Partial", last_name="", username=None, usernames=None, min=True)
+    result = normalize_full_user_response(
+        SimpleNamespace(full_user=SimpleNamespace(), users=[user], chats=[]),
+        target_id=42,
+        target_kind=TargetKind.USER,
+        observation=ObservationBoundary(10.0, 11.0),
+    )
+
+    identity = result.full_profile.dialog_identity_observation
+    assert identity is not None
+    assert (identity.name, identity.username, identity.dialog_type, identity.complete, identity.observed_at) == (
+        "Partial",
+        IDENTITY_OMITTED,
+        IDENTITY_OMITTED,
+        False,
+        10,
+    )
 
 
 def test_full_profile_identity_patch_distinguishes_absent_empty_and_deleted_username() -> None:

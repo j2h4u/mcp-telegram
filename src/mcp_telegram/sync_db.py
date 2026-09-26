@@ -14,8 +14,9 @@ from .dialog_classification import (
 )
 from .telegram_rpc_consumers import DemandKind, demand_freshness_seconds
 
-_CURRENT_SCHEMA_VERSION = 77
+_CURRENT_SCHEMA_VERSION = 78
 _LINKED_CHAT_FACT_DEMAND_MIGRATION = 77
+_DIALOG_IDENTITY_OWNER_MIGRATION = 78
 _SCHEMA_VERSION_WITH_FTS = 3
 _EVENT_STORE_MIGRATION_51 = 51
 _MESSAGE_ORIGIN_MIGRATION_52 = 52
@@ -568,7 +569,8 @@ CREATE TABLE IF NOT EXISTS dialogs (
     username                TEXT,
     identity_observed_at    INTEGER,
     identity_complete       INTEGER NOT NULL DEFAULT 0 CHECK(identity_complete IN (0, 1)),
-    identity_source         TEXT CHECK(identity_source IN ('directory', 'realtime', 'mixed', 'legacy') OR identity_source IS NULL)
+    identity_source         TEXT CHECK(identity_source IN ('directory', 'realtime', 'profile', 'mixed', 'legacy') OR identity_source IS NULL),
+    identity_revision       INTEGER NOT NULL DEFAULT 0 CHECK(identity_revision >= 0)
 )
 """
 
@@ -741,7 +743,10 @@ ON dialog_full_reconciliation_baseline(generation, seen, dialog_id)
 
 _DIALOGS_REVISION_TRIGGER_DDL = """
 CREATE TRIGGER IF NOT EXISTS dialogs_revision_after_update
-AFTER UPDATE ON dialogs
+AFTER UPDATE OF archived,pinned,members,created,last_message_at,snapshot_at,hidden,needs_refresh,
+                unread_mentions_count,unread_reactions_count,unread_count,unread_mark,
+                unread_count_observed_at,unread_mark_observed_at,linked_chat_id,linked_chat_resolved_at,
+                read_inbox_max_id,read_outbox_max_id ON dialogs
 WHEN NEW.revision = OLD.revision
 BEGIN
     UPDATE dialogs
@@ -795,10 +800,12 @@ CREATE TABLE IF NOT EXISTS dialog_directory_staging (
     unread_mark         INTEGER,
     snapshot_at         INTEGER NOT NULL,
     baseline_revision   INTEGER,
+    baseline_identity_revision INTEGER,
+    identity_fields_observed INTEGER NOT NULL DEFAULT 0 CHECK(identity_fields_observed BETWEEN 0 AND 7),
     username            TEXT,
     identity_observed_at INTEGER,
     identity_complete   INTEGER NOT NULL DEFAULT 0 CHECK(identity_complete IN (0, 1)),
-    identity_source     TEXT CHECK(identity_source IN ('directory', 'realtime', 'mixed', 'legacy') OR identity_source IS NULL),
+    identity_source     TEXT CHECK(identity_source IN ('directory', 'realtime', 'profile', 'mixed', 'legacy') OR identity_source IS NULL),
     eligibility_category TEXT CHECK(eligibility_category IN ('contact', 'non_contact', 'bot', 'group', 'broadcast') OR eligibility_category IS NULL),
     eligibility_archived INTEGER CHECK(eligibility_archived IN (0, 1) OR eligibility_archived IS NULL),
     eligibility_unread   INTEGER CHECK(eligibility_unread IN (0, 1) OR eligibility_unread IS NULL),
@@ -889,6 +896,24 @@ CREATE TABLE IF NOT EXISTS draft_order_uncertainty (
 ) WITHOUT ROWID
 """
 
+_DIALOGS_V78_DDL = """
+CREATE TABLE dialogs_v78 (
+    dialog_id INTEGER PRIMARY KEY, name TEXT, type TEXT,
+    archived INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0,
+    members INTEGER, created INTEGER, last_message_at INTEGER, snapshot_at INTEGER,
+    hidden INTEGER NOT NULL DEFAULT 0, needs_refresh INTEGER NOT NULL DEFAULT 0,
+    unread_mentions_count INTEGER NOT NULL DEFAULT 0, unread_reactions_count INTEGER NOT NULL DEFAULT 0,
+    unread_count INTEGER, unread_mark INTEGER, unread_count_observed_at INTEGER,
+    unread_mark_observed_at INTEGER, linked_chat_id INTEGER, linked_chat_resolved_at INTEGER,
+    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+    read_inbox_max_id INTEGER, read_outbox_max_id INTEGER, username TEXT,
+    identity_observed_at INTEGER,
+    identity_complete INTEGER NOT NULL DEFAULT 0 CHECK(identity_complete IN (0, 1)),
+    identity_source TEXT CHECK(identity_source IN ('directory','realtime','profile','mixed','legacy') OR identity_source IS NULL),
+    identity_revision INTEGER NOT NULL DEFAULT 0 CHECK(identity_revision >= 0)
+)
+"""
+
 _DIALOG_DIRECTORY_FACTS_DDL = """
 CREATE TABLE IF NOT EXISTS dialog_directory_facts (
     dialog_id   INTEGER PRIMARY KEY,
@@ -905,6 +930,7 @@ CREATE TABLE IF NOT EXISTS dialog_directory_baseline (
     generation        INTEGER NOT NULL,
     dialog_id         INTEGER NOT NULL,
     baseline_revision INTEGER NOT NULL CHECK(baseline_revision >= 0),
+    baseline_identity_revision INTEGER NOT NULL DEFAULT 0 CHECK(baseline_identity_revision >= 0),
     seen              INTEGER NOT NULL DEFAULT 0 CHECK(seen IN (0, 1)),
     PRIMARY KEY(generation, dialog_id)
 ) WITHOUT ROWID
@@ -4459,6 +4485,130 @@ def _apply_migration_77(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _reset_pre78_directory_generation(conn: sqlite3.Connection) -> None:
+    state = cast(
+        tuple[int, str] | None,
+        conn.execute("SELECT generation,status FROM dialog_directory_state WHERE singleton=1").fetchone(),
+    )
+    if state is None or state[1] not in {"in_progress", "incomplete"}:
+        return
+    generation = state[0]
+    conn.execute("DELETE FROM dialog_directory_staging WHERE generation=?", (generation,))
+    conn.execute("DELETE FROM dialog_directory_baseline WHERE generation=?", (generation,))
+    conn.execute("DELETE FROM dialog_directory_pins WHERE generation=?", (generation,))
+    conn.execute(
+        "UPDATE dialog_directory_state SET status='pending',ordinary_status='pending',"
+        "pinned_main_status='pending',pinned_archive_status='pending',offset_date=NULL,offset_id=0,"
+        "offset_peer=NULL,observation_started_at=NULL,observation_completed_at=NULL,observed_count=0,"
+        "reason='identity_baseline_cutover',retry_at=NULL WHERE singleton=1"
+    )
+
+
+def _dialog_needs_v78_rebuild(conn: sqlite3.Connection) -> bool:
+    columns = _table_column_names(conn, "dialogs")
+    schema_row = cast(
+        tuple[str | None] | None,
+        conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='dialogs'").fetchone(),
+    )
+    schema_sql = "" if schema_row is None or schema_row[0] is None else schema_row[0]
+    return "identity_revision" not in columns or "profile" not in schema_sql
+
+
+def _seed_v78_dialog_facts(conn: sqlite3.Connection, columns: set[str]) -> None:
+    names = [
+        "dialog_id",
+        "name",
+        "type",
+        "archived",
+        "pinned",
+        "members",
+        "created",
+        "last_message_at",
+        "snapshot_at",
+        "hidden",
+        "needs_refresh",
+        "unread_mentions_count",
+        "unread_reactions_count",
+        "unread_count",
+        "unread_mark",
+        "unread_count_observed_at",
+        "unread_mark_observed_at",
+        "linked_chat_id",
+        "linked_chat_resolved_at",
+        "revision",
+        "read_inbox_max_id",
+        "read_outbox_max_id",
+        "username",
+        "identity_observed_at",
+        "identity_complete",
+        "identity_source",
+    ]
+    present = [name for name in names if name in columns]
+    conn.execute(f"INSERT INTO dialogs_v78({','.join(present)}) SELECT {','.join(present)} FROM dialogs")
+    conn.execute(
+        "UPDATE dialogs_v78 SET identity_source='legacy',identity_complete=0,identity_observed_at=NULL "
+        "WHERE identity_source IS NULL AND (length(trim(COALESCE(name,'')))>0 "
+        "OR length(trim(COALESCE(username,'')))>0 OR (type IS NOT NULL AND lower(trim(type)) NOT IN ('','unknown'))) "
+    )
+
+
+def _rebuild_dialogs_for_v78(conn: sqlite3.Connection) -> None:
+    if not _dialog_needs_v78_rebuild(conn):
+        return
+    triggers = cast(
+        list[tuple[str, str]],
+        conn.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='dialogs' AND sql IS NOT NULL"
+        ).fetchall(),
+    )
+    for name, _ in triggers:
+        conn.execute(f"DROP TRIGGER {name}")
+    conn.execute(_DIALOGS_V78_DDL)
+    _seed_v78_dialog_facts(conn, _table_column_names(conn, "dialogs"))
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    conn.execute("DROP TABLE dialogs")
+    conn.execute("ALTER TABLE dialogs_v78 RENAME TO dialogs")
+    conn.execute("PRAGMA legacy_alter_table=OFF")
+    for _, statement in triggers:
+        conn.execute(statement)
+    for statement in (
+        _DIALOGS_HIDDEN_PINNED_INDEX_DDL,
+        _DIALOGS_TYPE_INDEX_DDL,
+        _DIALOGS_SNAPSHOT_AT_INDEX_DDL,
+        _DIALOGS_NEEDS_REFRESH_INDEX_DDL,
+    ):
+        conn.execute(statement)
+
+
+def _install_v78_directory_schema(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP TRIGGER IF EXISTS dialogs_revision_after_update")
+    conn.execute(_DIALOGS_REVISION_TRIGGER_DDL)
+    baseline_columns = _table_column_names(conn, "dialog_directory_baseline")
+    if "baseline_identity_revision" not in baseline_columns:
+        conn.execute(
+            "ALTER TABLE dialog_directory_baseline ADD COLUMN baseline_identity_revision INTEGER NOT NULL DEFAULT 0 CHECK(baseline_identity_revision >= 0)"
+        )
+    conn.execute("DROP TABLE IF EXISTS dialog_directory_staging")
+    conn.execute(_DIALOG_DIRECTORY_STAGING_DDL)
+
+
+def _apply_migration_78(conn: sqlite3.Connection, current: int) -> int:
+    """Separate directory presence and dialog identity fences."""
+    if current >= _DIALOG_IDENTITY_OWNER_MIGRATION:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _reset_pre78_directory_generation(conn)
+        _rebuild_dialogs_for_v78(conn)
+        _install_v78_directory_schema(conn)
+        conn.execute("INSERT OR IGNORE INTO schema_version VALUES (78, strftime('%s','now'))")
+        conn.commit()
+        return 78
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _apply_migrations_64_to_67(conn: sqlite3.Connection, current: int) -> int:
     """Apply the ordered canonical-directory and folder migrations."""
     if _CURRENT_SCHEMA_VERSION >= _CANONICAL_DIALOG_DIRECTORY_MIGRATION_64:
@@ -4504,6 +4654,8 @@ def _apply_late_migrations(conn: sqlite3.Connection, current: int) -> int:
     current = _apply_migrations_72_to_76(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _LINKED_CHAT_FACT_DEMAND_MIGRATION:
         current = _apply_migration_77(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _DIALOG_IDENTITY_OWNER_MIGRATION:
+        current = _apply_migration_78(conn, current)
     return current
 
 

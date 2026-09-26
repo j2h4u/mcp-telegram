@@ -9,6 +9,7 @@ import pytest
 from telethon.tl import types
 from telethon.tl.functions.messages import GetFullChatRequest
 
+from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED
 from mcp_telegram.telegram_gateway import TelethonGroupProfileGateway
 
 
@@ -74,8 +75,37 @@ async def test_group_gateway_builds_request_and_normalizes_all_primitives() -> N
     assert observation.current_photo.photo_id == 55
     assert observation.observation_started_at == 100
     assert observation.observation_completed_at == 101
+    assert observation.identity_patch == {"type": "group", "name": "Group", "username": None}
+    assert observation.dialog_identity_observation is not None
+    assert (
+        observation.dialog_identity_observation.dialog_id,
+        observation.dialog_identity_observation.name,
+        observation.dialog_identity_observation.dialog_type,
+        observation.dialog_identity_observation.complete,
+        observation.dialog_identity_observation.observed_at,
+    ) == (-123, "Group", "group", True, 100)
     assert observation.created is None
     assert not hasattr(observation, "full_chat")
+
+
+@pytest.mark.asyncio
+async def test_forbidden_group_gateway_observation_keeps_only_positive_title() -> None:
+    response = _full_chat()
+    object.__setattr__(response, "chats", [types.ChatForbidden(id=123, title="Partial group")])
+
+    observation = await TelethonGroupProfileGateway(
+        _Client(response), now_provider=iter((100.2, 101.8)).__next__
+    ).fetch_group_profile(-123)
+
+    identity = observation.dialog_identity_observation
+    assert identity is not None
+    assert (identity.name, identity.username, identity.dialog_type, identity.complete, identity.observed_at) == (
+        "Partial group",
+        IDENTITY_OMITTED,
+        IDENTITY_OMITTED,
+        False,
+        100,
+    )
 
 
 @pytest.mark.asyncio

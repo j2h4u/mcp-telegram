@@ -6,7 +6,7 @@ from typing import cast
 
 from pydantic import ConfigDict, Field, StrictInt, model_validator
 
-from ..entity_identity import ENTITY_IDENTITY_SCHEMA, EntityIdentity, project_entity_identity
+from ..entity_identity import ENTITY_IDENTITY_SCHEMA, project_entity_identity
 from ..formatter import (
     _render_read_state_header,
 )
@@ -43,7 +43,15 @@ GET_INBOX_OUTPUT_SCHEMA = {
         "read_position_pending_count": {"type": "integer"},
         "read_position_pending_entities": {
             "type": "array",
-            "items": ENTITY_IDENTITY_SCHEMA,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "entity": ENTITY_IDENTITY_SCHEMA,
+                    "display_name_source": {"type": "string", "enum": ["name", "username", "numeric"]},
+                },
+                "required": ["entity", "display_name_source"],
+                "additionalProperties": False,
+            },
         },
         "coverage": {
             "type": "object",
@@ -53,7 +61,15 @@ GET_INBOX_OUTPUT_SCHEMA = {
                 "read_position_pending_count": {"type": "integer"},
                 "read_position_pending_entities": {
                     "type": "array",
-                    "items": ENTITY_IDENTITY_SCHEMA,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "entity": ENTITY_IDENTITY_SCHEMA,
+                            "display_name_source": {"type": "string", "enum": ["name", "username", "numeric"]},
+                        },
+                        "required": ["entity", "display_name_source"],
+                        "additionalProperties": False,
+                    },
                 },
             },
             "required": ["complete", "state", "read_position_pending_count", "read_position_pending_entities"],
@@ -86,9 +102,10 @@ GET_INBOX_OUTPUT_SCHEMA = {
                         "type": "object",
                         "properties": {
                             "entity": ENTITY_IDENTITY_SCHEMA,
+                            "display_name_source": {"type": "string", "enum": ["name", "username", "numeric"]},
                             "hidden_count": {"type": "integer"},
                         },
-                        "required": ["entity", "hidden_count"],
+                        "required": ["entity", "display_name_source", "hidden_count"],
                         "additionalProperties": False,
                     },
                 },
@@ -110,6 +127,7 @@ GET_INBOX_OUTPUT_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "entity": ENTITY_IDENTITY_SCHEMA,
+                    "display_name_source": {"type": "string", "enum": ["name", "username", "numeric"]},
                     "category": {"type": ["string", "null"]},
                     "dialog_type": {"type": ["string", "null"]},
                     "unread_count": {"type": "integer"},
@@ -158,6 +176,7 @@ GET_INBOX_OUTPUT_SCHEMA = {
                 },
                 "required": [
                     "entity",
+                    "display_name_source",
                     "category",
                     "dialog_type",
                     "unread_count",
@@ -202,6 +221,7 @@ GET_UNREAD_SUMMARY_OUTPUT_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "entity": ENTITY_IDENTITY_SCHEMA,
+                    "display_name_source": {"type": "string", "enum": ["name", "username", "numeric"]},
                     "dialog_type": {"type": ["string", "null"]},
                     "unread_count": {"type": ["integer", "null"]},
                     "unread_mark": {"type": ["boolean", "null"]},
@@ -212,6 +232,7 @@ GET_UNREAD_SUMMARY_OUTPUT_SCHEMA = {
                 },
                 "required": [
                     "entity",
+                    "display_name_source",
                     "dialog_type",
                     "unread_count",
                     "unread_mark",
@@ -380,33 +401,50 @@ def _read_position_pending_warnings(read_position_pending_count: int) -> list[St
     ]
 
 
-def _project_read_position_pending_entities(raw_entities: object) -> list[EntityIdentity]:
+def _display_name_source(value: object) -> str:
+    return value if isinstance(value, str) and value in {"name", "username", "numeric"} else "numeric"
+
+
+def _project_read_position_pending_entity(
+    raw: object,
+) -> tuple[tuple[str, str | int], dict[str, object]] | None:
+    if not isinstance(raw, Mapping):
+        return None
+    dialog_id = raw.get("dialog_id")
+    if isinstance(dialog_id, bool) or not isinstance(dialog_id, int):
+        return None
+    identity = project_entity_identity(
+        display_name=_identity_text_fact(raw.get("display_name")),
+        username=_identity_text_fact(raw.get("username")),
+        telegram_id=dialog_id,
+    )
+    username_value = cast(str | None, identity.get("username"))
+    key = (
+        ("username", username_value)
+        if username_value is not None
+        else ("telegram_id", cast(int, identity.get("telegram_id")))
+    )
+    return key, {
+        "entity": identity,
+        "display_name_source": _display_name_source(raw.get("display_name_source")),
+    }
+
+
+def _project_read_position_pending_entities(raw_entities: object) -> list[dict[str, object]]:
     """Project and deduplicate bounded pending identities for the MCP contract."""
     if not isinstance(raw_entities, list):
         return []
-    projected: list[EntityIdentity] = []
+    projected: list[dict[str, object]] = []
     seen: set[tuple[str, str | int]] = set()
     for raw in raw_entities:
-        if not isinstance(raw, Mapping):
+        candidate = _project_read_position_pending_entity(raw)
+        if candidate is None:
             continue
-        dialog_id = raw.get("dialog_id")
-        if isinstance(dialog_id, bool) or not isinstance(dialog_id, int):
-            continue
-        identity = project_entity_identity(
-            display_name=raw.get("display_name") if isinstance(raw.get("display_name"), str) else None,
-            username=raw.get("username") if isinstance(raw.get("username"), str) else None,
-            telegram_id=dialog_id,
-        )
-        username_value = cast(str | None, identity.get("username"))
-        key = (
-            ("username", username_value)
-            if username_value is not None
-            else ("telegram_id", cast(int, identity.get("telegram_id")))
-        )
+        key, entity = candidate
         if key in seen:
             continue
         seen.add(key)
-        projected.append(identity)
+        projected.append(entity)
     return projected
 
 
@@ -424,6 +462,7 @@ def _structured_inbox_group(group: dict) -> tuple[dict[str, object], dict[str, o
     )
     dialog = {
         "entity": entity,
+        "display_name_source": group.get("display_name_source", "numeric"),
         "category": group.get("category"),
         "dialog_type": group.get("dialog_type"),
         "unread_count": group.get("unread_count", 0),
@@ -445,7 +484,11 @@ def _structured_inbox_group(group: dict) -> tuple[dict[str, object], dict[str, o
     }
     hidden_entry: dict[str, object] | None = None
     if hidden_count:
-        hidden_entry = {"entity": entity, "hidden_count": hidden_count}
+        hidden_entry = {
+            "entity": entity,
+            "display_name_source": group.get("display_name_source", "numeric"),
+            "hidden_count": hidden_count,
+        }
     return dialog, hidden_entry, len(message_rows)
 
 
@@ -496,6 +539,7 @@ def _project_unread_summary_dialog(raw_row: Mapping[str, object]) -> dict[str, o
     )
     return {
         "entity": entity,
+        "display_name_source": _display_name_source(raw_row.get("display_name_source")),
         "dialog_type": raw_row.get("dialog_type"),
         "unread_count": raw_row.get("unread_count"),
         "unread_mark": raw_row.get("unread_mark"),

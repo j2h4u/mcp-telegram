@@ -153,6 +153,7 @@ def _make_db() -> Iterator[sqlite3.Connection]:
                 dialog_id               INTEGER PRIMARY KEY,
                 name                    TEXT,
                 type                    TEXT,
+                username                TEXT,
                 archived                INTEGER NOT NULL DEFAULT 0,
                 pinned                  INTEGER NOT NULL DEFAULT 0,
                 members                 INTEGER,
@@ -367,7 +368,7 @@ async def test_list_dialogs_non_dm_row_has_null_unread_fields() -> None:
         server = _make_server(conn, client)
 
         row = (await server._list_dialogs({}))["data"]["dialogs"][0]
-        assert row["type"] == "Channel"
+        assert row["type"] == "channel"
         assert row["unread_in"] is None
         assert row["unread_out"] is None
 

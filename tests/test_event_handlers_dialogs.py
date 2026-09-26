@@ -723,10 +723,17 @@ async def test_realtime_identity_and_mute_update_only_their_canonical_bundles(
         "INSERT INTO entities(id,type,name,username,name_normalized,updated_at) VALUES (?,?,?,?,?,?)",
         (dialog_id, "user", "Old", "old", "old", 10),
     )
+    presence_revision = sync_db.execute("SELECT revision FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
     sync_db.commit()
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
 
     await mgr.on_raw_identity_or_notify(UpdateUserName(dialog_id, "New", "Name", [Username("new", active=True)]))
+    assert sync_db.execute(
+        "SELECT revision,identity_revision FROM dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (
+        presence_revision,
+        1,
+    )
     await mgr.on_raw_identity_or_notify(
         UpdateNotifySettings(
             NotifyPeer(PeerUser(dialog_id)),
@@ -737,7 +744,7 @@ async def test_realtime_identity_and_mute_update_only_their_canonical_bundles(
     assert sync_db.execute(
         "SELECT name,username,type,identity_complete,identity_source,identity_observed_at FROM dialogs WHERE dialog_id=?",
         (dialog_id,),
-    ).fetchone() == ("New Name", "new", "user", 1, "mixed", 10)
+    ).fetchone() == ("New Name", "new", "user", 0, "mixed", 10)
     assert sync_db.execute(
         "SELECT mute_until FROM dialog_directory_facts WHERE dialog_id=?", (dialog_id,)
     ).fetchone() == (1_767_225_600,)
@@ -760,6 +767,7 @@ async def test_username_only_realtime_update_preserves_canonical_name_and_type(
         "INSERT INTO entities(id,type,name,username,name_normalized,updated_at) VALUES (?,?,?,?,?,?)",
         (dialog_id, "service", "Known Name", "old", "known name", 10),
     )
+    sync_db.execute("UPDATE dialogs SET name='Known Name',type='service' WHERE dialog_id=?", (dialog_id,))
     sync_db.commit()
     manager = _make_manager(mock_client, sync_db, shutdown_event)
     manager._update_realtime_username(
@@ -770,6 +778,42 @@ async def test_username_only_realtime_update_preserves_canonical_name_and_type(
         "new",
         "service",
     )
+    assert sync_db.execute("SELECT name,username,type FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        "Known Name",
+        "new",
+        "service",
+    )
+
+
+@pytest.mark.asyncio
+async def test_realtime_username_clear_is_authoritative_without_changing_presence_fence(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 67894
+    _insert_dialog(sync_db, dialog_id, snapshot_at=1)
+    sync_db.execute(
+        "UPDATE dialogs SET name='Known Name',type='user',username='old',identity_complete=1,"
+        "identity_source='directory',identity_observed_at=10,hidden=1 WHERE dialog_id=?",
+        (dialog_id,),
+    )
+    sync_db.execute(
+        "INSERT INTO entities(id,type,name,username,name_normalized,updated_at) VALUES (?,?,?,?,?,?)",
+        (dialog_id, "user", "Known Name", "old", "known name", 10),
+    )
+    presence_revision = sync_db.execute("SELECT revision FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
+    sync_db.commit()
+
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    manager._update_realtime_username(SimpleNamespace(user_id=dialog_id, usernames=[]), now=20)
+
+    assert sync_db.execute(
+        "SELECT name,username,type,identity_complete,hidden FROM dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == ("Known Name", None, "user", 0, 1)
+    assert sync_db.execute(
+        "SELECT revision,identity_revision FROM dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (presence_revision, 1)
 
 
 @pytest.mark.asyncio

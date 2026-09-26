@@ -138,6 +138,15 @@ def _sections_schema(conn: sqlite3.Connection) -> None:
             acquisition_cursor INTEGER NOT NULL DEFAULT 0
         ) WITHOUT ROWID"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS dialogs (
+            dialog_id INTEGER PRIMARY KEY, name TEXT, type TEXT, username TEXT,
+            created INTEGER, hidden INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0,
+            revision INTEGER NOT NULL DEFAULT 0, identity_revision INTEGER NOT NULL DEFAULT 0,
+            identity_observed_at INTEGER, identity_complete INTEGER NOT NULL DEFAULT 0,
+            identity_source TEXT, linked_chat_id INTEGER, linked_chat_resolved_at INTEGER
+        )"""
+    )
 
 
 def _advance_fixture_cursor(repo: EntityProfileRepository, entity_id: int, next_cursor: int, now: int) -> None:
@@ -594,10 +603,6 @@ def _channel_profile_service(
     _sections_schema(conn)
     conn.execute(
         "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE dialogs (dialog_id INTEGER PRIMARY KEY, linked_chat_id INTEGER, linked_chat_resolved_at INTEGER, "
-        "revision INTEGER NOT NULL DEFAULT 0)"
     )
     conn.execute(
         "CREATE TABLE linked_chat_fact_state (channel_id INTEGER PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 0, "
@@ -1864,6 +1869,7 @@ async def test_entity_info_rejects_ids_outside_telethon_peer_domain_before_rpc(
     conn.execute(
         "CREATE TABLE entity_details (entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL)"
     )
+    conn.execute("CREATE TABLE dialogs (dialog_id INTEGER PRIMARY KEY, identity_revision INTEGER NOT NULL DEFAULT 0)")
     client = CountingClient()
     service = _test_service(conn, limits=RefreshLimits())
     demand_sink = MagicMock()

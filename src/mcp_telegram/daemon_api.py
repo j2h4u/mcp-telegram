@@ -23,7 +23,7 @@ Protocol: newline-delimited JSON (one request line → one response line).
 
 Dialog name resolution: when dialog_id is absent or 0 and a "dialog" string
 is present, _resolve_dialog_name() resolves it from the canonical local dialog
-directory. Explicit usernames may use one targeted exact-peer lookup.
+directory. Dialog selectors are resolved locally without identity RPCs.
 
 Architecture:
 - One DaemonAPIServer instance is created per daemon run; it holds a
@@ -49,7 +49,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, SupportsIndex, cast
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
-from telethon.errors import RPCError  # type: ignore[import-untyped]
 
 from . import daemon_activity_stats as _activity_stats
 from .auth_scope import TelegramAuthScope
@@ -67,6 +66,7 @@ from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import recover_invalid_generation_in_transaction
 from .dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
+from .dialog_identity import read_local_dialog_identities
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
 from .entity_profile.ports import (
     ChannelProfilePort,
@@ -412,7 +412,7 @@ from .resolver import (
 
 logger = logging.getLogger(__name__)
 
-type _DialogMetadata = Mapping[int, tuple[str | None, str | None, bool, str | None, bool | None]]
+type _DialogMetadata = Mapping[int, bool]
 type _DialogDirectoryResult = tuple[
     dict[int, str],
     dict[int, str],
@@ -462,13 +462,7 @@ class _LocalDialogDirectory:
 
     @classmethod
     def from_metadata(cls, metadata: _DialogMetadata) -> _LocalDialogDirectory:
-        return cls(
-            ineligible_ids={
-                entity_id
-                for entity_id, (_name, _type, eligible, _username, _complete) in metadata.items()
-                if not eligible
-            }
-        )
+        return cls(ineligible_ids={entity_id for entity_id, eligible in metadata.items() if not eligible})
 
     def add(
         self,
@@ -478,19 +472,16 @@ class _LocalDialogDirectory:
         stored_type: str | None,
         dialog_metadata: _DialogMetadata,
     ) -> None:
-        dialog_name, dialog_type, eligible, _username, _identity_complete = dialog_metadata.get(
-            entity_id, (None, None, True, None, None)
-        )
+        eligible = dialog_metadata.get(entity_id, True)
         if not eligible:
             return
-        name = _selector_dialog_name(entity_id, dialog_name, stored_name)
+        name = _selector_dialog_name(entity_id, None, stored_name)
         if name is None:
             return
         self.names[entity_id] = name
         self.normalized[entity_id] = latinize(name)
-        selected_type = dialog_type if dialog_type is not None else stored_type
-        if selected_type is not None:
-            self.entity_types[entity_id] = selected_type
+        if stored_type is not None:
+            self.entity_types[entity_id] = stored_type
         if entity_id in dialog_metadata:
             self.fuzzy_names[entity_id] = name
             self.fuzzy_normalized[entity_id] = latinize(name)
@@ -1021,85 +1012,39 @@ class DaemonAPIServer:
     # Dialog name resolution
     # ------------------------------------------------------------------
 
-    def _local_dialog_metadata(self) -> dict[int, tuple[str | None, str | None, bool, str | None, bool | None]]:
-        """Read dialog eligibility from the canonical snapshot without column-order assumptions."""
-        cursor = self._conn.execute(
-            "SELECT d.*, sd.status AS selector_sync_status "
-            "FROM dialogs d LEFT JOIN synced_dialogs sd ON sd.dialog_id = d.dialog_id "
-            "ORDER BY d.dialog_id"
+    def _local_dialog_eligibility(self) -> dict[int, bool]:
+        rows = cast(
+            list[tuple[object, object, object]],
+            self._conn.execute(
+                "SELECT d.dialog_id,d.hidden,sd.status FROM dialogs d "
+                "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id ORDER BY d.dialog_id"
+            ).fetchall(),
         )
-        columns = [str(description[0]) for description in cursor.description or ()]
-        metadata: dict[int, tuple[str | None, str | None, bool, str | None, bool | None]] = {}
-        rows = cast(list[Sequence[object]], cursor.fetchall())
-        for raw_row in rows:
-            row = dict(zip(columns, raw_row, strict=True))
-            dialog_id = _coerce_int(row.get("dialog_id"), 0)
-            if dialog_id == 0:
-                continue
-            raw_name = row.get("name")
-            raw_type = row.get("type")
-            name = raw_name if isinstance(raw_name, str) else None
-            entity_type = raw_type if isinstance(raw_type, str) else None
-            eligible = not bool(row.get("hidden", 0)) or row.get("selector_sync_status") == "access_lost"
-            raw_username = row.get("username")
-            username = raw_username if isinstance(raw_username, str) else None
-            raw_complete = row.get("identity_complete")
-            identity_complete = bool(raw_complete) if raw_complete is not None else None
-            metadata[dialog_id] = (name, entity_type, eligible, username, identity_complete)
-        return metadata
+        return {
+            _coerce_int(dialog_id, 0): not bool(hidden) or status == "access_lost"
+            for dialog_id, hidden, status in rows
+            if _coerce_int(dialog_id, 0) != 0
+        }
 
     def _local_dialog_directory(
         self,
     ) -> _DialogDirectoryResult:
         """Return exact-name cache entries and fuzzy-eligible dialog entries."""
-        dialog_metadata = self._local_dialog_metadata()
-        stored_entities = self._local_dialog_stored_entities()
+        dialog_metadata = self._local_dialog_eligibility()
+        identities = read_local_dialog_identities(self._conn)
         directory = _LocalDialogDirectory.from_metadata(dialog_metadata)
-        for entity_id in sorted(dialog_metadata):
-            identity = self._local_dialog_effective_identity(entity_id, dialog_metadata, stored_entities)
-            if identity is None:
+        for entity_id, identity in identities.items():
+            if identity.display_name_source == "numeric":
                 continue
-            name, entity_type = identity
             directory.add(
                 entity_id,
-                stored_name=name,
-                stored_type=entity_type,
+                stored_name=identity.display_name,
+                stored_type=identity.dialog_type.value if identity.dialog_type.value != "unknown" else None,
                 dialog_metadata=dialog_metadata,
             )
         names, normalized, fuzzy_names, fuzzy_normalized, entity_types, ineligible_ids, _ = directory.result()
         coverage = read_dialog_directory_coverage(self._conn)
         return names, normalized, fuzzy_names, fuzzy_normalized, entity_types, ineligible_ids, coverage
-
-    def _local_dialog_stored_entities(self) -> dict[int, tuple[object, str | None, str | None]]:
-        rows = cast(
-            list[tuple[object, ...]],
-            self._conn.execute("SELECT id, name, username, type FROM entities ORDER BY id").fetchall(),
-        )
-        return {
-            _coerce_int(row[0], 0): (
-                row[1],
-                row[2] if isinstance(row[2], str) and row[2] else None,
-                row[3] if isinstance(row[3], str) and row[3] else None,
-            )
-            for row in rows
-        }
-
-    @staticmethod
-    def _local_dialog_effective_identity(
-        entity_id: int,
-        dialog_metadata: _DialogMetadata,
-        stored_entities: Mapping[int, tuple[object, str | None, str | None]],
-    ) -> tuple[object, str | None] | None:
-        dialog_name, dialog_type, eligible, _dialog_username, identity_complete = dialog_metadata[entity_id]
-        if not eligible:
-            return None
-        stored_name, _stored_username, stored_type = stored_entities.get(entity_id, (None, None, None))
-        # A complete canonical bundle is authoritative, including a known
-        # absence (for example a username removed by Telegram).
-        if identity_complete is True:
-            stored_name = None
-            stored_type = None
-        return dialog_name if dialog_name is not None else stored_name, dialog_type or stored_type
 
     @staticmethod
     def _resolve_exact_natural_name(
@@ -1133,55 +1078,6 @@ class DaemonAPIServer:
             for match in result.matches:
                 match["entity_type"] = entity_types.get(match["entity_id"])
 
-    def _local_dialog_username_rows(self, username: str) -> list[tuple[object, ...]]:
-        column_rows = cast(list[tuple[object, ...]], self._conn.execute("PRAGMA table_info(dialogs)").fetchall())
-        dialog_columns = {str(row[1]) for row in column_rows}
-        canonical_username_sql = "d.username" if "username" in dialog_columns else "NULL"
-        identity_complete_sql = "d.identity_complete" if "identity_complete" in dialog_columns else "0"
-        hidden = "d.hidden" if "hidden" in dialog_columns else "0"
-        return cast(
-            list[tuple[object, ...]],
-            self._conn.execute(
-                f"SELECT d.dialog_id,d.name,{canonical_username_sql},d.type,{identity_complete_sql},e.name,e.username,e.type "
-                "FROM dialogs d LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
-                "LEFT JOIN entities e ON e.id=d.dialog_id "
-                f"WHERE ({hidden}=0 OR sd.status='access_lost') AND "
-                f"({canonical_username_sql}=? COLLATE NOCASE OR "
-                f"(COALESCE({identity_complete_sql},0)<>1 AND e.username=? COLLATE NOCASE)) "
-                "ORDER BY d.dialog_id",
-                (username, username),
-            ).fetchall(),
-        )
-
-    @staticmethod
-    def _project_local_dialog_username_row(row: tuple[object, ...], username: str) -> MatchInfo | None:
-        (
-            dialog_id,
-            name,
-            canonical_username,
-            dialog_type,
-            identity_complete,
-            entity_name,
-            entity_username,
-            entity_type,
-        ) = row
-        complete = bool(identity_complete)
-        effective_username = (
-            canonical_username if canonical_username is not None else (None if complete else entity_username)
-        )
-        if not isinstance(effective_username, str):
-            return None
-        display_name = name if isinstance(name, str) else (None if complete else entity_name)
-        effective_type = dialog_type if isinstance(dialog_type, str) else (None if complete else entity_type)
-        return {
-            "entity_id": _coerce_int(dialog_id, 0),
-            "display_name": str(display_name or f"@{username}"),
-            "score": 100,
-            "username": effective_username,
-            "entity_type": str(effective_type) if effective_type is not None else None,
-            "disambiguation_hint": None,
-        }
-
     @staticmethod
     def _resolve_local_username_matches(query: str, matches: list[MatchInfo]) -> Resolved | Candidates | NotFound:
         matches.sort(key=lambda item: (item["display_name"].casefold(), item["entity_id"]))
@@ -1193,45 +1089,24 @@ class DaemonAPIServer:
         return NotFound(query=query)
 
     def _resolve_local_dialog_username(self, username: str, query: str) -> Resolved | Candidates | NotFound:
-        rows = self._local_dialog_username_rows(username)
-        matches = [
-            match for row in rows if (match := self._project_local_dialog_username_row(row, username)) is not None
-        ]
+        eligible = self._local_dialog_eligibility()
+        matches: list[MatchInfo] = []
+        for dialog_id, identity in read_local_dialog_identities(self._conn).items():
+            if not eligible.get(dialog_id, False) or identity.username is None:
+                continue
+            if identity.username.casefold().removeprefix("@") != username.casefold().removeprefix("@"):
+                continue
+            matches.append(
+                {
+                    "entity_id": dialog_id,
+                    "display_name": identity.display_name,
+                    "score": 100,
+                    "username": identity.username,
+                    "entity_type": identity.dialog_type.value if identity.dialog_type.value != "unknown" else None,
+                    "disambiguation_hint": None,
+                }
+            )
         return self._resolve_local_username_matches(query, matches)
-
-    async def _resolve_dialog_entity(self, dialog: str) -> int | None:
-        """Resolve a dialog selector through the live Telegram entity lookup."""
-        with _preserve_or_rpc_scope(
-            TelegramRpcSource.DIALOG_RESOLUTION,
-            acquisition_kind=AcquisitionKind.ENTITY_LOOKUP,
-        ):
-            try:
-                entity = await self._client.get_entity(dialog)
-                return int(cast(int, telethon_utils.get_peer_id(entity)))
-            except ValueError, KeyError:
-                return None
-            except TelegramRpcThrottled:
-                raise
-            except RPCError, TimeoutError:
-                raise
-            except Exception:
-                logger.exception("unexpected get_entity failure for %r", dialog)
-                raise
-
-    async def _resolve_dialog_username(
-        self,
-        query: str,
-        username: str,
-        *,
-        ineligible_ids: set[int],
-    ) -> Resolved | Candidates | NotFound:
-        local = self._resolve_local_dialog_username(username, query)
-        if not isinstance(local, NotFound):
-            return local
-        entity_id = await self._resolve_dialog_entity(query)
-        if entity_id is not None and entity_id not in ineligible_ids:
-            return Resolved(entity_id=entity_id, display_name=query)
-        return local
 
     @staticmethod
     def _sorted_dialog_matches(matches: list[MatchInfo]) -> list[MatchInfo]:
@@ -1245,20 +1120,11 @@ class DaemonAPIServer:
         tme = _parse_tme_link(dialog)
         return tme[0] if tme is not None else dialog[1:] if dialog.startswith("@") else None
 
-    async def _resolve_username_dialog_name(
+    def _resolve_username_dialog_name(
         self,
         dialog: str,
         username: str,
-        *,
-        allow_remote: bool,
     ) -> Resolved | Candidates | NotFound:
-        ineligible_ids = {
-            entity_id
-            for entity_id, (_name, _type, eligible, _username, _complete) in self._local_dialog_metadata().items()
-            if not eligible
-        }
-        if allow_remote:
-            return await self._resolve_dialog_username(dialog, username, ineligible_ids=ineligible_ids)
         return self._resolve_local_dialog_username(username, dialog)
 
     def _resolve_non_username_dialog_name(self, dialog: str) -> Resolved | Candidates | NotFound:
@@ -1280,32 +1146,12 @@ class DaemonAPIServer:
         self._apply_dialog_candidate_types(local_result, entity_types)
         return local_result
 
-    async def _resolve_dialog_name(
-        self,
-        dialog: str,
-        *,
-        allow_remote: bool = True,
-    ) -> Resolved | Candidates | NotFound:
-        """Resolve one normalized natural selector without silent precedence."""
+    def _resolve_dialog_name(self, dialog: str) -> Resolved | Candidates | NotFound:
+        """Resolve a dialog selector using only the current local identity snapshot."""
         username = self._natural_username(dialog)
         if username is not None:
-            return await self._resolve_username_dialog_name(dialog, username, allow_remote=allow_remote)
+            return self._resolve_username_dialog_name(dialog, username)
         return self._resolve_non_username_dialog_name(dialog)
-
-    @staticmethod
-    def _dialog_resolution_retryable_response(
-        *, retry_after: int | None = None, transient: bool = True
-    ) -> dict[str, object]:
-        response: dict[str, object] = {
-            "ok": False,
-            "error": "dialog_resolution_retryable",
-            "message": "The targeted Telegram peer lookup did not complete; no dialog was selected.",
-            "retryable": transient,
-            "required_action": "Retry the request; use an exact dialog id when already known.",
-        }
-        if retry_after is not None:
-            response["retry_after"] = retry_after
-        return response
 
     @classmethod
     def _dialog_resolution_candidates_response(
@@ -1373,19 +1219,12 @@ class DaemonAPIServer:
             return ResolvedDialogId(selector.exact_id, read_dialog_directory_coverage(self._conn))
         assert selector.query is not None
         directory_coverage = read_dialog_directory_coverage(self._conn)
-        try:
-            result = await self._resolve_dialog_name(selector.query)
-        except TelegramRpcThrottled as exc:
-            retry_after = exc.retry_after_seconds
-            return self._dialog_resolution_retryable_response(retry_after=retry_after, transient=not exc.latched)
-        except RPCError, TimeoutError:
-            retry_after = None
-            return self._dialog_resolution_retryable_response(retry_after=retry_after)
+        result = self._resolve_dialog_name(selector.query)
         if isinstance(result, Resolved):
             return ResolvedDialogId(result.entity_id, directory_coverage)
         if isinstance(result, Candidates):
             return self._dialog_resolution_candidates_response(selector, result, directory_coverage)
-        return self._dialog_resolution_no_match_response(selector, directory_coverage)
+        return self._local_dialog_resolution_no_match_response(selector, directory_coverage)
 
     async def _resolve_dialog_id_local(
         self,
@@ -1401,7 +1240,7 @@ class DaemonAPIServer:
             return ResolvedDialogId(selector.exact_id, read_dialog_directory_coverage(self._conn))
         assert selector.query is not None
         directory_coverage = read_dialog_directory_coverage(self._conn)
-        result = await self._resolve_dialog_name(selector.query, allow_remote=False)
+        result = self._resolve_dialog_name(selector.query)
         if isinstance(result, Resolved):
             return ResolvedDialogId(result.entity_id, directory_coverage)
         if isinstance(result, Candidates):

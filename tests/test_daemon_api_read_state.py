@@ -3,7 +3,7 @@
 Covers:
 - _classify_dialog_type(entity) — reuse existing helper (all six type strings).
 - _read_state_for_dialog(conn, dialog_id, dialog_type) — returns ReadState dict for DMs, None otherwise.
-- _dialog_type_from_db(conn, dialog_id) — DB-only dialog-type lookup (zero Telegram API).
+- read_dialog_identities(conn, dialog_ids) — canonical identity lookup (zero Telegram API).
 - _list_messages / _list_messages_context_window / _search_messages / _fetch_unread_groups / _list_unread_messages responses include read_state + dialog_type fields.
 
 Uses in-memory SQLite; telethon client mocked. Zero real Telegram calls.
@@ -22,7 +22,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
-from mcp_telegram.reading.sqlite_projection import _dialog_type_from_db, _read_state_for_dialog
+from mcp_telegram.dialog_identity import read_dialog_identities
+from mcp_telegram.reading.sqlite_projection import _read_state_for_dialog
 from mcp_telegram.telethon_dialog import classify_dialog_type
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.dialog_directory_coverage_fixtures import install_dialog_directory_coverage_schema
@@ -223,6 +224,7 @@ def _make_db() -> Iterator[sqlite3.Connection]:
             dialog_id   INTEGER PRIMARY KEY,
             name        TEXT,
             type        TEXT,
+            username    TEXT,
             members     INTEGER,
             hidden      INTEGER NOT NULL DEFAULT 0,
             identity_observed_at INTEGER,
@@ -366,21 +368,32 @@ def test_classify_dialog_type_channel_group_bot_forum() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _dialog_type_from_db — DB lookup, zero Telegram calls
+# Canonical dialog identity — DB lookup, zero Telegram calls
 # ---------------------------------------------------------------------------
 
 
-def test_dialog_type_from_db_reads_entities_table() -> None:
+def test_dialog_identity_reads_canonical_bundle_before_profile_cache() -> None:
     with _make_db() as conn:
-        _insert_entity(conn, 100, "User")
-        _insert_entity(conn, 200, "Channel")
-        assert _dialog_type_from_db(conn, 100) == "User"
-        assert _dialog_type_from_db(conn, 200) == "Channel"
+        _insert_entity(conn, 100, "Channel", name="Stale cache")
+        conn.execute(
+            "INSERT INTO dialogs (dialog_id, name, type, identity_observed_at, identity_complete, identity_source) "
+            "VALUES (100, 'Canonical title', 'supergroup', 123, 1, 'directory')"
+        )
+        identity = read_dialog_identities(conn, [100])[100]
+        assert identity.dialog_id == 100
+        assert identity.display_name == "Canonical title"
+        assert identity.display_name_source == "name"
+        assert identity.dialog_type.value == "supergroup"
+        assert identity.complete is True
+        assert identity.source == "directory"
 
 
-def test_dialog_type_from_db_missing_entity_returns_unknown() -> None:
+def test_dialog_identity_missing_facts_uses_numeric_name_and_unknown_type() -> None:
     with _make_db() as conn:
-        assert _dialog_type_from_db(conn, 999) == "Unknown"
+        identity = read_dialog_identities(conn, [999])[999]
+        assert identity.display_name == "999"
+        assert identity.display_name_source == "numeric"
+        assert identity.dialog_type.value == "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +536,7 @@ async def test_list_messages_response_includes_read_state_and_dialog_type() -> N
         result = await server._list_messages({"dialog_id": 1, "limit": 10})
         assert result["ok"] is True
         data = result["data"]
-        assert data["dialog_type"] == "User"
+        assert data["dialog_type"] == "user"
         rs = data["read_state"]
         assert rs is not None
         assert rs["inbox_unread_count"] == 1
@@ -544,7 +557,7 @@ async def test_list_messages_context_window_response_includes_read_state() -> No
         )
         assert result["ok"] is True
         data = result["data"]
-        assert data["dialog_type"] == "User"
+        assert data["dialog_type"] == "user"
         assert data["read_state"] is not None
         assert data["read_state"]["inbox_unread_count"] == 5
 
@@ -614,7 +627,7 @@ async def test_list_unread_messages_response_includes_per_group_read_state() -> 
             assert "dialog_type" in g
             assert "read_state" in g
             if g["dialog_id"] in (1, 2):
-                assert g["dialog_type"] == "User"
+                assert g["dialog_type"] == "user"
                 assert g["read_state"] is not None
 
 
@@ -629,5 +642,5 @@ async def test_non_dm_read_path_response_has_none_read_state() -> None:
         server.self_id = 999
         result = await server._list_messages({"dialog_id": 42, "limit": 10})
         assert result["ok"] is True
-        assert result["data"]["dialog_type"] == "Channel"
+        assert result["data"]["dialog_type"] == "channel"
         assert result["data"]["read_state"] is None

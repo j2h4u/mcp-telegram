@@ -20,6 +20,7 @@ from mcp_telegram.entity_profile.repository import EntitySectionCommit
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcAttemptBudgetExhaustedError
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
+from mcp_telegram.telethon_dialog import observe_dialog_identity
 from tests.helpers import ClientChatAvatarHistoryPort
 from tests.test_entity_profile_full_user_pair import _fenced_schema, _pair_service
 
@@ -38,7 +39,15 @@ def _full_chat(
         notify_settings=types.PeerNotifySettings(),
         exported_invite=types.ChatInviteExported(link="https://t.me/+group", admin_id=1, date=None),
     )
-    return types.messages.ChatFull(full_chat=full, chats=[], users=[])
+    chat = types.Chat(
+        id=chat_id,
+        title="Group",
+        photo=types.ChatPhotoEmpty(),
+        participants_count=0,
+        date=None,
+        version=1,
+    )
+    return types.messages.ChatFull(full_chat=full, chats=[chat], users=[])
 
 
 class _GroupClient:
@@ -139,6 +148,9 @@ class _GroupProfilePort:
             observation_started_at=100,
             observation_completed_at=100,
             created=self._client.created,
+            dialog_identity_observation=observe_dialog_identity(
+                response.chats[0], dialog_id=group_id, source="profile", observed_at=100
+            ),
         )
 
 
@@ -165,6 +177,8 @@ def _service() -> tuple[sqlite3.Connection, DaemonEntityInfoService, _GroupClien
 @pytest.mark.asyncio
 async def test_group_pair_uses_one_rpc_and_commits_independent_projections() -> None:
     conn, service, client = _service()
+    conn.execute("INSERT INTO dialogs(dialog_id,name,type) VALUES (-123,'Old group','group')")
+    conn.commit()
     participants = types.ChatParticipants(
         chat_id=123,
         participants=[types.ChatParticipant(user_id=7, inviter_id=1, date=None)],
@@ -188,6 +202,32 @@ async def test_group_pair_uses_one_rpc_and_commits_independent_projections() -> 
     assert detail.detail["contacts_subscribed"] == [{"id": 7, "name": None, "username": None}]
     assert conn.execute("SELECT next_section FROM entity_profile_refresh_state WHERE entity_id=-123").fetchone() == (
         "avatar_history",
+    )
+    assert conn.execute("SELECT name,type,identity_revision FROM dialogs WHERE dialog_id=-123").fetchone() == (
+        "Group",
+        "group",
+        1,
+    )
+    await service.shutdown()  # type: ignore[attr-defined]
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_forbidden_group_pair_publishes_positive_title_without_inferred_type_or_username() -> None:
+    conn, service, client = _service()
+    conn.execute("INSERT INTO dialogs(dialog_id,name,type,username) VALUES (-123,'Old group','group','old_public')")
+    conn.commit()
+    response = _full_chat()
+    object.__setattr__(response, "chats", [types.ChatForbidden(id=123, title="Partial group")])
+    client.response = response
+
+    await EntityProfileDemandAdapter(service.refresh_coordinator).run_slice(RpcAttemptBudget(limit=1))  # type: ignore[attr-defined]
+
+    assert conn.execute("SELECT name,type,username,identity_revision FROM dialogs WHERE dialog_id=-123").fetchone() == (
+        "Partial group",
+        "group",
+        "old_public",
+        1,
     )
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()
@@ -255,9 +295,6 @@ async def test_group_pair_sections_share_the_observation_boundary() -> None:
 @pytest.mark.asyncio
 async def test_group_profile_refresh_fills_missing_hidden_dialog_created_once() -> None:
     conn, service, client = _service()
-    conn.execute(
-        "CREATE TABLE dialogs (dialog_id INTEGER PRIMARY KEY, created INTEGER, hidden INTEGER NOT NULL DEFAULT 0)"
-    )
     conn.execute("INSERT INTO dialogs(dialog_id, created, hidden) VALUES (-123, NULL, 1)")
     client.created = 1_700_000_000
     conn.commit()
@@ -276,9 +313,6 @@ async def test_group_profile_refresh_fills_missing_hidden_dialog_created_once() 
 
 def test_rejected_group_profile_cursor_cannot_mutate_dialog_created() -> None:
     conn, service, _client = _service()
-    conn.execute(
-        "CREATE TABLE dialogs (dialog_id INTEGER PRIMARY KEY, created INTEGER, hidden INTEGER NOT NULL DEFAULT 0)"
-    )
     conn.execute("INSERT INTO dialogs(dialog_id, created, hidden) VALUES (-123, NULL, 1)")
     cursor = service._profiles.next_due_refresh(now=100)  # type: ignore[attr-defined]
     assert cursor is not None

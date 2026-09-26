@@ -206,10 +206,11 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
             "properties": {
                 "id": {"type": ["integer", "null"]},
                 "name": {"type": ["string", "null"]},
+                "display_name_source": {"type": ["string", "null"], "enum": ["name", "username", "numeric", None]},
                 "type": {"type": ["string", "null"]},
                 "access": {"type": ["string", "null"]},
             },
-            "required": ["id", "name", "type", "access"],
+            "required": ["id", "name", "display_name_source", "type", "access"],
             "additionalProperties": False,
         },
         "source": {"type": "string"},
@@ -747,6 +748,7 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
         "dialog": {
             "id": resolved_dialog_id,
             "name": _list_messages_dialog_name(data, rows, args.dialog),
+            "display_name_source": data.get("dialog_name_source"),
             "type": dialog_type,
             "access": data.get("dialog_access"),
         },
@@ -817,6 +819,7 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
     "properties": {
         "query": {"type": "string"},
         "dialog_name": {"type": ["string", "null"]},
+        "dialog_name_source": {"type": ["string", "null"], "enum": ["name", "username", "numeric", None]},
         "scope": {
             "type": "object",
             "properties": {
@@ -878,6 +881,7 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
     "required": [
         "query",
         "dialog_name",
+        "dialog_name_source",
         "scope",
         "source",
         "coverage",
@@ -931,14 +935,30 @@ def _search_read_state_per_dialog(data: dict) -> dict[str, object]:
     return structured
 
 
-def _search_dialog_name(rows: list[dict], global_mode: bool, dialog_label: str | None) -> str | None:
+def _search_dialog_name(
+    rows: list[dict], global_mode: bool, dialog_label: str | None, response_name: object
+) -> str | None:
     if global_mode:
         return None
+    if isinstance(response_name, str):
+        return response_name
     for row in rows:
         dialog_name = row.get("dialog_name")
         if isinstance(dialog_name, str):
             return dialog_name
     return dialog_label
+
+
+def _search_dialog_name_source(rows: list[dict], global_mode: bool, response_source: object) -> str | None:
+    if global_mode:
+        return None
+    if isinstance(response_source, str) and response_source in {"name", "username", "numeric"}:
+        return cast(str, response_source)
+    for row in rows:
+        source = row.get("dialog_name_source")
+        if source in {"name", "username", "numeric"}:
+            return cast(str, source)
+    return "numeric"
 
 
 def _search_scope_payload(ctx: _SearchStructuredContentContext) -> dict[str, object]:
@@ -1067,7 +1087,8 @@ def _search_structured_content(ctx: _SearchStructuredContentContext) -> dict[str
     data_with_source = {**data, "source": source}
     return {
         "query": ctx.args.query,
-        "dialog_name": _search_dialog_name(ctx.rows, ctx.global_mode, ctx.dialog_label),
+        "dialog_name": _search_dialog_name(ctx.rows, ctx.global_mode, ctx.dialog_label, data.get("dialog_name")),
+        "dialog_name_source": _search_dialog_name_source(ctx.rows, ctx.global_mode, data.get("dialog_name_source")),
         "scope": _search_scope_payload(ctx),
         "source": source,
         "coverage": _list_messages_coverage(data_with_source),

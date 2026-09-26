@@ -72,15 +72,14 @@ from .channel_full_siblings import (
 )
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import (
-    IDENTITY_OMITTED,
-    _IdentityOmitted,
     apply_active_generation_pin_delta,
     apply_realtime_eligibility,
-    apply_realtime_identity,
     clear_realtime_mute,
     record_realtime_pin_fence,
     sync_active_generation_pins_from_publication,
 )
+from .dialog_identity import capture_identity_baseline, publish_dialog_identity
+from .dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
 from .entity_store import PartialEntityIdentity, apply_partial_entity_identity
 from .flood import TelegramRpcThrottled
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
@@ -141,7 +140,7 @@ from .telegram_demand import (
 )
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
-from .telethon_dialog import classify_dialog_type
+from .telethon_dialog import classify_dialog_type, observe_dialog_identity
 from .topics.sqlite_repository import SQLiteTopicMetadataRepository
 from .unread_state import apply_unread_facts
 
@@ -261,6 +260,12 @@ class _DmIdentity:
     entity_type: str
     name_observed: bool
     username_observed: bool
+    dialog_identity_observation: DialogIdentityObservation | None
+
+
+@dataclass(frozen=True, slots=True)
+class _IdentityBaseline:
+    revision: int | None
 
 
 class _MessageLike(Protocol):
@@ -598,12 +603,10 @@ _UPDATE_DIALOG_LAST_MESSAGE_AT_SQL = (
 
 _UPSERT_REALTIME_DM_DIALOG_SQL = """
 INSERT INTO dialogs (
-    dialog_id, name, type, last_message_at, snapshot_at, hidden, needs_refresh,
+    dialog_id, last_message_at, snapshot_at, hidden, needs_refresh,
     archived, pinned, unread_mentions_count, unread_reactions_count
-) VALUES (?, ?, ?, ?, ?, 0, 1, 0, 0, 0, 0)
+) VALUES (?, ?, ?, 0, 1, 0, 0, 0, 0)
 ON CONFLICT(dialog_id) DO UPDATE SET
-    name = COALESCE(dialogs.name, excluded.name),
-    type = COALESCE(dialogs.type, excluded.type),
     last_message_at = CASE
         WHEN excluded.last_message_at IS NULL THEN dialogs.last_message_at
         WHEN dialogs.last_message_at IS NULL THEN excluded.last_message_at
@@ -817,7 +820,12 @@ class EventHandlerManager:
         return coverage is not RealtimeHistoryCoverage.NO_REALTIME_HISTORY
 
     @staticmethod
-    def _dm_identity(sender: _SenderLike | None) -> _DmIdentity | None:
+    def _dm_identity(
+        sender: _SenderLike | None,
+        *,
+        dialog_id: int,
+        observed_at: int,
+    ) -> _DmIdentity | None:
         if sender is None:
             return None
         first_raw = getattr(sender, "first_name", USERNAME_UNOBSERVED)
@@ -833,6 +841,12 @@ class EventHandlerManager:
             entity_type=classify_dialog_type(sender).value,
             name_observed=first_raw is not USERNAME_UNOBSERVED or last_raw is not USERNAME_UNOBSERVED,
             username_observed=observed_username is not USERNAME_UNOBSERVED,
+            dialog_identity_observation=observe_dialog_identity(
+                sender,
+                dialog_id=dialog_id,
+                source="realtime",
+                observed_at=observed_at,
+            ),
         )
 
     def _persist_dm_enrollment(
@@ -842,29 +856,68 @@ class EventHandlerManager:
         *,
         message_timestamp: int | None,
         observed_at: int,
+        identity_baseline: _IdentityBaseline | None = None,
     ) -> EnrollmentOutcome:
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            baseline_revision = (
+                identity_baseline.revision
+                if identity_baseline is not None
+                else capture_identity_baseline(self._conn, dialog_id)
+            )
             outcome = ensure_automatic_dm_enrollment(self._conn, dialog_id, now=observed_at)
             if not outcome.enabled:
                 self._conn.commit()
                 return outcome
+            row_existed_before_presence = (
+                self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
+            )
             self._conn.execute(
                 _UPSERT_REALTIME_DM_DIALOG_SQL,
                 (
                     dialog_id,
-                    identity.name if identity is not None else None,
-                    identity.entity_type if identity is not None else None,
                     message_timestamp,
                     observed_at,
                 ),
             )
+            if identity is not None:
+                self._publish_dm_identity(
+                    identity,
+                    dialog_id,
+                    baseline_revision,
+                    observed_at,
+                    row_existed_before_presence=row_existed_before_presence,
+                )
             unhide_after_realtime_presence(self._conn, dialog_id)
             self._conn.commit()
             return outcome
         except BaseException:
             self._conn.rollback()
             raise
+
+    def _publish_dm_identity(
+        self,
+        identity: _DmIdentity,
+        dialog_id: int,
+        baseline_revision: int | None,
+        observed_at: int,
+        *,
+        row_existed_before_presence: bool,
+    ) -> None:
+        observation = identity.dialog_identity_observation
+        if observation is None:
+            return
+        expected_revision = (
+            baseline_revision if baseline_revision is not None else (0 if not row_existed_before_presence else None)
+        )
+        if expected_revision is None:
+            return
+        publish_dialog_identity(
+            self._conn,
+            dialog_id,
+            observation,
+            expected_revision,
+        )
 
     def _persist_dm_entity(self, dialog_id: int, identity: _DmIdentity, observed_at: int) -> None:
         try:
@@ -893,6 +946,7 @@ class EventHandlerManager:
         *,
         message_date: datetime | None = None,
         observed_at: int | None = None,
+        identity_baseline: _IdentityBaseline | None = None,
     ) -> bool:
         """Enroll a new DM dialog into synced_dialogs on first incoming message.
 
@@ -908,7 +962,7 @@ class EventHandlerManager:
         """
         now = int(time.time()) if observed_at is None else observed_at
         message_timestamp = int(message_date.timestamp()) if message_date is not None else None
-        identity = self._dm_identity(sender)
+        identity = self._dm_identity(sender, dialog_id=dialog_id, observed_at=now)
 
         try:
             outcome = self._persist_dm_enrollment(
@@ -916,6 +970,7 @@ class EventHandlerManager:
                 identity,
                 message_timestamp=message_timestamp,
                 observed_at=now,
+                identity_baseline=identity_baseline,
             )
             if outcome.enabled and identity is not None:
                 self._persist_dm_entity(dialog_id, identity, now)
@@ -971,7 +1026,8 @@ class EventHandlerManager:
             return
         reaction_observed_at = int(time.time())
         msg = event.message
-        coverage = await self._new_message_coverage(dialog_id, event)
+        identity_baseline = _IdentityBaseline(capture_identity_baseline(self._conn, dialog_id))
+        coverage = await self._new_message_coverage(dialog_id, event, identity_baseline=identity_baseline)
         if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
             return
         if not allows_new_message(coverage, outgoing=bool(getattr(msg, "out", False))):
@@ -1025,6 +1081,8 @@ class EventHandlerManager:
         self,
         dialog_id: int,
         event: _NewMessageEvent,
+        *,
+        identity_baseline: _IdentityBaseline | None = None,
     ) -> RealtimeHistoryCoverage:
         coverage = self._realtime_coverage(dialog_id)
         if coverage is not RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
@@ -1050,6 +1108,7 @@ class EventHandlerManager:
                 sender=peer,
                 message_date=event.message.date,
                 observed_at=int(time.time()),
+                identity_baseline=identity_baseline,
             )
             coverage = self._realtime_coverage(dialog_id)
         return coverage
@@ -1977,13 +2036,13 @@ class EventHandlerManager:
         )
 
     @staticmethod
-    def _username_update_name(update: UpdateUserName) -> str | _IdentityOmitted | None:
+    def _username_update_name(update: UpdateUserName) -> ObservedText:
         if not hasattr(update, "first_name") and not hasattr(update, "last_name"):
             return IDENTITY_OMITTED
         return " ".join(part for part in (update.first_name, update.last_name) if part) or None
 
     @staticmethod
-    def _username_update_alias(update: UpdateUserName) -> str | _IdentityOmitted | None:
+    def _username_update_alias(update: UpdateUserName) -> ObservedText:
         if not hasattr(update, "usernames"):
             return IDENTITY_OMITTED
         observed = observe_username(USERNAME_UNOBSERVED, update.usernames)
@@ -1993,14 +2052,19 @@ class EventHandlerManager:
         with self._conn:
             name = self._username_update_name(update)
             username = self._username_update_alias(update)
-            apply_realtime_identity(
+            dialog_id = int(update.user_id)
+            baseline_revision = capture_identity_baseline(self._conn, dialog_id)
+            publish_dialog_identity(
                 self._conn,
-                int(update.user_id),
-                name=name,
-                username=username,
-                dialog_type=None,
-                observed_at=now,
-                complete=False,
+                dialog_id,
+                DialogIdentityObservation(
+                    dialog_id=dialog_id,
+                    name=name,
+                    username=username,
+                    source="realtime",
+                    observed_at=now,
+                ),
+                baseline_revision,
             )
             if name is not IDENTITY_OMITTED or username is not IDENTITY_OMITTED:
                 apply_partial_entity_identity(

@@ -15,6 +15,7 @@ from datetime import date, datetime
 from typing import TypedDict, cast
 
 from ..identity_observation import USERNAME_UNOBSERVED, observe_username
+from ..telethon_dialog import observe_dialog_identity
 from .contracts import (
     FULL_PROFILE_OWNED_FIELDS,
     FULL_USER_ENDPOINT,
@@ -592,6 +593,16 @@ def normalize_full_user_response(
     profile, complete, identity_patch = _normalize_full_profile(
         full_user, user, target_id=target_id, target_kind=normalized_kind
     )
+    identity_observation = (
+        observe_dialog_identity(
+            user,
+            dialog_id=target_id,
+            source="profile",
+            observed_at=int(boundary.started_at),
+        )
+        if boundary.valid and boundary.started_at is not None
+        else None
+    )
     profile_provenance = _projection_provenance(FULL_PROFILE_OWNED_FIELDS, profile, boundary, authoritative=complete)
     return UserProfileObservation(
         target_id=target_id,
@@ -602,6 +613,7 @@ def normalize_full_user_response(
             reason=None if complete else "full_profile_fields_unknown",
             provenance=profile_provenance,
             identity_patch=identity_patch,
+            dialog_identity_observation=identity_observation,
         ),
         personal_channel=_normalize_personal_channel(full_user, _attr(response, "chats"), boundary),
     )

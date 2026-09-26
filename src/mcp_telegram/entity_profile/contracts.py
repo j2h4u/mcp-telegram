@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import cast
 
+from ..dialog_identity_contracts import DialogIdentityObservation
+
 PROFILE_SECTIONS: tuple[str, ...] = (
     "full_profile",
     "common_chats",
@@ -143,6 +145,7 @@ class ProjectionOutcome:
     reason: str | None
     provenance: ProjectionProvenance | None
     identity_patch: Mapping[str, object] | None = None
+    dialog_identity_observation: DialogIdentityObservation | None = None
 
     @property
     def authoritative_absence(self) -> bool:
@@ -336,6 +339,8 @@ class ChannelProfileObservation:
     created: int | None = None
     endpoint: str = CHANNEL_PROFILE_ENDPOINT
     normalization_version: str = CHANNEL_PROFILE_NORMALIZATION_VERSION
+    identity_patch: Mapping[str, object] | None = None
+    dialog_identity_observation: DialogIdentityObservation | None = None
 
     def __post_init__(self) -> None:
         _validate_nonzero_id(self.channel_id, field_name="channel_id")
@@ -349,6 +354,8 @@ class ChannelProfileObservation:
         object.__setattr__(self, "status", status)
         _validate_projection_reason(status, self.reason, usable_message="usable channel profile cannot have a reason")
         _validate_observation_boundary(self.observation_started_at, self.observation_completed_at)
+        if self.identity_patch is not None and not isinstance(self.identity_patch, Mapping):
+            raise TypeError("identity_patch must be a mapping or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,12 +394,16 @@ class GroupProfileObservation:
     created: int | None = None
     endpoint: str = GROUP_PROFILE_ENDPOINT
     normalization_version: str = GROUP_PROFILE_NORMALIZATION_VERSION
+    identity_patch: Mapping[str, object] | None = None
+    dialog_identity_observation: DialogIdentityObservation | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.group_id, int) or isinstance(self.group_id, bool):
             raise ValueError("group_id must be an integer")
         _validate_participant_observation(self.participant_ids, self.participants_unavailable_reason)
         _validate_observation_interval(self.observation_started_at, self.observation_completed_at)
+        if self.identity_patch is not None and not isinstance(self.identity_patch, Mapping):
+            raise TypeError("identity_patch must be a mapping or None")
 
 
 def _validate_positive_id(value: object, *, field_name: str) -> None:

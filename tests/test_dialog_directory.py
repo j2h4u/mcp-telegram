@@ -22,7 +22,6 @@ from mcp_telegram.dialog_directory import (
     _three_valued_unread,
     apply_active_generation_pin_delta,
     apply_realtime_eligibility,
-    apply_realtime_identity,
     clear_realtime_mute,
     record_realtime_pin_fence,
     recover_invalid_generation_in_transaction,
@@ -30,10 +29,13 @@ from mcp_telegram.dialog_directory import (
 )
 from mcp_telegram.dialog_directory_tl import (
     DialogCursor,
+    RawDialogFact,
     get_dialogs_request,
     normalize_dialogs_response,
     normalize_pinned_dialogs_response,
 )
+from mcp_telegram.dialog_identity import capture_identity_baseline, publish_dialog_identity
+from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 
@@ -70,14 +72,22 @@ def _state() -> object:
     return types.updates.State(pts=0, qts=0, date=None, seq=0, unread_count=0)
 
 
-def _response(dialogs: Sequence[types.Dialog], *, terminal: bool = True) -> object:
-    users: list[types.TypeUser] = [
-        types.User(id=_user_id(dialog), first_name=f"User {_user_id(dialog)}", access_hash=42) for dialog in dialogs
-    ]
+def _response(
+    dialogs: Sequence[types.Dialog], *, terminal: bool = True, users: Sequence[types.TypeUser] | None = None
+) -> object:
+    response_users: list[types.TypeUser] = []
+    if users is not None:
+        response_users.extend(users)
+    else:
+        response_users.extend(
+            types.User(id=_user_id(dialog), first_name=f"User {_user_id(dialog)}", access_hash=42) for dialog in dialogs
+        )
     messages = [_message(dialog, second) for second, dialog in enumerate(dialogs)]
     if terminal:
-        return types.messages.Dialogs(dialogs=list(dialogs), messages=messages, chats=[], users=users)
-    return types.messages.DialogsSlice(count=200, dialogs=list(dialogs), messages=messages, chats=[], users=users)
+        return types.messages.Dialogs(dialogs=list(dialogs), messages=messages, chats=[], users=response_users)
+    return types.messages.DialogsSlice(
+        count=200, dialogs=list(dialogs), messages=messages, chats=[], users=response_users
+    )
 
 
 def _pinned_response(dialogs: Sequence[types.Dialog] = ()) -> types.messages.PeerDialogs:
@@ -242,7 +252,7 @@ async def test_imperfect_slice_advances_and_retains_every_identifiable_row(tmp_p
     conn = _open_sync_db(db_path)
     try:
         assert conn.execute("SELECT dialog_id,type FROM dialogs ORDER BY dialog_id").fetchall() == [
-            (1, "unknown"),
+            (1, None),
             (2, "user"),
         ]
     finally:
@@ -355,8 +365,8 @@ async def test_pinned_membership_keeps_source_order_when_entities_are_unknown(tm
             "SELECT dialog_id,position FROM dialog_directory_published_pins WHERE folder_id=0 ORDER BY position"
         ).fetchall() == [(2, 0), (1, 1)]
         assert conn.execute("SELECT dialog_id,type FROM dialogs ORDER BY dialog_id").fetchall() == [
-            (1, "unknown"),
-            (2, "unknown"),
+            (1, None),
+            (2, None),
         ]
     finally:
         conn.close()
@@ -578,7 +588,10 @@ def test_realtime_mute_clear_fences_staged_directory_eligibility(tmp_path: Path)
     try:
         conn.execute("INSERT INTO dialogs(dialog_id,type,hidden,revision) VALUES (1,'user',0,0)")
         conn.execute("INSERT INTO dialog_directory_facts VALUES (1,'contact',0,1,500,10)")
-        conn.execute("INSERT INTO dialog_directory_baseline VALUES (1,1,0,1)")
+        conn.execute(
+            "INSERT INTO dialog_directory_baseline(generation,dialog_id,baseline_revision,baseline_identity_revision,seen) "
+            "VALUES (1,1,0,0,1)"
+        )
         conn.execute(
             "INSERT INTO dialog_directory_staging(generation,dialog_id,source,peer_kind,top_message,name,type,archived,pinned,"
             "unread_mentions_count,unread_reactions_count,snapshot_at,identity_complete,identity_source,"
@@ -633,7 +646,7 @@ async def test_first_ordinary_page_is_productive_when_every_dialog_was_pinned(tm
 
 
 @pytest.mark.asyncio
-async def test_publication_is_atomic_and_preserves_realtime_revision(tmp_path: Path) -> None:
+async def test_directory_identity_loses_equal_time_race_but_presence_publishes(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
@@ -644,6 +657,7 @@ async def test_publication_is_atomic_and_preserves_realtime_revision(tmp_path: P
         conn.commit()
     finally:
         conn.close()
+
     client = _FakeClient(
         [
             _pinned_response(),
@@ -657,8 +671,14 @@ async def test_publication_is_atomic_and_preserves_realtime_revision(tmp_path: P
     await directory.run_slice()
     conn = _open_sync_db(db_path)
     try:
-        # Simulate the realtime writer after the baseline and before terminal publication.
-        conn.execute("UPDATE dialogs SET name='New realtime fact' WHERE dialog_id=1")
+        # Equal timestamps still order by identity revision, independently from presence.
+        revision = capture_identity_baseline(conn, 1)
+        assert publish_dialog_identity(
+            conn,
+            1,
+            DialogIdentityObservation(1, "New realtime fact", "new", "user", True, "realtime", 20),
+            revision,
+        )
         conn.commit()
     finally:
         conn.close()
@@ -666,13 +686,57 @@ async def test_publication_is_atomic_and_preserves_realtime_revision(tmp_path: P
 
     conn = _open_sync_db(db_path)
     try:
-        assert conn.execute("SELECT name, created, hidden FROM dialogs WHERE dialog_id=1").fetchone() == (
+        assert conn.execute("SELECT name,created,hidden FROM dialogs WHERE dialog_id=1").fetchone() == (
             "New realtime fact",
             123456789,
             0,
         )
         assert conn.execute("SELECT status FROM dialog_directory_state").fetchone() == ("complete",)
         assert conn.execute("SELECT COUNT(*) FROM dialog_directory_staging").fetchone() == (0,)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_directory_does_not_publish_identity_over_realtime_created_membership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    monkeypatch.setattr("mcp_telegram.dialog_directory.time.time", lambda: 20)
+    directory = CanonicalDialogDirectory(
+        _FakeClient(
+            [
+                _pinned_response(),
+                _pinned_response(),
+                _response([_dialog(1, 8)], terminal=False),
+                types.messages.Dialogs(dialogs=[], messages=[], chats=[], users=[]),
+            ]
+        ),
+        db_path,
+        asyncio.Event(),
+    )
+    await _run_slices(directory, 3)
+
+    conn = _open_sync_db(db_path)
+    try:
+        with conn:
+            conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (1,'unknown',0)")
+            assert publish_dialog_identity(
+                conn,
+                1,
+                DialogIdentityObservation(1, "Realtime", "live", "user", True, "realtime", 20),
+                0,
+            )
+    finally:
+        conn.close()
+    await directory.run_slice()
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT name,username,type,identity_revision FROM dialogs WHERE dialog_id=1"
+        ).fetchone() == ("Realtime", "live", "user", 1)
     finally:
         conn.close()
 
@@ -706,8 +770,8 @@ async def test_cursor_and_page_commit_together_and_absence_waits_for_eof(tmp_pat
         assert conn.execute("SELECT hidden FROM dialogs WHERE dialog_id=9").fetchone() == (0,)
         assert conn.execute("SELECT offset_id FROM dialog_directory_state").fetchone() == (8,)
         assert conn.execute("SELECT COUNT(*) FROM dialog_directory_staging").fetchone() == (1,)
-        # An unseen row modified after the baseline cannot be hidden at EOF.
-        conn.execute("UPDATE dialogs SET name='Event-created fact' WHERE dialog_id=9")
+        # A realtime presence update after the baseline cannot be hidden at EOF.
+        conn.execute("UPDATE dialogs SET last_message_at=2 WHERE dialog_id=9")
         conn.commit()
     finally:
         conn.close()
@@ -715,11 +779,229 @@ async def test_cursor_and_page_commit_together_and_absence_waits_for_eof(tmp_pat
 
     conn = _open_sync_db(db_path)
     try:
-        assert conn.execute("SELECT name,hidden FROM dialogs WHERE dialog_id=9").fetchone() == ("Event-created fact", 0)
+        assert conn.execute("SELECT last_message_at,hidden FROM dialogs WHERE dialog_id=9").fetchone() == (2, 0)
         assert isinstance(client.requests[0], functions.messages.GetPinnedDialogsRequest)
         assert client.requests[0].folder_id == 0
         assert isinstance(client.requests[1], functions.messages.GetPinnedDialogsRequest)
         assert client.requests[1].folder_id == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_directory_resume_keeps_pre_rpc_identity_baseline_and_presence_absence_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    monkeypatch.setattr("mcp_telegram.dialog_directory.time.time", lambda: 20)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute("INSERT INTO dialogs(dialog_id,name,type,snapshot_at,hidden) VALUES (1,'Old','user',1,0)")
+        conn.execute("INSERT INTO dialogs(dialog_id,name,type,snapshot_at,hidden) VALUES (9,'Absent','user',1,0)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    first = CanonicalDialogDirectory(
+        _FakeClient([_pinned_response(), _pinned_response(), _response([_dialog(1, 8)], terminal=False)]),
+        db_path,
+        asyncio.Event(),
+    )
+    await _run_slices(first, 3)
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT baseline_identity_revision FROM dialog_directory_staging WHERE generation=1 AND dialog_id=1"
+        ).fetchone() == (0,)
+        for dialog_id, name in ((1, "Profile identity"), (9, "Profile only")):
+            assert publish_dialog_identity(
+                conn,
+                dialog_id,
+                DialogIdentityObservation(dialog_id, name=name, source="profile", observed_at=30),
+                capture_identity_baseline(conn, dialog_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    resumed = CanonicalDialogDirectory(
+        _FakeClient([types.messages.Dialogs(dialogs=[], messages=[], chats=[], users=[])]),
+        db_path,
+        asyncio.Event(),
+    )
+    await resumed.run_slice()
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute("SELECT name,identity_revision FROM dialogs WHERE dialog_id=1").fetchone() == (
+            "Profile identity",
+            1,
+        )
+        assert conn.execute("SELECT hidden FROM dialogs WHERE dialog_id=9").fetchone() == (1,)
+        assert conn.execute("SELECT status FROM dialog_directory_state").fetchone() == ("complete",)
+    finally:
+        conn.close()
+
+
+def _stage_min_user_directory_generation(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute("INSERT INTO dialogs(dialog_id) VALUES (1)")
+        assert publish_dialog_identity(
+            conn,
+            1,
+            DialogIdentityObservation(1, "Known Bot", "known_bot", "bot", True, "profile", 1),
+            capture_identity_baseline(conn, 1),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    directory = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event())
+    directory.bind_account_id(99)
+    conn = _open_sync_db(db_path)
+    try:
+        with conn:
+            directory._start_generation(conn, 1)
+            directory._stage_facts(
+                conn,
+                1,
+                (
+                    RawDialogFact(
+                        1,
+                        types.User(id=1, first_name="Partial Name", min=True, access_hash=42),
+                        _dialog(1, 8),
+                        datetime(2026, 1, 1, tzinfo=UTC),
+                    ),
+                ),
+                folder_id=None,
+                account_id=99,
+            )
+            conn.execute(
+                "UPDATE dialog_directory_state SET status='incomplete',ordinary_status='incomplete',"
+                "pinned_main_status='complete',pinned_archive_status='complete' WHERE singleton=1"
+            )
+        assert conn.execute(
+            "SELECT identity_fields_observed,name,username,type,identity_complete "
+            "FROM dialog_directory_staging WHERE generation=1 AND dialog_id=1"
+        ).fetchone() == (1, "Partial Name", None, "unknown", 0)
+    finally:
+        conn.close()
+
+
+def _stage_repeated_peer_directory_facts(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute("INSERT INTO dialogs(dialog_id) VALUES (1)")
+        assert publish_dialog_identity(
+            conn,
+            1,
+            DialogIdentityObservation(1, "Old Bot", "old_bot", "bot", True, "profile", 1),
+            capture_identity_baseline(conn, 1),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    directory = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event())
+    directory.bind_account_id(99)
+    facts = (
+        RawDialogFact(
+            1,
+            types.User(id=1, first_name="First Name", username=None, bot=True),
+            _dialog(1, 1),
+            datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
+        ),
+        RawDialogFact(
+            1,
+            types.User(id=1, first_name="Partial Name", min=True),
+            _dialog(1, 2),
+            datetime(2026, 1, 1, 0, 0, 2, tzinfo=UTC),
+        ),
+        RawDialogFact(
+            2,
+            types.User(id=2, first_name="New Full", username="new_peer", bot=True),
+            _dialog(2, 3),
+            datetime(2026, 1, 1, 0, 0, 3, tzinfo=UTC),
+        ),
+        RawDialogFact(
+            2,
+            types.User(id=2, first_name="New Partial", min=True),
+            _dialog(2, 4),
+            datetime(2026, 1, 1, 0, 0, 4, tzinfo=UTC),
+        ),
+        RawDialogFact(
+            3,
+            types.User(id=3, first_name="Early Partial", min=True),
+            _dialog(3, 5),
+            datetime(2026, 1, 1, 0, 0, 5, tzinfo=UTC),
+        ),
+        RawDialogFact(
+            3,
+            types.User(id=3, first_name="Full Final", username=None, bot=True),
+            _dialog(3, 6),
+            datetime(2026, 1, 1, 0, 0, 6, tzinfo=UTC),
+        ),
+    )
+    conn = _open_sync_db(db_path)
+    try:
+        with conn:
+            directory._start_generation(conn, 1)
+            directory._stage_facts(conn, 1, facts, folder_id=None, account_id=99)
+            conn.execute(
+                "UPDATE dialog_directory_state SET status='incomplete',ordinary_status='incomplete',"
+                "pinned_main_status='complete',pinned_archive_status='complete' WHERE singleton=1"
+            )
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_min_user_identity_mask_survives_directory_restart(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    _stage_min_user_directory_generation(db_path)
+    resumed = CanonicalDialogDirectory(
+        _FakeClient([types.messages.Dialogs(dialogs=[], messages=[], chats=[], users=[])]),
+        db_path,
+        asyncio.Event(),
+    )
+    await resumed.run_slice()
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT name,username,type,identity_complete FROM dialogs WHERE dialog_id=1"
+        ).fetchone() == ("Partial Name", "known_bot", "bot", 0)
+        assert conn.execute("SELECT status FROM dialog_directory_state").fetchone() == ("complete",)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_peer_stage_merges_partial_and_complete_identity_fieldwise(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    _stage_repeated_peer_directory_facts(db_path)
+    resumed = CanonicalDialogDirectory(
+        _FakeClient([types.messages.Dialogs(dialogs=[], messages=[], chats=[], users=[])]),
+        db_path,
+        asyncio.Event(),
+    )
+    await resumed.run_slice()
+
+    conn = _open_sync_db(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT name,username,type,identity_complete,last_message_at FROM dialogs WHERE dialog_id IN (1,2,3) "
+            "ORDER BY dialog_id"
+        ).fetchall()
+        assert rows == [
+            ("Partial Name", None, "bot", 0, int(datetime(2026, 1, 1, 0, 0, 2, tzinfo=UTC).timestamp())),
+            ("New Partial", "new_peer", "bot", 0, int(datetime(2026, 1, 1, 0, 0, 4, tzinfo=UTC).timestamp())),
+            ("Full Final", None, "bot", 1, int(datetime(2026, 1, 1, 0, 0, 6, tzinfo=UTC).timestamp())),
+        ]
     finally:
         conn.close()
 
@@ -1409,14 +1691,32 @@ def test_entity_projection_persists_chat_and_channel_creation_dates() -> None:
             participants_count=1,
             date=chat_date,
             version=1,
-        )
+        ),
+        dialog_id=5,
+        observed_at=1,
     ).created == int(chat_date.timestamp())
     assert _staged_entity_projection(
-        types.Channel(id=6, title="supergroup", photo=types.ChatPhotoEmpty(), date=channel_date, megagroup=True)
+        types.Channel(id=6, title="supergroup", photo=types.ChatPhotoEmpty(), date=channel_date, megagroup=True),
+        dialog_id=6,
+        observed_at=1,
     ).created == int(channel_date.timestamp())
 
 
-def test_realtime_bundles_preserve_oldest_boundary_and_complete_identity_replaces(tmp_path: Path) -> None:
+def test_directory_mask_does_not_turn_partial_default_username_into_a_clear() -> None:
+    partial = _staged_entity_projection(
+        types.User(id=7, first_name="Partial", username=None, min=True), dialog_id=7, observed_at=1
+    )
+    complete = _staged_entity_projection(
+        types.User(id=8, first_name="Complete", username=None), dialog_id=8, observed_at=1
+    )
+
+    assert partial.identity_fields_observed == 1
+    assert partial.username is None
+    assert complete.identity_fields_observed == 7
+    assert complete.username is None
+
+
+def test_identity_owner_keeps_presence_and_identity_fences_independent(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
@@ -1425,14 +1725,15 @@ def test_realtime_bundles_preserve_oldest_boundary_and_complete_identity_replace
             "INSERT INTO dialogs(dialog_id,name,type,username,identity_observed_at,identity_complete,identity_source) "
             "VALUES (1,'Old','user','old',10,1,'directory')"
         )
+        identity_revision = capture_identity_baseline(conn, 1)
         with conn:
             assert apply_realtime_eligibility(conn, 1, category="contact", archived=0, observed_at=20) == 1
             assert apply_realtime_eligibility(conn, 1, unread=1, observed_at=30) == 1
-            assert (
-                apply_realtime_identity(
-                    conn, 1, name="Renamed", username=None, dialog_type="user", observed_at=40, complete=True
-                )
-                == 1
+            assert publish_dialog_identity(
+                conn,
+                1,
+                DialogIdentityObservation(1, "Renamed", None, "user", True, "realtime", 40),
+                identity_revision,
             )
         assert conn.execute(
             "SELECT name,username,identity_observed_at,identity_complete,identity_source FROM dialogs WHERE dialog_id=1"
@@ -1444,7 +1745,7 @@ def test_realtime_bundles_preserve_oldest_boundary_and_complete_identity_replace
         conn.close()
 
 
-def test_partial_realtime_identity_omission_preserves_values_and_explicit_removal_clears(tmp_path: Path) -> None:
+def test_partial_identity_omission_preserves_values_and_explicit_clear_clears(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
@@ -1453,13 +1754,18 @@ def test_partial_realtime_identity_omission_preserves_values_and_explicit_remova
             "INSERT INTO dialogs(dialog_id,name,type,username,identity_observed_at,identity_complete,identity_source) "
             "VALUES (1,'Known','user','known',10,1,'directory')"
         )
+        revision = capture_identity_baseline(conn, 1)
         with conn:
-            assert apply_realtime_identity(conn, 1, observed_at=20, complete=False) == 0
-            assert (
-                apply_realtime_identity(
-                    conn, 1, name=None, username=None, dialog_type=None, observed_at=30, complete=False
-                )
-                == 1
+            assert not publish_dialog_identity(
+                conn, 1, DialogIdentityObservation(1, source="realtime", observed_at=20), revision
+            )
+            assert publish_dialog_identity(
+                conn,
+                1,
+                DialogIdentityObservation(
+                    1, name=None, username=None, dialog_type=IDENTITY_OMITTED, source="realtime", observed_at=30
+                ),
+                revision,
             )
         assert conn.execute(
             "SELECT name,username,type,identity_observed_at,identity_source FROM dialogs WHERE dialog_id=1"
@@ -1468,7 +1774,7 @@ def test_partial_realtime_identity_omission_preserves_values_and_explicit_remova
         conn.close()
 
 
-def test_realtime_identity_presence_unhides_catalog_row_without_reviving_access_loss(tmp_path: Path) -> None:
+def test_realtime_identity_does_not_change_hidden_presence(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
@@ -1479,9 +1785,15 @@ def test_realtime_identity_presence_unhides_catalog_row_without_reviving_access_
         )
         conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (2,'access_lost')")
         with conn:
-            assert apply_realtime_identity(conn, 1, name="Renamed", observed_at=20, complete=False) == 1
-            assert apply_realtime_identity(conn, 2, name="Renamed", observed_at=20, complete=False) == 1
-        assert conn.execute("SELECT hidden FROM dialogs WHERE dialog_id=1").fetchone() == (0,)
+            for dialog_id in (1, 2):
+                revision = capture_identity_baseline(conn, dialog_id)
+                assert publish_dialog_identity(
+                    conn,
+                    dialog_id,
+                    DialogIdentityObservation(dialog_id, name="Renamed", source="realtime", observed_at=20),
+                    revision,
+                )
+        assert conn.execute("SELECT hidden FROM dialogs WHERE dialog_id=1").fetchone() == (1,)
         assert conn.execute("SELECT hidden FROM dialogs WHERE dialog_id=2").fetchone() == (1,)
     finally:
         conn.close()
@@ -1618,7 +1930,7 @@ async def test_incomplete_directory_identity_keeps_known_username_and_oldest_bou
     try:
         assert conn.execute(
             "SELECT name,username,identity_observed_at,identity_complete,identity_source FROM dialogs WHERE dialog_id=1"
-        ).fetchone() == ("Known", "known", 10, 1, "mixed")
+        ).fetchone() == ("Partial", "partial", 10, 0, "mixed")
     finally:
         conn.close()
 

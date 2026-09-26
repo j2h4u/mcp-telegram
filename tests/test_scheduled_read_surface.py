@@ -82,6 +82,35 @@ async def test_list_messages_draft_is_local_and_has_no_sent_identity() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("has_draft", [False, True], ids=["empty", "populated"])
+async def test_draft_only_response_has_canonical_dialog_identity(has_draft: bool) -> None:
+    server = make_server(_make_db_with_dialogs())
+    server.self_id = 7
+    conn = server._conn
+    _seed_dialog_row(conn, 1, name="Canonical User")
+    conn.execute(
+        "UPDATE dialogs SET type='user',username=NULL,identity_source='directory',identity_complete=1 WHERE dialog_id=1"
+    )
+    _create_draft_projection(conn)
+    if has_draft:
+        conn.execute(
+            "INSERT INTO draft_current VALUES "
+            "(7, 1, 0, 0, 'present', 'draft text', '[]', NULL, NULL, NULL, NULL, NULL, 0, 0, 1, "
+            "'realtime_present', 100, 100, 101, 2, 1)"
+        )
+    conn.execute("INSERT INTO draft_sync_state VALUES (7, 'ready', 'complete', 100, 101, NULL)")
+    conn.commit()
+
+    result = await server._list_messages({"dialog_id": 1, "message_state": "draft"})
+
+    assert result["ok"] is True
+    assert result["data"]["dialog_name"] == "Canonical User"
+    assert result["data"]["dialog_name_source"] == "name"
+    assert result["data"]["dialog_type"] == "user"
+    assert bool(result["data"]["messages"]) is has_draft
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("message_state", ["draft", "all"])
 async def test_draft_response_budget_keeps_complete_rows_reachable(message_state: str) -> None:
     server = make_server()
@@ -872,6 +901,28 @@ async def test_search_messages_scheduled_is_local_and_explicit() -> None:
     assert rows[0]["scheduled_at"] == FUTURE_BASE + 200
     assert rows[0]["unpublished"] is True
     assert rows[0]["unseen"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_state", ["scheduled", "all"])
+async def test_scheduled_search_hits_use_canonical_username_identity(message_state: str) -> None:
+    conn = _make_db_with_dialogs(with_fts=True)
+    server = make_server(conn)
+    _seed_dialog_row(conn, 1, name=None)
+    conn.execute(
+        "UPDATE dialogs SET type='user',username='peer_handle',identity_source='directory',identity_complete=1 "
+        "WHERE dialog_id=1"
+    )
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 11, FUTURE_BASE + 200, "needle in future")
+
+    result = await server._search_messages(
+        {"dialog_id": 1, "query": "needle", "message_state": message_state, "limit": 20}
+    )
+
+    hit = result["data"]["messages"][0]
+    assert hit["dialog_name"] == "@peer_handle"
+    assert hit["dialog_name_source"] == "username"
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,7 @@ SEARCH_HIT_SCHEMA: dict[str, object] = {
     "properties": {
         "dialog_id": {"type": "integer"},
         "dialog_name": {"type": ["string", "null"]},
+        "dialog_name_source": {"type": "string", "enum": ["name", "username", "numeric"]},
         "msg_id": {"type": "integer"},
         # Keep the canonical Unix moment internally; shared temporal projection
         # renders it as ISO-8601 in the requested response timezone.
@@ -63,6 +64,7 @@ SEARCH_HIT_SCHEMA: dict[str, object] = {
     "required": [
         "dialog_id",
         "dialog_name",
+        "dialog_name_source",
         "msg_id",
         "anchor_call",
         "message_state",
@@ -171,6 +173,7 @@ def project_search_hit(
     result: dict[str, object] = {
         "dialog_id": dialog_id,
         "dialog_name": row.get("dialog_name"),
+        "dialog_name_source": row.get("dialog_name_source") or "numeric",
         "msg_id": msg_id,
         "date": _search_date(row),
         "sender": resolve_sender_label(row),
