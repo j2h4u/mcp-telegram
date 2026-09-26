@@ -2524,6 +2524,10 @@ class ReadingService:
                 "message": "Either dialog_id or dialog name is required",
             }
         result = await self._list_messages_for_state(dialog_id, request, direction)
+        if result.get("ok"):
+            data = result.get("data")
+            if isinstance(data, dict):
+                data["dialog_id"] = dialog_id
         with timing_phase("response_shape"):
             return self._attach_directory_coverage(result, getattr(resolved, "coverage", None))
 

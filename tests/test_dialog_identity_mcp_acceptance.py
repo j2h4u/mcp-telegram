@@ -27,10 +27,12 @@ from test_daemon_api import make_server
 
 _GROUP_ID = -10090001
 _PENDING_GROUP_ID = -10090002
+_EMPTY_OWN_ONLY_GROUP_ID = -10090004
 _ACCOUNT_ID = 90003
 _GROUP_NAME = "Canonical acceptance group"
 _GROUP_USERNAME = "canonical_acceptance_group"
 _PENDING_NAME = "Pending cursor group"
+_EMPTY_OWN_ONLY_GROUP_NAME = "Canonical empty own-only group"
 
 
 class _FailOnRpcClient:
@@ -60,6 +62,7 @@ def _seed_dialog(
     identity: tuple[str, str | None],
     *,
     read_cursor: int | None,
+    own_only: bool = False,
 ) -> None:
     name, username = identity
     now = int(time.time())
@@ -83,21 +86,35 @@ def _seed_dialog(
         ),
         baseline,
     )
-    conn.execute(
-        "UPDATE dialogs SET unread_count=1,unread_count_observed_at=? WHERE dialog_id=?",
-        (now, dialog_id),
-    )
-    conn.execute(
-        "INSERT INTO synced_dialogs(dialog_id,status,read_inbox_max_id,read_outbox_max_id,last_event_at) "
-        "VALUES (?,'synced',?,0,?)",
-        (dialog_id, read_cursor, now),
-    )
+    if own_only:
+        conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?,'own_only')", (dialog_id,))
+        conn.execute(
+            "INSERT INTO own_only_dialogs(dialog_id,inclusion_basis,updated_at) VALUES (?,?,?)",
+            (dialog_id, '["owned_channel"]', now),
+        )
+    else:
+        conn.execute(
+            "UPDATE dialogs SET unread_count=1,unread_count_observed_at=? WHERE dialog_id=?",
+            (now, dialog_id),
+        )
+        conn.execute(
+            "INSERT INTO synced_dialogs(dialog_id,status,read_inbox_max_id,read_outbox_max_id,last_event_at) "
+            "VALUES (?,'synced',?,0,?)",
+            (dialog_id, read_cursor, now),
+        )
 
 
 def _seed_acceptance_data(conn: sqlite3.Connection) -> None:
     now = int(time.time())
     _seed_dialog(conn, _GROUP_ID, (_GROUP_NAME, _GROUP_USERNAME), read_cursor=1)
     _seed_dialog(conn, _PENDING_GROUP_ID, (_PENDING_NAME, None), read_cursor=None)
+    _seed_dialog(
+        conn,
+        _EMPTY_OWN_ONLY_GROUP_ID,
+        (_EMPTY_OWN_ONLY_GROUP_NAME, None),
+        read_cursor=None,
+        own_only=True,
+    )
     conn.execute(
         "INSERT INTO dialogs(dialog_id,name,type,identity_complete,identity_observed_at,identity_source) "
         "VALUES (?,'Acceptance account','user',1,?,'directory')",
@@ -133,7 +150,7 @@ def _seed_acceptance_data(conn: sqlite3.Connection) -> None:
     conn.execute(
         "UPDATE dialog_directory_state SET account_id=7,generation=1,status='complete',"
         "ordinary_status='complete',pinned_main_status='complete',pinned_archive_status='complete',"
-        "observation_started_at=?,observation_completed_at=?,observed_count=2 WHERE singleton=1",
+        "observation_started_at=?,observation_completed_at=?,observed_count=3 WHERE singleton=1",
         (now, now),
     )
     conn.execute(
@@ -177,6 +194,23 @@ def _acceptance_steps() -> list[dict[str, object]]:
                 "structuredContent.dialog.type": "supergroup",
                 "structuredContent.dialog.display_name_source": "name",
                 "structuredContent.source": "sync_db+scheduled_messages+draft_current",
+            },
+        ),
+        _tool_step(
+            "list_messages",
+            {
+                "dialog": _EMPTY_OWN_ONLY_GROUP_NAME,
+                "limit": 2,
+                "navigation": "latest",
+                "message_state": "all",
+            },
+            checks={
+                "structuredContent.dialog_id": _EMPTY_OWN_ONLY_GROUP_ID,
+                "structuredContent.dialog.id": _EMPTY_OWN_ONLY_GROUP_ID,
+                "structuredContent.dialog.name": _EMPTY_OWN_ONLY_GROUP_NAME,
+                "structuredContent.dialog.type": "supergroup",
+                "structuredContent.dialog.display_name_source": "name",
+                "structuredContent.count": 0,
             },
         ),
         _tool_step(
@@ -346,7 +380,11 @@ async def _run_isolated_mcp_scenario(
         assert telegram.attempts == []
         assert demand_sink.offers == []
         assert (
-            conn.execute("SELECT 1 FROM entities WHERE id IN (?,?)", (_GROUP_ID, _PENDING_GROUP_ID)).fetchone() is None
+            conn.execute(
+                "SELECT 1 FROM entities WHERE id IN (?,?,?)",
+                (_GROUP_ID, _PENDING_GROUP_ID, _EMPTY_OWN_ONLY_GROUP_ID),
+            ).fetchone()
+            is None
         )
     finally:
         stop_event.set()
@@ -368,7 +406,13 @@ async def test_canonical_only_dialog_identity_over_mcp_http_cli(
 ) -> None:
     conn = make_synced_db()
     _seed_acceptance_data(conn)
-    assert conn.execute("SELECT 1 FROM entities WHERE id IN (?,?)", (_GROUP_ID, _PENDING_GROUP_ID)).fetchone() is None
+    assert (
+        conn.execute(
+            "SELECT 1 FROM entities WHERE id IN (?,?,?)",
+            (_GROUP_ID, _PENDING_GROUP_ID, _EMPTY_OWN_ONLY_GROUP_ID),
+        ).fetchone()
+        is None
+    )
 
     telegram = _FailOnRpcClient()
     with pytest.raises(AssertionError):
