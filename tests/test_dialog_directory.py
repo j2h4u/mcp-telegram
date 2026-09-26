@@ -891,6 +891,74 @@ def _stage_min_user_directory_generation(db_path: Path) -> None:
         conn.close()
 
 
+def _stage_repeated_peer_directory_facts(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute("INSERT INTO dialogs(dialog_id) VALUES (1)")
+        assert publish_dialog_identity(
+            conn,
+            1,
+            DialogIdentityObservation(1, "Old Bot", "old_bot", "bot", True, "profile", 1),
+            capture_identity_baseline(conn, 1),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    directory = CanonicalDialogDirectory(_FakeClient([]), db_path, asyncio.Event())
+    directory.bind_account_id(99)
+    facts = (
+        RawDialogFact(
+            1,
+            types.User(id=1, first_name="First Name", username=None, bot=True),
+            _dialog(1, 1),
+            datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
+        ),
+        RawDialogFact(
+            1,
+            types.User(id=1, first_name="Partial Name", min=True),
+            _dialog(1, 2),
+            datetime(2026, 1, 1, 0, 0, 2, tzinfo=UTC),
+        ),
+        RawDialogFact(
+            2,
+            types.User(id=2, first_name="New Full", username="new_peer", bot=True),
+            _dialog(2, 3),
+            datetime(2026, 1, 1, 0, 0, 3, tzinfo=UTC),
+        ),
+        RawDialogFact(
+            2,
+            types.User(id=2, first_name="New Partial", min=True),
+            _dialog(2, 4),
+            datetime(2026, 1, 1, 0, 0, 4, tzinfo=UTC),
+        ),
+        RawDialogFact(
+            3,
+            types.User(id=3, first_name="Early Partial", min=True),
+            _dialog(3, 5),
+            datetime(2026, 1, 1, 0, 0, 5, tzinfo=UTC),
+        ),
+        RawDialogFact(
+            3,
+            types.User(id=3, first_name="Full Final", username=None, bot=True),
+            _dialog(3, 6),
+            datetime(2026, 1, 1, 0, 0, 6, tzinfo=UTC),
+        ),
+    )
+    conn = _open_sync_db(db_path)
+    try:
+        with conn:
+            directory._start_generation(conn, 1)
+            directory._stage_facts(conn, 1, facts, folder_id=None, account_id=99)
+            conn.execute(
+                "UPDATE dialog_directory_state SET status='incomplete',ordinary_status='incomplete',"
+                "pinned_main_status='complete',pinned_archive_status='complete' WHERE singleton=1"
+            )
+    finally:
+        conn.close()
+
+
 @pytest.mark.asyncio
 async def test_min_user_identity_mask_survives_directory_restart(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
@@ -908,6 +976,32 @@ async def test_min_user_identity_mask_survives_directory_restart(tmp_path: Path)
             "SELECT name,username,type,identity_complete FROM dialogs WHERE dialog_id=1"
         ).fetchone() == ("Partial Name", "known_bot", "bot", 0)
         assert conn.execute("SELECT status FROM dialog_directory_state").fetchone() == ("complete",)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_peer_stage_merges_partial_and_complete_identity_fieldwise(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    _stage_repeated_peer_directory_facts(db_path)
+    resumed = CanonicalDialogDirectory(
+        _FakeClient([types.messages.Dialogs(dialogs=[], messages=[], chats=[], users=[])]),
+        db_path,
+        asyncio.Event(),
+    )
+    await resumed.run_slice()
+
+    conn = _open_sync_db(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT name,username,type,identity_complete,last_message_at FROM dialogs WHERE dialog_id IN (1,2,3) "
+            "ORDER BY dialog_id"
+        ).fetchall()
+        assert rows == [
+            ("Partial Name", None, "bot", 0, int(datetime(2026, 1, 1, 0, 0, 2, tzinfo=UTC).timestamp())),
+            ("New Partial", "new_peer", "bot", 0, int(datetime(2026, 1, 1, 0, 0, 4, tzinfo=UTC).timestamp())),
+            ("Full Final", None, "bot", 1, int(datetime(2026, 1, 1, 0, 0, 6, tzinfo=UTC).timestamp())),
+        ]
     finally:
         conn.close()
 

@@ -62,9 +62,11 @@ def test_identity_dml_aliases_and_conflict_updates_are_rejected() -> None:
         "UPDATE OR IGNORE dialogs SET type=? WHERE dialog_id=?",
         "UPDATE dialogs SET (type)=(?) WHERE dialog_id=?",
         "UPDATE dialogs SET (name,type)=(?,?) WHERE dialog_id=?",
+        "INSERT OR REPLACE INTO dialogs(dialog_id,last_message_at) VALUES (?,?)",
+        'REPLACE INTO "main"."dialogs"(dialog_id,name) VALUES (?,?)',
         "INSERT INTO main.dialogs(dialog_id,name) VALUES (?,?) ON CONFLICT(dialog_id) DO UPDATE SET name=excluded.name",
     ):
-        assert _identity_findings("rogue.py", f'conn.execute("{sql}")')
+        assert _identity_findings("rogue.py", f"conn.execute({sql!r})")
 
     entity_findings = _gate().violations_for(
         _gate().SOURCE_ROOT / "rogue.py",
@@ -158,10 +160,12 @@ def test_operational_dialog_roles_are_read_only_and_field_limited() -> None:
         "UPDATE OR IGNORE dialogs SET type=? WHERE dialog_id=?",
         "UPDATE dialogs SET (type)=(?) WHERE dialog_id=?",
         "UPDATE dialogs SET (name,type)=(?,?) WHERE dialog_id=?",
+        "INSERT OR REPLACE INTO dialogs(dialog_id,last_message_at) VALUES (?,?)",
+        'REPLACE INTO "main"."dialogs"(dialog_id,name) VALUES (?,?)',
     ):
         assert _identity_findings(
             "activity_peer_sweep.py",
-            f'def _next_enrollment_dialog(conn):\n    return conn.execute("{sql}")\n',
+            f"def _next_enrollment_dialog(conn):\n    return conn.execute({sql!r})\n",
         )
     assert _identity_findings(
         "sync_worker.py",

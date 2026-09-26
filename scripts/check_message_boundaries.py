@@ -221,7 +221,7 @@ MESSAGE_BODY_SURFACE_FUNCTION_NAMES = frozenset({"get_inbox", "list_messages", "
 
 _EXECUTE_METHODS = frozenset({"execute", "executemany", "executescript"})
 _SQL_NAME = re.compile(r"(?:^|_)(?:SQL|DDL|QUERY)(?:$|_)", re.IGNORECASE)
-_SQL_START = re.compile(r"^(?:SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b", re.IGNORECASE)
+_SQL_START = re.compile(r"^(?:SELECT|WITH|INSERT|REPLACE|UPDATE|DELETE|CREATE|ALTER|DROP)\b", re.IGNORECASE)
 _SQL_TOKEN = re.compile(
     r"--[^\n]*|/\*.*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*|[().*=]",
     re.IGNORECASE | re.DOTALL,
@@ -530,7 +530,13 @@ def _has_dialog_identity_dml(sql: str) -> bool:  # noqa: PLR0911, PLR0912
         return False
     statement = tokens[statement_index].casefold()
     target_index = statement_index + 1
+    replacement = statement == "replace"
     if statement in {"insert", "update"} and target_index < len(tokens) and tokens[target_index].casefold() == "or":
+        replacement = (
+            statement == "insert"
+            and target_index + 1 < len(tokens)
+            and tokens[target_index + 1].casefold() == "replace"
+        )
         target_index += 2
     if statement in {"insert", "replace"}:
         if target_index < len(tokens) and tokens[target_index].casefold() == "into":
@@ -541,6 +547,8 @@ def _has_dialog_identity_dml(sql: str) -> bool:  # noqa: PLR0911, PLR0912
         return False
     if not _is_exact_table_at(tokens, target_index, "dialogs"):
         return False
+    if replacement:
+        return True
     fields = {field.casefold() for field in _IDENTITY_FIELDS}
     if statement in {"insert", "replace"}:
         opening = next((i for i in range(target_index + 1, len(tokens)) if tokens[i] == "("), None)
