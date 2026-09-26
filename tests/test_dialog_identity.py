@@ -67,6 +67,51 @@ def test_partial_clear_preserves_omitted_fields_but_forgets_legacy_age(
     assert identity.observed_at is None and not identity.complete and identity.source == "mixed"
 
 
+@pytest.mark.parametrize("unknown_type", [None, DialogType.UNKNOWN, "unknown", "Unknown", "not-a-type"])
+def test_partial_unknown_type_preserves_known_type(
+    make_synced_db: Callable[[], sqlite3.Connection],
+    unknown_type: DialogType | str | None,
+) -> None:
+    conn = make_synced_db()
+    _dialog(conn, 121, name="Before", type="supergroup", username="before", identity_source="realtime")
+    baseline = capture_identity_baseline(conn, 121)
+    observation = DialogIdentityObservation(
+        121, name="After", dialog_type=unknown_type, complete=False, source="profile", observed_at=20
+    )
+    assert publish_dialog_identity(conn, 121, observation, baseline)
+    identity = read_dialog_identities(conn, [121])[121]
+    assert identity.name == "After"
+    assert identity.dialog_type is DialogType.SUPERGROUP
+    assert identity.source == "mixed"
+
+
+@pytest.mark.parametrize("unknown_type", [None, DialogType.UNKNOWN, "unknown", "Unknown", "not-a-type"])
+def test_unknown_type_only_is_noop_without_revision_advance(
+    make_synced_db: Callable[[], sqlite3.Connection],
+    unknown_type: DialogType | str | None,
+) -> None:
+    conn = make_synced_db()
+    _dialog(conn, 122, name="Known", type="user", identity_source="directory")
+    baseline = capture_identity_baseline(conn, 122)
+    observation = DialogIdentityObservation(122, dialog_type=unknown_type, source="profile", observed_at=21)
+    assert not publish_dialog_identity(conn, 122, observation, baseline)
+    assert conn.execute("SELECT type,identity_revision FROM dialogs WHERE dialog_id=122").fetchone() == ("user", 0)
+
+
+@pytest.mark.parametrize("unknown_type", [None, DialogType.UNKNOWN, "unknown", "Unknown", "not-a-type"])
+def test_complete_unknown_type_is_rejected(
+    make_synced_db: Callable[[], sqlite3.Connection],
+    unknown_type: DialogType | str | None,
+) -> None:
+    conn = make_synced_db()
+    _dialog(conn, 123, name="Known", type="user")
+    observation = DialogIdentityObservation(
+        123, name="New", username=None, dialog_type=unknown_type, complete=True, source="directory", observed_at=22
+    )
+    with pytest.raises(ValueError, match="known dialog_type"):
+        publish_dialog_identity(conn, 123, observation, capture_identity_baseline(conn, 123))
+
+
 def test_profile_fallback_is_partial_and_never_uses_updated_at(
     make_synced_db: Callable[[], sqlite3.Connection],
 ) -> None:

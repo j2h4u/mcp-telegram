@@ -1296,11 +1296,21 @@ class ReadingService:
                 )
                 raw_rows = _fetchall_rows(self._conn.execute(sql, params))
         with timing_phase("response_shape"):
+            dialog_ids = {_object_to_int(_row_value(raw_row, "dialog_id")) for raw_row in raw_rows}
+            if request.dialog_id:
+                dialog_ids.add(request.dialog_id)
+            identities = read_dialog_identities(self._conn, dialog_ids)
             rows = [
-                scheduled_row_to_wire(
-                    cast(Mapping[str, object], raw_row),
-                    inclusion_basis=own_basis.get(_object_to_int(_row_value(raw_row, "dialog_id")), ()),
-                )
+                {
+                    **scheduled_row_to_wire(
+                        cast(Mapping[str, object], raw_row),
+                        inclusion_basis=own_basis.get(_object_to_int(_row_value(raw_row, "dialog_id")), ()),
+                    ),
+                    "dialog_name": identities[_object_to_int(_row_value(raw_row, "dialog_id"))].display_name,
+                    "dialog_name_source": identities[
+                        _object_to_int(_row_value(raw_row, "dialog_id"))
+                    ].display_name_source,
+                }
                 for raw_row in raw_rows
             ]
             next_nav = self._search_next_navigation(
@@ -1316,6 +1326,14 @@ class ReadingService:
                 "next_navigation": next_nav,
                 "source": "scheduled_messages",
                 "scope": "own_only",
+                **(
+                    {
+                        "dialog_name": identities[request.dialog_id].display_name,
+                        "dialog_name_source": identities[request.dialog_id].display_name_source,
+                    }
+                    if request.dialog_id
+                    else {}
+                ),
             },
         }
 
@@ -1351,6 +1369,8 @@ class ReadingService:
                 "source": "sync_db+scheduled_messages",
                 "read_state_per_dialog": sent_data.get("read_state_per_dialog", {}),
                 "scope": "all",
+                "dialog_name": sent_data.get("dialog_name", scheduled_data.get("dialog_name")),
+                "dialog_name_source": sent_data.get("dialog_name_source", scheduled_data.get("dialog_name_source")),
             },
         }
 
@@ -1888,11 +1908,20 @@ class ReadingService:
                 raw_rows = []
 
         with timing_phase("response_shape"):
+            identity_ids = {req.dialog_id}
+            identity_ids.update(_object_to_int(_row_value(raw_row, "dialog_id")) for raw_row in raw_rows)
+            identities = read_dialog_identities(self._conn, identity_ids)
             rows = [
-                scheduled_row_to_wire(
-                    cast(Mapping[str, object], raw_row),
-                    inclusion_basis=own_basis.get(_object_to_int(_row_value(raw_row, "dialog_id")), ()),
-                )
+                {
+                    **scheduled_row_to_wire(
+                        cast(Mapping[str, object], raw_row),
+                        inclusion_basis=own_basis.get(_object_to_int(_row_value(raw_row, "dialog_id")), ()),
+                    ),
+                    "dialog_name": identities[_object_to_int(_row_value(raw_row, "dialog_id"))].display_name,
+                    "dialog_name_source": identities[
+                        _object_to_int(_row_value(raw_row, "dialog_id"))
+                    ].display_name_source,
+                }
                 for raw_row in raw_rows
             ]
             next_nav = self._maybe_encode_next_nav(
@@ -1918,6 +1947,8 @@ class ReadingService:
                     "next_navigation": next_nav,
                     "message_state": "scheduled",
                     "scope": "own_only",
+                    "dialog_name": identities[req.dialog_id].display_name,
+                    "dialog_name_source": identities[req.dialog_id].display_name_source,
                 },
             }
 

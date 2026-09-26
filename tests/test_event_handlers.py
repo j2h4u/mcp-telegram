@@ -23,6 +23,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from helpers import build_mock_message
+from mcp_telegram.dialog_identity import capture_identity_baseline, publish_dialog_identity
+from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
 from mcp_telegram.event_handlers import (
     EventHandlerManager,
     UpdateProcessingBarrier,
@@ -480,6 +482,67 @@ async def test_first_seen_private_message_projects_visible_dialog_and_entity(
         "SELECT type, name, username, name_normalized FROM entities WHERE id=?", (dialog_id,)
     ).fetchone() == ("user", "Алиса Иванова", "alice", "alisa ivanova")
     assert sync_db.execute("SELECT message_id FROM messages WHERE dialog_id=?", (dialog_id,)).fetchone() == (17,)
+
+
+@pytest.mark.asyncio
+async def test_dm_enrollment_does_not_overwrite_identity_published_during_sender_lookup(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_id = 7017
+    sync_db.execute("INSERT INTO dialogs(dialog_id) VALUES (?)", (dialog_id,))
+    baseline = capture_identity_baseline(sync_db, dialog_id)
+    assert publish_dialog_identity(
+        sync_db,
+        dialog_id,
+        DialogIdentityObservation(dialog_id, "Known", "old_handle", "user", True, "directory", 10),
+        baseline,
+    )
+    sync_db.commit()
+
+    lookup_started = asyncio.Event()
+    lookup_release = asyncio.Event()
+
+    async def delayed_sender() -> SimpleNamespace:
+        lookup_started.set()
+        await lookup_release.wait()
+        return SimpleNamespace(first_name="Stale", last_name="Sender", username="old_handle")
+
+    msg = build_mock_message(id=19, text="hello")
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(chat_id=dialog_id, message=msg, is_private=True, get_sender=delayed_sender),
+    )
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    handling = asyncio.create_task(manager.on_new_message(event))
+    await lookup_started.wait()
+
+    baseline = capture_identity_baseline(sync_db, dialog_id)
+    assert publish_dialog_identity(
+        sync_db,
+        dialog_id,
+        DialogIdentityObservation(
+            dialog_id,
+            name=IDENTITY_OMITTED,
+            username=None,
+            dialog_type=IDENTITY_OMITTED,
+            complete=False,
+            source="realtime",
+            observed_at=20,
+        ),
+        baseline,
+    )
+    sync_db.commit()
+    lookup_release.set()
+    await handling
+
+    assert sync_db.execute(
+        "SELECT name,username,type,identity_complete FROM dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == ("Known", None, "user", 0)
+    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        dialog_id,
+    )
 
 
 @pytest.mark.asyncio

@@ -263,6 +263,11 @@ class _DmIdentity:
     username_observed: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _IdentityBaseline:
+    revision: int | None
+
+
 class _MessageLike(Protocol):
     id: int
     message: str | None
@@ -840,14 +845,22 @@ class EventHandlerManager:
         *,
         message_timestamp: int | None,
         observed_at: int,
+        identity_baseline: _IdentityBaseline | None = None,
     ) -> EnrollmentOutcome:
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            baseline_revision = capture_identity_baseline(self._conn, dialog_id)
+            baseline_revision = (
+                identity_baseline.revision
+                if identity_baseline is not None
+                else capture_identity_baseline(self._conn, dialog_id)
+            )
             outcome = ensure_automatic_dm_enrollment(self._conn, dialog_id, now=observed_at)
             if not outcome.enabled:
                 self._conn.commit()
                 return outcome
+            row_existed_before_presence = (
+                self._conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is not None
+            )
             self._conn.execute(
                 _UPSERT_REALTIME_DM_DIALOG_SQL,
                 (
@@ -857,22 +870,12 @@ class EventHandlerManager:
                 ),
             )
             if identity is not None:
-                publish_dialog_identity(
-                    self._conn,
+                self._publish_dm_identity(
+                    identity,
                     dialog_id,
-                    DialogIdentityObservation(
-                        dialog_id=dialog_id,
-                        name=identity.name if identity.name_observed else IDENTITY_OMITTED,
-                        username=identity.username if identity.username_observed else IDENTITY_OMITTED,
-                        dialog_type=(
-                            IDENTITY_OMITTED
-                            if DialogType.parse(identity.entity_type) is DialogType.UNKNOWN
-                            else identity.entity_type
-                        ),
-                        source="realtime",
-                        observed_at=observed_at,
-                    ),
-                    0 if baseline_revision is None else baseline_revision,
+                    baseline_revision,
+                    observed_at,
+                    row_existed_before_presence=row_existed_before_presence,
                 )
             unhide_after_realtime_presence(self._conn, dialog_id)
             self._conn.commit()
@@ -880,6 +883,38 @@ class EventHandlerManager:
         except BaseException:
             self._conn.rollback()
             raise
+
+    def _publish_dm_identity(
+        self,
+        identity: _DmIdentity,
+        dialog_id: int,
+        baseline_revision: int | None,
+        observed_at: int,
+        *,
+        row_existed_before_presence: bool,
+    ) -> None:
+        expected_revision = (
+            baseline_revision if baseline_revision is not None else (0 if not row_existed_before_presence else None)
+        )
+        if expected_revision is None:
+            return
+        publish_dialog_identity(
+            self._conn,
+            dialog_id,
+            DialogIdentityObservation(
+                dialog_id=dialog_id,
+                name=identity.name if identity.name_observed else IDENTITY_OMITTED,
+                username=identity.username if identity.username_observed else IDENTITY_OMITTED,
+                dialog_type=(
+                    IDENTITY_OMITTED
+                    if DialogType.parse(identity.entity_type) is DialogType.UNKNOWN
+                    else identity.entity_type
+                ),
+                source="realtime",
+                observed_at=observed_at,
+            ),
+            expected_revision,
+        )
 
     def _persist_dm_entity(self, dialog_id: int, identity: _DmIdentity, observed_at: int) -> None:
         try:
@@ -908,6 +943,7 @@ class EventHandlerManager:
         *,
         message_date: datetime | None = None,
         observed_at: int | None = None,
+        identity_baseline: _IdentityBaseline | None = None,
     ) -> bool:
         """Enroll a new DM dialog into synced_dialogs on first incoming message.
 
@@ -931,6 +967,7 @@ class EventHandlerManager:
                 identity,
                 message_timestamp=message_timestamp,
                 observed_at=now,
+                identity_baseline=identity_baseline,
             )
             if outcome.enabled and identity is not None:
                 self._persist_dm_entity(dialog_id, identity, now)
@@ -986,7 +1023,8 @@ class EventHandlerManager:
             return
         reaction_observed_at = int(time.time())
         msg = event.message
-        coverage = await self._new_message_coverage(dialog_id, event)
+        identity_baseline = _IdentityBaseline(capture_identity_baseline(self._conn, dialog_id))
+        coverage = await self._new_message_coverage(dialog_id, event, identity_baseline=identity_baseline)
         if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
             return
         if not allows_new_message(coverage, outgoing=bool(getattr(msg, "out", False))):
@@ -1040,6 +1078,8 @@ class EventHandlerManager:
         self,
         dialog_id: int,
         event: _NewMessageEvent,
+        *,
+        identity_baseline: _IdentityBaseline | None = None,
     ) -> RealtimeHistoryCoverage:
         coverage = self._realtime_coverage(dialog_id)
         if coverage is not RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
@@ -1065,6 +1105,7 @@ class EventHandlerManager:
                 sender=peer,
                 message_date=event.message.date,
                 observed_at=int(time.time()),
+                identity_baseline=identity_baseline,
             )
             coverage = self._realtime_coverage(dialog_id)
         return coverage

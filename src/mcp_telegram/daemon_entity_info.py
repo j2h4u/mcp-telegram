@@ -21,6 +21,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
     UsernameInvalidError,
     UsernameNotOccupiedError,
 )
+from telethon.tl import types  # type: ignore[import-untyped]
 
 from .auth_scope import TelegramAuthScope
 from .demand_wiring import DemandOfferSink, offer_durable_demand
@@ -144,26 +145,60 @@ def _profile_identity_observation_from_outcome(
 
 def _fresh_entity_identity_observation(
     entity: object, dialog_id: int, *, observed_at: int
-) -> DialogIdentityObservation:
+) -> DialogIdentityObservation | None:
     entity_type = classify_dialog_type(entity)
+    name = _fresh_entity_name(entity, entity_type)
+    username = _fresh_username_observation(entity)
+    patch = {
+        "type": entity_type.value if _fresh_entity_type_is_authoritative(entity, entity_type) else IDENTITY_OMITTED,
+        "name": name,
+        "username": username,
+    }
+    return _profile_identity_observation(dialog_id, patch, observed_at=observed_at)
+
+
+def _fresh_entity_type_is_authoritative(entity: object, entity_type: DialogType) -> bool:
+    return (
+        entity_type is not DialogType.UNKNOWN
+        and not bool(_attr(entity, "min", False))
+        and not isinstance(entity, (types.ChatForbidden, types.ChannelForbidden))
+    )
+
+
+def _fresh_entity_name(entity: object, entity_type: DialogType) -> object:
     if entity_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}:
-        first = _attr(entity, "first_name", IDENTITY_OMITTED)
-        last = _attr(entity, "last_name", IDENTITY_OMITTED)
-        if first is IDENTITY_OMITTED and last is IDENTITY_OMITTED:
-            name: object = IDENTITY_OMITTED
-        else:
-            name = (
-                " ".join(part for value in (first, last) if isinstance(value, str) and (part := value.strip())) or None
-            )
-        username = observe_username(
-            _attr(entity, "username", USERNAME_UNOBSERVED),
-            _attr(entity, "usernames", USERNAME_UNOBSERVED),
-        )
-    else:
-        name = _attr(entity, "title", IDENTITY_OMITTED)
-        username = _attr(entity, "username", IDENTITY_OMITTED)
-    patch = {"type": entity_type.value, "name": name, "username": username}
-    return cast(DialogIdentityObservation, _profile_identity_observation(dialog_id, patch, observed_at=observed_at))
+        return _fresh_user_name(entity, entity_type)
+    return _fresh_title_name(entity, entity_type)
+
+
+def _fresh_user_name(entity: object, entity_type: DialogType) -> object:
+    first = _attr(entity, "first_name", IDENTITY_OMITTED)
+    last = _attr(entity, "last_name", IDENTITY_OMITTED)
+    parts = [part for value in (first, last) if isinstance(value, str) and (part := value.strip())]
+    if parts:
+        return " ".join(parts)
+    has_name_fields = first is not IDENTITY_OMITTED or last is not IDENTITY_OMITTED
+    if has_name_fields and _fresh_entity_type_is_authoritative(entity, entity_type):
+        return None
+    return IDENTITY_OMITTED
+
+
+def _fresh_title_name(entity: object, entity_type: DialogType) -> object:
+    title = _attr(entity, "title", IDENTITY_OMITTED)
+    if isinstance(title, str) and title.strip():
+        return title
+    if _fresh_entity_type_is_authoritative(entity, entity_type) and title is not IDENTITY_OMITTED:
+        return title
+    return IDENTITY_OMITTED
+
+
+def _fresh_username_observation(entity: object) -> object:
+    if bool(_attr(entity, "min", False)):
+        return USERNAME_UNOBSERVED
+    return observe_username(
+        _attr(entity, "username", USERNAME_UNOBSERVED),
+        _attr(entity, "usernames", USERNAME_UNOBSERVED),
+    )
 
 
 class _LinkedChatFactCaptureUnavailable:

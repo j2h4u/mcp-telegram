@@ -295,7 +295,7 @@ class FullSyncWorker:
             list[tuple[object, ...]],
             self._conn.execute(
                 "SELECT dialog_id,type,name,read_inbox_max_id,read_outbox_max_id FROM dialogs "
-                "WHERE type IN ('user','bot') AND identity_complete=1 AND hidden=0 ORDER BY dialog_id"
+                "WHERE type IN ('user','bot') AND hidden=0 ORDER BY dialog_id"
             ).fetchall(),
         )
         now = int(time.time())

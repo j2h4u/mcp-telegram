@@ -935,9 +935,13 @@ def _search_read_state_per_dialog(data: dict) -> dict[str, object]:
     return structured
 
 
-def _search_dialog_name(rows: list[dict], global_mode: bool, dialog_label: str | None) -> str | None:
+def _search_dialog_name(
+    rows: list[dict], global_mode: bool, dialog_label: str | None, response_name: object
+) -> str | None:
     if global_mode:
         return None
+    if isinstance(response_name, str):
+        return response_name
     for row in rows:
         dialog_name = row.get("dialog_name")
         if isinstance(dialog_name, str):
@@ -945,9 +949,11 @@ def _search_dialog_name(rows: list[dict], global_mode: bool, dialog_label: str |
     return dialog_label
 
 
-def _search_dialog_name_source(rows: list[dict], global_mode: bool) -> str | None:
+def _search_dialog_name_source(rows: list[dict], global_mode: bool, response_source: object) -> str | None:
     if global_mode:
         return None
+    if isinstance(response_source, str) and response_source in {"name", "username", "numeric"}:
+        return cast(str, response_source)
     for row in rows:
         source = row.get("dialog_name_source")
         if source in {"name", "username", "numeric"}:
@@ -1081,8 +1087,8 @@ def _search_structured_content(ctx: _SearchStructuredContentContext) -> dict[str
     data_with_source = {**data, "source": source}
     return {
         "query": ctx.args.query,
-        "dialog_name": _search_dialog_name(ctx.rows, ctx.global_mode, ctx.dialog_label),
-        "dialog_name_source": _search_dialog_name_source(ctx.rows, ctx.global_mode),
+        "dialog_name": _search_dialog_name(ctx.rows, ctx.global_mode, ctx.dialog_label, data.get("dialog_name")),
+        "dialog_name_source": _search_dialog_name_source(ctx.rows, ctx.global_mode, data.get("dialog_name_source")),
         "scope": _search_scope_payload(ctx),
         "source": source,
         "coverage": _list_messages_coverage(data_with_source),

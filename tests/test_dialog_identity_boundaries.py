@@ -146,10 +146,22 @@ def test_operational_dialog_roles_are_read_only_and_field_limited() -> None:
         source_root / "activity_peer_sweep.py",
         'def _next_enrollment_dialog(conn):\n    return conn.execute("UPDATE dialogs SET name=?")',
     )
+    type_write = (
+        "def _next_enrollment_dialog(conn):\n"
+        '    return conn.execute("UPDATE dialogs SET type = ? WHERE dialog_id = ?")\n'
+    )
+    assert _identity_findings("activity_peer_sweep.py", type_write)
+    assert _identity_findings(
+        "sync_worker.py",
+        "class FullSyncWorker:\n"
+        "    def consume_canonical_dm_publication(self):\n"
+        "        return self._conn.execute(\"SELECT identity_complete FROM dialogs WHERE type IN ('user','bot')\")\n",
+    )
 
 
 def test_dialog_entity_alias_filters_remain_owned_in_consumer_roles() -> None:
     for sql in (
+        "SELECT d.name FROM scheduled_messages sm LEFT JOIN dialogs d ON d.dialog_id=sm.dialog_id",
         "SELECT m.id FROM messages m JOIN entities e ON e.id=m.dialog_id WHERE e.username=?",
         "SELECT e.type FROM messages m JOIN entities e ON e.id=m.dialog_id",
         "SELECT e.name FROM messages m JOIN entities e ON e.id=m.dialog_id",

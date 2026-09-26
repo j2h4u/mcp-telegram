@@ -180,6 +180,17 @@ def _parse_observed_type(value: ObservedDialogType) -> DialogType:
     return DialogType.parse(cast(str | DialogType | None, value))
 
 
+def _effective_observed_type(value: ObservedDialogType, *, complete: bool) -> ObservedDialogType:
+    if value is IDENTITY_OMITTED:
+        return IDENTITY_OMITTED
+    normalized = _parse_observed_type(value)
+    if normalized is not DialogType.UNKNOWN:
+        return normalized
+    if complete:
+        raise ValueError("complete identity observation requires a known dialog_type")
+    return IDENTITY_OMITTED
+
+
 def _validate_observation_identity(dialog_id: int, observation: DialogIdentityObservation) -> None:
     if not isinstance(observation, DialogIdentityObservation) or observation.dialog_id != dialog_id:
         raise ValueError("observation must describe the dialog_id being published")
@@ -188,7 +199,8 @@ def _validate_observation_identity(dialog_id: int, observation: DialogIdentityOb
 
 
 def _validate_observation_fields(observation: DialogIdentityObservation) -> bool:
-    fields = (observation.name, observation.username, observation.dialog_type)
+    observed_type = _effective_observed_type(observation.dialog_type, complete=observation.complete)
+    fields = (observation.name, observation.username, observed_type)
     for name, value in zip(("name", "username", "dialog_type"), fields, strict=True):
         _valid_field(value, name)
     complete_fields = all(value is not IDENTITY_OMITTED for value in fields)
@@ -234,16 +246,28 @@ def _retain_or_observe(prior: str | None, value: ObservedText) -> str | None:
 
 
 def _retains_prior_identity(
-    observation: DialogIdentityObservation,
-    prior_name: str | None,
-    prior_username: str | None,
-    prior_type: str | None,
+    prior: _StoredIdentityRow, observation: DialogIdentityObservation, observed_type: ObservedDialogType
 ) -> bool:
+    prior_name, prior_username, prior_type = prior[:3]
     return (
         (observation.name is IDENTITY_OMITTED and prior_name is not None)
         or (observation.username is IDENTITY_OMITTED and prior_username is not None)
-        or (observation.dialog_type is IDENTITY_OMITTED and prior_type is not None)
+        or (observed_type is IDENTITY_OMITTED and prior_type is not None)
     )
+
+
+def _partial_observation_metadata(
+    prior: _StoredIdentityRow, observation: DialogIdentityObservation, retained: bool
+) -> tuple[int | None, str]:
+    prior_name, prior_username, prior_type, prior_at, prior_source, _, prior_complete = prior
+    mixed = retained and (
+        prior_source is not None
+        or prior_at is not None
+        or bool(prior_complete)
+        or _is_material(prior_name, prior_username, prior_type)
+    )
+    boundary = _observation_boundary(prior_at, observation.observed_at, retained)
+    return boundary, "mixed" if mixed else observation.source
 
 
 def _partial_identity_values(
@@ -251,28 +275,20 @@ def _partial_identity_values(
     observation: DialogIdentityObservation,
     expected_revision: int,
 ) -> tuple[object, ...]:
-    prior_name, prior_username, prior_type, prior_at, prior_source, _, prior_complete = prior
+    prior_name, prior_username, prior_type, _, _, _, _ = prior
     name = _retain_or_observe(prior_name, observation.name)
     username = _retain_or_observe(prior_username, observation.username)
-    raw_type = (
-        prior_type
-        if observation.dialog_type is IDENTITY_OMITTED
-        else _parse_observed_type(observation.dialog_type).value
-    )
-    retained = _retains_prior_identity(observation, prior_name, prior_username, prior_type)
-    mixed = retained and (
-        prior_source is not None
-        or prior_at is not None
-        or bool(prior_complete)
-        or _is_material(prior_name, prior_username, prior_type)
-    )
+    observed_type = _effective_observed_type(observation.dialog_type, complete=False)
+    raw_type = prior_type if observed_type is IDENTITY_OMITTED else _parse_observed_type(observed_type).value
+    retained = _retains_prior_identity(prior, observation, observed_type)
+    observed_at, source = _partial_observation_metadata(prior, observation, retained)
     return (
         name,
         username,
         raw_type,
-        _observation_boundary(prior_at, observation.observed_at, retained),
+        observed_at,
         0,
-        "mixed" if mixed else observation.source,
+        source,
         observation.dialog_id,
         expected_revision,
     )

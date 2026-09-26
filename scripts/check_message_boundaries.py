@@ -84,7 +84,7 @@ DIALOG_IDENTITY_ROLE_FUNCTIONS: Mapping[str, Mapping[str, frozenset[str]]] = {
     "event_handlers.py": {"EventHandlerManager._mark_channel_chat_update": frozenset({"type"})},
     "scheduled_messages.py": {"ScheduledMessageReconciler._discover_eligibility": frozenset({"type"})},
     "sync_worker.py": {
-        "FullSyncWorker.consume_canonical_dm_publication": frozenset({"name", "type", "identity_complete"}),
+        "FullSyncWorker.consume_canonical_dm_publication": frozenset({"name", "type"}),
         "FullSyncWorker._automatic_group_earliest_retry": frozenset({"type"}),
         "FullSyncWorker._eligible_automatic_group": frozenset({"type"}),
         "FullSyncWorker._is_eligible_automatic_group": frozenset({"type"}),
@@ -223,7 +223,7 @@ _EXECUTE_METHODS = frozenset({"execute", "executemany", "executescript"})
 _SQL_NAME = re.compile(r"(?:^|_)(?:SQL|DDL|QUERY)(?:$|_)", re.IGNORECASE)
 _SQL_START = re.compile(r"^(?:SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b", re.IGNORECASE)
 _SQL_TOKEN = re.compile(
-    r"--[^\n]*|/\*.*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*|[().*]",
+    r"--[^\n]*|/\*.*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*|[().*=]",
     re.IGNORECASE | re.DOTALL,
 )
 

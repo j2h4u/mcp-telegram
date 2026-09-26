@@ -875,6 +875,28 @@ async def test_search_messages_scheduled_is_local_and_explicit() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("message_state", ["scheduled", "all"])
+async def test_scheduled_search_hits_use_canonical_username_identity(message_state: str) -> None:
+    conn = _make_db_with_dialogs(with_fts=True)
+    server = make_server(conn)
+    _seed_dialog_row(conn, 1, name=None)
+    conn.execute(
+        "UPDATE dialogs SET type='user',username='peer_handle',identity_source='directory',identity_complete=1 "
+        "WHERE dialog_id=1"
+    )
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 11, FUTURE_BASE + 200, "needle in future")
+
+    result = await server._search_messages(
+        {"dialog_id": 1, "query": "needle", "message_state": message_state, "limit": 20}
+    )
+
+    hit = result["data"]["messages"][0]
+    assert hit["dialog_name"] == "@peer_handle"
+    assert hit["dialog_name_source"] == "username"
+
+
+@pytest.mark.asyncio
 async def test_list_and_search_scheduled_rows_have_identical_wire_shape() -> None:
     conn = _make_db_with_dialogs()
     server = make_server(conn)
