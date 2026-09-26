@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TextIO, cast
 
 _CAPACITY_MARKERS = ("no space left on device", "disk quota exceeded", "errno 28")
+_SQLITE_SHARED_MEMORY_MARKERS = ("sqlite_errorname=sqlite_ioerr_shmmap",)
 _SQLITE_IO_MARKERS = ("sqlite_errorname=SQLITE_IOERR", "sqlite3.operationalerror: disk i/o error")
 _SQLITE_APPLICATION_MARKERS = (
     "sqlite_error",
@@ -57,6 +58,8 @@ def classify_failure(log_text: str, runner_temp: Path) -> str:
         or stat.f_favail < _MIN_FREE_INODES
     ):
         return "runner_capacity_exhausted"
+    if any(marker in lowered for marker in _SQLITE_SHARED_MEMORY_MARKERS):
+        return "sqlite_shared_memory_mapping_failure"
     if any(marker.lower() in lowered for marker in _SQLITE_IO_MARKERS):
         return "runner_filesystem_io_failure"
     if any(marker in lowered for marker in _SQLITE_APPLICATION_MARKERS):

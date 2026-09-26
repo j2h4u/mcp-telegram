@@ -3,19 +3,9 @@ from __future__ import annotations
 import resource
 import sqlite3
 import sys
-from importlib import import_module
 
-# Hard virtual memory limit: 512 MB per test process.
-# Prevents runaway tests (e.g., infinite loops with MagicMock) from
-# consuming all RAM and pushing the system into swap.
-if sys.platform != "win32":
-    _MAX_AS_BYTES = 512 * 1024 * 1024
-    _soft, _hard = resource.getrlimit(resource.RLIMIT_AS)
-    resource.setrlimit(resource.RLIMIT_AS, (_MAX_AS_BYTES, _hard))
-
-# Load Hypothesis before collection so its native extension does not first map
-# during terminal-summary hooks after coverage has accumulated.
-import_module("hypothesis")
+_UNIT_MAX_AS_BYTES = 512 * 1024 * 1024
+_COVERAGE_MAX_AS_BYTES = 1024 * 1024 * 1024
 
 from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
@@ -23,6 +13,25 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+
+def _target_address_space_limit(config: pytest.Config, hard_limit: int) -> int:
+    """Choose the bounded test-process address-space budget from pytest options."""
+    cov_source = config.getoption("cov_source", default=None)
+    no_cov = config.getoption("no_cov", default=False)
+    requested_limit = _COVERAGE_MAX_AS_BYTES if cov_source and not no_cov else _UNIT_MAX_AS_BYTES
+    if hard_limit == resource.RLIM_INFINITY:
+        return requested_limit
+    return min(requested_limit, hard_limit)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Keep unit tests bounded and allow a larger bounded budget with coverage."""
+    if sys.platform == "win32":
+        return
+    _, hard_limit = resource.getrlimit(resource.RLIMIT_AS)
+    soft_limit = _target_address_space_limit(config, hard_limit)
+    resource.setrlimit(resource.RLIMIT_AS, (soft_limit, hard_limit))
 
 
 def pytest_exception_interact(node: pytest.Item, call: pytest.CallInfo[object], report: pytest.TestReport) -> None:

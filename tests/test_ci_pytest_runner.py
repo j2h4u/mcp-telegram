@@ -38,6 +38,16 @@ def test_sqlite_lock_is_application_failure(monkeypatch: pytest.MonkeyPatch, tmp
     )
 
 
+def test_sqlite_shmmap_is_not_classified_as_retryable_runner_io(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _healthy_capacity(monkeypatch)
+    outcome = ci_pytest_runner.classify_failure("sqlite_errorname=SQLITE_IOERR_SHMMAP", tmp_path)
+    assert outcome == "sqlite_shared_memory_mapping_failure"
+    assert outcome not in ci_pytest_runner._RETRYABLE_OUTCOMES
+
+
 @pytest.mark.parametrize(
     ("log_text", "expected"),
     [
