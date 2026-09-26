@@ -17,10 +17,12 @@ import pytest
 
 from mcp_telegram.config import load_config
 from mcp_telegram.daemon_ipc import get_daemon_socket_path
+from mcp_telegram.demand_wiring import DemandOfferSink, offer_durable_demand
 from mcp_telegram.dialog_identity import capture_identity_baseline, publish_dialog_identity
 from mcp_telegram.dialog_identity_contracts import DialogIdentityObservation
 from mcp_telegram.fts import INSERT_FTS_SQL, stem_text
 from mcp_telegram.server import run_mcp_http_server
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from test_daemon_api import make_server
 
 _GROUP_ID = -10090001
@@ -41,6 +43,15 @@ class _FailOnRpcClient:
             raise AssertionError(f"unexpected Telegram RPC attempt: {name}")
 
         return reject
+
+
+class _RecordingDemandOfferSink(DemandOfferSink):
+    def __init__(self) -> None:
+        self.offers: list[DemandKind] = []
+
+    def offer(self, kind: DemandKind) -> bool:
+        self.offers.append(kind)
+        return True
 
 
 def _seed_dialog(
@@ -317,6 +328,11 @@ async def _run_isolated_mcp_scenario(
     api = make_server(conn, telegram, feedback_conn)
     api.self_id = 7
     api.self_profile = {"id": 7, "first_name": "Acceptance", "last_name": "Account", "username": None}
+    demand_sink = _RecordingDemandOfferSink()
+    api.bind_demand_sink(demand_sink)
+    offer_durable_demand(demand_sink, DemandKind.ENTITY_PROFILE_REFRESH)
+    assert demand_sink.offers == [DemandKind.ENTITY_PROFILE_REFRESH]
+    demand_sink.offers.clear()
     state_dir = load_config().state.dir
     state_dir.mkdir(parents=True, exist_ok=True)
     socket_path = get_daemon_socket_path(state_dir)
@@ -328,6 +344,7 @@ async def _run_isolated_mcp_scenario(
         await _wait_for_http(f"http://127.0.0.1:{port}/health", http_task)
         await _run_supported_cli(port, script_path)
         assert telegram.attempts == []
+        assert demand_sink.offers == []
         assert (
             conn.execute("SELECT 1 FROM entities WHERE id IN (?,?)", (_GROUP_ID, _PENDING_GROUP_ID)).fetchone() is None
         )
