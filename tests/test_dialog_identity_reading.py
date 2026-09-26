@@ -169,3 +169,45 @@ def test_global_search_uses_canonical_dialog_label_and_source(
     assert message["dialog_name"] == "ИИ Лаборатория"
     assert message["dialog_name_source"] == "name"
     assert len(identity_queries) == 1
+
+
+async def test_empty_own_only_all_read_preserves_natural_name_resolution_id(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    conn = make_synced_db()
+    dialog_id = -1002696759785
+    conn.execute(
+        "INSERT INTO dialogs(dialog_id,name,type,identity_source,identity_complete) "
+        "VALUES (?, 'Canonical own-only peer', 'supergroup', 'directory', 1)",
+        (dialog_id,),
+    )
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?, 'own_only')", (dialog_id,))
+
+    async def resolve_dialog(selector: object) -> int:
+        assert getattr(selector, "query", None) == "Canonical own-only peer"
+        return dialog_id
+
+    service = ReadingService(
+        ReadingDeps(
+            conn=conn,
+            sync_db_path=None,
+            self_id=1,
+            resolve_dialog_id=resolve_dialog,
+            resolve_dialog_id_local=resolve_dialog,
+            fragment_context=cast(FragmentContextService, object()),
+            history_gateway=cast(TelegramHistoryGateway, object()),
+            logger=_TestLogger(),
+            rid=lambda: "",
+            deleted_message_visibility_seconds=86_400,
+            draft_response_budget_bytes=1024,
+        )
+    )
+
+    result = await service._list_messages({"dialog": "Canonical own-only peer", "message_state": "all", "limit": 2})
+
+    assert result["ok"] is True
+    assert result["data"]["dialog_id"] == dialog_id
+    assert result["data"]["dialog_name"] == "Canonical own-only peer"
+    assert result["data"]["dialog_type"] == DialogType.SUPERGROUP.value
+    assert result["data"]["coverage"] == "local_only"
+    assert result["data"]["messages"] == []
