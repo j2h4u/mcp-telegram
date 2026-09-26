@@ -21,17 +21,11 @@ from telethon.errors import (  # type: ignore[import-untyped]
     UsernameInvalidError,
     UsernameNotOccupiedError,
 )
-from telethon.tl import types  # type: ignore[import-untyped]
 
 from .auth_scope import TelegramAuthScope
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_identity import capture_identity_baseline, publish_dialog_identity
-from .dialog_identity_contracts import (
-    IDENTITY_OMITTED,
-    DialogIdentityObservation,
-    ObservedDialogType,
-    ObservedText,
-)
+from .dialog_identity_contracts import DialogIdentityObservation
 from .entity_profile.contracts import (
     CHANNEL_ID_MARKER,
     FULL_PROFILE_OWNED_FIELDS,
@@ -82,7 +76,6 @@ from .entity_profile.repository import EntityProfileRepository, EntityRefreshCur
 from .entity_store import EntitySnapshot, ensure_entity_stub
 from .flood import TelegramRpcThrottled
 from .folders.read_model import dialog_placement
-from .identity_observation import USERNAME_UNOBSERVED, observe_username
 from .linked_chat_fact import linked_chat_fact_owner
 from .models import DialogType
 from .telegram_access import ACCESS_LOST_ERRORS
@@ -96,109 +89,9 @@ from .telegram_demand import (
 from .telegram_rpc import raise_if_flood_wait_error
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_scope
-from .telethon_dialog import classify_dialog_type
+from .telethon_dialog import classify_dialog_type, observe_dialog_identity
 
 _ENTITY_DETAIL_SCHEMA_VERSION = 1
-
-
-def _profile_identity_observation(
-    dialog_id: int,
-    patch: Mapping[str, object] | None,
-    *,
-    observed_at: int,
-) -> DialogIdentityObservation | None:
-    if not isinstance(patch, Mapping):
-        return None
-    fields: dict[str, object] = {}
-    for identity_field, key in (("name", "name"), ("username", "username"), ("dialog_type", "type")):
-        value = patch.get(key, IDENTITY_OMITTED)
-        if value is USERNAME_UNOBSERVED:
-            value = IDENTITY_OMITTED
-        if value is not IDENTITY_OMITTED:
-            fields[identity_field] = value
-    if not fields:
-        return None
-    complete = all(field in fields for field in ("name", "username", "dialog_type"))
-    return DialogIdentityObservation(
-        dialog_id=dialog_id,
-        name=cast(ObservedText, fields.get("name", IDENTITY_OMITTED)),
-        username=cast(ObservedText, fields.get("username", IDENTITY_OMITTED)),
-        dialog_type=cast(ObservedDialogType, fields.get("dialog_type", IDENTITY_OMITTED)),
-        complete=complete,
-        source="profile",
-        observed_at=observed_at,
-    )
-
-
-def _profile_identity_observation_from_outcome(
-    dialog_id: int,
-    outcome: ProjectionOutcome,
-    *,
-    fallback_at: float,
-) -> DialogIdentityObservation | None:
-    provenance = outcome.provenance
-    boundary = provenance.observation.started_at if provenance is not None and provenance.observation.valid else None
-    if boundary is None:
-        boundary = fallback_at
-    return _profile_identity_observation(dialog_id, outcome.identity_patch, observed_at=int(boundary))
-
-
-def _fresh_entity_identity_observation(
-    entity: object, dialog_id: int, *, observed_at: int
-) -> DialogIdentityObservation | None:
-    entity_type = classify_dialog_type(entity)
-    name = _fresh_entity_name(entity, entity_type)
-    username = _fresh_username_observation(entity)
-    patch = {
-        "type": entity_type.value if _fresh_entity_type_is_authoritative(entity, entity_type) else IDENTITY_OMITTED,
-        "name": name,
-        "username": username,
-    }
-    return _profile_identity_observation(dialog_id, patch, observed_at=observed_at)
-
-
-def _fresh_entity_type_is_authoritative(entity: object, entity_type: DialogType) -> bool:
-    return (
-        entity_type is not DialogType.UNKNOWN
-        and not bool(_attr(entity, "min", False))
-        and not isinstance(entity, (types.ChatForbidden, types.ChannelForbidden))
-    )
-
-
-def _fresh_entity_name(entity: object, entity_type: DialogType) -> object:
-    if entity_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}:
-        return _fresh_user_name(entity, entity_type)
-    return _fresh_title_name(entity, entity_type)
-
-
-def _fresh_user_name(entity: object, entity_type: DialogType) -> object:
-    first = _attr(entity, "first_name", IDENTITY_OMITTED)
-    last = _attr(entity, "last_name", IDENTITY_OMITTED)
-    parts = [part for value in (first, last) if isinstance(value, str) and (part := value.strip())]
-    if parts:
-        return " ".join(parts)
-    has_name_fields = first is not IDENTITY_OMITTED or last is not IDENTITY_OMITTED
-    if has_name_fields and _fresh_entity_type_is_authoritative(entity, entity_type):
-        return None
-    return IDENTITY_OMITTED
-
-
-def _fresh_title_name(entity: object, entity_type: DialogType) -> object:
-    title = _attr(entity, "title", IDENTITY_OMITTED)
-    if isinstance(title, str) and title.strip():
-        return title
-    if _fresh_entity_type_is_authoritative(entity, entity_type) and title is not IDENTITY_OMITTED:
-        return title
-    return IDENTITY_OMITTED
-
-
-def _fresh_username_observation(entity: object) -> object:
-    if bool(_attr(entity, "min", False)):
-        return USERNAME_UNOBSERVED
-    return observe_username(
-        _attr(entity, "username", USERNAME_UNOBSERVED),
-        _attr(entity, "usernames", USERNAME_UNOBSERVED),
-    )
 
 
 class _LinkedChatFactCaptureUnavailable:
@@ -778,6 +671,7 @@ class DaemonEntityInfoService:
     ) -> dict[str, object]:
         self._log_stage(entity_id, "cache_miss", started_at)
         stage_started_at = self._deps.now_provider()
+        identity_started_at = int(stage_started_at)
         identity_baseline = capture_identity_baseline(self._deps.conn, entity_id)
         entity, resolve_error = await self._resolve_entity(entity_id)
         self._log_stage(entity_id, "resolve_entity", stage_started_at)
@@ -796,8 +690,8 @@ class DaemonEntityInfoService:
             entity_id,
             detail,
             now,
-            dialog_identity_observation=_fresh_entity_identity_observation(
-                entity, entity_id, observed_at=int(stage_started_at)
+            dialog_identity_observation=observe_dialog_identity(
+                entity, dialog_id=entity_id, source="profile", observed_at=identity_started_at
             ),
             dialog_identity_baseline_revision=identity_baseline,
         )
@@ -854,8 +748,8 @@ class DaemonEntityInfoService:
         self._profiles.save_core(
             core,
             now=now,
-            dialog_identity_observation=_fresh_entity_identity_observation(
-                entity, entity_id, observed_at=identity_started_at
+            dialog_identity_observation=observe_dialog_identity(
+                entity, dialog_id=entity_id, source="profile", observed_at=identity_started_at
             ),
             dialog_identity_baseline_revision=identity_baseline,
         )
@@ -1492,11 +1386,7 @@ class DaemonEntityInfoService:
         full_profile = self._normalized_full_profile_commit(
             normalized.full_profile, cursor, identity, current_photo=normalized.current_photo
         )
-        identity_observation = _profile_identity_observation_from_outcome(
-            cursor.entity_id,
-            normalized.full_profile,
-            fallback_at=now,
-        )
+        identity_observation = normalized.full_profile.dialog_identity_observation
         full_profile = dataclass_replace(
             full_profile,
             dialog_identity_observation=identity_observation,
@@ -2004,8 +1894,15 @@ class DaemonEntityInfoService:
             core,
             next_acquisition_cursor=cursor.acquisition_cursor + 1,
             now=now,
-            dialog_identity_observation=_fresh_entity_identity_observation(
-                entity, cursor.entity_id, observed_at=identity_started_at
+            dialog_identity_observation=(
+                observe_dialog_identity(
+                    entity,
+                    dialog_id=cursor.entity_id,
+                    source="profile",
+                    observed_at=identity_started_at,
+                )
+                if self._deps.self_id != cursor.entity_id
+                else None
             ),
             dialog_identity_baseline_revision=identity_baseline,
         )
@@ -2110,7 +2007,6 @@ class DaemonEntityInfoService:
 
     async def _acquire_user_full_profile(self, entity_id: int, entity_type: DialogType) -> EntitySectionCommit:
         target_kind = self._target_kind(entity_type)
-        requested_at = self._deps.now_provider()
         observation = await self._deps.user_profile_port.fetch_user_profile(entity_id, target_kind)
         outcome = observation.full_profile
         if outcome.status is ProjectionStatus.UNAVAILABLE or outcome.payload is None:
@@ -2127,17 +2023,12 @@ class DaemonEntityInfoService:
             )
         }
         raw_identity_patch = dict(outcome.identity_patch or {})
-        identity_observation = _profile_identity_observation_from_outcome(
-            entity_id,
-            outcome,
-            fallback_at=requested_at,
-        )
         identity_patch = {**raw_identity_patch, "type": entity_type.value}
         return EntitySectionCommit(
             patch,
             payload=private_payload,
             identity_patch=identity_patch,
-            dialog_identity_observation=identity_observation,
+            dialog_identity_observation=outcome.dialog_identity_observation,
         )
 
     async def _acquire_channel_full_profile(
@@ -2169,11 +2060,7 @@ class DaemonEntityInfoService:
             payload=_channel_profile_payload(observation),
             dialog_created=observation.created,
             identity_patch=observation.identity_patch,
-            dialog_identity_observation=_profile_identity_observation(
-                entity_id,
-                observation.identity_patch,
-                observed_at=int(observation.observation_started_at),
-            ),
+            dialog_identity_observation=observation.dialog_identity_observation,
         )
 
     def _capture_linked_chat_fact_generation(
@@ -2229,11 +2116,7 @@ class DaemonEntityInfoService:
                 declared_fields=("about", "invite_link", "members_count"),
             ),
         )
-        identity_observation = _profile_identity_observation(
-            cursor.entity_id,
-            observation.identity_patch,
-            observed_at=started_at,
-        )
+        identity_observation = observation.dialog_identity_observation
         full_profile = dataclass_replace(
             full_profile,
             identity_patch=observation.identity_patch,

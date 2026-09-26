@@ -22,7 +22,6 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 
 from .access_lifecycle import not_access_lost_sql
-from .dialog_classification import EntityKind, classify_dialog_type
 from .dialog_directory_tl import (
     DialogCursor,
     RawDialogFact,
@@ -36,7 +35,7 @@ from .dialog_identity import publish_dialog_identity
 from .dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
 from .flood import TelegramRpcThrottled
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
-from .identity_observation import USERNAME_UNOBSERVED, observe_username
+from .models import DialogType
 from .read_state import apply_read_cursor
 from .sync_db import _open_sync_db
 from .telegram_demand import (
@@ -55,6 +54,7 @@ from .telegram_rpc_scheduler import (
     rpc_attempt_budget,
     rpc_scope,
 )
+from .telethon_dialog import observe_dialog_identity
 
 logger = logging.getLogger(__name__)
 
@@ -164,8 +164,8 @@ def _publication_ready(state: _DirectoryState, generation: int, account_id: int)
     )
 
 
-def _staged_entity_projection(entity: object | None) -> _StagedEntityProjection:
-    identity = _staged_identity_projection(entity)
+def _staged_entity_projection(entity: object | None, *, dialog_id: int, observed_at: int) -> _StagedEntityProjection:
+    identity = _staged_identity_projection(entity, dialog_id=dialog_id, observed_at=observed_at)
     return _StagedEntityProjection(
         name=identity.name,
         dialog_type=identity.dialog_type,
@@ -182,45 +182,30 @@ def _staged_entity_projection(entity: object | None) -> _StagedEntityProjection:
     )
 
 
-def _entity_kind(entity: object | None) -> EntityKind:
-    if isinstance(entity, types.User):
-        return EntityKind.USER
-    if isinstance(entity, (types.Chat, types.ChatForbidden)):
-        return EntityKind.CHAT
-    if isinstance(entity, (types.Channel, types.ChannelForbidden)):
-        return EntityKind.CHANNEL
-    return EntityKind.UNKNOWN
-
-
-def _staged_identity_projection(entity: object | None) -> _StagedIdentityProjection:
-    kind = _entity_kind(entity)
-    identity_complete = int(_identity_is_complete(entity))
-    observed_name = _entity_name(entity)
-    name_observed = bool(identity_complete or observed_name is not None)
-    observed_username, username_observed = _staged_username_projection(entity, bool(identity_complete))
-    observed_mask = (1 if name_observed else 0) | (2 if username_observed else 0) | (4 if identity_complete else 0)
+def _staged_identity_projection(
+    entity: object | None, *, dialog_id: int, observed_at: int
+) -> _StagedIdentityProjection:
+    observation = observe_dialog_identity(
+        entity,
+        dialog_id=dialog_id,
+        source="directory",
+        observed_at=observed_at,
+    )
+    if observation is None:
+        return _StagedIdentityProjection(None, "unknown", None, 0, 0)
+    name_observed = observation.name is not IDENTITY_OMITTED
+    username_observed = observation.username is not IDENTITY_OMITTED
+    type_observed = observation.dialog_type is not IDENTITY_OMITTED
+    observed_mask = (1 if name_observed else 0) | (2 if username_observed else 0) | (4 if type_observed else 0)
     return _StagedIdentityProjection(
-        name=observed_name,
-        dialog_type=classify_dialog_type(entity, entity_kind=kind).value if identity_complete else "unknown",
-        username=observed_username,
-        complete=identity_complete,
+        name=cast(str | None, observation.name) if name_observed else None,
+        dialog_type=DialogType.parse(cast(str | DialogType | None, observation.dialog_type)).value
+        if type_observed
+        else "unknown",
+        username=cast(str | None, observation.username) if username_observed else None,
+        complete=int(observation.complete),
         fields_observed=observed_mask,
     )
-
-
-def _staged_username_projection(entity: object | None, identity_complete: bool) -> tuple[str | None, bool]:
-    raw_username = (
-        getattr(entity, "username", USERNAME_UNOBSERVED) if hasattr(entity, "username") else USERNAME_UNOBSERVED
-    )
-    raw_usernames = (
-        getattr(entity, "usernames", USERNAME_UNOBSERVED) if hasattr(entity, "usernames") else USERNAME_UNOBSERVED
-    )
-    observed_username = observe_username(raw_username, raw_usernames)
-    # TL constructors default optional alternate usernames to an empty list;
-    # on min/forbidden objects that cannot distinguish omission from deletion.
-    username_observed = bool(identity_complete or (isinstance(observed_username, str) and observed_username))
-    username = cast(str | None, observed_username) if observed_username is not USERNAME_UNOBSERVED else None
-    return username, username_observed
 
 
 def _staged_dialog_projection(fact: RawDialogFact, observed_at: int, folder_id: int | None) -> _StagedDialogProjection:
@@ -712,7 +697,7 @@ class CanonicalDialogDirectory:
         return {fact.dialog_id for fact in facts if fact.dialog_id not in staged_ids}
 
     def _staged_fact(self, fact: RawDialogFact, observed_at: int, folder_id: int | None, source: str) -> _StagedFact:
-        entity = _staged_entity_projection(fact.entity)
+        entity = _staged_entity_projection(fact.entity, dialog_id=fact.dialog_id, observed_at=observed_at)
         dialog = _staged_dialog_projection(fact, observed_at, folder_id)
         return _StagedFact(
             fact.dialog_id,
@@ -1039,18 +1024,6 @@ def _publish_directory_absence(conn: sqlite3.Connection, state: _DirectoryState,
         f"AND {not_access_lost_sql('current.dialog_id')}",
         (observed_at, generation),
     )
-
-
-def _entity_name(entity: object | None) -> str | None:
-    if entity is None:
-        return None
-    title = getattr(entity, "title", None)
-    if isinstance(title, str) and title:
-        return title
-    first = getattr(entity, "first_name", None)
-    last = getattr(entity, "last_name", None)
-    pieces = [part for part in (first, last) if isinstance(part, str) and part]
-    return " ".join(pieces) or None
 
 
 def _nullable_int(value: object) -> int | None:

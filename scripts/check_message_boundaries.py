@@ -522,7 +522,7 @@ def _identity_table_aliases(sql: str) -> dict[str, str]:
     return aliases
 
 
-def _has_dialog_identity_dml(sql: str) -> bool:  # noqa: PLR0911
+def _has_dialog_identity_dml(sql: str) -> bool:  # noqa: PLR0911, PLR0912
     """Only dialogs-target DML is governed here; entity writes use ENTITY_DML."""
     tokens = _sql_tokens(sql)
     statement_index = _top_level_statement_index(tokens)
@@ -530,7 +530,7 @@ def _has_dialog_identity_dml(sql: str) -> bool:  # noqa: PLR0911
         return False
     statement = tokens[statement_index].casefold()
     target_index = statement_index + 1
-    if statement == "insert" and target_index < len(tokens) and tokens[target_index].casefold() == "or":
+    if statement in {"insert", "update"} and target_index < len(tokens) and tokens[target_index].casefold() == "or":
         target_index += 2
     if statement in {"insert", "replace"}:
         if target_index < len(tokens) and tokens[target_index].casefold() == "into":
@@ -570,10 +570,20 @@ def _has_dialog_identity_dml(sql: str) -> bool:  # noqa: PLR0911
     end = next(
         (i for i in range(set_index + 1, len(tokens)) if tokens[i].casefold() in {"where", "returning"}), len(tokens)
     )
-    return any(
-        _identifier(tokens[i]).casefold() in fields and i + 1 < end and tokens[i + 1] == "="
-        for i in range(set_index + 1, end)
-    )
+    assignment_start = set_index + 1
+    depth = 0
+    for index in range(set_index + 1, end):
+        token = tokens[index]
+        if token == "(":
+            depth += 1
+        elif token == ")":
+            depth -= 1
+        elif depth == 0 and token == "=":
+            if fields.intersection(_identifier(part).casefold() for part in tokens[assignment_start:index]):
+                return True
+        elif depth == 0 and token == ",":
+            assignment_start = index + 1
+    return False
 
 
 def _has_dialog_identity_sql(sql: str, *, relative: str, function: str | None = None, name: str | None = None) -> bool:  # noqa: PLR0912, PLR0914

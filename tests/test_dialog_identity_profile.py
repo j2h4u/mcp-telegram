@@ -4,9 +4,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from telethon.tl import types
 
-from mcp_telegram.daemon_entity_info import _fresh_entity_identity_observation
 from mcp_telegram.dialog_identity import capture_identity_baseline, publish_dialog_identity, read_dialog_identities
 from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
 from mcp_telegram.entity_profile.contracts import ProfileAcquisitionEvidence
@@ -166,97 +164,4 @@ def test_partial_clear_preserves_omitted_and_profile_lookup_never_creates_member
     repo.save_core({"id": 43, "type": "user", "name": "Self", "username": "self"}, now=20)
     assert conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=43").fetchone() is None
     assert conn.execute("SELECT identity_revision FROM dialogs WHERE dialog_id=42").fetchone() == (1,)
-    conn.close()
-
-
-def test_fresh_entity_identity_uses_collectible_username_and_omits_min_and_unknown_type(
-    tmp_path: Path,
-) -> None:
-    conn, _repo = _database(tmp_path / "raw-identity.sqlite")
-    baseline = capture_identity_baseline(conn, 42)
-    channel = types.Channel(
-        id=42,
-        title="Fresh channel",
-        photo=types.ChatPhotoEmpty(),
-        date=None,
-        broadcast=True,
-        username=None,
-        usernames=[types.Username("collectible", active=True)],
-    )
-    observed = _fresh_entity_identity_observation(channel, 42, observed_at=18)
-    assert observed is not None
-    assert (observed.name, observed.username, observed.dialog_type, observed.complete) == (
-        "Fresh channel",
-        "collectible",
-        DialogType.CHANNEL,
-        True,
-    )
-    cleared_channel = types.Channel(
-        id=42,
-        title="Fresh channel",
-        photo=types.ChatPhotoEmpty(),
-        date=None,
-        broadcast=True,
-        username=None,
-        usernames=[],
-    )
-    cleared_observation = _fresh_entity_identity_observation(cleared_channel, 42, observed_at=18)
-    assert cleared_observation is not None
-    assert cleared_observation.username is None and cleared_observation.complete
-
-    min_user = types.User(id=42, min=True, first_name="", last_name="")
-    assert _fresh_entity_identity_observation(min_user, 42, observed_at=19) is None
-
-    min_channel = types.Channel(
-        id=42,
-        title="",
-        photo=types.ChatPhotoEmpty(),
-        date=None,
-        megagroup=False,
-        min=True,
-        username=None,
-    )
-    min_observation = _fresh_entity_identity_observation(min_channel, 42, observed_at=19)
-    assert min_observation is None
-    assert (read_dialog_identities(conn, [42])[42].name, read_dialog_identities(conn, [42])[42].dialog_type) == (
-        "Old",
-        DialogType.USER,
-    )
-
-    positive_min_channel = types.Channel(
-        id=42,
-        title="Partial channel",
-        photo=types.ChatPhotoEmpty(),
-        date=None,
-        megagroup=True,
-        min=True,
-        username=None,
-    )
-    min_observation = _fresh_entity_identity_observation(positive_min_channel, 42, observed_at=19)
-    assert min_observation is not None
-    assert (
-        min_observation.name,
-        min_observation.username,
-        min_observation.dialog_type,
-        min_observation.complete,
-    ) == ("Partial channel", IDENTITY_OMITTED, IDENTITY_OMITTED, False)
-    assert publish_dialog_identity(conn, 42, min_observation, baseline)
-    assert (
-        read_dialog_identities(conn, [42])[42].name,
-        read_dialog_identities(conn, [42])[42].username,
-        read_dialog_identities(conn, [42])[42].dialog_type,
-    ) == (
-        "Partial channel",
-        "old",
-        DialogType.USER,
-    )
-
-    forbidden = types.ChannelForbidden(id=42, access_hash=9, title="")
-    forbidden_observation = _fresh_entity_identity_observation(forbidden, 42, observed_at=20)
-    assert forbidden_observation is None
-    assert (
-        read_dialog_identities(conn, [42])[42].name,
-        read_dialog_identities(conn, [42])[42].username,
-        read_dialog_identities(conn, [42])[42].dialog_type,
-    ) == ("Partial channel", "old", DialogType.USER)
     conn.close()

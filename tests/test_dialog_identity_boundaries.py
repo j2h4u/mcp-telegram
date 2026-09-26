@@ -59,6 +59,9 @@ def test_dialog_identity_fallbacks_are_rejected_in_consumers() -> None:
 def test_identity_dml_aliases_and_conflict_updates_are_rejected() -> None:
     for sql in (
         "UPDATE dialogs AS d SET username = ? WHERE d.dialog_id = ?",
+        "UPDATE OR IGNORE dialogs SET type=? WHERE dialog_id=?",
+        "UPDATE dialogs SET (type)=(?) WHERE dialog_id=?",
+        "UPDATE dialogs SET (name,type)=(?,?) WHERE dialog_id=?",
         "INSERT INTO main.dialogs(dialog_id,name) VALUES (?,?) ON CONFLICT(dialog_id) DO UPDATE SET name=excluded.name",
     ):
         assert _identity_findings("rogue.py", f'conn.execute("{sql}")')
@@ -151,6 +154,15 @@ def test_operational_dialog_roles_are_read_only_and_field_limited() -> None:
         '    return conn.execute("UPDATE dialogs SET type = ? WHERE dialog_id = ?")\n'
     )
     assert _identity_findings("activity_peer_sweep.py", type_write)
+    for sql in (
+        "UPDATE OR IGNORE dialogs SET type=? WHERE dialog_id=?",
+        "UPDATE dialogs SET (type)=(?) WHERE dialog_id=?",
+        "UPDATE dialogs SET (name,type)=(?,?) WHERE dialog_id=?",
+    ):
+        assert _identity_findings(
+            "activity_peer_sweep.py",
+            f'def _next_enrollment_dialog(conn):\n    return conn.execute("{sql}")\n',
+        )
     assert _identity_findings(
         "sync_worker.py",
         "class FullSyncWorker:\n"

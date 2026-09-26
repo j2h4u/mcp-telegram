@@ -40,6 +40,7 @@ from .entity_profile.contracts import (
     ChatCurrentPhoto,
     CommonChatsObservation,
     CommonChatSummary,
+    DialogIdentityObservation,
     GroupProfileObservation,
     GroupReference,
     ObservationBoundary,
@@ -66,7 +67,7 @@ from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_reading import GatewayFailure, GatewayFailureKind
 from .telegram_rpc_error import is_reaction_detail_terminal_rpc_error
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, RpcAdmissionError, UnclassifiedTelegramRpcError
-from .telethon_dialog import classify_dialog_type
+from .telethon_dialog import classify_dialog_type, observe_dialog_identity
 
 CATCHABLE_GATEWAY_FAILURES = (Exception,)
 
@@ -141,6 +142,9 @@ class TelethonChannelProfileGateway(ChannelProfilePort):
             observation_completed_at=completed_at,
             created=created,
             identity_patch=_channel_identity_patch(result, channel_id),
+            dialog_identity_observation=_channel_dialog_identity_observation(
+                result, channel_id, observed_at=int(started_at)
+            ),
         )
 
     async def fetch_channel_contact_overlap(self, reference: ChannelReference) -> ChannelContactOverlapObservation:
@@ -218,6 +222,9 @@ class TelethonGroupProfileGateway(GroupProfilePort):
             observation_started_at=started_at,
             observation_completed_at=completed_at,
             identity_patch=_group_identity_patch(result, raw_group_id),
+            dialog_identity_observation=_group_dialog_identity_observation(
+                result, group_id, raw_group_id, observed_at=started_at
+            ),
         )
 
 
@@ -481,6 +488,16 @@ def _channel_identity_patch(result: object, channel_id: int) -> dict[str, object
     return None if chat is None else _channel_identity_fields(chat)
 
 
+def _channel_dialog_identity_observation(
+    result: object, channel_id: int, *, observed_at: int
+) -> DialogIdentityObservation | None:
+    chats = getattr(result, "chats", None)
+    if not isinstance(chats, Sequence):
+        return None
+    chat = next((item for item in chats if _channel_target_matches(channel_id, getattr(item, "id", None))), None)
+    return observe_dialog_identity(chat, dialog_id=channel_id, source="profile", observed_at=observed_at)
+
+
 def _channel_identity_fields(chat: object) -> dict[str, object]:
     dialog_type = classify_dialog_type(chat)
     patch: dict[str, object] = {"type": dialog_type.value} if dialog_type.value != "unknown" else {}
@@ -516,6 +533,16 @@ def _group_identity_patch(result: object, raw_group_id: int) -> dict[str, object
             return None
         return {"type": "group", "name": title, "username": None}
     return None
+
+
+def _group_dialog_identity_observation(
+    result: object, group_id: int, raw_group_id: int, *, observed_at: int
+) -> DialogIdentityObservation | None:
+    chats = getattr(result, "chats", None)
+    if not isinstance(chats, Sequence):
+        return None
+    chat = next((item for item in chats if _positive_id(getattr(item, "id", None)) == raw_group_id), None)
+    return observe_dialog_identity(chat, dialog_id=group_id, source="profile", observed_at=observed_at)
 
 
 class _RawMissing:

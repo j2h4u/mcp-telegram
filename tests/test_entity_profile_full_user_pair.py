@@ -83,11 +83,13 @@ class _PairClient:
         bot: bool = False,
         omit_channel_id: bool = False,
         username: str | None = "target",
+        min_user: bool = False,
     ) -> None:
         self.channel_id = channel_id
         self.bot = bot
         self.omit_channel_id = omit_channel_id
         self.username = username
+        self.min_user = min_user
         self.full_user_calls = 0
 
     def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference:
@@ -98,7 +100,13 @@ class _PairClient:
         assert scope.attempt_budget is not None
         scope.attempt_budget.debit()
         self.full_user_calls += 1
-        user = User(id=42, first_name="Target", username=self.username, bot=self.bot)
+        user = User(
+            id=42,
+            first_name="Partial" if self.min_user else "Target",
+            username=self.username,
+            bot=self.bot,
+            min=self.min_user,
+        )
         full_user_data = {"about": "about", "personal_channel_message": 9}
         if not self.omit_channel_id:
             full_user_data["personal_channel_id"] = self.channel_id
@@ -182,6 +190,7 @@ def _prepare(
     entity_type: str = "user",
     bot: bool = False,
     migrated: bool = False,
+    min_user: bool = False,
 ) -> tuple[sqlite3.Connection, object]:
     if migrated:
         ensure_sync_schema(path)
@@ -193,7 +202,7 @@ def _prepare(
         "INSERT INTO entities VALUES (?, 'channel', 'Local Channel', 'local_channel', NULL, 100)", (-1000000000123,)
     )
     conn.commit()
-    service = _pair_service(conn, _PairClient(bot=bot), enabled=True)
+    service = _pair_service(conn, _PairClient(bot=bot, min_user=min_user), enabled=True)
     service._profiles.save_core({"id": 42, "type": entity_type, "name": "Target"}, now=100)  # type: ignore[attr-defined]
     service._profiles.mark_pending(42, now=100)  # type: ignore[attr-defined]
     return conn, service
@@ -229,6 +238,24 @@ async def test_enabled_pair_commits_two_projections_with_one_full_user_call(tmp_
     detail = service._profiles.read(42, now=100)  # type: ignore[attr-defined]
     assert detail is not None
     assert detail.detail["personal_channel"]["metadata_source"] == "user_full_chats"
+    await service.shutdown()  # type: ignore[attr-defined]
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_min_full_user_pair_publishes_only_positive_identity_fields(tmp_path: Path) -> None:
+    conn, service = _prepare(tmp_path / "min-pair.sqlite", min_user=True)
+    conn.execute("INSERT INTO dialogs(dialog_id,name,type,username) VALUES (42,'Old name','user','old_username')")
+    conn.commit()
+    cast(_PairClient, service._deps.client).username = None  # type: ignore[attr-defined]
+    coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
+    assert coordinator is not None
+
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+
+    assert conn.execute(
+        "SELECT name,username,type,identity_revision,revision FROM dialogs WHERE dialog_id=42"
+    ).fetchone() == ("Partial", "old_username", "user", 1, 0)
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()
 

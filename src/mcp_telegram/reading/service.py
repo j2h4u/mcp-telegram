@@ -1979,7 +1979,7 @@ class ReadingService:
             page, budget_truncated = self._bounded_draft_page(candidates)
             rows = [self._draft_wire_row(record) for record in page]
         next_navigation = self._draft_next_navigation(req, coverage.projection_fingerprint, visible, page, start)
-        return {
+        response = {
             "ok": True,
             "data": {
                 "messages": rows,
@@ -1997,6 +1997,21 @@ class ReadingService:
                 },
             },
         }
+        return self._attach_dialog_identity(response, req.dialog_id)
+
+    def _attach_dialog_identity(self, response: dict, dialog_id: int) -> dict:
+        """Attach the canonical owner bundle to a successful scoped response."""
+        identity = read_dialog_identities(self._conn, [dialog_id])[dialog_id]
+        data = response.get("data")
+        if isinstance(data, dict):
+            data.update(
+                {
+                    "dialog_type": identity.dialog_type.value,
+                    "dialog_name": identity.display_name,
+                    "dialog_name_source": identity.display_name_source,
+                }
+            )
+        return response
 
     @staticmethod
     def _visible_drafts(records: list[DraftReadRecord], direction: str) -> list[DraftReadRecord]:
@@ -2185,14 +2200,10 @@ class ReadingService:
 
     def _scheduled_local_state_result(self, dialog_id: int, scheduled_result: dict) -> dict:
         with timing_phase("local_projection"):
-            identity = read_dialog_identities(self._conn, [dialog_id])[dialog_id]
-            dialog_type = identity.dialog_type.value
+            result = self._attach_dialog_identity(scheduled_result, dialog_id)
         with timing_phase("response_shape"):
-            scheduled_result["data"]["dialog_type"] = dialog_type
-            scheduled_result["data"]["dialog_name"] = identity.display_name
-            scheduled_result["data"]["dialog_name_source"] = identity.display_name_source
-            scheduled_result["data"]["read_state"] = None
-        return scheduled_result
+            result["data"]["read_state"] = None
+        return result
 
     async def _all_local_state_result(self, all_request: _AllLocalStateRequest) -> dict:
         navigation = all_request.navigation

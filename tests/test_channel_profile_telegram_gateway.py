@@ -11,6 +11,7 @@ from telethon.errors import ChatAdminRequiredError
 from telethon.tl import types
 from telethon.tl.functions.channels import GetFullChannelRequest, GetParticipantsRequest
 
+from mcp_telegram.dialog_identity_contracts import IDENTITY_OMITTED
 from mcp_telegram.entity_profile.contracts import ChannelReference, ProjectionStatus
 from mcp_telegram.telegram_gateway import TelethonChannelProfileGateway
 
@@ -169,8 +170,41 @@ async def test_profile_gateway_normalizes_one_full_channel_rpc() -> None:
     assert observation.current_photo.photo_id == 55
     assert (observation.observation_started_at, observation.observation_completed_at) == (100.25, 101.5)
     assert observation.identity_patch == {"type": "supergroup", "name": "Channel", "username": None}
+    assert observation.dialog_identity_observation is not None
+    assert (
+        observation.dialog_identity_observation.dialog_id,
+        observation.dialog_identity_observation.dialog_type,
+        observation.dialog_identity_observation.observed_at,
+        observation.dialog_identity_observation.source,
+    ) == (-1000000000123, "supergroup", 100, "profile")
     assert observation.created is None
     assert not hasattr(observation, "full_chat")
+
+
+@pytest.mark.asyncio
+async def test_min_forum_channel_gateway_preserves_kind_and_only_observes_positive_name() -> None:
+    response = _full_channel()
+    channel = response.chats[0]
+    object.__setattr__(channel, "min", True)
+    object.__setattr__(channel, "forum", True)
+    object.__setattr__(channel, "megagroup", True)
+    object.__setattr__(channel, "title", "Partial forum")
+    object.__setattr__(channel, "username", None)
+    object.__setattr__(channel, "usernames", None)
+
+    observation = await TelethonChannelProfileGateway(
+        _Client(response), now_provider=iter((100.25, 101.5)).__next__
+    ).fetch_channel_profile(_reference(access_hash=7))
+
+    identity = observation.dialog_identity_observation
+    assert identity is not None
+    assert (identity.name, identity.username, identity.dialog_type, identity.complete, identity.observed_at) == (
+        "Partial forum",
+        IDENTITY_OMITTED,
+        IDENTITY_OMITTED,
+        False,
+        100,
+    )
 
 
 @pytest.mark.asyncio

@@ -109,7 +109,6 @@ from .messages.telegram_adapter import (
 from .messages.telegram_adapter import (
     extract_message_row,
 )
-from .models import DialogType
 from .reactions.contracts import ReactionAggregate, ReactionAggregateSource, ReactionObservationBoundary
 from .reactions.persistence import allocate_observation_boundary, replace_reaction_aggregates
 from .reactions.projection import project_reaction_aggregates
@@ -141,7 +140,7 @@ from .telegram_demand import (
 )
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import RpcAdmissionClosedError, TelegramRpcSource, rpc_scope
-from .telethon_dialog import classify_dialog_type
+from .telethon_dialog import classify_dialog_type, observe_dialog_identity
 from .topics.sqlite_repository import SQLiteTopicMetadataRepository
 from .unread_state import apply_unread_facts
 
@@ -261,6 +260,7 @@ class _DmIdentity:
     entity_type: str
     name_observed: bool
     username_observed: bool
+    dialog_identity_observation: DialogIdentityObservation | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -820,7 +820,12 @@ class EventHandlerManager:
         return coverage is not RealtimeHistoryCoverage.NO_REALTIME_HISTORY
 
     @staticmethod
-    def _dm_identity(sender: _SenderLike | None) -> _DmIdentity | None:
+    def _dm_identity(
+        sender: _SenderLike | None,
+        *,
+        dialog_id: int,
+        observed_at: int,
+    ) -> _DmIdentity | None:
         if sender is None:
             return None
         first_raw = getattr(sender, "first_name", USERNAME_UNOBSERVED)
@@ -836,6 +841,12 @@ class EventHandlerManager:
             entity_type=classify_dialog_type(sender).value,
             name_observed=first_raw is not USERNAME_UNOBSERVED or last_raw is not USERNAME_UNOBSERVED,
             username_observed=observed_username is not USERNAME_UNOBSERVED,
+            dialog_identity_observation=observe_dialog_identity(
+                sender,
+                dialog_id=dialog_id,
+                source="realtime",
+                observed_at=observed_at,
+            ),
         )
 
     def _persist_dm_enrollment(
@@ -893,6 +904,9 @@ class EventHandlerManager:
         *,
         row_existed_before_presence: bool,
     ) -> None:
+        observation = identity.dialog_identity_observation
+        if observation is None:
+            return
         expected_revision = (
             baseline_revision if baseline_revision is not None else (0 if not row_existed_before_presence else None)
         )
@@ -901,18 +915,7 @@ class EventHandlerManager:
         publish_dialog_identity(
             self._conn,
             dialog_id,
-            DialogIdentityObservation(
-                dialog_id=dialog_id,
-                name=identity.name if identity.name_observed else IDENTITY_OMITTED,
-                username=identity.username if identity.username_observed else IDENTITY_OMITTED,
-                dialog_type=(
-                    IDENTITY_OMITTED
-                    if DialogType.parse(identity.entity_type) is DialogType.UNKNOWN
-                    else identity.entity_type
-                ),
-                source="realtime",
-                observed_at=observed_at,
-            ),
+            observation,
             expected_revision,
         )
 
@@ -959,7 +962,7 @@ class EventHandlerManager:
         """
         now = int(time.time()) if observed_at is None else observed_at
         message_timestamp = int(message_date.timestamp()) if message_date is not None else None
-        identity = self._dm_identity(sender)
+        identity = self._dm_identity(sender, dialog_id=dialog_id, observed_at=now)
 
         try:
             outcome = self._persist_dm_enrollment(
