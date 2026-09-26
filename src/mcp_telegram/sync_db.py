@@ -4490,7 +4490,7 @@ def _reset_pre78_directory_generation(conn: sqlite3.Connection) -> None:
         tuple[int, str] | None,
         conn.execute("SELECT generation,status FROM dialog_directory_state WHERE singleton=1").fetchone(),
     )
-    if state is None or state[1] != "in_progress":
+    if state is None or state[1] not in {"in_progress", "incomplete"}:
         return
     generation = state[0]
     conn.execute("DELETE FROM dialog_directory_staging WHERE generation=?", (generation,))

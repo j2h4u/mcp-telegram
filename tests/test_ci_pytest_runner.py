@@ -36,3 +36,26 @@ def test_sqlite_lock_is_application_failure(monkeypatch: pytest.MonkeyPatch, tmp
     assert ci_pytest_runner.classify_failure("sqlite3.OperationalError: database is locked", tmp_path) == (
         "sqlite_application_failure"
     )
+
+
+@pytest.mark.parametrize(
+    ("log_text", "expected"),
+    [
+        ("ImportError: failed to map segment from shared object", "native_extension_load_failure"),
+        ("RuntimeError: unexpected test runner failure", "unknown_failure"),
+    ],
+)
+def test_unrecognized_runner_failures_are_not_mislabeled_or_retried(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    log_text: str,
+    expected: str,
+) -> None:
+    _healthy_capacity(monkeypatch)
+    outcome = ci_pytest_runner.classify_failure(log_text, tmp_path)
+    assert outcome == expected
+    assert outcome not in ci_pytest_runner._RETRYABLE_OUTCOMES
+    assert {
+        "runner_capacity_exhausted",
+        "runner_filesystem_io_failure",
+    } == ci_pytest_runner._RETRYABLE_OUTCOMES

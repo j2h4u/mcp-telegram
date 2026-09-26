@@ -3,6 +3,7 @@ from __future__ import annotations
 import resource
 import sqlite3
 import sys
+from importlib import import_module
 
 # Hard virtual memory limit: 512 MB per test process.
 # Prevents runaway tests (e.g., infinite loops with MagicMock) from
@@ -11,6 +12,10 @@ if sys.platform != "win32":
     _MAX_AS_BYTES = 512 * 1024 * 1024
     _soft, _hard = resource.getrlimit(resource.RLIMIT_AS)
     resource.setrlimit(resource.RLIMIT_AS, (_MAX_AS_BYTES, _hard))
+
+# Load Hypothesis before collection so its native extension does not first map
+# during terminal-summary hooks after coverage has accumulated.
+import_module("hypothesis")
 
 from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
