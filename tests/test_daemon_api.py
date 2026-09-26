@@ -131,7 +131,7 @@ class _InsertSyncedDialogKwargs(TypedDict, total=False):
 
 
 class _SeedDialogRowKwargs(TypedDict, total=False):
-    name: str
+    name: str | None
     type_: str
     archived: int
     pinned: int

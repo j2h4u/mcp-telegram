@@ -184,6 +184,7 @@ def test_fresh_entity_identity_uses_collectible_username_and_omits_min_and_unkno
         usernames=[types.Username("collectible", active=True)],
     )
     observed = _fresh_entity_identity_observation(channel, 42, observed_at=18)
+    assert observed is not None
     assert (observed.name, observed.username, observed.dialog_type, observed.complete) == (
         "Fresh channel",
         "collectible",
@@ -200,6 +201,7 @@ def test_fresh_entity_identity_uses_collectible_username_and_omits_min_and_unkno
         usernames=[],
     )
     cleared_observation = _fresh_entity_identity_observation(cleared_channel, 42, observed_at=18)
+    assert cleared_observation is not None
     assert cleared_observation.username is None and cleared_observation.complete
 
     min_user = types.User(id=42, min=True, first_name="", last_name="")
