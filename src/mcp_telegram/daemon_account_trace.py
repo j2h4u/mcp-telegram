@@ -20,9 +20,11 @@ from .account_trace_sqlite import (
     account_by_id,
     account_by_username,
     account_directory_names,
+    apply_trace_dialog_identities,
     common_chat_ids,
     coverage_fragments,
     dialog_metadata,
+    dialog_presence_metadata,
     dialog_statuses,
     dialog_summary_page,
     evidence_page,
@@ -36,6 +38,8 @@ from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_peer_sweep import enroll_activity_dialog
 from .daemon_message import fetch_text_links
 from .dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
+from .dialog_identity import read_dialog_identities
+from .dialog_identity_contracts import DialogIdentity
 from .dialog_selector import DialogSelector, DialogSelectorError, optional_dialog_selector
 from .entity_store import EntitySnapshot, upsert_entity_snapshots
 from .flood import TelegramRpcThrottled, _raise_if_latched
@@ -476,7 +480,7 @@ class DaemonAccountTraceService:
         request: _TraceAccountQueryContext,
     ) -> _TraceAccountQueryResult:
         limit = request.request.limit
-        rows = _trace_query_rows(request, limit=limit + 1)
+        rows = apply_trace_dialog_identities(request.conn, _trace_query_rows(request, limit=limit + 1))
         selected_rows = list(rows[:limit])
         evidence: list[dict[str, object]] = []
         dialog_summaries: list[dict[str, object]] = []
@@ -1715,6 +1719,7 @@ class _TraceCandidateBuildState:
     candidates: list[dict[str, object]]
     seen: set[int]
     linked_chat_map: dict[int, int]
+    dialog_identities: Mapping[int, DialogIdentity]
 
 
 def _parse_trace_int(value: object) -> int | None:
@@ -2256,11 +2261,20 @@ def _trace_candidate_dialogs(
 ) -> list[dict[str, object]]:
     """Select deterministic bounded Account Trace enrichment candidates."""
     now = int(time.time())
+    identity_ids = {_row_int(row, "dialog_id") for row in request.observed_rows}
+    identity_ids.update(retry_fragment_dialog_ids(request.conn, target_user_id=request.target_user_id, now=now))
+    identity_ids.update(common_chat_ids(request.conn, request.target_user_id))
+    identity_ids.update(visible_synced_dialog_ids(request.conn))
+    identity_ids.update(request.linked_chat_map or {})
+    identity_ids.update((request.linked_chat_map or {}).values())
+    if request.exact_dialog_id is not None:
+        identity_ids.add(request.exact_dialog_id)
     state = _TraceCandidateBuildState(
         request=request,
         candidates=[],
         seen=set(),
         linked_chat_map=request.linked_chat_map or {},
+        dialog_identities=read_dialog_identities(request.conn, identity_ids),
     )
     _collect_trace_candidate_dialogs(
         state=state,
@@ -2346,7 +2360,10 @@ def _trace_candidate_metadata(
         return None
     if dialog_id in state.seen or len(state.candidates) >= request.max_dialogs:
         return None
-    meta = dialog_metadata(request.conn, dialog_id)
+    identity = state.dialog_identities.get(dialog_id)
+    meta = cast(TraceDialogMetadata, dialog_presence_metadata(request.conn, dialog_id))
+    if identity is not None:
+        meta["dialog_type"] = identity.dialog_type.value
     if not include_inaccessible and (meta["status"] == "access_lost" or meta["hidden"]):
         return None
     return meta

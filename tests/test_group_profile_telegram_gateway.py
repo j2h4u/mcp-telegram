@@ -74,6 +74,7 @@ async def test_group_gateway_builds_request_and_normalizes_all_primitives() -> N
     assert observation.current_photo.photo_id == 55
     assert observation.observation_started_at == 100
     assert observation.observation_completed_at == 101
+    assert observation.identity_patch == {"type": "group", "name": "Group", "username": None}
     assert observation.created is None
     assert not hasattr(observation, "full_chat")
 

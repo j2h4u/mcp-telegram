@@ -168,6 +168,7 @@ async def test_profile_gateway_normalizes_one_full_channel_rpc() -> None:
     assert observation.current_photo is not None
     assert observation.current_photo.photo_id == 55
     assert (observation.observation_started_at, observation.observation_completed_at) == (100.25, 101.5)
+    assert observation.identity_patch == {"type": "supergroup", "name": "Channel", "username": None}
     assert observation.created is None
     assert not hasattr(observation, "full_chat")
 

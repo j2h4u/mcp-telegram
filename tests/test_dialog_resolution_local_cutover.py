@@ -49,7 +49,7 @@ async def test_bare_name_miss_never_enumerates_telegram_or_entity_cache_only() -
 
 
 @pytest.mark.asyncio
-async def test_unknown_canonical_identity_can_be_enriched_by_existing_entity_cache() -> None:
+async def test_material_canonical_identity_does_not_fill_name_from_entity_cache() -> None:
     conn = _make_db_with_dialogs()
     _seed_dialog_row(conn, 9002)
     conn.execute("UPDATE dialogs SET name=NULL WHERE dialog_id=9002")
@@ -63,7 +63,8 @@ async def test_unknown_canonical_identity_can_be_enriched_by_existing_entity_cac
     client.get_entity = AsyncMock(side_effect=AssertionError("cache enrichment must stay local"))
     result = await make_server(conn, client)._resolve_dialog_id(required_dialog_selector(dialog="Cached Name"))
 
-    assert result == 9002
+    assert isinstance(result, dict)
+    assert result["error"] == "dialog_directory_incomplete"
     client.get_entity.assert_not_awaited()
 
 

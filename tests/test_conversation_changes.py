@@ -27,11 +27,17 @@ def _conn() -> sqlite3.Connection:
           seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, occurred_at INTEGER, time_basis TEXT,
           dialog_id INTEGER, message_id INTEGER, version INTEGER, reason_code TEXT,
           access_change_cause TEXT, actor_id INTEGER);
-        CREATE TABLE dialogs(dialog_id INTEGER PRIMARY KEY,name TEXT);
+        CREATE TABLE dialogs(
+          dialog_id INTEGER PRIMARY KEY,name TEXT,type TEXT,username TEXT,
+          identity_observed_at INTEGER,identity_complete INTEGER DEFAULT 0,
+          identity_source TEXT,identity_revision INTEGER DEFAULT 0);
+        CREATE TABLE entities(id INTEGER PRIMARY KEY,type TEXT,name TEXT,username TEXT);
         CREATE TABLE messages(dialog_id INTEGER,message_id INTEGER,text TEXT,PRIMARY KEY(dialog_id,message_id));
         CREATE TABLE message_versions(dialog_id INTEGER,message_id INTEGER,version INTEGER,old_text TEXT,
           PRIMARY KEY(dialog_id,message_id,version));
-        INSERT INTO dialogs VALUES (1,'Alice'),(2,'Group');
+        INSERT INTO dialogs(dialog_id,name,type,identity_complete,identity_source)
+          VALUES (1,'Alice','user',1,'directory'),(2,'Group','supergroup',1,'directory');
+        INSERT INTO entities VALUES (1,'user','Stale profile name','stale_user');
         INSERT INTO messages VALUES (1,10,'after'),(1,11,'deleted candidate');
         INSERT INTO message_versions VALUES (1,10,1,'before');
         INSERT INTO conversation_history_events(kind,occurred_at,time_basis,dialog_id,message_id,version)
@@ -68,6 +74,22 @@ def test_query_returns_one_canonical_event_shape_with_truthful_evidence() -> Non
         "provenance": "message_versions.old_text+messages.text[current_candidate]",
         "confidence": "exact_before_candidate_after",
     }
+
+
+def test_dialog_title_uses_identity_owner_and_numeric_fallback_for_missing_dialog() -> None:
+    with closing(_conn()) as conn:
+        conn.execute(
+            "INSERT INTO conversation_history_events(kind,occurred_at,time_basis,dialog_id) "
+            "VALUES ('access_lost',104,'observed',404)"
+        )
+        result = query_conversation_changes(
+            conn,
+            {"kinds": ["access_lost"], "dialog_id": 404},
+            ConversationChangesTokenCodec(),
+        )
+
+    event = _events(_data(result))[0]
+    assert event["dialog_title"] == "404"
 
 
 def test_filters_use_inclusive_since_and_exclusive_until() -> None:

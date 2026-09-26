@@ -2202,8 +2202,9 @@ async def test_list_dialogs_includes_orphan_access_lost_archive() -> None:
     dialogs = result["data"]["dialogs"]
     assert len(dialogs) == 1
     assert dialogs[0]["id"] == 84
-    assert dialogs[0]["name"] is None
-    assert dialogs[0]["type"] is None
+    assert dialogs[0]["name"] == "84"
+    assert dialogs[0]["display_name_source"] == "numeric"
+    assert dialogs[0]["type"] == "unknown"
     assert dialogs[0]["last_message_at"] == 1700000050
     assert dialogs[0]["sync_status"] == "access_lost"
     assert dialogs[0]["access_lost_at"] == 1700000100
@@ -5588,13 +5589,13 @@ async def test_list_dialogs_includes_coverage():
     assert dialogs[0]["history_sync_state"] == "complete_as_of_last_sync"
     assert dialogs[0]["coverage_state"] == "telegram_total_comparable"
     assert dialogs[0]["access_lost_at"] is None
-    assert dialogs[0]["type"] == "User"
+    assert dialogs[0]["type"] == "user"
     cast(MagicMock, mock_client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_list_dialogs_classifies_forum() -> None:
-    """list_dialogs returns type='Forum' for a Forum row in dialogs snapshot table."""
+    """list_dialogs returns the canonical forum type from the dialog identity bundle."""
     conn = _make_db_with_dialogs()
     # Forum type is stored directly in the dialogs.type column by the bootstrap sweep.
     _seed_dialog_row(conn, 6001, name="Forum Group", type_="Forum")
@@ -5607,7 +5608,7 @@ async def test_list_dialogs_classifies_forum() -> None:
     assert result["ok"] is True
     dialogs = result["data"]["dialogs"]
     assert len(dialogs) == 1
-    assert dialogs[0]["type"] == "Forum"
+    assert dialogs[0]["type"] == "forum"
     cast(MagicMock, mock_client.iter_dialogs).assert_not_called()
 
 
@@ -6764,12 +6765,12 @@ def test_fts_sql_invariants_mandatory() -> None:
     assert "COALESCE(e_raw.name, e_eff.name, m.sender_first_name)" in d._SELECT_FTS_SQL, (
         "_SELECT_FTS_SQL missing triple COALESCE(e_raw.name, e_eff.name, m.sender_first_name)"
     )
-    # _SELECT_FTS_ALL_SQL: de for dialog, e_raw/e_eff for sender
+    # _SELECT_FTS_ALL_SQL: sender entities only; dialog identity comes from its owner bundle.
     assert "LEFT JOIN entities e_raw ON e_raw.id = m.sender_id" in d._SELECT_FTS_ALL_SQL, (
         "_SELECT_FTS_ALL_SQL missing LEFT JOIN entities e_raw"
     )
-    assert "LEFT JOIN entities de ON de.id = f.dialog_id" in d._SELECT_FTS_ALL_SQL, (
-        "_SELECT_FTS_ALL_SQL missing LEFT JOIN entities de ON de.id = f.dialog_id"
+    assert "entities de" not in d._SELECT_FTS_ALL_SQL, (
+        "_SELECT_FTS_ALL_SQL must not source dialog identity from entities"
     )
     assert "COALESCE(e_raw.name, e_eff.name, m.sender_first_name)" in d._SELECT_FTS_ALL_SQL, (
         "_SELECT_FTS_ALL_SQL must use triple COALESCE(e_raw.name, e_eff.name, m.sender_first_name)"
@@ -7397,43 +7398,67 @@ async def test_get_my_recent_activity_falls_back_to_str_dialog_id() -> None:
 
 @pytest.mark.asyncio
 async def test_get_my_recent_activity_default_filters_dms_before_limit() -> None:
-    """Default dialog_kinds excludes DMs before LIMIT so group rows are not paged out."""
+    """Default filtering handles many newer DMs before SQL LIMIT, including historical forums."""
     server = make_server(_make_db_with_activity())
     now = int(time.time())
     with server._conn:
-        server._conn.execute("INSERT OR REPLACE INTO dialogs (dialog_id, name, type) VALUES (42, 'Alice', 'user')")
         server._conn.execute(
             "INSERT OR REPLACE INTO dialogs (dialog_id, name, type) VALUES (-1001, 'Group', 'supergroup')"
         )
         server._conn.execute(
+            "INSERT INTO entities (id,type,name,username,name_normalized,updated_at) "
+            "VALUES (-1001,'User','Stale DM Type',NULL,'stale dm type',?)",
+            (now,),
+        )
+        server._conn.executemany(
             "INSERT INTO messages "
             "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
-            "VALUES (42, 1, ?, 'dm-recent', 1, 0, 0)",
-            (now - 10,),
+            "VALUES (?, 1, ?, 'newer-dm', 1, 0, 0)",
+            [
+                (
+                    10000 + i,
+                    now - i,
+                )
+                for i in range(1001)
+            ],
         )
         server._conn.execute(
             "INSERT INTO messages "
             "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
             "VALUES (-1001, 2, ?, 'group-older', 1, 0, 0)",
-            (now - 100,),
+            (now - 2000,),
+        )
+        server._conn.execute(
+            "INSERT INTO topic_metadata (dialog_id,topic_id,title,is_general,is_deleted,updated_at) "
+            "VALUES (-1002,1,'General',1,0,?)",
+            (now,),
+        )
+        server._conn.execute(
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+            "VALUES (-1002, 3, ?, 'historical-forum', 1, 0, 0)",
+            (now - 3000,),
         )
         server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
 
-    resp = await server._dispatch({"method": "get_my_recent_activity", "since_hours": 1, "limit": 1})
+    sql = []
+    server._conn.set_trace_callback(sql.append)
+    resp = await server._dispatch({"method": "get_my_recent_activity", "since_hours": 1, "limit": 2})
+    server._conn.set_trace_callback(None)
     assert _activity_data(resp)["dialog_kinds"] == ["group", "forum"]
     assert [
         (c["dialog_id"], c["dialog_category"], c["text"])
         for c in cast(list[dict[str, object]], _activity_data(resp)["comments"])
-    ] == [(-1001, "group", "group-older")]
+    ] == [(-1002, "forum", "historical-forum"), (-1001, "group", "group-older")]
+    assert any("json_each(" in statement and "LIMIT 2" in statement for statement in sql)
 
-    dm_resp = await server._dispatch(
-        {"method": "get_my_recent_activity", "since_hours": 1, "limit": 1, "dialog_kinds": ["user"]}
+    empty = await server._dispatch(
+        {"method": "get_my_recent_activity", "since_hours": 1, "limit": 2, "dialog_kinds": ["channel"]}
     )
-    assert [
-        (c["dialog_id"], c["dialog_category"], c["text"])
-        for c in cast(list[dict[str, object]], _activity_data(dm_resp)["comments"])
-    ] == [(42, "user", "dm-recent")]
+    empty_data = _activity_data(empty)
+    assert empty_data["comments"] == []
+    assert empty_data["scan_status"] == "complete"
 
 
 @pytest.mark.asyncio
@@ -7934,7 +7959,7 @@ async def test_list_topics_dialog_resolution_remains_local_only() -> None:
     cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
-async def test_duplicate_username_candidates_preserve_truthful_cached_metadata() -> None:
+async def test_dialog_username_selector_ignores_entity_cache_for_canonical_bundles() -> None:
     conn = _make_db_with_dialogs()
     _seed_dialog_row(conn, 1303, name="Shared User", type_="user")
     _seed_dialog_row(conn, 1404, name="Shared Group", type_="supergroup")
@@ -7953,12 +7978,7 @@ async def test_duplicate_username_candidates_preserve_truthful_cached_metadata()
     result = await server._resolve_dialog_id(required_dialog_selector(dialog="@shared"))
 
     assert isinstance(result, dict)
-    assert result["error"] == "ambiguous_dialog"
-    candidates = cast(list[dict[str, object]], result["candidates"])
-    assert {candidate["entity_id"]: (candidate["username"], candidate["entity_type"]) for candidate in candidates} == {
-        1303: ("shared", "user"),
-        1404: ("shared", "supergroup"),
-    }
+    assert result["error"] == "dialog_directory_incomplete"
     cast(AsyncMock, client.get_entity).assert_not_awaited()
 
 
@@ -8045,7 +8065,11 @@ def _make_trace_db() -> sqlite3.Connection:
             needs_refresh           INTEGER NOT NULL DEFAULT 0,
             unread_mentions_count   INTEGER NOT NULL DEFAULT 0,
             unread_reactions_count  INTEGER NOT NULL DEFAULT 0,
-            draft_text              TEXT
+            draft_text              TEXT,
+            username                TEXT,
+            identity_observed_at    INTEGER,
+            identity_complete       INTEGER NOT NULL DEFAULT 0,
+            identity_source         TEXT
         );
 
         CREATE TABLE entities (

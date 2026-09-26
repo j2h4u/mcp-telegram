@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import cast
 
+from .dialog_identity import read_dialog_identities
 from .models import DialogType
 from .own_only_contracts import OwnOnlyContext, normalize_channel_peer_id
 from .sync_db import ensure_own_only_schema
@@ -89,19 +90,13 @@ def classify_own_only_dialog(
 
 
 _OWN_ONLY_CANDIDATE_SQL = """
-SELECT d.dialog_id, d.name, d.type, d.linked_chat_id, d.last_message_at
+SELECT d.dialog_id, d.linked_chat_id, d.last_message_at,
+       d.dialog_id IN (
+           SELECT linked_chat_id FROM dialogs WHERE dialog_id = ? AND linked_chat_id IS NOT NULL
+       ) AS is_personal_discussion
 FROM dialogs d
 LEFT JOIN synced_dialogs sd ON sd.dialog_id = d.dialog_id
-WHERE (
-      d.type IN ('user', 'bot')
-      OR d.type = 'channel'
-      OR d.dialog_id IN (
-          SELECT linked_chat_id
-          FROM dialogs
-          WHERE dialog_id = ? AND linked_chat_id IS NOT NULL
-      )
-  )
-  AND COALESCE(sd.status, '') != 'access_lost'
+WHERE COALESCE(sd.status, '') != 'access_lost'
 ORDER BY d.dialog_id
 """
 
@@ -254,19 +249,28 @@ def query_own_only_candidates(
     """
     personal_id = normalize_channel_peer_id(personal_channel_id)
     rows = cast(
-        list[tuple[object, object, object, object, object]],
+        list[tuple[object, object, object, object]],
         conn.execute(_OWN_ONLY_CANDIDATE_SQL, (personal_id,)).fetchall(),
     )
-    return [
-        {
-            "dialog_id": _as_int(row[0]),
-            "name": cast(str | None, row[1]),
-            "type": cast(str | None, row[2]),
-            "linked_chat_id": cast(int | None, row[3]),
-            "last_message_at": cast(int | None, row[4]),
-        }
-        for row in rows
-    ]
+    identities = read_dialog_identities(conn, (_as_int(row[0]) for row in rows))
+    candidates: list[dict[str, object]] = []
+    for dialog_id_raw, linked_chat_id, last_message_at, is_personal_discussion in rows:
+        dialog_id = _as_int(dialog_id_raw)
+        identity = identities[dialog_id]
+        if identity.dialog_type not in (DialogType.USER, DialogType.BOT, DialogType.CHANNEL) and not bool(
+            is_personal_discussion
+        ):
+            continue
+        candidates.append(
+            {
+                "dialog_id": dialog_id,
+                "name": identity.display_name,
+                "type": identity.dialog_type.value,
+                "linked_chat_id": cast(int | None, linked_chat_id),
+                "last_message_at": cast(int | None, last_message_at),
+            }
+        )
+    return candidates
 
 
 __all__ = [

@@ -63,6 +63,78 @@ MESSAGE_SQL_SCHEMA_OWNER_PATHS = frozenset({"sync_db.py"})
 
 ENTITY_DML_OWNER_PATHS = frozenset({"entity_store.py"})
 ENTITY_DML_SCHEMA_OWNER_PATHS = frozenset({"sync_db.py"})
+IDENTITY_SQL_OWNER_PATHS = frozenset({"dialog_identity.py", "sync_db.py"})
+# Exact consumers of canonical kind for routing, policy, diagnostics, or
+# revision fencing. These do not assemble user-facing dialog identity.
+DIALOG_IDENTITY_ROLE_FUNCTIONS: Mapping[str, Mapping[str, frozenset[str]]] = {
+    "activity_peer_sweep.py": {
+        name: frozenset({"type"})
+        for name in (
+            "_has_working_set_enrollment_candidate",
+            "_next_linked_chat_projection_lag",
+            "_next_enrollment_dialog",
+        )
+    },
+    "daemon_log_context.py": {"dialog_log_context": frozenset({"name", "type"})},
+    "delta_sync.py": {"_dm_gap_scan_dialog_ids": frozenset({"type"})},
+    "dialog_directory.py": {"CanonicalDialogDirectory._start_generation": frozenset({"identity_revision"})},
+    "dialog_directory_coverage.py": {
+        "_read_identity_aggregate": frozenset({"identity_complete", "identity_observed_at"})
+    },
+    "event_handlers.py": {"EventHandlerManager._mark_channel_chat_update": frozenset({"type"})},
+    "scheduled_messages.py": {"ScheduledMessageReconciler._discover_eligibility": frozenset({"type"})},
+    "sync_worker.py": {
+        "FullSyncWorker.consume_canonical_dm_publication": frozenset({"name", "type", "identity_complete"}),
+        "FullSyncWorker._automatic_group_earliest_retry": frozenset({"type"}),
+        "FullSyncWorker._eligible_automatic_group": frozenset({"type"}),
+        "FullSyncWorker._is_eligible_automatic_group": frozenset({"type"}),
+    },
+}
+# These functions read entities in an explicit non-dialog role: account target,
+# profile stub, or user-only read-receipt routing.
+ENTITY_IDENTITY_ROLE_FUNCTIONS: Mapping[str, Mapping[str, frozenset[str]]] = {
+    "account_trace_sqlite.py": {
+        name: frozenset({"name", "username", "type"})
+        for name in ("account_by_id", "account_by_username", "account_directory_names")
+    },
+    "entity_profile/repository.py": {"_read_entity_stub": frozenset({"type", "name", "username"})},
+    "daemon_api.py": {
+        "_resolve_entity": frozenset({"name", "username", "type"}),
+        "_ResolverEntityCache.get": frozenset({"name", "username", "type"}),
+        "_ResolverEntityCache.get_by_username": frozenset({"name", "username", "type"}),
+    },
+    "delta_sync.py": {"_dm_gap_scan_dialog_ids": frozenset({"type"})},
+    "channel_full_siblings.py": {"_merged_identity_values": frozenset({"name", "username"})},
+    "daemon_entity_info.py": {
+        name: frozenset({"name", "username", "type"})
+        for name in ("_local_personal_channel_metadata", "_enrich_contact_ids_with_names")
+    },
+    "message_fact_refresh.py": {},
+    "telegram_fact_queries.py": {"_persist_message_too_old": frozenset({"type"})},
+}
+# SQL constants used by exact entity-target operations get narrow field masks.
+ENTITY_IDENTITY_ROLE_CONSTANTS: Mapping[str, Mapping[str, frozenset[str]]] = {
+    "account_trace_sqlite.py": {
+        "_ENTITY_BY_USERNAME_SQL": frozenset({"name", "username"}),
+        "_TRACE_ACCOUNT_BY_ID_SQL": frozenset({"name", "username"}),
+        "_TRACE_ACCOUNT_NAMES_SQL": frozenset({"name", "type"}),
+        "_TRACE_ACCOUNT_NAMES_NORMALIZED_SQL": frozenset({"name", "type"}),
+    },
+    "daemon_api.py": {
+        "_ALL_ENTITY_NAMES_SQL": frozenset({"name", "type"}),
+        "_ALL_ENTITY_NAMES_NORMALIZED_SQL": frozenset({"name", "type"}),
+        "_ENTITY_BY_USERNAME_SQL": frozenset({"name", "username", "type"}),
+    },
+}
+ENTITY_DIALOG_ROLE_PATHS = frozenset(
+    {
+        "reading/sqlite_projection.py",
+        "daemon_activity_stats.py",
+        "account_trace_sqlite.py",
+        "daemon_api.py",
+        "conversation_changes.py",
+    }
+)
 
 CONTENT_WRAPPER_PATH = "tools/structured.py"
 CONTENT_PROJECTOR_PATH = "message_content.py"
@@ -151,7 +223,7 @@ _EXECUTE_METHODS = frozenset({"execute", "executemany", "executescript"})
 _SQL_NAME = re.compile(r"(?:^|_)(?:SQL|DDL|QUERY)(?:$|_)", re.IGNORECASE)
 _SQL_START = re.compile(r"^(?:SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b", re.IGNORECASE)
 _SQL_TOKEN = re.compile(
-    r"--[^\n]*|/\*.*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*|[().]",
+    r"--[^\n]*|/\*.*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*|[().*]",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -170,6 +242,8 @@ class Finding:
 class _SqlSnippet:
     text: str
     line: int
+    function: str | None = None
+    name: str | None = None
 
 
 def _line(node: ast.AST) -> int:
@@ -301,6 +375,18 @@ def _is_exact_table_at(tokens: list[str], index: int, table_name: str) -> bool:
     )
 
 
+def _matching_paren(tokens: list[str], opening: int) -> int | None:
+    depth = 0
+    for index in range(opening, len(tokens)):
+        if tokens[index] == "(":
+            depth += 1
+        elif tokens[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
 def _top_level_statement_index(tokens: list[str]) -> int | None:
     """Locate the statement following an optional sequence of CTEs."""
     if not tokens:
@@ -352,15 +438,32 @@ def _has_entity_table_dml(sql: str) -> bool:
 
 def _sql_snippets(tree: ast.AST, constants: Mapping[str, str]) -> list[_SqlSnippet]:
     snippets: list[_SqlSnippet] = []
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, int, str | None]] = set()
+    parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+    function_names: dict[int, str | None] = {}
+
+    def mark_functions(node: ast.AST, current: str | None = None, class_name: str | None = None) -> None:
+        for child in ast.iter_child_nodes(node):
+            name = current
+            owner = class_name
+            if isinstance(child, ast.ClassDef):
+                owner = child.name
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = f"{owner}.{child.name}" if owner else child.name
+            function_names[id(child)] = name
+            mark_functions(child, name, owner)
+
+    mark_functions(tree)
 
     def add(node: ast.AST, text: str | None, *, name: str | None = None) -> None:
         if text is None or not _looks_like_sql(text, name=name):
             return
-        key = (text, _line(node))
+        function = function_names.get(id(node))
+        key = (text, _line(node), function)
         if key not in seen:
             seen.add(key)
-            snippets.append(_SqlSnippet(text=text, line=_line(node)))
+            snippets.append(_SqlSnippet(text=text, line=_line(node), function=function, name=name))
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -372,13 +475,254 @@ def _sql_snippets(tree: ast.AST, constants: Mapping[str, str]) -> list[_SqlSnipp
             add(node, _literal_string(node.value, constants))
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if node.func.attr in _EXECUTE_METHODS and node.args:
-                add(node, _literal_string(node.args[0], constants))
+                argument = node.args[0]
+                name = argument.id if isinstance(argument, ast.Name) else None
+                add(node, _literal_string(argument, constants), name=name)
         elif isinstance(node, ast.Constant) and isinstance(node.value, str) and _SQL_START.match(node.value.strip()):
             # Migration lists and other execute-family argument containers may
             # hold SQL strings without assigning each item a name.  Restrict
             # this fallback to strings that begin with a SQL statement keyword.
-            add(node, node.value)
+            parent = parents.get(id(node))
+            while isinstance(parent, (ast.BinOp, ast.JoinedStr, ast.FormattedValue)):
+                parent = parents.get(id(parent))
+            if not isinstance(parent, (ast.Assign, ast.AnnAssign)):
+                add(node, node.value)
     return snippets
+
+
+_IDENTITY_FIELDS = frozenset(
+    {"name", "username", "type", "identity_observed_at", "identity_complete", "identity_source", "identity_revision"}
+)
+
+
+def _identity_table_aliases(sql: str) -> dict[str, str]:
+    tokens = _sql_tokens(sql)
+    aliases: dict[str, str] = {}
+    for index, token in enumerate(tokens):
+        if token.casefold() not in {"from", "join", "update", "into"} or index + 1 >= len(tokens):
+            continue
+        table_index = index + 1
+        table = _identifier(tokens[table_index]).casefold()
+        if table == "main" and table_index + 2 < len(tokens) and tokens[table_index + 1] == ".":
+            table_index += 2
+            table = _identifier(tokens[table_index]).casefold()
+        if table not in {"dialogs", "entities"}:
+            continue
+        alias_index = table_index + 1
+        if alias_index < len(tokens) and tokens[alias_index].casefold() == "as":
+            alias_index += 1
+        if alias_index < len(tokens) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", tokens[alias_index]):
+            alias = _identifier(tokens[alias_index]).casefold()
+            if alias not in {"where", "on", "join", "left", "right", "inner", "outer", "cross", "set"}:
+                aliases[alias] = table
+            else:
+                aliases[table] = table
+        else:
+            aliases[table] = table
+    return aliases
+
+
+def _has_dialog_identity_dml(sql: str) -> bool:  # noqa: PLR0911
+    """Only dialogs-target DML is governed here; entity writes use ENTITY_DML."""
+    tokens = _sql_tokens(sql)
+    statement_index = _top_level_statement_index(tokens)
+    if statement_index is None:
+        return False
+    statement = tokens[statement_index].casefold()
+    target_index = statement_index + 1
+    if statement == "insert" and target_index < len(tokens) and tokens[target_index].casefold() == "or":
+        target_index += 2
+    if statement in {"insert", "replace"}:
+        if target_index < len(tokens) and tokens[target_index].casefold() == "into":
+            target_index += 1
+    elif statement == "update":
+        pass
+    else:
+        return False
+    if not _is_exact_table_at(tokens, target_index, "dialogs"):
+        return False
+    fields = {field.casefold() for field in _IDENTITY_FIELDS}
+    if statement in {"insert", "replace"}:
+        opening = next((i for i in range(target_index + 1, len(tokens)) if tokens[i] == "("), None)
+        closing = _matching_paren(tokens, opening) if opening is not None else None
+        if (
+            opening is not None
+            and closing is not None
+            and fields.intersection(
+                _identifier(token).casefold() for token in tokens[opening + 1 : closing] if token not in {",", "."}
+            )
+        ):
+            return True
+        conflict = next(
+            (
+                i
+                for i in range(target_index + 1, len(tokens) - 2)
+                if tokens[i].casefold() == "do" and tokens[i + 1].casefold() == "update"
+            ),
+            None,
+        )
+        if conflict is not None:
+            return any(_identifier(tokens[i]).casefold() in fields for i in range(conflict + 3, len(tokens)))
+        return False
+    set_index = next((i for i in range(target_index + 1, len(tokens)) if tokens[i].casefold() == "set"), None)
+    if set_index is None:
+        return False
+    end = next(
+        (i for i in range(set_index + 1, len(tokens)) if tokens[i].casefold() in {"where", "returning"}), len(tokens)
+    )
+    return any(
+        _identifier(tokens[i]).casefold() in fields and i + 1 < end and tokens[i + 1] == "="
+        for i in range(set_index + 1, end)
+    )
+
+
+def _has_dialog_identity_sql(sql: str, *, relative: str, function: str | None = None, name: str | None = None) -> bool:  # noqa: PLR0912, PLR0914
+    aliases = _identity_table_aliases(sql)
+    tokens = _sql_tokens(sql)
+    dialog_aliases = {alias for alias, table in aliases.items() if table == "dialogs"}
+    entity_aliases = {alias for alias, table in aliases.items() if table == "entities"}
+    dialog_fields = DIALOG_IDENTITY_ROLE_FUNCTIONS.get(relative, {}).get(function or "", frozenset())
+    entity_fields = ENTITY_IDENTITY_ROLE_FUNCTIONS.get(relative, {}).get(function or "", frozenset())
+    entity_fields |= ENTITY_IDENTITY_ROLE_CONSTANTS.get(relative, {}).get(name or "", frozenset())
+    strict_entity_role = relative in ENTITY_DIALOG_ROLE_PATHS
+    statement_index = _top_level_statement_index(tokens)
+    if statement_index is not None and tokens[statement_index].casefold() == "select":
+        depth = 0
+        projection: list[str] = []
+        for token in tokens[statement_index + 1 :]:
+            if token == "(":
+                depth += 1
+            elif token == ")":
+                depth -= 1
+            if depth == 0 and token.casefold() == "from":
+                break
+            projection.append(token)
+        if any(
+            token == "*"
+            and (dialog_aliases or (strict_entity_role and entity_aliases))
+            and (
+                (
+                    index > 1
+                    and projection[index - 1] == "."
+                    and _identifier(projection[index - 2]).casefold() in aliases
+                )
+                or (
+                    (
+                        index == 0
+                        or projection[index - 1] == ","
+                        or (index == 1 and projection[0].casefold() == "distinct")
+                    )
+                    and (index + 1 == len(projection) or projection[index + 1] == ",")
+                )
+            )
+            for index, token in enumerate(projection)
+        ) and (dialog_aliases or (strict_entity_role and entity_aliases)):
+            return True
+    sender_aliases: set[str] = set()
+    for match in re.finditer(
+        r"\bJOIN\s+entities\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_$]*)\s+ON\s+(.+?)(?=\b(?:LEFT|RIGHT|INNER|OUTER|CROSS)?\s*JOIN\b|\bWHERE\b|\bGROUP\b|\bORDER\b|$)",
+        sql,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        alias, condition = match.groups()
+        if (
+            f"{alias}.id = m.sender_id" in condition
+            or f"{alias}.id=m.sender_id" in condition
+            or (alias.casefold() in {"e_eff", "e_sender"} and "m.sender_id" in condition and "m.dialog_id" in condition)
+        ):
+            sender_aliases.add(alias.casefold())
+    for index in range(len(tokens) - 2):
+        alias = _identifier(tokens[index]).casefold()
+        field = _identifier(tokens[index + 2]).casefold()
+        is_dialog_identity = aliases.get(alias) == "dialogs"
+        is_dialog_entity_identity = strict_entity_role and alias in entity_aliases
+        is_sender_identity = aliases.get(alias) == "entities" and alias in sender_aliases
+        role_allowed = (is_dialog_identity and field in dialog_fields) or (
+            aliases.get(alias) == "entities" and field in entity_fields
+        )
+        qualified_identity_reference = tokens[index + 1] == "." and field in _IDENTITY_FIELDS
+        identity_role = is_dialog_identity or is_dialog_entity_identity
+        if qualified_identity_reference and identity_role and not is_sender_identity and not role_allowed:
+            return True
+    # Unqualified identity fields matter in statements that name one identity
+    # table and do not qualify its columns.
+    for index, token in enumerate(tokens):
+        field = _identifier(token).casefold()
+        if field not in _IDENTITY_FIELDS or (index > 0 and tokens[index - 1] == "."):
+            continue
+        if index + 1 < len(tokens) and tokens[index + 1] == ".":
+            continue
+        tables = set(aliases.values())
+        if field.startswith("identity_") and "dialogs" in tables and field not in dialog_fields:
+            return True
+        if field in {"name", "username", "type"} and "dialogs" in tables and field not in dialog_fields:
+            return True
+        if (
+            field in {"name", "username", "type"}
+            and strict_entity_role
+            and "entities" in tables
+            and field not in entity_fields
+        ):
+            return True
+    return False
+
+
+def _identity_sql_allowed(relative: str) -> bool:
+    return relative in IDENTITY_SQL_OWNER_PATHS
+
+
+def _identity_bundle_constructor_violations(relative: str, tree: ast.AST) -> list[Finding]:  # noqa: PLR0912
+    if relative == "dialog_identity.py":
+        return []
+    symbol_aliases: set[str] = set()
+    module_aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and node.module.endswith("dialog_identity_contracts"):
+            symbol_aliases.update(alias.asname or alias.name for alias in node.names if alias.name == "DialogIdentity")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.endswith("dialog_identity_contracts"):
+                    module_aliases.add(alias.asname or alias.name.split(".", 1)[0])
+    assignments = [node for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign))]
+    for _ in range(len(assignments) + 1):
+        changed = False
+        for node in assignments:
+            value = node.value
+            is_identity_symbol = (
+                isinstance(value, ast.Attribute)
+                and value.attr == "DialogIdentity"
+                and isinstance(value.value, ast.Name)
+                and value.value.id in module_aliases
+            ) or (isinstance(value, ast.Name) and value.id in symbol_aliases)
+            if is_identity_symbol:
+                aliases = symbol_aliases
+            elif isinstance(value, ast.Name) and value.id in module_aliases:
+                aliases = module_aliases
+            else:
+                continue
+            for name in _assignment_names(node):
+                if name not in aliases:
+                    aliases.add(name)
+                    changed = True
+        if not changed:
+            break
+    findings: list[Finding] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        direct = isinstance(target, ast.Name) and target.id in symbol_aliases
+        qualified = (
+            isinstance(target, ast.Attribute)
+            and target.attr == "DialogIdentity"
+            and isinstance(target.value, ast.Name)
+            and target.value.id in module_aliases
+        )
+        if direct or qualified:
+            findings.append(
+                Finding(relative, node.lineno, "DialogIdentity bundles are assembled only by dialog_identity.py")
+            )
+    return findings
 
 
 def _dict_string_keys(node: ast.Dict) -> dict[str, ast.expr]:
@@ -1004,6 +1348,7 @@ def violations_for(path: Path, source: str) -> list[Finding]:
     findings.extend(_raw_message_content_violations(relative, tree))
     findings.extend(_canonical_message_view_violations(relative, tree))
     findings.extend(_search_hit_violations(relative, tree))
+    findings.extend(_identity_bundle_constructor_violations(relative, tree))
 
     sql_hits = [snippet for snippet in _sql_snippets(tree, constants) if _has_message_table_sql(snippet.text)]
     if (
@@ -1030,6 +1375,21 @@ def violations_for(path: Path, source: str) -> list[Finding]:
             )
             for snippet in entity_dml_hits
         )
+    identity_hits = [
+        snippet
+        for snippet in _sql_snippets(tree, constants)
+        if (_has_dialog_identity_dml(snippet.text) and relative not in IDENTITY_SQL_OWNER_PATHS)
+        or _has_dialog_identity_sql(snippet.text, relative=relative, function=snippet.function, name=snippet.name)
+    ]
+    findings.extend(
+        Finding(
+            relative,
+            snippet.line,
+            "dialog name/type/username reads and writes belong to dialog_identity.py (profile/account role reads require an exact function allowance)",
+        )
+        for snippet in identity_hits
+        if not _identity_sql_allowed(relative)
+    )
     return findings
 
 

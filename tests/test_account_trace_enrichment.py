@@ -282,11 +282,11 @@ def test_trace_candidate_dialogs_are_bounded_visible_and_strategy_labeled(
         _TraceCandidateBuildRequest(conn=conn, target_user_id=101, observed_rows=[], max_dialogs=10)
     )
     strategies = {candidate["dialog_type"]: candidate["strategy"] for candidate in base_candidates}
-    assert strategies["User"] == "dialog_scan"
-    assert strategies["Group"] == "author_search"
-    assert strategies["Forum"] == "author_search"
-    assert strategies["Chat"] == "author_search"
-    assert strategies["Channel"] == "signature_only"
+    assert strategies["user"] == "dialog_scan"
+    assert strategies["supergroup"] == "author_search"
+    assert strategies["forum"] == "author_search"
+    assert strategies["group"] == "author_search"
+    assert strategies["channel"] == "signature_only"
 
     seed_dialog(conn, dialog_id=-2001, name="Hidden", dialog_type="Group", hidden=1)
     seed_synced_dialog(conn, dialog_id=-2001)

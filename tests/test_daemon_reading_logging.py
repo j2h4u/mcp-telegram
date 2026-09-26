@@ -113,7 +113,21 @@ def test_read_state_per_dialog_skips_non_dm_and_zero_dialogs() -> None:
     conn = sqlite3.connect(":memory:")
     conn.executescript(
         """
-        CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL);
+        CREATE TABLE entities (
+            id INTEGER PRIMARY KEY,
+            type TEXT NOT NULL,
+            name TEXT,
+            username TEXT
+        );
+        CREATE TABLE dialogs (
+            dialog_id INTEGER PRIMARY KEY,
+            name TEXT,
+            type TEXT,
+            username TEXT,
+            identity_observed_at INTEGER,
+            identity_complete INTEGER NOT NULL DEFAULT 0,
+            identity_source TEXT
+        );
         CREATE TABLE synced_dialogs (
             dialog_id INTEGER PRIMARY KEY,
             read_inbox_max_id INTEGER,
@@ -136,7 +150,7 @@ def test_read_state_per_dialog_skips_non_dm_and_zero_dialogs() -> None:
             is_deleted INTEGER NOT NULL,
             is_service INTEGER NOT NULL
         );
-        INSERT INTO entities VALUES (7, 'User'), (8, 'Channel');
+        INSERT INTO entities (id, type) VALUES (7, 'User'), (8, 'Channel');
         INSERT INTO synced_dialogs (dialog_id, read_inbox_max_id, read_outbox_max_id) VALUES (7, 10, 20);
         INSERT INTO messages VALUES (7, 11, 1700000000, NULL, NULL, 0, 0, 0), (7, 21, 1700000100, NULL, NULL, 1, 0, 0);
         """
@@ -326,7 +340,16 @@ async def test_search_scoped_result_applies_time_bounds_and_keeps_cursor_context
     conn = sqlite3.connect(":memory:")
     conn.executescript(
         """
-        CREATE TABLE entities (id INTEGER PRIMARY KEY, name TEXT, type TEXT);
+        CREATE TABLE entities (id INTEGER PRIMARY KEY, name TEXT, username TEXT, type TEXT);
+        CREATE TABLE dialogs (
+            dialog_id INTEGER PRIMARY KEY,
+            name TEXT,
+            type TEXT,
+            username TEXT,
+            identity_observed_at INTEGER,
+            identity_complete INTEGER NOT NULL DEFAULT 0,
+            identity_source TEXT
+        );
         CREATE TABLE messages (
             dialog_id INTEGER NOT NULL,
             message_id INTEGER NOT NULL,

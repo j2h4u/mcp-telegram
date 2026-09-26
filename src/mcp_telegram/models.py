@@ -200,6 +200,7 @@ class ReadMessage:
     reaction_events_status: str = "unavailable"
     reactions_display: str = ""
     dialog_name: str | None = None
+    dialog_name_source: str | None = None
 
     @property
     def id(self) -> int:

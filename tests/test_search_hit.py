@@ -60,10 +60,11 @@ def test_search_hit_schema_and_maximal_projector_have_exact_field_parity() -> No
     properties = cast(dict[str, object], SEARCH_HIT_SCHEMA["properties"])
 
     assert set(hit) == set(properties)
-    assert len(properties) == 20
+    assert len(properties) == 21
     assert cast(list[str], SEARCH_HIT_SCHEMA["required"]) == [
         "dialog_id",
         "dialog_name",
+        "dialog_name_source",
         "msg_id",
         "anchor_call",
         "message_state",
@@ -87,9 +88,10 @@ def test_registered_search_hit_schema_preserves_normalized_20_field_11_required_
     results = cast(dict[str, object], properties["results"])
     item = cast(dict[str, object], results["items"])
 
-    assert len(cast(dict[str, object], item["properties"])) == 20
+    assert len(cast(dict[str, object], item["properties"])) == 21
     assert cast(list[str], item["required"]) == [
         "dialog_id",
+        "dialog_name_source",
         "msg_id",
         "anchor_call",
         "message_state",

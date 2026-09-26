@@ -66,6 +66,10 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                 "properties": {
                     "id": {"type": "integer"},
                     "name": {"type": ["string", "null"]},
+                    "display_name_source": {
+                        "type": ["string", "null"],
+                        "enum": ["name", "username", "numeric", None],
+                    },
                     "type": {"type": ["string", "null"]},
                     "last_message_at": {"type": ["integer", "string", "null"]},
                     "unread_count": {"type": ["integer", "null"]},
@@ -296,6 +300,7 @@ class _DialogSurface:
     model: SyncReadModel
     dialog_id: int
     name: str | None
+    display_name_source: str | None
     dialog_type: str | None
     last_message_at: int | str | None
     unread_count: int | None
@@ -370,6 +375,15 @@ def _strict_optional_string(data: Mapping[str, object], name: str, *, context: s
     if value is None or isinstance(value, str):
         return value
     raise SyncReadModelContractError(f"{context}.{name} must be a string or null")
+
+
+def _strict_display_name_source(data: Mapping[str, object], *, context: str) -> str | None:
+    value = data.get("display_name_source")
+    if value is None:
+        return None
+    if value not in {"name", "username", "numeric"}:
+        raise SyncReadModelContractError(f"{context}.display_name_source is invalid")
+    return cast(str, value)
 
 
 def _strict_optional_timestamp(data: Mapping[str, object], name: str, *, context: str) -> int | str | None:
@@ -474,6 +488,7 @@ def _strict_dialog(value: object, index: int) -> _DialogSurface:
         model=decode_sync_read_model(value),
         dialog_id=_strict_int(value, "id", context=context),
         name=_strict_optional_string(value, "name", context=context),
+        display_name_source=_strict_display_name_source(value, context=context),
         dialog_type=_strict_optional_string(value, "type", context=context),
         last_message_at=_strict_optional_timestamp(value, "last_message_at", context=context),
         unread_count=_strict_optional_int(value, "unread_count", context=context),
@@ -804,6 +819,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
             {
                 "id": dialog.dialog_id,
                 "name": dialog.name,
+                "display_name_source": dialog.display_name_source,
                 "type": dialog.dialog_type,
                 "last_message_at": dialog.last_message_at,
                 "unread_count": dialog.unread_count,

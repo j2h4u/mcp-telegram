@@ -88,8 +88,12 @@ def test_candidate_query_keeps_rights_classification_out_of_sql() -> None:
     conn = sqlite3.connect(":memory:")
     try:
         conn.execute(
-            "CREATE TABLE dialogs (dialog_id INTEGER, name TEXT, type TEXT, linked_chat_id INTEGER, last_message_at INTEGER, hidden INTEGER)"
+            "CREATE TABLE dialogs ("
+            "dialog_id INTEGER PRIMARY KEY,name TEXT,type TEXT,username TEXT,linked_chat_id INTEGER,"
+            "last_message_at INTEGER,hidden INTEGER,identity_observed_at INTEGER,"
+            "identity_complete INTEGER DEFAULT 0,identity_source TEXT,identity_revision INTEGER DEFAULT 0)"
         )
+        conn.execute("CREATE TABLE entities (id INTEGER PRIMARY KEY,type TEXT,name TEXT,username TEXT)")
         conn.execute("CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT)")
         conn.execute(
             """CREATE TABLE full_history_enrollment (
@@ -100,7 +104,7 @@ def test_candidate_query_keeps_rights_classification_out_of_sql() -> None:
             ) WITHOUT ROWID"""
         )
         conn.executemany(
-            "INSERT INTO dialogs VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO dialogs(dialog_id,name,type,linked_chat_id,last_message_at,hidden) VALUES (?, ?, ?, ?, ?, ?)",
             [
                 (1, "dm", "user", None, 10, 0),
                 (-1000000009001, "channel", "channel", -1000000008001, 20, 0),
@@ -109,16 +113,20 @@ def test_candidate_query_keeps_rights_classification_out_of_sql() -> None:
                 (-1000000006001, "lost", "channel", None, 50, 1),
             ],
         )
+        conn.execute("INSERT INTO entities VALUES (1,'bot','Stale profile name','stale_bot')")
         conn.execute(
             "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'access_lost')",
             (-1000000006001,),
         )
         seed_full_history_enrollment(conn, -1000000006001, enabled=False)
-        assert [row["dialog_id"] for row in query_own_only_candidates(conn, personal_channel_id=9001)] == [
+        candidates = query_own_only_candidates(conn, personal_channel_id=9001)
+        assert [row["dialog_id"] for row in candidates] == [
             -1000000009001,
             -1000000008001,
             1,
         ]
+        assert candidates[-1]["name"] == "dm"
+        assert candidates[-1]["type"] == "user"
     finally:
         conn.close()
 

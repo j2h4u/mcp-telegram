@@ -885,8 +885,8 @@ async def test_unscoped_trace_paginates_across_excluded_direct_chat(
     _server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Alice", username="alice")
     seed_dialog(conn, dialog_id=101, name="Alice", dialog_type="User")
-    seed_dialog(conn, dialog_id=-100123, name="New Group", dialog_type="Supergroup")
-    seed_dialog(conn, dialog_id=-100124, name="Old Group", dialog_type="Supergroup")
+    seed_dialog(conn, dialog_id=-100123, name="New Group", dialog_type="supergroup")
+    seed_dialog(conn, dialog_id=-100124, name="Old Group", dialog_type="supergroup")
     seed_message(conn, dialog_id=-100123, message_id=1, sent_at=30, sender_id=101, text="new group")
     seed_message(conn, dialog_id=101, message_id=2, sent_at=20, sender_id=101, text="direct")
     seed_message(conn, dialog_id=-100124, message_id=3, sent_at=10, sender_id=101, text="old group")
@@ -923,8 +923,8 @@ async def test_dialog_view_returns_content_free_summaries_and_paginates_by_dialo
 ) -> None:
     _server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Alice", username="alice")
-    seed_dialog(conn, dialog_id=-100123, name="New Group", dialog_type="Supergroup")
-    seed_dialog(conn, dialog_id=-100124, name="Old Group", dialog_type="Supergroup")
+    seed_dialog(conn, dialog_id=-100123, name="New Group", dialog_type="supergroup")
+    seed_dialog(conn, dialog_id=-100124, name="Old Group", dialog_type="supergroup")
     seed_synced_dialog(conn, dialog_id=-100123)
     seed_synced_dialog(conn, dialog_id=-100124)
     seed_message(conn, dialog_id=-100123, message_id=1, sent_at=30, sender_id=101, text="newest")
@@ -943,7 +943,7 @@ async def test_dialog_view_returns_content_free_summaries_and_paginates_by_dialo
         {
             "dialog_id": -100123,
             "dialog_title": "New Group",
-            "dialog_type": "Supergroup",
+            "dialog_type": "supergroup",
             "message_count": 2,
             "first_message_at": 20,
             "last_message_at": 30,

@@ -15,12 +15,13 @@ from typing import cast
 
 import pytest
 
+from mcp_telegram.dialog_identity import read_dialog_identities
+from mcp_telegram.models import DialogType
 from mcp_telegram.reading.sqlite_projection import (
     _EFFECTIVE_SENDER_ID_EXPR,
     _LIST_MESSAGES_BASE_SQL,
     _build_list_messages_query,
     _compute_snapshot_age_h,
-    _dialog_type_from_db,
     _ListMessagesDbRequest,
     _read_state_for_dialog,
 )
@@ -140,7 +141,10 @@ def _make_min_db() -> sqlite3.Connection:
         """
     )
     conn.execute(
-        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0)"
+        "CREATE TABLE entities (id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT, updated_at INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute(
+        "CREATE TABLE dialogs (dialog_id INTEGER PRIMARY KEY, name TEXT, type TEXT, username TEXT, identity_observed_at INTEGER, identity_complete INTEGER NOT NULL DEFAULT 0, identity_source TEXT)"
     )
     return conn
 
@@ -151,12 +155,17 @@ def min_db() -> Iterator[sqlite3.Connection]:
         yield conn
 
 
-def test_dialog_type_from_db_golden(min_db: sqlite3.Connection) -> None:
+def test_dialog_identity_owner_golden(min_db: sqlite3.Connection) -> None:
     conn = min_db
-    conn.execute("INSERT INTO entities (id, type) VALUES (55, 'User')")
+    conn.execute(
+        "INSERT INTO dialogs (dialog_id, name, type, identity_source) VALUES (55, 'Canonical', 'user', 'directory')"
+    )
     conn.commit()
-    assert _dialog_type_from_db(conn, 55) == "User"
-    assert _dialog_type_from_db(conn, 999) == "Unknown"
+    identities = read_dialog_identities(conn, [55, 999])
+    assert identities[55].dialog_type is DialogType.USER
+    assert identities[55].display_name == "Canonical"
+    assert identities[999].dialog_type is DialogType.UNKNOWN
+    assert identities[999].display_name == "999"
 
 
 def test_read_state_for_dialog_golden_dm(min_db: sqlite3.Connection) -> None:

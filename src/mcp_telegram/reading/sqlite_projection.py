@@ -105,17 +105,15 @@ def _build_access_metadata(
 
 # Phase 44 (LISTDIALOGS-01/02/04, DIFF-04): pure-SQL dialog list.
 # LEFT JOIN synced_dialogs to preserve sync_status/total_messages/access_lost_at.
-# `:name_pat` is a Python-lowered LIKE pattern (e.g. "%женск%") OR None for
-# no pre-filter. Cyrillic case-folding is delegated to the Python fuzzy pass
-# because SQLite LOWER() is ASCII-only.
+# Dialog name filtering is applied after the owner selects canonical identity.
+# Cyrillic case-folding is delegated to the Python fuzzy pass because SQLite
+# LOWER() is ASCII-only.
 # `:archived_filter` and `:pinned_filter` are 0 (filter rows where col=0)
 # or None (no filter).
 _LIST_DIALOGS_SQL = """
 WITH agent_visible_dialogs AS (
     SELECT
         d.dialog_id,
-        d.name,
-        d.type,
         d.archived,
         d.pinned,
         d.members,
@@ -139,8 +137,6 @@ WITH agent_visible_dialogs AS (
 
     SELECT
         sd.dialog_id,
-        NULL AS name,
-        NULL AS type,
         0 AS archived,
         0 AS pinned,
         NULL AS members,
@@ -161,14 +157,13 @@ WITH agent_visible_dialogs AS (
     WHERE sd.status = 'access_lost' AND d.dialog_id IS NULL
 )
 SELECT
-    dialog_id, name, type, archived, pinned,
+    dialog_id, archived, pinned,
     members, created, last_message_at, snapshot_at,
     unread_mentions_count, unread_reactions_count, unread_count,
     sync_status, total_messages, last_synced_at, last_event_at, last_delta_checked_at, access_lost_at
 FROM agent_visible_dialogs
 WHERE (:archived_filter IS NULL OR archived = :archived_filter)
 AND (:pinned_filter IS NULL OR pinned = :pinned_filter)
-AND (:name_pat IS NULL OR LOWER(name) LIKE :name_pat ESCAPE '\\')
 ORDER BY pinned DESC, last_message_at DESC, dialog_id ASC
 """
 
@@ -219,9 +214,6 @@ _UNREAD_SUMMARY_SQL = """
 WITH matching AS (
     SELECT
         d.dialog_id,
-        d.name,
-        e.username,
-        d.type,
         d.archived,
         d.last_message_at,
         d.unread_count,
@@ -229,7 +221,6 @@ WITH matching AS (
         d.unread_mentions_count,
         d.unread_reactions_count
     FROM dialogs d
-    LEFT JOIN entities e ON e.id = d.dialog_id
     LEFT JOIN synced_dialogs sd USING(dialog_id)
     WHERE d.hidden = 0
       AND (sd.status IS NULL OR sd.status <> 'access_lost')
@@ -265,8 +256,6 @@ _SELECT_DIALOG_ACCESS_META_SQL = (
 # Unread SQL - zero Telegram API calls.
 _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
     "SELECT sd.dialog_id, sd.read_inbox_max_id, sd.last_event_at, "
-    "e.name AS display_name, e.username, "
-    "COALESCE(e.type, d.type, 'Unknown') AS entity_type, "
     "d.members AS participants_count, "
     "(SELECT COUNT(*) FROM messages m "
     " WHERE m.dialog_id = sd.dialog_id "
@@ -278,7 +267,6 @@ _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
     "       AND (:since_utc IS NULL OR m.deleted_at >= :since_utc)"
     f"       AND {incoming_human_dm_sql('m')}))) AS unread_count "
     "FROM synced_dialogs sd "
-    "LEFT JOIN entities e ON e.id = sd.dialog_id "
     "LEFT JOIN dialogs d ON d.dialog_id = sd.dialog_id "
     "WHERE sd.status = 'synced' "
     "AND sd.read_inbox_max_id IS NOT NULL"
@@ -289,8 +277,8 @@ _COUNT_READ_POSITION_PENDING_SQL = (
     "SELECT COUNT(*) FROM synced_dialogs WHERE status = 'synced' AND read_inbox_max_id IS NULL"
 )
 _READ_POSITION_PENDING_IDENTITIES_SQL = (
-    "SELECT sd.dialog_id, e.name AS display_name, e.username "
-    "FROM synced_dialogs sd LEFT JOIN entities e ON e.id = sd.dialog_id "
+    "SELECT sd.dialog_id "
+    "FROM synced_dialogs sd "
     "WHERE sd.status = 'synced' AND sd.read_inbox_max_id IS NULL "
     "ORDER BY sd.dialog_id LIMIT 20"
 )
@@ -354,20 +342,18 @@ _SELECT_FTS_SQL = (
     f"ORDER BY rank LIMIT :limit OFFSET :offset"
 )
 
-# _SELECT_FTS_ALL_SQL uses aliases e_raw/e_eff for sender entity JOINs (matching the
-# shared helpers) and de for dialog name entity JOIN.
+# _SELECT_FTS_ALL_SQL keeps entity joins only for sender identity.
 _SELECT_FTS_ALL_SQL = (
     f"SELECT f.message_id, m.text, "
     f"{_SENDER_FIRST_NAME_SQL}, "
     f"m.sent_at, m.media_kind, m.media_payload, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
     f"COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
-    f"f.dialog_id, COALESCE(de.name, CAST(f.dialog_id AS TEXT)) AS dialog_name, "
+    f"f.dialog_id, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out "
     f"FROM messages_fts f "
     f"JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
     f"LEFT JOIN topic_metadata tm "
     f"  ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
-    f"LEFT JOIN entities de ON de.id = f.dialog_id "
     f"{_SENDER_ENTITY_JOINS_SQL}"
     f"WHERE messages_fts MATCH :query "
     f"AND (:since_utc IS NULL OR m.sent_at >= :since_utc) "
@@ -429,6 +415,7 @@ def _assert_select_columns_match_read_message() -> None:
         not in {
             "reactions_display",
             "dialog_name",
+            "dialog_name_source",
             "read_at",
             "reaction_events",
             "reaction_events_status",
@@ -593,7 +580,6 @@ def _log_list_messages_query(
     )
 
 
-_DIALOG_TYPE_SQL = "SELECT type FROM entities WHERE id = ?"
 _READ_STATE_SQL = """
 WITH sd AS (
   SELECT read_inbox_max_id AS in_c, read_outbox_max_id AS out_c
@@ -619,14 +605,6 @@ class _ReadStateValues:
     outbox_count: int
     inbox_oldest: int | None
     outbox_oldest: int | None
-
-
-def _dialog_type_from_db(conn: sqlite3.Connection, dialog_id: int) -> str:
-    """Return the cached entity type for a dialog, or ``Unknown``."""
-    row = cast(tuple[object] | None, conn.execute(_DIALOG_TYPE_SQL, (dialog_id,)).fetchone())
-    if row is None:
-        return "Unknown"
-    return str(row[0])
 
 
 def _read_state_for_dialog(conn: sqlite3.Connection, dialog_id: int, dialog_type: str) -> ReadState | None:

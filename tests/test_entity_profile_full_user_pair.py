@@ -45,6 +45,13 @@ def _fenced_schema(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT,
             name_normalized TEXT, updated_at INTEGER NOT NULL
         );
+        CREATE TABLE dialogs (
+            dialog_id INTEGER PRIMARY KEY, name TEXT, type TEXT, username TEXT,
+            created INTEGER, hidden INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0,
+            revision INTEGER NOT NULL DEFAULT 0,
+            identity_observed_at INTEGER, identity_complete INTEGER NOT NULL DEFAULT 0,
+            identity_source TEXT, identity_revision INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE entity_details (
             entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL,
             profile_revision INTEGER NOT NULL DEFAULT 0
@@ -195,12 +202,17 @@ def _prepare(
 @pytest.mark.asyncio
 async def test_enabled_pair_commits_two_projections_with_one_full_user_call(tmp_path: Path) -> None:
     conn, service = _prepare(tmp_path / "pair.sqlite")
+    conn.execute("INSERT INTO dialogs(dialog_id,name,type,username) VALUES (42,'Old','user','old')")
+    conn.commit()
     client = cast(_PairClient, service._deps.client)  # type: ignore[attr-defined]
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
     await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
 
     assert client.full_user_calls == 1
+    assert conn.execute(
+        "SELECT name,username,identity_revision,revision FROM dialogs WHERE dialog_id=42"
+    ).fetchone() == ("Target", "target", 1, 0)
     assert conn.execute("SELECT next_section FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
         "common_chats",
     )

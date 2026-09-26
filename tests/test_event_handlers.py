@@ -541,6 +541,7 @@ async def test_first_seen_outgoing_private_lookup_failure_keeps_message_discover
     assert sync_db.execute(
         "SELECT name, type, hidden, needs_refresh FROM dialogs WHERE dialog_id=?", (dialog_id,)
     ).fetchone() == (None, None, 0, 1)
+    assert sync_db.execute("SELECT identity_revision FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (0,)
     assert sync_db.execute("SELECT message_id, out FROM messages WHERE dialog_id=?", (dialog_id,)).fetchone() == (19, 1)
 
 
@@ -601,9 +602,13 @@ async def test_first_seen_private_event_preserves_existing_dialog_facts(
     # Realtime presence intentionally exposes an absent-from-snapshot row; other
     # durable dialog facts must survive the thin first-event projection.
     assert sync_db.execute(
-        "SELECT name, archived, pinned, members, hidden, unread_count FROM dialogs WHERE dialog_id=?",
+        "SELECT archived, pinned, members, hidden, unread_count FROM dialogs WHERE dialog_id=?",
         (dialog_id,),
-    ).fetchone() == ("Saved", 1, 1, 9, 0, 4)
+    ).fetchone() == (1, 1, 9, 0, 4)
+    assert sync_db.execute(
+        "SELECT name,username,type,identity_complete,identity_source,identity_revision FROM dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone() == ("New Name", "new_name", "user", 0, "realtime", 1)
 
 
 @pytest.mark.asyncio

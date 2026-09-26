@@ -13,6 +13,7 @@ import pytest
 import mcp_telegram.sync_db as sync_db_module
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
+    _DIALOGS_V74_DDL,
     _ENTITY_TABLE_DDL,
     _apply_migration_51,
     _apply_migration_52,
@@ -819,7 +820,7 @@ def test_schema_version_records_current(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-    assert _CURRENT_SCHEMA_VERSION == 77
+    assert _CURRENT_SCHEMA_VERSION == 78
 
 
 def test_migration_v77_creates_retained_linked_chat_fact_ledger() -> None:
@@ -1630,7 +1631,72 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-    assert _CURRENT_SCHEMA_VERSION == 77
+    assert _CURRENT_SCHEMA_VERSION == 78
+
+
+def test_migration_v78_rollback_then_reopen_applies_atomically(tmp_path: Path) -> None:
+    db_path = tmp_path / "v77.sqlite"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        triggers = cast(
+            list[tuple[str, str]],
+            conn.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='dialogs' AND sql IS NOT NULL"
+            ).fetchall(),
+        )
+        for name, _ in triggers:
+            conn.execute(f"DROP TRIGGER {name}")
+        conn.execute(_DIALOGS_V74_DDL)
+        column_rows = cast(list[tuple[object, str]], conn.execute("PRAGMA table_info(dialogs)").fetchall())
+        old_columns = [row[1] for row in column_rows if row[1] != "identity_revision"]
+        conn.execute(f"INSERT INTO dialogs_v74({','.join(old_columns)}) SELECT {','.join(old_columns)} FROM dialogs")
+        conn.execute("PRAGMA legacy_alter_table=ON")
+        conn.execute("DROP TABLE dialogs")
+        conn.execute("ALTER TABLE dialogs_v74 RENAME TO dialogs")
+        conn.execute("PRAGMA legacy_alter_table=OFF")
+        for _, statement in triggers:
+            conn.execute(statement)
+        conn.execute("DROP TABLE dialog_directory_baseline")
+        conn.execute(
+            "CREATE TABLE dialog_directory_baseline(generation INTEGER,dialog_id INTEGER,"
+            "baseline_revision INTEGER NOT NULL,seen INTEGER NOT NULL DEFAULT 0,"
+            "PRIMARY KEY(generation,dialog_id)) WITHOUT ROWID"
+        )
+        conn.execute("DELETE FROM schema_version WHERE version=78")
+        conn.execute(
+            "UPDATE dialog_directory_state SET generation=8,status='in_progress',"
+            "ordinary_status='incomplete',pinned_main_status='complete',"
+            "pinned_archive_status='incomplete',offset_id=5,observed_count=1 WHERE singleton=1"
+        )
+        conn.execute("INSERT INTO dialog_directory_baseline VALUES (8,71,4,0)")
+        conn.execute(
+            "CREATE TRIGGER reject_v78 BEFORE INSERT ON schema_version WHEN NEW.version=78 "
+            "BEGIN SELECT RAISE(ABORT,'injected migration failure'); END"
+        )
+        conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected migration failure"):
+        ensure_sync_schema(db_path)
+
+    with _sync_db_connection(db_path) as conn:
+        column_rows = cast(list[tuple[object, str]], conn.execute("PRAGMA table_info(dialogs)").fetchall())
+        columns = {row[1] for row in column_rows}
+        state = _fetchone_row(conn, "SELECT generation,status,offset_id FROM dialog_directory_state WHERE singleton=1")
+        assert "identity_revision" not in columns
+        assert state == (8, "in_progress", 5)
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM dialog_directory_baseline WHERE generation=8") == 1
+        conn.execute("DROP TRIGGER reject_v78")
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == 78
+        assert _fetchone_row(conn, "SELECT generation,status FROM dialog_directory_state WHERE singleton=1") == (
+            8,
+            "pending",
+        )
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM dialog_directory_baseline WHERE generation=8") == 0
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_migration_v72_keeps_existing_topic_attribution_unknown(tmp_path: Path) -> None:

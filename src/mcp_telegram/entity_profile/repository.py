@@ -17,6 +17,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import cast
 
+from ..dialog_identity import publish_dialog_identity
+from ..dialog_identity_contracts import DialogIdentityObservation
 from ..entity_store import EntitySnapshot, ensure_entity_stub, upsert_entity_snapshots
 from ..models import DialogType
 from ..resolver import latinize
@@ -72,6 +74,8 @@ class EntitySectionCommit:
     ownership_observed: bool = False
     identity_patch: Mapping[str, object] | None = None
     dialog_created: int | None = None
+    dialog_identity_observation: DialogIdentityObservation | None = None
+    dialog_identity_baseline_revision: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -502,7 +506,14 @@ class EntityProfileRepository:
             ],
         )
 
-    def save_core(self, detail: Mapping[str, object], *, now: int) -> None:
+    def save_core(
+        self,
+        detail: Mapping[str, object],
+        *,
+        now: int,
+        dialog_identity_observation: DialogIdentityObservation | None = None,
+        dialog_identity_baseline_revision: int | None = None,
+    ) -> None:
         """Persist the mandatory core in the existing entities projection."""
         entity_id = detail.get("id")
         if not isinstance(entity_id, int):
@@ -526,6 +537,7 @@ class EntityProfileRepository:
             # Identity writes are canonical profile writes for fencing, but
             # they do not renew the detail blob's observation age.
             self._bump_identity_fence(entity_id)
+            self._publish_dialog_identity(dialog_identity_observation, dialog_identity_baseline_revision)
 
     def persist_group_created(self, entity_id: int, created: int | None) -> None:
         """Ratchet a legacy group's canonical creation time when the table exists."""
@@ -536,13 +548,15 @@ class EntityProfileRepository:
             (created, entity_id),
         )
 
-    def commit_core_acquisition(
+    def commit_core_acquisition(  # noqa: PLR0913
         self,
         cursor: EntityRefreshCursor,
         core: Mapping[str, object],
         *,
         next_acquisition_cursor: int,
         now: int,
+        dialog_identity_observation: DialogIdentityObservation | None = None,
+        dialog_identity_baseline_revision: int | None = None,
     ) -> bool:
         """Atomically commit canonical core identity and durable progress."""
         if next_acquisition_cursor <= cursor.acquisition_cursor:
@@ -584,6 +598,7 @@ class EntityProfileRepository:
                     # next section owns the first detail insert.  Advance the
                     # refresh fence through the cursor CAS below.
                     detail_revision = cursor.profile_revision + 1
+            self._publish_dialog_identity(dialog_identity_observation, dialog_identity_baseline_revision)
             predicate, parameters = self._cursor_predicate(cursor)
             assignments = (
                 "status='pending', retry_at=NULL, reason='refresh_in_progress', updated_at=?, acquisition_cursor=?"
@@ -1273,6 +1288,8 @@ class EntityProfileRepository:
             observation_scope=commit.observation_auth_scope,
             ownership_observed=commit.ownership_observed,
             identity_patch=commit.identity_patch,
+            dialog_identity_observation=commit.dialog_identity_observation,
+            dialog_identity_baseline_revision=commit.dialog_identity_baseline_revision,
         ):
             return False
         section_payload = _section_payload(detail, cursor.next_section) if commit.payload is None else commit.payload
@@ -1359,6 +1376,8 @@ class EntityProfileRepository:
         observation_scope: Mapping[str, object] | None = None,
         ownership_observed: bool = False,
         identity_patch: Mapping[str, object] | None = None,
+        dialog_identity_observation: DialogIdentityObservation | None = None,
+        dialog_identity_baseline_revision: int | None = None,
     ) -> bool:
         canonical = self._read_entity_stub(entity_id)
         encoded_detail = json.dumps({"schema": _DETAIL_SCHEMA, **detail}, separators=(",", ":"))
@@ -1378,7 +1397,17 @@ class EntityProfileRepository:
             changed = self._write_legacy_detail(entity_id, encoded_detail, metadata_columns, metadata_values, now=now)
         if changed and identity_patch:
             self._update_canonical_identity(entity_id, identity_patch, now=now, canonical=canonical)
+        if changed:
+            self._publish_dialog_identity(dialog_identity_observation, dialog_identity_baseline_revision)
         return changed
+
+    def _publish_dialog_identity(
+        self,
+        observation: DialogIdentityObservation | None,
+        baseline_revision: int | None,
+    ) -> None:
+        if observation is not None:
+            publish_dialog_identity(self._conn, observation.dialog_id, observation, baseline_revision)
 
     def _detail_metadata(
         self,
@@ -1611,6 +1640,8 @@ class EntityProfileRepository:
             observation_scope=observation_scope,
             ownership_observed=ownership_observed,
             identity_patch=_combine_identity_patches(full_profile.identity_patch, contact_overlap.identity_patch),
+            dialog_identity_observation=full_profile.dialog_identity_observation,
+            dialog_identity_baseline_revision=full_profile.dialog_identity_baseline_revision,
         ):
             return None
         return detail
@@ -1728,6 +1759,8 @@ class EntityProfileRepository:
             observation_scope=observation_scope,
             ownership_observed=ownership_observed,
             identity_patch=_combine_identity_patches(full_profile.identity_patch, personal_channel.identity_patch),
+            dialog_identity_observation=full_profile.dialog_identity_observation,
+            dialog_identity_baseline_revision=full_profile.dialog_identity_baseline_revision,
         ):
             return None
         self._write_pair_section(cursor.entity_id, "full_profile", full_profile, detail, now=now)

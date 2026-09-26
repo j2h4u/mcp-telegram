@@ -20,6 +20,8 @@ from ..daemon_message import (
     project_cached_message_facts_by_dialog,
 )
 from ..dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
+from ..dialog_identity import read_dialog_identities
+from ..dialog_identity_contracts import DialogIdentity
 from ..dialog_selector import DialogSelector, DialogSelectorError, optional_dialog_selector, required_dialog_selector
 from ..fts import stem_query
 from ..models import DialogType, DraftReadRecord, ReadMessage, ReadState
@@ -68,7 +70,6 @@ from .sqlite_projection import (
     _build_access_metadata,
     _build_list_messages_query,
     _compute_snapshot_age_h,
-    _dialog_type_from_db,
     _read_state_for_dialog,
     count_dialog_rows,
     message_sent_at,
@@ -408,7 +409,6 @@ class _ListDialogsFilter:
     raw: str | None
     normalized: str | None
     raw_lower: str | None
-    name_pat: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -735,21 +735,16 @@ class ReadingService:
     @staticmethod
     def _prepare_list_dialogs_filter(filter_raw: str | None) -> _ListDialogsFilter:
         raw_lower: str | None = None
-        name_pat: str | None = None
         normalized: str | None = None
         if filter_raw is not None:
             stripped = filter_raw.strip()
             if stripped:
                 normalized = latinize(stripped)
                 raw_lower = stripped.lower()
-                if stripped.isascii():
-                    escaped = stripped.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                    name_pat = f"%{escaped}%"
         return _ListDialogsFilter(
             raw=filter_raw,
             normalized=normalized,
             raw_lower=raw_lower,
-            name_pat=name_pat,
         )
 
     @staticmethod
@@ -960,8 +955,10 @@ class ReadingService:
     def _read_state_per_dialog(self, messages: list[ReadMessage]) -> dict[int, ReadState]:
         read_state_per_dialog: dict[int, ReadState] = {}
         with timing_phase("local_projection"):
-            for dialog_id in {m.dialog_id for m in messages if m.dialog_id}:
-                dialog_type = _dialog_type_from_db(self._conn, dialog_id)
+            dialog_ids = {m.dialog_id for m in messages if m.dialog_id}
+            identities = read_dialog_identities(self._conn, dialog_ids)
+            for dialog_id in dialog_ids:
+                dialog_type = identities[dialog_id].dialog_type.value
                 read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
                 if read_state is not None:
                     read_state_per_dialog[dialog_id] = read_state
@@ -1030,7 +1027,7 @@ class ReadingService:
         _mark_fragment_coverage(result)
         return result
 
-    async def _list_messages_history_result(
+    async def _list_messages_history_result(  # noqa: PLR0914
         self,
         dialog_id: int,
         request: _ListMessagesRequest,
@@ -1061,7 +1058,8 @@ class ReadingService:
         with timing_phase("local_projection"):
             row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)))
             status = _status_from_row(row)
-            dialog_type = _dialog_type_from_db(self._conn, dialog_id)
+            identity = read_dialog_identities(self._conn, [dialog_id])[dialog_id]
+            dialog_type = identity.dialog_type.value
             read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
 
         if status in ("synced", "syncing", "access_lost"):
@@ -1087,6 +1085,8 @@ class ReadingService:
                 access_metadata = _build_access_metadata(self._conn, dialog_id, status)
             result["data"].update(access_metadata)
             result["data"]["dialog_type"] = dialog_type
+            result["data"]["dialog_name"] = identity.display_name
+            result["data"]["dialog_name_source"] = identity.display_name_source
             result["data"]["read_state"] = read_state
             with timing_phase("local_projection"):
                 receipt = _topic_attribution_receipt(self._conn, dialog_id)
@@ -1120,6 +1120,8 @@ class ReadingService:
         if telegram_result.get("ok"):
             telegram_result["data"]["dialog_access"] = "live"
             telegram_result["data"]["dialog_type"] = dialog_type
+            telegram_result["data"]["dialog_name"] = identity.display_name
+            telegram_result["data"]["dialog_name_source"] = identity.display_name_source
             telegram_result["data"]["read_state"] = read_state
         return telegram_result
 
@@ -1142,12 +1144,23 @@ class ReadingService:
                     },
                 )
             )
-        messages = self._enrich_search_messages(rows)
+            identities = read_dialog_identities(
+                self._conn, {_object_to_int(_row_value(row, "dialog_id")) for row in rows}
+            )
+        messages = [
+            dataclasses.replace(
+                message,
+                dialog_name=identities[message.dialog_id].display_name,
+                dialog_name_source=identities[message.dialog_id].display_name_source,
+            )
+            for message in self._enrich_search_messages(rows)
+        ]
         next_nav = self._search_next_navigation(request, messages, global_mode=True)
         return {
             "ok": True,
             "data": {
                 "messages": [dataclasses.asdict(m) for m in messages],
+                "dialog_name_source": None,
                 "total": len(messages),
                 "next_navigation": next_nav,
                 "read_state_per_dialog": self._read_state_per_dialog(messages),
@@ -1176,6 +1189,15 @@ class ReadingService:
             )
         messages, freshness = await self._build_read_messages_from_rows(request.dialog_id, rows, log_rendered=False)
         messages = self._restore_search_plain_text(rows, messages)
+        identity = read_dialog_identities(self._conn, [request.dialog_id])[request.dialog_id]
+        messages = [
+            dataclasses.replace(
+                message,
+                dialog_name=identity.display_name,
+                dialog_name_source=identity.display_name_source,
+            )
+            for message in messages
+        ]
         next_nav = self._search_next_navigation(request, messages, global_mode=False)
         with timing_phase("local_projection"):
             row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (request.dialog_id,)))
@@ -1185,6 +1207,8 @@ class ReadingService:
             "ok": True,
             "data": {
                 "messages": [dataclasses.asdict(m) for m in messages],
+                "dialog_name": identity.display_name,
+                "dialog_name_source": identity.display_name_source,
                 "total": len(messages),
                 "next_navigation": next_nav,
                 "read_state_per_dialog": self._read_state_per_dialog(messages),
@@ -1339,11 +1363,8 @@ class ReadingService:
         params = {
             "archived_filter": 0 if request.exclude_archived else None,
             "pinned_filter": 0 if request.ignore_pinned else None,
-            "name_pat": dialog_filter.name_pat,
         }
         rows = _fetchall_rows(conn.execute(_LIST_DIALOGS_SQL, params))
-        if not rows and dialog_filter.name_pat is not None and dialog_filter.normalized:
-            rows = _fetchall_rows(conn.execute(_LIST_DIALOGS_SQL, {**params, "name_pat": None}))
         return [cast(Mapping[str, object], row) for row in rows]
 
     @staticmethod
@@ -1398,21 +1419,20 @@ class ReadingService:
         self,
         dialog_filter: _ListDialogsFilter,
         name: str | None,
+        username: str | None = None,
     ) -> bool:
         if dialog_filter.normalized is None:
             return True
-        raw_name = name or ""
-        if not raw_name:
-            return False
-        name_norm = latinize(raw_name)
-        if name_norm in (None, ""):
-            return False
         filter_raw_lc = dialog_filter.raw_lower or ""
-        return (
-            dialog_filter.normalized in name_norm
-            or _dialog_filter_matches_acronym(filter_raw_lc, raw_name)
-            or _dialog_filter_matches_fuzzy(dialog_filter.normalized, name_norm)
-        )
+        for raw_name in (name or "", username or ""):
+            name_norm = latinize(raw_name)
+            if name_norm and (
+                dialog_filter.normalized in name_norm
+                or _dialog_filter_matches_acronym(filter_raw_lc, raw_name)
+                or _dialog_filter_matches_fuzzy(dialog_filter.normalized, name_norm)
+            ):
+                return True
+        return False
 
     def _list_dialogs_request_error(self, request: _ListDialogsRequest) -> dict | None:
         if request.message_state not in {"sent", "scheduled", "all"}:
@@ -1429,17 +1449,19 @@ class ReadingService:
             }
         return None
 
-    def _select_list_dialog_rows(
+    def _select_list_dialog_rows(  # noqa: PLR0913, PLR0917
         self,
         sql_rows: Sequence[Mapping[str, object]],
         request: _ListDialogsRequest,
         dialog_filter: _ListDialogsFilter,
         scheduled_summary: Mapping[int, tuple[int, int | None]],
         own_basis: Mapping[int, tuple[str, ...]],
+        identities: Mapping[int, DialogIdentity],
     ) -> list[tuple[Mapping[str, object], tuple[int, int | None], tuple[str, ...] | None]]:
         selected_rows: list[tuple[Mapping[str, object], tuple[int, int | None], tuple[str, ...] | None]] = []
         for row in sql_rows:
             dialog_id = _object_to_int(row["dialog_id"])
+            identity = identities[dialog_id]
             if request.scope == "own_only" and dialog_id not in own_basis:
                 continue
             summary = scheduled_summary.get(dialog_id, (0, None))
@@ -1447,9 +1469,20 @@ class ReadingService:
                 summary = (0, None)
             if request.message_state == "scheduled" and summary[0] == 0:
                 continue
-            if not self._dialog_row_matches_filter(dialog_filter, _object_to_str_or_none(row["name"])):
+            if not self._dialog_row_matches_filter(dialog_filter, identity.display_name, identity.username):
                 continue
-            selected_rows.append((row, summary, own_basis.get(dialog_id)))
+            selected_rows.append(
+                (
+                    {
+                        **row,
+                        "name": identity.display_name,
+                        "type": identity.dialog_type.value,
+                        "display_name_source": identity.display_name_source,
+                    },
+                    summary,
+                    own_basis.get(dialog_id),
+                )
+            )
         return selected_rows
 
     def _project_list_dialog_rows(
@@ -1532,6 +1565,7 @@ class ReadingService:
         row_data: dict[str, object] = {
             "id": d_id,
             "name": row["name"],
+            "display_name_source": row["display_name_source"],
             "type": row["type"],
             "last_message_at": row["last_message_at"],
             "archived": bool(row["archived"]),
@@ -1635,7 +1669,8 @@ class ReadingService:
             rows = list(reversed(selected_before)) + list(selected_after)
         messages, freshness = await self._build_read_messages_from_rows(dialog_id, rows, log_rendered=True)
         with timing_phase("local_projection"):
-            dialog_type = _dialog_type_from_db(self._conn, dialog_id)
+            identity = read_dialog_identities(self._conn, [dialog_id])[dialog_id]
+            dialog_type = identity.dialog_type.value
             read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
         with timing_phase("response_shape"):
             return {
@@ -1646,6 +1681,8 @@ class ReadingService:
                     "anchor_message_id": anchor_message_id,
                     "next_navigation": None,
                     "dialog_type": dialog_type,
+                    "dialog_name": identity.display_name,
+                    "dialog_name_source": identity.display_name_source,
                     "read_state": read_state,
                     "reaction_freshness": freshness.as_dict(),
                 },
@@ -2117,9 +2154,12 @@ class ReadingService:
 
     def _scheduled_local_state_result(self, dialog_id: int, scheduled_result: dict) -> dict:
         with timing_phase("local_projection"):
-            dialog_type = _dialog_type_from_db(self._conn, dialog_id)
+            identity = read_dialog_identities(self._conn, [dialog_id])[dialog_id]
+            dialog_type = identity.dialog_type.value
         with timing_phase("response_shape"):
             scheduled_result["data"]["dialog_type"] = dialog_type
+            scheduled_result["data"]["dialog_name"] = identity.display_name
+            scheduled_result["data"]["dialog_name_source"] = identity.display_name_source
             scheduled_result["data"]["read_state"] = None
         return scheduled_result
 
@@ -2179,9 +2219,12 @@ class ReadingService:
         self, dialog_id: int, status: str | None
     ) -> tuple[str, ReadState | None, dict[str, object]]:
         with timing_phase("local_projection"):
-            dialog_type = _dialog_type_from_db(self._conn, dialog_id)
+            identity = read_dialog_identities(self._conn, [dialog_id])[dialog_id]
+            dialog_type = identity.dialog_type.value
             read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
             access_metadata = _build_access_metadata(self._conn, dialog_id, status or "not_synced")
+            access_metadata["dialog_name"] = identity.display_name
+            access_metadata["dialog_name_source"] = identity.display_name_source
             if status not in {"synced", "syncing", "access_lost"}:
                 access_metadata.update(
                     {
@@ -2629,16 +2672,19 @@ class ReadingService:
         pending_row = cast(tuple[object] | None, self._conn.execute(_COUNT_READ_POSITION_PENDING_SQL).fetchone())
         pending_count = int(cast(int | str, pending_row[0])) if pending_row else 0
         pending_rows = cast(
-            list[tuple[object, object, object]],
+            list[tuple[object]],
             self._conn.execute(_READ_POSITION_PENDING_IDENTITIES_SQL).fetchall(),
         )
+        pending_ids = [int(cast(int | str, row[0])) for row in pending_rows]
+        pending_identities = read_dialog_identities(self._conn, pending_ids)
         pending_entities = [
             {
-                "dialog_id": int(cast(int | str, dialog_id)),
-                "display_name": display_name,
-                "username": username,
+                "dialog_id": dialog_id,
+                "display_name": pending_identities[dialog_id].display_name,
+                "username": pending_identities[dialog_id].username,
+                "display_name_source": pending_identities[dialog_id].display_name_source,
             }
-            for dialog_id, display_name, username in pending_rows
+            for dialog_id in pending_ids
         ]
         return {
             "ok": True,
@@ -2697,7 +2743,7 @@ class ReadingService:
         include_dialog_types: tuple[DialogType, ...] | None = None,
     ) -> tuple[list[dict], dict[int, int]]:
         rows = cast(
-            list[tuple[object, object, object, object, object, object, object, object]],
+            list[tuple[object, object, object, object, object]],
             self._conn.execute(
                 _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL,
                 {
@@ -2706,6 +2752,7 @@ class ReadingService:
                 },
             ).fetchall(),
         )
+        identities = read_dialog_identities(self._conn, [int(cast(int | str, row[0])) for row in rows])
         entries: list[dict] = []
         counts: dict[int, int] = {}
         for row in rows:
@@ -2713,17 +2760,15 @@ class ReadingService:
                 dialog_id,
                 read_max,
                 last_event_at,
-                display_name,
-                username,
-                entity_type,
                 participants_count,
                 unread_count,
             ) = row
             dialog_id_i = int(cast(int | str, dialog_id))
+            identity = identities[dialog_id_i]
             unread_count_i = int(cast(int | str, unread_count))
             if unread_count_i == 0:
                 continue
-            category = DialogType.parse(str(entity_type))
+            category = identity.dialog_type
             if include_dialog_types is not None and category not in include_dialog_types:
                 continue
             if not self._should_include_unread_dialog(
@@ -2736,8 +2781,10 @@ class ReadingService:
             entries.append(
                 {
                     "chat_id": dialog_id_i,
-                    "display_name": display_name,
-                    "username": username,
+                    "display_name": identity.display_name,
+                    "username": identity.username,
+                    "display_name_source": identity.display_name_source,
+                    "dialog_type": category.value,
                     "unread_count": unread_count_i,
                     "unread_mentions_count": 0,
                     "category": category,
@@ -2763,11 +2810,12 @@ class ReadingService:
         for entry in entries:
             chat_id = int(cast(int | str, entry["chat_id"]))
             budget = allocation.get(chat_id, 0)
-            dialog_type = _dialog_type_from_db(self._conn, chat_id)
+            dialog_type = cast(str, entry["dialog_type"])
             group: dict = {
                 "dialog_id": chat_id,
                 "display_name": entry["display_name"],
                 "username": entry["username"],
+                "display_name_source": entry["display_name_source"],
                 "tier": entry["tier"],
                 "category": entry["category"],
                 "unread_count": entry["unread_count"],
@@ -2894,16 +2942,20 @@ class ReadingService:
         try:
             rows = _fetchall_rows(conn.execute(_UNREAD_SUMMARY_SQL, {"limit": limit}))
             total_matching = _object_to_int(_row_value(rows[0], "total_matching")) if rows else 0
+            identities = read_dialog_identities(conn, [_object_to_int(_row_value(row, "dialog_id")) for row in rows])
 
             dialogs: list[dict[str, object]] = []
             for row in rows:
+                dialog_id = _object_to_int(_row_value(row, "dialog_id"))
+                identity = identities[dialog_id]
                 unread_mark_raw = _row_value(row, "unread_mark")
                 dialogs.append(
                     {
-                        "dialog_id": _object_to_int(_row_value(row, "dialog_id")),
-                        "name": _object_to_str_or_none(_row_value(row, "name")),
-                        "username": _object_to_str_or_none(_row_value(row, "username")),
-                        "dialog_type": _object_to_str_or_none(_row_value(row, "type")),
+                        "dialog_id": dialog_id,
+                        "name": identity.display_name,
+                        "username": identity.username,
+                        "dialog_type": identity.dialog_type.value,
+                        "display_name_source": identity.display_name_source,
                         "unread_count": _object_to_int_or_none(_row_value(row, "unread_count")),
                         "unread_mark": (None if unread_mark_raw is None else bool(_object_to_int(unread_mark_raw, 0))),
                         "unread_mentions_count": _object_to_int(_row_value(row, "unread_mentions_count"), 0),
@@ -2965,12 +3017,14 @@ class ReadingService:
                 directory_coverage,
                 bootstrap_pending=count_total == 0,
             )
+        identities = read_dialog_identities(conn, [_object_to_int(_row_value(row, "dialog_id")) for row in sql_rows])
         selected_rows = self._select_list_dialog_rows(
             sql_rows,
             request,
             dialog_filter,
             scheduled_summary,
             own_basis,
+            identities,
         )
         if not selected_rows:
             return self._empty_list_dialogs_response(

@@ -59,4 +59,5 @@ def read_message_from_row(row: Mapping[str, object] | object, *, reactions_displ
         read_at=_coerce_optional_int(_row_value(row, "read_at")),
         reactions_display=reactions_display,
         dialog_name=cast(str | None, _row_value(row, "dialog_name")),
+        dialog_name_source=cast(str | None, _row_value(row, "dialog_name_source")),
     )

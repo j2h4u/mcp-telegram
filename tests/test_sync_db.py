@@ -1616,6 +1616,7 @@ def test_dialogs_columns_match_current_schema(tmp_sync_db_path: Path) -> None:
             "identity_observed_at",
             "identity_complete",
             "identity_source",
+            "identity_revision",
         }
         assert required == set(columns.keys()), (
             f"Column mismatch.\nExpected: {sorted(required)}\nGot: {sorted(columns.keys())}"
@@ -1629,6 +1630,7 @@ def test_dialogs_columns_match_current_schema(tmp_sync_db_path: Path) -> None:
             "unread_mentions_count",
             "unread_reactions_count",
             "identity_complete",
+            "identity_revision",
         ):
             col = columns[col_name]
             assert col[2] == "INTEGER", f"{col_name} must be INTEGER, got {col[2]}"
@@ -1719,7 +1721,7 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 77, f"_CURRENT_SCHEMA_VERSION must be 77, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 78, f"_CURRENT_SCHEMA_VERSION must be 78, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
 

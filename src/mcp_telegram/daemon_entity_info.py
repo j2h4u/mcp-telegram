@@ -24,6 +24,13 @@ from telethon.errors import (  # type: ignore[import-untyped]
 
 from .auth_scope import TelegramAuthScope
 from .demand_wiring import DemandOfferSink, offer_durable_demand
+from .dialog_identity import capture_identity_baseline, publish_dialog_identity
+from .dialog_identity_contracts import (
+    IDENTITY_OMITTED,
+    DialogIdentityObservation,
+    ObservedDialogType,
+    ObservedText,
+)
 from .entity_profile.contracts import (
     CHANNEL_ID_MARKER,
     FULL_PROFILE_OWNED_FIELDS,
@@ -45,6 +52,7 @@ from .entity_profile.contracts import (
     ProjectionOutcome,
     ProjectionStatus,
     TargetKind,
+    UserProfileObservation,
     UserReference,
     completeness,
     reconcile_chat_avatar_history,
@@ -73,6 +81,7 @@ from .entity_profile.repository import EntityProfileRepository, EntityRefreshCur
 from .entity_store import EntitySnapshot, ensure_entity_stub
 from .flood import TelegramRpcThrottled
 from .folders.read_model import dialog_placement
+from .identity_observation import USERNAME_UNOBSERVED, observe_username
 from .linked_chat_fact import linked_chat_fact_owner
 from .models import DialogType
 from .telegram_access import ACCESS_LOST_ERRORS
@@ -89,6 +98,72 @@ from .telegram_rpc_scheduler import TelegramRpcSource, current_rpc_scope, rpc_sc
 from .telethon_dialog import classify_dialog_type
 
 _ENTITY_DETAIL_SCHEMA_VERSION = 1
+
+
+def _profile_identity_observation(
+    dialog_id: int,
+    patch: Mapping[str, object] | None,
+    *,
+    observed_at: int,
+) -> DialogIdentityObservation | None:
+    if not isinstance(patch, Mapping):
+        return None
+    fields: dict[str, object] = {}
+    for identity_field, key in (("name", "name"), ("username", "username"), ("dialog_type", "type")):
+        value = patch.get(key, IDENTITY_OMITTED)
+        if value is USERNAME_UNOBSERVED:
+            value = IDENTITY_OMITTED
+        if value is not IDENTITY_OMITTED:
+            fields[identity_field] = value
+    if not fields:
+        return None
+    complete = all(field in fields for field in ("name", "username", "dialog_type"))
+    return DialogIdentityObservation(
+        dialog_id=dialog_id,
+        name=cast(ObservedText, fields.get("name", IDENTITY_OMITTED)),
+        username=cast(ObservedText, fields.get("username", IDENTITY_OMITTED)),
+        dialog_type=cast(ObservedDialogType, fields.get("dialog_type", IDENTITY_OMITTED)),
+        complete=complete,
+        source="profile",
+        observed_at=observed_at,
+    )
+
+
+def _profile_identity_observation_from_outcome(
+    dialog_id: int,
+    outcome: ProjectionOutcome,
+    *,
+    fallback_at: float,
+) -> DialogIdentityObservation | None:
+    provenance = outcome.provenance
+    boundary = provenance.observation.started_at if provenance is not None and provenance.observation.valid else None
+    if boundary is None:
+        boundary = fallback_at
+    return _profile_identity_observation(dialog_id, outcome.identity_patch, observed_at=int(boundary))
+
+
+def _fresh_entity_identity_observation(
+    entity: object, dialog_id: int, *, observed_at: int
+) -> DialogIdentityObservation:
+    entity_type = classify_dialog_type(entity)
+    if entity_type in {DialogType.USER, DialogType.BOT, DialogType.SERVICE}:
+        first = _attr(entity, "first_name", IDENTITY_OMITTED)
+        last = _attr(entity, "last_name", IDENTITY_OMITTED)
+        if first is IDENTITY_OMITTED and last is IDENTITY_OMITTED:
+            name: object = IDENTITY_OMITTED
+        else:
+            name = (
+                " ".join(part for value in (first, last) if isinstance(value, str) and (part := value.strip())) or None
+            )
+        username = observe_username(
+            _attr(entity, "username", USERNAME_UNOBSERVED),
+            _attr(entity, "usernames", USERNAME_UNOBSERVED),
+        )
+    else:
+        name = _attr(entity, "title", IDENTITY_OMITTED)
+        username = _attr(entity, "username", IDENTITY_OMITTED)
+    patch = {"type": entity_type.value, "name": name, "username": username}
+    return cast(DialogIdentityObservation, _profile_identity_observation(dialog_id, patch, observed_at=observed_at))
 
 
 class _LinkedChatFactCaptureUnavailable:
@@ -668,6 +743,7 @@ class DaemonEntityInfoService:
     ) -> dict[str, object]:
         self._log_stage(entity_id, "cache_miss", started_at)
         stage_started_at = self._deps.now_provider()
+        identity_baseline = capture_identity_baseline(self._deps.conn, entity_id)
         entity, resolve_error = await self._resolve_entity(entity_id)
         self._log_stage(entity_id, "resolve_entity", stage_started_at)
         if resolve_error is not None:
@@ -681,7 +757,15 @@ class DaemonEntityInfoService:
             return detail_error or self._error("telegram_api_error", "per-type helper returned no detail")
 
         stage_started_at = self._deps.now_provider()
-        self._writeback(entity_id, detail, now)
+        self._writeback(
+            entity_id,
+            detail,
+            now,
+            dialog_identity_observation=_fresh_entity_identity_observation(
+                entity, entity_id, observed_at=int(stage_started_at)
+            ),
+            dialog_identity_baseline_revision=identity_baseline,
+        )
         self._log_stage(entity_id, "writeback", stage_started_at, detail_type=detail.get("type"))
         self._log_stage(entity_id, "complete", started_at, detail_type=detail.get("type"))
         return {"ok": True, "data": detail}
@@ -710,6 +794,8 @@ class DaemonEntityInfoService:
         return self._pending_error(entity_id, message)
 
     async def _progressive_miss(self, entity_id: int, *, now: int, started_at: float) -> dict[str, object]:
+        identity_baseline = capture_identity_baseline(self._deps.conn, entity_id)
+        identity_started_at = int(self._deps.now_provider())
         try:
             entity, resolve_error = await asyncio.wait_for(
                 self._resolve_entity(entity_id),
@@ -730,7 +816,14 @@ class DaemonEntityInfoService:
             return self._queue_unknown_refresh(entity_id, now=now, message=message)
 
         core = self._core_from_entity(entity)
-        self._profiles.save_core(core, now=now)
+        self._profiles.save_core(
+            core,
+            now=now,
+            dialog_identity_observation=_fresh_entity_identity_observation(
+                entity, entity_id, observed_at=identity_started_at
+            ),
+            dialog_identity_baseline_revision=identity_baseline,
+        )
         assert self._refresh is not None
         enqueue_result = self._refresh.enqueue(entity_id)
         self._persist_refresh_admission(entity_id, enqueue_result, now=now)
@@ -1000,6 +1093,7 @@ class DaemonEntityInfoService:
         now: int,
     ) -> DurableRefreshTerminal | None:
         context = self._profile_section_context(cursor, entity_type)
+        identity_baseline = capture_identity_baseline(self._deps.conn, cursor.entity_id)
         try:
             if entity_type is DialogType.CHANNEL and cursor.next_section == "full_profile":
                 result = await self._acquire_profile_section(cursor, entity_type, context=context)
@@ -1040,6 +1134,8 @@ class DaemonEntityInfoService:
                 retry_at=scope_changed_retry_at(now),
             )
             return DurableRefreshTerminal.FAILURE
+        if result.dialog_identity_observation is not None:
+            result = dataclass_replace(result, dialog_identity_baseline_revision=identity_baseline)
         result = self._with_observation_metadata(result, context.captured_scope)
         committed = self._commit_profile_section_result(cursor, entity_type, result, context, now=now)
         return self._success_if_refresh_finished(cursor, committed=committed)
@@ -1348,6 +1444,7 @@ class DaemonEntityInfoService:
         cursor: EntityRefreshCursor,
     ) -> tuple[EntitySectionCommit, EntitySectionCommit]:
         captured_scope = self._capture_pair_scope()
+        identity_baseline = capture_identity_baseline(self._deps.conn, cursor.entity_id)
         now = self._deps.now_provider()
         target_kind = (
             TargetKind.BOT
@@ -1355,15 +1452,20 @@ class DaemonEntityInfoService:
             else TargetKind.USER
         )
         normalized = await self._deps.user_profile_port.fetch_user_profile(cursor.entity_id, target_kind)
-        if normalized.full_profile.status is ProjectionStatus.UNAVAILABLE:
-            raise ValueError(normalized.full_profile.reason or "full user payload is unavailable")
-        if self._deps.full_user_auth_scope is not None:
-            verified_scope = self._capture_pair_scope()
-            if captured_scope is None or verified_scope != captured_scope:
-                raise _AuthScopeUnavailableError("authenticated session scope changed during acquisition")
+        self._validate_full_user_acquisition(normalized, captured_scope)
         identity = self._full_user_pair_identity(target_kind, scope=captured_scope)
         full_profile = self._normalized_full_profile_commit(
             normalized.full_profile, cursor, identity, current_photo=normalized.current_photo
+        )
+        identity_observation = _profile_identity_observation_from_outcome(
+            cursor.entity_id,
+            normalized.full_profile,
+            fallback_at=now,
+        )
+        full_profile = dataclass_replace(
+            full_profile,
+            dialog_identity_observation=identity_observation,
+            dialog_identity_baseline_revision=identity_baseline,
         )
         personal_channel = self._normalized_personal_channel_commit(
             normalized.personal_channel,
@@ -1371,6 +1473,18 @@ class DaemonEntityInfoService:
             identity,
         )
         return full_profile, personal_channel
+
+    def _validate_full_user_acquisition(
+        self,
+        observation: UserProfileObservation,
+        captured_scope: TelegramAuthScope | None,
+    ) -> None:
+        if observation.full_profile.status is ProjectionStatus.UNAVAILABLE:
+            raise ValueError(observation.full_profile.reason or "full user payload is unavailable")
+        if self._deps.full_user_auth_scope is not None:
+            verified_scope = self._capture_pair_scope()
+            if captured_scope is None or verified_scope != captured_scope:
+                raise _AuthScopeUnavailableError("authenticated session scope changed during acquisition")
 
     def _capture_pair_scope(self) -> TelegramAuthScope | None:
         provider = self._deps.full_user_auth_scope
@@ -1822,6 +1936,8 @@ class DaemonEntityInfoService:
         now: int,
     ) -> DurableRefreshTerminal | None:
         """Persist one resolved core so later raw section requests can resume by id."""
+        identity_baseline = capture_identity_baseline(self._deps.conn, cursor.entity_id)
+        identity_started_at = int(self._deps.now_provider())
         try:
             entity, error = await self._resolve_entity(cursor.entity_id)
         except RpcAttemptBudgetExhaustedError:
@@ -1853,6 +1969,10 @@ class DaemonEntityInfoService:
             core,
             next_acquisition_cursor=cursor.acquisition_cursor + 1,
             now=now,
+            dialog_identity_observation=_fresh_entity_identity_observation(
+                entity, cursor.entity_id, observed_at=identity_started_at
+            ),
+            dialog_identity_baseline_revision=identity_baseline,
         )
         if not committed:
             return None
@@ -1955,6 +2075,7 @@ class DaemonEntityInfoService:
 
     async def _acquire_user_full_profile(self, entity_id: int, entity_type: DialogType) -> EntitySectionCommit:
         target_kind = self._target_kind(entity_type)
+        requested_at = self._deps.now_provider()
         observation = await self._deps.user_profile_port.fetch_user_profile(entity_id, target_kind)
         outcome = observation.full_profile
         if outcome.status is ProjectionStatus.UNAVAILABLE or outcome.payload is None:
@@ -1970,9 +2091,19 @@ class DaemonEntityInfoService:
                 else None
             )
         }
-        identity_patch = dict(outcome.identity_patch or {})
-        identity_patch["type"] = entity_type.value
-        return EntitySectionCommit(patch, payload=private_payload, identity_patch=identity_patch)
+        raw_identity_patch = dict(outcome.identity_patch or {})
+        identity_observation = _profile_identity_observation_from_outcome(
+            entity_id,
+            outcome,
+            fallback_at=requested_at,
+        )
+        identity_patch = {**raw_identity_patch, "type": entity_type.value}
+        return EntitySectionCommit(
+            patch,
+            payload=private_payload,
+            identity_patch=identity_patch,
+            dialog_identity_observation=identity_observation,
+        )
 
     async def _acquire_channel_full_profile(
         self,
@@ -2002,6 +2133,12 @@ class DaemonEntityInfoService:
             patch,
             payload=_channel_profile_payload(observation),
             dialog_created=observation.created,
+            identity_patch=observation.identity_patch,
+            dialog_identity_observation=_profile_identity_observation(
+                entity_id,
+                observation.identity_patch,
+                observed_at=int(observation.observation_started_at),
+            ),
         )
 
     def _capture_linked_chat_fact_generation(
@@ -2033,6 +2170,7 @@ class DaemonEntityInfoService:
     ) -> tuple[EntitySectionCommit, EntitySectionCommit]:
         """Build full profile and contact overlap from one validated RPC result."""
         captured_scope = self._capture_pair_scope()
+        identity_baseline = capture_identity_baseline(self._deps.conn, cursor.entity_id)
         if self._deps.full_user_auth_scope is not None and captured_scope is None:
             raise _AuthScopeUnavailableError("authenticated session scope is unavailable")
         observation = await self._deps.group_profile_port.fetch_group_profile(cursor.entity_id)
@@ -2055,6 +2193,17 @@ class DaemonEntityInfoService:
                 authoritative=True,
                 declared_fields=("about", "invite_link", "members_count"),
             ),
+        )
+        identity_observation = _profile_identity_observation(
+            cursor.entity_id,
+            observation.identity_patch,
+            observed_at=started_at,
+        )
+        full_profile = dataclass_replace(
+            full_profile,
+            identity_patch=observation.identity_patch,
+            dialog_identity_observation=identity_observation,
+            dialog_identity_baseline_revision=identity_baseline,
         )
         if participants is None:
             contact_overlap = EntitySectionCommit(
@@ -2707,7 +2856,15 @@ class DaemonEntityInfoService:
             return await self._fetch_group_detail(entity), None
         return None, self._error("unsupported_entity_type", f"unknown entity kind: {dispatch_kind}")
 
-    def _writeback(self, entity_id: int, detail: dict[str, object], now: int) -> None:
+    def _writeback(
+        self,
+        entity_id: int,
+        detail: dict[str, object],
+        now: int,
+        *,
+        dialog_identity_observation: DialogIdentityObservation | None = None,
+        dialog_identity_baseline_revision: int | None = None,
+    ) -> None:
         full_fetch_ok = detail.pop("_full_fetch_ok", True)
         try:
             ensure_entity_stub(
@@ -2729,6 +2886,13 @@ class DaemonEntityInfoService:
                 self._deps.conn.execute(
                     "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
                     (entity_id, json.dumps(payload_with_schema), now),
+                )
+            if dialog_identity_observation is not None:
+                publish_dialog_identity(
+                    self._deps.conn,
+                    entity_id,
+                    dialog_identity_observation,
+                    dialog_identity_baseline_revision,
                 )
             self._deps.conn.commit()
         except sqlite3.OperationalError as exc:

@@ -1,5 +1,6 @@
 """Activity and stats service extracted from daemon_api."""
 
+import json
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -9,8 +10,11 @@ from typing import Protocol, cast
 
 from .daemon_message import fetch_text_links
 from .dialog_directory_coverage import DialogDirectoryCoverage
+from .dialog_identity import read_dialog_identities
+from .dialog_identity_contracts import DialogIdentity
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
 from .message_content import MessageSnapshot, project_message_content
+from .models import DialogType
 
 
 class _LoggerLike(Protocol):
@@ -359,8 +363,6 @@ def _recent_activity_query_parts(request: _RecentActivityQueryParts) -> tuple[st
     if request.dialog_kinds != ["all"]:
         dialog_kind_placeholders = ",".join("?" for _ in request.dialog_kinds)
         kinded_activity_filters.append(f"dialog_kind IN ({dialog_kind_placeholders})")
-        query_params.extend(request.dialog_kinds)
-    query_params.append(request.limit)
     return " AND ".join(typed_activity_filters), " AND ".join(kinded_activity_filters), query_params
 
 
@@ -416,18 +418,17 @@ def _where_clause(filters: str) -> str:
     return f"WHERE {filters}" if filters else ""
 
 
-def _build_recent_activity_rows_query(typed_activity_filter_sql: str, kinded_activity_filter_sql: str) -> str:
+def _build_recent_activity_rows_query(
+    typed_activity_filter_sql: str,
+    kinded_activity_filter_sql: str,
+    limit: int | None = None,
+) -> str:
+    limit_clause = "LIMIT ?" if limit is not None else ""
     return (
         "WITH typed_activity AS ("
         "SELECT m.dialog_id AS dialog_id, m.message_id AS message_id, "
         "       m.sent_at AS sent_at, m.text AS text, m.media_kind AS media_kind, m.media_payload AS media_payload, "
-        "       COALESCE(e.name, d.name, CAST(m.dialog_id AS TEXT)) AS dialog_name, "
-        "       CASE "
-        "         WHEN lower(COALESCE(e.type, '')) = 'bot' THEN 'bot' "
-        "         WHEN d.type IS NOT NULL AND d.type != '' THEN d.type "
-        "         WHEN e.type IS NOT NULL AND e.type != '' THEN e.type "
-        "         ELSE 'unknown' "
-        "       END AS dialog_type, "
+        "       CAST(m.dialog_id AS TEXT) AS dialog_name, 'unknown' AS dialog_type, "
         "       MAX(COALESCE(m.reply_count, 0), ("
         "         SELECT COUNT(*) FROM messages replies INDEXED BY idx_messages_reply "
         "         WHERE replies.dialog_id = m.dialog_id "
@@ -436,8 +437,6 @@ def _build_recent_activity_rows_query(typed_activity_filter_sql: str, kinded_act
         "       )) AS reply_count, "
         "       sd.status AS sync_status "
         "FROM messages m "
-        "LEFT JOIN entities e ON e.id = m.dialog_id "
-        "LEFT JOIN dialogs d ON d.dialog_id = m.dialog_id "
         "LEFT JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id "
         # out=1: authored by the account owner.
         # is_service=0: exclude join/leave/group-created system events
@@ -448,26 +447,102 @@ def _build_recent_activity_rows_query(typed_activity_filter_sql: str, kinded_act
         f"{_where_clause(typed_activity_filter_sql)} "
         "), kinded_activity AS ("
         "SELECT ta.*, "
-        "       CASE "
-        "         WHEN lower(ta.dialog_type) = 'bot' THEN 'bot' "
-        "         WHEN lower(ta.dialog_type) = 'user' THEN 'user' "
-        "         WHEN lower(ta.dialog_type) = 'forum' THEN 'forum' "
-        "         WHEN EXISTS (SELECT 1 FROM topic_metadata tm WHERE tm.dialog_id = ta.dialog_id) THEN 'forum' "
-        "         WHEN lower(ta.dialog_type) IN ('group', 'supergroup', 'chat') THEN 'group' "
-        "         WHEN lower(ta.dialog_type) = 'channel' THEN 'channel' "
-        "         WHEN lower(ta.dialog_type) = 'unknown' AND ta.dialog_id > 0 THEN 'user' "
-        "         WHEN lower(ta.dialog_type) = 'unknown' AND ta.dialog_id < 0 THEN 'group' "
-        "         ELSE 'unknown' "
-        "       END AS dialog_kind "
+        "       'unknown' AS dialog_kind "
         "FROM typed_activity ta"
         ") "
         "SELECT * FROM ("
         "SELECT * FROM kinded_activity "
         f"{_where_clause(kinded_activity_filter_sql)} "
-        "ORDER BY sent_at DESC, dialog_id DESC, message_id DESC "
-        "LIMIT ?"
-        ") ORDER BY sent_at ASC, dialog_id ASC, message_id ASC"
+        f"ORDER BY sent_at DESC, dialog_id DESC, message_id DESC {limit_clause}) "
+        "ORDER BY sent_at ASC, dialog_id ASC, message_id ASC"
     )
+
+
+def _activity_dialog_kind(dialog_id: int, dialog_type: DialogType, has_topics: bool) -> str:
+    if dialog_type in {DialogType.BOT, DialogType.USER, DialogType.FORUM}:
+        return dialog_type.value
+    if has_topics:
+        return DialogType.FORUM.value
+    if dialog_type in {DialogType.GROUP, DialogType.SUPERGROUP}:
+        return "group"
+    if dialog_type is DialogType.CHANNEL:
+        return DialogType.CHANNEL.value
+    if dialog_type is DialogType.UNKNOWN:
+        return "user" if dialog_id > 0 else "group" if dialog_id < 0 else "unknown"
+    return "unknown"
+
+
+def _project_activity_rows(
+    rows: Sequence[tuple[object, ...]],
+    identities: Mapping[int, DialogIdentity],
+    topic_dialogs: set[int],
+) -> list[tuple[object, ...]]:
+    selected: list[tuple[object, ...]] = []
+    for raw_row in rows:
+        dialog_id = int(cast(int | str, raw_row[0]))
+        identity = identities[dialog_id]
+        dialog_type = identity.dialog_type.value
+        dialog_kind = _activity_dialog_kind(dialog_id, identity.dialog_type, dialog_id in topic_dialogs)
+        row = list(raw_row)
+        row[6], row[7], row[10] = identity.display_name, dialog_type, dialog_kind
+        selected.append(tuple(row))
+    return selected
+
+
+def _matching_activity_dialog_ids(
+    conn: sqlite3.Connection,
+    filters: str,
+    params: Sequence[object],
+) -> list[int]:
+    rows = cast(
+        list[tuple[object, ...]],
+        conn.execute(
+            f"SELECT DISTINCT m.dialog_id FROM messages m {_where_clause(filters)}",
+            params,
+        ).fetchall(),
+    )
+    return [int(cast(int | str, row[0])) for row in rows]
+
+
+def _query_activity_rows(conn: sqlite3.Connection, request: _RecentActivityRequest) -> list[tuple[object, ...]]:
+    topic_rows = cast(
+        list[tuple[object, ...]],
+        conn.execute("SELECT DISTINCT dialog_id FROM topic_metadata").fetchall(),
+    )
+    topic_dialogs = {int(cast(int | str, row[0])) for row in topic_rows}
+    identities: dict[int, DialogIdentity] = {}
+    filters = request.typed_activity_filter_sql
+    params = list(request.query_params)
+    if request.dialog_kinds != ["all"]:
+        # Identity selection scales with distinct peers; message rows remain limited in SQL.
+        peer_ids = _matching_activity_dialog_ids(conn, filters, request.query_params)
+        identities = read_dialog_identities(conn, peer_ids)
+        allowed_ids = [
+            dialog_id
+            for dialog_id in peer_ids
+            if _activity_dialog_kind(
+                dialog_id,
+                identities[dialog_id].dialog_type,
+                dialog_id in topic_dialogs,
+            )
+            in request.dialog_kinds
+        ]
+        if not allowed_ids:
+            return []
+        filters += " AND m.dialog_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))"
+        params.append(json.dumps(allowed_ids))
+
+    params.append(request.limit)
+    rows = cast(
+        list[tuple[object, ...]],
+        conn.execute(
+            _build_recent_activity_rows_query(filters, "", request.limit),
+            params,
+        ).fetchall(),
+    )
+    if request.dialog_kinds == ["all"]:
+        identities = read_dialog_identities(conn, (int(cast(int | str, row[0])) for row in rows))
+    return _project_activity_rows(rows, identities, topic_dialogs)
 
 
 def _activity_text_links(
@@ -630,16 +705,7 @@ class DaemonActivityStatsService:
         if error is not None or parsed is None:
             return error or {"ok": False, "error": "internal", "message": "internal error"}
 
-        rows = cast(
-            list[tuple[object, object, object, object, object, object, object, object, object, object]],
-            self._deps.conn.execute(
-                _build_recent_activity_rows_query(
-                    parsed.typed_activity_filter_sql,
-                    parsed.kinded_activity_filter_sql,
-                ),
-                parsed.query_params,
-            ).fetchall(),
-        )
+        rows = _query_activity_rows(self._deps.conn, parsed)
 
         state_rows = dict(
             cast(

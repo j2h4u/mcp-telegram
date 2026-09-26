@@ -25,6 +25,10 @@ The SYNC-001 frontier is closed. Runtime entity writers use the canonical,
 transaction-neutral `entity_store` persistence boundary, and `event_handlers`
 no longer imports `sync_worker`.
 
+TG-12 assigns dialog name, type, and username reads and writes to
+`dialog_identity`; profile `entities` rows remain the profile/account-target
+store, and message sender joins remain historical sender enrichment.
+
 The READ-001/READ-002 frontier is closed. Reading orchestration and SQLite
 projection now live under `mcp_telegram.reading`; scheduled projection imports
 the canonical `reading.query_records.read_message_from_row` decoder (the

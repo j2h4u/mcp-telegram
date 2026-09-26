@@ -71,6 +71,7 @@ def test_unread_summary_projection_helper_keeps_identity_contract_and_skips_bad_
     assert _project_unread_summary_dialog({"dialog_id": "42"}) is None
     assert _project_unread_summary_dialog({"dialog_id": 42, "name": 123, "username": False}) == {
         "entity": {"display_name": "42", "telegram_id": 42},
+        "display_name_source": "numeric",
         "dialog_type": None,
         "unread_count": None,
         "unread_mark": None,
@@ -82,6 +83,7 @@ def test_unread_summary_projection_helper_keeps_identity_contract_and_skips_bad_
     assert _project_unread_summary_dialogs([{"dialog_id": 42, "name": "Alice"}, "bad"]) == [
         {
             "entity": {"display_name": "Alice", "telegram_id": 42},
+            "display_name_source": "numeric",
             "dialog_type": None,
             "unread_count": None,
             "unread_mark": None,

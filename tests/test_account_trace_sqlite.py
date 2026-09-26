@@ -33,7 +33,11 @@ def _conn() -> sqlite3.Connection:
             sender_id INTEGER, media_kind TEXT, media_payload TEXT, forum_topic_id INTEGER,
             post_author TEXT, is_deleted INTEGER, is_service INTEGER, out INTEGER
         );
-        CREATE TABLE dialogs (dialog_id INTEGER, name TEXT, type TEXT, hidden INTEGER);
+        CREATE TABLE dialogs (
+            dialog_id INTEGER, name TEXT, type TEXT, username TEXT,
+            identity_observed_at INTEGER, identity_complete INTEGER DEFAULT 0,
+            identity_source TEXT, hidden INTEGER
+        );
         CREATE TABLE entities (id INTEGER, name TEXT, username TEXT, name_normalized TEXT, type TEXT, updated_at INTEGER);
         CREATE TABLE topic_metadata (dialog_id INTEGER, topic_id INTEGER, title TEXT);
         CREATE TABLE synced_dialogs (dialog_id INTEGER, status TEXT);
@@ -135,7 +139,7 @@ def test_sqlite_reads_preserve_scopes_and_metadata_defaults() -> None:
             == conn.execute("SELECT id, name, username, name_normalized FROM entities WHERE id = 7").fetchone()
         )
         assert coverage_fragments(conn, target_user_id=7)[0]["status"] == "partial"
-        assert dialog_metadata(conn, 999) == {"dialog_type": "Unknown", "status": "not_synced", "hidden": False}
+        assert dialog_metadata(conn, 999) == {"dialog_type": "unknown", "status": "not_synced", "hidden": False}
     finally:
         conn.close()
 

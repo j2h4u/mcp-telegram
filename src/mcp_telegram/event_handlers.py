@@ -72,15 +72,14 @@ from .channel_full_siblings import (
 )
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import (
-    IDENTITY_OMITTED,
-    _IdentityOmitted,
     apply_active_generation_pin_delta,
     apply_realtime_eligibility,
-    apply_realtime_identity,
     clear_realtime_mute,
     record_realtime_pin_fence,
     sync_active_generation_pins_from_publication,
 )
+from .dialog_identity import capture_identity_baseline, publish_dialog_identity
+from .dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation, ObservedText
 from .entity_store import PartialEntityIdentity, apply_partial_entity_identity
 from .flood import TelegramRpcThrottled
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
@@ -110,6 +109,7 @@ from .messages.telegram_adapter import (
 from .messages.telegram_adapter import (
     extract_message_row,
 )
+from .models import DialogType
 from .reactions.contracts import ReactionAggregate, ReactionAggregateSource, ReactionObservationBoundary
 from .reactions.persistence import allocate_observation_boundary, replace_reaction_aggregates
 from .reactions.projection import project_reaction_aggregates
@@ -598,12 +598,10 @@ _UPDATE_DIALOG_LAST_MESSAGE_AT_SQL = (
 
 _UPSERT_REALTIME_DM_DIALOG_SQL = """
 INSERT INTO dialogs (
-    dialog_id, name, type, last_message_at, snapshot_at, hidden, needs_refresh,
+    dialog_id, last_message_at, snapshot_at, hidden, needs_refresh,
     archived, pinned, unread_mentions_count, unread_reactions_count
-) VALUES (?, ?, ?, ?, ?, 0, 1, 0, 0, 0, 0)
+) VALUES (?, ?, ?, 0, 1, 0, 0, 0, 0)
 ON CONFLICT(dialog_id) DO UPDATE SET
-    name = COALESCE(dialogs.name, excluded.name),
-    type = COALESCE(dialogs.type, excluded.type),
     last_message_at = CASE
         WHEN excluded.last_message_at IS NULL THEN dialogs.last_message_at
         WHEN dialogs.last_message_at IS NULL THEN excluded.last_message_at
@@ -845,6 +843,7 @@ class EventHandlerManager:
     ) -> EnrollmentOutcome:
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            baseline_revision = capture_identity_baseline(self._conn, dialog_id)
             outcome = ensure_automatic_dm_enrollment(self._conn, dialog_id, now=observed_at)
             if not outcome.enabled:
                 self._conn.commit()
@@ -853,12 +852,28 @@ class EventHandlerManager:
                 _UPSERT_REALTIME_DM_DIALOG_SQL,
                 (
                     dialog_id,
-                    identity.name if identity is not None else None,
-                    identity.entity_type if identity is not None else None,
                     message_timestamp,
                     observed_at,
                 ),
             )
+            if identity is not None:
+                publish_dialog_identity(
+                    self._conn,
+                    dialog_id,
+                    DialogIdentityObservation(
+                        dialog_id=dialog_id,
+                        name=identity.name if identity.name_observed else IDENTITY_OMITTED,
+                        username=identity.username if identity.username_observed else IDENTITY_OMITTED,
+                        dialog_type=(
+                            IDENTITY_OMITTED
+                            if DialogType.parse(identity.entity_type) is DialogType.UNKNOWN
+                            else identity.entity_type
+                        ),
+                        source="realtime",
+                        observed_at=observed_at,
+                    ),
+                    0 if baseline_revision is None else baseline_revision,
+                )
             unhide_after_realtime_presence(self._conn, dialog_id)
             self._conn.commit()
             return outcome
@@ -1977,13 +1992,13 @@ class EventHandlerManager:
         )
 
     @staticmethod
-    def _username_update_name(update: UpdateUserName) -> str | _IdentityOmitted | None:
+    def _username_update_name(update: UpdateUserName) -> ObservedText:
         if not hasattr(update, "first_name") and not hasattr(update, "last_name"):
             return IDENTITY_OMITTED
         return " ".join(part for part in (update.first_name, update.last_name) if part) or None
 
     @staticmethod
-    def _username_update_alias(update: UpdateUserName) -> str | _IdentityOmitted | None:
+    def _username_update_alias(update: UpdateUserName) -> ObservedText:
         if not hasattr(update, "usernames"):
             return IDENTITY_OMITTED
         observed = observe_username(USERNAME_UNOBSERVED, update.usernames)
@@ -1993,14 +2008,19 @@ class EventHandlerManager:
         with self._conn:
             name = self._username_update_name(update)
             username = self._username_update_alias(update)
-            apply_realtime_identity(
+            dialog_id = int(update.user_id)
+            baseline_revision = capture_identity_baseline(self._conn, dialog_id)
+            publish_dialog_identity(
                 self._conn,
-                int(update.user_id),
-                name=name,
-                username=username,
-                dialog_type=None,
-                observed_at=now,
-                complete=False,
+                dialog_id,
+                DialogIdentityObservation(
+                    dialog_id=dialog_id,
+                    name=name,
+                    username=username,
+                    source="realtime",
+                    observed_at=now,
+                ),
+                baseline_revision,
             )
             if name is not IDENTITY_OMITTED or username is not IDENTITY_OMITTED:
                 apply_partial_entity_identity(
