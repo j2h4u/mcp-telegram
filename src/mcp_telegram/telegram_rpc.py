@@ -991,7 +991,7 @@ class TelegramRpcGate(TelegramClient):
 
     def _release_confirmed_teardown_dispatches(self) -> None:
         """A confirmed raw teardown is the sole fallback completion evidence."""
-        for raw_future, pending in tuple(self._pending_scalar_dispatches.items()):
+        for raw_future, _pending in tuple(self._pending_scalar_dispatches.items()):
             if raw_future.done() and not raw_future.cancelled():
                 self._finalize_scalar_dispatch(raw_future)
             remaining = self._pending_scalar_dispatches.get(raw_future)
