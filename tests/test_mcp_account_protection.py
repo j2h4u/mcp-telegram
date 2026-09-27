@@ -413,6 +413,103 @@ async def test_feedback_persists_when_only_following_status_operation_fails(
 
 
 @pytest.mark.asyncio
+async def test_feedback_omits_status_only_after_explicit_inactive_status_over_real_ipc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_server, "_schedule_telemetry", lambda _event: None)
+    daemon, sync_conn, feedback_conn, feedback_path = _local_daemon(tmp_path, object())
+    socket_path = tmp_path / "daemon.sock"
+    _install_daemon_socket(monkeypatch, socket_path)
+    try:
+        async with await asyncio.start_unix_server(daemon.handle_client, path=socket_path):
+            result = await mcp_server.call_tool("submit_feedback", {"message": "known inactive status"})
+    finally:
+        sync_conn.close()
+        feedback_conn.close()
+
+    assert result.is_error is False
+    assert result.content == []
+    payload = cast(dict[str, object], result.structured_content)
+    assert payload["accepted"] is True
+    assert "account_protection" not in payload
+    readback = sqlite3.connect(feedback_path)
+    try:
+        assert readback.execute("SELECT message FROM feedback").fetchone() == ("known inactive status",)
+    finally:
+        readback.close()
+    schema = mcp_server.tool_by_name["submit_feedback"].output_schema
+    assert schema is not None
+    validate(payload, cast(dict[str, object], schema))
+
+
+@pytest.mark.parametrize(
+    "status_response",
+    [
+        {"ok": True, "data": {}},
+        {"ok": True, "data": {"account_protection": {"status": "active"}}},
+        {
+            "ok": True,
+            "data": {
+                "account_protection": {
+                    "status": "active",
+                    "outbound_acquisition": "blocked",
+                    "recovery": "manual",
+                    "notice": 42,
+                }
+            },
+        },
+        {
+            "ok": True,
+            "data": {
+                "account_protection": {
+                    "status": "active",
+                    "outbound_acquisition": "blocked",
+                    "recovery": "manual",
+                    "notice": "Active protection",
+                    "opened_at": True,
+                }
+            },
+        },
+    ],
+)
+@pytest.mark.asyncio
+async def test_feedback_status_missing_or_malformed_stays_unavailable_over_real_ipc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status_response: dict[str, object],
+) -> None:
+    monkeypatch.setattr(mcp_server, "_schedule_telemetry", lambda _event: None)
+    daemon, sync_conn, feedback_conn, feedback_path = _local_daemon(tmp_path, object())
+    daemon._get_account_protection = lambda _req: status_response  # type: ignore[method-assign]
+    socket_path = tmp_path / "daemon.sock"
+    _install_daemon_socket(monkeypatch, socket_path)
+    try:
+        async with await asyncio.start_unix_server(daemon.handle_client, path=socket_path):
+            result = await mcp_server.call_tool("submit_feedback", {"message": "saved before bad status"})
+    finally:
+        sync_conn.close()
+        feedback_conn.close()
+
+    assert result.is_error is False
+    assert result.content == []
+    payload = cast(dict[str, object], result.structured_content)
+    assert payload["accepted"] is True
+    assert payload["account_protection"] == {
+        "status": "unavailable",
+        "notice": "Account protection status is unavailable; Telegram acquisition state could not be confirmed.",
+    }
+    readback = sqlite3.connect(feedback_path)
+    try:
+        assert readback.execute("SELECT message FROM feedback").fetchone() == ("saved before bad status",)
+    finally:
+        readback.close()
+    schema = mcp_server.tool_by_name["submit_feedback"].output_schema
+    assert schema is not None
+    validate(payload, cast(dict[str, object], schema))
+
+
+@pytest.mark.asyncio
 async def test_registered_list_messages_pins_real_topic_lookup_identity_under_protection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

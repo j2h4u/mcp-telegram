@@ -1407,6 +1407,16 @@ async def test_each_registered_tool_response_gets_one_active_protection_snapshot
         assert result.is_error is False
         assert result.content == []
         assert cast(dict[str, object], result.structured_content)["account_protection"] == protection
+        schema = cast(dict[str, object], server.tool_by_name[name].output_schema)
+        protection_schema = cast(dict[str, object], cast(dict[str, object], schema["properties"])["account_protection"])
+        validate(protection, protection_schema)
+        validate(
+            {
+                "status": "unavailable",
+                "notice": "Account protection status is unavailable; Telegram acquisition state could not be confirmed.",
+            },
+            protection_schema,
+        )
 
     assert status_reads == len(server.tool_by_name) == 15
 

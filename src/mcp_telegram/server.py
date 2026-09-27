@@ -298,15 +298,38 @@ async def _account_protection_status() -> dict[str, object]:
     try:
         async with daemon_connection() as conn:
             response = await conn.get_account_protection()
+        if not isinstance(response, dict):
+            return _account_protection_unavailable()
         data = response.get("data")
-        if response.get("ok") is True and isinstance(data, dict):
-            status = data.get("account_protection")
+        if response.get("ok") is True and isinstance(data, dict) and "account_protection" in data:
+            status = data["account_protection"]
             if status is None:
                 return {}
-            if isinstance(status, dict):
-                return {"account_protection": status}
+            if _is_valid_active_account_protection(status):
+                return {"account_protection": t.cast(dict[str, object], status)}
     except Exception as exc:  # noqa: BLE001 - status failure must not discard the tool result
         logger.debug("account_protection_status_unavailable: %s", exc)
+    return _account_protection_unavailable()
+
+
+def _is_valid_active_account_protection(status: object) -> bool:
+    if not isinstance(status, dict):
+        return False
+    if (
+        status.get("status") != "active"
+        or status.get("outbound_acquisition") != "blocked"
+        or status.get("recovery") != "manual"
+        or not isinstance(status.get("notice"), str)
+    ):
+        return False
+    if not set(status).issubset({"status", "outbound_acquisition", "recovery", "notice", "reason", "opened_at"}):
+        return False
+    if "reason" in status and not isinstance(status["reason"], str):
+        return False
+    return "opened_at" not in status or (type(status["opened_at"]) is int)
+
+
+def _account_protection_unavailable() -> dict[str, object]:
     return {
         "account_protection": {
             "status": "unavailable",
