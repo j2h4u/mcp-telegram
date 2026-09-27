@@ -43,6 +43,7 @@ from .config import (
     resolve_logging_config,
 )
 from .correlation import correlation_context, current_correlation_ids
+from .daemon_client import AccountProtectionError, daemon_connection
 from .request_timing import standalone_operation_id
 from .runtime_logging import install_telethon_log_filter
 from .tools._base import _send_telemetry_event, safe_error_code
@@ -257,8 +258,77 @@ def _safe_boundary_error_text(*, tool_name: str, stage: str, exc: Exception) -> 
     return f"Tool {tool_name} runtime execution failed: {detail}. Action: {action}"
 
 
-def _error_call_result(text: str) -> CallToolResult:
-    return CallToolResult(content=[TextContent(type="text", text=text)], is_error=True)
+def _error_call_result(text: str, *, code: str) -> CallToolResult:
+    lines = text.splitlines()
+    action_line = next((line for line in lines if line.lower().startswith("action:")), None)
+    action = action_line.partition(":")[2].strip() if action_line else "Check the tool response and retry."
+    message = "\n".join(line for line in lines if not line.lower().startswith("action:")).strip()
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structured_content={
+            "error": {
+                "code": safe_error_code(code),
+                "message": message,
+                "action": action,
+            }
+        },
+        is_error=True,
+    )
+
+
+def _protection_error_call_result(exc: AccountProtectionError) -> CallToolResult:
+    response = exc.response
+    message = str(response.get("message", "Telegram acquisition is blocked by account protection."))
+    action = "Recovery requires operator action."
+    text = f"{message}\nAction: {action}"
+    details = {
+        key: value
+        for key, value in response.items()
+        if key not in {"ok", "error", "message"}
+    }
+    error: dict[str, object] = {
+        "code": "flood_wait_kill_switch_open",
+        "message": message,
+        "action": action,
+    }
+    if details:
+        error["details"] = details
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structured_content={"error": error},
+        is_error=True,
+    )
+
+
+async def _account_protection_status() -> dict[str, object]:
+    try:
+        async with daemon_connection() as conn:
+            response = await conn.get_account_protection()
+        data = response.get("data")
+        if response.get("ok") is True and isinstance(data, dict):
+            status = data.get("account_protection")
+            if status is None:
+                return {}
+            if isinstance(status, dict):
+                return {"account_protection": status}
+    except Exception as exc:  # noqa: BLE001 - status failure must not discard the tool result
+        logger.debug("account_protection_status_unavailable: %s", exc)
+    return {
+        "account_protection": {
+            "status": "unavailable",
+            "notice": "Account protection status is unavailable; Telegram acquisition state could not be confirmed.",
+        }
+    }
+
+
+def _attach_account_protection(result: CallToolResult, status: dict[str, object]) -> CallToolResult:
+    structured_content = dict(result.structured_content or {})
+    structured_content.update(status)
+    return CallToolResult(
+        content=result.content,
+        structured_content=structured_content,
+        is_error=result.is_error,
+    )
 
 
 def _dedupe(values: t.Iterable[str]) -> list[str]:
@@ -373,6 +443,8 @@ def _project_tool_result(
 ) -> CallToolResult:
     if not isinstance(tool_result, tools.ToolResult):
         raise TypeError("tool runner returned an invalid result")
+    if not tool_result.is_error and tool_result.structured_content and "error" in tool_result.structured_content:
+        raise ValueError("Successful tool result uses the reserved top-level error property")
     telemetry.outcome = "tool_error" if tool_result.is_error else "success"
     telemetry.error_code = tool_result.error_code
     elapsed = time.monotonic() - started_at
@@ -396,15 +468,55 @@ def _project_tool_result(
         )
     else:
         logger.debug("call_tool[%s] completed duration_s=%.3f rids=%s", name, elapsed, rid_str)
+    structured_content = (
+        t.cast(dict[str, object], tools.omit_none_mapping_values(tool_result.structured_content))
+        if tool_result.structured_content is not None
+        else None
+    )
+    if tool_result.is_error:
+        structured_content = _canonical_tool_error(tool_result.error_code, tool_result.content, structured_content)
     return CallToolResult(
         content=list(tool_result.content) if tool_result.is_error else [],
-        structured_content=(
-            t.cast(dict[str, object], tools.omit_none_mapping_values(tool_result.structured_content))
-            if tool_result.structured_content is not None
-            else None
-        ),
+        structured_content=structured_content,
         is_error=tool_result.is_error,
     )
+
+
+def _canonical_tool_error(
+    error_code: str | None,
+    content: t.Sequence[t.Any],
+    structured_content: dict[str, object] | None,
+) -> dict[str, object]:
+    if structured_content is not None:
+        existing_error = structured_content.get("error")
+        if isinstance(existing_error, dict) and all(
+            isinstance(existing_error.get(field), str) for field in ("code", "message", "action")
+        ):
+            canonical_error = dict(existing_error)
+            details = canonical_error.get("details")
+            preserved: dict[str, object] = dict(details) if isinstance(details, dict) else {}
+            preserved.update(
+                {key: value for key, value in structured_content.items() if key not in {"error", "account_protection"}}
+            )
+            if preserved:
+                canonical_error["details"] = preserved
+            return {"error": canonical_error}
+    text = next((item.text for item in content if isinstance(item, TextContent)), "Tool request failed.")
+    lines = text.splitlines()
+    action_line = next((line for line in lines if line.lower().startswith("action:")), None)
+    error: dict[str, object] = {
+        "code": safe_error_code(error_code),
+        "message": "\n".join(line for line in lines if not line.lower().startswith("action:")).strip(),
+        "action": action_line.partition(":")[2].strip() if action_line else "Check the tool response and retry.",
+    }
+    if structured_content:
+        details = structured_content.get("details")
+        error["details"] = (
+            dict(details)
+            if len(structured_content) == 1 and isinstance(details, dict)
+            else structured_content
+        )
+    return {"error": error}
 
 
 async def _execute_tool(
@@ -428,7 +540,10 @@ async def _execute_tool(
             elapsed,
             type(exc).__name__,
         )
-        return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="validation", exc=exc))
+        return _error_call_result(
+            _safe_boundary_error_text(tool_name=name, stage="validation", exc=exc),
+            code="validation_error",
+        )
 
     try:
         tool_result = await tools.tool_runner(args)
@@ -436,11 +551,18 @@ async def _execute_tool(
     except asyncio.CancelledError:
         telemetry.outcome = "cancelled"
         raise
+    except AccountProtectionError as exc:
+        telemetry.outcome = "tool_error"
+        telemetry.error_code = "flood_wait_kill_switch_open"
+        return _protection_error_call_result(exc)
     except Exception as exc:  # noqa: BLE001 - tool boundary must classify runner failures
         telemetry.outcome = "exception"
         telemetry.error_type = type(exc).__name__
         _log_tool_failure(name, exc, stage="runtime", started_at=started_at)
-        return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc))
+        return _error_call_result(
+            _safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc),
+            code="tool_error",
+        )
 
     try:
         return _project_tool_result(name, tool_result, telemetry, started_at)
@@ -451,7 +573,10 @@ async def _execute_tool(
         telemetry.outcome = "exception"
         telemetry.error_type = type(exc).__name__
         _log_tool_failure(name, exc, stage="runtime", started_at=started_at)
-        return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc))
+        return _error_call_result(
+            _safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc),
+            code="tool_error",
+        )
 
 
 async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
@@ -469,7 +594,8 @@ async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
     telemetry = _CallTelemetry()
     try:
         with correlation_context(operation_id):
-            return await _execute_tool(name, tool, arguments, t0, telemetry)
+            result = await _execute_tool(name, tool, arguments, t0, telemetry)
+            return _attach_account_protection(result, await _account_protection_status())
     finally:
         _schedule_telemetry(
             _telemetry_event(

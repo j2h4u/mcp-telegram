@@ -222,6 +222,63 @@ def normalize_output_schema(schema: dict[str, object] | None) -> dict[str, objec
     return normalized
 
 
+def _protection_output_schema(schema: dict[str, object] | None) -> dict[str, object] | None:
+    if schema is None:
+        return None
+    result = deepcopy(schema)
+    properties = result.get("properties")
+    required = result.pop("required", None)
+    if not isinstance(properties, dict) or not isinstance(required, list):
+        raise ValueError("Tool output schema must have root properties and required fields")
+    if "error" in properties or "account_protection" in properties:
+        raise ValueError("Tool output schema uses a reserved shared response property")
+    properties["error"] = {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string"},
+            "message": {"type": "string"},
+            "action": {"type": "string"},
+            "details": {"type": "object"},
+        },
+        "required": ["code", "message", "action"],
+        "additionalProperties": False,
+    }
+    properties["account_protection"] = {
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "status": {"const": "active"},
+                    "outbound_acquisition": {"const": "blocked"},
+                    "recovery": {"const": "manual"},
+                    "notice": {"type": "string"},
+                },
+                "required": ["status", "outbound_acquisition", "recovery", "notice"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {"status": {"const": "unavailable"}, "notice": {"type": "string"}},
+                "required": ["status", "notice"],
+                "additionalProperties": False,
+            },
+        ],
+    }
+    if_schema = {"required": ["error"]}
+    then_schema = {
+        "properties": {"error": {}, "account_protection": {}},
+        "additionalProperties": False,
+    }
+    result.update(
+        {
+            "if": if_schema,
+            "then": then_schema,
+            "else": {"required": required},
+        }
+    )
+    return result
+
+
 class ToolArgs(BaseModel):
     model_config = ConfigDict()
 
@@ -274,17 +331,32 @@ def _check_daemon_response(
     """
     if response.get("ok") is True:
         return None
-    error_detail = response.get("message", "Request failed.")
-    if not isinstance(error_detail, str):
-        error_detail = str(error_detail)
+    error_detail = response.get("message")
+    if not isinstance(error_detail, str) or not error_detail.strip():
+        error_detail = response.get("detail")
+    if not isinstance(error_detail, str) or not error_detail.strip():
+        error_detail = "Request failed."
     error_code = response.get("error")
     if isinstance(error_code, str) and error_code and error_code not in str(error_detail):
         text = f"Error: {error_code}: {error_detail}"
     else:
         text = f"Error: {error_detail}"
+    required_action = response.get("required_action")
+    if required_action == "manual_operator_recovery":
+        action = "Recovery requires operator action."
+        text = "\n".join(line for line in text.splitlines() if not line.lower().startswith("action:"))
+    elif isinstance(required_action, str) and required_action.strip():
+        action = required_action.strip()
+        text = "\n".join(line for line in text.splitlines() if not line.lower().startswith("action:"))
     if "action:" not in text.lower():
         text = f"{text}\nAction: {action}"
-    return error_result(text, error_code=safe_error_code(error_code), **extra_kwargs)
+    details = response.get("details")
+    return error_result(
+        text,
+        error_code=safe_error_code(error_code),
+        details=details if isinstance(details, Mapping) else None,
+        **extra_kwargs,
+    )
 
 
 @dataclass
@@ -349,15 +421,19 @@ def error_result(
     text: str,
     *,
     error_code: str = "tool_error",
+    details: Mapping[str, object] | None = None,
     **metadata: Unpack[ToolResultMetadata],
 ) -> ToolResult:
-    """Return recoverable error text with a safe machine-readable code."""
-    return ToolResult(
+    """Return recoverable error text; the MCP boundary adds its structured envelope."""
+    result = ToolResult(
         content=_text_response(text),
         is_error=True,
         error_code=safe_error_code(error_code),
         **metadata,
     )
+    if details is not None:
+        result.structured_content = {"details": dict(details)}
+    return result
 
 
 async def _send_telemetry_event(event_dict: dict[str, object]) -> None:
@@ -470,7 +546,9 @@ def mcp_tool(
             annotations=annotations,
             exported_name=exported_name,
             title=exported_title or cls.__name__,
-            output_schema=normalize_output_schema(normalize_temporal_output_schema(output_schema)),
+            output_schema=_protection_output_schema(
+                normalize_output_schema(normalize_temporal_output_schema(output_schema))
+            ),
         )
         return wrapped
 

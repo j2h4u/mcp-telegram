@@ -6,6 +6,7 @@ import logging
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from functools import partial
 from pathlib import Path
 from typing import Protocol, cast
@@ -17,6 +18,7 @@ from jsonschema import ValidationError, validate
 from mcp.types import CallToolResult, Prompt, TextContent, Tool
 
 from mcp_telegram import server
+from mcp_telegram.daemon_client import AccountProtectionError
 from mcp_telegram.request_timing import is_valid_operation_id
 from mcp_telegram.tools._base import ToolRegistryEntry, ToolResult, tool_description
 from mcp_telegram.tools.discovery import ListDialogs
@@ -30,7 +32,50 @@ def _tool_input_schema(tool: Tool) -> dict[str, object]:
 
 def _tool_output_schema(tool: Tool) -> dict[str, object]:
     assert tool.output_schema is not None
-    return cast(dict[str, object], tool.output_schema)
+    schema = cast(dict[str, object], tool.output_schema)
+    success_requirements = schema.get("else")
+    if isinstance(success_requirements, dict):
+        schema = deepcopy(schema)
+        schema["required"] = success_requirements["required"]
+    return schema
+
+
+def _minimal_schema_value(schema: dict[str, object]) -> object:  # noqa: PLR0911
+    for union_key in ("anyOf", "oneOf"):
+        variants = schema.get(union_key)
+        if isinstance(variants, list):
+            return _minimal_schema_value(cast(dict[str, object], variants[0]))
+    if "const" in schema:
+        return schema["const"]
+    enum = schema.get("enum")
+    if isinstance(enum, list):
+        return enum[0]
+    schema_type = schema.get("type")
+    if schema_type == "object":
+        properties = cast(dict[str, dict[str, object]], schema.get("properties", {}))
+        return {
+            name: _minimal_schema_value(properties[name])
+            for name in cast(list[str], schema.get("required", []))
+            if name in properties
+        }
+    if schema_type == "array":
+        return []
+    if schema_type == "boolean":
+        return False
+    if schema_type == "integer" or schema_type == "number":
+        return 0
+    if schema_type == "null":
+        return None
+    return "example"
+
+
+@asynccontextmanager
+async def _status_context(response: dict[str, object]) -> AsyncIterator[object]:
+    class _Connection:
+        async def get_account_protection(self) -> dict[str, object]:
+            return response
+
+    yield _Connection()
 
 
 class _HasContent(Protocol):
@@ -1043,7 +1088,7 @@ def test_list_tools_exposes_list_dialogs_output_schema() -> None:
     assert tool.output_schema is not None
     properties = cast(dict[str, object], _tool_output_schema(tool)["properties"])
     assert "dialogs" in properties
-    assert "count" in cast(list[str], cast(dict[str, object], tool.output_schema)["required"])
+    assert "count" in cast(list[str], _tool_output_schema(tool)["required"])
 
 
 def test_all_registered_tools_declare_output_schema() -> None:
@@ -1061,6 +1106,9 @@ def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
         property_fields: tuple[str, ...] = (),
     ) -> None:
         schema = cast(dict[str, object], output_schema)
+        branches = schema.get("anyOf")
+        if isinstance(branches, list):
+            schema = cast(dict[str, object], branches[0])
         items = cast(
             dict[str, object],
             cast(dict[str, object], cast(dict[str, object], schema["properties"])[collection_name])["items"],
@@ -1076,7 +1124,7 @@ def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
 
     list_messages_schema = server.tool_by_name["list_messages"].output_schema
     assert list_messages_schema is not None
-    list_messages_dict = cast(dict[str, object], list_messages_schema)
+    list_messages_dict = _tool_output_schema(server.tool_by_name["list_messages"])
     assert "presentation" in cast(list[str], list_messages_dict["required"])
     assert_nested_item_fields(
         list_messages_schema,
@@ -1087,10 +1135,10 @@ def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
 
     list_dialogs_schema = server.tool_by_name["list_dialogs"].output_schema
     assert list_dialogs_schema is not None
-    list_dialogs_items = cast(
-        dict[str, object],
-        cast(dict[str, object], cast(dict[str, object], list_dialogs_schema["properties"])["dialogs"])["items"],
+    list_dialogs_properties = cast(
+        dict[str, object], _tool_output_schema(server.tool_by_name["list_dialogs"])["properties"]
     )
+    list_dialogs_items = cast(dict[str, object], cast(dict[str, object], list_dialogs_properties["dialogs"])["items"])
     assert "draft_content" not in cast(dict[str, object], list_dialogs_items["properties"])
 
     list_topics_schema = server.tool_by_name["list_topics"].output_schema
@@ -1151,12 +1199,230 @@ def test_list_tools_exposes_feedback_and_entity_info_output_schemas() -> None:
     entity_tool = server.tool_by_name["get_entity_info"]
 
     assert feedback_tool.output_schema is not None
-    feedback_schema = cast(dict[str, object], feedback_tool.output_schema)
-    entity_schema = cast(dict[str, object], entity_tool.output_schema)
+    feedback_schema = _tool_output_schema(feedback_tool)
+    entity_schema = _tool_output_schema(entity_tool)
     assert "accepted" in cast(list[str], feedback_schema["required"])
     assert "tracking_id" not in cast(dict[str, object], feedback_schema["properties"])
     assert "type_specific" in cast(list[str], entity_schema["required"])
     assert "content_fields" in cast(list[str], entity_schema["required"])
+
+
+def test_all_registered_output_schemas_validate_success_and_canonical_error_examples() -> None:
+    assert len(server.tool_by_name) == 15
+    for name, tool in server.tool_by_name.items():
+        assert tool.output_schema is not None, name
+        schema = cast(dict[str, object], tool.output_schema)
+        success_requirements = cast(dict[str, object], schema["else"])["required"]
+        success_schema = {**schema, "required": success_requirements}
+        success = cast(dict[str, object], _minimal_schema_value(success_schema))
+        validate(instance=success, schema=schema)
+        for protection in (
+            {
+                "status": "active",
+                "outbound_acquisition": "blocked",
+                "recovery": "manual",
+                "notice": "Telegram acquisition is blocked by account protection.",
+            },
+            {
+                "status": "unavailable",
+                "notice": "Account protection status is unavailable.",
+            },
+        ):
+            validate(instance={**success, "account_protection": protection}, schema=schema)
+        error = {"error": {"code": "tool_error", "message": "failed", "action": "inspect"}}
+        validate(instance=error, schema=schema)
+        validate(
+            instance={"error": {**error["error"], "details": {"source": "daemon"}}},
+            schema=schema,
+        )
+        validate(
+            instance={**error, "account_protection": {"status": "unavailable", "notice": "unavailable"}},
+            schema=schema,
+        )
+        for invalid in (
+            {},
+            {**error, "error": {"code": "tool_error"}},
+            {**error, "account_protection": None},
+            {**error, "account_protection": {"status": "unavailable"}},
+            {**error, "account_protection": {"status": "active", "notice": "active"}},
+            {**error, "accepted": True},
+        ):
+            with pytest.raises(ValidationError):
+                validate(instance=invalid, schema=schema)
+
+
+@pytest.mark.asyncio
+async def test_unavailable_protection_status_keeps_successful_local_feedback_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server.tools, "tool_args", lambda tool, **kwargs: object())
+    monkeypatch.setattr(
+        server.tools,
+        "tool_runner",
+        AsyncMock(return_value=ToolResult(structured_content={"accepted": True, "status": "open"})),
+    )
+
+    def unavailable_status() -> object:
+        raise OSError("daemon unavailable")
+
+    monkeypatch.setattr(server, "daemon_connection", unavailable_status)
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+
+    result = _call_tool_result(await server.call_tool("submit_feedback", {"message": "useful tool"}))
+
+    assert result.is_error is False
+    assert result.content == []
+    assert result.structured_content == {
+        "accepted": True,
+        "status": "open",
+        "account_protection": {
+            "status": "unavailable",
+            "notice": "Account protection status is unavailable; Telegram acquisition state could not be confirmed.",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_validation_error_includes_active_account_protection_notice(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        server,
+        "daemon_connection",
+        lambda: _status_context(
+            {
+                "ok": True,
+                "data": {
+                    "account_protection": {
+                        "status": "active",
+                        "outbound_acquisition": "blocked",
+                        "recovery": "manual",
+                        "notice": (
+                            "Telegram acquisition is blocked by account protection. Freshness and incoming coverage "
+                            "may be limited. Recovery requires operator action."
+                        ),
+                    }
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+
+    result = _call_tool_result(await server.call_tool("submit_feedback", {"message": 123}))
+
+    assert result.is_error is True
+    assert result.content
+    assert result.structured_content is not None
+    assert result.structured_content["account_protection"] == {
+        "status": "active",
+        "outbound_acquisition": "blocked",
+        "recovery": "manual",
+        "notice": (
+            "Telegram acquisition is blocked by account protection. Freshness and incoming coverage may be limited. "
+            "Recovery requires operator action."
+        ),
+    }
+    assert "error" in result.structured_content
+
+
+@pytest.mark.asyncio
+async def test_each_registered_tool_response_gets_one_active_protection_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    protection = {
+        "status": "active",
+        "outbound_acquisition": "blocked",
+        "recovery": "manual",
+        "notice": (
+            "Telegram acquisition is blocked by account protection. Freshness and incoming coverage may be limited. "
+            "Recovery requires operator action."
+        ),
+    }
+    status_reads = 0
+
+    @asynccontextmanager
+    async def status_context() -> AsyncIterator[object]:
+        class _Connection:
+            async def get_account_protection(self) -> dict[str, object]:
+                nonlocal status_reads
+                status_reads += 1
+                return {"ok": True, "data": {"account_protection": protection}}
+
+        yield _Connection()
+
+    monkeypatch.setattr(server.tools, "tool_args", lambda tool, **kwargs: object())
+    monkeypatch.setattr(
+        server.tools,
+        "tool_runner",
+        AsyncMock(return_value=ToolResult(structured_content={"ok": True})),
+    )
+    monkeypatch.setattr(server, "daemon_connection", status_context)
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+
+    for name in server.tool_by_name:
+        result = _call_tool_result(await server.call_tool(name, {}))
+        assert result.is_error is False
+        assert result.content == []
+        assert cast(dict[str, object], result.structured_content)["account_protection"] == protection
+
+    assert status_reads == len(server.tool_by_name) == 15
+
+
+@pytest.mark.asyncio
+async def test_typed_protection_error_has_manual_action_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server.tools, "tool_args", lambda tool, **kwargs: object())
+    monkeypatch.setattr(
+        server.tools,
+        "tool_runner",
+        AsyncMock(
+            side_effect=AccountProtectionError(
+                {
+                    "error": "flood_wait_kill_switch_open",
+                    "message": "Telegram acquisition is blocked by account protection.",
+                    "required_action": "manual_operator_recovery",
+                    "retryable": False,
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "daemon_connection",
+        lambda: _status_context({"ok": True, "data": {"account_protection": None}}),
+    )
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+
+    result = _call_tool_result(await server.call_tool("list_dialogs", {}))
+
+    assert result.is_error is True
+    assert result.structured_content is not None
+    error = cast(dict[str, object], result.structured_content["error"])
+    assert error["code"] == "flood_wait_kill_switch_open"
+    assert error["action"] == "Recovery requires operator action."
+    assert "retry" not in str(error["action"]).lower()
+    assert "account_protection" not in result.structured_content
+
+
+@pytest.mark.asyncio
+async def test_success_result_cannot_use_reserved_error_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server.tools, "tool_args", lambda tool, **kwargs: object())
+    monkeypatch.setattr(
+        server.tools,
+        "tool_runner",
+        AsyncMock(return_value=ToolResult(structured_content={"error": {"code": "bad_request"}})),
+    )
+    monkeypatch.setattr(
+        server,
+        "daemon_connection",
+        lambda: _status_context({"ok": True, "data": {"account_protection": None}}),
+    )
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+
+    result = _call_tool_result(await server.call_tool("list_dialogs", {}))
+
+    assert result.is_error is True
+    assert result.structured_content is not None
+    error = cast(dict[str, object], result.structured_content["error"])
+    assert error["code"] == "tool_error"
+    assert "reserved top-level error" in cast(str, error["message"])
 
 
 @pytest.mark.asyncio
@@ -1174,12 +1440,21 @@ async def test_call_tool_returns_structuredContent_with_empty_success_content(
             )
         ),
     )
+    monkeypatch.setattr(
+        server,
+        "daemon_connection",
+        lambda: _status_context({"ok": True, "data": {"account_protection": None}}),
+    )
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
 
     result = _call_tool_result(await server.call_tool("list_dialogs", {}))
 
     assert result.is_error is False
     structured_content = cast(dict[str, object], result.structured_content)
-    assert structured_content == {"dialogs": [{"id": 1, "name": "Alice"}], "count": 1}
+    assert structured_content == {
+        "dialogs": [{"id": 1, "name": "Alice"}],
+        "count": 1,
+    }
     assert result.content == []
 
 

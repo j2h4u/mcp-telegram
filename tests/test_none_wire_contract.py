@@ -141,6 +141,10 @@ async def test_call_tool_omits_none_from_direct_tool_result(monkeypatch: pytest.
     assert cast(dict[str, object], result.structured_content) == {
         "nested": {"keep": 1},
         "items": [None, {"keep": 2}],
+        "account_protection": {
+            "status": "unavailable",
+            "notice": "Account protection status is unavailable; Telegram acquisition state could not be confirmed.",
+        },
     }
 
 
@@ -156,7 +160,18 @@ async def test_call_tool_omits_none_from_direct_structured_error(monkeypatch: py
     monkeypatch.setattr(server.tools, "tool_runner", fake_runner)
     result = await server.call_tool("list_dialogs", {})
     assert result.is_error is True
-    assert cast(dict[str, object], result.structured_content) == {"error": {"code": "bad_request"}}
+    assert cast(dict[str, object], result.structured_content) == {
+        "error": {
+            "code": "tool_error",
+            "message": "Tool request failed.",
+            "action": "Check the tool response and retry.",
+            "details": {"error": {"code": "bad_request"}},
+        },
+        "account_protection": {
+            "status": "unavailable",
+            "notice": "Account protection status is unavailable; Telegram acquisition state could not be confirmed.",
+        },
+    }
 
 
 def test_structured_result_temporal_projection_precedes_wire_compaction() -> None:

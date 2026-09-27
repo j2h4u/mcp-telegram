@@ -74,6 +74,31 @@ def test_check_daemon_response_passes_extra_kwargs():
     assert result.has_cursor is True
 
 
+def test_check_daemon_response_exposes_manual_recovery_in_structured_error() -> None:
+    result = _check_daemon_response(
+        {
+            "ok": False,
+            "error": "flood_wait_kill_switch_open",
+            "message": "Telegram acquisition is blocked by account protection.",
+            "required_action": "manual_operator_recovery",
+            "retryable": False,
+        }
+    )
+
+    assert result is not None
+    content = cast(_TextContent, result.content[0])
+    assert "Recovery requires operator action." in content.text
+    assert "Fix the arguments" not in content.text
+    assert result.error_code == "flood_wait_kill_switch_open"
+
+
+def test_check_daemon_response_uses_string_detail_fallback() -> None:
+    result = _check_daemon_response({"ok": False, "error": "backend_error", "detail": "daemon is busy"})
+
+    assert result is not None
+    assert "daemon is busy" in cast(_TextContent, result.content[0]).text
+
+
 # ---------------------------------------------------------------------------
 # Telemetry helpers (_base.py)
 # ---------------------------------------------------------------------------
