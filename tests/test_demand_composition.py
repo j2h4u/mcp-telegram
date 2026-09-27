@@ -621,7 +621,8 @@ async def test_malformed_dm_checkpoint_does_not_block_realtime_gate_acquisition(
 ) -> None:
     from telethon.tl import functions, types  # type: ignore[import-untyped]
 
-    from mcp_telegram.event_handlers import EventHandlerManager
+    from mcp_telegram.demand_wiring import DemandOfferSink
+    from mcp_telegram.event_handlers import EventHandlerManager, _NewMessageEvent
     from tests.test_telegram_rpc import _gate, _set_sender
 
     dependencies, _objects = composition_dependencies
@@ -652,12 +653,19 @@ async def test_malformed_dm_checkpoint_does_not_block_realtime_gate_acquisition(
 
     monkeypatch.setattr("mcp_telegram.event_handlers._build_fwd_entity_map", acquire_forward_entity)
     manager = EventHandlerManager(SimpleNamespace(), dependencies.conn, dependencies.shutdown_event)  # type: ignore[arg-type]
-    manager.bind_demand_sink(lambda *_kinds: None)
+
+    class _DemandSink:
+        def offer(self, _kind: DemandKind) -> bool:
+            return True
+
+    manager.bind_demand_sink(cast(DemandOfferSink, _DemandSink()))
     message = build_mock_message(id=1, text="realtime")
     message.fwd_from = SimpleNamespace(from_name=None, from_id=types.PeerChannel(channel_id=8))
     try:
         with rpc_scope(TelegramRpcSource.REALTIME_EVENT):
-            await manager.on_new_message(SimpleNamespace(chat_id=dialog_id, message=message, is_private=False))
+            await manager.on_new_message(
+                cast(_NewMessageEvent, SimpleNamespace(chat_id=dialog_id, message=message, is_private=False))
+            )
 
         assert len(sends) == 1 and isinstance(sends[0], functions.channels.GetFullChannelRequest)
         assert scopes == [
