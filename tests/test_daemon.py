@@ -32,6 +32,7 @@ from mcp_telegram.entity_profile.contracts import (
     UserProfileObservation,
 )
 from mcp_telegram.own_only_contracts import OwnOnlyContext
+from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.startup_identity import (
     StartupIdentityResult,
     StartupIdentityState,
@@ -130,12 +131,15 @@ class _ClientStub:
         self.close_scheduler_calls = 0
         self.observer_detached = False
         self.request_observer_detached = False
+        self.flood_event_observer_detached = False
+        self.stages: list[str] = []
 
     def is_connected(self) -> bool:
         return True
 
     async def disconnect(self) -> None:
         self.disconnect_calls += 1
+        self.stages.append("disconnect")
 
     async def close_rpc_scheduler(self) -> None:
         self.close_scheduler_calls += 1
@@ -145,6 +149,9 @@ class _ClientStub:
 
     def set_rpc_request_observer(self, observer: object | None) -> None:
         self.request_observer_detached = observer is None
+
+    def set_flood_event_observer(self, observer: object | None) -> None:
+        self.flood_event_observer_detached = observer is None
 
     async def get_me(self) -> object:
         return SimpleNamespace(id=1)
@@ -613,4 +620,21 @@ async def test_shutdown_requests_coordinator_stop_before_connections_close() -> 
     assert client.close_scheduler_calls == 1
     assert client.observer_detached
     assert client.request_observer_detached
+    assert client.flood_event_observer_detached
     assert cast(_ConnectionStub, ctx.conn).close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_flushes_rpc_summaries_after_telegram_disconnect() -> None:
+    stages: list[str] = []
+    client = _ClientStub()
+    client.stages = stages
+    ctx = _typed_ctx(client=client, conn=_ConnectionStub())
+    ctx.rpc_admission_observer = cast(
+        RpcAdmissionObservationAggregator,
+        SimpleNamespace(flush=lambda: stages.append("flush")),
+    )
+
+    await _shutdown_sync_main_context(ctx)
+
+    assert stages.index("disconnect") < stages.index("flush")

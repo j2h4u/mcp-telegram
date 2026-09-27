@@ -4,6 +4,7 @@ import threading
 from dataclasses import dataclass, field, replace
 
 from mcp_telegram.config import RuntimeObservationConfig
+from mcp_telegram.flood import FloodWaitObservation
 from mcp_telegram.rpc_admission_observations import DemandEvidenceOutcome, RpcAdmissionObservationAggregator
 from mcp_telegram.runtime_observations import MAX_PAYLOAD_BYTES, encode_payload
 from mcp_telegram.telegram_demand import AcquisitionKind
@@ -83,6 +84,48 @@ def test_terminal_admission_outcomes_remain_raw() -> None:
     payload = recorder.rows[0]["payload"]
     assert isinstance(payload, dict)
     assert payload["source"] == "mcp_interactive"
+
+
+def test_flood_wait_records_content_free_sender_provenance_immediately() -> None:
+    recorder = _Recorder()
+    aggregator = RpcAdmissionObservationAggregator(recorder, policy=RuntimeObservationConfig(), clock=lambda: 0.0)
+
+    aggregator.observe_flood_wait(
+        FloodWaitObservation(
+            source=TelegramRpcSource.MESSAGE_READ_FALLBACK,
+            service_class=RPC_SOURCE_SERVICE_CLASS[TelegramRpcSource.MESSAGE_READ_FALLBACK],
+            demand_kind=DemandKind.MESSAGE_READ_FALLBACK,
+            acquisition_kind=AcquisitionKind.MESSAGE_HISTORY_PAGE,
+            seconds=23,
+            cooldown_until_utc_ms=1_700_000_023_000,
+            circuit_open=False,
+            request_method="GetHistoryRequest",
+            origin="vendor_cache",
+            actual_dispatch=False,
+            admission_sequence=None,
+            dispatch_at_monotonic=None,
+            observed_at_ms=1_700_000_000_000,
+        )
+    )
+
+    assert len(recorder.rows) == 1
+    row = recorder.rows[0]
+    assert row["kind"] == "telegram.rpc_admission"
+    assert row["outcome"] == "flood_wait"
+    assert row["reason_code"] == "vendor_cache"
+    assert row["duration_ms"] == 23_000
+    assert row["observed_at_ms"] == 1_700_000_000_000
+    assert row["payload"] == {
+        "source": "message_read_fallback",
+        "service_class": "interactive",
+        "request_method": "GetHistoryRequest",
+        "origin": "vendor_cache",
+        "actual_dispatch": False,
+        "cooldown_until_utc_ms": 1_700_000_023_000,
+        "circuit_open": False,
+        "demand_kind": "message_read_fallback",
+        "acquisition_kind": "message_history_page",
+    }
 
 
 def test_due_event_flushes_completed_window() -> None:

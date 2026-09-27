@@ -31,7 +31,7 @@ from telethon.tl.functions.updates import (  # type: ignore[import-untyped]
 )
 from telethon.utils import is_list_like  # type: ignore[import-untyped]
 
-from .flood import TelegramRpcThrottled, flood_seconds
+from .flood import FloodWaitObservation, TelegramRpcThrottled, flood_seconds
 from .request_timing import current_timing, timing_phase
 from .telegram_demand import (
     AcquisitionKind,
@@ -68,6 +68,32 @@ def raise_if_flood_wait_error(error: BaseException) -> None:
     """Re-raise vendor FloodWait outcomes before application catches."""
     if isinstance(error, FloodWaitError):
         raise error
+
+
+def _annotate_flood_attempt(
+    error: BaseException,
+    *,
+    request_method: str,
+    admission_sequence: int | None,
+    dispatch_at_monotonic: float | None,
+    dispatch_kind: str,
+) -> None:
+    """Attach bounded request provenance without retaining request arguments."""
+    if getattr(error, "_mcp_telegram_flood_attempt", None) is not None:
+        return
+    try:
+        setattr(  # noqa: B010 - Telethon exception provenance is attached dynamically.
+            error,
+            "_mcp_telegram_flood_attempt",
+            {
+                "request_method": request_method,
+                "admission_sequence": admission_sequence,
+                "dispatch_at_monotonic": dispatch_at_monotonic,
+                "dispatch_kind": dispatch_kind,
+            },
+        )
+    except (AttributeError, TypeError):
+        return
 
 
 TransientRpcErrors = (
@@ -131,11 +157,22 @@ class _AdmissionAwareSender:
                     self._gate._observe_rpc_request(self._scope)
                 if (timing := current_timing()) is not None:
                     timing.record_rpc_attempt()
+                dispatch_at_monotonic = time.monotonic()
                 future = self._send_attempt(request, ordered=ordered)
                 if isinstance(future, list):
                     self._reject_batch(future)
                 with timing_phase("rpc_execution"):
-                    return await future
+                    try:
+                        return await future
+                    except (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError) as exc:
+                        _annotate_flood_attempt(
+                            exc,
+                            request_method=type(request).__name__,
+                            admission_sequence=admission.sequence,
+                            dispatch_at_monotonic=dispatch_at_monotonic,
+                    dispatch_kind="actual_send",
+                        )
+                        raise
             finally:
                 self._gate._admission_scheduler.complete(admission)
 
@@ -242,6 +279,7 @@ class TelegramRpcGate(TelegramClient):
         self._cooldown_buffer_seconds = cooldown_buffer_seconds
         self._transient_retry_delays = transient_retry_delays_seconds
         self._flood_observer = flood_observer
+        self._flood_event_observer: Callable[[FloodWaitObservation], None] | None = None
         self._rpc_request_observer = rpc_request_observer
         self._cooldown_persistence = cooldown_persistence
         self._restore_account_cooldown()
@@ -286,6 +324,10 @@ class TelegramRpcGate(TelegramClient):
     def set_rpc_request_observer(self, observer: Callable[..., None] | None) -> None:
         """Attach bounded per-request-class attempt telemetry."""
         self._rpc_request_observer = observer
+
+    def set_flood_event_observer(self, observer: Callable[[FloodWaitObservation], None] | None) -> None:
+        """Attach content-free FloodWait telemetry owned by the daemon."""
+        self._flood_event_observer = observer
 
     @property
     def reconnect_event(self) -> asyncio.Event:
@@ -437,7 +479,7 @@ class TelegramRpcGate(TelegramClient):
         await asyncio.sleep(self._scheduler_policy.update_loop_retry_seconds)
 
     async def _handle_flood_wait(self, scope: TelegramRpcScope, exc: BaseException) -> None:
-        seconds = await self._observe_flood(exc)
+        seconds = await self._observe_flood(exc, scope=scope)
         if scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
             self._admission_scheduler.record_retry(scope, reason="flood_wait")
             return
@@ -461,8 +503,23 @@ class TelegramRpcGate(TelegramClient):
         without constructing a live Telethon sender.
         """
         self.check_circuit()
+        await self._wait_for_account_cooldown(scope)
+        self.check_circuit()
         sender = _AdmissionAwareSender(self, self._send_real_sender, scope)
-        return await super()._call(sender, request, ordered=ordered)  # type: ignore[misc]
+        evidence = scope.attempt_evidence
+        attempts_before = evidence.actual_attempts if evidence is not None else None
+        try:
+            return await super()._call(sender, request, ordered=ordered)  # type: ignore[misc]
+        except (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError) as exc:
+            positively_pre_sender = evidence is not None and evidence.actual_attempts == attempts_before
+            _annotate_flood_attempt(
+                exc,
+                request_method=type(request).__name__ if positively_pre_sender else "unknown",
+                admission_sequence=None,
+                dispatch_at_monotonic=None,
+                dispatch_kind="vendor_cache" if positively_pre_sender else "unknown",
+            )
+            raise
 
     async def _admit(self, scope: TelegramRpcScope) -> RpcAdmission:
         self.check_circuit()
@@ -512,7 +569,31 @@ class TelegramRpcGate(TelegramClient):
             )
             await asyncio.sleep(delay)
 
-    async def _observe_flood(self, exc: BaseException) -> int:
+    async def _wait_for_account_cooldown(self, scope: TelegramRpcScope) -> None:
+        """Wait before Telethon's cache path, bounded by this scope's deadline."""
+        started = time.monotonic()
+        deadline = scope.deadline
+        if deadline is None:
+            raise RuntimeError("Telegram RPC scope must carry its absolute admission deadline")
+        while True:
+            self.check_circuit()
+            now = time.monotonic()
+            until_deadline = deadline - now
+            if until_deadline <= 0:
+                waited = max(0.0, now - started)
+                self._admission_scheduler.record_expired_before_dispatch(scope, wait_seconds=waited)
+                raise RpcAdmissionExpiredError(scope, "Telegram RPC admission deadline elapsed")
+            remaining = account_cooldown_deadline() - now
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, until_deadline))
+            self.check_circuit()
+            if time.monotonic() >= deadline and account_cooldown_deadline() > time.monotonic():
+                waited = max(0.0, time.monotonic() - started)
+                self._admission_scheduler.record_expired_before_dispatch(scope, wait_seconds=waited)
+                raise RpcAdmissionExpiredError(scope, "Telegram RPC admission deadline elapsed")
+
+    async def _observe_flood(self, exc: BaseException, *, scope: TelegramRpcScope | None = None) -> int:
         """Atomically extend cooldown and send exactly one telemetry event."""
         seconds = flood_seconds(exc, default=self._fallback_wait_seconds)
         now = time.monotonic()
@@ -529,8 +610,55 @@ class TelegramRpcGate(TelegramClient):
                 _OBSERVED_FLOOD_IDS.add(identity)
             except TypeError:
                 _OBSERVED_FLOOD_IDS.add(identity)
-            if self._flood_observer is not None:
+            attempt = getattr(exc, "_mcp_telegram_flood_attempt", {})
+            if not isinstance(attempt, dict):
+                attempt = {}
+            origin = attempt.get("dispatch_kind", "unknown")
+            if origin != "vendor_cache" and self._flood_observer is not None:
                 self._flood_observer(source="telegram_rpc_gate", seconds=seconds)
+            flood_event_observer = getattr(self, "_flood_event_observer", None)
+            if scope is not None and flood_event_observer is not None:
+                cooldown_until_utc_ms = int(
+                    (time.time() + max(0.0, _COOLDOWN_DEADLINE - time.monotonic())) * 1_000
+                )
+                status = self._rpc_circuit_status()
+                actual_dispatch = origin == "actual_send"
+                if origin not in {"actual_send", "vendor_cache"}:
+                    origin = "unknown"
+                observation = FloodWaitObservation(
+                    source=scope.source.value,
+                    service_class=scope.service_class.value,
+                    demand_kind=scope.demand_kind.value if scope.demand_kind is not None else None,
+                    acquisition_kind=scope.acquisition_kind.value if scope.acquisition_kind is not None else None,
+                    seconds=seconds,
+                    cooldown_until_utc_ms=cooldown_until_utc_ms,
+                    circuit_open=status.open,
+                    request_method=str(attempt.get("request_method", "unknown")),
+                    origin=origin,
+                    actual_dispatch=actual_dispatch if origin != "unknown" else None,
+                    admission_sequence=cast(int | None, attempt.get("admission_sequence")),
+                    dispatch_at_monotonic=cast(float | None, attempt.get("dispatch_at_monotonic")),
+                    observed_at_ms=int(time.time() * 1_000),
+                )
+                logger.warning(
+                    "telegram_flood_wait source=%s demand=%s acquisition=%s request_method=%s "
+                    "origin=%s actual_dispatch=%s admission_sequence=%s seconds=%d "
+                    "cooldown_until_utc_ms=%d circuit_open=%s",
+                    scope.source.value,
+                    scope.demand_kind.value if scope.demand_kind is not None else "unknown",
+                    scope.acquisition_kind.value if scope.acquisition_kind is not None else "unknown",
+                    observation.request_method,
+                    observation.origin,
+                    observation.actual_dispatch,
+                    observation.admission_sequence,
+                    observation.seconds,
+                    cooldown_until_utc_ms,
+                    observation.circuit_open,
+                )
+                try:
+                    flood_event_observer(observation)
+                except Exception:
+                    logger.exception("flood_wait_event_observer_failed source=%s", scope.source.value)
             return seconds
 
 

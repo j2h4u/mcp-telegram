@@ -56,6 +56,25 @@ class TelegramRpcThrottled(RuntimeError):  # noqa: N818 - public domain outcome 
         super().__init__(detail or ("Telegram RPC circuit is latched" if latched else "Telegram RPC throttled"))
 
 
+@dataclass(frozen=True, slots=True)
+class FloodWaitObservation:
+    """Content-free provenance for one observed server or cached FloodWait."""
+
+    source: str
+    service_class: str
+    demand_kind: str | None
+    acquisition_kind: str | None
+    seconds: int
+    cooldown_until_utc_ms: int
+    circuit_open: bool
+    request_method: str
+    origin: str
+    actual_dispatch: bool | None
+    admission_sequence: int | None
+    dispatch_at_monotonic: float | None
+    observed_at_ms: int
+
+
 def _validate_throttle_state(retry_after_seconds: int | None, latched: bool) -> None:
     if not isinstance(latched, bool):
         raise ValueError("latched must be a bool")

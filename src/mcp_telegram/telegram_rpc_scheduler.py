@@ -709,6 +709,15 @@ class TelegramRpcAdmissionScheduler:
         """Record a durable slice yield before another sender attempt."""
         self._emit_for_scope(RpcAdmissionEventKind.REJECTED, scope, reason="attempt_budget_exhausted")
 
+    def record_expired_before_dispatch(self, scope: TelegramRpcScope, *, wait_seconds: float) -> None:
+        """Record an attempt that expired while waiting outside the admission queue."""
+        self._emit_for_scope(
+            RpcAdmissionEventKind.EXPIRED,
+            scope,
+            wait_seconds=max(0.0, wait_seconds),
+            reason="deadline_elapsed",
+        )
+
     def _configured_deadline_seconds(self, service_class: RpcServiceClass) -> float:
         """Return the injected admission duration for one service class."""
         if service_class is RpcServiceClass.INTERACTIVE:

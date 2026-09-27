@@ -247,6 +247,8 @@ class _DaemonClient(Protocol):
 
     def set_rpc_request_observer(self, observer: Callable[..., None] | None) -> None: ...
 
+    def set_flood_event_observer(self, observer: Callable[..., None] | None) -> None: ...
+
     async def get_me(self) -> object: ...
 
     async def get_input_entity(self, dialog_id: int, /) -> object: ...
@@ -1245,6 +1247,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
             )
         )
         client.set_rpc_request_observer(rpc_admission_observer.observe_request_attempt)
+        client.set_flood_event_observer(rpc_admission_observer.observe_flood_wait)
     return ctx
 
 
@@ -1766,6 +1769,7 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
     async def detach_observer() -> None:
         ctx.client.set_rpc_admission_observer(None)
         ctx.client.set_rpc_request_observer(None)
+        ctx.client.set_flood_event_observer(None)
 
     async def drain_telemetry() -> None:
         if ctx.rpc_admission_observer is not None:
