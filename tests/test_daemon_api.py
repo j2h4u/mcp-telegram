@@ -8072,8 +8072,9 @@ async def test_duplicate_exact_dialog_names_fail_closed_with_deterministic_ids_a
     assert {candidate["disambiguation_hint"] for candidate in candidates} == {
         '2 entities match "Twin Project": supergroup, user. Specify @username or numeric id.'
     }
-    assert "exact" in str(first["required_action"]).lower()
-    assert "id" in str(first["required_action"]).lower()
+    assert first["required_action"] == (
+        "Retry with an exact dialog id from structuredContent.error.details.candidates."
+    )
     cast(MagicMock, client.iter_messages).assert_not_called()
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import sqlite3
 from collections.abc import Coroutine
@@ -29,6 +30,7 @@ from mcp_telegram.daemon import (
     _SyncMainContext,
     _wait_for_startup_identity,
 )
+from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.dialog_directory import CanonicalDialogDirectory
 from mcp_telegram.entity_profile.contracts import (
     ProjectionOutcome,
@@ -36,7 +38,9 @@ from mcp_telegram.entity_profile.contracts import (
     TargetKind,
     UserProfileObservation,
 )
-from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
+from mcp_telegram.feedback_service import FeedbackApplicationService
+from mcp_telegram.flood import FloodWaitKillSwitchStatus, TelegramRpcThrottled
 from mcp_telegram.own_only_contracts import OwnOnlyContext
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.runtime_observations import RuntimeObservationSink
@@ -46,12 +50,23 @@ from mcp_telegram.startup_identity import (
     StartupIdentityUnavailableError,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_demand import DemandStatus, RpcAttemptBudget
+from mcp_telegram.telegram_demand_coordinator import CoordinatorState, TelegramDemandCoordinator
+from mcp_telegram.telegram_rpc_consumers import DURABLE_DEMAND_ORDER, DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
     RPC_SOURCE_SERVICE_CLASS,
     RpcAdmissionEvent,
     RpcAdmissionEventKind,
     TelegramRpcSource,
+)
+from tests.daemon_api_policy import make_daemon_api_policy
+from tests.helpers import (
+    LoudChannelProfilePort,
+    LoudChatAvatarHistoryPort,
+    LoudCommonChatsPort,
+    LoudGroupProfilePort,
+    LoudUserAvatarHistoryPort,
+    LoudUserProfilePort,
 )
 
 
@@ -692,6 +707,220 @@ async def test_protective_stop_drains_producers_before_flushing_admission_observ
     await _monitor_flood_wait_kill_switch(ctx)
 
     assert stages == ["producer_cancelled", "disconnect", "flush"]
+
+
+@pytest.mark.asyncio
+async def test_latched_coordinator_stop_keeps_local_daemon_socket_available(  # noqa: PLR0914, PLR0915
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A latched durable acquisition stops its pump, then the monitor tears down Telegram only."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    feedback_conn = ensure_feedback_schema(tmp_path / "feedback.db")
+    shutdown = asyncio.Event()
+    kill_switch = asyncio.Event()
+    client = _ClientStub()
+    api = DaemonAPIServer(
+        conn,
+        cast(DaemonClientLike, client),
+        shutdown,
+        FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn)),
+        channel_profile_port=LoudChannelProfilePort(),
+        group_profile_port=LoudGroupProfilePort(),
+        user_profile_port=LoudUserProfilePort(),
+        common_chats_port=LoudCommonChatsPort(),
+        user_avatar_history_port=LoudUserAvatarHistoryPort(),
+        chat_avatar_history_port=LoudChatAvatarHistoryPort(),
+        policy=make_daemon_api_policy(),
+    )
+    api._ready = True
+    active_status = FloodWaitKillSwitchStatus(
+        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    )
+    api._health_status = lambda: active_status
+    monkeypatch.setattr(daemon, "flood_wait_kill_switch_status", lambda: active_status)
+
+    raw_sends: list[str] = []
+
+    class _Adapter:
+        def __init__(self, *, ready: bool = False) -> None:
+            self.ready = ready
+
+        def status(self, _now: float) -> DemandStatus | None:
+            return DemandStatus(0) if self.ready else None
+
+        async def run_slice(self, _budget: RpcAttemptBudget) -> None:
+            raw_sends.append("attempt")
+            kill_switch.set()
+            raise TelegramRpcThrottled(latched=True)
+
+    target = DemandKind.ENTITY_PROFILE_REFRESH
+    adapters = {kind: _Adapter(ready=kind is target) for kind in DURABLE_DEMAND_ORDER}
+    coordinator = TelegramDemandCoordinator(adapters, shutdown)
+    noncritical_started = asyncio.Event()
+
+    async def noncritical_producer() -> None:
+        noncritical_started.set()
+        await asyncio.Future()
+
+    ctx = _typed_ctx(
+        conn=conn,
+        client=client,
+        api_server=api,
+        shutdown_event=shutdown,
+        flood_wait_kill_switch_event=kill_switch,
+        background_tasks=set(),
+        rpc_admission_observer=None,
+    )
+    socket_path = tmp_path / "daemon.sock"
+    unix_server = await asyncio.start_unix_server(api.handle_client, path=socket_path)
+    try:
+        coordinator_task = daemon._create_tracked_task(
+            ctx,
+            coordinator.run(),
+            name="telegram_demand_coordinator",
+            critical=True,
+        )
+        noncritical_task = daemon._create_tracked_task(ctx, noncritical_producer(), name="noncritical_producer")
+        await noncritical_started.wait()
+        await coordinator_task
+
+        assert coordinator.state is CoordinatorState.STOPPED
+        assert shutdown.is_set() is False
+        assert api._ready is True
+        assert raw_sends == ["attempt"]
+
+        await _monitor_flood_wait_kill_switch(ctx)
+        assert client.disconnect_calls == 1
+        assert noncritical_task.cancelled()
+        assert shutdown.is_set() is False
+        assert api._ready is True
+        assert unix_server.is_serving()
+        assert socket_path.exists()
+        assert raw_sends == ["attempt"]
+
+        async def request(payload: dict[str, object]) -> dict[str, object]:
+            reader, writer = await asyncio.open_unix_connection(socket_path)
+            writer.write(json.dumps(payload).encode() + b"\n")
+            await writer.drain()
+            response = cast(dict[str, object], json.loads((await reader.readline()).decode()))
+            writer.close()
+            await writer.wait_closed()
+            return response
+
+        protection = await request({"method": "get_account_protection"})
+        feedback = await request({"method": "submit_feedback", "message": "local after latch"})
+        assert protection["ok"] is True
+        assert cast(dict[str, object], protection["data"])["account_protection"] is not None
+        assert feedback["ok"] is True
+        assert feedback_conn.execute("SELECT message FROM feedback").fetchone() == ("local after latch",)
+    finally:
+        unix_server.close()
+        await unix_server.wait_closed()
+        await api.shutdown()
+        feedback_conn.close()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_protective_monitor_cancels_active_coordinator_without_closing_local_socket(  # noqa: PLR0914, PLR0915
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = sqlite3.connect(":memory:")
+    shutdown = asyncio.Event()
+    kill_switch = asyncio.Event()
+    client = _ClientStub()
+    api = DaemonAPIServer(
+        conn,
+        cast(DaemonClientLike, client),
+        shutdown,
+        channel_profile_port=LoudChannelProfilePort(),
+        group_profile_port=LoudGroupProfilePort(),
+        user_profile_port=LoudUserProfilePort(),
+        common_chats_port=LoudCommonChatsPort(),
+        user_avatar_history_port=LoudUserAvatarHistoryPort(),
+        chat_avatar_history_port=LoudChatAvatarHistoryPort(),
+        policy=make_daemon_api_policy(),
+    )
+    api._ready = True
+    active_status = FloodWaitKillSwitchStatus(
+        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    )
+    api._health_status = lambda: active_status
+    monkeypatch.setattr(daemon, "flood_wait_kill_switch_status", lambda: active_status)
+    started = asyncio.Event()
+    raw_sends: list[str] = []
+
+    class _BlockedAdapter:
+        def __init__(self, *, ready: bool = False) -> None:
+            self.ready = ready
+
+        def status(self, _now: float) -> DemandStatus | None:
+            return DemandStatus(0) if self.ready else None
+
+        async def run_slice(self, _budget: RpcAttemptBudget) -> None:
+            started.set()
+            await asyncio.Future()
+            raw_sends.append("unexpected")
+
+    target = DemandKind.ENTITY_PROFILE_REFRESH
+    coordinator = TelegramDemandCoordinator(
+        {kind: _BlockedAdapter(ready=kind is target) for kind in DURABLE_DEMAND_ORDER}, shutdown
+    )
+    noncritical_started = asyncio.Event()
+
+    async def noncritical_producer() -> None:
+        noncritical_started.set()
+        await asyncio.Future()
+
+    ctx = _typed_ctx(
+        conn=conn,
+        client=client,
+        api_server=api,
+        shutdown_event=shutdown,
+        flood_wait_kill_switch_event=kill_switch,
+        background_tasks=set(),
+        rpc_admission_observer=None,
+    )
+    socket_path = tmp_path / "monitor-first.sock"
+    unix_server = await asyncio.start_unix_server(api.handle_client, path=socket_path)
+    try:
+        coordinator_task = daemon._create_tracked_task(
+            ctx,
+            coordinator.run(),
+            name="telegram_demand_coordinator",
+            critical=True,
+        )
+        noncritical_task = daemon._create_tracked_task(ctx, noncritical_producer(), name="noncritical_producer")
+        await asyncio.gather(started.wait(), noncritical_started.wait())
+        kill_switch.set()
+        await _monitor_flood_wait_kill_switch(ctx)
+        with pytest.raises(asyncio.CancelledError):
+            await coordinator_task
+
+        assert coordinator.state is CoordinatorState.STOPPED
+        assert client.disconnect_calls == 1
+        assert noncritical_task.cancelled()
+        assert shutdown.is_set() is False
+        assert api._ready is True
+        assert unix_server.is_serving()
+        assert raw_sends == []
+
+        reader, writer = await asyncio.open_unix_connection(socket_path)
+        writer.write(b'{"method":"get_account_protection"}\n')
+        await writer.drain()
+        response = cast(dict[str, object], json.loads((await reader.readline()).decode()))
+        writer.close()
+        await writer.wait_closed()
+        assert response["ok"] is True
+    finally:
+        unix_server.close()
+        await unix_server.wait_closed()
+        await api.shutdown()
+        conn.close()
 
 
 @pytest.mark.asyncio

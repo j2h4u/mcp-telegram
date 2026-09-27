@@ -393,6 +393,12 @@ class DaemonHealthStatus(Protocol):
     @property
     def open(self) -> bool: ...
 
+    @property
+    def reason(self) -> str | None: ...
+
+    @property
+    def opened_at(self) -> int | None: ...
+
     def detail(self) -> str: ...
 
 
@@ -400,6 +406,14 @@ class _HealthyDaemonStatus:
     @property
     def open(self) -> bool:
         return False
+
+    @property
+    def reason(self) -> None:
+        return None
+
+    @property
+    def opened_at(self) -> None:
+        return None
 
     def detail(self) -> str:
         return "daemon health gate is closed"
@@ -1211,7 +1225,7 @@ class DaemonAPIServer:
             "message": f"Dialog {selector.label!r} matched multiple dialogs.",
             "candidates": candidates,
             "directory_coverage": coverage_wire,
-            "required_action": "Retry with an exact dialog id from candidates.",
+            "required_action": "Retry with an exact dialog id from structuredContent.error.details.candidates.",
         }
 
     @staticmethod
