@@ -998,6 +998,36 @@ async def test_observed_trace_reports_only_current_evidence_dialog_problems(
 
 
 @pytest.mark.asyncio
+async def test_trace_partial_local_evidence_survives_active_protection(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+) -> None:
+    server, conn, client = trace_server
+    server._ready = True
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    )
+    seed_entity(conn, entity_id=101, name="Alice", username="alice")
+    seed_dialog(conn, dialog_id=-100123, name="Historical", dialog_type="Supergroup")
+    seed_synced_dialog(conn, dialog_id=-100123, status="access_lost")
+    seed_message(conn, dialog_id=-100123, message_id=1, sent_at=10, sender_id=101, text="cached")
+    seed_trace_fragment(conn, target_user_id=101, dialog_id=-100123, status="budget_exceeded")
+    conn.commit()
+
+    result, _, _ = await server._handle_client_line(
+        b'{"method":"trace_account_messages","exact_account_id":101,"coverage_goal":"best_effort_visible"}',
+        "",
+        None,
+    )
+    data = _dict(result["data"])
+    coverage = _dict(data["coverage"])
+
+    assert result["ok"] is True
+    assert coverage["state"] == "partial"
+    assert coverage["observed_message_count"] == 1
+    client.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_best_effort_keeps_broad_warnings_but_excludes_direct_chat(
     trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
     trace_service: DaemonAccountTraceService,
