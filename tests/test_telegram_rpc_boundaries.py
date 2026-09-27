@@ -72,6 +72,9 @@ def test_repository_has_no_boundary_violations() -> None:
         "client._call(request)\n",
         "client._sender.send(request)\n",
         "sender = client._sender\nsender.send(request)\n",
+        "client._main_sender.send(request)\n",
+        "sender = client._main_sender\nsender.send(request)\n",
+        "send = client._main_sender.send\nawait send(request)\n",
         "from telethon import TelegramClient\nTelegramClient.__call__(client, request)\n",
         "from telethon import TelegramClient\nTelegramClient.get_messages(client)\n",
         "from telethon import TelegramClient\nclass OtherGate(TelegramClient):\n    async def call(self, request):\n        return await super().__call__(request)\n",
@@ -140,7 +143,12 @@ def test_boundary_allows_only_named_factory_and_transport_seams(
         "    async def update(self):\n"
         "        return await super()._update_loop()\n"
         "    async def send(self, request):\n"
-        "        return await self._sender.send(request)\n",
+        "        return await self._sender.send(request)\n"
+        "    async def send_main(self, request):\n"
+        "        return await self._main_sender.send(request)\n"
+        "class _MainSenderAdapter:\n"
+        "    def send(self, request):\n"
+        "        return self._gate._main_sender.send(request)\n",
         encoding="utf-8",
     )
     gate = _load_gate()

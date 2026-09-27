@@ -60,10 +60,12 @@ _UNADMITTED_TRANSPORT_METHODS = frozenset(
         "_create_exported_sender",
     }
 )
+_PRIVATE_SENDER_ATTRIBUTES = frozenset({"_sender", "_main_sender"})
 _MIN_CLIENT_CHAIN_PARTS = 2
 _VENDOR_WAIT_NAMES = frozenset({"FloodWaitError", "FloodPremiumWaitError", "FloodTestPhoneWaitError"})
 _REMOVED_NAMES = frozenset({"TelegramRpcCircuitOpenError", "FloodWaitErrors"})
 _GATE_NAME = "TelegramRpcGate"
+_TRANSPORT_OWNER_CLASSES = frozenset({"TelegramRpcGate", "_MainSenderAdapter"})
 _LIMITER_NAME = "AsyncLimiter"
 _SCHEDULER_NAME = "TelegramRpcAdmissionScheduler"
 
@@ -129,7 +131,11 @@ class _BoundaryVisitor(ast.NodeVisitor):
 
     @property
     def in_transport_owner(self) -> bool:
-        return _owner_path(self.path, _TRANSPORT_OWNER_PATHS) and self._class_stack[-1:] == ["TelegramRpcGate"]
+        return (
+            _owner_path(self.path, _TRANSPORT_OWNER_PATHS)
+            and bool(self._class_stack)
+            and self._class_stack[-1] in _TRANSPORT_OWNER_CLASSES
+        )
 
     @property
     def in_telethon_client_subclass(self) -> bool:
@@ -392,8 +398,8 @@ class _BoundaryVisitor(ast.NodeVisitor):
     def _check_private_telegram_attribute(self, node: ast.Attribute) -> None:
         if node.attr == "_call" and not self.in_transport_owner:
             self._add(node, "private Telegram _call bypasses admission")
-        if node.attr == "_sender" and not self.in_transport_owner:
-            self._add(node, "private Telegram _sender bypasses admission")
+        if node.attr in _PRIVATE_SENDER_ATTRIBUTES and not self.in_transport_owner:
+            self._add(node, "private Telegram transport sender bypasses admission")
         if (
             node.attr in _UNADMITTED_TRANSPORT_METHODS
             and _is_client_receiver(node.value)
@@ -405,10 +411,10 @@ class _BoundaryVisitor(ast.NodeVisitor):
         if (
             node.attr == "send"
             and isinstance(node.value, ast.Attribute)
-            and node.value.attr == "_sender"
+            and node.value.attr in _PRIVATE_SENDER_ATTRIBUTES
             and not self.in_transport_owner
         ):
-            self._add(node, "private Telegram _sender.send bypasses admission")
+            self._add(node, "private Telegram transport sender.send bypasses admission")
 
     def _mark_gate_attribute(self, node: ast.Attribute) -> None:
         gate_target = self._gate_qualified_target(node)
