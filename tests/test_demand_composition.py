@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from collections.abc import Awaitable, Callable, Generator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -18,7 +20,13 @@ from mcp_telegram.activity_cold_backfill import (
 from mcp_telegram.activity_hot_sweep import HotActivityDemandAdapter
 from mcp_telegram.activity_sync import ArchiveBackfillDemandAdapter, ArchiveIncrementalDemandAdapter
 from mcp_telegram.daemon import SQLiteSelfProfileCadence
-from mcp_telegram.delta_sync import DeltaAccessProbeDemandAdapter, DeltaGapFillDemandAdapter, DmGapScanPage
+from mcp_telegram.delta_sync import (
+    DeltaAccessProbeDemandAdapter,
+    DeltaGapFillDemandAdapter,
+    DeltaSyncWorker,
+    DmDeletionReconciliationDemandAdapter,
+    DmGapScanPage,
+)
 from mcp_telegram.demand_composition import (
     DemandCompositionClient,
     DemandCompositionDependencies,
@@ -46,6 +54,7 @@ from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshPolicy,
     ReadReceiptDemandAdapter,
 )
+from mcp_telegram.message_history.contracts import ForwardGapPage
 from mcp_telegram.own_only_contracts import OwnOnlyContext
 from mcp_telegram.scheduled_messages import (
     ScheduledDiscoveryDemandAdapter,
@@ -65,13 +74,14 @@ from mcp_telegram.telegram_demand import (
     RpcAttemptBudget,
     current_demand_token,
 )
+from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator
 from mcp_telegram.telegram_rpc_consumers import (
     DemandKind,
     TelegramRpcSource,
     demand_freshness_seconds,
 )
-from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
-from tests.helpers import LoudUserProfilePort
+from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope, rpc_scope
+from tests.helpers import LoudUserProfilePort, build_mock_message
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +274,7 @@ def test_adapter_map_is_exact_against_literal_21_kind_class_map(
     expected = {
         DemandKind.ENTITY_PROFILE_REFRESH: EntityProfileDemandAdapter,
         DemandKind.DELTA_GAP_FILL: DeltaGapFillDemandAdapter,
+        DemandKind.DM_DELETION_RECONCILIATION: DmDeletionReconciliationDemandAdapter,
         DemandKind.DELTA_ACCESS_PROBE: DeltaAccessProbeDemandAdapter,
         DemandKind.HOT_ACTIVITY_PAGE: HotActivityDemandAdapter,
         DemandKind.LIVE_HYDRATION_BATCH: FactHydrationDemandAdapter,
@@ -284,14 +295,14 @@ def test_adapter_map_is_exact_against_literal_21_kind_class_map(
         DemandKind.SELF_PROFILE_MAINTENANCE: SelfProfileMaintenanceDemandAdapter,
         DemandKind.LINKED_CHAT_REFRESH: LinkedChatFactDemandAdapter,
     }
-    assert len(expected) == 21
+    assert len(expected) == 22
     assert set(adapters) == set(expected)
     assert {kind: type(adapter) for kind, adapter in adapters.items()} == expected
     assert all(getattr(adapter, "demand_kind", None) is kind for kind, adapter in adapters.items())
     assert adapters[DemandKind.FULL_SYNC_PAGE]._worker is objects["full"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.FULL_SYNC_DM_ENROLLMENT]._worker is objects["full"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DELTA_GAP_FILL]._worker is objects["delta"]  # type: ignore[attr-defined]
-    assert adapters[DemandKind.DELTA_GAP_FILL]._dm_gap_scanner is objects["dm_gap_scanner"]  # type: ignore[attr-defined]
+    assert adapters[DemandKind.DM_DELETION_RECONCILIATION]._scanner is objects["dm_gap_scanner"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DELTA_ACCESS_PROBE]._worker is objects["delta"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DIALOG_LIGHT_RECONCILIATION]._worker is objects["dialog"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DIALOG_BOOTSTRAP]._directory is objects["directory"]  # type: ignore[attr-defined]
@@ -300,6 +311,38 @@ def test_adapter_map_is_exact_against_literal_21_kind_class_map(
         == demand_freshness_seconds(DemandKind.ARCHIVE_INCREMENTAL)
     )
     assert adapters[DemandKind.LIVE_HYDRATION_BATCH]._worker is objects["hydration"]  # type: ignore[attr-defined]
+
+
+def test_adapter_composition_quarantines_legacy_dm_generation_before_registration(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+) -> None:
+    dependencies, objects = composition_dependencies
+    legacy_state = {
+        "status": "running",
+        "generation": 8,
+        "scan_started_at": 100,
+        "dialog_id_cursor": 7,
+        "message_cursor": 44,
+        "next_run_at": 0,
+    }
+    dependencies.conn.execute(
+        "INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', ?)",
+        (json.dumps(legacy_state),),
+    )
+    dependencies.conn.commit()
+
+    adapters = build_durable_adapter_map(dependencies)
+
+    stored = cast(
+        tuple[str],
+        dependencies.conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone(),
+    )
+    quarantined = cast(dict[str, object], json.loads(stored[0]))
+    assert {key: quarantined[key] for key in legacy_state} == {**legacy_state, "status": "suspended"}
+    assert quarantined["policy_version"] == 1
+    assert quarantined["reason"] == "legacy_generation_review"
+    assert isinstance(quarantined["state_changed_at"], int)
+    assert adapters[DemandKind.DM_DELETION_RECONCILIATION].status(1_000_000.0) is None
     assert adapters[DemandKind.BACKFILL_HYDRATION_BATCH]._worker is objects["hydration"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.FOLDER_SNAPSHOT]._worker is objects["folder"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.SCHEDULED_REPAIR]._reconciler is objects["scheduled"]  # type: ignore[attr-defined]
@@ -308,6 +351,129 @@ def test_adapter_map_is_exact_against_literal_21_kind_class_map(
     assert adapters[DemandKind.MESSAGE_FACT_REFRESH]._shutdown_event is objects["shutdown"]  # type: ignore[attr-defined]
     with pytest.raises(TypeError):
         adapters[DemandKind.SCHEDULED_REPAIR] = adapters[DemandKind.SCHEDULED_DISCOVERY]  # type: ignore[index]
+
+
+def test_adapter_composition_contains_invalid_dm_checkpoint_to_its_domain(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+) -> None:
+    dependencies, objects = composition_dependencies
+    dependencies.conn.execute("INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', NULL)")
+    dependencies.conn.commit()
+    before = cast(
+        tuple[object, ...] | None,
+        dependencies.conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone(),
+    )
+
+    adapters = build_durable_adapter_map(dependencies)
+
+    assert adapters[DemandKind.DELTA_GAP_FILL]._worker is objects["delta"]  # type: ignore[attr-defined]
+    assert adapters[DemandKind.DM_DELETION_RECONCILIATION].status(1_000_000.0) is None
+    assert (
+        dependencies.conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone()
+        == before
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_dm_checkpoint_does_not_block_forward_delta_coordinator(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+) -> None:
+    dependencies, objects = composition_dependencies
+    dialog_id = 7123
+    dependencies.conn.execute("INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', NULL)")
+    dependencies.conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?,'synced')", (dialog_id,))
+    dependencies.conn.execute(
+        "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (?,1,'explicit',0)",
+        (dialog_id,),
+    )
+    dependencies.conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (?,1,1)", (dialog_id,))
+    dependencies.conn.commit()
+
+    class EmptyForwardPage:
+        async def fetch_page(
+            self, _dialog_id: int, *, after_message_id: int, should_stop: Callable[[], bool]
+        ) -> ForwardGapPage:
+            assert after_message_id == 1
+            assert not should_stop()
+            return ForwardGapPage(messages=(), complete=True)
+
+    worker = DeltaSyncWorker(EmptyForwardPage(), dependencies.conn, dependencies.shutdown_event)  # type: ignore[arg-type]
+    coordinated_dependencies = replace(dependencies, delta_sync_worker=worker)
+    coordinator = build_durable_coordinator(coordinated_dependencies)
+
+    assert DemandKind.DELTA_GAP_FILL in coordinator.ready_kinds
+    assert DemandKind.DM_DELETION_RECONCILIATION not in coordinator.ready_kinds
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1_000):
+        await coordinator._execute_slice(DemandKind.DELTA_GAP_FILL)
+    coordinator.scan(now=1_000)
+
+    assert DemandKind.DM_DELETION_RECONCILIATION not in coordinator.ready_kinds
+    assert coordinator._adapters[DemandKind.DELTA_GAP_FILL].status(1_000).release_at == 8_200  # type: ignore[union-attr]
+    assert dependencies.conn.execute(
+        "SELECT delta_refresh_requested_at,last_delta_checked_at FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone() == (None, 1_000)
+
+
+@pytest.mark.asyncio
+async def test_claim_write_failure_uses_coordinator_backoff_then_reclaims_before_scanner(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+) -> None:
+    dependencies, _objects = composition_dependencies
+    dialog_id = 7199
+    dependencies.conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?,'synced')", (dialog_id,))
+    dependencies.conn.execute(
+        "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (?,1,'explicit',0)",
+        (dialog_id,),
+    )
+    dependencies.conn.execute("INSERT INTO entities(id,type,updated_at) VALUES (?,'user',1)", (dialog_id,))
+    dependencies.conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (?,1,1)", (dialog_id,))
+    dependencies.conn.execute(
+        """CREATE TRIGGER fail_dm_claim
+           BEFORE INSERT ON daemon_state
+           WHEN NEW.key='delta_dm_gap_scan_state' AND NEW.value LIKE '%\"status\": \"verifying\"%'
+           BEGIN SELECT RAISE(ABORT, 'injected DM claim failure'); END"""
+    )
+    dependencies.conn.commit()
+    calls = 0
+
+    class RecordingScanner:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+            nonlocal calls
+            del dialog_id, message_ids
+            calls += 1
+            row = cast(
+                tuple[object, ...] | None,
+                dependencies.conn.execute(
+                    "SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'"
+                ).fetchone(),
+            )
+            assert row is not None and isinstance(row[0], str) and '"status": "verifying"' in row[0]
+            return 0
+
+    composed = replace(dependencies, dm_gap_scanner=RecordingScanner())
+    first = TelegramDemandCoordinator(
+        build_durable_adapter_map(composed), dependencies.shutdown_event, clock=lambda: 1_000
+    )
+    kind = DemandKind.DM_DELETION_RECONCILIATION
+    assert kind in first.ready_kinds
+    await first._execute_slice(kind)
+    first._active_kind = None
+    assert calls == 0
+    assert kind not in first.scan(now=1_059)
+    assert kind in first.scan(now=1_060)
+    await first._execute_slice(kind)
+    first._active_kind = None
+    assert calls == 0
+
+    dependencies.conn.execute("DROP TRIGGER fail_dm_claim")
+    dependencies.conn.commit()
+    recovered = TelegramDemandCoordinator(
+        build_durable_adapter_map(composed), dependencies.shutdown_event, clock=lambda: 1_120
+    )
+    assert kind in recovered.ready_kinds
+    await recovered._execute_slice(kind)
+    assert calls == 1
 
 
 def test_linked_chat_adapter_selects_due_demand_and_passes_one_attempt_budget(
@@ -379,6 +545,8 @@ async def test_linked_chat_adapter_real_gate_cannot_retry_physical_send(
     from tests.test_telegram_rpc import _gate, _set_sender
 
     dependencies, _objects = composition_dependencies
+    dependencies.conn.execute("INSERT INTO daemon_state(key,value) VALUES ('delta_dm_gap_scan_state', NULL)")
+    dependencies.conn.commit()
     gate = _gate(retry_delays=(0.0,))
     physical_scopes = []
     physical_attempts = 0
@@ -434,6 +602,9 @@ async def test_linked_chat_adapter_real_gate_cannot_retry_physical_send(
 
     assert physical_attempts == 1
     assert budget.attempts == 1
+    assert dependencies.conn.execute(
+        "SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'"
+    ).fetchone() == (None,)
     assert physical_scopes == [
         (
             TelegramRpcSource.LINKED_CHAT_REFRESH,
@@ -441,6 +612,74 @@ async def test_linked_chat_adapter_real_gate_cannot_retry_physical_send(
             AcquisitionKind.LINKED_CHAT_RESOLUTION,
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_malformed_dm_checkpoint_does_not_block_realtime_gate_acquisition(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from telethon.tl import functions, types  # type: ignore[import-untyped]
+
+    from mcp_telegram.demand_wiring import DemandOfferSink
+    from mcp_telegram.event_handlers import EventHandlerManager, _NewMessageEvent
+    from tests.test_telegram_rpc import _gate, _set_sender
+
+    dependencies, _objects = composition_dependencies
+    dialog_id = 7188
+    dependencies.conn.execute("INSERT INTO daemon_state(key,value) VALUES ('delta_dm_gap_scan_state', NULL)")
+    dependencies.conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?,'synced')", (dialog_id,))
+    dependencies.conn.execute(
+        "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (?,1,'explicit',0)",
+        (dialog_id,),
+    )
+    dependencies.conn.commit()
+    gate = _gate()
+    sends: list[object] = []
+    scopes: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
+    gate.set_rpc_request_observer(
+        lambda **kwargs: scopes.append((kwargs["source"], kwargs["demand_kind"], kwargs["acquisition_kind"]))
+    )
+
+    def send(request: object) -> object:
+        sends.append(request)
+        return object()
+
+    _set_sender(gate, send)
+
+    async def acquire_forward_entity(_message: object, _client: object) -> dict[int, str]:
+        await gate(functions.channels.GetFullChannelRequest(types.InputChannel(channel_id=8, access_hash=9)))
+        return {}
+
+    monkeypatch.setattr("mcp_telegram.event_handlers._build_fwd_entity_map", acquire_forward_entity)
+    manager = EventHandlerManager(SimpleNamespace(), dependencies.conn, dependencies.shutdown_event)  # type: ignore[arg-type]
+
+    class _DemandSink:
+        def offer(self, _kind: DemandKind) -> bool:
+            return True
+
+    manager.bind_demand_sink(cast(DemandOfferSink, _DemandSink()))
+    message = build_mock_message(id=1, text="realtime")
+    message.fwd_from = SimpleNamespace(from_name=None, from_id=types.PeerChannel(channel_id=8))
+    try:
+        with rpc_scope(TelegramRpcSource.REALTIME_EVENT):
+            await manager.on_new_message(
+                cast(_NewMessageEvent, SimpleNamespace(chat_id=dialog_id, message=message, is_private=False))
+            )
+
+        assert len(sends) == 1 and isinstance(sends[0], functions.channels.GetFullChannelRequest)
+        assert scopes == [
+            (
+                TelegramRpcSource.REALTIME_EVENT,
+                DemandKind.REALTIME_EVENT_ACQUISITION,
+                AcquisitionKind.ENTITY_LOOKUP,
+            )
+        ]
+        assert dependencies.conn.execute(
+            "SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'"
+        ).fetchone() == (None,)
+    finally:
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio

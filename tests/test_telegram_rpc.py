@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import logging
 import sqlite3
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,13 +38,26 @@ from mcp_telegram.config import (
     TelegramRpcSchedulerConfig,
 )
 from mcp_telegram.daemon import _connect_telegram, _SyncMainContext
+from mcp_telegram.delta_sync import (
+    DeltaGapFillDemandAdapter,
+    DeltaSyncWorker,
+    DmDeletionReconciliationDemandAdapter,
+    prepare_dm_deletion_reconciliation,
+)
+from mcp_telegram.event_handlers import EventHandlerManager
 from mcp_telegram.flood import (
     FloodWaitAccumulator,
     FloodWaitKillSwitchPolicy,
     FloodWaitObservation,
     TelegramRpcThrottled,
 )
-from mcp_telegram.sync_db import ensure_sync_schema, load_account_cooldown_until_utc, save_account_cooldown_until_utc
+from mcp_telegram.message_history.contracts import ForwardGapPage
+from mcp_telegram.sync_db import (
+    _apply_migrations,
+    ensure_sync_schema,
+    load_account_cooldown_until_utc,
+    save_account_cooldown_until_utc,
+)
 from mcp_telegram.telegram import create_client
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
@@ -82,6 +95,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcAdmissionScheduler,
     TelegramRpcScope,
 )
+from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,12 +160,14 @@ class _RawFutureSender:
     def __init__(self) -> None:
         self.calls = 0
         self.futures: list[asyncio.Future[object]] = []
+        self.requests: list[object] = []
         self.disconnect_calls = 0
         self._connected = True
 
     def send(self, _request: object, *, ordered: bool = False) -> asyncio.Future[object]:
         del ordered
         self.calls += 1
+        self.requests.append(_request)
         future = asyncio.get_running_loop().create_future()
         self.futures.append(future)
         return future
@@ -2327,6 +2343,335 @@ async def test_actual_future_flood_is_recorded_when_caller_cancels_after_respons
     assert observation.request_method == "_TestRequest"
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
     await gate.close_rpc_scheduler()
+
+
+def _dm_reconciliation_test_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    _apply_migrations(conn)
+    conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (211, 'synced')")
+    seed_full_history_enrollment(conn, 211, enabled=True)
+    conn.execute("INSERT INTO entities(id, type, updated_at) VALUES (211, 'user', 1)")
+    conn.execute("INSERT INTO messages(dialog_id, message_id, sent_at, text) VALUES (211, 1, 1, 'local')")
+    conn.commit()
+    return conn
+
+
+def _dm_reconciliation_state_for_rpc_test(conn: sqlite3.Connection) -> dict[str, object]:
+    row = cast(
+        tuple[str], conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone()
+    )
+    import json
+
+    return cast(dict[str, object], json.loads(row[0]))
+
+
+class _DmPageFutureSender(_RawFutureSender):
+    """Record the real Telethon page request and its inherited gate scope."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scopes: list[TelegramRpcScope] = []
+
+    def send(self, request: object, *, ordered: bool = False) -> asyncio.Future[object]:
+        self.scopes.append(current_rpc_scope())
+        return super().send(request, ordered=ordered)
+
+
+class _DmEventHandlerGateClient:
+    """Typed test bridge from the production page scanner to the real gate."""
+
+    def __init__(self, gate: TelegramRpcGate) -> None:
+        self._gate = gate
+
+    def add_event_handler(self, _callback: object, _event: object) -> None:
+        return
+
+    def remove_event_handler(self, _callback: object) -> None:
+        return
+
+    async def get_messages(self, *args: object, **kwargs: object) -> object:
+        return await self._gate.get_messages(*args, **kwargs)
+
+    async def get_me(self) -> object:
+        return await self._gate.get_me()
+
+    def __call__(self, _request: object) -> Coroutine[object, object, object]:
+        async def call_gate() -> object:
+            return await self._gate(_request)
+
+        return call_gate()
+
+
+class _RecordingDmPageScanner:
+    """Preserve the production scanner while exposing its collaborator boundary."""
+
+    def __init__(self, manager: EventHandlerManager) -> None:
+        self._manager = manager
+        self.calls = 0
+
+    async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        self.calls += 1
+        return await self._manager.run_dm_gap_scan_page(dialog_id, message_ids)
+
+
+def _real_dm_page_scanner(gate: TelegramRpcGate, conn: sqlite3.Connection) -> _RecordingDmPageScanner:
+    manager = EventHandlerManager(_DmEventHandlerGateClient(gate), conn, asyncio.Event())
+    return _RecordingDmPageScanner(manager)
+
+
+def _real_dm_page_adapter(
+    conn: sqlite3.Connection,
+) -> tuple[TelegramRpcGate, _DmPageFutureSender, DmDeletionReconciliationDemandAdapter, _RecordingDmPageScanner]:
+    gate = _gate()
+    sender = _DmPageFutureSender()
+    gate._main_sender = sender
+    gate.session = SimpleNamespace(
+        process_entities=lambda _result: None,
+        get_input_entity=lambda entity: types.InputPeerUser(int(entity), 0),
+    )
+    scanner = _real_dm_page_scanner(gate, conn)
+    prepare_dm_deletion_reconciliation(conn, now=100)
+    return gate, sender, DmDeletionReconciliationDemandAdapter(conn, scanner), scanner
+
+
+async def _dispatch_forward_history_sibling(
+    gate: TelegramRpcGate,
+    sender: _DmPageFutureSender,
+    conn: sqlite3.Connection,
+) -> None:
+    """Run one normal durable sibling after the shared cooldown has expired."""
+
+    class GateForwardPort:
+        async def fetch_page(
+            self,
+            dialog_id: int,
+            *,
+            after_message_id: int,
+            should_stop: Callable[[], bool],
+        ) -> ForwardGapPage:
+            assert dialog_id == 211
+            assert after_message_id == 1
+            assert not should_stop()
+            await gate(
+                functions.messages.GetHistoryRequest(
+                    peer=types.InputPeerUser(user_id=dialog_id, access_hash=0),
+                    offset_id=0,
+                    offset_date=None,
+                    add_offset=0,
+                    limit=100,
+                    max_id=0,
+                    min_id=after_message_id,
+                    hash=0,
+                )
+            )
+            return ForwardGapPage(messages=(), complete=True)
+
+    forward_adapter = DeltaGapFillDemandAdapter(DeltaSyncWorker(GateForwardPort(), conn, asyncio.Event()))
+    sibling = asyncio.create_task(forward_adapter.run_slice(RpcAttemptBudget(limit=1)))
+    await _wait_for(lambda: sender.calls == 2)
+    assert isinstance(sender.requests[1], functions.messages.GetHistoryRequest)
+    assert sender.scopes[1].demand_kind is DemandKind.DELTA_GAP_FILL
+    assert sender.scopes[1].acquisition_kind is AcquisitionKind.MESSAGE_HISTORY_PAGE
+    sender.futures[1].set_result(types.messages.Messages(messages=[], topics=[], chats=[], users=[]))
+    await sibling
+
+
+@pytest.mark.asyncio
+async def test_dm_page_success_uses_real_get_messages_and_commits_tombstone_cursor() -> None:
+    conn = _dm_reconciliation_test_db()
+    gate, sender, adapter, scanner = _real_dm_page_adapter(conn)
+    try:
+        budget = RpcAttemptBudget(limit=1)
+        task = asyncio.create_task(adapter.run_slice(budget))
+        await _wait_for(lambda: sender.calls == 1)
+
+        request = sender.requests[0]
+        assert isinstance(request, functions.messages.GetMessagesRequest)
+        assert len(request.id) == 1
+        assert request.id[0].id == 1
+        scope = sender.scopes[0]
+        assert scope.demand_kind is DemandKind.DM_DELETION_RECONCILIATION
+        assert scope.acquisition_kind is AcquisitionKind.MESSAGE_LOOKUP
+        assert scope.attempt_budget is budget
+        sender.futures[0].set_result(types.messages.MessagesNotModified(count=1))
+        await task
+
+        assert scanner.calls == 1
+        assert budget.attempts == 1
+        assert conn.execute("SELECT is_deleted FROM messages WHERE dialog_id=211 AND message_id=1").fetchone() == (1,)
+        state = _dm_reconciliation_state_for_rpc_test(conn)
+        assert state["status"] == "running"
+        assert state["dialog_id_cursor"] == 211
+        assert state["message_cursor"] == 1
+    finally:
+        await gate.close_rpc_scheduler()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_dm_page_cursor_commit_failure_preserves_tombstone_and_blocks_reconstruction() -> None:
+    conn = _dm_reconciliation_test_db()
+    gate, sender, adapter, scanner = _real_dm_page_adapter(conn)
+    try:
+        conn.execute(
+            """CREATE TRIGGER fail_dm_cursor_commit
+               BEFORE INSERT ON daemon_state
+               WHEN NEW.key='delta_dm_gap_scan_state' AND NEW.value LIKE '%\"message_cursor\": 1%'
+               BEGIN SELECT RAISE(ABORT, 'injected cursor commit failure'); END"""
+        )
+        conn.commit()
+
+        budget = RpcAttemptBudget(limit=1)
+        task = asyncio.create_task(adapter.run_slice(budget))
+        await _wait_for(lambda: sender.calls == 1)
+        assert isinstance(sender.requests[0], functions.messages.GetMessagesRequest)
+        sender.futures[0].set_result(types.messages.MessagesNotModified(count=1))
+        with pytest.raises(sqlite3.IntegrityError, match="injected cursor commit failure"):
+            await task
+
+        assert scanner.calls == 1
+        assert budget.attempts == 1
+        assert conn.execute("SELECT is_deleted FROM messages WHERE dialog_id=211 AND message_id=1").fetchone() == (1,)
+        state = _dm_reconciliation_state_for_rpc_test(conn)
+        assert state["status"] == "verifying"
+        assert state["message_cursor"] == 0
+        assert adapter.status(10_000_000) is None
+
+        reconstructed_scanner = _real_dm_page_scanner(gate, conn)
+        reconstructed = DmDeletionReconciliationDemandAdapter(conn, reconstructed_scanner)
+        assert reconstructed.status(10_000_000) is None
+        await reconstructed.run_slice(RpcAttemptBudget(limit=1))
+        assert reconstructed_scanner.calls == 0
+        assert sender.calls == 1
+    finally:
+        await gate.close_rpc_scheduler()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_dm_page_flood_crosses_gate_with_durable_demand_and_acquisition() -> None:
+    accumulator = FloodWaitAccumulator()
+    accumulator.configure_kill_switch(
+        FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
+    )
+    conn = _dm_reconciliation_test_db()
+    gate, sender, adapter, scanner = _real_dm_page_adapter(conn)
+    try:
+        gate._rpc_circuit_status = accumulator.kill_switch_status
+        gate._flood_observer = lambda **event: accumulator.observe(**event)
+        observations: list[FloodWaitObservation] = []
+        gate.set_flood_event_observer(observations.append)
+
+        task = asyncio.create_task(adapter.run_slice(RpcAttemptBudget(limit=1)))
+        await _wait_for(lambda: sender.calls == 1)
+        assert isinstance(sender.requests[0], functions.messages.GetMessagesRequest)
+        assert sender.scopes[0].demand_kind is DemandKind.DM_DELETION_RECONCILIATION
+        assert sender.scopes[0].acquisition_kind is AcquisitionKind.MESSAGE_LOOKUP
+        sender.futures[0].set_exception(FloodWaitError(request=None, capture=20))
+        with pytest.raises(TelegramRpcThrottled):
+            await task
+
+        assert scanner.calls == 1
+        assert len(observations) == 1
+        assert observations[0].actual_dispatch is True
+        token_kind = DemandKind.DM_DELETION_RECONCILIATION
+        assert observations[0].demand_kind == token_kind.value
+        assert observations[0].acquisition_kind == AcquisitionKind.MESSAGE_LOOKUP.value
+        assert accumulator.kill_switch_status().events_in_window == 1
+        assert _dm_reconciliation_state_for_rpc_test(conn)["status"] == "suspended"
+        assert conn.execute("SELECT is_deleted FROM messages WHERE dialog_id=211 AND message_id=1").fetchone() == (0,)
+        assert sender.calls == 1
+        assert adapter.status(10_000_000) is None
+
+        import mcp_telegram.telegram_rpc as rpc
+
+        rpc._COOLDOWN_DEADLINE = rpc.time.monotonic() - 1
+        await _dispatch_forward_history_sibling(gate, sender, conn)
+
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+        assert scanner.calls == 1
+        assert sender.calls == 2
+        assert len(observations) == 1
+    finally:
+        await gate.close_rpc_scheduler()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_dm_page_late_gate_flood_stays_claimed_across_restart() -> None:
+    accumulator = FloodWaitAccumulator()
+    accumulator.configure_kill_switch(
+        FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
+    )
+    conn = _dm_reconciliation_test_db()
+    gate, sender, adapter, scanner = _real_dm_page_adapter(conn)
+    try:
+        gate._rpc_circuit_status = accumulator.kill_switch_status
+        gate._flood_observer = lambda **event: accumulator.observe(**event)
+        observations: list[FloodWaitObservation] = []
+        gate.set_flood_event_observer(observations.append)
+
+        task = asyncio.create_task(adapter.run_slice(RpcAttemptBudget(limit=1)))
+        await _wait_for(lambda: sender.calls == 1)
+        assert isinstance(sender.requests[0], functions.messages.GetMessagesRequest)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert _dm_reconciliation_state_for_rpc_test(conn)["status"] == "verifying"
+        assert not sender.futures[0].cancelled()
+
+        sender.futures[0].set_exception(FloodWaitError(request=None, capture=20))
+        await _wait_for(lambda: not gate._pending_scalar_dispatches)
+        assert len(observations) == 1
+        assert observations[0].actual_dispatch is True
+        assert observations[0].demand_kind == DemandKind.DM_DELETION_RECONCILIATION.value
+        assert observations[0].acquisition_kind == AcquisitionKind.MESSAGE_LOOKUP.value
+        assert accumulator.kill_switch_status().events_in_window == 1
+        restarted_scanner = _real_dm_page_scanner(gate, conn)
+        restarted = DmDeletionReconciliationDemandAdapter(conn, restarted_scanner)
+        assert restarted.status(10_000_000) is None
+        prepare_dm_deletion_reconciliation(conn, now=200)
+        assert _dm_reconciliation_state_for_rpc_test(conn)["status"] == "suspended"
+        assert _dm_reconciliation_state_for_rpc_test(conn)["reason"] == "interrupted"
+        await restarted.run_slice(RpcAttemptBudget(limit=1))
+        assert scanner.calls == 1
+        assert restarted_scanner.calls == 0
+        assert sender.calls == 1
+    finally:
+        await gate.close_rpc_scheduler()
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_dm_local_deferral_after_nested_dispatch_keeps_page_claimed() -> None:
+    gate = _gate()
+    sender = _set_sender(gate, _request_value)
+
+    class Scanner:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+            del dialog_id, message_ids
+            with rpc_scope(TelegramRpcSource.DELTA_SYNC):
+                await gate(_TestRequest("nested-dispatch"))
+            raise TelegramRpcAdmissionDeferred(retry_after_seconds=3)
+
+    conn = _dm_reconciliation_test_db()
+    prepare_dm_deletion_reconciliation(conn, now=100)
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner())
+    budget = RpcAttemptBudget(limit=1)
+    with pytest.raises(TelegramRpcAdmissionDeferred):
+        await adapter.run_slice(budget)
+
+    state = _dm_reconciliation_state_for_rpc_test(conn)
+    assert state["status"] == "verifying"
+    assert state["message_cursor"] == 0
+    assert budget.attempts == 1
+    assert sender.calls == 1
+    assert adapter.status(10_000_000) is None
+    prepare_dm_deletion_reconciliation(conn, now=200)
+    assert _dm_reconciliation_state_for_rpc_test(conn)["reason"] == "interrupted"
+    assert sender.calls == 1
+    await gate.close_rpc_scheduler()
+    conn.close()
 
 
 @pytest.mark.asyncio

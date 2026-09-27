@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import json
 from typing import cast
 
 import pytest
 
 from mcp_telegram.realtime_history_policy import realtime_history_coverage
 from mcp_telegram.sync_read_model import (
+    DmDeletionCheckpoint,
+    InvalidDmDeletionCheckpointError,
     SyncReadModel,
     SyncReadModelContractError,
     build_sync_read_model,
+    decode_dm_deletion_checkpoint,
     decode_sync_read_model,
+    dm_deletion_reconciliation_is_blocked,
+    encode_dm_deletion_checkpoint,
 )
 
 _HISTORY_BY_STATUS = {
@@ -119,6 +125,118 @@ def test_builder_rejects_noncanonical_status(persisted_status: str) -> None:
 def test_builder_rejects_representative_malformed_facts(field: str, value: object) -> None:
     with pytest.raises(SyncReadModelContractError):
         _build(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "expected"),
+    [
+        ("running", None, False),
+        ("idle", None, False),
+        ("verifying", None, True),
+        ("suspended", "account_throttle", True),
+        ("suspended", "interrupted", True),
+        ("suspended", "legacy_generation_review", True),
+    ],
+)
+def test_dm_deletion_reconciliation_suspension_contract(
+    status: str,
+    reason: str | None,
+    expected: bool,
+) -> None:
+    checkpoint = DmDeletionCheckpoint(status, 1, 0, None, 0, 0, 1, reason, 0)
+    assert dm_deletion_reconciliation_is_blocked(checkpoint) is expected
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [("unknown", None), ("suspended", None), ("suspended", "other"), ("running", "other")],
+)
+def test_dm_deletion_checkpoint_decoder_rejects_invalid_blocked_fields(
+    status: str,
+    reason: str | None,
+) -> None:
+    payload = json.dumps(_current_dm_checkpoint(status=status, reason=reason))
+    with pytest.raises(InvalidDmDeletionCheckpointError):
+        decode_dm_deletion_checkpoint((payload,))
+
+
+def _current_dm_checkpoint(**updates: object) -> dict[str, object]:
+    checkpoint: dict[str, object] = {
+        "status": "running",
+        "generation": 1,
+        "scan_started_at": 0,
+        "dialog_id_cursor": None,
+        "message_cursor": 0,
+        "next_run_at": 0,
+        "policy_version": 1,
+        "reason": None,
+        "state_changed_at": 0,
+    }
+    checkpoint.update(updates)
+    return checkpoint
+
+
+def test_dm_deletion_checkpoint_absent_versus_present_payload() -> None:
+    assert decode_dm_deletion_checkpoint(None) is None
+    for payload in (None, "", "   ", "{invalid", "null", "[]", "42"):
+        with pytest.raises(InvalidDmDeletionCheckpointError):
+            decode_dm_deletion_checkpoint((payload,))
+
+
+def test_dm_deletion_checkpoint_rejects_oversized_json_integer() -> None:
+    payload = '{"generation":' + "9" * 5_000 + "}"
+    with pytest.raises(InvalidDmDeletionCheckpointError):
+        decode_dm_deletion_checkpoint((payload,))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"generation": True},
+        {"generation": 0},
+        {"scan_started_at": 1.5},
+        {"message_cursor": 1},
+        {"dialog_id_cursor": 0},
+        {"status": "idle", "dialog_id_cursor": 22},
+        {"status": "idle", "message_cursor": 1, "dialog_id_cursor": 22},
+        {"next_run_at": "0"},
+        {"policy_version": 2},
+        {"state_changed_at": True},
+        {"reason": "unbounded"},
+    ],
+)
+def test_dm_deletion_checkpoint_rejects_invalid_current_facts(changes: dict[str, object]) -> None:
+    payload = json.dumps(_current_dm_checkpoint(**changes))
+    with pytest.raises(InvalidDmDeletionCheckpointError):
+        decode_dm_deletion_checkpoint((payload,))
+
+
+def test_dm_deletion_checkpoint_accepts_supported_prefixes_and_encodes_canonical_state() -> None:
+    first = decode_dm_deletion_checkpoint((json.dumps(_current_dm_checkpoint()),))
+    assert first is not None and first.dialog_id_cursor is None and first.message_cursor == 0
+    empty_dialog = decode_dm_deletion_checkpoint((json.dumps(_current_dm_checkpoint(dialog_id_cursor=22)),))
+    assert empty_dialog is not None and empty_dialog.dialog_id_cursor == 22 and empty_dialog.message_cursor == 0
+    removed_dialog_prefix = decode_dm_deletion_checkpoint(
+        (json.dumps(_current_dm_checkpoint(dialog_id_cursor=22, message_cursor=9)),)
+    )
+    assert removed_dialog_prefix is not None and removed_dialog_prefix.message_cursor == 9
+    assert decode_dm_deletion_checkpoint((encode_dm_deletion_checkpoint(first),)) == first
+
+
+def test_dm_deletion_checkpoint_accepts_only_supported_legacy_cursor_alias() -> None:
+    legacy = {
+        "status": "running",
+        "generation": 2,
+        "scan_started_at": 1,
+        "dialog_id_cursor": 22,
+        "message_offset": 3,
+        "next_run_at": 0,
+    }
+    decoded = decode_dm_deletion_checkpoint((json.dumps(legacy),))
+    assert decoded is not None and decoded.message_cursor == 3 and decoded.policy_version is None
+    legacy["message_cursor"] = 3
+    with pytest.raises(InvalidDmDeletionCheckpointError):
+        decode_dm_deletion_checkpoint((json.dumps(legacy),))
 
 
 @pytest.mark.parametrize("field", ["last_synced_at", "last_event_at", "last_delta_checked_at"])

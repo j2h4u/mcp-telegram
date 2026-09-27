@@ -33,6 +33,7 @@ EXPECTED_DURABLE_DEMAND_ORDER = (
     DemandKind.SELF_PROFILE_MAINTENANCE,
     DemandKind.ENTITY_PROFILE_REFRESH,
     DemandKind.DELTA_GAP_FILL,
+    DemandKind.DM_DELETION_RECONCILIATION,
     DemandKind.DELTA_ACCESS_PROBE,
     DemandKind.HOT_ACTIVITY_PAGE,
     DemandKind.LIVE_HYDRATION_BATCH,
@@ -84,7 +85,11 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
         TelegramRpcSource.TELETHON_CONNECTION_BOOTSTRAP: {DemandKind.TELETHON_CONNECTION_BOOTSTRAP},
         TelegramRpcSource.RECONNECT_DIFFERENCE: {DemandKind.RECONNECT_DIFFERENCE},
         TelegramRpcSource.REALTIME_EVENT: {DemandKind.REALTIME_EVENT_ACQUISITION},
-        TelegramRpcSource.DELTA_SYNC: {DemandKind.DELTA_GAP_FILL, DemandKind.DELTA_ACCESS_PROBE},
+        TelegramRpcSource.DELTA_SYNC: {
+            DemandKind.DELTA_GAP_FILL,
+            DemandKind.DM_DELETION_RECONCILIATION,
+            DemandKind.DELTA_ACCESS_PROBE,
+        },
         TelegramRpcSource.ACTIVITY_HOT_SWEEP: {DemandKind.HOT_ACTIVITY_PAGE},
         TelegramRpcSource.FACT_HYDRATION_LIVE: {DemandKind.LIVE_HYDRATION_BATCH},
         TelegramRpcSource.FULL_SYNC: {DemandKind.FULL_SYNC_DM_ENROLLMENT, DemandKind.FULL_SYNC_PAGE},
@@ -208,7 +213,7 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
 
 def test_durable_demand_order_is_a_literal_complete_contract() -> None:
     assert DURABLE_DEMAND_ORDER == EXPECTED_DURABLE_DEMAND_ORDER
-    assert len(DURABLE_DEMAND_ORDER) == 21
+    assert len(DURABLE_DEMAND_ORDER) == 22
     assert {
         kind for kind, contract in TELEGRAM_DEMAND_CONTRACTS.items() if contract.execution_mode is ExecutionMode.DURABLE
     } == set(EXPECTED_DURABLE_DEMAND_ORDER)

@@ -245,7 +245,8 @@ async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
 class GetSyncStatus(ToolArgs):
     """Get sync status for a dialog: message count, sync progress, last sync/event timestamps,
     and delete detection reliability. delete_detection is 'reliable (channel)' for channels/supergroups
-    (real-time MTProto events) or 'best-effort weekly (DM)' for personal chats (periodic gap scan).
+    (real-time MTProto events), 'best-effort weekly (DM)' while periodic DM verification is active,
+    or a paused/stale notice when that maintenance has been suspended.
     sync_progress is the raw message_id offset cursor, not a row count. Works for any dialog —
     non-synced dialogs return status='not_synced' with zero counts."""
 

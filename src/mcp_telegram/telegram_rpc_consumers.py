@@ -67,6 +67,7 @@ class DemandKind(StrEnum):
     RECONNECT_DIFFERENCE = "reconnect_difference"
     REALTIME_EVENT_ACQUISITION = "realtime_event_acquisition"
     DELTA_GAP_FILL = "delta_gap_fill"
+    DM_DELETION_RECONCILIATION = "dm_deletion_reconciliation"
     DELTA_ACCESS_PROBE = "delta_access_probe"
     HOT_ACTIVITY_PAGE = "hot_activity_page"
     LIVE_HYDRATION_BATCH = "live_hydration_batch"
@@ -96,6 +97,7 @@ DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
     DemandKind.SELF_PROFILE_MAINTENANCE,
     DemandKind.ENTITY_PROFILE_REFRESH,
     DemandKind.DELTA_GAP_FILL,
+    DemandKind.DM_DELETION_RECONCILIATION,
     DemandKind.DELTA_ACCESS_PROBE,
     DemandKind.HOT_ACTIVITY_PAGE,
     DemandKind.LIVE_HYDRATION_BATCH,
@@ -115,7 +117,7 @@ DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
     DemandKind.DRAFT_SNAPSHOT,
     DemandKind.LINKED_CHAT_REFRESH,
 )
-_EXPECTED_DURABLE_DEMAND_COUNT = 21
+_EXPECTED_DURABLE_DEMAND_COUNT = 22
 
 
 class ExecutionMode(StrEnum):
@@ -687,6 +689,12 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
     ),
     DemandKind.DELTA_GAP_FILL: _contract(
         DemandKind.DELTA_GAP_FILL,
+        TelegramRpcSource.DELTA_SYNC,
+        _DURABLE,
+        max_rpc_attempts_per_slice=1,
+    ),
+    DemandKind.DM_DELETION_RECONCILIATION: _contract(
+        DemandKind.DM_DELETION_RECONCILIATION,
         TelegramRpcSource.DELTA_SYNC,
         _DURABLE,
         max_rpc_attempts_per_slice=1,

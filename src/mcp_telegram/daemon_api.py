@@ -101,7 +101,14 @@ from .runtime_observations import (
     record_runtime_observation,
     tool_telemetry_identity,
 )
-from .sync_read_model import SyncStatus, build_sync_read_model
+from .sync_read_model import (
+    DM_DELETION_RECONCILIATION_STATE_KEY,
+    InvalidDmDeletionCheckpointError,
+    SyncStatus,
+    build_sync_read_model,
+    decode_dm_deletion_checkpoint,
+    dm_deletion_reconciliation_is_blocked,
+)
 from .telegram_demand import AcquisitionKind
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
@@ -115,6 +122,22 @@ from .telegram_rpc_scheduler import (
 )
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
+
+
+def _dm_deletion_reconciliation_is_blocked(conn: sqlite3.Connection) -> bool:
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT value FROM daemon_state WHERE key = ?",
+            (DM_DELETION_RECONCILIATION_STATE_KEY,),
+        ).fetchone(),
+    )
+    try:
+        state = decode_dm_deletion_checkpoint(row)
+    except InvalidDmDeletionCheckpointError:
+        return True
+    return dm_deletion_reconciliation_is_blocked(state)
+
 
 # Entity / telemetry SQL
 _ALL_ENTITY_NAMES_SQL = (
@@ -1614,7 +1637,7 @@ class DaemonAPIServer:
 
         delete_detection is derived from dialog_id sign:
         - Negative → channel/supergroup → "reliable (channel)"
-        - Positive → DM/small group → "best-effort weekly (DM)"
+        - Positive → DM/small group → weekly or paused deletion verification
         """
         dialog_id = _coerce_int(req.get("dialog_id", 0), 0)
         row = cast(tuple[object, ...] | None, self._conn.execute(_GET_SYNC_STATUS_SQL, (dialog_id,)).fetchone())
@@ -1663,7 +1686,13 @@ class DaemonAPIServer:
             "delta_refresh_requested_at": delta_refresh_requested_at,
             "sync_progress": sync_progress,
             "sync_progress_message_id": sync_progress,
-            "delete_detection": "reliable (channel)" if dialog_id < 0 else "best-effort weekly (DM)",
+            "delete_detection": (
+                "reliable (channel)"
+                if dialog_id < 0
+                else "paused (DM; older deletions may be stale)"
+                if _dm_deletion_reconciliation_is_blocked(self._conn)
+                else "best-effort weekly (DM)"
+            ),
             "access_lost_at": access_lost_at,
             "access_last_revalidated_at": access_revalidation[0],
             "access_next_revalidate_at": access_revalidation[1],
