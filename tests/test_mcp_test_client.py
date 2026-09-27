@@ -197,6 +197,26 @@ def test_successful_smoke_steps_assert_structured_content_paths_not_text_parsing
                 assert "content_text_contains" not in expect, (relative_path, step.get("name"))
 
 
+def test_integration_smoke_dialog_errors_assert_canonical_error_codes() -> None:
+    script = cast(
+        dict[str, object],
+        json.loads((_repo_root() / "devtools/mcp_client/smoke-integration.json").read_text(encoding="utf-8")),
+    )
+    topic_step = next(
+        step
+        for step in cast(list[dict[str, object]], script["steps"])
+        if step.get("name") == "list_topics" and "one_of" in cast(dict[str, object], step.get("expect", {}))
+    )
+    branches = _expectation_branches(cast(dict[str, object], topic_step["expect"]))
+    expected_codes = {"dialog_not_found", "dialog_directory_incomplete", "stale_local_directory"}
+    actual_codes = {
+        cast(dict[str, object], branch["path_equals"]).get("structuredContent.error.code") for branch in branches
+    }
+
+    assert actual_codes == expected_codes
+    assert all("structuredContent.error" not in cast(dict[str, object], branch["path_equals"]) for branch in branches)
+
+
 def test_no_daemon_smoke_expects_backend_errors() -> None:
     script = cast(
         dict[str, object],
