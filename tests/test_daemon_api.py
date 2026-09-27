@@ -3277,13 +3277,12 @@ async def test_list_unread_messages_basic() -> None:
 
     client = _TestClient()
     server = make_server(conn, client)
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    )
 
-    result = await server._dispatch(
-        {
-            "method": "get_inbox",
-            "limit": 100,
-            "group_size_threshold": 100,
-        }
+    result, _, _ = await server._handle_client_line(
+        b'{"method":"get_inbox","limit":100,"group_size_threshold":100}', "", None
     )
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
@@ -3912,20 +3911,27 @@ async def test_record_telemetry_inserts_row() -> None:
     """record_telemetry inserts a structured mcp.call runtime event."""
     conn = _make_db_with_entities()
     server = make_server(conn)
-    result = await server._dispatch(
-        {
-            "method": "record_telemetry",
-            "event": {
-                "tool_name": "ListDialogs",
-                "timestamp": time.time(),
-                "duration_ms": 123.4,
-                "result_count": 5,
-                "has_cursor": False,
-                "page_depth": 1,
-                "has_filter": True,
-                "error_type": None,
-            },
-        }
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    )
+    result, _, _ = await server._handle_client_line(
+        json.dumps(
+            {
+                "method": "record_telemetry",
+                "event": {
+                    "tool_name": "ListDialogs",
+                    "timestamp": time.time(),
+                    "duration_ms": 123.4,
+                    "result_count": 5,
+                    "has_cursor": False,
+                    "page_depth": 1,
+                    "has_filter": True,
+                    "error_type": None,
+                },
+            }
+        ).encode(),
+        "",
+        None,
     )
     assert result["ok"] is True
     row = cast(

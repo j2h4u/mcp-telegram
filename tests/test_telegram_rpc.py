@@ -38,6 +38,7 @@ from mcp_telegram.config import (
     TelegramRpcSchedulerConfig,
 )
 from mcp_telegram.daemon import _connect_telegram, _SyncMainContext
+from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.delta_sync import (
     DeltaGapFillDemandAdapter,
     DeltaSyncWorker,
@@ -94,6 +95,15 @@ from mcp_telegram.telegram_rpc_scheduler import (
     RpcTransportReadiness,
     TelegramRpcAdmissionScheduler,
     TelegramRpcScope,
+)
+from tests.daemon_api_policy import make_daemon_api_policy
+from tests.helpers import (
+    LoudChannelProfilePort,
+    LoudChatAvatarHistoryPort,
+    LoudCommonChatsPort,
+    LoudGroupProfilePort,
+    LoudUserAvatarHistoryPort,
+    LoudUserProfilePort,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 
@@ -1325,6 +1335,61 @@ async def test_latched_circuit_precedes_disconnected_transport_deferral() -> Non
     assert caught.value.latched is True
     assert sender.calls == 0
     assert gate._limiter.acquisitions == 0
+
+
+@pytest.mark.asyncio
+async def test_daemon_remote_topic_miss_projects_latched_gate_without_raw_send(tmp_path: Path) -> None:
+    """A daemon remote miss reaches the real Gate and stops before its raw sender."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    gate = _gate(_CircuitStatus(open=True))
+    sender = _RawFutureSender()
+    gate._main_sender = sender
+    gate._sender = sender
+    check_calls = 0
+    original_check = gate.check_circuit
+
+    def check_circuit() -> None:
+        nonlocal check_calls
+        check_calls += 1
+        original_check()
+
+    gate.check_circuit = check_circuit  # type: ignore[method-assign]
+
+    class GateClient:
+        async def get_entity(self, dialog_id: int) -> object:
+            return await gate(_TestRequest(dialog_id))
+
+    server = DaemonAPIServer(
+        conn,
+        cast(DaemonClientLike, GateClient()),
+        asyncio.Event(),
+        topic_refresher=cast(object, object()),
+        channel_profile_port=LoudChannelProfilePort(),
+        group_profile_port=LoudGroupProfilePort(),
+        user_profile_port=LoudUserProfilePort(),
+        common_chats_port=LoudCommonChatsPort(),
+        user_avatar_history_port=LoudUserAvatarHistoryPort(),
+        chat_avatar_history_port=LoudChatAvatarHistoryPort(),
+        policy=make_daemon_api_policy(),
+    )
+    server._ready = True
+    try:
+        response, _, _ = await server._handle_client_line(b'{"method":"list_topics","dialog_id":123}', "", None)
+    finally:
+        conn.close()
+        await gate.close_rpc_scheduler()
+
+    assert response == {
+        "ok": False,
+        "error": "flood_wait_kill_switch_open",
+        "message": "Telegram acquisition is blocked by account protection.",
+        "required_action": "manual_operator_recovery",
+        "retryable": False,
+    }
+    assert check_calls > 0
+    assert sender.calls == 0
 
 
 @pytest.mark.asyncio
