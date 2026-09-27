@@ -57,6 +57,22 @@ def test_check_daemon_response_missing_message_uses_default():
     assert "Action:" in content.text
 
 
+def test_tool_result_uses_structured_domain_error_code_when_explicit_code_is_missing():
+    result = ToolResult(is_error=True, structured_content={"error": "ambiguous_dialog"})
+
+    assert result.error_code == "ambiguous_dialog"
+
+
+def test_tool_result_keeps_explicit_error_code_over_structured_domain_error_code():
+    result = ToolResult(
+        is_error=True,
+        error_code="specific_error",
+        structured_content={"error": "ambiguous_dialog"},
+    )
+
+    assert result.error_code == "specific_error"
+
+
 def test_check_daemon_response_preserves_existing_action_hint():
     result = _check_daemon_response({"ok": False, "message": "boom\nAction: Retry later."})
     assert isinstance(result, ToolResult)

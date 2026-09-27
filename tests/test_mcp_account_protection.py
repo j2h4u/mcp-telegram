@@ -7,6 +7,7 @@ from typing import cast
 
 import pytest
 from jsonschema import validate
+from mcp.types import TextContent
 
 from mcp_telegram import server as mcp_server
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
@@ -14,7 +15,7 @@ from mcp_telegram.feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
 from mcp_telegram.feedback_service import FeedbackApplicationService
 from mcp_telegram.flood import FloodWaitKillSwitchStatus
 from mcp_telegram.sync_db import ensure_sync_schema
-from mcp_telegram.telegram_rpc import TelegramRpcGate
+from mcp_telegram.telegram_rpc import TelegramRpcGate, _MainSender, _MainSenderAdapter
 from mcp_telegram.topics.refresh import TopicRefresher
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
@@ -129,8 +130,8 @@ async def test_registered_remote_topic_miss_crosses_gate_ipc_client_and_server(
 
     gate: TelegramRpcGate = _gate(_CircuitStatus(open=True))
     sender = _RawFutureSender()
-    gate._main_sender = sender
-    gate._sender = sender
+    gate._main_sender = cast(_MainSender, sender)
+    gate._sender = _MainSenderAdapter(gate)
     circuit_checks = 0
     original_check = gate.check_circuit
 
@@ -174,7 +175,8 @@ async def test_registered_remote_topic_miss_crosses_gate_ipc_client_and_server(
     assert details["retryable"] is False
     assert "retry_after" not in details
     assert "retry" not in cast(str, error["action"]).lower()
-    assert "Fix the arguments" not in cast(str, result.content[0].text)
+    assert isinstance(result.content[0], TextContent)
+    assert "Fix the arguments" not in result.content[0].text
     assert cast(dict[str, object], payload["account_protection"]) == {
         "status": "active",
         "outbound_acquisition": "blocked",
@@ -218,7 +220,7 @@ async def test_feedback_persists_when_only_following_status_operation_fails(
     }
     readback = sqlite3.connect(feedback_path)
     try:
-        row = readback.execute("SELECT message FROM feedback").fetchone()
+        row = cast(tuple[str] | None, readback.execute("SELECT message FROM feedback").fetchone())
     finally:
         readback.close()
     assert row == ("saved before status failure",)

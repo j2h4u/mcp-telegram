@@ -1272,7 +1272,9 @@ async def test_unavailable_protection_status_keeps_successful_local_feedback_res
 
     assert result.is_error is False
     assert result.content == []
-    assert result.structured_content == {
+    payload = cast(dict[str, object] | None, result.structured_content)
+    assert payload is not None
+    assert payload == {
         "accepted": True,
         "status": "open",
         "account_protection": {
@@ -1310,8 +1312,9 @@ async def test_validation_error_includes_active_account_protection_notice(monkey
 
     assert result.is_error is True
     assert result.content
-    assert result.structured_content is not None
-    assert result.structured_content["account_protection"] == {
+    payload = cast(dict[str, object] | None, result.structured_content)
+    assert payload is not None
+    assert payload["account_protection"] == {
         "status": "active",
         "outbound_acquisition": "blocked",
         "recovery": "manual",
@@ -1320,7 +1323,7 @@ async def test_validation_error_includes_active_account_protection_notice(monkey
             "Recovery requires operator action."
         ),
     }
-    assert "error" in result.structured_content
+    assert "error" in payload
 
 
 @pytest.mark.asyncio
@@ -1393,12 +1396,13 @@ async def test_typed_protection_error_has_manual_action_without_retry(monkeypatc
     result = _call_tool_result(await server.call_tool("list_dialogs", {}))
 
     assert result.is_error is True
-    assert result.structured_content is not None
-    error = cast(dict[str, object], result.structured_content["error"])
+    payload = cast(dict[str, object] | None, result.structured_content)
+    assert payload is not None
+    error = cast(dict[str, object], payload["error"])
     assert error["code"] == "flood_wait_kill_switch_open"
     assert error["action"] == "Recovery requires operator action."
     assert "retry" not in str(error["action"]).lower()
-    assert "account_protection" not in result.structured_content
+    assert "account_protection" not in payload
 
 
 @pytest.mark.asyncio
@@ -1419,8 +1423,9 @@ async def test_success_result_cannot_use_reserved_error_envelope(monkeypatch: py
     result = _call_tool_result(await server.call_tool("list_dialogs", {}))
 
     assert result.is_error is True
-    assert result.structured_content is not None
-    error = cast(dict[str, object], result.structured_content["error"])
+    payload = cast(dict[str, object] | None, result.structured_content)
+    assert payload is not None
+    error = cast(dict[str, object], payload["error"])
     assert error["code"] == "tool_error"
     assert "reserved top-level error" in cast(str, error["message"])
 
@@ -1567,6 +1572,97 @@ async def test_registered_ambiguity_action_points_to_canonical_error_details(  #
         "recovery": "manual",
         "notice": "Telegram acquisition is blocked by account protection. Freshness and incoming coverage may be limited. Recovery requires operator action.",
     }
+    validate(payload, cast(dict[str, object], server.tool_by_name[tool_name].output_schema))
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        (
+            "list_messages",
+            "mcp_telegram.tools.reading",
+            "list_messages",
+            {"dialog": "Project", "message_state": "sent"},
+        ),
+        ("search_messages", "mcp_telegram.tools.reading", "search_messages", {"dialog": "Project", "query": "needle"}),
+        ("list_topics", "mcp_telegram.tools.discovery", "list_topics", {"dialog": "Project"}),
+        ("get_dialog_stats", "mcp_telegram.tools.stats", "get_dialog_stats", {"dialog": "Project"}),
+        (
+            "trace_account_messages",
+            "mcp_telegram.tools.account_trace",
+            "trace_account_messages",
+            {"exact_account_id": 101, "dialog": "Project"},
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_registered_dialog_ambiguity_uses_domain_code_and_nested_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+    case: tuple[str, str, str, dict[str, object]],
+) -> None:
+    tool_name, tool_module, method_name, arguments = case
+    tool_connection = AsyncMock()
+    response = {
+        "ok": False,
+        "error": "ambiguous_dialog",
+        "message": "Multiple dialogs match.",
+        "required_action": "Retry with an exact dialog id from structuredContent.error.details.candidates.",
+        "candidates": [
+            {
+                "entity_id": 101,
+                "display_name": "Project Alpha",
+                "username": "project_alpha",
+                "score": 100,
+                "entity_type": "supergroup",
+                "disambiguation_hint": "Use @project_alpha.",
+            },
+            {
+                "entity_id": 202,
+                "display_name": "Project Archive",
+                "username": "project_archive",
+                "score": 100,
+                "entity_type": "channel",
+                "disambiguation_hint": "Use @project_archive.",
+            },
+        ],
+    }
+    setattr(tool_connection, method_name, AsyncMock(return_value=response))
+
+    @asynccontextmanager
+    async def tool_connection_context() -> AsyncIterator[object]:
+        yield tool_connection
+
+    monkeypatch.setattr(f"{tool_module}.daemon_connection", tool_connection_context)
+    monkeypatch.setattr(
+        server,
+        "daemon_connection",
+        lambda: _status_context(
+            {
+                "ok": True,
+                "data": {
+                    "account_protection": {
+                        "status": "active",
+                        "outbound_acquisition": "blocked",
+                        "recovery": "manual",
+                        "notice": "Telegram acquisition is blocked by account protection. Freshness and incoming coverage may be limited. Recovery requires operator action.",
+                    }
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+
+    result = await server.call_tool(tool_name, arguments)
+
+    assert result.is_error is True
+    payload = cast(dict[str, object], result.structured_content)
+    error = cast(dict[str, object], payload["error"])
+    details = cast(dict[str, object], error["details"])
+    assert error["code"] == "ambiguous_dialog"
+    assert "structuredContent.error.details.candidates" in cast(str, error["action"])
+    candidates = cast(list[dict[str, object]], details["candidates"])
+    assert [candidate["entity_id"] for candidate in candidates] == [101, 202]
+    assert cast(dict[str, object], payload["account_protection"])["status"] == "active"
     validate(payload, cast(dict[str, object], server.tool_by_name[tool_name].output_schema))
 
 

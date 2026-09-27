@@ -18,6 +18,7 @@ from mcp.types import (
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..daemon_client import DaemonConnection, DaemonNotRunningError, daemon_connection
+from ..errors import action_text
 from ..temporal import (
     normalize_temporal_output_schema,
     project_temporal_response,
@@ -333,25 +334,13 @@ def _check_daemon_response(
     """
     if response.get("ok") is True:
         return None
-    error_detail = response.get("message")
-    if not isinstance(error_detail, str) or not error_detail.strip():
-        error_detail = response.get("detail")
-    if not isinstance(error_detail, str) or not error_detail.strip():
-        error_detail = "Request failed."
+    error_detail = _daemon_response_message(response)
     error_code = response.get("error")
     if isinstance(error_code, str) and error_code and error_code not in str(error_detail):
         text = f"Error: {error_code}: {error_detail}"
     else:
         text = f"Error: {error_detail}"
-    required_action = response.get("required_action")
-    if required_action == "manual_operator_recovery":
-        action = "Recovery requires operator action."
-        text = "\n".join(line for line in text.splitlines() if not line.lower().startswith("action:"))
-    elif isinstance(required_action, str) and required_action.strip():
-        action = required_action.strip()
-        text = "\n".join(line for line in text.splitlines() if not line.lower().startswith("action:"))
-    if "action:" not in text.lower():
-        text = f"{text}\nAction: {action}"
+    text = _daemon_error_action(text, response.get("required_action"), action)
     details = response.get("details")
     return error_result(
         text,
@@ -359,6 +348,31 @@ def _check_daemon_response(
         details=details if isinstance(details, Mapping) else None,
         **extra_kwargs,
     )
+
+
+def _daemon_response_message(response: Mapping[str, object]) -> str:
+    for key in ("message", "detail"):
+        value = response.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return "Request failed."
+
+
+def _daemon_error_action(text: str, required_action: object, fallback: str) -> str:
+    action = fallback
+    if required_action == "manual_operator_recovery":
+        action = "Recovery requires operator action."
+    elif isinstance(required_action, str) and required_action.strip():
+        action = required_action.strip()
+    if required_action == "manual_operator_recovery" or (isinstance(required_action, str) and required_action.strip()):
+        text = _without_action_lines(text)
+    if "action:" not in text.lower():
+        text = action_text(text, action)
+    return text
+
+
+def _without_action_lines(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if not line.lower().startswith("action:"))
 
 
 @dataclass
@@ -377,7 +391,8 @@ class ToolResult:
     def __post_init__(self) -> None:
         """Give every recoverable error a bounded machine code."""
         if self.is_error:
-            self.error_code = safe_error_code(self.error_code)
+            structured_error = (self.structured_content or {}).get("error")
+            self.error_code = safe_error_code(self.error_code, fallback=safe_error_code(structured_error))
 
 
 ToolArgT = t.TypeVar("ToolArgT", bound=ToolArgs)

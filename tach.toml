@@ -919,7 +919,7 @@ expose = ["DaemonAPIServer", "DaemonApiPolicy", "DaemonClientLike", "DaemonHealt
 
 [[interfaces]]
 from = ["mcp_telegram.daemon_client"]
-expose = ["DaemonConnection", "DaemonNotRunningError", "ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS", "daemon_connection"]
+expose = ["AccountProtectionError", "DaemonConnection", "DaemonNotRunningError", "ENTITY_PROFILE_ENDPOINT_TIMEOUT_CAP_SECONDS", "daemon_connection"]
 
 [[interfaces]]
 from = ["mcp_telegram.history_enrollment"]

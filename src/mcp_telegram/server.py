@@ -259,21 +259,19 @@ def _safe_boundary_error_text(*, tool_name: str, stage: str, exc: Exception) -> 
 
 
 def _error_call_result(text: str, *, code: str) -> CallToolResult:
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structured_content={"error": _error_fields_from_text(text, code)},
+        is_error=True,
+    )
+
+
+def _error_fields_from_text(text: str, code: str) -> dict[str, object]:
     lines = text.splitlines()
     action_line = next((line for line in lines if line.lower().startswith("action:")), None)
     action = action_line.partition(":")[2].strip() if action_line else "Check the tool response and retry."
     message = "\n".join(line for line in lines if not line.lower().startswith("action:")).strip()
-    return CallToolResult(
-        content=[TextContent(type="text", text=text)],
-        structured_content={
-            "error": {
-                "code": safe_error_code(code),
-                "message": message,
-                "action": action,
-            }
-        },
-        is_error=True,
-    )
+    return {"code": safe_error_code(code), "message": message, "action": action}
 
 
 def _protection_error_call_result(exc: AccountProtectionError) -> CallToolResult:
@@ -318,7 +316,10 @@ async def _account_protection_status() -> dict[str, object]:
 
 
 def _attach_account_protection(result: CallToolResult, status: dict[str, object]) -> CallToolResult:
-    structured_content = dict(result.structured_content or {})
+    structured_content: dict[str, object] = {}
+    result_content = t.cast(dict[str, object] | None, result.structured_content)
+    if result_content is not None:
+        structured_content.update(result_content)
     structured_content.update(status)
     return CallToolResult(
         content=result.content,
@@ -444,26 +445,7 @@ def _project_tool_result(
     telemetry.outcome = "tool_error" if tool_result.is_error else "success"
     telemetry.error_code = tool_result.error_code
     elapsed = time.monotonic() - started_at
-    rid_str = ",".join(current_correlation_ids()) or "-"
-    slow_seconds = _SLOW_TOOL_CALL_SECONDS
-    if tool_result.is_error:
-        logger.info(
-            "call_tool[%s] tool_error duration_s=%.3f rids=%s error=%s",
-            name,
-            elapsed,
-            rid_str,
-            safe_error_code(tool_result.error_code),
-        )
-    elif elapsed >= slow_seconds:
-        logger.warning(
-            "call_tool[%s] slow_completed duration_s=%.3f threshold_s=%.3f rids=%s",
-            name,
-            elapsed,
-            slow_seconds,
-            rid_str,
-        )
-    else:
-        logger.debug("call_tool[%s] completed duration_s=%.3f rids=%s", name, elapsed, rid_str)
+    _log_tool_result(name, tool_result, elapsed)
     structured_content = (
         t.cast(dict[str, object], tools.omit_none_mapping_values(tool_result.structured_content))
         if tool_result.structured_content is not None
@@ -478,39 +460,63 @@ def _project_tool_result(
     )
 
 
+def _log_tool_result(name: str, tool_result: tools.ToolResult, elapsed: float) -> None:
+    rid_str = ",".join(current_correlation_ids()) or "-"
+    if tool_result.is_error:
+        logger.info(
+            "call_tool[%s] tool_error duration_s=%.3f rids=%s error=%s",
+            name,
+            elapsed,
+            rid_str,
+            safe_error_code(tool_result.error_code),
+        )
+    elif elapsed >= _SLOW_TOOL_CALL_SECONDS:
+        logger.warning(
+            "call_tool[%s] slow_completed duration_s=%.3f threshold_s=%.3f rids=%s",
+            name,
+            elapsed,
+            _SLOW_TOOL_CALL_SECONDS,
+            rid_str,
+        )
+    else:
+        logger.debug("call_tool[%s] completed duration_s=%.3f rids=%s", name, elapsed, rid_str)
+
+
 def _canonical_tool_error(
     error_code: str | None,
-    content: t.Sequence[t.Any],
+    content: t.Sequence[object],
     structured_content: dict[str, object] | None,
 ) -> dict[str, object]:
     if structured_content is not None:
-        existing_error = structured_content.get("error")
-        if isinstance(existing_error, dict) and all(
-            isinstance(existing_error.get(field), str) for field in ("code", "message", "action")
-        ):
-            canonical_error = dict(existing_error)
-            details = canonical_error.get("details")
-            preserved: dict[str, object] = dict(details) if isinstance(details, dict) else {}
-            preserved.update(
-                {key: value for key, value in structured_content.items() if key not in {"error", "account_protection"}}
-            )
-            if preserved:
-                canonical_error["details"] = preserved
-            return {"error": canonical_error}
+        existing_error = _existing_canonical_tool_error(structured_content)
+        if existing_error is not None:
+            return {"error": existing_error}
     text = next((item.text for item in content if isinstance(item, TextContent)), "Tool request failed.")
-    lines = text.splitlines()
-    action_line = next((line for line in lines if line.lower().startswith("action:")), None)
-    error: dict[str, object] = {
-        "code": safe_error_code(error_code),
-        "message": "\n".join(line for line in lines if not line.lower().startswith("action:")).strip(),
-        "action": action_line.partition(":")[2].strip() if action_line else "Check the tool response and retry.",
-    }
+    error: dict[str, object] = _error_fields_from_text(text, safe_error_code(error_code))
     if structured_content:
         details = structured_content.get("details")
         error["details"] = (
             dict(details) if len(structured_content) == 1 and isinstance(details, dict) else structured_content
         )
     return {"error": error}
+
+
+def _existing_canonical_tool_error(structured_content: dict[str, object]) -> dict[str, object] | None:
+    existing_error = structured_content.get("error")
+    if not isinstance(existing_error, dict):
+        return None
+    if not all(isinstance(existing_error.get(field), str) for field in ("code", "message", "action")):
+        return None
+
+    canonical_error = dict(existing_error)
+    details = canonical_error.get("details")
+    preserved: dict[str, object] = dict(details) if isinstance(details, dict) else {}
+    preserved.update(
+        {key: value for key, value in structured_content.items() if key not in {"error", "account_protection"}}
+    )
+    if preserved:
+        canonical_error["details"] = preserved
+    return canonical_error
 
 
 async def _execute_tool(

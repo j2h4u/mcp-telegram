@@ -271,6 +271,7 @@ async def test_protective_disconnect_serves_valid_partial_profile_from_local_cac
     conn.close()
 
     conn = sqlite3.connect(path)
+
     class _ProtectionClient:
         def __init__(self) -> None:
             self.disconnect_calls = 0
