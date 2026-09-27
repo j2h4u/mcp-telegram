@@ -52,19 +52,19 @@
           {
             "is_error": true,
             "path_equals": {
-              "structuredContent.error": "dialog_not_found"
+              "structuredContent.error.code": "dialog_not_found"
             }
           },
           {
             "is_error": true,
             "path_equals": {
-              "structuredContent.error": "dialog_directory_incomplete"
+              "structuredContent.error.code": "dialog_directory_incomplete"
             }
           },
           {
             "is_error": true,
             "path_equals": {
-              "structuredContent.error": "stale_local_directory"
+              "structuredContent.error.code": "stale_local_directory"
             }
           }
         ]
