@@ -96,7 +96,7 @@ def _annotate_flood_attempt(
                 "dispatch_kind": dispatch_kind,
             },
         )
-    except (AttributeError, TypeError):
+    except AttributeError, TypeError:
         return
 
 
@@ -174,7 +174,7 @@ class _AdmissionAwareSender:
                             request_method=type(request).__name__,
                             admission_sequence=admission.sequence,
                             dispatch_at_monotonic=dispatch_at_monotonic,
-                    dispatch_kind="actual_send",
+                            dispatch_kind="actual_send",
                         )
                         raise
             finally:
@@ -803,9 +803,7 @@ class TelegramRpcGate(TelegramClient):
                 self._flood_observer(source="telegram_rpc_gate", seconds=seconds)
             flood_event_observer = getattr(self, "_flood_event_observer", None)
             if scope is not None and flood_event_observer is not None:
-                cooldown_until_utc_ms = int(
-                    (time.time() + max(0.0, _COOLDOWN_DEADLINE - time.monotonic())) * 1_000
-                )
+                cooldown_until_utc_ms = int((time.time() + max(0.0, _COOLDOWN_DEADLINE - time.monotonic())) * 1_000)
                 status = self._rpc_circuit_status()
                 actual_dispatch = origin == "actual_send"
                 if origin not in {"actual_send", "vendor_cache"}:

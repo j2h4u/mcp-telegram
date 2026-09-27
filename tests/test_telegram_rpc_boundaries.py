@@ -113,9 +113,7 @@ def test_boundary_rejects_inherited_borrowed_sender_methods(tmp_path: Path, sour
 def test_boundary_allows_admitted_public_client_methods(tmp_path: Path) -> None:
     path = tmp_path / "adapter.py"
     path.write_text(
-        "await client.get_messages(peer, ids=[1])\n"
-        "await client.get_entity(peer)\n"
-        "await client(request)\n",
+        "await client.get_messages(peer, ids=[1])\nawait client.get_entity(peer)\nawait client(request)\n",
         encoding="utf-8",
     )
     gate = _load_gate()

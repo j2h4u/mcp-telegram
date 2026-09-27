@@ -1159,6 +1159,7 @@ async def test_five_independent_sender_warnings_latch_the_account_circuit() -> N
     sender_calls = 0
 
     for index in range(5):
+
         def send(_request: object, *, _index: int = index) -> object:
             nonlocal sender_calls
             sender_calls += 1
