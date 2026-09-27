@@ -37,7 +37,7 @@ from mcp_telegram.config import (
     TelegramRpcConfig,
     TelegramRpcSchedulerConfig,
 )
-from mcp_telegram.daemon import _connect_telegram
+from mcp_telegram.daemon import _SyncMainContext, _connect_telegram
 from mcp_telegram.flood import (
     FloodWaitAccumulator,
     FloodWaitKillSwitchPolicy,
@@ -2531,9 +2531,9 @@ async def test_actual_failed_bootstrap_parks_daemon_until_shutdown_without_retry
     observed_errors: list[TelegramRpcAdmissionDeferred] = []
     actual_connect = gate.connect
 
-    async def capture_gate_failure() -> bool:
+    async def capture_gate_failure() -> None:
         try:
-            return await actual_connect()
+            await actual_connect()
         except TelegramRpcAdmissionDeferred as exc:
             observed_errors.append(exc)
             raise
@@ -2541,7 +2541,10 @@ async def test_actual_failed_bootstrap_parks_daemon_until_shutdown_without_retry
     monkeypatch.setattr(gate, "connect", capture_gate_failure)
     shutdown = asyncio.Event()
     api_server = SimpleNamespace(startup_detail="", _ready=False)
-    daemon_context = SimpleNamespace(client=gate, api_server=api_server, shutdown_event=shutdown)
+    daemon_context = cast(
+        _SyncMainContext,
+        SimpleNamespace(client=gate, api_server=api_server, shutdown_event=shutdown),
+    )
     parked = asyncio.create_task(_connect_telegram(daemon_context))
     await _wait_for(lambda: bool(observed_errors))
     assert isinstance(observed_errors[0].__cause__, TelegramRpcThrottled)
