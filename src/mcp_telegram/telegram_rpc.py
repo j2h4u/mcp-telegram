@@ -994,6 +994,13 @@ class TelegramRpcGate(TelegramClient):
             raise self._transport_unavailable()
         if self._transport_state is _TransportBoundaryState.DISCONNECTED:
             return None
+        try:
+            connected = self._main_sender.is_connected() and self._main_sender._transport_connected()
+        except Exception:  # noqa: BLE001 - a sender-probe failure is unconfirmed termination evidence.
+            connected = False
+        if not connected:
+            self._transport_state = _TransportBoundaryState.FAILED
+            raise self._transport_unavailable()
         self._transport_state = _TransportBoundaryState.DISCONNECTING
         try:
             result = await self._main_sender.disconnect()

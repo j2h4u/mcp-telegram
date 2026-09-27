@@ -351,6 +351,12 @@ async def test_scalar_future_remains_owned_until_raw_disconnect_finishes(
     disconnect_release = asyncio.Event()
 
     class _BlockedDisconnectSender:
+        def is_connected(self) -> bool:
+            return True
+
+        def _transport_connected(self) -> bool:
+            return True
+
         def send(self, _request: object, *, ordered: bool = False) -> asyncio.Future[object]:
             nonlocal raw_future
             del ordered
@@ -411,6 +417,12 @@ async def test_same_caller_timeouts_cannot_reuse_retained_scalar_capacity(capaci
     raw_futures: list[asyncio.Future[object]] = []
 
     class _PendingSender:
+        def is_connected(self) -> bool:
+            return True
+
+        def _transport_connected(self) -> bool:
+            return True
+
         def send(self, _request: object, *, ordered: bool = False) -> asyncio.Future[object]:
             del ordered
             future = asyncio.get_running_loop().create_future()
