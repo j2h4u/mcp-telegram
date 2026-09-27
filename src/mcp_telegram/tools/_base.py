@@ -252,6 +252,8 @@ def _protection_output_schema(schema: dict[str, object] | None) -> dict[str, obj
                     "outbound_acquisition": {"const": "blocked"},
                     "recovery": {"const": "manual"},
                     "notice": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "opened_at": {"type": "integer"},
                 },
                 "required": ["status", "outbound_acquisition", "recovery", "notice"],
                 "additionalProperties": False,
