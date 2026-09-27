@@ -14,6 +14,7 @@ import pytest
 from mcp_telegram.config import AutomaticGroupHistoryConfig, load_config
 from mcp_telegram.daemon import (
     _acquire_startup_identity_before_updates,
+    _connect_telegram,
     _ensure_demand_runtime,
     _HistorySyncRuntime,
     _message_fact_refresh_policy_from_config,
@@ -31,6 +32,7 @@ from mcp_telegram.entity_profile.contracts import (
     TargetKind,
     UserProfileObservation,
 )
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.own_only_contracts import OwnOnlyContext
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.runtime_observations import RuntimeObservationSink
@@ -156,6 +158,44 @@ class _ClientStub:
 
     async def get_me(self) -> object:
         return SimpleNamespace(id=1)
+
+
+@pytest.mark.asyncio
+async def test_admission_blocked_startup_stays_not_ready_until_shutdown() -> None:
+    class _BlockedClient(_ClientStub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.connect_calls = 0
+
+        async def connect(self) -> None:
+            self.connect_calls += 1
+            raise TelegramRpcThrottled(retry_after_seconds=None, latched=True, detail="open-for-test")
+
+    shutdown = asyncio.Event()
+    api_server = _ApiStub()
+    client = _BlockedClient()
+    ctx = _typed_ctx(client=client, api_server=api_server, shutdown_event=shutdown)
+    pending = asyncio.create_task(_connect_telegram(ctx))
+    await asyncio.sleep(0)
+    assert not pending.done()
+    assert client.connect_calls == 1
+    assert api_server._ready is False
+    assert "admission unavailable" in api_server.startup_detail
+    shutdown.set()
+    assert await pending is False
+
+
+@pytest.mark.asyncio
+async def test_admission_blocked_startup_cancellation_propagates() -> None:
+    class _BlockedClient(_ClientStub):
+        async def connect(self) -> None:
+            raise TelegramRpcThrottled(retry_after_seconds=None, latched=True, detail="open-for-test")
+
+    pending = asyncio.create_task(_connect_telegram(_typed_ctx(client=_BlockedClient())))
+    await asyncio.sleep(0)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
 
 
 class _UserProfilePort:

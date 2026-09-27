@@ -147,6 +147,7 @@ from .telegram_rpc_consumers import DemandKind, demand_contract
 from .telegram_rpc_scheduler import (
     AdmissionObserver,
     RpcAdmissionClosedError,
+    RpcAdmissionError,
     RpcAdmissionEvent,
     RpcAdmissionEventKind,
     TelegramRpcAdmissionDeferred,
@@ -1283,6 +1284,12 @@ async def _connect_telegram(ctx: _SyncMainContext) -> bool:
     except (TimeoutError, OSError) as exc:
         ctx.api_server.startup_detail = f"connection failed: {exc}"
         logger.exception("sync-daemon connection failed: %s", exc)
+        return False
+    except (TelegramRpcThrottled, RpcAdmissionError) as exc:
+        ctx.api_server.startup_detail = f"Telegram admission unavailable: {exc}"
+        ctx.api_server._ready = False
+        logger.warning("sync-daemon Telegram admission unavailable: %s", exc)
+        await ctx.shutdown_event.wait()
         return False
 
     logger.info("sync-daemon started — connected=%s", ctx.client.is_connected())
