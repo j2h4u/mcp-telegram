@@ -78,6 +78,28 @@ async def _status_context(response: dict[str, object]) -> AsyncIterator[object]:
     yield _Connection()
 
 
+class _ReadingTopicConnection:
+    def __init__(
+        self,
+        topics_response: dict[str, object],
+        messages_response: dict[str, object] | None,
+    ) -> None:
+        self.topics_response = topics_response
+        self.messages_response = messages_response
+        self.topic_calls: list[dict[str, object]] = []
+        self.message_calls: list[dict[str, object]] = []
+
+    async def list_topics(self, **kwargs: object) -> dict[str, object]:
+        self.topic_calls.append(kwargs)
+        return self.topics_response
+
+    async def list_messages(self, **kwargs: object) -> dict[str, object]:
+        self.message_calls.append(kwargs)
+        if self.messages_response is None:
+            raise AssertionError("list_messages must not run after a topic resolution error")
+        return self.messages_response
+
+
 class _HasContent(Protocol):
     content: list[object]
 
@@ -1573,6 +1595,138 @@ async def test_registered_ambiguity_action_points_to_canonical_error_details(  #
         "notice": "Telegram acquisition is blocked by account protection. Freshness and incoming coverage may be limited. Recovery requires operator action.",
     }
     validate(payload, cast(dict[str, object], server.tool_by_name[tool_name].output_schema))
+
+
+@pytest.mark.asyncio
+async def test_list_messages_resolves_natural_dialog_topic_without_sending_zero_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_connection = _ReadingTopicConnection(
+        topics_response={"ok": True, "data": {"topics": [{"id": 9, "title": "General"}], "dialog_id": 701}},
+        messages_response={"ok": True, "data": {"messages": [], "source": "sync_db", "dialog_id": 701}},
+    )
+
+    @asynccontextmanager
+    async def tool_connection_context() -> AsyncIterator[object]:
+        yield tool_connection
+
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", tool_connection_context)
+    monkeypatch.setattr(server, "daemon_connection", lambda: _status_context({"ok": True, "data": {}}))
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+
+    result = _call_tool_result(
+        await server.call_tool(
+            "list_messages",
+            {"dialog": "Project", "topic": "General", "message_state": "sent"},
+        )
+    )
+
+    assert result.is_error is False
+    assert result.content == []
+    payload = cast(dict[str, object], result.structured_content)
+    validate(payload, cast(dict[str, object], server.tool_by_name["list_messages"].output_schema))
+    assert tool_connection.topic_calls == [{"dialog": "Project"}]
+    assert len(tool_connection.message_calls) == 1
+    assert tool_connection.message_calls[0]["dialog"] == "Project"
+    assert tool_connection.message_calls[0]["topic_id"] == 9
+    assert "dialog_id" not in tool_connection.message_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_list_messages_natural_topic_lookup_projects_dialog_ambiguity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_connection = _ReadingTopicConnection(
+        topics_response={
+            "ok": False,
+            "error": "ambiguous_dialog",
+            "message": "Multiple dialogs match.",
+            "required_action": "Retry with an exact dialog id from structuredContent.error.details.candidates.",
+            "candidates": [
+                {"entity_id": 101, "display_name": "Project Alpha", "username": "project_alpha", "score": 100},
+                {"entity_id": 202, "display_name": "Project Archive", "username": "project_archive", "score": 100},
+            ],
+        },
+        messages_response=None,
+    )
+
+    @asynccontextmanager
+    async def tool_connection_context() -> AsyncIterator[object]:
+        yield tool_connection
+
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", tool_connection_context)
+    monkeypatch.setattr(
+        server,
+        "daemon_connection",
+        lambda: _status_context(
+            {
+                "ok": True,
+                "data": {
+                    "account_protection": {
+                        "status": "active",
+                        "outbound_acquisition": "blocked",
+                        "recovery": "manual",
+                        "notice": "Telegram acquisition is blocked by account protection. Freshness and incoming coverage may be limited. Recovery requires operator action.",
+                    }
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+
+    result = _call_tool_result(
+        await server.call_tool(
+            "list_messages",
+            {"dialog": "Project", "topic": "General", "message_state": "sent"},
+        )
+    )
+
+    assert result.is_error is True
+    payload = cast(dict[str, object], result.structured_content)
+    error = cast(dict[str, object], payload["error"])
+    details = cast(dict[str, object], error["details"])
+    candidates = cast(list[dict[str, object]], details["candidates"])
+    assert error["code"] == "ambiguous_dialog"
+    assert "structuredContent.error.details.candidates" in cast(str, error["action"])
+    assert [candidate["entity_id"] for candidate in candidates] == [101, 202]
+    assert cast(dict[str, object], payload["account_protection"])["status"] == "active"
+    validate(payload, cast(dict[str, object], server.tool_by_name["list_messages"].output_schema))
+    assert tool_connection.topic_calls == [{"dialog": "Project"}]
+    assert tool_connection.message_calls == []
+
+
+@pytest.mark.asyncio
+async def test_list_messages_exact_dialog_topic_lookup_keeps_exact_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_connection = _ReadingTopicConnection(
+        topics_response={"ok": True, "data": {"topics": [{"id": 9, "title": "General"}], "dialog_id": 701}},
+        messages_response={"ok": True, "data": {"messages": [], "source": "sync_db", "dialog_id": 701}},
+    )
+
+    @asynccontextmanager
+    async def tool_connection_context() -> AsyncIterator[object]:
+        yield tool_connection
+
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", tool_connection_context)
+    monkeypatch.setattr(server, "daemon_connection", lambda: _status_context({"ok": True, "data": {}}))
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+
+    result = _call_tool_result(
+        await server.call_tool(
+            "list_messages",
+            {"exact_dialog_id": 701, "topic": "General", "message_state": "sent"},
+        )
+    )
+
+    assert result.is_error is False
+    payload = cast(dict[str, object], result.structured_content)
+    validate(payload, cast(dict[str, object], server.tool_by_name["list_messages"].output_schema))
+    assert tool_connection.topic_calls == [{"dialog_id": 701}]
+    assert len(tool_connection.message_calls) == 1
+    assert tool_connection.message_calls[0]["dialog_id"] == 701
+    assert tool_connection.message_calls[0]["topic_id"] == 9
+    assert "dialog" not in tool_connection.message_calls[0]
 
 
 @pytest.mark.parametrize(

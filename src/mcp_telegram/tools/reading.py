@@ -1328,7 +1328,7 @@ def _validate_utc_range(args: ListMessages) -> None:
 async def _resolve_topic_id(
     topic_name: str,
     *,
-    dialog_id: int,
+    dialog_id: int | None,
     dialog_name: str | None,
 ) -> int | ToolResult:
     """Resolve a fuzzy topic name to a numeric topic_id via the daemon.
@@ -1338,10 +1338,10 @@ async def _resolve_topic_id(
     """
     try:
         async with daemon_connection() as conn:
-            response = await conn.list_topics(
-                dialog_id=dialog_id,
-                dialog=dialog_name,
-            )
+            if dialog_id is not None:
+                response = await conn.list_topics(dialog_id=dialog_id)
+            else:
+                response = await conn.list_topics(dialog=dialog_name)
     except DaemonNotRunningError as exc:
         return error_result(_daemon_not_running_text(exc))
 
@@ -1353,6 +1353,17 @@ async def _resolve_topic_id(
 def _topic_lookup_error(response: dict) -> ToolResult:
     error = response.get("error", "unknown")
     error_detail = response.get("message", "Request failed.")
+    projection = project_dialog_resolution_error(
+        response,
+        fallback_action="Retry ListMessages with an exact dialog id.",
+    )
+    if projection is not None:
+        return ToolResult(
+            content=_text_response(projection.text),
+            is_error=True,
+            structured_content=projection.structured_content,
+            error_code=safe_error_code(error),
+        )
     return error_result(
         f"Topic lookup failed: {error}: {error_detail}\n"
         "Action: Call list_topics for this dialog, then retry list_messages with a numeric exact_topic_id."
@@ -1499,7 +1510,7 @@ async def _list_messages_topic_id(
         return args.exact_topic_id
     resolved = await _resolve_topic_id(
         args.topic,
-        dialog_id=request_context.dialog_id or 0,
+        dialog_id=request_context.dialog_id,
         dialog_name=request_context.dialog_label if request_context.dialog_id is None else None,
     )
     if not isinstance(resolved, ToolResult):
