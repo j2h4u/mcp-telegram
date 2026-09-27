@@ -315,6 +315,41 @@ def _dm_gap_scan_release_at(conn: sqlite3.Connection, now: float) -> float | Non
     return float(state.next_run_at) if state.next_run_at > now else 0.0
 
 
+def _dm_scan_transition(
+    state: _DmGapScanState,
+    *,
+    status: str,
+    reason: str | None,
+    changed_at: int,
+) -> _DmGapScanState:
+    return _DmGapScanState(
+        status,
+        state.generation,
+        state.scan_started_at,
+        state.dialog_id_cursor,
+        state.message_cursor,
+        state.next_run_at,
+        _DM_GAP_SCAN_POLICY_VERSION,
+        reason,
+        changed_at,
+    )
+
+
+def _prepare_legacy_dm_scan_state(state: _DmGapScanState, changed_at: int) -> _DmGapScanState:
+    if state.status == "running":
+        return _dm_scan_transition(state, status="suspended", reason="legacy_generation_review", changed_at=changed_at)
+    if state.status == "verifying":
+        return _dm_scan_transition(state, status="suspended", reason="interrupted", changed_at=changed_at)
+    if state.status == "suspended":
+        return _dm_scan_transition(
+            state,
+            status="suspended",
+            reason=state.reason or "legacy_generation_review",
+            changed_at=state.state_changed_at if state.state_changed_at is not None else changed_at,
+        )
+    return _dm_scan_transition(state, status=state.status, reason=None, changed_at=changed_at)
+
+
 def prepare_dm_deletion_reconciliation(conn: sqlite3.Connection, *, now: int | None = None) -> None:
     """Quarantine unfinished legacy work and interrupted claims before registration."""
     state = _load_dm_gap_scan_state(conn)
@@ -325,66 +360,9 @@ def prepare_dm_deletion_reconciliation(conn: sqlite3.Connection, *, now: int | N
         raise ValueError("now must be non-negative")
 
     if state.policy_version is None:
-        if state.status == "running":
-            state = _DmGapScanState(
-                "suspended",
-                state.generation,
-                state.scan_started_at,
-                state.dialog_id_cursor,
-                state.message_cursor,
-                state.next_run_at,
-                _DM_GAP_SCAN_POLICY_VERSION,
-                "legacy_generation_review",
-                changed_at,
-            )
-        elif state.status == "verifying":
-            state = _DmGapScanState(
-                "suspended",
-                state.generation,
-                state.scan_started_at,
-                state.dialog_id_cursor,
-                state.message_cursor,
-                state.next_run_at,
-                _DM_GAP_SCAN_POLICY_VERSION,
-                "interrupted",
-                changed_at,
-            )
-        elif state.status == "suspended":
-            state = _DmGapScanState(
-                "suspended",
-                state.generation,
-                state.scan_started_at,
-                state.dialog_id_cursor,
-                state.message_cursor,
-                state.next_run_at,
-                _DM_GAP_SCAN_POLICY_VERSION,
-                state.reason or "legacy_generation_review",
-                state.state_changed_at if state.state_changed_at is not None else changed_at,
-            )
-        else:
-            state = _DmGapScanState(
-                state.status,
-                state.generation,
-                state.scan_started_at,
-                state.dialog_id_cursor,
-                state.message_cursor,
-                state.next_run_at,
-                _DM_GAP_SCAN_POLICY_VERSION,
-                None,
-                changed_at,
-            )
+        state = _prepare_legacy_dm_scan_state(state, changed_at)
     elif state.status == "verifying":
-        state = _DmGapScanState(
-            "suspended",
-            state.generation,
-            state.scan_started_at,
-            state.dialog_id_cursor,
-            state.message_cursor,
-            state.next_run_at,
-            _DM_GAP_SCAN_POLICY_VERSION,
-            "interrupted",
-            changed_at,
-        )
+        state = _dm_scan_transition(state, status="suspended", reason="interrupted", changed_at=changed_at)
     else:
         return
 
@@ -908,25 +886,44 @@ class DmDeletionReconciliationDemandAdapter:
         )
         self._write_transition(state, advanced)
 
-    async def run_slice(self, budget: RpcAttemptBudget) -> None:  # noqa: PLR0912
-        """Claim and verify at most one page, failing closed on ambiguity."""
-        if not isinstance(budget, RpcAttemptBudget):
-            raise TypeError("budget must be an RpcAttemptBudget")
-        now = int(time.time())
+    def _select_page(self, now: int) -> tuple[_DmGapScanState, int, tuple[int, ...]] | None:
         state = self._start_scan(now)
         if state is None:
-            return
+            return None
         dialog_ids = _dm_gap_scan_dialog_ids(self._conn)
         dialog_id = self._next_dialog(state, dialog_ids)
         if dialog_id is None:
             self._complete_scan(state, now)
-            return
+            return None
         page = _dm_gap_scan_page_ids(self._conn, dialog_id, state.scan_started_at, state.message_cursor)
         if not page:
             self._advance_empty_dialog(state, dialog_id, now)
-            return
+            return None
+        return state, dialog_id, page
 
-        claimed = self._claim_page(state, now)
+    def _handle_zero_dispatch_deferral(
+        self, state: _DmGapScanState, budget: RpcAttemptBudget, token: DemandToken | None
+    ) -> None:
+        if not self._has_zero_dispatches(budget, token):
+            return
+        try:
+            self._restore_after_proven_defer(state, int(time.time()))
+        except Exception:
+            logger.exception("dm_deletion_reconciliation_zero_dispatch_restore_failed")
+
+    def _handle_throttle(self, state: _DmGapScanState) -> None:
+        try:
+            self._suspend_after_throttle(state, int(time.time()))
+        except Exception:
+            logger.exception("dm_deletion_reconciliation_throttle_suspend_failed")
+
+    async def _verify_claimed_page(
+        self,
+        state: _DmGapScanState,
+        dialog_id: int,
+        page: tuple[int, ...],
+        budget: RpcAttemptBudget,
+    ) -> None:
         token: DemandToken | None = None
         try:
             with demand_context(self.demand_kind) as token:
@@ -936,11 +933,7 @@ class DmDeletionReconciliationDemandAdapter:
                     with rpc_attempt_budget(budget):
                         await self._scanner.run_dm_gap_scan_page(dialog_id, page)
         except TelegramRpcAdmissionDeferred:
-            if self._has_zero_dispatches(budget, token):
-                try:
-                    self._restore_after_proven_defer(claimed, int(time.time()))
-                except Exception:
-                    logger.exception("dm_deletion_reconciliation_zero_dispatch_restore_failed")
+            self._handle_zero_dispatch_deferral(state, budget, token)
             raise
         except (
             RpcAdmissionClosedError,
@@ -948,20 +941,24 @@ class DmDeletionReconciliationDemandAdapter:
             RpcAdmissionSaturatedError,
             RpcAttemptBudgetExhaustedError,
         ):
-            if self._has_zero_dispatches(budget, token):
-                try:
-                    self._restore_after_proven_defer(claimed, int(time.time()))
-                except Exception:
-                    logger.exception("dm_deletion_reconciliation_zero_dispatch_restore_failed")
+            self._handle_zero_dispatch_deferral(state, budget, token)
             raise
         except TelegramRpcThrottled:
-            try:
-                self._suspend_after_throttle(claimed, int(time.time()))
-            except Exception:
-                logger.exception("dm_deletion_reconciliation_throttle_suspend_failed")
+            self._handle_throttle(state)
             raise
 
-        self._commit_page(claimed, dialog_id, page[-1], int(time.time()))
+        self._commit_page(state, dialog_id, page[-1], int(time.time()))
+
+    async def run_slice(self, budget: RpcAttemptBudget) -> None:
+        """Claim and verify at most one page, failing closed on ambiguity."""
+        if not isinstance(budget, RpcAttemptBudget):
+            raise TypeError("budget must be an RpcAttemptBudget")
+        selected = self._select_page(int(time.time()))
+        if selected is None:
+            return
+        state, dialog_id, page = selected
+        claimed = self._claim_page(state, int(time.time()))
+        await self._verify_claimed_page(claimed, dialog_id, page, budget)
 
 
 def _restore_revalidated_access(
