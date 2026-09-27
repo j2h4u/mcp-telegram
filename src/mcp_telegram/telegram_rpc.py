@@ -305,6 +305,8 @@ class _MainSenderAdapter:
         self._gate._begin_transport_connect()
         try:
             result = await self._gate._main_sender.connect(connection)
+        except asyncio.CancelledError:
+            raise
         except BaseException:
             self._gate._finish_transport_connect_failure()
             raise
@@ -614,6 +616,11 @@ class TelegramRpcGate(TelegramClient):
                 await super().connect()  # type: ignore[misc]
                 return
             raise self._connection_owner_deferred()
+        self.check_circuit()
+        if self._transport_state is _TransportBoundaryState.READY:
+            if self._main_sender.is_connected():
+                return
+            raise self._transport_unavailable()
         self._raise_if_transport_unavailable(allow_disconnected=True)
         capability = self._capture_connection_capability()
         scope = self._scope_for_connection_capability(capability)
@@ -623,7 +630,6 @@ class TelegramRpcGate(TelegramClient):
         owner: asyncio.Task[object] | None = None
         release_reservation = False
         try:
-            self.check_circuit()
             await self._wait_for_account_cooldown(scope)
             self.check_circuit()
             owner = self._start_connection_owner(scope)
@@ -669,18 +675,27 @@ class TelegramRpcGate(TelegramClient):
     ) -> tuple[bool, bool]:
         if owner is None:
             return True, False
-        try:
-            cancelled = await self._complete_failed_connection_cleanup()
-        except BaseException:
-            logger.exception("telegram_connection_bootstrap_cleanup_failed")
-            if isinstance(bootstrap_error, asyncio.CancelledError):
-                return False, False
+        cancelled, cleanup_error = await self._complete_failed_connection_cleanup()
+        release_reservation = cleanup_error is None
+        cancellation_wins = (
+            isinstance(bootstrap_error, asyncio.CancelledError)
+            or cancelled
+            or isinstance(cleanup_error, asyncio.CancelledError)
+        )
+        if cleanup_error is not None:
+            logger.error(
+                "telegram_connection_bootstrap_cleanup_failed",
+                exc_info=(type(cleanup_error), cleanup_error, cleanup_error.__traceback__),
+            )
+        if cancellation_wins:
+            return release_reservation, True
+        if cleanup_error is not None:
             raise TelegramRpcAdmissionDeferred(
                 retry_after_seconds=self._scheduler_policy.admission_retry_seconds,
                 latched=False,
                 detail="Telegram transport termination is unconfirmed; retry after manual recovery",
             ) from bootstrap_error
-        return True, cancelled
+        return release_reservation, False
 
     def _connection_owner_deferred(self) -> TelegramRpcAdmissionDeferred:
         retry_seconds = self._scheduler_policy.admission_retry_seconds
@@ -723,7 +738,7 @@ class TelegramRpcGate(TelegramClient):
         self._connection_rpc_tasks.clear()
         await super()._disconnect()  # type: ignore[misc]
 
-    async def _complete_failed_connection_cleanup(self) -> bool:
+    async def _complete_failed_connection_cleanup(self) -> tuple[bool, BaseException | None]:
         """Keep the connection reservation until a cancellation-safe cleanup finishes."""
         cleanup = asyncio.get_running_loop().create_task(
             self._cleanup_failed_connection_bootstrap(),
@@ -736,8 +751,13 @@ class TelegramRpcGate(TelegramClient):
                 await asyncio.wait({cleanup})
             except asyncio.CancelledError:
                 cancelled = True
-        cleanup.result()
-        return cancelled
+        try:
+            cleanup.result()
+        except asyncio.CancelledError as exc:
+            return cancelled, exc
+        except Exception as exc:  # noqa: BLE001 - a teardown failure is returned with its cancellation state.
+            return cancelled, exc
+        return cancelled, None
 
     async def _switch_dc(self, new_dc: int) -> None:
         """Prevent concurrent migration from mutating a guarded bootstrap transport."""
@@ -938,15 +958,16 @@ class TelegramRpcGate(TelegramClient):
         if pending is None:
             return
         if raw_future.cancelled():
-            if self._transport_state not in {
-                _TransportBoundaryState.DISCONNECTING,
-                _TransportBoundaryState.DISCONNECTED,
-            }:
+            if self._transport_state is _TransportBoundaryState.DISCONNECTED:
+                self._release_scalar_dispatch(raw_future, pending)
+            elif self._transport_state is not _TransportBoundaryState.DISCONNECTING:
                 self._transport_state = _TransportBoundaryState.FAILED
             return
         exc = raw_future.exception()
         if exc is not None and not isinstance(exc, RPCError):
-            if self._transport_state is not _TransportBoundaryState.DISCONNECTING:
+            if self._transport_state is _TransportBoundaryState.DISCONNECTED:
+                self._release_scalar_dispatch(raw_future, pending)
+            elif self._transport_state is not _TransportBoundaryState.DISCONNECTING:
                 self._transport_state = _TransportBoundaryState.FAILED
             return
         if isinstance(exc, (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError)):
@@ -971,8 +992,10 @@ class TelegramRpcGate(TelegramClient):
 
     async def _disconnect_main_sender(self) -> object:
         """Terminate raw transport, then settle every gate-owned scalar response."""
-        if self._transport_state is _TransportBoundaryState.FAILED:
+        if self._transport_state in {_TransportBoundaryState.FAILED, _TransportBoundaryState.DISCONNECTING}:
             raise self._transport_unavailable()
+        if self._transport_state is _TransportBoundaryState.DISCONNECTED:
+            return None
         self._transport_state = _TransportBoundaryState.DISCONNECTING
         try:
             result = await self._main_sender.disconnect()

@@ -429,11 +429,23 @@ async def test_same_caller_timeouts_cannot_reuse_retained_scalar_capacity(capaci
                     with rpc_scope(TelegramRpcSource.FULL_SYNC):
                         await gate(_ScalarRequest(value))
 
+    async def timed_scope_request(value: object) -> object:
+        with demand_context(DemandKind.FULL_SYNC_PAGE):
+            with rpc_scope(TelegramRpcSource.FULL_SYNC):
+                async with asyncio.timeout(0.01):
+                    return await gate(_ScalarRequest(value))
+
     try:
         for value in range(capacity):
             await abandon(value)
         assert len(raw_futures) == capacity
         assert gate._admission_scheduler.active_depths()[RpcServiceClass.BACKGROUND] == capacity
+        if capacity == 1:
+            for value in ("second-timeout-scope", "third-timeout-scope"):
+                with pytest.raises(TelegramRpcAdmissionDeferred, match="temporarily busy"):
+                    await timed_scope_request(value)
+            assert len(raw_futures) == 1
+            assert gate._admission_scheduler.active_depths()[RpcServiceClass.BACKGROUND] == 1
         with pytest.raises(TelegramRpcAdmissionDeferred, match="temporarily busy"):
             with demand_context(DemandKind.FULL_SYNC_PAGE):
                 with rpc_scope(TelegramRpcSource.FULL_SYNC):

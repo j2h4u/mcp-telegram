@@ -1001,11 +1001,12 @@ async def _monitor_flood_wait_kill_switch(ctx: _SyncMainContext) -> None:
         await ctx.client.disconnect()
     except Exception:
         logger.exception("flood_wait_kill_switch_telegram_disconnect_failed")
+    else:
+        logger.critical("flood_wait_kill_switch_telegram_disconnected")
     finally:
         observer = ctx.rpc_admission_observer
         if observer is not None:
             observer.flush()
-    logger.critical("flood_wait_kill_switch_telegram_disconnected")
 
 
 def _install_flood_wait_kill_switch(config: McpTelegramConfig, event: asyncio.Event) -> None:

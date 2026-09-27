@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import sqlite3
 from collections.abc import Coroutine
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -12,7 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import mcp_telegram.daemon as daemon
-from mcp_telegram.config import AutomaticGroupHistoryConfig, load_config
+from mcp_telegram.config import AutomaticGroupHistoryConfig, RuntimeObservationConfig, load_config
 from mcp_telegram.daemon import (
     _acquire_startup_identity_before_updates,
     _connect_telegram,
@@ -45,6 +46,12 @@ from mcp_telegram.startup_identity import (
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_scheduler import (
+    RPC_SOURCE_SERVICE_CLASS,
+    RpcAdmissionEvent,
+    RpcAdmissionEventKind,
+    TelegramRpcSource,
+)
 
 
 def _ctx(**overrides: object) -> SimpleNamespace:
@@ -684,6 +691,98 @@ async def test_protective_stop_drains_producers_before_flushing_admission_observ
     await _monitor_flood_wait_kill_switch(ctx)
 
     assert stages == ["producer_cancelled", "disconnect", "flush"]
+
+
+@pytest.mark.asyncio
+async def test_protective_stop_persists_pending_summary_while_daemon_remains_parked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    policy = RuntimeObservationConfig()
+    sink = RuntimeObservationSink(db_path, retention_ttl_seconds=3600, policy=policy)
+    observer = RpcAdmissionObservationAggregator(sink, policy=policy)
+    source = TelegramRpcSource.MCP_INTERACTIVE
+    service_class = RPC_SOURCE_SERVICE_CLASS[source]
+    observer.observe(
+        RpcAdmissionEvent(
+            kind=RpcAdmissionEventKind.QUEUED,
+            source=source,
+            service_class=service_class,
+            queue_depth=1,
+            total_depth=1,
+        )
+    )
+    observer.observe(
+        RpcAdmissionEvent(
+            kind=RpcAdmissionEventKind.DISPATCHED,
+            source=source,
+            service_class=service_class,
+            queue_depth=0,
+            total_depth=0,
+            active_depth=1,
+            total_outstanding=1,
+            wait_seconds=0.01,
+        )
+    )
+
+    stages: list[str] = []
+    shutdown = asyncio.Event()
+    kill_switch = asyncio.Event()
+    kill_switch.set()
+
+    class _StoppingClient(_ClientStub):
+        async def disconnect(self) -> None:
+            stages.append("disconnect")
+            await super().disconnect()
+
+    async def producer() -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            stages.append("producer_cancelled")
+
+    task = asyncio.create_task(producer())
+    await asyncio.sleep(0)
+    ctx = _typed_ctx(
+        client=_StoppingClient(),
+        background_tasks={task},
+        shutdown_event=shutdown,
+        flood_wait_kill_switch_event=kill_switch,
+        rpc_admission_observer=observer,
+        rpc_observation_sink=sink,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "flood_wait_kill_switch_status",
+        lambda: SimpleNamespace(open=True, detail=lambda: "open-for-test"),
+    )
+
+    try:
+        await _monitor_flood_wait_kill_switch(ctx)
+        assert stages == ["producer_cancelled", "disconnect"]
+        assert shutdown.is_set() is False
+        assert cast(_ClientStub, ctx.client).disconnect_calls == 1
+
+        row: tuple[object, ...] | None = None
+        for _ in range(100):
+            with closing(sqlite3.connect(db_path)) as conn:
+                row = cast(
+                    tuple[object, ...] | None,
+                    conn.execute(
+                        "SELECT outcome, reason_code FROM runtime_observations "
+                        "WHERE kind = 'telegram.rpc_admission' ORDER BY observed_at_ms DESC LIMIT 1"
+                    ).fetchone(),
+                )
+            if row is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert row is not None
+        assert row[0] == "summary"
+        assert stages == ["producer_cancelled", "disconnect"]
+    finally:
+        await sink.aclose()
 
 
 @pytest.mark.asyncio
