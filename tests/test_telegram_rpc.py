@@ -38,7 +38,12 @@ from mcp_telegram.config import (
     TelegramRpcSchedulerConfig,
 )
 from mcp_telegram.daemon import _connect_telegram, _SyncMainContext
-from mcp_telegram.delta_sync import DmDeletionReconciliationDemandAdapter, prepare_dm_deletion_reconciliation
+from mcp_telegram.delta_sync import (
+    DeltaGapFillDemandAdapter,
+    DeltaSyncWorker,
+    DmDeletionReconciliationDemandAdapter,
+    prepare_dm_deletion_reconciliation,
+)
 from mcp_telegram.event_handlers import EventHandlerManager
 from mcp_telegram.flood import (
     FloodWaitAccumulator,
@@ -46,6 +51,7 @@ from mcp_telegram.flood import (
     FloodWaitObservation,
     TelegramRpcThrottled,
 )
+from mcp_telegram.message_history.contracts import ForwardGapPage
 from mcp_telegram.sync_db import (
     _apply_migrations,
     ensure_sync_schema,
@@ -2428,6 +2434,48 @@ def _real_dm_page_adapter(
     return gate, sender, DmDeletionReconciliationDemandAdapter(conn, scanner), scanner
 
 
+async def _dispatch_forward_history_sibling(
+    gate: TelegramRpcGate,
+    sender: _DmPageFutureSender,
+    conn: sqlite3.Connection,
+) -> None:
+    """Run one normal durable sibling after the shared cooldown has expired."""
+
+    class GateForwardPort:
+        async def fetch_page(
+            self,
+            dialog_id: int,
+            *,
+            after_message_id: int,
+            should_stop: Callable[[], bool],
+        ) -> ForwardGapPage:
+            assert dialog_id == 211
+            assert after_message_id == 1
+            assert not should_stop()
+            await gate(
+                functions.messages.GetHistoryRequest(
+                    peer=types.InputPeerUser(user_id=dialog_id, access_hash=0),
+                    offset_id=0,
+                    offset_date=None,
+                    add_offset=0,
+                    limit=100,
+                    max_id=0,
+                    min_id=after_message_id,
+                    hash=0,
+                )
+            )
+            return ForwardGapPage(messages=(), complete=True)
+
+    forward_adapter = DeltaGapFillDemandAdapter(DeltaSyncWorker(GateForwardPort(), conn, asyncio.Event()))
+    sibling = asyncio.create_task(forward_adapter.run_slice(RpcAttemptBudget(limit=1)))
+    await _wait_for(lambda: sender.calls == 2)
+    assert isinstance(sender.requests[1], functions.messages.GetHistoryRequest)
+    assert sender.scopes[1].demand_kind is DemandKind.DELTA_GAP_FILL
+    assert sender.scopes[1].acquisition_kind is AcquisitionKind.MESSAGE_HISTORY_PAGE
+    sender.futures[1].set_result(types.messages.Messages(messages=[], topics=[], chats=[], users=[]))
+    await sibling
+
+
 @pytest.mark.asyncio
 async def test_dm_page_success_uses_real_get_messages_and_commits_tombstone_cursor() -> None:
     conn = _dm_reconciliation_test_db()
@@ -2534,9 +2582,16 @@ async def test_dm_page_flood_crosses_gate_with_durable_demand_and_acquisition() 
         assert conn.execute("SELECT is_deleted FROM messages WHERE dialog_id=211 AND message_id=1").fetchone() == (0,)
         assert sender.calls == 1
         assert adapter.status(10_000_000) is None
+
+        import mcp_telegram.telegram_rpc as rpc
+
+        rpc._COOLDOWN_DEADLINE = rpc.time.monotonic() - 1
+        await _dispatch_forward_history_sibling(gate, sender, conn)
+
         await adapter.run_slice(RpcAttemptBudget(limit=1))
         assert scanner.calls == 1
-        assert sender.calls == 1
+        assert sender.calls == 2
+        assert len(observations) == 1
     finally:
         await gate.close_rpc_scheduler()
         conn.close()
