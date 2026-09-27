@@ -30,7 +30,7 @@ from mcp_telegram.telegram_demand import (
     DurableDemandAdapter,
     RpcAttemptBudget,
 )
-from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator
+from mcp_telegram.telegram_demand_coordinator import CoordinatorState, TelegramDemandCoordinator
 from mcp_telegram.telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from mcp_telegram.telegram_rpc_consumers import DURABLE_DEMAND_ORDER, DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
@@ -138,9 +138,11 @@ class _ThrottledHydrationHandler(_HydrationHandler):
         super().__init__()
         self._error = error
         self._dispatch = dispatch
+        self.calls = 0
 
     async def request(self, client: object, jobs: Sequence[HydrationJob]) -> object:
         del client, jobs
+        self.calls += 1
         self.scope = current_rpc_scope()
         if self._dispatch:
             assert self.scope.attempt_budget is not None
@@ -232,28 +234,31 @@ async def test_hydration_finite_throttle_reschedules_and_defers_through_coordina
 @pytest.mark.asyncio
 async def test_hydration_latched_throttle_restores_undispatched_job_and_stops_coordinator() -> None:
     conn = _hydration_db()
-    conn.execute(
-        "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, priority) "
-        "VALUES ('test', 1, 1, 1, 2, 1)"
-    )
-    error = TelegramRpcThrottled(latched=True, detail="test circuit open")
-    handler = _ThrottledHydrationHandler(error, dispatch=False)
-    adapter = FactHydrationDemandAdapter(
-        _hydration_worker(conn, handler, clock=lambda: 100.0), HydrationPriority.FOREGROUND
-    )
-    observer = _DemandObserver()
-    shutdown_event = asyncio.Event()
-    coordinator = _hydration_coordinator(adapter, observer=observer, shutdown_event=shutdown_event)
+    try:
+        conn.execute(
+            "INSERT INTO hydration_jobs(kind, dialog_id, message_id, due_at, attempts, priority) "
+            "VALUES ('test', 1, 1, 1, 2, 1)"
+        )
+        error = TelegramRpcThrottled(latched=True, detail="test circuit open")
+        handler = _ThrottledHydrationHandler(error, dispatch=False)
+        adapter = FactHydrationDemandAdapter(
+            _hydration_worker(conn, handler, clock=lambda: 100.0), HydrationPriority.FOREGROUND
+        )
+        observer = _DemandObserver()
+        shutdown_event = asyncio.Event()
+        coordinator = _hydration_coordinator(adapter, observer=observer, shutdown_event=shutdown_event)
 
-    with pytest.raises(TelegramRpcThrottled, match="test circuit open"):
-        await coordinator._execute_slice(DemandKind.LIVE_HYDRATION_BATCH)
+        await coordinator.run()
 
-    assert shutdown_event.is_set()
-    assert conn.execute(
-        "SELECT due_at, attempts, terminal, last_outcome, last_error_code FROM hydration_jobs WHERE message_id=1"
-    ).fetchone() == (1, 2, 0, "rpc_paused", "TelegramRpcThrottled")
-    assert [event["outcome"] for event in observer.events] == ["selected"]
-    conn.close()
+        assert coordinator.state is CoordinatorState.STOPPED
+        assert shutdown_event.is_set() is False
+        assert handler.calls == 1
+        assert conn.execute(
+            "SELECT due_at, attempts, terminal, last_outcome, last_error_code FROM hydration_jobs WHERE message_id=1"
+        ).fetchone() == (1, 2, 0, "rpc_paused", "TelegramRpcThrottled")
+        assert [event["outcome"] for event in observer.events] == ["selected"]
+    finally:
+        conn.close()
 
 
 def _repair_hydration_worker(conn: sqlite3.Connection, handler: _HydrationHandler) -> MessageFactHydrationWorker:

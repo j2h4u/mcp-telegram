@@ -288,6 +288,7 @@ class _RpcSchedulerFailureStatus:
 
     reason: str
     open: bool = True
+    opened_at: int | None = None
 
     def detail(self) -> str:
         return self.reason

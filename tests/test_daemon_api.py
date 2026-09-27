@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from telethon.tl.types import PeerUser, UpdateReadHistoryInbox
 
+from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.config import RuntimeObservationConfig, TelemetryConfig
 from mcp_telegram.daemon_api import (
     DaemonAPIServer,
@@ -37,7 +38,7 @@ from mcp_telegram.dialog_selector import required_dialog_selector
 from mcp_telegram.event_handlers import EventHandlerManager, _InboxReadUpdateLike
 from mcp_telegram.feedback_db import SQLiteFeedbackStore
 from mcp_telegram.feedback_service import FeedbackApplicationService
-from mcp_telegram.flood import FloodWaitKillSwitchStatus
+from mcp_telegram.flood import FloodWaitKillSwitchStatus, TelegramRpcThrottled
 from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
@@ -378,6 +379,68 @@ def make_server(
     )
     server._ready = True
     return server
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("protected", "stored_owner"),
+    [(False, None), (True, None), (True, 7)],
+    ids=["inactive-missing-owner", "active-missing-owner", "active-wrong-owner"],
+)
+async def test_entity_profile_pending_projects_protection_only_when_active(
+    tmp_path: Path,
+    protected: bool,
+    stored_owner: int | None,
+) -> None:
+    """Known local entity stubs retain domain ownership checks before API projection."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    client = _TestClient()
+    client.get_entity = AsyncMock(side_effect=AssertionError("owned cache must not acquire Telegram"))
+    server = make_server(conn, client)
+    server._policy = replace(
+        server._policy,
+        entity_profile=replace(server._policy.entity_profile, foreground_refresh_wait_seconds=0.01),
+    )
+    server._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
+    server.bind_demand_sink(MagicMock(offer=MagicMock(return_value=True)))
+    service = server._get_entity_info_service()
+    service._profiles.save_core({"id": 42, "type": "user", "name": "Local stub"}, now=100)  # type: ignore[attr-defined]
+    service._profiles.mark_pending(42, now=100)  # type: ignore[attr-defined]
+    if stored_owner is not None:
+        conn.execute(
+            "UPDATE entity_details SET profile_owner_account_id=?, profile_observation_scope_json='{}' WHERE entity_id=42",
+            (stored_owner,),
+        )
+        conn.commit()
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=protected,
+        reason="test" if protected else None,
+        opened_at=1 if protected else None,
+        events_in_window=1 if protected else 0,
+        wait_s_in_window=1 if protected else 0,
+        window_seconds=1,
+        source="test" if protected else None,
+    )
+    try:
+        result, _, _ = await server._handle_client_line(b'{"method":"get_entity_info","entity_id":42}', "", None)
+    finally:
+        await server.shutdown()
+        conn.close()
+
+    client.get_entity.assert_not_called()
+    if protected:
+        assert result == {
+            "ok": False,
+            "error": "flood_wait_kill_switch_open",
+            "message": "Telegram acquisition is blocked by account protection.",
+            "required_action": "manual_operator_recovery",
+            "retryable": False,
+        }
+    else:
+        assert result["error"] == "entity_info_pending"
+        assert result["retryable"] is True
 
 
 @pytest.mark.asyncio
@@ -1192,8 +1255,15 @@ async def test_list_messages_from_db() -> None:
     client = _TestClient()
     client.iter_messages = AsyncMock()
     server = make_server(conn, client)
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    )
 
-    result = await server._list_messages({"dialog_id": 1, "limit": 10, "message_state": "sent"})
+    result, _, _ = await server._handle_client_line(
+        json.dumps({"method": "list_messages", "dialog_id": 1, "limit": 10, "message_state": "sent"}).encode(),
+        "",
+        None,
+    )
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
     assert result["data"]["source"] == "sync_db"
@@ -2361,8 +2431,11 @@ async def test_list_topics_through_daemon() -> None:
 
     client = _TestClient()
     server = make_server(conn, client)
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    )
 
-    result = await server._list_topics({"dialog_id": 123})
+    result, _, _ = await server._handle_client_line(b'{"method":"list_topics","dialog_id":123}', "", None)
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
     assert "topics" in result["data"]
@@ -2370,6 +2443,120 @@ async def test_list_topics_through_daemon() -> None:
     assert result["data"]["topics"][0]["id"] == 1
     assert result["data"]["topics"][0]["title"] == "General"
     cast(AsyncMock, client.get_entity).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_topics_serves_cached_catalog_when_protection_blocks_optional_icon_enrichment() -> None:
+    """A cached catalog remains usable when only optional icon Unicode is missing."""
+
+    class _Gateway:
+        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
+            del entity
+            raise AssertionError("active protection must skip optional topic icon enrichment")
+
+    conn = _make_db_with_topics()
+    conn.execute(
+        "INSERT INTO topic_metadata "
+        "(dialog_id, topic_id, title, icon_emoji_id, icon_emoji, icon_color, updated_at) "
+        "VALUES (123, 7, 'Cached topic', 42, NULL, 6, 100)"
+    )
+    conn.commit()
+    client = _TestClient()
+    client.get_entity = AsyncMock(side_effect=AssertionError("cached catalog must not acquire Telegram"))
+    server = make_server(
+        conn,
+        client,
+        topic_refresher=TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn)),
+    )
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    )
+
+    result, _, _ = await server._handle_client_line(b'{"method":"list_topics","dialog_id":123}', "", None)
+
+    assert result == {
+        "ok": True,
+        "data": {
+            "dialog_id": 123,
+            "topics": [
+                {
+                    "id": 7,
+                    "title": "Cached topic",
+                    "icon_emoji_id": 42,
+                    "icon_emoji": None,
+                    "icon_color": 6,
+                    "date": None,
+                }
+            ],
+        },
+    }
+    cast(AsyncMock, client.get_entity).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_topics_keeps_cached_catalog_when_protection_opens_during_icon_enrichment() -> None:
+    """A latched optional refresh preserves the catalog fetched before the race."""
+
+    protected = False
+
+    class _Gateway:
+        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
+            del entity
+            raise TelegramRpcThrottled(latched=True)
+
+    async def _get_entity_after_protection_opens(dialog_id: int) -> object:
+        nonlocal protected
+        assert dialog_id == 123
+        protected = True
+        return SimpleNamespace(forum=True)
+
+    def _health_status() -> FloodWaitKillSwitchStatus:
+        return FloodWaitKillSwitchStatus(
+            open=protected,
+            reason="test" if protected else None,
+            opened_at=1 if protected else None,
+            events_in_window=1 if protected else 0,
+            wait_s_in_window=1 if protected else 0,
+            window_seconds=1,
+            source="test" if protected else None,
+        )
+
+    conn = _make_db_with_topics()
+    conn.execute(
+        "INSERT INTO topic_metadata "
+        "(dialog_id, topic_id, title, icon_emoji_id, icon_emoji, updated_at) "
+        "VALUES (123, 7, 'Cached topic', 42, NULL, 100)"
+    )
+    conn.commit()
+    client = _TestClient()
+    client.get_entity = AsyncMock(side_effect=_get_entity_after_protection_opens)
+    server = make_server(
+        conn,
+        client,
+        topic_refresher=TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn)),
+    )
+    server._health_status = _health_status
+
+    result, _, _ = await server._handle_client_line(b'{"method":"list_topics","dialog_id":123}', "", None)
+
+    assert protected is True
+    assert result == {
+        "ok": True,
+        "data": {
+            "dialog_id": 123,
+            "topics": [
+                {
+                    "id": 7,
+                    "title": "Cached topic",
+                    "icon_emoji_id": 42,
+                    "icon_emoji": None,
+                    "icon_color": None,
+                    "date": None,
+                }
+            ],
+        },
+    }
+    cast(AsyncMock, client.get_entity).assert_awaited_once_with(123)
 
 
 @pytest.mark.asyncio
@@ -2646,8 +2833,8 @@ async def test_unknown_method() -> None:
 
 
 @pytest.mark.asyncio
-async def test_daemon_api_returns_unhealthy_when_flood_wait_kill_switch_is_open() -> None:
-    """Healthcheck method is blocked with a clear kill-switch error."""
+async def test_daemon_api_keeps_local_status_available_when_flood_wait_kill_switch_is_open() -> None:
+    """An active circuit does not pre-dispatch reject a local daemon read."""
     server = make_server()
     server._health_status = lambda: FloodWaitKillSwitchStatus(
         open=True,
@@ -2667,9 +2854,61 @@ async def test_daemon_api_returns_unhealthy_when_flood_wait_kill_switch_is_open(
 
     assert method == "get_sync_status"
     assert request_id == "deadbeef"
-    assert response["ok"] is False
-    assert response["error"] == "flood_wait_kill_switch_open"
-    assert "too_many_flood_wait_events" in str(response["detail"])
+    assert response["ok"] is True
+    assert response["data"]["dialog_id"] == 0
+
+
+def test_get_account_protection_reports_only_process_local_status() -> None:
+    server = make_server()
+
+    assert server._get_account_protection({}) == {"ok": True, "data": {"account_protection": None}}
+
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True,
+        reason="too_many_flood_wait_events",
+        opened_at=1_700_000_000,
+        events_in_window=5,
+        wait_s_in_window=300,
+        window_seconds=600,
+        source="test",
+    )
+
+    assert server._get_account_protection({}) == {
+        "ok": True,
+        "data": {
+            "account_protection": {
+                "status": "active",
+                "outbound_acquisition": "blocked",
+                "recovery": "manual",
+                "notice": (
+                    "Telegram acquisition is blocked by account protection. "
+                    "Freshness and incoming coverage may be limited. Recovery requires operator action."
+                ),
+                "reason": "too_many_flood_wait_events",
+                "opened_at": 1_700_000_000,
+            }
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_daemon_api_projects_latched_rpc_without_finite_retry() -> None:
+    server = make_server()
+
+    async def latched_dispatch(_req: dict[str, object]) -> dict[str, object]:
+        raise TelegramRpcThrottled(latched=True)
+
+    server._dispatch = latched_dispatch  # type: ignore[method-assign]
+
+    response = await server._dispatch_with_error_projection({}, method="list_topics", request_id="deadbeef")
+
+    assert response == {
+        "ok": False,
+        "error": "flood_wait_kill_switch_open",
+        "message": "Telegram acquisition is blocked by account protection.",
+        "required_action": "manual_operator_recovery",
+        "retryable": False,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3215,13 +3454,12 @@ async def test_list_unread_messages_basic() -> None:
 
     client = _TestClient()
     server = make_server(conn, client)
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    )
 
-    result = await server._dispatch(
-        {
-            "method": "get_inbox",
-            "limit": 100,
-            "group_size_threshold": 100,
-        }
+    result, _, _ = await server._handle_client_line(
+        b'{"method":"get_inbox","limit":100,"group_size_threshold":100}', "", None
     )
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
@@ -3850,20 +4088,27 @@ async def test_record_telemetry_inserts_row() -> None:
     """record_telemetry inserts a structured mcp.call runtime event."""
     conn = _make_db_with_entities()
     server = make_server(conn)
-    result = await server._dispatch(
-        {
-            "method": "record_telemetry",
-            "event": {
-                "tool_name": "ListDialogs",
-                "timestamp": time.time(),
-                "duration_ms": 123.4,
-                "result_count": 5,
-                "has_cursor": False,
-                "page_depth": 1,
-                "has_filter": True,
-                "error_type": None,
-            },
-        }
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    )
+    result, _, _ = await server._handle_client_line(
+        json.dumps(
+            {
+                "method": "record_telemetry",
+                "event": {
+                    "tool_name": "ListDialogs",
+                    "timestamp": time.time(),
+                    "duration_ms": 123.4,
+                    "result_count": 5,
+                    "has_cursor": False,
+                    "page_depth": 1,
+                    "has_filter": True,
+                    "error_type": None,
+                },
+            }
+        ).encode(),
+        "",
+        None,
     )
     assert result["ok"] is True
     row = cast(
@@ -8004,8 +8249,9 @@ async def test_duplicate_exact_dialog_names_fail_closed_with_deterministic_ids_a
     assert {candidate["disambiguation_hint"] for candidate in candidates} == {
         '2 entities match "Twin Project": supergroup, user. Specify @username or numeric id.'
     }
-    assert "exact" in str(first["required_action"]).lower()
-    assert "id" in str(first["required_action"]).lower()
+    assert first["required_action"] == (
+        "Retry with an exact dialog id from structuredContent.error.details.candidates."
+    )
     cast(MagicMock, client.iter_messages).assert_not_called()
 
 

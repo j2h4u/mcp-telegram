@@ -2906,7 +2906,8 @@ def test_get_inbox_output_schema_declares_applied_since_utc():
     assert schema is not None
     properties = _json_dict(schema["properties"])
     assert properties["applied_since_utc"] == {"type": "string"}
-    assert "applied_since_utc" not in _json_list(schema["required"])
+    success_requirements = _json_list(_json_dict(schema["else"])["required"])
+    assert "applied_since_utc" not in success_requirements
 
 
 async def test_get_inbox_empty_with_read_position_pending():
@@ -3557,7 +3558,7 @@ async def test_list_messages_topic_fuzzy_ambiguous_returns_error():
     text = _result_text(result)
     assert result.is_error is True
     assert "Multiple topics matched" in text
-    assert "structuredContent.candidates" in text
+    assert "structuredContent.error.details.candidates" in text
     assert "exact_topic_id" in text
     assert "General Chat" not in text
     assert "General Topics" not in text

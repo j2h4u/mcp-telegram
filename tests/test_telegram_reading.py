@@ -439,14 +439,15 @@ async def test_read_at_telemetry_counts_local_admission_deferral_as_transient(
     ).fetchone() == ("unavailable", "transient", 3_600)
 
 
-def test_read_date_exception_classifier_retries_latched_flood_wait() -> None:
-    result = classify_read_date_exception(TelegramRpcThrottled(latched=True))
+def test_read_date_exception_classifier_propagates_latched_flood_wait_for_manual_recovery() -> None:
+    latched = TelegramRpcThrottled(latched=True)
 
-    assert result.reason is ReadDateReason.TRANSIENT
-    assert result.failure is not None
-    assert result.failure.kind is GatewayFailureKind.TRANSIENT
-    assert result.failure.retryable is True
-    assert result.failure.retry_after is None
+    with pytest.raises(TelegramRpcThrottled) as raised:
+        classify_read_date_exception(latched)
+
+    assert raised.value is latched
+    assert raised.value.latched is True
+    assert raised.value.retry_after_seconds is None
 
 
 @pytest.mark.asyncio

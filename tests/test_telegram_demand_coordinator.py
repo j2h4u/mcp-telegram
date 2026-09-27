@@ -323,6 +323,22 @@ async def test_recoverable_transport_outcomes_do_not_kill_siblings() -> None:
 
 
 @pytest.mark.asyncio
+async def test_latched_throttle_stops_only_the_coordinator_without_shared_shutdown() -> None:
+    first, second = DURABLE_DEMAND_ORDER[:2]
+    shutdown = asyncio.Event()
+    adapters = _adapters({first: DemandStatus(0), second: DemandStatus(0)})
+    adapters[first].run_error = TelegramRpcThrottled(latched=True)
+    coordinator = TelegramDemandCoordinator(adapters, shutdown, clock=_Clock())
+
+    await coordinator.run()
+
+    assert coordinator.state is CoordinatorState.STOPPED
+    assert shutdown.is_set() is False
+    assert len(adapters[first].run_calls) == 1
+    assert adapters[second].run_calls == []
+
+
+@pytest.mark.asyncio
 async def test_suspended_discovery_does_not_spin_coordinator_and_restore_reoffers_due_work() -> None:
     now = 1_800_000_000
     clock = _Clock(float(now))

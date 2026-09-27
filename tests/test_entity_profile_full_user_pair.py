@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from collections.abc import AsyncIterator
@@ -14,7 +15,9 @@ from unittest.mock import MagicMock
 import pytest
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
+import mcp_telegram.daemon as daemon
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
+from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from mcp_telegram.entity_profile.contracts import (
     ObservationBoundary,
@@ -26,15 +29,18 @@ from mcp_telegram.entity_profile.contracts import (
 )
 from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, RefreshLimits
+from mcp_telegram.flood import FloodWaitKillSwitchStatus
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import RpcAttemptBudget
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
+from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     LoudChannelProfilePort,
     LoudChatAvatarHistoryPort,
     LoudCommonChatsPort,
     LoudGroupProfilePort,
     LoudUserAvatarHistoryPort,
+    LoudUserProfilePort,
 )
 
 
@@ -240,6 +246,98 @@ async def test_enabled_pair_commits_two_projections_with_one_full_user_call(tmp_
     assert detail.detail["personal_channel"]["metadata_source"] == "user_full_chats"
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()
+
+
+@pytest.mark.asyncio
+async def test_protective_disconnect_serves_valid_partial_profile_from_local_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verified progressive cache stays locally useful after protective disconnect."""
+    path = tmp_path / "protected-pair.sqlite"
+    conn, seed_service = _prepare(path, migrated=True)
+    seed_client = cast(_PairClient, seed_service._deps.client)  # type: ignore[attr-defined]
+    coordinator = seed_service.refresh_coordinator  # type: ignore[attr-defined]
+    assert coordinator is not None
+    await EntityProfileDemandAdapter(coordinator).run_slice(RpcAttemptBudget(limit=1))
+    assert seed_client.full_user_calls == 1
+    assert conn.execute(
+        "SELECT status FROM entity_detail_sections WHERE entity_id=42 AND section='full_profile'"
+    ).fetchone() == ("fresh",)
+    assert conn.execute(
+        "SELECT status FROM entity_detail_sections WHERE entity_id=42 AND section='common_chats'"
+    ).fetchone() == ("pending",)
+    await seed_service.shutdown()  # type: ignore[attr-defined]
+    conn.close()
+
+    conn = sqlite3.connect(path)
+
+    class _ProtectionClient:
+        def __init__(self) -> None:
+            self.disconnect_calls = 0
+
+        async def disconnect(self) -> None:
+            self.disconnect_calls += 1
+
+    client = _ProtectionClient()
+    base_policy = make_daemon_api_policy()
+    policy = replace(
+        base_policy,
+        entity_profile=replace(base_policy.entity_profile, foreground_refresh_wait_seconds=0.01),
+        full_user_pair_enabled=True,
+    )
+    api = DaemonAPIServer(
+        conn,
+        cast(DaemonClientLike, client),
+        asyncio.Event(),
+        channel_profile_port=LoudChannelProfilePort(),
+        group_profile_port=LoudGroupProfilePort(),
+        user_profile_port=LoudUserProfilePort(),
+        common_chats_port=LoudCommonChatsPort(),
+        user_avatar_history_port=LoudUserAvatarHistoryPort(),
+        chat_avatar_history_port=LoudChatAvatarHistoryPort(),
+        policy=policy,
+    )
+    scope = TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99)
+    api._ready = True
+    api.bind_demand_sink(MagicMock(offer=MagicMock(return_value=True)))
+    api._publish_auth_scope(scope)
+    api._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    )
+    kill_event = asyncio.Event()
+    kill_event.set()
+    monkeypatch.setattr(daemon, "flood_wait_kill_switch_status", api._health_status)
+    try:
+        await daemon._monitor_flood_wait_kill_switch(
+            cast(
+                daemon._SyncMainContext,
+                SimpleNamespace(
+                    flood_wait_kill_switch_event=kill_event,
+                    background_tasks=set(),
+                    client=client,
+                    rpc_admission_observer=None,
+                ),
+            )
+        )
+        assert client.disconnect_calls == 1
+        assert api._auth_scope == scope
+
+        result, _, _ = await api._handle_client_line(b'{"method":"get_entity_info","entity_id":42}', "", None)
+        data = cast(dict[str, object], result["data"])
+        sections = cast(dict[str, dict[str, object]], data["sections"])
+
+        assert result["ok"] is True
+        assert data["name"] == "Target"
+        assert data["about"] == "about"
+        assert data["completeness"] == "partial"
+        assert sections["common_chats"]["status"] == "pending"
+        assert "auth_scope" not in data
+        assert "profile_owner_account_id" not in data
+        assert client.disconnect_calls == 1
+    finally:
+        await api.shutdown()
+        conn.close()
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,7 @@ from typing import Protocol, cast
 from telethon.tl.functions.messages import GetOutboxReadDateRequest
 from telethon.tl.types import TypeInputPeer
 
-from .flood import TelegramRpcThrottled
+from .flood import TelegramRpcThrottled, _raise_if_latched
 from .telegram_demand import AcquisitionKind, RpcAttemptBudgetExhaustedError
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES, translate_gateway_failure
 from .telegram_reading import (
@@ -53,7 +53,8 @@ def _read_failure(
 
 
 def _classify_throttle_exception(exc: BaseException) -> ReadDateFetchResult | None:
-    if isinstance(exc, TelegramRpcAdmissionDeferred) or (isinstance(exc, TelegramRpcThrottled) and exc.latched):
+    _raise_if_latched(exc)
+    if isinstance(exc, TelegramRpcAdmissionDeferred):
         failure = replace(
             translate_gateway_failure(exc),
             kind=GatewayFailureKind.TRANSIENT,

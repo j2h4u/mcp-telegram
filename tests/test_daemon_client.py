@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mcp_telegram.daemon_client import (
+    AccountProtectionError,
     DaemonConnection,
     DaemonNotRunningError,
     daemon_connection,
@@ -934,3 +935,40 @@ async def test_get_inbox_includes_absolute_since_filter() -> None:
     conn.request = _mock_request  # type: ignore[method-assign]
     await conn.get_inbox(since_utc="2026-08-20T10:00:00Z")
     assert captured[0]["since_utc"] == "2026-08-20T10:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_request_raises_typed_account_protection_error_without_retry_guidance() -> None:
+    payload = {
+        "ok": False,
+        "error": "flood_wait_kill_switch_open",
+        "message": "Telegram acquisition is blocked by account protection.",
+        "required_action": "manual_operator_recovery",
+        "retryable": False,
+    }
+    reader = MagicMock(spec=asyncio.StreamReader)
+    reader.readline = AsyncMock(return_value=json.dumps(payload).encode() + b"\n")
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    writer.drain = AsyncMock()
+    conn = DaemonConnection(reader, writer)
+
+    with pytest.raises(AccountProtectionError) as exc_info:
+        await conn.request({"method": "list_dialogs"})
+
+    assert exc_info.value.response["required_action"] == "manual_operator_recovery"
+    assert "retry" not in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_get_account_protection_uses_registered_daemon_method() -> None:
+    conn = DaemonConnection(MagicMock(), MagicMock())
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True, "data": {"account_protection": None}}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+    await conn.get_account_protection()
+
+    assert captured == [{"method": "get_account_protection"}]

@@ -57,6 +57,22 @@ def test_check_daemon_response_missing_message_uses_default():
     assert "Action:" in content.text
 
 
+def test_tool_result_uses_structured_domain_error_code_when_explicit_code_is_missing():
+    result = ToolResult(is_error=True, structured_content={"error": "ambiguous_dialog"})
+
+    assert result.error_code == "ambiguous_dialog"
+
+
+def test_tool_result_keeps_explicit_error_code_over_structured_domain_error_code():
+    result = ToolResult(
+        is_error=True,
+        error_code="specific_error",
+        structured_content={"error": "ambiguous_dialog"},
+    )
+
+    assert result.error_code == "specific_error"
+
+
 def test_check_daemon_response_preserves_existing_action_hint():
     result = _check_daemon_response({"ok": False, "message": "boom\nAction: Retry later."})
     assert isinstance(result, ToolResult)
@@ -72,6 +88,31 @@ def test_check_daemon_response_passes_extra_kwargs():
     assert result is not None
     assert result.has_filter is True
     assert result.has_cursor is True
+
+
+def test_check_daemon_response_exposes_manual_recovery_in_structured_error() -> None:
+    result = _check_daemon_response(
+        {
+            "ok": False,
+            "error": "flood_wait_kill_switch_open",
+            "message": "Telegram acquisition is blocked by account protection.",
+            "required_action": "manual_operator_recovery",
+            "retryable": False,
+        }
+    )
+
+    assert result is not None
+    content = cast(_TextContent, result.content[0])
+    assert "Recovery requires operator action." in content.text
+    assert "Fix the arguments" not in content.text
+    assert result.error_code == "flood_wait_kill_switch_open"
+
+
+def test_check_daemon_response_uses_string_detail_fallback() -> None:
+    result = _check_daemon_response({"ok": False, "error": "backend_error", "detail": "daemon is busy"})
+
+    assert result is not None
+    assert "daemon is busy" in cast(_TextContent, result.content[0]).text
 
 
 # ---------------------------------------------------------------------------

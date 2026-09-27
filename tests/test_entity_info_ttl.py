@@ -8,6 +8,7 @@ AND entity_details rows; subsequent in-TTL call serves from DB).
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -29,6 +30,7 @@ from mcp_telegram.entity_profile.contracts import (
     TargetKind,
     UserProfileObservation,
 )
+from mcp_telegram.flood import FloodWaitKillSwitchStatus
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     ClientChatAvatarHistoryPort,
@@ -195,7 +197,12 @@ async def test_get_entity_info_serves_from_db_within_ttl(monkeypatch: pytest.Mon
 
     # Within TTL window
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base + 250)
-    r2 = await server._dispatch({"method": "get_entity_info", "entity_id": 42})
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    )
+    r2, _, _ = await server._handle_client_line(
+        json.dumps({"method": "get_entity_info", "entity_id": 42}).encode(), "", None
+    )
     assert r2["ok"]
     assert get_entity.call_count == first_call_count, "must serve from DB; no new fetch"
 

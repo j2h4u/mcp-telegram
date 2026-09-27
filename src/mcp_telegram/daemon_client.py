@@ -160,6 +160,7 @@ def _parse_response_line(line: bytes) -> _DaemonResponse:
 
 
 __all__ = [
+    "AccountProtectionError",
     "DaemonConnection",
     "DaemonNotRunningError",
     "daemon_connection",
@@ -182,6 +183,14 @@ class DaemonNotRunningError(Exception):
     def __init__(self, message: str, *, kind: DaemonFailureKind = "not_running") -> None:
         super().__init__(message)
         self.kind = kind
+
+
+class AccountProtectionError(Exception):
+    """Raised when Telegram acquisition is blocked by account protection."""
+
+    def __init__(self, response: Mapping[str, object]) -> None:
+        super().__init__(str(response.get("message", "Telegram acquisition is blocked by account protection.")))
+        self.response = dict(response)
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +271,10 @@ class DaemonConnection:
             response.get("request_id", rid),
             response.get("ok"),
         )
-        return dict(response)
+        result = dict(response)
+        if result.get("ok") is False and result.get("error") == "flood_wait_kill_switch_open":
+            raise AccountProtectionError(result)
+        return result
 
     # ------------------------------------------------------------------
     # Convenience wrappers for the daemon API methods
@@ -588,6 +600,10 @@ class DaemonConnection:
         if reason is not None:
             payload["reason"] = reason
         return await self.request(payload)
+
+    async def get_account_protection(self) -> dict:
+        """Read the daemon's current account-protection status."""
+        return await self.request({"method": "get_account_protection"})
 
 
 # ---------------------------------------------------------------------------

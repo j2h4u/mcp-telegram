@@ -263,6 +263,9 @@ class TelegramDemandCoordinator:
                     self.scan(now=self._now())
         except asyncio.CancelledError:
             raise
+        except TelegramRpcThrottled as exc:
+            if not exc.latched:
+                raise
         finally:
             self._state = CoordinatorState.STOPPING
             self._active_kind = None
@@ -314,8 +317,6 @@ class TelegramDemandCoordinator:
 
     def _handle_throttle(self, kind: DemandKind, budget: RpcAttemptBudget, exc: TelegramRpcThrottled) -> bool:
         if exc.latched:
-            self._shutdown_event.set()
-            self._wake.set()
             return True
         self._global_release_at = max(self._global_release_at or 0.0, self._now() + (exc.retry_after_seconds or 0))
         self._observe("deferred", kind, actual_attempts=budget.attempts, reason="flood_wait")

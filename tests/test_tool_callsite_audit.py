@@ -89,7 +89,7 @@ async def test_entity_info_candidates_surfaces_hint() -> None:
         result = await get_entity_info(GetEntityInfo(entity="Ivan"))
 
     text = cast(_TextContent, result.content[0]).text
-    assert "structuredContent.candidates" in text
+    assert "structuredContent.error.details.candidates" in text
     assert "Specify @username or numeric id" not in text
     payload = result.structured_content
     assert payload is not None
@@ -146,7 +146,7 @@ async def test_entity_info_candidates_does_not_auto_pick() -> None:
     get_entity_info_mock.assert_not_called()
     text = cast(_TextContent, result.content[0]).text
     # Must be an ambiguity response, not a profile
-    assert "structuredContent.candidates" in text
+    assert "structuredContent.error.details.candidates" in text
     assert "id=101" not in text and "id=202" not in text
     assert result.structured_content is not None
     assert result.structured_content["error"] == "ambiguous_entity"

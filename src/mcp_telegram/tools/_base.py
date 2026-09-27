@@ -18,6 +18,7 @@ from mcp.types import (
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..daemon_client import DaemonConnection, DaemonNotRunningError, daemon_connection
+from ..errors import action_text
 from ..temporal import (
     normalize_temporal_output_schema,
     project_temporal_response,
@@ -222,6 +223,65 @@ def normalize_output_schema(schema: dict[str, object] | None) -> dict[str, objec
     return normalized
 
 
+def _protection_output_schema(schema: dict[str, object] | None) -> dict[str, object] | None:
+    if schema is None:
+        return None
+    result = deepcopy(schema)
+    properties = result.get("properties")
+    required = result.pop("required", None)
+    if not isinstance(properties, dict) or not isinstance(required, list):
+        raise ValueError("Tool output schema must have root properties and required fields")
+    if "error" in properties or "account_protection" in properties:
+        raise ValueError("Tool output schema uses a reserved shared response property")
+    properties["error"] = {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string"},
+            "message": {"type": "string"},
+            "action": {"type": "string"},
+            "details": {"type": "object"},
+        },
+        "required": ["code", "message", "action"],
+        "additionalProperties": False,
+    }
+    properties["account_protection"] = {
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "status": {"const": "active"},
+                    "outbound_acquisition": {"const": "blocked"},
+                    "recovery": {"const": "manual"},
+                    "notice": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "opened_at": {"type": "integer"},
+                },
+                "required": ["status", "outbound_acquisition", "recovery", "notice"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {"status": {"const": "unavailable"}, "notice": {"type": "string"}},
+                "required": ["status", "notice"],
+                "additionalProperties": False,
+            },
+        ],
+    }
+    if_schema = {"required": ["error"]}
+    then_schema = {
+        "properties": {"error": {}, "account_protection": {}},
+        "additionalProperties": False,
+    }
+    result.update(
+        {
+            "if": if_schema,
+            "then": then_schema,
+            "else": {"required": required},
+        }
+    )
+    return result
+
+
 class ToolArgs(BaseModel):
     model_config = ConfigDict()
 
@@ -274,17 +334,45 @@ def _check_daemon_response(
     """
     if response.get("ok") is True:
         return None
-    error_detail = response.get("message", "Request failed.")
-    if not isinstance(error_detail, str):
-        error_detail = str(error_detail)
+    error_detail = _daemon_response_message(response)
     error_code = response.get("error")
     if isinstance(error_code, str) and error_code and error_code not in str(error_detail):
         text = f"Error: {error_code}: {error_detail}"
     else:
         text = f"Error: {error_detail}"
+    text = _daemon_error_action(text, response.get("required_action"), action)
+    details = response.get("details")
+    return error_result(
+        text,
+        error_code=safe_error_code(error_code),
+        details=details if isinstance(details, Mapping) else None,
+        **extra_kwargs,
+    )
+
+
+def _daemon_response_message(response: Mapping[str, object]) -> str:
+    for key in ("message", "detail"):
+        value = response.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return "Request failed."
+
+
+def _daemon_error_action(text: str, required_action: object, fallback: str) -> str:
+    action = fallback
+    if required_action == "manual_operator_recovery":
+        action = "Recovery requires operator action."
+    elif isinstance(required_action, str) and required_action.strip():
+        action = required_action.strip()
+    if required_action == "manual_operator_recovery" or (isinstance(required_action, str) and required_action.strip()):
+        text = _without_action_lines(text)
     if "action:" not in text.lower():
-        text = f"{text}\nAction: {action}"
-    return error_result(text, error_code=safe_error_code(error_code), **extra_kwargs)
+        text = action_text(text, action)
+    return text
+
+
+def _without_action_lines(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if not line.lower().startswith("action:"))
 
 
 @dataclass
@@ -303,7 +391,8 @@ class ToolResult:
     def __post_init__(self) -> None:
         """Give every recoverable error a bounded machine code."""
         if self.is_error:
-            self.error_code = safe_error_code(self.error_code)
+            structured_error = (self.structured_content or {}).get("error")
+            self.error_code = safe_error_code(self.error_code, fallback=safe_error_code(structured_error))
 
 
 ToolArgT = t.TypeVar("ToolArgT", bound=ToolArgs)
@@ -349,15 +438,19 @@ def error_result(
     text: str,
     *,
     error_code: str = "tool_error",
+    details: Mapping[str, object] | None = None,
     **metadata: Unpack[ToolResultMetadata],
 ) -> ToolResult:
-    """Return recoverable error text with a safe machine-readable code."""
-    return ToolResult(
+    """Return recoverable error text; the MCP boundary adds its structured envelope."""
+    result = ToolResult(
         content=_text_response(text),
         is_error=True,
         error_code=safe_error_code(error_code),
         **metadata,
     )
+    if details is not None:
+        result.structured_content = {"details": dict(details)}
+    return result
 
 
 async def _send_telemetry_event(event_dict: dict[str, object]) -> None:
@@ -470,7 +563,9 @@ def mcp_tool(
             annotations=annotations,
             exported_name=exported_name,
             title=exported_title or cls.__name__,
-            output_schema=normalize_output_schema(normalize_temporal_output_schema(output_schema)),
+            output_schema=_protection_output_schema(
+                normalize_output_schema(normalize_temporal_output_schema(output_schema))
+            ),
         )
         return wrapped
 

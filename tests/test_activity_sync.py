@@ -20,7 +20,7 @@ from mcp_telegram.activity_sync import ArchiveBackfillDemandAdapter, ArchiveIncr
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import DemandStatus, DurableDemandAdapter, RpcAttemptBudget
-from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator
+from mcp_telegram.telegram_demand_coordinator import CoordinatorState, TelegramDemandCoordinator
 from mcp_telegram.telegram_rpc_consumers import DURABLE_DEMAND_ORDER, DemandKind
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcScope, current_rpc_scope
 
@@ -101,9 +101,11 @@ class _ThrottledClient:
     def __init__(self, error: TelegramRpcThrottled, *, dispatch: bool) -> None:
         self._error = error
         self._dispatch = dispatch
+        self.calls = 0
 
     async def __call__(self, request: object) -> object:
         del request
+        self.calls += 1
         scope = current_rpc_scope()
         if self._dispatch:
             assert scope.attempt_budget is not None
@@ -277,8 +279,9 @@ async def test_archive_incremental_latched_throttle_stops_coordinator_without_lo
         conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         conn.execute("INSERT OR REPLACE INTO activity_sync_state(key, value) VALUES ('last_sync_at', '1')")
     error = TelegramRpcThrottled(latched=True, detail="test circuit open")
+    client = _ThrottledClient(error, dispatch=False)
     adapter = ArchiveIncrementalDemandAdapter(
-        _ThrottledClient(error, dispatch=False),
+        client,
         conn,
         asyncio.Event(),
         10.0,
@@ -293,14 +296,13 @@ async def test_archive_incremental_latched_throttle_stops_coordinator_without_lo
         shutdown_event=shutdown_event,
     )
 
-    with (
-        patch("mcp_telegram.activity_sync.sleep_through_flood", new=AsyncMock()) as sleep,
-        pytest.raises(TelegramRpcThrottled, match="test circuit open"),
-    ):
-        await coordinator._execute_slice(DemandKind.ARCHIVE_INCREMENTAL)
+    with patch("mcp_telegram.activity_sync.sleep_through_flood", new=AsyncMock()) as sleep:
+        await coordinator.run()
 
     sleep.assert_not_awaited()
-    assert shutdown_event.is_set()
+    assert coordinator.state is CoordinatorState.STOPPED
+    assert shutdown_event.is_set() is False
+    assert client.calls == 1
     assert conn.execute("SELECT value FROM activity_sync_state WHERE key='last_sync_at'").fetchone() == ("1",)
     assert conn.execute("SELECT value FROM activity_sync_state WHERE key='incremental_min_date'").fetchone() == ("0",)
     assert [event["outcome"] for event in observer.events] == ["selected"]

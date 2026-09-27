@@ -467,7 +467,7 @@ async def test_get_entity_info_resolver_ambiguous() -> None:
     text = cast(_TextContent, result.content[0]).text
     assert result.is_error is True
     assert "Multiple entities matched" in text
-    assert "structuredContent.candidates" in text
+    assert "structuredContent.error.details.candidates" in text
     assert "Alice A" not in text and "Alice B" not in text
     payload = _dict(result.structured_content)
     assert payload is not None
