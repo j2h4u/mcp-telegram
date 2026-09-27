@@ -418,6 +418,20 @@ def _assert_confirmed_scalar_outcome_consumed(
         assert accumulator.kill_switch_status().events_in_window == 1
 
 
+def _assert_frozen_flood_observation(
+    observed_floods: list[FloodWaitObservation],
+    request_method: str,
+    admission_sequence: int,
+    dispatch_at_monotonic: float,
+) -> None:
+    assert len(observed_floods) == 1
+    observation = observed_floods[0]
+    assert observation.request_method == request_method
+    assert observation.admission_sequence == admission_sequence
+    assert observation.dispatch_at_monotonic == dispatch_at_monotonic
+    assert observation.actual_dispatch is True
+
+
 async def _assert_failed_gate_blocks_api_migration_and_ping(
     gate: TelegramRpcGate,
     forwarded_pings: list[int],
@@ -2656,6 +2670,75 @@ async def test_installed_vendor_internal_teardown_in_progress_cannot_be_taken_ov
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "raise_user_probe", "raise_transport_probe"),
+    [
+        (_TransportBoundaryState.READY, False, False),
+        (_TransportBoundaryState.CONNECTING, False, False),
+        (_TransportBoundaryState.READY, True, False),
+        (_TransportBoundaryState.CONNECTING, False, True),
+    ],
+)
+async def test_teardown_preflight_rejects_missing_or_unreadable_raw_transport(
+    state: _TransportBoundaryState,
+    raise_user_probe: bool,
+    raise_transport_probe: bool,
+) -> None:
+    gate = _gate()
+    raw_future = asyncio.get_running_loop().create_future()
+    owner = object()
+
+    class _ProbeSender:
+        def __init__(self) -> None:
+            self.disconnect_calls = 0
+
+        def is_connected(self) -> bool:
+            if raise_user_probe:
+                raise RuntimeError("user-connected probe failed")
+            return True
+
+        def _transport_connected(self) -> bool:
+            if raise_transport_probe:
+                raise RuntimeError("transport-connected probe failed")
+            return False
+
+        async def disconnect(self) -> None:
+            self.disconnect_calls += 1
+
+    sender = _ProbeSender()
+    gate._main_sender = sender
+    gate._connect_owner = owner
+    with demand_context(DemandKind.FULL_SYNC_PAGE):
+        with rpc_scope(TelegramRpcSource.FULL_SYNC):
+            scope = current_rpc_scope()
+            admission = await gate._admission_scheduler.admit(scope)
+    gate._register_scalar_dispatch_completion(
+        raw_future,
+        scope=scope,
+        request_method="GetHistoryRequest",
+        admission=admission,
+        dispatch_at_monotonic=asyncio.get_running_loop().time(),
+    )
+    gate._transport_state = state
+
+    with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
+        await gate._disconnect_main_sender()
+    assert sender.disconnect_calls == 0
+    assert gate._transport_state is _TransportBoundaryState.FAILED
+    assert gate._connect_owner is owner
+    assert set(gate._pending_scalar_dispatches) == {raw_future}
+    assert sum(gate._admission_scheduler.active_depths().values()) == 1
+    with pytest.raises(TelegramRpcAdmissionDeferred):
+        await _call(gate, _TestRequest("blocked"))
+    with pytest.raises(TelegramRpcAdmissionDeferred):
+        await gate.connect()
+
+    raw_future.set_result("terminal cleanup")
+    await _wait_for(lambda: gate._pending_scalar_dispatches == {})
+    await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("first_teardown_fails", [False, True])
 async def test_overlapping_installed_sender_disconnect_cannot_confirm_first_teardown(
     first_teardown_fails: bool,
@@ -2725,11 +2808,14 @@ async def test_confirmed_installed_sender_outcomes_release_once_after_owned_tear
     """Only a successful owned teardown may consume residual scalar outcomes."""
     gate = _gate()
     raw_future = asyncio.get_running_loop().create_future()
+    flood_error = FloodWaitError(request=None, capture=20)
     accumulator = FloodWaitAccumulator()
     accumulator.configure_kill_switch(
         FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
     )
     gate._flood_observer = lambda **event: accumulator.observe(**event)
+    observed_floods: list[FloodWaitObservation] = []
+    gate.set_flood_event_observer(observed_floods.append)
 
     class _SuccessfulConnection:
         def __init__(self) -> None:
@@ -2738,6 +2824,10 @@ async def test_confirmed_installed_sender_outcomes_release_once_after_owned_tear
 
         async def disconnect(self) -> None:
             self.disconnect_calls += 1
+            if outcome == "result":
+                raw_future.set_result("response")
+            elif outcome == "flood_wait":
+                raw_future.set_exception(flood_error)
 
     connection = _SuccessfulConnection()
     sender = _installed_sender(connection)
@@ -2749,10 +2839,6 @@ async def test_confirmed_installed_sender_outcomes_release_once_after_owned_tear
             await sender._disconnect(error=OSError("local sender failure"))
 
         sender.disconnect = disconnect_with_local_error
-    elif outcome == "result":
-        raw_future.set_result("response")
-    elif outcome == "flood_wait":
-        raw_future.set_exception(FloodWaitError(request=None, capture=20))
 
     gate._main_sender = sender
     gate._sender = _MainSenderAdapter(gate)
@@ -2767,10 +2853,21 @@ async def test_confirmed_installed_sender_outcomes_release_once_after_owned_tear
         admission=admission,
         dispatch_at_monotonic=asyncio.get_running_loop().time(),
     )
+    pending = gate._pending_scalar_dispatches[raw_future]
+    assert pending.scope is scope
+    assert pending.request_method == "GetHistoryRequest"
+    assert pending.admission is admission
 
     await gate._disconnect_main_sender()
     assert connection.disconnect_calls == 1
     _assert_confirmed_scalar_outcome_consumed(gate, raw_future, accumulator, outcome)
+    if outcome == "flood_wait":
+        _assert_frozen_flood_observation(
+            observed_floods,
+            pending.request_method,
+            pending.admission.sequence,
+            pending.dispatch_at_monotonic,
+        )
 
     reconnect_sender = _BootstrapSender()
     gate._main_sender = reconnect_sender
