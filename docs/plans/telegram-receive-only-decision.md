@@ -26,6 +26,17 @@ its existing completion/FloodWait accounting are legitimate. Re-emitting the
 application payload after the latch is the separate behavior that cannot be
 authorized implicitly as a transport control.
 
+The current fallback guarantees transport stop **only after confirmed teardown**.
+From latch observation until that confirmation, the monitor is in a
+`stopping/teardown-uncertain` interval: it first awaits producer cancellation,
+then starts client disconnect, while the raw sender and encrypted connection
+queues may still be live. This research does not establish zero new physical
+application-payload writes from the instant the latch opens. It identifies that
+unknown wire interval and retains strict zero-new-application-emission as the
+target for any later retained-transport proposal. No post-latch live write has
+been observed in production; the interval is a source-derived risk, not an
+incident claim.
+
 This research makes no runtime change, opens no implementation work, and does
 not authorize rearm, restart, bootstrap or reconnect. The reported healthy
 runtime from the previous session is historical context, not a fresh check.
@@ -88,6 +99,19 @@ unbounded reconnect loop.
 | Same-connection repair | `V/network/mtprotosender.py:750–798`, `_handle_bad_server_salt` / `_handle_bad_notification`, requeue request states below the adapter. At 876–883, state/resend requests generate `MsgsStateInfo`; at 603–640 RPC-result handling queues acknowledgments. | Preserve the distinction between control replies and application payload replay. Do not classify every action from the receive loop as a permissible control. |
 | Original dispatch ownership | [telegram_rpc.py:158](../../src/mcp_telegram/telegram_rpc.py#L158)–236 owns the scalar raw Future and admission lifetime. `V/network/mtprotosender.py:83–89` owns `_pending_state`; its send loop at 472–499 populates it and can initiate reconnect. | Existing attempt/completion evidence is not a count or authorization of every later raw transmission. No current proof exposes a quiescent raw packer queue through the Gate. |
 | Explicit teardown | [telegram_rpc.py:991](../../src/mcp_telegram/telegram_rpc.py#L991)–1018 awaits owned sender teardown and settles tracked completion Futures. `V/network/mtprotosender.py:320–346` cancels pending requests and send/receive loops; `V/client/telegrambaseclient.py:724–756` cancels callback tasks and saves session state. | Confirmed teardown is the present transport stop. An overlapping reconnect before teardown completes remains a race to test, not a demonstrated live incident. Never report failed/unconfirmed teardown as a safe disconnected state. |
+
+### Required measurement boundary
+
+For a future safety probe, the forbidden event is a **new application payload
+handoff to the actual transport writer after the latch**, including a replay.
+It is not a late arrival of bytes handed to that writer before the latch, nor a
+late RPC response to an already transmitted request. Counting `adapter.send`
+or `Connection.send` alone is insufficient: the former misses raw replay and
+the latter sees encrypted mixed frames. The fake harness must retain the real
+connection queue, count its final fake writer, and classify mixed
+control/application frames from known request correlation in test context. It
+must not decode production traffic or log credentials, message content, or
+session material.
 
 ## Inbound events to local persistence
 
@@ -182,6 +206,7 @@ facts; a healthy socket alone is not healthy sync.
 |---|---|---|
 | Normal healthy sync | Authorized transport and Gate available; local processing and admitted acquisition run. | A past health report is not current verification. |
 | Healthy receive-only — desired, not currently established | Existing authorized connection remains usable, all application emissions including replays are fenced, protocol controls continue, and locally complete updates may commit. | Continuous real-time coverage, zero outbound bytes, or recovery after disconnect. Current raw sender ownership does not meet this entry condition. |
+| Stopping / teardown uncertain | The latch is open and the monitor is cancelling producers or awaiting transport teardown. | Zero new physical application writes from the latch instant, a disconnected transport, or drained callback work. These are established only after confirmed teardown. |
 | Gapped | Transport may still exist, but vendor sequence recovery needs account/channel difference API work. Previously dispatched local callbacks may still finish. | Skipping ordering checks to deliver raw updates as complete history, allowing GetDifference under the latch, or claiming all later push events reach handlers. |
 | Degraded local ingestion | A dispatch or domain handler lacks required self/entity facts, or a local write fails; some independent complete facts may still commit. | Treating a failed enrichment/identity dependency as confirmed absence or marking its cursor/coverage complete. |
 | Disconnected/protectively stopped | No new push reception; committed local data remains available in principle. Confirmed teardown is distinct from failed/uncertain teardown. | Autonomous reconnect/rearm, current Telegram freshness, or recovery of memory-only callbacks without evidence. |
@@ -195,7 +220,7 @@ acceptable; hidden bootstrap or protocol-gap API exemptions are not.
 
 | Alternative | Benefit | Cost / decision |
 |---|---|---|
-| Retain the owned protective disconnect | Uses the existing supported lifecycle and stops vendor transport machinery; preserves account priority. | Incoming updates stop and memory-only work can be lost. **Recommended feasible behavior now**, with honest connectivity/freshness reporting. |
+| Retain the owned protective disconnect | Uses the existing supported lifecycle and stops vendor transport machinery after confirmed teardown; preserves account priority. | Incoming updates stop, memory-only work can be lost, and the pre-confirmation wire interval is not measured. **Recommended feasible behavior now**, with honest stopping/connectivity/freshness reporting. |
 | Remove disconnect; stop producers and reject high-level calls | Appears small and retains some pushes. | Fails the raw replay boundary; vendor dispatch can also block on required API work. **Reject.** |
 | Disable auto-reconnect and retain the socket | Avoids one replay trigger. | Same-connection repair and queued application payloads remain; not a complete receive-only contract. **Insufficient alone.** |
 | Add a supported, owned final-transmission boundary | Could make conditional receive-only defensible while retaining one Gate. | Missing capability today; requires bounded evidence below. It is a prerequisite for a future decision, not approval for a vendor fork, arbitrary allowlist or new framework. |
@@ -320,14 +345,52 @@ retained-transport implementation. Local-service availability and DM historical
 recovery remain their existing independent decisions. Panel ideas are inputs,
 not automatic implementation scope, account rearm or new work items.
 
-## Bounded offline validation and proposed implementation acceptance
+## Sol panel and final plan
 
-These are recommendations for a separately authorized change, not completed
-tests or new tickets. Use the locked Telethon classes, an in-memory session,
-fake connection/sender transport and disposable local SQLite. Deny actual
-network connection in the harness. Count application payload emissions at the
-raw transport boundary as well as Gate admissions; observing only Gate calls
-would miss the deciding failure mode.
+All three Sol roles accepted the research conclusion and required a narrower
+guarantee. The protocol/safety role found the decisive below-Gate replay and
+control paths; the product/local-data role accepted that the inbound-availability
+goal remains unmet by the current fallback; the operational role required the
+distinction between latch observation and confirmed teardown. No role approved
+a receive-only implementation, vendor fork, spool, or automatic rearm.
+
+| Question | Panel finding | Root resolution |
+|---|---|---|
+| Is current disconnect atomic at latch time? | No. Producer cancellation and raw teardown are awaited steps; the queue may remain live before confirmation. | State the interval as `stopping/teardown-uncertain`; do not promise zero physical writes from latch time. |
+| Run a full receive-only experiment now? | No. Its required emission boundary is unsupported and the broad handler matrix would not establish it. | Accept the research decision now; first authorize only the narrower existing-stop probe below. |
+| Can lossless ingestion be claimed? | No. Vendor cursor/session and domain commits have distinct lifecycles. | Guarantee completed database commits only; preserve gapped/degraded reporting. |
+
+There was no dissent from retaining the fail-closed disconnect as the current
+behavior. The product goal is **not achieved**: safe retained transport is not
+established. The TG19 research deliverable is achieved because it identifies
+the boundary, limits, and a bounded way to test the current stop claim without
+weakening account protection.
+
+The approved order is:
+
+- [ ] Separately authorize one bounded offline probe of the **existing stop**:
+  an initial queued/pending request with delayed producer cancellation, plus
+  same-connection bad-salt/reconnect and concurrent teardown interleavings.
+  It must use the measurement boundary above. This is not a receive-only
+  experiment, a full handler matrix, or production validation.
+- [ ] Separately decide TG15 local MCP feedback and local reads while stopped:
+  zero cloud calls and truthful freshness reporting. This is the next useful
+  product candidate; it does not change Telegram transport protection.
+- [ ] Reconsider receive-only only for a named, supported package/API version
+  that supplies the required ownership seam, then validate it offline before
+  proposing implementation.
+
+TG17 DM recovery remains separate. None of the unchecked actions authorizes
+production code, tests, runtime actions, account rearm, bootstrap, reconnect,
+or an open-ended fork/spool/ticket program.
+
+## Future receive-only acceptance matrix (not the next action)
+
+These are future recommendations for a separately authorized receive-only
+change, not completed tests, the approved next probe, or new tickets. Use the
+locked Telethon classes, an in-memory session, fake connection/sender transport
+and disposable local SQLite. Deny actual network connection in the harness.
+The completed-database-commit limit above remains the only durability claim.
 
 | Scenario | Required observable result |
 |---|---|
