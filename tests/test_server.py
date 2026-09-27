@@ -1726,8 +1726,48 @@ async def test_list_messages_exact_dialog_topic_lookup_keeps_exact_selector(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tool_connection = _ReadingTopicConnection(
-        topics_response={"ok": True, "data": {"topics": [{"id": 9, "title": "General"}], "dialog_id": 701}},
-        messages_response={"ok": True, "data": {"messages": [], "source": "sync_db", "dialog_id": 701}},
+        topics_response={
+            "ok": True,
+            "data": {"topics": [{"id": 2**63 - 1, "title": "General"}], "dialog_id": -(2**63)},
+        },
+        messages_response={"ok": True, "data": {"messages": [], "source": "sync_db", "dialog_id": -(2**63)}},
+    )
+
+    @asynccontextmanager
+    async def tool_connection_context() -> AsyncIterator[object]:
+        yield tool_connection
+
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", tool_connection_context)
+    monkeypatch.setattr(server, "daemon_connection", lambda: _status_context({"ok": True, "data": {}}))
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+
+    result = _call_tool_result(
+        await server.call_tool(
+            "list_messages",
+            {"exact_dialog_id": -(2**63), "topic": "General", "message_state": "sent"},
+        )
+    )
+
+    assert result.is_error is False
+    payload = cast(dict[str, object], result.structured_content)
+    validate(payload, cast(dict[str, object], server.tool_by_name["list_messages"].output_schema))
+    assert tool_connection.topic_calls == [{"dialog_id": -(2**63)}]
+    assert len(tool_connection.message_calls) == 1
+    assert tool_connection.message_calls[0]["dialog_id"] == -(2**63)
+    assert tool_connection.message_calls[0]["topic_id"] == 2**63 - 1
+    assert "dialog" not in tool_connection.message_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_list_messages_rejects_topic_catalog_for_different_exact_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_connection = _ReadingTopicConnection(
+        topics_response={
+            "ok": True,
+            "data": {"topics": [{"id": 9, "title": "General"}], "dialog_id": 702},
+        },
+        messages_response=None,
     )
 
     @asynccontextmanager
@@ -1745,14 +1785,12 @@ async def test_list_messages_exact_dialog_topic_lookup_keeps_exact_selector(
         )
     )
 
-    assert result.is_error is False
+    assert result.is_error is True
     payload = cast(dict[str, object], result.structured_content)
+    error = cast(dict[str, object], payload["error"])
+    assert error["code"] == "invalid_topic_lookup_response"
     validate(payload, cast(dict[str, object], server.tool_by_name["list_messages"].output_schema))
-    assert tool_connection.topic_calls == [{"dialog_id": 701}]
-    assert len(tool_connection.message_calls) == 1
-    assert tool_connection.message_calls[0]["dialog_id"] == 701
-    assert tool_connection.message_calls[0]["topic_id"] == 9
-    assert "dialog" not in tool_connection.message_calls[0]
+    assert tool_connection.message_calls == []
 
 
 @pytest.mark.asyncio
@@ -1787,7 +1825,7 @@ async def test_list_messages_natural_dialog_with_exact_topic_id_skips_topic_reso
     assert "dialog_id" not in tool_connection.message_calls[0]
 
 
-@pytest.mark.parametrize("invalid_dialog_id", [None, True, "701"])
+@pytest.mark.parametrize("invalid_dialog_id", [None, True, "701", 0, 2**63])
 @pytest.mark.asyncio
 async def test_list_messages_topic_lookup_without_numeric_dialog_id_stops_before_message_fetch(
     monkeypatch: pytest.MonkeyPatch,
@@ -1820,7 +1858,44 @@ async def test_list_messages_topic_lookup_without_numeric_dialog_id_stops_before
     payload = cast(dict[str, object], result.structured_content)
     error = cast(dict[str, object], payload["error"])
     assert error["code"] == "invalid_topic_lookup_response"
-    assert "valid dialog id" in cast(str, error["message"])
+    assert "valid dialog and topic data" in cast(str, error["message"])
+    validate(payload, cast(dict[str, object], server.tool_by_name["list_messages"].output_schema))
+    assert tool_connection.message_calls == []
+
+
+@pytest.mark.parametrize("invalid_topic_id", [None, True, "9", 0, -1, 2**63, 9.0])
+@pytest.mark.asyncio
+async def test_list_messages_rejects_invalid_topic_id_before_message_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_topic_id: object,
+) -> None:
+    tool_connection = _ReadingTopicConnection(
+        topics_response={
+            "ok": True,
+            "data": {"topics": [{"id": invalid_topic_id, "title": "General"}], "dialog_id": 701},
+        },
+        messages_response=None,
+    )
+
+    @asynccontextmanager
+    async def tool_connection_context() -> AsyncIterator[object]:
+        yield tool_connection
+
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", tool_connection_context)
+    monkeypatch.setattr(server, "daemon_connection", lambda: _status_context({"ok": True, "data": {}}))
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+
+    result = _call_tool_result(
+        await server.call_tool(
+            "list_messages",
+            {"dialog": "Project", "topic": "General", "message_state": "sent"},
+        )
+    )
+
+    assert result.is_error is True
+    payload = cast(dict[str, object], result.structured_content)
+    error = cast(dict[str, object], payload["error"])
+    assert error["code"] == "invalid_topic_lookup_response"
     validate(payload, cast(dict[str, object], server.tool_by_name["list_messages"].output_schema))
     assert tool_connection.message_calls == []
 

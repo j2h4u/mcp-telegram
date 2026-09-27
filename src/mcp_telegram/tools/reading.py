@@ -10,6 +10,7 @@ from pydantic import Field, StrictInt, field_validator, model_validator
 from ..dialog_selector import (
     EXACT_DIALOG_ID_DESCRIPTION,
     NATURAL_DIALOG_SELECTOR_DESCRIPTION,
+    SQLITE_INT64_MAX,
     DialogSelectorError,
     optional_dialog_selector,
     required_dialog_selector,
@@ -1351,26 +1352,60 @@ async def _resolve_topic_id(
     except DaemonNotRunningError as exc:
         return error_result(_daemon_not_running_text(exc))
 
+    return _project_resolved_topic(response, topic_name, dialog_id)
+
+
+def _project_resolved_topic(
+    response: dict[str, object],
+    topic_name: str,
+    requested_dialog_id: int | None,
+) -> _ResolvedTopic | ToolResult:
+    catalog = _validated_topic_catalog(response, requested_dialog_id)
+    if isinstance(catalog, ToolResult):
+        return catalog
+    dialog_id, topics = catalog
+    resolved_topic_id = _resolve_topic_matches(topics, topic_name)
+    if isinstance(resolved_topic_id, ToolResult):
+        return resolved_topic_id
+    return _ResolvedTopic(dialog_id=dialog_id, topic_id=resolved_topic_id)
+
+
+def _validated_topic_catalog(
+    response: dict[str, object],
+    requested_dialog_id: int | None,
+) -> tuple[int, list[dict[str, object]]] | ToolResult:
     if not response.get("ok"):
         return _topic_lookup_error(response)
     data = response.get("data")
     if not isinstance(data, dict):
-        return error_result(
-            "Topic lookup did not return a valid dialog id.\n"
-            "Action: Call list_topics for this dialog, then retry list_messages.",
-            error_code="invalid_topic_lookup_response",
-        )
+        return _invalid_topic_lookup_response()
     resolved_dialog_id = data.get("dialog_id")
-    if isinstance(resolved_dialog_id, bool) or not isinstance(resolved_dialog_id, int):
-        return error_result(
-            "Topic lookup did not return a valid dialog id.\n"
-            "Action: Call list_topics for this dialog, then retry list_messages.",
-            error_code="invalid_topic_lookup_response",
-        )
-    resolved_topic_id = _resolve_topic_matches(data.get("topics", []), topic_name)
-    if isinstance(resolved_topic_id, ToolResult):
-        return resolved_topic_id
-    return _ResolvedTopic(dialog_id=resolved_dialog_id, topic_id=resolved_topic_id)
+    try:
+        canonical_dialog_id = required_dialog_selector(exact_id=resolved_dialog_id).exact_id
+    except DialogSelectorError:
+        return _invalid_topic_lookup_response()
+    if canonical_dialog_id is None or (requested_dialog_id is not None and canonical_dialog_id != requested_dialog_id):
+        return _invalid_topic_lookup_response()
+
+    topics = data.get("topics")
+    if not isinstance(topics, list) or any(not _is_valid_topic_row(topic) for topic in topics):
+        return _invalid_topic_lookup_response()
+    return canonical_dialog_id, cast(list[dict[str, object]], topics)
+
+
+def _is_valid_topic_row(topic: object) -> bool:
+    if not isinstance(topic, dict) or not isinstance(topic.get("title"), str):
+        return False
+    topic_id = topic.get("id")
+    return type(topic_id) is int and 1 <= topic_id <= SQLITE_INT64_MAX
+
+
+def _invalid_topic_lookup_response() -> ToolResult:
+    return error_result(
+        "Topic lookup did not return valid dialog and topic data.\n"
+        "Action: Call list_topics for this dialog, then retry list_messages.",
+        error_code="invalid_topic_lookup_response",
+    )
 
 
 def _topic_lookup_error(response: dict) -> ToolResult:
