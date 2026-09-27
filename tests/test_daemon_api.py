@@ -2992,7 +2992,7 @@ async def test_get_sync_status_reports_claimed_and_legacy_dm_work_as_paused(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("payload", [None, "", "  ", "{broken", "{}"])
+@pytest.mark.parametrize("payload", [None, "", "  ", "{broken", "{}", '{"generation":' + "9" * 5_000 + "}"])
 async def test_get_sync_status_reports_invalid_dm_checkpoint_as_paused_without_rewriting(
     payload: str | None,
 ) -> None:

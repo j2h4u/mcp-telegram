@@ -134,6 +134,7 @@ def test_builder_rejects_representative_malformed_facts(field: str, value: objec
         ("idle", None, False),
         ("verifying", None, True),
         ("suspended", "flood_wait", True),
+        ("suspended", "account_throttle", True),
         ("suspended", "interrupted", True),
         ("suspended", "legacy_generation_review", True),
     ],
@@ -181,6 +182,12 @@ def test_dm_deletion_checkpoint_absent_versus_present_payload() -> None:
     for payload in (None, "", "   ", "{invalid", "null", "[]", "42"):
         with pytest.raises(InvalidDmDeletionCheckpointError):
             decode_dm_deletion_checkpoint((payload,))
+
+
+def test_dm_deletion_checkpoint_rejects_oversized_json_integer() -> None:
+    payload = '{"generation":' + "9" * 5_000 + "}"
+    with pytest.raises(InvalidDmDeletionCheckpointError):
+        decode_dm_deletion_checkpoint((payload,))
 
 
 @pytest.mark.parametrize(

@@ -21,7 +21,9 @@ class InvalidDmDeletionCheckpointError(SyncReadModelContractError):
 
 
 DM_DELETION_POLICY_VERSION = 1
-DM_DELETION_SUSPENSION_REASONS = frozenset({"legacy_generation_review", "interrupted", "flood_wait"})
+DM_DELETION_SUSPENSION_REASONS = frozenset(
+    {"legacy_generation_review", "interrupted", "flood_wait", "account_throttle"}
+)
 DM_DELETION_RECONCILIATION_STATE_KEY = "delta_dm_gap_scan_state"
 _DM_DELETION_LEGACY_FIELDS = frozenset({"status", "generation", "scan_started_at", "dialog_id_cursor", "next_run_at"})
 _DM_DELETION_CURRENT_FIELDS = _DM_DELETION_LEGACY_FIELDS | frozenset(
@@ -168,7 +170,7 @@ def decode_dm_deletion_checkpoint(row: tuple[object, ...] | None) -> DmDeletionC
         raise InvalidDmDeletionCheckpointError("DM deletion checkpoint payload is empty or invalid")
     try:
         value = cast(object, json.loads(row[0], object_pairs_hook=_unique_json_object))
-    except json.JSONDecodeError, InvalidDmDeletionCheckpointError:
+    except ValueError, RecursionError:
         raise InvalidDmDeletionCheckpointError("DM deletion checkpoint JSON is invalid") from None
     if not isinstance(value, dict):
         raise InvalidDmDeletionCheckpointError("DM deletion checkpoint must be a JSON object")

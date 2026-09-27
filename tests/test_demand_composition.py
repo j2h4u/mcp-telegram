@@ -6,6 +6,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable, Generator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, patch
 
@@ -73,13 +74,14 @@ from mcp_telegram.telegram_demand import (
     RpcAttemptBudget,
     current_demand_token,
 )
+from mcp_telegram.telegram_demand_coordinator import TelegramDemandCoordinator
 from mcp_telegram.telegram_rpc_consumers import (
     DemandKind,
     TelegramRpcSource,
     demand_freshness_seconds,
 )
-from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
-from tests.helpers import LoudUserProfilePort
+from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope, rpc_scope
+from tests.helpers import LoudUserProfilePort, build_mock_message
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,6 +415,67 @@ async def test_invalid_dm_checkpoint_does_not_block_forward_delta_coordinator(
     ).fetchone() == (None, 1_000)
 
 
+@pytest.mark.asyncio
+async def test_claim_write_failure_uses_coordinator_backoff_then_reclaims_before_scanner(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+) -> None:
+    dependencies, _objects = composition_dependencies
+    dialog_id = 7199
+    dependencies.conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?,'synced')", (dialog_id,))
+    dependencies.conn.execute(
+        "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (?,1,'explicit',0)",
+        (dialog_id,),
+    )
+    dependencies.conn.execute("INSERT INTO entities(id,type,updated_at) VALUES (?,'user',1)", (dialog_id,))
+    dependencies.conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (?,1,1)", (dialog_id,))
+    dependencies.conn.execute(
+        """CREATE TRIGGER fail_dm_claim
+           BEFORE INSERT ON daemon_state
+           WHEN NEW.key='delta_dm_gap_scan_state' AND NEW.value LIKE '%\"status\": \"verifying\"%'
+           BEGIN SELECT RAISE(ABORT, 'injected DM claim failure'); END"""
+    )
+    dependencies.conn.commit()
+    calls = 0
+
+    class RecordingScanner:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+            nonlocal calls
+            del dialog_id, message_ids
+            calls += 1
+            row = cast(
+                tuple[object, ...] | None,
+                dependencies.conn.execute(
+                    "SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'"
+                ).fetchone(),
+            )
+            assert row is not None and isinstance(row[0], str) and '"status": "verifying"' in row[0]
+            return 0
+
+    composed = replace(dependencies, dm_gap_scanner=RecordingScanner())
+    first = TelegramDemandCoordinator(
+        build_durable_adapter_map(composed), dependencies.shutdown_event, clock=lambda: 1_000
+    )
+    kind = DemandKind.DM_DELETION_RECONCILIATION
+    assert kind in first.ready_kinds
+    await first._execute_slice(kind)
+    first._active_kind = None
+    assert calls == 0
+    assert kind not in first.scan(now=1_059)
+    assert kind in first.scan(now=1_060)
+    await first._execute_slice(kind)
+    first._active_kind = None
+    assert calls == 0
+
+    dependencies.conn.execute("DROP TRIGGER fail_dm_claim")
+    dependencies.conn.commit()
+    recovered = TelegramDemandCoordinator(
+        build_durable_adapter_map(composed), dependencies.shutdown_event, clock=lambda: 1_120
+    )
+    assert kind in recovered.ready_kinds
+    await recovered._execute_slice(kind)
+    assert calls == 1
+
+
 def test_linked_chat_adapter_selects_due_demand_and_passes_one_attempt_budget(
     composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
 ) -> None:
@@ -549,6 +612,70 @@ async def test_linked_chat_adapter_real_gate_cannot_retry_physical_send(
             AcquisitionKind.LINKED_CHAT_RESOLUTION,
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_malformed_dm_checkpoint_does_not_block_realtime_gate_acquisition(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from telethon.tl import functions, types  # type: ignore[import-untyped]
+
+    from mcp_telegram.event_handlers import EventHandlerManager
+    from tests.test_telegram_rpc import _gate, _set_sender
+
+    dependencies, _objects = composition_dependencies
+    dialog_id = 7188
+    dependencies.conn.execute("INSERT INTO daemon_state(key,value) VALUES ('delta_dm_gap_scan_state', NULL)")
+    dependencies.conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?,'synced')", (dialog_id,))
+    dependencies.conn.execute(
+        "INSERT INTO full_history_enrollment(dialog_id,enabled,source,updated_at) VALUES (?,1,'explicit',0)",
+        (dialog_id,),
+    )
+    dependencies.conn.commit()
+    gate = _gate()
+    sends: list[object] = []
+    scopes: list[tuple[TelegramRpcSource, DemandKind, AcquisitionKind | None]] = []
+    gate.set_rpc_request_observer(
+        lambda **kwargs: scopes.append((kwargs["source"], kwargs["demand_kind"], kwargs["acquisition_kind"]))
+    )
+
+    def send(request: object) -> object:
+        sends.append(request)
+        return object()
+
+    _set_sender(gate, send)
+
+    async def acquire_forward_entity(_message: object, _client: object) -> dict[int, str]:
+        await gate(
+            functions.channels.GetFullChannelRequest(
+                types.InputChannel(channel_id=8, access_hash=9)
+            )
+        )
+        return {}
+
+    monkeypatch.setattr("mcp_telegram.event_handlers._build_fwd_entity_map", acquire_forward_entity)
+    manager = EventHandlerManager(SimpleNamespace(), dependencies.conn, dependencies.shutdown_event)  # type: ignore[arg-type]
+    manager.bind_demand_sink(lambda *_kinds: None)
+    message = build_mock_message(id=1, text="realtime")
+    message.fwd_from = SimpleNamespace(from_name=None, from_id=types.PeerChannel(channel_id=8))
+    try:
+        with rpc_scope(TelegramRpcSource.REALTIME_EVENT):
+            await manager.on_new_message(SimpleNamespace(chat_id=dialog_id, message=message, is_private=False))
+
+        assert len(sends) == 1 and isinstance(sends[0], functions.channels.GetFullChannelRequest)
+        assert scopes == [
+            (
+                TelegramRpcSource.REALTIME_EVENT,
+                DemandKind.REALTIME_EVENT_ACQUISITION,
+                AcquisitionKind.ENTITY_LOOKUP,
+            )
+        ]
+        assert dependencies.conn.execute(
+            "SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'"
+        ).fetchone() == (None,)
+    finally:
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio

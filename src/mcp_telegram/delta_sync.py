@@ -274,15 +274,6 @@ def _dm_scan_transition(
 def _prepare_legacy_dm_scan_state(state: _DmGapScanState, changed_at: int) -> _DmGapScanState:
     if state.status == "running":
         return _dm_scan_transition(state, status="suspended", reason="legacy_generation_review", changed_at=changed_at)
-    if state.status == "verifying":
-        return _dm_scan_transition(state, status="suspended", reason="interrupted", changed_at=changed_at)
-    if state.status == "suspended":
-        return _dm_scan_transition(
-            state,
-            status="suspended",
-            reason=state.reason or "legacy_generation_review",
-            changed_at=state.state_changed_at if state.state_changed_at is not None else changed_at,
-        )
     return _dm_scan_transition(state, status=state.status, reason=None, changed_at=changed_at)
 
 
@@ -738,7 +729,7 @@ class DmDeletionReconciliationDemandAdapter:
             state.message_cursor,
             state.next_run_at,
             _DM_GAP_SCAN_POLICY_VERSION,
-            "flood_wait",
+            "account_throttle",
             now,
         )
         self._write_transition(state, suspended)
@@ -829,7 +820,8 @@ class DmDeletionReconciliationDemandAdapter:
         if dialog_id is None:
             self._complete_scan(state, now)
             return None
-        page = _dm_gap_scan_page_ids(self._conn, dialog_id, state.scan_started_at, state.message_cursor)
+        message_cursor = state.message_cursor if dialog_id == state.dialog_id_cursor else 0
+        page = _dm_gap_scan_page_ids(self._conn, dialog_id, state.scan_started_at, message_cursor)
         if not page:
             self._advance_empty_dialog(state, dialog_id, now)
             return None
@@ -861,7 +853,11 @@ class DmDeletionReconciliationDemandAdapter:
         token: DemandToken | None = None
         try:
             with demand_context(self.demand_kind) as token:
-                if token.kind is not self.demand_kind or token.source is not TelegramRpcSource.DELTA_SYNC:
+                if (
+                    token is None
+                    or token.kind is not self.demand_kind
+                    or token.source is not TelegramRpcSource.DELTA_SYNC
+                ):
                     raise DmGapScanStateError("DM deletion reconciliation demand identity is invalid")
                 with acquisition_context(AcquisitionKind.MESSAGE_LOOKUP):
                     with rpc_attempt_budget(budget):
