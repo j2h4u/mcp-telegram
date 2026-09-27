@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from telethon.tl.types import PeerUser, UpdateReadHistoryInbox
 
+from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.config import RuntimeObservationConfig, TelemetryConfig
 from mcp_telegram.daemon_api import (
     DaemonAPIServer,
@@ -378,6 +379,68 @@ def make_server(
     )
     server._ready = True
     return server
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("protected", "stored_owner"),
+    [(False, None), (True, None), (True, 7)],
+    ids=["inactive-missing-owner", "active-missing-owner", "active-wrong-owner"],
+)
+async def test_entity_profile_pending_projects_protection_only_when_active(
+    tmp_path: Path,
+    protected: bool,
+    stored_owner: int | None,
+) -> None:
+    """Known local entity stubs retain domain ownership checks before API projection."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    client = _TestClient()
+    client.get_entity = AsyncMock(side_effect=AssertionError("owned cache must not acquire Telegram"))
+    server = make_server(conn, client)
+    server._policy = replace(
+        server._policy,
+        entity_profile=replace(server._policy.entity_profile, foreground_refresh_wait_seconds=0.01),
+    )
+    server._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
+    server.bind_demand_sink(MagicMock(offer=MagicMock(return_value=True)))
+    service = server._get_entity_info_service()
+    service._profiles.save_core({"id": 42, "type": "user", "name": "Local stub"}, now=100)  # type: ignore[attr-defined]
+    service._profiles.mark_pending(42, now=100)  # type: ignore[attr-defined]
+    if stored_owner is not None:
+        conn.execute(
+            "UPDATE entity_details SET profile_owner_account_id=?, profile_observation_scope_json='{}' WHERE entity_id=42",
+            (stored_owner,),
+        )
+        conn.commit()
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=protected,
+        reason="test" if protected else None,
+        opened_at=1 if protected else None,
+        events_in_window=1 if protected else 0,
+        wait_s_in_window=1 if protected else 0,
+        window_seconds=1,
+        source="test" if protected else None,
+    )
+    try:
+        result, _, _ = await server._handle_client_line(b'{"method":"get_entity_info","entity_id":42}', "", None)
+    finally:
+        await server.shutdown()
+        conn.close()
+
+    client.get_entity.assert_not_called()
+    if protected:
+        assert result == {
+            "ok": False,
+            "error": "flood_wait_kill_switch_open",
+            "message": "Telegram acquisition is blocked by account protection.",
+            "required_action": "manual_operator_recovery",
+            "retryable": False,
+        }
+    else:
+        assert result["error"] == "entity_info_pending"
+        assert result["retryable"] is True
 
 
 @pytest.mark.asyncio

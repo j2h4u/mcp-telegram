@@ -1807,6 +1807,8 @@ class DaemonAPIServer:
         """Type-tagged entity inspector covering 5 Telegram entity kinds."""
         self._reproject_due_folder_memberships()
         result = await self._get_entity_info_service().get_entity_info(req)
+        if result.get("error") == "entity_info_pending" and self._health_status().open:
+            return _account_protection_error()
         if result.get("ok"):
             data = cast(dict[str, object], result.get("data", {}))
             entity_id = data.get("id")
