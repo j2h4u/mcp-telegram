@@ -341,6 +341,83 @@ async def test_inherited_connect_admits_one_bootstrap_send_without_leaking_its_c
 
 
 @pytest.mark.asyncio
+async def test_inherited_connect_waits_for_a_restored_cooldown_before_its_first_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate, sender = _bootstrap_gate()
+    import mcp_telegram.telegram_rpc as rpc
+
+    gate._cooldown_persistence = TelegramRpcCooldownPersistence(lambda: rpc.time.time() + 30, lambda _until: None)
+    gate._restore_account_cooldown()
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+
+    async def wait_for_cooldown(_delay: float) -> None:
+        waiting.set()
+        await release.wait()
+
+    monkeypatch.setattr(rpc.asyncio, "sleep", wait_for_cooldown)
+    caller = asyncio.create_task(gate.connect())
+    await waiting.wait()
+    assert sender.connect_calls == 0
+    assert sender.sent == []
+    rpc._COOLDOWN_DEADLINE = 0
+    release.set()
+    try:
+        await caller
+        assert len(sender.sent) == 1
+    finally:
+        await _close_bootstrap_gate(gate)
+
+
+@pytest.mark.asyncio
+async def test_inherited_connect_transfers_the_caller_deadline_and_attempt_budget() -> None:
+    gate, sender = _bootstrap_gate()
+    deadline = asyncio.get_running_loop().time() + 5
+    budget = RpcAttemptBudget(2)
+    try:
+        with demand_context(DemandKind.MCP_REMOTE_ACQUISITION, deadline=deadline):
+            with rpc_attempt_budget(budget):
+                with rpc_scope(TelegramRpcSource.MCP_INTERACTIVE, deadline=deadline) as caller_scope:
+                    await gate.connect()
+        assert sender.scopes[0].source is caller_scope.source
+        assert sender.scopes[0].deadline == caller_scope.deadline
+        assert sender.scopes[0].attempt_budget is budget
+        assert budget.attempts == 1
+    finally:
+        await _close_bootstrap_gate(gate)
+
+
+@pytest.mark.asyncio
+async def test_inherited_connect_admits_optional_get_me_and_get_state_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate, sender = _bootstrap_gate()
+
+    async def get_me(client: TelegramClient) -> object:
+        await client(functions.users.GetUsersRequest([types.InputUserSelf()]))
+        return object()
+
+    async def on_login(client: TelegramClient, _me: object) -> None:
+        await client(functions.updates.GetStateRequest())
+
+    gate._message_box = SimpleNamespace(is_empty=lambda: True)
+    monkeypatch.setattr(TelegramClient, "get_me", get_me)
+    monkeypatch.setattr(TelegramClient, "_on_login", on_login)
+    try:
+        await gate.connect()
+        assert [type(request).__name__ for request in sender.sent] == [
+            "InvokeWithLayerRequest",
+            "GetUsersRequest",
+            "GetStateRequest",
+        ]
+        assert all(scope.source is TelegramRpcSource.TELETHON_CONNECTION_BOOTSTRAP for scope in sender.scopes)
+        assert gate._limiter.acquisitions == 3
+    finally:
+        await _close_bootstrap_gate(gate)
+
+
+@pytest.mark.asyncio
 async def test_inherited_connect_stops_before_transport_when_circuit_is_open() -> None:
     gate, sender = _bootstrap_gate(_CircuitStatus(open=True))
     try:

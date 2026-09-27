@@ -126,6 +126,32 @@ class _SendAttempt(Protocol):
     ) -> Awaitable[object] | list[asyncio.Future[object]]: ...
 
 
+class _MainSender(_SendAttempt, Protocol):
+    """The only raw Telethon sender surface retained by the gate."""
+
+    auth_key: object
+
+    def send(
+        self,
+        request: object,
+        *,
+        ordered: bool = False,
+    ) -> Awaitable[object] | list[asyncio.Future[object]]: ...
+
+    async def connect(self, connection: object) -> object: ...
+
+    async def disconnect(self) -> object: ...
+
+    def is_connected(self) -> bool: ...
+
+    @property
+    def disconnected(self) -> asyncio.Future[object]: ...
+
+    def _transport_connected(self) -> bool: ...
+
+    def _keepalive_ping(self, random_id: int) -> None: ...
+
+
 class _AdmissionAwareSender:
     """Admit each scalar attempt at Telethon's synchronous sender seam."""
 
@@ -139,12 +165,8 @@ class _AdmissionAwareSender:
 
     async def _send(self, request: object, *, ordered: bool) -> object:
         while True:
-            budget = self._scope.attempt_budget
-            if budget is not None and budget.exhausted:
-                self._gate._admission_scheduler.record_attempt_budget_exhausted(self._scope)
-                budget.debit()
-            with timing_phase("rpc_admission"):
-                admission = await self._gate._admit(self._scope)
+            self._reject_exhausted_budget()
+            admission = await self._admit()
             try:
                 if not self._gate._scheduler_transport_ready():
                     self._gate._admission_scheduler.record_retry(
@@ -152,33 +174,49 @@ class _AdmissionAwareSender:
                         reason="transport_readiness_changed",
                     )
                     continue
-                if budget is not None:
-                    if budget.exhausted:
-                        self._gate._admission_scheduler.record_attempt_budget_exhausted(self._scope)
-                    budget.debit()
-                self._gate._admission_scheduler.record_dispatch(admission)
-                if isinstance(request, GetFullChannelRequest):
-                    self._gate._observe_rpc_request(self._scope)
-                if (timing := current_timing()) is not None:
-                    timing.record_rpc_attempt()
-                dispatch_at_monotonic = time.monotonic()
-                future = self._send_attempt(request, ordered=ordered)
-                if isinstance(future, list):
-                    self._reject_batch(future)
-                with timing_phase("rpc_execution"):
-                    try:
-                        return await future
-                    except (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError) as exc:
-                        _annotate_flood_attempt(
-                            exc,
-                            request_method=type(request).__name__,
-                            admission_sequence=admission.sequence,
-                            dispatch_at_monotonic=dispatch_at_monotonic,
-                            dispatch_kind="actual_send",
-                        )
-                        raise
+                return await self._send_admitted(request, ordered=ordered, admission=admission)
             finally:
                 self._gate._admission_scheduler.complete(admission)
+
+    def _reject_exhausted_budget(self) -> None:
+        budget = self._scope.attempt_budget
+        if budget is not None and budget.exhausted:
+            self._gate._admission_scheduler.record_attempt_budget_exhausted(self._scope)
+            budget.debit()
+
+    async def _admit(self) -> RpcAdmission:
+        with timing_phase("rpc_admission"):
+            return await self._gate._admit(self._scope)
+
+    async def _send_admitted(self, request: object, *, ordered: bool, admission: RpcAdmission) -> object:
+        budget = self._scope.attempt_budget
+        if budget is not None:
+            self._reject_exhausted_budget()
+            budget.debit()
+        self._gate._admission_scheduler.record_dispatch(admission)
+        if isinstance(request, GetFullChannelRequest):
+            self._gate._observe_rpc_request(self._scope)
+        if (timing := current_timing()) is not None:
+            timing.record_rpc_attempt()
+        return await self._await_send(request, ordered=ordered, admission=admission)
+
+    async def _await_send(self, request: object, *, ordered: bool, admission: RpcAdmission) -> object:
+        dispatch_at_monotonic = time.monotonic()
+        future = self._send_attempt(request, ordered=ordered)
+        if isinstance(future, list):
+            self._reject_batch(future)
+        with timing_phase("rpc_execution"):
+            try:
+                return await future
+            except (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError) as exc:
+                _annotate_flood_attempt(
+                    exc,
+                    request_method=type(request).__name__,
+                    admission_sequence=admission.sequence,
+                    dispatch_at_monotonic=dispatch_at_monotonic,
+                    dispatch_kind="actual_send",
+                )
+                raise
 
     @staticmethod
     def _reject_batch(futures: list[asyncio.Future[object]]) -> Never:
@@ -352,7 +390,7 @@ class TelegramRpcGate(TelegramClient):
                 wait=self._wait_for_scheduler_transport,
             ),
         )
-        self._main_sender = self._sender
+        self._main_sender: _MainSender = cast(_MainSender, self._sender)  # type: ignore[has-type]
         self._sender = _MainSenderAdapter(self)
         self._connect_owner: asyncio.Task[object] | None = None
         self._connection_capability: _ConnectionCapability | None = None
@@ -534,8 +572,7 @@ class TelegramRpcGate(TelegramClient):
                 acquisition_kind=AcquisitionKind.CONNECTION_BOOTSTRAP,
             )
             return _ConnectionCapability(token, token.admission_deadline, None)
-        scope = current_rpc_scope()
-        return _ConnectionCapability(token, scope.deadline, scope.attempt_budget)
+        return self._connection_capability_from_scope(token, current_rpc_scope())
 
     @staticmethod
     def _scope_for_connection_capability(capability: _ConnectionCapability) -> TelegramRpcScope:
@@ -558,7 +595,15 @@ class TelegramRpcGate(TelegramClient):
             token = current_demand_token()
         except UnclassifiedTelegramDemandError as exc:
             return self._connection_capability_for_current_owner(exc)
-        scope = current_rpc_scope()
+        return self._connection_capability_from_scope(token, current_rpc_scope())
+
+    @staticmethod
+    def _connection_capability_from_scope(
+        token: DemandToken,
+        scope: TelegramRpcScope,
+    ) -> _ConnectionCapability:
+        if scope.deadline is None:
+            raise RuntimeError("Telegram RPC scope must carry its absolute admission deadline")
         return _ConnectionCapability(token, scope.deadline, scope.attempt_budget)
 
     def _connection_capability_for_current_owner(self, error: UnclassifiedTelegramDemandError) -> _ConnectionCapability:
@@ -786,63 +831,87 @@ class TelegramRpcGate(TelegramClient):
         async with _COOLDOWN_LOCK:
             _COOLDOWN_DEADLINE = max(_COOLDOWN_DEADLINE, now + seconds + self._cooldown_buffer_seconds)
             self._persist_account_cooldown(monotonic_now=now)
-            identity = id(exc)
-            if getattr(exc, "_mcp_telegram_flood_observed", False) or identity in _OBSERVED_FLOOD_IDS:
+            if self._flood_already_observed(exc):
                 return seconds
-            try:
-                setattr(exc, "_mcp_telegram_flood_observed", True)  # noqa: B010 - exception marker is intentional
-            except AttributeError:
-                _OBSERVED_FLOOD_IDS.add(identity)
-            except TypeError:
-                _OBSERVED_FLOOD_IDS.add(identity)
-            attempt = getattr(exc, "_mcp_telegram_flood_attempt", {})
-            if not isinstance(attempt, dict):
-                attempt = {}
-            origin = attempt.get("dispatch_kind", "unknown")
-            if origin != "vendor_cache" and self._flood_observer is not None:
-                self._flood_observer(source="telegram_rpc_gate", seconds=seconds)
-            flood_event_observer = getattr(self, "_flood_event_observer", None)
-            if scope is not None and flood_event_observer is not None:
-                cooldown_until_utc_ms = int((time.time() + max(0.0, _COOLDOWN_DEADLINE - time.monotonic())) * 1_000)
-                status = self._rpc_circuit_status()
-                actual_dispatch = origin == "actual_send"
-                if origin not in {"actual_send", "vendor_cache"}:
-                    origin = "unknown"
-                observation = FloodWaitObservation(
-                    source=scope.source.value,
-                    service_class=scope.service_class.value,
-                    demand_kind=scope.demand_kind.value if scope.demand_kind is not None else None,
-                    acquisition_kind=scope.acquisition_kind.value if scope.acquisition_kind is not None else None,
-                    seconds=seconds,
-                    cooldown_until_utc_ms=cooldown_until_utc_ms,
-                    circuit_open=status.open,
-                    request_method=str(attempt.get("request_method", "unknown")),
-                    origin=origin,
-                    actual_dispatch=actual_dispatch if origin != "unknown" else None,
-                    admission_sequence=cast(int | None, attempt.get("admission_sequence")),
-                    dispatch_at_monotonic=cast(float | None, attempt.get("dispatch_at_monotonic")),
-                    observed_at_ms=int(time.time() * 1_000),
-                )
-                logger.warning(
-                    "telegram_flood_wait source=%s demand=%s acquisition=%s request_method=%s "
-                    "origin=%s actual_dispatch=%s admission_sequence=%s seconds=%d "
-                    "cooldown_until_utc_ms=%d circuit_open=%s",
-                    scope.source.value,
-                    scope.demand_kind.value if scope.demand_kind is not None else "unknown",
-                    scope.acquisition_kind.value if scope.acquisition_kind is not None else "unknown",
-                    observation.request_method,
-                    observation.origin,
-                    observation.actual_dispatch,
-                    observation.admission_sequence,
-                    observation.seconds,
-                    cooldown_until_utc_ms,
-                    observation.circuit_open,
-                )
-                try:
-                    flood_event_observer(observation)
-                except Exception:
-                    logger.exception("flood_wait_event_observer_failed source=%s", scope.source.value)
+            self._mark_flood_observed(exc)
+            attempt = self._flood_attempt(exc)
+            self._observe_flood_warning(attempt, seconds)
+            self._observe_flood_event(scope, attempt, seconds)
             return seconds
+
+    @staticmethod
+    def _flood_already_observed(exc: BaseException) -> bool:
+        return getattr(exc, "_mcp_telegram_flood_observed", False) or id(exc) in _OBSERVED_FLOOD_IDS
+
+    @staticmethod
+    def _mark_flood_observed(exc: BaseException) -> None:
+        try:
+            setattr(exc, "_mcp_telegram_flood_observed", True)  # noqa: B010 - exception marker is intentional
+        except AttributeError, TypeError:
+            _OBSERVED_FLOOD_IDS.add(id(exc))
+
+    @staticmethod
+    def _flood_attempt(exc: BaseException) -> dict[object, object]:
+        attempt = getattr(exc, "_mcp_telegram_flood_attempt", {})
+        return attempt if isinstance(attempt, dict) else {}
+
+    def _observe_flood_warning(self, attempt: dict[object, object], seconds: int) -> None:
+        if attempt.get("dispatch_kind", "unknown") != "vendor_cache" and self._flood_observer is not None:
+            self._flood_observer(source="telegram_rpc_gate", seconds=seconds)
+
+    def _observe_flood_event(
+        self,
+        scope: TelegramRpcScope | None,
+        attempt: dict[object, object],
+        seconds: int,
+    ) -> None:
+        observer = getattr(self, "_flood_event_observer", None)
+        if scope is None or observer is None:
+            return
+        observation = self._flood_event(scope, attempt, seconds)
+        logger.warning(
+            "telegram_flood_wait source=%s demand=%s acquisition=%s request_method=%s "
+            "origin=%s actual_dispatch=%s admission_sequence=%s seconds=%d cooldown_until_utc_ms=%d circuit_open=%s",
+            scope.source.value,
+            scope.demand_kind.value if scope.demand_kind is not None else "unknown",
+            scope.acquisition_kind.value if scope.acquisition_kind is not None else "unknown",
+            observation.request_method,
+            observation.origin,
+            observation.actual_dispatch,
+            observation.admission_sequence,
+            observation.seconds,
+            observation.cooldown_until_utc_ms,
+            observation.circuit_open,
+        )
+        try:
+            observer(observation)
+        except Exception:
+            logger.exception("flood_wait_event_observer_failed source=%s", scope.source.value)
+
+    def _flood_event(
+        self,
+        scope: TelegramRpcScope,
+        attempt: dict[object, object],
+        seconds: int,
+    ) -> FloodWaitObservation:
+        origin = attempt.get("dispatch_kind", "unknown")
+        if origin not in {"actual_send", "vendor_cache"}:
+            origin = "unknown"
+        return FloodWaitObservation(
+            source=scope.source.value,
+            service_class=scope.service_class.value,
+            demand_kind=scope.demand_kind.value if scope.demand_kind is not None else None,
+            acquisition_kind=scope.acquisition_kind.value if scope.acquisition_kind is not None else None,
+            seconds=seconds,
+            cooldown_until_utc_ms=int((time.time() + max(0.0, _COOLDOWN_DEADLINE - time.monotonic())) * 1_000),
+            circuit_open=self._rpc_circuit_status().open,
+            request_method=str(attempt.get("request_method", "unknown")),
+            origin=origin,
+            actual_dispatch=origin == "actual_send" if origin != "unknown" else None,
+            admission_sequence=cast(int | None, attempt.get("admission_sequence")),
+            dispatch_at_monotonic=cast(float | None, attempt.get("dispatch_at_monotonic")),
+            observed_at_ms=int(time.time() * 1_000),
+        )
 
 
 __all__ = [
