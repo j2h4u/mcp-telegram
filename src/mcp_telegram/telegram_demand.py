@@ -26,6 +26,7 @@ class AcquisitionKind(StrEnum):
     """Telegram operation performed inside a root demand context."""
 
     ACCOUNT_SELF_PROFILE = "account_self_profile"
+    CONNECTION_BOOTSTRAP = "connection_bootstrap"
     DIALOG_TRAVERSAL = "dialog_traversal"
     ENTITY_LOOKUP = "entity_lookup"
     FOLDER_SNAPSHOT = "folder_snapshot"
@@ -164,6 +165,10 @@ class UnclassifiedTelegramDemandError(RuntimeError):
     """Raised when code reaches Telegram acquisition without root identity."""
 
 
+class MissingTelegramDemandContextError(UnclassifiedTelegramDemandError):
+    """Raised only when Telegram work has no task-local demand identity."""
+
+
 _DEMAND_CONTEXT: ContextVar[DemandToken | None] = ContextVar("telegram_demand_context", default=None)
 
 
@@ -272,7 +277,7 @@ def current_demand_token() -> DemandToken:
     """Return the current registered root token or fail closed."""
     token = _DEMAND_CONTEXT.get()
     if token is None:
-        raise UnclassifiedTelegramDemandError("Telegram acquisition has no demand context")
+        raise MissingTelegramDemandContextError("Telegram acquisition has no demand context")
     if token.owner_task is not None and token.owner_task is not _current_task():
         raise UnclassifiedTelegramDemandError(
             "detached Telegram work inherited another task's demand context; transfer it explicitly"

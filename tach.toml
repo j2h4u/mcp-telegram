@@ -301,7 +301,7 @@ depends_on = ["mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_schedul
 [[modules]]
 path = "mcp_telegram.rpc_admission_observations"
 layer = "application"
-depends_on = ["mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
+depends_on = ["mcp_telegram.flood", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler"]
 [[modules]]
 path = "mcp_telegram.activity_contracts"
 layer = "foundation"

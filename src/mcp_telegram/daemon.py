@@ -147,6 +147,7 @@ from .telegram_rpc_consumers import DemandKind, demand_contract
 from .telegram_rpc_scheduler import (
     AdmissionObserver,
     RpcAdmissionClosedError,
+    RpcAdmissionError,
     RpcAdmissionEvent,
     RpcAdmissionEventKind,
     TelegramRpcAdmissionDeferred,
@@ -246,6 +247,8 @@ class _DaemonClient(Protocol):
     def set_rpc_admission_observer(self, observer: AdmissionObserver | None) -> None: ...
 
     def set_rpc_request_observer(self, observer: Callable[..., None] | None) -> None: ...
+
+    def set_flood_event_observer(self, observer: Callable[..., None] | None) -> None: ...
 
     async def get_me(self) -> object: ...
 
@@ -990,11 +993,20 @@ async def _monitor_flood_wait_kill_switch(ctx: _SyncMainContext) -> None:
 
     logger.critical("flood_wait_kill_switch_stopping_telegram_work %s", status.detail())
     current_task = asyncio.current_task()
-    for task in list(ctx.background_tasks):
-        if task is not current_task:
-            task.cancel()
-    await ctx.client.disconnect()
-    logger.critical("flood_wait_kill_switch_telegram_disconnected")
+    producers = [task for task in ctx.background_tasks if task is not current_task]
+    for task in producers:
+        task.cancel()
+    await asyncio.gather(*producers, return_exceptions=True)
+    try:
+        await ctx.client.disconnect()
+    except Exception:
+        logger.exception("flood_wait_kill_switch_telegram_disconnect_failed")
+    else:
+        logger.critical("flood_wait_kill_switch_telegram_disconnected")
+    finally:
+        observer = ctx.rpc_admission_observer
+        if observer is not None:
+            observer.flush()
 
 
 def _install_flood_wait_kill_switch(config: McpTelegramConfig, event: asyncio.Event) -> None:
@@ -1245,6 +1257,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914, PLR0
             )
         )
         client.set_rpc_request_observer(rpc_admission_observer.observe_request_attempt)
+        client.set_flood_event_observer(rpc_admission_observer.observe_flood_wait)
     return ctx
 
 
@@ -1280,6 +1293,12 @@ async def _connect_telegram(ctx: _SyncMainContext) -> bool:
     except (TimeoutError, OSError) as exc:
         ctx.api_server.startup_detail = f"connection failed: {exc}"
         logger.exception("sync-daemon connection failed: %s", exc)
+        return False
+    except (TelegramRpcThrottled, RpcAdmissionError) as exc:
+        ctx.api_server.startup_detail = f"Telegram admission unavailable: {exc}"
+        ctx.api_server._ready = False
+        logger.warning("sync-daemon Telegram admission unavailable: %s", exc)
+        await ctx.shutdown_event.wait()
         return False
 
     logger.info("sync-daemon started — connected=%s", ctx.client.is_connected())
@@ -1766,6 +1785,7 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
     async def detach_observer() -> None:
         ctx.client.set_rpc_admission_observer(None)
         ctx.client.set_rpc_request_observer(None)
+        ctx.client.set_flood_event_observer(None)
 
     async def drain_telemetry() -> None:
         if ctx.rpc_admission_observer is not None:

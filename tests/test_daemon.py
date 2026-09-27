@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import sqlite3
 from collections.abc import Coroutine
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -11,12 +13,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from mcp_telegram.config import AutomaticGroupHistoryConfig, load_config
+import mcp_telegram.daemon as daemon
+from mcp_telegram.config import AutomaticGroupHistoryConfig, RuntimeObservationConfig, load_config
 from mcp_telegram.daemon import (
     _acquire_startup_identity_before_updates,
+    _connect_telegram,
     _ensure_demand_runtime,
     _HistorySyncRuntime,
     _message_fact_refresh_policy_from_config,
+    _monitor_flood_wait_kill_switch,
     _offer_startup_demands,
     _prime_runtime,
     _run_daemon_lifetime,
@@ -31,7 +36,10 @@ from mcp_telegram.entity_profile.contracts import (
     TargetKind,
     UserProfileObservation,
 )
+from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.own_only_contracts import OwnOnlyContext
+from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
+from mcp_telegram.runtime_observations import RuntimeObservationSink
 from mcp_telegram.startup_identity import (
     StartupIdentityResult,
     StartupIdentityState,
@@ -39,6 +47,12 @@ from mcp_telegram.startup_identity import (
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_rpc_consumers import DemandKind
+from mcp_telegram.telegram_rpc_scheduler import (
+    RPC_SOURCE_SERVICE_CLASS,
+    RpcAdmissionEvent,
+    RpcAdmissionEventKind,
+    TelegramRpcSource,
+)
 
 
 def _ctx(**overrides: object) -> SimpleNamespace:
@@ -130,12 +144,15 @@ class _ClientStub:
         self.close_scheduler_calls = 0
         self.observer_detached = False
         self.request_observer_detached = False
+        self.flood_event_observer_detached = False
+        self.stages: list[str] = []
 
     def is_connected(self) -> bool:
         return True
 
     async def disconnect(self) -> None:
         self.disconnect_calls += 1
+        self.stages.append("disconnect")
 
     async def close_rpc_scheduler(self) -> None:
         self.close_scheduler_calls += 1
@@ -146,8 +163,49 @@ class _ClientStub:
     def set_rpc_request_observer(self, observer: object | None) -> None:
         self.request_observer_detached = observer is None
 
+    def set_flood_event_observer(self, observer: object | None) -> None:
+        self.flood_event_observer_detached = observer is None
+
     async def get_me(self) -> object:
         return SimpleNamespace(id=1)
+
+
+@pytest.mark.asyncio
+async def test_admission_blocked_startup_stays_not_ready_until_shutdown() -> None:
+    class _BlockedClient(_ClientStub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.connect_calls = 0
+
+        async def connect(self) -> None:
+            self.connect_calls += 1
+            raise TelegramRpcThrottled(retry_after_seconds=None, latched=True, detail="open-for-test")
+
+    shutdown = asyncio.Event()
+    api_server = _ApiStub()
+    client = _BlockedClient()
+    ctx = _typed_ctx(client=client, api_server=api_server, shutdown_event=shutdown)
+    pending = asyncio.create_task(_connect_telegram(ctx))
+    await asyncio.sleep(0)
+    assert not pending.done()
+    assert client.connect_calls == 1
+    assert api_server._ready is False
+    assert "admission unavailable" in api_server.startup_detail
+    shutdown.set()
+    assert await pending is False
+
+
+@pytest.mark.asyncio
+async def test_admission_blocked_startup_cancellation_propagates() -> None:
+    class _BlockedClient(_ClientStub):
+        async def connect(self) -> None:
+            raise TelegramRpcThrottled(retry_after_seconds=None, latched=True, detail="open-for-test")
+
+    pending = asyncio.create_task(_connect_telegram(_typed_ctx(client=_BlockedClient())))
+    await asyncio.sleep(0)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
 
 
 class _UserProfilePort:
@@ -599,6 +657,218 @@ async def test_daemon_lifetime_refreshes_local_dialog_set_and_stops() -> None:
 
 
 @pytest.mark.asyncio
+async def test_protective_stop_drains_producers_before_flushing_admission_observations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stages: list[str] = []
+    event = asyncio.Event()
+    event.set()
+
+    class _StoppingClient(_ClientStub):
+        async def disconnect(self) -> None:
+            stages.append("disconnect")
+
+    async def producer() -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            stages.append("producer_cancelled")
+
+    task = asyncio.create_task(producer())
+    await asyncio.sleep(0)
+    ctx = _typed_ctx(
+        client=_StoppingClient(),
+        background_tasks={task},
+        flood_wait_kill_switch_event=event,
+        rpc_admission_observer=cast(
+            RpcAdmissionObservationAggregator,
+            SimpleNamespace(flush=lambda: stages.append("flush")),
+        ),
+    )
+    monkeypatch.setattr(
+        daemon, "flood_wait_kill_switch_status", lambda: SimpleNamespace(open=True, detail=lambda: "open")
+    )
+
+    await _monitor_flood_wait_kill_switch(ctx)
+
+    assert stages == ["producer_cancelled", "disconnect", "flush"]
+
+
+@pytest.mark.asyncio
+async def test_protective_stop_persists_pending_summary_while_daemon_remains_parked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    policy = RuntimeObservationConfig()
+    sink = RuntimeObservationSink(db_path, retention_ttl_seconds=3600, policy=policy)
+    observer = RpcAdmissionObservationAggregator(sink, policy=policy)
+    source = TelegramRpcSource.MCP_INTERACTIVE
+    service_class = RPC_SOURCE_SERVICE_CLASS[source]
+    observer.observe(
+        RpcAdmissionEvent(
+            kind=RpcAdmissionEventKind.QUEUED,
+            source=source,
+            service_class=service_class,
+            queue_depth=1,
+            total_depth=1,
+        )
+    )
+    observer.observe(
+        RpcAdmissionEvent(
+            kind=RpcAdmissionEventKind.DISPATCHED,
+            source=source,
+            service_class=service_class,
+            queue_depth=0,
+            total_depth=0,
+            active_depth=1,
+            total_outstanding=1,
+            wait_seconds=0.01,
+        )
+    )
+
+    stages: list[str] = []
+    shutdown = asyncio.Event()
+    kill_switch = asyncio.Event()
+    kill_switch.set()
+
+    class _StoppingClient(_ClientStub):
+        async def disconnect(self) -> None:
+            stages.append("disconnect")
+            await super().disconnect()
+
+    async def producer() -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            stages.append("producer_cancelled")
+
+    task = asyncio.create_task(producer())
+    await asyncio.sleep(0)
+    ctx = _typed_ctx(
+        client=_StoppingClient(),
+        background_tasks={task},
+        shutdown_event=shutdown,
+        flood_wait_kill_switch_event=kill_switch,
+        rpc_admission_observer=observer,
+        rpc_observation_sink=sink,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "flood_wait_kill_switch_status",
+        lambda: SimpleNamespace(open=True, detail=lambda: "open-for-test"),
+    )
+
+    try:
+        await _monitor_flood_wait_kill_switch(ctx)
+        assert stages == ["producer_cancelled", "disconnect"]
+        assert shutdown.is_set() is False
+        assert cast(_ClientStub, ctx.client).disconnect_calls == 1
+
+        row: tuple[object, ...] | None = None
+        for _ in range(100):
+            with closing(sqlite3.connect(db_path)) as conn:
+                row = cast(
+                    tuple[object, ...] | None,
+                    conn.execute(
+                        "SELECT outcome, reason_code FROM runtime_observations "
+                        "WHERE kind = 'telegram.rpc_admission' ORDER BY observed_at_ms DESC LIMIT 1"
+                    ).fetchone(),
+                )
+            if row is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert row is not None
+        assert row[0] == "summary"
+        assert stages == ["producer_cancelled", "disconnect"]
+    finally:
+        await sink.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_protective_stop_flushes_without_disconnected_success_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    policy = RuntimeObservationConfig()
+    sink = RuntimeObservationSink(db_path, retention_ttl_seconds=3600, policy=policy)
+    observer = RpcAdmissionObservationAggregator(sink, policy=policy)
+    source = TelegramRpcSource.MCP_INTERACTIVE
+    service_class = RPC_SOURCE_SERVICE_CLASS[source]
+    observer.observe(
+        RpcAdmissionEvent(
+            kind=RpcAdmissionEventKind.QUEUED,
+            source=source,
+            service_class=service_class,
+            queue_depth=1,
+            total_depth=1,
+        )
+    )
+    observer.observe(
+        RpcAdmissionEvent(
+            kind=RpcAdmissionEventKind.DISPATCHED,
+            source=source,
+            service_class=service_class,
+            queue_depth=0,
+            total_depth=0,
+            active_depth=1,
+            total_outstanding=1,
+            wait_seconds=0.01,
+        )
+    )
+
+    class _FailingClient(_ClientStub):
+        async def disconnect(self) -> None:
+            self.disconnect_calls += 1
+            raise OSError("transport teardown failed")
+
+    kill_switch = asyncio.Event()
+    kill_switch.set()
+    ctx = _typed_ctx(
+        client=_FailingClient(),
+        shutdown_event=asyncio.Event(),
+        flood_wait_kill_switch_event=kill_switch,
+        rpc_admission_observer=observer,
+        rpc_observation_sink=sink,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "flood_wait_kill_switch_status",
+        lambda: SimpleNamespace(open=True, detail=lambda: "open-for-test"),
+    )
+    caplog.set_level(logging.ERROR, logger=daemon.__name__)
+
+    try:
+        await _monitor_flood_wait_kill_switch(ctx)
+        assert cast(_ClientStub, ctx.client).disconnect_calls == 1
+        assert not ctx.shutdown_event.is_set()
+        assert "flood_wait_kill_switch_telegram_disconnect_failed" in caplog.messages
+        assert "flood_wait_kill_switch_telegram_disconnected" not in caplog.messages
+
+        row: tuple[object, ...] | None = None
+        for _ in range(100):
+            with closing(sqlite3.connect(db_path)) as conn:
+                row = cast(
+                    tuple[object, ...] | None,
+                    conn.execute(
+                        "SELECT outcome, reason_code FROM runtime_observations "
+                        "WHERE kind = 'telegram.rpc_admission' ORDER BY observed_at_ms DESC LIMIT 1"
+                    ).fetchone(),
+                )
+            if row is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert row is not None
+        assert row[0] == "summary"
+    finally:
+        await sink.aclose()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_requests_coordinator_stop_before_connections_close() -> None:
     event = asyncio.Event()
     coordinator = _CoordinatorStub()
@@ -613,4 +883,71 @@ async def test_shutdown_requests_coordinator_stop_before_connections_close() -> 
     assert client.close_scheduler_calls == 1
     assert client.observer_detached
     assert client.request_observer_detached
+    assert client.flood_event_observer_detached
     assert cast(_ConnectionStub, ctx.conn).close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_disconnects_and_detaches_before_flushing_telemetry(tmp_path: Path) -> None:
+    stages: list[str] = []
+
+    class _OrderedClient(_ClientStub):
+        async def disconnect(self) -> None:
+            stages.append("disconnect")
+
+        async def close_rpc_scheduler(self) -> None:
+            stages.append("scheduler_close")
+
+        def set_rpc_admission_observer(self, observer: object | None) -> None:
+            stages.append("admission_detach")
+
+        def set_rpc_request_observer(self, observer: object | None) -> None:
+            stages.append("request_detach")
+
+        def set_flood_event_observer(self, observer: object | None) -> None:
+            stages.append("flood_detach")
+
+    class _OrderedConnection(_ConnectionStub):
+        def close(self) -> None:
+            stages.append("connections_close")
+
+    client = _OrderedClient()
+    task_release = asyncio.Event()
+
+    async def background_task() -> None:
+        try:
+            await task_release.wait()
+        finally:
+            stages.append("task_cancelled")
+
+    task = asyncio.create_task(background_task())
+    await asyncio.sleep(0)
+    ctx = _typed_ctx(
+        client=client,
+        conn=_OrderedConnection(),
+        background_tasks={task},
+        socket_path=tmp_path / "daemon.sock",
+    )
+    ctx.rpc_admission_observer = cast(
+        RpcAdmissionObservationAggregator,
+        SimpleNamespace(flush=lambda: stages.append("flush")),
+    )
+    ctx.rpc_observation_sink = cast(
+        RuntimeObservationSink,
+        SimpleNamespace(aclose=lambda: _append_async(stages, "sink_close")),
+    )
+
+    await _shutdown_sync_main_context(ctx)
+
+    assert stages.index("task_cancelled") < stages.index("disconnect")
+    assert stages.index("disconnect") < stages.index("scheduler_close")
+    assert stages.index("scheduler_close") < stages.index("admission_detach")
+    assert stages.index("scheduler_close") < stages.index("request_detach")
+    assert stages.index("scheduler_close") < stages.index("flood_detach")
+    assert stages.index("flood_detach") < stages.index("flush")
+    assert stages.index("flush") < stages.index("sink_close")
+    assert stages.index("sink_close") < stages.index("connections_close")
+
+
+async def _append_async(stages: list[str], stage: str) -> None:
+    stages.append(stage)

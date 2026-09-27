@@ -72,6 +72,9 @@ def test_repository_has_no_boundary_violations() -> None:
         "client._call(request)\n",
         "client._sender.send(request)\n",
         "sender = client._sender\nsender.send(request)\n",
+        "client._main_sender.send(request)\n",
+        "sender = client._main_sender\nsender.send(request)\n",
+        "send = client._main_sender.send\nawait send(request)\n",
         "from telethon import TelegramClient\nTelegramClient.__call__(client, request)\n",
         "from telethon import TelegramClient\nTelegramClient.get_messages(client)\n",
         "from telethon import TelegramClient\nclass OtherGate(TelegramClient):\n    async def call(self, request):\n        return await super().__call__(request)\n",
@@ -87,6 +90,38 @@ def test_boundary_rejects_transport_bypasses(tmp_path: Path, source: str) -> Non
     violations = gate._violations(path)
 
     assert violations
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "await client.download_media(message)\n",
+        "await client.download_file(location, bytes)\n",
+        "await client.get_stats(channel)\n",
+        "await client.edit_message(inline_message_id, 'updated')\n",
+        "borrow = client._borrow_exported_sender\n",
+        "create = self._client._create_exported_sender\n",
+    ],
+)
+def test_boundary_rejects_inherited_borrowed_sender_methods(tmp_path: Path, source: str) -> None:
+    path = tmp_path / "consumer.py"
+    path.write_text(source, encoding="utf-8")
+    gate = _load_gate()
+
+    violations = gate._violations(path)
+
+    assert any("bypasses admission through inherited transport" in violation for violation in violations)
+
+
+def test_boundary_allows_admitted_public_client_methods(tmp_path: Path) -> None:
+    path = tmp_path / "adapter.py"
+    path.write_text(
+        "await client.get_messages(peer, ids=[1])\nawait client.get_entity(peer)\nawait client(request)\n",
+        encoding="utf-8",
+    )
+    gate = _load_gate()
+
+    assert gate._violations(path) == []
 
 
 def test_boundary_allows_only_named_factory_and_transport_seams(
@@ -108,7 +143,12 @@ def test_boundary_allows_only_named_factory_and_transport_seams(
         "    async def update(self):\n"
         "        return await super()._update_loop()\n"
         "    async def send(self, request):\n"
-        "        return await self._sender.send(request)\n",
+        "        return await self._sender.send(request)\n"
+        "    async def send_main(self, request):\n"
+        "        return await self._main_sender.send(request)\n"
+        "class _MainSenderAdapter:\n"
+        "    def send(self, request):\n"
+        "        return self._gate._main_sender.send(request)\n",
         encoding="utf-8",
     )
     gate = _load_gate()

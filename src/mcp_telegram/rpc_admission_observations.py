@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, TypedDict, cast
 
+from .flood import FloodWaitObservation
 from .telegram_demand import AcquisitionKind, DemandObservationHook
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import RpcAdmissionEvent, RpcAdmissionEventKind, RpcServiceClass, TelegramRpcSource
@@ -88,6 +89,7 @@ class ObservationRecorder(Protocol):
         duration_ms: float | None = None,
         result_count: int | None = None,
         payload: Mapping[str, object] | None = None,
+        observed_at_ms: int | None = None,
     ) -> bool | None: ...
 
 
@@ -253,6 +255,40 @@ class RpcAdmissionObservationAggregator:
             self.flush_if_due()
         except Exception:  # noqa: BLE001 - telemetry cannot affect RPC dispatch
             return
+
+    def observe_flood_wait(
+        self,
+        observation: FloodWaitObservation,
+    ) -> None:
+        """Persist one content-free, source-attributed FloodWait observation."""
+        payload: dict[str, object] = {
+            "source": observation.source,
+            "service_class": observation.service_class,
+            "request_method": observation.request_method,
+            "origin": observation.origin,
+            "actual_dispatch": observation.actual_dispatch,
+            "cooldown_until_utc_ms": observation.cooldown_until_utc_ms,
+            "circuit_open": observation.circuit_open,
+        }
+        if observation.demand_kind is not None:
+            payload["demand_kind"] = observation.demand_kind
+        if observation.acquisition_kind is not None:
+            payload["acquisition_kind"] = observation.acquisition_kind
+        if observation.admission_sequence is not None:
+            payload["admission_sequence"] = observation.admission_sequence
+        if observation.dispatch_at_monotonic is not None:
+            payload["dispatch_at_monotonic"] = observation.dispatch_at_monotonic
+        try:
+            self._recorder.record(
+                kind="telegram.rpc_admission",
+                outcome="flood_wait",
+                reason_code=observation.origin,
+                duration_ms=observation.seconds * _MILLISECONDS_PER_SECOND,
+                payload=payload,
+                observed_at_ms=observation.observed_at_ms,
+            )
+        except Exception:
+            logger.exception("flood_wait_observation_failed source=%s", observation.source)
 
     def observe_demand(  # noqa: PLR0913 - explicit bounded evidence dimensions
         self,
