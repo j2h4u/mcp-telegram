@@ -1552,16 +1552,8 @@ class DaemonAPIServer:
             else:
                 empty_reason = await self._refresh_topic_catalog_for_list_topics(dialog_id)
                 rows = self._topic_rows(dialog_id)
-        elif _topic_icons_need_refresh(rows) and not self._health_status().open:
-            cached_rows = rows
-            try:
-                await self._refresh_topic_catalog_for_list_topics(dialog_id)
-            except TelegramRpcThrottled as exc:
-                if not exc.latched:
-                    raise
-                rows = cached_rows
-            else:
-                rows = self._topic_rows(dialog_id)
+        else:
+            rows = await self._refresh_cached_topic_icons(dialog_id, rows)
         topics = [
             {
                 "id": int(cast(int | str, row[0])),
@@ -1583,6 +1575,22 @@ class DaemonAPIServer:
             list[tuple[object, object, object, object, object, object]],
             self._conn.execute(_LIST_TOPICS_SQL, (dialog_id,)).fetchall(),
         )
+
+    async def _refresh_cached_topic_icons(
+        self,
+        dialog_id: int,
+        rows: list[tuple[object, object, object, object, object, object]],
+    ) -> list[tuple[object, object, object, object, object, object]]:
+        """Refresh optional Unicode icon fallbacks without discarding cached topics."""
+        if not _topic_icons_need_refresh(rows) or self._health_status().open:
+            return rows
+        try:
+            await self._refresh_topic_catalog_for_list_topics(dialog_id)
+        except TelegramRpcThrottled as exc:
+            if exc.latched:
+                return rows
+            raise
+        return self._topic_rows(dialog_id)
 
     async def _refresh_topic_catalog_for_list_topics(self, dialog_id: int) -> str:
         if self._topic_refresher is None:
