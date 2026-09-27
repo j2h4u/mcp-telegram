@@ -357,7 +357,10 @@ def test_adapter_composition_contains_invalid_dm_checkpoint_to_its_domain(
     dependencies, objects = composition_dependencies
     dependencies.conn.execute("INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', NULL)")
     dependencies.conn.commit()
-    before = dependencies.conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone()
+    before = cast(
+        tuple[object, ...] | None,
+        dependencies.conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone(),
+    )
 
     adapters = build_durable_adapter_map(dependencies)
 

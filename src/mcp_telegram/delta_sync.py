@@ -310,15 +310,6 @@ def prepare_dm_deletion_reconciliation(conn: sqlite3.Connection, *, now: int | N
         _store_dm_gap_scan_state(conn, state)
 
 
-def dm_deletion_reconciliation_blocked(conn: sqlite3.Connection) -> bool:
-    """Return whether persisted metadata keeps DM deletion maintenance blocked."""
-    try:
-        state = _load_dm_gap_scan_state(conn)
-    except InvalidDmDeletionCheckpointError:
-        return True
-    return dm_deletion_reconciliation_is_blocked(state)
-
-
 class AccessProbe(Protocol):
     """Existing narrow access probe kept separate from paged history ports."""
 

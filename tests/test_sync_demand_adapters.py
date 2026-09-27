@@ -23,7 +23,6 @@ from mcp_telegram.delta_sync import (
     DeltaGapFillDemandAdapter,
     DeltaSyncWorker,
     DmDeletionReconciliationDemandAdapter,
-    dm_deletion_reconciliation_blocked,
     prepare_dm_deletion_reconciliation,
 )
 from mcp_telegram.dialog_sync import DialogLightReconciliationDemandAdapter, DialogReconciliationWorker
@@ -500,7 +499,8 @@ async def test_dm_empty_and_terminal_scan_persists_weekly_completion(conn: sqlit
     conn.commit()
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, _dialog_id: int, _message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+            del dialog_id, message_ids
             raise AssertionError("empty DM history must not dispatch a lookup")
 
     adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner())
@@ -613,7 +613,6 @@ async def test_prepare_quarantines_legacy_running_checkpoint_without_advancing_i
         "reason": "legacy_generation_review",
         "state_changed_at": 200,
     }
-    assert dm_deletion_reconciliation_blocked(conn)
 
     adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner())
     for now in (200, 1_000, 1_000_000):
@@ -827,7 +826,6 @@ def test_prepare_fails_closed_on_corrupt_dm_scan_state(conn: sqlite3.Connection)
     prepare_dm_deletion_reconciliation(conn, now=100)
     assert conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone() == (original,)
     assert DmDeletionReconciliationDemandAdapter(conn, cast(object, None)).status(100.0) is None  # type: ignore[arg-type]
-    assert dm_deletion_reconciliation_blocked(conn)
 
 
 @pytest.mark.asyncio
@@ -851,14 +849,16 @@ async def test_invalid_dm_checkpoint_stays_raw_and_blocks_all_pages(
             calls += 1
             return 0
 
-    before = conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone()
+    before = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone(),
+    )
     prepare_dm_deletion_reconciliation(conn, now=500)
     adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner())
     assert adapter.status(10_000_000.0) is None
     await adapter.run_slice(RpcAttemptBudget(limit=1))
     assert calls == 0
     assert conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone() == before
-    assert dm_deletion_reconciliation_blocked(conn)
 
 
 def test_dm_checkpoint_sql_read_failure_is_not_contained_as_metadata(conn: sqlite3.Connection) -> None:
