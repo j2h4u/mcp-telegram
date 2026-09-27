@@ -340,34 +340,17 @@ async def test_scheduler_rejects_caller_overrides_of_registered_transport_policy
 
 
 @pytest.mark.asyncio
-async def test_nested_attempt_reenters_same_source_without_consuming_another_slot() -> None:
+async def test_nested_attempt_from_same_task_still_consumes_another_slot() -> None:
     policy = replace(TelegramRpcSchedulerConfig(), background_queue_capacity=1)
-    limiter = _ControlledLimiter()
-    scheduler = TelegramRpcAdmissionScheduler(policy=policy, limiter=limiter)
+    scheduler = TelegramRpcAdmissionScheduler(policy=policy, limiter=None)
     scope = _scope(TelegramRpcSource.FULL_SYNC)
-    active_ready = asyncio.Event()
-    allow_nested = asyncio.Event()
-    nested_done = asyncio.Event()
 
-    async def root_operation() -> None:
-        outer = await scheduler.admit(scope)
-        active_ready.set()
-        await allow_nested.wait()
-        inner = await scheduler.admit(scope)
-        assert scheduler.source_outstanding_depths()[TelegramRpcSource.FULL_SYNC] == 1
-        scheduler.complete(inner)
-        scheduler.complete(outer)
-        nested_done.set()
+    outer = await scheduler.admit(scope)
+    with pytest.raises(RpcAdmissionSaturatedError, match="outstanding capacity"):
+        await scheduler.admit(scope)
+    assert scheduler.source_outstanding_depths()[TelegramRpcSource.FULL_SYNC] == 1
 
-    root = asyncio.create_task(root_operation())
-    await limiter.allow_one()
-    await active_ready.wait()
-    allow_nested.set()
-    await _wait_until(lambda: scheduler.source_queue_depths()[TelegramRpcSource.FULL_SYNC] == 1)
-    await limiter.allow_one()
-    await asyncio.wait_for(nested_done.wait(), timeout=1.0)
-
-    await root
+    scheduler.complete(outer)
     await scheduler.close()
 
 

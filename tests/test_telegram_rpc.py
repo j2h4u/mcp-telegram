@@ -60,6 +60,7 @@ from mcp_telegram.telegram_rpc import (
     TelegramRpcSource,
     UnclassifiedTelegramRpcError,
     _MainSenderAdapter,
+    _TransportBoundaryState,
     account_cooldown_deadline,
     current_rpc_scope,
     reset_account_cooldown,
@@ -169,6 +170,7 @@ class _BootstrapSender:
         self.connect_release: asyncio.Event | None = None
         self.disconnect_started: asyncio.Event | None = None
         self.disconnect_release: asyncio.Event | None = None
+        self.disconnect_error: BaseException | None = None
         self.response: Callable[[object], object | Awaitable[object]] | None = None
 
     async def connect(self, _connection: object) -> bool:
@@ -184,6 +186,8 @@ class _BootstrapSender:
         if self.disconnect_started is not None and self.disconnect_release is not None:
             self.disconnect_started.set()
             await self.disconnect_release.wait()
+        if self.disconnect_error is not None:
+            raise self.disconnect_error
         self._connected = False
         if not self._disconnected.done():
             self._disconnected.set_result(None)
@@ -232,6 +236,7 @@ def _set_sender(
     sender = _Sender(callback)
     gate._main_sender = sender
     gate._sender = sender
+    gate._transport_state = _TransportBoundaryState.READY
     return sender
 
 
@@ -282,7 +287,8 @@ def _gate(status: _CircuitStatus | None = None, *, retry_delays: tuple[float, ..
     gate._connect_owner = None
     gate._connection_capability = None
     gate._connection_rpc_tasks = set()
-    gate._pending_scalar_dispatches = set()
+    gate._pending_scalar_dispatches = {}
+    gate._transport_state = _TransportBoundaryState.READY
     gate._log = {"telethon.client.users": logging.getLogger(__name__)}
     gate.flood_sleep_threshold = 0
     gate.session = SimpleNamespace(process_entities=lambda _result: None)
@@ -297,6 +303,7 @@ def _bootstrap_gate(status: _CircuitStatus | None = None) -> tuple[TelegramRpcGa
     gate._connect_owner = None
     gate._connection_capability = None
     gate._connection_rpc_tasks = set()
+    gate._transport_state = _TransportBoundaryState.DISCONNECTED
     gate._updates_handle = None
     gate._keepalive_handle = None
     gate._use_ipv6 = False
@@ -1008,6 +1015,22 @@ async def test_repeated_cancellation_keeps_connection_owner_through_blocked_clea
 
 
 @pytest.mark.asyncio
+async def test_failed_bootstrap_cleanup_keeps_reservation_and_chains_original_failure() -> None:
+    gate, sender = _bootstrap_gate()
+    sender.response = lambda _request: FloodWaitError(request=None, capture=20)
+    sender.disconnect_error = OSError("transport teardown failed")
+    with pytest.raises(TelegramRpcAdmissionDeferred, match="termination is unconfirmed") as caught:
+        await gate.connect()
+    assert isinstance(caught.value.__cause__, TelegramRpcThrottled)
+    assert gate._transport_state is _TransportBoundaryState.FAILED
+    assert gate._connect_owner is not None
+    assert gate._connection_capability is not None
+    with pytest.raises(TelegramRpcAdmissionDeferred, match="connection bootstrap is already running"):
+        await gate.connect()
+    await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
 async def test_retained_bootstrap_flood_is_recorded_during_cancelled_cleanup() -> None:
     gate, sender = _bootstrap_gate()
     accumulator = FloodWaitAccumulator()
@@ -1038,7 +1061,7 @@ async def test_retained_bootstrap_flood_is_recorded_during_cancelled_cleanup() -
         sender.disconnect_release.set()
         with pytest.raises(asyncio.CancelledError):
             await caller
-        assert gate._pending_scalar_dispatches == set()
+        assert gate._pending_scalar_dispatches == {}
         assert gate._connection_rpc_tasks == set()
         assert gate._connect_owner is None
         assert gate._connection_capability is None
@@ -2252,7 +2275,7 @@ async def test_abandoned_actual_future_keeps_capacity_and_records_later_flood() 
     with pytest.raises(asyncio.CancelledError):
         await caller
     assert not raw_future.cancelled()
-    assert gate._pending_scalar_dispatches == {raw_future}
+    assert set(gate._pending_scalar_dispatches) == {raw_future}
     assert gate._admission_scheduler.active_depths()[RpcServiceClass.INTERACTIVE] == 1
     with pytest.raises(TelegramRpcAdmissionDeferred):
         await _call(gate, _TestRequest("blocked"))
@@ -2325,7 +2348,7 @@ async def test_already_completed_actual_futures_finalize_once_for_success_and_fl
         await _call(gate, _TestRequest("flood"))
     assert sender.calls == 2
     assert accumulator.kill_switch_status().events_in_window == 1
-    assert gate._pending_scalar_dispatches == set()
+    assert gate._pending_scalar_dispatches == {}
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
     await gate.close_rpc_scheduler()
 
@@ -2376,8 +2399,50 @@ async def test_disconnect_drains_completed_actual_flood_after_caller_cancellatio
     await gate._disconnect_main_sender()
     assert sender.disconnect_calls == 1
     assert accumulator.kill_switch_status().events_in_window == 1
-    assert gate._pending_scalar_dispatches == set()
+    assert gate._pending_scalar_dispatches == {}
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+    await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
+async def test_failed_raw_disconnect_retains_response_lease_and_blocks_transport_reuse() -> None:
+    gate = _gate()
+
+    class _FailingDisconnectSender(_RawFutureSender):
+        async def disconnect(self) -> None:
+            self.disconnect_calls += 1
+            for future in self.futures:
+                future.cancel()
+            raise OSError("transport teardown failed")
+
+        def _keepalive_ping(self, _random_id: int) -> None:
+            raise AssertionError("failed transport must not forward keepalive ping")
+
+    sender = _FailingDisconnectSender()
+    gate._main_sender = sender
+    caller = asyncio.create_task(_call(gate, _TestRequest("actual")))
+    await _wait_for(lambda: sender.calls == 1)
+    raw_future = sender.futures[0]
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    with pytest.raises(OSError, match="teardown failed"):
+        await gate._disconnect_main_sender()
+    assert gate._transport_state is _TransportBoundaryState.FAILED
+    assert raw_future.cancelled()
+    assert set(gate._pending_scalar_dispatches) == {raw_future}
+    assert gate._admission_scheduler.active_depths()[RpcServiceClass.INTERACTIVE] == 1
+    with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
+        await _call(gate, _TestRequest("blocked"))
+    with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
+        await gate.connect()
+    with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
+        await gate._switch_dc(3)
+    _MainSenderAdapter(gate)._keepalive_ping(1)
+    with pytest.raises(TelegramRpcAdmissionDeferred, match="transport is failed"):
+        await gate._disconnect_main_sender()
+    assert sender.disconnect_calls == 1
     await gate.close_rpc_scheduler()
 
 
@@ -2413,7 +2478,7 @@ async def test_gate_cancellation_after_admission_cannot_leak_active_capacity(
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
     assert gate._admission_scheduler.outstanding_depths() == dict.fromkeys(RpcServiceClass, 0)
     assert sends == 0
-    assert gate._pending_scalar_dispatches == set()
+    assert gate._pending_scalar_dispatches == {}
 
 
 @pytest.mark.asyncio
@@ -2441,10 +2506,10 @@ async def test_scheduler_close_keeps_dispatched_transport_until_disconnect() -> 
 
     assert caller.cancelled()
     assert in_flight is not None and not in_flight.cancelled()
-    assert gate._pending_scalar_dispatches == {in_flight}
+    assert set(gate._pending_scalar_dispatches) == {in_flight}
     await gate._disconnect_main_sender()
     assert in_flight.cancelled()
-    assert gate._pending_scalar_dispatches == set()
+    assert gate._pending_scalar_dispatches == {}
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
 
 

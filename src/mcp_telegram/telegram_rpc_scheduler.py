@@ -640,17 +640,14 @@ class TelegramRpcAdmissionScheduler:
             self._prune_done_locked()
             queue = self._queues[scope.source]
             owner_task = _current_task()
-            owns_capacity_slot = not self._owner_has_active_attempt_locked(owner_task, scope.source)
+            owns_capacity_slot = True
             source_limit = self._source_outstanding_limit(scope)
-            if owns_capacity_slot and self._source_outstanding_depth(scope.source) >= source_limit:
+            if self._source_outstanding_depth(scope.source) >= source_limit:
                 self._emit_for_scope(RpcAdmissionEventKind.REJECTED, scope, reason="source_outstanding_saturated")
                 raise RpcAdmissionSaturatedError(
                     scope, f"{scope.source.value} Telegram RPC source outstanding capacity is full"
                 )
-            if (
-                owns_capacity_slot
-                and self._outstanding_depth(scope.service_class) >= self._capacities[scope.service_class]
-            ):
+            if self._outstanding_depth(scope.service_class) >= self._capacities[scope.service_class]:
                 self._emit_for_scope(RpcAdmissionEventKind.REJECTED, scope, reason="outstanding_saturated")
                 raise RpcAdmissionSaturatedError(
                     scope, f"{scope.service_class.value} Telegram RPC outstanding capacity is full"
@@ -1067,19 +1064,7 @@ class TelegramRpcAdmissionScheduler:
         return any(self._ticket_can_dispatch_locked(ticket) for queue in self._queues.values() for ticket in queue)
 
     def _ticket_can_dispatch_locked(self, ticket: _AdmissionTicket) -> bool:
-        return (
-            not ticket.owns_capacity_slot
-            or self._active_counts[ticket.scope.service_class] < self._capacities[ticket.scope.service_class]
-        )
-
-    def _owner_has_active_attempt_locked(
-        self,
-        owner_task: asyncio.Task[object] | None,
-        source: TelegramRpcSource,
-    ) -> bool:
-        return owner_task is not None and any(
-            active.owner_task is owner_task and active.scope.source is source for active in self._active.values()
-        )
+        return self._active_counts[ticket.scope.service_class] < self._capacities[ticket.scope.service_class]
 
     @staticmethod
     def _source_outstanding_limit(scope: TelegramRpcScope) -> int:

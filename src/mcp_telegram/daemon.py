@@ -993,10 +993,18 @@ async def _monitor_flood_wait_kill_switch(ctx: _SyncMainContext) -> None:
 
     logger.critical("flood_wait_kill_switch_stopping_telegram_work %s", status.detail())
     current_task = asyncio.current_task()
-    for task in list(ctx.background_tasks):
-        if task is not current_task:
-            task.cancel()
-    await ctx.client.disconnect()
+    producers = [task for task in ctx.background_tasks if task is not current_task]
+    for task in producers:
+        task.cancel()
+    await asyncio.gather(*producers, return_exceptions=True)
+    try:
+        await ctx.client.disconnect()
+    except Exception:
+        logger.exception("flood_wait_kill_switch_telegram_disconnect_failed")
+    finally:
+        observer = ctx.rpc_admission_observer
+        if observer is not None:
+            observer.flush()
     logger.critical("flood_wait_kill_switch_telegram_disconnected")
 
 

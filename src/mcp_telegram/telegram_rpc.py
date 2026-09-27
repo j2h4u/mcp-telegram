@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import AbstractContextManager
 from contextvars import Context
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import Never, Protocol, cast
 
 from aiolimiter import AsyncLimiter
@@ -21,6 +22,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
     InterdcCallErrorError,
     InterdcCallRichErrorError,
     RpcCallFailError,
+    RPCError,
     RpcMcgetFailError,
     ServerError,
     TimedOutError,
@@ -167,6 +169,7 @@ class _AdmissionAwareSender:
 
     async def _send(self, request: object, *, ordered: bool) -> object:
         while True:
+            self._gate._raise_if_transport_unavailable()
             self._reject_exhausted_budget()
             admission = await self._admit()
             completion_transferred = False
@@ -187,7 +190,8 @@ class _AdmissionAwareSender:
                 raw_future = self._start_dispatched_send(request, ordered=ordered, admission=admission)
                 completion_transferred = True
                 with timing_phase("rpc_execution"):
-                    return await asyncio.shield(raw_future)
+                    await asyncio.wait({raw_future})
+                    return raw_future.result()
             finally:
                 if not completion_transferred:
                     self._gate._admission_scheduler.complete(admission)
@@ -260,6 +264,26 @@ class _ConnectionDcMigrationRequestedError(Exception):
         self.dc_id = dc_id
 
 
+class _TransportBoundaryState(StrEnum):
+    """Whether the admitted main transport is reusable or unresolved."""
+
+    DISCONNECTED = "disconnected"
+    CONNECTING = "connecting"
+    READY = "ready"
+    DISCONNECTING = "disconnecting"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingScalarDispatch:
+    """Frozen completion ownership for one dispatched scalar request."""
+
+    scope: TelegramRpcScope
+    request_method: str
+    admission: RpcAdmission
+    dispatch_at_monotonic: float
+
+
 class _MainSenderAdapter:
     """Narrow main-sender boundary for Telethon connection bootstrap."""
 
@@ -278,13 +302,20 @@ class _MainSenderAdapter:
         )
 
     async def connect(self, connection: object) -> object:
-        return await self._gate._main_sender.connect(connection)
+        self._gate._begin_transport_connect()
+        try:
+            result = await self._gate._main_sender.connect(connection)
+        except BaseException:
+            self._gate._finish_transport_connect_failure()
+            raise
+        self._gate._finish_transport_connect()
+        return result
 
     async def disconnect(self) -> object:
         return await self._gate._disconnect_main_sender()
 
     def is_connected(self) -> bool:
-        return self._gate._main_sender.is_connected()
+        return self._gate._transport_state is _TransportBoundaryState.READY and self._gate._main_sender.is_connected()
 
     @property
     def disconnected(self) -> asyncio.Future[object]:
@@ -299,10 +330,14 @@ class _MainSenderAdapter:
         self._gate._main_sender.auth_key = value
 
     def _transport_connected(self) -> bool:
-        return self._gate._main_sender._transport_connected()
+        return (
+            self._gate._transport_state is _TransportBoundaryState.READY
+            and self._gate._main_sender._transport_connected()
+        )
 
     def _keepalive_ping(self, random_id: int) -> None:
-        self._gate._main_sender._keepalive_ping(random_id)
+        if self._gate._transport_state is _TransportBoundaryState.READY:
+            self._gate._main_sender._keepalive_ping(random_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -427,7 +462,8 @@ class TelegramRpcGate(TelegramClient):
         self._connect_owner: asyncio.Task[object] | object | None = None
         self._connection_capability: _ConnectionCapability | None = None
         self._connection_rpc_tasks: set[asyncio.Task[object]] = set()
-        self._pending_scalar_dispatches: set[asyncio.Future[object]] = set()
+        self._pending_scalar_dispatches: dict[asyncio.Future[object], _PendingScalarDispatch] = {}
+        self._transport_state = _TransportBoundaryState.DISCONNECTED
 
     @staticmethod
     def rpc_scope(
@@ -578,47 +614,73 @@ class TelegramRpcGate(TelegramClient):
                 await super().connect()  # type: ignore[misc]
                 return
             raise self._connection_owner_deferred()
+        self._raise_if_transport_unavailable(allow_disconnected=True)
         capability = self._capture_connection_capability()
         scope = self._scope_for_connection_capability(capability)
         self._connection_capability = capability
         reservation = object()
         self._connect_owner = reservation
         owner: asyncio.Task[object] | None = None
+        release_reservation = False
         try:
             self.check_circuit()
             await self._wait_for_account_cooldown(scope)
             self.check_circuit()
-
-            async def run_vendor_connect() -> None:
-                migration_dc: int | None = None
-                for retry_index, retry_delay in enumerate((0.0, *self._transient_retry_delays)):
-                    try:
-                        if migration_dc is None:
-                            await super(TelegramRpcGate, self).connect()  # type: ignore[misc]
-                        else:
-                            await self._continue_connection_migration(scope, migration_dc, retry_delay)
-                        return
-                    except _ConnectionDcMigrationRequestedError as exc:
-                        migration_dc = exc.dc_id
-                        if retry_index >= len(self._transient_retry_delays):
-                            raise self._connection_redirect_exhausted() from None
-
-            owner = asyncio.get_running_loop().create_task(
-                run_vendor_connect(),
-                name="telethon_connection_bootstrap",
-                context=Context(),
-            )
+            owner = self._start_connection_owner(scope)
             self._connect_owner = owner
             await owner
-        except BaseException:
-            if owner is not None:
-                await self._complete_failed_connection_cleanup()
+            release_reservation = True
+        except BaseException as bootstrap_error:
+            release_reservation, cancellation_arrived = await self._finish_connection_failure(owner, bootstrap_error)
+            if cancellation_arrived:
+                raise asyncio.CancelledError from None
             raise
         finally:
-            if self._connect_owner is reservation or self._connect_owner is owner:
+            if release_reservation and (self._connect_owner is reservation or self._connect_owner is owner):
                 self._connect_owner = None
                 self._connection_capability = None
                 self._connection_rpc_tasks.clear()
+
+    def _start_connection_owner(self, scope: TelegramRpcScope) -> asyncio.Task[object]:
+        async def run_vendor_connect() -> None:
+            migration_dc: int | None = None
+            for retry_index, retry_delay in enumerate((0.0, *self._transient_retry_delays)):
+                try:
+                    if migration_dc is None:
+                        await super(TelegramRpcGate, self).connect()  # type: ignore[misc]
+                    else:
+                        await self._continue_connection_migration(scope, migration_dc, retry_delay)
+                    return
+                except _ConnectionDcMigrationRequestedError as exc:
+                    migration_dc = exc.dc_id
+                    if retry_index >= len(self._transient_retry_delays):
+                        raise self._connection_redirect_exhausted() from None
+
+        return asyncio.get_running_loop().create_task(
+            run_vendor_connect(),
+            name="telethon_connection_bootstrap",
+            context=Context(),
+        )
+
+    async def _finish_connection_failure(
+        self,
+        owner: asyncio.Task[object] | None,
+        bootstrap_error: BaseException,
+    ) -> tuple[bool, bool]:
+        if owner is None:
+            return True, False
+        try:
+            cancelled = await self._complete_failed_connection_cleanup()
+        except BaseException:
+            logger.exception("telegram_connection_bootstrap_cleanup_failed")
+            if isinstance(bootstrap_error, asyncio.CancelledError):
+                return False, False
+            raise TelegramRpcAdmissionDeferred(
+                retry_after_seconds=self._scheduler_policy.admission_retry_seconds,
+                latched=False,
+                detail="Telegram transport termination is unconfirmed; retry after manual recovery",
+            ) from bootstrap_error
+        return True, cancelled
 
     def _connection_owner_deferred(self) -> TelegramRpcAdmissionDeferred:
         retry_seconds = self._scheduler_policy.admission_retry_seconds
@@ -659,12 +721,9 @@ class TelegramRpcGate(TelegramClient):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._connection_rpc_tasks.clear()
-        try:
-            await super()._disconnect()  # type: ignore[misc]
-        except Exception:
-            logger.exception("telegram_connection_bootstrap_cleanup_failed")
+        await super()._disconnect()  # type: ignore[misc]
 
-    async def _complete_failed_connection_cleanup(self) -> None:
+    async def _complete_failed_connection_cleanup(self) -> bool:
         """Keep the connection reservation until a cancellation-safe cleanup finishes."""
         cleanup = asyncio.get_running_loop().create_task(
             self._cleanup_failed_connection_bootstrap(),
@@ -674,12 +733,11 @@ class TelegramRpcGate(TelegramClient):
         cancelled = False
         while not cleanup.done():
             try:
-                await asyncio.shield(cleanup)
+                await asyncio.wait({cleanup})
             except asyncio.CancelledError:
                 cancelled = True
         cleanup.result()
-        if cancelled:
-            raise asyncio.CancelledError
+        return cancelled
 
     async def _switch_dc(self, new_dc: int) -> None:
         """Prevent concurrent migration from mutating a guarded bootstrap transport."""
@@ -690,6 +748,7 @@ class TelegramRpcGate(TelegramClient):
                 raise _ConnectionDcMigrationRequestedError(new_dc)
             if current_task is not owner:
                 raise self._connection_owner_deferred()
+        self._raise_if_transport_unavailable()
         await super()._switch_dc(new_dc)  # type: ignore[misc]
 
     def _capture_connection_capability(self) -> _ConnectionCapability:
@@ -832,6 +891,8 @@ class TelegramRpcGate(TelegramClient):
                 return await self._dispatch_attempt(request, ordered=ordered, scope=scope)
             except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
                 await self._handle_admission_deferral(scope, exc, connection_owned=connection_owned)
+            except TelegramRpcAdmissionDeferred:
+                raise
             except TelegramRpcThrottled:
                 if connection_owned or scope.source is not TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
                     raise
@@ -857,60 +918,85 @@ class TelegramRpcGate(TelegramClient):
         dispatch_at_monotonic: float,
     ) -> None:
         """Transfer one dispatched scalar response and its lease to the gate."""
-        self._pending_scalar_dispatches.add(raw_future)
+        self._pending_scalar_dispatches[raw_future] = _PendingScalarDispatch(
+            scope=scope,
+            request_method=request_method,
+            admission=admission,
+            dispatch_at_monotonic=dispatch_at_monotonic,
+        )
 
         def finalize(future: asyncio.Future[object]) -> None:
-            self._finalize_scalar_dispatch(
-                future,
-                scope=scope,
-                request_method=request_method,
-                admission=admission,
-                dispatch_at_monotonic=dispatch_at_monotonic,
-            )
+            self._finalize_scalar_dispatch(future)
 
         raw_future.add_done_callback(finalize, context=Context())
         if raw_future.done():
             finalize(raw_future)
 
-    def _finalize_scalar_dispatch(
+    def _finalize_scalar_dispatch(self, raw_future: asyncio.Future[object]) -> None:
+        """Record terminal actual-send outcomes and release their admission once."""
+        pending = self._pending_scalar_dispatches.get(raw_future)
+        if pending is None:
+            return
+        if raw_future.cancelled():
+            if self._transport_state not in {
+                _TransportBoundaryState.DISCONNECTING,
+                _TransportBoundaryState.DISCONNECTED,
+            }:
+                self._transport_state = _TransportBoundaryState.FAILED
+            return
+        exc = raw_future.exception()
+        if exc is not None and not isinstance(exc, RPCError):
+            if self._transport_state is not _TransportBoundaryState.DISCONNECTING:
+                self._transport_state = _TransportBoundaryState.FAILED
+            return
+        if isinstance(exc, (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError)):
+            _annotate_flood_attempt(
+                exc,
+                request_method=pending.request_method,
+                admission_sequence=pending.admission.sequence,
+                dispatch_at_monotonic=pending.dispatch_at_monotonic,
+                dispatch_kind="actual_send",
+            )
+            self._record_flood(exc, scope=pending.scope)
+        self._release_scalar_dispatch(raw_future, pending)
+
+    def _release_scalar_dispatch(
         self,
         raw_future: asyncio.Future[object],
-        *,
-        scope: TelegramRpcScope,
-        request_method: str,
-        admission: RpcAdmission,
-        dispatch_at_monotonic: float,
+        pending: _PendingScalarDispatch,
     ) -> None:
-        """Record terminal actual-send outcomes and release their admission once."""
-        if raw_future not in self._pending_scalar_dispatches:
-            return
-        try:
-            if not raw_future.cancelled():
-                exc = raw_future.exception()
-                if isinstance(exc, (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError)):
-                    _annotate_flood_attempt(
-                        exc,
-                        request_method=request_method,
-                        admission_sequence=admission.sequence,
-                        dispatch_at_monotonic=dispatch_at_monotonic,
-                        dispatch_kind="actual_send",
-                    )
-                    self._record_flood(exc, scope=scope)
-        finally:
-            self._admission_scheduler.complete(admission)
-            self._pending_scalar_dispatches.discard(raw_future)
+        """Release an admission only after a response or confirmed teardown."""
+        if self._pending_scalar_dispatches.pop(raw_future, None) is not None:
+            self._admission_scheduler.complete(pending.admission)
 
     async def _disconnect_main_sender(self) -> object:
         """Terminate raw transport, then settle every gate-owned scalar response."""
-        result = await self._main_sender.disconnect()
+        if self._transport_state is _TransportBoundaryState.FAILED:
+            raise self._transport_unavailable()
+        self._transport_state = _TransportBoundaryState.DISCONNECTING
+        try:
+            result = await self._main_sender.disconnect()
+        except BaseException:
+            self._transport_state = _TransportBoundaryState.FAILED
+            raise
         pending = tuple(self._pending_scalar_dispatches)
         for raw_future in pending:
             if not raw_future.done():
                 raw_future.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-            await asyncio.sleep(0)
+        self._transport_state = _TransportBoundaryState.DISCONNECTED
+        self._release_confirmed_teardown_dispatches()
         return result
+
+    def _release_confirmed_teardown_dispatches(self) -> None:
+        """A confirmed raw teardown is the sole fallback completion evidence."""
+        for raw_future, pending in tuple(self._pending_scalar_dispatches.items()):
+            if raw_future.done() and not raw_future.cancelled():
+                self._finalize_scalar_dispatch(raw_future)
+            pending = self._pending_scalar_dispatches.get(raw_future)
+            if pending is not None:
+                self._release_scalar_dispatch(raw_future, pending)
 
     async def _handle_admission_deferral(
         self,
@@ -963,6 +1049,7 @@ class TelegramRpcGate(TelegramClient):
         explicit and lets focused callers exercise admission translation
         without constructing a live Telethon sender.
         """
+        self._raise_if_transport_unavailable()
         self.check_circuit()
         await self._wait_for_account_cooldown(scope)
         self.check_circuit()
@@ -1030,17 +1117,51 @@ class TelegramRpcGate(TelegramClient):
             await super()._dispatch_update(update)  # type: ignore[misc]
 
     def _scheduler_transport_ready(self) -> bool:
-        return not self._rpc_circuit_status().open and account_cooldown_deadline() <= time.monotonic()
+        return (
+            self._transport_state is _TransportBoundaryState.READY
+            and not self._rpc_circuit_status().open
+            and account_cooldown_deadline() <= time.monotonic()
+        )
 
     async def _wait_for_scheduler_transport(self) -> None:
         while not self._scheduler_transport_ready():
             status = self._rpc_circuit_status()
-            delay = (
-                self._scheduler_policy.update_loop_retry_seconds
-                if status.open
-                else max(account_cooldown_deadline() - time.monotonic(), 0.0)
-            )
+            if self._transport_state is not _TransportBoundaryState.READY:
+                delay = self._scheduler_policy.admission_retry_seconds
+            elif status.open:
+                delay = self._scheduler_policy.update_loop_retry_seconds
+            else:
+                delay = max(account_cooldown_deadline() - time.monotonic(), 0.0)
             await asyncio.sleep(delay)
+
+    def _begin_transport_connect(self) -> None:
+        self._raise_if_transport_unavailable(allow_disconnected=True)
+        if self._transport_state is not _TransportBoundaryState.DISCONNECTED:
+            raise self._transport_unavailable()
+        self._transport_state = _TransportBoundaryState.CONNECTING
+
+    def _finish_transport_connect(self) -> None:
+        if self._transport_state is _TransportBoundaryState.CONNECTING:
+            self._transport_state = _TransportBoundaryState.READY
+
+    def _finish_transport_connect_failure(self) -> None:
+        if self._transport_state is _TransportBoundaryState.CONNECTING:
+            self._transport_state = _TransportBoundaryState.DISCONNECTED
+
+    def _raise_if_transport_unavailable(self, *, allow_disconnected: bool = False) -> None:
+        reusable = {_TransportBoundaryState.READY}
+        if allow_disconnected:
+            reusable.add(_TransportBoundaryState.DISCONNECTED)
+        if self._transport_state not in reusable:
+            raise self._transport_unavailable()
+
+    def _transport_unavailable(self) -> TelegramRpcAdmissionDeferred:
+        retry_seconds = self._scheduler_policy.admission_retry_seconds
+        return TelegramRpcAdmissionDeferred(
+            retry_after_seconds=retry_seconds,
+            latched=False,
+            detail=f"Telegram transport is {self._transport_state.value}; retry in {retry_seconds:g}s",
+        )
 
     async def _wait_for_account_cooldown(self, scope: TelegramRpcScope) -> None:
         """Wait before Telethon's cache path, bounded by this scope's deadline."""

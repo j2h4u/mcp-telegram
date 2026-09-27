@@ -359,10 +359,21 @@ async def test_admission_wait_and_rpc_execution_are_separate_boundaries() -> Non
         await release_admission.wait()
         return RpcAdmission(TelegramRpcSource.MCP_INTERACTIVE, RpcServiceClass.INTERACTIVE, 0.0, 1)
 
+    def register_completion(
+        raw_future: asyncio.Future[object],
+        *,
+        admission: RpcAdmission,
+        **_kwargs: object,
+    ) -> None:
+        raw_future.add_done_callback(lambda _future: scheduler.complete(admission))
+
+    scheduler = Scheduler()
     gate = SimpleNamespace(
         _admit=admit,
+        _raise_if_transport_unavailable=lambda: None,
         _scheduler_transport_ready=lambda: True,
-        _admission_scheduler=Scheduler(),
+        _admission_scheduler=scheduler,
+        _register_scalar_dispatch_completion=register_completion,
     )
     scope = TelegramRpcScope(
         source=TelegramRpcSource.MCP_INTERACTIVE,

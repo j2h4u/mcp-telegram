@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import mcp_telegram.daemon as daemon
 from mcp_telegram.config import AutomaticGroupHistoryConfig, load_config
 from mcp_telegram.daemon import (
     _acquire_startup_identity_before_updates,
@@ -18,6 +19,7 @@ from mcp_telegram.daemon import (
     _ensure_demand_runtime,
     _HistorySyncRuntime,
     _message_fact_refresh_policy_from_config,
+    _monitor_flood_wait_kill_switch,
     _offer_startup_demands,
     _prime_runtime,
     _run_daemon_lifetime,
@@ -644,6 +646,44 @@ async def test_daemon_lifetime_refreshes_local_dialog_set_and_stops() -> None:
     await _run_daemon_lifetime(ctx)
 
     assert handler.refresh_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_protective_stop_drains_producers_before_flushing_admission_observations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stages: list[str] = []
+    event = asyncio.Event()
+    event.set()
+
+    class _StoppingClient(_ClientStub):
+        async def disconnect(self) -> None:
+            stages.append("disconnect")
+
+    async def producer() -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            stages.append("producer_cancelled")
+
+    task = asyncio.create_task(producer())
+    await asyncio.sleep(0)
+    ctx = _typed_ctx(
+        client=_StoppingClient(),
+        background_tasks={task},
+        flood_wait_kill_switch_event=event,
+        rpc_admission_observer=cast(
+            RpcAdmissionObservationAggregator,
+            SimpleNamespace(flush=lambda: stages.append("flush")),
+        ),
+    )
+    monkeypatch.setattr(
+        daemon, "flood_wait_kill_switch_status", lambda: SimpleNamespace(open=True, detail=lambda: "open")
+    )
+
+    await _monitor_flood_wait_kill_switch(ctx)
+
+    assert stages == ["producer_cancelled", "disconnect", "flush"]
 
 
 @pytest.mark.asyncio
