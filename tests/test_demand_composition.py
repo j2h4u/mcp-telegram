@@ -647,11 +647,7 @@ async def test_malformed_dm_checkpoint_does_not_block_realtime_gate_acquisition(
     _set_sender(gate, send)
 
     async def acquire_forward_entity(_message: object, _client: object) -> dict[int, str]:
-        await gate(
-            functions.channels.GetFullChannelRequest(
-                types.InputChannel(channel_id=8, access_hash=9)
-            )
-        )
+        await gate(functions.channels.GetFullChannelRequest(types.InputChannel(channel_id=8, access_hash=9)))
         return {}
 
     monkeypatch.setattr("mcp_telegram.event_handlers._build_fwd_entity_map", acquire_forward_entity)
