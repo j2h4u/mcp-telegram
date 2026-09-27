@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
+from typing import cast
 
 from .realtime_history_policy import RealtimeHistoryCoverage, realtime_history_coverage
 
@@ -166,7 +167,7 @@ def decode_dm_deletion_checkpoint(row: tuple[object, ...] | None) -> DmDeletionC
     if len(row) != 1 or type(row[0]) is not str or not row[0].strip():
         raise InvalidDmDeletionCheckpointError("DM deletion checkpoint payload is empty or invalid")
     try:
-        value = json.loads(row[0], object_pairs_hook=_unique_json_object)
+        value = cast(object, json.loads(row[0], object_pairs_hook=_unique_json_object))
     except json.JSONDecodeError, InvalidDmDeletionCheckpointError:
         raise InvalidDmDeletionCheckpointError("DM deletion checkpoint JSON is invalid") from None
     if not isinstance(value, dict):
