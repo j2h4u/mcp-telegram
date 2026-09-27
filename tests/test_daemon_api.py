@@ -587,6 +587,7 @@ async def test_daemon_api_projects_gate_admission_deferral_without_internal_name
 def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:
     """Return an in-memory SQLite connection with the required schema."""
     conn = _register_sqlite_connection(sqlite3.connect(":memory:"))
+    conn.execute("CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT)")
     conn.execute(
         """
         CREATE TABLE synced_dialogs (
@@ -2911,6 +2912,38 @@ async def test_get_sync_status_dm_delete_detection() -> None:
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
     assert data["delete_detection"] == "best-effort weekly (DM)"
+
+
+@pytest.mark.asyncio
+async def test_get_sync_status_reports_suspended_dm_deletion_verification() -> None:
+    conn = _make_db()
+    _insert_synced_dialog(conn, 12345, status="synced")
+    conn.execute(
+        "INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', ?)",
+        (
+            json.dumps(
+                {
+                    "status": "suspended",
+                    "generation": 4,
+                    "scan_started_at": 100,
+                    "dialog_id_cursor": 12345,
+                    "message_cursor": 12,
+                    "next_run_at": 0,
+                    "policy_version": 1,
+                    "reason": "flood_wait",
+                    "state_changed_at": 200,
+                }
+            ),
+        ),
+    )
+    conn.commit()
+    server = make_server(conn)
+
+    result = await server._dispatch({"method": "get_sync_status", "dialog_id": 12345})
+
+    assert result["ok"] is True
+    data = cast(dict[str, object], result["data"])
+    assert data["delete_detection"] == "paused (DM; older deletions may be stale)"
 
 
 @pytest.mark.asyncio

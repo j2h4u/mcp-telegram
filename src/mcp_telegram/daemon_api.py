@@ -63,6 +63,7 @@ from .daemon_dialog_queries import (
     _LIST_TOPICS_SQL,
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
+from .delta_sync import dm_deletion_reconciliation_suspended
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import recover_invalid_generation_in_transaction
 from .dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
@@ -1614,7 +1615,7 @@ class DaemonAPIServer:
 
         delete_detection is derived from dialog_id sign:
         - Negative → channel/supergroup → "reliable (channel)"
-        - Positive → DM/small group → "best-effort weekly (DM)"
+        - Positive → DM/small group → weekly or paused deletion verification
         """
         dialog_id = _coerce_int(req.get("dialog_id", 0), 0)
         row = cast(tuple[object, ...] | None, self._conn.execute(_GET_SYNC_STATUS_SQL, (dialog_id,)).fetchone())
@@ -1663,7 +1664,13 @@ class DaemonAPIServer:
             "delta_refresh_requested_at": delta_refresh_requested_at,
             "sync_progress": sync_progress,
             "sync_progress_message_id": sync_progress,
-            "delete_detection": "reliable (channel)" if dialog_id < 0 else "best-effort weekly (DM)",
+            "delete_detection": (
+                "reliable (channel)"
+                if dialog_id < 0
+                else "paused (DM; older deletions may be stale)"
+                if dm_deletion_reconciliation_suspended(self._conn)
+                else "best-effort weekly (DM)"
+            ),
             "access_lost_at": access_lost_at,
             "access_last_revalidated_at": access_revalidation[0],
             "access_next_revalidate_at": access_revalidation[1],

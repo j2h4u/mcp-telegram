@@ -22,6 +22,10 @@ from mcp_telegram.delta_sync import (
     DeltaAccessProbeDemandAdapter,
     DeltaGapFillDemandAdapter,
     DeltaSyncWorker,
+    DmDeletionReconciliationDemandAdapter,
+    DmGapScanStateError,
+    dm_deletion_reconciliation_suspended,
+    prepare_dm_deletion_reconciliation,
 )
 from mcp_telegram.dialog_sync import DialogLightReconciliationDemandAdapter, DialogReconciliationWorker
 from mcp_telegram.flood import TelegramRpcThrottled
@@ -315,8 +319,35 @@ async def test_dm_enrollment_restarts_after_interruption_without_replaying_teleg
 
 def test_delta_gap_status_uses_two_hour_fallback_and_immediate_explicit_refresh(conn: sqlite3.Connection) -> None:
     _seed_history_dialog(conn, 201, status="synced", last_delta_checked_at=100)
+    conn.execute(
+        "INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', ?)",
+        (
+            json.dumps(
+                {
+                    "status": "suspended",
+                    "generation": 4,
+                    "scan_started_at": 1,
+                    "dialog_id_cursor": 201,
+                    "message_cursor": 5,
+                    "next_run_at": 0,
+                    "policy_version": 1,
+                    "reason": "flood_wait",
+                    "state_changed_at": 10,
+                }
+            ),
+        ),
+    )
+    conn.commit()
     worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event())
     adapter = DeltaGapFillDemandAdapter(worker)
+
+    class Scanner:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+            del dialog_id, message_ids
+            raise AssertionError("suspended DM maintenance must not run")
+
+    dm_adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner())
+    assert dm_adapter.status(7_300.0) is None
     changes_before = conn.total_changes
 
     assert adapter.status(7299.0).release_at == 7300.0  # type: ignore[union-attr]
@@ -444,8 +475,7 @@ async def test_delta_gap_adapter_resumes_dm_tombstone_cursor_after_restart(conn:
             return 0
 
     scanner = Scanner()
-    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event())
-    adapter = DeltaGapFillDemandAdapter(worker, scanner)
+    adapter = DmDeletionReconciliationDemandAdapter(conn, scanner)
 
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
         await adapter.run_slice(RpcAttemptBudget(limit=1))
@@ -456,7 +486,7 @@ async def test_delta_gap_adapter_resumes_dm_tombstone_cursor_after_restart(conn:
     )[0]
     assert '"message_cursor": 100' in state
 
-    restarted = DeltaGapFillDemandAdapter(worker, scanner)
+    restarted = DmDeletionReconciliationDemandAdapter(conn, scanner)
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
         await restarted.run_slice(RpcAttemptBudget(limit=1))
     assert scanner.pages[1] == (101,)
@@ -485,8 +515,7 @@ async def test_delta_gap_tombstone_cursor_does_not_skip_after_earlier_dialog_is_
             return 0
 
     scanner = Scanner()
-    worker = DeltaSyncWorker(cast(ForwardGapPagePort, object()), conn, asyncio.Event())
-    adapter = DeltaGapFillDemandAdapter(worker, scanner)
+    adapter = DmDeletionReconciliationDemandAdapter(conn, scanner)
 
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
         await adapter.run_slice(RpcAttemptBudget(limit=1))
@@ -495,7 +524,7 @@ async def test_delta_gap_tombstone_cursor_does_not_skip_after_earlier_dialog_is_
 
     conn.execute("DELETE FROM synced_dialogs WHERE dialog_id=203")
     conn.commit()
-    restarted = DeltaGapFillDemandAdapter(worker, scanner)
+    restarted = DmDeletionReconciliationDemandAdapter(conn, scanner)
     with patch("mcp_telegram.delta_sync.time.time", return_value=1000):
         await restarted.run_slice(RpcAttemptBudget(limit=1))
 
@@ -506,6 +535,184 @@ async def test_delta_gap_tombstone_cursor_does_not_skip_after_earlier_dialog_is_
     state = cast(dict[str, object], json.loads(raw_state))
     assert state["dialog_id_cursor"] == 204
     assert "dialog_index" not in state
+
+
+def _seed_dm_reconciliation_page(conn: sqlite3.Connection, dialog_id: int = 211) -> None:
+    _seed_history_dialog(conn, dialog_id, status="synced")
+    conn.execute("INSERT INTO entities (id, type, updated_at) VALUES (?, 'user', 1)", (dialog_id,))
+    conn.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, text) VALUES (?, 1, 1, 'kept locally')",
+        (dialog_id,),
+    )
+    conn.commit()
+
+
+def _dm_reconciliation_state(conn: sqlite3.Connection) -> dict[str, object]:
+    row = cast(
+        tuple[str], conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone()
+    )
+    return cast(dict[str, object], json.loads(row[0]))
+
+
+@pytest.mark.asyncio
+async def test_prepare_quarantines_legacy_running_checkpoint_without_advancing_it(conn: sqlite3.Connection) -> None:
+    original = {
+        "status": "running",
+        "generation": 9,
+        "scan_started_at": 100,
+        "dialog_id_cursor": 211,
+        "message_cursor": 1,
+        "next_run_at": 0,
+    }
+    conn.execute(
+        "INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', ?)",
+        (json.dumps(original),),
+    )
+    conn.commit()
+    _seed_dm_reconciliation_page(conn)
+    calls: list[tuple[int, ...]] = []
+
+    class Scanner:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+            del dialog_id
+            calls.append(tuple(message_ids))
+            return 0
+
+    prepare_dm_deletion_reconciliation(conn, now=200)
+    state = _dm_reconciliation_state(conn)
+    assert state == {
+        **original,
+        "status": "suspended",
+        "policy_version": 1,
+        "reason": "legacy_generation_review",
+        "state_changed_at": 200,
+    }
+    assert dm_deletion_reconciliation_suspended(conn)
+
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner())
+    for now in (200, 1_000, 1_000_000):
+        assert adapter.status(float(now)) is None
+        with patch("mcp_telegram.delta_sync.time.time", return_value=now):
+            await adapter.run_slice(RpcAttemptBudget(limit=1))
+        prepare_dm_deletion_reconciliation(conn, now=now + 1)
+    assert calls == []
+    assert _dm_reconciliation_state(conn)["message_cursor"] == original["message_cursor"]
+
+
+@pytest.mark.asyncio
+async def test_dm_throttle_suspends_generation_and_never_retries_page(conn: sqlite3.Connection) -> None:
+    _seed_dm_reconciliation_page(conn)
+    calls: list[tuple[int, ...]] = []
+
+    class Scanner:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+            del dialog_id
+            calls.append(tuple(message_ids))
+            raise TelegramRpcThrottled(retry_after_seconds=22)
+
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner())
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1_000):
+        with pytest.raises(TelegramRpcThrottled):
+            await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert _dm_reconciliation_state(conn)["status"] == "suspended"
+    assert _dm_reconciliation_state(conn)["reason"] == "flood_wait"
+    assert _dm_reconciliation_state(conn)["message_cursor"] == 0
+    for now in (1_023, 1_000_000):
+        assert adapter.status(float(now)) is None
+        with patch("mcp_telegram.delta_sync.time.time", return_value=now):
+            await adapter.run_slice(RpcAttemptBudget(limit=1))
+    prepare_dm_deletion_reconciliation(conn, now=2_000_000)
+    assert calls == [(1,)]
+    assert conn.execute("SELECT is_deleted FROM messages WHERE dialog_id=211 AND message_id=1").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_dm_zero_dispatch_deferral_restores_running_with_original_budget(conn: sqlite3.Connection) -> None:
+    _seed_dm_reconciliation_page(conn)
+
+    class Scanner:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+            del dialog_id, message_ids
+            raise TelegramRpcAdmissionDeferred(retry_after_seconds=3)
+
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner())
+    budget = RpcAttemptBudget(limit=1)
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1_000):
+        with pytest.raises(TelegramRpcAdmissionDeferred):
+            await adapter.run_slice(budget)
+    state = _dm_reconciliation_state(conn)
+    assert state["status"] == "running"
+    assert state["message_cursor"] == 0
+    assert budget.limit == 1 and budget.attempts == 0
+    assert adapter.status(1_000.0).is_ready(1_000.0)  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_dm_unknown_failure_stays_verifying_until_startup_quarantines_it(conn: sqlite3.Connection) -> None:
+    _seed_dm_reconciliation_page(conn)
+    calls = 0
+
+    class Scanner:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+            nonlocal calls
+            del dialog_id, message_ids
+            calls += 1
+            raise RuntimeError("unknown page outcome")
+
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner())
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1_000):
+        with pytest.raises(RuntimeError, match="unknown page outcome"):
+            await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert _dm_reconciliation_state(conn)["status"] == "verifying"
+    assert adapter.status(1_000.0) is None
+    with patch("mcp_telegram.delta_sync.time.time", return_value=2_000):
+        await adapter.run_slice(RpcAttemptBudget(limit=1))
+    prepare_dm_deletion_reconciliation(conn, now=2_001)
+    assert _dm_reconciliation_state(conn)["status"] == "suspended"
+    assert _dm_reconciliation_state(conn)["reason"] == "interrupted"
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_dm_success_before_cursor_commit_failure_stays_claimed(conn: sqlite3.Connection) -> None:
+    _seed_dm_reconciliation_page(conn)
+    calls = 0
+
+    class Scanner:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+            nonlocal calls
+            del dialog_id, message_ids
+            calls += 1
+            return 0
+
+    conn.execute(
+        """CREATE TRIGGER fail_dm_cursor_commit
+           BEFORE INSERT ON daemon_state
+           WHEN NEW.key='delta_dm_gap_scan_state' AND NEW.value LIKE '%\"message_cursor\": 1%'
+           BEGIN SELECT RAISE(ABORT, 'injected cursor commit failure'); END"""
+    )
+    conn.commit()
+    adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner())
+    with patch("mcp_telegram.delta_sync.time.time", return_value=1_000):
+        with pytest.raises(sqlite3.IntegrityError, match="injected cursor commit failure"):
+            await adapter.run_slice(RpcAttemptBudget(limit=1))
+    assert calls == 1
+    assert _dm_reconciliation_state(conn)["status"] == "verifying"
+    assert _dm_reconciliation_state(conn)["message_cursor"] == 0
+    assert adapter.status(1_000_000) is None
+    prepare_dm_deletion_reconciliation(conn, now=2_000)
+    state = _dm_reconciliation_state(conn)
+    assert state["status"] == "suspended"
+    assert state["reason"] == "interrupted"
+    assert state["message_cursor"] == 0
+    assert conn.execute("SELECT is_deleted FROM messages WHERE dialog_id=211 AND message_id=1").fetchone() == (0,)
+
+
+def test_prepare_fails_closed_on_corrupt_dm_scan_state(conn: sqlite3.Connection) -> None:
+    conn.execute("INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', '{invalid')")
+    conn.commit()
+    with pytest.raises(DmGapScanStateError):
+        prepare_dm_deletion_reconciliation(conn, now=100)
 
 
 @pytest.mark.asyncio

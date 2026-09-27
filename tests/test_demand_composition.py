@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from collections.abc import Awaitable, Callable, Generator, Sequence
 from dataclasses import dataclass
@@ -18,7 +19,12 @@ from mcp_telegram.activity_cold_backfill import (
 from mcp_telegram.activity_hot_sweep import HotActivityDemandAdapter
 from mcp_telegram.activity_sync import ArchiveBackfillDemandAdapter, ArchiveIncrementalDemandAdapter
 from mcp_telegram.daemon import SQLiteSelfProfileCadence
-from mcp_telegram.delta_sync import DeltaAccessProbeDemandAdapter, DeltaGapFillDemandAdapter, DmGapScanPage
+from mcp_telegram.delta_sync import (
+    DeltaAccessProbeDemandAdapter,
+    DeltaGapFillDemandAdapter,
+    DmDeletionReconciliationDemandAdapter,
+    DmGapScanPage,
+)
 from mcp_telegram.demand_composition import (
     DemandCompositionClient,
     DemandCompositionDependencies,
@@ -264,6 +270,7 @@ def test_adapter_map_is_exact_against_literal_21_kind_class_map(
     expected = {
         DemandKind.ENTITY_PROFILE_REFRESH: EntityProfileDemandAdapter,
         DemandKind.DELTA_GAP_FILL: DeltaGapFillDemandAdapter,
+        DemandKind.DM_DELETION_RECONCILIATION: DmDeletionReconciliationDemandAdapter,
         DemandKind.DELTA_ACCESS_PROBE: DeltaAccessProbeDemandAdapter,
         DemandKind.HOT_ACTIVITY_PAGE: HotActivityDemandAdapter,
         DemandKind.LIVE_HYDRATION_BATCH: FactHydrationDemandAdapter,
@@ -284,14 +291,14 @@ def test_adapter_map_is_exact_against_literal_21_kind_class_map(
         DemandKind.SELF_PROFILE_MAINTENANCE: SelfProfileMaintenanceDemandAdapter,
         DemandKind.LINKED_CHAT_REFRESH: LinkedChatFactDemandAdapter,
     }
-    assert len(expected) == 21
+    assert len(expected) == 22
     assert set(adapters) == set(expected)
     assert {kind: type(adapter) for kind, adapter in adapters.items()} == expected
     assert all(getattr(adapter, "demand_kind", None) is kind for kind, adapter in adapters.items())
     assert adapters[DemandKind.FULL_SYNC_PAGE]._worker is objects["full"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.FULL_SYNC_DM_ENROLLMENT]._worker is objects["full"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DELTA_GAP_FILL]._worker is objects["delta"]  # type: ignore[attr-defined]
-    assert adapters[DemandKind.DELTA_GAP_FILL]._dm_gap_scanner is objects["dm_gap_scanner"]  # type: ignore[attr-defined]
+    assert adapters[DemandKind.DM_DELETION_RECONCILIATION]._scanner is objects["dm_gap_scanner"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DELTA_ACCESS_PROBE]._worker is objects["delta"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DIALOG_LIGHT_RECONCILIATION]._worker is objects["dialog"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.DIALOG_BOOTSTRAP]._directory is objects["directory"]  # type: ignore[attr-defined]
@@ -300,6 +307,38 @@ def test_adapter_map_is_exact_against_literal_21_kind_class_map(
         == demand_freshness_seconds(DemandKind.ARCHIVE_INCREMENTAL)
     )
     assert adapters[DemandKind.LIVE_HYDRATION_BATCH]._worker is objects["hydration"]  # type: ignore[attr-defined]
+
+
+def test_adapter_composition_quarantines_legacy_dm_generation_before_registration(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+) -> None:
+    dependencies, objects = composition_dependencies
+    legacy_state = {
+        "status": "running",
+        "generation": 8,
+        "scan_started_at": 100,
+        "dialog_id_cursor": 7,
+        "message_cursor": 44,
+        "next_run_at": 0,
+    }
+    dependencies.conn.execute(
+        "INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', ?)",
+        (json.dumps(legacy_state),),
+    )
+    dependencies.conn.commit()
+
+    adapters = build_durable_adapter_map(dependencies)
+
+    stored = cast(
+        tuple[str],
+        dependencies.conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone(),
+    )
+    quarantined = cast(dict[str, object], json.loads(stored[0]))
+    assert {key: quarantined[key] for key in legacy_state} == {**legacy_state, "status": "suspended"}
+    assert quarantined["policy_version"] == 1
+    assert quarantined["reason"] == "legacy_generation_review"
+    assert isinstance(quarantined["state_changed_at"], int)
+    assert adapters[DemandKind.DM_DELETION_RECONCILIATION].status(1_000_000.0) is None
     assert adapters[DemandKind.BACKFILL_HYDRATION_BATCH]._worker is objects["hydration"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.FOLDER_SNAPSHOT]._worker is objects["folder"]  # type: ignore[attr-defined]
     assert adapters[DemandKind.SCHEDULED_REPAIR]._reconciler is objects["scheduled"]  # type: ignore[attr-defined]

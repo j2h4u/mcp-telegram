@@ -19,7 +19,9 @@ from mcp_telegram.delta_sync import (
     DeltaAccessProbeDemandAdapter,
     DeltaGapFillDemandAdapter,
     DeltaSyncWorker,
+    DmDeletionReconciliationDemandAdapter,
     DmGapScanPage,
+    prepare_dm_deletion_reconciliation,
 )
 from mcp_telegram.dialog_directory import (
     CanonicalDialogDirectory,
@@ -149,12 +151,12 @@ def build_durable_adapter_map(
     observer: DeltaGapFillObservationHook | None = None,
 ) -> Mapping[DemandKind, DurableDemandAdapter]:
     """Build and validate the exhaustive durable adapter map."""
+    prepare_dm_deletion_reconciliation(dependencies.conn)
     adapters: dict[DemandKind, DurableDemandAdapter] = {
         DemandKind.ENTITY_PROFILE_REFRESH: EntityProfileDemandAdapter(dependencies.entity_refresh_coordinator),
-        DemandKind.DELTA_GAP_FILL: DeltaGapFillDemandAdapter(
-            dependencies.delta_sync_worker,
-            dependencies.dm_gap_scanner,
-            observer=observer,
+        DemandKind.DELTA_GAP_FILL: DeltaGapFillDemandAdapter(dependencies.delta_sync_worker, observer=observer),
+        DemandKind.DM_DELETION_RECONCILIATION: DmDeletionReconciliationDemandAdapter(
+            dependencies.conn, dependencies.dm_gap_scanner
         ),
         DemandKind.DELTA_ACCESS_PROBE: DeltaAccessProbeDemandAdapter(
             dependencies.delta_sync_worker,
