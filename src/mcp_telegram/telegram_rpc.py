@@ -994,9 +994,9 @@ class TelegramRpcGate(TelegramClient):
         for raw_future, pending in tuple(self._pending_scalar_dispatches.items()):
             if raw_future.done() and not raw_future.cancelled():
                 self._finalize_scalar_dispatch(raw_future)
-            pending = self._pending_scalar_dispatches.get(raw_future)
-            if pending is not None:
-                self._release_scalar_dispatch(raw_future, pending)
+            remaining = self._pending_scalar_dispatches.get(raw_future)
+            if remaining is not None:
+                self._release_scalar_dispatch(raw_future, remaining)
 
     async def _handle_admission_deferral(
         self,
@@ -1126,6 +1126,7 @@ class TelegramRpcGate(TelegramClient):
     async def _wait_for_scheduler_transport(self) -> None:
         while not self._scheduler_transport_ready():
             status = self._rpc_circuit_status()
+            delay: float
             if self._transport_state is not _TransportBoundaryState.READY:
                 delay = self._scheduler_policy.admission_retry_seconds
             elif status.open:
