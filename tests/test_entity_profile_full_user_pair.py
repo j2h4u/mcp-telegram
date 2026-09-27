@@ -10,14 +10,14 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import MagicMock
 
 import pytest
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
 import mcp_telegram.daemon as daemon
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
-from mcp_telegram.daemon_api import DaemonAPIServer
+from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from mcp_telegram.entity_profile.contracts import (
     ObservationBoundary,
@@ -271,7 +271,14 @@ async def test_protective_disconnect_serves_valid_partial_profile_from_local_cac
     conn.close()
 
     conn = sqlite3.connect(path)
-    client = AsyncMock()
+    class _ProtectionClient:
+        def __init__(self) -> None:
+            self.disconnect_calls = 0
+
+        async def disconnect(self) -> None:
+            self.disconnect_calls += 1
+
+    client = _ProtectionClient()
     base_policy = make_daemon_api_policy()
     policy = replace(
         base_policy,
@@ -280,7 +287,7 @@ async def test_protective_disconnect_serves_valid_partial_profile_from_local_cac
     )
     api = DaemonAPIServer(
         conn,
-        client,
+        cast(DaemonClientLike, client),
         asyncio.Event(),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
@@ -312,7 +319,7 @@ async def test_protective_disconnect_serves_valid_partial_profile_from_local_cac
                 ),
             )
         )
-        assert client.disconnect.await_count == 1
+        assert client.disconnect_calls == 1
         assert api._auth_scope == scope
 
         result, _, _ = await api._handle_client_line(b'{"method":"get_entity_info","entity_id":42}', "", None)
@@ -326,7 +333,7 @@ async def test_protective_disconnect_serves_valid_partial_profile_from_local_cac
         assert sections["common_chats"]["status"] == "pending"
         assert "auth_scope" not in data
         assert "profile_owner_account_id" not in data
-        assert client.mock_calls == [call.disconnect()]
+        assert client.disconnect_calls == 1
     finally:
         await api.shutdown()
         conn.close()

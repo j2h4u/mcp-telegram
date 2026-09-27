@@ -748,10 +748,12 @@ async def test_latched_coordinator_stop_keeps_local_daemon_socket_available(  # 
         def __init__(self, *, ready: bool = False) -> None:
             self.ready = ready
 
-        def status(self, _now: float) -> DemandStatus | None:
+        def status(self, now: float) -> DemandStatus | None:
+            del now
             return DemandStatus(0) if self.ready else None
 
-        async def run_slice(self, _budget: RpcAttemptBudget) -> None:
+        async def run_slice(self, budget: RpcAttemptBudget) -> None:
+            del budget
             raw_sends.append("attempt")
             kill_switch.set()
             raise TelegramRpcThrottled(latched=True)
@@ -858,10 +860,12 @@ async def test_protective_monitor_cancels_active_coordinator_without_closing_loc
         def __init__(self, *, ready: bool = False) -> None:
             self.ready = ready
 
-        def status(self, _now: float) -> DemandStatus | None:
+        def status(self, now: float) -> DemandStatus | None:
+            del now
             return DemandStatus(0) if self.ready else None
 
-        async def run_slice(self, _budget: RpcAttemptBudget) -> None:
+        async def run_slice(self, budget: RpcAttemptBudget) -> None:
+            del budget
             started.set()
             await asyncio.Future()
             raw_sends.append("unexpected")

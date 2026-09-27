@@ -109,7 +109,7 @@ async def test_submit_feedback_persists_through_local_ipc_when_protection_is_act
             reader, writer = await asyncio.open_unix_connection(socket_path)
             writer.write(b'{"method":"submit_feedback","message":"local while protected"}\n')
             await writer.drain()
-            response = json.loads((await reader.readline()).decode())
+            response = cast(dict[str, object], json.loads((await reader.readline()).decode()))
             writer.close()
             await writer.wait_closed()
 

@@ -96,6 +96,9 @@ from mcp_telegram.telegram_rpc_scheduler import (
     TelegramRpcAdmissionScheduler,
     TelegramRpcScope,
 )
+from mcp_telegram.topics.contracts import TopicFact
+from mcp_telegram.topics.refresh import TopicRefresher
+from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.helpers import (
     LoudChannelProfilePort,
@@ -1361,11 +1364,16 @@ async def test_daemon_remote_topic_miss_projects_latched_gate_without_raw_send(t
         async def get_entity(self, dialog_id: int) -> object:
             return await gate(_TestRequest(dialog_id))
 
+    class _TopicGateway:
+        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
+            del entity
+            raise AssertionError("latched gate must reject before topic refresh")
+
     server = DaemonAPIServer(
         conn,
         cast(DaemonClientLike, GateClient()),
         asyncio.Event(),
-        topic_refresher=cast(object, object()),
+        topic_refresher=TopicRefresher(_TopicGateway(), SQLiteTopicSnapshotRepository(conn)),
         channel_profile_port=LoudChannelProfilePort(),
         group_profile_port=LoudGroupProfilePort(),
         user_profile_port=LoudUserProfilePort(),
@@ -1402,7 +1410,9 @@ async def test_disconnected_transport_keeps_finite_admission_deferral_when_circu
         await _call(gate, "request")
 
     assert caught.value.latched is False
-    assert caught.value.retry_after_seconds > 0
+    retry_after = caught.value.retry_after_seconds
+    assert retry_after is not None
+    assert retry_after > 0
     assert sender.calls == 0
 
 
