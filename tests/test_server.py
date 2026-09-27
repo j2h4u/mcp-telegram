@@ -83,18 +83,38 @@ class _ReadingTopicConnection:
         self,
         topics_response: dict[str, object],
         messages_response: dict[str, object] | None,
+        *,
+        dialog_mapping: dict[str, int] | None = None,
+        mapping_after_topic_lookup: int | None = None,
     ) -> None:
         self.topics_response = topics_response
         self.messages_response = messages_response
+        self.dialog_mapping = dict(dialog_mapping or {})
+        self.mapping_after_topic_lookup = mapping_after_topic_lookup
         self.topic_calls: list[dict[str, object]] = []
         self.message_calls: list[dict[str, object]] = []
+        self.topic_lookup_dialog_ids: list[int] = []
+        self.message_lookup_dialog_ids: list[int] = []
 
     async def list_topics(self, **kwargs: object) -> dict[str, object]:
         self.topic_calls.append(kwargs)
+        dialog_name = kwargs.get("dialog")
+        if isinstance(dialog_name, str) and dialog_name in self.dialog_mapping:
+            resolved_dialog_id = self.dialog_mapping[dialog_name]
+            self.topic_lookup_dialog_ids.append(resolved_dialog_id)
+            if self.mapping_after_topic_lookup is not None:
+                self.dialog_mapping[dialog_name] = self.mapping_after_topic_lookup
         return self.topics_response
 
     async def list_messages(self, **kwargs: object) -> dict[str, object]:
         self.message_calls.append(kwargs)
+        dialog_id = kwargs.get("dialog_id")
+        if isinstance(dialog_id, int) and not isinstance(dialog_id, bool):
+            self.message_lookup_dialog_ids.append(dialog_id)
+        else:
+            dialog_name = kwargs.get("dialog")
+            if isinstance(dialog_name, str) and dialog_name in self.dialog_mapping:
+                self.message_lookup_dialog_ids.append(self.dialog_mapping[dialog_name])
         if self.messages_response is None:
             raise AssertionError("list_messages must not run after a topic resolution error")
         return self.messages_response
@@ -1604,6 +1624,8 @@ async def test_list_messages_resolves_natural_dialog_topic_without_sending_zero_
     tool_connection = _ReadingTopicConnection(
         topics_response={"ok": True, "data": {"topics": [{"id": 9, "title": "General"}], "dialog_id": 701}},
         messages_response={"ok": True, "data": {"messages": [], "source": "sync_db", "dialog_id": 701}},
+        dialog_mapping={"Project": 701},
+        mapping_after_topic_lookup=702,
     )
 
     @asynccontextmanager
@@ -1627,9 +1649,13 @@ async def test_list_messages_resolves_natural_dialog_topic_without_sending_zero_
     validate(payload, cast(dict[str, object], server.tool_by_name["list_messages"].output_schema))
     assert tool_connection.topic_calls == [{"dialog": "Project"}]
     assert len(tool_connection.message_calls) == 1
-    assert tool_connection.message_calls[0]["dialog"] == "Project"
+    assert tool_connection.message_calls[0]["dialog_id"] == 701
     assert tool_connection.message_calls[0]["topic_id"] == 9
-    assert "dialog_id" not in tool_connection.message_calls[0]
+    assert "dialog" not in tool_connection.message_calls[0]
+    assert tool_connection.topic_lookup_dialog_ids == [701]
+    assert tool_connection.dialog_mapping["Project"] == 702
+    assert tool_connection.message_lookup_dialog_ids == [701]
+    assert payload["dialog_id"] == 701
 
 
 @pytest.mark.asyncio
@@ -1727,6 +1753,76 @@ async def test_list_messages_exact_dialog_topic_lookup_keeps_exact_selector(
     assert tool_connection.message_calls[0]["dialog_id"] == 701
     assert tool_connection.message_calls[0]["topic_id"] == 9
     assert "dialog" not in tool_connection.message_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_list_messages_natural_dialog_with_exact_topic_id_skips_topic_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_connection = _ReadingTopicConnection(
+        topics_response={"ok": True, "data": {"topics": [], "dialog_id": 701}},
+        messages_response={"ok": True, "data": {"messages": [], "source": "sync_db", "dialog_id": 701}},
+    )
+
+    @asynccontextmanager
+    async def tool_connection_context() -> AsyncIterator[object]:
+        yield tool_connection
+
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", tool_connection_context)
+    monkeypatch.setattr(server, "daemon_connection", lambda: _status_context({"ok": True, "data": {}}))
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+
+    result = _call_tool_result(
+        await server.call_tool(
+            "list_messages",
+            {"dialog": "Project", "exact_topic_id": 9, "message_state": "sent"},
+        )
+    )
+
+    assert result.is_error is False
+    assert tool_connection.topic_calls == []
+    assert len(tool_connection.message_calls) == 1
+    assert tool_connection.message_calls[0]["dialog"] == "Project"
+    assert tool_connection.message_calls[0]["topic_id"] == 9
+    assert "dialog_id" not in tool_connection.message_calls[0]
+
+
+@pytest.mark.parametrize("invalid_dialog_id", [None, True, "701"])
+@pytest.mark.asyncio
+async def test_list_messages_topic_lookup_without_numeric_dialog_id_stops_before_message_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_dialog_id: object,
+) -> None:
+    tool_connection = _ReadingTopicConnection(
+        topics_response={
+            "ok": True,
+            "data": {"topics": [{"id": 9, "title": "General"}], "dialog_id": invalid_dialog_id},
+        },
+        messages_response=None,
+    )
+
+    @asynccontextmanager
+    async def tool_connection_context() -> AsyncIterator[object]:
+        yield tool_connection
+
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", tool_connection_context)
+    monkeypatch.setattr(server, "daemon_connection", lambda: _status_context({"ok": True, "data": {}}))
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+
+    result = _call_tool_result(
+        await server.call_tool(
+            "list_messages",
+            {"dialog": "Project", "topic": "General", "message_state": "sent"},
+        )
+    )
+
+    assert result.is_error is True
+    payload = cast(dict[str, object], result.structured_content)
+    error = cast(dict[str, object], payload["error"])
+    assert error["code"] == "invalid_topic_lookup_response"
+    assert "valid dialog id" in cast(str, error["message"])
+    validate(payload, cast(dict[str, object], server.tool_by_name["list_messages"].output_schema))
+    assert tool_connection.message_calls == []
 
 
 @pytest.mark.parametrize(

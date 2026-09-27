@@ -1,6 +1,6 @@
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import fields as dataclass_fields
 from datetime import UTC, datetime
 from typing import Literal, cast
@@ -181,6 +181,12 @@ class _ListMessagesErrorContext:
     has_cursor: bool
     structured_content: dict[str, object] | None = None
     rendered_text: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedTopic:
+    dialog_id: int
+    topic_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1330,7 +1336,7 @@ async def _resolve_topic_id(
     *,
     dialog_id: int | None,
     dialog_name: str | None,
-) -> int | ToolResult:
+) -> _ResolvedTopic | ToolResult:
     """Resolve a fuzzy topic name to a numeric topic_id via the daemon.
 
     Returns the resolved int topic_id on success, or a ToolResult with an
@@ -1347,7 +1353,24 @@ async def _resolve_topic_id(
 
     if not response.get("ok"):
         return _topic_lookup_error(response)
-    return _resolve_topic_matches(response.get("data", {}).get("topics", []), topic_name)
+    data = response.get("data")
+    if not isinstance(data, dict):
+        return error_result(
+            "Topic lookup did not return a valid dialog id.\n"
+            "Action: Call list_topics for this dialog, then retry list_messages.",
+            error_code="invalid_topic_lookup_response",
+        )
+    resolved_dialog_id = data.get("dialog_id")
+    if isinstance(resolved_dialog_id, bool) or not isinstance(resolved_dialog_id, int):
+        return error_result(
+            "Topic lookup did not return a valid dialog id.\n"
+            "Action: Call list_topics for this dialog, then retry list_messages.",
+            error_code="invalid_topic_lookup_response",
+        )
+    resolved_topic_id = _resolve_topic_matches(data.get("topics", []), topic_name)
+    if isinstance(resolved_topic_id, ToolResult):
+        return resolved_topic_id
+    return _ResolvedTopic(dialog_id=resolved_dialog_id, topic_id=resolved_topic_id)
 
 
 def _topic_lookup_error(response: dict) -> ToolResult:
@@ -1505,7 +1528,7 @@ def _list_messages_structured_error_content(response: dict) -> dict[str, object]
 async def _list_messages_topic_id(
     args: ListMessages,
     request_context: _ListMessagesRequestContext,
-) -> int | ToolResult | None:
+) -> _ResolvedTopic | int | ToolResult | None:
     if args.exact_topic_id is not None or args.topic is None:
         return args.exact_topic_id
     resolved = await _resolve_topic_id(
@@ -1597,8 +1620,13 @@ async def list_messages(args: ListMessages) -> ToolResult:
     topic_id = await _list_messages_topic_id(args, request_context)
     if isinstance(topic_id, ToolResult):
         return topic_id
+    if isinstance(topic_id, _ResolvedTopic):
+        request_context = replace(request_context, dialog_id=topic_id.dialog_id)
+        resolved_topic_id: int | None = topic_id.topic_id
+    else:
+        resolved_topic_id = topic_id
     try:
-        response = await _request_list_messages(args, request_context, topic_id)
+        response = await _request_list_messages(args, request_context, resolved_topic_id)
     except DaemonNotRunningError as exc:
         return error_result(_daemon_not_running_text(exc))
 
@@ -1617,7 +1645,7 @@ async def list_messages(args: ListMessages) -> ToolResult:
             dialog_id=request_context.dialog_id,
             sender_id=request_context.sender_id,
             sender_name=request_context.sender_name,
-            topic_id=topic_id,
+            topic_id=resolved_topic_id,
             direction=request_context.direction,
             next_navigation=next_nav,
         )
