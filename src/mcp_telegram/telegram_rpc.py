@@ -8,7 +8,8 @@ import math
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from contextvars import Context
+from dataclasses import dataclass, replace
 from typing import Never, Protocol, cast
 
 from aiolimiter import AsyncLimiter
@@ -35,13 +36,16 @@ from .flood import FloodWaitObservation, TelegramRpcThrottled, flood_seconds
 from .request_timing import current_timing, timing_phase
 from .telegram_demand import (
     AcquisitionKind,
+    DemandToken,
+    RpcAttemptBudget,
     UnclassifiedTelegramDemandError,
     acquisition_context,
+    create_demand_token,
     current_demand_token,
     demand_context,
     require_execution_mode,
 )
-from .telegram_rpc_consumers import DemandKind, ExecutionMode
+from .telegram_rpc_consumers import DemandKind, ExecutionMode, demand_contract
 from .telegram_rpc_scheduler import (
     AdmissionObserver,
     RpcAdmission,
@@ -184,6 +188,58 @@ class _AdmissionAwareSender:
 
 
 @dataclass(frozen=True, slots=True)
+class _ConnectionCapability:
+    """Explicit identity carried into Telethon's context-free connect task."""
+
+    token: DemandToken
+    deadline: float
+    attempt_budget: RpcAttemptBudget | None
+
+
+class _MainSenderAdapter:
+    """Narrow main-sender boundary for Telethon connection bootstrap."""
+
+    def __init__(self, gate: TelegramRpcGate) -> None:
+        self._gate = gate
+
+    def send(self, request: object, ordered: bool = False) -> asyncio.Task[object]:
+        if is_list_like(request):
+            raise ValueError("transport batching is forbidden; use sequential scalar calls")
+        return self._gate._run_with_connection_capability(
+            request,
+            ordered=ordered,
+            capability=self._gate._sender_capability(),
+        )
+
+    async def connect(self, connection: object) -> object:
+        return await self._gate._main_sender.connect(connection)
+
+    async def disconnect(self) -> object:
+        return await self._gate._main_sender.disconnect()
+
+    def is_connected(self) -> bool:
+        return self._gate._main_sender.is_connected()
+
+    @property
+    def disconnected(self) -> asyncio.Future[object]:
+        return self._gate._main_sender.disconnected
+
+    @property
+    def auth_key(self) -> object:
+        return self._gate._main_sender.auth_key
+
+    @auth_key.setter
+    def auth_key(self, value: object) -> None:
+        self._gate._main_sender.auth_key = value
+
+    def _transport_connected(self) -> bool:
+        return self._gate._main_sender._transport_connected()
+
+    def _keepalive_ping(self, random_id: int) -> None:
+        self._gate._main_sender._keepalive_ping(random_id)
+
+
+@dataclass(frozen=True, slots=True)
 class TelegramRpcBudget:
     """Process-wide logical RPC limiter settings."""
 
@@ -296,6 +352,10 @@ class TelegramRpcGate(TelegramClient):
                 wait=self._wait_for_scheduler_transport,
             ),
         )
+        self._main_sender = self._sender
+        self._sender = _MainSenderAdapter(self)
+        self._connect_owner: asyncio.Task[object] | None = None
+        self._connection_capability: _ConnectionCapability | None = None
 
     @staticmethod
     def rpc_scope(
@@ -394,9 +454,134 @@ class TelegramRpcGate(TelegramClient):
         del flood_sleep_threshold  # The gate always uses the client-level zero threshold.
         if request is not None and is_list_like(request):
             raise ValueError("transport batching is forbidden; use sequential scalar calls")
+        capability = getattr(self, "_connection_capability", None)
+        if capability is not None and getattr(self, "_connect_owner", None) is asyncio.current_task():
+            return await self._run_with_connection_capability(request, ordered=ordered, capability=capability)
+        return await self._call_classified(request, ordered=ordered)
+
+    async def _call_classified(self, request: object, *, ordered: bool) -> object:
+        """Dispatch after a demand context has been installed explicitly."""
         if isinstance(request, (GetDifferenceRequest, GetChannelDifferenceRequest)):
             return await self._call_update_difference(request, ordered=ordered)
         return await self._call_registered(request, ordered=ordered)
+
+    async def _call(
+        self,
+        _sender: object,
+        _request: object,
+        ordered: bool = False,
+        flood_sleep_threshold: int | None = None,
+    ) -> Never:
+        """Reject unbound Telethon dispatch; the gate owns its sole super call."""
+        del ordered, flood_sleep_threshold
+        raise RuntimeError("unbound Telethon _call bypasses Telegram RPC admission")
+
+    async def _borrow_exported_sender(self, _dc_id: int) -> Never:
+        """Reject multi-sender transport paths outside the admitted main sender."""
+        raise RuntimeError("borrowed Telethon senders are unsupported by Telegram RPC admission")
+
+    async def _create_exported_sender(self, _dc_id: int) -> Never:
+        """Reject exported sender creation before any remote side effect."""
+        raise RuntimeError("exported Telethon senders are unsupported by Telegram RPC admission")
+
+    async def _get_cdn_client(self, _cdn_redirect: object) -> Never:
+        """Reject CDN clients before they create an unadmitted transport."""
+        raise RuntimeError("Telethon CDN clients are unsupported by Telegram RPC admission")
+
+    async def connect(self) -> None:
+        """Run Telethon bootstrap with one explicit, bounded RPC capability."""
+        active_owner = self._connect_owner
+        if active_owner is not None and not active_owner.done():
+            raise RuntimeError("incompatible Telegram connection bootstrap is already running")
+        capability = self._capture_connection_capability()
+        scope = self._scope_for_connection_capability(capability)
+        self.check_circuit()
+        await self._wait_for_account_cooldown(scope)
+        self.check_circuit()
+
+        async def run_vendor_connect() -> None:
+            await super(TelegramRpcGate, self).connect()  # type: ignore[misc]
+
+        self._connection_capability = capability
+        owner = asyncio.get_running_loop().create_task(
+            run_vendor_connect(),
+            name="telethon_connection_bootstrap",
+            context=Context(),
+        )
+        self._connect_owner = owner
+        try:
+            await owner
+        except BaseException:
+            try:
+                await self._main_sender.disconnect()
+            except Exception:
+                logger.exception("telegram_connection_bootstrap_cleanup_failed")
+            raise
+        finally:
+            if self._connect_owner is owner:
+                self._connect_owner = None
+                self._connection_capability = None
+
+    def _capture_connection_capability(self) -> _ConnectionCapability:
+        """Capture an existing root or create the sole protocol bootstrap root."""
+        try:
+            token = current_demand_token()
+        except UnclassifiedTelegramDemandError as exc:
+            if "no demand context" not in str(exc):
+                raise
+            token = replace(
+                create_demand_token(DemandKind.TELETHON_CONNECTION_BOOTSTRAP),
+                acquisition_kind=AcquisitionKind.CONNECTION_BOOTSTRAP,
+            )
+            return _ConnectionCapability(token, token.admission_deadline, None)
+        scope = current_rpc_scope()
+        return _ConnectionCapability(token, scope.deadline, scope.attempt_budget)
+
+    @staticmethod
+    def _scope_for_connection_capability(capability: _ConnectionCapability) -> TelegramRpcScope:
+        contract = demand_contract(capability.token.kind)
+        return TelegramRpcScope(
+            source=capability.token.source,
+            service_class=capability.token.service_class,
+            deadline=capability.deadline,
+            owner_task=capability.token.owner_task,
+            demand_kind=capability.token.kind,
+            acquisition_kind=capability.token.acquisition_kind,
+            source_outstanding_limit=contract.source_outstanding_limit,
+            attempt_budget=capability.attempt_budget,
+            attempt_evidence=capability.token.attempt_evidence,
+        )
+
+    def _sender_capability(self) -> _ConnectionCapability:
+        """Resolve a sender task's explicit root without accepting inherited work."""
+        try:
+            token = current_demand_token()
+        except UnclassifiedTelegramDemandError as exc:
+            return self._connection_capability_for_current_owner(exc)
+        scope = current_rpc_scope()
+        return _ConnectionCapability(token, scope.deadline, scope.attempt_budget)
+
+    def _connection_capability_for_current_owner(self, error: UnclassifiedTelegramDemandError) -> _ConnectionCapability:
+        capability = getattr(self, "_connection_capability", None)
+        if capability is None or getattr(self, "_connect_owner", None) is not asyncio.current_task():
+            raise error
+        return capability
+
+    def _run_with_connection_capability(
+        self,
+        request: object,
+        *,
+        ordered: bool,
+        capability: _ConnectionCapability,
+    ) -> asyncio.Task[object]:
+        """Transfer exactly one captured connection capability to an admitted RPC."""
+        return create_scoped_rpc_task(
+            self._call_classified(request, ordered=ordered),
+            source=capability.token.source,
+            deadline=capability.deadline,
+            demand_token=capability.token,
+            attempt_budget=capability.attempt_budget,
+        )
 
     async def _call_update_difference(self, request: object, *, ordered: bool) -> object:
         """Give only Telethon's actual difference request its protocol identity."""
@@ -461,7 +646,7 @@ class TelegramRpcGate(TelegramClient):
         *,
         ordered: bool = False,
     ) -> Awaitable[object] | list[asyncio.Future[object]]:
-        return cast(_SendAttempt, self._sender.send)(request, ordered=ordered)
+        return cast(_SendAttempt, self._main_sender.send)(request, ordered=ordered)
 
     async def _handle_admission_deferral(self, scope: TelegramRpcScope, exc: RpcAdmissionError) -> None:
         if scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:

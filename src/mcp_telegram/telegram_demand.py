@@ -26,6 +26,7 @@ class AcquisitionKind(StrEnum):
     """Telegram operation performed inside a root demand context."""
 
     ACCOUNT_SELF_PROFILE = "account_self_profile"
+    CONNECTION_BOOTSTRAP = "connection_bootstrap"
     DIALOG_TRAVERSAL = "dialog_traversal"
     ENTITY_LOOKUP = "entity_lookup"
     FOLDER_SNAPSHOT = "folder_snapshot"

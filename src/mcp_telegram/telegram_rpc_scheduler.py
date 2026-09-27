@@ -95,6 +95,7 @@ LEGACY_DEMAND_KIND_BY_SOURCE: Mapping[TelegramRpcSource, DemandKind] = MappingPr
         TelegramRpcSource.ACCOUNT_TRACE: DemandKind.ACCOUNT_TRACE_PAGE,
         TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE: DemandKind.TELETHON_UPDATE_DIFFERENCE,
         TelegramRpcSource.TELETHON_RECONNECT_PROBE: DemandKind.TELETHON_RECONNECT_PROBE,
+        TelegramRpcSource.TELETHON_CONNECTION_BOOTSTRAP: DemandKind.TELETHON_CONNECTION_BOOTSTRAP,
         TelegramRpcSource.RECONNECT_DIFFERENCE: DemandKind.RECONNECT_DIFFERENCE,
         TelegramRpcSource.REALTIME_EVENT: DemandKind.REALTIME_EVENT_ACQUISITION,
         TelegramRpcSource.DELTA_SYNC: DemandKind.DELTA_GAP_FILL,

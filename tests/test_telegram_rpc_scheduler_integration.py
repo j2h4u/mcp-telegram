@@ -202,7 +202,7 @@ async def test_gate_shared_scheduler_keeps_interactive_bounded_and_shutdown_clea
     events: list[RpcAdmissionEvent] = []
     gate = _make_gate(limiter, policy, events)
     sent: list[tuple[TelegramRpcSource, object]] = []
-    gate._sender = _SynchronousSender(sent)
+    gate._main_sender = gate._sender = _SynchronousSender(sent)
 
     async def send(source: TelegramRpcSource, request: object) -> object:
         with rpc_scope(source):
@@ -245,7 +245,7 @@ async def test_sender_debits_actual_attempts_and_stops_transport_retry_at_slice_
             result.set_exception(ServerError(None, "temporary"))
             return result
 
-    gate._sender = _FailingSender()
+    gate._main_sender = gate._sender = _FailingSender()
     budget = RpcAttemptBudget(limit=1)
     with demand_context(DemandKind.FULL_SYNC_PAGE):
         with acquisition_context(AcquisitionKind.MESSAGE_HISTORY_PAGE):

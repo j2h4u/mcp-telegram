@@ -81,6 +81,7 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
         TelegramRpcSource.ACCOUNT_TRACE: {DemandKind.ACCOUNT_TRACE_PAGE},
         TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE: {DemandKind.TELETHON_UPDATE_DIFFERENCE},
         TelegramRpcSource.TELETHON_RECONNECT_PROBE: {DemandKind.TELETHON_RECONNECT_PROBE},
+        TelegramRpcSource.TELETHON_CONNECTION_BOOTSTRAP: {DemandKind.TELETHON_CONNECTION_BOOTSTRAP},
         TelegramRpcSource.RECONNECT_DIFFERENCE: {DemandKind.RECONNECT_DIFFERENCE},
         TelegramRpcSource.REALTIME_EVENT: {DemandKind.REALTIME_EVENT_ACQUISITION},
         TelegramRpcSource.DELTA_SYNC: {DemandKind.DELTA_GAP_FILL, DemandKind.DELTA_ACCESS_PROBE},
@@ -138,6 +139,17 @@ def test_telethon_reconnect_probe_is_a_truthful_protocol_consumer() -> None:
     assert consumer.demand.owner is DemandPolicyOwner.TELETHON
     assert consumer.demand.bound is DemandBound.TELETHON
     assert demand_contract(DemandKind.TELETHON_RECONNECT_PROBE).execution_mode is ExecutionMode.PROTOCOL
+
+
+def test_telethon_connection_bootstrap_is_a_truthful_protocol_consumer() -> None:
+    consumer = TELEGRAM_RPC_CONSUMERS[TelegramRpcSource.TELETHON_CONNECTION_BOOTSTRAP]
+    assert consumer.admission.service_class is RpcServiceClass.LIVE_SYNC
+    assert consumer.acquisition.domains == frozenset({TelegramFactDomain.ACCOUNT})
+    assert consumer.acquisition.fanout is FanoutScope.ACCOUNT
+    assert consumer.acquisition.trigger is AcquisitionTrigger.CONNECTION_TRANSITION
+    assert consumer.demand.owner is DemandPolicyOwner.TELETHON
+    assert consumer.demand.bound is DemandBound.TELETHON
+    assert demand_contract(DemandKind.TELETHON_CONNECTION_BOOTSTRAP).execution_mode is ExecutionMode.PROTOCOL
 
 
 def test_scheduler_classification_is_derived_from_consumer_registry() -> None:
