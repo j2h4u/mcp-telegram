@@ -33,6 +33,7 @@ from mcp_telegram.entity_profile.contracts import (
 )
 from mcp_telegram.own_only_contracts import OwnOnlyContext
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
+from mcp_telegram.runtime_observations import RuntimeObservationSink
 from mcp_telegram.startup_identity import (
     StartupIdentityResult,
     StartupIdentityState,
@@ -669,7 +670,10 @@ async def test_shutdown_cancels_disconnects_and_detaches_before_flushing_telemet
         RpcAdmissionObservationAggregator,
         SimpleNamespace(flush=lambda: stages.append("flush")),
     )
-    ctx.rpc_observation_sink = SimpleNamespace(aclose=lambda: _append_async(stages, "sink_close"))
+    ctx.rpc_observation_sink = cast(
+        RuntimeObservationSink,
+        SimpleNamespace(aclose=lambda: _append_async(stages, "sink_close")),
+    )
 
     await _shutdown_sync_main_context(ctx)
 

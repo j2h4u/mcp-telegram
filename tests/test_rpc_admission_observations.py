@@ -6,6 +6,7 @@ import threading
 from contextlib import closing
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import cast
 
 from mcp_telegram.config import RuntimeObservationConfig
 from mcp_telegram.flood import FloodWaitObservation
@@ -159,13 +160,19 @@ def test_flood_wait_observation_persists_through_runtime_sink(tmp_path: Path) ->
     sink.close()
 
     with closing(sqlite3.connect(path)) as conn:
-        row = conn.execute(
-            "SELECT kind, outcome, reason_code, duration_ms, observed_at_ms, payload_json "
-            "FROM runtime_observations WHERE kind = 'telegram.rpc_admission'"
-        ).fetchone()
+        row = cast(
+            tuple[object, ...] | None,
+            conn.execute(
+                "SELECT kind, outcome, reason_code, duration_ms, observed_at_ms, payload_json "
+                "FROM runtime_observations WHERE kind = 'telegram.rpc_admission'"
+            ).fetchone(),
+        )
     assert row is not None
+    assert len(row) == 6
     assert row[:5] == ("telegram.rpc_admission", "flood_wait", "actual_send", 23_000, 1_700_000_000_000)
-    assert json.loads(row[5]) == {
+    payload_json = row[5]
+    assert isinstance(payload_json, str)
+    assert json.loads(payload_json) == {
         "source": "message_read_fallback",
         "service_class": "interactive",
         "request_method": "GetHistoryRequest",
