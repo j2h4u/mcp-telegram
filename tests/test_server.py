@@ -1459,6 +1459,118 @@ async def test_call_tool_returns_structuredContent_with_empty_success_content(
 
 
 @pytest.mark.parametrize(
+    (
+        "tool_name",
+        "tool_module",
+        "method_name",
+        "arguments",
+        "response",
+        "expected_code",
+        "candidate_id_key",
+        "expected_ids",
+    ),
+    [
+        (
+            "list_messages",
+            "mcp_telegram.tools.reading",
+            "list_topics",
+            {"exact_dialog_id": 1, "topic": "General", "message_state": "sent"},
+            {
+                "ok": True,
+                "data": {
+                    "dialog_id": 1,
+                    "topics": [
+                        {"id": 7, "title": "General Chat"},
+                        {"id": 8, "title": "General Topics"},
+                    ],
+                },
+            },
+            "ambiguous_topic",
+            "topic_id",
+            [7, 8],
+        ),
+        (
+            "get_entity_info",
+            "mcp_telegram.tools.entity_info",
+            "resolve_entity",
+            {"entity": "Alice"},
+            {
+                "ok": True,
+                "data": {
+                    "result": "candidates",
+                    "matches": [
+                        {"entity_id": 1, "display_name": "Alice A", "score": 0.9, "entity_type": "User"},
+                        {"entity_id": 2, "display_name": "Alice B", "score": 0.8, "entity_type": "User"},
+                    ],
+                },
+            },
+            "ambiguous_entity",
+            "entity_id",
+            [1, 2],
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_registered_ambiguity_action_points_to_canonical_error_details(  # noqa: PLR0913
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    tool_module: str,
+    method_name: str,
+    arguments: dict[str, object],
+    response: dict[str, object],
+    expected_code: str,
+    candidate_id_key: str,
+    expected_ids: list[int],
+) -> None:
+    tool_connection = AsyncMock()
+    setattr(tool_connection, method_name, AsyncMock(return_value=response))
+
+    @asynccontextmanager
+    async def tool_connection_context() -> AsyncIterator[object]:
+        yield tool_connection
+
+    monkeypatch.setattr(f"{tool_module}.daemon_connection", tool_connection_context)
+    monkeypatch.setattr(
+        server,
+        "daemon_connection",
+        lambda: _status_context(
+            {
+                "ok": True,
+                "data": {
+                    "account_protection": {
+                        "status": "active",
+                        "outbound_acquisition": "blocked",
+                        "recovery": "manual",
+                        "notice": "Telegram acquisition is blocked by account protection. Freshness and incoming coverage may be limited. Recovery requires operator action.",
+                    }
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+
+    result = await server.call_tool(tool_name, arguments)
+
+    assert result.is_error is True
+    payload = cast(dict[str, object], result.structured_content)
+    error = cast(dict[str, object], payload["error"])
+    assert "details" in error, error
+    details = cast(dict[str, object], error["details"])
+    assert error["code"] == expected_code
+    assert "structuredContent.error.details.candidates" in cast(str, error["action"])
+    candidates = cast(list[dict[str, object]], details["candidates"])
+    assert [candidate[candidate_id_key] for candidate in candidates] == expected_ids
+    protection = cast(dict[str, object], payload["account_protection"])
+    assert protection == {
+        "status": "active",
+        "outbound_acquisition": "blocked",
+        "recovery": "manual",
+        "notice": "Telegram acquisition is blocked by account protection. Freshness and incoming coverage may be limited. Recovery requires operator action.",
+    }
+    validate(payload, cast(dict[str, object], server.tool_by_name[tool_name].output_schema))
+
+
+@pytest.mark.parametrize(
     "case",
     [
         (

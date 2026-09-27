@@ -200,7 +200,9 @@ async def test_get_entity_info_serves_from_db_within_ttl(monkeypatch: pytest.Mon
     server._health_status = lambda: FloodWaitKillSwitchStatus(
         open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
     )
-    r2, _, _ = await server._handle_client_line(json.dumps({"method": "get_entity_info", "entity_id": 42}).encode(), "", None)
+    r2, _, _ = await server._handle_client_line(
+        json.dumps({"method": "get_entity_info", "entity_id": 42}).encode(), "", None
+    )
     assert r2["ok"]
     assert get_entity.call_count == first_call_count, "must serve from DB; no new fetch"
 

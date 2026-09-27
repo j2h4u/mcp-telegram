@@ -281,11 +281,7 @@ def _protection_error_call_result(exc: AccountProtectionError) -> CallToolResult
     message = str(response.get("message", "Telegram acquisition is blocked by account protection."))
     action = "Recovery requires operator action."
     text = f"{message}\nAction: {action}"
-    details = {
-        key: value
-        for key, value in response.items()
-        if key not in {"ok", "error", "message"}
-    }
+    details = {key: value for key, value in response.items() if key not in {"ok", "error", "message"}}
     error: dict[str, object] = {
         "code": "flood_wait_kill_switch_open",
         "message": message,
@@ -512,9 +508,7 @@ def _canonical_tool_error(
     if structured_content:
         details = structured_content.get("details")
         error["details"] = (
-            dict(details)
-            if len(structured_content) == 1 and isinstance(details, dict)
-            else structured_content
+            dict(details) if len(structured_content) == 1 and isinstance(details, dict) else structured_content
         )
     return {"error": error}
 

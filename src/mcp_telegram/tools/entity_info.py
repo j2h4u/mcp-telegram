@@ -724,7 +724,9 @@ async def _resolve_entity_lookup(entity: str) -> ToolResult | _EntityLookup:
         matches = resolve_data.get("matches", [])
         err = error_result(
             "Multiple entities matched.\n"
-            "Action: Retry get_entity_info with one numeric entity_id from structuredContent.candidates.",
+            "Action: Retry get_entity_info with one numeric entity_id from "
+            "structuredContent.error.details.candidates.",
+            error_code="ambiguous_entity",
         )
         return ToolResult(
             content=err.content,
@@ -733,6 +735,7 @@ async def _resolve_entity_lookup(entity: str) -> ToolResult | _EntityLookup:
                 "error": "ambiguous_entity",
                 "candidates": [_entity_candidate_payload(match) for match in matches if isinstance(match, dict)],
             },
+            error_code=err.error_code,
         )
 
     return _EntityLookup(

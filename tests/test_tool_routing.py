@@ -3558,7 +3558,7 @@ async def test_list_messages_topic_fuzzy_ambiguous_returns_error():
     text = _result_text(result)
     assert result.is_error is True
     assert "Multiple topics matched" in text
-    assert "structuredContent.candidates" in text
+    assert "structuredContent.error.details.candidates" in text
     assert "exact_topic_id" in text
     assert "General Chat" not in text
     assert "General Topics" not in text

@@ -96,7 +96,13 @@ async def test_submit_feedback_happy_path(tmp_path: Path) -> None:
 async def test_submit_feedback_persists_through_local_ipc_when_protection_is_active(tmp_path: Path) -> None:
     with _make_feedback_server(tmp_path) as (server, feedback_conn):
         server._health_status = lambda: FloodWaitKillSwitchStatus(
-            open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+            open=True,
+            reason="test",
+            opened_at=1,
+            events_in_window=1,
+            wait_s_in_window=1,
+            window_seconds=1,
+            source="test",
         )
         socket_path = tmp_path / "daemon.sock"
         async with await asyncio.start_unix_server(server.handle_client, path=socket_path):

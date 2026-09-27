@@ -1382,7 +1382,9 @@ def _resolve_multiple_topic_matches(fuzzy_matches: list[dict], query: str) -> in
         return exact_matches[0]["id"]
     err = error_result(
         "Multiple topics matched.\n"
-        "Action: Retry list_messages with one numeric exact_topic_id from structuredContent.candidates."
+        "Action: Retry list_messages with one numeric exact_topic_id from "
+        "structuredContent.error.details.candidates.",
+        error_code="ambiguous_topic",
     )
     return ToolResult(
         content=err.content,
@@ -1391,6 +1393,7 @@ def _resolve_multiple_topic_matches(fuzzy_matches: list[dict], query: str) -> in
             "error": "ambiguous_topic",
             "candidates": [_topic_candidate_payload(topic) for topic in fuzzy_matches[:5]],
         },
+        error_code=err.error_code,
     )
 
 
@@ -1507,6 +1510,7 @@ async def _list_messages_topic_id(
         structured_content=resolved.structured_content,
         has_filter=request_context.has_filter,
         has_cursor=request_context.has_cursor,
+        error_code=resolved.error_code,
     )
 
 
