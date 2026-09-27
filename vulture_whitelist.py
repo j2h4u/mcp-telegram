@@ -85,6 +85,14 @@ visit_AnnAssign
 # string-based getattr in the compatibility adapter (telegram_adapter.py:99,153).
 is_topic_message
 
+# Telethon invokes these dynamic client hooks. `_sender` retains the original
+# raw transport behind the admitted adapter; the three overrides fail closed
+# before Telethon can create unsupported secondary transports.
+_sender
+_borrow_exported_sender
+_create_exported_sender
+_get_cdn_client
+
 # Test-only state inspection hooks; tests are intentionally outside vulture's scan.
 worker_count
 fair_cycle

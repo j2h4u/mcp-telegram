@@ -237,6 +237,13 @@ class _ConnectionCapability:
     attempt_budget: RpcAttemptBudget | None
 
 
+class _ConnectionDcMigrationRequestedError(Exception):
+    """Unwind a connection-owned RPC before Telethon mutates its transport."""
+
+    def __init__(self, dc_id: int) -> None:
+        self.dc_id = dc_id
+
+
 class _MainSenderAdapter:
     """Narrow main-sender boundary for Telethon connection bootstrap."""
 
@@ -336,6 +343,11 @@ def _validate_cooldown_until_utc(deadline_utc: float) -> float:
     return float(deadline_utc)
 
 
+def _cooldown_until_utc_ms() -> int:
+    """Project the process cooldown's monotonic deadline onto the UTC clock."""
+    return int((time.time() + max(0.0, _COOLDOWN_DEADLINE - time.monotonic())) * 1_000)
+
+
 class TelegramRpcGate(TelegramClient):
     """A Telethon client with account-global admission and transient retry.
 
@@ -399,6 +411,7 @@ class TelegramRpcGate(TelegramClient):
         self._sender = _MainSenderAdapter(self)
         self._connect_owner: asyncio.Task[object] | object | None = None
         self._connection_capability: _ConnectionCapability | None = None
+        self._connection_rpc_tasks: set[asyncio.Task[object]] = set()
 
     @staticmethod
     def rpc_scope(
@@ -541,8 +554,12 @@ class TelegramRpcGate(TelegramClient):
 
     async def connect(self) -> None:
         """Run Telethon bootstrap with one explicit, bounded RPC capability."""
+        current_task = asyncio.current_task()
         if self._connect_owner is not None:
-            raise RuntimeError("incompatible Telegram connection bootstrap is already running")
+            if self._connect_owner is current_task:
+                await super().connect()  # type: ignore[misc]
+                return
+            raise self._connection_owner_deferred()
         capability = self._capture_connection_capability()
         scope = self._scope_for_connection_capability(capability)
         self._connection_capability = capability
@@ -555,7 +572,18 @@ class TelegramRpcGate(TelegramClient):
             self.check_circuit()
 
             async def run_vendor_connect() -> None:
-                await super(TelegramRpcGate, self).connect()  # type: ignore[misc]
+                migration_dc: int | None = None
+                for retry_index, retry_delay in enumerate((0.0, *self._transient_retry_delays)):
+                    try:
+                        if migration_dc is None:
+                            await super(TelegramRpcGate, self).connect()  # type: ignore[misc]
+                        else:
+                            await self._continue_connection_migration(scope, migration_dc, retry_delay)
+                        return
+                    except _ConnectionDcMigrationRequestedError as exc:
+                        migration_dc = exc.dc_id
+                        if retry_index >= len(self._transient_retry_delays):
+                            raise self._connection_redirect_exhausted() from None
 
             owner = asyncio.get_running_loop().create_task(
                 run_vendor_connect(),
@@ -566,15 +594,68 @@ class TelegramRpcGate(TelegramClient):
             await owner
         except BaseException:
             if owner is not None:
-                try:
-                    await self._main_sender.disconnect()
-                except Exception:
-                    logger.exception("telegram_connection_bootstrap_cleanup_failed")
+                await self._cleanup_failed_connection_bootstrap()
             raise
         finally:
             if self._connect_owner is reservation or self._connect_owner is owner:
                 self._connect_owner = None
                 self._connection_capability = None
+                self._connection_rpc_tasks.clear()
+
+    def _connection_owner_deferred(self) -> TelegramRpcAdmissionDeferred:
+        retry_seconds = self._scheduler_policy.admission_retry_seconds
+        return TelegramRpcAdmissionDeferred(
+            retry_after_seconds=retry_seconds,
+            latched=False,
+            detail=f"Telegram connection bootstrap is already running; retry in {retry_seconds:g}s",
+        )
+
+    def _connection_redirect_exhausted(self) -> TelegramRpcAdmissionDeferred:
+        retry_seconds = self._scheduler_policy.admission_retry_seconds
+        return TelegramRpcAdmissionDeferred(
+            retry_after_seconds=retry_seconds,
+            latched=False,
+            detail=f"Telegram connection bootstrap redirect exhausted; retry in {retry_seconds:g}s",
+        )
+
+    async def _continue_connection_migration(
+        self,
+        scope: TelegramRpcScope,
+        dc_id: int,
+        retry_delay: float,
+    ) -> None:
+        """Resume one unwound migration without refreshing connection identity."""
+        if retry_delay:
+            await asyncio.sleep(retry_delay)
+        self.check_circuit()
+        await self._wait_for_account_cooldown(scope)
+        self.check_circuit()
+        await super()._switch_dc(dc_id)  # type: ignore[misc]
+
+    async def _cleanup_failed_connection_bootstrap(self) -> None:
+        """Cancel owned sends, then let Telethon clean up the partial transport."""
+        tasks = tuple(self._connection_rpc_tasks)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._connection_rpc_tasks.clear()
+        try:
+            await super()._disconnect()  # type: ignore[misc]
+        except Exception:
+            logger.exception("telegram_connection_bootstrap_cleanup_failed")
+
+    async def _switch_dc(self, new_dc: int) -> None:
+        """Prevent concurrent migration from mutating a guarded bootstrap transport."""
+        owner = self._connect_owner
+        if owner is not None and self._connection_capability is not None:
+            current_task = asyncio.current_task()
+            if current_task in self._connection_rpc_tasks:
+                raise _ConnectionDcMigrationRequestedError(new_dc)
+            if current_task is not owner:
+                raise self._connection_owner_deferred()
+        await super()._switch_dc(new_dc)  # type: ignore[misc]
 
     def _capture_connection_capability(self) -> _ConnectionCapability:
         """Capture an existing root or create the sole protocol bootstrap root."""
@@ -636,17 +717,21 @@ class TelegramRpcGate(TelegramClient):
     ) -> asyncio.Task[object]:
         """Transfer exactly one captured connection capability to an admitted RPC."""
         call = (
-            self._call_registered(request, ordered=ordered, retry_update_difference=False)
+            self._call_registered(request, ordered=ordered, connection_owned=True)
             if connection_owned
             else self._call_classified(request, ordered=ordered)
         )
-        return create_scoped_rpc_task(
+        task = create_scoped_rpc_task(
             call,
             source=capability.token.source,
             deadline=capability.deadline,
             demand_token=capability.token,
             attempt_budget=capability.attempt_budget,
         )
+        if connection_owned:
+            self._connection_rpc_tasks.add(task)
+            task.add_done_callback(self._connection_rpc_tasks.discard)
+        return task
 
     async def _call_update_difference(self, request: object, *, ordered: bool) -> object:
         """Give only Telethon's actual difference request its protocol identity."""
@@ -667,7 +752,7 @@ class TelegramRpcGate(TelegramClient):
         request: object,
         *,
         ordered: bool,
-        retry_update_difference: bool = True,
+        connection_owned: bool = False,
     ) -> object:
         """Run one logical RPC after its root demand context is established."""
         scope = self._require_rpc_scope()
@@ -680,7 +765,7 @@ class TelegramRpcGate(TelegramClient):
                     request,
                     ordered=ordered,
                     scope=scope,
-                    retry_update_difference=retry_update_difference,
+                    connection_owned=connection_owned,
                 )
             except TransientRpcErrors:
                 if retry_index >= len(retry_delays):
@@ -704,19 +789,19 @@ class TelegramRpcGate(TelegramClient):
         *,
         ordered: bool,
         scope: TelegramRpcScope,
-        retry_update_difference: bool,
+        connection_owned: bool,
     ) -> object:
         while True:
             try:
                 return await self._dispatch_attempt(request, ordered=ordered, scope=scope)
             except (RpcAdmissionSaturatedError, RpcAdmissionExpiredError) as exc:
-                await self._handle_admission_deferral(scope, exc, retry_update_difference=retry_update_difference)
+                await self._handle_admission_deferral(scope, exc, connection_owned=connection_owned)
             except TelegramRpcThrottled:
-                if not retry_update_difference or scope.source is not TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
+                if connection_owned or scope.source is not TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
                     raise
                 await self._retry_update_source(scope, reason="account_circuit")
             except (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError) as exc:
-                await self._handle_flood_wait(scope, exc, retry_update_difference=retry_update_difference)
+                await self._handle_flood_wait(scope, exc, connection_owned=connection_owned)
 
     def _send_real_sender(
         self,
@@ -731,9 +816,9 @@ class TelegramRpcGate(TelegramClient):
         scope: TelegramRpcScope,
         exc: RpcAdmissionError,
         *,
-        retry_update_difference: bool,
+        connection_owned: bool,
     ) -> None:
-        if retry_update_difference and scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
+        if not connection_owned and scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
             await self._retry_update_source(scope, reason=type(exc).__name__)
             return
         retry_seconds = self._scheduler_policy.admission_retry_seconds
@@ -752,10 +837,10 @@ class TelegramRpcGate(TelegramClient):
         scope: TelegramRpcScope,
         exc: BaseException,
         *,
-        retry_update_difference: bool,
+        connection_owned: bool,
     ) -> None:
         seconds = await self._observe_flood(exc, scope=scope)
-        if retry_update_difference and scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
+        if not connection_owned and scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
             self._admission_scheduler.record_retry(scope, reason="flood_wait")
             return
         raise TelegramRpcThrottled(
@@ -865,15 +950,15 @@ class TelegramRpcGate(TelegramClient):
         while True:
             self.check_circuit()
             now = time.monotonic()
-            until_deadline = deadline - now
-            if until_deadline <= 0:
+            remaining_scope_seconds = deadline - now
+            if remaining_scope_seconds <= 0:
                 waited = max(0.0, now - started)
                 self._admission_scheduler.record_expired_before_dispatch(scope, wait_seconds=waited)
                 raise RpcAdmissionExpiredError(scope, "Telegram RPC admission deadline elapsed")
             remaining = account_cooldown_deadline() - now
             if remaining <= 0:
                 return
-            await asyncio.sleep(min(remaining, until_deadline))
+            await asyncio.sleep(min(remaining, remaining_scope_seconds))
             self.check_circuit()
             if time.monotonic() >= deadline and account_cooldown_deadline() > time.monotonic():
                 waited = max(0.0, time.monotonic() - started)
@@ -964,7 +1049,7 @@ class TelegramRpcGate(TelegramClient):
             demand_kind=scope.demand_kind.value if scope.demand_kind is not None else None,
             acquisition_kind=scope.acquisition_kind.value if scope.acquisition_kind is not None else None,
             seconds=seconds,
-            cooldown_until_utc_ms=int((time.time() + max(0.0, _COOLDOWN_DEADLINE - time.monotonic())) * 1_000),
+            cooldown_until_utc_ms=_cooldown_until_utc_ms(),
             circuit_open=self._rpc_circuit_status().open,
             request_method=str(attempt.get("request_method", "unknown")),
             origin=origin,
