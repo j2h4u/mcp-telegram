@@ -2947,6 +2947,87 @@ async def test_get_sync_status_reports_suspended_dm_deletion_verification() -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        {
+            "status": "verifying",
+            "generation": 4,
+            "scan_started_at": 100,
+            "dialog_id_cursor": 12345,
+            "message_cursor": 0,
+            "next_run_at": 0,
+            "policy_version": 1,
+            "reason": None,
+            "state_changed_at": 200,
+        },
+        {
+            "status": "running",
+            "generation": 4,
+            "scan_started_at": 100,
+            "dialog_id_cursor": 12345,
+            "next_run_at": 0,
+        },
+    ],
+)
+async def test_get_sync_status_reports_claimed_and_legacy_dm_work_as_paused(
+    checkpoint: dict[str, object],
+) -> None:
+    conn = _make_db()
+    _insert_synced_dialog(conn, 12345, status="synced")
+    raw = json.dumps(checkpoint)
+    conn.execute(
+        "INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', ?)",
+        (raw,),
+    )
+    conn.commit()
+    server = make_server(conn)
+
+    result = await server._dispatch({"method": "get_sync_status", "dialog_id": 12345})
+
+    assert result["ok"] is True
+    data = cast(dict[str, object], result["data"])
+    assert data["delete_detection"] == "paused (DM; older deletions may be stale)"
+    assert conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone()[0] == raw
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [None, "", "  ", "{broken", "{}"])
+async def test_get_sync_status_reports_invalid_dm_checkpoint_as_paused_without_rewriting(
+    payload: str | None,
+) -> None:
+    conn = _make_db()
+    _insert_synced_dialog(conn, 12345, status="synced")
+    conn.execute(
+        "INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', ?)",
+        (payload,),
+    )
+    conn.commit()
+    before = tuple(conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone())
+    server = make_server(conn)
+
+    result = await server._dispatch({"method": "get_sync_status", "dialog_id": 12345})
+
+    assert result["ok"] is True
+    data = cast(dict[str, object], result["data"])
+    assert data["delete_detection"] == "paused (DM; older deletions may be stale)"
+    after = tuple(conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone())
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_get_sync_status_propagates_dm_checkpoint_sql_failure() -> None:
+    conn = _make_db()
+    _insert_synced_dialog(conn, 12345, status="synced")
+    conn.execute("DROP TABLE daemon_state")
+    conn.commit()
+    server = make_server(conn)
+
+    with pytest.raises(sqlite3.OperationalError):
+        await server._dispatch({"method": "get_sync_status", "dialog_id": 12345})
+
+
+@pytest.mark.asyncio
 async def test_get_sync_status_non_synced() -> None:
     """get_sync_status for non-synced dialog returns sync_status='not_synced'."""
     conn = _make_db()

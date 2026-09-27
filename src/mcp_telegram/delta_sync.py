@@ -13,7 +13,6 @@ Architecture:
 """
 
 import asyncio
-import json
 import logging
 import sqlite3
 import time
@@ -37,6 +36,15 @@ from .message_history.contracts import MessageHistoryAccessLostError, MessageHis
 from .message_history.ports import ForwardGapPagePort
 from .messages.sqlite_bundle import insert_messages_with_fts
 from .reactions.contracts import ReactionAggregateSource
+from .sync_read_model import (
+    DM_DELETION_POLICY_VERSION,
+    DM_DELETION_RECONCILIATION_STATE_KEY,
+    DmDeletionCheckpoint,
+    InvalidDmDeletionCheckpointError,
+    decode_dm_deletion_checkpoint,
+    dm_deletion_reconciliation_is_blocked,
+    encode_dm_deletion_checkpoint,
+)
 from .telegram_demand import (
     AcquisitionKind,
     DeltaGapFillObservationHook,
@@ -119,9 +127,8 @@ DELTA_AUTOMATIC_REFRESH_INTERVAL_S: int = 2 * 60 * 60
 _DELTA_SLICE_MESSAGE_LIMIT = 100
 _DM_GAP_SCAN_RPC_CHUNK = 100
 _DM_GAP_SCAN_PERIOD_S = 7 * 24 * 60 * 60
-_DM_GAP_SCAN_STATE_KEY = "delta_dm_gap_scan_state"
-_DM_GAP_SCAN_POLICY_VERSION = 1
-_DM_GAP_SCAN_SUSPENSION_REASONS = frozenset({"legacy_generation_review", "interrupted", "flood_wait"})
+_DM_GAP_SCAN_STATE_KEY = DM_DELETION_RECONCILIATION_STATE_KEY
+_DM_GAP_SCAN_POLICY_VERSION = DM_DELETION_POLICY_VERSION
 
 _SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL = """
 SELECT sd.dialog_id, sd.last_synced_at, sd.last_delta_checked_at, sd.delta_refresh_requested_at
@@ -165,19 +172,7 @@ SELECT sd.dialog_id
 """
 
 
-@dataclass(frozen=True, slots=True)
-class _DmGapScanState:
-    """Restart-safe state for weekly DM deletion reconciliation."""
-
-    status: str
-    generation: int
-    scan_started_at: int
-    dialog_id_cursor: int | None
-    message_cursor: int
-    next_run_at: int
-    policy_version: int | None = None
-    reason: str | None = None
-    state_changed_at: int | None = None
+_DmGapScanState = DmDeletionCheckpoint
 
 
 class DmGapScanStateError(RuntimeError):
@@ -207,79 +202,16 @@ def _delta_gap_fill_error_result(exc: BaseException) -> tuple[str, str]:
 
 def _load_dm_gap_scan_state(conn: sqlite3.Connection) -> _DmGapScanState | None:
     row = cast(
-        tuple[str | None] | None,
+        tuple[object, ...] | None,
         conn.execute("SELECT value FROM daemon_state WHERE key = ?", (_DM_GAP_SCAN_STATE_KEY,)).fetchone(),
     )
-    if row is None or not row[0]:
-        return None
-    try:
-        value = cast(dict[str, object], json.loads(row[0]))
-        state = _DmGapScanState(
-            status=str(value["status"]),
-            generation=int(cast(int | str, value["generation"])),
-            scan_started_at=int(cast(int | str, value["scan_started_at"])),
-            dialog_id_cursor=(
-                int(cast(int | str, value["dialog_id_cursor"])) if value["dialog_id_cursor"] is not None else None
-            ),
-            message_cursor=int(cast(int | str, value.get("message_cursor", value.get("message_offset", 0)))),
-            next_run_at=int(cast(int | str, value["next_run_at"])),
-            policy_version=(
-                int(cast(int | str, value["policy_version"])) if value.get("policy_version") is not None else None
-            ),
-            reason=str(value["reason"]) if value.get("reason") is not None else None,
-            state_changed_at=(
-                int(cast(int | str, value["state_changed_at"])) if value.get("state_changed_at") is not None else None
-            ),
-        )
-    except KeyError, TypeError, ValueError, json.JSONDecodeError:
-        raise DmGapScanStateError("persisted DM deletion reconciliation state is corrupt") from None
-    if not _valid_dm_gap_scan_state(state):
-        raise DmGapScanStateError("persisted DM deletion reconciliation state is invalid")
-    return state
-
-
-def _valid_dm_gap_scan_state(state: _DmGapScanState) -> bool:
-    if state.status not in {"running", "idle", "verifying", "suspended"}:
-        return False
-    if state.policy_version not in {None, _DM_GAP_SCAN_POLICY_VERSION}:
-        return False
-    if state.reason is not None and state.reason not in _DM_GAP_SCAN_SUSPENSION_REASONS:
-        return False
-    if state.state_changed_at is not None and state.state_changed_at < 0:
-        return False
-    if state.status == "suspended" and state.reason not in _DM_GAP_SCAN_SUSPENSION_REASONS:
-        return False
-    return all(
-        value >= 0
-        for value in (
-            state.generation,
-            state.scan_started_at,
-            state.message_cursor,
-            state.next_run_at,
-        )
-    )
+    return decode_dm_deletion_checkpoint(row)
 
 
 def _store_dm_gap_scan_state(conn: sqlite3.Connection, state: _DmGapScanState) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO daemon_state(key, value) VALUES (?, ?)",
-        (
-            _DM_GAP_SCAN_STATE_KEY,
-            json.dumps(
-                {
-                    "status": state.status,
-                    "generation": state.generation,
-                    "scan_started_at": state.scan_started_at,
-                    "dialog_id_cursor": state.dialog_id_cursor,
-                    "message_cursor": state.message_cursor,
-                    "next_run_at": state.next_run_at,
-                    "policy_version": state.policy_version,
-                    "reason": state.reason,
-                    "state_changed_at": state.state_changed_at,
-                },
-                sort_keys=True,
-            ),
-        ),
+        (_DM_GAP_SCAN_STATE_KEY, encode_dm_deletion_checkpoint(state)),
     )
 
 
@@ -307,11 +239,15 @@ def _dm_gap_scan_page_ids(
 
 
 def _dm_gap_scan_release_at(conn: sqlite3.Connection, now: float) -> float | None:
-    state = _load_dm_gap_scan_state(conn)
+    try:
+        state = _load_dm_gap_scan_state(conn)
+    except InvalidDmDeletionCheckpointError:
+        logger.warning("dm_deletion_reconciliation_checkpoint_invalid")
+        return None
+    if dm_deletion_reconciliation_is_blocked(state):
+        return None
     if state is None or state.status == "running":
         return 0.0
-    if state.status in {"verifying", "suspended"}:
-        return None
     return float(state.next_run_at) if state.next_run_at > now else 0.0
 
 
@@ -352,7 +288,11 @@ def _prepare_legacy_dm_scan_state(state: _DmGapScanState, changed_at: int) -> _D
 
 def prepare_dm_deletion_reconciliation(conn: sqlite3.Connection, *, now: int | None = None) -> None:
     """Quarantine unfinished legacy work and interrupted claims before registration."""
-    state = _load_dm_gap_scan_state(conn)
+    try:
+        state = _load_dm_gap_scan_state(conn)
+    except InvalidDmDeletionCheckpointError:
+        logger.warning("dm_deletion_reconciliation_checkpoint_invalid_during_prepare")
+        return
     if state is None:
         return
     changed_at = int(time.time()) if now is None else now
@@ -370,10 +310,13 @@ def prepare_dm_deletion_reconciliation(conn: sqlite3.Connection, *, now: int | N
         _store_dm_gap_scan_state(conn, state)
 
 
-def dm_deletion_reconciliation_suspended(conn: sqlite3.Connection) -> bool:
-    """Return whether DM deletion maintenance is suspended, without writes."""
-    state = _load_dm_gap_scan_state(conn)
-    return state is not None and state.status == "suspended"
+def dm_deletion_reconciliation_blocked(conn: sqlite3.Connection) -> bool:
+    """Return whether persisted metadata keeps DM deletion maintenance blocked."""
+    try:
+        state = _load_dm_gap_scan_state(conn)
+    except InvalidDmDeletionCheckpointError:
+        return True
+    return dm_deletion_reconciliation_is_blocked(state)
 
 
 class AccessProbe(Protocol):
@@ -953,12 +896,15 @@ class DmDeletionReconciliationDemandAdapter:
         """Claim and verify at most one page, failing closed on ambiguity."""
         if not isinstance(budget, RpcAttemptBudget):
             raise TypeError("budget must be an RpcAttemptBudget")
-        selected = self._select_page(int(time.time()))
-        if selected is None:
-            return
-        state, dialog_id, page = selected
-        claimed = self._claim_page(state, int(time.time()))
-        await self._verify_claimed_page(claimed, dialog_id, page, budget)
+        try:
+            selected = self._select_page(int(time.time()))
+            if selected is None:
+                return
+            state, dialog_id, page = selected
+            claimed = self._claim_page(state, int(time.time()))
+            await self._verify_claimed_page(claimed, dialog_id, page, budget)
+        except InvalidDmDeletionCheckpointError:
+            logger.warning("dm_deletion_reconciliation_checkpoint_invalid_during_slice")
 
 
 def _restore_revalidated_access(

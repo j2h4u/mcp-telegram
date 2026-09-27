@@ -63,7 +63,6 @@ from .daemon_dialog_queries import (
     _LIST_TOPICS_SQL,
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
-from .delta_sync import dm_deletion_reconciliation_suspended
 from .demand_wiring import DemandOfferSink, offer_durable_demand
 from .dialog_directory import recover_invalid_generation_in_transaction
 from .dialog_directory_coverage import DialogDirectoryCoverage, read_dialog_directory_coverage
@@ -102,7 +101,14 @@ from .runtime_observations import (
     record_runtime_observation,
     tool_telemetry_identity,
 )
-from .sync_read_model import SyncStatus, build_sync_read_model
+from .sync_read_model import (
+    DM_DELETION_RECONCILIATION_STATE_KEY,
+    InvalidDmDeletionCheckpointError,
+    SyncStatus,
+    build_sync_read_model,
+    decode_dm_deletion_checkpoint,
+    dm_deletion_reconciliation_is_blocked,
+)
 from .telegram_demand import AcquisitionKind
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
@@ -116,6 +122,22 @@ from .telegram_rpc_scheduler import (
 )
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
+
+
+def _dm_deletion_reconciliation_is_blocked(conn: sqlite3.Connection) -> bool:
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT value FROM daemon_state WHERE key = ?",
+            (DM_DELETION_RECONCILIATION_STATE_KEY,),
+        ).fetchone(),
+    )
+    try:
+        state = decode_dm_deletion_checkpoint(row)
+    except InvalidDmDeletionCheckpointError:
+        return True
+    return dm_deletion_reconciliation_is_blocked(state)
+
 
 # Entity / telemetry SQL
 _ALL_ENTITY_NAMES_SQL = (
@@ -1668,7 +1690,7 @@ class DaemonAPIServer:
                 "reliable (channel)"
                 if dialog_id < 0
                 else "paused (DM; older deletions may be stale)"
-                if dm_deletion_reconciliation_suspended(self._conn)
+                if _dm_deletion_reconciliation_is_blocked(self._conn)
                 else "best-effort weekly (DM)"
             ),
             "access_lost_at": access_lost_at,
