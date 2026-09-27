@@ -169,6 +169,7 @@ class _AdmissionAwareSender:
         while True:
             self._reject_exhausted_budget()
             admission = await self._admit()
+            completion_transferred = False
             try:
                 if not self._gate._scheduler_transport_ready():
                     self._gate._admission_scheduler.record_retry(
@@ -176,9 +177,20 @@ class _AdmissionAwareSender:
                         reason="transport_readiness_changed",
                     )
                     continue
-                return await self._send_admitted(request, ordered=ordered, admission=admission)
+                self._raise_if_cancel_pending()
+                self._debit_dispatched_attempt()
+                self._gate._admission_scheduler.record_dispatch(admission)
+                if isinstance(request, GetFullChannelRequest):
+                    self._gate._observe_rpc_request(self._scope)
+                if (timing := current_timing()) is not None:
+                    timing.record_rpc_attempt()
+                raw_future = self._start_dispatched_send(request, ordered=ordered, admission=admission)
+                completion_transferred = True
+                with timing_phase("rpc_execution"):
+                    return await asyncio.shield(raw_future)
             finally:
-                self._gate._admission_scheduler.complete(admission)
+                if not completion_transferred:
+                    self._gate._admission_scheduler.complete(admission)
 
     def _reject_exhausted_budget(self) -> None:
         budget = self._scope.attempt_budget
@@ -190,36 +202,40 @@ class _AdmissionAwareSender:
         with timing_phase("rpc_admission"):
             return await self._gate._admit(self._scope)
 
-    async def _send_admitted(self, request: object, *, ordered: bool, admission: RpcAdmission) -> object:
+    def _debit_dispatched_attempt(self) -> None:
         budget = self._scope.attempt_budget
         if budget is not None:
             self._reject_exhausted_budget()
             budget.debit()
-        self._gate._admission_scheduler.record_dispatch(admission)
-        if isinstance(request, GetFullChannelRequest):
-            self._gate._observe_rpc_request(self._scope)
-        if (timing := current_timing()) is not None:
-            timing.record_rpc_attempt()
-        return await self._await_send(request, ordered=ordered, admission=admission)
 
-    async def _await_send(self, request: object, *, ordered: bool, admission: RpcAdmission) -> object:
+    def _start_dispatched_send(
+        self,
+        request: object,
+        *,
+        ordered: bool,
+        admission: RpcAdmission,
+    ) -> asyncio.Future[object]:
+        self._raise_if_cancel_pending()
         dispatch_at_monotonic = time.monotonic()
         self._dispatch_started = True
-        try:
-            future = self._send_attempt(request, ordered=ordered)
-            if isinstance(future, list):
-                self._reject_batch(future)
-            with timing_phase("rpc_execution"):
-                return await future
-        except (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError) as exc:
-            _annotate_flood_attempt(
-                exc,
-                request_method=type(request).__name__,
-                admission_sequence=admission.sequence,
-                dispatch_at_monotonic=dispatch_at_monotonic,
-                dispatch_kind="actual_send",
-            )
-            raise
+        raw_awaitable = self._send_attempt(request, ordered=ordered)
+        if isinstance(raw_awaitable, list):
+            self._reject_batch(raw_awaitable)
+        raw_future = asyncio.ensure_future(raw_awaitable)
+        self._gate._register_scalar_dispatch_completion(
+            raw_future,
+            scope=self._scope,
+            request_method=type(request).__name__,
+            admission=admission,
+            dispatch_at_monotonic=dispatch_at_monotonic,
+        )
+        return raw_future
+
+    @staticmethod
+    def _raise_if_cancel_pending() -> None:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise asyncio.CancelledError
 
     @staticmethod
     def _reject_batch(futures: list[asyncio.Future[object]]) -> Never:
@@ -265,7 +281,7 @@ class _MainSenderAdapter:
         return await self._gate._main_sender.connect(connection)
 
     async def disconnect(self) -> object:
-        return await self._gate._main_sender.disconnect()
+        return await self._gate._disconnect_main_sender()
 
     def is_connected(self) -> bool:
         return self._gate._main_sender.is_connected()
@@ -315,7 +331,6 @@ class TelegramRpcCooldownPersistence:
             raise TypeError("save_until_utc must be callable")
 
 
-_COOLDOWN_LOCK = asyncio.Lock()
 _COOLDOWN_DEADLINE = 0.0
 _OBSERVED_FLOOD_IDS: set[int] = set()
 
@@ -412,6 +427,7 @@ class TelegramRpcGate(TelegramClient):
         self._connect_owner: asyncio.Task[object] | object | None = None
         self._connection_capability: _ConnectionCapability | None = None
         self._connection_rpc_tasks: set[asyncio.Task[object]] = set()
+        self._pending_scalar_dispatches: set[asyncio.Future[object]] = set()
 
     @staticmethod
     def rpc_scope(
@@ -518,6 +534,8 @@ class TelegramRpcGate(TelegramClient):
                 capability=capability,
                 connection_owned=True,
             )
+        if capability is not None and asyncio.current_task() in self._connection_rpc_tasks:
+            return await self._call_registered(request, ordered=ordered, connection_owned=True)
         return await self._call_classified(request, ordered=ordered)
 
     async def _call_classified(self, request: object, *, ordered: bool) -> object:
@@ -594,7 +612,7 @@ class TelegramRpcGate(TelegramClient):
             await owner
         except BaseException:
             if owner is not None:
-                await self._cleanup_failed_connection_bootstrap()
+                await self._complete_failed_connection_cleanup()
             raise
         finally:
             if self._connect_owner is reservation or self._connect_owner is owner:
@@ -646,6 +664,23 @@ class TelegramRpcGate(TelegramClient):
         except Exception:
             logger.exception("telegram_connection_bootstrap_cleanup_failed")
 
+    async def _complete_failed_connection_cleanup(self) -> None:
+        """Keep the connection reservation until a cancellation-safe cleanup finishes."""
+        cleanup = asyncio.get_running_loop().create_task(
+            self._cleanup_failed_connection_bootstrap(),
+            name="telethon_connection_cleanup",
+            context=Context(),
+        )
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
     async def _switch_dc(self, new_dc: int) -> None:
         """Prevent concurrent migration from mutating a guarded bootstrap transport."""
         owner = self._connect_owner
@@ -690,7 +725,8 @@ class TelegramRpcGate(TelegramClient):
             token = current_demand_token()
         except MissingTelegramDemandContextError as exc:
             return self._connection_capability_for_current_owner(exc), True
-        return self._connection_capability_from_scope(token, current_rpc_scope()), False
+        capability = self._connection_capability_from_scope(token, current_rpc_scope())
+        return capability, asyncio.current_task() in self._connection_rpc_tasks
 
     @staticmethod
     def _connection_capability_from_scope(
@@ -810,6 +846,71 @@ class TelegramRpcGate(TelegramClient):
         ordered: bool = False,
     ) -> Awaitable[object] | list[asyncio.Future[object]]:
         return cast(_SendAttempt, self._main_sender.send)(request, ordered=ordered)
+
+    def _register_scalar_dispatch_completion(
+        self,
+        raw_future: asyncio.Future[object],
+        *,
+        scope: TelegramRpcScope,
+        request_method: str,
+        admission: RpcAdmission,
+        dispatch_at_monotonic: float,
+    ) -> None:
+        """Transfer one dispatched scalar response and its lease to the gate."""
+        self._pending_scalar_dispatches.add(raw_future)
+
+        def finalize(future: asyncio.Future[object]) -> None:
+            self._finalize_scalar_dispatch(
+                future,
+                scope=scope,
+                request_method=request_method,
+                admission=admission,
+                dispatch_at_monotonic=dispatch_at_monotonic,
+            )
+
+        raw_future.add_done_callback(finalize, context=Context())
+        if raw_future.done():
+            finalize(raw_future)
+
+    def _finalize_scalar_dispatch(
+        self,
+        raw_future: asyncio.Future[object],
+        *,
+        scope: TelegramRpcScope,
+        request_method: str,
+        admission: RpcAdmission,
+        dispatch_at_monotonic: float,
+    ) -> None:
+        """Record terminal actual-send outcomes and release their admission once."""
+        if raw_future not in self._pending_scalar_dispatches:
+            return
+        try:
+            if not raw_future.cancelled():
+                exc = raw_future.exception()
+                if isinstance(exc, (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError)):
+                    _annotate_flood_attempt(
+                        exc,
+                        request_method=request_method,
+                        admission_sequence=admission.sequence,
+                        dispatch_at_monotonic=dispatch_at_monotonic,
+                        dispatch_kind="actual_send",
+                    )
+                    self._record_flood(exc, scope=scope)
+        finally:
+            self._admission_scheduler.complete(admission)
+            self._pending_scalar_dispatches.discard(raw_future)
+
+    async def _disconnect_main_sender(self) -> object:
+        """Terminate raw transport, then settle every gate-owned scalar response."""
+        result = await self._main_sender.disconnect()
+        pending = tuple(self._pending_scalar_dispatches)
+        for raw_future in pending:
+            if not raw_future.done():
+                raw_future.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+            await asyncio.sleep(0)
+        return result
 
     async def _handle_admission_deferral(
         self,
@@ -966,20 +1067,27 @@ class TelegramRpcGate(TelegramClient):
                 raise RpcAdmissionExpiredError(scope, "Telegram RPC admission deadline elapsed")
 
     async def _observe_flood(self, exc: BaseException, *, scope: TelegramRpcScope | None = None) -> int:
-        """Atomically extend cooldown and send exactly one telemetry event."""
+        """Compatibility wrapper for event-loop-atomic FloodWait recording."""
+        return self._record_flood(exc, scope=scope)
+
+    def _record_flood(self, exc: BaseException, *, scope: TelegramRpcScope | None = None) -> int:
+        """Extend cooldown and record one terminal FloodWait without caller ownership."""
         seconds = flood_seconds(exc, default=self._fallback_wait_seconds)
         now = time.monotonic()
         global _COOLDOWN_DEADLINE
-        async with _COOLDOWN_LOCK:
-            _COOLDOWN_DEADLINE = max(_COOLDOWN_DEADLINE, now + seconds + self._cooldown_buffer_seconds)
-            self._persist_account_cooldown(monotonic_now=now)
-            if self._flood_already_observed(exc):
-                return seconds
+        _COOLDOWN_DEADLINE = max(_COOLDOWN_DEADLINE, now + seconds + self._cooldown_buffer_seconds)
+        observed = not self._flood_already_observed(exc)
+        attempt = self._flood_attempt(exc)
+        if observed:
             self._mark_flood_observed(exc)
-            attempt = self._flood_attempt(exc)
-            self._observe_flood_warning(attempt, seconds)
+            try:
+                self._observe_flood_warning(attempt, seconds)
+            except Exception:
+                logger.exception("flood_wait_warning_observer_failed")
+        self._persist_account_cooldown(monotonic_now=now)
+        if observed:
             self._observe_flood_event(scope, attempt, seconds)
-            return seconds
+        return seconds
 
     @staticmethod
     def _flood_already_observed(exc: BaseException) -> bool:

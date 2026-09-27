@@ -168,6 +168,7 @@ def _make_gate(
     gate._connect_owner = None
     gate._connection_capability = None
     gate._connection_rpc_tasks = set()
+    gate._pending_scalar_dispatches = set()
     gate._log = {"telethon.client.users": logging.getLogger(__name__)}
     gate.flood_sleep_threshold = 0
     gate.session = SimpleNamespace(process_entities=lambda _result: None)

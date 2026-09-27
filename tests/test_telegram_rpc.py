@@ -20,6 +20,7 @@ from telethon.errors import (
     FloodPremiumWaitError,
     FloodTestPhoneWaitError,
     FloodWaitError,
+    NetworkMigrateError,
     ServerError,
     SlowModeWaitError,
     UserMigrateError,
@@ -35,7 +36,12 @@ from mcp_telegram.config import (
     TelegramRpcConfig,
     TelegramRpcSchedulerConfig,
 )
-from mcp_telegram.flood import FloodWaitAccumulator, FloodWaitKillSwitchPolicy, TelegramRpcThrottled
+from mcp_telegram.flood import (
+    FloodWaitAccumulator,
+    FloodWaitKillSwitchPolicy,
+    FloodWaitObservation,
+    TelegramRpcThrottled,
+)
 from mcp_telegram.sync_db import ensure_sync_schema, load_account_cooldown_until_utc, save_account_cooldown_until_utc
 from mcp_telegram.telegram import create_client
 from mcp_telegram.telegram_demand import (
@@ -129,6 +135,25 @@ class _Sender:
             return result
 
         return execute()
+
+
+class _RawFutureSender:
+    """Controllable scalar Telethon sender seam with real response Futures."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.futures: list[asyncio.Future[object]] = []
+        self.disconnect_calls = 0
+
+    def send(self, _request: object, *, ordered: bool = False) -> asyncio.Future[object]:
+        del ordered
+        self.calls += 1
+        future = asyncio.get_running_loop().create_future()
+        self.futures.append(future)
+        return future
+
+    async def disconnect(self) -> None:
+        self.disconnect_calls += 1
 
 
 class _BootstrapSender:
@@ -257,6 +282,7 @@ def _gate(status: _CircuitStatus | None = None, *, retry_delays: tuple[float, ..
     gate._connect_owner = None
     gate._connection_capability = None
     gate._connection_rpc_tasks = set()
+    gate._pending_scalar_dispatches = set()
     gate._log = {"telethon.client.users": logging.getLogger(__name__)}
     gate.flood_sleep_threshold = 0
     gate.session = SimpleNamespace(process_entities=lambda _result: None)
@@ -315,7 +341,7 @@ async def _close_bootstrap_gate(gate: TelegramRpcGate) -> None:
         *(task for task in (getattr(gate, "_updates_handle", None), getattr(gate, "_keepalive_handle", None)) if task),
         return_exceptions=True,
     )
-    await gate._main_sender.disconnect()
+    await gate._sender.disconnect()
     await gate.close_rpc_scheduler()
 
 
@@ -498,6 +524,38 @@ async def test_real_telethon_login_bootstrap_admits_get_difference_with_inherite
         assert len(loaded) == 1
     finally:
         await _close_bootstrap_gate(gate)
+
+
+@pytest.mark.asyncio
+async def test_nested_bootstrap_migration_flood_stops_with_original_update_scope() -> None:
+    gate, sender = _bootstrap_gate()
+    budget = RpcAttemptBudget(2)
+    deadline = asyncio.get_running_loop().time() + 5
+    gate._authorized = None
+    sender.response = lambda request: (
+        NetworkMigrateError(request, capture=3)
+        if type(request).__name__ == "InvokeWithLayerRequest"
+        else FloodWaitError(request, capture=20)
+        if isinstance(request, functions.updates.GetStateRequest)
+        else _bootstrap_login_response(request)
+    )
+    try:
+        with demand_context(DemandKind.TELETHON_UPDATE_DIFFERENCE, deadline=deadline) as token:
+            with rpc_attempt_budget(budget):
+                with rpc_scope(TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE, deadline=deadline):
+                    with pytest.raises(TelegramRpcThrottled):
+                        await gate.connect()
+        assert [type(request).__name__ for request in sender.sent] == [
+            "InvokeWithLayerRequest",
+            "GetStateRequest",
+        ]
+        assert all(scope.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE for scope in sender.scopes)
+        assert all(scope.deadline == deadline for scope in sender.scopes)
+        assert all(scope.attempt_budget is budget for scope in sender.scopes)
+        assert budget.attempts == token.attempt_evidence.actual_attempts == 2
+        assert sender.disconnect_calls == 1
+    finally:
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
@@ -922,6 +980,74 @@ async def test_inherited_connect_reservation_survives_failed_transport_cleanup()
         assert sender.connect_calls == 2
     finally:
         await _close_bootstrap_gate(gate)
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_keeps_connection_owner_through_blocked_cleanup() -> None:
+    gate, sender = _bootstrap_gate()
+    sender.response = lambda _request: FloodWaitError(request=None, capture=20)
+    sender.disconnect_started = asyncio.Event()
+    sender.disconnect_release = asyncio.Event()
+    caller = asyncio.create_task(gate.connect())
+    await sender.disconnect_started.wait()
+    caller.cancel()
+    await asyncio.sleep(0)
+    caller.cancel()
+    await asyncio.sleep(0)
+    assert gate._connect_owner is not None
+    assert gate._connection_capability is not None
+    with pytest.raises(TelegramRpcAdmissionDeferred, match="connection bootstrap is already running"):
+        await gate.connect()
+    sender.disconnect_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert gate._connect_owner is None
+    assert gate._connection_capability is None
+    assert gate._connection_rpc_tasks == set()
+    await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
+async def test_retained_bootstrap_flood_is_recorded_during_cancelled_cleanup() -> None:
+    gate, sender = _bootstrap_gate()
+    accumulator = FloodWaitAccumulator()
+    accumulator.configure_kill_switch(
+        FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
+    )
+    gate._flood_observer = lambda **event: accumulator.observe(**event)
+    pending = asyncio.get_running_loop().create_future()
+    sender.response = lambda request: (
+        pending if isinstance(request, functions.updates.GetDifferenceRequest) else _bootstrap_login_response(request)
+    )
+    sender.disconnect_started = asyncio.Event()
+    sender.disconnect_release = asyncio.Event()
+    gate._message_box = SimpleNamespace(is_empty=lambda: True, load=lambda *_args: None)
+    gate._mb_entity_cache = SimpleNamespace(self_id=None, set_self_user=lambda *_args: None)
+    caller = asyncio.create_task(gate.connect())
+    try:
+        await _wait_for(lambda: len(sender.sent) == 4)
+        caller.cancel()
+        await sender.disconnect_started.wait()
+        caller.cancel()
+        assert not pending.cancelled()
+        assert gate._connect_owner is not None
+        assert gate._connection_capability is not None
+        pending.set_exception(FloodWaitError(request=None, capture=20))
+        await _wait_for(lambda: accumulator.kill_switch_status().events_in_window == 1)
+        assert account_cooldown_deadline() > asyncio.get_running_loop().time()
+        sender.disconnect_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert gate._pending_scalar_dispatches == set()
+        assert gate._connection_rpc_tasks == set()
+        assert gate._connect_owner is None
+        assert gate._connection_capability is None
+    finally:
+        sender.disconnect_release.set()
+        if not caller.done():
+            caller.cancel()
+            await asyncio.gather(caller, return_exceptions=True)
+        await gate.close_rpc_scheduler()
 
 
 @pytest.mark.asyncio
@@ -2070,6 +2196,192 @@ async def test_gate_releases_active_capacity_after_transport_completion(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_actual_future_flood_is_recorded_when_caller_cancels_after_response() -> None:
+    accumulator = FloodWaitAccumulator()
+    accumulator.configure_kill_switch(
+        FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
+    )
+    gate = _gate()
+    sender = _RawFutureSender()
+    gate._main_sender = sender
+    gate._flood_observer = lambda **event: accumulator.observe(**event)
+    observations: list[FloodWaitObservation] = []
+    gate.set_flood_event_observer(observations.append)
+    caller = asyncio.create_task(_call(gate, _TestRequest("actual")))
+    await _wait_for(lambda: sender.calls == 1)
+    raw_future = sender.futures[0]
+    raw_future.set_exception(FloodWaitError(request=None, capture=20))
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    await _wait_for(lambda: not gate._pending_scalar_dispatches)
+    assert account_cooldown_deadline() > asyncio.get_running_loop().time()
+    assert accumulator.kill_switch_status().events_in_window == 1
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation.origin == "actual_send"
+    assert observation.actual_dispatch is True
+    assert observation.request_method == "_TestRequest"
+    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+    await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
+async def test_abandoned_actual_future_keeps_capacity_and_records_later_flood() -> None:
+    accumulator = FloodWaitAccumulator()
+    accumulator.configure_kill_switch(
+        FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
+    )
+    gate = _gate()
+    gate._scheduler_policy = TelegramRpcSchedulerConfig(interactive_queue_capacity=1)
+    gate._admission_scheduler = TelegramRpcAdmissionScheduler(
+        policy=gate._scheduler_policy,
+        limiter=gate._limiter,
+        readiness=RpcTransportReadiness(
+            probe=gate._scheduler_transport_ready,
+            wait=gate._wait_for_scheduler_transport,
+        ),
+    )
+    sender = _RawFutureSender()
+    gate._main_sender = sender
+    gate._flood_observer = lambda **event: accumulator.observe(**event)
+    caller = asyncio.create_task(_call(gate, _TestRequest("actual")))
+    await _wait_for(lambda: sender.calls == 1)
+    raw_future = sender.futures[0]
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert not raw_future.cancelled()
+    assert gate._pending_scalar_dispatches == {raw_future}
+    assert gate._admission_scheduler.active_depths()[RpcServiceClass.INTERACTIVE] == 1
+    with pytest.raises(TelegramRpcAdmissionDeferred):
+        await _call(gate, _TestRequest("blocked"))
+    raw_future.set_exception(FloodWaitError(request=None, capture=20))
+    await _wait_for(lambda: not gate._pending_scalar_dispatches)
+    assert accumulator.kill_switch_status().events_in_window == 1
+    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+    await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
+async def test_five_abandoned_actual_futures_still_latch_the_account() -> None:
+    accumulator = FloodWaitAccumulator()
+    accumulator.configure_kill_switch(
+        FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
+    )
+    gate = _gate()
+    sender = _RawFutureSender()
+    gate._main_sender = sender
+    gate._rpc_circuit_status = accumulator.kill_switch_status
+    gate._flood_observer = lambda **event: accumulator.observe(**event)
+    import mcp_telegram.telegram_rpc as rpc
+
+    for index in range(5):
+        caller = asyncio.create_task(_call(gate, _TestRequest(index)))
+        expected_calls = index + 1
+        await _wait_for(lambda expected_calls=expected_calls: sender.calls == expected_calls)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        sender.futures[index].set_exception(FloodWaitError(request=None, capture=1))
+        await _wait_for(lambda: not gate._pending_scalar_dispatches)
+        if index < 4:
+            rpc._COOLDOWN_DEADLINE = 0
+            gate._flood_waited_requests.clear()
+
+    assert accumulator.kill_switch_status().open is True
+    assert accumulator.kill_switch_status().events_in_window == 5
+    assert gate._limiter.acquisitions == 5
+    await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
+async def test_already_completed_actual_futures_finalize_once_for_success_and_flood() -> None:
+    gate = _gate()
+    accumulator = FloodWaitAccumulator()
+    accumulator.configure_kill_switch(
+        FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
+    )
+    gate._flood_observer = lambda **event: accumulator.observe(**event)
+
+    class _DoneSender:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def send(self, _request: object, *, ordered: bool = False) -> asyncio.Future[object]:
+            del ordered
+            self.calls += 1
+            future = asyncio.get_running_loop().create_future()
+            if self.calls == 1:
+                future.set_result("ok")
+            else:
+                future.set_exception(FloodWaitError(request=None, capture=20))
+            return future
+
+    sender = _DoneSender()
+    gate._main_sender = sender
+    assert await _call(gate, _TestRequest("success")) == "ok"
+    with pytest.raises(TelegramRpcThrottled):
+        await _call(gate, _TestRequest("flood"))
+    assert sender.calls == 2
+    assert accumulator.kill_switch_status().events_in_window == 1
+    assert gate._pending_scalar_dispatches == set()
+    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+    await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
+async def test_actual_future_flood_protects_when_persistence_and_event_sinks_fail() -> None:
+    gate = _gate()
+    sender = _RawFutureSender()
+    accumulator = FloodWaitAccumulator()
+    accumulator.configure_kill_switch(
+        FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
+    )
+    gate._main_sender = sender
+    gate._flood_observer = lambda **event: accumulator.observe(**event)
+    gate._cooldown_persistence = TelegramRpcCooldownPersistence(
+        lambda: None, lambda _deadline: (_ for _ in ()).throw(OSError())
+    )
+    gate.set_flood_event_observer(lambda _event: (_ for _ in ()).throw(OSError()))
+    caller = asyncio.create_task(_call(gate, _TestRequest("actual")))
+    await _wait_for(lambda: sender.calls == 1)
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    sender.futures[0].set_exception(FloodWaitError(request=None, capture=20))
+    await _wait_for(lambda: not gate._pending_scalar_dispatches)
+    assert account_cooldown_deadline() > asyncio.get_running_loop().time()
+    assert accumulator.kill_switch_status().events_in_window == 1
+    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+    await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_drains_completed_actual_flood_after_caller_cancellation() -> None:
+    gate = _gate()
+    sender = _RawFutureSender()
+    accumulator = FloodWaitAccumulator()
+    accumulator.configure_kill_switch(
+        FloodWaitKillSwitchPolicy(enabled=True, window_seconds=600, max_events=5, max_wait_seconds=900)
+    )
+    gate._main_sender = sender
+    gate._flood_observer = lambda **event: accumulator.observe(**event)
+    caller = asyncio.create_task(_call(gate, _TestRequest("actual")))
+    await _wait_for(lambda: sender.calls == 1)
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    sender.futures[0].set_exception(FloodWaitError(request=None, capture=20))
+    await gate._disconnect_main_sender()
+    assert sender.disconnect_calls == 1
+    assert accumulator.kill_switch_status().events_in_window == 1
+    assert gate._pending_scalar_dispatches == set()
+    assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
+    await gate.close_rpc_scheduler()
+
+
+@pytest.mark.asyncio
 async def test_gate_cancellation_after_admission_cannot_leak_active_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2083,7 +2395,11 @@ async def test_gate_cancellation_after_admission_cannot_leak_active_capacity(
         task.cancel()
         return admission
 
+    sends = 0
+
     async def send(request: object) -> object:
+        nonlocal sends
+        sends += 1
         await asyncio.sleep(0)
         return _request_value(request)
 
@@ -2096,10 +2412,12 @@ async def test_gate_cancellation_after_admission_cannot_leak_active_capacity(
 
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
     assert gate._admission_scheduler.outstanding_depths() == dict.fromkeys(RpcServiceClass, 0)
+    assert sends == 0
+    assert gate._pending_scalar_dispatches == set()
 
 
 @pytest.mark.asyncio
-async def test_scheduler_close_cancels_active_transport_caller() -> None:
+async def test_scheduler_close_keeps_dispatched_transport_until_disconnect() -> None:
     gate = _gate()
     transport_started = asyncio.Event()
     in_flight: asyncio.Future[object] | None = None
@@ -2112,6 +2430,9 @@ async def test_scheduler_close_cancels_active_transport_caller() -> None:
             transport_started.set()
             return in_flight
 
+        async def disconnect(self) -> None:
+            return None
+
     gate._main_sender = gate._sender = _PendingSender()
     caller = asyncio.create_task(_call(gate, "request"))
     await transport_started.wait()
@@ -2119,7 +2440,11 @@ async def test_scheduler_close_cancels_active_transport_caller() -> None:
     await gate.close_rpc_scheduler()
 
     assert caller.cancelled()
-    assert in_flight is not None and in_flight.cancelled()
+    assert in_flight is not None and not in_flight.cancelled()
+    assert gate._pending_scalar_dispatches == {in_flight}
+    await gate._disconnect_main_sender()
+    assert in_flight.cancelled()
+    assert gate._pending_scalar_dispatches == set()
     assert gate._admission_scheduler.active_depths() == dict.fromkeys(RpcServiceClass, 0)
 
 
