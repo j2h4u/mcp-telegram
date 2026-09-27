@@ -2461,6 +2461,46 @@ async def test_dm_page_success_uses_real_get_messages_and_commits_tombstone_curs
 
 
 @pytest.mark.asyncio
+async def test_dm_page_cursor_commit_failure_preserves_tombstone_and_blocks_reconstruction() -> None:
+    conn = _dm_reconciliation_test_db()
+    gate, sender, adapter, scanner = _real_dm_page_adapter(conn)
+    try:
+        conn.execute(
+            """CREATE TRIGGER fail_dm_cursor_commit
+               BEFORE INSERT ON daemon_state
+               WHEN NEW.key='delta_dm_gap_scan_state' AND NEW.value LIKE '%\"message_cursor\": 1%'
+               BEGIN SELECT RAISE(ABORT, 'injected cursor commit failure'); END"""
+        )
+        conn.commit()
+
+        budget = RpcAttemptBudget(limit=1)
+        task = asyncio.create_task(adapter.run_slice(budget))
+        await _wait_for(lambda: sender.calls == 1)
+        assert isinstance(sender.requests[0], functions.messages.GetMessagesRequest)
+        sender.futures[0].set_result(types.messages.MessagesNotModified(count=1))
+        with pytest.raises(sqlite3.IntegrityError, match="injected cursor commit failure"):
+            await task
+
+        assert scanner.calls == 1
+        assert budget.attempts == 1
+        assert conn.execute("SELECT is_deleted FROM messages WHERE dialog_id=211 AND message_id=1").fetchone() == (1,)
+        state = _dm_reconciliation_state_for_rpc_test(conn)
+        assert state["status"] == "verifying"
+        assert state["message_cursor"] == 0
+        assert adapter.status(10_000_000) is None
+
+        reconstructed_scanner = _real_dm_page_scanner(gate, conn)
+        reconstructed = DmDeletionReconciliationDemandAdapter(conn, reconstructed_scanner)
+        assert reconstructed.status(10_000_000) is None
+        await reconstructed.run_slice(RpcAttemptBudget(limit=1))
+        assert reconstructed_scanner.calls == 0
+        assert sender.calls == 1
+    finally:
+        await gate.close_rpc_scheduler()
+        conn.close()
+
+
+@pytest.mark.asyncio
 async def test_dm_page_flood_crosses_gate_with_durable_demand_and_acquisition() -> None:
     accumulator = FloodWaitAccumulator()
     accumulator.configure_kill_switch(
