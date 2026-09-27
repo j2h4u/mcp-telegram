@@ -2446,6 +2446,120 @@ async def test_list_topics_through_daemon() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_topics_serves_cached_catalog_when_protection_blocks_optional_icon_enrichment() -> None:
+    """A cached catalog remains usable when only optional icon Unicode is missing."""
+
+    class _Gateway:
+        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
+            del entity
+            raise AssertionError("active protection must skip optional topic icon enrichment")
+
+    conn = _make_db_with_topics()
+    conn.execute(
+        "INSERT INTO topic_metadata "
+        "(dialog_id, topic_id, title, icon_emoji_id, icon_emoji, icon_color, updated_at) "
+        "VALUES (123, 7, 'Cached topic', 42, NULL, 6, 100)"
+    )
+    conn.commit()
+    client = _TestClient()
+    client.get_entity = AsyncMock(side_effect=AssertionError("cached catalog must not acquire Telegram"))
+    server = make_server(
+        conn,
+        client,
+        topic_refresher=TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn)),
+    )
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True, reason="test", opened_at=1, events_in_window=1, wait_s_in_window=1, window_seconds=1, source="test"
+    )
+
+    result, _, _ = await server._handle_client_line(b'{"method":"list_topics","dialog_id":123}', "", None)
+
+    assert result == {
+        "ok": True,
+        "data": {
+            "dialog_id": 123,
+            "topics": [
+                {
+                    "id": 7,
+                    "title": "Cached topic",
+                    "icon_emoji_id": 42,
+                    "icon_emoji": None,
+                    "icon_color": 6,
+                    "date": None,
+                }
+            ],
+        },
+    }
+    cast(AsyncMock, client.get_entity).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_topics_keeps_cached_catalog_when_protection_opens_during_icon_enrichment() -> None:
+    """A latched optional refresh preserves the catalog fetched before the race."""
+
+    protected = False
+
+    class _Gateway:
+        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
+            del entity
+            raise TelegramRpcThrottled(latched=True)
+
+    async def _get_entity_after_protection_opens(dialog_id: int) -> object:
+        nonlocal protected
+        assert dialog_id == 123
+        protected = True
+        return SimpleNamespace(forum=True)
+
+    def _health_status() -> FloodWaitKillSwitchStatus:
+        return FloodWaitKillSwitchStatus(
+            open=protected,
+            reason="test" if protected else None,
+            opened_at=1 if protected else None,
+            events_in_window=1 if protected else 0,
+            wait_s_in_window=1 if protected else 0,
+            window_seconds=1,
+            source="test" if protected else None,
+        )
+
+    conn = _make_db_with_topics()
+    conn.execute(
+        "INSERT INTO topic_metadata "
+        "(dialog_id, topic_id, title, icon_emoji_id, icon_emoji, updated_at) "
+        "VALUES (123, 7, 'Cached topic', 42, NULL, 100)"
+    )
+    conn.commit()
+    client = _TestClient()
+    client.get_entity = AsyncMock(side_effect=_get_entity_after_protection_opens)
+    server = make_server(
+        conn,
+        client,
+        topic_refresher=TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn)),
+    )
+    server._health_status = _health_status
+
+    result, _, _ = await server._handle_client_line(b'{"method":"list_topics","dialog_id":123}', "", None)
+
+    assert protected is True
+    assert result == {
+        "ok": True,
+        "data": {
+            "dialog_id": 123,
+            "topics": [
+                {
+                    "id": 7,
+                    "title": "Cached topic",
+                    "icon_emoji_id": 42,
+                    "icon_emoji": None,
+                    "icon_color": None,
+                    "date": None,
+                }
+            ],
+        },
+    }
+    cast(AsyncMock, client.get_entity).assert_awaited_once_with(123)
+
+
+@pytest.mark.asyncio
 async def test_list_topics_empty_snapshot() -> None:
     """_list_topics reports that an empty catalog was never refreshed."""
     conn = _make_db_with_topics()

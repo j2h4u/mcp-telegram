@@ -1546,12 +1546,21 @@ class DaemonAPIServer:
 
         rows = self._topic_rows(dialog_id)
         empty_reason = None
-        if not rows or _topic_icons_need_refresh(rows):
+        if not rows:
             if self._topic_refresher is None:
-                if not rows:
-                    empty_reason = "topic_catalog_not_refreshed"
+                empty_reason = "topic_catalog_not_refreshed"
             else:
                 empty_reason = await self._refresh_topic_catalog_for_list_topics(dialog_id)
+                rows = self._topic_rows(dialog_id)
+        elif _topic_icons_need_refresh(rows) and not self._health_status().open:
+            cached_rows = rows
+            try:
+                await self._refresh_topic_catalog_for_list_topics(dialog_id)
+            except TelegramRpcThrottled as exc:
+                if not exc.latched:
+                    raise
+                rows = cached_rows
+            else:
                 rows = self._topic_rows(dialog_id)
         topics = [
             {
