@@ -48,6 +48,18 @@ _LIFECYCLE_METHODS = frozenset(
         "is_user_authorized",
     }
 )
+# These inherited Telethon APIs can dispatch directly through private senders,
+# bypassing TelegramRpcGate's __call__ admission path.
+_UNADMITTED_TRANSPORT_METHODS = frozenset(
+    {
+        "download_file",
+        "download_media",
+        "edit_message",
+        "get_stats",
+        "_borrow_exported_sender",
+        "_create_exported_sender",
+    }
+)
 _MIN_CLIENT_CHAIN_PARTS = 2
 _VENDOR_WAIT_NAMES = frozenset({"FloodWaitError", "FloodPremiumWaitError", "FloodTestPhoneWaitError"})
 _REMOVED_NAMES = frozenset({"TelegramRpcCircuitOpenError", "FloodWaitErrors"})
@@ -382,6 +394,12 @@ class _BoundaryVisitor(ast.NodeVisitor):
             self._add(node, "private Telegram _call bypasses admission")
         if node.attr == "_sender" and not self.in_transport_owner:
             self._add(node, "private Telegram _sender bypasses admission")
+        if (
+            node.attr in _UNADMITTED_TRANSPORT_METHODS
+            and _is_client_receiver(node.value)
+            and not self.in_transport_owner
+        ):
+            self._add(node, f"Telethon {node.attr} bypasses admission through inherited transport")
 
     def _check_private_sender_send(self, node: ast.Attribute) -> None:
         if (

@@ -89,6 +89,40 @@ def test_boundary_rejects_transport_bypasses(tmp_path: Path, source: str) -> Non
     assert violations
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "await client.download_media(message)\n",
+        "await client.download_file(location, bytes)\n",
+        "await client.get_stats(channel)\n",
+        "await client.edit_message(inline_message_id, 'updated')\n",
+        "borrow = client._borrow_exported_sender\n",
+        "create = self._client._create_exported_sender\n",
+    ],
+)
+def test_boundary_rejects_inherited_borrowed_sender_methods(tmp_path: Path, source: str) -> None:
+    path = tmp_path / "consumer.py"
+    path.write_text(source, encoding="utf-8")
+    gate = _load_gate()
+
+    violations = gate._violations(path)
+
+    assert any("bypasses admission through inherited transport" in violation for violation in violations)
+
+
+def test_boundary_allows_admitted_public_client_methods(tmp_path: Path) -> None:
+    path = tmp_path / "adapter.py"
+    path.write_text(
+        "await client.get_messages(peer, ids=[1])\n"
+        "await client.get_entity(peer)\n"
+        "await client(request)\n",
+        encoding="utf-8",
+    )
+    gate = _load_gate()
+
+    assert gate._violations(path) == []
+
+
 def test_boundary_allows_only_named_factory_and_transport_seams(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
