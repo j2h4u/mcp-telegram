@@ -625,16 +625,63 @@ async def test_shutdown_requests_coordinator_stop_before_connections_close() -> 
 
 
 @pytest.mark.asyncio
-async def test_shutdown_flushes_rpc_summaries_after_telegram_disconnect() -> None:
+async def test_shutdown_cancels_disconnects_and_detaches_before_flushing_telemetry(tmp_path: Path) -> None:
     stages: list[str] = []
-    client = _ClientStub()
-    client.stages = stages
-    ctx = _typed_ctx(client=client, conn=_ConnectionStub())
+
+    class _OrderedClient(_ClientStub):
+        async def disconnect(self) -> None:
+            stages.append("disconnect")
+
+        async def close_rpc_scheduler(self) -> None:
+            stages.append("scheduler_close")
+
+        def set_rpc_admission_observer(self, observer: object | None) -> None:
+            stages.append("admission_detach")
+
+        def set_rpc_request_observer(self, observer: object | None) -> None:
+            stages.append("request_detach")
+
+        def set_flood_event_observer(self, observer: object | None) -> None:
+            stages.append("flood_detach")
+
+    class _OrderedConnection(_ConnectionStub):
+        def close(self) -> None:
+            stages.append("connections_close")
+
+    client = _OrderedClient()
+    task_release = asyncio.Event()
+
+    async def background_task() -> None:
+        try:
+            await task_release.wait()
+        finally:
+            stages.append("task_cancelled")
+
+    task = asyncio.create_task(background_task())
+    await asyncio.sleep(0)
+    ctx = _typed_ctx(
+        client=client,
+        conn=_OrderedConnection(),
+        background_tasks={task},
+        socket_path=tmp_path / "daemon.sock",
+    )
     ctx.rpc_admission_observer = cast(
         RpcAdmissionObservationAggregator,
         SimpleNamespace(flush=lambda: stages.append("flush")),
     )
+    ctx.rpc_observation_sink = SimpleNamespace(aclose=lambda: _append_async(stages, "sink_close"))
 
     await _shutdown_sync_main_context(ctx)
 
-    assert stages.index("disconnect") < stages.index("flush")
+    assert stages.index("task_cancelled") < stages.index("disconnect")
+    assert stages.index("disconnect") < stages.index("scheduler_close")
+    assert stages.index("scheduler_close") < stages.index("admission_detach")
+    assert stages.index("scheduler_close") < stages.index("request_detach")
+    assert stages.index("scheduler_close") < stages.index("flood_detach")
+    assert stages.index("flood_detach") < stages.index("flush")
+    assert stages.index("flush") < stages.index("sink_close")
+    assert stages.index("sink_close") < stages.index("connections_close")
+
+
+async def _append_async(stages: list[str], stage: str) -> None:
+    stages.append(stage)

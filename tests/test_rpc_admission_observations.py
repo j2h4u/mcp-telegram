@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 import threading
+from contextlib import closing
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 from mcp_telegram.config import RuntimeObservationConfig
 from mcp_telegram.flood import FloodWaitObservation
 from mcp_telegram.rpc_admission_observations import DemandEvidenceOutcome, RpcAdmissionObservationAggregator
-from mcp_telegram.runtime_observations import MAX_PAYLOAD_BYTES, encode_payload
+from mcp_telegram.runtime_observations import MAX_PAYLOAD_BYTES, RuntimeObservationSink, encode_payload
+from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telegram_demand import AcquisitionKind
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import (
@@ -126,6 +131,89 @@ def test_flood_wait_records_content_free_sender_provenance_immediately() -> None
         "demand_kind": "message_read_fallback",
         "acquisition_kind": "message_history_page",
     }
+
+
+def test_flood_wait_observation_persists_through_runtime_sink(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    sink = RuntimeObservationSink(path, retention_ttl_seconds=3600, policy=RuntimeObservationConfig())
+    aggregator = RpcAdmissionObservationAggregator(sink, policy=RuntimeObservationConfig(), clock=lambda: 0.0)
+
+    aggregator.observe_flood_wait(
+        FloodWaitObservation(
+            source=TelegramRpcSource.MESSAGE_READ_FALLBACK,
+            service_class=RPC_SOURCE_SERVICE_CLASS[TelegramRpcSource.MESSAGE_READ_FALLBACK],
+            demand_kind=DemandKind.MESSAGE_READ_FALLBACK,
+            acquisition_kind=AcquisitionKind.MESSAGE_HISTORY_PAGE,
+            seconds=23,
+            cooldown_until_utc_ms=1_700_000_023_000,
+            circuit_open=True,
+            request_method="GetHistoryRequest",
+            origin="actual_send",
+            actual_dispatch=True,
+            admission_sequence=17,
+            dispatch_at_monotonic=42.5,
+            observed_at_ms=1_700_000_000_000,
+        )
+    )
+    sink.close()
+
+    with closing(sqlite3.connect(path)) as conn:
+        row = conn.execute(
+            "SELECT kind, outcome, reason_code, duration_ms, observed_at_ms, payload_json "
+            "FROM runtime_observations WHERE kind = 'telegram.rpc_admission'"
+        ).fetchone()
+    assert row is not None
+    assert row[:5] == ("telegram.rpc_admission", "flood_wait", "actual_send", 23_000, 1_700_000_000_000)
+    assert json.loads(row[5]) == {
+        "source": "message_read_fallback",
+        "service_class": "interactive",
+        "request_method": "GetHistoryRequest",
+        "origin": "actual_send",
+        "actual_dispatch": True,
+        "cooldown_until_utc_ms": 1_700_000_023_000,
+        "circuit_open": True,
+        "demand_kind": "message_read_fallback",
+        "acquisition_kind": "message_history_page",
+        "admission_sequence": 17,
+        "dispatch_at_monotonic": 42.5,
+    }
+
+
+def test_flood_wait_sink_failure_does_not_escape_after_circuit_latches() -> None:
+    from mcp_telegram.flood import FloodWaitAccumulator, FloodWaitKillSwitchPolicy
+
+    accumulator = FloodWaitAccumulator()
+    accumulator.configure_kill_switch(FloodWaitKillSwitchPolicy(True, 600, 1, 900))
+    accumulator.observe(source="mcp_interactive", seconds=20, now_mono=1.0)
+    assert accumulator.kill_switch_status(now_mono=1.0).open
+
+    class _FailingRecorder:
+        def record(self, **_values: object) -> None:
+            raise RuntimeError("sink unavailable")
+
+    aggregator = RpcAdmissionObservationAggregator(
+        _FailingRecorder(), policy=RuntimeObservationConfig(), clock=lambda: 0.0
+    )
+    aggregator.observe_flood_wait(
+        FloodWaitObservation(
+            source=TelegramRpcSource.MCP_INTERACTIVE,
+            service_class=RPC_SOURCE_SERVICE_CLASS[TelegramRpcSource.MCP_INTERACTIVE],
+            demand_kind=DemandKind.MCP_REMOTE_ACQUISITION,
+            acquisition_kind=AcquisitionKind.MESSAGE_HISTORY_PAGE,
+            seconds=20,
+            cooldown_until_utc_ms=1_700_000_020_000,
+            circuit_open=True,
+            request_method="GetHistoryRequest",
+            origin="actual_send",
+            actual_dispatch=True,
+            admission_sequence=1,
+            dispatch_at_monotonic=1.0,
+            observed_at_ms=1_700_000_000_000,
+        )
+    )
+
+    assert accumulator.kill_switch_status(now_mono=1.0).open
 
 
 def test_due_event_flushes_completed_window() -> None:
