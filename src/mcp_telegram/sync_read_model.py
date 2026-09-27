@@ -60,9 +60,13 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def _validate_dm_deletion_checkpoint(state: DmDeletionCheckpoint, *, legacy: bool) -> None:
-    valid_statuses = {"running", "idle", "verifying", "suspended"}
-    if not isinstance(state.status, str) or state.status not in valid_statuses:
+    if state.status not in {"running", "idle", "verifying", "suspended"}:
         raise InvalidDmDeletionCheckpointError("DM deletion checkpoint status is invalid")
+    _validate_dm_checkpoint_cursors(state)
+    _validate_dm_checkpoint_lifecycle(state, legacy=legacy)
+
+
+def _validate_dm_checkpoint_cursors(state: DmDeletionCheckpoint) -> None:
     _checkpoint_int(state.generation, "generation", positive=True)
     _checkpoint_int(state.scan_started_at, "scan start time")
     _checkpoint_int(state.message_cursor, "message cursor")
@@ -73,16 +77,14 @@ def _validate_dm_deletion_checkpoint(state: DmDeletionCheckpoint, *, legacy: boo
         raise InvalidDmDeletionCheckpointError("DM deletion message cursor has no dialog cursor")
     if state.status == "idle" and (state.dialog_id_cursor is not None or state.message_cursor != 0):
         raise InvalidDmDeletionCheckpointError("idle DM deletion checkpoint contains pending progress")
+
+
+def _validate_dm_checkpoint_lifecycle(state: DmDeletionCheckpoint, *, legacy: bool) -> None:
     if state.status in {"running", "verifying"} and state.next_run_at != 0:
         raise InvalidDmDeletionCheckpointError("active DM deletion checkpoint has an invalid run time")
     if state.status in {"running", "verifying", "idle"} and state.reason is not None:
         raise InvalidDmDeletionCheckpointError("runnable DM deletion checkpoint has a suspension reason")
-    if state.reason is not None and (
-        not isinstance(state.reason, str) or state.reason not in DM_DELETION_SUSPENSION_REASONS
-    ):
-        raise InvalidDmDeletionCheckpointError("DM deletion checkpoint reason is invalid")
-    if state.status == "suspended" and state.reason not in DM_DELETION_SUSPENSION_REASONS:
-        raise InvalidDmDeletionCheckpointError("suspended DM deletion checkpoint has an invalid reason")
+    _validate_dm_checkpoint_reason(state)
     if state.status == "verifying" and legacy:
         raise InvalidDmDeletionCheckpointError("legacy DM deletion checkpoint cannot be verifying")
     if not legacy and state.state_changed_at is None:
@@ -91,26 +93,46 @@ def _validate_dm_deletion_checkpoint(state: DmDeletionCheckpoint, *, legacy: boo
         _checkpoint_int(state.state_changed_at, "change time")
 
 
+def _validate_dm_checkpoint_reason(state: DmDeletionCheckpoint) -> None:
+    if state.reason is not None and (
+        not isinstance(state.reason, str) or state.reason not in DM_DELETION_SUSPENSION_REASONS
+    ):
+        raise InvalidDmDeletionCheckpointError("DM deletion checkpoint reason is invalid")
+    if state.status == "suspended" and state.reason not in DM_DELETION_SUSPENSION_REASONS:
+        raise InvalidDmDeletionCheckpointError("suspended DM deletion checkpoint has an invalid reason")
+
+
 def _validate_dm_checkpoint_fields(value: dict[str, object]) -> bool:
     legacy = "policy_version" not in value
     if legacy:
-        if not isinstance(value.get("status"), str) or value["status"] not in {"running", "idle"}:
-            raise InvalidDmDeletionCheckpointError("unsupported legacy DM deletion checkpoint status")
-        allowed_fields = _DM_DELETION_LEGACY_FIELDS | {"message_cursor", "message_offset"}
-        if "message_cursor" in value and "message_offset" in value:
-            raise InvalidDmDeletionCheckpointError("legacy DM deletion checkpoint has conflicting cursors")
+        _validate_legacy_dm_checkpoint_fields(value)
     else:
-        if type(value["policy_version"]) is not int or value["policy_version"] != DM_DELETION_POLICY_VERSION:
-            raise InvalidDmDeletionCheckpointError("DM deletion checkpoint policy version is unsupported")
-        allowed_fields = _DM_DELETION_CURRENT_FIELDS
+        _validate_current_dm_checkpoint_fields(value)
+    return legacy
+
+
+def _validate_legacy_dm_checkpoint_fields(value: dict[str, object]) -> None:
+    if not isinstance(value.get("status"), str) or value["status"] not in {"running", "idle"}:
+        raise InvalidDmDeletionCheckpointError("unsupported legacy DM deletion checkpoint status")
+    if "message_cursor" in value and "message_offset" in value:
+        raise InvalidDmDeletionCheckpointError("legacy DM deletion checkpoint has conflicting cursors")
+    allowed_fields = _DM_DELETION_LEGACY_FIELDS | {"message_cursor", "message_offset"}
+    _validate_dm_checkpoint_keys(value, allowed_fields, _DM_DELETION_LEGACY_FIELDS)
+
+
+def _validate_current_dm_checkpoint_fields(value: dict[str, object]) -> None:
+    if type(value["policy_version"]) is not int or value["policy_version"] != DM_DELETION_POLICY_VERSION:
+        raise InvalidDmDeletionCheckpointError("DM deletion checkpoint policy version is unsupported")
+    _validate_dm_checkpoint_keys(value, _DM_DELETION_CURRENT_FIELDS, _DM_DELETION_CURRENT_FIELDS)
+
+
+def _validate_dm_checkpoint_keys(
+    value: dict[str, object], allowed_fields: frozenset[str], required_fields: frozenset[str]
+) -> None:
     if set(value) - allowed_fields:
         raise InvalidDmDeletionCheckpointError("DM deletion checkpoint contains unsupported fields")
-    required = _DM_DELETION_LEGACY_FIELDS
-    if not value.keys() >= required:
+    if not value.keys() >= required_fields:
         raise InvalidDmDeletionCheckpointError("DM deletion checkpoint is missing required fields")
-    if not legacy and not value.keys() >= _DM_DELETION_CURRENT_FIELDS:
-        raise InvalidDmDeletionCheckpointError("current DM deletion checkpoint is missing required fields")
-    return legacy
 
 
 def _build_dm_checkpoint(value: dict[str, object], *, legacy: bool) -> DmDeletionCheckpoint:
