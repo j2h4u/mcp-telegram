@@ -336,7 +336,7 @@ def test_delta_gap_status_uses_two_hour_fallback_and_immediate_explicit_refresh(
                     "message_cursor": 5,
                     "next_run_at": 0,
                     "policy_version": 1,
-                    "reason": "flood_wait",
+                    "reason": "account_throttle",
                     "state_changed_at": 10,
                 }
             ),

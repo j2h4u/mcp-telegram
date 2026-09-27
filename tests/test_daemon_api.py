@@ -2930,7 +2930,7 @@ async def test_get_sync_status_reports_suspended_dm_deletion_verification() -> N
                     "message_cursor": 12,
                     "next_run_at": 0,
                     "policy_version": 1,
-                    "reason": "flood_wait",
+                    "reason": "account_throttle",
                     "state_changed_at": 200,
                 }
             ),

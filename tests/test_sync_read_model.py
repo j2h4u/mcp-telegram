@@ -133,7 +133,6 @@ def test_builder_rejects_representative_malformed_facts(field: str, value: objec
         ("running", None, False),
         ("idle", None, False),
         ("verifying", None, True),
-        ("suspended", "flood_wait", True),
         ("suspended", "account_throttle", True),
         ("suspended", "interrupted", True),
         ("suspended", "legacy_generation_review", True),

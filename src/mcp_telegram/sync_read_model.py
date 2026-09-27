@@ -22,7 +22,7 @@ class InvalidDmDeletionCheckpointError(SyncReadModelContractError):
 
 DM_DELETION_POLICY_VERSION = 1
 DM_DELETION_SUSPENSION_REASONS = frozenset(
-    {"legacy_generation_review", "interrupted", "flood_wait", "account_throttle"}
+    {"legacy_generation_review", "interrupted", "account_throttle"}
 )
 DM_DELETION_RECONCILIATION_STATE_KEY = "delta_dm_gap_scan_state"
 _DM_DELETION_LEGACY_FIELDS = frozenset({"status", "generation", "scan_started_at", "dialog_id_cursor", "next_run_at"})
