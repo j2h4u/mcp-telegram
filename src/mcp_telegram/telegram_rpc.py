@@ -305,8 +305,6 @@ class _MainSenderAdapter:
         self._gate._begin_transport_connect()
         try:
             result = await self._gate._main_sender.connect(connection)
-        except asyncio.CancelledError:
-            raise
         except BaseException:
             self._gate._finish_transport_connect_failure()
             raise
@@ -1170,7 +1168,7 @@ class TelegramRpcGate(TelegramClient):
 
     def _finish_transport_connect_failure(self) -> None:
         if self._transport_state is _TransportBoundaryState.CONNECTING:
-            self._transport_state = _TransportBoundaryState.DISCONNECTED
+            self._transport_state = _TransportBoundaryState.FAILED
 
     def _raise_if_transport_unavailable(self, *, allow_disconnected: bool = False) -> None:
         reusable = {_TransportBoundaryState.READY}

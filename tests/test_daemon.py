@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import sqlite3
 from collections.abc import Coroutine
 from contextlib import closing
@@ -781,6 +782,88 @@ async def test_protective_stop_persists_pending_summary_while_daemon_remains_par
         assert row is not None
         assert row[0] == "summary"
         assert stages == ["producer_cancelled", "disconnect"]
+    finally:
+        await sink.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_protective_stop_flushes_without_disconnected_success_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    policy = RuntimeObservationConfig()
+    sink = RuntimeObservationSink(db_path, retention_ttl_seconds=3600, policy=policy)
+    observer = RpcAdmissionObservationAggregator(sink, policy=policy)
+    source = TelegramRpcSource.MCP_INTERACTIVE
+    service_class = RPC_SOURCE_SERVICE_CLASS[source]
+    observer.observe(
+        RpcAdmissionEvent(
+            kind=RpcAdmissionEventKind.QUEUED,
+            source=source,
+            service_class=service_class,
+            queue_depth=1,
+            total_depth=1,
+        )
+    )
+    observer.observe(
+        RpcAdmissionEvent(
+            kind=RpcAdmissionEventKind.DISPATCHED,
+            source=source,
+            service_class=service_class,
+            queue_depth=0,
+            total_depth=0,
+            active_depth=1,
+            total_outstanding=1,
+            wait_seconds=0.01,
+        )
+    )
+
+    class _FailingClient(_ClientStub):
+        async def disconnect(self) -> None:
+            self.disconnect_calls += 1
+            raise OSError("transport teardown failed")
+
+    kill_switch = asyncio.Event()
+    kill_switch.set()
+    ctx = _typed_ctx(
+        client=_FailingClient(),
+        shutdown_event=asyncio.Event(),
+        flood_wait_kill_switch_event=kill_switch,
+        rpc_admission_observer=observer,
+        rpc_observation_sink=sink,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "flood_wait_kill_switch_status",
+        lambda: SimpleNamespace(open=True, detail=lambda: "open-for-test"),
+    )
+    caplog.set_level(logging.ERROR, logger=daemon.__name__)
+
+    try:
+        await _monitor_flood_wait_kill_switch(ctx)
+        assert cast(_ClientStub, ctx.client).disconnect_calls == 1
+        assert not ctx.shutdown_event.is_set()
+        assert "flood_wait_kill_switch_telegram_disconnect_failed" in caplog.messages
+        assert "flood_wait_kill_switch_telegram_disconnected" not in caplog.messages
+
+        row: tuple[object, ...] | None = None
+        for _ in range(100):
+            with closing(sqlite3.connect(db_path)) as conn:
+                row = cast(
+                    tuple[object, ...] | None,
+                    conn.execute(
+                        "SELECT outcome, reason_code FROM runtime_observations "
+                        "WHERE kind = 'telegram.rpc_admission' ORDER BY observed_at_ms DESC LIMIT 1"
+                    ).fetchone(),
+                )
+            if row is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert row is not None
+        assert row[0] == "summary"
     finally:
         await sink.aclose()
 
